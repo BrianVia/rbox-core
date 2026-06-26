@@ -1,0 +1,52 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { hashBytes } from "./hash.js";
+
+/**
+ * Content-addressed blob store on the local filesystem. In Phase 1 this stands
+ * in for R2 — the engine talks to this interface, so swapping in a real remote
+ * later is a driver change, not an engine change. Blobs are immutable and keyed
+ * by SHA-256: `blobs/<ab>/<full-sha>`.
+ */
+export interface BlobStore {
+  has(sha256: string): Promise<boolean>;
+  put(sha256: string, bytes: Uint8Array): Promise<void>;
+  get(sha256: string): Promise<Buffer>;
+}
+
+export class LocalBlobStore implements BlobStore {
+  constructor(private readonly dir: string) {}
+
+  private keyPath(sha256: string): string {
+    return path.join(this.dir, "blobs", sha256.slice(0, 2), sha256);
+  }
+
+  async has(sha256: string): Promise<boolean> {
+    try {
+      await fs.access(this.keyPath(sha256));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async put(sha256: string, bytes: Uint8Array): Promise<void> {
+    const dest = this.keyPath(sha256);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    // Atomic publish: write a temp sibling, then rename over. A crash mid-write
+    // never leaves a half-written blob at its content address.
+    const tmp = `${dest}.tmp-${process.pid}-${Date.now()}`;
+    await fs.writeFile(tmp, bytes);
+    await fs.rename(tmp, dest);
+  }
+
+  async get(sha256: string): Promise<Buffer> {
+    const bytes = await fs.readFile(this.keyPath(sha256));
+    // Integrity is cheap and catches store corruption / bugs early.
+    const actual = hashBytes(bytes);
+    if (actual !== sha256) {
+      throw new Error(`blob integrity mismatch: wanted ${sha256}, got ${actual}`);
+    }
+    return bytes;
+  }
+}

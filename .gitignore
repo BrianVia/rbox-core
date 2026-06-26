@@ -1,0 +1,15 @@
+# deps
+node_modules/
+
+# build output
+dist/
+
+# local workspace/runtime state (per-device, never synced or committed)
+.rbox/
+
+# wrangler local state
+.wrangler/
+
+# logs / os junk
+*.log
+.DS_Store

@@ -1,0 +1,21 @@
+{
+  "name": "rbox-dev-api",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-23",
+  "d1_databases": [
+    {
+      "binding": "rbox_dev_db",
+      "database_name": "rbox-dev-db",
+      "database_id": "91ae0add-f766-4dd5-8de3-96b8ce1f4e04"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "rbox_dev_blobs",
+      "bucket_name": "rbox-dev-blobs"
+    }
+  ],
+  "vars": {
+    "RBOX_DEV_TOKEN": "rbox-dev-7f3a9c2e8b1d4a60"
+  }
+}
