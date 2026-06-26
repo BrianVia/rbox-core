@@ -12,6 +12,8 @@ import {
   type WatchEvent,
 } from "./index.js";
 import type { FileEntry } from "./index.js";
+import { createHash, randomBytes } from "node:crypto";
+import { Sha256 } from "./sha256-stream.js";
 
 // ---- manifest validation (the path-traversal / corruption defense) --------
 
@@ -154,6 +156,27 @@ test("applyWatchEvents: addDir scans the whole subtree; unlinkDir removes dir/**
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---- streaming SHA-256 (Worker-side multipart verify) ---------------------
+
+test("Sha256 matches node:crypto across boundaries and odd-chunk streaming", () => {
+  const node = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+  const oneShot = (b: Buffer) => new Sha256().update(b).digestHex();
+  for (const n of [0, 1, 3, 55, 56, 63, 64, 65, 1000]) {
+    const b = Buffer.from("a".repeat(n));
+    expect(oneShot(b)).toBe(node(b));
+  }
+  // Large buffer fed in irregular chunks must match a one-shot hash.
+  const big = randomBytes(2_000_003);
+  const h = new Sha256();
+  let o = 0;
+  for (const c of [1, 63, 64, 65, 127, 4096, 100000]) {
+    h.update(big.subarray(o, o + c));
+    o += c;
+  }
+  h.update(big.subarray(o));
+  expect(h.digestHex()).toBe(node(big));
 });
 
 test("applyWatchEvents: ignored paths never enter the manifest", async () => {

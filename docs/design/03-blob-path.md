@@ -1,6 +1,8 @@
 # Design 03 — Production Blob Path (Milestone 3)
 
-**Status:** draft → pending codex adversarial review
+**Status:** ✅ IMPLEMENTED & VERIFIED. Design review #1 (2 blockers + 7 majors) + implementation code review (3 High + 1 Medium) — all resolved. Live-verified against deployed `rbox-dev-api`: 50MiB single-PUT, 120MiB multipart, resume-from-partial, concurrent same-sha, wrong-sha rejection, and a 40MB file synced cross-machine Mac↔prod (the cap is gone — M2 unblocked).
+
+**Code-review fixes applied:** multipart assembles into a per-upload **staging key** and publishes to canonical only via `put(..., {sha256})` (R2 verifies on publish; canonical never written with unverified bytes nor deleted by a bad/losing upload — this also removed the bespoke JS hash from the verify path); `uploads` keyed by `upload_id` (not sha) so concurrent same-sha uploads don't clobber; created_at-based expiry → 410 so dead resumes don't wedge (client retries once fresh, or adopts a concurrently-finished blob); cleanup-always after a consumed MPU; partial temp files removed on any error in `getBlobToFile` and `apply.writeEntry`.
 **Implements:** roadmap M3. **Decision:** D3 (direct-to-R2 / large-blob path). **Unblocks:** M2 (`.git` packs > 25MB).
 **Goal:** upload and download blobs of any realistic size (hundreds of MB) without OOM on client or Worker, without the 25MB cap, and resumably (a killed daemon picks up where it left off).
 
@@ -16,40 +18,42 @@ Real `.git/objects/pack/*.pack` and large assets exceed 25MB routinely, so M2 an
 
 ---
 
-## 2. The central constraint: no streaming WebCrypto digest
+## 2. Integrity without buffering: R2-native sha + post-complete verify **[R#1-BLOCKER]**
 
-`crypto.subtle.digest("SHA-256", buf)` needs the whole buffer. To verify a large blob's sha without buffering it, we need a **streaming** SHA-256. Options:
-- **(A) Pure-JS streaming SHA-256** updated as bytes flow through a `TransformStream` in the Worker. No buffering; verifies inline. Cost: JS hashing CPU (~100–200 MB/s) counts against the Worker CPU budget. Fine for tens-to-low-hundreds of MB (our case); not for multi-GB.
-- **(B) Defer verification to a Queue consumer** that streams the object back through a JS hash. Needs Cloudflare Queues (Workers Paid) + a consumer; doubles R2 egress. Heavier infra.
-- **(C) Trust the client sha, never verify.** Unacceptable — a buggy/malicious client poisons the content-addressed store for everyone (worse under M7 multi-tenancy).
+`crypto.subtle.digest` needs the whole buffer (no streaming WebCrypto). Per-part SHAs **cannot** prove the whole-object SHA (SHA-256 isn't composable) — the prior draft's "per-part + client full-sha" was an integrity hole. Resolved per path:
 
-**Chosen: (A) for M3** — a vetted streaming SHA-256 (`src/engine/sha256-stream.ts`, also usable client-side), run in the Worker as bytes stream to R2. Inline verification, no buffering, no Queues, fully autonomous to build+verify. (B) is noted as the scale path for multi-GB blobs and is *required* later for the presigned-direct path (§6) where the Worker never sees bytes. Keep the small-blob fast path on WebCrypto (buffer+digest) below a threshold.
-
----
-
-## 3. Upload protocol
-
-A size threshold `MULTIPART_THRESHOLD` (e.g. 8 MB) splits two paths:
-
-### 3.1 Small blobs (≤ threshold): single streaming PUT
-- Client streams the file (`fs.createReadStream`, **not** `readFile`) as the request body to `PUT /v1/blobs/:sha`.
-- Worker pipes `request.body` through the streaming-SHA transform into `bucket.put(key, stream)` — no `arrayBuffer()`. On stream end, compare computed sha to the URL sha; mismatch → delete the R2 object, 400. Insert blob row.
-- Removes both the buffer and the cap for the common case.
-
-### 3.2 Large blobs (> threshold): R2 multipart, resumable
-Use the R2 binding multipart API (no S3 credentials needed):
-- `POST /v1/blobs/:sha/multipart` → Worker `bucket.createMultipartUpload(key)` → returns `{ uploadId }`. Worker records `(sha, uploadId, partSize)` in D1 `uploads` so it survives Worker restarts and other devices.
-- `PUT /v1/blobs/:sha/multipart/:uploadId/part/:n` (body = one part) → Worker `mpu.uploadPart(n, body)` (streamed), records the returned `{ partNumber, etag }` + that part's streamed-sha contribution. **Per-part integrity:** the client sends the part's own sha in a header; Worker streams-hashes the part and rejects a mismatch immediately (cheap, bounded by part size).
-- `POST /v1/blobs/:sha/multipart/:uploadId/complete` { parts } → Worker verifies it has all parts, `mpu.complete(parts)`. **Whole-object sha:** since we can't re-read 300MB to hash, the client commits the full-file sha (computed via the same streaming hash during scan) and the Worker trusts the per-part-verified assembly equals it; a sampled/lazy full re-verify is the (B) Queue path, deferred. Insert blob row; clear the `uploads` row.
-
-### 3.3 Resumable token (prior-art §5)
-Client persists `.rbox/state/uploads/<sha>.json` = `{ sha, uploadId, partSize, totalParts, uploadedParts: [{n, etag, sha}] }` (atomic write). On (re)start, before uploading a missing blob, the client checks for a token: if present and the Worker still has the `uploadId` live (`GET …/multipart/:uploadId` → known parts), it resumes from the first missing part instead of restarting. A killed daemon mid-300MB-pack resumes, doesn't re-send. Tokens for completed or stale (R2-expired) uploads are pruned.
+- **Single PUT → R2 native integrity.** `bucket.put(key, request.body, { sha256: <expected> })` makes **R2 verify the content hash server-side** and reject a mismatch. No JS hashing, no buffering, plan-agnostic. This is the clean fix codex pointed to; the bespoke streaming-JS-hash in the Worker is unnecessary for single PUT.
+- **Multipart → post-complete full-object verify.** After `mpu.complete`, the Worker `bucket.get(key)` and streams the assembled object through a JS streaming SHA-256 (`src/engine/sha256-stream.ts`), compares to the claimed sha, and **only then inserts the `blobs` row** (mismatch → delete object + 412). One extra full read; CPU is fine on Paid for moderate sizes (note the ceiling). For multi-GB / scale this moves to a **Queue consumer** (Queues confirmed available) — same code, async — that's the documented scale path, not M3.
+- **Never `tee()` to hash+store [R#1-MAJOR]** — the slower branch buffers unboundedly. Single-consumer streams only (R2-native for PUT; pass-through hashing transform for downloads).
+- A buggy/malicious client therefore can never land bytes that don't match their content address (the threat C the draft rejected).
 
 ---
 
-## 4. Download path
-- Client streams `GET /v1/blobs/:sha` to a temp file (`fs.createWriteStream`), **streaming-hashing as it writes**, then verifies the sha before the atomic rename into the blob store / working tree. No buffering. (Today `getBlob` does `Buffer.from(arrayBuffer())` — replace with streamed write+verify.)
-- `apply.writeEntry` already stages to temp then renames; it will consume the streamed blob rather than a full Buffer.
+## 3. Upload protocol — single PUT vs multipart, bounded by CF's body cap **[R#1-BLOCKER]**
+
+Cloudflare caps inbound request bodies (~100MB Pro/standard) **independent of our app cap** — so streaming a single `request.body` removes our 25MB limit but not CF's. Therefore:
+
+- `SINGLE_PUT_MAX = 90 MiB` (margin under the 100MB CF cap). Files ≤ this use single PUT; **> this MUST use multipart.**
+- Multipart part sizing respects R2 limits **[R#1-MAJOR]**: 5 MiB min (except last), 5 GiB max, ≤ 10,000 parts, uniform non-final sizes. `partSize = max(8 MiB, ceil(total / 9000) rounded up to MiB)` so even multi-GB files stay under 10,000 parts. All sizes in MiB constants.
+
+### 3.1 Single PUT (≤ 90 MiB)
+- Client streams the file (`fs.createReadStream`, never `readFile`) as the body to `PUT /v1/blobs/:sha`.
+- Worker: `bucket.put(blobKey(sha), request.body, { sha256: sha })` — streamed, R2-verified. Insert blob row. (Keep a tiny in-memory fast path only for very small blobs if measurably simpler.)
+
+### 3.2 Multipart (> 90 MiB), resumable
+- `POST /v1/blobs/:sha/multipart` { size } → Worker computes partSize, `bucket.createMultipartUpload(blobKey)` → persists `uploads(sha, upload_id, part_size, total_parts, size, created_at)` in D1. Returns `{ uploadId, partSize, totalParts }`.
+- `PUT /v1/blobs/:sha/multipart/:uploadId/part/:n` (body = one part ≤ partSize) → `bucket.resumeMultipartUpload(blobKey, uploadId).uploadPart(n, request.body)` (streamed). Persist `upload_parts(upload_id, part_number, etag, size, created_at)` — **server-authoritative part state [R#1-MAJOR]**. (Per-part client sha optional sanity check; the real integrity gate is the post-complete whole-object verify.)
+- `POST /v1/blobs/:sha/multipart/:uploadId/complete` → load parts from `upload_parts` (ordered), `mpu.complete(parts)` using the stored `R2UploadedPart.etag` values **[R#1-MINOR: composite ETag is not the content hash]**; then **post-complete verify (§2)**; on success insert `blobs` row + clear `uploads`/`upload_parts`; on mismatch delete object + 412.
+
+### 3.3 Resumable token (prior-art §5) — server is the source of truth **[R#1-MAJOR]**
+Client persists `.rbox/state/uploads/<sha>.json` = `{ sha, uploadId, partSize, totalParts }` as a **cache/hint** (atomic write). On (re)start, before uploading a missing blob the client asks the server `GET /v1/blobs/:sha/multipart/:uploadId` → server returns the authoritative set of completed part numbers from `upload_parts`; client resumes from the first missing part. If the server doesn't know the uploadId (R2's 7-day TTL elapsed / never existed), the client starts fresh. A killed daemon mid-large-pack resumes; it never trusts its local token over server state.
+
+---
+
+## 4. Download path — streamed end-to-end, including apply **[R#1-MAJOR]**
+- Client streams `GET /v1/blobs/:sha` to a temp file (`fs.createWriteStream`), **streaming-hashing as it writes** (single pass-through, no tee), verifies the sha, then renames. No buffering. Today `remote.getBlob` does `Buffer.from(arrayBuffer())` (`remote.ts:46`) — replace with streamed write+verify.
+- **`apply.writeEntry` must also stream [R#1-MAJOR].** Today it does `store.get(sha)` (whole Buffer) then `fs.writeFile(tmp, bytes)` (`apply.ts:90`). Change to stream the blob into the existing temp file, then the precondition-check + rename flow runs unchanged. So large blobs never materialize in client memory on either upload or download.
+- Both upload buffering sites are plumbed to streaming **[R#1-MAJOR]**: `sync.uploadBlobs` (`sync.ts:48`) and `engine.uploadManifestBlobs` (`apply.ts:24`) switch to streaming variants for files over a small threshold.
 
 ---
 
@@ -72,7 +76,7 @@ Plan: implement presigned PUT/GET generation in the Worker with **aws4fetch** (t
 |---|---|
 | `src/engine/sha256-stream.ts` | **new** — streaming SHA-256 (shared client + Worker) |
 | `apps/api/src/worker.ts` | streaming PUT (no cap/buffer for ≤threshold); multipart endpoints; streamed GET; keep small-blob WebCrypto fast path |
-| `apps/api/migrations/0002_uploads.sql` | **new** — `uploads(sha, upload_id, part_size, created_at)` for resumable multipart |
+| `apps/api/migrations/0002_uploads.sql` | **new** — `uploads(sha, upload_id, part_size, total_parts, size, created_at)` + `upload_parts(upload_id, part_number, etag, size, created_at)` (server-authoritative resumable state) |
 | `apps/api/src/presign.ts` | **new** — aws4fetch presigned URLs, credential-gated (§6) |
 | `src/engine/blobstore.ts` | streaming `putStream`/`getStream` variants |
 | `src/cli/remote.ts` | streaming upload/download; multipart client; resume check |
@@ -88,10 +92,15 @@ Plan: implement presigned PUT/GET generation in the Worker with **aws4fetch** (t
 
 **Cross-machine + M2 readiness:** on the prod host, sync a directory containing a >25MB file Mac↔prod (proves the cap is gone end-to-end), which is the prerequisite M2 needed.
 
-## 9. Open questions for review
-1. Streaming JS SHA-256 in the Worker — is the CPU cost within Workers' limits for ~200MB? Where's the realistic ceiling before (B) Queue verification becomes mandatory?
-2. Whole-object integrity for multipart: is per-part-sha + client-committed full-sha acceptable for M3 (trusted dev), with full re-verify deferred to (B)? Or must M3 guarantee full-object verification inline?
-3. R2 binding limits: max single `put` stream size; max parts / part-size constraints (R2 multipart min part size 5MiB except last?). Confirm thresholds.
-4. Does `bucket.put(key, request.body)` actually stream without buffering in workerd, and is `request.body` re-readable if we also tee it for hashing? (TransformStream tee semantics.)
-5. Presigned sequencing: ship M3 on streaming-through-Worker now and treat presigned+Queue as a follow-up needing the R2 token (human), or block M3 on provisioning?
-6. Multipart upload TTL in R2 (incomplete uploads) vs our resumable token lifetime — prune policy.
+## 9. Review #1 resolutions
+- [x] BLOCKER multipart whole-object integrity → §2 (R2-native `sha256` for single PUT; post-complete full-object re-hash before inserting `blobs` for multipart; per-part shas never trusted as the whole)
+- [x] BLOCKER CF request-body cap → §3 (`SINGLE_PUT_MAX=90MiB`; multipart mandatory above; documented)
+- [x] MAJOR no `tee()` → §2/§4 (R2-native sha for PUT; single-consumer pass-through hash for downloads)
+- [x] MAJOR JS-SHA CPU → Paid confirmed; post-complete hash bounded; Queue path noted for multi-GB
+- [x] MAJOR resumable server state → §3.2/§3.3 (`upload_parts` authoritative; client token is a cache; `resumeMultipartUpload`)
+- [x] MAJOR R2 multipart constraints → §3 (MiB constants; 5MiB min/5GiB max/10k parts; dynamic partSize; 7-day TTL)
+- [x] MAJOR download/apply streaming → §4 (stream into `apply.writeEntry` temp/precondition/rename; both upload sites streamed)
+- [x] MINOR presigned provisioning → §6 ("provisioning required", attempt via API token, fallback to streaming)
+- [x] MINOR ETag → §3.2 (use `R2UploadedPart.etag` for complete only; never as content-address)
+
+**M3 scope to unblock M2:** single-PUT (R2-native-verified) lifts the cap to 90MiB — covers typical git repos immediately; multipart (verified, resumable) covers the rest. Presigned-direct is an additive cost optimization, credential-gated, with a transparent streaming fallback so M3 ships and verifies fully without it.

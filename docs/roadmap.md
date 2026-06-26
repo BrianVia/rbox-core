@@ -33,12 +33,14 @@ Currently `.git` is excluded entirely. **Codex review found M2 hard-depends on M
 - [ ] Whole-repo-state conflict handling (never per-object).
 - ⚠️ Flagged risk: quiescence is heuristic — prototype early.
 
-### 3. Production blob path (**D3**) — replace the dev shortcut — 🔄 ACTIVE (pulled ahead of M2)
-Today: Worker-mediated PUT, 25MB cap. Unblocks M2 (large git packs) and removes the OOM risk of buffering whole files.
-- [ ] Presigned direct-to-R2 upload (`/v1/blobs/upload-url` → `commit`); Worker out of the byte path.
-- [ ] R2 multipart for large files.
-- [ ] Serializable resumable-upload token persisted in `.rbox/state/uploads/` (prior-art §5) so a killed daemon resumes.
-- [ ] Lazy streaming plaintext-hash verification in a Queue consumer.
+### 3. Production blob path (**D3**) — ✅ DONE & VERIFIED (pulled ahead of M2)
+Lifted the 25MB cap and OOM risk; unblocks M2 (large git packs). Design: [`design/03-blob-path.md`](./design/03-blob-path.md). Verified live: 50MiB single-PUT, 120MiB multipart, resume, concurrent same-sha, wrong-sha rejection, 40MB cross-machine.
+- [x] Streaming single-PUT with **R2-native sha256 verification** (≤90MiB; server-side integrity, no buffering).
+- [x] **R2 multipart** for large files (staging key → publish-to-canonical on R2-verify).
+- [x] **Serializable resumable-upload token** in `.rbox/state/uploads/` (server-authoritative `upload_parts`); killed daemon resumes, expiry-safe.
+- [x] Streamed download into apply (no whole-file buffering on either side); bounded-concurrency uploads.
+- [ ] **Presigned direct-to-R2** (Worker out of the byte path) — additive SaaS cost optimization; **needs an R2 S3 API token (provisioning)**; transparent streaming fallback already in place, so this is deferred, not blocking.
+- [ ] Queue-based lazy verification for multi-GB blobs — current post-publish R2 verify covers typical sizes.
 
 ### 3b. Configurable ignore patterns in config
 Today ignore rules come from `BUILTIN_IGNORE` + `.gitignore` + `.rboxignore` only (`src/engine/ignore.ts`). `buildIgnoreMatcher(root, extra)` already accepts an `extra: string[]` — the matcher plumbing exists, it's just not fed from config.

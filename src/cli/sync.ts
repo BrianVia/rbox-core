@@ -33,7 +33,8 @@ async function withCache(
   return { cache, save: () => cache.save(root) };
 }
 
-/** Upload blobs with bounded concurrency (performance: never open all fds at once). */
+/** Upload blobs with bounded concurrency, streaming each file (single PUT or
+ *  resumable multipart by size) so memory stays flat regardless of file size. */
 async function uploadBlobs(
   api: RboxApi,
   root: string,
@@ -41,11 +42,14 @@ async function uploadBlobs(
   shaToPath: Map<string, string>
 ): Promise<void> {
   const queue = [...shas];
+  const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   const worker = async () => {
     for (let sha = queue.pop(); sha !== undefined; sha = queue.pop()) {
       const rel = shaToPath.get(sha);
       if (!rel) continue; // sha not among our local files (nothing to upload)
-      await api.putBlob(sha, await fs.readFile(path.join(root, rel)));
+      const abs = path.join(root, rel);
+      const st = await fs.stat(abs);
+      await api.putBlobFile(sha, abs, st.size, uploadsDir);
     }
   };
   await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));

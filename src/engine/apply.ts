@@ -84,15 +84,20 @@ async function writeEntry(
   await fs.mkdir(path.dirname(abs), { recursive: true });
 
   const tmp = tmpName(abs);
-  if (entry.type === "symlink") {
-    await fs.symlink(entry.symlinkTarget ?? "", tmp);
-  } else {
-    const bytes = await store.get(entry.sha256);
-    await fs.writeFile(tmp, bytes);
-    await fs.chmod(tmp, entry.mode);
-  }
-
   try {
+    if (entry.type === "symlink") {
+      await fs.symlink(entry.symlinkTarget ?? "", tmp);
+    } else {
+      // Stream large blobs straight to the temp file (no whole-file buffer); the
+      // streaming download verifies the sha. Fall back to buffered get otherwise.
+      if (store.getToFile) {
+        await store.getToFile(entry.sha256, tmp);
+      } else {
+        await fs.writeFile(tmp, await store.get(entry.sha256));
+      }
+      await fs.chmod(tmp, entry.mode);
+    }
+
     // Final precondition: does the target still match what reconcile assumed?
     const current = await currentEntryAt(destRoot, entry.path);
     if (!sameContent(current, expectedLocal) && current) {

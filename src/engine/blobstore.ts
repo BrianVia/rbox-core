@@ -12,6 +12,9 @@ export interface BlobStore {
   has(sha256: string): Promise<boolean>;
   put(sha256: string, bytes: Uint8Array): Promise<void>;
   get(sha256: string): Promise<Buffer>;
+  /** Optional streaming download into a file — used by apply for large blobs so
+   *  they never materialize in memory. Falls back to get()+write when absent. */
+  getToFile?(sha256: string, destPath: string): Promise<void>;
 }
 
 export class LocalBlobStore implements BlobStore {
@@ -48,5 +51,9 @@ export class LocalBlobStore implements BlobStore {
       throw new Error(`blob integrity mismatch: wanted ${sha256}, got ${actual}`);
     }
     return bytes;
+  }
+
+  async getToFile(sha256: string, destPath: string): Promise<void> {
+    await fs.copyFile(this.keyPath(sha256), destPath);
   }
 }

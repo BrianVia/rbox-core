@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "../../src/engine/manifest-validate.ts"]
+  "include": ["src", "../../src/engine/manifest-validate.ts", "../../src/engine/sha256-stream.ts"]
 }
