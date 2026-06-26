@@ -25,16 +25,16 @@ Turns manual `push`/`pull` into passive "edit here, appears there" sync. Design:
 - **Hardened beyond original scope:** precondition-checked non-destructive apply (no lost edits), shared manifest path-traversal validation (server+client), blob-existence 422, atomic local state (missing-vs-corrupt), realpath-within-root guard.
 - Deferred to later: systemd/launchd service install; parallel hashing + `@parcel/watcher` for monorepo scale (M9).
 
-### 2. `.git` atomic mirroring (**D6**)
-Currently `.git` is excluded entirely.
+### 2. `.git` atomic mirroring (**D6**) — ⛔ BLOCKED on M3, reordered after it
+Currently `.git` is excluded entirely. **Codex review found M2 hard-depends on M3** (git packs exceed the 25MB blob cap) plus 5 more blockers; building M3 first. Narrowed M2 scope + blocker list in [`design/02-git-mirroring.md`](./design/02-git-mirroring.md) §10.
 - [ ] Quiescence detection (no `.git` writes + no `*.lock` for a debounce window).
 - [ ] Snapshot `.git` as one transactional unit; assemble in temp dir, swap in atomically.
 - [ ] Integrity check (HEAD/refs/index consistency) before committing a `.git` update; skip+retry if torn.
 - [ ] Whole-repo-state conflict handling (never per-object).
 - ⚠️ Flagged risk: quiescence is heuristic — prototype early.
 
-### 3. Production blob path (**D3**) — replace the dev shortcut
-Today: Worker-mediated PUT, 25MB cap.
+### 3. Production blob path (**D3**) — replace the dev shortcut — 🔄 ACTIVE (pulled ahead of M2)
+Today: Worker-mediated PUT, 25MB cap. Unblocks M2 (large git packs) and removes the OOM risk of buffering whole files.
 - [ ] Presigned direct-to-R2 upload (`/v1/blobs/upload-url` → `commit`); Worker out of the byte path.
 - [ ] R2 multipart for large files.
 - [ ] Serializable resumable-upload token persisted in `.rbox/state/uploads/` (prior-art §5) so a killed daemon resumes.
