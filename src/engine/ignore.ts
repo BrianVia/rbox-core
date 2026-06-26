@@ -33,6 +33,9 @@ export const BUILTIN_IGNORE: string[] = [
   "*.sqlite",
   "*.sqlite3",
   "*.db",
+  // rbox's own atomic-write temp files (see fsutil RBOX_TMP_PREFIX). A crashed
+  // temp left beside a real file must never be scanned into a manifest.
+  ".rbox-tmp-*",
   // ...but templates are safe to sync.
   "!.env.example",
   "!.env.sample",

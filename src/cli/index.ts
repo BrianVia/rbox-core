@@ -3,6 +3,8 @@ import path from "node:path";
 import { scanManifest } from "../engine/index.js";
 import { findRoot, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
+import { runDaemon } from "./daemon.js";
+import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
 const DEFAULT_TOKEN = process.env.RBOX_TOKEN ?? "rbox-dev-7f3a9c2e8b1d4a60";
@@ -80,8 +82,27 @@ async function main(): Promise<void> {
       console.log(`  local files: ${local.files.length}`);
       break;
     }
+    case "daemon": {
+      const sub = positional[0];
+      const root = await resolveRoot(positional[1]);
+      if (sub === "start") await startDaemon(root);
+      else if (sub === "stop") await stopDaemon(root);
+      else if (sub === "status") await statusDaemon(root);
+      else if (sub === "logs") await logsDaemon(root, flags.follow === "true" || flags.f === "true");
+      else {
+        console.log("usage: rbox daemon <start|stop|status|logs> [path] [--follow]");
+        process.exitCode = 1;
+      }
+      break;
+    }
+    case "__daemon-run": {
+      // Hidden: the actual in-process daemon loop (spawned detached by `daemon start`).
+      const root = path.resolve(positional[0] ?? process.cwd());
+      await runDaemon(root);
+      break;
+    }
     default:
-      console.log("rbox — dev-aware sync\n\nCommands:\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state");
+      console.log("rbox — dev-aware sync\n\nCommands:\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  daemon <start|stop|status|logs>  passive continuous sync");
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }

@@ -8,8 +8,15 @@ import type { FileEntry, Manifest } from "./types.js";
  * the remote, decided by a three-way comparison (base = last-synced).
  */
 export type Action =
-  | { kind: "write"; entry: FileEntry }
-  | { kind: "delete"; path: string }
+  | {
+      kind: "write";
+      entry: FileEntry;
+      /** What local looked like when reconcile decided this (undefined = expected absent).
+       *  Apply re-checks the disk against this before overwriting, so an edit landing in
+       *  the scan→apply window is preserved as a conflict, not clobbered. */
+      expectedLocal?: FileEntry;
+    }
+  | { kind: "delete"; path: string; expectedLocal?: FileEntry }
   | {
       /** Both sides edited the same path differently — keep both, lose nothing. */
       kind: "conflict";
@@ -51,8 +58,8 @@ export function reconcile(
     if (sameContent(l, r)) continue;
 
     if (sameContent(l, b)) {
-      if (r) actions.push({ kind: "write", entry: r });
-      else actions.push({ kind: "delete", path: p });
+      if (r) actions.push({ kind: "write", entry: r, expectedLocal: l });
+      else actions.push({ kind: "delete", path: p, expectedLocal: l });
       continue;
     }
 
@@ -62,7 +69,7 @@ export function reconcile(
     if (r && l) {
       actions.push({ kind: "conflict", path: p, keepLocalAs: conflictName(p, device, now), entry: r });
     } else if (r && !l) {
-      actions.push({ kind: "write", entry: r }); // delete-vs-modify → remote wins, nothing to keep
+      actions.push({ kind: "write", entry: r, expectedLocal: l }); // delete-vs-modify → remote wins, nothing to keep
     }
     // (!r && l): remote deleted, local modified → keep local, no local action.
   }

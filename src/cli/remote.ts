@@ -2,8 +2,12 @@ import type { BlobStore, Manifest } from "../engine/index.js";
 
 export interface CommitResult {
   sequence?: number;
+  /** Parent-sequence conflict (HTTP 409): client must pull+reconcile, then retry. */
   conflict?: boolean;
   head?: number;
+  /** Manifest referenced blobs the server doesn't have (HTTP 422): upload these, then retry.
+   *  Distinct from a parent conflict — a different recovery (upload, not pull). */
+  unsatisfiedBlobs?: string[];
 }
 
 /** Thin client for the rbox control plane. */
@@ -58,8 +62,24 @@ export class RboxApi {
       const body = (await res.json()) as { head: number };
       return { conflict: true, head: body.head };
     }
+    if (res.status === 422) {
+      const body = (await res.json()) as { missing?: string[] };
+      return { unsatisfiedBlobs: body.missing ?? [] };
+    }
     if (!res.ok) throw new Error(`commit failed: ${res.status} ${await res.text()}`);
     return { sequence: ((await res.json()) as { sequence: number }).sequence };
+  }
+
+  /** wss:// URL for the live notification channel. The daemon opens this with an
+   *  `Authorization: Bearer` header (Bun WS supports custom headers); the DO reads
+   *  the same bearer as HTTP. Notification-only — correctness never depends on it. */
+  wsConnectUrl(): string {
+    const ws = this.baseUrl.replace(/^http/, "ws");
+    return `${ws}/v1/ws/${this.workspaceId}/proj/${this.projectId}/connect`;
+  }
+
+  get bearerToken(): string {
+    return this.token;
   }
 
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {

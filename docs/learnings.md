@@ -1,0 +1,49 @@
+# rbox Build Learnings (append-only)
+
+Hard-won, reusable facts discovered while building rbox. **Append only** — never rewrite history; add a new dated entry. Read this before grinding on something that smells familiar.
+
+Format: `## YYYY-MM-DD — <short title>` then the learning + why it matters.
+
+---
+
+## 2026-06-26 — Autonomous build loop kickoff: tooling facts
+
+- **Codex adversarial review is `coy exec "<prompt>"`.** `coy` is aliased to `codex --dangerously-bypass-approvals-and-sandbox`; the non-interactive subcommand is `exec` (not `--exec`). Codex emits a banner (sandbox/reasoning/session id), then hook lines, then the real answer after a `codex` marker, then a `tokens used` footer. Parse the answer from the body, not the banner. A line like `ERROR rmcp::transport::worker ... AuthorizationRequired` is just a side MCP server failing to load — harmless, ignore it.
+- **Prod host `flat-meadow-prod-main-01`: bun is NOT on the non-interactive SSH PATH.** `ssh host 'which bun'` → "bun not found", but it exists at `/home/via/.bun/bin/bun` (login shells only). Always invoke bun on the host by full path, or `source ~/.bashrc`/`~/.profile` first. Same caution applies to any tool installed via a user-level installer.
+- **macOS has no `timeout` command.** Use `ssh -o ConnectTimeout=N` for SSH; for general timeouts install coreutils (`gtimeout`) or rely on the tool's own flags.
+- **Safety rails (carry forward every milestone):** prod host writes are confined to `~/rbox-lab`; code lives in `~/rbox-app`. Never point rbox at arbitrary prod paths. Cloudflare resources stay namespaced `rbox-dev-*`. `.env`/secrets excluded by default; opt-in sync is E2EE-only. The cleartext dev token must die at milestone 4.
+
+## 2026-06-26 — WebSocket subprotocol facts (M1)
+
+- **Bun's WebSocket *client* supports subprotocols** (`new WebSocket(url, ["a","b"])`) and negotiates per-RFC: it constructs fine, and on handshake **rejects with close code 1002 "Mismatch client protocol" if the server does not echo back one of the offered subprotocols.** Implication for the DO: on a successful auth it MUST respond with `Sec-WebSocket-Protocol: rbox.v1` (a value the client offered); on auth failure it must reject the upgrade outright (401, no 101) — it must NOT complete the 101 without echoing a matching protocol, or the client tears down with 1002.
+- **Bun's WebSocket *server* (`server.upgrade(req, {headers:{"Sec-WebSocket-Protocol":...}})`) does NOT reliably echo the selected subprotocol** — a Bun-client↔Bun-server subprotocol handshake fails with 1002. This is a Bun-server limitation and is irrelevant to rbox (server is a Cloudflare DO, which echoes correctly), but don't waste time trying to repro the auth scheme with a Bun test server — it will mislead you. Verify against a real deployed DO instead.
+- **chokidar@5.0.0 imports and runs under Bun** (`import chokidar from "chokidar"; chokidar.watch` is a function). No shim needed. NOTE: import working ≠ behavior verified — still must test add/change/unlink/atomic-save events under Bun on Linux+macOS, and set `followSymlinks:false` (chokidar defaults to true, but `scanManifest` records symlinks without following — mismatch) and `ignoreInitial:true`.
+- **Bun's WebSocket client supports a custom `Authorization` header** via `new WebSocket(url, { headers: { Authorization: "Bearer ..." } })` — verified the server receives it. Because rbox's daemon is ALWAYS Bun (never a browser), this is the auth path for the `/connect` WebSocket: same bearer token as HTTP, no subprotocol echo dance, no 1002 risk. The subprotocol scheme (previous entry) is the fallback only if a browser client ever needs WS. The CF DO reads `Authorization` off the upgrade request like any header.
+- **chokidar behavioral test under Bun (macOS) PASSES:** with `{followSymlinks:false, ignoreInitial:true, awaitWriteFinish:{stabilityThreshold:120,pollInterval:20}}`, add/change/unlink and atomic-save (write-temp + rename-over) all surface correctly (atomic-save shows as `change`). `awaitWriteFinish` matters — it coalesces chunked writes. Linux (prod host) confirmation still pending via remote test. This clears the M1 chokidar gate on macOS.
+- **DO commit critical section must contain NO `await` on external I/O** (R2/D1). Cloudflare DO single-threading does NOT make a read-head→write-head sequence atomic if there's an `await` between them — another request interleaves at the yield. Pattern: upload manifest to R2 *first* (outside the section), then do the head re-read + parent-check + advance with synchronous SQLite-backed storage. Pre-commit R2 manifest blobs that lose the race become GC-able orphans (fine; content-addressed). **Confirmed APIs (codex, CF docs):** `ctx.storage.transactionSync(fn)` is real on SQLite-backed DOs and gives an atomic synchronous multi-key write (use it for head+seq together — not two `put`s). `ctx.storage.kv.get/put` are the synchronous KV ops. Sync ops need NO `blockConcurrencyWhile`; reserve `blockConcurrencyWhile` for ASYNC state-sensitive init — e.g. the one-time D1→DO bootstrap, run in the DO constructor so it gates all requests and two first-touch requests can't both import.
+
+## 2026-06-26 — M1 (daemon) DONE & verified cross-machine
+
+- The full daemon shipped and is verified Mac ↔ flat-meadow-prod-main-01 against the live `rbox-dev-api` (DO deployed with `new_sqlite_classes` migration v1). Test artifacts in scratchpad (smoke.ts, e2e-local.sh, xm-e2e.sh). Results: 11/11 live control-plane, 7/7 local 2-daemon, 6/6 cross-machine, 16/16 unit.
+- **Content-addressed blobs persist globally across workspaces/runs** — a smoke test asserting "commit with missing blob → 422" FALSELY failed because a prior run had already uploaded that exact content (same sha). Lesson: any test needing a genuinely-absent blob must use per-run-unique content (e.g. embed the random workspace id in the bytes). Fresh workspace ≠ fresh blobs.
+- **Codex `exec` running in background saturates CPU** (xhigh, 90k–250k tokens) and made an unrelated `bun test` flake with a 5000ms timeout on the round-trip test. Isolated/idle runs are 100% stable. If tests flake with exactly-the-timeout durations while a heavy background job runs, suspect CPU starvation, not a logic bug.
+- **prod host code lives in `~/rbox-app`** (rsync'd, NOT a git clone). Update it with `rsync -az --delete --exclude '._*' src/ HOST:rbox-app/src/` + `bun install`. The daemon's detached child uses `process.argv[1]` as the entry, so starting via `cd ~/rbox-app && bun src/cli/index.ts daemon start <root>` makes the child resolve `src/cli/index.ts` relative to the inherited cwd — works. chokidar confirmed working under Bun on the prod **Linux** host too (clears the Linux watcher gate).
+
+## 2026-06-26 — DO bootstrap can't run in the constructor (name not recoverable)
+
+- A Durable Object created via `idFromName(`${ws}/${proj}`)` **cannot recover its ws/proj string inside the DO** — the name is hashed into the id and not exposed. So the design's "bootstrap from D1 in the constructor under blockConcurrencyWhile" is impossible: the constructor doesn't know which workspace it is. Resolution that keeps the same guarantee: **lazy single-flight bootstrap** — `ensureBootstrap(ws, proj)` called at the top of each request; a memoized `bootstrapPromise` (created with no `await` between the `if (!promise)` check and the assignment, so atomic under the DO's single thread) ensures `doBootstrap` runs exactly once and all concurrent first-touch requests await the same promise. Same effect as constructor-gating (one import, requests wait), achieved where ws/proj are actually known. Pass ws/proj to the DO by keeping the original `/v1/ws/:ws/proj/:proj/...` path on the forwarded request and parsing it in the DO.
+
+## 2026-06-26 — Build/types setup gap
+
+- Root `tsconfig.json` has `include: ["src"]`, so `apps/api/` (the Worker/DO) was NOT typechecked by `bunx tsc --noEmit`, and `@cloudflare/workers-types` wasn't installed — the Worker had zero type coverage (wrangler/esbuild bundles without typechecking). Fixed: installed `@cloudflare/workers-types`, added `apps/api/tsconfig.json` (types: workers-types; includes `../../src/engine/manifest-validate.ts` for the shared validator). Typecheck the API with `bunx tsc -p apps/api --noEmit`. The Worker must import `manifest-validate.ts` DIRECTLY (not via the engine barrel `index.ts`) so node:fs-using modules don't get pulled into the Worker bundle.
+
+## 2026-06-26 — Daemon performance is paramount (user directive)
+
+- **The daemon must be invisible: O(changed) work, not O(repo) work, and always lose the scheduler race to the developer's tools.** Concrete failure to avoid: getting pegged by `npm ci`, a 50k-file `git clone` into the watched root, or bulk copies. Architecture (see design 01 §6.0):
+  1. **Ignore-first watching** — watcher uses the SAME ignore matcher as the scanner, so `node_modules/`/`.git/`/`dist/` etc. emit zero events & consume zero watches. `npm ci` → no events at all. Biggest lever, free.
+  2. **Event-driven incremental manifest** — hash only the changed paths the watcher reported, patch the in-memory manifest; never full-rescan on the hot path.
+  3. **Periodic full scan = cheap safety net** (hashcache makes it stat-only), reconciles dropped events; rate-limited (~60s±jitter), never per-event.
+  4. **Bounded-concurrency hashing/upload pools** (`min(cores,8)`) — never open 50k fds; flat memory (streaming hash, one blob at a time).
+  5. **Low process priority** — `os.setPriority` (CPU) + best-effort `ionice` on Linux; the daemon never makes the laptop feel slow.
+  6. **Adaptive coalescing debounce** — extend settle window during a burst (capped), don't scan a moving target.
+  - This ELEVATED "scan only changed subtrees" from M9 into M1 (delivered via event-driven patching); monorepo-scale tuning of the *full* scan stays M9.

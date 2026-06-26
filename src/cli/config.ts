@@ -1,6 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Manifest } from "../engine/index.js";
+import { writeFileAtomic } from "../engine/fsutil.js";
+
+function isENOENT(e: unknown): boolean {
+  return (e as NodeJS.ErrnoException)?.code === "ENOENT";
+}
 
 /** Per-device, machine-local workspace binding. `rootPath` is NEVER synced. */
 export interface WorkspaceConfig {
@@ -46,27 +51,52 @@ export async function findRoot(start: string): Promise<string | undefined> {
 }
 
 export async function loadConfig(root: string): Promise<WorkspaceConfig> {
+  let raw: string;
   try {
-    return JSON.parse(await fs.readFile(configPath(root), "utf8")) as WorkspaceConfig;
+    raw = await fs.readFile(configPath(root), "utf8");
+  } catch (e) {
+    if (isENOENT(e)) throw new Error(`No rbox workspace at ${root}. Run: rbox link ${root}`);
+    throw e;
+  }
+  try {
+    return JSON.parse(raw) as WorkspaceConfig;
   } catch {
-    throw new Error(`No rbox workspace at ${root}. Run: rbox link ${root}`);
+    throw new Error(`Corrupt workspace config at ${configPath(root)}. Inspect or re-run \`rbox link\`.`);
   }
 }
 
 export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  await fs.writeFile(configPath(root), JSON.stringify(cfg, null, 2));
+  await writeFileAtomic(configPath(root), JSON.stringify(cfg, null, 2));
 }
 
+/**
+ * Load the sync state (the reconcile base). A MISSING file is the expected
+ * first-run case → empty base. A CORRUPT file is NOT silently treated as empty:
+ * resetting the base to empty would make the next reconcile see every remote
+ * file as "new" and every local file as conflicting — a destructive surprise.
+ * We refuse and surface it instead.
+ */
 export async function loadState(root: string): Promise<SyncState> {
+  let raw: string;
   try {
-    return JSON.parse(await fs.readFile(statePath(root), "utf8")) as SyncState;
+    raw = await fs.readFile(statePath(root), "utf8");
+  } catch (e) {
+    if (isENOENT(e)) return { lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST };
+    throw e;
+  }
+  try {
+    return JSON.parse(raw) as SyncState;
   } catch {
-    return { lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST };
+    throw new Error(
+      `Corrupt sync state at ${statePath(root)}. Refusing to reset to an empty base ` +
+        `(that would force a destructive reconcile). Inspect the file, or delete it to ` +
+        `intentionally re-baseline from scratch.`
+    );
   }
 }
 
 export async function saveState(root: string, state: SyncState): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  await fs.writeFile(statePath(root), JSON.stringify(state, null, 2));
+  await writeFileAtomic(statePath(root), JSON.stringify(state, null, 2));
 }

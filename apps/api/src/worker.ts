@@ -1,24 +1,18 @@
 /**
  * rbox dev control plane.
  *
- * Faithful to the v2 design where it counts:
- *  - manifests are content-addressed blobs in R2; D1 stores only a pointer row (D4)
- *  - optimistic concurrency: a commit must carry the parent sequence it observed,
- *    else 409 conflict (the check v1 described but never implemented)
- *  - missing-blob check is one batched query, not N round-trips
- *  - top-level error boundary turns thrown Responses into real responses (v1 bug)
+ *  - blobs: content-addressed in R2, pointer rows in D1 (Worker-mediated PUT with
+ *    a dev size cap; production path is presigned direct-to-R2 + multipart, D3/M3)
+ *  - manifests: commit/latest/connect are delegated to the WorkspaceSync Durable
+ *    Object (D2/M1) — the authoritative per-(workspace,project) commit sequencer
+ *    and live notification fanout. The DO fixes the old MAX(sequence)+1 race.
+ *  - top-level error boundary turns thrown Responses into real responses.
  *
- * Deliberate dev-harness shortcuts (documented, not hidden):
- *  - auth is a shared bearer token, not the device-code flow
- *  - blob upload is Worker-mediated with a size cap; PRODUCTION path is presigned
- *    direct-to-R2 + multipart (D3). Fine here because test files are tiny.
+ * Dev-harness shortcut (documented): auth is a shared bearer token, not the
+ * device-code flow (M4 replaces it).
  */
-
-export interface Env {
-  rbox_dev_db: D1Database;
-  rbox_dev_blobs: R2Bucket;
-  RBOX_DEV_TOKEN: string;
-}
+import type { Env } from "./env.js";
+export { WorkspaceSync } from "./workspace-sync.js";
 
 const MAX_BLOB_BYTES = 25 * 1024 * 1024; // dev cap; prod uses presigned multipart
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -56,12 +50,15 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "GET") return blobGet(env, sha);
   }
 
-  // /v1/ws/:ws/proj/:proj/(manifests|latest)
+  // /v1/ws/:ws/proj/:proj/(manifests|latest|connect) -> delegate to the WorkspaceSync DO.
   if (seg.length === 6 && seg[0] === "v1" && seg[1] === "ws" && seg[3] === "proj") {
     const ws = seg[2]!;
     const proj = seg[4]!;
-    if (req.method === "POST" && seg[5] === "manifests") return commitManifest(req, env, ws, proj);
-    if (req.method === "GET" && seg[5] === "latest") return latestManifest(env, ws, proj);
+    const action = seg[5]!;
+    if (action === "manifests" || action === "latest" || action === "connect") {
+      const id = env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`);
+      return env.WORKSPACE_SYNC.get(id).fetch(req);
+    }
   }
 
   return jsonResponse({ error: "not_found" }, 404);
@@ -73,7 +70,6 @@ async function blobsCheck(req: Request, env: Env): Promise<Response> {
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && SHA_RE.test(s)) : [];
   const present = new Set<string>();
-  // Batched IN query in chunks (D1 binds one param per sha).
   for (let i = 0; i < shas.length; i += 80) {
     const chunk = shas.slice(i, i + 80);
     if (chunk.length === 0) break;
@@ -112,53 +108,6 @@ async function blobGet(env: Env, sha: string): Promise<Response> {
   return new Response(obj.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
-// ---- manifests ----------------------------------------------------------
-
-async function commitManifest(req: Request, env: Env, ws: string, proj: string): Promise<Response> {
-  const body = (await req.json()) as { parentSequence?: number | null; deviceId?: string; manifest?: unknown };
-  const parent = body.parentSequence ?? 0;
-  if (body.manifest == null || typeof body.manifest !== "object") throw badRequest("missing manifest");
-
-  const head = await currentHead(env, ws, proj);
-  if (parent !== head) {
-    // Optimistic-concurrency conflict — client must pull head and reconcile.
-    return jsonResponse({ error: "conflict", head }, 409);
-  }
-
-  const serialized = new TextEncoder().encode(JSON.stringify(body.manifest));
-  const sha = await sha256Hex(serialized.buffer as ArrayBuffer);
-  await env.rbox_dev_blobs.put(manifestKey(sha), serialized);
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, serialized.byteLength).run();
-
-  const next = head + 1;
-  await env.rbox_dev_db
-    .prepare("INSERT INTO manifests (workspace_id, project_id, sequence, manifest_blob_sha, device_id) VALUES (?, ?, ?, ?, ?)")
-    .bind(ws, proj, next, sha, body.deviceId ?? null)
-    .run();
-  return jsonResponse({ sequence: next, manifestSha: sha });
-}
-
-async function latestManifest(env: Env, ws: string, proj: string): Promise<Response> {
-  const row = await env.rbox_dev_db
-    .prepare("SELECT sequence, manifest_blob_sha FROM manifests WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT 1")
-    .bind(ws, proj)
-    .first<{ sequence: number; manifest_blob_sha: string }>();
-  if (!row) return jsonResponse({ sequence: 0, manifest: { generatedAt: "", files: [] } });
-
-  const obj = await env.rbox_dev_blobs.get(manifestKey(row.manifest_blob_sha));
-  if (!obj) return jsonResponse({ error: "manifest_blob_missing" }, 500);
-  const manifest = JSON.parse(await obj.text());
-  return jsonResponse({ sequence: row.sequence, manifest });
-}
-
-async function currentHead(env: Env, ws: string, proj: string): Promise<number> {
-  const row = await env.rbox_dev_db
-    .prepare("SELECT COALESCE(MAX(sequence), 0) AS head FROM manifests WHERE workspace_id = ? AND project_id = ?")
-    .bind(ws, proj)
-    .first<{ head: number }>();
-  return Number(row?.head ?? 0);
-}
-
 // ---- helpers ------------------------------------------------------------
 
 function requireAuth(req: Request, env: Env): void {
@@ -173,9 +122,6 @@ function eq(a: string[], b: string[]): boolean {
 }
 function blobKey(sha: string): string {
   return `blobs/sha256/${sha.slice(0, 2)}/${sha}`;
-}
-function manifestKey(sha: string): string {
-  return `manifests/sha256/${sha.slice(0, 2)}/${sha}`;
 }
 function badRequest(message: string): Response {
   return jsonResponse({ error: "bad_request", message }, 400);

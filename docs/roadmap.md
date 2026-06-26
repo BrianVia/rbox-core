@@ -14,13 +14,16 @@ Status as of the initial commit (v1). What's working, what's stubbed, and what's
 
 ## 🔜 Next milestones (priority order)
 
-### 1. Daemon + watcher + live push — *the headline feature*
-Turns manual `push`/`pull` into passive "edit here, appears there" sync.
-- [ ] File watcher (chokidar/native) with debounce; scan only changed subtrees.
-- [ ] `WorkspaceSync` Durable Object (**D2**) as commit sequencer + WebSocket broadcaster; **auth the WS upgrade**.
-- [ ] Daemon holds a WS to the DO; on broadcast `{sequence}` newer than local → auto-pull.
-- [ ] `rbox daemon {start|stop|logs}`; run as a service on the host.
-- [ ] Incremental hashing: reuse cached hash when `(mtime, size)` unchanged (mtime as fast-path only).
+### 1. Daemon + watcher + live push — *the headline feature* ✅ DONE & VERIFIED
+Turns manual `push`/`pull` into passive "edit here, appears there" sync. Design: [`design/01-daemon.md`](./design/01-daemon.md) (3 correctness review rounds + 2 perf rounds with codex). Verified cross-machine (Mac ↔ `flat-meadow-prod-main-01`): 6/6 cross-machine + 7/7 local-2-dir + 11/11 live control-plane + 16/16 unit.
+- [x] File watcher (chokidar, swappable) with adaptive coalescing debounce; **event-driven incremental manifest patch (O(changed), not O(repo))**.
+- [x] `WorkspaceSync` Durable Object (**D2**) as authoritative commit sequencer (atomic `transactionSync`, fixes the old `MAX(seq)+1` race) + hibernating WebSocket broadcaster; **WS authed via `Authorization` header**.
+- [x] Daemon holds a WS to the DO; on `committed` broadcast → auto-pull. Single-flight pump, jittered safety-net + deep reconcile tiers, reconnect w/ backoff.
+- [x] `rbox daemon {start|stop|status|logs}`; detached process, PID-reuse-safe.
+- [x] Incremental hashing: `(mtime,size)` cache skips re-hash (fast-path only); stat→hash→stat consistency.
+- **Performance (user directive):** ignore-first watching (`npm ci` → zero events, verified), low process priority, bounded-concurrency uploads, three-tier scan (incremental / stat-only safety / cache-bypassing deep).
+- **Hardened beyond original scope:** precondition-checked non-destructive apply (no lost edits), shared manifest path-traversal validation (server+client), blob-existence 422, atomic local state (missing-vs-corrupt), realpath-within-root guard.
+- Deferred to later: systemd/launchd service install; parallel hashing + `@parcel/watcher` for monorepo scale (M9).
 
 ### 2. `.git` atomic mirroring (**D6**)
 Currently `.git` is excluded entirely.
@@ -36,6 +39,14 @@ Today: Worker-mediated PUT, 25MB cap.
 - [ ] R2 multipart for large files.
 - [ ] Serializable resumable-upload token persisted in `.rbox/state/uploads/` (prior-art §5) so a killed daemon resumes.
 - [ ] Lazy streaming plaintext-hash verification in a Queue consumer.
+
+### 3b. Configurable ignore patterns in config
+Today ignore rules come from `BUILTIN_IGNORE` + `.gitignore` + `.rboxignore` only (`src/engine/ignore.ts`). `buildIgnoreMatcher(root, extra)` already accepts an `extra: string[]` — the matcher plumbing exists, it's just not fed from config.
+- [ ] Add an `ignore: string[]` (gitignore-syntax globs) to the **synced** project config (`rbox.yml`, **D11**) so every machine agrees on what's in-scope — ignore rules are part of the project definition, not a per-device preference.
+- [ ] Wire it through: `rbox.yml.ignore` → `buildIgnoreMatcher(root, extra)` → `scanManifest`. Per-device `.rboxignore` still layers on top as a local override.
+- [ ] Precedence + negation order documented (builtin → `rbox.yml` → `.gitignore` → `.rboxignore`), since `!`-unignore depends on order.
+- [ ] `rbox ignore <glob>` / `rbox ignore --list` convenience commands (optional sugar over editing `rbox.yml`).
+- ⚠️ Changing the ignore set changes the manifest — newly-ignored files become deletes on other machines, newly-included files become adds. Surface that as a diff preview before commit, don't silently propagate mass deletions.
 
 ### 4. Real auth — replace the shared token
 - [ ] Device authorization flow (**D8**): `rbox login` prints a code, browser approves, device token issued.
@@ -67,6 +78,12 @@ Today: Worker-mediated PUT, 25MB cap.
 - [ ] Stripe integration: subscriptions (Free/Solo/Pro/Team), per-seat for Team, $3/100GB add-on.
 - [ ] Usage metering + soft/hard quota signals surfaced in `rbox status` and the dashboard.
 - [ ] Plan → capability mapping (retention window, advanced hydration/ignore on Pro).
+
+### 7c. Onboarding TUI / terminal UX
+First-time setup is the highest-leverage UX moment — it's where a dev decides rbox is "easy" or "another sync tool to fight." Today onboarding is bare `console.log`. Two complementary directions (want one or both):
+- [ ] **chalk** ([chalk/chalk](https://github.com/chalk/chalk)) — low-cost polish on the *existing* command output: colorize `status`, conflict warnings, the post-`link` "link another machine" hint, spinners on push/pull. No flow change, just legibility. Do this first; it's nearly free.
+- [ ] **OpenTUI** ([opentui.com](https://opentui.com/)) — a real interactive wizard for `rbox init` / first `link`: pick or create a workspace, choose the sync root, toggle `.env`/secrets sync (defaulting off, **D5**), approve the device (ties into device-code auth, milestone 4), and watch the first sync stream live. This is the bigger lift — an actual TUI runtime (React/Solid-style) — so gate it on auth + link being stable.
+- ⚠️ Keep every TUI flow scriptable: a `--no-interactive` / flag-driven path must stay first-class so headless/Docker onboarding (the Host B story) and CI never depend on a TTY. The TUI is a layer over the flags, never the only way in.
 
 ### 8. Hydration brain (the dev-aware wedge)
 - [ ] Project detection (package.json, Cargo.toml, go.mod, …) + package-manager inference.
