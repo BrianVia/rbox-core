@@ -70,15 +70,27 @@ function isInside(p: string, root: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-/** First of `names` that exists directly in `dir`, or undefined. */
-async function firstPresent(dir: string, names: string[]): Promise<string | undefined> {
-  for (const name of names) {
-    try {
-      await fs.access(path.join(dir, name));
-      return name;
-    } catch {
-      /* not present */
+/**
+ * First of `names` found in `startDir` or any ANCESTOR up to and including
+ * `rootDir` — Yarn reads `.yarnrc.yml` from ancestors, so a config at the
+ * workspace root applies to a nested project. We bound the walk at the workspace
+ * (above it is the user's own machine config, trusted). Returns "name (dir)".
+ */
+async function firstPresentUpTo(startDir: string, rootDir: string, names: string[]): Promise<string | undefined> {
+  let dir = startDir;
+  for (;;) {
+    for (const name of names) {
+      try {
+        await fs.access(path.join(dir, name));
+        return dir === startDir ? name : `${name} (in ${path.relative(rootDir, dir) || "."})`;
+      } catch {
+        /* not present here */
+      }
     }
+    if (dir === rootDir) break;
+    const parent = path.dirname(dir);
+    if (parent === dir || !isInside(parent, rootDir)) break; // never walk above the workspace
+    dir = parent;
   }
   return undefined;
 }
@@ -251,7 +263,7 @@ export async function hydrateCmd(root: string, opts: { allowBuild: boolean; mana
     // Untrusted project manager-config (yarn `.yarnrc.yml` → yarnPath/plugins =
     // repo code at startup) gates auto-run behind explicit --allow-build.
     if (!opts.allowBuild && p.rule.untrustedConfigFiles.length > 0) {
-      const found = await firstPresent(cwdReal, p.rule.untrustedConfigFiles);
+      const found = await firstPresentUpTo(cwdReal, workspaceReal, p.rule.untrustedConfigFiles);
       if (found) {
         skipped++;
         console.log(`${style.sym.warn} ${style.cyan(loc)} skipped — ${style.bold(found)} can run project code (yarnPath/plugins); re-run with ${style.bold("--allow-build")} to permit it.`);
