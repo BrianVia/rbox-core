@@ -1,6 +1,8 @@
 # Design 07b — Billing, Plans & Metering (Milestone 7b)
 
-**Status:** draft → pending codex review. **Split:** autonomous quota/accounting/plan-enforcement (build now) + Stripe (needs the user's keys — flagged).
+**Status:** ✅ AUTONOMOUS CORE IMPLEMENTED & VERIFIED (Stripe deferred to user provisioning). Verified 12/12: free 1-workspace cap → 402, exact storage accounting, dedup-no-double-charge, atomic plan upgrade via platform secret, tenant-can't-set-plan (404), GC purge decrements usage. v2 (post-review) fixes below. Key fixes: **(a) atomic quota reserve** — `INSERT OR IGNORE blob_refs` (dedups concurrent grants of the same (account,sha)); only if newly inserted, conditional `UPDATE accounts SET used_bytes = used_bytes + size WHERE used_bytes + size <= cap` (D1 serializes per-row → atomic, no soft overage); over cap → delete the just-inserted blob_ref + 402 (canonical R2 blob left as a GC-reclaimable orphan, never deleted). **(b)** quota/accounting charge the **actual staged size** at multipart complete (not the declared size). **(c)** usage is the maintained `accounts.used_bytes` counter; GC purge **decrements** it per account when dropping blob_refs (`SUM(blob_refs⋈blobs)` is the reconciler). **(d)** quota defined as **entitlement-based storage** (you're charged for blobs you possess/uploaded, deduped within your account; freed on GC) — per-account-reachability pruning of entitlements is a noted follow-up. **(e)** adminSetPlan validates the plan enum + audits; Stripe endpoints 501 without `STRIPE_SECRET`.
+
+**Split:** autonomous quota/accounting/plan-enforcement (build now) + Stripe (needs the user's keys — flagged).
 **Implements:** roadmap M7b. Source of truth: `docs/pricing.md`.
 
 ## 1. Scope split

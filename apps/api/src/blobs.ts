@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { blobKey, json } from "./util.js";
-import { entitledSubset, grantEntitlement, isEntitled } from "./authz.js";
+import { entitledSubset, isEntitled } from "./authz.js";
+import { grantEntitlementWithQuota } from "./billing.js";
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -60,7 +61,8 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   }
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
   await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
-  await grantEntitlement(env, accountId, sha); // verified upload → read access
+  const q = await grantEntitlementWithQuota(env, accountId, sha, obj.size); // verified upload → quota-checked read access
+  if (!q.granted) return json({ error: "quota_exceeded", used: q.used, cap: q.cap }, 402);
   return json({ ok: true, sha256: sha, sizeBytes: obj.size });
 }
 
@@ -172,16 +174,18 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     await mpu.complete(parts); // composite etag is NOT the content hash — only for assembly
     const staged = await env.rbox_dev_blobs.get(up.staging_key);
     if (!staged || !staged.body) return json({ error: "staged_missing" }, 500);
+    const actualSize = staged.size; // charge/record the ACTUAL bytes, not the declared size (M7b)
     try {
       // Publish to canonical; R2 verifies the whole-object sha server-side.
       await env.rbox_dev_blobs.put(blobKey(sha), staged.body, { sha256: sha });
     } catch (e) {
       return json({ error: "sha_mismatch", message: String((e as Error)?.message ?? e) }, 412);
     }
-    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, up.size).run();
+    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, actualSize).run();
     await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
-    await grantEntitlement(env, accountId, sha); // verified multipart upload → read access
-    return json({ ok: true, sha256: sha, sizeBytes: up.size });
+    const q = await grantEntitlementWithQuota(env, accountId, sha, actualSize);
+    if (!q.granted) return json({ error: "quota_exceeded", used: q.used, cap: q.cap }, 402);
+    return json({ ok: true, sha256: sha, sizeBytes: actualSize });
   } finally {
     await env.rbox_dev_blobs.delete(up.staging_key).catch(() => {});
     await cleanupUpload(env, uploadId);

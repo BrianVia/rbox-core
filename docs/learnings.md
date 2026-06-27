@@ -68,6 +68,16 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M7b (quotas/accounting) autonomous core DONE; Stripe needs user keys
+
+- Built+verified (12/12) the autonomous billing core; Stripe deferred (needs the user's Stripe account + API keys → the human-intervention point).
+- **Atomic, race-safe quota grant (codex review):** `INSERT OR IGNORE blob_refs` (dedups concurrent grants of the same (account,sha)); only if newly inserted, a conditional `UPDATE accounts SET used_bytes = used_bytes + size WHERE used_bytes + size <= cap` — D1 serializes per-row writes so concurrent uploads can't jointly exceed the cap (no soft overage). Over cap → delete the just-inserted blob_ref (roll back) + 402; the canonical R2 blob is left as a GC-reclaimable orphan, NEVER deleted on over-quota.
+- **Charge the ACTUAL staged size** at multipart complete (`staged.size`), not the client-declared size — under-declaring would otherwise bypass quota.
+- Usage is the maintained `accounts.used_bytes` counter (fast, consistent with the reserve); GC purge decrements it per entitled account before dropping blob_refs. `SUM(blob_refs ⋈ blobs)` is the reconciler.
+- Quota defined as **entitlement-based** (charged for blobs you uploaded/possess, deduped within your account, freed on GC). Per-account-reachability pruning of entitlements is a follow-up.
+- Avoided a circular import: `authz` does NOT import `billing` (billing imports authz's audit/Principal); the workspace-COUNT quota check lives in the worker route, not in `authz.createWorkspace`.
+- Plan control until Stripe: `POST /v1/admin/account/:id/plan` (platform secret), same pattern as GC.
+
 ## 2026-06-26 — M7 (multi-tenancy & isolation) DONE
 
 - Real accounts with enforced isolation; verified 16/16 cross-tenant + 5/5 happy-path. 3 security-review rounds.

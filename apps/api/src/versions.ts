@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { blobKey, json, manifestKey } from "./util.js";
+import { releaseUsage } from "./billing.js";
 
 /**
  * Build the GLOBAL reachable set from AUTHORITATIVE DO roots (M6 GC). Enumerates
@@ -73,6 +74,15 @@ export async function gcPurge(env: Env, graceMs: number): Promise<Response> {
       continue;
     }
     if (now - c.marked_at < graceMs) continue; // not past grace yet
+    // Decrement each entitled account's usage counter before dropping entitlements (M7b).
+    if (c.kind === "blob") {
+      const sizeRow = await env.rbox_dev_db.prepare("SELECT size_bytes FROM blobs WHERE sha256 = ?").bind(c.sha256).first<{ size_bytes: number }>();
+      const size = Number(sizeRow?.size_bytes ?? 0);
+      if (size > 0) {
+        const accts = await env.rbox_dev_db.prepare("SELECT account_id FROM blob_refs WHERE sha256 = ?").bind(c.sha256).all<{ account_id: string }>();
+        for (const a of accts.results ?? []) await releaseUsage(env, a.account_id, size);
+      }
+    }
     await env.rbox_dev_blobs.delete(c.kind === "manifest" ? manifestKey(c.sha256) : blobKey(c.sha256));
     await env.rbox_dev_db.prepare("DELETE FROM blobs WHERE sha256 = ?").bind(c.sha256).run();
     await env.rbox_dev_db.prepare("DELETE FROM blob_refs WHERE sha256 = ?").bind(c.sha256).run(); // drop entitlements (M7)

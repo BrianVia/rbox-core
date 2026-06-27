@@ -87,12 +87,13 @@ Real accounts with enforced isolation. Design: [`design/07-multitenancy.md`](./d
 - [x] Platform vs tenant: GC/admin require a platform secret (not a device token); roots/prune internal-only.
 - [ ] Team cross-account sharing + pooled storage + audit UI — within-account roles done; cross-account invites are a follow-up. KEK isolation rides M5 (per-workspace keys already isolated).
 
-### 7b. Billing, plans & metering (SaaS)
-- [ ] **Per-account storage accounting** (sum of live blob sizes) — billing-critical; reuses reachability GC (milestone 6). Must be accurate enough to bill against.
-- [ ] **Plan-gated limits enforced server-side**: storage caps, workspace/project counts (Free: 1 ws / 5 projects), manifest size — reject or 402 over quota.
-- [ ] Stripe integration: subscriptions (Free/Solo/Pro/Team), per-seat for Team, $3/100GB add-on.
-- [ ] Usage metering + soft/hard quota signals surfaced in `rbox status` and the dashboard.
-- [ ] Plan → capability mapping (retention window, advanced hydration/ignore on Pro).
+### 7b. Billing, plans & metering — ✅ AUTONOMOUS CORE DONE (Stripe needs user keys)
+Design: [`design/07b-billing.md`](./design/07b-billing.md). Verified 12/12 quota/accounting.
+- [x] **Per-account storage accounting** — atomic `used_bytes` counter; deduped; decremented by GC purge.
+- [x] **Plan-gated limits server-side** — storage cap (atomic race-safe reserve → 402), workspace count (Free=1 → 402); plan→retention/manifest-cap/feature map (`plans.ts` from pricing.md).
+- [x] Usage endpoint `GET /v1/account/usage`; admin set-plan (platform secret) as the interim plan control.
+- [ ] **Stripe (NEEDS USER PROVISIONING):** Stripe account + secret/webhook keys + product/price IDs → `STRIPE_SECRET`/`STRIPE_WEBHOOK_SECRET` Wrangler secrets; then `/v1/billing/checkout`, `/portal`, `/stripe/webhook` (flips `accounts.plan`/`extra_storage_bytes`). Endpoints stubbed/gated until then. Per-seat Team + `$3/100GB` add-on plumb through `extra_storage_bytes`.
+- [ ] `rbox status` usage display + soft/hard signals (usage endpoint exists; CLI surfacing is a small follow-up).
 
 ### 7c. Onboarding TUI / terminal UX
 First-time setup is the highest-leverage UX moment — it's where a dev decides rbox is "easy" or "another sync tool to fight." Today onboarding is bare `console.log`. Two complementary directions (want one or both):

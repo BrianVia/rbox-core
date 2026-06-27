@@ -16,6 +16,7 @@ import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { json } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
+import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -45,6 +46,11 @@ async function route(req: Request, env: Env): Promise<Response> {
     const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
     return url.searchParams.get("phase") === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
   }
+  // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N (platform secret; interim until Stripe).
+  if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {
+    if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
+    return adminSetPlan(env, seg[3]!, url.searchParams.get("plan") ?? "free", Number(url.searchParams.get("extraGB") ?? "0"));
+  }
 
   // Public auth endpoints (EXACT routes only — start the device-authorization flow).
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
@@ -61,7 +67,14 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {
     return revokeDevice(env, p, seg[3]!);
   }
-  if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) return createWorkspace(env, p, url.searchParams.get("project") ?? "root");
+  if (req.method === "GET" && eq(seg, ["v1", "account", "usage"])) return usage(env, p);
+  if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) {
+    const limits = await planLimitsFor(env, p.accountId); // workspace-count quota (M7b)
+    if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
+      return jsonResponse({ error: "quota_exceeded", limit: "workspaces", cap: limits.workspaces }, 402);
+    }
+    return createWorkspace(env, p, url.searchParams.get("project") ?? "root");
+  }
 
   // POST /v1/blobs/check — entitlement-scoped to the caller's account.
   if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE, p.accountId);
