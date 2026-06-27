@@ -11,7 +11,7 @@
  */
 import readline from "node:readline/promises";
 import { runInit } from "./init-cmd.js";
-import { login } from "./auth-cmd.js";
+import { login, redeemPair } from "./auth-cmd.js";
 import { loadCredentials } from "./credentials.js";
 import { stderrStyle } from "./style.js";
 
@@ -67,10 +67,23 @@ export async function runMenu(opts: { cwd: string; defaultRemote: string }): Pro
     }
 
     if (action === "connect") {
-      // Authorize first (device-code unless already signed in), then join.
+      // Authorize this machine first (unless already signed in), then join.
       if (!creds) {
-        rl.close();
-        await login(opts.defaultRemote, undefined); // guided device-code flow
+        const how = await ask(
+          rl,
+          `${e.bold("How do you want to authorize this machine?")}\n` +
+            `   ${e.cyan("p")}  Paste a pairing token   ${e.dim("· from `rbox pair` on a signed-in machine (fewest steps)")}\n` +
+            `   ${e.cyan("a")}  Approve a code          ${e.dim("· this machine shows a code you approve elsewhere")}\n${e.cyan("›")} `
+        );
+        if (how.toLowerCase().startsWith("p")) {
+          const pair = await ask(rl, `${e.dim("Paste pairing token:")} `);
+          rl.close();
+          if (!pair) return;
+          await redeemPair(opts.defaultRemote, pair);
+        } else {
+          rl.close();
+          await login(opts.defaultRemote, undefined); // guided device-code flow
+        }
         const ws = await promptWorkspace(opts);
         await runInit(ws ? { workspace: ws } : {}, opts);
         return;

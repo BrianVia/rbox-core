@@ -14,6 +14,12 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
 /** `rbox login [--bootstrap <secret>]` — obtain a per-device token. */
 export async function login(remoteUrl: string, bootstrapSecret?: string): Promise<void> {
   const label = os.hostname();
+  // Headless pairing: redeem a token from the env (never argv — it's a bearer).
+  const envPair = process.env.RBOX_PAIR_TOKEN;
+  if (envPair) {
+    await redeemPair(remoteUrl, envPair);
+    return;
+  }
   if (bootstrapSecret) {
     const res = await postJson(`${remoteUrl}/v1/auth/device/bootstrap`, { secret: bootstrapSecret, label });
     if (!res.ok) throw new Error(`bootstrap failed: ${res.status} ${await res.text()}`);
@@ -74,6 +80,31 @@ export async function listDevices(): Promise<void> {
     const seen = d.last_seen_at ? new Date(d.last_seen_at).toISOString() : "never";
     console.log(`${d.isSelf ? "* " : "  "}${d.device_id}  ${d.label ?? ""}  last-seen ${seen}`);
   }
+}
+
+/** `rbox pair` — generate a short-lived, single-use token to connect a new
+ *  machine without the device-code round-trip. Printed once; treat as a secret. */
+export async function pairCreate(): Promise<void> {
+  const creds = await requireCreds();
+  const res = await postJson(`${creds.remoteUrl}/v1/auth/pair/create`, {}, creds.token);
+  if (res.status === 429) throw new Error("too many active pairing tokens — redeem or wait for one to expire");
+  if (!res.ok) throw new Error(`pair failed: ${res.status} ${await res.text()}`);
+  const { token, expiresAt } = (await res.json()) as { token: string; expiresAt: number };
+  const mins = Math.max(1, Math.round((expiresAt - Date.now()) / 60000));
+  console.log(`\nPairing token (valid ~${mins} min, single use):\n`);
+  console.log(`    ${token}\n`);
+  console.log(`On the new machine: run \`rbox\`, choose "Connect this machine", and paste it.`);
+}
+
+/** Redeem a pairing token → save this machine's device credential. The token is
+ *  a bearer; it's read from a prompt or the RBOX_PAIR_TOKEN env, never argv, and
+ *  never logged. */
+export async function redeemPair(remoteUrl: string, pairToken: string): Promise<void> {
+  const res = await postJson(`${remoteUrl}/v1/auth/pair/redeem`, { token: pairToken.trim(), label: os.hostname() });
+  if (!res.ok) throw new Error("pairing failed — the token may be expired, already used, or invalid. Generate a fresh one with `rbox pair`.");
+  const { token, deviceId } = (await res.json()) as { token: string; deviceId: string };
+  await saveCredentials({ token, deviceId, remoteUrl });
+  console.log(`device authorized: ${deviceId}`);
 }
 
 export async function revokeDevice(deviceId: string): Promise<void> {

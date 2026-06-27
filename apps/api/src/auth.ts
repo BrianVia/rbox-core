@@ -66,6 +66,87 @@ async function mintDevice(env: Env, accountId: string, userId: string, deviceId:
   return token;
 }
 
+// ---- pairing tokens (M10): low-friction "connect a new machine" ----
+
+const PAIR_TTL_MS = 10 * 60 * 1000;
+const PAIR_ACTIVE_CAP = 5; // max outstanding (unconsumed, unexpired) per account
+const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
+
+/**
+ * POST /v1/auth/pair/create — AUTHENTICATED. Mint a short-lived, single-use
+ * pairing token bound to the caller's account + user. Requires a real membership
+ * (never the viewer-by-absence path) so a removed user can't mint, and enforces a
+ * per-account active-token cap. Plaintext token returned exactly once.
+ */
+export async function createPairToken(env: Env, p: Principal): Promise<Response> {
+  if (!p.userId) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
+  const member = await env.rbox_dev_db
+    .prepare("SELECT 1 FROM memberships WHERE account_id = ? AND user_id = ?")
+    .bind(p.accountId, p.userId)
+    .first();
+  if (!member) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
+
+  const now = Date.now();
+  const active = await env.rbox_dev_db
+    .prepare("SELECT COUNT(*) AS n FROM pairing_tokens WHERE account_id = ? AND consumed_at IS NULL AND expires_at > ?")
+    .bind(p.accountId, now)
+    .first<{ n: number }>();
+  if ((active?.n ?? 0) >= PAIR_ACTIVE_CAP) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
+
+  const token = randomHex(TOKEN_BYTES);
+  const hash = await sha256Hex(token);
+  const expiresAt = now + PAIR_TTL_MS;
+  await env.rbox_dev_db
+    .prepare("INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(hash, p.accountId, p.userId, p.deviceId, "pair", now, expiresAt)
+    .run();
+  return json({ token: `${PAIR_PREFIX}${token}`, expiresAt });
+}
+
+/**
+ * POST /v1/auth/pair/redeem — PUBLIC. Atomically consume an unexpired, unused
+ * token (UPDATE … RETURNING is the sole single-use gate), then FAIL-CLOSED
+ * re-validate live authority — the creating device is still non-revoked AND the
+ * user still has a membership — before minting. A token from a since-revoked
+ * device is consumed and rejected (never mints). Uniform 401 for every failure.
+ */
+export async function redeemPairToken(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => ({}))) as { token?: string; label?: string };
+  const raw = typeof body.token === "string" ? body.token : "";
+  const token = raw.startsWith(PAIR_PREFIX) ? raw.slice(PAIR_PREFIX.length) : raw;
+  if (!TOKEN_RE.test(token)) return json({ error: "unauthorized" }, 401); // bound format before hashing
+  const label = (typeof body.label === "string" ? body.label : "paired").slice(0, 200);
+  const hash = await sha256Hex(token);
+  const now = Date.now();
+
+  // Atomic single-use consume + snapshot — only the row-winning redeem gets a row.
+  const consumed = await env.rbox_dev_db
+    .prepare("UPDATE pairing_tokens SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING account_id, user_id, created_by")
+    .bind(now, hash, now)
+    .first<{ account_id: string; user_id: string; created_by: string }>();
+  if (!consumed) return json({ error: "unauthorized" }, 401); // invalid / expired / already used
+
+  // Fail-closed live authority check: creator device non-revoked AND user a member.
+  const live = await env.rbox_dev_db
+    .prepare(
+      `SELECT 1 FROM memberships m
+       JOIN devices d ON d.account_id = m.account_id AND d.user_id = m.user_id
+       WHERE m.account_id = ? AND m.user_id = ? AND d.device_id = ? AND d.revoked = 0`
+    )
+    .bind(consumed.account_id, consumed.user_id, consumed.created_by)
+    .first();
+  if (!live) return json({ error: "unauthorized" }, 401); // source revoked / membership gone (token already burned)
+
+  const deviceId = `dev_${randomHex(4)}`;
+  try {
+    const minted = await mintDevice(env, consumed.account_id, consumed.user_id, deviceId, label);
+    return json({ token: minted, deviceId });
+  } catch (e) {
+    console.error("pair redeem: mint failed after consume (token burned):", String((e as Error)?.message ?? e));
+    return json({ error: "internal" }, 500);
+  }
+}
+
 // POST /v1/auth/device/bootstrap { secret, label } -> { token, deviceId, accountId }
 // Creates a fresh account + owner user + device (the trust anchor for a new tenant).
 export async function bootstrap(req: Request, env: Env): Promise<Response> {

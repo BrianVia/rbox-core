@@ -11,14 +11,14 @@ beforeAll(async () => {
 });
 
 // Each test bootstraps its own account/device so they're isolated.
-async function bootstrap(accountName: string): Promise<{ token: string; accountId: string }> {
+async function bootstrap(accountName: string): Promise<{ token: string; accountId: string; deviceId: string }> {
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ secret: "test-bootstrap-secret", accountName }),
   });
   expect(res.status).toBe(200);
-  return (await res.json()) as { token: string; accountId: string };
+  return (await res.json()) as { token: string; accountId: string; deviceId: string };
 }
 
 const authed = (token: string, extra: Record<string, string> = {}) => ({ authorization: `Bearer ${token}`, ...extra });
@@ -92,6 +92,74 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(first.status).toBe(200);
     const second = await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
     expect(second.status).toBe(402);
+  });
+
+  // ── pairing tokens (M10) ─────────────────────────────────────────────────
+
+  const pairCreate = (token: string) => SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(token) });
+  const pairRedeem = (pair: string) =>
+    SELF.fetch(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: pair, label: "new-machine" }) });
+
+  test("pair/create requires auth (no token → 401)", async () => {
+    const res = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST" });
+    expect(res.status).toBe(401);
+  });
+
+  test("pair create → redeem mints a working device on the SAME account", async () => {
+    const a = await bootstrap("acct-pair");
+    const cr = await pairCreate(a.token);
+    expect(cr.status).toBe(200);
+    const { token: pair } = (await cr.json()) as { token: string };
+    expect(pair.startsWith("rbox-pair_")).toBe(true);
+
+    const rd = await pairRedeem(pair);
+    expect(rd.status).toBe(200);
+    const { token: deviceToken, deviceId } = (await rd.json()) as { token: string; deviceId: string };
+    expect(deviceId.startsWith("dev_")).toBe(true);
+    // The minted token authenticates and lands in the creator's account.
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(deviceToken) });
+    expect(usage.status).toBe(200);
+    expect(((await usage.json()) as { plan: string }).plan).toBe("free");
+  });
+
+  test("pairing token is SINGLE-USE (second redeem → 401)", async () => {
+    const a = await bootstrap("acct-pair-once");
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    expect((await pairRedeem(pair)).status).toBe(200);
+    expect((await pairRedeem(pair)).status).toBe(401); // already consumed
+  });
+
+  test("malformed / unknown pairing token → 401", async () => {
+    expect((await pairRedeem("rbox-pair_not-hex")).status).toBe(401);
+    expect((await pairRedeem(`rbox-pair_${"a".repeat(64)}`)).status).toBe(401); // well-formed but unknown
+  });
+
+  test("expired pairing token → 401 (and is not minted)", async () => {
+    const a = await bootstrap("acct-pair-exp");
+    // Insert a token that's already expired, directly into D1.
+    const { createHash } = await import("node:crypto");
+    const raw = "b".repeat(64);
+    const hash = createHash("sha256").update(raw).digest("hex");
+    const past = Date.now() - 1000;
+    await env.rbox_dev_db
+      .prepare("INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at) VALUES (?, ?, ?, ?, 'x', ?, ?)")
+      .bind(hash, a.accountId, "u", a.deviceId, past - 1000, past)
+      .run();
+    expect((await pairRedeem(`rbox-pair_${raw}`)).status).toBe(401);
+  });
+
+  test("revoked creator device → its outstanding token is dead at redeem (fix #1)", async () => {
+    const a = await bootstrap("acct-pair-revoke");
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    // Revoke the device that created the token, THEN try to redeem it.
+    await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(a.deviceId).run();
+    expect((await pairRedeem(pair)).status).toBe(401); // live-authority check fails closed
+  });
+
+  test("active-token cap enforced (6th create → 429)", async () => {
+    const a = await bootstrap("acct-pair-cap");
+    for (let i = 0; i < 5; i++) expect((await pairCreate(a.token)).status).toBe(200);
+    expect((await pairCreate(a.token)).status).toBe(429);
   });
 
   const PLAT = { "x-rbox-platform": "test-platform-secret" };

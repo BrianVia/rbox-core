@@ -12,7 +12,7 @@
  */
 import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
-import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
+import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { retentionPrune } from "./retention.js";
 import { json } from "./util.js";
@@ -61,12 +61,15 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
+  // Pairing redeem is PUBLIC (the pasted token IS the credential) — exact route.
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);
 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);
   if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
 
   // Account ops (scoped to the caller's account).
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
   if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {
