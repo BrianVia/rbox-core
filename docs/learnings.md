@@ -1,5 +1,17 @@
 # rbox Build Learnings (append-only)
 
+## 2026-06-27 — Billing (Stripe) + web auth (Clerk), provisioned via Stripe Projects
+
+- **Stripe Projects (`projects.dev`) provisions OTHER services (auth/db/hosting), NOT Stripe payments for your own product.** Payments = the regular `stripe` CLI authed to your account (`stripe config --list` shows test+live keys). Don't confuse the two.
+- **`stripe login` binds whatever account is ACTIVE in the dashboard, and won't cleanly bind a Sandbox.** After 3 failed attempts, the reliable path was: drop the sandbox **secret** key in a file (`/tmp/...`, never chat) and `--api-key "$(cat file)"`. `stripe sandbox create` only works no-browser when logged OUT.
+- **Stripe products create JSON by default — `--json` is an unsupported flag that silently errors** (empty output under `2>/dev/null`). Resolve prices by **lookup_key** (stable across test/live), never hardcoded ids → same worker code works in both modes.
+- **Stripe webhook security (codex):** parse ALL `v1` sigs (rotation), verify over raw `${t}.${body}` with the raw `t` string, **success-based idempotency** (record only after apply, so failed applies retry), and bind plan flips to the stored **customer** (an account bound to a different customer can't be hijacked). `customer_creation:always` is payment-mode-only — omit it in subscription mode.
+- **Clerk session JWT verify in a Worker (raw WebCrypto):** RS256 only; JWKS host is base64-decoded from the publishable key; verify over raw `${h}.${p}` (decode only the sig); claims: exact `iss` vs a server constant, non-empty `sub`, numeric `exp`/`nbf` + 5s leeway, `azp` present AND allowlisted (reject absent for browser routes); throttle unknown-`kid` refetch; ignore token-supplied `jku`/`x5u`; guard `JSON.parse`→non-object → 401 not 500.
+- **Web sessions ≠ durable device tokens.** Give web a SHORT-lived token (`devices.expires_at`, enforced in `authenticate`); the browser re-exchanges on 401. CLI tokens keep `expires_at` NULL.
+- **Provisioning an account from a verified external identity (Clerk) must be race-safe + fail-closed:** run the email-verified gate BEFORE the `clerk_users` INSERT-OR-IGNORE claim, for every not-yet-mapped sub (idempotent read → no "loser skips gate" bypass); a mapping row only exists post-gate; **fail closed if the verification secret is unconfigured** (don't silently skip). Same conditional-INSERT-as-gate primitive as M7b quota / pairing.
+- Process: keep secrets out of git+chat — publishable keys are public (safe to embed/record in a gitignored file); secret/live keys go via `wrangler secret put` (piped from a file, never echoed). The stripe-projects vault + `.env` are gitignored; verify `git ls-files | grep -E 'sk_|rk_live|whsec_'` is empty.
+
+
 > **Process:** at the END of each milestone (after verify+commit), run an **antislop pass** (`/antislop-codebase`) — scan for AI-slop/bad patterns (oversized files, duplicated helpers, type escape-hatches, dead code) and clean them up while green, then commit separately. Keep it proportional (this is a small, modular codebase). First pass after M6 deduped the apps/api helpers into `util.ts`.
 
 
