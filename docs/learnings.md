@@ -65,6 +65,12 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M5 convergent-encryption primitive validated (PoC)
+
+- Convergent AES-256-GCM with **HKDF-derived key AND nonce** from (KEK, plaintext_sha256) works: same plaintext+KEK → byte-identical ciphertext (so the ciphertext sha is a stable dedup address), round-trips, tampering a byte → GCM tag rejects, wrong KEK → fails, 50MB fine. Node: `hkdfSync("sha256", kek, salt, infoBytes, len)` + `createCipheriv("aes-256-gcm", dek, nonce)` + `getAuthTag()`; store `ciphertext||tag` (nonce is derived, not stored). GCM nonce-reuse is safe ONLY because distinct plaintext → distinct (DEK,nonce); never reuse a (key,nonce) across different plaintexts.
+- **Large files:** GCM needs the whole input for the tag, but `createCipheriv` is a STREAM — pipe plaintext file → cipher → ciphertext temp file (append tag), then upload the temp via M3's file-based `putFile`/multipart. Decrypt: download to temp, stream through decipher holding back the last 16 bytes as the tag. Integrates with M3's file-based blob path; no whole-file buffer.
+- **OPEN architecture decision (for review):** the manifest carries file PATHS + plaintext shas + sizes. The server stores the manifest → it learns that metadata even if blob *contents* are encrypted. So blob-content-encryption ≠ true E2EE. Full E2EE requires encrypting the manifest too (server stores opaque manifest blobs; DO sequences by number; blob-existence validation moves client-side). Pending codex review #4.
+
 ## 2026-06-26 — M4 (self-hosted device auth) DONE
 
 - Replaced the shared cleartext bearer token with per-device tokens. Verified 15/15 auth-flow live + 7/7 daemon e2e via credential. Cleartext token now 401 server-side.
