@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { json, sha256Hex } from "./util.js";
 
 /**
  * Self-hosted device-token auth (M4). Per-device opaque tokens, stored only as
@@ -14,9 +15,6 @@ const POLL_INTERVAL_S = 5;
 const LAST_SEEN_THROTTLE_MS = 10 * 60 * 1000;
 const USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
 
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-}
 function randomHex(bytes: number): string {
   const b = new Uint8Array(bytes);
   crypto.getRandomValues(b);
@@ -27,10 +25,6 @@ function randomUserCode(): string {
   crypto.getRandomValues(b);
   const c = [...b].map((x) => USER_CODE_ALPHABET[x % USER_CODE_ALPHABET.length]).join("");
   return `${c.slice(0, 4)}-${c.slice(4)}`;
-}
-async function sha256Hex(s: string): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 /** Constant-time string compare (lengths leak, contents don't). */
 function ctEqual(a: string, b: string): boolean {

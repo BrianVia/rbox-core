@@ -1,10 +1,5 @@
 import type { Env } from "./env.js";
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-}
-const blobKey = (sha: string) => `blobs/sha256/${sha.slice(0, 2)}/${sha}`;
-const manifestKey = (sha: string) => `manifests/sha256/${sha.slice(0, 2)}/${sha}`;
+import { blobKey, json, manifestKey } from "./util.js";
 
 /**
  * Build the GLOBAL reachable set from AUTHORITATIVE DO roots (M6 GC). Enumerates

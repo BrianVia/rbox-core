@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { blobKey, json } from "./util.js";
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -15,13 +16,6 @@ const SINGLE_PUT_MAX = 90 * MiB; // margin under CF's ~100MB request-body cap â†
 const MIN_PART = 8 * MiB; // â‰¥ R2's 5 MiB minimum non-final part
 const MAX_PARTS = 9000; // margin under R2's 10,000 hard cap
 const UPLOAD_EXPIRY_MS = 6 * 24 * 60 * 60 * 1000; // expire our state before R2's 7-day MPU TTL
-
-function blobKey(sha: string): string {
-  return `blobs/sha256/${sha.slice(0, 2)}/${sha}`;
-}
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-}
 
 export function partSizeFor(size: number): number {
   let p = MIN_PART;

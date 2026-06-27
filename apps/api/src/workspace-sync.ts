@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { validateManifest } from "../../../src/engine/manifest-validate.js";
+import { json, manifestKey, sha256Hex } from "./util.js";
 
 /**
  * WorkspaceSync — the per-(workspace, project) Durable Object (D2).
@@ -245,14 +246,3 @@ export class WorkspaceSync {
 }
 
 const ABORT = Symbol("abort-commit-txn");
-
-function manifestKey(sha: string): string {
-  return `manifests/sha256/${sha.slice(0, 2)}/${sha}`;
-}
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-}
-async function sha256Hex(buf: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}

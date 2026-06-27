@@ -1,5 +1,8 @@
 # rbox Build Learnings (append-only)
 
+> **Process:** at the END of each milestone (after verify+commit), run an **antislop pass** (`/antislop-codebase`) — scan for AI-slop/bad patterns (oversized files, duplicated helpers, type escape-hatches, dead code) and clean them up while green, then commit separately. Keep it proportional (this is a small, modular codebase). First pass after M6 deduped the apps/api helpers into `util.ts`.
+
+
 Hard-won, reusable facts discovered while building rbox. **Append only** — never rewrite history; add a new dated entry. Read this before grinding on something that smells familiar.
 
 Format: `## YYYY-MM-DD — <short title>` then the learning + why it matters.

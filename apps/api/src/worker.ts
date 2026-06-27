@@ -14,6 +14,7 @@ import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
+import { json } from "./util.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -109,6 +110,4 @@ function eq(a: string[], b: string[]): boolean {
 function badRequest(message: string): Response {
   return jsonResponse({ error: "bad_request", message }, 400);
 }
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-}
+const jsonResponse = json; // worker uses jsonResponse; shared impl is util.json
