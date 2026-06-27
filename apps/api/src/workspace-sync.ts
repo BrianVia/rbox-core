@@ -82,6 +82,9 @@ export class WorkspaceSync {
   private async commit(req: Request, ws: string, proj: string): Promise<Response> {
     const body = (await req.json()) as { parentSequence?: number | null; deviceId?: string; manifest?: unknown };
     const parent = body.parentSequence ?? 0;
+    // Authenticated account, set by the Worker after authorizeWorkspace (the DO is
+    // only reachable via the Worker, which overrides any client-provided value).
+    const accountId = req.headers.get("x-rbox-account") ?? "";
 
     const v = validateManifest(body.manifest);
     if (!v.ok) return json({ error: "bad_request", message: v.error }, 400);
@@ -91,7 +94,7 @@ export class WorkspaceSync {
     // we don't have, or every future pull breaks. Distinct 422 so the client uploads.
     // Check the STORED address: encSha (ciphertext) when encrypted, else the sha.
     const fileShas = [...new Set(manifest.files.filter((f) => f.type === "file").map((f) => f.encSha ?? f.sha256))];
-    const missing = await this.missingBlobs(fileShas);
+    const missing = await this.missingBlobs(fileShas, accountId); // account-scoped (M7)
     if (missing.length > 0) return json({ error: "unsatisfied_blobs", missing }, 422);
 
     // Stage the manifest blob in R2 BEFORE the critical section. If this commit
@@ -123,12 +126,9 @@ export class WorkspaceSync {
     if ("conflict" in outcome!) return json({ error: "conflict", head: outcome!.conflict }, 409);
     const sequence = outcome!.sequence;
 
-    // Best-effort D1 mirror (not authoritative) + workspace registry for GC.
+    // Best-effort D1 manifest mirror (not authoritative). Workspace ownership is
+    // established at creation (POST /v1/workspaces), NOT here, so no registry write.
     try {
-      await this.env.rbox_dev_db
-        .prepare("INSERT OR IGNORE INTO workspaces (workspace_id, project_id, created_at) VALUES (?, ?, ?)")
-        .bind(ws, proj, Date.now())
-        .run();
       await this.env.rbox_dev_db
         .prepare("INSERT OR IGNORE INTO manifests (workspace_id, project_id, sequence, manifest_blob_sha, device_id) VALUES (?, ?, ?, ?, ?)")
         .bind(ws, proj, sequence, sha, body.deviceId ?? null)
@@ -190,21 +190,25 @@ export class WorkspaceSync {
     return json({ sequence: head, manifest: JSON.parse(await obj.text()) });
   }
 
-  private async missingBlobs(shas: string[]): Promise<string[]> {
-    const present = new Set<string>();
+  /** Account-scoped (M7): a sha is "have it" only if THIS account is entitled
+   *  (blob_refs) and it's not a GC candidate (M6). Referencing an unentitled sha
+   *  → reported missing → client must upload it (needs the bytes). */
+  private async missingBlobs(shas: string[], accountId: string): Promise<string[]> {
+    const entitled = new Set<string>();
     const condemned = new Set<string>();
     for (let i = 0; i < shas.length; i += 80) {
       const chunk = shas.slice(i, i + 80);
       if (chunk.length === 0) break;
       const ph = chunk.map(() => "?").join(",");
-      const rows = await this.env.rbox_dev_db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
-      for (const r of rows.results ?? []) present.add(r.sha256);
-      // GC candidates count as MISSING → forces a re-upload that resurrects them
-      // before any new commit can reference them. Closes the dedup/GC race.
+      const rows = await this.env.rbox_dev_db
+        .prepare(`SELECT sha256 FROM blob_refs WHERE account_id = ? AND sha256 IN (${ph})`)
+        .bind(accountId, ...chunk)
+        .all<{ sha256: string }>();
+      for (const r of rows.results ?? []) entitled.add(r.sha256);
       const cand = await this.env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
       for (const r of cand.results ?? []) condemned.add(r.sha256);
     }
-    return shas.filter((s) => !present.has(s) || condemned.has(s));
+    return shas.filter((s) => !entitled.has(s) || condemned.has(s));
   }
 
   // ---- WebSocket fanout (hibernatable) ----

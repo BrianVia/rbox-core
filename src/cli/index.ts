@@ -39,12 +39,24 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "link": {
       const root = path.resolve(positional[0] ?? process.cwd());
+      const remoteUrl = flags.remote ?? DEFAULT_REMOTE;
+      const projectId = flags.project ?? "root";
+      // New workspace → create it server-side (ownership at creation, M7). Joining
+      // an existing one (--workspace) requires the caller's account to own it.
+      let workspaceId = flags.workspace;
+      if (!workspaceId) {
+        const { loadCredentials } = await import("./credentials.js");
+        const { createRemoteWorkspace } = await import("./remote.js");
+        const creds = await loadCredentials();
+        if (!creds) throw new Error("run `rbox login` before creating a workspace");
+        workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
+      }
       const cfg: WorkspaceConfig = {
-        remoteWorkspaceId: flags.workspace ?? `ws_${crypto.randomUUID().slice(0, 12)}`,
-        projectId: flags.project ?? "root",
+        remoteWorkspaceId: workspaceId,
+        projectId,
         deviceId: flags.device ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
         rootPath: root,
-        remoteUrl: flags.remote ?? DEFAULT_REMOTE,
+        remoteUrl,
         token: "", // token comes from `rbox login` (per-machine credential), never config
         syncGit: flags.git === "true",
       };

@@ -244,6 +244,17 @@ export class RboxApi {
   }
 }
 
+/** Create a server-owned workspace (M7) — ownership is established here, not at
+ *  first commit. Returns the high-entropy server-assigned workspace id. */
+export async function createRemoteWorkspace(baseUrl: string, token: string, project: string): Promise<string> {
+  const res = await fetch(`${baseUrl}/v1/workspaces?project=${encodeURIComponent(project)}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`workspace create failed: ${res.status} ${await res.text()}`);
+  return ((await res.json()) as { workspaceId: string }).workspaceId;
+}
+
 /** Adapts the control plane to the engine's BlobStore interface. */
 export class RemoteBlobStore implements BlobStore {
   constructor(private readonly api: RboxApi) {}

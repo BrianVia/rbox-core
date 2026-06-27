@@ -78,12 +78,14 @@ Design: [`design/06-versions-gc.md`](./design/06-versions-gc.md). Verified 3/3 (
 - [x] Retention prune in the DO (authoritative; never prunes head).
 - [ ] Plan-gated retention windows (7/30/90d) + Cron-scheduled GC — wire with M7b plans.
 
-### 7. Multi-tenancy & security
-- [ ] Full D1 schema: accounts, users, devices, memberships, workspaces, projects.
-- [ ] `account_id` on every row; membership checks on every route.
-- [ ] **Team tier**: shared workspaces, roles (owner/editor/viewer), pooled per-user storage.
-- [ ] Audit log (workspace/device/manifest/member/blob lifecycle) — a paid Team feature per `pricing.md`.
-- [ ] Per-workspace KEK isolation (prior-art §1 threat note).
+### 7. Multi-tenancy & security — ✅ DONE & VERIFIED
+Real accounts with enforced isolation. Design: [`design/07-multitenancy.md`](./design/07-multitenancy.md). Verified 16/16 cross-tenant isolation + 5/5 happy-path. 3 security-review rounds.
+- [x] Schema: accounts/users/memberships/devices(+user_id)/workspaces(+account_id)/blob_refs/audit_log (migration 0006).
+- [x] **Isolation**: per-account blob entitlement (`blob_refs`, created ONLY by hash-verified upload → no entitlement-by-reference); every workspace+blob route gated by account (cross-account → 404); account-scoped multipart + device list.
+- [x] Ownership at workspace **creation** (`POST /v1/workspaces`, high-entropy id), not first-commit; `rbox link` creates/joins.
+- [x] Roles (owner/admin/editor/viewer) via device→user→membership; viewer can't write (403); audit log from the authenticated principal.
+- [x] Platform vs tenant: GC/admin require a platform secret (not a device token); roots/prune internal-only.
+- [ ] Team cross-account sharing + pooled storage + audit UI — within-account roles done; cross-account invites are a follow-up. KEK isolation rides M5 (per-workspace keys already isolated).
 
 ### 7b. Billing, plans & metering (SaaS)
 - [ ] **Per-account storage accounting** (sum of live blob sizes) — billing-critical; reuses reachability GC (milestone 6). Must be accurate enough to bill against.

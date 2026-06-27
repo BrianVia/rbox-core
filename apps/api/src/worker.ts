@@ -15,6 +15,7 @@ import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipa
 import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { json } from "./util.js";
+import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -37,65 +38,73 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-dev-api" });
 
+  // Platform-only internal op (M7): GC requires the PLATFORM secret, NOT a tenant
+  // device token. roots/prune are not exposed by the public router (GC calls the DO directly).
+  if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
+    if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
+    const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
+    return url.searchParams.get("phase") === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
+  }
+
   // Public auth endpoints (EXACT routes only — start the device-authorization flow).
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
 
-  // Everything else requires a valid (non-revoked) device token.
-  const device = await authenticate(req, env);
-  if (!device) throw jsonResponse({ error: "unauthorized" }, 401);
+  // Everything else requires a valid (non-revoked) device token → full Principal.
+  const p = await authenticate(req, env);
+  if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
 
-  // Admin GC (M6): POST /v1/admin/gc?phase=mark|purge&graceMs=N (authed).
-  if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
-    const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
-    return url.searchParams.get("phase") === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
-  }
-
-  // Authed auth endpoints.
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env);
-  if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, device);
+  // Account ops (scoped to the caller's account).
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
+  if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {
-    return revokeDevice(env, seg[3]!);
+    return revokeDevice(env, p, seg[3]!);
   }
+  if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) return createWorkspace(env, p, url.searchParams.get("project") ?? "root");
 
-  // POST /v1/blobs/check  { shas } -> { missing }
-  if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE);
+  // POST /v1/blobs/check — entitlement-scoped to the caller's account.
+  if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE, p.accountId);
 
-  // /v1/blobs/:sha[...]
+  // /v1/blobs/:sha[...] — all entitlement-gated by p.accountId.
   if (seg[0] === "v1" && seg[1] === "blobs" && seg.length >= 3) {
     const sha = seg[2]!;
     if (!SHA_RE.test(sha)) throw badRequest("invalid sha256");
-
     if (seg.length === 3) {
-      if (req.method === "PUT") return blobPut(req, env, sha);
-      if (req.method === "GET") return blobGet(env, sha);
+      if (req.method === "PUT") return blobPut(req, env, sha, p.accountId);
+      if (req.method === "GET") return blobGet(env, sha, p.accountId);
     }
     if (seg[3] === "multipart") {
       const uploadId = seg[4];
-      if (seg.length === 4 && req.method === "POST") return multipartInit(req, env, sha);
-      if (seg.length === 5 && uploadId && req.method === "GET") return multipartStatus(env, sha, uploadId);
-      if (seg.length === 7 && uploadId && seg[5] === "part" && req.method === "PUT") {
-        const n = Number(seg[6]);
-        return multipartPart(req, env, sha, uploadId, n);
-      }
-      if (seg.length === 6 && uploadId && seg[5] === "complete" && req.method === "POST") return multipartComplete(env, sha, uploadId);
+      if (seg.length === 4 && req.method === "POST") return multipartInit(req, env, sha, p.accountId);
+      if (seg.length === 5 && uploadId && req.method === "GET") return multipartStatus(env, sha, uploadId, p.accountId);
+      if (seg.length === 7 && uploadId && seg[5] === "part" && req.method === "PUT") return multipartPart(req, env, sha, uploadId, Number(seg[6]), p.accountId);
+      if (seg.length === 6 && uploadId && seg[5] === "complete" && req.method === "POST") return multipartComplete(env, sha, uploadId, p.accountId);
     }
   }
 
-  // /v1/ws/:ws/proj/:proj/...
+  // /v1/ws/:ws/proj/:proj/... — authorize (cross-account → 404) before any access.
   if (seg[0] === "v1" && seg[1] === "ws" && seg[3] === "proj" && seg.length >= 6) {
     const ws = seg[2]!;
     const proj = seg[4]!;
     const action = seg[5]!;
-    // versions list (D1) — served by the Worker.
+    const write = action === "manifests" && req.method === "POST"; // commit
+    const az = await authorizeWorkspace(env, p, ws, proj, write);
+    if (!az.ok) return jsonResponse({ error: az.status === 403 ? "forbidden" : "not_found" }, az.status);
+
     if (seg.length === 6 && action === "versions" && req.method === "GET") {
       return versionsList(env, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
     }
-    // commit/latest/connect and historical manifests/:seq -> the DO (authoritative).
     if (action === "manifests" || action === "latest" || action === "connect") {
-      const id = env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`);
-      return env.WORKSPACE_SYNC.get(id).fetch(req);
+      const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
+      if (write) {
+        // Commit: forward with the authenticated account (DO does account-scoped
+        // blob-existence). Clean header set by the Worker (overrides any client value).
+        const headers = new Headers(req.headers);
+        headers.set("x-rbox-account", p.accountId);
+        return stub.fetch(new Request(req, { headers }));
+      }
+      return stub.fetch(req);
     }
   }
 

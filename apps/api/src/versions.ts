@@ -75,6 +75,7 @@ export async function gcPurge(env: Env, graceMs: number): Promise<Response> {
     if (now - c.marked_at < graceMs) continue; // not past grace yet
     await env.rbox_dev_blobs.delete(c.kind === "manifest" ? manifestKey(c.sha256) : blobKey(c.sha256));
     await env.rbox_dev_db.prepare("DELETE FROM blobs WHERE sha256 = ?").bind(c.sha256).run();
+    await env.rbox_dev_db.prepare("DELETE FROM blob_refs WHERE sha256 = ?").bind(c.sha256).run(); // drop entitlements (M7)
     await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(c.sha256).run();
     purged++;
   }

@@ -68,6 +68,16 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M7 (multi-tenancy & isolation) DONE
+
+- Real accounts with enforced isolation; verified 16/16 cross-tenant + 5/5 happy-path. 3 security-review rounds.
+- **The isolation primitive: blob entitlement created ONLY by hash-verified upload.** `blob_refs(account, sha)` is written on a verified `blobPut`/multipart-complete; the commit blob-existence check is **account-scoped against `blob_refs`** (not global `blobs`). So account B referencing A's sha in a manifest → 422 (unentitled) → B must upload the bytes (which it can't without possessing them). This is what makes content-addressed cross-account dedup-at-rest safe. `blobsCheck` also reports an unentitled sha as "missing" → no cross-account existence oracle.
+- **Ownership at workspace CREATION, not first-commit** — `POST /v1/workspaces` assigns a high-entropy id + records `(ws, account_id)` in D1. First-commit-sets-owner was a hijack vector. `rbox link` (no `--workspace`) creates; `--workspace <id>` joins (account must own it). The DO no longer writes the workspace registry on commit.
+- **Cross-account = 404 everywhere** (indistinguishable, no enumeration leak), checked BEFORE any R2/DO access; 403 reserved for same-account role failures (viewer write).
+- **Platform vs tenant authz:** GC/admin require `RBOX_PLATFORM_SECRET` (header), NOT a tenant device token; roots/prune are internal-only (the public Worker router never forwards them — GC calls the DO via its binding). A tenant device hitting `/v1/admin/gc` → 404.
+- **DO trusts a Worker-set `X-Rbox-Account` header** for commit's account-scoped check: safe because the DO is only reachable via the Worker (env binding, no public route) and the Worker overrides any client-supplied value after authorizing. Constructed via `new Request(req, { headers })` to clone the commit with a clean header.
+- authenticate() now returns a full `Principal {deviceId, accountId, userId, role}` (joins memberships); legacy/membership-less devices get least-privilege `viewer`. Every route threads the principal; account ops (device list/revoke) are account-scoped.
+
 ## 2026-06-26 — M6 (versions + reachability GC) DONE
 
 - Version history/restore = exposing the DO's existing per-commit `seq:<n>` pointers; restore decrypts encrypted blobs + can recover deleted files. Verified 3/3.

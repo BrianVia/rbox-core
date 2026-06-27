@@ -12,6 +12,16 @@ export function manifestKey(sha: string): string {
   return `manifests/sha256/${sha.slice(0, 2)}/${sha}`;
 }
 
+/** Constant-time string compare (lengths leak, contents don't). */
+export function ctEqual(a: string, b: string): boolean {
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  if (ea.length !== eb.length) return false;
+  let r = 0;
+  for (let i = 0; i < ea.length; i++) r |= ea[i]! ^ eb[i]!;
+  return r === 0;
+}
+
 /** Lowercase-hex SHA-256 of a string (UTF-8) or raw bytes. */
 export async function sha256Hex(data: string | ArrayBuffer | Uint8Array): Promise<string> {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;

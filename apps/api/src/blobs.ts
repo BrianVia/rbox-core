@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { blobKey, json } from "./util.js";
+import { entitledSubset, grantEntitlement, isEntitled } from "./authz.js";
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -23,8 +24,11 @@ export function partSizeFor(size: number): number {
   return p;
 }
 
-// POST /v1/blobs/check
-export async function blobsCheck(req: Request, env: Env, shaRe: RegExp): Promise<Response> {
+// POST /v1/blobs/check — "have it" = physically present AND this account is
+// entitled (M7) AND not a GC candidate (M6). An unentitled caller is always told
+// "missing" → it must upload (which grants entitlement); it never learns whether
+// the platform already has another account's content.
+export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountId: string): Promise<Response> {
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
   const present = new Set<string>();
@@ -35,15 +39,16 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp): Promise
     const ph = chunk.map(() => "?").join(",");
     const rows = await env.rbox_dev_db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of rows.results ?? []) present.add(r.sha256);
-    // A GC candidate reads as MISSING so a re-upload resurrects it (M6 dedup-race fix).
     const cand = await env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of cand.results ?? []) condemned.add(r.sha256);
   }
-  return json({ missing: [...new Set(shas)].filter((s) => !present.has(s) || condemned.has(s)) });
+  const entitled = await entitledSubset(env, accountId, [...new Set(shas)]);
+  return json({ missing: [...new Set(shas)].filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s)) });
 }
 
 // PUT /v1/blobs/:sha — single streaming PUT, R2 verifies the content hash.
-export async function blobPut(req: Request, env: Env, sha: string): Promise<Response> {
+// Possessing+uploading the bytes is what grants this account read access (M7).
+export async function blobPut(req: Request, env: Env, sha: string, accountId: string): Promise<Response> {
   const len = Number(req.headers.get("content-length") ?? "0");
   if (len > SINGLE_PUT_MAX) return json({ error: "too_large", message: "use multipart", maxSingle: SINGLE_PUT_MAX }, 413);
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
@@ -55,18 +60,21 @@ export async function blobPut(req: Request, env: Env, sha: string): Promise<Resp
   }
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
   await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+  await grantEntitlement(env, accountId, sha); // verified upload → read access
   return json({ ok: true, sha256: sha, sizeBytes: obj.size });
 }
 
-// GET /v1/blobs/:sha — streamed body.
-export async function blobGet(env: Env, sha: string): Promise<Response> {
+// GET /v1/blobs/:sha — streamed body. Entitlement checked BEFORE R2 (no timing/
+// existence oracle); an unentitled account gets 404 even if the blob exists (M7).
+export async function blobGet(env: Env, sha: string, accountId: string): Promise<Response> {
+  if (!(await isEntitled(env, accountId, sha))) return json({ error: "not_found" }, 404);
   const obj = await env.rbox_dev_blobs.get(blobKey(sha));
   if (!obj) return json({ error: "not_found" }, 404);
   return new Response(obj.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
 // POST /v1/blobs/:sha/multipart  { size } -> { uploadId, partSize, totalParts }
-export async function multipartInit(req: Request, env: Env, sha: string): Promise<Response> {
+export async function multipartInit(req: Request, env: Env, sha: string, accountId: string): Promise<Response> {
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
@@ -79,8 +87,8 @@ export async function multipartInit(req: Request, env: Env, sha: string): Promis
   const stagingKey = `staging/${sha}/${crypto.randomUUID()}`;
   const mpu = await env.rbox_dev_blobs.createMultipartUpload(stagingKey);
   await env.rbox_dev_db
-    .prepare("INSERT INTO uploads (upload_id, sha256, staging_key, part_size, total_parts, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(mpu.uploadId, sha, stagingKey, partSize, totalParts, size, Date.now())
+    .prepare("INSERT INTO uploads (upload_id, sha256, staging_key, part_size, total_parts, size, created_at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(mpu.uploadId, sha, stagingKey, partSize, totalParts, size, Date.now(), accountId)
     .run();
   return json({ uploadId: mpu.uploadId, partSize, totalParts });
 }
@@ -91,18 +99,21 @@ interface UploadRow {
   total_parts: number;
   size: number;
   created_at: number;
+  account_id: string | null;
 }
-function loadUpload(env: Env, sha: string, uploadId: string): Promise<UploadRow | null> {
+/** Load an upload, scoped to the caller's account — a leaked uploadId from
+ *  another account returns null (can't be completed cross-account). */
+function loadUpload(env: Env, sha: string, uploadId: string, accountId: string): Promise<UploadRow | null> {
   return env.rbox_dev_db
-    .prepare("SELECT staging_key, part_size, total_parts, size, created_at FROM uploads WHERE upload_id = ? AND sha256 = ?")
-    .bind(uploadId, sha)
+    .prepare("SELECT staging_key, part_size, total_parts, size, created_at, account_id FROM uploads WHERE upload_id = ? AND sha256 = ? AND account_id = ?")
+    .bind(uploadId, sha, accountId)
     .first<UploadRow>();
 }
 const expired = (row: UploadRow) => Date.now() - row.created_at > UPLOAD_EXPIRY_MS;
 
 // GET /v1/blobs/:sha/multipart/:uploadId -> resumable state
-export async function multipartStatus(env: Env, sha: string, uploadId: string): Promise<Response> {
-  const up = await loadUpload(env, sha, uploadId);
+export async function multipartStatus(env: Env, sha: string, uploadId: string, accountId: string): Promise<Response> {
+  const up = await loadUpload(env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
   if (expired(up)) {
     await cleanupUpload(env, uploadId);
@@ -116,10 +127,10 @@ export async function multipartStatus(env: Env, sha: string, uploadId: string): 
 }
 
 // PUT /v1/blobs/:sha/multipart/:uploadId/part/:n
-export async function multipartPart(req: Request, env: Env, sha: string, uploadId: string, n: number): Promise<Response> {
+export async function multipartPart(req: Request, env: Env, sha: string, uploadId: string, n: number, accountId: string): Promise<Response> {
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
   if (!Number.isInteger(n) || n < 1) return json({ error: "bad_request", message: "bad part number" }, 400);
-  const up = await loadUpload(env, sha, uploadId);
+  const up = await loadUpload(env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
   if (expired(up)) {
     await cleanupUpload(env, uploadId);
@@ -143,8 +154,8 @@ export async function multipartPart(req: Request, env: Env, sha: string, uploadI
 }
 
 // POST /v1/blobs/:sha/multipart/:uploadId/complete
-export async function multipartComplete(env: Env, sha: string, uploadId: string): Promise<Response> {
-  const up = await loadUpload(env, sha, uploadId);
+export async function multipartComplete(env: Env, sha: string, uploadId: string, accountId: string): Promise<Response> {
+  const up = await loadUpload(env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
 
   const rows = await env.rbox_dev_db
@@ -169,6 +180,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string)
     }
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, up.size).run();
     await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+    await grantEntitlement(env, accountId, sha); // verified multipart upload → read access
     return json({ ok: true, sha256: sha, sizeBytes: up.size });
   } finally {
     await env.rbox_dev_blobs.delete(up.staging_key).catch(() => {});

@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
-import { json, sha256Hex } from "./util.js";
+import { ctEqual, json, sha256Hex } from "./util.js";
+import type { Principal } from "./authz.js";
 
 /**
  * Self-hosted device-token auth (M4). Per-device opaque tokens, stored only as
@@ -26,65 +27,62 @@ function randomUserCode(): string {
   const c = [...b].map((x) => USER_CODE_ALPHABET[x % USER_CODE_ALPHABET.length]).join("");
   return `${c.slice(0, 4)}-${c.slice(4)}`;
 }
-/** Constant-time string compare (lengths leak, contents don't). */
-function ctEqual(a: string, b: string): boolean {
-  const ea = new TextEncoder().encode(a);
-  const eb = new TextEncoder().encode(b);
-  if (ea.length !== eb.length) return false;
-  let r = 0;
-  for (let i = 0; i < ea.length; i++) r |= ea[i]! ^ eb[i]!;
-  return r === 0;
-}
 
 const TOKEN_RE = /^[0-9a-f]{64}$/; // 32 bytes hex
 
-export interface AuthedDevice {
-  tokenHash: string;
-  deviceId: string;
-  accountId: string;
-}
-
-/** Validate a bearer token: hash → devices lookup (not revoked). Throttled
- *  last_seen update. Returns the device or null. */
-export async function authenticate(req: Request, env: Env): Promise<AuthedDevice | null> {
+/** Validate a bearer token → the full Principal (device + account + user + role).
+ *  Throttled last_seen update. Role comes from the membership; a device with no
+ *  membership (legacy) gets least-privilege 'viewer'. */
+export async function authenticate(req: Request, env: Env): Promise<Principal | null> {
   const header = req.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ")) return null;
   const token = header.slice(7);
   if (!TOKEN_RE.test(token)) return null; // reject malformed before hashing
   const hash = await sha256Hex(token);
   const row = await env.rbox_dev_db
-    .prepare("SELECT token_hash, device_id, account_id, last_seen_at FROM devices WHERE token_hash = ? AND revoked = 0")
+    .prepare(
+      `SELECT d.device_id, d.account_id, d.user_id, d.last_seen_at, m.role AS role
+       FROM devices d LEFT JOIN memberships m ON m.account_id = d.account_id AND m.user_id = d.user_id
+       WHERE d.token_hash = ? AND d.revoked = 0`
+    )
     .bind(hash)
-    .first<{ token_hash: string; device_id: string; account_id: string; last_seen_at: number | null }>();
+    .first<{ device_id: string; account_id: string; user_id: string | null; last_seen_at: number | null; role: string | null }>();
   if (!row) return null;
   const now = Date.now();
   if (!row.last_seen_at || now - row.last_seen_at > LAST_SEEN_THROTTLE_MS) {
     await env.rbox_dev_db.prepare("UPDATE devices SET last_seen_at = ? WHERE token_hash = ?").bind(now, hash).run().catch(() => {});
   }
-  return { tokenHash: row.token_hash, deviceId: row.device_id, accountId: row.account_id };
+  return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer" };
 }
 
-async function mintDevice(env: Env, deviceId: string, label: string | null): Promise<string> {
+/** Mint a device token into a specific account/user (returns the plaintext once). */
+async function mintDevice(env: Env, accountId: string, userId: string, deviceId: string, label: string | null): Promise<string> {
   const token = randomHex(TOKEN_BYTES);
   const hash = await sha256Hex(token);
   await env.rbox_dev_db
-    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, created_at) VALUES (?, ?, ?, 'default', ?)")
-    .bind(hash, deviceId, label, Date.now())
+    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(hash, deviceId, label, accountId, userId, Date.now())
     .run();
   return token;
 }
 
-// POST /v1/auth/device/bootstrap { secret, label } -> { token, deviceId }
+// POST /v1/auth/device/bootstrap { secret, label } -> { token, deviceId, accountId }
+// Creates a fresh account + owner user + device (the trust anchor for a new tenant).
 export async function bootstrap(req: Request, env: Env): Promise<Response> {
-  const body = (await req.json().catch(() => ({}))) as { secret?: string; label?: string };
+  const body = (await req.json().catch(() => ({}))) as { secret?: string; label?: string; accountName?: string };
   const secret = env.RBOX_BOOTSTRAP_SECRET ?? "";
-  // Constant-time; identical failure regardless of why.
   if (!secret || typeof body.secret !== "string" || !ctEqual(body.secret, secret)) {
-    return json({ error: "unauthorized" }, 401);
+    return json({ error: "unauthorized" }, 401); // constant-time, identical failure
   }
+  const now = Date.now();
+  const accountId = `acct_${randomHex(8)}`;
+  const userId = `user_${randomHex(8)}`;
+  await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, ?, 'free', ?)").bind(accountId, body.accountName ?? "account", now).run();
+  await env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
+  await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
   const deviceId = `dev_${randomHex(6)}`;
-  const token = await mintDevice(env, deviceId, body.label ?? "bootstrap");
-  return json({ token, deviceId });
+  const token = await mintDevice(env, accountId, userId, deviceId, body.label ?? "bootstrap");
+  return json({ token, deviceId, accountId });
 }
 
 // POST /v1/auth/device/start { label } -> { deviceCode, userCode, interval, expiresIn }
@@ -115,9 +113,9 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
   const body = (await req.json().catch(() => ({}))) as { deviceCode?: string };
   if (typeof body.deviceCode !== "string") return json({ error: "bad_request" }, 400);
   const row = await env.rbox_dev_db
-    .prepare("SELECT user_code, status, device_id, label, expires_at FROM device_auth WHERE device_code = ?")
+    .prepare("SELECT user_code, status, device_id, label, expires_at, account_id, user_id FROM device_auth WHERE device_code = ?")
     .bind(body.deviceCode)
-    .first<{ user_code: string; status: string; device_id: string; label: string | null; expires_at: number }>();
+    .first<{ user_code: string; status: string; device_id: string; label: string | null; expires_at: number; account_id: string | null; user_id: string | null }>();
   if (!row) return json({ status: "not_found" }, 404);
   if (Date.now() > row.expires_at && row.status === "pending") return json({ status: "expired" });
   if (row.status === "pending") return json({ status: "pending", interval: POLL_INTERVAL_S });
@@ -129,34 +127,36 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
       .bind(body.deviceCode)
       .run();
     if (claim.meta.changes !== 1) return json({ status: "claimed" }); // lost the race
-    const token = await mintDevice(env, row.device_id, row.label);
-    return json({ status: "approved", token, deviceId: row.device_id });
+    // Mint into the APPROVER's account/user (device-to-device join).
+    const token = await mintDevice(env, row.account_id ?? "default", row.user_id ?? "", row.device_id, row.label);
+    return json({ status: "approved", token, deviceId: row.device_id, accountId: row.account_id });
   }
   return json({ status: row.status });
 }
 
-// POST /v1/auth/device/approve { userCode }  (authed)
-export async function approveDeviceAuth(req: Request, env: Env): Promise<Response> {
+// POST /v1/auth/device/approve { userCode }  (authed) — the new device joins the approver's account.
+export async function approveDeviceAuth(req: Request, env: Env, approver: Principal): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { userCode?: string };
   if (typeof body.userCode !== "string") return json({ error: "bad_request" }, 400);
   const res = await env.rbox_dev_db
-    .prepare("UPDATE device_auth SET status = 'approved' WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
-    .bind(body.userCode.toUpperCase(), Date.now())
+    .prepare("UPDATE device_auth SET status = 'approved', account_id = ?, user_id = ? WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
+    .bind(approver.accountId, approver.userId, body.userCode.toUpperCase(), Date.now())
     .run();
   if (res.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
   return json({ ok: true });
 }
 
-// GET /v1/auth/devices  (authed) -> device list
-export async function listDevices(env: Env, self: AuthedDevice): Promise<Response> {
+// GET /v1/auth/devices  (authed) -> device list, SCOPED to the caller's account.
+export async function listDevices(env: Env, self: Principal): Promise<Response> {
   const rows = await env.rbox_dev_db
-    .prepare("SELECT device_id, label, created_at, last_seen_at FROM devices WHERE revoked = 0 ORDER BY created_at")
+    .prepare("SELECT device_id, label, created_at, last_seen_at FROM devices WHERE revoked = 0 AND account_id = ? ORDER BY created_at")
+    .bind(self.accountId)
     .all<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null }>();
   return json({ devices: (rows.results ?? []).map((r) => ({ ...r, isSelf: r.device_id === self.deviceId })) });
 }
 
-// POST /v1/auth/devices/:deviceId/revoke  (authed)
-export async function revokeDevice(env: Env, deviceId: string): Promise<Response> {
-  const res = await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(deviceId).run();
+// POST /v1/auth/devices/:deviceId/revoke  (authed) — only within the caller's account.
+export async function revokeDevice(env: Env, self: Principal, deviceId: string): Promise<Response> {
+  const res = await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ?").bind(deviceId, self.accountId).run();
   return json({ ok: true, revoked: res.meta.changes });
 }
