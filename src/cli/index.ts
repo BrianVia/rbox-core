@@ -7,6 +7,7 @@ import { runDaemon } from "./daemon.js";
 import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, listDevices, login, logout, revokeDevice } from "./auth-cmd.js";
+import { encryptWorkspace, exportKey, importKey } from "./crypto-cmd.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
 
@@ -126,6 +127,20 @@ async function main(): Promise<void> {
       const root = await resolveRoot(flags.path);
       if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
       else await addIgnorePattern(root, positional[0]!);
+      break;
+    }
+    case "encrypt": {
+      await encryptWorkspace(await resolveRoot(positional[0]));
+      break;
+    }
+    case "key": {
+      const root = await resolveRoot(flags.path); // run inside the workspace
+      if (positional[0] === "export") await exportKey(root);
+      else if (positional[0] === "import") await importKey(root, positional[1] ?? "");
+      else {
+        console.log("usage (inside the workspace): rbox key <export | import <recovery-phrase>>");
+        process.exitCode = 1;
+      }
       break;
     }
     case "__daemon-run": {

@@ -63,11 +63,12 @@ Per-device revocable tokens (sha256-hashed in D1) via a device-authorization flo
 - [x] `rbox device list/revoke`; immediate per-request revocation; constant-time bootstrap compare; throttled last-seen.
 - [ ] External identity / user layer (**deferred**): prefer **Cloudflare Zero Trust/Access + BetterAuth** over Clerk (user pref); federates *who the human is* onto these device tokens; ties into M7. Live-WS revocation also deferred to M7 (WS is notification-only).
 
-### 5. Encryption (**D5**) + secrets
-- [ ] Envelope encryption (per-blob DEK wrapped by per-workspace KEK; prior-art §1).
-- [ ] Convergent DEK (`HKDF(KEK, plaintext_sha256)`) so dedup survives E2EE.
-- [ ] Opt-in `.env`/secrets sync, **always E2EE** when enabled.
-- [ ] KEK onboarding UX (passphrase / device-to-device approval) — surface the E2EE onboarding tax honestly.
+### 5. Encryption (**D5**) + secrets — ✅ DONE (blob-content E2EE; full-E2EE follow-up)
+Opt-in client-side encryption: server stores only ciphertext for blob bodies. Design: [`design/05-encryption.md`](./design/05-encryption.md). Verified 8/8 e2e (server blob is ciphertext, keyed device decrypts, keyless locked out, dedup survives).
+- [x] Convergent envelope encryption: per-blob AES-256-GCM key+nonce = HKDF(KEK, plaintext_sha) — deterministic, so dedup survives; KEK never leaves the device; DEK re-derived (never stored).
+- [x] `rbox encrypt` (recovery phrase), `rbox key export/import` (device-to-device); KEK in `~/.rbox/keys/<ws>.key` (600); encryption self-describing from the manifest (`encSha`).
+- [x] Fresh-hash key derivation, encrypt-to-temp→upload-by-encSha, GCM-tag + plaintext-sha verify on download.
+- [ ] **Full E2EE follow-up** (chosen scope: content-only now): encrypt the MANIFEST too (currently metadata — paths/sizes/plaintext-hashes — is visible to the server); encrypt git artifact blobs (currently `syncGit`+encryption is refused together); passphrase escrow; key rotation. Opt-in `.env` sync rides on this (forced-E2EE).
 
 ### 6. Version history, trash, GC (**D7, D10**)
 - [ ] **Time-windowed retention per plan** (Free 7d / Solo 30d / Pro 90d) — prune versions past the account's window, not just "last N".

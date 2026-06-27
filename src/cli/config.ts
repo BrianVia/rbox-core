@@ -25,6 +25,10 @@ export interface WorkspaceConfig {
   /** Opt-in git-state sync (M2). Default off — syncing git config could move
    *  machine-local settings; hooks are never synced regardless. */
   syncGit?: boolean;
+  /** Opt-in blob-content encryption (M5). Persisted. */
+  encrypted?: boolean;
+  /** Workspace KEK — runtime only, loaded from the keystore; NEVER persisted. */
+  kek?: Buffer;
 }
 
 /** Last point this device and the server agreed on — the reconcile base. */
@@ -73,9 +77,10 @@ export async function loadConfig(root: string): Promise<WorkspaceConfig> {
 
 export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  // Never persist the token to the workspace config (M4) — it lives in the
-  // per-machine credential and is injected at runtime by loadAuthedConfig.
-  await writeFileAtomic(configPath(root), JSON.stringify({ ...cfg, token: "" }, null, 2));
+  // Never persist secrets to the workspace config: the token lives in the
+  // per-machine credential (M4) and the KEK in the keystore (M5). Both injected
+  // at runtime by loadAuthedConfig.
+  await writeFileAtomic(configPath(root), JSON.stringify({ ...cfg, token: "", kek: undefined }, null, 2));
 }
 
 /** Load the workspace config and inject the device token from the per-machine
@@ -84,7 +89,13 @@ export async function loadAuthedConfig(root: string): Promise<WorkspaceConfig> {
   const cfg = await loadConfig(root);
   const creds = await loadCredentials();
   if (!creds) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
-  return { ...cfg, token: creds.token, remoteUrl: cfg.remoteUrl || creds.remoteUrl };
+  const authed: WorkspaceConfig = { ...cfg, token: creds.token, remoteUrl: cfg.remoteUrl || creds.remoteUrl };
+  if (cfg.encrypted) {
+    const { loadKek } = await import("./keystore.js");
+    authed.kek = await loadKek(cfg.remoteWorkspaceId);
+    if (!authed.kek) throw new Error(`workspace is encrypted but no key on this device — run \`rbox key import <recovery-phrase>\``);
+  }
+  return authed;
 }
 
 /**

@@ -3,6 +3,7 @@ import path from "node:path";
 import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
+import { decryptFileToPath } from "./crypto.js";
 import { RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import type { FileEntry, Manifest } from "./types.js";
@@ -32,6 +33,9 @@ export interface ApplyOptions {
   device?: string;
   /** ISO timestamp for conflict-copy names; defaults to now. */
   now?: string;
+  /** Workspace KEK (M5). When set and an entry has `encSha`, the blob is fetched
+   *  by `encSha` (ciphertext) and decrypted+verified before write. */
+  kek?: Buffer;
 }
 
 /**
@@ -57,11 +61,11 @@ export async function applyActions(
 
   for (const a of rest) {
     if (a.kind === "write") {
-      await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now);
+      await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek);
     } else if (a.kind === "conflict") {
       // Reconcile already decided both sides diverged: keep local aside, take remote.
       await moveAside(destRoot, a.path, a.keepLocalAs);
-      await writeEntry(destRoot, a.entry, undefined, store, device, now);
+      await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek);
     }
   }
   for (const a of deletes) {
@@ -77,7 +81,8 @@ async function writeEntry(
   expectedLocal: FileEntry | undefined,
   store: BlobStore,
   device: string,
-  now: string
+  now: string,
+  kek?: Buffer
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -87,6 +92,17 @@ async function writeEntry(
   try {
     if (entry.type === "symlink") {
       await fs.symlink(entry.symlinkTarget ?? "", tmp);
+    } else if (entry.encSha && kek) {
+      // Encrypted (M5): fetch ciphertext by encSha, decrypt+verify into tmp.
+      const ctTmp = `${tmp}.ct`;
+      try {
+        if (store.getToFile) await store.getToFile(entry.encSha, ctTmp);
+        else await fs.writeFile(ctTmp, await store.get(entry.encSha));
+        await decryptFileToPath(ctTmp, kek, entry.sha256, tmp);
+      } finally {
+        await fs.rm(ctTmp, { force: true }).catch(() => {});
+      }
+      await fs.chmod(tmp, entry.mode);
     } else {
       // Stream large blobs straight to the temp file (no whole-file buffer); the
       // streaming download verifies the sha. Fall back to buffered get otherwise.

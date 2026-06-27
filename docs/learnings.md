@@ -65,6 +65,14 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M5 (blob-content E2EE) DONE
+
+- Shipped opt-in convergent blob-content encryption; verified 8/8 e2e (server stores only ciphertext, keyed device decrypts, keyless locked out, dedup survives). User chose content-only scope; full-E2EE (encrypted manifest) is the documented follow-up.
+- **Encryption must be self-describing from the manifest, not a local config flag.** The receiver detects encryption by `entry.encSha` in the remote manifest and loads the KEK from the keystore — relying on the device's local `encrypted` config flag fails (a device that only pulled never set the flag → skips the key → tries the plaintext-sha blob → 404). Lesson: protocol state that the other side must act on belongs IN the synced data, not in per-device local config.
+- **Server blob-existence check must validate the STORED address** (`encSha ?? sha256`), not the plaintext sha — encrypted blobs live under `encSha`; checking plaintext sha would 422 every encrypted commit.
+- `encSha` (ciphertext addr) is in `FileEntry` alongside `sha256` (plaintext identity); reconcile/diff/dedup still key off `sha256` (unchanged) so M1/M3 logic is untouched.
+- Secrets never persisted to config: token→credential (M4), KEK→keystore (M5); `saveConfig` strips both; `loadAuthedConfig` injects at runtime.
+
 ## 2026-06-26 — M5 convergent-encryption primitive validated (PoC)
 
 - Convergent AES-256-GCM with **HKDF-derived key AND nonce** from (KEK, plaintext_sha256) works: same plaintext+KEK → byte-identical ciphertext (so the ciphertext sha is a stable dedup address), round-trips, tampering a byte → GCM tag rejects, wrong KEK → fails, 50MB fine. Node: `hkdfSync("sha256", kek, salt, infoBytes, len)` + `createCipheriv("aes-256-gcm", dek, nonce)` + `getAuthTag()`; store `ciphertext||tag` (nonce is derived, not stored). GCM nonce-reuse is safe ONLY because distinct plaintext → distinct (DEK,nonce); never reuse a (key,nonce) across different plaintexts.

@@ -1,5 +1,6 @@
 export type { FileEntry, FileType, Manifest, GitSection } from "./types.js";
 export { gitPreflight, gitIdentity, captureGitState, applyGitState, preserveGitConflict, validateGitSection, isSyncableRef, gitIdentityKey, type ApplyGitResult } from "./git-state.js";
+export { generateKek, kekToPhrase, kekFromPhrase, encryptFileToTemp, decryptFileToPath, type EncryptedBlob } from "./crypto.js";
 export { hashFile, hashBytes } from "./hash.js";
 export { BUILTIN_IGNORE, buildIgnoreMatcher, effectiveIgnoreRules, type IgnoreMatcher, type IgnoreRule } from "./ignore.js";
 export { scanManifest, applyWatchEvents, type WatchEvent, type WatchEventKind } from "./manifest.js";

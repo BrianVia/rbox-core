@@ -79,11 +79,12 @@ export class WorkspaceSync {
 
     const v = validateManifest(body.manifest);
     if (!v.ok) return json({ error: "bad_request", message: v.error }, 400);
-    const manifest = body.manifest as { files: { type: string; sha256: string }[] };
+    const manifest = body.manifest as { files: { type: string; sha256: string; encSha?: string }[] };
 
     // Blob-existence: refuse to advance head past a manifest that references blobs
     // we don't have, or every future pull breaks. Distinct 422 so the client uploads.
-    const fileShas = [...new Set(manifest.files.filter((f) => f.type === "file").map((f) => f.sha256))];
+    // Check the STORED address: encSha (ciphertext) when encrypted, else the sha.
+    const fileShas = [...new Set(manifest.files.filter((f) => f.type === "file").map((f) => f.encSha ?? f.sha256))];
     const missing = await this.missingBlobs(fileShas);
     if (missing.length > 0) return json({ error: "unsatisfied_blobs", missing }, 422);
 

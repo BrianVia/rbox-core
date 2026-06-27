@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import {
   applyActions,
@@ -6,6 +7,7 @@ import {
   buildIgnoreMatcher,
   captureGitState,
   diffManifests,
+  encryptFileToTemp,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
@@ -63,6 +65,46 @@ async function uploadBlobs(
   await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));
 }
 
+/** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
+ *  encSha for unchanged files; else convergent-encrypt), then upload the missing
+ *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha). */
+async function encryptAndUpload(api: RboxApi, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest): Promise<void> {
+  if (cfg.syncGit) throw new Error("encryption + git-state sync aren't supported together yet (M5 limitation; full-E2EE milestone covers it)");
+  if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
+  const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
+  const ctByEnc = new Map<string, string>();
+  try {
+    for (const f of local.files) {
+      if (f.type !== "file") continue;
+      const reuse = baseEnc.get(f.sha256);
+      if (reuse) {
+        f.encSha = reuse; // unchanged file → reuse ciphertext address (no re-encrypt)
+        continue;
+      }
+      const e = await encryptFileToTemp(path.join(root, f.path), cfg.kek, tmpDir);
+      f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
+      f.encSha = e.encSha;
+      ctByEnc.set(e.encSha, e.ciphertextPath);
+    }
+    const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
+    const missing = await api.missingBlobs(encShas);
+    const uploadsDir = path.join(root, ".rbox", "state", "uploads");
+    for (const encSha of missing) {
+      let ct = ctByEnc.get(encSha);
+      if (!ct) {
+        // Missing on the server but reused-from-base (server lost it) → re-encrypt.
+        const f = local.files.find((x) => x.encSha === encSha);
+        if (!f) continue;
+        ct = (await encryptFileToTemp(path.join(root, f.path), cfg.kek, tmpDir)).ciphertextPath;
+      }
+      await api.putBlobFile(encSha, ct, (await fs.stat(ct)).size, uploadsDir);
+    }
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
 /** Capture/carry the git section for a push (M2). Capture+upload only when the
  *  repo's stable identity changed vs the base; otherwise carry the base section. */
 async function captureGitForPush(
@@ -96,8 +138,17 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
   const { cache, save } = await withCache(root, providedCache);
   const local = await scanManifest(root, undefined, cache);
 
+  // Encryption is self-describing: if the remote manifest carries encSha, this is
+  // an encrypted workspace — load the key (even if our local config doesn't say so).
+  let kek = cfg.kek;
+  if (!kek && remote.files.some((f) => f.encSha)) {
+    const { loadKek } = await import("./keystore.js");
+    kek = await loadKek(cfg.remoteWorkspaceId);
+    if (!kek) throw new Error("remote workspace is encrypted — run `rbox key import <recovery-phrase>` to get the key");
+  }
+
   const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
-  await applyActions(root, actions, new RemoteBlobStore(api), { device: cfg.deviceId });
+  await applyActions(root, actions, new RemoteBlobStore(api), { device: cfg.deviceId, kek });
 
   // Paths we just wrote/removed changed on disk — invalidate so the next scan
   // re-hashes them from real disk truth (never trust a stale cache entry there).
@@ -204,10 +255,17 @@ export async function pushManifest(
   }
   const d = diffManifests(state.lastSyncedManifest, local);
 
-  const shaToPath = new Map<string, string>();
-  for (const f of local.files) if (f.type === "file") shaToPath.set(f.sha256, f.path);
-  const missing = await api.missingBlobs([...shaToPath.keys()]);
-  await uploadBlobs(api, root, missing, shaToPath);
+  // Upload missing blobs — encrypted (by encSha, ciphertext) or plaintext (by sha).
+  const doUpload = async () => {
+    if (cfg.encrypted) {
+      await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest);
+    } else {
+      const shaToPath = new Map<string, string>();
+      for (const f of local.files) if (f.type === "file") shaToPath.set(f.sha256, f.path);
+      await uploadBlobs(api, root, await api.missingBlobs([...shaToPath.keys()]), shaToPath);
+    }
+  };
+  await doUpload();
 
   const res = await api.commit(state.lastSyncedSequence, cfg.deviceId, local);
 
@@ -222,7 +280,7 @@ export async function pushManifest(
   }
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
-    await uploadBlobs(api, root, res.unsatisfiedBlobs, shaToPath);
+    await doUpload(); // re-check + re-upload (encrypted or plaintext)
     return pushManifest(root, cfg, local, providedCache, attempt + 1, purgeIgnored);
   }
 

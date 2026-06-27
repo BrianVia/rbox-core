@@ -1,12 +1,22 @@
 # Design 05 — Encryption + Secrets (Milestone 5)
 
-**Status:** draft → pending codex (crypto) review.
+**Status:** ⛔ v1 NEEDS-PASS (codex crypto review). Critical finding: a **plaintext manifest leaks metadata** (paths, filenames, plaintext shas, sizes, modes, mtimes, symlink targets, git refs) → this is deterministic blob-content encryption, NOT full E2EE. Other findings: (1) derive GCM keys only from FRESHLY-verified bytes (never the hashcache's possibly-stale sha) + fixed/versioned AAD only, soften the "impossible" overclaim; (3) `encSha = sha256(ciphertext||tag)` is unknown until after encryption → encrypt-to-temp-then-upload-by-encSha; (5) device-to-device key transfer (SAS/QR-authenticated) as default, Argon2id escrow optional + key rotation story; (6) encrypt git bundle/index/op-state blobs too when the workspace is encrypted. The primitive itself (convergent AES-256-GCM) was validated 7/7. **Full E2EE = encrypt the manifest** (server stores an opaque encrypted-manifest blob + an outer envelope of {version, encManifestSha, encSha refs for existence checks}; DO sequences by number; blob-existence validation moves client-side). This is a substantial scope expansion vs blob-content-only — see conversation for the decision.
 **Implements:** roadmap M5. **Decision:** D5 (at-rest default + opt-in E2EE; `.env` forced E2EE).
 **Goal:** opt-in **end-to-end encryption** — the server stores only ciphertext, only devices holding the workspace key can read it — **while preserving content-addressed dedup**. Opt-in `.env`/secret sync is E2EE-only.
 
 > At-rest encryption is already provided by R2 (server-side). The distinctive, valuable work here is **client-side E2EE** where the Worker never sees plaintext. High-stakes: lose the key → lose the data; get the construction wrong → a breach.
 
 ---
+
+## 0. M5 v2 scope decision — blob-content encryption (user choice)
+Ship **blob-content E2EE** now; **full E2EE (encrypted manifest) is a documented follow-up.** Honest boundary, stated in `status`/docs:
+- File **blob bodies are encrypted** end-to-end (server stores ciphertext, can't read contents).
+- The **manifest stays plaintext** → server sees paths, sizes, plaintext content hashes (metadata). Labeled "encrypted at rest + content; metadata visible," NOT full E2EE.
+- Review findings still honored even in this scope: **(1)** derive GCM key+nonce from a **freshly re-hashed** plaintext sha (never the hashcache), fixed/versioned AAD only; **(3)** encrypt to a temp file, then `encSha = sha256(ciphertext)` is known → upload by `encSha` via the normal M3 file path; **(5)** device-to-device key transfer + optional Argon2id escrow.
+- **`syncGit` + encryption together is REFUSED in M5** (clear error) — encrypting working files while git history sits plaintext on the server is a worse trap than refusing; lifted in the full-E2EE pass (which encrypts git artifact blobs too). [defer finding 6]
+- Full-E2EE follow-up (deferred): encrypt the manifest (opaque manifest blobs + outer envelope; client-side blob validation; encrypted git blobs). [finding 4]
+
+> ✅ IMPLEMENTED & VERIFIED (blob-content scope). 8/8 e2e: server stores only ciphertext, keyed device decrypts, keyless device locked out, dedup survives encryption, recovery-phrase round-trips. Crypto primitive + module 15/15 unit. Encryption is self-describing via `encSha`; server validates `encSha ?? sha256`. Full E2EE (encrypted manifest + git blobs) is the documented follow-up.
 
 ## 1. Crypto construction — convergent envelope encryption
 

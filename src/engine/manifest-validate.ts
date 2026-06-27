@@ -59,6 +59,7 @@ export function validateManifest(m: unknown): ValidationResult {
 
     if (e.type !== "file" && e.type !== "symlink") return { ok: false, error: `bad type for ${p}: ${JSON.stringify(e.type)}` };
     if (typeof e.sha256 !== "string" || !SHA_RE.test(e.sha256)) return { ok: false, error: `bad sha256 for ${p}` };
+    if (e.encSha !== undefined && (typeof e.encSha !== "string" || !SHA_RE.test(e.encSha))) return { ok: false, error: `bad encSha for ${p}` };
     if (typeof e.size !== "number" || !Number.isInteger(e.size) || e.size < 0) return { ok: false, error: `bad size for ${p}` };
     if (typeof e.mode !== "number" || !Number.isInteger(e.mode) || e.mode < 0 || e.mode > 0o7777) return { ok: false, error: `bad mode for ${p}` };
 

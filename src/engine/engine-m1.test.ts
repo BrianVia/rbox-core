@@ -209,3 +209,31 @@ test("ignore: .rboxignore !negation re-includes a pattern-ignored file (not a pr
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---- M5: convergent blob encryption -------------------------------------
+
+test("crypto: encrypt→decrypt round-trips, is convergent, and rejects tamper/wrong-key", async () => {
+  const { encryptFileToTemp, decryptFileToPath, generateKek, kekFromPhrase, kekToPhrase } = await import("./crypto.js");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-enc-"));
+  try {
+    const kek = generateKek();
+    const f = path.join(dir, "secret.ts");
+    const data = Buffer.from("const KEY='sk-abc';\n".repeat(2000));
+    await fs.writeFile(f, data);
+
+    const e1 = await encryptFileToTemp(f, kek, dir);
+    const e2 = await encryptFileToTemp(f, kek, await fs.mkdtemp(path.join(os.tmpdir(), "rbox-enc2-")));
+    expect(e1.encSha).toBe(e2.encSha); // convergent → dedup
+    expect(e1.encSha).not.toBe(e1.plaintextSha);
+    expect((await fs.readFile(e1.ciphertextPath)).includes(Buffer.from("sk-abc"))).toBe(false); // ciphertext hides plaintext
+
+    const out = path.join(dir, "out.ts");
+    await decryptFileToPath(e1.ciphertextPath, kek, e1.plaintextSha, out);
+    expect((await fs.readFile(out)).equals(data)).toBe(true);
+
+    await expect(decryptFileToPath(e1.ciphertextPath, generateKek(), e1.plaintextSha, path.join(dir, "x"))).rejects.toThrow();
+    expect(kekFromPhrase(kekToPhrase(kek)).equals(kek)).toBe(true);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

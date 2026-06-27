@@ -21,6 +21,10 @@ export interface FileEntry {
   type: FileType;
   /** For `type: "symlink"`, the raw link target. */
   symlinkTarget?: string;
+  /** Ciphertext content-address (M5, encrypted workspaces): where the encrypted
+   *  body is stored. `sha256` stays the PLAINTEXT identity (dedup/reconcile key);
+   *  this is the address of the AES-GCM ciphertext in R2. Absent = plaintext blob. */
+  encSha?: string;
 }
 
 /**
