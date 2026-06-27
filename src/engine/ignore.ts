@@ -65,3 +65,25 @@ function readIfExists(filePath: string): string | undefined {
     return undefined;
   }
 }
+
+export interface IgnoreRule {
+  source: "builtin" | ".gitignore" | ".rboxignore";
+  pattern: string;
+}
+
+/** The effective rule set in precedence order (later overrides earlier; a
+ *  `.rboxignore` `!negation` can re-include a builtin/gitignore-excluded path). */
+export function effectiveIgnoreRules(root: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = BUILTIN_IGNORE.map((pattern) => ({ source: "builtin" as const, pattern }));
+  const fromFile = (rel: string, source: IgnoreRule["source"]) => {
+    const text = readIfExists(path.join(root, rel));
+    if (!text) return;
+    for (const line of text.split("\n")) {
+      const p = line.trim();
+      if (p && !p.startsWith("#")) rules.push({ source, pattern: p });
+    }
+  };
+  fromFile(".gitignore", ".gitignore");
+  fromFile(".rboxignore", ".rboxignore");
+  return rules;
+}

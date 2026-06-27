@@ -5,6 +5,7 @@ import { findRoot, loadConfig, loadState, saveConfig, type WorkspaceConfig } fro
 import { pull, push, sync } from "./sync.js";
 import { runDaemon } from "./daemon.js";
 import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
+import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
 const DEFAULT_TOKEN = process.env.RBOX_TOKEN ?? "rbox-dev-7f3a9c2e8b1d4a60";
@@ -100,6 +101,12 @@ async function main(): Promise<void> {
         console.log("usage: rbox daemon <start|stop|status|logs> [path] [--follow]");
         process.exitCode = 1;
       }
+      break;
+    }
+    case "ignore": {
+      const root = await resolveRoot(flags.path);
+      if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
+      else await addIgnorePattern(root, positional[0]!);
       break;
     }
     case "__daemon-run": {

@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   applyActions,
   applyGitState,
+  buildIgnoreMatcher,
   captureGitState,
   diffManifests,
   gitIdentity,
@@ -148,11 +149,11 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
  * Scan and push. Convenience wrapper for CLI one-shots — the daemon uses
  * {@link pushManifest} directly with its incrementally-patched in-memory manifest.
  */
-export async function push(root: string, cfg: WorkspaceConfig, providedCache?: HashCache): Promise<number> {
+export async function push(root: string, cfg: WorkspaceConfig, providedCache?: HashCache, purgeIgnored = false): Promise<number> {
   const { cache, save } = await withCache(root, providedCache);
   const local = await scanManifest(root, undefined, cache);
   await save();
-  return (await pushManifest(root, cfg, local, providedCache)).sequence;
+  return (await pushManifest(root, cfg, local, providedCache, 0, purgeIgnored)).sequence;
 }
 
 /**
@@ -170,10 +171,24 @@ export async function pushManifest(
   cfg: WorkspaceConfig,
   local: Manifest,
   providedCache?: HashCache,
-  attempt = 0
+  attempt = 0,
+  purgeIgnored = false
 ): Promise<{ sequence: number; manifest: Manifest }> {
   const api = apiFor(cfg);
   const state = await loadState(root);
+
+  // Forward-only ignore (M3b): a file that was synced but is now ignored should
+  // NOT read as a deletion on other machines. Carry forward its last-synced entry
+  // unless --purge explicitly requests propagating the deletion. (A real `rm` of a
+  // non-ignored file is still absent-and-not-ignored → a genuine deletion.)
+  if (!purgeIgnored) {
+    const matcher = buildIgnoreMatcher(root);
+    const present = new Set(local.files.map((f) => f.path));
+    const carried = state.lastSyncedManifest.files.filter((e) => !present.has(e.path) && matcher.ignores(e.path));
+    if (carried.length) {
+      local = { ...local, files: [...local.files, ...carried].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
+    }
+  }
 
   // Attach the git section (M2): capture only when its stable identity changed
   // vs the base (re-bundling unchanged state would echo forever); else carry it.
@@ -203,12 +218,12 @@ export async function pushManifest(
     const { cache, save } = await withCache(root, providedCache);
     const fresh = await scanManifest(root, undefined, cache); // disk changed under us
     await save();
-    return pushManifest(root, cfg, fresh, providedCache, attempt + 1);
+    return pushManifest(root, cfg, fresh, providedCache, attempt + 1, purgeIgnored);
   }
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
     await uploadBlobs(api, root, res.unsatisfiedBlobs, shaToPath);
-    return pushManifest(root, cfg, local, providedCache, attempt + 1);
+    return pushManifest(root, cfg, local, providedCache, attempt + 1, purgeIgnored);
   }
 
   await saveState(root, { lastSyncedSequence: res.sequence!, lastSyncedManifest: local });

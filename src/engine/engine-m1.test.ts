@@ -193,3 +193,19 @@ test("applyWatchEvents: ignored paths never enter the manifest", async () => {
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---- M3b: ignore precedence ----------------------------------------------
+
+test("ignore: .rboxignore !negation re-includes a pattern-ignored file (not a pruned dir)", async () => {
+  const { buildIgnoreMatcher } = await import("./ignore.js");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ig-"));
+  try {
+    await fs.writeFile(path.join(dir, ".gitignore"), "*.log\n");
+    await fs.writeFile(path.join(dir, ".rboxignore"), "!important.log\n");
+    const m = buildIgnoreMatcher(dir);
+    expect(m.ignores("debug.log")).toBe(true); // *.log ignored
+    expect(m.ignores("important.log")).toBe(false); // re-included by .rboxignore (last wins)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

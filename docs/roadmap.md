@@ -47,7 +47,8 @@ Lifted the 25MB cap and OOM risk; unblocks M2 (large git packs). Design: [`desig
 - [ ] **Presigned direct-to-R2** (Worker out of the byte path) — additive SaaS cost optimization; **needs an R2 S3 API token (provisioning)**; transparent streaming fallback already in place, so this is deferred, not blocking.
 - [ ] Queue-based lazy verification for multi-GB blobs — current post-publish R2 verify covers typical sizes.
 
-### 3b. Configurable ignore patterns in config
+### 3b. Configurable ignore patterns — ✅ DONE
+`.rboxignore` is a synced, shared ignore file (read by the matcher, syncs as a normal file). `rbox ignore <glob>` / `rbox ignore --list`; precedence builtin→.gitignore→.rboxignore (negations last-win, except pruned dirs). **Forward-only**: ignoring an already-synced file stops its sync but does NOT delete copies elsewhere (delete-then-ignore to purge). Daemon rebuilds its matcher + full-rescans when `.rboxignore`/`.gitignore` changes. Verified 5/5 e2e. Design: [`design/03b-ignore.md`](./design/03b-ignore.md). (Below was the original plan.)
 Today ignore rules come from `BUILTIN_IGNORE` + `.gitignore` + `.rboxignore` only (`src/engine/ignore.ts`). `buildIgnoreMatcher(root, extra)` already accepts an `extra: string[]` — the matcher plumbing exists, it's just not fed from config.
 - [ ] Add an `ignore: string[]` (gitignore-syntax globs) to the **synced** project config (`rbox.yml`, **D11**) so every machine agrees on what's in-scope — ignore rules are part of the project definition, not a per-device preference.
 - [ ] Wire it through: `rbox.yml.ignore` → `buildIgnoreMatcher(root, extra)` → `scanManifest`. Per-device `.rboxignore` still layers on top as a local override.

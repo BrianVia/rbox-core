@@ -40,7 +40,7 @@ interface Wants {
  */
 export class RboxDaemon {
   private readonly api: RboxApi;
-  private readonly matcher: IgnoreMatcher;
+  private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
   private manifest: Manifest = { generatedAt: "", files: [] };
   private pendingEvents: WatchEvent[] = [];
@@ -150,7 +150,15 @@ export class RboxDaemon {
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
       this.pendingEvents = [];
-      this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache);
+      // If the ignore rules themselves changed, rebuild the matcher and full-rescan
+      // so newly-ignored paths are dropped (and re-included ones picked up) — the
+      // incremental matcher would otherwise be stale until restart. [M3b]
+      if (events.some((e) => e.relPath === ".rboxignore" || e.relPath.endsWith("/.rboxignore") || e.relPath === ".gitignore" || e.relPath.endsWith("/.gitignore"))) {
+        this.matcher = buildIgnoreMatcher(this.root);
+        this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+      } else {
+        this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache);
+      }
     }
     const res = await pushManifest(this.root, this.cfg, this.manifest, this.cache);
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan

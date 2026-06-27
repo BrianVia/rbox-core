@@ -1,7 +1,7 @@
 export type { FileEntry, FileType, Manifest, GitSection } from "./types.js";
 export { gitPreflight, gitIdentity, captureGitState, applyGitState, preserveGitConflict, validateGitSection, isSyncableRef, gitIdentityKey, type ApplyGitResult } from "./git-state.js";
 export { hashFile, hashBytes } from "./hash.js";
-export { BUILTIN_IGNORE, buildIgnoreMatcher, type IgnoreMatcher } from "./ignore.js";
+export { BUILTIN_IGNORE, buildIgnoreMatcher, effectiveIgnoreRules, type IgnoreMatcher, type IgnoreRule } from "./ignore.js";
 export { scanManifest, applyWatchEvents, type WatchEvent, type WatchEventKind } from "./manifest.js";
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
