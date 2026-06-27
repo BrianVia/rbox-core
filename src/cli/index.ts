@@ -43,12 +43,14 @@ async function main(): Promise<void> {
         rootPath: root,
         remoteUrl: flags.remote ?? DEFAULT_REMOTE,
         token: flags.token ?? DEFAULT_TOKEN,
+        syncGit: flags.git === "true",
       };
       await saveConfig(root, cfg);
       console.log(`linked ${root}`);
       console.log(`  workspace: ${cfg.remoteWorkspaceId}`);
       console.log(`  device:    ${cfg.deviceId}`);
       console.log(`  remote:    ${cfg.remoteUrl}`);
+      if (cfg.syncGit) console.log(`  git-sync:  on (opt-in)`);
       console.log(`\nLink another machine with:\n  rbox link <path> --workspace ${cfg.remoteWorkspaceId}`);
       break;
     }
@@ -80,6 +82,11 @@ async function main(): Promise<void> {
       console.log(`  device: ${cfg.deviceId}`);
       console.log(`  last-synced sequence: ${state.lastSyncedSequence}`);
       console.log(`  local files: ${local.files.length}`);
+      if (cfg.syncGit) {
+        const { gitPreflight } = await import("../engine/index.js");
+        const pf = await gitPreflight(root);
+        console.log(`  git-sync: ${pf.ok ? "on (eligible)" : `on but skipped — ${pf.reason}`}`);
+      }
       break;
     }
     case "daemon": {

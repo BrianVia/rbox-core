@@ -1,6 +1,6 @@
 # Design 02 — Git State Sync (Milestone 2) — v3 (git-native, bundle-based)
 
-**Status:** draft v3 → pending codex review #3. v1 (file-mirror) and v2 (narrowed file-mirror) were rejected: **copying a live `.git` tree is never atomic**. v3 abandons file-mirroring and uses git's own consistent-snapshot tools. M3 (large blobs) is done, so bundles of any size transfer.
+**Status:** ✅ IMPLEMENTED & VERIFIED (git-native v3). v1/v2 (file-mirror) rejected — copying a live `.git` is never atomic; v3 uses git's own consistent tools. A code review (FIX-FIRST) caught 5 safety gaps, all resolved (rollback on fsck-fail, section validation, ref-namespace restriction, temp-rename restores, fail-closed quarantine, non-clobbering conflict, write-tree stable identity). Verified: 3/3 isolation + 9/9 integrated CLI + **8/8 cross-machine Mac↔prod** — `git fsck` clean both ways, bidirectional, branches/staged/stash preserved.
 **Implements:** roadmap M2. **Decision:** D6 (move git state) — delivered **opt-in** (`syncGit`, default off) because git config/hooks are a code-exec/credential vector.
 **Goal:** branch, staged/unstaged changes, local-only commits, stashes, and in-progress ops follow you to the other machine, so you continue mid-work. **Never a corrupt repo, never lost committed work.**
 

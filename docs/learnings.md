@@ -38,10 +38,32 @@ Format: `## YYYY-MM-DD — <short title>` then the learning + why it matters.
 - **Don't `ReadableStream.tee()` to hash+store** — the slower branch buffers unboundedly → recreates OOM. Use a single pass-through hashing TransformStream, or R2 native sha256 (preferred).
 - **R2 multipart constraints:** 5 MiB min part (except last), 5 GiB max part, 10,000 max parts, uniform non-final part sizes, incomplete uploads abort after 7 days. `resumeMultipartUpload(key, uploadId)` re-instantiates an MPU across Worker invocations but does NOT validate existence — server must persist authoritative part state (`upload_parts` table), client token is just a cache. Multipart final ETag is composite/MD5-derived — never use it as the content-address; use `R2UploadedPart.etag` for `complete` only.
 
+## 2026-06-26 — M2 (git state sync) DONE & verified cross-machine
+
+Git-native bundle approach shipped + verified 8/8 cross-machine. Hard-won implementation lessons beyond the earlier PoC notes:
+- **`git stash create` rewrites `.git/index` stat info** → the raw index-file hash is NOT a stable identity (causes phantom "changed" → echo + false conflicts). Use **`git write-tree`** (content sha of staging, ignores stat) as the staging identity; still ship the actual index file bytes for exact restore. Capture: stage the index COPY before stash-create, hash+upload the copy (TOCTOU-free).
+- **macOS `/var/folders` symlinks to `/private/...`** → `git rev-parse --show-toplevel` (realpath'd) never lexically equals an un-resolved sync root. Compare `fs.realpath` of both. (Bites any user with a symlink in their root path.)
+- **Only sync refs/heads, refs/tags, refs/stash** — NEVER refs/remotes (machine-local origins), refs/notes, refs/replace. Mirroring "all refs" would delete a user's local remotes on the other machine.
+- **Receiver apply must be transactional:** snapshot local refs+HEAD+index+op-state BEFORE mutating; on any error or post-apply `git fsck --connectivity-only` failure, ROLL BACK. Quarantine local via `git bundle --all` first and FAIL CLOSED if quarantine fails. Restore index/HEAD/op-state via temp→rename (never a torn live `.git` file).
+- **Validate the git section before applying** (HEAD format, ref names in safe namespaces, op-state paths no `..`, shas hex) — never trust a manifest off the wire to drive git commands / file writes.
+- **Don't gate the RECEIVER apply on gitPreflight** — a fresh machine has no `.git` yet (applyGitState `git init`s it); preflight is a SENDER-side eligibility check.
+- **Conflict = don't auto-clobber local:** import remote into `refs/rbox-conflict/<ts>/*` + a recovery bundle, keep local intact, log loudly, checkpoint base to remote to stop the pull-loop. Last-writer-wins canonical on the server, both sides recoverable.
+- The whole `.git` dir stays ignore-listed for the `files` manifest; git state rides the separate `git` section orchestrated entirely in sync.ts (push capture / pull apply) so reconcile/diff/scan (M1/M3 core) are untouched.
+
 ## 2026-06-26 — Reordered M2 (.git mirroring) behind M3 (large blobs)
 
 - Codex review of the M2 `.git`-atomic-mirroring design returned 6 BLOCKERS; the decisive one: **M2 hard-depends on M3**. Real `.git/objects/pack/*.pack` files routinely exceed the current 25MB Worker blob cap, so `.git` mirroring cannot work until the production large-blob path (presigned/multipart/streaming) exists. **Decision: build M3 first, then return to M2 with a narrowed scope.** Full blocker list + narrowed M2 scope preserved in `docs/design/02-git-mirroring.md` §10.
 - Other M2 lessons banked for the redo: quiescence (`*.lock`+stability) is NOT a safety boundary (gc/repack/tmp_*/gc.pid/MIDX/commit-graph/fsmonitor/hooks hold no lock); integrity needs real `git fsck` not magic-byte checks; must upload from an immutable staged snapshot (live packs get repacked mid-upload); receiver swap needs receiver-side git quiescence + quarantine (never `rm -rf` old, a live `index.lock` op can write into it); NO hybrid carry-forward (stale `.git` + fresh tree = `git reset --hard` data loss); `.git` can be a FILE (worktrees/submodules); hooks/config are a code-exec/credential hazard → `syncGit` is a trust decision; bypass hashcache for `.git`.
+
+## 2026-06-26 — Git-state sync mechanics (M2 v3 PoC, empirically verified)
+
+Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to git-native capture. PoC proved the round-trip; the working recipe:
+- **History:** `git bundle create out.bundle --all refs/stash` on the LIVE repo — git guarantees object/ref consistency even during concurrent writes (no quiescence needed for the object DB). `git bundle verify` on the receiver.
+- **Staged/index blobs are NOT ref-reachable, so `--all` omits them** → receiver gets "missing blob" when restoring `.git/index`. FIX: `WIP=$(git stash create)` captures the full dirty+staged state as a reachable commit WITHOUT touching the stash list; `git update-ref refs/rbox-wip $WIP` then include `refs/rbox-wip` in the bundle so the index's blobs ship. Delete the temp ref after bundling.
+- **Receiver can't `git fetch` into the checked-out branch** ("refusing to fetch into branch ... checked out"). FIX: `git fetch <bundle> 'refs/*:refs/rbox-incoming/*'` into a non-checked-out namespace, then publish each with `git update-ref refs/heads/<n> <sha>` (update-ref CAN move the checked-out branch's ref), then delete the incoming namespace. Restore `.git/index` and `.git/HEAD` by atomic file copy (git writes these via rename, so a copy is never torn).
+- **`git stash list` reads the `refs/stash` REFLOG (`logs/refs/stash`), not just the ref** — update-ref'ing refs/stash preserves the stash COMMIT (recoverable) but leaves `git stash list` empty. Full stash fidelity needs shipping the stash reflog file too. Same for branch reflogs if wanted.
+- Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
+- Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
 ## 2026-06-26 — M1 (daemon) DONE & verified cross-machine
 

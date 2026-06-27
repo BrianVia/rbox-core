@@ -23,8 +23,36 @@ export interface FileEntry {
   symlinkTarget?: string;
 }
 
+/**
+ * Git repository state, synced as ONE indivisible unit (M2), separate from the
+ * working-tree `files`. History rides a `git bundle` (consistent on a live repo);
+ * index/HEAD/op-state are atomic single-file captures. Artifacts are content-
+ * addressed blobs, never materialized in the working tree. Absent when the repo
+ * is ineligible (not opt-in / unsupported layout) or empty (no commits).
+ */
+export interface GitSection {
+  /** sha of the `git bundle` blob (all refs + stash + a temp ref making index blobs reachable). */
+  bundleSha: string;
+  /** sha of the bundle blob's byte length, for streaming upload. */
+  bundleSize: number;
+  /** HEAD file contents — "ref: refs/heads/x" or a detached 40-hex sha. */
+  head: string;
+  /** refname → commit sha for every published ref (identity + receiver publish set). */
+  refs: Record<string, string>;
+  /** sha of the `.git/index` blob (staging) for exact restore, if present. */
+  indexSha?: string;
+  /** `git write-tree` sha of the staging — a STABLE content identity (the raw index
+   *  file hash is not: git refreshes its stat info). Used for change-detection. */
+  indexTree?: string;
+  /** op-state file path (relative to .git) → blob sha: MERGE_HEAD, REBASE_HEAD, rebase-merge/**, etc. */
+  opState?: Record<string, string>;
+  generatedAt: string;
+}
+
 /** A point-in-time snapshot of a tree's syncable files, sorted by `path`. */
 export interface Manifest {
   generatedAt: string;
   files: FileEntry[];
+  /** Present only when git-state sync is enabled and the repo is eligible (M2). */
+  git?: GitSection;
 }

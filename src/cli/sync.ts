@@ -2,12 +2,19 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   applyActions,
+  applyGitState,
+  captureGitState,
   diffManifests,
+  gitIdentity,
+  gitIdentityKey,
+  gitPreflight,
+  preserveGitConflict,
   HashCache,
   reconcile,
   scanManifest,
   validateManifest,
   type Action,
+  type GitSection,
   type Manifest,
 } from "../engine/index.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
@@ -55,6 +62,22 @@ async function uploadBlobs(
   await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));
 }
 
+/** Capture/carry the git section for a push (M2). Capture+upload only when the
+ *  repo's stable identity changed vs the base; otherwise carry the base section. */
+async function captureGitForPush(
+  root: string,
+  cfg: WorkspaceConfig,
+  baseGit: GitSection | undefined,
+  api: RboxApi
+): Promise<GitSection | undefined> {
+  if (!cfg.syncGit) return undefined;
+  if (!(await gitPreflight(root)).ok) return baseGit;
+  const localId = await gitIdentity(root);
+  if (!localId) return baseGit; // empty repo (no commits) → no git section yet
+  if (baseGit && gitIdentityKey(localId) === gitIdentityKey(baseGit)) return baseGit; // unchanged → carry
+  return captureGitState(root, new RemoteBlobStore(api)); // changed → capture + upload artifacts
+}
+
 /**
  * Pull the latest remote manifest and reconcile it onto the local tree. The
  * reconcile base is the last-synced manifest; after applying, the new base is
@@ -86,7 +109,38 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
     }
   }
   await save();
-  await saveState(root, { lastSyncedSequence: sequence, lastSyncedManifest: remote });
+
+  // Git section (M2): apply remote git state if it changed; advance the git base
+  // ONLY if the apply actually succeeded (else keep base so the next pull retries
+  // — never record an unapplied remote git as the base and later push stale git).
+  let appliedGit = state.lastSyncedManifest.git;
+  if (cfg.syncGit) {
+    const baseGit = state.lastSyncedManifest.git;
+    const baseKey = gitIdentityKey(baseGit);
+    const remoteKey = gitIdentityKey(remote.git);
+    if (remote.git && remoteKey !== baseKey) {
+      const store = new RemoteBlobStore(api);
+      const localChanged = gitIdentityKey(await gitIdentity(root)) !== baseKey;
+      if (localChanged) {
+        // Both sides diverged → never auto-clobber local. Preserve remote for manual
+        // merge and checkpoint the base to remote so we stop pull-conflict-looping.
+        const { recoveryBundle } = await preserveGitConflict(root, remote.git, store);
+        appliedGit = remote.git;
+        console.error(`rbox: git conflict — local kept; remote preserved at ${recoveryBundle} and refs/rbox-conflict/*. Resolve manually.`);
+      } else {
+        // Clean fast-forward (local == base): apply remote transactionally.
+        const res = await applyGitState(root, remote.git, store);
+        if (res.applied) appliedGit = remote.git;
+        else {
+          appliedGit = baseGit; // deferred/rolled-back → retry next pull
+          console.error(`rbox: git apply not done: ${res.reason}`);
+        }
+      }
+    } else if (remote.git && remoteKey === baseKey) {
+      appliedGit = remote.git; // unchanged
+    }
+  }
+  await saveState(root, { lastSyncedSequence: sequence, lastSyncedManifest: { ...remote, git: appliedGit } });
   return actions;
 }
 
@@ -121,10 +175,19 @@ export async function pushManifest(
   const api = apiFor(cfg);
   const state = await loadState(root);
 
-  const d = diffManifests(state.lastSyncedManifest, local);
-  if (d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0) {
-    return { sequence: state.lastSyncedSequence, manifest: local }; // no-op
+  // Attach the git section (M2): capture only when its stable identity changed
+  // vs the base (re-bundling unchanged state would echo forever); else carry it.
+  local = { ...local, git: await captureGitForPush(root, cfg, state.lastSyncedManifest.git, api) };
+
+  const filesUnchanged = (() => {
+    const d = diffManifests(state.lastSyncedManifest, local);
+    return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
+  })();
+  const gitUnchanged = gitIdentityKey(local.git) === gitIdentityKey(state.lastSyncedManifest.git);
+  if (filesUnchanged && gitUnchanged) {
+    return { sequence: state.lastSyncedSequence, manifest: local }; // no-op (files AND git)
   }
+  const d = diffManifests(state.lastSyncedManifest, local);
 
   const shaToPath = new Map<string, string>();
   for (const f of local.files) if (f.type === "file") shaToPath.set(f.sha256, f.path);

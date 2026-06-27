@@ -15,6 +15,8 @@ export interface BlobStore {
   /** Optional streaming download into a file — used by apply for large blobs so
    *  they never materialize in memory. Falls back to get()+write when absent. */
   getToFile?(sha256: string, destPath: string): Promise<void>;
+  /** Optional streaming upload from a file (e.g. a git bundle) by content address. */
+  putFile?(sha256: string, srcPath: string, size: number): Promise<void>;
 }
 
 export class LocalBlobStore implements BlobStore {
@@ -55,5 +57,11 @@ export class LocalBlobStore implements BlobStore {
 
   async getToFile(sha256: string, destPath: string): Promise<void> {
     await fs.copyFile(this.keyPath(sha256), destPath);
+  }
+
+  async putFile(sha256: string, srcPath: string): Promise<void> {
+    const dest = this.keyPath(sha256);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.copyFile(srcPath, dest);
   }
 }

@@ -25,8 +25,13 @@ Turns manual `push`/`pull` into passive "edit here, appears there" sync. Design:
 - **Hardened beyond original scope:** precondition-checked non-destructive apply (no lost edits), shared manifest path-traversal validation (server+client), blob-existence 422, atomic local state (missing-vs-corrupt), realpath-within-root guard.
 - Deferred to later: systemd/launchd service install; parallel hashing + `@parcel/watcher` for monorepo scale (M9).
 
-### 2. `.git` atomic mirroring (**D6**) — ⛔ BLOCKED on M3, reordered after it
-Currently `.git` is excluded entirely. **Codex review found M2 hard-depends on M3** (git packs exceed the 25MB blob cap) plus 5 more blockers; building M3 first. Narrowed M2 scope + blocker list in [`design/02-git-mirroring.md`](./design/02-git-mirroring.md) §10.
+### 2. Git state sync (**D6**) — ✅ DONE & VERIFIED (git-native, opt-in)
+Pivoted from file-mirroring `.git` (never atomic on a live repo) to **git-native** capture: history via `git bundle`, index/HEAD/op-state via atomic single-file snapshots, stored as a manifest `git` section (not materialized in the tree). Design: [`design/02-git-mirroring.md`](./design/02-git-mirroring.md). Verified 8/8 cross-machine.
+- [x] Opt-in `syncGit` (default off; `.git/hooks/` never synced — code-exec vector); preflight rejects worktree/bare/alternates/toplevel-mismatch.
+- [x] Bundle capture (incl. stash + `stash create` for index blobs); stable `write-tree` identity (no echo); content-addressed artifacts ride M3.
+- [x] Receiver: non-destructive object import → ref publish → temp-rename index/HEAD/op-state, transactional with **rollback on fsck failure**; fail-closed quarantine.
+- [x] Whole-repo conflict preserved (remote into `refs/rbox-conflict/*` + bundle, local never clobbered); base advances only on successful apply.
+- [ ] Incremental bundles (basis chain) + stash reflog fidelity — follow-ups; current full-bundle-on-change is correct.
 - [ ] Quiescence detection (no `.git` writes + no `*.lock` for a debounce window).
 - [ ] Snapshot `.git` as one transactional unit; assemble in temp dir, swap in atomically.
 - [ ] Integrity check (HEAD/refs/index consistency) before committing a `.git` update; skip+retry if torn.

@@ -19,6 +19,9 @@ export interface WorkspaceConfig {
   rootPath: string;
   remoteUrl: string;
   token: string;
+  /** Opt-in git-state sync (M2). Default off — syncing git config could move
+   *  machine-local settings; hooks are never synced regardless. */
+  syncGit?: boolean;
 }
 
 /** Last point this device and the server agreed on — the reconcile base. */
