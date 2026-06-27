@@ -318,6 +318,11 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await webExchange(await signJwt(claims({ sub: "u_kid" }), { kid: "nope" }))).status).toBe(401);
   });
 
+  test("JWT whose header/payload decode to non-objects → 401 (not 500)", async () => {
+    const nullHeader = `${b64url(new TextEncoder().encode("null"))}.${b64url(new TextEncoder().encode(JSON.stringify(claims())))}.AAAA`;
+    expect((await webExchange(nullHeader)).status).toBe(401);
+  });
+
   test("first-login with an UNVERIFIED email → 403 (abuse gate), no account created", async () => {
     const res = await webExchange(await signJwt(claims({ sub: "user_unverified" })));
     expect(res.status).toBe(403);

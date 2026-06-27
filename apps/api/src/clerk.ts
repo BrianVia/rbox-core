@@ -66,6 +66,9 @@ export async function verifyClerkJWT(env: Env, token: string, nowS: number): Pro
   } catch {
     return null;
   }
+  // Guard: JSON.parse can yield null/primitives (valid JSON) — property access on
+  // those would throw (→ 500). Require both to be objects.
+  if (!header || typeof header !== "object" || !payload || typeof payload !== "object") return null;
 
   // Algorithm + kid pinning (reject alg:none / HS256 confusion; require a kid).
   if (header.alg !== "RS256" || typeof header.kid !== "string" || header.kid.length === 0) return null;
@@ -118,10 +121,10 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
   if (!map) {
     // First provisioning. Gate on a verified email BEFORE creating anything — run
     // by EVERY concurrent first-login (it's an idempotent read), so the gate can't
-    // be raced/bypassed by a "loser" that skips it. Fail closed.
-    if (env.CLERK_SECRET_KEY && !(await clerkEmailVerified(env, sub))) {
-      return json({ error: "email_unverified" }, 403);
-    }
+    // be raced/bypassed by a "loser" that skips it. FAIL CLOSED: without the Clerk
+    // secret we can't verify, so we refuse to provision (no unverified accounts).
+    if (!env.CLERK_SECRET_KEY) return json({ error: "web_auth_not_configured" }, 501);
+    if (!(await clerkEmailVerified(env, sub))) return json({ error: "email_unverified" }, 403);
     // Claim the mapping (INSERT OR IGNORE = the single gate); only the won
     // candidate ids ever materialize, so a lost race never orphans an account.
     const candAcct = randomId("acct", 8);
