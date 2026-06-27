@@ -9,6 +9,8 @@ import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, listDevices, login, logout, revokeDevice } from "./auth-cmd.js";
 import { encryptWorkspace, exportKey, importKey } from "./crypto-cmd.js";
 import { listVersions, restoreVersion } from "./versions-cmd.js";
+import { style } from "./style.js";
+import { spinner } from "./spinner.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
 
@@ -37,6 +39,11 @@ async function main(): Promise<void> {
   const { positional, flags } = parseFlags(rest);
 
   switch (cmd) {
+    case "init": {
+      const { runInit } = await import("./init-cmd.js");
+      await runInit(flags, { cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+      break;
+    }
     case "link": {
       const root = path.resolve(positional[0] ?? process.cwd());
       const remoteUrl = flags.remote ?? DEFAULT_REMOTE;
@@ -90,21 +97,41 @@ async function main(): Promise<void> {
     }
     case "push": {
       const root = await resolveRoot(positional[0]);
-      const seq = await push(root, await loadAuthedConfig(root));
-      console.log(`pushed ${root} -> sequence ${seq}`);
+      const sp = spinner("pushing");
+      try {
+        const seq = await push(root, await loadAuthedConfig(root));
+        sp.succeed(`pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
+      } catch (e) {
+        sp.fail("push failed");
+        throw e;
+      }
       break;
     }
     case "pull": {
       const root = await resolveRoot(positional[0]);
-      const actions = await pull(root, await loadAuthedConfig(root));
-      summarize("pulled", actions, root);
+      const sp = spinner("pulling");
+      try {
+        const actions = await pull(root, await loadAuthedConfig(root));
+        sp.stop();
+        summarize("pulled", actions, root);
+      } catch (e) {
+        sp.fail("pull failed");
+        throw e;
+      }
       break;
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      const { pulled, pushedSequence } = await sync(root, await loadAuthedConfig(root));
-      summarize("pulled", pulled, root);
-      console.log(`pushed -> sequence ${pushedSequence}`);
+      const sp = spinner("syncing");
+      try {
+        const { pulled, pushedSequence } = await sync(root, await loadAuthedConfig(root));
+        sp.stop();
+        summarize("pulled", pulled, root);
+        console.log(`${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`);
+      } catch (e) {
+        sp.fail("sync failed");
+        throw e;
+      }
       break;
     }
     case "status": {
@@ -112,14 +139,14 @@ async function main(): Promise<void> {
       const cfg = await loadConfig(root);
       const state = await loadState(root);
       const local = await scanManifest(root);
-      console.log(`workspace ${cfg.remoteWorkspaceId} @ ${root}`);
-      console.log(`  device: ${cfg.deviceId}`);
-      console.log(`  last-synced sequence: ${state.lastSyncedSequence}`);
-      console.log(`  local files: ${local.files.length}`);
+      console.log(`${style.bold("workspace")} ${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`);
+      console.log(`  ${style.dim("device:")} ${cfg.deviceId}`);
+      console.log(`  ${style.dim("last-synced sequence:")} ${state.lastSyncedSequence}`);
+      console.log(`  ${style.dim("local files:")} ${local.files.length}`);
       if (cfg.syncGit) {
         const { gitPreflight } = await import("../engine/index.js");
         const pf = await gitPreflight(root);
-        console.log(`  git-sync: ${pf.ok ? "on (eligible)" : `on but skipped — ${pf.reason}`}`);
+        console.log(`  ${style.dim("git-sync:")} ${pf.ok ? style.green("on (eligible)") : style.yellow(`on but skipped — ${pf.reason}`)}`);
       }
       break;
     }
@@ -180,7 +207,7 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      console.log("rbox — dev-aware sync\n\nCommands:\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync");
+      console.log(`rbox — dev-aware sync\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }
@@ -189,8 +216,9 @@ function summarize(label: string, actions: { kind: string; path?: string; keepLo
   const writes = actions.filter((a) => a.kind === "write").length;
   const deletes = actions.filter((a) => a.kind === "delete").length;
   const conflicts = actions.filter((a) => a.kind === "conflict");
-  console.log(`${label}: ${writes} written, ${deletes} deleted, ${conflicts.length} conflict(s)`);
-  for (const c of conflicts) console.log(`  conflict: ${c.path} (local kept as ${c.keepLocalAs})`);
+  const conflictPart = conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)");
+  console.log(`${style.bold(label)}: ${style.green(`${writes} written`)}, ${deletes} deleted, ${conflictPart}`);
+  for (const c of conflicts) console.log(`  ${style.sym.warn} conflict: ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
 }
 
 main().catch((e) => {

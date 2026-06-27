@@ -95,11 +95,13 @@ Design: [`design/07b-billing.md`](./design/07b-billing.md). Verified 12/12 quota
 - [ ] **Stripe (NEEDS USER PROVISIONING):** Stripe account + secret/webhook keys + product/price IDs → `STRIPE_SECRET`/`STRIPE_WEBHOOK_SECRET` Wrangler secrets; then `/v1/billing/checkout`, `/portal`, `/stripe/webhook` (flips `accounts.plan`/`extra_storage_bytes`). Endpoints stubbed/gated until then. Per-seat Team + `$3/100GB` add-on plumb through `extra_storage_bytes`.
 - [ ] `rbox status` usage display + soft/hard signals (usage endpoint exists; CLI surfacing is a small follow-up).
 
-### 7c. Onboarding TUI / terminal UX
-First-time setup is the highest-leverage UX moment — it's where a dev decides rbox is "easy" or "another sync tool to fight." Today onboarding is bare `console.log`. Two complementary directions (want one or both):
-- [ ] **chalk** ([chalk/chalk](https://github.com/chalk/chalk)) — low-cost polish on the *existing* command output: colorize `status`, conflict warnings, the post-`link` "link another machine" hint, spinners on push/pull. No flow change, just legibility. Do this first; it's nearly free.
-- [ ] **OpenTUI** ([opentui.com](https://opentui.com/)) — a real interactive wizard for `rbox init` / first `link`: pick or create a workspace, choose the sync root, toggle `.env`/secrets sync (defaulting off, **D5**), approve the device (ties into device-code auth, milestone 4), and watch the first sync stream live. This is the bigger lift — an actual TUI runtime (React/Solid-style) — so gate it on auth + link being stable.
-- ⚠️ Keep every TUI flow scriptable: a `--no-interactive` / flag-driven path must stay first-class so headless/Docker onboarding (the Host B story) and CI never depend on a TTY. The TUI is a layer over the flags, never the only way in.
+### 7c. Onboarding TUI / terminal UX — ✅ DONE (zero-dep; OpenTUI deferred)
+Design: [`design/07c-onboarding-tui.md`](./design/07c-onboarding-tui.md). Two codex passes (design flaws → doc/impl sync). Live-verified end-to-end.
+- [x] **Zero-dep color/polish** (`style.ts`, not chalk): styled `status`/`push`/`pull`/`sync`, conflict warnings, spinners. Single TTY/`NO_COLOR`/`FORCE_COLOR` gate; piped → 0 ANSI.
+- [x] **`rbox init` wizard** on a **pure `resolveInitPlan` + executor** split (readline shell, prompts → stderr): create/join workspace, choose root, device-id unified to the auth credential, first-sync derived (new→push, join→pull-first sync). 12 unit tests on the plan matrix.
+- [x] ⚠️ **Scriptable:** `--no-interactive` + flags first-class; non-TTY never hangs (missing auth → exit 2 with hint); `--bootstrap` is the headless/CI auth path. Verified live.
+- [x] Secrets stay builtin-ignored (the v1 "sync secrets" toggle was cut — plaintext manifest leaks metadata; opt-in *encrypted* secrets sync moved under the full-E2EE milestone).
+- [ ] **OpenTUI** ([opentui.com](https://opentui.com/)) — deferred (codex-confirmed): adopt only when there's genuine non-linear UI value (multi-workspace picker, conflict preview, live transfer table). Slots in as a presentation layer over the same `resolveInitPlan` core.
 
 ### 8. Hydration brain (the dev-aware wedge)
 - [ ] Project detection (package.json, Cargo.toml, go.mod, …) + package-manager inference.

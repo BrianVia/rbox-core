@@ -68,6 +68,54 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M7c (onboarding UX) DONE; zero-dep, OpenTUI deferred
+
+- **Defer the heavy runtime; ship the pure core.** Codex confirmed OpenTUI isn't
+  worth a terminal-React runtime for a 5-step linear wizard. The deliverable that
+  makes a rich UI "slot in later" is NOT the readline layer — it's a **pure
+  `resolveInitPlan(input) → InitPlan | InitError`** that any front-end (flags,
+  readline, OpenTUI) drives. That purity is also the tight feedback loop: 12
+  unit tests over the TTY×flags×creds matrix with zero process I/O.
+- **A pure planner must take cwd as input, not read `process.cwd()`.** A unit
+  test caught `path.resolve(flags.root)` resolving against the real cwd →
+  impure. Fix: `path.resolve(input.cwd, flags.root ?? input.cwd)`. Purity is
+  testable purity.
+- **Headless contract (the Host-B/CI rule):** non-TTY must NEVER block on a
+  prompt. `interactive = stdin.isTTY && !--no-interactive`. Auth resolution:
+  creds → have; `--bootstrap <secret>` → headless one-shot login (the CI path);
+  else TTY → device-code; else → `InitError` exit 2 with a copy-pasteable hint.
+  **Never start a device-code wait in CI.** Verified: exit 2, no hang.
+- **First-sync is new-vs-join, not "always push":** new workspace → push
+  (publish); join `--workspace <id>` → SYNC (pull-first, surface conflicts) so we
+  never blind-upload an arbitrary local tree over someone else's workspace.
+- **chalk is unnecessary:** a ~40-line `style.ts` with one TTY/`NO_COLOR`/
+  `FORCE_COLOR` gate (NO_COLOR wins; FORCE_COLOR=0 off; FORCE_COLOR is the *only*
+  ANSI-when-piped exception) + separate stdout/stderr instances. Spinner writes
+  to stderr, `unref()`s its interval, and `stop()` must clear the line (`\r\x1b[K`)
+  or pull/sync leave a stale frame before their summary.
+- **Unify device identity:** `link` used to mint a throwaway `dev_<rand>` unrelated
+  to the auth device id. `init` sets the workspace deviceId = the credential's
+  server-issued id (falling back to generated only for the `RBOX_TOKEN` env
+  placeholder). One device, one id.
+- M7b's workspace quota (free cap 1) blocked the smoke until I bootstrapped a
+  FRESH account — incidental live proof that M7b enforcement works.
+- Process: a v2 "NEEDS-PASS" can be pure doc-lag — codex reviews the DOC; if the
+  implementation already embodies the fix (it did: `ResolvedDeviceId` union,
+  shell-loads-creds), sync the doc to the code rather than re-architecting.
+
+## 2026-06-26 — PROCESS: root cause of the recurring "codex review hangs at 0 bytes"
+
+Two distinct causes, both now fixed — apply to EVERY `coy exec` review going forward:
+1. **stdin not closed (the big one).** A backgrounded `coy exec "<prompt>"` prints
+   `Reading additional input from stdin...` and blocks forever waiting for stdin
+   EOF → the 0-byte hang we kept killing. **Fix: always append `< /dev/null`.**
+   This is the real reason past reviews "hung," not slowness.
+2. **Stale zombies serialize behind the Codex app-server.** A killed-but-unreaped
+   prior `codex exec` (even one from a much earlier milestone) keeps the
+   app-server busy so the new review never starts. Before launching:
+   `ps aux | grep 'codex.*exec'` and `pkill -f "<old-doc-name>"` leftovers.
+Canonical launch: `coy exec --dangerously-bypass-approvals-and-sandbox "$PROMPT" < /dev/null > out.txt 2>&1` (run_in_background), then poll out.txt for a LINE-START `^VERDICT:` (matching bare `VERDICT:` also matches the prompt echo). Keep prompts bounded + "Do NOT web search".
+
 ## 2026-06-26 — M7b (quotas/accounting) autonomous core DONE; Stripe needs user keys
 
 - Built+verified (12/12) the autonomous billing core; Stripe deferred (needs the user's Stripe account + API keys → the human-intervention point).
