@@ -1,33 +1,118 @@
 # rbox
 
-**Dropbox for devs.** Continuous, dev-aware sync of your working directories across machines — source, configs, and uncommitted git state move; `node_modules`, build output, and secrets stay local and get regenerated per machine.
+**Dropbox for devs.** Continuous, dev-aware sync of your working directories across machines — source, configs, and uncommitted git state move; `node_modules`, build output, and secrets stay local and get *regenerated* per machine.
 
-Built as a **SaaS** on Cloudflare (Workers + D1 + R2 + Durable Objects). The wedge isn't sync — it's *understanding what not to sync, and how to rehydrate the rest.*
+Built as a **SaaS** on Cloudflare (Workers + D1 + R2 + Durable Objects), with a Bun/TypeScript client. The wedge isn't sync — it's *understanding what not to sync, and how to rehydrate the rest.*
 
-## Status
+## Why it's different from Dropbox/Syncthing
 
-A full vertical slice works and is verified cross-machine (Mac ↔ a remote Linux host) against live Cloudflare:
+- **It doesn't sync `node_modules`.** It syncs the lockfile and rebuilds dependencies locally (`rbox hydrate`) — no OS-specific binaries over the wire, no multi-GB transfers, no conflicts in regenerable trees.
+- **It syncs uncommitted git state safely.** Index, HEAD, stashes, and rebase state ride along via `git bundle` (never a torn copy of a live `.git`).
+- **Secrets never leave by default.** `.env`, `*.pem`, keys are ignored; opt-in secret sync is E2EE-only (arrives with full-manifest encryption).
+- **It's daemon-friendly.** The watcher debounces and prunes ignored dirs, so an `npm ci` or a giant clone never pegs your machine.
 
-- **Engine** (`src/engine/`) — content-addressed manifests, three-way reconcile, atomic apply, conflict copies, dev-aware ignore. Unit-tested.
-- **Control plane** (`apps/api/`) — Worker API: content-addressed blobs + manifests, optimistic-concurrency conflict detection.
-- **Client** (`src/cli/`) — `rbox link / push / pull / sync / status`, with per-device root mapping (Host A's `~/Development` ↔ Host B's `~/code`).
+## Status — roadmap complete ✅
 
-Sync today is manual (`push`/`pull`); the passive watcher daemon is the next milestone. See **[`docs/roadmap.md`](docs/roadmap.md)**.
+All milestones (M1–M9) are implemented, codex-reviewed, and verified live against Cloudflare (Mac ↔ remote Linux host). See [`docs/roadmap.md`](docs/roadmap.md) and the per-milestone specs in [`docs/design/`](docs/design/).
 
-## Docs
+| Area | What works |
+|---|---|
+| **Sync** | continuous daemon (chokidar + content-addressed manifests), three-way reconcile, conflict copies, optimistic-concurrency commits via a Durable Object sequencer |
+| **Git** | uncommitted index/HEAD/stash/op-state via `git bundle` (opt-in `--git`) |
+| **Blobs** | content-addressed R2, streaming PUT + resumable multipart, convergent AES-256-GCM encryption |
+| **Auth** | per-device tokens (device-code + bootstrap flows), revocation |
+| **Multi-tenancy** | account isolation, blob entitlement, cross-account 404, audit log |
+| **Billing** | plan-gated storage/workspace quotas, atomic usage accounting (Stripe pending keys) |
+| **Onboarding** | `rbox init` guided wizard (zero-dep), fully scriptable for CI |
+| **Hydration** | `rbox detect` / `hydrate` / `doctor` — reconstruct deps from lockfiles |
+| **Hardening** | client conflict-retry tests, cold-scan tuned (50k files in ~2.4s), Miniflare worker tests |
 
-- [`docs/rbox-architecture-v2.md`](docs/rbox-architecture-v2.md) — current design + decision log
-- [`docs/roadmap.md`](docs/roadmap.md) — what's done and what's next
-- [`docs/pricing.md`](docs/pricing.md) — plans
-- [`docs/prior-art-files-sdk.md`](docs/prior-art-files-sdk.md) — storage-layer prior art
-- [`docs/rbox-architecture.md`](docs/rbox-architecture.md) — original "CodeSync" draft (superseded)
+**Pending human setup:** Stripe keys + price IDs (billing), `rbox.to` nameservers → Cloudflare, and the IdP decision (Cloudflare Zero Trust/Access + BetterAuth vs Clerk).
 
-## Dev
+## Quickstart
 
 ```bash
 bun install
-bun test            # engine tests
-bunx tsc --noEmit   # typecheck
+
+# First-time setup (guided). --bootstrap for the first device on an account.
+rbox init --new --bootstrap <secret>
+
+# Or join an existing workspace on another machine:
+rbox login                       # device-code flow
+rbox init --workspace <id>
+
+# Continuous background sync:
+rbox daemon start
+rbox status                      # workspace state + sync metrics
+
+# Rebuild dependencies on a fresh machine (deps aren't synced — lockfiles are):
+rbox doctor                      # is this host ready? (node/pnpm/go/… versions)
+rbox hydrate                     # runs npm ci / pnpm install / cargo fetch / …
 ```
 
-The control plane lives in `apps/api/` (deploy with `wrangler deploy`).
+Everything interactive has a `--no-interactive` flag-driven path (CI/Docker never depends on a TTY). `NO_COLOR` / `FORCE_COLOR` honored.
+
+## CLI
+
+```
+init    [--new|--workspace <id>]   guided first-time setup (--no-interactive for CI)
+login   [--bootstrap <secret>]     authorize this device
+device  <approve|list|revoke>      manage devices
+link    <path> [--workspace <id>]  bind a directory to a workspace
+push | pull | sync [path]          upload / apply / both
+status  [path]                     workspace state + conflict metrics
+ignore  <glob> | --list            manage .rboxignore
+daemon  <start|stop|status|logs>   passive continuous sync
+detect  [path]                     list hydratable projects (by lockfile)
+doctor  [path]                     host readiness to hydrate
+hydrate [path] [--allow-build]     reconstruct deps from synced lockfiles
+key     <export|import>            workspace encryption key
+versions <path> | restore <p>@<n>  version history & restore
+```
+
+## Architecture
+
+```
+src/engine/   pure sync core — manifests, reconcile, apply, hashing, ignore,
+              git-state capture, convergent crypto, project detection
+src/cli/      client — daemon, watcher, sync (push/pull/conflict-retry),
+              auth, init wizard, hydrate, remote client
+apps/api/     Cloudflare Worker control plane — blobs (R2), manifests + the
+              WorkspaceSync Durable Object (per-(ws,proj) commit sequencer +
+              hibernating-WebSocket fanout), D1 (auth/accounts/quota), GC
+docs/         design specs (one per milestone), ADRs, learnings, pricing
+```
+
+The blob layer is content-addressed: a file's identity is `sha256(bytes)`, so dedup, integrity, and GC fall out for free. Commits are sequenced by the DO with optimistic concurrency — a stale parent gets a 409 and the client pulls, re-scans, and retries.
+
+## Plans
+
+| Plan | Storage | Workspaces | Retention |
+|---|---|---|---|
+| Free | 2 GiB | 1 | 7 days |
+| Solo | 50 GiB | ∞ | 30 days |
+| Pro | 250 GiB | ∞ | 90 days (advanced hydration) |
+| Team | 150 GiB/seat | ∞ | 90 days |
+
+Details: [`docs/pricing.md`](docs/pricing.md).
+
+## Development
+
+```bash
+bun install
+bun run typecheck          # tsc (root) + tsc (apps/api)
+bun test src               # engine + client tests (bun:test)
+bun run test:api           # Worker integration tests (Miniflare/workerd: D1+R2+DO)
+bun run test:all           # both suites
+```
+
+The control plane deploys with `wrangler deploy` from `apps/api/`. Secrets (`RBOX_BOOTSTRAP_SECRET`, `RBOX_PLATFORM_SECRET`, and later `STRIPE_*`) are Wrangler secrets — never committed.
+
+## Docs
+
+- [`docs/roadmap.md`](docs/roadmap.md) — milestone status
+- [`docs/design/`](docs/design/) — one spec per milestone (each carries its codex review resolutions)
+- [`docs/learnings.md`](docs/learnings.md) — append-only build log of non-obvious findings
+- [`docs/adr/`](docs/adr/) — architecture decision records
+- [`docs/rbox-architecture-v2.md`](docs/rbox-architecture-v2.md) — design + decision log
+- [`docs/pricing.md`](docs/pricing.md) — plans
