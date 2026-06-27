@@ -34,12 +34,19 @@ All milestones (M1–M9) are implemented, codex-reviewed, and verified live agai
 ```bash
 bun install
 
-# First-time setup (guided). --bootstrap for the first device on an account.
-rbox init --new --bootstrap <secret>
+# Just run `rbox` in a terminal — it opens a guided menu:
+#   1 Set up a new workspace   2 Connect this machine   3 Just log in
+rbox
 
-# Or join an existing workspace on another machine:
-rbox login                       # device-code flow
-rbox init --workspace <id>
+# Connecting a new machine in ~2 steps (lowest friction):
+rbox pair                        # on a machine you're already signed into → prints a token
+#   → on the new machine: `rbox` → "Connect this machine" → paste the token
+# (or the classic device-code flow: `rbox login` then approve it elsewhere)
+
+# Scriptable equivalents (no menu / CI):
+rbox init --new --bootstrap <secret>          # first device on a new account
+RBOX_PAIR_TOKEN=<token> rbox login            # redeem a pairing token headlessly
+rbox init --workspace <id> --no-interactive   # join
 
 # Continuous background sync:
 rbox daemon start
@@ -55,8 +62,10 @@ Everything interactive has a `--no-interactive` flag-driven path (CI/Docker neve
 ## CLI
 
 ```
+(no args)                          guided onboarding menu (setup / connect / log in)
 init    [--new|--workspace <id>]   guided first-time setup (--no-interactive for CI)
 login   [--bootstrap <secret>]     authorize this device
+pair                               mint a token to connect a new machine (~2 steps)
 device  <approve|list|revoke>      manage devices
 link    <path> [--workspace <id>]  bind a directory to a workspace
 push | pull | sync [path]          upload / apply / both

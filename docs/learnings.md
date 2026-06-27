@@ -68,6 +68,35 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-27 — M10 (pairing tokens) — low-friction "connect a new machine"
+
+- **A pairing token is a transferable bearer that's sufficient by itself** — so it
+  needs more care than the M4 device-code (which is a two-party flow where the
+  visible user_code alone can't mint). Codex security review caught the core risk:
+  a create-time snapshot of account/user is NOT enough.
+- **Live-revalidate authority at REDEEM, not create.** After the atomic single-use
+  consume, re-check (fail-closed) that the creating device is still non-revoked AND
+  the user still has a membership. Otherwise a compromised-then-revoked device's
+  outstanding tokens keep minting for the TTL — defeating "revoke cuts off this
+  device." Verified live: revoke creator → its token is dead at redeem.
+- **Atomic single-use via `UPDATE … RETURNING`** (D1/SQLite supports it): one
+  statement consumes (`WHERE consumed_at IS NULL AND expires_at > now`) and returns
+  the snapshot — only the row-winning redeem proceeds. The live-authority check
+  runs AFTER and fails closed (burning a token whose source is revoked is correct).
+  Mint-failure-after-consume = logged availability loss, never escalation; validate
+  token/label format BEFORE consuming.
+- **Never put a bearer in argv** (shell history + `ps`): redeem reads from an
+  interactive paste, stdin, or `RBOX_PAIR_TOKEN` env — not a flag. Redact it from
+  logs/errors. (M4's user_code in argv was fine because it can't mint alone.)
+- **Caps aren't optional for an auth-minting path:** per-account active-token cap
+  (≤5 → 429) bounds a create-spam foothold even before request-rate limiting.
+- **`user_id` NOT NULL + require a real membership at create** — the auth layer
+  defaults a membership-less device to `viewer` (which can still READ same-account
+  workspaces), so a removed user must NOT be able to mint read-capable devices.
+- Pattern echo: the consume→revalidate→mint(rollback-on-fail) shape mirrors M7b's
+  quota reserve and M4's one-time poll-claim — conditional-UPDATE-as-the-gate is
+  the reusable D1 concurrency primitive across this codebase.
+
 ## 2026-06-27 — M9 (hardening & scale) DONE — roadmap complete
 
 - **A benchmark earns its keep by finding the bug you didn't look for.** The
