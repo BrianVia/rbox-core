@@ -21,9 +21,9 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
-import { RboxApi, RemoteBlobStore } from "./remote.js";
+import { RboxApi, type SyncRemote } from "./remote.js";
 
-const apiFor = (cfg: WorkspaceConfig) =>
+const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
 
 const MAX_ATTEMPTS = 5;
@@ -31,7 +31,22 @@ const UPLOAD_CONCURRENCY = 8; // bounded so a big push never opens thousands of 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
-const backoff = (attempt: number) => sleep(Math.min(2000, 100 * 2 ** attempt) * (0.5 + Math.random()));
+const defaultBackoff = (attempt: number) => sleep(Math.min(2000, 100 * 2 ** attempt) * (0.5 + Math.random()));
+
+/**
+ * Injectable dependencies for the sync entry points (design 09 §1). Defaults
+ * give production behavior; tests inject an in-memory `SyncRemote` and a no-op
+ * `backoff` to exercise the conflict-retry control flow offline & fast. The SAME
+ * deps object flows through pull/push/pushManifest/sync and the recursive retry.
+ */
+export interface SyncDeps {
+  cache?: HashCache;
+  remote?: SyncRemote;
+  backoff?: (attempt: number) => Promise<void>;
+  /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
+   *  tally retry pressure without sync.ts doing metrics I/O (design 09 §3). */
+  onCommitConflict?: () => void;
+}
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
 async function withCache(
@@ -46,7 +61,7 @@ async function withCache(
 /** Upload blobs with bounded concurrency, streaming each file (single PUT or
  *  resumable multipart by size) so memory stays flat regardless of file size. */
 async function uploadBlobs(
-  api: RboxApi,
+  api: SyncRemote,
   root: string,
   shas: string[],
   shaToPath: Map<string, string>
@@ -68,7 +83,7 @@ async function uploadBlobs(
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
  *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha). */
-async function encryptAndUpload(api: RboxApi, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest): Promise<void> {
+async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest): Promise<void> {
   if (cfg.syncGit) throw new Error("encryption + git-state sync aren't supported together yet (M5 limitation; full-E2EE milestone covers it)");
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
@@ -111,14 +126,14 @@ async function captureGitForPush(
   root: string,
   cfg: WorkspaceConfig,
   baseGit: GitSection | undefined,
-  api: RboxApi
+  api: SyncRemote
 ): Promise<GitSection | undefined> {
   if (!cfg.syncGit) return undefined;
   if (!(await gitPreflight(root)).ok) return baseGit;
   const localId = await gitIdentity(root);
   if (!localId) return baseGit; // empty repo (no commits) → no git section yet
   if (baseGit && gitIdentityKey(localId) === gitIdentityKey(baseGit)) return baseGit; // unchanged → carry
-  return captureGitState(root, new RemoteBlobStore(api)); // changed → capture + upload artifacts
+  return captureGitState(root, api.blobStore()); // changed → capture + upload artifacts
 }
 
 /**
@@ -127,15 +142,15 @@ async function captureGitForPush(
  * the remote we just pulled. The remote manifest is validated before it touches
  * the filesystem (never trust the network). Returns the actions taken.
  */
-export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: HashCache): Promise<Action[]> {
-  const api = apiFor(cfg);
+export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
+  const api = deps.remote ?? apiFor(cfg);
   const { sequence, manifest: remote } = await api.latest();
 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
   const state = await loadState(root);
-  const { cache, save } = await withCache(root, providedCache);
+  const { cache, save } = await withCache(root, deps.cache);
   const local = await scanManifest(root, undefined, cache);
 
   // Encryption is self-describing: if the remote manifest carries encSha, this is
@@ -148,7 +163,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
   }
 
   const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
-  await applyActions(root, actions, new RemoteBlobStore(api), { device: cfg.deviceId, kek });
+  await applyActions(root, actions, api.blobStore(), { device: cfg.deviceId, kek });
 
   // Paths we just wrote/removed changed on disk — invalidate so the next scan
   // re-hashes them from real disk truth (never trust a stale cache entry there).
@@ -171,7 +186,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
     const baseKey = gitIdentityKey(baseGit);
     const remoteKey = gitIdentityKey(remote.git);
     if (remote.git && remoteKey !== baseKey) {
-      const store = new RemoteBlobStore(api);
+      const store = api.blobStore();
       const localChanged = gitIdentityKey(await gitIdentity(root)) !== baseKey;
       if (localChanged) {
         // Both sides diverged → never auto-clobber local. Preserve remote for manual
@@ -200,11 +215,11 @@ export async function pull(root: string, cfg: WorkspaceConfig, providedCache?: H
  * Scan and push. Convenience wrapper for CLI one-shots — the daemon uses
  * {@link pushManifest} directly with its incrementally-patched in-memory manifest.
  */
-export async function push(root: string, cfg: WorkspaceConfig, providedCache?: HashCache, purgeIgnored = false): Promise<number> {
-  const { cache, save } = await withCache(root, providedCache);
+export async function push(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}, purgeIgnored = false): Promise<number> {
+  const { cache, save } = await withCache(root, deps.cache);
   const local = await scanManifest(root, undefined, cache);
   await save();
-  return (await pushManifest(root, cfg, local, providedCache, 0, purgeIgnored)).sequence;
+  return (await pushManifest(root, cfg, local, deps, 0, purgeIgnored)).sequence;
 }
 
 /**
@@ -221,11 +236,12 @@ export async function pushManifest(
   root: string,
   cfg: WorkspaceConfig,
   local: Manifest,
-  providedCache?: HashCache,
+  deps: SyncDeps = {},
   attempt = 0,
   purgeIgnored = false
 ): Promise<{ sequence: number; manifest: Manifest }> {
-  const api = apiFor(cfg);
+  const api = deps.remote ?? apiFor(cfg);
+  const backoff = deps.backoff ?? defaultBackoff;
   const state = await loadState(root);
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
@@ -270,18 +286,19 @@ export async function pushManifest(
   const res = await api.commit(state.lastSyncedSequence, cfg.deviceId, local);
 
   if (res.conflict) {
+    deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: too many conflicts, remote is moving faster than we can reconcile");
     await backoff(attempt);
-    await pull(root, cfg, providedCache);
-    const { cache, save } = await withCache(root, providedCache);
+    await pull(root, cfg, deps);
+    const { cache, save } = await withCache(root, deps.cache);
     const fresh = await scanManifest(root, undefined, cache); // disk changed under us
     await save();
-    return pushManifest(root, cfg, fresh, providedCache, attempt + 1, purgeIgnored);
+    return pushManifest(root, cfg, fresh, deps, attempt + 1, purgeIgnored);
   }
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
     await doUpload(); // re-check + re-upload (encrypted or plaintext)
-    return pushManifest(root, cfg, local, providedCache, attempt + 1, purgeIgnored);
+    return pushManifest(root, cfg, local, deps, attempt + 1, purgeIgnored);
   }
 
   await saveState(root, { lastSyncedSequence: res.sequence!, lastSyncedManifest: local });
@@ -292,9 +309,9 @@ export async function pushManifest(
 export async function sync(
   root: string,
   cfg: WorkspaceConfig,
-  providedCache?: HashCache
+  deps: SyncDeps = {}
 ): Promise<{ pulled: Action[]; pushedSequence: number }> {
-  const pulled = await pull(root, cfg, providedCache);
-  const pushedSequence = await push(root, cfg, providedCache);
+  const pulled = await pull(root, cfg, deps);
+  const pushedSequence = await push(root, cfg, deps);
   return { pulled, pushedSequence };
 }

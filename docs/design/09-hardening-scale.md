@@ -1,6 +1,41 @@
 # Design 09 — Hardening & Scale (Milestone 9)
 
-**Status:** v1 — DRAFT for codex adversarial review.
+**Status:** v2 — IMPLEMENTED. Resolved a thorough codex NEEDS-PASS (6 must-fix).
+The cold-scan benchmark found & fixed a real scale bug (bonus). Resolutions:
+
+1. **FakeRemote = stateful server simulator** (blob map, head sequence, manifest
+   log, parent-sequence check, blob-existence validation, byte-verifying
+   `putBlobFile`) — NOT a scripted mock. Tests are oracle assertions: the 409
+   test asserts the rescan preserves BOTH changes; the give-up test asserts our
+   change is never committed nor lost; the no-op test asserts ZERO commits.
+   `src/cli/sync.test.ts` (9 tests).
+2. **SyncRemote flows through everything** — `pull`/`push`/`pushManifest`/`sync`/
+   `captureGitForPush`/`encryptAndUpload`/`uploadBlobs`/blob-store + the recursive
+   retry, all via a `SyncDeps` object; tests inject a **no-op backoff**.
+3. **Cold-scan thresholds + a real fix.** Bar: cold <5s / warm <1s for ~50k
+   syncable files; never publish manifests without content hashes (we don't).
+   **The benchmark exposed an O(per-file-stream) bug**: a 50k-file tree took
+   >2min. Fixed via (a) reading small files whole instead of streaming, (b)
+   bounded-parallel hashing of cache misses → **cold 2.4s, warm 0.76s** (50k
+   files; node_modules pruned, not descended). `scripts/bench-scan.ts`.
+4. **Conflict metrics = two counters** (`commitConflicts409` via a sync hook +
+   `fileConflicts` from reconcile actions), persisted in a SEPARATE
+   `metrics.json` (never the correctness-critical `state.json`), surfaced in
+   `rbox status`. `src/cli/metrics.ts`.
+5. **Miniflare/workerd Worker tests** (`apps/api/test/worker.test.ts`, via
+   `@cloudflare/vitest-pool-workers`): real DO+D1+R2. 4 pass — auth/401, blob
+   entitlement, **cross-account 404 isolation**, **quota 402**. The 2 DO
+   commit-sequencer tests are **skipped**: the DO uses `ctx.storage.kv` /
+   `transactionSync`, newer than the workerd bundled with the pinned
+   pool-workers (caps at compat 2025-07-30) — verified LIVE (M1–M7) + by the
+   client FakeRemote 409/422 suite. Re-enable when a newer test runtime lands.
+6. **files-sdk ADR** upgraded to a real comparison table + residual gaps
+   (per-part retry, direct-to-R2, manifest E2EE) + revisit triggers.
+   `docs/adr/001-files-sdk-build-vs-buy.md` — decision: **build/keep ours**.
+
+---
+
+**v1 plan (for reference):**
 
 **Implements:** roadmap M9 (the final milestone). Four threads, ordered by value:
 1. **Client/sync-layer tests** (the explicit coverage gap — engine is tested,

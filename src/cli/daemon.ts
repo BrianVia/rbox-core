@@ -10,6 +10,7 @@ import {
 } from "../engine/index.js";
 import { loadAuthedConfig, loadState, type WorkspaceConfig } from "./config.js";
 import { pull, pushManifest } from "./sync.js";
+import { loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
@@ -54,6 +55,7 @@ export class RboxDaemon {
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
+  private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0 };
 
   constructor(private readonly root: string, private readonly cfg: WorkspaceConfig) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
@@ -70,6 +72,7 @@ export class RboxDaemon {
     // (ionice for IO priority on Linux is a follow-up; CPU nice is the main lever.)
 
     this.cache = await HashCache.load(this.root);
+    this.metrics = await loadMetrics(this.root);
     log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})`);
 
     // Initial convergence: full scan, then a real pull+push cycle.
@@ -160,14 +163,30 @@ export class RboxDaemon {
         this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache);
       }
     }
-    const res = await pushManifest(this.root, this.cfg, this.manifest, this.cache);
+    const res = await pushManifest(this.root, this.cfg, this.manifest, {
+      cache: this.cache,
+      onCommitConflict: () => this.bumpConflict("commit"),
+    });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan
+    this.metrics.syncs += 1;
+    await saveMetrics(this.root, this.metrics);
   }
 
   private async doPull(): Promise<void> {
-    await pull(this.root, this.cfg, this.cache);
+    const actions = await pull(this.root, this.cfg, { cache: this.cache });
+    const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
+    if (fileConflicts > 0) {
+      this.metrics.fileConflicts += fileConflicts;
+      this.metrics.lastConflictAt = new Date().toISOString();
+      await saveMetrics(this.root, this.metrics);
+    }
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+  }
+
+  private bumpConflict(_kind: "commit"): void {
+    this.metrics.commitConflicts409 += 1;
+    this.metrics.lastConflictAt = new Date().toISOString();
   }
 
   private async doFullScan(): Promise<void> {

@@ -18,8 +18,23 @@ export interface CommitResult {
   unsatisfiedBlobs?: string[];
 }
 
+/**
+ * The narrow remote surface `sync.ts` depends on — the seam that lets the
+ * conflict-retry control flow be unit-tested against an in-memory `FakeRemote`
+ * (design 09 §1). `RboxApi` implements it for production; tests inject a stateful
+ * simulator. Keep it minimal: only what pull/push actually call.
+ */
+export interface SyncRemote {
+  latest(): Promise<{ sequence: number; manifest: Manifest }>;
+  missingBlobs(shas: string[]): Promise<string[]>;
+  putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void>;
+  commit(parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult>;
+  /** BlobStore view for applyActions / git capture+apply on the pull path. */
+  blobStore(): BlobStore;
+}
+
 /** Thin client for the rbox control plane. */
-export class RboxApi {
+export class RboxApi implements SyncRemote {
   constructor(
     private readonly baseUrl: string,
     private readonly token: string,
@@ -241,6 +256,11 @@ export class RboxApi {
     const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests/${seq}`, { headers: this.auth });
     if (!res.ok) throw new Error(`manifest@${seq} failed: ${res.status}`);
     return ((await res.json()) as { manifest: Manifest }).manifest;
+  }
+
+  /** SyncRemote: a BlobStore backed by this client (pull / git apply path). */
+  blobStore(): BlobStore {
+    return new RemoteBlobStore(this);
   }
 }
 

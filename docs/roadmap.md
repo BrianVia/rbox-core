@@ -110,11 +110,13 @@ Design: [`design/08-hydration.md`](./design/08-hydration.md). Codex NEEDS-PASS (
 - [x] **`rbox doctor`** — advisory host-vs-project readiness (tool presence + runtime major/minimum); warns (never fails) on undecidable ranges; probes from a neutral cwd (no project-local code). 20 unit tests.
 - Generated artifacts (`.pnpm-store/`, `vendor/bundle/`) added to `BUILTIN_IGNORE`.
 
-### 9. Hardening & scale
-- [ ] Monorepo scale: per-subtree manifests, incremental scan; measure cold-scan cost on a real `~/Development`.
-- [ ] Conflict-rate metrics in dogfooding (continuous sync amplifies conflicts).
-- [ ] Tests for the client/sync layer (push/pull/conflict-retry) — engine is covered, client is not yet.
-- [ ] `files-sdk` buy-vs-build decision for the R2 blob layer (workerd-verified; bundling caveat in prior-art §7).
+### 9. Hardening & scale — ✅ DONE
+Design: [`design/09-hardening-scale.md`](./design/09-hardening-scale.md). Codex NEEDS-PASS (6 must-fix) resolved.
+- [x] **Scale / cold-scan:** benchmark (`scripts/bench-scan.ts`) found an O(per-file-stream) bug — a 50k-file tree took >2min. Fixed (read small files whole + bounded-parallel hashing): **cold 2.4s, warm 0.76s** for 50k files; node_modules pruned. (Per-subtree/incremental manifests not needed at this scale — measured, not assumed.)
+- [x] **Conflict metrics:** two counters (`commitConflicts409` + `fileConflicts`) in a separate `metrics.json`, surfaced in `rbox status`.
+- [x] **Client/sync tests:** `SyncRemote` DI seam + a stateful `FakeRemote` simulator → 9 oracle tests for no-op/clean-push/409-retry/give-up/422/pull-validate/ignore-carry (`src/cli/sync.test.ts`). Closed the explicit gap.
+- [x] **Worker tests (Miniflare):** `@cloudflare/vitest-pool-workers` real DO+D1+R2 — auth, blob entitlement, cross-account 404, quota 402 (`bun run test:api`). DO commit-sequencer tests skipped (runtime `storage.kv` gap; covered live + client suite).
+- [x] **files-sdk decision:** ADR [`adr/001`](./adr/001-files-sdk-build-vs-buy.md) — **build/keep ours** (comparison table + residual gaps + revisit triggers).
 
 ---
 

@@ -3,7 +3,10 @@
 **Status:** v3 — IMPLEMENTED & live-verified. Resolved TWO codex passes: v1 (6
 must-fix, structural) and v2 (3 residual P1 security holes). Resolutions below.
 
-### v2 re-review P1s (security) — resolved
+### v2/v3 re-review P1s (security) — ALL resolved & confirmed
+(v3 confirm: cwd-containment + pnpm closed; yarn ancestor-scan added after — a
+`.yarnrc.yml` in any dir from the project up to the workspace root now gates
+auto-run. Verified live.)
 - **Yarn/Corepack `yarnPath`/plugins:** `.yarnrc.yml`/`.yarnrc` can point yarn at
   a repo-shipped binary or load repo-local plugins (repo code at startup) — no
   flag fully prevents it. Resolution: the rule declares `untrustedConfigFiles`;

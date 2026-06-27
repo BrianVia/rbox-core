@@ -68,6 +68,43 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-27 — M9 (hardening & scale) DONE — roadmap complete
+
+- **A benchmark earns its keep by finding the bug you didn't look for.** The
+  cold-scan bench (built to "measure before optimizing") exposed an
+  O(per-file-stream) cost: a 50k-file tree took >2 MINUTES. Two fixes → 2.4s
+  cold / 0.76s warm: (a) `hashFile` reads files ≤1MiB whole instead of streaming
+  (stream setup per tiny file dominated); (b) `walk` defers cache-miss hashing to
+  a bounded-parallel batch (HASH_CONCURRENCY=16) instead of sequential awaits.
+  The "do we need incremental scan?" question answered itself: no — fix the
+  constant factor first.
+- **Make the remote injectable to test the client's hardest logic offline.** The
+  conflict-retry control flow (409→pull+rescan+retry, 422→reupload, echo-storm
+  no-op) was untestable because `sync.ts` built `RboxApi` internally. A narrow
+  `SyncRemote` interface + a `SyncDeps` object threaded through EVERY helper +
+  the recursive retry (+ injectable no-op backoff) made it testable.
+- **A fake must be a stateful SIMULATOR, not a scripted mock** (codex). `FakeRemote`
+  mirrors the real DO invariants (monotonic head, parent-sequence 409, blob-
+  existence 422, byte-verifying upload). Then tests assert ORACLES: "removing the
+  rescan must lose the remote change," "exhausted retries never commit nor lose
+  our change," "no-op makes zero commits" — these fail on real regressions, not
+  on call-order.
+- **Metrics go in their OWN file, never the correctness-critical state** (codex):
+  `metrics.json` separate from `state.json`; a metrics write can't corrupt the
+  sync base. Two distinct conflict signals: commit-level 409 retry pressure (via
+  a hook, invisible to reconcile) vs reconcile file-conflicts.
+- **vitest-pool-workers versions are tightly coupled to a bundled workerd.** The
+  newest (0.16.x) needs vitest 4 + moved the config export; older (0.8.x) works
+  with vitest 2.0.5 but bundles a workerd capped at compat 2025-07-30 that LACKS
+  `ctx.storage.kv`/`transactionSync` — so the DO commit-sequencer tests 500 in
+  the test runtime though they work live. Pin vitest EXACTLY (2.0.5) for 0.8.x;
+  set `isolatedStorage:false`+`singleWorker:true` to dodge the D1+DO stacked-
+  storage teardown assert. Net: automated the worker's auth/entitlement/quota
+  paths; the DO-storage paths stay live-verified until a newer runtime lands.
+- **Keep two test runners cleanly separated:** `bun test src` (bun:test, engine+
+  client) vs `vitest run` in apps/api (workerd). Scope bun test to `src` so it
+  never tries to run the `cloudflare:test`-importing files.
+
 ## 2026-06-26 — M8 (hydration brain) DONE — the dev-aware wedge
 
 - **The wedge:** don't sync regenerable dep dirs (node_modules/target/.venv —

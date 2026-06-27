@@ -168,6 +168,14 @@ async function main(): Promise<void> {
         const pf = await gitPreflight(root);
         console.log(`  ${style.dim("git-sync:")} ${pf.ok ? style.green("on (eligible)") : style.yellow(`on but skipped — ${pf.reason}`)}`);
       }
+      const { loadMetrics } = await import("./metrics.js");
+      const m = await loadMetrics(root);
+      if (m.syncs > 0 || m.commitConflicts409 > 0 || m.fileConflicts > 0) {
+        const conf = m.commitConflicts409 + m.fileConflicts;
+        console.log(
+          `  ${style.dim("sync metrics:")} ${m.syncs} syncs, ${conf ? style.yellow(`${m.commitConflicts409} commit-409 / ${m.fileConflicts} file-conflict`) : style.green("0 conflicts")}${m.lastConflictAt ? style.dim(` (last ${m.lastConflictAt})`) : ""}`
+        );
+      }
       break;
     }
     case "daemon": {

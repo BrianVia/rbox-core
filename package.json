@@ -5,7 +5,9 @@
   "type": "module",
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
-    "test": "bun test",
+    "test": "bun test src",
+    "test:api": "cd apps/api && vitest run",
+    "test:all": "bun test src && cd apps/api && vitest run",
     "typecheck": "tsc --noEmit && tsc -p apps/api --noEmit"
   },
   "dependencies": {
@@ -13,8 +15,12 @@
     "ignore": "^5.3.2"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.8.59",
     "@cloudflare/workers-types": "^4.20260626.1",
     "@types/node": "^20.0.0",
-    "typescript": "^5.5.4"
+    "@vitest/runner": "2.0.5",
+    "@vitest/snapshot": "2.0.5",
+    "typescript": "^5.5.4",
+    "vitest": "2.0.5"
   }
 }

@@ -108,20 +108,37 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
   const cached = cache?.lookup(rel, st1.mtimeMs, st1.size);
   if (cached) return { path: rel, type: "file", sha256: cached, size: st1.size, mode: st1.mode & 0o777, mtimeMs: st1.mtimeMs };
 
-  const sha256 = await hashFile(abs);
+  const sha256 = await hashFile(abs, st1.size);
   const st2 = await fs.lstat(abs);
   if (st2.mtimeMs !== st1.mtimeMs || st2.size !== st1.size) return undefined; // mid-write → defer
   cache?.record(rel, { mtimeMs: st2.mtimeMs, size: st2.size, sha256 });
   return { path: rel, type: "file", sha256, size: st2.size, mode: st2.mode & 0o777, mtimeMs: st2.mtimeMs };
 }
 
+/** A cache-miss file whose hashing is deferred to a bounded-parallel batch. */
+interface PendingHash {
+  childRel: string;
+  abs: string;
+  size: number;
+  mode: number;
+  mtimeMs: number;
+}
+
+const HASH_CONCURRENCY = 16; // bound on parallel hashing — saturates disk without fd storms
+
 async function walk(
   root: string,
   rel: string,
   matcher: IgnoreMatcher,
   out: FileEntry[],
-  cache?: HashCache
+  cache?: HashCache,
+  pending?: PendingHash[]
 ): Promise<void> {
+  // Top-level call owns the pending list + drains it in parallel at the end;
+  // recursive calls share the same list.
+  const isRoot = pending === undefined;
+  const toHash = pending ?? [];
+
   const entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
   for (const entry of entries) {
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
@@ -129,7 +146,7 @@ async function walk(
 
     if (entry.isDirectory()) {
       if (matcher.ignores(`${childRel}/`)) continue;
-      await walk(root, childRel, matcher, out, cache);
+      await walk(root, childRel, matcher, out, cache, toHash);
     } else if (entry.isSymbolicLink()) {
       if (matcher.ignores(childRel)) continue;
       const target = await fs.readlink(abs);
@@ -146,16 +163,28 @@ async function walk(
       if (matcher.ignores(childRel)) continue;
       const st = await fs.stat(abs);
       const cached = cache?.lookup(childRel, st.mtimeMs, st.size);
-      const sha256 = cached ?? (await hashFile(abs));
-      if (!cached) cache?.record(childRel, { mtimeMs: st.mtimeMs, size: st.size, sha256 });
-      out.push({
-        path: childRel,
-        type: "file",
-        sha256,
-        size: st.size,
-        mode: st.mode & 0o777,
-        mtimeMs: st.mtimeMs,
-      });
+      if (cached) {
+        out.push({ path: childRel, type: "file", sha256: cached, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
+      } else {
+        // Defer the hash — sequential per-file hashing dominates a cold scan.
+        toHash.push({ childRel, abs, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
+      }
     }
   }
+
+  if (isRoot && toHash.length > 0) await drainHashes(toHash, out, cache);
+}
+
+/** Hash the deferred cache-miss files with bounded concurrency. */
+async function drainHashes(pending: PendingHash[], out: FileEntry[], cache?: HashCache): Promise<void> {
+  let i = 0;
+  const worker = async () => {
+    for (let idx = i++; idx < pending.length; idx = i++) {
+      const p = pending[idx]!;
+      const sha256 = await hashFile(p.abs, p.size);
+      cache?.record(p.childRel, { mtimeMs: p.mtimeMs, size: p.size, sha256 });
+      out.push({ path: p.childRel, type: "file", sha256, size: p.size, mode: p.mode, mtimeMs: p.mtimeMs });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(HASH_CONCURRENCY, pending.length) }, worker));
 }
