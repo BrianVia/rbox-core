@@ -12,6 +12,7 @@
  */
 import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
+import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -34,7 +35,21 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-dev-api" });
 
-  requireAuth(req, env);
+  // Public auth endpoints (EXACT routes only — start the device-authorization flow).
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
+
+  // Everything else requires a valid (non-revoked) device token.
+  const device = await authenticate(req, env);
+  if (!device) throw jsonResponse({ error: "unauthorized" }, 401);
+
+  // Authed auth endpoints.
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env);
+  if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, device);
+  if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {
+    return revokeDevice(env, seg[3]!);
+  }
 
   // POST /v1/blobs/check  { shas } -> { missing }
   if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE);
@@ -76,12 +91,6 @@ async function route(req: Request, env: Env): Promise<Response> {
 
 // ---- helpers ------------------------------------------------------------
 
-function requireAuth(req: Request, env: Env): void {
-  const header = req.headers.get("authorization") ?? "";
-  if (!header.startsWith("Bearer ") || header.slice(7) !== env.RBOX_DEV_TOKEN) {
-    throw jsonResponse({ error: "unauthorized" }, 401);
-  }
-}
 function eq(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }

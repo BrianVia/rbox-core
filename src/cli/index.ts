@@ -1,14 +1,14 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { scanManifest } from "../engine/index.js";
-import { findRoot, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
+import { findRoot, loadAuthedConfig, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { runDaemon } from "./daemon.js";
 import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
+import { approveDevice, listDevices, login, logout, revokeDevice } from "./auth-cmd.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
-const DEFAULT_TOKEN = process.env.RBOX_TOKEN ?? "rbox-dev-7f3a9c2e8b1d4a60";
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
   const positional: string[] = [];
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
         deviceId: flags.device ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
         rootPath: root,
         remoteUrl: flags.remote ?? DEFAULT_REMOTE,
-        token: flags.token ?? DEFAULT_TOKEN,
+        token: "", // token comes from `rbox login` (per-machine credential), never config
         syncGit: flags.git === "true",
       };
       await saveConfig(root, cfg);
@@ -55,21 +55,40 @@ async function main(): Promise<void> {
       console.log(`\nLink another machine with:\n  rbox link <path> --workspace ${cfg.remoteWorkspaceId}`);
       break;
     }
+    case "login": {
+      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap === "true" ? undefined : flags.bootstrap);
+      break;
+    }
+    case "logout": {
+      await logout();
+      break;
+    }
+    case "device": {
+      const sub = positional[0];
+      if (sub === "approve") await approveDevice(positional[1] ?? "");
+      else if (sub === "list") await listDevices();
+      else if (sub === "revoke") await revokeDevice(positional[1] ?? "");
+      else {
+        console.log("usage: rbox device <approve <user-code>|list|revoke <device-id>>");
+        process.exitCode = 1;
+      }
+      break;
+    }
     case "push": {
       const root = await resolveRoot(positional[0]);
-      const seq = await push(root, await loadConfig(root));
+      const seq = await push(root, await loadAuthedConfig(root));
       console.log(`pushed ${root} -> sequence ${seq}`);
       break;
     }
     case "pull": {
       const root = await resolveRoot(positional[0]);
-      const actions = await pull(root, await loadConfig(root));
+      const actions = await pull(root, await loadAuthedConfig(root));
       summarize("pulled", actions, root);
       break;
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      const { pulled, pushedSequence } = await sync(root, await loadConfig(root));
+      const { pulled, pushedSequence } = await sync(root, await loadAuthedConfig(root));
       summarize("pulled", pulled, root);
       console.log(`pushed -> sequence ${pushedSequence}`);
       break;
@@ -116,7 +135,7 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      console.log("rbox — dev-aware sync\n\nCommands:\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  daemon <start|stop|status|logs>  passive continuous sync");
+      console.log("rbox — dev-aware sync\n\nCommands:\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync");
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }

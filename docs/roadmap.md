@@ -56,10 +56,12 @@ Today ignore rules come from `BUILTIN_IGNORE` + `.gitignore` + `.rboxignore` onl
 - [ ] `rbox ignore <glob>` / `rbox ignore --list` convenience commands (optional sugar over editing `rbox.yml`).
 - ⚠️ Changing the ignore set changes the manifest — newly-ignored files become deletes on other machines, newly-included files become adds. Surface that as a diff preview before commit, don't silently propagate mass deletions.
 
-### 4. Real auth — replace the shared token
-- [ ] Device authorization flow (**D8**): `rbox login` prints a code, browser approves, device token issued.
-- [ ] External identity (Clerk/Auth0/WorkOS) → map JWT `sub` → `users.id`.
-- [ ] Remove the cleartext dev token from `apps/api/wrangler.jsonc`; use a Wrangler secret.
+### 4. Real auth — ✅ DONE & VERIFIED (self-hosted device tokens)
+Per-device revocable tokens (sha256-hashed in D1) via a device-authorization flow; cleartext shared token removed (now inert server-side). Design: [`design/04-auth.md`](./design/04-auth.md). Verified 15/15 auth-flow + 7/7 daemon e2e.
+- [x] Device authorization flow (**D8**): `rbox login` (bootstrap secret or device-to-device `rbox device approve <code>`); token minted on first poll (one-time claim).
+- [x] Removed cleartext `RBOX_DEV_TOKEN` from `wrangler.jsonc`; `RBOX_BOOTSTRAP_SECRET` is a Wrangler secret; client token in `~/.rbox/credentials.json` (600).
+- [x] `rbox device list/revoke`; immediate per-request revocation; constant-time bootstrap compare; throttled last-seen.
+- [ ] External identity / user layer (**deferred**): prefer **Cloudflare Zero Trust/Access + BetterAuth** over Clerk (user pref); federates *who the human is* onto these device tokens; ties into M7. Live-WS revocation also deferred to M7 (WS is notification-only).
 
 ### 5. Encryption (**D5**) + secrets
 - [ ] Envelope encryption (per-blob DEK wrapped by per-workspace KEK; prior-art §1).
@@ -108,5 +110,5 @@ First-time setup is the highest-leverage UX moment — it's where a dev decides 
 
 ## 🧹 Housekeeping / known debt
 - Dev D1/R2 hold leftover test data (`wsTEST`, `ws_local_*`, `ws_xm_*`) — wipe before any real use.
-- Dev bearer token is cleartext in `wrangler.jsonc` — must not outlive the dev harness (see milestone 4).
+- ~~Dev bearer token cleartext in `wrangler.jsonc`~~ — ✅ RESOLVED in M4: removed from config, replaced by per-device tokens + a Wrangler bootstrap secret; the old token is now rejected (401) server-side (history copy is inert).
 - `apps/api` has no automated test (covered only by the curl smoke script); add Vitest + Miniflare.

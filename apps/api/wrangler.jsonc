@@ -15,9 +15,6 @@
       "bucket_name": "rbox-dev-blobs"
     }
   ],
-  "vars": {
-    "RBOX_DEV_TOKEN": "rbox-dev-7f3a9c2e8b1d4a60"
-  },
   "durable_objects": {
     "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
   },

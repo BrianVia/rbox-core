@@ -8,7 +8,7 @@ import {
   type Manifest,
   type WatchEvent,
 } from "../engine/index.js";
-import { loadConfig, loadState, type WorkspaceConfig } from "./config.js";
+import { loadAuthedConfig, loadState, type WorkspaceConfig } from "./config.js";
 import { pull, pushManifest } from "./sync.js";
 import { RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
@@ -237,7 +237,7 @@ export class RboxDaemon {
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
 export async function runDaemon(root: string): Promise<void> {
-  const cfg = await loadConfig(root);
+  const cfg = await loadAuthedConfig(root);
   await loadState(root); // surfaces corrupt-state errors loudly before we go live
   const daemon = new RboxDaemon(root, cfg);
   const shutdown = async () => {

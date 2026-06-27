@@ -1,6 +1,6 @@
 # Design 04 — Real Auth: Self-Hosted Device Tokens (Milestone 4)
 
-**Status:** draft → pending codex review.
+**Status:** ✅ IMPLEMENTED & VERIFIED. Revised per codex security review (NEEDS-PASS → resolved). Verified live: 15/15 auth-flow (cleartext token now 401, bootstrap, device-to-device approval, one-time token claim, immediate revocation, /health public) + 7/7 daemon e2e via the device-token credential. The old shared token is inert server-side. Key fixes applied in implementation: **approve only marks approved; the FIRST poll atomically mints + one-time-claims the token** (status `pending→approved→claimed` via conditional UPDATE; plaintext never stored, returned once, only to the new device); constant-time bootstrap-secret compare + CSPRNG 32-byte tokens; `last_seen_at` throttled (~10 min); revocation immediate via per-request hash lookup; **exact** public routes (`/health`, `/v1/auth/device/start|poll|bootstrap`) not a wildcard; all old `RBOX_DEV_TOKEN` paths removed; `~/.rbox` 700 + credentials 600. Known M4 limitation: revoking a device doesn't force-close its live `/connect` WebSocket (notification-only, carries no data; all real ops re-auth per request) — documented, hardened in M7.
 **Implements:** roadmap M4. **Decision:** D8 (device authorization). User chose self-hosted device tokens now; external IdP later.
 **Goal:** replace the single shared cleartext bearer token with per-device, revocable tokens issued via a device-authorization flow and validated server-side. Remove the cleartext token from config/git.
 

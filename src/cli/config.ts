@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Manifest } from "../engine/index.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
+import { loadCredentials } from "./credentials.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -18,6 +19,8 @@ export interface WorkspaceConfig {
   /** Resolved absolute root on THIS machine. Local-only; joined onto relative paths. */
   rootPath: string;
   remoteUrl: string;
+  /** Device token — NOT stored in config (M4); injected at runtime from the
+   *  per-machine credential (`rbox login`). Empty in the saved workspace.json. */
   token: string;
   /** Opt-in git-state sync (M2). Default off — syncing git config could move
    *  machine-local settings; hooks are never synced regardless. */
@@ -70,7 +73,18 @@ export async function loadConfig(root: string): Promise<WorkspaceConfig> {
 
 export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  await writeFileAtomic(configPath(root), JSON.stringify(cfg, null, 2));
+  // Never persist the token to the workspace config (M4) — it lives in the
+  // per-machine credential and is injected at runtime by loadAuthedConfig.
+  await writeFileAtomic(configPath(root), JSON.stringify({ ...cfg, token: "" }, null, 2));
+}
+
+/** Load the workspace config and inject the device token from the per-machine
+ *  credential (`rbox login`). Throws if not logged in. Use for any networked op. */
+export async function loadAuthedConfig(root: string): Promise<WorkspaceConfig> {
+  const cfg = await loadConfig(root);
+  const creds = await loadCredentials();
+  if (!creds) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
+  return { ...cfg, token: creds.token, remoteUrl: cfg.remoteUrl || creds.remoteUrl };
 }
 
 /**

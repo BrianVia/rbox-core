@@ -65,6 +65,16 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M4 (self-hosted device auth) DONE
+
+- Replaced the shared cleartext bearer token with per-device tokens. Verified 15/15 auth-flow live + 7/7 daemon e2e via credential. Cleartext token now 401 server-side.
+- **Token handoff pattern (codex security review):** `approve` ONLY marks the pending auth `approved`; the **first poll** atomically mints+returns the token via a conditional `UPDATE ... WHERE status='approved'` (→ `claimed`); `meta.changes===1` means this poll won the one-time claim. Plaintext token never stored (only sha256), returned exactly once, only to the polling (new) device.
+- Tokens: CSPRNG 32-byte hex; `sha256(token)` at rest is fine for high-entropy random bearer tokens (bcrypt/argon are for human passwords). Reject malformed token length before hashing. Constant-time compare for the bootstrap secret (Workers lack node `timingSafeEqual` → hand-roll XOR-accumulate over equal-length encoded buffers).
+- `last_seen_at` updated only when stale (>~10min) — avoid a D1 write per request; always READ for immediate revocation.
+- Public routes must be EXACT (`/health`, `/v1/auth/device/start|poll|bootstrap`), never a wildcard `/v1/auth/device/*` (would expose `approve`). Everything else requires a valid device token.
+- Client credential: `~/.rbox/credentials.json` mode 600, dir 700, per-machine (one device token for all workspaces). `RBOX_TOKEN` env overrides for CI/headless. Token is NEVER persisted in the workspace `.rbox/workspace.json` (saveConfig forces token:""); injected at runtime by `loadAuthedConfig`.
+- Known M4 limitation: revoking a device doesn't force-close its live `/connect` WebSocket (notification-only, no data; all real ops re-auth per request) — hardened in M7.
+
 ## 2026-06-26 — M1 (daemon) DONE & verified cross-machine
 
 - The full daemon shipped and is verified Mac ↔ flat-meadow-prod-main-01 against the live `rbox-dev-api` (DO deployed with `new_sqlite_classes` migration v1). Test artifacts in scratchpad (smoke.ts, e2e-local.sh, xm-e2e.sh). Results: 11/11 live control-plane, 7/7 local 2-daemon, 6/6 cross-machine, 16/16 unit.
