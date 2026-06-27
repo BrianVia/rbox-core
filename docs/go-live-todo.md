@@ -18,10 +18,13 @@ this is what's left to flip the switch to a real, paid, public product.
 - [ ] `wrangler secret put --env production`: `STRIPE_SECRET` (live restricted key), `STRIPE_WEBHOOK_SECRET` (live whsec), `RBOX_BOOTSTRAP_SECRET`, `RBOX_PLATFORM_SECRET`
 - [ ] Live-verify: real checkout URL + a real signed webhook event recorded (as done for test)
 
-## 🚧 Frontend (makes billing + Clerk actually reachable)
-- [ ] Web dashboard: Clerk sign-in → "Subscribe" buttons hitting `/v1/billing/checkout` + portal
-- [ ] Worker: validate Clerk session JWTs → map Clerk user → rbox account/user (CLI device-auth/pairing stays for machines)
-- [ ] Wire the live **publishable** key into the frontend
+## ✅ Frontend + Clerk wiring (built autonomously 2026-06-27)
+- [x] Worker `/v1/web/session`: verifies Clerk JWT (JWKS/RS256, hardened) → maps clerk user → rbox account/user → short-lived web session token. Codex-reviewed; 9 worker tests. (`apps/api/src/clerk.ts`, migration 0010)
+- [x] Web dashboard `apps/web/` (static ClerkJS): sign-in → exchange → plan/usage → Subscribe + Manage-billing buttons.
+- [x] Retention cron: scheduled `retention→mark→purge` daily (`wrangler.jsonc` triggers).
+- [ ] **Deploy web-auth to a worker + set Clerk config** (`CLERK_ISSUER/JWKS/ALLOWED_ORIGINS/SECRET`) — pending (dev deploy next; prod with the prod env).
+- [ ] **Decide where `apps/web` is hosted** (Cloudflare Pages vs local) → set `CLERK_ALLOWED_ORIGINS` to that exact origin (azp is enforced). Dev Clerk instance is `certain-ray-33.clerk.accounts.dev`.
+- [ ] Real end-to-end sign-in test (needs a browser — your step).
 
 ## 🚧 Needs the human
 - [ ] Point **`rbox.to` nameservers** at Cloudflare → custom domain `api.rbox.to` for `rbox-prod-api` (until then it's `rbox-prod-api.brian-via.workers.dev`)
