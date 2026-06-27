@@ -10,6 +10,7 @@ import type { CommitResult, SyncRemote } from "./remote.js";
 import type { BlobStore, Manifest } from "../engine/index.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
 /**
  * Stateful in-memory server simulator (design 09 §1) — mirrors the real
@@ -53,9 +54,10 @@ class FakeRemote implements SyncRemote {
     return shas.filter((s) => !this.blobs.has(s));
   }
   async putBlobFile(sha256: string, absPath: string): Promise<void> {
-    // Verify bytes match the claimed content address — the real server does too.
+    // Verify RAW bytes match the claimed content address — exactly as the server
+    // does. (Hashing bytes.toString() would corrupt non-UTF8/binary content.)
     const bytes = await fs.readFile(absPath);
-    if (sha(bytes.toString()) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
+    if (shaBytes(bytes) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
     this.blobs.set(sha256, bytes);
   }
   async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
@@ -142,6 +144,17 @@ test("clean push uploads the blob, commits, advances base", async () => {
   expect(seq).toBe(1);
   expect(remote.hasBlob(sha("fresh content\n"))).toBe(true);
   expect((await loadState(root)).lastSyncedSequence).toBe(1);
+});
+
+test("binary (non-UTF8) content is uploaded + byte-verified by content address", async () => {
+  const remote = new FakeRemote();
+  // Bytes that do NOT survive a UTF-8 round-trip — a toString()-based hash would
+  // mis-verify these and the push would wrongly fail.
+  const binary = Buffer.from([0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f, 0xc3, 0x28]);
+  await fs.writeFile(path.join(root, "blob.bin"), binary);
+  const seq = await push(root, cfg, deps(remote));
+  expect(seq).toBe(1);
+  expect(remote.hasBlob(shaBytes(binary))).toBe(true); // raw bytes addressed correctly
 });
 
 // ── 409 conflict-retry: the rescan is load-bearing ─────────────────────────
