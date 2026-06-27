@@ -87,19 +87,21 @@ export async function createPairToken(env: Env, p: Principal): Promise<Response>
   if (!member) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
 
   const now = Date.now();
-  const active = await env.rbox_dev_db
-    .prepare("SELECT COUNT(*) AS n FROM pairing_tokens WHERE account_id = ? AND consumed_at IS NULL AND expires_at > ?")
-    .bind(p.accountId, now)
-    .first<{ n: number }>();
-  if ((active?.n ?? 0) >= PAIR_ACTIVE_CAP) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
-
   const token = randomHex(TOKEN_BYTES);
   const hash = await sha256Hex(token);
   const expiresAt = now + PAIR_TTL_MS;
-  await env.rbox_dev_db
-    .prepare("INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(hash, p.accountId, p.userId, p.deviceId, "pair", now, expiresAt)
+  // Atomic active-token cap: insert ONLY while the account is under the cap, in a
+  // single INSERT…SELECT…WHERE. D1 serializes writes, so concurrent creates can't
+  // both pass a stale count (closes the check-then-insert race). changes===0 → over cap.
+  const res = await env.rbox_dev_db
+    .prepare(
+      `INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at)
+       SELECT ?, ?, ?, ?, 'pair', ?, ?
+       WHERE (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ? AND consumed_at IS NULL AND expires_at > ?) < ?`
+    )
+    .bind(hash, p.accountId, p.userId, p.deviceId, now, expiresAt, p.accountId, now, PAIR_ACTIVE_CAP)
     .run();
+  if ((res.meta.changes ?? 0) === 0) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
   return json({ token: `${PAIR_PREFIX}${token}`, expiresAt });
 }
 
