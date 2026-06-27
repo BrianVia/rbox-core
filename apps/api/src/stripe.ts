@@ -1,0 +1,195 @@
+import type { Env } from "./env.js";
+import type { Principal } from "./authz.js";
+import { ctEqual, json } from "./util.js";
+import { PLAN_LOOKUP_KEYS, planForLookupKey } from "./plans.js";
+
+/**
+ * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
+ * over raw fetch (no SDK). All routes are feature-gated on STRIPE_SECRET, so the
+ * worker runs fine before billing is provisioned. Prices are resolved by
+ * lookup_key (stable across test/live), never hardcoded ids. The webhook is the
+ * source of truth that keeps accounts.plan / stripe_customer_id authoritative.
+ */
+const API = "https://api.stripe.com/v1";
+const WEBHOOK_TOLERANCE_S = 300; // reject signatures older than 5 min (replay window)
+
+/** Form-encode params with Stripe's bracket notation (nested objects/arrays). */
+function encode(params: Record<string, unknown>, prefix = ""): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    const key = prefix ? `${prefix}[${k}]` : k;
+    if (typeof v === "object") parts.push(encode(v as Record<string, unknown>, key));
+    else parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(v))}`);
+  }
+  return parts.filter(Boolean).join("&");
+}
+
+async function stripeApi(env: Env, method: "GET" | "POST", path: string, params?: Record<string, unknown>): Promise<any> {
+  const secret = env.STRIPE_SECRET!;
+  const isGet = method === "GET";
+  const body = params ? encode(params) : "";
+  const url = isGet && body ? `${API}${path}?${body}` : `${API}${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      authorization: `Bearer ${secret}`,
+      ...(isGet ? {} : { "content-type": "application/x-www-form-urlencoded" }),
+    },
+    body: isGet ? undefined : body || undefined,
+  });
+  const data = (await res.json()) as any;
+  if (!res.ok) throw new Error(`stripe ${path} ${res.status}: ${data?.error?.message ?? "error"}`);
+  return data;
+}
+
+/** Resolve a plan's active price id from its lookup_key (test/live agnostic). */
+async function priceIdForPlan(env: Env, plan: string): Promise<string | null> {
+  const lookupKey = PLAN_LOOKUP_KEYS[plan];
+  if (!lookupKey) return null;
+  const list = await stripeApi(env, "GET", "/prices", { "lookup_keys[0]": lookupKey, active: "true", limit: 1 });
+  return list.data?.[0]?.id ?? null;
+}
+
+// ---- routes (all gated on STRIPE_SECRET) ----
+
+/** POST /v1/billing/checkout?plan=solo — authed. Returns a Stripe Checkout URL. */
+export async function billingCheckout(req: Request, env: Env, p: Principal): Promise<Response> {
+  if (!env.STRIPE_SECRET) return json({ error: "billing_not_configured" }, 501);
+  const plan = new URL(req.url).searchParams.get("plan") ?? "";
+  if (!PLAN_LOOKUP_KEYS[plan]) return json({ error: "bad_request", message: "unknown or non-purchasable plan" }, 400);
+
+  const priceId = await priceIdForPlan(env, plan);
+  if (!priceId) return json({ error: "price_unavailable", message: `no active price for ${plan}` }, 500);
+
+  const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
+  // Reuse the account's existing customer if it has one (avoids duplicates).
+  const acct = await env.rbox_dev_db.prepare("SELECT stripe_customer_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null }>();
+  const session = await stripeApi(env, "POST", "/checkout/sessions", {
+    mode: "subscription",
+    "line_items[0][price]": priceId,
+    "line_items[0][quantity]": 1,
+    success_url: `${appUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl}/billing`,
+    client_reference_id: p.accountId,
+    "metadata[account_id]": p.accountId,
+    // Bind the subscription to the account so webhooks can map it back.
+    "subscription_data[metadata][account_id]": p.accountId,
+    ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : { customer_creation: "always" }),
+  });
+  return json({ url: session.url });
+}
+
+/** POST /v1/billing/portal — authed. Returns a Customer Portal URL for self-serve
+ *  plan changes / cancellation. Requires the account to have a Stripe customer. */
+export async function billingPortal(req: Request, env: Env, p: Principal): Promise<Response> {
+  if (!env.STRIPE_SECRET) return json({ error: "billing_not_configured" }, 501);
+  const acct = await env.rbox_dev_db.prepare("SELECT stripe_customer_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null }>();
+  if (!acct?.stripe_customer_id) return json({ error: "no_subscription", message: "no billing customer yet — subscribe first" }, 409);
+  const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
+  const session = await stripeApi(env, "POST", "/billing_portal/sessions", { customer: acct.stripe_customer_id, return_url: `${appUrl}/billing` });
+  return json({ url: session.url });
+}
+
+// ---- webhook ----
+
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Verify a Stripe-Signature header against the raw body (HMAC-SHA256 over
+ *  `${t}.${body}`), within the replay tolerance. Returns true iff a v1 sig matches. */
+export async function verifyStripeSignature(rawBody: string, sigHeader: string, secret: string, nowS: number): Promise<boolean> {
+  // Header: "t=...,v1=...,v1=...,v0=...". Preserve the RAW timestamp string (it's
+  // signed verbatim) and collect ALL v1 signatures — Stripe sends one per active
+  // secret during rotation, and any match is valid.
+  let t = "";
+  const v1s: string[] = [];
+  for (const part of sigHeader.split(",")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const k = part.slice(0, i);
+    const val = part.slice(i + 1);
+    if (k === "t") t = val;
+    else if (k === "v1") v1s.push(val);
+  }
+  if (!t || v1s.length === 0) return false;
+  const tn = Number(t);
+  if (!Number.isFinite(tn) || Math.abs(nowS - tn) > WEBHOOK_TOLERANCE_S) return false; // stale → reject (replay guard)
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${t}.${rawBody}`));
+  const expected = toHex(mac);
+  return v1s.some((v) => ctEqual(expected, v)); // accept if ANY signature matches (constant-time)
+}
+
+/** POST /v1/stripe/webhook — PUBLIC, signature-verified. Keeps accounts.plan
+ *  authoritative on subscription lifecycle. Idempotent via the stripe_events table. */
+export async function stripeWebhook(req: Request, env: Env, nowMs: number): Promise<Response> {
+  if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: "billing_not_configured" }, 501);
+  const sig = req.headers.get("stripe-signature") ?? "";
+  const raw = await req.text(); // RAW body — signature is over exact bytes
+  if (!(await verifyStripeSignature(raw, sig, env.STRIPE_WEBHOOK_SECRET, Math.floor(nowMs / 1000)))) {
+    return json({ error: "bad_signature" }, 400);
+  }
+  const event = JSON.parse(raw) as { id: string; type: string; data: { object: any } };
+
+  // Success-based idempotency: skip if already PROCESSED, else apply then record.
+  // applyStripeEvent is idempotent, so a concurrent double-delivery is harmless;
+  // recording only AFTER a successful apply means a failed apply (which throws →
+  // 500) is retried by Stripe rather than silently swallowed (at-least-once).
+  const seen = await env.rbox_dev_db.prepare("SELECT 1 FROM stripe_events WHERE id = ?").bind(event.id).first();
+  if (seen) return json({ received: true, duplicate: true });
+  await applyStripeEvent(env, event);
+  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO stripe_events (id, type, received_at) VALUES (?, ?, ?)").bind(event.id, event.type, nowMs).run();
+  return json({ received: true });
+}
+
+async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }): Promise<void> {
+  const obj = event.data.object;
+  switch (event.type) {
+    case "checkout.session.completed": {
+      // Bind the customer + subscription to the account; the subscription.* events
+      // carry the price → plan, so we don't set the plan here (avoids a race).
+      const accountId = obj.client_reference_id ?? obj.metadata?.account_id;
+      if (accountId && obj.customer) {
+        await env.rbox_dev_db
+          .prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+          .bind(obj.customer, obj.subscription ?? null, accountId, obj.customer)
+          .run();
+      }
+      break;
+    }
+    case "customer.subscription.created":
+    case "customer.subscription.updated": {
+      const accountId = obj.metadata?.account_id;
+      if (!accountId || !obj.customer) break;
+      const item = obj.items?.data?.[0];
+      const lookupKey = item?.price?.lookup_key as string | undefined;
+      // active/trialing → the purchased plan; anything else (canceled, unpaid,
+      // past_due) → downgrade to free (fail closed, the user isn't paying).
+      const paying = obj.status === "active" || obj.status === "trialing";
+      const plan = paying ? planForLookupKey(lookupKey) ?? "free" : "free";
+      // Ownership guard: only the account this customer is bound to (or an as-yet
+      // UNBOUND account named by the trusted-at-checkout metadata) can be changed.
+      // An account already bound to a DIFFERENT customer can never be flipped — so
+      // a stray/off-path event can't hijack someone else's plan.
+      await env.rbox_dev_db
+        .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+        .bind(plan, obj.customer, obj.id, accountId, obj.customer)
+        .run();
+      break;
+    }
+    case "customer.subscription.deleted": {
+      // Downgrade only the account that actually owns this customer + subscription.
+      if (obj.customer && obj.id) {
+        await env.rbox_dev_db
+          .prepare("UPDATE accounts SET plan = 'free', stripe_subscription_id = NULL WHERE stripe_customer_id = ? AND stripe_subscription_id = ?")
+          .bind(obj.customer, obj.id)
+          .run();
+      }
+      break;
+    }
+    default:
+      break; // ignore unrelated events
+  }
+}

@@ -15,6 +15,7 @@ import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipa
 import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { retentionPrune } from "./retention.js";
+import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
 import { json } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
@@ -63,6 +64,8 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
   // Pairing redeem is PUBLIC (the pasted token IS the credential) — exact route.
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);
+  // Stripe webhook is PUBLIC but signature-verified (exact route).
+  if (req.method === "POST" && eq(seg, ["v1", "stripe", "webhook"])) return stripeWebhook(req, env, Date.now());
 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);
@@ -70,6 +73,8 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   // Account ops (scoped to the caller's account).
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(env, p);
+  if (req.method === "POST" && eq(seg, ["v1", "billing", "checkout"])) return billingCheckout(req, env, p);
+  if (req.method === "POST" && eq(seg, ["v1", "billing", "portal"])) return billingPortal(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
   if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {

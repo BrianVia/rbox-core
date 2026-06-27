@@ -18,6 +18,9 @@ export default defineWorkersConfig(async () => {
             bindings: {
               RBOX_BOOTSTRAP_SECRET: "test-bootstrap-secret",
               RBOX_PLATFORM_SECRET: "test-platform-secret",
+              // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
+              // deliberately ABSENT (so checkout/portal exercise the 501 gate).
+              STRIPE_WEBHOOK_SECRET: "whsec_test_secret",
               TEST_MIGRATIONS: migrations,
             },
           },

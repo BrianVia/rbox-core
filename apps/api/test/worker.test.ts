@@ -162,6 +162,69 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await pairCreate(a.token)).status).toBe(429);
   });
 
+  // ── Stripe billing (M10) ─────────────────────────────────────────────────
+
+  test("billing/checkout + portal are gated on STRIPE_SECRET (absent → 501)", async () => {
+    const a = await bootstrap("acct-bill");
+    expect((await SELF.fetch(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST", headers: authed(a.token) })).status).toBe(501);
+    expect((await SELF.fetch(`${BASE}/v1/billing/portal`, { method: "POST", headers: authed(a.token) })).status).toBe(501);
+  });
+
+  // Sign a payload exactly as Stripe does: HMAC-SHA256 over `${t}.${body}`.
+  async function stripeSig(body: string, secret: string, t: number): Promise<string> {
+    const { createHmac } = await import("node:crypto");
+    const v1 = createHmac("sha256", secret).update(`${t}.${body}`).digest("hex");
+    return `t=${t},v1=${v1}`;
+  }
+  const webhook = (body: string, sig: string) =>
+    SELF.fetch(`${BASE}/v1/stripe/webhook`, { method: "POST", headers: { "stripe-signature": sig, "content-type": "application/json" }, body });
+
+  test("webhook rejects a bad/forged signature → 400 (no plan change)", async () => {
+    const evt = JSON.stringify({ id: "evt_bad", type: "customer.subscription.updated", data: { object: {} } });
+    expect((await webhook(evt, "t=123,v1=deadbeef")).status).toBe(400);
+  });
+
+  test("webhook flips accounts.plan on an active subscription (valid signature)", async () => {
+    const a = await bootstrap("acct-sub");
+    const t = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      id: "evt_sub_1",
+      type: "customer.subscription.updated",
+      data: { object: { id: "sub_1", status: "active", customer: "cus_sub1", metadata: { account_id: a.accountId }, items: { data: [{ price: { lookup_key: "rbox_pro_monthly" } }] } } },
+    });
+    const res = await webhook(body, await stripeSig(body, "whsec_test_secret", t));
+    expect(res.status).toBe(200);
+    // Confirm via the authed usage endpoint that the plan is now pro.
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(((await usage.json()) as { plan: string }).plan).toBe("pro");
+  });
+
+  test("webhook is idempotent (same event id re-delivered → duplicate, applied once)", async () => {
+    const a = await bootstrap("acct-idem");
+    const t = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      id: "evt_dup",
+      type: "customer.subscription.updated",
+      data: { object: { id: "sub_2", status: "active", customer: "cus_sub2", metadata: { account_id: a.accountId }, items: { data: [{ price: { lookup_key: "rbox_solo_monthly" } }] } } },
+    });
+    const sig = await stripeSig(body, "whsec_test_secret", t);
+    expect((await (await webhook(body, sig)).json() as { duplicate?: boolean }).duplicate).toBeUndefined();
+    expect((await (await webhook(body, sig)).json() as { duplicate?: boolean }).duplicate).toBe(true); // 2nd = no-op
+  });
+
+  test("webhook downgrades to free when subscription is canceled/past_due", async () => {
+    const a = await bootstrap("acct-cancel");
+    const t = Math.floor(Date.now() / 1000);
+    const mk = (id: string, status: string, lk: string) =>
+      JSON.stringify({ id, type: "customer.subscription.updated", data: { object: { id: "sub_3", status, customer: "cus_sub3", metadata: { account_id: a.accountId }, items: { data: [{ price: { lookup_key: lk } }] } } } });
+    const up = mk("evt_up", "active", "rbox_pro_monthly");
+    await webhook(up, await stripeSig(up, "whsec_test_secret", t));
+    const down = mk("evt_down", "past_due", "rbox_pro_monthly");
+    await webhook(down, await stripeSig(down, "whsec_test_secret", t));
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(((await usage.json()) as { plan: string }).plan).toBe("free"); // fail-closed
+  });
+
   const PLAT = { "x-rbox-platform": "test-platform-secret" };
 
   test("retention prune is platform-gated (tenant token → 404)", async () => {
