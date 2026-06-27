@@ -34,16 +34,18 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp): Promise
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
   const present = new Set<string>();
+  const condemned = new Set<string>();
   for (let i = 0; i < shas.length; i += 80) {
     const chunk = shas.slice(i, i + 80);
     if (chunk.length === 0) break;
-    const rows = await env.rbox_dev_db
-      .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")})`)
-      .bind(...chunk)
-      .all<{ sha256: string }>();
+    const ph = chunk.map(() => "?").join(",");
+    const rows = await env.rbox_dev_db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of rows.results ?? []) present.add(r.sha256);
+    // A GC candidate reads as MISSING so a re-upload resurrects it (M6 dedup-race fix).
+    const cand = await env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+    for (const r of cand.results ?? []) condemned.add(r.sha256);
   }
-  return json({ missing: [...new Set(shas)].filter((s) => !present.has(s)) });
+  return json({ missing: [...new Set(shas)].filter((s) => !present.has(s) || condemned.has(s)) });
 }
 
 // PUT /v1/blobs/:sha — single streaming PUT, R2 verifies the content hash.
@@ -58,6 +60,7 @@ export async function blobPut(req: Request, env: Env, sha: string): Promise<Resp
     return json({ error: "sha_mismatch", message: String((e as Error)?.message ?? e) }, 400);
   }
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
+  await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
   return json({ ok: true, sha256: sha, sizeBytes: obj.size });
 }
 
@@ -171,6 +174,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string)
       return json({ error: "sha_mismatch", message: String((e as Error)?.message ?? e) }, 412);
     }
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, up.size).run();
+    await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
     return json({ ok: true, sha256: sha, sizeBytes: up.size });
   } finally {
     await env.rbox_dev_blobs.delete(up.staging_key).catch(() => {});

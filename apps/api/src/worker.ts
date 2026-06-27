@@ -13,7 +13,7 @@
 import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
-import { versionsList } from "./versions.js";
+import { gcMark, gcPurge, versionsList } from "./versions.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 const SHA_RE = /^[0-9a-f]{64}$/;
@@ -44,6 +44,12 @@ async function route(req: Request, env: Env): Promise<Response> {
   // Everything else requires a valid (non-revoked) device token.
   const device = await authenticate(req, env);
   if (!device) throw jsonResponse({ error: "unauthorized" }, 401);
+
+  // Admin GC (M6): POST /v1/admin/gc?phase=mark|purge&graceMs=N (authed).
+  if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
+    const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
+    return url.searchParams.get("phase") === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
+  }
 
   // Authed auth endpoints.
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env);

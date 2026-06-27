@@ -1,6 +1,6 @@
 # Design 06 — Version History, Trash, GC (Milestone 6)
 
-**Status:** draft → pending codex review.
+**Status:** ✅ IMPLEMENTED & VERIFIED. Version history + restore (3/3) and reachability GC (9/9, incl. the cardinal assertion *reachable blob survives GC*) verified live. GC uses the barrier-free candidate-tagging design (§4-SAFE) per codex review: authoritative DO roots, fail-closed, never moves canonical keys, candidate-aware existence check resurrects on re-upload. Note: GC enumerates the `workspaces` registry (written on commit); blobs of unregistered/pre-registry workspaces are collectible — fine post-wipe, and it self-cleaned 207 leftover test orphans. Retention prune lives in the DO (authoritative, never prunes head). Cron scheduling of GC + per-workspace retention windows (plan-gated) remain M7b/follow-ups.
 **Implements:** roadmap M6. **Decisions:** D7 (conflict copies + version history), D10 (reachability GC).
 **Goal:** browse and restore past versions; deletes are recoverable (soft, then purged); storage is reclaimed safely (a retained version's blob is NEVER deleted).
 
@@ -19,7 +19,23 @@
 - Per-workspace retention window `retentionDays` (default 30; **plan-gated in M7b** — Free 7 / Solo 30 / Pro 90). Stored in workspace/project config.
 - A version (sequence) older than the window AND not the current head is **prunable**: its `seq:<n>` pointer + D1 row are removed. The head is always retained; recent history within the window is retained. (Pruning a pointer doesn't delete blobs — GC does, only if unreachable.)
 
-## 4. Reachability GC (the safety-critical part) — D10
+## 4-SAFE. Reachability GC — barrier-free candidate-tagging (revised per review)
+
+Codex review found 2 BLOCKERS: GC must mark from **authoritative DO roots** (the D1 mirror is best-effort), and grace+recheck alone can't close the **commit/dedup race** (an old unreferenced blob can be deduped-against by a new commit mid-sweep → if GC then deletes it, that commit references a missing blob). The safe, barrier-free design:
+
+**Authoritative roots.** A D1 `workspaces(workspace_id, project_id)` registry is written (INSERT OR IGNORE) on every commit. GC enumerates the registry and, **per workspace, asks its DO for the authoritative retained roots** (head + in-retention `seq:<n>` → manifest shas). If any DO can't be read → **abort GC (fail closed)**, never sweep on partial knowledge.
+
+**Mark (global).** Reachable set = union across ALL workspaces of: each retained manifest blob sha; for each `type=file` entry `encSha ?? sha256`; git `bundleSha`, `indexSha`, every `opState` value. (NOT symlink shas — no blob is stored for symlinks; NOT git refs/head/indexTree — not blobs.) Plus active `uploads.staging_key` (in-flight multipart).
+
+**Candidate tagging (never touch canonical keys).** Sweep R2; any blob/manifest object **older than a grace age** and not in the reachable set → insert into `gc_candidates(sha, marked_at)`. **R2 objects are NOT moved or deleted in this phase** (moving the canonical key was the rejected BLOCKER).
+
+**Dedup-race fix — candidate-aware existence checks.** The blob-existence check (`blobsCheck` AND the DO commit's `missingBlobs`) treats a sha present in `gc_candidates` as **MISSING**. So if a new commit would dedup against a dying blob, the client is told to re-upload it; the re-upload (`blobPut`/multipart complete) **deletes its `gc_candidates` row** (un-condemns it). A candidate can therefore never be referenced by a new commit without first being resurrected. This removes the need for a cross-DO write barrier.
+
+**Purge (after grace).** For each candidate older than the grace window: **rebuild the global roots, re-check reachability, and confirm it's still a candidate** (not resurrected); only then delete the R2 object + its row. Invariant: **a canonical object is deleted only if the current authoritative global roots exclude it AND it has been a continuous candidate across the grace window** (any reference attempt in between resurrected it).
+
+Retention prune (§3) runs in the DO from authoritative `head`/`seq:<n>` (abort if `seq:<head>` missing); D1 is browsing-only, never deletion authority. GC is an admin/cron route, off the hot path.
+
+## 4. (original draft — superseded by 4-SAFE above)
 **Never per-commit ref-counting (the v1 leak).** Mark-and-sweep over R2:
 1. **Mark:** the reachable set = for every RETAINED manifest (head + all sequences within retention), every referenced blob sha: file `sha256` (plaintext blobs), `encSha` (ciphertext blobs), git artifact shas (bundle/index/op-state), and the manifest blob sha itself. Collect into a set (or a bloom/temp table for scale).
 2. **Sweep:** list R2 objects under `blobs/` and `manifests/`; any object whose sha ∉ reachable set is **garbage**.

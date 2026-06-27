@@ -65,6 +65,13 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M6 (versions + reachability GC) DONE
+
+- Version history/restore = exposing the DO's existing per-commit `seq:<n>` pointers; restore decrypts encrypted blobs + can recover deleted files. Verified 3/3.
+- **Reachability GC without a cross-DO write barrier (the key insight):** make the blob-existence check (`blobsCheck` + the DO's `missingBlobs`) treat a GC-candidate sha as **MISSING**. Then any new dedup reference is told to re-upload, and the (re)upload path deletes the candidate row → resurrects the blob BEFORE any commit can reference it. This closes the dedup/GC race that grace+recheck alone can't, with no DO coordination. Verified 9/9.
+- GC rules that matter: (1) **mark from AUTHORITATIVE DO roots** (a `workspaces` D1 registry written on commit lets GC enumerate which DOs to ask; each DO returns its retained `seq→manifestSha`); **fail closed** if any DO is unreadable. (2) reachability is **GLOBAL** (blobs dedup across workspaces) and includes file `encSha??sha256` + git bundle/index/opState shas + the manifest blob shas (NOT symlink shas / git refs). (3) **never move or delete canonical R2 keys during mark** — only tag candidates; delete only at purge after grace + a fresh re-mark. (4) retention prune runs in the DO (authoritative), never prunes head.
+- GC enumerates only REGISTERED workspaces → pre-registry/unregistered blobs are collectible (it self-cleaned 207 leftover test orphans — also knocks out the "wipe dev test data" housekeeping item).
+
 ## 2026-06-26 — M5 (blob-content E2EE) DONE
 
 - Shipped opt-in convergent blob-content encryption; verified 8/8 e2e (server stores only ciphertext, keyed device decrypts, keyless locked out, dedup survives). User chose content-only scope; full-E2EE (encrypted manifest) is the documented follow-up.

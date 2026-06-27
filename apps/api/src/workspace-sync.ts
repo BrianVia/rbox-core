@@ -42,6 +42,9 @@ export class WorkspaceSync {
     if (action === "manifests" && req.method === "POST") return this.commit(req, ws, proj);
     // GET /v1/ws/:ws/proj/:proj/manifests/:seq — a specific historical version.
     if (seg[5] === "manifests" && seg[6] && req.method === "GET") return this.manifestAt(Number(seg[6]));
+    // GC support (M6): authoritative retained roots + retention prune.
+    if (action === "roots" && req.method === "GET") return this.roots();
+    if (action === "prune" && req.method === "POST") return this.prune(req);
     return json({ error: "not_found" }, 404);
   }
 
@@ -119,8 +122,12 @@ export class WorkspaceSync {
     if ("conflict" in outcome!) return json({ error: "conflict", head: outcome!.conflict }, 409);
     const sequence = outcome!.sequence;
 
-    // Best-effort D1 mirror (not authoritative). Failure is logged, never fatal.
+    // Best-effort D1 mirror (not authoritative) + workspace registry for GC.
     try {
+      await this.env.rbox_dev_db
+        .prepare("INSERT OR IGNORE INTO workspaces (workspace_id, project_id, created_at) VALUES (?, ?, ?)")
+        .bind(ws, proj, Date.now())
+        .run();
       await this.env.rbox_dev_db
         .prepare("INSERT OR IGNORE INTO manifests (workspace_id, project_id, sequence, manifest_blob_sha, device_id) VALUES (?, ?, ?, ?, ?)")
         .bind(ws, proj, sequence, sha, body.deviceId ?? null)
@@ -131,6 +138,35 @@ export class WorkspaceSync {
 
     this.broadcast(JSON.stringify({ type: "committed", sequence, deviceId: body.deviceId ?? null }), body.deviceId ?? null);
     return json({ sequence, manifestSha: sha });
+  }
+
+  /** Authoritative retained roots (M6 GC): {seq, manifestSha} for every sequence
+   *  the DO still holds (pruneFloor, head]. The mark phase reads these. */
+  private async roots(): Promise<Response> {
+    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
+    const roots: Array<{ seq: number; sha: string }> = [];
+    for (let s = floor + 1; s <= head; s++) {
+      const sha = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
+      if (sha) roots.push({ seq: s, sha });
+    }
+    return json({ head, pruneFloor: floor, roots });
+  }
+
+  /** Retention prune (M6): drop seq pointers ≤ floor (NEVER the head). The blobs
+   *  those versions referenced become GC-collectible if no retained version needs
+   *  them. Authoritative — operates on DO storage. */
+  private async prune(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as { floor?: number };
+    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const curFloor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
+    const target = Math.min(Number(body.floor ?? 0), head - 1); // never prune the head
+    if (!Number.isFinite(target) || target <= curFloor) return json({ pruned: 0, pruneFloor: curFloor });
+    this.ctx.storage.transactionSync(() => {
+      for (let s = curFloor + 1; s <= target; s++) this.ctx.storage.kv.delete(`seq:${s}`);
+      this.ctx.storage.kv.put("pruneFloor", target);
+    });
+    return json({ pruned: target - curFloor, pruneFloor: target });
   }
 
   /** A specific historical version's manifest (M6). */
@@ -155,16 +191,19 @@ export class WorkspaceSync {
 
   private async missingBlobs(shas: string[]): Promise<string[]> {
     const present = new Set<string>();
+    const condemned = new Set<string>();
     for (let i = 0; i < shas.length; i += 80) {
       const chunk = shas.slice(i, i + 80);
       if (chunk.length === 0) break;
-      const rows = await this.env.rbox_dev_db
-        .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")})`)
-        .bind(...chunk)
-        .all<{ sha256: string }>();
+      const ph = chunk.map(() => "?").join(",");
+      const rows = await this.env.rbox_dev_db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
       for (const r of rows.results ?? []) present.add(r.sha256);
+      // GC candidates count as MISSING → forces a re-upload that resurrects them
+      // before any new commit can reference them. Closes the dedup/GC race.
+      const cand = await this.env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+      for (const r of cand.results ?? []) condemned.add(r.sha256);
     }
-    return shas.filter((s) => !present.has(s));
+    return shas.filter((s) => !present.has(s) || condemned.has(s));
   }
 
   // ---- WebSocket fanout (hibernatable) ----

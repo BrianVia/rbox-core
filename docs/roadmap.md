@@ -70,11 +70,13 @@ Opt-in client-side encryption: server stores only ciphertext for blob bodies. De
 - [x] Fresh-hash key derivation, encrypt-to-temp→upload-by-encSha, GCM-tag + plaintext-sha verify on download.
 - [ ] **Full E2EE follow-up** (chosen scope: content-only now): encrypt the MANIFEST too (currently metadata — paths/sizes/plaintext-hashes — is visible to the server); encrypt git artifact blobs (currently `syncGit`+encryption is refused together); passphrase escrow; key rotation. Opt-in `.env` sync rides on this (forced-E2EE).
 
-### 6. Version history, trash, GC (**D7, D10**)
-- [ ] **Time-windowed retention per plan** (Free 7d / Solo 30d / Pro 90d) — prune versions past the account's window, not just "last N".
-- [ ] `rbox versions <path>` / `rbox restore <path>@<n>`.
-- [ ] Soft-delete trash tier before purge (prior-art §4) — recoverable propagated deletes.
-- [ ] Reachability-based GC (walk live manifests + retained versions), trash → purge after grace. **No per-commit ref counting** (the v1 leak).
+### 6. Version history, trash, GC (**D7, D10**) — ✅ DONE & VERIFIED
+Design: [`design/06-versions-gc.md`](./design/06-versions-gc.md). Verified 3/3 (versions/restore) + 9/9 (GC, incl. reachable-blob-survives).
+- [x] `rbox versions [path]` / `rbox restore <path>@<seq>` (restores deleted files from history; decrypts encrypted blobs).
+- [x] **Reachability GC**: barrier-free candidate-tagging — authoritative DO roots, GLOBAL cross-workspace reachability (file `encSha??sha256` + git + manifest shas), **never moves canonical keys**, candidate-aware existence check (re-upload resurrects, closing the dedup/GC race), fail-closed. **No per-commit ref counting.** Admin route `POST /v1/admin/gc?phase=mark|purge`.
+- [x] Soft-delete: deletes recoverable from version history; GC trash = candidate-tagging + grace window before purge.
+- [x] Retention prune in the DO (authoritative; never prunes head).
+- [ ] Plan-gated retention windows (7/30/90d) + Cron-scheduled GC — wire with M7b plans.
 
 ### 7. Multi-tenancy & security
 - [ ] Full D1 schema: accounts, users, devices, memberships, workspaces, projects.
