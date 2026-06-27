@@ -1,6 +1,19 @@
 # Design 07 — Multi-Tenancy & Security (Milestone 7)
 
-**Status:** draft → pending codex (security) review.
+**Status:** v2 — revised after codex security review (v1 NEEDS-PASS, 4 Criticals). The entitlement primitive is kept but made non-bypassable; ownership moves to workspace-creation time; every workspace/blob route is gated; auth becomes role-aware. Pending review #2.
+
+## v2 RESOLUTIONS (the load-bearing security fixes)
+1. **Entitlement is created ONLY by hash-verified upload — never by commit [Critical-1].** `blobPut`/`multipartComplete`, after R2 verifies the bytes hash to the sha, INSERT `blob_refs(account, sha)`. **Commit's blob-existence check is ACCOUNT-SCOPED** against `blob_refs` (not global `blobs`): a manifest referencing a sha the account isn't entitled to → 422 `unsatisfied_blobs` → the client must upload it → upload requires possessing the actual bytes. So B can never gain access to A's content by referencing its sha; B must already have the bytes (in which case there's no secret to leak). Dedup-at-rest still happens (one physical blob) but access is per-account.
+2. **Ownership at CREATION, not first-commit [Critical-3].** Workspaces are created via `POST /v1/workspaces` (authed) → server assigns a **high-entropy** `workspace_id` and records `(workspace_id, account_id)` immutably in D1. `rbox link` calls this (or joins an existing ws the account is a member of). The first commit verifies the workspace is owned by the caller's account; an unowned/foreign ws → 404. No first-arbitrary-commit hijack.
+3. **DO loads immutable owner from D1 [Critical-3].** The DO is NOT an authz boundary by name; on bootstrap it loads the workspace's owner account from D1 and **rejects any caller whose account ≠ owner** (or lacks membership), re-checked per request. The Worker also gates before forwarding.
+4. **Gate EVERY workspace+blob route [Critical-2/4].** `authenticate()` now returns the full principal `{deviceId, accountId, userId, role}` and the router threads it. Gated (404 on cross-account): blobs check/GET/PUT/multipart-*, ws latest/manifests(POST)/manifests/:seq/versions/connect. `roots`/`prune` internal-only (GC). `/v1/admin/gc` platform-internal only. `auth/devices` + revoke scoped to the caller's account.
+5. **404 cross-account, 403 same-account role fail [High-5].** Cross-account = indistinguishable 404/missing, entitlement checked BEFORE any R2 lookup (no timing/existence oracle). 403 only for an authenticated same-account role failure (viewer attempting commit, non-admin audit).
+6. **Roles via device→user→membership [High-6].** `devices` gains `user_id`; bootstrap creates account+user+owner-membership+device; authenticate joins `memberships` → role. Commit uses the AUTHENTICATED device/user (ignore any body `deviceId` for audit/identity). Audit rows written from the authenticated principal after success (+ notable denials).
+
+---
+_v1 draft below (superseded by the resolutions above)._
+
+**Status (v1):** draft → pending codex (security) review.
 **Implements:** roadmap M7. **Decision:** D9 (single bucket, logical isolation).
 **Goal:** real accounts with enforced isolation — a device can only touch workspaces its account is a member of; one tenant can never read another's data. Team roles + audit log.
 
