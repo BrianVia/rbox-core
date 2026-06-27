@@ -24,6 +24,7 @@ export default defineWorkersConfig(async () => {
               CLERK_ISSUER: "https://clerk.test",
               CLERK_JWKS_URL: "https://clerk.test/.well-known/jwks.json",
               CLERK_ALLOWED_ORIGINS: "https://app.test",
+              CLERK_SECRET_KEY: "sk_test_clerk_dummy",
               TEST_MIGRATIONS: migrations,
             },
           },

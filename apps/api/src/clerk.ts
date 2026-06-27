@@ -83,14 +83,13 @@ export async function verifyClerkJWT(env: Env, token: string, nowS: number): Pro
   let key = (await getJwks(env)).find((k) => (k as { kid?: string }).kid === header.kid);
   if (!key) key = (await getJwks(env, true)).find((k) => (k as { kid?: string }).kid === header.kid);
   if (!key) return null;
-  let cryptoKey: CryptoKey;
   try {
-    cryptoKey = await crypto.subtle.importKey("jwk", key, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    const cryptoKey = await crypto.subtle.importKey("jwk", key, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, b64urlToBytes(sig), new TextEncoder().encode(`${h}.${p}`));
+    if (!ok) return null;
   } catch {
-    return null;
+    return null; // malformed key/signature → reject (never 500)
   }
-  const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, b64urlToBytes(sig), new TextEncoder().encode(`${h}.${p}`));
-  if (!ok) return null;
   return { sub: payload.sub };
 }
 
@@ -109,32 +108,37 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
   if (!claims) return json({ error: "unauthorized" }, 401);
   const sub = claims.sub;
 
-  // Map clerk user → rbox account/user. The clerk_users INSERT OR IGNORE is the
-  // single gate: only the WON candidate ids ever materialize (no orphan accounts).
-  const candAcct = randomId("acct", 8);
-  const candUser = randomId("user", 8);
-  await env.rbox_dev_db
-    .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
-    .bind(sub, candAcct, candUser, nowMs)
-    .run();
-  const map = await env.rbox_dev_db
+  // Already provisioned? A clerk_users row only ever exists AFTER the email gate
+  // passed (below), so a returning user is known-verified — no re-check needed.
+  let map = await env.rbox_dev_db
     .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
     .bind(sub)
     .first<{ account_id: string; user_id: string }>();
-  if (!map) return json({ error: "internal" }, 500);
-  const firstLogin = map.account_id === candAcct;
 
-  // Abuse control: first-time provisioning requires a verified email (when the
-  // Clerk Backend API is configured). Roll back the claim if unverified.
-  if (firstLogin && env.CLERK_SECRET_KEY) {
-    if (!(await clerkEmailVerified(env, sub))) {
-      await env.rbox_dev_db.prepare("DELETE FROM clerk_users WHERE clerk_user_id = ? AND account_id = ?").bind(sub, candAcct).run();
+  if (!map) {
+    // First provisioning. Gate on a verified email BEFORE creating anything — run
+    // by EVERY concurrent first-login (it's an idempotent read), so the gate can't
+    // be raced/bypassed by a "loser" that skips it. Fail closed.
+    if (env.CLERK_SECRET_KEY && !(await clerkEmailVerified(env, sub))) {
       return json({ error: "email_unverified" }, 403);
     }
+    // Claim the mapping (INSERT OR IGNORE = the single gate); only the won
+    // candidate ids ever materialize, so a lost race never orphans an account.
+    const candAcct = randomId("acct", 8);
+    const candUser = randomId("user", 8);
+    await env.rbox_dev_db
+      .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
+      .bind(sub, candAcct, candUser, nowMs)
+      .run();
+    map = await env.rbox_dev_db
+      .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
+      .bind(sub)
+      .first<{ account_id: string; user_id: string }>();
+    if (!map) return json({ error: "internal" }, 500);
   }
 
-  // Ensure account/user/membership exist for the resolved ids (idempotent; runs
-  // for winner AND any concurrent loser, so membership is present before minting).
+  // Ensure account/user/membership exist for the resolved ids (idempotent; also
+  // self-heals partial provisioning and guarantees membership before minting).
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO accounts (id, name, plan, created_at) VALUES (?, 'web', 'free', ?)").bind(map.account_id, nowMs).run();
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();

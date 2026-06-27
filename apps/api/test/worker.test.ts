@@ -247,6 +247,16 @@ describe("worker integration (real DO + D1 + R2)", () => {
     fetchMock.activate();
     fetchMock.disableNetConnect();
     fetchMock.get("https://clerk.test").intercept({ path: "/.well-known/jwks.json" }).reply(200, JSON.stringify({ keys: [jwk] })).persist();
+    // Clerk Backend API (email verification): every sub verified EXCEPT "user_unverified".
+    fetchMock
+      .get("https://api.clerk.com")
+      .intercept({ path: /^\/v1\/users\//, method: "GET" })
+      .reply((opts: { path: string }) => {
+        const sub = decodeURIComponent(opts.path.split("/").pop() ?? "");
+        const status = sub === "user_unverified" ? "unverified" : "verified";
+        return { statusCode: 200, data: JSON.stringify({ primary_email_address_id: "e1", email_addresses: [{ id: "e1", verification: { status } }] }) };
+      })
+      .persist();
   });
 
   async function signJwt(payload: Record<string, unknown>, opts: { alg?: string; kid?: string } = {}): Promise<string> {
@@ -306,6 +316,13 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   test("unknown kid → 401", async () => {
     expect((await webExchange(await signJwt(claims({ sub: "u_kid" }), { kid: "nope" }))).status).toBe(401);
+  });
+
+  test("first-login with an UNVERIFIED email → 403 (abuse gate), no account created", async () => {
+    const res = await webExchange(await signJwt(claims({ sub: "user_unverified" })));
+    expect(res.status).toBe(403);
+    // A subsequent call still 403s (no mapping was claimed → gate re-runs).
+    expect((await webExchange(await signJwt(claims({ sub: "user_unverified" })))).status).toBe(403);
   });
 
   const PLAT = { "x-rbox-platform": "test-platform-secret" };
