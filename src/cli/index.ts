@@ -8,6 +8,7 @@ import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-cont
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, listDevices, login, logout, revokeDevice } from "./auth-cmd.js";
 import { encryptWorkspace, exportKey, importKey } from "./crypto-cmd.js";
+import { listVersions, restoreVersion } from "./versions-cmd.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
 
@@ -127,6 +128,23 @@ async function main(): Promise<void> {
       const root = await resolveRoot(flags.path);
       if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
       else await addIgnorePattern(root, positional[0]!);
+      break;
+    }
+    case "versions": {
+      const root = await resolveRoot(flags.path);
+      await listVersions(await loadAuthedConfig(root), positional[0]);
+      break;
+    }
+    case "restore": {
+      const root = await resolveRoot(flags.path);
+      const arg = positional[0] ?? "";
+      const at = arg.lastIndexOf("@");
+      if (at < 1) {
+        console.log("usage: rbox restore <path>@<seq>");
+        process.exitCode = 1;
+        break;
+      }
+      await restoreVersion(root, await loadAuthedConfig(root), arg.slice(0, at), Number(arg.slice(at + 1)));
       break;
     }
     case "encrypt": {

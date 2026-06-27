@@ -230,6 +230,18 @@ export class RboxApi {
     if (!res.ok) throw new Error(`latest failed: ${res.status} ${await res.text()}`);
     return (await res.json()) as { sequence: number; manifest: Manifest };
   }
+
+  async versions(limit = 50): Promise<Array<{ sequence: number; manifest_blob_sha: string; device_id: string | null; created_at: string }>> {
+    const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/versions?limit=${limit}`, { headers: this.auth });
+    if (!res.ok) throw new Error(`versions failed: ${res.status}`);
+    return ((await res.json()) as { versions: [] }).versions;
+  }
+
+  async manifestAt(seq: number): Promise<Manifest> {
+    const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests/${seq}`, { headers: this.auth });
+    if (!res.ok) throw new Error(`manifest@${seq} failed: ${res.status}`);
+    return ((await res.json()) as { manifest: Manifest }).manifest;
+  }
 }
 
 /** Adapts the control plane to the engine's BlobStore interface. */

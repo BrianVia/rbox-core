@@ -40,6 +40,8 @@ export class WorkspaceSync {
     }
     if (action === "latest" && req.method === "GET") return this.latest();
     if (action === "manifests" && req.method === "POST") return this.commit(req, ws, proj);
+    // GET /v1/ws/:ws/proj/:proj/manifests/:seq — a specific historical version.
+    if (seg[5] === "manifests" && seg[6] && req.method === "GET") return this.manifestAt(Number(seg[6]));
     return json({ error: "not_found" }, 404);
   }
 
@@ -129,6 +131,16 @@ export class WorkspaceSync {
 
     this.broadcast(JSON.stringify({ type: "committed", sequence, deviceId: body.deviceId ?? null }), body.deviceId ?? null);
     return json({ sequence, manifestSha: sha });
+  }
+
+  /** A specific historical version's manifest (M6). */
+  private async manifestAt(seq: number): Promise<Response> {
+    if (!Number.isInteger(seq) || seq < 1) return json({ error: "bad_request" }, 400);
+    const sha = this.ctx.storage.kv.get(`seq:${seq}`) as string | undefined;
+    if (!sha) return json({ error: "not_found" }, 404);
+    const obj = await this.env.rbox_dev_blobs.get(manifestKey(sha));
+    if (!obj) return json({ error: "manifest_blob_missing" }, 500);
+    return json({ sequence: seq, manifest: JSON.parse(await obj.text()) });
   }
 
   private async latest(): Promise<Response> {
