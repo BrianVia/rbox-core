@@ -14,6 +14,7 @@ import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { approveDeviceAuth, authenticate, bootstrap, listDevices, pollDeviceAuth, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
+import { retentionPrune } from "./retention.js";
 import { json } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
@@ -43,8 +44,12 @@ async function route(req: Request, env: Env): Promise<Response> {
   // device token. roots/prune are not exposed by the public router (GC calls the DO directly).
   if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
     if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
+    const phase = url.searchParams.get("phase");
+    // Plan-driven retention: set per-workspace prune floors from each account's
+    // tier; mark/purge then reclaim. Operational order: retention → mark → purge.
+    if (phase === "retention") return retentionPrune(env);
     const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
-    return url.searchParams.get("phase") === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
+    return phase === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
   }
   // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N (platform secret; interim until Stripe).
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {

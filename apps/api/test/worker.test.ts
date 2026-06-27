@@ -93,4 +93,26 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const second = await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
     expect(second.status).toBe(402);
   });
+
+  const PLAT = { "x-rbox-platform": "test-platform-secret" };
+
+  test("retention prune is platform-gated (tenant token → 404)", async () => {
+    const a = await bootstrap("acct-ret-gate");
+    const res = await SELF.fetch(`${BASE}/v1/admin/gc?phase=retention`, { method: "POST", headers: authed(a.token) });
+    expect(res.status).toBe(404);
+  });
+
+  test("retention prune runs the plan→floor pass over workspaces (no old versions → 0 pruned)", async () => {
+    // Exercises the workspaces⋈accounts join + per-plan cutoff query. The DO
+    // prune reclaim itself uses ctx.storage.kv (skipped here; verified live, M6) —
+    // with no committed versions there's nothing past the window, so no DO call.
+    const a = await bootstrap("acct-ret");
+    await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
+    const res = await SELF.fetch(`${BASE}/v1/admin/gc?phase=retention`, { method: "POST", headers: PLAT });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; workspaces: number; pruned: number };
+    expect(body.ok).toBe(true);
+    expect(body.workspaces).toBeGreaterThanOrEqual(1); // our workspace was in the pass
+    expect(body.pruned).toBe(0); // nothing old enough to prune
+  });
 });
