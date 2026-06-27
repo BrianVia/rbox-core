@@ -6,7 +6,7 @@
 - Unlimited devices
 - 1 workspace
 - 5 projects
-- 7-day version history
+- No version history (current state only — upgrade for history)
 
 ### Solo
 - $8/mo
