@@ -235,6 +235,13 @@ async function main(): Promise<void> {
       break;
     }
     default:
+      // Bare `rbox` in a terminal → the guided onboarding menu (setup / connect /
+      // log in). Non-interactive or `rbox help` → the command list (never hangs).
+      if (!cmd && process.stdin.isTTY) {
+        const { runMenu } = await import("./menu-cmd.js");
+        await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+        break;
+      }
       console.log(`rbox — dev-aware sync\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
