@@ -75,7 +75,9 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
     "metadata[account_id]": p.accountId,
     // Bind the subscription to the account so webhooks can map it back.
     "subscription_data[metadata][account_id]": p.accountId,
-    ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : { customer_creation: "always" }),
+    // Reuse the account's customer if it has one; in subscription mode Stripe
+    // auto-creates a customer otherwise (customer_creation is payment-mode only).
+    ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : {}),
   });
   return json({ url: session.url });
 }
