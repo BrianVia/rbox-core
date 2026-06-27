@@ -68,6 +68,56 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
 - Result with the recipe: branches + staged state identical across machines, `git fsck --connectivity-only` clean.
 - Working-tree files (tracked edits + untracked) sync as NORMAL rbox files — they are NOT part of the git artifacts. The git section adds history/refs/index/HEAD/op-state only.
 
+## 2026-06-26 — M8 (hydration brain) DONE — the dev-aware wedge
+
+- **The wedge:** don't sync regenerable dep dirs (node_modules/target/.venv —
+  builtin-ignored); sync the lockfile and reconstruct via the package manager.
+  `detect` (pure) / `hydrate` (executor) / `doctor` (pure advisory).
+- **Trust boundary (the whole milestone, per codex):** "trusted = the ARGV we
+  run, untrusted = everything the synced tree supplies." We run a FIXED in-binary
+  argv keyed by detected lockfile — never a string from synced content, never a
+  shell. But `npm ci`/`pnpm install` themselves execute repo-controlled lifecycle
+  scripts, and pip/poetry/bundler/cargo-build compile sdists/native ext = repo
+  code that CAN'T be disabled. So: **lifecycle scripts off by default**
+  (`--ignore-scripts` where supported), and ecosystems whose dep step inherently
+  runs code (`fetchRunsCode`) are **blocked behind `--allow-build`**. `cargo
+  fetch`/`go mod download`/bun-default run no repo code → auto-runnable.
+- **The package-manager binary is itself an attack surface.** A synced tree can
+  ship `./pnpm`, or a PATH entry can point inside the workspace. Resolve tools
+  from PATH with **realpath containment**: reject the binary if its realpath — or
+  the PATH dir's realpath — is inside the workspace (defeats symlinks). Verified:
+  a planted malicious `./npm` first on PATH did NOT run.
+- **The package manager has MORE repo-code vectors than lifecycle scripts** (codex
+  v2 P1s): yarn `.yarnrc.yml` carries `yarnPath` (repo-shipped binary) AND
+  `plugins` (repo .js loaded at startup) — no flag fully neutralizes plugins, so
+  its presence GATES auto-run behind `--allow-build` (+ `YARN_IGNORE_PATH=1` when
+  it does run). pnpm runs `.pnpmfile.cjs` even with `--ignore-scripts` → must also
+  pass `--ignore-pnpmfile`. Lesson: per-manager, enumerate EVERY repo-controlled
+  config/hook, not just lifecycle scripts. corepack-DOWNLOADED pinned versions
+  (npm-registry-signed) are an accepted residual.
+- **Containment must be checked at the moment of use:** realpath the spawn cwd and
+  assert it's inside the workspace IMMEDIATELY before spawn, not via lexical
+  path.join — a symlinked project dir could otherwise escape.
+- **Probe versions from a NEUTRAL cwd** (`os.tmpdir`), never the project dir, so
+  project-local version-manager shims (.nvmrc/.tool-versions/.npmrc) can't steer
+  the probe.
+- **Never silently pick among multiple lockfiles.** Multiple node lockfiles in
+  one dir = `ambiguous`; resolve only via `package.json#packageManager` or
+  `--manager`, else refuse. Picking one could hydrate a graph the project doesn't
+  use. (Workspaces are NOT this case — they keep ONE lockfile at the root, so
+  lockfile-location-driven detection is workspace-correct for free.)
+- **Prefetch ≠ reconstruction:** cargo/go populate a GLOBAL cache, not `target/`/
+  a workspace dir (`installDir: null`). Don't promise dir reconstruction for them.
+- **Doctor stays advisory:** hard-fail missing tools / incompatible majors; WARN
+  (never fail) on semver ranges too complex to cheaply decide (`minMajor → null`).
+  Full semver-range satisfaction is a rabbit hole; major/minimum is the pragmatic
+  line.
+- Generated artifacts hydrate creates (`.pnpm-store/`, `vendor/bundle/`) must be
+  added to `BUILTIN_IGNORE` or the daemon re-uploads them. (Yarn PnP `.yarn/` is
+  intentionally committed by some projects → left syncable.)
+- Recipes (`rbox.yml` custom commands) deliberately NOT implemented — the safest
+  default is "only the inferred allowlist runs."
+
 ## 2026-06-26 — M7c (onboarding UX) DONE; zero-dep, OpenTUI deferred
 
 - **Defer the heavy runtime; ship the pure core.** Codex confirmed OpenTUI isn't

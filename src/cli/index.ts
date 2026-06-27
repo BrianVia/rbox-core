@@ -44,6 +44,26 @@ async function main(): Promise<void> {
       await runInit(flags, { cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
       break;
     }
+    case "detect": {
+      // Hydration works on any directory — it does not require a linked workspace.
+      const { detectCmd } = await import("./hydrate-cmd.js");
+      await detectCmd(path.resolve(positional[0] ?? process.cwd()), flags.manager);
+      break;
+    }
+    case "doctor": {
+      const { doctorCmd } = await import("./hydrate-cmd.js");
+      await doctorCmd(path.resolve(positional[0] ?? process.cwd()));
+      break;
+    }
+    case "hydrate": {
+      const { hydrateCmd } = await import("./hydrate-cmd.js");
+      await hydrateCmd(path.resolve(positional[0] ?? process.cwd()), {
+        allowBuild: flags["allow-build"] === "true",
+        manager: flags.manager,
+        only: flags.only,
+      });
+      break;
+    }
     case "link": {
       const root = path.resolve(positional[0] ?? process.cwd());
       const remoteUrl = flags.remote ?? DEFAULT_REMOTE;
@@ -207,7 +227,7 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      console.log(`rbox — dev-aware sync\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync`);
+      console.log(`rbox — dev-aware sync\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }

@@ -103,10 +103,12 @@ Design: [`design/07c-onboarding-tui.md`](./design/07c-onboarding-tui.md). Two co
 - [x] Secrets stay builtin-ignored (the v1 "sync secrets" toggle was cut — plaintext manifest leaks metadata; opt-in *encrypted* secrets sync moved under the full-E2EE milestone).
 - [ ] **OpenTUI** ([opentui.com](https://opentui.com/)) — deferred (codex-confirmed): adopt only when there's genuine non-linear UI value (multi-workspace picker, conflict preview, live transfer table). Slots in as a presentation layer over the same `resolveInitPlan` core.
 
-### 8. Hydration brain (the dev-aware wedge)
-- [ ] Project detection (package.json, Cargo.toml, go.mod, …) + package-manager inference.
-- [ ] `rbox hydrate` (npm ci / pnpm i / cargo fetch / …) — synced `rbox.yml` commands treated as untrusted (**Security rule 7**).
-- [ ] `rbox doctor` — host vs project readiness.
+### 8. Hydration brain (the dev-aware wedge) — ✅ DONE
+Design: [`design/08-hydration.md`](./design/08-hydration.md). Codex NEEDS-PASS (6 must-fix) resolved; live-verified (node/python multi-project tree).
+- [x] **`rbox detect`** — pure `detectProjects(fileList)` over a fixed lockfile allowlist (pnpm/yarn/bun/npm/cargo/go/uv/poetry/bundler); workspace-root-correct (one lockfile per workspace), ambiguity hard-flagged, monorepo per-dir.
+- [x] **`rbox hydrate`** — runs the inferred argv (no shell); **lifecycle/build scripts off by default** (`--ignore-scripts`); ecosystems that compile repo code (pip/poetry/bundler) blocked behind `--allow-build`; ambiguous node lockfiles refused unless `package.json#packageManager`/`--manager`. Tool resolved from PATH with **realpath containment** (repo-local `./npm` rejected — verified). `rbox.yml` recipes NOT implemented (safest default). Security rule 7 honored.
+- [x] **`rbox doctor`** — advisory host-vs-project readiness (tool presence + runtime major/minimum); warns (never fails) on undecidable ranges; probes from a neutral cwd (no project-local code). 20 unit tests.
+- Generated artifacts (`.pnpm-store/`, `vendor/bundle/`) added to `BUILTIN_IGNORE`.
 
 ### 9. Hardening & scale
 - [ ] Monorepo scale: per-subtree manifests, incremental scan; measure cold-scan cost on a real `~/Development`.

@@ -22,6 +22,11 @@ export const BUILTIN_IGNORE: string[] = [
   ".cache/",
   "coverage/",
   "target/",
+  // Generated package-manager artifacts (hydration reconstructs these — design 08;
+  // must be ignored or `rbox hydrate` output would be re-uploaded). NB: Yarn PnP's
+  // `.yarn/` is intentionally committed by some projects, so it's NOT ignored here.
+  ".pnpm-store/",
+  "vendor/bundle/",
   ".DS_Store",
   // Secrets: excluded by default; opt-in sync is E2EE-only (not in Phase 1).
   ".env",
