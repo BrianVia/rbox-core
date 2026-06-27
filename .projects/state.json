@@ -1,5 +1,15 @@
 {
   "version": 1,
-  "providers": {},
-  "resources": {}
+  "providers": {
+    "clerk": {
+      "name": "Clerk"
+    }
+  },
+  "resources": {
+    "rbox": {
+      "name": "rbox",
+      "providerName": "Clerk",
+      "serviceId": "auth"
+    }
+  }
 }

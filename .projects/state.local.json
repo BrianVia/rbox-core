@@ -1,12 +1,37 @@
 {
   "version": 1,
   "project": {
-    "merchantId": "acct_1Tn2iOAPKpwtC3xY",
+    "initializedAt": "2026-06-27T21:19:21.552Z",
     "merchantDisplayName": null,
+    "merchantId": "acct_1Tn2iOAPKpwtC3xY",
     "projectId": "project_61UwRabDnIuRMuC7616UwQfk1FSQCGlFD2ByDT840VFo",
-    "projectName": "rbox-core",
-    "initializedAt": "2026-06-27T21:19:21.552Z"
+    "projectName": "rbox-core"
   },
-  "providers": {},
-  "resources": {}
+  "providers": {
+    "clerk": {
+      "accountRequestId": "facctrq_61UwRh6Zj3XysFCXU16UwQfk1FSQCGlFD2ByDT8400GO",
+      "configuration": {},
+      "linkedAt": "2026-06-27T21:26:06.226Z",
+      "providerId": "prvdr_61UGOeSW4e0T9Etwn537w",
+      "providerName": "Clerk",
+      "redirectUrl": null,
+      "requestedAt": "2026-06-27T21:26:06.226Z",
+      "status": "complete"
+    }
+  },
+  "resources": {
+    "rbox": {
+      "configuration": {
+        "app_name": "rbox"
+      },
+      "createdAt": "2026-06-27T21:26:09.170Z",
+      "lastRevealedAt": "2026-06-27T21:26:09.385Z",
+      "lastStatus": "complete",
+      "name": "rbox",
+      "providerId": "prvdr_61UGOeSW4e0T9Etwn537w",
+      "providerName": "Clerk",
+      "resourceId": "fres_61UwRh8ofnIVgUFCd16UwQfk1FSQCGlFD2ByDT8400aG",
+      "serviceId": "auth"
+    }
+  }
 }
