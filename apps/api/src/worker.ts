@@ -33,6 +33,23 @@ export default {
       return jsonResponse({ error: "internal", message: String((e as Error)?.message ?? e) }, 500);
     }
   },
+  /**
+   * Scheduled GC (cron). Plan-driven retention prune → mark → purge, in order:
+   * retention sets each workspace's prune floor from its account's plan, mark
+   * tags now-unreachable canonical objects past a grace window, purge deletes
+   * those still unreachable (and decrements usage). Idempotent + fail-safe; a
+   * thrown phase is logged and the next run retries.
+   */
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    const GRACE_MS = 60 * 60 * 1000; // protect brand-new uploads for 1h
+    try {
+      await retentionPrune(env);
+      await gcMark(env, GRACE_MS);
+      await gcPurge(env, GRACE_MS);
+    } catch (e) {
+      console.error("scheduled GC failed (will retry next run):", String((e as Error)?.message ?? e));
+    }
+  },
 };
 
 async function route(req: Request, env: Env): Promise<Response> {

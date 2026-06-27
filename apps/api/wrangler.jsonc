@@ -18,5 +18,8 @@
   "durable_objects": {
     "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
+  "triggers": {
+    "crons": ["0 4 * * *"]
+  }
 }
