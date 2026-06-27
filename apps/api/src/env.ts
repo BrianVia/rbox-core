@@ -14,4 +14,13 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Base URL for checkout success/cancel redirects (e.g. https://rbox.to). */
   RBOX_APP_URL?: string;
+  /** Clerk web auth (M11). Issuer = https://<frontend-api>; /v1/web/session 501s
+   *  when CLERK_ISSUER is unset (feature-gated). */
+  CLERK_ISSUER?: string;
+  /** JWKS URL; defaults to `${CLERK_ISSUER}/.well-known/jwks.json` when unset. */
+  CLERK_JWKS_URL?: string;
+  /** Clerk Backend API secret (optional — only for fetching the user's email). */
+  CLERK_SECRET_KEY?: string;
+  /** CSV allowlist of acceptable `azp` (origins) on the Clerk session JWT. */
+  CLERK_ALLOWED_ORIGINS?: string;
 }

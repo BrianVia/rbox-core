@@ -21,6 +21,9 @@ export default defineWorkersConfig(async () => {
               // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
               // deliberately ABSENT (so checkout/portal exercise the 501 gate).
               STRIPE_WEBHOOK_SECRET: "whsec_test_secret",
+              CLERK_ISSUER: "https://clerk.test",
+              CLERK_JWKS_URL: "https://clerk.test/.well-known/jwks.json",
+              CLERK_ALLOWED_ORIGINS: "https://app.test",
               TEST_MIGRATIONS: migrations,
             },
           },

@@ -16,6 +16,7 @@ import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevice
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
+import { webSession } from "./clerk.js";
 import { json } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
@@ -83,6 +84,8 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);
   // Stripe webhook is PUBLIC but signature-verified (exact route).
   if (req.method === "POST" && eq(seg, ["v1", "stripe", "webhook"])) return stripeWebhook(req, env, Date.now());
+  // Web auth: exchange a Clerk session JWT for an rbox web session (PUBLIC, exact).
+  if (req.method === "POST" && eq(seg, ["v1", "web", "session"])) return webSession(req, env, Date.now());
 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);

@@ -225,6 +225,89 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await usage.json()) as { plan: string }).plan).toBe("free"); // fail-closed
   });
 
+  // ── web auth via Clerk (M11) ─────────────────────────────────────────────
+
+  // Generate a test RSA key, publish it as the JWKS, and sign Clerk-like JWTs.
+  const b64url = (buf: ArrayBuffer | Uint8Array) => {
+    const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    let s = ""; for (const x of b) s += String.fromCharCode(x);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  };
+  let priv: CryptoKey;
+  const KID = "test-kid-1";
+  const ISS = "https://clerk.test";
+  const AZP = "https://app.test";
+
+  beforeAll(async () => {
+    const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
+    priv = pair.privateKey;
+    const jwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & { kid?: string; use?: string; alg?: string };
+    jwk.kid = KID; jwk.use = "sig"; jwk.alg = "RS256";
+    const { fetchMock } = await import("cloudflare:test");
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock.get("https://clerk.test").intercept({ path: "/.well-known/jwks.json" }).reply(200, JSON.stringify({ keys: [jwk] })).persist();
+  });
+
+  async function signJwt(payload: Record<string, unknown>, opts: { alg?: string; kid?: string } = {}): Promise<string> {
+    const header = { alg: opts.alg ?? "RS256", kid: opts.kid ?? KID, typ: "JWT" };
+    const h = b64url(new TextEncoder().encode(JSON.stringify(header)));
+    const p = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+    if (header.alg === "none") return `${h}.${p}.`;
+    const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", priv, new TextEncoder().encode(`${h}.${p}`));
+    return `${h}.${p}.${b64url(sig)}`;
+  }
+  const now = () => Math.floor(Date.now() / 1000);
+  const claims = (over: Record<string, unknown> = {}) => ({ iss: ISS, sub: "user_clerk_1", azp: AZP, exp: now() + 60, nbf: now() - 5, ...over });
+  const webExchange = (token: string) =>
+    SELF.fetch(`${BASE}/v1/web/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
+
+  test("valid Clerk JWT → rbox web session token that authenticates", async () => {
+    const res = await webExchange(await signJwt(claims()));
+    expect(res.status).toBe(200);
+    const { token, accountId } = (await res.json()) as { token: string; accountId: string };
+    expect(accountId.startsWith("acct_")).toBe(true);
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(token) });
+    expect(usage.status).toBe(200);
+  });
+
+  test("same Clerk user logging in twice reuses the SAME account (idempotent)", async () => {
+    const a1 = (await (await webExchange(await signJwt(claims({ sub: "user_dup" })))).json()) as { accountId: string };
+    const a2 = (await (await webExchange(await signJwt(claims({ sub: "user_dup" })))).json()) as { accountId: string };
+    expect(a1.accountId).toBe(a2.accountId);
+  });
+
+  test("forged signature → 401", async () => {
+    const t = await signJwt(claims({ sub: "user_forge" }));
+    const tampered = t.slice(0, -4) + (t.slice(-4) === "AAAA" ? "BBBB" : "AAAA");
+    expect((await webExchange(tampered)).status).toBe(401);
+  });
+
+  test("alg:none → 401 (algorithm-confusion guard)", async () => {
+    expect((await webExchange(await signJwt(claims({ sub: "u_none" }), { alg: "none" }))).status).toBe(401);
+  });
+
+  test("wrong issuer → 401", async () => {
+    expect((await webExchange(await signJwt(claims({ sub: "u_iss", iss: "https://evil.test" })))).status).toBe(401);
+  });
+
+  test("expired token → 401", async () => {
+    expect((await webExchange(await signJwt(claims({ sub: "u_exp", exp: now() - 120 })))).status).toBe(401);
+  });
+
+  test("disallowed azp (origin) → 401", async () => {
+    expect((await webExchange(await signJwt(claims({ sub: "u_azp", azp: "https://evil.test" })))).status).toBe(401);
+  });
+
+  test("absent azp → 401 (web route requires origin binding)", async () => {
+    const c = claims({ sub: "u_noazp" }); delete (c as Record<string, unknown>).azp;
+    expect((await webExchange(await signJwt(c))).status).toBe(401);
+  });
+
+  test("unknown kid → 401", async () => {
+    expect((await webExchange(await signJwt(claims({ sub: "u_kid" }), { kid: "nope" }))).status).toBe(401);
+  });
+
   const PLAT = { "x-rbox-platform": "test-platform-secret" };
 
   test("retention prune is platform-gated (tenant token → 404)", async () => {

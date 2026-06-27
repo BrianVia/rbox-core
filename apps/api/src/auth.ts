@@ -43,9 +43,9 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
     .prepare(
       `SELECT d.device_id, d.account_id, d.user_id, d.last_seen_at, m.role AS role
        FROM devices d LEFT JOIN memberships m ON m.account_id = d.account_id AND m.user_id = d.user_id
-       WHERE d.token_hash = ? AND d.revoked = 0`
+       WHERE d.token_hash = ? AND d.revoked = 0 AND (d.expires_at IS NULL OR d.expires_at > ?)`
     )
-    .bind(hash)
+    .bind(hash, Date.now())
     .first<{ device_id: string; account_id: string; user_id: string | null; last_seen_at: number | null; role: string | null }>();
   if (!row) return null;
   const now = Date.now();
@@ -55,15 +55,25 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer" };
 }
 
-/** Mint a device token into a specific account/user (returns the plaintext once). */
-async function mintDevice(env: Env, accountId: string, userId: string, deviceId: string, label: string | null): Promise<string> {
+/** Mint a device token into a specific account/user (returns the plaintext once).
+ *  `expiresAt` (epoch ms) makes it a short-lived token (web sessions); omit for
+ *  durable CLI/device tokens. */
+async function mintDevice(env: Env, accountId: string, userId: string, deviceId: string, label: string | null, expiresAt: number | null = null): Promise<string> {
   const token = randomHex(TOKEN_BYTES);
   const hash = await sha256Hex(token);
   await env.rbox_dev_db
-    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(hash, deviceId, label, accountId, userId, Date.now())
+    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(hash, deviceId, label, accountId, userId, Date.now(), expiresAt)
     .run();
   return token;
+}
+
+/** Mint a SHORT-LIVED web session token (M11) for a Clerk-authenticated user.
+ *  Returns the plaintext once; expires after `ttlMs` (default 1h). */
+export async function createWebSession(env: Env, accountId: string, userId: string, ttlMs = 60 * 60 * 1000): Promise<{ token: string; deviceId: string }> {
+  const deviceId = `web_${randomHex(4)}`;
+  const token = await mintDevice(env, accountId, userId, deviceId, "web", Date.now() + ttlMs);
+  return { token, deviceId };
 }
 
 // ---- pairing tokens (M10): low-friction "connect a new machine" ----
