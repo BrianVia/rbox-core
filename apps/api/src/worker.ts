@@ -57,7 +57,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const seg = url.pathname.split("/").filter(Boolean);
 
-  if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-dev-api" });
+  if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-api" });
 
   // Platform-only internal op (M7): GC requires the PLATFORM secret, NOT a tenant
   // device token. roots/prune are not exposed by the public router (GC calls the DO directly).

@@ -21,5 +21,30 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
   "triggers": {
     "crons": ["0 4 * * *"]
+  },
+  // Production environment: separate worker (rbox-prod-api) + its own D1/R2/DO,
+  // served at api.rbox.to. Binding NAMES are kept identical to dev so the code is
+  // env-agnostic; only the underlying resources differ.
+  "env": {
+    "production": {
+      "name": "rbox-prod-api",
+      // Keep the workers.dev URL too (fallback + lets us verify before api.rbox.to
+      // DNS propagates). api.rbox.to activates once the zone is live on Cloudflare.
+      "workers_dev": true,
+      "d1_databases": [
+        {
+          "binding": "rbox_dev_db",
+          "database_name": "rbox-prod-db",
+          "database_id": "c6b3e6ab-4130-4c9b-8f77-cdae47745c5c"
+        }
+      ],
+      "r2_buckets": [{ "binding": "rbox_dev_blobs", "bucket_name": "rbox-prod-blobs" }],
+      "durable_objects": {
+        "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
+      "triggers": { "crons": ["0 4 * * *"] },
+      "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]
+    }
   }
 }
