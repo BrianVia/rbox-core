@@ -59,6 +59,22 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-api" });
 
+  // Public installer: `curl -fsSL https://api.rbox.to/install.sh | sh` (from R2).
+  if (url.pathname === "/install.sh" && req.method === "GET") {
+    const obj = await env.rbox_dev_blobs.get("releases/install.sh");
+    if (!obj) return jsonResponse({ error: "not_found" }, 404);
+    return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" } });
+  }
+  // Public release binaries, served from R2 under releases/. Name is validated to
+  // a fixed shape (no path traversal); 404 if absent.
+  if (seg[0] === "bin" && seg.length === 2 && req.method === "GET") {
+    const name = seg[1]!;
+    if (!/^rbox-(darwin|linux)-(arm64|x64)$/.test(name)) return jsonResponse({ error: "not_found" }, 404);
+    const obj = await env.rbox_dev_blobs.get(`releases/${name}`);
+    if (!obj) return jsonResponse({ error: "not_found" }, 404);
+    return new Response(obj.body, { headers: { "content-type": "application/octet-stream", "content-disposition": `attachment; filename="rbox"`, "cache-control": "public, max-age=3600" } });
+  }
+
   // Platform-only internal op (M7): GC requires the PLATFORM secret, NOT a tenant
   // device token. roots/prune are not exposed by the public router (GC calls the DO directly).
   if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
