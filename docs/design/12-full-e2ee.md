@@ -1,6 +1,116 @@
 # Design 12 — Full End-to-End Encryption (zero-knowledge server)
 
-**Status:** v1 — DRAFT for codex adversarial (cryptography/security) review.
+**Status:** v2 — revised after codex adversarial crypto review (NEEDS-PASS → resolved below). v1 body kept for context; §§ marked **[v2]** supersede it.
+
+## v2 — Resolutions to codex review (these are normative)
+
+### R1 [v2] — Authenticated commit chain (replaces the cross-check-only envelope)
+The envelope was unauthenticated → a malicious server could roll back, fork,
+relabel old manifests as new, or lie about head/seq. **Fix: a signed, hash-
+chained commit object.** The client builds:
+```
+commitBody = canonicalJSON({
+  version: 2, accountId, workspaceId,
+  parentSeq, parentCommitHash,         // hash chain → rollback/splice-evident
+  deviceId, keyEpoch,
+  encManifestSha,
+  blobRefs: sortedUnique([{ encSha, size }]),
+})
+commitHash = SHA256(commitBody)
+sig        = Ed25519.sign(deviceSigningKey, commitHash)   // P-256 ECDSA fallback (WebCrypto)
+```
+The server stores `commitBody + sig + commitHash` (still can't decrypt) and
+returns the chain. **Clients verify from genesis**: each `parentCommitHash`
+links to the prior `commitHash`; each `sig` verifies against a **device signing
+pubkey** in the workspace's **device roster** (itself authenticated under
+MK/KEK — see R3); and the client **pins the latest accepted `commitHash`
+locally** per workspace (reject any head that isn't a descendant of the pin).
+The decrypted-manifest `blobRefs` cross-check stays as an internal consistency
+check, not the auth mechanism.
+**Honest residual:** a hash chain is rollback-*evident*, not rollback-*proof* —
+it's caught only by a client with a pinned head, or when two devices compare
+heads. A *fresh recovery-only device* can still be served an old valid prefix.
+Mitigation: a signed monotonic **checkpoint** (highest `seq`+`commitHash`,
+HMAC'd under `HKDF(KEK,"checkpoint/v1")`, refreshed on each commit) that any
+device re-derives and compares; true defense (transparency log / external
+witness) is noted as future.
+
+### R2 [v2] — Pairing: split lookup from secret (raw secret never reaches server)
+v1 reused M10's token, but M10 redeem sends the **raw token** to the server
+(`auth.ts:126`) — fatal if that token also derives the MK-wrap key. **Fix:**
+token = `tokenId.tokenSecret`.
+- Server stores `{ tokenId → sha256(tokenSecret), pairing_mk_wrap }` and, on
+  redeem, receives **`tokenId` + `sha256(tokenSecret)`** (the lookup/auth proof),
+  never `tokenSecret`. Constant-time compare to the stored hash.
+- The client derives the MK-wrap key from `tokenSecret` **locally**
+  (`HKDF(tokenSecret, "rbox/mk-wrap/v1")`) → unwraps MK. The server, lacking
+  `tokenSecret`, cannot derive it.
+- `pairing_mk_wrap` is **single-use** (deleted on successful redeem) + short TTL,
+  bounding exposure.
+**Residual (documented):** no forward secrecy — if `tokenSecret` later leaks
+(scrollback) within the (now-deleted-on-use) window, MK could be unwrapped.
+Stronger option (future): token-authenticated ephemeral HPKE instead of a stored
+MK wrap. The device-code path (M4) gets the same split-secret treatment.
+
+### R3 [v2] — Exact crypto parameters (no hand-rolled primitives)
+- **Key separation via HKDF-SHA256 with versioned domains**, never reuse a key
+  across purposes: `rbox/blob/v1`, `rbox/manifest/v1`, `rbox/commit-auth/v1`,
+  `rbox/checkpoint/v1`, `rbox/mk-wrap/v1`, `rbox/kek-wrap/v1`. MK is **never used
+  directly** as an AES key — only as HKDF input material.
+- **AEAD:** AES-256-GCM, **fresh random 96-bit nonce per encryption**, with
+  **AAD binding** `{ accountId, workspaceId|deviceId, keyEpoch, alg:"A256GCM", purpose }`.
+- **Device MK-wrap:** RSA-OAEP-SHA256 (≥3072-bit) for portability across
+  WebCrypto/Workers/Bun (or audited **HPKE** if X25519 available). Device key is
+  encryption-only.
+- **Signing:** separate **Ed25519** (P-256 ECDSA via WebCrypto where Ed25519
+  isn't available). Never reuse the encryption keypair for signing.
+- **Recovery KDF:** the recovery phrase is a **generated high-entropy** 24-word
+  BIP39 string = 256-bit recovery key RK (full entropy → used directly; Argon2id
+  only if we ever allow a user-chosen passphrase, params m=256MiB,t=3,p=1). MK is
+  wrapped under RK.
+- **Manifest key** = `HKDF(KEK,"rbox/manifest/v1")`, distinct from blob keys,
+  **random nonce per commit** (not convergent — manifests must not be
+  dedup-correlatable).
+
+### R4 [v2] — Honest zero-knowledge claims (supersede §0's overclaim)
+The server **does** learn, even fully E2EE: blob **count** per commit, the
+**ciphertext-size multiset**, **encrypted-manifest size**, **commit cadence**,
+**per-device cadence**, **same-workspace ciphertext equality** (a within-
+workspace "does blob X exist" confirmation oracle, from convergent encryption),
+and **churn over time**. It does **not** learn names/paths/contents/structure/
+git refs, and **cross-account `encSha` correlation is gone** (random per-
+workspace KEK). "Hides tree structure / per-file sizes" in §0 is **downgraded**:
+per-file *plaintext* sizes are hidden, but ciphertext sizes (≈plaintext +tag)
+and their distribution are visible. Size-bucketing/padding + cover traffic are
+future hardening, not claimed now.
+
+### R5 [v2] — Server keeps resource limits (despite opaque manifests)
+Dropping `validateManifest` is fine for *path-safety* (client validates post-
+decrypt) ONLY if the server still hard-caps, per commit: envelope JSON size,
+`blobRefs` **count**, `encManifest` blob size, `encSha` format (`^[0-9a-f]{64}$`),
+total per-commit bytes, and GC scan cost. **Quota bills the actual stored R2
+ciphertext size**, never the client-supplied `size` (the client value is advisory
+for GC math only and is re-checked against R2 on upload).
+
+### R6 [v2] — Fail-closed recovery, downgrade, and real rotation
+- **Recovery phrase**: generated high-entropy (R3), shown once at setup with a
+  forced "no escrow — save this" ack. `rbox key backup` re-shows it only from the
+  locally-cached RK (encrypted under the device key); if not cached, it can't be
+  re-derived (use an existing phrase/device).
+- **Fail closed**: clients reject v1/plaintext-manifest commits, reject missing/
+  unknown keys, reject changed KDF/alg metadata, **never** "repair" by uploading
+  plaintext, **never** accept a server-driven downgrade to non-E2EE.
+- **Real revocation = rotation**, not just dropping a wrap: revoking a
+  device/phrase requires a **new `keyEpoch`** — generate a fresh KEK, re-wrap MK/
+  KEK, and re-encrypt (lazily on next write, or eagerly) under the new epoch.
+  Data written under the old epoch stays readable by anyone who held the old KEK,
+  so rotation protects **future** data; full protection needs re-encryption of
+  history. `keyEpoch` is in `commitBody` so clients select the right KEK.
+
+---
+(Original v1 spec follows; superseded where it conflicts with R1–R6 above.)
+
+**Status (v1):** DRAFT for codex adversarial (cryptography/security) review.
 
 **Implements:** the deferred "full E2EE" milestone flagged in M5. Goal: the rbox
 server (Workers + D1 + R2) becomes a **dumb encrypted-blob store + commit
