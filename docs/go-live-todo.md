@@ -53,6 +53,13 @@ this is what's left to flip the switch to a real, paid, public product.
 - [ ] **Decide where `apps/web` is hosted** (Cloudflare Pages vs local) → set `CLERK_ALLOWED_ORIGINS` to that exact origin (azp is enforced). Dev Clerk instance is `certain-ray-33.clerk.accounts.dev`.
 - [ ] Real end-to-end sign-in test (needs a browser — your step).
 
+## 📊 Perf & observability (post-dogfood, 2026-06-29)
+See **`docs/benchmarking-and-observability.md`** for the full plan. Tracked work:
+- [ ] **Observability instrumentation** — wrap R2/D1/commit in timing, emit to Workers Analytics Engine, dashboard commit-latency + commit-body-size + blobs/commit + missingBlobs ratio. ("What's slow in prod" without guessing.)
+- [ ] **Benchmark harness (Tier 1)** — fixtures (small/medium/large, with duplicate + empty files), sweep upload concurrency 8→64, measure cold push / cold clone / warm no-op + p50/p99 per-blob latency. Find the real optimal concurrency (16 was a blind default).
+- [ ] **Commit-body scaling** — blobRefs are inlined in the *signed* commit body (~85B each); raised the cap to 1MB (≈12k blobs) but a 50k-file monorepo needs blobRefs moved OUT of the body into a side R2 object referenced by hash. Architectural — design + codex review first.
+- [ ] (later) Two-machine Apple `container` Linux bench for real end-to-end convergence + Linux watcher validation.
+
 ## 🚧 Needs the human
 - [ ] Point **`rbox.to` nameservers** at Cloudflare → custom domain `api.rbox.to` for `rbox-prod-api` (until then it's `rbox-prod-api.brian-via.workers.dev`)
 - [ ] (Optional) create `acct_1Tn2iO` **test-mode** catalog too, so prod's test mode matches live (today test billing uses the separate `acct_1Tn3UN` sandbox)
