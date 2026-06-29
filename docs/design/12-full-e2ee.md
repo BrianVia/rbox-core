@@ -603,7 +603,29 @@ the server rejects v1 (plaintext-manifest) commits.
 
 **Status:** plan reviewed by codex (NEEDS-PASS → all 8 BLOCKER + 4 SHOULD-FIX
 resolved in §13.12, two confirm rounds → **PASS**). §13.12 is normative and
-amends §13.1–13.11. Ready to implement.
+amends §13.1–13.11.
+
+**Build status:** the transport + crypto glue are IMPLEMENTED + PROVEN.
+- Engine pull-verify glue: `verifyAccount` (pinnable head facts + authorized
+  MK-wrap-hash set), `verifyCommitChain` (C1 chain-descent/anti-rollback),
+  `openCommit` disjunctive reject (C4), `assertMkWrapAuthorized` (C7). [tested]
+- `src/cli/e2ee-keystore.ts`: device/MK/per-epoch-KEK store, opt-in recovery
+  caching (C9), partial-state detection (C10), anti-rollback `HeadPin` (C2). [tested]
+- `.rbox/` hard, non-overridable ignore (C8). [tested]
+- Server deltas (C1/C3/C4/C5/C6) on `apps/api/`. [tested]
+- `src/cli/e2ee-remote.ts` `E2eeRemote implements SyncRemote`: transparent
+  encrypt/decrypt + signed-commit chain + KEK CAS (C3) + head pinning. PROVEN by
+  `e2ee-sync.test.ts` through the REAL `sync.ts`: two machines (A push, B pair-in
+  + pull byte-identical), bidirectional convergence, ZERO plaintext in everything
+  the faithful server stores. `RboxApi` implements the production HTTP `E2eeApi`.
+
+**Remaining (interactive UX + live verification):** the user-facing commands —
+`login --bootstrap` (show recovery phrase + bootstrap keys), `init` (create
+workspace + KEK, encryption default-on), `rbox pair` create/redeem (split-secret
+token via stdin, C11), `recover`, `rbox key backup/status`; thread `accountId`
+through the per-machine credential; construct `E2eeRemote` in `loadAuthedConfig`;
+M5-upgrade detection (C12) — plus the real-Workers two-VM e2e (best driven
+interactively / in CI). These are mechanical glue over the proven transport.
 
 The engine (`src/engine/e2ee/`) and server (`apps/api/`) are built + tested. This
 section plans wiring the **`rbox` CLI** to use them so encryption is the default,
