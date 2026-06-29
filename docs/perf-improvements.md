@@ -68,6 +68,19 @@ unique content per run so each is a true cold push, against `rbox-dev-api`.
 16); 32/48/64 plateau (~30s). **Default bumped 16 → 32** for upload (and download, by
 analogy — same latency-bound shape, not yet directly swept). Both still env-tunable.
 
+**Validated on the Linux VM (flat-meadow, v0.1.2 via the real release pipeline):**
+
+| conc | wall (s) — Mac | wall (s) — Linux |
+|-----:|---------------:|-----------------:|
+| 16 | 46.7 | 42.3 |
+| **32** | **31.2** | **28.6** |
+| 64 | 29.6 | 25.9 |
+
+Both clients confirm 32 ≫ 16 (~32–33% faster) — the default generalizes. Nuance: the
+Mac *plateaus* at 32 (64 ≈ 32), while flat-meadow (lower-latency link to Cloudflare)
+still gains ~9% to 64. So the optimum is **network-dependent** — which is exactly why
+the call is "32 default + env knob," not a single hard-coded max. Shipped in **v0.1.2**.
+
 ### The pivot this revealed: client perf → server scalability
 The plateau is the headline. The first-push cost is **no longer client-side** (we
 fixed sequential I/O); past ~32 concurrent requests the wall is **server-side
