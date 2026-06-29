@@ -1,7 +1,10 @@
 # rbox — Go-Live TODO
 
-Status as of 2026-06-27. Test/sandbox billing + Clerk provisioning are **done**;
-this is what's left to flip the switch to a real, paid, public product.
+Status as of 2026-06-29. Test/sandbox billing + Clerk provisioning are **done**;
+the prod funnel (marketing → auth → checkout) is **live end-to-end**; the dashboard
+has been **rebuilt on SvelteKit**, **CI/CD auto-deploys** on push to `main`, and
+**GitHub + Google one-click sign-in** are wired. Remaining work is hardening +
+the post-launch feature set (see the design-docs batch at the bottom).
 
 ## ✅ Done (autonomous)
 - [x] Stripe **test** billing built + live-verified in sandbox `acct_1Tn3UN` (checkout/portal/webhook, codex-reviewed, 18 Miniflare tests, deployed to `rbox-dev-api`).
@@ -38,12 +41,37 @@ this is what's left to flip the switch to a real, paid, public product.
   - ClerkJS loaded **legacy v4** (`@latest`) → couldn't drive prod client-trust. Pinned **v5** + added `#clerk-captcha` mount.
   - **Client Trust** attack-protection (can't be disabled in dash) forces email-code on password sign-in *via the prebuilt component's two-step*; a single-call `signIn.create({identifier,password})` completes directly. Prebuilt vanilla mount handles `needs_client_trust` poorly → motivates the SvelteKit rebuild.
   - Prod + dev D1 were missing **migration `0012_billing_grace.sql`** (`grace_until`) → `/v1/account/usage` 500. Applied to both.
-- [ ] **Frontend rebuild (SvelteKit + Vite + official Clerk components)** — see backlog; today's vanilla static dashboard caused most of the friction (hardcoded keys, no CORS awareness, no build/cache-busting, weak client-trust handling).
+- [x] **Frontend rebuild (SvelteKit + Vite + official Clerk components)** — **DONE 2026-06-29**, see the section below.
+
+## ✅ Update 2026-06-29 (cont. 2) — SvelteKit rebuild, CI/CD, one-click OAuth
+- [x] **Dashboard rebuilt on SvelteKit + Vite + Svelte 5 runes** (replaces the vanilla static SPA). `@sveltejs/adapter-static` (`fallback: index.html`), Pages `_redirects` + `_headers` (CSP). Clerk-js **v6** prebuilt sign-in/up component (loads the `@clerk/ui` bundle from the FAPI). Session-bound rbox-token cache keyed by Clerk session id with a refresh mutex + one-shot 401 retry. **Codex-reviewed → /simplify → /antislop-codebase**, merged to `main`, deployed to the `rbox-app` Pages project (`app.rbox.to`). `apps/web` package renamed `web-next → web`; vanilla dashboard retired.
+- [x] **Subscribed-state UX fix** — plan buttons hide once `usage.plan !== 'free'`; paid users see **Manage billing** (portal) instead of a second-checkout path.
+- [x] **CI/CD auto-deploy on push to `main`** (GitHub Actions):
+  - `.github/workflows/deploy-api.yml` — `apps/api/**` → `wrangler deploy --env production` (`rbox-prod-api` / `api.rbox.to`), gated on typecheck + worker tests.
+  - `.github/workflows/deploy-web.yml` — `apps/web/**` → build + `wrangler pages deploy` (`rbox-app` / `app.rbox.to`), gated on `check` + unit tests. Uses `npm install` (not `ci`) — macOS-generated lock fails strict `npm ci` on Linux (utf-8-validate optional dep).
+  - `.github/workflows/release.yml` — `v*` tags → build/sign/publish the `rbox` CLI binaries to R2. **First CI-signed release `v0.1.0` shipped.**
+  - Repo secret **`CLOUDFLARE_DEPLOY_TOKEN`** (Workers Scripts:Edit + Cloudflare Pages:Edit + Account:Read), distinct from release.yml's R2-only `CLOUDFLARE_API_TOKEN`. Dev-first workflow documented in `AGENTS.md`.
+- [x] **One-click sign-in — GitHub + Google OAuth** (reduces signup friction; bot protection stays ON):
+  - **GitHub** OAuth App live; **Google** via a dedicated GCP project (`rbox-500920`), consent screen published "In production", Web client `942927500825-…`, callback `https://clerk.rbox.to/v1/oauth_callback`.
+  - Prod Clerk env confirms `oauth_github` and `oauth_google` both `enabled + authenticatable`; `app.rbox.to` sign-in renders both buttons. (Pending: a human one-click test of the Google button after the user pruned extra client secrets.)
 
 ## 📋 Backlog (your asks — not pressing)
-- [ ] **Rebuild `apps/web` as a real framework app (Svelte/SvelteKit + Vite)** — today it's a deliberately zero-build vanilla-JS static SPA (`index.html` + `config.js` + `app.js`). Fine for the current single-page dashboard, but it'll get unwieldy as account/billing UI grows (esp. Team management: member invites, roles, per-seat). A SvelteKit+Vite app buys components, routing, typed state, and a proper ClerkJS/`@clerk` integration. Do this when Team work starts; keep it deployed to the same `rbox-app` Pages project. (Deferred 2026-06-29.)
-- [ ] **CI/CD**: auto-build the `rbox` binaries (all platforms) + publish to R2 on tag/release; CLI self-update (`rbox upgrade`). (Today binaries are built locally with `bun build --compile` and uploaded by hand.)
+- [x] **Rebuild `apps/web` as a real framework app (Svelte/SvelteKit + Vite)** — **DONE 2026-06-29** (see "cont. 2" above).
+- [x] **CI/CD**: auto-build the `rbox` binaries (all platforms) + publish to R2 on tag/release; CLI self-update (`rbox upgrade`). — **DONE** via `release.yml` (`v0.1.0` shipped) + `rbox upgrade`.
 - [ ] **Two-VM sync e2e test**: spin up two VMs/containers, have them pair + sync a tree both ways, assert convergence. The richest integration coverage (today: engine unit tests + Miniflare worker tests + the FakeRemote client suite + manual cross-host runs).
+
+## 🎨 Post-launch features — designed, not yet built (2026-06-29)
+Each spec is codex adversarially-reviewed; **design only, no implementation yet.**
+Three cross-cutting prerequisites surfaced repeatedly and must be resolved before these ship:
+1. **`device_id` is not unique** (PK is `token_hash`; `device_id` is a non-unique 32-bit index) — revoke/keys/email all depend on a unique credential id. Hit independently by docs 16, 17, 20. **Blocks the revoke deep-link and the api-key sidecar.**
+2. **No web↔CLI account link** — web sign-in mints a *new* Clerk account and never links a pre-existing CLI/bootstrap account, so CLI-only accounts are currently un-notifiable and unmanageable from the dashboard.
+3. **E2EE epoch rotation isn't wired** (`keyEpoch` pinned at 0) — so `revoked=1` stops *new* access but a leaked credential still decrypts *existing* data. Owned by the `feat/full-e2ee` branch.
+
+- [ ] `docs/design/16-new-device-emails.md` — "new device added" security email. Outbound has **no Cloudflare-native path** (Email Workers only send to verified destinations). **DECISION 2026-06-29: stay all-Cloudflare → MailChannels Email API (paid)** on `security.rbox.to` (overrides the doc's Resend recommendation; provider-specific SPF/DKIM swapped at build time). Durable D1 outbox + Queues (no `ctx.waitUntil` in the worker's `fetch`).
+- [ ] `docs/design/17-account-devices-workspaces.md` — read-only devices + workspaces list in the dashboard. New `GET /v1/account/devices|workspaces` (camelCase, paginated; **never** exposes `token_hash`); leaves the snake_case CLI endpoint untouched.
+- [ ] `docs/design/18-support-email-routing.md` — `support@rbox.to → Gmail` via **Cloudflare Email Routing**. It's a **migration off Namecheap** (apex MX today; DMARC already `p=reject`); catch-all = **Drop**.
+- [ ] `docs/design/19-device-revocation.md` — revoke from web + CLI (codex **PASS**, 4 rounds). **Access-revocation already works** (`authenticate()` enforces `revoked=0` since M4; `revokeDevice` + `rbox device revoke` exist) — but with **no role check** (a `viewer` can revoke the owner), `rbox logout` doesn't revoke server-side, web-revoke is undone by the SPA re-minting from the live Clerk session, and **cryptographic** revocation needs the unwired MK-rotation (prereq #3) + an account write-freeze.
+- [ ] `docs/design/20-cli-api-keys.md` — headless `RBOX_KEY` for CI 1-shot sync. v1 is necessarily a **full E2EE device carrying MK** (the transport refuses non-roster sync); a leaked key is MK-equivalent → **do not GA before epoch rotation (prereq #3) ships.**
 
 ## ✅ Frontend + Clerk wiring (built autonomously 2026-06-27)
 - [x] Worker `/v1/web/session`: verifies Clerk JWT (JWKS/RS256, hardened) → maps clerk user → rbox account/user → short-lived web session token. Codex-reviewed; 9 worker tests. (`apps/api/src/clerk.ts`, migration 0010)
