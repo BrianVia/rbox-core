@@ -32,8 +32,13 @@ this is what's left to flip the switch to a real, paid, public product.
 - [x] **Marketing CTAs now resolve** — every "Sign in"/paid button on `rbox.to` points at `app.rbox.to`, which is now live → signup→authenticated-checkout funnel is wired end to end.
 
 ### Follow-ups (non-blocking)
-- [ ] **Dev Clerk drift**: consolidating the Clerk app replaced the old dev instance `certain-ray-33` with `cosmic-phoenix-51`. `config.js` uses the new dev key, but the **dev worker `rbox-dev-api` still has `CLERK_ISSUER=certain-ray-33…`** (now dead) — update its `CLERK_*` secrets to `cosmic-phoenix-51` if you want local/dev web sign-in working again. Prod is unaffected.
-- [ ] Real browser sign-in smoke test on `https://app.rbox.to` (sign up → `/v1/web/session` exchange → usage renders → Subscribe redirects to a `cs_live` checkout).
+- [x] **Dev Clerk drift** fixed: `rbox-dev-api` CLERK_* secrets repointed to `cosmic-phoenix-51`.
+- [x] **Full prod funnel VERIFIED end-to-end (2026-06-29)** via agent-browser: sign in → `/v1/web/session` exchange → usage renders (`0 B / 250 GB`) → click Solo → **live `cs_live_…` Stripe checkout**. Bugs found + fixed along the way:
+  - Worker had **no CORS** → all `app.rbox.to → api.rbox.to` fetches failed. Added CORS (preflight + allowlisted via CLERK_ALLOWED_ORIGINS).
+  - ClerkJS loaded **legacy v4** (`@latest`) → couldn't drive prod client-trust. Pinned **v5** + added `#clerk-captcha` mount.
+  - **Client Trust** attack-protection (can't be disabled in dash) forces email-code on password sign-in *via the prebuilt component's two-step*; a single-call `signIn.create({identifier,password})` completes directly. Prebuilt vanilla mount handles `needs_client_trust` poorly → motivates the SvelteKit rebuild.
+  - Prod + dev D1 were missing **migration `0012_billing_grace.sql`** (`grace_until`) → `/v1/account/usage` 500. Applied to both.
+- [ ] **Frontend rebuild (SvelteKit + Vite + official Clerk components)** — see backlog; today's vanilla static dashboard caused most of the friction (hardcoded keys, no CORS awareness, no build/cache-busting, weak client-trust handling).
 
 ## 📋 Backlog (your asks — not pressing)
 - [ ] **Rebuild `apps/web` as a real framework app (Svelte/SvelteKit + Vite)** — today it's a deliberately zero-build vanilla-JS static SPA (`index.html` + `config.js` + `app.js`). Fine for the current single-page dashboard, but it'll get unwieldy as account/billing UI grows (esp. Team management: member invites, roles, per-seat). A SvelteKit+Vite app buys components, routing, typed state, and a proper ClerkJS/`@clerk` integration. Do this when Team work starts; keep it deployed to the same `rbox-app` Pages project. (Deferred 2026-06-29.)
