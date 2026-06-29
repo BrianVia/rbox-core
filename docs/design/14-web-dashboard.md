@@ -1,6 +1,33 @@
 # Design 14 — Web dashboard rebuild (SvelteKit + Vite)
 
-**Status:** v1 — DESIGN, pending codex adversarial review.
+**Status:** v2 — DESIGN, codex adversarial review **NEEDS-PASS → addressed** (4 BLOCKER + 6 SHOULD-FIX + 3 NIT). v2 resolutions below are authoritative where they conflict with the v1 body; the biggest change is **using Clerk's prebuilt sign-in-or-up component instead of a hand-rolled custom flow**.
+
+## v2 — Resolutions to codex review
+
+**B1+B2 [BLOCKER] custom flow drops signup + an incomplete status model → use Clerk's prebuilt component.**
+The v1 custom `signIn.create({identifier,password})` flow handles neither **sign-up** (the funnel's whole point — new users from marketing) nor email verification, bot CAPTCHA, the full Client-Trust/MFA status matrix, or session finalize. Owning the flow means re-implementing all of Clerk's auth and recreating the exact bugs we're escaping. **Resolution:** mount Clerk's prebuilt **sign-in-or-up** UI (`@clerk/clerk-js` v5 `mountSignIn` with `withSignUp: true`, `#clerk-captcha` present, `afterSignInUrl`/`afterSignUpUrl` → `/dashboard`). It handles signup, verification, CAPTCHA, **Client Trust**, MFA, and finalize/redirect for us. The old vanilla failure was v4 + a dead instance + no captcha mount — not an inherent prebuilt limitation; verify in the new app with an e2e test that exercises the Client-Trust email-code path (user relays the code).
+
+**B3 [BLOCKER] rbox-token cache not bound to the Clerk session.**
+The worker mints independent ~1h bearer tokens; caching one bare `rbox_token` lets account A's token survive a switch to account B. **Resolution:** key the cache by Clerk `session.id` (`rbox_token:<sessionId>`); `clerk.addListener` clears it on any session/user change; serialize refresh (one in-flight promise).
+
+**B4 [BLOCKER] billing routes don't match the worker.**
+The worker returns to `${RBOX_APP_URL}/billing` (Checkout cancel + portal return) and `${RBOX_APP_URL}/billing/success` — there is no `/billing/cancel`. **Resolution:** set **`RBOX_APP_URL=https://app.rbox.to`** on the prod worker, and implement routes `/billing` (→ dashboard) + `/billing/success`. Drop `/billing/cancel`.
+
+**SF1 401 refresh mutex.** Single in-flight refresh promise; concurrent callers await it; retry the original request exactly once after a successful re-exchange.
+
+**SF2 SPA fallback.** `adapter-static` with `fallback: '200.html'` + a Pages `_redirects` (`/* /index.html 200`). Test direct loads of `/dashboard`, `/billing`, `/billing/success?session_id=…` — no top-level `404.html`.
+
+**SF3 origins.** Prod `CLERK_ALLOWED_ORIGINS = https://app.rbox.to` ONLY (it gates both CORS and the Clerk JWT `azp`). The **dev** worker also allows `http://localhost:5173` (Vite). Never add Pages preview URLs to prod.
+
+**SF4 billing-success webhook lag.** Plan flips on the Stripe subscription webhook, not the browser return. `/billing/success` polls `/v1/account/usage` until the plan changes (bounded), showing "finalizing your subscription…".
+
+**SF5 CSP.** Pages `_headers` with `script-src`/`connect-src`/`frame-src` scoped to: `clerk.rbox.to` + `*.clerk.accounts.dev`, `js.stripe.com` + `checkout.stripe.com`, `challenges.cloudflare.com` (Turnstile), and the API base. Required because we hold a bearer token in `sessionStorage`.
+
+**SF6 tests.** Vitest covers our glue, not Clerk's matrix: session-switch cache invalidation, concurrent-401 single-refresh, API-client one-retry, env/config validation.
+
+**N1** Boot-time config assertion (prod build ⇒ `pk_live` + `api.rbox.to`; dev ⇒ `pk_test` + dev worker) — fail loud on mismatch.
+**N2** `npm run deploy` script with an explicit output dir (no ambiguous `wrangler pages deploy build`).
+**N3** Rollback = record the prior Pages deployment ID + keep the vanilla artifact, not just git history.
 
 Replace the hand-rolled vanilla `apps/web/` dashboard (`index.html` + `config.js`
 + `app.js`, no build step) with a typed **SvelteKit + Vite** app, deployed as a
