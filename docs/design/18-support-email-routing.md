@@ -1,5 +1,7 @@
 # Design 18 — Support email routing (`support@rbox.to` → Gmail)
 
+> **Implementation: 🔴 NOT STARTED** — design/runbook complete & codex-reviewed (2026-06-29); ready to execute. Status index: [`README.md`](./README.md).
+
 **Status:** v4 — DESIGN / RUNBOOK. Codex adversarial review converged
 v1 **FAIL (11)** → v2 **FAIL (7)** → v3 **FAIL (1)** → v4 applies codex's exact rollback
 fix; all prior issues confirmed resolved by codex. Key correction along the way: **doc 16

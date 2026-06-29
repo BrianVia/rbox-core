@@ -1,5 +1,7 @@
 # Design 16 — New-device security email ("a new device was added to your account")
 
+> **Implementation: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Status index: [`README.md`](./README.md).
+
 **Status:** v2 — design only (no implementation). Revised after an adversarial
 codex review (VERDICT: FAIL → all 13 findings resolved; see §13).
 

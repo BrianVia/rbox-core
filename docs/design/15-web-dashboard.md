@@ -1,5 +1,7 @@
 # Design 15 — Web dashboard rebuild (SvelteKit + Vite)
 
+> **Implementation: ✅ DONE & DEPLOYED.** The SvelteKit dashboard is live at **app.rbox.to** (`apps/web`, merged to `main`, CI-deployed). The "v2 — DESIGN" note below is the original design-review record.
+
 **Status:** v2 — DESIGN, codex adversarial review **NEEDS-PASS → addressed** (4 BLOCKER + 6 SHOULD-FIX + 3 NIT). v2 resolutions below are authoritative where they conflict with the v1 body; the biggest change is **using Clerk's prebuilt sign-in-or-up component instead of a hand-rolled custom flow**.
 
 ## v2 — Resolutions to codex review

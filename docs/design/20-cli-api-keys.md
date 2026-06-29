@@ -1,5 +1,7 @@
 # Design 20 — CLI / CI API keys (headless `rbox sync`)
 
+> **Implementation: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). **Do not GA before E2EE epoch rotation ships** (a leaked key is MK-equivalent). Status index: [`README.md`](./README.md).
+
 **Status:** DRAFT — codex adversarial review: pass 1 FAIL (4 BLOCKER + 3 HIGH + 3
 MEDIUM), pass 2 confirmed those resolved but caught 2 new self-contradictions (R11/R12);
 all 12 resolved in §11 (normative, amends the body). The two BLOCKER-level architectural

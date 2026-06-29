@@ -1,5 +1,7 @@
 # Design 19 — Device Revocation (kill a lost/compromised machine)
 
+> **Implementation: 🔴 NOT STARTED** — design complete, codex **PASS** (4 rounds, 2026-06-29). Note: access-revocation already works in code (`authenticate()` enforces `revoked=0`); this spec covers the authz/audit/crypto gaps around it. Status index: [`README.md`](./README.md).
+
 **Status:** DESIGN, codex-reviewed over four rounds (R1: 3 CRITICAL + 6 MAJOR; R2: 2
 residual CRITICAL + 3 MAJOR; R3: 1 CRITICAL + 2 MAJOR; R4: 1 concurrency race) — each
 round's findings resolved in this revision (§12). Remaining items are documented residuals

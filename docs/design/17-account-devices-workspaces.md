@@ -1,5 +1,7 @@
 # Design 17 — Account: devices & workspaces (read-only dashboard view)
 
+> **Implementation: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Status index: [`README.md`](./README.md).
+
 **Status:** DESIGN — codex adversarial review (2 rounds) absorbed; remaining FAILs
 are scoped to upstream/dependent work and recorded in §9. Design only, no
 implementation.
