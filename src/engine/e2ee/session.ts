@@ -200,6 +200,8 @@ export interface VerifiedAccount {
   currentRosterHash: string;
   /** Highest account epoch (commits MUST be at this epoch to be applied — C4). */
   currentEpoch: number;
+  /** Workspace-KEK epoch selector at the current account epoch. */
+  currentKeyEpoch: number;
   currentKeyStateHash: string;
   /** Every MK-wrap hash ever bound in a signed roster/key-state (C7): a fetched
    *  MK wrap is trusted only if its hash is in here. */
@@ -235,6 +237,7 @@ export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: 
     currentRoster: rosters[currentRosterIdx]!,
     currentRosterHash: rosterChain[currentRosterIdx]!.rosterHash,
     currentEpoch: keyStates[keyStates.length - 1]!.accountEpoch,
+    currentKeyEpoch: keyStates[keyStates.length - 1]!.keyEpoch,
     currentKeyStateHash: keyStateChain[keyStateChain.length - 1]!.stateHash,
     authorizedMkWrapHashes,
   };

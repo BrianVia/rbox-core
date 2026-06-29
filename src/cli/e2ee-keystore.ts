@@ -126,3 +126,25 @@ export async function loadRecoveryKey(accountId: string): Promise<Uint8Array | u
 export async function forgetRecoveryKey(accountId: string): Promise<void> {
   await fs.rm(path.join(root(accountId), "rk.key"), { force: true });
 }
+
+// ---- head pin (anti-rollback, C1/C2) --------------------------------------
+
+/** The locally-pinned head a device has verified up to (design 12 §13.8). A
+ *  pulled chain MUST extend these hashes; rollback to an earlier hash is rejected. */
+export interface HeadPin {
+  commitSeq: number;
+  commitHash: string;
+  rosterVersion: number;
+  rosterHash: string;
+  accountEpoch: number;
+  keyStateHash: string;
+}
+
+export async function loadPin(accountId: string, workspaceId: string): Promise<HeadPin | undefined> {
+  const raw = await readMaybe(path.join(root(accountId), "ws", `${workspaceId}.pin.json`));
+  return raw ? (JSON.parse(raw) as HeadPin) : undefined;
+}
+
+export async function savePin(accountId: string, workspaceId: string, pin: HeadPin): Promise<void> {
+  await writeSecret(path.join(root(accountId), "ws", `${workspaceId}.pin.json`), JSON.stringify(pin));
+}
