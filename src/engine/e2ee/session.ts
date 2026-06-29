@@ -10,8 +10,8 @@
  * can open a workspace KEK and decrypt.
  */
 import { generateSignKeyPair, generateWrapKeyPair, sign, signKeyPairFromSeed, signPrivateFromPkcs8, signPrivateToPkcs8, wrapPrivateFromPkcs8, wrapPrivateToPkcs8 } from "./asym.js";
-import { buildSignedCommit, parseCommit, verifyCommitSig, type BlobRef, type SignedCommit } from "./commit.js";
-import { buildKeyState, GENESIS_PREV_STATE_HASH, verifyKeyStateChain, type SignedKeyState } from "./epoch.js";
+import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type SignedCommit } from "./commit.js";
+import { buildKeyState, GENESIS_PREV_STATE_HASH, verifyKeyStateChain, type AccountKeyState, type SignedKeyState } from "./epoch.js";
 import { canonicalString, parseStrict } from "./jcs.js";
 import { aesGcmUnwrap, aesGcmWrap, generateMasterKey, generateWorkspaceKek, rsaDeviceUnwrap, rsaDeviceWrap, wrapHash, type Wrap, type WrapContext } from "./keys.js";
 import { decryptManifest, encryptManifest } from "./manifest-crypto.js";
@@ -194,22 +194,89 @@ export async function buildCommit(args: {
 export interface VerifiedAccount {
   rosters: RosterBody[];
   rosterHashByVersion: Map<number, string>;
+  keyStates: AccountKeyState[];
+  /** Highest-version roster — the authority for "is this device active NOW". */
+  currentRoster: RosterBody;
+  currentRosterHash: string;
+  /** Highest account epoch (commits MUST be at this epoch to be applied — C4). */
+  currentEpoch: number;
+  currentKeyStateHash: string;
+  /** Every MK-wrap hash ever bound in a signed roster/key-state (C7): a fetched
+   *  MK wrap is trusted only if its hash is in here. */
+  authorizedMkWrapHashes: Set<string>;
+}
+
+/** A device's locally pinned head, anti-rollback (C1/C2). */
+export interface Pin {
+  commitSeq: number;
+  commitHash: string;
 }
 
 /** Verify the roster chain + key-state chain for an account (call once per pull
- *  session). `genesisKeyStateTrust` must equal the locally-pinned genesis
- *  key-state hash if the device has one (anti-rollback of the trust root). */
+ *  session). Returns the verified, pinnable head facts. The caller MUST also
+ *  check these extend its locally-pinned `rosterHash`/`keyStateHash` (C2). */
 export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: SignedKeyState[], now: number): Promise<VerifiedAccount> {
   const rosters = await verifyRosterChain(rosterChain, { now });
   const rosterHashByVersion = new Map<number, string>();
   for (let i = 0; i < rosterChain.length; i++) rosterHashByVersion.set(i, rosterChain[i]!.rosterHash);
-  await verifyKeyStateChain(keyStateChain, rosters, rosterHashByVersion);
-  return { rosters, rosterHashByVersion };
+  const keyStates = await verifyKeyStateChain(keyStateChain, rosters, rosterHashByVersion);
+
+  // The set of MK-wrap hashes the account has ever signed: key-state mkWrapHashes
+  // (genesis device + recovery, and any rotation) ∪ each admission's deviceWrapHash.
+  const authorizedMkWrapHashes = new Set<string>();
+  for (const s of keyStates) for (const h of s.mkWrapHashes) authorizedMkWrapHashes.add(h);
+  for (const sr of rosterChain) if (sr.admission?.deviceWrapHash) authorizedMkWrapHashes.add(sr.admission.deviceWrapHash);
+
+  const currentRosterIdx = rosterChain.length - 1;
+  return {
+    rosters,
+    rosterHashByVersion,
+    keyStates,
+    currentRoster: rosters[currentRosterIdx]!,
+    currentRosterHash: rosterChain[currentRosterIdx]!.rosterHash,
+    currentEpoch: keyStates[keyStates.length - 1]!.accountEpoch,
+    currentKeyStateHash: keyStateChain[keyStateChain.length - 1]!.stateHash,
+    authorizedMkWrapHashes,
+  };
 }
 
-/** Verify a pulled commit's signature against the signer's roster entry, then
- *  decrypt the manifest. Throws if the signer isn't an active device in the
- *  commit's rosterVersion, the signature is bad, or the manifest won't decrypt. */
+/** Fail closed unless a fetched MK wrap's hash was signed into the account's
+ *  roster/key-state (C7) — stops a server substituting a wrap. */
+export async function assertMkWrapAuthorized(wrap: Wrap, account: VerifiedAccount): Promise<void> {
+  const h = await wrapHash(wrap);
+  if (!account.authorizedMkWrapHashes.has(h)) throw new Error("MK wrap not authorized by the signed roster/key-state (possible server substitution)");
+}
+
+/**
+ * Verify a commit chain descends from the pinned head (C1): hash-links forward
+ * from `pin` (or genesis), each commit signed by a device active in ITS OWN
+ * roster version (authentic history). Returns the head commit, or null if empty.
+ * Does NOT apply the current-epoch/current-roster gate — that's `openCommit` on
+ * the head (a historical link may predate a rotation).
+ */
+export async function verifyCommitChain(commits: SignedCommit[], pin: Pin | null, account: VerifiedAccount): Promise<SignedCommit | null> {
+  if (commits.length === 0) return null;
+  let prevHash = pin ? pin.commitHash : GENESIS_PARENT_HASH;
+  let prevSeq = pin ? pin.commitSeq : 0;
+  for (const c of commits) {
+    const body = parseCommit(c);
+    if (body.parentSeq !== prevSeq || body.parentCommitHash !== prevHash) throw new Error(`commit chain break at seq ${body.seq} (rollback/splice evident)`);
+    const roster = account.rosters[body.rosterVersion];
+    if (!roster) throw new Error(`commit seq ${body.seq} references unknown rosterVersion ${body.rosterVersion}`);
+    const pub = activeSigners(roster).get(body.deviceId);
+    if (!pub) throw new Error(`commit seq ${body.seq} signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
+    if (!(await verifyCommitSig(c, pub))) throw new Error(`commit seq ${body.seq} signature invalid`);
+    prevHash = c.commitHash;
+    prevSeq = body.seq;
+  }
+  return commits[commits.length - 1]!;
+}
+
+/**
+ * Verify the HEAD commit is safe to apply, then decrypt its manifest. C4: reject
+ * if EITHER the signer is not active in the CURRENT roster OR the commit's
+ * accountEpoch != the current verified epoch (disjunctive — either is fatal).
+ */
 export async function openCommit(args: {
   secrets: DeviceSecrets;
   kek: Uint8Array;
@@ -219,11 +286,10 @@ export async function openCommit(args: {
   workspaceId: string;
 }): Promise<Uint8Array> {
   const body = parseCommit(args.commit);
-  const roster = args.account.rosters[body.rosterVersion];
-  if (!roster) throw new Error(`commit references unknown rosterVersion ${body.rosterVersion}`);
-  const signers = activeSigners(roster);
-  const signerPub = signers.get(body.deviceId);
-  if (!signerPub) throw new Error(`commit signer ${body.deviceId} is not an active device in roster v${body.rosterVersion}`);
+  const signerPub = activeSigners(args.account.currentRoster).get(body.deviceId);
+  if (!signerPub || body.accountEpoch !== args.account.currentEpoch) {
+    throw new Error("commit rejected: signer not active in the current roster, or stale/unknown accountEpoch");
+  }
   if (!(await verifyCommitSig(args.commit, signerPub))) throw new Error("commit signature invalid");
   // encManifest integrity: its hash must equal the signed encManifestSha.
   if ((await sha256Hex(args.encManifest)) !== body.encManifestSha) throw new Error("encManifest does not match the signed encManifestSha");
