@@ -105,7 +105,11 @@ async function main(): Promise<void> {
       break;
     }
     case "login": {
-      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap === "true" ? undefined : flags.bootstrap);
+      // `--bootstrap` MUST carry a secret. A value-less/empty flag (parsed as
+      // "true") used to silently fall through to the device-approval flow and
+      // block ~10min looking hung — fail fast with a clear message instead.
+      if (flags.bootstrap === "true") throw new Error("`--bootstrap` needs a secret value: `rbox login --bootstrap <secret>` (or just `rbox login` for device approval)");
+      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap);
       break;
     }
     case "logout": {
@@ -138,6 +142,7 @@ async function main(): Promise<void> {
       const sp = spinner("pushing");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
+        deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
         const seq = await push(root, cfg, deps);
         sp.succeed(`pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
       } catch (e) {

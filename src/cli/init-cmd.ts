@@ -124,6 +124,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot");
     try {
+      deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
       const seq = await push(plan.root, authed, deps);
       sp.succeed(`published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
     } catch (e) {

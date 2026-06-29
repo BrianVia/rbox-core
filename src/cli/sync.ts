@@ -45,7 +45,24 @@ export interface SyncDeps {
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
    *  tally retry pressure without sync.ts doing metrics I/O (design 09 §3). */
   onCommitConflict?: () => void;
+  /** Progress for the long phases of a push (encrypt, upload). The CLI renders it
+   *  on the spinner; the daemon ignores it. `done`/`total` are blob counts. */
+  onProgress?: (done: number, total: number, phase: "encrypt" | "upload") => void;
 }
+
+/** Run `fn` over `items` with bounded concurrency (worker-pool, like the manifest
+ *  hasher). Rejects on the first failure (fail-fast); already-running tasks settle
+ *  but no new ones start — safe because blob uploads are idempotent + resumable. */
+async function pool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const worker = async () => {
+    for (let idx = i++; idx < items.length; idx = i++) await fn(items[idx]!);
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+}
+
+const ENCRYPT_CONCURRENCY = 8; // CPU/disk bound
+const UPLOAD_CONCURRENCY = 16; // network/latency bound — the dominant cost on a first push
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
 async function withCache(
@@ -61,38 +78,49 @@ async function withCache(
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
  *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha). */
-async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest): Promise<void> {
+async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest, onProgress?: SyncDeps["onProgress"]): Promise<void> {
   if (cfg.syncGit) throw new Error("encryption + git-state sync aren't supported together yet (M5 limitation; full-E2EE milestone covers it)");
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
+  const kek = cfg.kek;
   const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
   const ctByEnc = new Map<string, string>();
   try {
+    // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
+    const toEncrypt: typeof local.files = [];
     for (const f of local.files) {
       if (f.type !== "file") continue;
       const reuse = baseEnc.get(f.sha256);
-      if (reuse) {
-        f.encSha = reuse; // unchanged file → reuse ciphertext address (no re-encrypt)
-        continue;
-      }
-      const e = await encryptFileToTemp(path.join(root, f.path), cfg.kek, tmpDir);
+      if (reuse) f.encSha = reuse; // unchanged → reuse ciphertext address (no re-encrypt)
+      else toEncrypt.push(f);
+    }
+    // Encrypt changed files concurrently (was sequential — slow on a big first push).
+    let enc = 0;
+    await pool(toEncrypt, ENCRYPT_CONCURRENCY, async (f) => {
+      const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
       f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
       f.encSha = e.encSha;
       ctByEnc.set(e.encSha, e.ciphertextPath);
-    }
+      onProgress?.(++enc, toEncrypt.length, "encrypt");
+    });
+
     const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
     const missing = await api.missingBlobs(encShas);
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
-    for (const encSha of missing) {
+    // Upload missing blobs concurrently — THE dominant cost on a first push (each
+    // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
+    let up = 0;
+    await pool(missing, UPLOAD_CONCURRENCY, async (encSha) => {
       let ct = ctByEnc.get(encSha);
       if (!ct) {
         // Missing on the server but reused-from-base (server lost it) → re-encrypt.
         const f = local.files.find((x) => x.encSha === encSha);
-        if (!f) continue;
-        ct = (await encryptFileToTemp(path.join(root, f.path), cfg.kek, tmpDir)).ciphertextPath;
+        if (!f) return;
+        ct = (await encryptFileToTemp(path.join(root, f.path), kek, tmpDir)).ciphertextPath;
       }
       await api.putBlobFile(encSha, ct, (await fs.stat(ct)).size, uploadsDir);
-    }
+      onProgress?.(++up, missing.length, "upload");
+    });
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -252,7 +280,7 @@ export async function pushManifest(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox recover`)");
   const doUpload = async () => {
-    await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest);
+    await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, deps.onProgress);
   };
   await doUpload();
 
