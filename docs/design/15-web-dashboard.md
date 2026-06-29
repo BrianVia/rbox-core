@@ -1,4 +1,4 @@
-# Design 14 — Web dashboard rebuild (SvelteKit + Vite)
+# Design 15 — Web dashboard rebuild (SvelteKit + Vite)
 
 **Status:** v2 — DESIGN, codex adversarial review **NEEDS-PASS → addressed** (4 BLOCKER + 6 SHOULD-FIX + 3 NIT). v2 resolutions below are authoritative where they conflict with the v1 body; the biggest change is **using Clerk's prebuilt sign-in-or-up component instead of a hand-rolled custom flow**.
 
