@@ -41,8 +41,11 @@
 	const portal = () => redirectVia(openBillingPortal);
 
 	async function signOut() {
-		await authState.clerk?.signOut();
-		goto('/');
+		try {
+			await authState.clerk?.signOut();
+		} finally {
+			goto('/'); // always leave, even if Clerk sign-out rejects
+		}
 	}
 
 	const pct = $derived(

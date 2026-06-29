@@ -27,16 +27,18 @@ export function clearStaleTokens(currentSid: string | null): void {
 	}
 }
 
-// One in-flight exchange at a time (SF1): concurrent callers share the same promise.
-let refreshInflight: Promise<string> | null = null;
+// One in-flight exchange per session (SF1): concurrent callers for the SAME Clerk
+// session share its promise. It is keyed by sid so a caller that arrives mid-switch
+// can never receive a promise that resolves to a different account's token (B3).
+let refreshInflight: { sid: string; promise: Promise<string> } | null = null;
 
 async function exchange(clerk: Clerk): Promise<string> {
 	const sid = sessionId(clerk);
 	if (!sid) throw new Error('not signed in');
 	const cached = sessionStorage.getItem(keyFor(sid));
 	if (cached) return cached;
-	if (refreshInflight) return refreshInflight;
-	refreshInflight = (async () => {
+	if (refreshInflight?.sid === sid) return refreshInflight.promise;
+	const promise = (async () => {
 		const clerkToken = await clerk.session!.getToken();
 		if (!clerkToken) throw new Error('no Clerk session token');
 		const res = await fetch(`${config.apiBase}/v1/web/session`, {
@@ -51,9 +53,10 @@ async function exchange(clerk: Clerk): Promise<string> {
 		sessionStorage.setItem(keyFor(sid), data.token);
 		return data.token;
 	})().finally(() => {
-		refreshInflight = null;
+		if (refreshInflight?.sid === sid) refreshInflight = null;
 	});
-	return refreshInflight;
+	refreshInflight = { sid, promise };
+	return promise;
 }
 
 // Authed fetch with a single re-exchange + retry on 401 (SF1).
@@ -82,12 +85,16 @@ export async function fetchUsage(clerk: Clerk): Promise<Usage> {
 export async function startCheckout(clerk: Clerk, plan: 'solo' | 'pro'): Promise<string> {
 	const res = await authed(clerk, `/v1/billing/checkout?plan=${plan}`, { method: 'POST' });
 	if (!res.ok) throw new Error(`checkout failed (${res.status})`);
-	return (await res.json()).url as string;
+	const { url } = (await res.json()) as { url?: string };
+	if (!url) throw new Error('checkout returned no URL');
+	return url;
 }
 
 export async function openBillingPortal(clerk: Clerk): Promise<string> {
 	const res = await authed(clerk, '/v1/billing/portal', { method: 'POST' });
 	if (res.status === 409) throw new Error('No subscription yet — subscribe to a plan first.');
 	if (!res.ok) throw new Error(`portal failed (${res.status})`);
-	return (await res.json()).url as string;
+	const { url } = (await res.json()) as { url?: string };
+	if (!url) throw new Error('portal returned no URL');
+	return url;
 }

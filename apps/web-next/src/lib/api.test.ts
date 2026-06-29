@@ -83,6 +83,30 @@ describe('rbox token cache (B3 / SF1)', () => {
 		expect(sessionCalls(f)).toBe(2);
 	});
 
+	it('does not hand a concurrent different-session caller the in-flight token (B3)', async () => {
+		// A's exchange is in flight when B asks — B must mint its OWN token, never
+		// receive A's shared promise.
+		let releaseA!: () => void;
+		const f = vi.fn((url: string, init?: RequestInit) => {
+			if (String(url).includes('/v1/web/session')) {
+				const who = JSON.parse(init!.body as string).token; // jwt_A | jwt_B
+				return who === 'jwt_A'
+					? new Promise((res) => {
+							releaseA = () => res({ ok: true, status: 200, json: async () => ({ token: 'tok_A' }) });
+						})
+					: Promise.resolve({ ok: true, status: 200, json: async () => ({ token: 'tok_B' }) });
+			}
+			return Promise.resolve({ ok: true, status: 200, json: async () => usageBody });
+		});
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		const both = Promise.all([fetchUsage(clerk('A') as never), fetchUsage(clerk('B') as never)]);
+		await new Promise((r) => setTimeout(r, 10));
+		releaseA();
+		await both;
+		expect(store.getItem('rbox_token:A')).toBe('tok_A');
+		expect(store.getItem('rbox_token:B')).toBe('tok_B'); // B minted its own, not A's
+	});
+
 	it('never reuses another session’s token (per-session cache)', async () => {
 		store.setItem('rbox_token:A', 'tokenA'); // A is cached
 		const f = vi
