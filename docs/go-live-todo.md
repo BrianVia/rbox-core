@@ -20,10 +20,20 @@ this is what's left to flip the switch to a real, paid, public product.
 - [x] **One-line installer** live: `curl -fsSL https://api.rbox.to/install.sh | sh` (binaries for darwin/linux × arm64/x64 served from R2; verified end-to-end)
 - [x] **Marketing site** built (`../rbox-home-page`, Astro 5) + deployed to Pages (`rbox-home.pages.dev`)
 
-## 🚧 Remaining (need you — Cloudflare dashboard DNS, wrangler can't)
-- [ ] **Add `rbox.to` custom domain** to the `rbox-home` Pages project (Workers&Pages → rbox-home → Custom domains) → makes `rbox.to` + `rbox.to/install.sh` live. (Installer works at `api.rbox.to/install.sh` today.)
-- [ ] **Prod Clerk instance**: provision a production Clerk instance for the domain (needs Clerk DNS CNAMEs added to the zone) → set `CLERK_*` `--env production`. Until then web sign-in 501s on prod (CLI auth + billing work).
-- [ ] **App dashboard**: deploy `apps/web` to Pages (e.g. `app.rbox.to`); point it at `api.rbox.to`; set `CLERK_ALLOWED_ORIGINS` to that origin. (Today `apps/web` → the dev worker for safe test-mode trials.)
+## ✅ Update 2026-06-29
+- [x] **`rbox.to` custom domain is LIVE** — `https://rbox.to` + `https://rbox.to/install.sh` both serve 200 (marketing site on the `rbox-home` Pages project). The item below is done.
+- [x] **Marketing site under version control** — `../rbox-home-page` was untracked; now a **private repo `BrianVia/rbox-home`**. Pricing/quotas verified to match `apps/api/src/plans.ts`; removed dead links (wrong `github.com/rbox`, 4× nonexistent `docs.rbox.to`).
+- [x] **Prod Clerk instance PROVISIONED** — one Clerk app `rbox` (dev + **production**), domain `rbox.to`, Frontend API `https://clerk.rbox.to`. Creds in gitignored `.projects/vault`+`.env`. Sign into the Clerk dashboard with `stripe projects open clerk` (account `brian.via.dev@gmail.com`).
+
+## ✅ Update 2026-06-29 (cont.) — prod web auth + dashboard LIVE
+- [x] **Clerk prod DNS** — all 5 CNAMEs added to the `rbox.to` zone via the Cloudflare API (DNS-only). Clerk shows **Verified + SSL Issued**; `https://clerk.rbox.to/.well-known/jwks.json` serves the prod instance key (`ins_3Fom8QRdPwh9I0…`).
+- [x] **Prod worker secrets set** on `rbox-prod-api`: `CLERK_ISSUER=https://clerk.rbox.to`, `CLERK_SECRET_KEY` (sk_live), `CLERK_ALLOWED_ORIGINS=https://app.rbox.to`. Verified: `POST https://api.rbox.to/v1/web/session` now returns **401 (configured)**, not 501.
+- [x] **Dashboard deployed** — `apps/web` → Pages project **`rbox-app`** (`rbox-app.pages.dev`), with **`app.rbox.to`** custom domain attached. `config.js` is host-aware (prod = `api.rbox.to` + `pk_live`; localhost = dev worker + dev `pk_test`). Clerk prod `allowed_origins` includes `https://app.rbox.to`.
+- [x] **Marketing CTAs now resolve** — every "Sign in"/paid button on `rbox.to` points at `app.rbox.to`, which is now live → signup→authenticated-checkout funnel is wired end to end.
+
+### Follow-ups (non-blocking)
+- [ ] **Dev Clerk drift**: consolidating the Clerk app replaced the old dev instance `certain-ray-33` with `cosmic-phoenix-51`. `config.js` uses the new dev key, but the **dev worker `rbox-dev-api` still has `CLERK_ISSUER=certain-ray-33…`** (now dead) — update its `CLERK_*` secrets to `cosmic-phoenix-51` if you want local/dev web sign-in working again. Prod is unaffected.
+- [ ] Real browser sign-in smoke test on `https://app.rbox.to` (sign up → `/v1/web/session` exchange → usage renders → Subscribe redirects to a `cs_live` checkout).
 
 ## 📋 Backlog (your asks — not pressing)
 - [ ] **CI/CD**: auto-build the `rbox` binaries (all platforms) + publish to R2 on tag/release; CLI self-update (`rbox upgrade`). (Today binaries are built locally with `bun build --compile` and uploaded by hand.)

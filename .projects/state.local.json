@@ -22,15 +22,16 @@
   "resources": {
     "rbox": {
       "configuration": {
-        "app_name": "rbox"
+        "app_name": "rbox",
+        "production_domain": "rbox.to"
       },
-      "createdAt": "2026-06-27T21:26:09.170Z",
-      "lastRevealedAt": "2026-06-27T21:26:09.385Z",
+      "createdAt": "2026-06-29T16:13:56.734Z",
+      "lastRevealedAt": "2026-06-29T16:13:56.952Z",
       "lastStatus": "complete",
       "name": "rbox",
       "providerId": "prvdr_61UGOeSW4e0T9Etwn537w",
       "providerName": "Clerk",
-      "resourceId": "fres_61UwRh8ofnIVgUFCd16UwQfk1FSQCGlFD2ByDT8400aG",
+      "resourceId": "fres_61Ux5m6uMiTNqiCxz16UwQfk1FSQCGlFD2ByDT840JjM",
       "serviceId": "auth"
     }
   }
