@@ -8,8 +8,9 @@ import {
   type Manifest,
   type WatchEvent,
 } from "../engine/index.js";
-import { loadAuthedConfig, loadState, type WorkspaceConfig } from "./config.js";
-import { pull, pushManifest } from "./sync.js";
+import { loadState, type WorkspaceConfig } from "./config.js";
+import { pull, pushManifest, type SyncDeps } from "./sync.js";
+import { buildAuthedRemote } from "./e2ee-client.js";
 import { loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
@@ -57,7 +58,9 @@ export class RboxDaemon {
   private pumping = false;
   private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0 };
 
-  constructor(private readonly root: string, private readonly cfg: WorkspaceConfig) {
+  /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
+   *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
+  constructor(private readonly root: string, private readonly cfg: WorkspaceConfig, private readonly e2ee: SyncDeps) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root);
   }
@@ -164,6 +167,7 @@ export class RboxDaemon {
       }
     }
     const res = await pushManifest(this.root, this.cfg, this.manifest, {
+      ...this.e2ee,
       cache: this.cache,
       onCommitConflict: () => this.bumpConflict("commit"),
     });
@@ -173,7 +177,7 @@ export class RboxDaemon {
   }
 
   private async doPull(): Promise<void> {
-    const actions = await pull(this.root, this.cfg, { cache: this.cache });
+    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache });
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;
@@ -256,9 +260,9 @@ export class RboxDaemon {
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
 export async function runDaemon(root: string): Promise<void> {
-  const cfg = await loadAuthedConfig(root);
+  const { cfg, deps } = await buildAuthedRemote(root); // E2EE transport + injected KEK
   await loadState(root); // surfaces corrupt-state errors loudly before we go live
-  const daemon = new RboxDaemon(root, cfg);
+  const daemon = new RboxDaemon(root, cfg, deps);
   const shutdown = async () => {
     await daemon.stop();
     process.exit(0);

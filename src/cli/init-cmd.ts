@@ -10,7 +10,8 @@ import crypto from "node:crypto";
 import readline from "node:readline/promises";
 import { loadCredentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
-import { loadAuthedConfig, saveConfig, type WorkspaceConfig } from "./config.js";
+import { saveConfig, type WorkspaceConfig } from "./config.js";
+import { buildAuthedRemote } from "./e2ee-client.js";
 import { login } from "./auth-cmd.js";
 import { push, sync } from "./sync.js";
 import { resolveInitPlan, isInitError, type InitPlan } from "./init-plan.js";
@@ -96,6 +97,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
 
   // 3. Write the per-device binding (token injected at runtime, never persisted).
   const cfg: WorkspaceConfig = {
+    schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
     remoteWorkspaceId: workspaceId,
     projectId: plan.workspace.project,
     deviceId,
@@ -105,17 +107,16 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   };
   await saveConfig(plan.root, cfg);
 
-  // 4. Secrets stay ignored (the safe builtin default — design 07c §5).
-  process.stderr.write(
-    `${stderrStyle.dim("secrets (.env, *.pem, *.key, id_*) stay ignored — encrypted opt-in sync arrives with full E2EE.")}\n`
-  );
+  // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
+  process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
 
-  // 5. First sync: new → push (publish); join → sync (pull-first, surface conflicts).
-  const authed = await loadAuthedConfig(plan.root);
+  // 5. First sync through the E2EE transport (fails closed if this device isn't
+  //    enrolled — bootstrap/pair/recover first). new → push; join → sync.
+  const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot");
     try {
-      const seq = await push(plan.root, authed);
+      const seq = await push(plan.root, authed, deps);
       sp.succeed(`published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
     } catch (e) {
       sp.fail("initial push failed");
@@ -124,7 +125,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   } else if (plan.firstSync === "sync") {
     const sp = spinner("syncing from remote");
     try {
-      const { pulled, pushedSequence } = await sync(plan.root, authed);
+      const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
       sp.stop();
       const conflicts = pulled.filter((a) => a.kind === "conflict");
       const writes = pulled.filter((a) => a.kind === "write").length;

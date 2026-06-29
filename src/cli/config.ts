@@ -10,6 +10,9 @@ function isENOENT(e: unknown): boolean {
 
 /** Per-device, machine-local workspace binding. `rootPath` is NEVER synced. */
 export interface WorkspaceConfig {
+  /** Config schema marker. `e2ee/v1` = full end-to-end encryption (design 12).
+   *  A workspace lacking it predates E2EE → sync fails closed (D11). */
+  schema?: "e2ee/v1";
   /** Shared across machines — identifies the manifest stream on the server. */
   remoteWorkspaceId: string;
   /** Single project for now ("root" = the whole linked tree). */

@@ -1,7 +1,28 @@
 import os from "node:os";
+import readline from "node:readline/promises";
 import { clearCredentials, loadCredentials, saveCredentials } from "./credentials.js";
+import { RboxApi } from "./remote.js";
+import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
+import { buildPairing, generateRecoveryKey, toB64url } from "../engine/e2ee/index.js";
+import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Show the recovery phrase once with a forced acknowledgement (no escrow). */
+async function showRecoveryPhrase(phrase: string): Promise<void> {
+  process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
+  if (process.stdin.isTTY) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      let ack = "";
+      while (ack.trim().toLowerCase() !== "yes") ack = await rl.question(`Type "yes" once you've saved it somewhere safe: `);
+    } finally {
+      rl.close();
+    }
+  } else {
+    process.stderr.write(`(non-interactive: SAVE THE PHRASE ABOVE — it will not be shown again)\n`);
+  }
+}
 
 async function postJson(url: string, body: unknown, token?: string): Promise<Response> {
   return fetch(url, {
@@ -23,9 +44,19 @@ export async function login(remoteUrl: string, bootstrapSecret?: string): Promis
   if (bootstrapSecret) {
     const res = await postJson(`${remoteUrl}/v1/auth/device/bootstrap`, { secret: bootstrapSecret, label });
     if (!res.ok) throw new Error(`bootstrap failed: ${res.status} ${await res.text()}`);
-    const { token, deviceId } = (await res.json()) as { token: string; deviceId: string };
-    await saveCredentials({ token, deviceId, remoteUrl });
+    const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
+    await saveCredentials({ token, deviceId, remoteUrl, accountId });
     console.log(`logged in (bootstrapped) as device ${deviceId}`);
+    // E2EE: a brand-new account has no key material yet — enroll it now (this
+    // device becomes the genesis device) and show the recovery phrase once.
+    const api = new RboxApi(remoteUrl, token, "", "");
+    if (!(await api.getAccountKeys())) {
+      const phrase = await bootstrapNewAccount(api, accountId, deviceId, { now: Date.now() });
+      await showRecoveryPhrase(phrase);
+      console.log(`encryption enrolled — this workspace will be end-to-end encrypted.`);
+    } else {
+      console.error(`this account is already set up; to use it on THIS machine, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
+    }
     return;
   }
 
@@ -40,10 +71,11 @@ export async function login(remoteUrl: string, bootstrapSecret?: string): Promis
   while (Date.now() < deadline) {
     await sleep(start.interval * 1000);
     const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
-    const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; interval?: number };
+    const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
     if (p.status === "approved" && p.token) {
-      await saveCredentials({ token: p.token, deviceId: p.deviceId ?? "unknown", remoteUrl });
+      await saveCredentials({ token: p.token, deviceId: p.deviceId ?? "unknown", remoteUrl, accountId: p.accountId });
       console.log(`device authorized: ${p.deviceId}`);
+      console.error(`note: device-code login authorizes this machine but does NOT enroll it for encryption. To read/sync encrypted data, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
       return;
     }
     if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
@@ -82,29 +114,84 @@ export async function listDevices(): Promise<void> {
   }
 }
 
-/** `rbox pair` — generate a short-lived, single-use token to connect a new
- *  machine without the device-code round-trip. Printed once; treat as a secret. */
+/** `rbox pair` — generate a single-use, split-secret token that ALSO carries this
+ *  account's MK (wrapped) + a signed admission grant, so the new machine enrolls
+ *  for encryption in one paste. The `tokenSecret` half is generated locally and
+ *  NEVER sent to the server (design 12 §14.6). Printed once; treat as a secret. */
 export async function pairCreate(): Promise<void> {
   const creds = await requireCreds();
-  const res = await postJson(`${creds.remoteUrl}/v1/auth/pair/create`, {}, creds.token);
+  if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap`, `rbox pair`-connect, or `rbox recover` first.");
+  const loaded = await loadDevice(creds.accountId);
+  if (!loaded || !("secrets" in loaded)) throw new Error("no encryption key on this device — pair/recover this machine before creating a pairing token.");
+
+  // Client owns the tokenId (so the grant binds the exact token, C6) + a 32-byte
+  // tokenSecret kept local. The grant is verified-active by buildPairing's caller.
+  const tokenId = `t${toB64url(generateRecoveryKey()).slice(0, 24)}`;
+  const tokenSecret = generateRecoveryKey();
+  const notAfter = Date.now() + 10 * 60 * 1000;
+  const material = await buildPairing(loaded.secrets, { accountEpoch: 0, tokenId, tokenSecret, notAfter });
+
+  const res = await postJson(
+    `${creds.remoteUrl}/v1/auth/pair/create`,
+    { tokenId, mkWrap: JSON.stringify(material.mkWrap), admissionGrant: JSON.stringify(material.admissionGrant) },
+    creds.token
+  );
   if (res.status === 429) throw new Error("too many active pairing tokens — redeem or wait for one to expire");
   if (!res.ok) throw new Error(`pair failed: ${res.status} ${await res.text()}`);
-  const { token, expiresAt } = (await res.json()) as { token: string; expiresAt: number };
-  const mins = Math.max(1, Math.round((expiresAt - Date.now()) / 60000));
-  console.log(`\nPairing token (valid ~${mins} min, single use):\n`);
-  console.log(`    ${token}\n`);
+  const { token } = (await res.json()) as { token: string };
+  const full = `${token}.${toB64url(tokenSecret)}`; // <redeemToken>.<tokenSecret>
+  console.log(`\nPairing token (valid ~10 min, single use — carries your encryption key):\n`);
+  console.log(`    ${full}\n`);
   console.log(`On the new machine: run \`rbox\`, choose "Connect this machine", and paste it.`);
 }
 
-/** Redeem a pairing token → save this machine's device credential. The token is
- *  a bearer; it's read from a prompt or the RBOX_PAIR_TOKEN env, never argv, and
- *  never logged. */
+/** Redeem a split-secret pairing token → device credential + E2EE enrollment.
+ *  The full token is read from a prompt/stdin (never argv) and never logged. */
 export async function redeemPair(remoteUrl: string, pairToken: string): Promise<void> {
-  const res = await postJson(`${remoteUrl}/v1/auth/pair/redeem`, { token: pairToken.trim(), label: os.hostname() });
-  if (!res.ok) throw new Error("pairing failed — the token may be expired, already used, or invalid. Generate a fresh one with `rbox pair`.");
-  const { token, deviceId } = (await res.json()) as { token: string; deviceId: string };
-  await saveCredentials({ token, deviceId, remoteUrl });
-  console.log(`device authorized: ${deviceId}`);
+  const { deviceId } = await enrollViaPairing(remoteUrl, pairToken.trim(), Date.now());
+  console.log(`device authorized + encryption enrolled: ${deviceId}`);
+}
+
+/** `rbox recover` — re-enroll this machine from the recovery phrase (needs an
+ *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
+export async function recoverCmd(): Promise<void> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  let phrase: string;
+  try {
+    phrase = (await rl.question(`Enter your 24-word recovery phrase: `)).trim();
+  } finally {
+    rl.close();
+  }
+  if (!phrase) throw new Error("no phrase entered");
+  const { deviceId } = await enrollViaRecovery(phrase, Date.now());
+  console.log(`recovered + enrolled this device: ${deviceId}`);
+}
+
+/** `rbox key status` — local E2EE enrollment state for the current account. */
+export async function keyStatus(): Promise<void> {
+  const creds = await loadCredentials();
+  if (!creds) throw new Error("not logged in — run `rbox login`");
+  console.log(`device:   ${creds.deviceId}`);
+  console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
+  if (!creds.accountId) return;
+  const loaded = await loadDevice(creds.accountId);
+  const enrolled = loaded && "secrets" in loaded;
+  console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox recover`"}`);
+  console.log(`recovery phrase cached locally: ${(await loadRecoveryKey(creds.accountId)) ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
+}
+
+/** `rbox key backup` — re-show the recovery phrase IF it was cached at setup (C9). */
+export async function keyBackup(): Promise<void> {
+  const creds = await loadCredentials();
+  if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
+  const rk = await loadRecoveryKey(creds.accountId);
+  if (!rk) {
+    console.error("the recovery phrase isn't cached on this device. Use the phrase you saved at setup, or read it from another enrolled device.");
+    process.exitCode = 1;
+    return;
+  }
+  const { rkToPhrase } = await import("../engine/e2ee/index.js");
+  await showRecoveryPhrase(await rkToPhrase(rk));
 }
 
 export async function revokeDevice(deviceId: string): Promise<void> {

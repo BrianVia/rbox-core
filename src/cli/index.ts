@@ -1,14 +1,14 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { scanManifest } from "../engine/index.js";
-import { findRoot, loadAuthedConfig, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
+import { findRoot, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { runDaemon } from "./daemon.js";
 import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
-import { approveDevice, listDevices, login, logout, revokeDevice } from "./auth-cmd.js";
-import { encryptWorkspace, exportKey, importKey } from "./crypto-cmd.js";
-import { listVersions, restoreVersion } from "./versions-cmd.js";
+// versions/restore are temporarily unavailable under E2EE (design 12 D11).
+import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
+import { buildAuthedRemote } from "./e2ee-client.js";
 import { style } from "./style.js";
 import { spinner } from "./spinner.js";
 
@@ -79,6 +79,7 @@ async function main(): Promise<void> {
         workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
       }
       const cfg: WorkspaceConfig = {
+        schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
         remoteWorkspaceId: workspaceId,
         projectId,
         deviceId: flags.device ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
@@ -124,7 +125,8 @@ async function main(): Promise<void> {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pushing");
       try {
-        const seq = await push(root, await loadAuthedConfig(root));
+        const { cfg, deps } = await buildAuthedRemote(root);
+        const seq = await push(root, cfg, deps);
         sp.succeed(`pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
       } catch (e) {
         sp.fail("push failed");
@@ -136,7 +138,8 @@ async function main(): Promise<void> {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pulling");
       try {
-        const actions = await pull(root, await loadAuthedConfig(root));
+        const { cfg, deps } = await buildAuthedRemote(root);
+        const actions = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", actions, root);
       } catch (e) {
@@ -149,7 +152,8 @@ async function main(): Promise<void> {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("syncing");
       try {
-        const { pulled, pushedSequence } = await sync(root, await loadAuthedConfig(root));
+        const { cfg, deps } = await buildAuthedRemote(root);
+        const { pulled, pushedSequence } = await sync(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);
         console.log(`${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`);
@@ -202,33 +206,24 @@ async function main(): Promise<void> {
       else await addIgnorePattern(root, positional[0]!);
       break;
     }
-    case "versions": {
-      const root = await resolveRoot(flags.path);
-      await listVersions(await loadAuthedConfig(root), positional[0]);
+    case "recover": {
+      await recoverCmd();
       break;
     }
+    case "versions":
     case "restore": {
-      const root = await resolveRoot(flags.path);
-      const arg = positional[0] ?? "";
-      const at = arg.lastIndexOf("@");
-      if (at < 1) {
-        console.log("usage: rbox restore <path>@<seq>");
-        process.exitCode = 1;
-        break;
-      }
-      await restoreVersion(root, await loadAuthedConfig(root), arg.slice(0, at), Number(arg.slice(at + 1)));
-      break;
-    }
-    case "encrypt": {
-      await encryptWorkspace(await resolveRoot(positional[0]));
+      // E2EE: version history needs signed-commit-chain verification + per-commit
+      // KEK decrypt (design 12 D11) — not yet wired. Fail closed, never the old
+      // plaintext manifestAt path.
+      console.error("`rbox versions`/`restore` aren't available yet under end-to-end encryption (coming in a follow-up). Your data is safe and syncing normally.");
+      process.exitCode = 1;
       break;
     }
     case "key": {
-      const root = await resolveRoot(flags.path); // run inside the workspace
-      if (positional[0] === "export") await exportKey(root);
-      else if (positional[0] === "import") await importKey(root, positional[1] ?? "");
+      if (positional[0] === "status") await keyStatus();
+      else if (positional[0] === "backup") await keyBackup();
       else {
-        console.log("usage (inside the workspace): rbox key <export | import <recovery-phrase>>");
+        console.log("usage: rbox key <status | backup>");
         process.exitCode = 1;
       }
       break;
@@ -247,7 +242,7 @@ async function main(): Promise<void> {
         await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
         break;
       }
-      console.log(`rbox — dev-aware sync\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device\n  pair                             make a token to connect a new machine\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
+      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }
