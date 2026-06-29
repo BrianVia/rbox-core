@@ -896,11 +896,25 @@ batch (C5); `createPairToken` accepts a client-supplied `tokenId` (C6).
 
 ## 14. CLI command flows (interactive UX — codex **PASS**)
 
-**Status:** codex-reviewed (NEEDS-PASS → 6 BLOCKER + 5 SHOULD-FIX resolved in
-§14.11 D1–D11 → confirm **PASS**). §14.11 is normative. Tracked for rotation
-milestone: D1 needs an atomic commit-publish CAS (v1 has no rotation); D3 pending-
-join uses mode-600 keystore semantics; D5 is an accepted pre-launch signed-format
-change (`mkWrapHash` optional on `RosterEntry`).
+**Status:** BUILT + **LIVE-VERIFIED** (2026-06-29). codex-reviewed (NEEDS-PASS →
+6 BLOCKER + 5 SHOULD-FIX resolved in §14.11 D1–D11 → confirm **PASS**); §14.11 is
+normative. Implemented: `login --bootstrap` (genesis enroll + recovery-phrase
+ack), `init`/`link` (schema `e2ee/v1`, encryption-default), `pair` (split-secret
+token), `connect` (stdin redeem), `recover`, `key status|backup`,
+`buildAuthedRemote` sync seam (push/pull/sync/daemon), accountId in credentials,
+M5-upgrade fail-closed, dead M5 code removed. A post-build antislop pass caught +
+fixed 2 enrollment bugs (recovery keypair-reuse across 409s; recovery duplicate
+deviceId → fresh principal) + a fail-closed self-membership guard.
+
+**Live two-VM e2e (Mac + flat-meadow Linux, standalone binary, dev worker):**
+A bootstraps + pushes encrypted; **grep over the live R2 blobs + all 8 D1 tables
+= ZERO plaintext**; B connects via the split-secret token (unwraps MK, self-admits
+to the roster), pulls byte-identical; bidirectional edits converge; recovery +
+clone-pull of the recovered device's signed commit verified. Tracked for the
+rotation milestone: D1 atomic commit-publish CAS (v1 has no rotation); D5's
+`mkWrapHash` is an accepted pre-launch signed-format change. Deferred: `versions`/
+`restore` under E2EE (D11, fail closed for now); daemon refreshes account keys
+per sync (acceptable for v1).
 
 Wires the proven transport (§13, E2eeRemote) into the user-facing commands.
 Consumes §13.12 (normative). Encryption is the ONLY mode now.
