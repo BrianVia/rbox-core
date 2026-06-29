@@ -22,5 +22,6 @@ dist/
 .env.*
 !.env.example
 *.local.secret
+TEST_CREDENTIALS
 .agents/
 .claude/skills/
