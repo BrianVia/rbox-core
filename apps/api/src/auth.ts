@@ -29,6 +29,9 @@ function randomUserCode(): string {
 }
 
 const TOKEN_RE = /^[0-9a-f]{64}$/; // 32 bytes hex
+// A client-supplied opaque pairing tokenId (design 12, C6): url-safe, 16–64 chars.
+// A legacy server-generated 64-hex token also matches, so redeem accepts both.
+const PAIR_TOKEN_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 /** Validate a bearer token → the full Principal (device + account + user + role).
  *  Throttled last_seen update. Role comes from the membership; a device with no
@@ -93,6 +96,11 @@ const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
  * server stores both verbatim and never interprets them — they're handed back at
  * redeem so a freshly paired device can unwrap MK and admit itself. Both optional;
  * absent → a legacy (M10) token that redeems exactly as before.
+ *
+ * C6: the body MAY also carry a client-generated `tokenId` (16–64 url-safe chars).
+ * `buildPairing` needs the id up front to bind the `admissionGrant` to it, so the
+ * client owns it and the server just stores keyed by sha256(tokenId). Absent →
+ * the server mints a token itself (legacy M10 behavior), unchanged.
  */
 export async function createPairToken(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!p.userId) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
@@ -103,13 +111,23 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
   if (!member) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
 
   // Optional opaque E2EE admission material (bounded; stored verbatim, never parsed).
-  const body = (await req.json().catch(() => ({}))) as { mkWrap?: unknown; admissionGrant?: unknown };
+  const body = (await req.json().catch(() => ({}))) as { mkWrap?: unknown; admissionGrant?: unknown; tokenId?: unknown };
   const mkWrap = typeof body.mkWrap === "string" && body.mkWrap.length <= 64 * 1024 ? body.mkWrap : null;
   const admissionGrant = typeof body.admissionGrant === "string" && body.admissionGrant.length <= 64 * 1024 ? body.admissionGrant : null;
 
+  // C6: adopt the client tokenId if supplied (validated), else mint one server-side.
+  // Either way the row is keyed by sha256(<tokenId>) so redeem stays a single lookup.
+  let tokenId: string;
+  if (body.tokenId !== undefined) {
+    if (typeof body.tokenId !== "string" || !PAIR_TOKEN_ID_RE.test(body.tokenId)) {
+      return json({ error: "bad_request", message: "invalid tokenId" }, 400);
+    }
+    tokenId = body.tokenId;
+  } else {
+    tokenId = randomHex(TOKEN_BYTES);
+  }
   const now = Date.now();
-  const token = randomHex(TOKEN_BYTES);
-  const hash = await sha256Hex(token);
+  const hash = await sha256Hex(tokenId);
   const expiresAt = now + PAIR_TTL_MS;
   // Atomic active-token cap: insert ONLY while the account is under the cap, in a
   // single INSERT…SELECT…WHERE. D1 serializes writes, so concurrent creates can't
@@ -123,7 +141,7 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
     .bind(hash, p.accountId, p.userId, p.deviceId, now, expiresAt, mkWrap, admissionGrant, p.accountId, now, PAIR_ACTIVE_CAP)
     .run();
   if ((res.meta.changes ?? 0) === 0) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
-  return json({ token: `${PAIR_PREFIX}${token}`, expiresAt });
+  return json({ token: `${PAIR_PREFIX}${tokenId}`, expiresAt });
 }
 
 /**
@@ -137,7 +155,9 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   const body = (await req.json().catch(() => ({}))) as { token?: string; label?: string };
   const raw = typeof body.token === "string" ? body.token : "";
   const token = raw.startsWith(PAIR_PREFIX) ? raw.slice(PAIR_PREFIX.length) : raw;
-  if (!TOKEN_RE.test(token)) return json({ error: "unauthorized" }, 401); // bound format before hashing
+  // Accept both a client tokenId (C6) and a legacy 64-hex token — both stored as
+  // sha256(<id>), so one lookup covers both. Bound the format before hashing.
+  if (!PAIR_TOKEN_ID_RE.test(token)) return json({ error: "unauthorized" }, 401);
   const label = (typeof body.label === "string" ? body.label : "paired").slice(0, 200);
   const hash = await sha256Hex(token);
   const now = Date.now();

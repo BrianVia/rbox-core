@@ -167,9 +167,13 @@ export async function appendKeyState(env: Env, p: Principal, body: unknown): Pro
 }
 
 /**
- * POST /v1/keys/workspace — store a per-(workspace, keyEpoch) KEK wrap (idempotent).
- * Account-scoped: refuses unless the workspace belongs to the caller (404 to avoid
- * an enumeration leak). INSERT OR IGNORE keeps the wrap immutable per epoch.
+ * POST /v1/keys/workspace — store a per-(workspace, keyEpoch) KEK wrap as an
+ * immutable CAS (design 12, C3). Account-scoped: refuses unless the workspace
+ * belongs to the caller (404 to avoid an enumeration leak). INSERT OR IGNORE
+ * keeps an already-published epoch wrap immutable; we then SELECT and return the
+ * STORED winning wrap (the pre-existing one if this caller lost the race), so two
+ * devices that independently generated a KEK for the same epoch converge on one —
+ * the loser adopts the returned wrap and discards its own. Never an UPDATE.
  */
 export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Promise<Response> {
   const b = (body ?? {}) as Record<string, unknown>;
@@ -182,7 +186,54 @@ export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Pr
     .prepare("INSERT OR IGNORE INTO workspace_keys (workspace_id, account_id, key_epoch, kek_wrap, created_at) VALUES (?, ?, ?, ?, ?)")
     .bind(workspaceId, p.accountId, keyEpoch, kekWrap, Date.now())
     .run();
-  return json({ ok: true });
+  // Read back the winning wrap (D1 serializes writes, so this is the value that
+  // survived the CAS — ours iff we were first-writer, else the pre-existing one).
+  const row = await env.rbox_dev_db
+    .prepare("SELECT kek_wrap FROM workspace_keys WHERE workspace_id = ? AND key_epoch = ?")
+    .bind(workspaceId, keyEpoch)
+    .first<{ kek_wrap: string }>();
+  return json({ keyEpoch, kekWrap: row?.kek_wrap ?? kekWrap });
+}
+
+/**
+ * POST /v1/keys/admit (design 12, C5) — atomic device-admission: insert the new
+ * device's keys AND append the roster that references them in ONE D1 batch (a
+ * single transaction), so a crash can never leave a roster pointing at a device
+ * wrap the server never stored. Body: { device:{...}, roster:{version,signed} }.
+ *
+ * Both statements carry the SAME monotone-version guard (version === current
+ * max+1). The device insert is ordered FIRST so its guard reads MAX(version)
+ * BEFORE the roster append advances it; if the version isn't next, BOTH guards
+ * match zero rows → the batch commits nothing (no orphan device row) and we 409.
+ */
+export async function admitDevice(env: Env, p: Principal, body: unknown): Promise<Response> {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const device = (b.device ?? {}) as Record<string, unknown>;
+  const roster = (b.roster ?? {}) as Record<string, unknown>;
+  const deviceId = str(device.deviceId);
+  const sigPubKey = str(device.sigPubKey);
+  const encPubKey = str(device.encPubKey);
+  const mkWrap = str(device.mkWrap);
+  const version = nat(roster.version);
+  const signed = str(roster.signed);
+  if (!deviceId || !sigPubKey || !encPubKey || !mkWrap || version === null || !signed) {
+    return json({ error: "bad_request", message: "missing or oversized field" }, 400);
+  }
+  const now = Date.now();
+  const guard = `(SELECT COALESCE(MAX(version), -1) + 1 FROM rosters WHERE account_id = ?) = ?`;
+  const results = await env.rbox_dev_db.batch([
+    // Device first — its guard sees MAX(version) before the roster append below.
+    env.rbox_dev_db
+      .prepare(`INSERT INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE ${guard}`)
+      .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, now, p.accountId, version),
+    env.rbox_dev_db
+      .prepare(`INSERT INTO rosters (account_id, version, signed, created_at) SELECT ?, ?, ?, ? WHERE ${guard}`)
+      .bind(p.accountId, version, signed, now, p.accountId, version),
+  ]);
+  // Roster guard matched zero rows → version wasn't next → nothing applied. Client
+  // refetches, rebuilds the roster parent/version (reusing its keypair), retries.
+  if ((results[1]?.meta.changes ?? 0) === 0) return json({ error: "conflict", message: "roster version not next" }, 409);
+  return json({ ok: true, version });
 }
 
 /**

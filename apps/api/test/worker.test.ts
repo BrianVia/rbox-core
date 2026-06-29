@@ -63,6 +63,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     deviceId: string;
     seq?: number;
     parentSeq?: number;
+    accountEpoch?: number;
     encManifestSha: string;
     blobRefs?: Array<{ encSha: string; size: number }>;
   }) => {
@@ -71,7 +72,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const body = JSON.stringify({
       type: "rbox/commit/v1",
       accountId: over.accountId,
-      accountEpoch: 0,
+      accountEpoch: over.accountEpoch ?? 0,
       workspaceId: over.workspaceId,
       seq,
       parentSeq,
@@ -116,6 +117,45 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const envc = signedCommit({ accountId: a.accountId, workspaceId: ws, deviceId: a.deviceId, encManifestSha: ghostSha });
     const res = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/manifests`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, ...envc }) });
     expect(res.status).toBe(422);
+  });
+
+  // C1: commits?since returns the stored chain for (since, head]. Exercises DO
+  // storage.kv (unavailable in this runtime — see note above), so it's SKIPPED;
+  // verified live. We still pin the contract: each returned entry is a full
+  // SignedCommit and they're in ascending sequence from since+1.
+  test.skip("commits?since returns the SignedCommit chain from the pinned seq to head", async () => {
+    const a = await bootstrap("acct-commits-since");
+    const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    const commitUrl = `${BASE}/v1/ws/${ws}/proj/root/manifests`;
+    // Land two commits (seq 1, 2).
+    for (let seq = 1; seq <= 2; seq++) {
+      const m = sha(`enc-manifest-${seq}`);
+      await SELF.fetch(`${BASE}/v1/blobs/${m}`, { method: "PUT", headers: authed(a.token, { "content-length": String(`enc-manifest-${seq}`.length) }), body: `enc-manifest-${seq}` });
+      const env1 = signedCommit({ accountId: a.accountId, workspaceId: ws, deviceId: a.deviceId, seq, parentSeq: seq - 1, encManifestSha: m });
+      const c = await SELF.fetch(commitUrl, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: seq - 1, ...env1 }) });
+      expect(c.status).toBe(200);
+    }
+    // since=0 → both commits; since=1 → only seq 2.
+    const all = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/commits?since=0`, { headers: authed(a.token) });
+    expect(all.status).toBe(200);
+    expect(((await all.json()) as { commits: unknown[] }).commits).toHaveLength(2);
+    const tail = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/commits?since=1`, { headers: authed(a.token) });
+    expect(((await tail.json()) as { commits: Array<{ body: string }> }).commits).toHaveLength(1);
+  });
+
+  // C4: a commit signed under a stale/unknown epoch is refused inside the DO's
+  // head-advance txn. SKIPPED (DO storage.kv unavailable here); the authoritative
+  // guarantee is the client-side roster/epoch check, this is the server backstop.
+  test.skip("commit with accountEpoch != current → 409 epoch_stale", async () => {
+    const a = await bootstrap("acct-epoch-stale");
+    const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    // Account is at epoch 0 (no key-states); a commit claiming epoch 1 is stale.
+    const m = sha("enc-manifest-epoch");
+    await SELF.fetch(`${BASE}/v1/blobs/${m}`, { method: "PUT", headers: authed(a.token, { "content-length": "17" }), body: "enc-manifest-epoc" });
+    const envc = signedCommit({ accountId: a.accountId, workspaceId: ws, deviceId: a.deviceId, accountEpoch: 1, encManifestSha: m });
+    const res = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/manifests`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, ...envc }) });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("epoch_stale");
   });
 
   test("free plan workspace cap: 2nd workspace → 402 quota_exceeded", async () => {
@@ -438,6 +478,89 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const b = await bootstrap("acct-wskey-other");
     expect((await SELF.fetch(`${BASE}/v1/keys/workspace/${ws}`, { headers: authed(b.token) })).status).toBe(404);
     expect((await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(b.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "evil" }) })).status).toBe(404);
+  });
+
+  // C3: putWorkspaceKey is an immutable CAS — the FIRST wrap wins and a later
+  // caller with a DIFFERENT wrap gets the first one back (adopts it, never an UPDATE).
+  test("workspace key CAS: second writer with a different wrap gets the FIRST wrap back", async () => {
+    const a = await bootstrap("acct-wskey-cas");
+    const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    const put = (kekWrap: string) =>
+      SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap }) });
+    const first = (await (await put("kek-first")).json()) as { keyEpoch: number; kekWrap: string };
+    expect(first).toEqual({ keyEpoch: 0, kekWrap: "kek-first" });
+    // A second, different wrap for the SAME epoch must NOT overwrite — the winning
+    // (first) wrap is returned so the loser converges on it.
+    const second = (await (await put("kek-second")).json()) as { keyEpoch: number; kekWrap: string };
+    expect(second).toEqual({ keyEpoch: 0, kekWrap: "kek-first" });
+    // And the stored value is still the first wrap.
+    const got = (await (await SELF.fetch(`${BASE}/v1/keys/workspace/${ws}`, { headers: authed(a.token) })).json()) as { keys: Array<{ keyEpoch: number; kekWrap: string }> };
+    expect(got.keys).toEqual([{ keyEpoch: 0, kekWrap: "kek-first" }]);
+  });
+
+  // C5: /keys/admit inserts device keys AND appends the roster in one D1 batch.
+  const admit = (token: string, deviceId: string, version: number, signed: string) =>
+    SELF.fetch(`${BASE}/v1/keys/admit`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({ device: { deviceId, sigPubKey: "sig", encPubKey: "enc", mkWrap: "mk" }, roster: { version, signed } }),
+    });
+
+  test("keys/admit: atomic device-keys + roster append (happy path) lands both", async () => {
+    const a = await bootstrap("acct-admit");
+    await keysBootstrap(a.token, a.deviceId); // genesis roster = v0
+    const res = await admit(a.token, "dev_admitted_1", 1, "roster-v1");
+    expect(res.status).toBe(200);
+    const acct = (await (await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(a.token) })).json()) as { rosters: string[]; devices: Array<{ deviceId: string }> };
+    expect(acct.rosters).toEqual(["roster-v0", "roster-v1"]); // roster appended
+    expect(acct.devices.map((d) => d.deviceId)).toContain("dev_admitted_1"); // device stored
+  });
+
+  test("keys/admit: wrong roster version → 409 AND leaves NO device_keys row (atomic rollback)", async () => {
+    const a = await bootstrap("acct-admit-conflict");
+    await keysBootstrap(a.token, a.deviceId); // roster at v0, so next is v1
+    // Claim v5 (skips ahead) → roster guard fails → batch applies nothing.
+    const res = await admit(a.token, "dev_orphan", 5, "roster-v5");
+    expect(res.status).toBe(409);
+    // The device must NOT have been written (no orphan referencing an un-rostered wrap).
+    const row = await env.rbox_dev_db.prepare("SELECT 1 FROM device_keys WHERE device_id = ?").bind("dev_orphan").first();
+    expect(row).toBeNull();
+    const acct = (await (await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(a.token) })).json()) as { rosters: string[] };
+    expect(acct.rosters).toEqual(["roster-v0"]); // roster unchanged
+  });
+
+  // C6: the client owns the tokenId (so the grant binds the exact token); the
+  // server stores keyed by it and redeem looks it up.
+  test("pair/create with a client tokenId redeems by that same tokenId", async () => {
+    const a = await bootstrap("acct-pair-tokenid");
+    const tokenId = "clientchosen_tokenid_0001"; // 16–64 url-safe chars
+    const cr = await SELF.fetch(`${BASE}/v1/auth/pair/create`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": "application/json" }),
+      body: JSON.stringify({ tokenId, mkWrap: "mk-blob", admissionGrant: "grant-blob" }),
+    });
+    expect(cr.status).toBe(200);
+    const { token } = (await cr.json()) as { token: string };
+    expect(token).toBe(`rbox-pair_${tokenId}`); // server adopted the client id verbatim
+    // Redeem by the client tokenId → mints a working device + returns the bound material.
+    const rd = await SELF.fetch(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
+    expect(rd.status).toBe(200);
+    const redeemed = (await rd.json()) as { token: string; deviceId: string; mkWrap: string | null; admissionGrant: string | null };
+    expect(redeemed.deviceId.startsWith("dev_")).toBe(true);
+    expect(redeemed.mkWrap).toBe("mk-blob");
+    expect(redeemed.admissionGrant).toBe("grant-blob");
+    // Single-use still holds for the client-supplied id.
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) })).status).toBe(401);
+  });
+
+  test("pair/create rejects a malformed client tokenId → 400", async () => {
+    const a = await bootstrap("acct-pair-badid");
+    const res = await SELF.fetch(`${BASE}/v1/auth/pair/create`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": "application/json" }),
+      body: JSON.stringify({ tokenId: "too-short" }), // < 16 chars
+    });
+    expect(res.status).toBe(400);
   });
 
   test("pairing token carries opaque E2EE material through create → redeem", async () => {

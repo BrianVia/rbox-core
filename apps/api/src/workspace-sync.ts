@@ -17,10 +17,13 @@ interface CommitBodyView {
   type?: unknown;
   seq?: unknown;
   parentSeq?: unknown;
+  accountEpoch?: unknown;
   encManifestSha?: unknown;
   deviceId?: unknown;
   blobRefs?: unknown;
 }
+
+const MAX_COMMIT_SPAN = 5000; // commits?since span cap → over this, client re-baselines
 
 /**
  * WorkspaceSync — the per-(workspace, project) Durable Object (D2).
@@ -64,6 +67,9 @@ export class WorkspaceSync {
       return this.connect(url);
     }
     if (action === "latest" && req.method === "GET") return this.latest();
+    // C1: the stored SignedCommits for (since, head] so a client can verify the
+    // hash-chain forward from its pinned head to latest before applying.
+    if (action === "commits" && req.method === "GET") return this.commits(url);
     if (action === "manifests" && req.method === "POST") return this.commit(req, ws, proj);
     // GET /v1/ws/:ws/proj/:proj/manifests/:seq — a specific historical commit.
     if (seg[5] === "manifests" && seg[6] && req.method === "GET") return this.commitAt(Number(seg[6]));
@@ -111,6 +117,9 @@ export class WorkspaceSync {
     // Authenticated account, set by the Worker after authorizeWorkspace (the DO is
     // only reachable via the Worker, which overrides any client-provided value).
     const accountId = req.headers.get("x-rbox-account") ?? "";
+    // C4: the account's current key epoch, read by the Worker (MAX(account_epoch))
+    // and forwarded. The commit's accountEpoch must equal it (asserted in the txn).
+    const currentEpoch = Number(req.headers.get("x-rbox-account-epoch") ?? "0");
 
     // Envelope shape: three opaque strings. The body is bounded (we store verbatim).
     if (!commit || typeof commit.body !== "string" || typeof commit.commitHash !== "string" || typeof commit.sig !== "string") {
@@ -132,6 +141,8 @@ export class WorkspaceSync {
       return json({ error: "bad_request", message: "seq must be parentSeq+1" }, 400);
     }
     if (parent !== cb.parentSeq) return json({ error: "bad_request", message: "parentSequence mismatch" }, 400);
+    if (!Number.isInteger(cb.accountEpoch)) return json({ error: "bad_request", message: "bad accountEpoch" }, 400);
+    const commitEpoch = cb.accountEpoch as number;
     const refs = Array.isArray(cb.blobRefs) ? (cb.blobRefs as Array<{ encSha?: unknown }>) : null;
     if (!refs || refs.length > MAX_BLOB_REFS) return json({ error: "bad_request", message: "bad blobRefs" }, 400);
     const refShas: string[] = [];
@@ -151,13 +162,20 @@ export class WorkspaceSync {
     // Atomic head check + advance — synchronous, no await inside. We store the full
     // SignedCommit verbatim (opaque); parent===head guarantees next === cb.seq.
     const stored = JSON.stringify({ commitHash: commit.commitHash, sig: commit.sig, body: commit.body });
-    let outcome: { sequence: number } | { conflict: number };
+    let outcome: { sequence: number } | { conflict: number } | { epochStale: number };
     try {
       let next = 0;
       this.ctx.storage.transactionSync(() => {
         const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
         if (parent !== head) {
           outcome = { conflict: head };
+          throw ABORT;
+        }
+        // C4: refuse a commit signed under any epoch != the account's current one
+        // (==, so both stale and unknown-future epochs are rejected). Best-effort
+        // precondition; the client's roster/epoch check is the authority.
+        if (commitEpoch !== currentEpoch) {
+          outcome = { epochStale: currentEpoch };
           throw ABORT;
         }
         next = head + 1;
@@ -170,6 +188,7 @@ export class WorkspaceSync {
     }
 
     if ("conflict" in outcome!) return json({ error: "conflict", head: outcome!.conflict }, 409);
+    if ("epochStale" in outcome!) return json({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409);
     const sequence = outcome!.sequence;
 
     // Best-effort D1 commit mirror (not authoritative). Workspace ownership is
@@ -219,6 +238,27 @@ export class WorkspaceSync {
       this.ctx.storage.kv.put("pruneFloor", target);
     });
     return json({ pruned: target - curFloor, pruneFloor: target });
+  }
+
+  /** C1: the stored SignedCommits for (since, head], so a client can verify the
+   *  hash-chain forward from its pinned head to latest. The span is capped — a
+   *  client that's fallen too far behind (or below the prune floor, where commit
+   *  pointers were dropped) must re-baseline rather than stream unbounded history. */
+  private async commits(url: URL): Promise<Response> {
+    const since = Number(url.searchParams.get("since") ?? "0");
+    if (!Number.isInteger(since) || since < 0) return json({ error: "bad_request", message: "bad since" }, 400);
+    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    if (since >= head) return json({ commits: [] }); // caller already at/ahead of head
+    if (head - since > MAX_COMMIT_SPAN) return json({ error: "needs_rebaseline", head, maxSpan: MAX_COMMIT_SPAN }, 409);
+    const commits: SignedCommit[] = [];
+    for (let s = since + 1; s <= head; s++) {
+      const raw = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
+      // A gap (pruned below the retention floor) breaks chain verification → the
+      // client can't link forward and must re-baseline from latest.
+      if (!raw) return json({ error: "needs_rebaseline", head }, 409);
+      commits.push(JSON.parse(raw) as SignedCommit);
+    }
+    return json({ commits });
   }
 
   /** A specific historical commit (the opaque SignedCommit at that sequence). */

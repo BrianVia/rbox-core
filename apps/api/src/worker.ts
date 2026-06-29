@@ -14,7 +14,7 @@ import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
-import { appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
+import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
 import { webSession } from "./clerk.js";
@@ -131,6 +131,8 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (req.method === "GET" && eq(seg, ["v1", "keys", "account"])) return getAccountKeys(env, p);
     if (req.method === "POST" && eq(seg, ["v1", "keys", "device"])) return putDeviceKeys(env, p, await req.json().catch(() => ({})));
     if (req.method === "POST" && eq(seg, ["v1", "keys", "roster"])) return appendRoster(env, p, await req.json().catch(() => ({})));
+    // C5: atomic device-keys + roster append (admission) in one D1 batch.
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "admit"])) return admitDevice(env, p, await req.json().catch(() => ({})));
     if (req.method === "POST" && eq(seg, ["v1", "keys", "keystate"])) return appendKeyState(env, p, await req.json().catch(() => ({})));
     if (req.method === "POST" && eq(seg, ["v1", "keys", "workspace"])) return putWorkspaceKey(env, p, await req.json().catch(() => ({})));
     if (req.method === "GET" && seg.length === 4 && seg[2] === "workspace") return getWorkspaceKeys(env, p, seg[3]!);
@@ -168,13 +170,20 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (seg.length === 6 && action === "versions" && req.method === "GET") {
       return versionsList(env, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
     }
-    if (action === "manifests" || action === "latest" || action === "connect") {
+    if (action === "manifests" || action === "latest" || action === "connect" || action === "commits") {
       const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
       if (write) {
         // Commit: forward with the authenticated account (DO does account-scoped
         // blob-existence). Clean header set by the Worker (overrides any client value).
         const headers = new Headers(req.headers);
         headers.set("x-rbox-account", p.accountId);
+        // C4: also forward the account's CURRENT key epoch (MAX(account_epoch), 0 if
+        // none); the DO asserts the commit's accountEpoch == this inside the txn.
+        const epochRow = await env.rbox_dev_db
+          .prepare("SELECT MAX(account_epoch) AS epoch FROM account_key_states WHERE account_id = ?")
+          .bind(p.accountId)
+          .first<{ epoch: number | null }>();
+        headers.set("x-rbox-account-epoch", String(epochRow?.epoch ?? 0));
         return stub.fetch(new Request(req, { headers }));
       }
       return stub.fetch(req);
