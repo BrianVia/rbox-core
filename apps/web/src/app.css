@@ -1,7 +1,9 @@
 :root {
 	--bg: #0a0a0f;
+	--bg-soft: #101019;
 	--surface: #14141f;
 	--border: rgba(255, 255, 255, 0.1);
+	--border-strong: rgba(255, 255, 255, 0.16);
 	--text: #f2f2f7;
 	--dim: #a4a4b8;
 	--faint: #6f6f86;
@@ -24,19 +26,22 @@ body {
 }
 
 .shell {
-	max-width: 560px;
-	margin: 8vh auto;
-	padding: 28px;
+	max-width: 580px;
+	margin: 7vh auto;
+	padding: 30px;
 	background: var(--surface);
 	border: 1px solid var(--border);
-	border-radius: 16px;
+	border-radius: 20px;
+	box-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.8);
 }
 
 .shell header {
 	display: flex;
 	align-items: baseline;
 	gap: 10px;
-	margin-bottom: 22px;
+	margin-bottom: 24px;
+	padding-bottom: 18px;
+	border-bottom: 1px solid var(--border);
 }
 
 .logo {
@@ -88,6 +93,23 @@ button.primary {
 	background: linear-gradient(180deg, #8a7bff, var(--accent));
 	border-color: transparent;
 	color: #fff;
+	box-shadow: 0 8px 24px -10px var(--accent);
+}
+
+button.primary:hover:not(:disabled) {
+	background: linear-gradient(180deg, #9a8cff, #8676ff);
+}
+
+button.ghost {
+	background: transparent;
+	border-color: var(--border);
+	color: var(--dim);
+}
+
+button.ghost:hover:not(:disabled) {
+	color: var(--text);
+	background: rgba(255, 255, 255, 0.04);
+	border-color: var(--border-strong);
 }
 
 a {
