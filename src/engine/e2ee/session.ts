@@ -17,7 +17,7 @@ import { aesGcmUnwrap, aesGcmWrap, generateMasterKey, generateWorkspaceKek, rsaD
 import { decryptManifest, encryptManifest } from "./manifest-crypto.js";
 import { fromB64url, hkdf, sha256, sha256Hex, toB64url, utf8 } from "./primitives.js";
 import { generateRecoveryKey, recoverySignKeyPair, rkToPhrase, rkWrapKey } from "./recovery.js";
-import { activeSigners, buildAdmissionRoster, buildGenesisRoster, verifyRosterChain, type AdmissionGrant, type RosterBody, type RosterEntry, type SignedRoster } from "./roster.js";
+import { activeSigners, buildAdminRoster, buildAdmissionRoster, buildGenesisRoster, verifyRosterChain, type AdmissionGrant, type RosterBody, type RosterEntry, type SignedRoster } from "./roster.js";
 
 const PAIR_MK_WRAP_SALT = utf8("rbox/mk-wrap/v1");
 const ADMISSION_SALT = utf8("rbox/admission/v1");
@@ -34,7 +34,7 @@ export interface DeviceSecrets {
   encPrivPkcs8: Uint8Array;
 }
 
-function rosterEntry(deviceId: string, kind: "device" | "recovery", sigPubKey: Uint8Array, encPubSpki: Uint8Array, addedAt: number): RosterEntry {
+function rosterEntry(deviceId: string, kind: "device" | "recovery", sigPubKey: Uint8Array, encPubSpki: Uint8Array, addedAt: number, mkWrapHash?: string): RosterEntry {
   return {
     deviceId,
     sigAlg: "Ed25519",
@@ -45,6 +45,7 @@ function rosterEntry(deviceId: string, kind: "device" | "recovery", sigPubKey: U
     kind,
     addedAt,
     status: "active",
+    mkWrapHash,
   };
 }
 
@@ -89,14 +90,15 @@ export async function bootstrapAccount(accountId: string, deviceId: string, now:
   const rsk = await recoverySignKeyPair(rk);
 
   const accountEpoch = 0;
-  const deviceEntry = rosterEntry(deviceId, "device", sig.publicKey, enc.publicKeySpki, now);
-  const recoveryEntry = rosterEntry("recovery", "recovery", rsk.publicKey, enc.publicKeySpki, now);
-  const genesisRoster = await buildGenesisRoster({ accountId, bootstrap: deviceEntry, recovery: recoveryEntry, bootstrapSignKey: sig });
-
-  // Wraps: MK to this device (RSA), MK to recovery (AES under rkWrapKey).
+  // Wraps first — their hashes bind into the signed roster entries (D5/C7).
   const deviceWrap = await rsaDeviceWrap(enc.publicKeySpki, mk, deviceWrapCtx(accountId, accountEpoch));
   const recoveryWrap = await aesGcmWrap(await rkWrapKey(rk), mk, recoveryWrapCtx(accountId, accountEpoch));
+  const deviceWrapHash = await wrapHash(deviceWrap);
   const recoveryWrapId = await wrapHash(recoveryWrap);
+
+  const deviceEntry = rosterEntry(deviceId, "device", sig.publicKey, enc.publicKeySpki, now, deviceWrapHash);
+  const recoveryEntry = rosterEntry("recovery", "recovery", rsk.publicKey, enc.publicKeySpki, now, recoveryWrapId);
+  const genesisRoster = await buildGenesisRoster({ accountId, bootstrap: deviceEntry, recovery: recoveryEntry, bootstrapSignKey: sig });
 
   const genesisKeyState = await buildKeyState({
     accountId,
@@ -105,7 +107,7 @@ export async function bootstrapAccount(accountId: string, deviceId: string, now:
     rosterVersion: 0,
     rosterHash: genesisRoster.rosterHash,
     keyEpoch: 0,
-    mkWrapHashes: [await wrapHash(deviceWrap), recoveryWrapId],
+    mkWrapHashes: [deviceWrapHash, recoveryWrapId],
     recoveryWrapId,
     signerDeviceId: deviceId,
     signKey: sig,
@@ -228,6 +230,9 @@ export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: 
   const authorizedMkWrapHashes = new Set<string>();
   for (const s of keyStates) for (const h of s.mkWrapHashes) authorizedMkWrapHashes.add(h);
   for (const sr of rosterChain) if (sr.admission?.deviceWrapHash) authorizedMkWrapHashes.add(sr.admission.deviceWrapHash);
+  // D5: every roster entry binds its principal's MK-wrap hash, so bootstrap +
+  // recovery + pairing wraps are all authorized uniformly (not only pairing's grant).
+  for (const r of rosters) for (const d of r.devices) if (d.mkWrapHash) authorizedMkWrapHashes.add(d.mkWrapHash);
 
   const currentRosterIdx = rosterChain.length - 1;
   return {
@@ -360,9 +365,10 @@ export async function redeemPairing(args: {
   const sig = generateSignKeyPair();
   const enc = generateWrapKeyPair();
   const selfWrap = await rsaDeviceWrap(enc.publicKeySpki, mk, deviceWrapCtx(args.accountId, args.accountEpoch));
+  const selfWrapHash = await wrapHash(selfWrap);
 
   const prevBody = parseStrict(args.prevRoster.body) as RosterBody;
-  const newEntry = rosterEntry(args.deviceId, "device", sig.publicKey, enc.publicKeySpki, args.now);
+  const newEntry = rosterEntry(args.deviceId, "device", sig.publicKey, enc.publicKeySpki, args.now, selfWrapHash);
   const admissionKp = signKeyPairFromSeed(await hkdf(args.tokenSecret, ADMISSION_SALT, utf8("admission-key"), 32));
   const grant = parseStrict(args.material.admissionGrant.grant) as AdmissionGrant;
 
@@ -374,7 +380,7 @@ export async function redeemPairing(args: {
     grantSignerDeviceId: args.material.admissionGrant.grantSignerDeviceId,
     grantSig: args.material.admissionGrant.grantSig,
     admissionSignKey: admissionKp,
-    deviceWrapHash: await wrapHash(selfWrap),
+    deviceWrapHash: selfWrapHash,
   });
 
   return {
@@ -397,6 +403,48 @@ export async function redeemPairing(args: {
 export async function recoverMasterKey(accountId: string, accountEpoch: number, recoveryKey: Uint8Array, recoveryWrap: Wrap): Promise<Uint8Array> {
   if (recoveryWrap.kind !== "aesgcm-wrap") throw new Error("recovery wrap must be aesgcm-wrap");
   return aesGcmUnwrap(await rkWrapKey(recoveryKey), recoveryWrap, recoveryWrapCtx(accountId, accountEpoch));
+}
+
+/**
+ * Recover on a fresh device after device loss (design 12 §14.7 / D5): recover MK
+ * via RK, generate this device's keypairs + MK self-wrap, and build an admission
+ * roster signed by the RECOVERY principal (RSK, already `active` in the prev
+ * roster) admitting this device — its `mkWrapHash` is bound in the signed entry so
+ * C7 authorizes the recovered wrap. Returns the same shape as `redeemPairing`.
+ */
+export async function buildRecoveryAdmission(args: {
+  accountId: string;
+  accountEpoch: number;
+  deviceId: string;
+  recoveryKey: Uint8Array;
+  recoveryWrap: Wrap;
+  prevRoster: SignedRoster; // current head roster (caller verified it)
+  now: number;
+}): Promise<RedeemResult> {
+  const mk = await recoverMasterKey(args.accountId, args.accountEpoch, args.recoveryKey, args.recoveryWrap);
+  const rsk = await recoverySignKeyPair(args.recoveryKey);
+  const sig = generateSignKeyPair();
+  const enc = generateWrapKeyPair();
+  const selfWrap = await rsaDeviceWrap(enc.publicKeySpki, mk, deviceWrapCtx(args.accountId, args.accountEpoch));
+  const selfWrapHash = await wrapHash(selfWrap);
+
+  const prevBody = parseStrict(args.prevRoster.body) as RosterBody;
+  const newEntry = rosterEntry(args.deviceId, "device", sig.publicKey, enc.publicKeySpki, args.now, selfWrapHash);
+  const admissionRoster = await buildAdminRoster(prevBody, [...prevBody.devices, newEntry], "recovery", rsk);
+
+  return {
+    secrets: {
+      accountId: args.accountId,
+      deviceId: args.deviceId,
+      mk,
+      sigPubKey: sig.publicKey,
+      sigPrivPkcs8: signPrivateToPkcs8(sig.privateKey),
+      encPubSpki: enc.publicKeySpki,
+      encPrivPkcs8: wrapPrivateToPkcs8(enc.privateKey),
+    },
+    device: { deviceId: args.deviceId, sigPubKey: toB64url(sig.publicKey), encPubKey: toB64url(enc.publicKeySpki), mkWrap: selfWrap },
+    admissionRoster,
+  };
 }
 
 /** Open this device's own MK wrap (RSA) — used on a device that's already in the

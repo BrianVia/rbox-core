@@ -35,6 +35,10 @@ export interface RosterEntry {
   kind: "device" | "recovery";
   addedAt: number;
   status: "active" | "revoked";
+  /** SHA-256 (hex) of this principal's MK wrap, bound into the signed roster so a
+   *  fetched MK wrap is authorized uniformly for bootstrap/pairing/recovery (C7 /
+   *  design 12 D5). Optional only for back-compat with pre-D5 fixtures. */
+  mkWrapHash?: string;
 }
 
 export interface RosterBody {

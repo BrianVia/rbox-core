@@ -93,6 +93,7 @@ export {
   bootstrapAccount,
   buildCommit,
   buildPairing,
+  buildRecoveryAdmission,
   createWorkspaceKey,
   openCommit,
   openOwnMasterKey,
