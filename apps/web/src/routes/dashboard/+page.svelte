@@ -79,16 +79,24 @@
 		</div>
 	</section>
 
-	<section class="plans">
-		<button class="primary" disabled={busy} onclick={() => checkout('solo')}>Solo</button>
-		<button class="primary" disabled={busy} onclick={() => checkout('pro')}>Pro</button>
-		<button disabled title="Coming soon — per-seat billing not ready">Team — soon</button>
-	</section>
-
-	<section class="actions">
-		<button disabled={busy} onclick={portal}>Manage billing</button>
-		<button onclick={signOut}>Sign out</button>
-	</section>
+	{#if usage.plan === 'free'}
+		<!-- Free → offer plans. Paid users change/cancel via the portal, not a new
+		     checkout (which would create a second subscription). -->
+		<section class="plans">
+			<button class="primary" disabled={busy} onclick={() => checkout('solo')}>Solo</button>
+			<button class="primary" disabled={busy} onclick={() => checkout('pro')}>Pro</button>
+			<button disabled title="Coming soon — per-seat billing not ready">Team — soon</button>
+		</section>
+		<section class="actions">
+			<button onclick={signOut}>Sign out</button>
+		</section>
+	{:else}
+		<p class="faint hint">Change or cancel your plan in the billing portal.</p>
+		<section class="actions">
+			<button disabled={busy} onclick={portal}>Manage billing</button>
+			<button onclick={signOut}>Sign out</button>
+		</section>
+	{/if}
 {:else if !error}
 	<p class="muted">Loading account…</p>
 {/if}
@@ -120,6 +128,10 @@
 		grid-template-columns: repeat(3, 1fr);
 		gap: 8px;
 		margin-bottom: 14px;
+	}
+	.hint {
+		margin-bottom: 14px;
+		font-size: 14px;
 	}
 	.actions {
 		display: flex;
