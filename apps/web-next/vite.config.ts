@@ -3,9 +3,12 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 // Pure client-rendered SPA → static assets deployed to the rbox-app Pages project.
-// `fallback: '200.html'` makes every unknown path serve the app shell (SF2), so
-// direct loads of /dashboard, /billing, /billing/success?... work. Pair with
-// static/_redirects (`/* /200.html 200`) for Cloudflare Pages routing.
+// `fallback: 'index.html'` makes every unknown path serve the app shell (SF2), so
+// direct loads of /dashboard, /billing, /billing/success?... work. Paired with
+// static/_redirects (`/* /index.html 200`). index.html (not 200.html) is the
+// canonical directory index, so Cloudflare Pages' clean-URL handling doesn't
+// redirect it — 200.html loops (/200.html → /200 → /* → /200.html). Safe here:
+// prerender is off (no route emits a conflicting index.html) and there's no 404.html.
 export default defineConfig({
 	plugins: [
 		sveltekit({
@@ -13,7 +16,7 @@ export default defineConfig({
 				runes: ({ filename }) =>
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
-			adapter: adapter({ fallback: '200.html', strict: false })
+			adapter: adapter({ fallback: 'index.html', strict: false })
 		})
 	]
 });
