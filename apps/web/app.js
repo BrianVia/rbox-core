@@ -6,6 +6,10 @@ const CFG = window.RBOX_CONFIG;
 const API = CFG.apiBase.replace(/\/+$/, "");
 const RBOX_TOKEN_KEY = "rbox_token";
 const RBOX_ACCOUNT_KEY = "rbox_account_id";
+// Plan deep-link from the marketing site (?plan=solo|pro|team). Stashed so it
+// survives the Clerk sign-in redirect, then consumed once the user is signed in.
+const PLAN_INTENT_KEY = "rbox_intent_plan";
+const VALID_PLANS = ["solo", "pro", "team"];
 
 const $ = (id) => document.getElementById(id);
 
@@ -158,6 +162,21 @@ async function showSignedIn(clerk) {
     return;
   }
 
+  // Plan deep-link: if the user arrived via a marketing plan button, start that
+  // plan's checkout immediately. It binds to their signed-in account (no orphaned
+  // payment), so this gives the "payment link" feel without the reconciliation.
+  const intent = sessionStorage.getItem(PLAN_INTENT_KEY);
+  if (intent) {
+    sessionStorage.removeItem(PLAN_INTENT_KEY);
+    try {
+      setStatus(`Starting ${intent} checkout…`, "info");
+      await redirectTo(`/v1/billing/checkout?plan=${encodeURIComponent(intent)}`);
+      return; // redirecting to Stripe
+    } catch (e) {
+      setStatus(e.message, "error"); // fall through to the usual dashboard
+    }
+  }
+
   try {
     const usage = await api("/v1/account/usage");
     renderUsage(usage);
@@ -178,6 +197,13 @@ async function main() {
   if (!CFG || !CFG.clerkPublishableKey || CFG.clerkPublishableKey.includes("PASTE_PK")) {
     setStatus("Missing Clerk publishable key in config.js.", "error");
     return;
+  }
+
+  // Capture a plan deep-link before sign-in so it survives the Clerk redirect.
+  const urlPlan = new URLSearchParams(location.search).get("plan");
+  if (urlPlan && VALID_PLANS.includes(urlPlan)) {
+    sessionStorage.setItem(PLAN_INTENT_KEY, urlPlan);
+    history.replaceState(null, "", location.pathname); // don't re-trigger on refresh
   }
 
   wireButtons();
