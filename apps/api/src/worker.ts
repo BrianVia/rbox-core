@@ -14,15 +14,14 @@ import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
+import { appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
 import { webSession } from "./clerk.js";
-import { json } from "./util.js";
+import { json, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
 export { WorkspaceSync } from "./workspace-sync.js";
-
-const SHA_RE = /^[0-9a-f]{64}$/;
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -108,7 +107,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
 
   // Account ops (scoped to the caller's account).
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(env, p);
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "billing", "checkout"])) return billingCheckout(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "billing", "portal"])) return billingPortal(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
@@ -123,6 +122,18 @@ async function route(req: Request, env: Env): Promise<Response> {
       return jsonResponse({ error: "quota_exceeded", limit: "workspaces", cap: limits.workspaces }, 402);
     }
     return createWorkspace(env, p, url.searchParams.get("project") ?? "root");
+  }
+
+  // E2EE opaque key storage (design 12) — all authed + account-scoped via Principal.
+  // The server is zero-knowledge: it stores/serves these blobs verbatim, never decrypts.
+  if (seg[0] === "v1" && seg[1] === "keys") {
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "bootstrap"])) return bootstrapAccountKeys(env, p, await req.json().catch(() => ({})));
+    if (req.method === "GET" && eq(seg, ["v1", "keys", "account"])) return getAccountKeys(env, p);
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "device"])) return putDeviceKeys(env, p, await req.json().catch(() => ({})));
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "roster"])) return appendRoster(env, p, await req.json().catch(() => ({})));
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "keystate"])) return appendKeyState(env, p, await req.json().catch(() => ({})));
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "workspace"])) return putWorkspaceKey(env, p, await req.json().catch(() => ({})));
+    if (req.method === "GET" && seg.length === 4 && seg[2] === "workspace") return getWorkspaceKeys(env, p, seg[3]!);
   }
 
   // POST /v1/blobs/check — entitlement-scoped to the caller's account.

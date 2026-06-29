@@ -1,5 +1,8 @@
 /** Shared control-plane helpers (consolidated from per-file copies). */
 
+/** A lowercase-hex SHA-256 (32 bytes) — every content address / blob ref. */
+export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
 export function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }

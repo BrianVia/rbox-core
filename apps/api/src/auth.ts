@@ -87,14 +87,25 @@ const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
  * pairing token bound to the caller's account + user. Requires a real membership
  * (never the viewer-by-absence path) so a removed user can't mint, and enforces a
  * per-account active-token cap. Plaintext token returned exactly once.
+ *
+ * E2EE (design 12, V4-1): the body MAY carry opaque `mkWrap` (the MK wrapped for
+ * the redeemer) and `admissionGrant` (the pre-signed roster-delta authority). The
+ * server stores both verbatim and never interprets them — they're handed back at
+ * redeem so a freshly paired device can unwrap MK and admit itself. Both optional;
+ * absent → a legacy (M10) token that redeems exactly as before.
  */
-export async function createPairToken(env: Env, p: Principal): Promise<Response> {
+export async function createPairToken(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!p.userId) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
   const member = await env.rbox_dev_db
     .prepare("SELECT 1 FROM memberships WHERE account_id = ? AND user_id = ?")
     .bind(p.accountId, p.userId)
     .first();
   if (!member) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
+
+  // Optional opaque E2EE admission material (bounded; stored verbatim, never parsed).
+  const body = (await req.json().catch(() => ({}))) as { mkWrap?: unknown; admissionGrant?: unknown };
+  const mkWrap = typeof body.mkWrap === "string" && body.mkWrap.length <= 64 * 1024 ? body.mkWrap : null;
+  const admissionGrant = typeof body.admissionGrant === "string" && body.admissionGrant.length <= 64 * 1024 ? body.admissionGrant : null;
 
   const now = Date.now();
   const token = randomHex(TOKEN_BYTES);
@@ -105,11 +116,11 @@ export async function createPairToken(env: Env, p: Principal): Promise<Response>
   // both pass a stale count (closes the check-then-insert race). changes===0 → over cap.
   const res = await env.rbox_dev_db
     .prepare(
-      `INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at)
-       SELECT ?, ?, ?, ?, 'pair', ?, ?
+      `INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at, mk_wrap, admission_grant)
+       SELECT ?, ?, ?, ?, 'pair', ?, ?, ?, ?
        WHERE (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ? AND consumed_at IS NULL AND expires_at > ?) < ?`
     )
-    .bind(hash, p.accountId, p.userId, p.deviceId, now, expiresAt, p.accountId, now, PAIR_ACTIVE_CAP)
+    .bind(hash, p.accountId, p.userId, p.deviceId, now, expiresAt, mkWrap, admissionGrant, p.accountId, now, PAIR_ACTIVE_CAP)
     .run();
   if ((res.meta.changes ?? 0) === 0) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
   return json({ token: `${PAIR_PREFIX}${token}`, expiresAt });
@@ -132,10 +143,12 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   const now = Date.now();
 
   // Atomic single-use consume + snapshot — only the row-winning redeem gets a row.
+  // Also returns the opaque E2EE material (NULL for legacy tokens), handed back so
+  // the new device can unwrap MK + author its admission roster delta (V4-1).
   const consumed = await env.rbox_dev_db
-    .prepare("UPDATE pairing_tokens SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING account_id, user_id, created_by")
+    .prepare("UPDATE pairing_tokens SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING account_id, user_id, created_by, mk_wrap, admission_grant")
     .bind(now, hash, now)
-    .first<{ account_id: string; user_id: string; created_by: string }>();
+    .first<{ account_id: string; user_id: string; created_by: string; mk_wrap: string | null; admission_grant: string | null }>();
   if (!consumed) return json({ error: "unauthorized" }, 401); // invalid / expired / already used
 
   // Fail-closed live authority check: creator device non-revoked AND user a member.
@@ -152,7 +165,8 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   const deviceId = `dev_${randomHex(4)}`;
   try {
     const minted = await mintDevice(env, consumed.account_id, consumed.user_id, deviceId, label);
-    return json({ token: minted, deviceId });
+    // Pass the opaque E2EE material straight through (null for legacy tokens).
+    return json({ token: minted, deviceId, mkWrap: consumed.mk_wrap, admissionGrant: consumed.admission_grant });
   } catch (e) {
     console.error("pair redeem: mint failed after consume (token burned):", String((e as Error)?.message ?? e));
     return json({ error: "internal" }, 500);

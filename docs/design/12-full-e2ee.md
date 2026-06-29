@@ -1,6 +1,189 @@
 # Design 12 — Full End-to-End Encryption (zero-knowledge server)
 
-**Status:** v3 — SPEC COMPLETE (two codex crypto passes resolved: design review → v2, confirm review → v3). Ready to schedule as an implementation milestone; the build will get its own code-level adversarial review. Read v3 + v2 resolution blocks as normative; the v1 body is context, superseded where it conflicts.
+**Status:** v4 — IMPLEMENTATION SPEC, codex **PASS** (four crypto passes: design → v2, confirm → v3, pre-impl adversarial → v4, admission-binding confirm → PASS). v4 resolves the device-admission BLOCKER + 8 SHOULD-FIX and pins exact wire formats/algorithms so the build is unambiguous. **Read v4 first — it is the authoritative wire spec; v3/v2 blocks and the v1 body are context, superseded where they conflict.** Impl note (codex): clients MUST verify each MK-wrap blob hashes to the `deviceWrapHash`/`mkWrapHashes` signed in the roster/accountKeyState.
+
+## v4 — Resolutions to codex pre-implementation review (AUTHORITATIVE wire spec)
+
+These nine fixes make the design implementable without ambiguity. Where v4
+pins a value (algorithm, encoding, preimage), that pin wins over any earlier prose.
+
+### V4-1 [BLOCKER→resolved] — Device admission protocol (roster chicken-and-egg)
+A freshly paired/recovered device is **not yet in the roster**, so its commit
+signatures would be invalid — but R1′ says only an already-active device may sign
+`roster vN+1`. The server must **not** be allowed to mutate the roster. Resolution
+admits a new device with an **offline-verifiable admission grant**, never a server
+mutation:
+
+**Pairing / device-code admission.** The active creating device A pre-signs a
+**single-use admission grant** at token-creation time. Critically, the grant binds
+an **admission keypair derived from `tokenSecret`** so only the true token bearer
+(never the server, which sees only `sha256(tokenSecret)` per R2) can author the
+roster delta:
+```
+admissionSeed = HKDF(tokenSecret, salt="rbox/admission/v1", info="admission-key")  // A knows tokenSecret
+(admissionPub, admissionSecret) = Ed25519-from-seed(admissionSeed)
+
+admissionGrant = JCS({
+  type: "rbox/admission-grant/v1",
+  accountId, accountEpoch,
+  tokenId,                       // binds the grant to exactly one pairing/device-code token
+  grantId,                       // random 128-bit; recorded single-use (must be unseen in roster ancestry)
+  admissionPubKey,               // = admissionPub (b64url); ties the grant to tokenSecret possession
+  notAfter,                      // integer expiry (matches token TTL)
+})
+grantSig = Ed25519.sign(A.deviceSigKey, SHA256(admissionGrant))   // A is active+admin in rosterVersion
+```
+The new device B (after redeeming the token and unwrapping MK via the split
+secret, R2) holds `tokenSecret` out-of-band, so it re-derives `admissionSecret`.
+B generates its own Ed25519 sig keypair + RSA-OAEP enc keypair, self-wraps MK to
+its RSA pubkey, builds `roster vN+1 = roster vN + {B's entry}`, and signs the
+**exact delta** with the admission secret:
+```
+admissionSig = Ed25519.sign(admissionSecret, SHA256(JCS({
+  type: "rbox/admission/v1",
+  accountId, accountEpoch, grantId,
+  parentRosterVersion, parentRosterHash,   // pins the precise predecessor roster
+  addedDeviceEntry,                         // B's full roster entry (its sig+enc pubkeys, role, kind)
+  deviceWrapHash,                           // SHA256 of B's MK-to-self RSA wrap blob
+})))
+```
+Clients accept B's admission iff ALL hold: (a) `grantSig` verifies against a
+device `active`+`admin` in `roster vN`; (b) `admissionSig` verifies against the
+grant's `admissionPubKey` over the delta B actually applied; (c) `grantId` is
+unseen in roster ancestry (single-use) and `accountEpoch`/`notAfter` are valid;
+(d) the roster diff is **exactly one added device** — no other additions,
+revocations, role changes, or mutations; (e) B's `sigPubKey` proves possession by
+signing the roster (normal roster-sig rule). Because `admissionSecret` comes only
+from `tokenSecret`, a malicious server cannot substitute its own device keys —
+forging `admissionSig` would require `tokenSecret`, which it never receives. A
+need not be online at redeem time.
+
+**Recovery admission (all devices lost).** There is no active device to grant, so
+**recovery material is itself a roster authority.** At bootstrap (and re-bound on
+each epoch rotation) a **recovery signing key** `RSK` (Ed25519, derived from RK —
+see V4-9) has its pubkey recorded in the roster as a principal with
+`role:"admin", kind:"recovery"`. A recovery device holding RK derives RSK and
+signs its own `roster vN+1` admitting the fresh device. Recovery admission thus
+roots in MK/RK (held only by the user), never the server.
+
+### V4-2 [SHOULD-FIX] — Epoch transition is one signed object (`accountKeyState`)
+Rotation (V4 supersedes R6′) is bound atomically by a canonical signed object,
+hash-chained across epochs:
+```
+accountKeyState_v{E} = JCS({
+  type: "rbox/account-key-state/v1",
+  accountId, accountEpoch: E,
+  prevStateHash,                 // SHA256(accountKeyState_v{E-1}); genesis = 64×"0"
+  rosterVersion, rosterHash,     // pins the roster valid at this epoch
+  keyEpoch,                      // workspace KEK epoch selector (monotone)
+  mkWrapHashes: sortedUnique([...]),   // hashes of the MK-wrap blobs valid this epoch (device + recovery)
+  recoveryWrapId,                // id of the MK-under-RK wrap valid this epoch
+  revokedDeviceIds: sortedUnique([...]),
+})
+stateHash = SHA256(accountKeyState_v{E}); stateSig = Ed25519.sign(adminActiveInPrevEpoch, stateHash)
+```
+Genesis (E=0) is signed by the bootstrap device. Clients **verify the epoch chain**
+(`prevStateHash` links), require `rosterHash` to equal the roster they
+independently verified, and **reject any new-epoch key material** (MK′/KEK′ wraps,
+commits at `accountEpoch=E`) unless a valid `accountKeyState_v{E}` exists signed by
+an admin **active in epoch E−1** (genesis: the bootstrap device). This kills
+mix-and-match of stale wraps / roster-epoch mismatch.
+
+### V4-3 [SHOULD-FIX] — Admin authority: every active E2EE device is a full admin (v1)
+v1 is explicit: **every `active` device in the roster has `role:"admin"`** — it may
+admit, revoke, and rotate. This is not a downgrade: any active device already holds
+MK ⇒ already has total **read** access to all data; matching **write/sign**
+authority is the natural pair. The honest residual: a compromised active device is
+a full account takeover until revoked (revocation = rotation, V4-2). Non-admin /
+read-only roles are reserved for a future milestone (roster carries `role` already,
+so adding them later is a roster-schema extension, not a rework).
+
+### V4-4 [SHOULD-FIX] — Exact `commitBody` preimage (consensus-critical)
+This is the final, authoritative preimage (supersedes the R1/v3 snippets):
+```
+commitBody = JCS({
+  type: "rbox/commit/v1",
+  accountId, accountEpoch, workspaceId,
+  seq, parentSeq, parentCommitHash,    // REQUIRE seq === parentSeq + 1
+  rosterVersion, keyEpoch,
+  deviceId,
+  encManifestSha,                      // ^[0-9a-f]{64}$
+  blobRefs: sortedUniqueByEncSha([{ encSha, size }]),   // see V4-7
+})
+commitHash = SHA256(utf8(commitBody))
+sig        = Ed25519.sign(deviceSigKey, commitHash)
+```
+Genesis sentinel: `seq=1, parentSeq=0, parentCommitHash = 64×"0"`. `seq` is now
+**inside** `commitHash`. The monotonic checkpoint signs
+`JCS({type:"rbox/checkpoint/v1", accountId, workspaceId, accountEpoch, seq, commitHash, rosterVersion})`.
+
+### V4-5 [SHOULD-FIX] — Blob crypto: constant AAD, epoch-scoped KEK
+```
+(blobKey, blobNonce) = HKDF-SHA256(ikm=KEK_{keyEpoch}, salt="rbox/blob/v1", info=plaintextSha)
+                       → key=bytes[0:32], nonce=bytes[32:44]
+blob AAD = ascii("rbox/blob/v1")     // CONSTANT — never path/seq/commit/epoch
+```
+The KEK is **per-(workspace, keyEpoch)**: a `keyEpoch` bump means a *fresh* KEK, so
+a convergent `(key,nonce)` pair never recurs across epochs. Identical plaintext
+within one (workspace,keyEpoch) → identical ciphertext = the intended dedup; this
+is the *only* place a `(key,nonce)` repeats and it repeats with **identical AAD and
+identical plaintext**, so it is not GCM nonce-reuse. **Forbidden:** putting
+commit/path/seq/epoch into blob AAD (would break convergence into a real reuse
+vuln). Manifests + wraps are non-convergent (V4-6).
+
+### V4-6 [SHOULD-FIX] — Three explicit wrap wire formats, each context-bound
+- **AES-GCM wrap** (KEK-under-MK, MK-under-RK):
+  `{ v:1, kind:"aesgcm-wrap", alg:"A256GCM", nonce:<96-bit random b64url>, ct:<b64url>, aad:<canonical> }`
+  where `aad = JCS({accountId, accountEpoch, keyEpoch?, wrappedKeyKind, recipientKeyHash, purpose})`.
+- **RSA-OAEP device wrap** (MK-to-device): RSA-OAEP has **no GCM nonce** — bind
+  context via the **OAEP label**:
+  `{ v:1, kind:"rsa-oaep-wrap", alg:"RSA-OAEP-3072-SHA256", recipientKeyHash, ct:<b64url> }`,
+  `label = SHA256(JCS({accountId, accountEpoch, recipientKeyHash, wrappedKeyKind:"MK", purpose:"rbox/mk-wrap/device/v1"}))`.
+- **HPKE** — reserved/future.
+"Random 96-bit nonce for all wraps" (v3 R3″) is corrected: it applies **only to
+AES-GCM wraps**. Every wrap binds account, epoch, recipient-key hash, key kind, and
+purpose; clients reject a wrap whose bound context ≠ expected.
+
+### V4-7 [SHOULD-FIX] — JCS hardening (duplicate keys, safe integers, blobRefs)
+- Canonical bytes are built from **objects we construct in memory** (never
+  parse-then-reserialize untrusted input). To **verify** a received signed object,
+  canonicalize with a routine that: rejects **duplicate property names** at parse,
+  requires every numeric field be a **non-negative integer ≤ 2^53−1**
+  (`Number.isSafeInteger`) else reject, and emits RFC 8785 form (sorted keys, UTF-8,
+  no insignificant whitespace).
+- `blobRefs` is **unique by `encSha`** (one entry per encSha; duplicate `encSha` →
+  reject), sorted by `encSha`. `size` MUST equal the **actual stored R2 ciphertext
+  byte length** (server re-checks on upload; client value is advisory for GC only).
+
+### V4-8 [SHOULD-FIX] — Pinned algorithms + key encodings (no substitution)
+v1 mandatory, single set (P-256 fallback **dropped** for v1 — client is Bun, which
+has Ed25519; keeping one set removes the raw-vs-DER ambiguity):
+- **Signatures:** Ed25519, signature = **raw 64 bytes** (b64url on the wire).
+- **Device wrap:** RSA-OAEP, **3072-bit**, SHA-256.
+- **Key encodings:** `sigPubKey` = Ed25519 raw 32-byte (b64url); `encPubKey` =
+  RSA **SPKI DER** (b64url). `recipientKeyHash = SHA256(encPubKey-DER)` (hex).
+- Each roster entry carries `sigAlg:"Ed25519"`, `encAlg:"RSA-OAEP-3072-SHA256"`;
+  clients **reject unknown/substituted algorithms** before any verify.
+
+### V4-9 [SHOULD-FIX] — Recovery: exact RK bytes, derive RSK, drop Argon2id
+- Generate 256-bit entropy `E` (32 bytes, CSPRNG). Recovery phrase = **BIP39(E)**
+  (24 words incl. checksum), shown once.
+- **`RK` = the 32-byte BIP39 entropy `E`** (after checksum validation + NFKD
+  normalization to recover `E` from the mnemonic) — **not** the BIP39 PBKDF2 seed,
+  **not** the UTF-8 of the mnemonic.
+- Derivations: `rkWrapKey = HKDF(RK, salt="rbox/recovery/v1", info="mk-wrap")`
+  (wraps MK, AES-GCM per V4-6); `RSK = Ed25519-from-seed(HKDF(RK,
+  salt="rbox/recovery/v1", info="recovery-sign"))` (the recovery admin signer,
+  V4-1). MK is wrapped under `rkWrapKey`, **never** RK directly.
+- **Argon2id is removed from this milestone** (it was only for a hypothetical
+  user-chosen passphrase). §11 verification drops the Argon2id test.
+
+**Residual wording (per codex):** R1″'s fresh-device-rollback gap also covers
+**fork/equivocation** (server shows different valid heads to different devices) —
+same transparency-log/witness residual, documented, deferred. R4's metadata
+residuals stand (encrypted-manifest size + ciphertext-size multiset visible).
+
+---
 
 ## v3 — Resolutions to codex confirm review (normative; amend R1/R3/R6)
 
@@ -372,8 +555,39 @@ the server rejects v1 (plaintext-manifest) commits.
 | client `init` | encryption default; no `--encrypt` |
 
 ## 11. Verification
+
+> **Implementation status (v4 build).** The zero-knowledge engine is implemented
+> and tested under `src/engine/e2ee/` (jcs, primitives, asym, recovery, keys,
+> manifest-crypto, commit, roster, epoch, session — 73 passing tests incl. RFC
+> 5869 / BIP39 / SHA-256 vectors). The headline two-machine + zero-knowledge proof
+> (`e2ee-e2e.test.ts`) passes: device A bootstraps + commits an encrypted tree,
+> device B pairs in (token-derived MK wrap + self-admission to the roster),
+> verifies the signed commit against the roster, decrypts byte-identically, and a
+> grep over **everything** a faithful server stores finds **zero** plaintext
+> filenames/contents. Adversarial cases proven: server key-substitution on
+> admission rejected, grant replay rejected, expired grant rejected, non-roster
+> signer rejected, wrong-epoch/workspace/key manifest decrypt rejected. Argon2id
+> is NOT used (V4-9).
+>
+> **Server (`apps/api/`) implemented + tested:** migration `0011_e2ee.sql`
+> (`account_keys`, `device_keys`, `workspace_keys`, `rosters`,
+> `account_key_states`, `commits`, pairing MK-wrap columns); `keys.ts` opaque
+> key storage/serving (`/v1/keys/*`); `workspace-sync.ts` stores the signed
+> commit ENVELOPE (no plaintext manifest, no server-side `validateManifest`);
+> `versions.ts` GC reachability from `encManifestSha`+`encShas`. tsc clean, 36
+> Miniflare tests pass (2 DO-sequencer tests skipped — `transactionSync`
+> unavailable in the pinned vitest-pool-workers runtime, not a regression).
+>
+> **Remaining integration slice (next milestone):** CLI sync wiring
+> (`sync.ts` push/pull over the session module, the E2EE keystore for MK/device
+> keys, `rbox key` UX, split-secret pairing token in the CLI — the engine
+> already keeps `tokenSecret` client-only; the token shown to the user must be
+> `<redeemToken>.<tokenSecret>` so the secret never reaches the server —
+> encryption-on-by-default in `init`), and a real-Workers two-VM e2e.
+
 - Crypto unit tests: wrap/unwrap MK (device + recovery), KEK under MK, manifest
-  encrypt/decrypt round-trip, convergent blob keys (M5, keep), Argon2id KDF.
+  encrypt/decrypt round-trip, convergent blob keys (M5, keep). (No Argon2id —
+  recovery uses BIP39 entropy directly per V4-9.)
 - Worker (Miniflare): commit with envelope (409/422/quota on encShas), GC
   reachability from envelopes, `validateManifest` no longer server-side.
 - Client: pull rejects a decrypted manifest with a path-traversal entry (client

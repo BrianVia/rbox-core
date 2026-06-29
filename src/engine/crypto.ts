@@ -7,21 +7,22 @@ import { pipeline } from "node:stream/promises";
 import { hashFile } from "./hash.js";
 
 /**
- * Convergent blob-content encryption (M5). AES-256-GCM with a per-blob key+nonce
- * derived from (workspace KEK, plaintext sha) — deterministic, so identical
- * plaintext encrypts identically and content-addressed dedup survives. The KEK
- * never leaves the device; the server stores only ciphertext.
+ * Convergent blob-content encryption (design 12, V4-5). AES-256-GCM with a
+ * per-blob key+nonce derived in ONE HKDF from (workspace KEK, plaintext sha) —
+ * deterministic, so identical plaintext encrypts identically and content-
+ * addressed dedup survives. The KEK never leaves the device; the server stores
+ * only ciphertext.
  *
- * Scope (M5): blob CONTENT only. The manifest is plaintext (metadata visible) —
- * full E2EE (encrypted manifest) is a follow-up.
- *
- * Keys are derived from a FRESHLY re-hashed plaintext sha (never a cached hash),
- * with a fixed versioned AAD. Same plaintext → same key+nonce is safe because
- * distinct plaintext → distinct (key,nonce); never reuse a (key,nonce) pair
- * across different plaintext.
+ * The KEK passed here is the per-(workspace, keyEpoch) KEK — a keyEpoch bump
+ * means a FRESH KEK, so a convergent (key,nonce) pair never recurs across epochs.
+ * The AAD is the CONSTANT `rbox/blob/v1` (V4-5): putting path/seq/epoch in blob
+ * AAD would turn the intended convergence into real GCM nonce-reuse. Keys derive
+ * from a FRESHLY re-hashed plaintext sha (never a cached hash). Same plaintext →
+ * identical (key,nonce,ciphertext) is the intended dedup, not reuse: the pair
+ * repeats only for identical plaintext (identical output, no new leakage).
  */
 
-const AAD = Buffer.from("rbox-blob-v1");
+const AAD = Buffer.from("rbox/blob/v1");
 const TAG_BYTES = 16;
 
 export function generateKek(): Buffer {
@@ -37,11 +38,12 @@ export function kekFromPhrase(phrase: string): Buffer {
   return b;
 }
 
-function deriveDek(kek: Buffer, plaintextSha: string): Buffer {
-  return Buffer.from(hkdfSync("sha256", kek, Buffer.from("rbox-dek"), Buffer.from(plaintextSha, "hex"), 32));
-}
-function deriveNonce(kek: Buffer, plaintextSha: string): Buffer {
-  return Buffer.from(hkdfSync("sha256", kek, Buffer.from("rbox-nonce"), Buffer.from(plaintextSha, "hex"), 12));
+/** Single HKDF → 44 bytes split into the 32-byte key and 12-byte nonce (V4-5).
+ *  `AAD` doubles as the HKDF salt: the blob-domain string `rbox/blob/v1` is the
+ *  one shared label for this scheme (constant AAD + domain-separated derivation). */
+function deriveKeyNonce(kek: Buffer, plaintextSha: string): { dek: Buffer; nonce: Buffer } {
+  const out = Buffer.from(hkdfSync("sha256", kek, AAD, Buffer.from(plaintextSha, "hex"), 44));
+  return { dek: out.subarray(0, 32), nonce: out.subarray(32, 44) };
 }
 
 export interface EncryptedBlob {
@@ -58,8 +60,7 @@ export interface EncryptedBlob {
  */
 export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string): Promise<EncryptedBlob> {
   const plaintextSha = await hashFile(srcPath); // fresh hash of the real bytes
-  const dek = deriveDek(kek, plaintextSha);
-  const nonce = deriveNonce(kek, plaintextSha);
+  const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
   const dir = tmpDir ?? (await fs.mkdtemp(path.join(os.tmpdir(), "rbox-enc-")));
   const ctPath = path.join(dir, `${plaintextSha}.ct`);
 
@@ -79,8 +80,7 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
  * output) on tamper / wrong key / mismatch.
  */
 export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSha: string, destPath: string): Promise<void> {
-  const dek = deriveDek(kek, plaintextSha);
-  const nonce = deriveNonce(kek, plaintextSha);
+  const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
   const total = (await fs.stat(ctPath)).size;
   if (total < TAG_BYTES) throw new Error("ciphertext too short");
   const tag = Buffer.alloc(TAG_BYTES);

@@ -54,6 +54,37 @@ describe("worker integration (real DO + D1 + R2)", () => {
   // caps at compat 2025-07-30). These paths are verified LIVE (M1–M7) and the
   // client-side 409/422/retry logic is automated in src/cli/sync.test.ts against a
   // stateful FakeRemote. Re-enable when a pool-workers/runtime with storage.kv lands.
+  // Build the new E2EE commit envelope. The server stores it opaquely and does NOT
+  // verify the signature/canonicalization, so commitHash/sig can be any well-formed
+  // dummies — only encManifestSha + blobRefs.encSha must reference uploaded blobs.
+  const signedCommit = (over: {
+    accountId: string;
+    workspaceId: string;
+    deviceId: string;
+    seq?: number;
+    parentSeq?: number;
+    encManifestSha: string;
+    blobRefs?: Array<{ encSha: string; size: number }>;
+  }) => {
+    const seq = over.seq ?? 1;
+    const parentSeq = over.parentSeq ?? 0;
+    const body = JSON.stringify({
+      type: "rbox/commit/v1",
+      accountId: over.accountId,
+      accountEpoch: 0,
+      workspaceId: over.workspaceId,
+      seq,
+      parentSeq,
+      parentCommitHash: "0".repeat(64),
+      rosterVersion: 0,
+      keyEpoch: 0,
+      deviceId: over.deviceId,
+      encManifestSha: over.encManifestSha,
+      blobRefs: over.blobRefs ?? [],
+    });
+    return { commit: { body, commitHash: "a".repeat(64), sig: "dummy-sig" } };
+  };
+
   test.skip("commit sequencer: clean commit, then a STALE parent → 409 conflict", async () => {
     const a = await bootstrap("acct-commit");
     // Create a workspace (server-owned).
@@ -61,19 +92,20 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(wsRes.status).toBe(200);
     const ws = ((await wsRes.json()) as { workspaceId: string }).workspaceId;
 
-    // Upload a blob and commit a manifest referencing it (parent seq 0).
-    const content = "commit-payload";
-    const s = sha(content);
-    await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
-    const manifest = { generatedAt: "", files: [{ path: "f.txt", type: "file", sha256: s, size: content.length, mode: 0o644, mtimeMs: 1 }] };
+    // Upload the encrypted-manifest blob + a referenced content blob, then commit.
+    const manifestSha = sha("enc-manifest");
+    const contentSha = sha("commit-payload");
+    for (const [c, s] of [["enc-manifest", manifestSha], ["commit-payload", contentSha]] as const) {
+      await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(c.length) }), body: c });
+    }
     const commitUrl = `${BASE}/v1/ws/${ws}/proj/root/manifests`;
-    const c1 = await SELF.fetch(commitUrl, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, deviceId: a.accountId, manifest }) });
+    const env1 = signedCommit({ accountId: a.accountId, workspaceId: ws, deviceId: a.deviceId, encManifestSha: manifestSha, blobRefs: [{ encSha: contentSha, size: 14 }] });
+    const c1 = await SELF.fetch(commitUrl, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, ...env1 }) });
     expect(c1.status).toBe(200);
-    const seq1 = ((await c1.json()) as { sequence: number }).sequence;
-    expect(seq1).toBe(1);
+    expect(((await c1.json()) as { sequence: number }).sequence).toBe(1);
 
     // Re-commit with the now-stale parent 0 → 409.
-    const c2 = await SELF.fetch(commitUrl, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, deviceId: a.accountId, manifest }) });
+    const c2 = await SELF.fetch(commitUrl, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, ...env1 }) });
     expect(c2.status).toBe(409);
   });
 
@@ -81,8 +113,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const a = await bootstrap("acct-422");
     const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
     const ghostSha = sha("never-uploaded");
-    const manifest = { generatedAt: "", files: [{ path: "ghost.txt", type: "file", sha256: ghostSha, size: 13, mode: 0o644, mtimeMs: 1 }] };
-    const res = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/manifests`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, deviceId: a.accountId, manifest }) });
+    const envc = signedCommit({ accountId: a.accountId, workspaceId: ws, deviceId: a.deviceId, encManifestSha: ghostSha });
+    const res = await SELF.fetch(`${BASE}/v1/ws/${ws}/proj/root/manifests`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ parentSequence: 0, ...envc }) });
     expect(res.status).toBe(422);
   });
 
@@ -328,6 +360,100 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(res.status).toBe(403);
     // A subsequent call still 403s (no mapping was claimed → gate re-runs).
     expect((await webExchange(await signJwt(claims({ sub: "user_unverified" })))).status).toBe(403);
+  });
+
+  // ── E2EE opaque key storage (design 12) ──────────────────────────────────
+
+  const keysBootstrap = (token: string, deviceId: string, over: Record<string, unknown> = {}) =>
+    SELF.fetch(`${BASE}/v1/keys/bootstrap`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({
+        recoveryWrap: "rw",
+        recoveryWrapId: "rwid",
+        genesisRoster: "roster-v0",
+        genesisKeyState: "keystate-0",
+        device: { deviceId, sigPubKey: "sig", encPubKey: "enc", mkWrap: "mk" },
+        ...over,
+      }),
+    });
+
+  test("keys bootstrap → account read returns genesis material; second bootstrap → 409", async () => {
+    const a = await bootstrap("acct-keys");
+    expect((await keysBootstrap(a.token, a.deviceId)).status).toBe(200);
+
+    const acct = await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(a.token) });
+    expect(acct.status).toBe(200);
+    const body = (await acct.json()) as { recoveryWrap: string; rosters: string[]; keyStates: string[]; devices: Array<{ deviceId: string }> };
+    expect(body.recoveryWrap).toBe("rw");
+    expect(body.rosters).toEqual(["roster-v0"]);
+    expect(body.keyStates).toEqual(["keystate-0"]);
+    expect(body.devices.map((d) => d.deviceId)).toContain(a.deviceId);
+
+    expect((await keysBootstrap(a.token, a.deviceId)).status).toBe(409); // already bootstrapped
+  });
+
+  test("keys bootstrap with a device that isn't the caller's → 403", async () => {
+    const a = await bootstrap("acct-keys-spoof");
+    expect((await keysBootstrap(a.token, "dev_someone_else")).status).toBe(403);
+  });
+
+  test("account keys not found before bootstrap → 404", async () => {
+    const a = await bootstrap("acct-keys-empty");
+    expect((await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(a.token) })).status).toBe(404);
+  });
+
+  test("roster append is monotone: next version OK, replay/skew → 409", async () => {
+    const a = await bootstrap("acct-roster");
+    await keysBootstrap(a.token, a.deviceId); // genesis roster = v0
+    const append = (version: number) =>
+      SELF.fetch(`${BASE}/v1/keys/roster`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ version, signed: `roster-v${version}` }) });
+    expect((await append(1)).status).toBe(200); // exactly next
+    expect((await append(1)).status).toBe(409); // replay (already at 1)
+    expect((await append(5)).status).toBe(409); // skips ahead
+    expect((await append(2)).status).toBe(200); // next again
+    const acct = (await (await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(a.token) })).json()) as { rosters: string[] };
+    expect(acct.rosters).toEqual(["roster-v0", "roster-v1", "roster-v2"]);
+  });
+
+  test("keystate append is monotone by epoch (next OK, replay → 409)", async () => {
+    const a = await bootstrap("acct-keystate");
+    await keysBootstrap(a.token, a.deviceId); // genesis keystate = epoch 0
+    const append = (accountEpoch: number) =>
+      SELF.fetch(`${BASE}/v1/keys/keystate`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ accountEpoch, signed: `ks-${accountEpoch}` }) });
+    expect((await append(1)).status).toBe(200);
+    expect((await append(1)).status).toBe(409);
+  });
+
+  test("workspace keys: put + get round-trips; cross-account get → 404", async () => {
+    const a = await bootstrap("acct-wskey");
+    const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    const put = await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "kek-0" }) });
+    expect(put.status).toBe(200);
+    const got = await SELF.fetch(`${BASE}/v1/keys/workspace/${ws}`, { headers: authed(a.token) });
+    expect(got.status).toBe(200);
+    expect((await got.json()) as { keys: unknown[] }).toEqual({ keys: [{ keyEpoch: 0, kekWrap: "kek-0" }] });
+
+    // A different account must not see (or even confirm) the workspace's keys.
+    const b = await bootstrap("acct-wskey-other");
+    expect((await SELF.fetch(`${BASE}/v1/keys/workspace/${ws}`, { headers: authed(b.token) })).status).toBe(404);
+    expect((await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(b.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "evil" }) })).status).toBe(404);
+  });
+
+  test("pairing token carries opaque E2EE material through create → redeem", async () => {
+    const a = await bootstrap("acct-pair-e2ee");
+    const cr = await SELF.fetch(`${BASE}/v1/auth/pair/create`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": "application/json" }),
+      body: JSON.stringify({ mkWrap: "mk-wrap-blob", admissionGrant: "grant-blob" }),
+    });
+    expect(cr.status).toBe(200);
+    const { token: pair } = (await cr.json()) as { token: string };
+    const rd = await SELF.fetch(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: pair }) });
+    expect(rd.status).toBe(200);
+    const redeemed = (await rd.json()) as { mkWrap: string | null; admissionGrant: string | null };
+    expect(redeemed.mkWrap).toBe("mk-wrap-blob");
+    expect(redeemed.admissionGrant).toBe("grant-blob");
   });
 
   const PLAT = { "x-rbox-platform": "test-platform-secret" };

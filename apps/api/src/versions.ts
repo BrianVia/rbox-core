@@ -3,11 +3,11 @@ import { blobKey, json, manifestKey } from "./util.js";
 import { releaseUsage } from "./billing.js";
 
 /**
- * Build the GLOBAL reachable set from AUTHORITATIVE DO roots (M6 GC). Enumerates
- * the workspace registry, asks each DO for its retained {seq,manifestSha} roots
- * (fail closed if any can't be read), loads each manifest, and collects every
- * referenced content address: the manifest sha, file `encSha ?? sha256`, and git
- * bundle/index/op-state shas. (Symlink shas and git refs/head are NOT blobs.)
+ * Build the GLOBAL reachable set from AUTHORITATIVE DO roots (GC). Enumerates the
+ * workspace registry and asks each DO for its retained roots (fail closed if any
+ * can't be read). Under full E2EE the DO parses each retained commit body and
+ * hands back the content addresses directly — the encrypted manifest sha and every
+ * referenced encSha — so GC needs NO R2 manifest fetch and stays zero-knowledge.
  */
 async function computeReachable(env: Env): Promise<Set<string>> {
   const reachable = new Set<string>();
@@ -16,18 +16,10 @@ async function computeReachable(env: Env): Promise<Set<string>> {
     const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
     const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${w.workspace_id}/proj/${w.project_id}/roots`);
     if (!res.ok) throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`);
-    const { roots } = (await res.json()) as { roots: Array<{ seq: number; sha: string }> };
+    const { roots } = (await res.json()) as { roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> };
     for (const r of roots) {
-      reachable.add(r.sha); // the manifest blob itself
-      const obj = await env.rbox_dev_blobs.get(manifestKey(r.sha));
-      if (!obj) continue;
-      const m = JSON.parse(await obj.text()) as { files?: Array<{ type: string; sha256: string; encSha?: string }>; git?: { bundleSha?: string; indexSha?: string; opState?: Record<string, string> } };
-      for (const f of m.files ?? []) if (f.type === "file") reachable.add(f.encSha ?? f.sha256);
-      if (m.git) {
-        if (m.git.bundleSha) reachable.add(m.git.bundleSha);
-        if (m.git.indexSha) reachable.add(m.git.indexSha);
-        for (const s of Object.values(m.git.opState ?? {})) reachable.add(s);
-      }
+      if (r.encManifestSha) reachable.add(r.encManifestSha); // the encrypted manifest (itself a normal blob)
+      for (const s of r.encShas) reachable.add(s); // every referenced ciphertext blob
     }
   }
   return reachable;
@@ -93,12 +85,12 @@ export async function gcPurge(env: Env, graceMs: number): Promise<Response> {
 }
 
 /** GET /v1/ws/:ws/proj/:proj/versions?limit=N — commit history (newest first).
- *  Read from the D1 mirror (eventually consistent; fine for browsing). */
+ *  Read from the D1 `commits` mirror (eventually consistent; fine for browsing). */
 export async function versionsList(env: Env, ws: string, proj: string, limit: number): Promise<Response> {
   const n = Number.isInteger(limit) && limit > 0 && limit <= 500 ? limit : 50;
   const rows = await env.rbox_dev_db
-    .prepare("SELECT sequence, manifest_blob_sha, device_id, created_at FROM manifests WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT ?")
+    .prepare("SELECT sequence, commit_hash, device_id, created_at FROM commits WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT ?")
     .bind(ws, proj, n)
-    .all<{ sequence: number; manifest_blob_sha: string; device_id: string | null; created_at: string }>();
+    .all<{ sequence: number; commit_hash: string; device_id: string | null; created_at: number }>();
   return json({ versions: rows.results ?? [] });
 }
