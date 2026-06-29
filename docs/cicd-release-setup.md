@@ -8,6 +8,27 @@ signature against the key embedded in `src/cli/release-key.ts`.
 This file is the checklist to make the pipeline actually runnable. Nothing here is
 in code because it's all secrets/repo-settings that must live outside git.
 
+## Status (2026-06-29)
+
+Mostly done — **one step left**: the scoped Cloudflare token (step 2).
+
+- [x] `release` GitHub Environment created.
+- [x] `RBOX_RELEASE_PRIVATE_KEY`, `RBOX_RELEASE_KEY_ID`, `CLOUDFLARE_ACCOUNT_ID`
+      set as `release` environment secrets (key verified to derive the embedded
+      pubkey, so CI will sign releases clients accept).
+- [x] `v*` tag protection ruleset active (no deletion / no force-update).
+- [ ] **`CLOUDFLARE_API_TOKEN`** — create a scoped R2-write token (step 2) and:
+      `gh secret set CLOUDFLARE_API_TOKEN --env release --repo BrianVia/rbox-core`
+- [ ] First real multi-platform release cut (supersedes the test `v0.0.2`).
+
+> ⚠️ **No approval gate.** Required-reviewer protection is a paid-plan feature and
+> isn't available on this free private repo. The signing key lives in GitHub
+> secrets gated only by "who can push a `v*` tag" (owner-only). If you want the
+> key behind an approval wall, either upgrade the plan and add a required reviewer
+> to the `release` env, make the repo public (free protection rules), or switch to
+> local-only signing (`bun scripts/release.ts <ver>` — the key never leaves your
+> machine).
+
 ## Current state (read before cutting a real release)
 
 - **Signing key** — keyId `f98abd21b9ea06b3`, pubkey embedded in
@@ -43,35 +64,33 @@ Create Token → Custom:
 
 Note the token value and your **Account ID** (dash URL / Workers overview).
 
-## 3. GitHub: create the `release` environment
+## 3. GitHub: the `release` environment (already created)
 
-Repo → Settings → Environments → **New environment** named exactly `release`
-(the workflow's `environment: release` binds to it):
+The `release` environment exists and the workflow's `environment: release` binds
+to it. On this free private plan it can't enforce required reviewers, so it's
+purely a scoped secret container (see the no-approval-gate warning above).
 
-- **Required reviewers**: add yourself (this is the manual approval gate; the
-  signing key is only readable while a run is approved).
-- **Deployment branches**: restrict to protected tags / `main` if desired.
+Secrets already set (via `gh secret set … --env release`):
 
-Add these **environment secrets** (Settings → Environments → release → Secrets):
+| Secret | Value | Status |
+|--------|-------|--------|
+| `RBOX_RELEASE_PRIVATE_KEY` | b64url pkcs8 private key | ✅ set |
+| `RBOX_RELEASE_KEY_ID` | `f98abd21b9ea06b3` | ✅ set |
+| `CLOUDFLARE_ACCOUNT_ID` | `d1d5680013391ca21665add23eee6426` | ✅ set |
+| `CLOUDFLARE_API_TOKEN` | scoped R2-edit token from step 2 | ⏳ **you set this** |
 
-| Secret | Value |
-|--------|-------|
-| `RBOX_RELEASE_PRIVATE_KEY` | the b64url pkcs8 private key from step 1 |
-| `RBOX_RELEASE_KEY_ID` | `f98abd21b9ea06b3` |
-| `CLOUDFLARE_API_TOKEN` | the scoped R2-edit token from step 2 |
-| `CLOUDFLARE_ACCOUNT_ID` | your account id |
+```sh
+gh secret set CLOUDFLARE_API_TOKEN --env release --repo BrianVia/rbox-core
+# paste the token when prompted (or pipe it in)
+```
 
-Attach them to the **environment**, not the repo, so they're only exposed to the
-approved release job.
+## 4. Tag protection (`v*`) — already active
 
-## 4. Protect the `v*` tags
-
-Repo → Settings → Rules → Rulesets (or Settings → Tags) → add a rule matching
-`v*`:
-
-- Restrict creation/deletion to maintainers.
-- This is what stops an attacker who gets push access from minting a malicious
-  signed release by pushing a tag.
+A repository ruleset (`protect-release-tags`) targets `refs/tags/v*` with
+**deletion** and **non-fast-forward** blocked (admin can bypass for mistake
+recovery). This stops a `v*` tag from being silently re-pointed to re-trigger a
+release. On a single-owner private repo this is mostly belt-and-suspenders, but
+it keeps releases immutable.
 
 The third-party actions in the workflow are already pinned to commit SHAs
 (`actions/checkout` v4.2.1, `oven-sh/setup-bun` v2.1.3) — re-verify the SHA if you
