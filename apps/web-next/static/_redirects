@@ -1,0 +1,5 @@
+# Cloudflare Pages SPA fallback (SF2): adapter-static emits 200.html as the shell
+# (no index.html, dodging the SvelteKit prerender/fallback footgun). Every unmatched
+# path — including "/" — serves it with 200 so client routing owns /dashboard,
+# /billing, /billing/success.
+/*  /200.html  200

@@ -1,0 +1,95 @@
+:root {
+	--bg: #0a0a0f;
+	--surface: #14141f;
+	--border: rgba(255, 255, 255, 0.1);
+	--text: #f2f2f7;
+	--dim: #a4a4b8;
+	--faint: #6f6f86;
+	--accent: #7c6cff;
+	--accent-2: #36d6c3;
+	--danger: #ff6b6b;
+	font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+* {
+	box-sizing: border-box;
+	margin: 0;
+}
+
+body {
+	background: var(--bg);
+	color: var(--text);
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+}
+
+.shell {
+	max-width: 560px;
+	margin: 8vh auto;
+	padding: 28px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 16px;
+}
+
+.shell header {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+	margin-bottom: 22px;
+}
+
+.logo {
+	font-size: 26px;
+	font-weight: 800;
+	letter-spacing: -0.02em;
+}
+
+.tag {
+	color: var(--dim);
+	font-size: 14px;
+}
+
+.muted {
+	color: var(--dim);
+}
+
+.faint {
+	color: var(--faint);
+}
+
+.error {
+	color: var(--danger);
+	font-size: 14px;
+}
+
+button {
+	font: inherit;
+	font-weight: 600;
+	border-radius: 10px;
+	border: 1px solid var(--border);
+	background: rgba(255, 255, 255, 0.05);
+	color: var(--text);
+	padding: 10px 16px;
+	cursor: pointer;
+	transition: background 0.15s ease;
+}
+
+button:hover:not(:disabled) {
+	background: rgba(255, 255, 255, 0.1);
+}
+
+button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+
+button.primary {
+	background: linear-gradient(180deg, #8a7bff, var(--accent));
+	border-color: transparent;
+	color: #fff;
+}
+
+a {
+	color: var(--accent-2);
+}
