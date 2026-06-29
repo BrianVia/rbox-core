@@ -134,6 +134,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   } else if (plan.firstSync === "sync") {
     const sp = spinner("syncing from remote");
     try {
+      deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
       const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
       sp.stop();
       const conflicts = pulled.filter((a) => a.kind === "conflict");

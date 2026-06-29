@@ -13,6 +13,7 @@ import {
   gitPreflight,
   preserveGitConflict,
   HashCache,
+  poolMap,
   reconcile,
   scanManifest,
   validateManifest,
@@ -45,20 +46,10 @@ export interface SyncDeps {
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
    *  tally retry pressure without sync.ts doing metrics I/O (design 09 §3). */
   onCommitConflict?: () => void;
-  /** Progress for the long phases of a push (encrypt, upload). The CLI renders it
-   *  on the spinner; the daemon ignores it. `done`/`total` are blob counts. */
-  onProgress?: (done: number, total: number, phase: "encrypt" | "upload") => void;
-}
-
-/** Run `fn` over `items` with bounded concurrency (worker-pool, like the manifest
- *  hasher). Rejects on the first failure (fail-fast); already-running tasks settle
- *  but no new ones start — safe because blob uploads are idempotent + resumable. */
-async function pool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
-  let i = 0;
-  const worker = async () => {
-    for (let idx = i++; idx < items.length; idx = i++) await fn(items[idx]!);
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  /** Progress for the long phases of sync (encrypt+upload on push; download on
+   *  pull). The CLI renders it on the spinner; the daemon ignores it. `done`/`total`
+   *  are blob/entry counts. */
+  onProgress?: (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
 }
 
 const ENCRYPT_CONCURRENCY = 8; // CPU/disk bound
@@ -96,7 +87,7 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
     }
     // Encrypt changed files concurrently (was sequential — slow on a big first push).
     let enc = 0;
-    await pool(toEncrypt, ENCRYPT_CONCURRENCY, async (f) => {
+    await poolMap(toEncrypt, ENCRYPT_CONCURRENCY, async (f) => {
       const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
       f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
       f.encSha = e.encSha;
@@ -110,7 +101,7 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
     // Upload missing blobs concurrently — THE dominant cost on a first push (each
     // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
     let up = 0;
-    await pool(missing, UPLOAD_CONCURRENCY, async (encSha) => {
+    await poolMap(missing, UPLOAD_CONCURRENCY, async (encSha) => {
       let ct = ctByEnc.get(encSha);
       if (!ct) {
         // Missing on the server but reused-from-base (server lost it) → re-encrypt.
@@ -167,7 +158,11 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   }
 
   const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
-  await applyActions(root, actions, api.blobStore(), { device: cfg.deviceId, kek });
+  await applyActions(root, actions, api.blobStore(), {
+    device: cfg.deviceId,
+    kek,
+    onProgress: deps.onProgress ? (done, total) => deps.onProgress!(done, total, "download") : undefined,
+  });
 
   // Paths we just wrote/removed changed on disk — invalidate so the next scan
   // re-hashes them from real disk truth (never trust a stale cache entry there).

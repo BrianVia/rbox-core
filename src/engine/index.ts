@@ -8,6 +8,7 @@ export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./di
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
 export { applyActions, uploadManifestBlobs } from "./apply.js";
+export { poolMap } from "./pool.js";
 export { HashCache, type HashCacheEntry } from "./hashcache.js";
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
 export {

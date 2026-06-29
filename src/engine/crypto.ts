@@ -97,7 +97,16 @@ export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSh
   decipher.setAAD(AAD);
   decipher.setAuthTag(tag);
   try {
-    await pipeline(fsSync.createReadStream(ctPath, { start: 0, end: total - TAG_BYTES - 1 }), decipher, fsSync.createWriteStream(destPath));
+    const contentLen = total - TAG_BYTES;
+    if (contentLen === 0) {
+      // Empty plaintext (e.g. .gitkeep, __init__.py): the ciphertext is tag-only,
+      // so there's no body to stream — the range [0, -1] is invalid. Verify the
+      // GCM tag over zero bytes and write the empty file.
+      const out = Buffer.concat([decipher.update(Buffer.alloc(0)), decipher.final()]); // final() throws on a bad tag
+      await fs.writeFile(destPath, out);
+    } else {
+      await pipeline(fsSync.createReadStream(ctPath, { start: 0, end: contentLen - 1 }), decipher, fsSync.createWriteStream(destPath));
+    }
     const actual = await hashFile(destPath);
     if (actual !== plaintextSha) throw new Error(`decrypt integrity mismatch: ${actual} != ${plaintextSha}`);
   } catch (e) {

@@ -10,6 +10,23 @@ import { decryptFileToPath, encryptFileToTemp, generateKek } from "./crypto.js";
  *  same time INTO THE SAME tmpDir. The temp name must be unique per call — keying
  *  it by content let the interleaved writes corrupt the ciphertext (sha mismatch
  *  on upload). This proves concurrent identical-content encryption is correct. */
+describe("encryptFileToTemp / decryptFileToPath edge cases", () => {
+  test("empty (0-byte) files round-trip — .gitkeep / __init__.py / py.typed", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-empty-rt-"));
+    try {
+      const src = path.join(root, "empty.txt");
+      await fs.writeFile(src, "");
+      const blob = await encryptFileToTemp(src, kek);
+      const out = path.join(root, "out.txt");
+      await decryptFileToPath(blob.ciphertextPath, kek, blob.plaintextSha, out); // used to throw on the [0,-1] range
+      expect((await fs.stat(out)).size).toBe(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("encryptFileToTemp under concurrency", () => {
   test("identical-content files encrypted concurrently don't collide or corrupt", async () => {
     const kek = generateKek();

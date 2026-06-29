@@ -156,6 +156,7 @@ async function main(): Promise<void> {
       const sp = spinner("pulling");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
+        deps.onProgress = (done, total, phase) => sp.update(phase === "download" ? `downloading ${done}/${total}` : `${phase} ${done}/${total}`);
         const actions = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", actions, root);
@@ -170,6 +171,7 @@ async function main(): Promise<void> {
       const sp = spinner("syncing");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
+        deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
         const { pulled, pushedSequence } = await sync(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);

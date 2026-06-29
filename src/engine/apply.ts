@@ -6,6 +6,7 @@ import { hashBytes, hashFile } from "./hash.js";
 import { decryptFileToPath } from "./crypto.js";
 import { RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
+import { poolMap } from "./pool.js";
 import type { FileEntry, Manifest } from "./types.js";
 
 /**
@@ -36,6 +37,11 @@ export interface ApplyOptions {
   /** Workspace KEK (M5). When set and an entry has `encSha`, the blob is fetched
    *  by `encSha` (ciphertext) and decrypted+verified before write. */
   kek?: Buffer;
+  /** Max concurrent writes (each fetches+decrypts a blob). Defaults to 16 — the
+   *  dominant cost of a pull is per-blob download latency, so this is the lever. */
+  concurrency?: number;
+  /** Progress over the write phase (download+decrypt). `done`/`total` are entries. */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -59,7 +65,11 @@ export async function applyActions(
   const deletes = actions.filter((a) => a.kind === "delete");
   const rest = actions.filter((a) => a.kind !== "delete");
 
-  for (const a of rest) {
+  // Writes/conflicts target distinct paths and are independent, so fetch+decrypt
+  // them through a bounded pool — a pull was a sequential per-blob download, which
+  // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
+  let done = 0;
+  await poolMap(rest, opts.concurrency ?? 16, async (a) => {
     if (a.kind === "write") {
       await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek);
     } else if (a.kind === "conflict") {
@@ -67,7 +77,8 @@ export async function applyActions(
       await moveAside(destRoot, a.path, a.keepLocalAs);
       await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek);
     }
-  }
+    opts.onProgress?.(++done, rest.length);
+  });
   for (const a of deletes) {
     await deleteEntry(destRoot, a.path, a.expectedLocal, device, now);
   }
