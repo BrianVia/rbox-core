@@ -599,7 +599,280 @@ the server rejects v1 (plaintext-manifest) commits.
 - E2EE key transfer e2e: device A pairs B; B unwraps MK via the token; B pulls +
   decrypts. Recovery: fresh device + phrase → MK → decrypt.
 
-## 12. Open questions for codex
+## 13. CLI integration plan (the remaining slice — codex **PASS**)
+
+**Status:** plan reviewed by codex (NEEDS-PASS → all 8 BLOCKER + 4 SHOULD-FIX
+resolved in §13.12, two confirm rounds → **PASS**). §13.12 is normative and
+amends §13.1–13.11. Ready to implement.
+
+The engine (`src/engine/e2ee/`) and server (`apps/api/`) are built + tested. This
+section plans wiring the **`rbox` CLI** to use them so encryption is the default,
+end-to-end, over the network. It is **superseded by nothing above** — it consumes
+the v4 wire spec. Goal: a user runs `rbox` exactly as today; under the hood every
+workspace is E2EE and the server never sees plaintext.
+
+### 13.1 Local key material (the E2EE keystore)
+New `src/cli/e2ee-keystore.ts`, all files mode 600 under `~/.rbox/e2ee/<accountId>/`:
+- `device.json` — `{ deviceId, sigPubKey, sigPrivPkcs8, encPubSpki, encPrivPkcs8 }`
+  (b64url). The device's long-lived identity.
+- `mk.key` — the Account Master Key (b64url), at rest like today's KEK file.
+- `rk.key` — the recovery key (b64url), cached so `rbox key backup` can re-show
+  the phrase (R6). As sensitive as MK; same at-rest model; deletable by the user.
+- `ws/<workspaceId>.json` — `{ keyEpoch → kekB64 }` cache of unwrapped workspace
+  KEKs (avoids re-fetch+unwrap each sync). Authoritative copy is the server's
+  wrapped blob; this is a cache, re-derivable from MK.
+
+Trust/at-rest note: MK/RK/KEK sit in plaintext files (mode 600) exactly as M5's
+KEK does today. The zero-knowledge property is about the *server*, not local disk;
+OS-keychain storage is a future hardening, called out, not done here.
+
+### 13.2 `remote.ts` additions (client ↔ server API)
+Extend `RboxApi`/`SyncRemote`:
+- `bootstrapKeys(body)` → `POST /v1/keys/bootstrap`
+- `getAccountKeys()` → `GET /v1/keys/account` (recoveryWrap, roster chain,
+  keystate chain, device wraps)
+- `putDeviceKeys(body)`, `appendRoster({version,signed})`,
+  `appendKeyState({epoch,signed})`, `putWorkspaceKey(body)`,
+  `getWorkspaceKeys(workspaceId)`
+- **`commit` changes shape**: `commit(parentSequence, signedCommit)` →
+  `POST .../manifests` with `{ parentSequence, commit }`. `latest()` returns
+  `{ sequence, commit: SignedCommit | null }`.
+- Blob upload/download unchanged (content-addressed by `encSha`); the encManifest
+  is just another blob, uploaded by `encManifestSha` before the commit.
+
+### 13.3 Account bootstrap & device join
+- **New account** (`rbox login --bootstrap <secret>` / first device): after the
+  device token is minted, call `session.bootstrapAccount(accountId, deviceId)` →
+  generate MK + device keypairs + recovery phrase + genesis roster + genesis
+  keyState; `bootstrapKeys(...)`; persist `device.json`/`mk.key`/`rk.key`; **print
+  the recovery phrase with a forced "save this — no escrow" acknowledgement**.
+- **Join existing account via pairing** (§13.5) or **recovery** (§13.6). After
+  either, the device has MK + its own keypairs persisted, and is `active` in the
+  roster it just appended.
+- A device with a wiped keystore (lost `device.json`) is **not** the same
+  principal anymore (its enc privkey is gone → can't open its old MK wrap) — it
+  must re-join via pairing or recovery. Documented; `rbox` detects "no device.json
+  for this account" and routes to the connect/recover menu.
+
+### 13.4 Workspace create & the push/pull paths
+- **Create** (`rbox init`/`createWorkspace`): generate KEK at the account's current
+  `keyEpoch`, `aesGcmWrap` under MK, `putWorkspaceKey`. Encryption is mandatory —
+  remove the `--encrypt` opt-in and `cfg.encrypted` (always on). `init` refuses if
+  no account key material exists yet (prompts bootstrap/connect first).
+- **Push** (`sync.ts`): scan → for each changed file, convergently encrypt under
+  the **current-epoch** KEK (existing `crypto.ts`, V4-5) → upload missing file
+  blobs by `encSha` → `encryptManifest` → `buildCommit` (signed envelope at
+  `seq=parentSeq+1`, `parentCommitHash`=pinned head hash) → upload the encManifest
+  blob → `commit(parentSeq, signedCommit)`.
+  - **409 conflict**: `pull` (which re-pins the head), re-scan, rebuild the commit
+    against the new parent (fresh manifest nonce, new `seq`/`parentCommitHash`,
+    re-sign), retry — bounded, as today.
+  - **422 unsatisfied**: re-upload named blobs (incl. encManifest), retry.
+- **Pull** (`sync.ts`): `getAccountKeys` → `verifyAccount` (roster + keyState
+  chains) → `latest()` → `openCommit` (verify signer ∈ active roster, verify sig,
+  hash-link to pinned head, decrypt manifest under `commit.keyEpoch` KEK) →
+  `validateManifest` **client-side** (path-safety/limits — now the sole authority)
+  → reconcile → for each needed file, download by `encSha` + decrypt under
+  `commit.keyEpoch` KEK (existing `decryptFileToPath`). Then update the pin.
+
+### 13.5 Pairing (split-secret, the security-critical bit)
+- **`rbox pair`** (device A, authed): generate a 32-byte `tokenSecret` **locally**;
+  `session.buildPairing(secrets, {tokenId?, tokenSecret, notAfter})` → `{ mkWrap,
+  admissionGrant }`; `POST /v1/auth/pair/create` with `{ mkWrap, admissionGrant }`
+  → server returns its `redeemToken`. **Show the user
+  `rbox-pair_<redeemToken>.<b64url(tokenSecret)>`.** `tokenSecret` is NEVER sent to
+  the server.
+- **Connect** (device B, `rbox login --pair <token>` / menu): split on the last
+  `.` → `redeemToken` + `tokenSecret`; `POST /v1/auth/pair/redeem { token:
+  redeemToken }` → `{ deviceToken, mkWrap, admissionGrant }`; persist the device
+  token; `getAccountKeys()` for the current roster head; `session.redeemPairing({
+  tokenSecret, material:{mkWrap,admissionGrant}, prevRoster })` → unwrap MK, gen
+  device keypairs, build admission `roster vN+1`; `appendRoster` + `putDeviceKeys`;
+  persist `device.json`/`mk.key`; `getWorkspaceKeys` per workspace as needed.
+  - `appendRoster` **409** (someone else advanced the roster) → re-`getAccountKeys`,
+    rebuild the admission delta against the new head, retry (bounded). The grant's
+    `grantId` single-use still holds across the new parent.
+
+### 13.6 Recovery (`rbox login --recover`)
+Enter phrase → `phraseToRk` → `getAccountKeys` → `recoverMasterKey(recoveryWrap)`
+→ gen device keypairs + self MK-wrap → build a **recovery-signed** admission
+`roster vN+1` (RSK derived from RK, already a roster principal) → `appendRoster` +
+`putDeviceKeys` + persist. Same 409-retry as pairing.
+
+### 13.7 `rbox key` UX
+- `rbox key backup` — re-show the recovery phrase from cached `rk.key` (re-auth /
+  confirm). If `rk.key` absent (e.g. paired device that never held RK), say so and
+  point to a device that has it.
+- `rbox key status` — deviceId, accountId, roster version, whether MK is loaded,
+  whether this device is `active` in the latest roster, current `keyEpoch`.
+
+### 13.8 Local state / head pinning
+Extend `.rbox/state.json` (`SyncState`) with `pinnedCommitHash`, `rosterVersion`,
+`keyEpoch`. Pull rejects a `latest` whose chain doesn't descend from
+`pinnedCommitHash` (rollback-evident, R1). A fresh device with no pin accepts the
+current head and starts pinning (the documented fresh-device residual, R1″).
+
+### 13.9 Greenfield migration
+No real users → **wipe dev + prod D1 + R2** before launch (housekeeping). Remove
+the M5 `~/.rbox/keys/<ws>.key` path and the `encrypted` opt-in; all workspaces are
+E2EE. The server already rejects the old plaintext-manifest commit shape (the DO
+commit path now requires `{parentSequence, commit}`).
+
+### 13.10 Test plan
+- Unit (Bun): keystore round-trips; `remote.ts` request shapes against a fake;
+  sync push/pull against an in-memory faithful server (extend the existing
+  `FakeRemote`/e2e harness to carry signed commits + key endpoints).
+- **Real two-VM e2e** (the headline): `bun build --compile` the CLI, run two
+  containers against the **dev Worker** — A bootstraps + `init` + writes files +
+  syncs; A `rbox pair`; B connects with the pasted token; B syncs and gets A's
+  tree byte-identically; B edits, A pulls; then `wrangler r2/d1` dump + `grep`
+  for known plaintext → **zero hits**. Add to CI behind a flag (the backlog item).
+- Conflict/concurrency: two devices commit against the same parent → one 409s,
+  pulls, rebuilds the signed commit, converges.
+
+### 13.11 Risks / open questions (for the adversarial review)
+1. **Pinning store trust**: `pinnedCommitHash` lives in `.rbox/state.json`
+   (plaintext, user-writable). A local attacker editing it defeats rollback
+   detection — acceptable (local disk is already trusted), or should the pin live
+   with the keystore?
+2. **Conflict-retry re-signing**: rebuilding a commit on 409 re-encrypts the
+   manifest (new nonce) and re-signs against the new parent — is there any window
+   where a stale `parentCommitHash` or `keyEpoch` gets signed? (Plan: re-read both
+   from the just-pulled head inside the retry.)
+3. **keyEpoch selection on push vs pull**: push uses the current (highest) epoch;
+   pull decrypts under `commit.keyEpoch`. After a rotation, in-flight blobs from a
+   device that hasn't refreshed its roster/keyState — does it sign under a stale
+   epoch and get rejected? (Plan: refresh account keys at the start of each sync.)
+4. **Roster-append thundering herd**: N devices pairing/recovering concurrently
+   each append `roster vN+1` → 409s; bounded retry rebuilds against the new head.
+   Is the grant's single-use `grantId` still satisfiable after re-parenting? (It
+   should: `grantId` uniqueness is over ancestry, not a fixed version.)
+5. **encManifest never dedups** (random nonce) → one new blob per commit forever;
+   GC must reclaim superseded encManifest blobs (it does — they fall out of the
+   reachable set). Confirm no unbounded growth.
+6. **Multi-workspace KEK fetch**: a newly joined device lazily `getWorkspaceKeys`
+   per workspace on first touch — any ordering issue vs the roster/keyState it
+   must verify first?
+7. Anything that silently weakens to non-E2EE, locks a user out, or lets the
+   server forge state a wired client would accept.
+
+### 13.12 — Resolutions to codex CLI-plan review (NORMATIVE; amends §13.1–13.11)
+Codex pre-implementation review of §13 returned NEEDS-PASS (8 BLOCKER + 4
+SHOULD-FIX). These resolutions are authoritative for the build.
+
+**C1 [BLOCKER] Verify the whole chain from the pin, not just `latest()`.** A commit
+names only its immediate parent, so proving `latest` descends from
+`pinnedCommitHash` needs the intervening history. Add server `GET
+.../commits?since=<seq>` (returns the stored `SignedCommit`s for `seq+1..head`,
+already in the DO). Pull fetches `commitsSince(pinnedSeq)`, verifies each
+`parentCommitHash` links forward from the pinned hash to `latest`, each sig
+against its `rosterVersion`'s active set, **before** applying. A gap/!link →
+reject (fail closed).
+
+**C2 [BLOCKER] Pin hashes, not versions.** `SyncState` pins
+`{ commitSeq, commitHash, rosterVersion, rosterHash, accountEpoch, keyStateHash }`.
+Fetched roster/key-state chains MUST extend those pinned hashes (a version number
+alone doesn't identify a chain head). Rollback to an earlier hash at the same
+version → reject.
+
+**C3 [BLOCKER] keyEpoch correctness + rotation-on-write.** A commit's manifest and
+all its file/git blobs are encrypted under the **same** `keyEpoch` KEK. On push
+the client uses the workspace KEK for the account's **current** `keyEpoch` (from
+the verified accountKeyState); if it can't find that KEK locally it MUST
+`getWorkspaceKeys` and, if still absent, `createWorkspaceKey` for that epoch +
+`putWorkspaceKey`. **`workspace_keys` rows are immutable** — `putWorkspaceKey` is a
+CAS insert on `(workspaceId, keyEpoch)` (`INSERT … ON CONFLICT DO NOTHING`) that
+**always returns the stored winning wrap** (the pre-existing one if this caller
+lost the race). The client **adopts the returned wrap and discards its own**, so
+two devices that independently generated a KEK for the same epoch converge on one.
+A later write can never overwrite a published KEK. When `keyEpoch` advanced since
+the last sync, unchanged blobs cannot
+be carried forward under the old epoch — the client **re-encrypts all live file +
+git blobs under the new-epoch KEK** before signing (lazy rotation-on-write). On
+pull, decrypt strictly under `commit.keyEpoch`; a missing epoch KEK → fail closed,
+never guess. **Scope note:** v1 of the CLI ships with `keyEpoch` fixed at 0 (no
+revocation path wired yet); the rotation-on-write logic above is specified now so
+the epoch field is handled correctly, but exercising a real epoch bump is its own
+follow-up (revocation UX).
+
+**C4 [BLOCKER] Close the stale-epoch signing window (authoritative = client).**
+The **authoritative** guarantee is client-side and already follows from the
+crypto: on pull, `openCommit` **rejects a commit if EITHER** its signer is **not
+`active` in the current verified roster** (a rotated-out device is removed by the
+rotation) **OR** its `accountEpoch` **≠ the account's current verified epoch** (the
+conditions are **disjunctive** — either alone is fatal; an active signer presenting
+a stale/future epoch is still rejected). So even if a stale/unknown-epoch commit
+lands on the server, no trusted client applies it. To also keep it from landing (save a conflict round-trip), the server
+adds a **best-effort precondition in the serialized append path**: the Worker
+reads the current epoch (`MAX(account_key_states.account_epoch)`) and passes it to
+the DO, which asserts `commitBody.accountEpoch == currentEpoch` **inside the
+head-advance `transactionSync`** (reject `409`/`412` otherwise — `==`, so both
+stale and unknown-future epochs are refused). The residual D1-read↔txn TOCTOU is
+benign: its worst case is a one-epoch-off commit that the client-side roster/epoch
+check rejects anyway. Client also: refresh + verify account keys **immediately
+before signing**, assert this device is `active`, then sign.
+
+**C5 [BLOCKER] Admission is atomic: device keys before/with the roster.** Publishing
+`roster vN+1` that references a `deviceWrapHash` whose wrap isn't stored can wedge
+admission on a crash. Add server `POST /v1/keys/admit` =
+**`appendRosterWithDeviceKeys`** (one D1 `batch`: insert `device_keys` row + append
+the roster row under the same monotone-version guard). Across 409 retries the
+client **reuses the same generated device keypair + MK self-wrap**, rebuilding only
+the roster parent/version/signature (so `deviceWrapHash` stays stable).
+
+**C6 [BLOCKER] Client owns the tokenId so the grant binds the exact token.**
+`buildPairing` needs the `tokenId` up front, so the **client generates both
+`tokenId` (random) and `tokenSecret`**, builds the grant bound to `tokenId`, and
+`POST /v1/auth/pair/create { tokenId, mkWrap, admissionGrant }` (the server stores
+keyed by `tokenId`, validates uniqueness, no longer mints the token itself). The
+user-facing token is `rbox-pair_<tokenId>.<tokenSecret>`; redeem sends only
+`tokenId`. (Server change: `createPairToken` accepts a client `tokenId` instead of
+generating one.)
+
+**C7 [BLOCKER] Verify MK wraps against the signed hashes (v4 impl note).** After
+`getAccountKeys` + `verifyAccount`, hash every fetched MK wrap (device + recovery)
+and **fail closed** unless each matches a `deviceWrapHash`/`mkWrapHashes` value in
+the verified signed roster / accountKeyState. This is what stops a malicious server
+from substituting a wrap. Likewise verify a workspace `kekWrap` opens to a KEK only
+via MK (the GCM tag + bound context already enforce this; no extra hash needed).
+
+**C8 [BLOCKER] `.rbox/` is a hard, non-overridable exclusion.** `.rbox/` holds
+`state.json` with the **decrypted** base manifest. The ignore engine MUST exclude
+`.rbox/` unconditionally — a user `!.rbox` un-ignore rule cannot re-include it (and
+neither can `--purge`). Enforce in `buildIgnoreMatcher` as a fixed pre-filter ahead
+of all user rules. (Without this, plaintext metadata could be encrypted-and-synced,
+but its *presence/structure* in a synced tree is itself a leak of the base state.)
+
+**C9 [SHOULD-FIX] RK is not cached by default.** Drop `rk.key` from the default
+keystore. The recovery phrase is shown **once** at bootstrap (RK in memory). `rbox
+key backup` re-shows it only if the user opted into caching (`--cache-recovery` at
+bootstrap, or a keychain-backed store); otherwise it says "enter your saved phrase
+or use another device." Add `rbox key forget-recovery`. Document: RK compromise ⇒
+must rotate (recovery is admin-capable).
+
+**C10 [SHOULD-FIX] Fail-closed partial-keystore rules.** `device.json` present but
+`mk.key` missing → re-derive MK from this device's own stored RSA wrap
+(`getAccountKeys` → `openOwnMasterKey`), never sync without MK. `device.json`
+missing → refuse to sign/sync; route to pairing/recovery only. Any inconsistency
+(device not `active` in the latest roster) → refuse + explain.
+
+**C11 [SHOULD-FIX] Keep the pairing secret out of argv/history.** Read the pasted
+token via **prompt/stdin** (not `--pair <token>` in argv); validate `tokenSecret`
+base64url-decodes to exactly 32 bytes before any network call. Printed-token
+scrollback on device A stays a documented residual (short TTL + single-use).
+
+**C12 [SHOULD-FIX] Handle the local M5 upgrade.** Detect old `cfg.encrypted`
+workspaces and `~/.rbox/keys/<ws>.key` files; **fail with a re-init message**
+(greenfield: re-`init` under E2EE), never auto-fall back to plaintext/v1.
+
+Server deltas implied by the above (additions to the built `apps/api/`):
+`GET .../commits?since=<seq>` returning the stored `SignedCommit`s (C1);
+`putWorkspaceKey` = CAS insert returning the winning wrap (C3); DO commit asserts
+`accountEpoch == currentEpoch` inside the head-advance txn, current epoch passed
+from the Worker (C4); `POST /v1/keys/admit` atomic device-keys+roster in one D1
+batch (C5); `createPairToken` accepts a client-supplied `tokenId` (C6).
+
+## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and
    Argon2id(recovery-phrase), wrapping per-workspace KEKs — sound? Better than a
    purely passphrase-derived MK? Device keypair algorithm (X25519 ECIES vs
