@@ -1,6 +1,7 @@
 # Design 14 — CI/CD release builds + signed `rbox upgrade`
 
-**Status:** DRAFT for codex adversarial (supply-chain / update-integrity) review.
+**Status:** codex **PASS** (NEEDS-PASS → 2 BLOCKER + 6 SHOULD-FIX resolved in §10
+U1'–U9' → 2 confirm rounds → PASS). §10 is normative. Supply-chain / update-integrity reviewed.
 Goal: tag a release → CI builds the 4 standalone binaries, **signs** a release
 manifest, and publishes everything to R2; `rbox upgrade` self-updates the binary
 in place, **verifying a signature against an embedded public key** (the update
@@ -103,6 +104,92 @@ once via the last key-compatible release; full key-rotation UX is future).
   built binary pulls + verifies + replaces; `rbox --version` shows the new version.
 - Negative: corrupt the served binary (sha fail) / re-sign with a wrong key (sig
   fail) → upgrade refuses, original binary intact.
+
+## 10. Resolutions to codex review (NORMATIVE; amends §2–§7)
+
+**U1' [BLOCKER] `rbox upgrade` runs ONLY from a compiled standalone binary.** In dev
+(`bun run`) `process.execPath` is Bun itself — a naive replace would overwrite Bun.
+Gate on Bun's documented API: proceed only if **`Bun.isStandaloneExecutable`** is
+true (belt-and-suspenders: also require `basename(process.execPath) !== "bun"`).
+The replacement target is `realpath(process.execPath)`. Otherwise: "rbox upgrade
+only works on an installed binary (you're running from source) — use git." Never
+touch `process.execPath` when not a standalone executable.
+
+**U2 [BLOCKER] Threat model: CI is the ONLINE signer (hardened + gated), not
+"offline".** A GH-secret key is reachable by a compromised workflow, so we state
+it honestly: the signing key lives in a GitHub **Environment** (`release`) that
+requires **manual reviewer approval** before the sign+publish step runs, with
+pinned action SHAs + `--frozen-lockfile` + minimal token scope (U6/U9). Residual
+(documented): a CI-chain compromise during an approved run could sign a malicious
+update; the upgrade path to true offline/HSM/KMS signing (maintainer signs the
+manifest locally; CI only builds+uploads binaries to a staging prefix) is the
+noted hardening, out of v1 scope.
+
+**U3 [SHOULD-FIX] Detached sig over a domain-tagged hash of the RAW bytes.**
+`sig = Ed25519.sign(privKey, SHA256(utf8("rbox-release/v1\n") || rawVersionJsonBytes))`.
+`rbox upgrade` fetches `version.json` + `version.json.sig` as RAW bytes, verifies
+the sig over those exact bytes BEFORE `JSON.parse` (never verify a re-serialized
+object). The sig is a separate object, not folded into the JSON.
+
+**U4' [SHOULD-FIX] Persist highest-verified version (AFTER replace); semver compare.**
+Store `~/.rbox/release.json` = `{ version }`, written **only after a successful
+replace** (so a failed download/replace never blocks retrying the same version).
+`upgrade` proceeds iff `semverGt(manifest.version, max(RBOX_VERSION, persisted))`
+(proper semver comparison, not string) — so a signed-but-old manifest can't
+roll/pin you back, while re-running upgrade for the *same* latest version is a
+clean no-op ("already up to date"). **Freeze** (withholding updates) is NOT solved
+by this and needs a transparency/timestamp service — documented as future.
+
+**U5' [SHOULD-FIX] Crash/race-hardened replace.** In `dirname(realExe)`: create temp
+`O_CREAT|O_EXCL`, stream the download while hashing, verify sha == manifest,
+`chmod 0755`, **`fsync` the file (after chmod, so the mode is durable)**,
+`rename(temp, realExe)`, `fsync` the parent dir, always `unlink` temp on any error.
+Take an exclusive lock (`~/.rbox/upgrade.lock`) so two upgrades can't race. Partial
+state is impossible (rename is atomic; on failure the old binary is untouched).
+
+**U6 [SHOULD-FIX] Separate release bucket + scoped token.** Release artifacts move
+OFF `rbox_dev_blobs` (user E2EE data) to a dedicated **`rbox-releases`** R2 bucket,
+bound as `rbox_releases`. The `/bin/:name`, `/install.sh`, `/version` routes read
+from `rbox_releases`. The CI R2 token is scoped to **write only** that bucket — a
+leak can't touch user data.
+
+**U7 [SHOULD-FIX] Immutable versioned artifact paths (cache-safe).** Binaries are
+published to `releases/v{X.Y.Z}/rbox-<os>-<arch>` (immutable → `cache-control:
+public, max-age=31536000, immutable`). The signed manifest lists, per artifact,
+its **versioned path + sha256**. `rbox upgrade` downloads the versioned path from
+the verified manifest (never a mutable alias) → the stale-cache-vs-new-manifest sha
+failure is gone. `version.json` is served `no-cache`/short-TTL. A mutable
+`/bin/rbox-<os>-<arch>` "latest" alias stays ONLY for `install.sh` first-install
+(short cache) — `upgrade` never uses it. **Never cache a 404** on artifact/version
+routes (R2 binding reads are strongly read-after-write, but a cached 404 on the
+custom-domain edge could otherwise mask a just-published object) — set
+`cache-control: no-store` on all not-found responses for these routes.
+
+**U8 [SHOULD-FIX] Hardened `install.sh`.** Download to `"$DEST/.rbox.tmp.$$"` then
+`mv` over `$DEST/rbox` (never partial-overwrite a working binary); `--proto =https`
++ follow only https redirects; `trap` cleanup of the temp on failure; print the
+expected sha (out-of-band-checkable). First-install TOFU is documented as outside
+the protected-upgrade model.
+
+**U9 [SHOULD-FIX] CI hardening (`release.yml`).** Trigger on tag `v*` (protected
+tags). Pin every action to a full SHA; `bun install --frozen-lockfile`; assert
+`tag == package.json.version == RBOX_VERSION` (fail otherwise); run
+`bun test src` + both typechecks BEFORE building; build the 4 targets; compute
+shas; **upload binaries first**, then (in the approval-gated `release` environment)
+assemble+sign+upload `version.json`(+`.sig`) so a half-published release never has
+a signed manifest pointing at missing/older binaries; pass the signing key via
+`env:` (never argv); least-privilege `CLOUDFLARE_API_TOKEN` (releases bucket only).
+The signed manifest's shas are computed from the **exact uploaded bytes**, verified
+by a **fetch-back** of each artifact from R2 after upload and before signing (so the
+signature can't bind a sha that differs from what clients will download). Note:
+**protected tags** + the `release` **Environment reviewers** are repo settings
+(configured in GitHub, not the workflow YAML) — documented as a one-time setup step.
+
+**U-NICE Key rotation.** `version.json` carries a `keyId`; the binary embeds a
+keyring `{ keyId → pubkey }` (one key in v1). Rotation = ship a release signed by
+the OLD key that embeds BOTH keys, then sign subsequent releases with the NEW key.
+Documented; old-key compromise can't be repaired for clients that never get the
+bridge release.
 
 ## 9. Open questions for codex
 1. Signature design: sign `sha256(version.json)` vs sign the raw bytes; is binding
