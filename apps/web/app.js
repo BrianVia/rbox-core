@@ -31,15 +31,43 @@ function formatBytes(n) {
   return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// Wait for the async ClerkJS CDN script to load, then load the instance.
-function waitForClerk() {
+// Derive the Clerk Frontend API host from a publishable key. The key is
+// `pk_(test|live)_<base64("<fapi-host>$")>`, so we decode the suffix and strip
+// the trailing `$`. This lets one static page target prod (clerk.rbox.to) or
+// dev (…clerk.accounts.dev) purely from the host-aware key in config.js.
+function clerkFapiHost(pk) {
+  const enc = pk.slice(pk.indexOf("_", 3) + 1);
+  const b64 = enc + "=".repeat((4 - (enc.length % 4)) % 4);
+  return atob(b64).replace(/\$+$/, "");
+}
+
+// Inject the ClerkJS CDN script for the configured publishable key, then resolve
+// once window.Clerk is ready. Replaces the old hardcoded <script> tag so the key
+// + FAPI host always match the environment (prod vs dev).
+function loadClerk() {
+  const pk = CFG.clerkPublishableKey;
+  let host;
+  try {
+    host = clerkFapiHost(pk);
+  } catch (_) {
+    return Promise.reject(new Error("Invalid Clerk publishable key in config.js"));
+  }
   return new Promise((resolve, reject) => {
-    const start = Date.now();
-    (function poll() {
-      if (window.Clerk) return resolve(window.Clerk);
-      if (Date.now() - start > 15000) return reject(new Error("ClerkJS failed to load"));
-      setTimeout(poll, 50);
-    })();
+    const s = document.createElement("script");
+    s.async = true;
+    s.crossOrigin = "anonymous";
+    s.setAttribute("data-clerk-publishable-key", pk);
+    s.src = `https://${host}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js`;
+    s.onerror = () => reject(new Error("ClerkJS failed to load"));
+    s.onload = () => {
+      const start = Date.now();
+      (function poll() {
+        if (window.Clerk) return resolve(window.Clerk);
+        if (Date.now() - start > 15000) return reject(new Error("ClerkJS failed to initialize"));
+        setTimeout(poll, 50);
+      })();
+    };
+    document.head.appendChild(s);
   });
 }
 
@@ -211,7 +239,7 @@ async function main() {
 
   let clerk;
   try {
-    clerk = await waitForClerk();
+    clerk = await loadClerk();
     await clerk.load();
   } catch (e) {
     setStatus(e.message, "error");

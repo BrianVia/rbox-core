@@ -110,15 +110,9 @@
     </div>
 
     <script src="./config.js"></script>
-    <!-- ClerkJS via CDN. The publishable key + frontend API host are read by ClerkJS
-         from the data-clerk-publishable-key attribute (host is derived from the pk). -->
-    <script
-      async
-      crossorigin="anonymous"
-      data-clerk-publishable-key="pk_test_Y2VydGFpbi1yYXktMzMuY2xlcmsuYWNjb3VudHMuZGV2JA"
-      src="https://certain-ray-33.clerk.accounts.dev/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
-      type="text/javascript"
-    ></script>
+    <!-- ClerkJS is loaded dynamically in app.js using the host-aware publishable
+         key from config.js (prod vs dev), so a single static page works on both
+         app.rbox.to (pk_live) and localhost (pk_test). -->
     <script type="module" src="./app.js"></script>
   </body>
 </html>
