@@ -152,9 +152,15 @@ export class E2eeRemote implements SyncRemote {
     const pin = await this.pins.load();
     const parentCommitHash = pin?.commitHash ?? GENESIS_PARENT_HASH;
 
-    const blobRefs = manifest.files
-      .filter((f) => f.type === "file" && f.encSha)
-      .map((f) => ({ encSha: f.encSha!, size: f.size })); // size advisory; server bills actual R2 bytes
+    // The blobRef list is the UNIQUE set of blobs this commit references — many
+    // files can share one blob (identical content → same convergent encSha, e.g.
+    // empty files or repeated boilerplate). Dedup by encSha; the file→blob mapping
+    // lives in the manifest's file entries. (size advisory; server bills actual R2 bytes.)
+    const refByEnc = new Map<string, { encSha: string; size: number }>();
+    for (const f of manifest.files) {
+      if (f.type === "file" && f.encSha && !refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
+    }
+    const blobRefs = [...refByEnc.values()];
     const built = await buildCommit({
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,

@@ -1,7 +1,11 @@
 import type { Env } from "./env.js";
 import { json, SHA256_HEX_RE as SHA_RE } from "./util.js";
 
-const MAX_COMMIT_BODY = 256 * 1024; // opaque body cap (256KB)
+// Opaque body cap. The body inlines one blobRef ({encSha,size} ≈ 85B) per UNIQUE
+// blob, so a ~4k-file repo is ~350KB; 1MB covers ~12k unique blobs and fits D1's
+// ~2MB row limit. Beyond that, blobRefs should move out of the signed body (e.g.
+// a side R2 object referenced by hash) — see scaling notes; this cap is interim.
+const MAX_COMMIT_BODY = 1024 * 1024; // 1MB
 const MAX_BLOB_REFS = 50000; // sanity cap on referenced blobs per commit
 
 /** The opaque signed commit envelope the server stores verbatim (design 12, v4).

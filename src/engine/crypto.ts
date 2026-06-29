@@ -62,7 +62,10 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
   const plaintextSha = await hashFile(srcPath); // fresh hash of the real bytes
   const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
   const dir = tmpDir ?? (await fs.mkdtemp(path.join(os.tmpdir(), "rbox-enc-")));
-  const ctPath = path.join(dir, `${plaintextSha}.ct`);
+  // Unique per CALL, not per content: concurrent encryption of two identical-
+  // content files (same plaintextSha — common: empty files, boilerplate) must not
+  // write the same temp path, or the interleaved writes corrupt it (sha mismatch).
+  const ctPath = path.join(dir, `${plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
 
   const cipher = createCipheriv("aes-256-gcm", dek, nonce);
   cipher.setAAD(AAD);
