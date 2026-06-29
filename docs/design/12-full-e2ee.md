@@ -1,6 +1,69 @@
 # Design 12 — Full End-to-End Encryption (zero-knowledge server)
 
-**Status:** v2 — revised after codex adversarial crypto review (NEEDS-PASS → resolved below). v1 body kept for context; §§ marked **[v2]** supersede it.
+**Status:** v3 — SPEC COMPLETE (two codex crypto passes resolved: design review → v2, confirm review → v3). Ready to schedule as an implementation milestone; the build will get its own code-level adversarial review. Read v3 + v2 resolution blocks as normative; the v1 body is context, superseded where it conflicts.
+
+## v3 — Resolutions to codex confirm review (normative; amend R1/R3/R6)
+
+### R6′ — Revocation rotates the ROOT, not just the KEK
+A revoked device/phrase held **MK**, so re-wrapping a fresh KEK under the *same*
+MK doesn't protect future data (a complicit server could hand the revoked party
+the new KEK wrap). **Real revocation bumps an account epoch and rotates the
+root:** generate **MK′**, wrap MK′ **only to the remaining trusted devices'
+keypairs + fresh recovery material** (new phrase), then generate **KEK′** per
+workspace, wrap KEK′ under MK′, and encrypt future commits under KEK′
+(`keyEpoch++`). The revoked principal keeps whatever it already saw (old data
+under old KEK stays exposed to it — only **forward** protection is achievable
+without history re-encryption; offer eager re-encryption as an option). Account
+epoch + `keyEpoch` appear in `commitBody` and the roster so clients select the
+right keys and reject pre-rotation material from revoked signers.
+
+### R1′ — Device roster is an explicit signed, versioned, hash-chained object
+```
+roster_v{N} = canonicalJSON({
+  version: N, accountId, accountEpoch,
+  prevRosterHash,                       // roster hash chain
+  devices: [{ deviceId, sigPubKey, encPubKey, addedAt, status: "active"|"revoked" }],
+})
+rosterHash = SHA256(roster_v{N});  rosterSig = Ed25519.sign(adminDeviceSigKey, rosterHash)
+```
+- **Genesis trust:** roster v0 is created by the bootstrap device; its signing
+  pubkey is bound to **MK** (stored in MK-authenticated account setup), so any
+  device holding MK (via pairing/recovery) verifies the genesis signer — roster
+  trust roots in MK, not the server.
+- **Admission/revocation:** only a device whose `sigPubKey` is `active` in
+  roster v{N} may sign roster v{N+1} (adding/revoking a device). Clients verify
+  the roster chain from v0, each `rosterSig` against the then-active set.
+- **Binding to commits:** `commitBody` carries `rosterVersion` (+ `accountEpoch`);
+  a commit's `sig` is valid only if its signer is `active` in that roster
+  version. Clients **pin the latest roster version** (like head pinning) and
+  reject roster rollback for devices with local state.
+
+### R1″ — Checkpoint honestly cannot stop fresh-device rollback
+The HMAC checkpoint detects rollback **only for a device with prior local pinned
+state** (head/roster). A **fresh recovery-only device** can still be served a
+stale-but-validly-signed head/checkpoint/roster — this is **unresolved without
+an external transparency log / witness or out-of-band head confirmation**, and
+is documented as an accepted residual for now (transparency log = future work).
+
+### R3′ — Canonicalization is pinned (consensus-critical for `commitHash`)
+All signed objects (`commitBody`, `roster`) use **RFC 8785 JCS**: UTF-8,
+lexicographically sorted object keys, no insignificant whitespace, **integer-only
+numeric fields** (seq/size/epoch/version — no floats), no duplicate keys;
+`blobRefs` sorted by `(encSha, size)`. Non-conforming input is rejected before
+hashing/verifying.
+
+### R3″ — Nonce policy (resolves the convergent-vs-random contradiction)
+- **Blobs (convergent):** key **and** nonce are **deterministically derived** —
+  `HKDF(KEK, plaintextSha, info="rbox/blob/v1")` → (key, 96-bit nonce). Same
+  plaintext → identical (key,nonce,ciphertext) = the intended within-workspace
+  dedup; this is **not** a GCM nonce-reuse vuln because the pair repeats *only*
+  for identical plaintext (identical output, no new leakage). Distinct blobs «
+  2³², far under GCM limits.
+- **Manifests + all key wraps:** **fresh random 96-bit nonce** per encryption
+  (non-convergent — must not correlate). Per-key message count stays « 2³²
+  (manifests are per-commit); `keyEpoch` rotation occurs long before any limit.
+
+---
 
 ## v2 — Resolutions to codex review (these are normative)
 
