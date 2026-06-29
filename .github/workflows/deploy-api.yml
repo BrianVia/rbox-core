@@ -1,0 +1,41 @@
+# Auto-deploy the worker to PRODUCTION (rbox-prod-api / api.rbox.to) on pushes to
+# main that touch apps/api. Gated on typecheck + the Miniflare worker tests so a
+# broken change can't reach prod. See AGENTS.md "Deployment & local dev".
+#
+# Requires repo secret CLOUDFLARE_DEPLOY_TOKEN — a token scoped to
+# Workers Scripts:Edit (+ Account:Read) for this account. This is DISTINCT from
+# release.yml's R2-only CLOUDFLARE_API_TOKEN (keep least privilege).
+name: Deploy API (prod)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/api/**'
+      - '.github/workflows/deploy-api.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.5'
+      - run: bun install --frozen-lockfile
+      - name: Gate — typecheck + worker tests
+        run: |
+          bun run typecheck
+          bun run test:api
+      - name: Deploy to rbox-prod-api
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+          accountId: d1d5680013391ca21665add23eee6426
+          workingDirectory: apps/api
+          command: deploy --env production

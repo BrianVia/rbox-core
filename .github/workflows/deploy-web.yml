@@ -1,0 +1,46 @@
+# Auto-deploy the dashboard to the rbox-app Pages project (app.rbox.to) on pushes
+# to main that touch apps/web. Gated on svelte-check + unit tests, then builds the
+# static SPA and uploads it. See AGENTS.md "Deployment & local dev".
+#
+# apps/web is its own npm project (not the bun root). Uses CLOUDFLARE_DEPLOY_TOKEN
+# (Cloudflare Pages:Edit + Account:Read).
+name: Deploy dashboard (Pages)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web/**'
+      - '.github/workflows/deploy-web.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - name: Gate — types + unit tests, then build
+        run: |
+          npm run check
+          npm run test
+          npm run build
+      - name: Deploy build/ to rbox-app
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+          accountId: d1d5680013391ca21665add23eee6426
+          workingDirectory: apps/web
+          command: pages deploy build --project-name rbox-app --branch main
