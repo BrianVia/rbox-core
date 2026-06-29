@@ -19,6 +19,15 @@ describe("semver forward-only gate", () => {
     expect(() => parseSemver("nope")).toThrow();
     expect(() => parseSemver("1.2")).toThrow();
   });
+  test("prerelease identifiers compare numerically, not lexically (anti-rollback)", () => {
+    // The bug this guards: lexical "2" > "10" would let an OLDER signed rc replay as newer.
+    expect(semverGt("1.0.0-rc.10", "1.0.0-rc.2")).toBe(true);
+    expect(semverGt("1.0.0-rc.2", "1.0.0-rc.10")).toBe(false);
+    // numeric < alphanumeric; a longer identifier list wins when shared parts tie
+    expect(semverGt("1.0.0-rc.1.1", "1.0.0-rc.1")).toBe(true);
+    expect(semverGt("1.0.0-alpha", "1.0.0-1")).toBe(true);
+    expect(semverGt("1.0.0-beta", "1.0.0-alpha")).toBe(true);
+  });
 });
 
 /** Sign manifest bytes with a raw 32-byte Ed25519 seed-derived... we just generate

@@ -87,7 +87,35 @@ function artifactName(): string {
   return `rbox-${osName}-${arch}`;
 }
 
-const releaseStatePath = () => path.join(os.homedir(), ".rbox", "release.json");
+const rboxDir = () => path.join(os.homedir(), ".rbox");
+const releaseStatePath = () => path.join(rboxDir(), "release.json");
+const lockPath = () => path.join(rboxDir(), "upgrade.lock");
+
+/** Acquire an exclusive cross-process upgrade lock so two concurrent `rbox
+ *  upgrade` runs can't both pass the floor check and rename in reverse order
+ *  (which could leave an OLDER signed binary installed). Held from before the
+ *  floor read through the rename + state write. Recovers a lock left by a dead
+ *  process (stored pid no longer alive) rather than wedging forever. */
+function acquireUpgradeLock(): () => void {
+  fs.mkdirSync(rboxDir(), { recursive: true, mode: 0o700 });
+  const lock = lockPath();
+  const take = () => {
+    const fd = fs.openSync(lock, "wx"); // O_CREAT|O_EXCL — fails if held
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+  };
+  try {
+    take();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const holder = Number(fs.readFileSync(lock, "utf8").trim());
+    const alive = Number.isInteger(holder) && (() => { try { process.kill(holder, 0); return true; } catch (k) { return (k as NodeJS.ErrnoException).code === "EPERM"; } })();
+    if (alive) throw new Error(`another rbox upgrade is already running (pid ${holder}) — refusing to run concurrently`);
+    fs.rmSync(lock, { force: true }); // stale lock from a dead process
+    take();
+  }
+  return () => fs.rmSync(lock, { force: true });
+}
 
 async function highestVerified(): Promise<string> {
   try {
@@ -162,6 +190,13 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean } = 
   if (!art || !/^[0-9a-f]{64}$/.test(art.sha256) || typeof art.path !== "string") {
     throw new Error(`release has no valid artifact for ${name}`);
   }
+  // Bind the artifact path to the manifest's own version + this platform: the
+  // whole manifest is signed, so a correct release always names `v<ver>/<name>`.
+  // Rejecting anything else stops a mis-signed/buggy manifest from claiming a new
+  // version while serving another version's (or platform's) bytes (defense-in-depth).
+  if (art.path !== `v${manifest.version}/${name}`) {
+    throw new Error(`release artifact path ${art.path} doesn't match v${manifest.version}/${name} — refusing`);
+  }
   if (opts.check) {
     console.log(`update available: ${manifest.version} (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
     return;
@@ -174,26 +209,38 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean } = 
   } catch {
     throw new Error(`install dir ${dir} isn't writable — re-run with sudo, or re-run the installer`);
   }
-  const { tmp, sha256 } = await downloadToTemp(`${remoteUrl}/bin/${art.path}`, dir);
-  try {
-    if (sha256 !== art.sha256) throw new Error("downloaded binary sha256 did not match the signed manifest — refusing");
-    // 4. Atomic replace: chmod, fsync (mode durable), rename over the live binary,
-    //    fsync the dir. The running process keeps its inode; next exec uses the new file.
-    fs.chmodSync(tmp, 0o755);
-    const f = fs.openSync(tmp, "r");
-    fs.fsyncSync(f);
-    fs.closeSync(f);
-    fs.renameSync(tmp, exe);
-    const d = fs.openSync(dir, "r");
-    fs.fsyncSync(d);
-    fs.closeSync(d);
-  } catch (e) {
-    await fsp.rm(tmp, { force: true }).catch(() => {});
-    throw e;
-  }
 
-  // 5. Record the highest verified version ONLY after a successful replace.
-  await fsp.mkdir(path.dirname(releaseStatePath()), { recursive: true, mode: 0o700 });
-  await fsp.writeFile(releaseStatePath(), JSON.stringify({ version: manifest.version }));
-  console.log(`upgraded ${RBOX_VERSION} → ${manifest.version}. Re-run rbox.`);
+  // Serialize the mutating section: take the exclusive upgrade lock, then RE-READ
+  // the floor under it (a concurrent upgrade may have finished and bumped it) so
+  // two racing runs can't rename in reverse order and leave an older binary.
+  const releaseLock = acquireUpgradeLock();
+  try {
+    if (!semverGt(manifest.version, await highestVerified())) {
+      console.log(`already up to date (${RBOX_VERSION})`);
+      return;
+    }
+    const { tmp, sha256 } = await downloadToTemp(`${remoteUrl}/bin/${art.path}`, dir);
+    try {
+      if (sha256 !== art.sha256) throw new Error("downloaded binary sha256 did not match the signed manifest — refusing");
+      // 4. Atomic replace: chmod, fsync (mode durable), rename over the live binary,
+      //    fsync the dir. The running process keeps its inode; next exec uses the new file.
+      fs.chmodSync(tmp, 0o755);
+      const f = fs.openSync(tmp, "r");
+      fs.fsyncSync(f);
+      fs.closeSync(f);
+      fs.renameSync(tmp, exe);
+      const d = fs.openSync(dir, "r");
+      fs.fsyncSync(d);
+      fs.closeSync(d);
+    } catch (e) {
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+      throw e;
+    }
+
+    // 5. Record the highest verified version ONLY after a successful replace.
+    await fsp.writeFile(releaseStatePath(), JSON.stringify({ version: manifest.version }));
+    console.log(`upgraded ${RBOX_VERSION} → ${manifest.version}. Re-run rbox.`);
+  } finally {
+    releaseLock();
+  }
 }

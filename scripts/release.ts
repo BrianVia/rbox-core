@@ -11,7 +11,7 @@
  * Usage: bun scripts/release.ts <version> [--targets=linux-x64,darwin-arm64] [--no-upload]
  * Env:   RBOX_RELEASE_PRIVATE_KEY (Ed25519 pkcs8 b64url), RBOX_RELEASE_KEY_ID
  */
-import { createHash, createPrivateKey, sign as edSign } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign as edSign } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { releaseSigningInput } from "../src/cli/upgrade-cmd.js";
@@ -66,6 +66,15 @@ fs.writeFileSync(path.join(dist, "version.json"), manifestBytes);
 const privB64 = process.env.RBOX_RELEASE_PRIVATE_KEY;
 if (!privB64) throw new Error("RBOX_RELEASE_PRIVATE_KEY not set");
 const priv = createPrivateKey({ key: Buffer.from(privB64, "base64url"), format: "der", type: "pkcs8" });
+// Fail BEFORE signing if this private key doesn't match the public key clients
+// embed for `keyId` — otherwise we'd publish a perfectly-signed manifest that
+// every client rejects (a silent, bricked release).
+const embedded = RELEASE_KEYS.find((k) => k.keyId === keyId);
+if (!embedded) throw new Error(`keyId ${keyId} is not in the embedded RELEASE_KEYS — clients would reject this release`);
+const derivedPub = Buffer.from((createPublicKey(priv).export({ format: "jwk" }) as { x: string }).x, "base64url").toString("base64url");
+if (derivedPub !== embedded.pubKey) {
+  throw new Error(`RBOX_RELEASE_PRIVATE_KEY does not match the embedded pubKey for keyId ${keyId} — refusing to sign a release clients can't verify`);
+}
 const sig = edSign(null, Buffer.from(releaseSigningInput(manifestBytes)), priv).toString("base64url");
 fs.writeFileSync(path.join(dist, "version.json.sig"), sig);
 console.log(`[release] signed manifest (keyId ${keyId})`);
@@ -75,9 +84,12 @@ if (!upload) {
   process.exit(0);
 }
 
-// 5. upload to rbox-releases (binaries first, then manifest+sig last — U9)
+// 5. upload to rbox-releases (binaries first, then manifest+sig last — U9).
+// Pin wrangler to an exact version so the signing/publish step can't pull a
+// surprise "latest" off npm at release time (supply-chain hardening).
+const WRANGLER = "wrangler@4.27.0";
 const put = (key: string, file: string, ct: string) =>
-  sh(["bunx", "wrangler", "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
+  sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
 for (const t of targets) {
   put(`releases/${tag}/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // immutable versioned
   put(`releases/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // mutable latest alias
@@ -85,7 +97,7 @@ for (const t of targets) {
 put("releases/install.sh", "../scripts/install.sh", "text/x-shellscript");
 // fetch-back the binaries and re-verify the signed shas before publishing the manifest
 for (const [name, a] of Object.entries(artifacts)) {
-  const got = Bun.spawnSync(["bunx", "wrangler", "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
+  const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
   if (got.exitCode !== 0) throw new Error(`fetch-back failed for ${name}`);
   if (createHash("sha256").update(got.stdout).digest("hex") !== a.sha256) throw new Error(`fetch-back sha mismatch for ${name} — refusing to publish manifest`);
 }
