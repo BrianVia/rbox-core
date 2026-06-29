@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Manifest } from "../engine/index.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
-import { loadCredentials } from "./credentials.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -84,21 +83,6 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
   // per-machine credential (M4) and the KEK in the keystore (M5). Both injected
   // at runtime by loadAuthedConfig.
   await writeFileAtomic(configPath(root), JSON.stringify({ ...cfg, token: "", kek: undefined }, null, 2));
-}
-
-/** Load the workspace config and inject the device token from the per-machine
- *  credential (`rbox login`). Throws if not logged in. Use for any networked op. */
-export async function loadAuthedConfig(root: string): Promise<WorkspaceConfig> {
-  const cfg = await loadConfig(root);
-  const creds = await loadCredentials();
-  if (!creds) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
-  const authed: WorkspaceConfig = { ...cfg, token: creds.token, remoteUrl: cfg.remoteUrl || creds.remoteUrl };
-  if (cfg.encrypted) {
-    const { loadKek } = await import("./keystore.js");
-    authed.kek = await loadKek(cfg.remoteWorkspaceId);
-    if (!authed.kek) throw new Error(`workspace is encrypted but no key on this device — run \`rbox key import <recovery-phrase>\``);
-  }
-  return authed;
 }
 
 /**
