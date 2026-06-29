@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { authState } from '$lib/auth.svelte';
+	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { fetchUsage } from '$lib/api';
+	import { errMsg } from '$lib/format';
 
 	// The plan flips on the Stripe subscription webhook, not on this browser return
 	// (SF4). Poll usage until it leaves `free`, then show the dashboard — otherwise a
@@ -10,9 +11,7 @@
 	let done = $state(false);
 	let error = $state('');
 
-	$effect(() => {
-		if (!authState.signedIn) goto('/');
-	});
+	requireAuth(); // not signed in → /
 
 	onMount(async () => {
 		const clerk = authState.clerk;
@@ -23,7 +22,9 @@
 				const u = await fetchUsage(clerk);
 				if (u.plan && u.plan !== 'free') break;
 			} catch (e) {
-				error = (e as Error).message;
+				// Terminal here — a failed request won't fix itself by polling.
+				error = errMsg(e);
+				break;
 			}
 			await new Promise((r) => setTimeout(r, 2000));
 		}

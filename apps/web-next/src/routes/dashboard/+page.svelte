@@ -1,18 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { authState } from '$lib/auth.svelte';
+	import type { Clerk } from '@clerk/clerk-js';
+	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { fetchUsage, startCheckout, openBillingPortal, type Usage } from '$lib/api';
-	import { formatBytes } from '$lib/format';
+	import { formatBytes, errMsg } from '$lib/format';
 
 	let usage = $state<Usage | null>(null);
 	let error = $state('');
 	let busy = $state(false);
 
-	// Not signed in → back to sign-in.
-	$effect(() => {
-		if (!authState.signedIn) goto('/');
-	});
+	requireAuth(); // not signed in → /
 
 	onMount(load);
 
@@ -22,34 +20,25 @@
 			usage = await fetchUsage(authState.clerk);
 			error = '';
 		} catch (e) {
-			error =
-				(e as Error).message === 'WEB_AUTH_NOT_ENABLED'
-					? 'Web auth isn’t enabled on the API yet.'
-					: (e as Error).message;
+			const m = errMsg(e);
+			error = m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
 		}
 	}
 
-	async function checkout(plan: 'solo' | 'pro') {
+	// One busy-lock + error-capture + redirect path for every billing action.
+	async function redirectVia(get: (c: Clerk) => Promise<string>) {
 		if (!authState.clerk || busy) return;
 		busy = true;
 		try {
-			window.location.href = await startCheckout(authState.clerk, plan);
+			window.location.href = await get(authState.clerk);
 		} catch (e) {
-			error = (e as Error).message;
+			error = errMsg(e);
 			busy = false;
 		}
 	}
 
-	async function portal() {
-		if (!authState.clerk || busy) return;
-		busy = true;
-		try {
-			window.location.href = await openBillingPortal(authState.clerk);
-		} catch (e) {
-			error = (e as Error).message;
-			busy = false;
-		}
-	}
+	const checkout = (plan: 'solo' | 'pro') => redirectVia((c) => startCheckout(c, plan));
+	const portal = () => redirectVia(openBillingPortal);
 
 	async function signOut() {
 		await authState.clerk?.signOut();

@@ -3,6 +3,7 @@
 	import { getClerk } from '$lib/clerk';
 	import { clearStaleTokens } from '$lib/api';
 	import { setClerk, syncSignedIn } from '$lib/auth.svelte';
+	import { errMsg } from '$lib/format';
 	import '../app.css';
 
 	let { children } = $props();
@@ -22,7 +23,7 @@
 			});
 			ready = true;
 		} catch (e) {
-			fatal = (e as Error).message;
+			fatal = errMsg(e);
 		}
 	});
 </script>

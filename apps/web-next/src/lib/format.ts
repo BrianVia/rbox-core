@@ -1,3 +1,8 @@
+/** Best-effort human-readable message from a thrown value. */
+export function errMsg(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 
 /** Human-readable byte size (e.g. 250.0 GB). */
