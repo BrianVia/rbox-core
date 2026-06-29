@@ -52,6 +52,18 @@ export interface IgnoreMatcher {
   ignores(relPath: string): boolean;
 }
 
+/**
+ * Paths that are excluded UNCONDITIONALLY — no `.rboxignore`/`.gitignore`
+ * negation (`!.rbox`) and no `--purge` can re-include them (design 12, C8).
+ * `.rbox/` holds `state.json` with the DECRYPTED base manifest; letting it into a
+ * synced tree would leak the very metadata E2EE hides. Checked BEFORE the
+ * overridable `ignore` ruleset, so it always wins.
+ */
+function isHardExcluded(relPath: string): boolean {
+  const p = relPath.replace(/\/+$/, ""); // tolerate a trailing slash (dir form)
+  return p === ".rbox" || p.startsWith(".rbox/");
+}
+
 export function buildIgnoreMatcher(root: string, extra: string[] = []): IgnoreMatcher {
   const ig = ignore().add(BUILTIN_IGNORE);
   const gitignore = readIfExists(path.join(root, ".gitignore"));
@@ -60,7 +72,8 @@ export function buildIgnoreMatcher(root: string, extra: string[] = []): IgnoreMa
   if (rboxignore) ig.add(rboxignore);
   ig.add(extra);
   // `ignore` throws on an empty path; the root itself is never a candidate.
-  return { ignores: (relPath) => relPath.length > 0 && ig.ignores(relPath) };
+  // The hard-exclude short-circuit runs first so no user rule can re-include `.rbox/`.
+  return { ignores: (relPath) => relPath.length > 0 && (isHardExcluded(relPath) || ig.ignores(relPath)) };
 }
 
 function readIfExists(filePath: string): string | undefined {
