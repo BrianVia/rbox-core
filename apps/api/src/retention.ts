@@ -31,26 +31,36 @@ export async function resolveAccountPlan(_env: Env, _accountId: string, storedPl
  * operational order is: retention → mark → purge. The DO never prunes the head,
  * so the current version always survives regardless of the window.
  */
-export async function retentionPrune(env: Env): Promise<Response> {
+export async function retentionPrune(env: Env, nowMs: number = Date.now()): Promise<Response> {
   const rows = await env.rbox_dev_db
     .prepare(
-      "SELECT w.workspace_id AS ws, w.project_id AS proj, w.account_id AS acct, a.plan AS plan " +
+      "SELECT w.workspace_id AS ws, w.project_id AS proj, w.account_id AS acct, a.plan AS plan, a.grace_until AS grace_until " +
         "FROM workspaces w JOIN accounts a ON a.id = w.account_id"
     )
-    .all<{ ws: string; proj: string; acct: string; plan: string | null }>();
+    .all<{ ws: string; proj: string; acct: string; plan: string | null; grace_until: number | null }>();
 
   let pruned = 0;
+  let inGrace = 0;
   const perWorkspace: Array<{ ws: string; proj: string; floor: number; pruned: number }> = [];
   for (const r of rows.results ?? []) {
+    // Downgrade grace (design 13): while grace_until is in the future, retain ALL
+    // history — skip pruning entirely. Only consulted when free; paid plans keep
+    // their own retentionDays regardless.
+    if (r.grace_until != null && nowMs < r.grace_until) {
+      inGrace++;
+      continue;
+    }
     const plan = await resolveAccountPlan(env, r.acct, r.plan);
     const days = planFor(plan).retentionDays;
-    // The highest sequence whose version is OLDER than the retention window is the
+    // The highest sequence whose commit is OLDER than the retention window is the
     // prune floor (everything ≤ floor is past retention). days=0 → cutoff = now →
     // every version committed before this instant is prunable; the DO caps the
-    // floor at head-1, so the current state is never dropped.
+    // floor at head-1, so the current state is never dropped. Source = `commits`
+    // (E2EE writes there; created_at is epoch ms) — the legacy `manifests` table is
+    // empty for E2EE workspaces (design 13 G2).
     const floorRow = await env.rbox_dev_db
-      .prepare("SELECT MAX(sequence) AS floor FROM manifests WHERE workspace_id = ? AND project_id = ? AND created_at < datetime('now', ?)")
-      .bind(r.ws, r.proj, `-${days} days`)
+      .prepare("SELECT MAX(sequence) AS floor FROM commits WHERE workspace_id = ? AND project_id = ? AND created_at < ?")
+      .bind(r.ws, r.proj, nowMs - days * 86_400_000)
       .first<{ floor: number | null }>();
     const floor = floorRow?.floor ?? 0;
     if (floor <= 0) continue; // nothing old enough to prune
@@ -66,5 +76,5 @@ export async function retentionPrune(env: Env): Promise<Response> {
     pruned += out.pruned;
     if (out.pruned > 0) perWorkspace.push({ ws: r.ws, proj: r.proj, floor: out.pruneFloor, pruned: out.pruned });
   }
-  return json({ ok: true, workspaces: rows.results?.length ?? 0, pruned, perWorkspace });
+  return json({ ok: true, workspaces: rows.results?.length ?? 0, inGrace, pruned, perWorkspace });
 }

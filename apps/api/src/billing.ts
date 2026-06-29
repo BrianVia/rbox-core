@@ -3,14 +3,29 @@ import { json } from "./util.js";
 import { PLANS, planFor } from "./plans.js";
 import { audit, type Principal } from "./authz.js";
 
-async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number }> {
-  const r = await env.rbox_dev_db.prepare("SELECT plan, extra_storage_bytes, used_bytes FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number }>();
-  return { plan: r?.plan ?? "free", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0) };
+/** Downgrade grace window (design 13): paid→free preserves all version history
+ *  for this long before free-tier retention resumes. */
+export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null }> {
+  const r = await env.rbox_dev_db.prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null }>();
+  return { plan: r?.plan ?? "free", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
 }
 
 export async function storageCap(env: Env, accountId: string): Promise<number> {
   const a = await account(env, accountId);
   return planFor(a.plan).storageBytes + a.extra; // Infinity for unlimited plans
+}
+
+/** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
+ *  accepting `incomingSize` more bytes would exceed the cap. Advisory — the
+ *  authoritative, race-safe charge is still grantEntitlementWithQuota at finalize;
+ *  this just stops a downgraded/over-cap account from staging orphan R2 cost and
+ *  gives the client an immediate "you're over your plan" 402. */
+export async function wouldExceedCap(env: Env, accountId: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number }> {
+  const a = await account(env, accountId);
+  const cap = planFor(a.plan).storageBytes + a.extra;
+  return { over: cap !== Infinity && a.used + incomingSize > cap, used: a.used, cap };
 }
 
 /**
@@ -69,13 +84,29 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     workspaces: await countWorkspaces(env, p.accountId),
     workspaceCap: limits.workspaces === Infinity ? null : limits.workspaces,
     retentionDays: limits.retentionDays,
+    // Downgrade grace (design 13): graceUntil set on a paid→free transition; while
+    // it's in the future, history is preserved. readOnly = already at/over cap, so
+    // any new upload is blocked (used+size<=cap is the grant predicate).
+    graceUntil: a.graceUntil,
+    readOnly: cap !== Infinity && a.used >= cap,
   });
 }
 
 // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N  (PLATFORM secret — until Stripe).
-export async function adminSetPlan(env: Env, accountId: string, plan: string, extraGB: number): Promise<Response> {
+export async function adminSetPlan(env: Env, accountId: string, plan: string, extraGB: number, nowMs: number = Date.now()): Promise<Response> {
   if (!PLANS[plan]) return json({ error: "bad_plan", valid: Object.keys(PLANS) }, 400);
   const extra = Number.isFinite(extraGB) && extraGB >= 0 ? Math.floor(extraGB) * 1024 * 1024 * 1024 : 0;
+  if (plan === "free") {
+    // Paid→free downgrade gets the same grace stamp as the webhook path (design 13
+    // G7): same CASE predicate (only on a real paid→free transition, never re-extend
+    // an unexpired window) + clear extras. extraGB is ignored when downgrading.
+    const r = await env.rbox_dev_db
+      .prepare("UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'free' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
+      .bind(nowMs, nowMs + GRACE_PERIOD_MS, accountId)
+      .run();
+    await audit(env, null, "account.set_plan", `${accountId}:free`);
+    return json({ ok: true, accountId, plan: "free", changed: r.meta.changes });
+  }
   const r = await env.rbox_dev_db.prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId).run();
   await audit(env, null, "account.set_plan", `${accountId}:${plan}`);
   return json({ ok: true, accountId, plan, changed: r.meta.changes });

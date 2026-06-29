@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { blobKey, json } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
-import { grantEntitlementWithQuota } from "./billing.js";
+import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -53,6 +53,10 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   const len = Number(req.headers.get("content-length") ?? "0");
   if (len > SINGLE_PUT_MAX) return json({ error: "too_large", message: "use multipart", maxSingle: SINGLE_PUT_MAX }, 413);
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
+  // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
+  // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
+  const pre = await wouldExceedCap(env, accountId, len);
+  if (pre.over) return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
   let obj: R2Object;
   try {
     obj = await env.rbox_dev_blobs.put(blobKey(sha), req.body, { sha256: sha });
@@ -80,6 +84,9 @@ export async function multipartInit(req: Request, env: Env, sha: string, account
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
+  // Fail-fast over-cap before staging any multipart parts (design 13 G4).
+  const pre = await wouldExceedCap(env, accountId, size);
+  if (pre.over) return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
 
   // Best-effort GC of our own expired upload state.
   await env.rbox_dev_db.prepare("DELETE FROM uploads WHERE created_at < ?").bind(Date.now() - UPLOAD_EXPIRY_MS).run().catch(() => {});

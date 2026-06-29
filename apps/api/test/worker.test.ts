@@ -297,6 +297,55 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await usage.json()) as { plan: string }).plan).toBe("free"); // fail-closed
   });
 
+  // ── downgrade grace period (design 13) ──────────────────────────────────────
+  const usageOf = async (token: string) =>
+    (await (await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(token) })).json()) as { plan: string; graceUntil: number | null; storageCap: number | null; readOnly: boolean };
+
+  test("downgrade stamps a 30-day grace; a re-delivered downgrade does NOT extend it", async () => {
+    const a = await bootstrap("acct-grace");
+    const t = Math.floor(Date.now() / 1000);
+    const upd = (id: string, status: string) =>
+      JSON.stringify({ id, type: "customer.subscription.updated", data: { object: { id: "sub_g", status, customer: "cus_g", metadata: { account_id: a.accountId }, items: { data: [{ price: { lookup_key: "rbox_pro_monthly" } }] } } } });
+    const up = upd("evt_g_up", "active");
+    await webhook(up, await stripeSig(up, "whsec_test_secret", t));
+    const down1 = upd("evt_g_d1", "past_due"); // first downgrade → free + grace
+    await webhook(down1, await stripeSig(down1, "whsec_test_secret", t));
+    const u1 = await usageOf(a.token);
+    expect(u1.plan).toBe("free");
+    expect(u1.graceUntil).toBeGreaterThan(Date.now());
+    // A later subscription.deleted for the same sub must NOT push the window out.
+    const down2 = JSON.stringify({ id: "evt_g_d2", type: "customer.subscription.deleted", data: { object: { id: "sub_g", status: "canceled", customer: "cus_g", metadata: { account_id: a.accountId } } } });
+    await webhook(down2, await stripeSig(down2, "whsec_test_secret", t));
+    const u2 = await usageOf(a.token);
+    expect(u2.graceUntil).toBe(u1.graceUntil); // unchanged — once per window
+  });
+
+  test("adminSetPlan paid→free clears extra storage AND stamps grace", async () => {
+    const GiB = 1024 * 1024 * 1024;
+    const a = await bootstrap("acct-admin-grace");
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=pro&extraGB=100`, { method: "POST", headers: PLAT });
+    const u1 = await usageOf(a.token);
+    expect(u1.plan).toBe("pro");
+    expect(u1.storageCap).toBe(250 * GiB + 100 * GiB); // base + extra
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=free`, { method: "POST", headers: PLAT });
+    const u2 = await usageOf(a.token);
+    expect(u2.plan).toBe("free");
+    expect(u2.storageCap).toBe(2 * GiB); // extras cleared on downgrade
+    expect(u2.graceUntil).toBeGreaterThan(Date.now());
+  });
+
+  test("retention SKIPS an in-grace account (history preserved, 0 pruned)", async () => {
+    const a = await bootstrap("acct-grace-retain");
+    // pro → free puts it in grace; give it a workspace so retention iterates it.
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=pro`, { method: "POST", headers: PLAT });
+    await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=free`, { method: "POST", headers: PLAT });
+    const res = await SELF.fetch(`${BASE}/v1/admin/gc?phase=retention`, { method: "POST", headers: PLAT });
+    const body = (await res.json()) as { inGrace: number; pruned: number };
+    expect(body.inGrace).toBeGreaterThanOrEqual(1); // the in-grace workspace was skipped
+    expect(body.pruned).toBe(0); // nothing deleted during grace
+  });
+
   // ── web auth via Clerk (M11) ─────────────────────────────────────────────
 
   // Generate a test RSA key, publish it as the JWKS, and sign Clerk-like JWTs.

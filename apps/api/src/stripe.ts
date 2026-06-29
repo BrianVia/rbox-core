@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { ctEqual, json } from "./util.js";
 import { PLAN_LOOKUP_KEYS, planForLookupKey } from "./plans.js";
+import { GRACE_PERIOD_MS } from "./billing.js";
 
 /**
  * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
@@ -71,6 +72,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
     "line_items[0][quantity]": 1,
     success_url: `${appUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl}/billing`,
+    allow_promotion_codes: true, // let a coupon/promo code be entered (launch + 100%-off test flow)
     client_reference_id: p.accountId,
     "metadata[account_id]": p.accountId,
     // Bind the subscription to the account so webhooks can map it back.
@@ -141,12 +143,21 @@ export async function stripeWebhook(req: Request, env: Env, nowMs: number): Prom
   // 500) is retried by Stripe rather than silently swallowed (at-least-once).
   const seen = await env.rbox_dev_db.prepare("SELECT 1 FROM stripe_events WHERE id = ?").bind(event.id).first();
   if (seen) return json({ received: true, duplicate: true });
-  await applyStripeEvent(env, event);
+  await applyStripeEvent(env, event, nowMs);
   await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO stripe_events (id, type, received_at) VALUES (?, ?, ?)").bind(event.id, event.type, nowMs).run();
   return json({ received: true });
 }
 
-async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }): Promise<void> {
+// Grace stamp on a paid→free transition (design 13 G1/G6): only when the
+// PRE-update plan was paid AND no unexpired grace already exists (so an
+// at-least-once `deleted` / a subscribe-cancel loop inside the window can't extend
+// it). Reads pre-update `plan`/`grace_until` in the CASE, so a replay after
+// "UPDATE ok, event-insert failed" no-ops (plan is already 'free').
+function graceCase(): string {
+  return "CASE WHEN plan <> 'free' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END";
+}
+
+async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }, nowMs: number): Promise<void> {
   const obj = event.data.object;
   switch (event.type) {
     case "checkout.session.completed": {
@@ -167,26 +178,32 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
       if (!accountId || !obj.customer) break;
       const item = obj.items?.data?.[0];
       const lookupKey = item?.price?.lookup_key as string | undefined;
-      // active/trialing → the purchased plan; anything else (canceled, unpaid,
-      // past_due) → downgrade to free (fail closed, the user isn't paying).
       const paying = obj.status === "active" || obj.status === "trialing";
-      const plan = paying ? planForLookupKey(lookupKey) ?? "free" : "free";
-      // Ownership guard: only the account this customer is bound to (or an as-yet
-      // UNBOUND account named by the trusted-at-checkout metadata) can be changed.
-      // An account already bound to a DIFFERENT customer can never be flipped — so
-      // a stray/off-path event can't hijack someone else's plan.
-      await env.rbox_dev_db
-        .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
-        .bind(plan, obj.customer, obj.id, accountId, obj.customer)
-        .run();
+      // Ownership guard unchanged: only the account this customer is bound to (or an
+      // as-yet UNBOUND account named by trusted-at-checkout metadata) can change.
+      if (paying) {
+        // active/trialing → the purchased plan. Leave grace_until untouched (it's
+        // only read when free; clearing it would let a cancel re-grant in-window — G6).
+        const plan = planForLookupKey(lookupKey) ?? "free";
+        await env.rbox_dev_db
+          .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+          .bind(plan, obj.customer, obj.id, accountId, obj.customer)
+          .run();
+      } else {
+        // non-paying (past_due/unpaid/canceled-but-not-deleted) → free + grace + clear extras.
+        await env.rbox_dev_db
+          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
+          .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer)
+          .run();
+      }
       break;
     }
     case "customer.subscription.deleted": {
-      // Downgrade only the account that actually owns this customer + subscription.
+      // Downgrade + grace, only for the account that owns this customer+subscription.
       if (obj.customer && obj.id) {
         await env.rbox_dev_db
-          .prepare("UPDATE accounts SET plan = 'free', stripe_subscription_id = NULL WHERE stripe_customer_id = ? AND stripe_subscription_id = ?")
-          .bind(obj.customer, obj.id)
+          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
+          .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
       }
       break;

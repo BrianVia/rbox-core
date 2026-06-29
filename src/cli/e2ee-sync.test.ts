@@ -121,6 +121,16 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const seq = await push(rootA, cfgA, { remote: remoteA });
     expect(seq).toBe(1);
 
+    // GC-root invariant (design 13 G3): the commit's blobRefs must cover every
+    // current file blob (so GC reachability never drops a current blob), the
+    // encManifest is referenced separately (not in blobRefs), and every referenced
+    // blob is actually stored.
+    const body = JSON.parse(server.commits[0]!.body) as { blobRefs: { encSha: string }[]; encManifestSha: string };
+    const refs = new Set(body.blobRefs.map((r) => r.encSha));
+    expect(refs.size).toBe(2); // exactly the two files (secret-name.ts, README.md)
+    expect(refs.has(body.encManifestSha)).toBe(false);
+    for (const s of refs) expect(server.store.blobs.has(s)).toBe(true);
+
     // --- Machine B: pair in (token-derived MK wrap + self-admission) ---
     const tokenSecret = bootA.secrets.mk.slice(0, 32).map((b, i) => b ^ (i + 1)); // any 32 bytes; A would gen random
     const material = await buildPairing(bootA.secrets, { accountEpoch: 0, tokenId: "tok1", tokenSecret, notAfter: NOW + 600_000 });
