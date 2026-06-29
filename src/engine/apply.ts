@@ -69,7 +69,11 @@ export async function applyActions(
   // them through a bounded pool — a pull was a sequential per-blob download, which
   // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
   let done = 0;
-  await poolMap(rest, opts.concurrency ?? 16, async (a) => {
+  const envDl = Number(process.env.RBOX_DOWNLOAD_CONCURRENCY);
+  // 32 by analogy with the measured upload knee (same latency-bound per-blob shape;
+  // download not yet directly swept). Tunable via RBOX_DOWNLOAD_CONCURRENCY.
+  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 32);
+  await poolMap(rest, dlConc, async (a) => {
     if (a.kind === "write") {
       await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek);
     } else if (a.kind === "conflict") {

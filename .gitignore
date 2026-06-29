@@ -25,3 +25,4 @@ dist/
 TEST_CREDENTIALS
 .agents/
 .claude/skills/
+bench-results/

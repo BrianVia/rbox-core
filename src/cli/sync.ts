@@ -52,8 +52,18 @@ export interface SyncDeps {
   onProgress?: (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
 }
 
-const ENCRYPT_CONCURRENCY = 8; // CPU/disk bound
-const UPLOAD_CONCURRENCY = 16; // network/latency bound — the dominant cost on a first push
+// Concurrency knobs (read at call-time so the bench harness + power users can tune
+// via env). Upload is the dominant cost on a first push (latency-bound), so it's
+// the highest. Bench sweeps RBOX_UPLOAD_CONCURRENCY to find the real optimum.
+const clampConc = (v: string | undefined, dflt: number): number => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 && n <= 256 ? n : dflt;
+};
+const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, 8); // CPU/disk bound
+// 32 is the measured knee for upload (bench/push-sweep): 8→16→32 nearly halves wall
+// time each step, then 32/48/64 plateau (~30s) as server-side per-blob cost (R2+D1)
+// dominates. Past 32 buys ~nothing and risks D1 contention. Tunable via env.
+const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 32); // network/latency bound
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
 async function withCache(
@@ -87,7 +97,7 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
     }
     // Encrypt changed files concurrently (was sequential — slow on a big first push).
     let enc = 0;
-    await poolMap(toEncrypt, ENCRYPT_CONCURRENCY, async (f) => {
+    await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
       const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
       f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
       f.encSha = e.encSha;
@@ -101,7 +111,7 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
     // Upload missing blobs concurrently — THE dominant cost on a first push (each
     // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
     let up = 0;
-    await poolMap(missing, UPLOAD_CONCURRENCY, async (encSha) => {
+    await poolMap(missing, uploadConcurrency(), async (encSha) => {
       let ct = ctByEnc.get(encSha);
       if (!ct) {
         // Missing on the server but reused-from-base (server lost it) → re-encrypt.
