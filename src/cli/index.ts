@@ -206,6 +206,18 @@ async function main(): Promise<void> {
       else await addIgnorePattern(root, positional[0]!);
       break;
     }
+    case "connect": {
+      // Enroll this machine from a pairing token read on STDIN (never argv, C11):
+      //   rbox pair        # on a signed-in machine → prints the token
+      //   echo <token> | rbox connect
+      const { redeemPair } = await import("./auth-cmd.js");
+      const chunks: Buffer[] = [];
+      for await (const c of process.stdin) chunks.push(c as Buffer);
+      const token = Buffer.concat(chunks).toString("utf8").trim();
+      if (!token) throw new Error("no pairing token on stdin (pipe the token from `rbox pair`)");
+      await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
+      break;
+    }
     case "recover": {
       await recoverCmd();
       break;
