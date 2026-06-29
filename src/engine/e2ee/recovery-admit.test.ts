@@ -31,6 +31,22 @@ describe("recovery admission (D5 / §14.7)", () => {
     expect(Buffer.from(rec.secrets.mk).equals(Buffer.from(boot.secrets.mk))).toBe(true);
   });
 
+  test("admitting a deviceId already in the roster is rejected (CLI must use a fresh id)", async () => {
+    const boot = await bootstrapAccount("acct_rec3", "devA", NOW);
+    const rk = await phraseToRk(boot.recoveryPhrase);
+    // Reusing an existing roster deviceId (e.g. "devA") produces a duplicate → reject.
+    const rec = await buildRecoveryAdmission({
+      accountId: "acct_rec3",
+      accountEpoch: 0,
+      deviceId: "devA", // collides with the genesis device
+      recoveryKey: rk,
+      recoveryWrap: boot.upload.recoveryWrap,
+      prevRoster: boot.upload.genesisRoster,
+      now: NOW + 1000,
+    });
+    await expect(verifyAccount([boot.upload.genesisRoster, rec.admissionRoster], [boot.upload.genesisKeyState], NOW + 2000)).rejects.toThrow(/duplicate deviceId/);
+  });
+
   test("a wrong recovery phrase cannot unwrap MK", async () => {
     const boot = await bootstrapAccount("acct_rec2", "devA", NOW);
     const wrongRk = await phraseToRk((await bootstrapAccount("x", "y", NOW)).recoveryPhrase);

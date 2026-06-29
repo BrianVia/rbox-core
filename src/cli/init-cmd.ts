@@ -12,6 +12,7 @@ import { loadCredentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
 import { saveConfig, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { push, sync } from "./sync.js";
 import { resolveInitPlan, isInitError, type InitPlan } from "./init-plan.js";
@@ -110,8 +111,15 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
   process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
 
-  // 5. First sync through the E2EE transport (fails closed if this device isn't
-  //    enrolled — bootstrap/pair/recover first). new → push; join → sync.
+  // 5. First sync through the E2EE transport. Pre-check enrollment so a join via
+  //    device-code (which authorizes but doesn't carry the key) gives clear
+  //    guidance up front rather than failing mid-spinner.
+  if (creds.accountId && !(await hasDevice(creds.accountId))) {
+    fail("this machine isn't enrolled for encryption yet.");
+    process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
+    process.exitCode = 2;
+    return;
+  }
   const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot");

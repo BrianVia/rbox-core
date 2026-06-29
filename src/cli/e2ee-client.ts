@@ -1,14 +1,13 @@
 import {
   assertMkWrapAuthorized,
   bootstrapAccount,
-  buildPairing,
   buildRecoveryAdmission,
   fromB64url,
-  generateRecoveryKey,
   generateSignKeyPair,
   generateWrapKeyPair,
   openOwnMasterKey,
   phraseToRk,
+  randomBytes,
   redeemPairing,
   toB64url,
   verifyAccount,
@@ -23,7 +22,7 @@ import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { E2eeRemote } from "./e2ee-remote.js";
 import { hasDevice, keystorePinStore, loadDevice, saveDevice, saveMasterKey, saveRecoveryKey } from "./e2ee-keystore.js";
 import { loadConfig, type WorkspaceConfig } from "./config.js";
-import { loadCredentials } from "./credentials.js";
+import { loadCredentials, saveCredentials } from "./credentials.js";
 import type { SyncDeps } from "./sync.js";
 
 const ACCOUNT_ID_RE = /^acct_[a-z0-9]+$/i; // grammar gate before trusting the value (D7)
@@ -79,14 +78,9 @@ async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedR
 /** Persist the device secrets, POST /v1/keys/admit, retrying 409s by rebuilding the
  *  roster against the new head with the SAME keypair (crash-safe, D3/D4). `build`
  *  produces a RedeemResult for a given head roster + the reused keypair. */
-async function admitWithRetry(
-  api: RboxApi,
-  deviceId: string,
-  initial: RedeemResult,
-  keys: { sig: ReturnType<typeof generateSignKeyPair>; enc: ReturnType<typeof generateWrapKeyPair> },
-  rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>,
-  now: number
-): Promise<void> {
+const headRoster = (dto: AccountKeysDTO): SignedRoster => JSON.parse(dto.rosters[dto.rosters.length - 1]!) as SignedRoster;
+
+async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>): Promise<void> {
   let result = initial;
   // Persist the device + MK locally BEFORE admit (D3): the keypair is durable, so a
   // lost admit-response can be finalized on the next run rather than wedging.
@@ -132,8 +126,7 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
   assertSignedAccountId(redeem.accountId, account.currentRoster.accountId); // D7
 
   const material = { mkWrap: JSON.parse(redeem.mkWrap) as Wrap, admissionGrant: JSON.parse(redeem.admissionGrant) as { grant: string; grantSig: string; admissionPubKey: string; grantSignerDeviceId: string } };
-  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() };
-  const headRoster = (curDto: AccountKeysDTO) => JSON.parse(curDto.rosters[curDto.rosters.length - 1]!) as SignedRoster;
+  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
     const r = await redeemPairing({ accountId: redeem.accountId, deviceId: redeem.deviceId, tokenSecret, accountEpoch: account.currentEpoch, material, prevRoster: headRoster(curDto), now, deviceKeys: keys });
     await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap, now); // D4
@@ -141,8 +134,8 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
   };
 
   const initial = await build(dto);
-  await persistCredential(remoteUrl, redeem.token, redeem.deviceId, redeem.accountId);
-  await admitWithRetry(api, redeem.deviceId, initial, keys, build, now);
+  await saveCredentials({ token: redeem.token, deviceId: redeem.deviceId, remoteUrl, accountId: redeem.accountId });
+  await admitWithRetry(api, redeem.deviceId, initial, build);
   return { accountId: redeem.accountId, deviceId: redeem.deviceId };
 }
 
@@ -160,21 +153,19 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
 
   const rk = await phraseToRk(phrase);
   const recoveryWrap = JSON.parse(dto.recoveryWrap) as Wrap;
-  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() };
-  const headRoster = (curDto: AccountKeysDTO) => JSON.parse(curDto.rosters[curDto.rosters.length - 1]!) as SignedRoster;
+  // A recovered device is a FRESH roster principal — never reuse the credential's
+  // deviceId (it may already be an entry, e.g. recovering on the same machine that
+  // lost its keystore) which would collide as a duplicate roster deviceId.
+  const deviceId = `rec_${toB64url(randomBytes(6))}`;
+  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
-    const r = await buildRecoveryAdmission({ accountId: creds.accountId!, accountEpoch: account.currentEpoch, deviceId: creds.deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now });
+    const r = await buildRecoveryAdmission({ accountId: creds.accountId!, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
     await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap, now);
     return r;
   };
   const initial = await build(dto);
-  await admitWithRetry(api, creds.deviceId, initial, keys, build, now);
-  return { accountId: creds.accountId, deviceId: creds.deviceId };
-}
-
-async function persistCredential(remoteUrl: string, token: string, deviceId: string, accountId: string): Promise<void> {
-  const { saveCredentials } = await import("./credentials.js");
-  await saveCredentials({ token, deviceId, remoteUrl, accountId });
+  await admitWithRetry(api, deviceId, initial, build);
+  return { accountId: creds.accountId, deviceId };
 }
 
 // ---- the sync seam ---------------------------------------------------------
@@ -184,13 +175,14 @@ async function persistCredential(remoteUrl: string, token: string, deviceId: str
  * device.json is present but mk.key is missing, re-open this device's own
  * server-stored MK wrap and save it. A MISSING device.json → not enrolled (D6).
  */
-async function ensureSecrets(api: RboxApi, accountId: string, accountEpoch: number, now: number): Promise<DeviceSecrets> {
+async function ensureSecrets(api: RboxApi, accountId: string, now: number): Promise<DeviceSecrets> {
   const loaded = await loadDevice(accountId);
   if (loaded && "secrets" in loaded) return loaded.secrets;
   if (!loaded) {
     throw new Error("this machine isn't enrolled for encryption — run `rbox pair` on a signed-in machine and connect with the token, or `rbox recover`.");
   }
-  // device.json present, mk.key missing → re-derive MK from the server wrap (C7/D8).
+  // device.json present, mk.key missing → re-derive MK from the server wrap (C7/D8),
+  // using the account's verified current epoch (not a hardcoded 0).
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
   const { account } = await verifyDto(dto, now);
@@ -198,7 +190,7 @@ async function ensureSecrets(api: RboxApi, accountId: string, accountEpoch: numb
   if (!mine?.mkWrap) throw new Error("no MK wrap stored for this device — run `rbox recover`.");
   const wrap = JSON.parse(mine.mkWrap) as Wrap;
   await assertMkWrapAuthorized(wrap, account);
-  const mk = await openOwnMasterKey(loaded.device, accountEpoch, wrap);
+  const mk = await openOwnMasterKey(loaded.device, account.currentEpoch, wrap);
   await saveMasterKey(accountId, mk);
   return { ...loaded.device, mk };
 }
@@ -218,8 +210,8 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`");
 
   const api = new RboxApi(creds.remoteUrl ?? cfg.remoteUrl, creds.token, cfg.remoteWorkspaceId, cfg.projectId);
-  const secrets = await ensureSecrets(api, creds.accountId, 0, now());
-  const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, deviceId: cfg.deviceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
+  const secrets = await ensureSecrets(api, creds.accountId, now());
+  const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
   const kek = await remote.currentKek(); // frozen write epoch (D1)
   return { cfg: { ...cfg, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote } };
 }

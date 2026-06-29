@@ -3,7 +3,7 @@ import readline from "node:readline/promises";
 import { clearCredentials, loadCredentials, saveCredentials } from "./credentials.js";
 import { RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
-import { buildPairing, generateRecoveryKey, toB64url } from "../engine/e2ee/index.js";
+import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -126,8 +126,8 @@ export async function pairCreate(): Promise<void> {
 
   // Client owns the tokenId (so the grant binds the exact token, C6) + a 32-byte
   // tokenSecret kept local. The grant is verified-active by buildPairing's caller.
-  const tokenId = `t${toB64url(generateRecoveryKey()).slice(0, 24)}`;
-  const tokenSecret = generateRecoveryKey();
+  const tokenId = `t${toB64url(randomBytes(16))}`; // url-safe lookup id (no `.`)
+  const tokenSecret = randomBytes(32);
   const notAfter = Date.now() + 10 * 60 * 1000;
   const material = await buildPairing(loaded.secrets, { accountEpoch: 0, tokenId, tokenSecret, notAfter });
 

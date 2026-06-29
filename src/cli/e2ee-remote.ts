@@ -83,14 +83,14 @@ export interface PinStore {
 export interface E2eeContext {
   accountId: string;
   workspaceId: string;
-  deviceId: string;
+  /** `secrets.deviceId` is the authoritative device identity (set at enrollment);
+   *  there is intentionally no separate `deviceId` here to avoid divergence. */
   secrets: DeviceSecrets;
   /** Injected clock for grant-expiry checks (Date.now in prod). */
   now: () => number;
 }
 
 export class E2eeRemote implements SyncRemote {
-  private account?: VerifiedAccount;
   private readonly kekByEpoch = new Map<number, Uint8Array>();
   /** The keyEpoch the KEK handed to `currentKek()` belongs to — blobs are
    *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
@@ -190,8 +190,12 @@ export class E2eeRemote implements SyncRemote {
 
   // ---- internals -----------------------------------------------------------
 
-  /** Fetch + verify the account's roster/key-state chains, asserting they extend
-   *  the locally-pinned hashes (C2 anti-rollback). Cached per transport instance. */
+  /** Re-fetch + re-verify the account's roster/key-state chains on EVERY call
+   *  (intentional — C4 wants a fresh epoch immediately before signing, plus fresh
+   *  anti-rollback). Asserts the chains extend the locally-pinned hashes (C2) AND
+   *  that THIS device is still active in the current roster — otherwise a
+   *  half-admitted device (admit POST lost after local save) would silently sign
+   *  commits no peer can verify. Fail closed instead. */
   private async refreshAccount(): Promise<VerifiedAccount> {
     const keys = await this.api.getAccountKeys();
     if (!keys) throw new Error("workspace is E2EE but this account has no key material — run setup/connect first");
@@ -206,7 +210,9 @@ export class E2eeRemote implements SyncRemote {
         throw new Error("account key rollback detected (roster/key-state moved backward) — refusing to sync");
       }
     }
-    this.account = account;
+    if (!account.currentRoster.devices.some((d) => d.deviceId === this.ctx.secrets.deviceId && d.status === "active")) {
+      throw new Error("this device isn't an active member of the account roster — enrollment may be incomplete. Run `rbox connect` with a fresh `rbox pair` token, or `rbox recover`.");
+    }
     return account;
   }
 
