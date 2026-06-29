@@ -1,6 +1,10 @@
 export interface Env {
   rbox_dev_db: D1Database;
   rbox_dev_blobs: R2Bucket;
+  /** Release artifacts (CLI binaries, install.sh, signed version manifest) — a
+   *  SEPARATE bucket from user data (design 14 U6), so the release-write CI token
+   *  can never touch encrypted user blobs. */
+  rbox_releases: R2Bucket;
   /** Bootstrap trust anchor for the first device (Wrangler secret, never in git). */
   RBOX_BOOTSTRAP_SECRET: string;
   /** Platform-admin secret for internal ops (GC). Distinct from tenant device tokens. */

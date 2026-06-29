@@ -38,6 +38,13 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const { positional, flags } = parseFlags(rest);
 
+  // `rbox --version` / `-v` / `version` → the binary's embedded version.
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    const { RBOX_VERSION } = await import("./version.js");
+    console.log(RBOX_VERSION);
+    return;
+  }
+
   switch (cmd) {
     case "init": {
       const { runInit } = await import("./init-cmd.js");
@@ -108,6 +115,11 @@ async function main(): Promise<void> {
     case "pair": {
       const { pairCreate } = await import("./auth-cmd.js");
       await pairCreate();
+      break;
+    }
+    case "upgrade": {
+      const { upgradeCmd } = await import("./upgrade-cmd.js");
+      await upgradeCmd(flags.remote ?? DEFAULT_REMOTE, { check: flags.check === "true" });
       break;
     }
     case "device": {

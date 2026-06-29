@@ -13,6 +13,12 @@
     {
       "binding": "rbox_dev_blobs",
       "bucket_name": "rbox-dev-blobs"
+    },
+    // Release artifacts — one shared public bucket for both dev + prod (binaries +
+    // install.sh + signed manifest), separate from user data (design 14 U6).
+    {
+      "binding": "rbox_releases",
+      "bucket_name": "rbox-releases"
     }
   ],
   "durable_objects": {
@@ -38,7 +44,10 @@
           "database_id": "c6b3e6ab-4130-4c9b-8f77-cdae47745c5c"
         }
       ],
-      "r2_buckets": [{ "binding": "rbox_dev_blobs", "bucket_name": "rbox-prod-blobs" }],
+      "r2_buckets": [
+        { "binding": "rbox_dev_blobs", "bucket_name": "rbox-prod-blobs" },
+        { "binding": "rbox_releases", "bucket_name": "rbox-releases" }
+      ],
       "durable_objects": {
         "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
       },

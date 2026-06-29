@@ -601,3 +601,42 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(body.pruned).toBe(0); // nothing old enough to prune
   });
 });
+
+describe("release distribution (design 14)", () => {
+  beforeAll(async () => {
+    await env.rbox_releases.put("releases/version.json", '{"version":"0.0.2"}');
+    await env.rbox_releases.put("releases/version.json.sig", "sig-bytes");
+    await env.rbox_releases.put("releases/install.sh", "#!/bin/sh\n");
+    await env.rbox_releases.put("releases/rbox-linux-x64", "LATEST-BIN");
+    await env.rbox_releases.put("releases/v0.0.2/rbox-linux-x64", "VERSIONED-BIN");
+  });
+
+  test("/version + /version.sig serve from the release bucket, no-cache", async () => {
+    const v = await SELF.fetch(`${BASE}/version`);
+    expect(v.status).toBe(200);
+    expect(v.headers.get("cache-control")).toBe("no-cache");
+    expect(((await v.json()) as { version: string }).version).toBe("0.0.2");
+    expect((await SELF.fetch(`${BASE}/version.sig`)).status).toBe(200);
+  });
+
+  test("versioned binary is immutable-cached; latest alias is short-cached", async () => {
+    const versioned = await SELF.fetch(`${BASE}/bin/v0.0.2/rbox-linux-x64`);
+    expect(versioned.status).toBe(200);
+    expect(versioned.headers.get("cache-control")).toContain("immutable");
+    expect(await versioned.text()).toBe("VERSIONED-BIN");
+    const latest = await SELF.fetch(`${BASE}/bin/rbox-linux-x64`);
+    expect(latest.status).toBe(200);
+    expect(latest.headers.get("cache-control")).toBe("public, max-age=300");
+  });
+
+  test("rejects bad name / bad version / path traversal; 404s are no-store", async () => {
+    for (const bad of ["/bin/evil", "/bin/v0.0.2/evil", "/bin/notaversion/rbox-linux-x64", "/bin/rbox-windows-x64"]) {
+      const r = await SELF.fetch(`${BASE}${bad}`);
+      expect(r.status).toBe(404);
+      expect(r.headers.get("cache-control")).toBe("no-store");
+    }
+    const missing = await SELF.fetch(`${BASE}/bin/v9.9.9/rbox-linux-x64`);
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get("cache-control")).toBe("no-store");
+  });
+});
