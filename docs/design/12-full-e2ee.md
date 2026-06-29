@@ -894,6 +894,196 @@ Server deltas implied by the above (additions to the built `apps/api/`):
 from the Worker (C4); `POST /v1/keys/admit` atomic device-keys+roster in one D1
 batch (C5); `createPairToken` accepts a client-supplied `tokenId` (C6).
 
+## 14. CLI command flows (interactive UX — codex **PASS**)
+
+**Status:** codex-reviewed (NEEDS-PASS → 6 BLOCKER + 5 SHOULD-FIX resolved in
+§14.11 D1–D11 → confirm **PASS**). §14.11 is normative. Tracked for rotation
+milestone: D1 needs an atomic commit-publish CAS (v1 has no rotation); D3 pending-
+join uses mode-600 keystore semantics; D5 is an accepted pre-launch signed-format
+change (`mkWrapHash` optional on `RosterEntry`).
+
+Wires the proven transport (§13, E2eeRemote) into the user-facing commands.
+Consumes §13.12 (normative). Encryption is the ONLY mode now.
+
+### 14.1 accountId threading
+The client must know its `accountId` to namespace the keystore (`~/.rbox/e2ee/<accountId>/`)
+and to construct `E2eeRemote`. Add `accountId` to `Credentials`. The three auth
+responses already/again carry it: `device/bootstrap` (has it), `device/poll`
+(has it), `pair/redeem` (ADD it server-side — the row has `account_id`). `login`
++ `redeemPair` persist it.
+
+### 14.2 The MK problem with device-code (decision)
+Under E2EE-always, EVERY device needs MK to read anything. The two MK-carrying
+joins are **pairing** (token-wrapped MK + admission grant) and **recovery**
+(phrase → RK → MK). **Bare device-code (`approve a code`) does NOT carry MK** — it
+yields a valid device credential but no key material. Decision for v1:
+- The **primary "connect a machine" path is pairing** (the menu already leads with
+  it). It carries MK and self-admits to the roster.
+- A device that authenticated but has **no local MK** (device-code, or a wiped
+  keystore) is detected and **fails closed on any sync** with a clear message:
+  "this device isn't enrolled for encryption — run `rbox pair` on a signed-in
+  machine and connect with the token, or `rbox recover`." Never sync plaintext.
+- Device-code stays available for the credential, but enrollment (MK) requires
+  pair/recover. (Carrying MK over device-code — approver wraps MK under a
+  code-derived key — is a documented future option, not v1.)
+
+### 14.3 Bootstrap (new account, first device)
+After a **bootstrap login** that creates a NEW account (`device/bootstrap`),
+if `GET /v1/keys/account` is 404 (no key material yet), run
+`session.bootstrapAccount` → POST `/v1/keys/bootstrap`; persist
+`device.json`/`mk.key`; **print the recovery phrase with a forced "save this — no
+escrow" acknowledgement** (interactive: require typing `yes`; non-interactive:
+print + a loud stderr warning, never silently discard). Idempotent: a second
+bootstrap-login on an already-keyed account skips (the device already has keys, or
+must pair/recover).
+
+### 14.4 init / workspace KEK
+`init` (and `link`) for a NEW workspace: after `createRemoteWorkspace`, the first
+sync's `E2eeRemote` lazily creates + CAS-publishes the workspace KEK (C3) and sets
+`cfg.kek` for blob encryption. Remove the `--encrypt` opt-in and the `cfg.encrypted`
+flag's optionality — `encrypted` is implicitly always true; `init` refuses if the
+device has no MK (→ 14.2 message). The "secrets stay ignored / E2EE coming" notice
+is replaced with "this workspace is end-to-end encrypted."
+
+### 14.5 E2eeRemote construction (the sync seam)
+New `buildAuthedRemote(root): Promise<{ cfg, deps: SyncDeps }>` (CLI helper):
+loads cfg + creds (incl. accountId) + device secrets (keystore); if no
+secrets/MK → fail closed (14.2). Constructs `RboxApi` + `E2eeRemote`
+(keystore-backed `PinStore`), sets `cfg.kek = await remote.currentKek()`, returns
+`{ cfg, deps: { remote } }`. Every sync call site (`push`/`pull`/`sync`/`daemon`/
+`versions`/`restore`) switches from `loadAuthedConfig(root)` →
+`buildAuthedRemote(root)` and passes `deps`. (The daemon builds it once per loop.)
+
+### 14.6 pair create / redeem (split-secret)
+- `rbox pair`: load secrets; generate `tokenId` (16–64 url-safe) + 32-byte
+  `tokenSecret`; `buildPairing(secrets, {tokenId, tokenSecret, notAfter})`;
+  `POST /v1/auth/pair/create { tokenId, mkWrap, admissionGrant }`; print
+  `rbox-pair_<tokenId>.<base64url(tokenSecret)>` (valid ~N min, single use).
+- connect/redeem: read the token via **prompt/stdin** (never argv, C11); split on
+  the LAST `.` → `rbox-pair_<tokenId>` + `tokenSecret`; validate `tokenSecret`
+  decodes to exactly 32 bytes; `POST /v1/auth/pair/redeem { token:
+  rbox-pair_<tokenId> }` → `{ token, deviceId, accountId, mkWrap, admissionGrant }`;
+  persist credential (with accountId); `getAccountKeys` (verify chain, C2/C7);
+  `redeemPairing` → secrets + admission roster + device; `POST /v1/keys/admit
+  { device, roster }` (atomic, C5; 409 → refetch head, rebuild roster parent
+  reusing the SAME keypair, retry); persist `device.json`/`mk.key`.
+
+### 14.7 recover
+`rbox recover` (or menu): prompt phrase (stdin) → `phraseToRk` → `getAccountKeys`
+(verify chain) → `recoverMasterKey(recoveryWrap)` → gen device keypairs + self
+MK-wrap → build a **recovery-signed** admission roster (RSK from RK, already a
+roster principal — `session.buildRecoveryAdmission`) → `POST /v1/keys/admit` →
+persist. Same 409-retry as pairing.
+
+### 14.8 rbox key backup / status
+- `key backup`: re-show the phrase from cached `rk.key` IF the user opted into
+  caching at bootstrap (`--cache-recovery`); else print "not cached on this device
+  — use the phrase you saved at setup, or another enrolled device." (C9)
+- `key status`: deviceId, accountId, MK present?, this device `active` in the
+  latest roster?, current rosterVersion + accountEpoch + keyEpoch.
+
+### 14.9 M5 upgrade detection (C12)
+On any sync/init, if the OLD M5 state is present (`cfg.encrypted` was a persisted
+opt-in, or `~/.rbox/keys/<ws>.key` exists) **and** no new-world `device.json`,
+fail with: "this workspace predates full E2EE — re-run `rbox init` to re-enroll
+(greenfield; dev data is wiped)." Never auto-fall back to the M5 path.
+
+### 14.10 Risks / open questions (for review)
+1. **device-code → no-MK dead-end** (14.2): is failing closed + directing to
+   pair/recover the right v1 call, or must device-code carry MK now?
+2. **bootstrap idempotency**: bootstrap-login on an account already bootstrapped by
+   another device — the second device has a credential but no MK; does 14.3's "skip
+   + route to pair/recover" hold without a confusing half-state?
+3. **buildAuthedRemote per daemon loop**: refreshing account keys every sync (C4)
+   — acceptable overhead, or cache with invalidation?
+4. **recover with no active device**: total-device-loss recovery appends a
+   recovery-signed roster; if the recovery principal was itself rotated out, the
+   user is locked out — is that the correct (documented) failure?
+5. **first-sync ordering on a fresh join**: pair → admit roster → init --workspace
+   → pull. Must the roster admission land BEFORE the first pull (so the device is
+   active for commit verification)? (Yes — admit before sync.)
+6. Anything that silently weakens to non-E2EE or strands a user without MK.
+
+### 14.11 — Resolutions to codex §14 review (NORMATIVE; amends §14.1–14.10)
+Review returned NEEDS-PASS (6 BLOCKER + 5 SHOULD-FIX). Resolutions D1–D11:
+
+**D1 [BLOCKER §14.5] Frozen write context (no stale-KEK window).** One snapshot
+drives BOTH blob encryption and commit signing. `E2eeRemote.beginWrite()` returns
+a `WriteContext { accountEpoch, keyEpoch, kek }` captured after a fresh
+`refreshAccount`. `cfg.kek` for blob encryption comes from that context; `commit()`
+re-reads the current epoch at sign time and, if it differs from the context's
+epoch, returns a `conflict`-style result so `sync.ts` re-scans + re-encrypts under
+the new KEK (never signs a commit whose `keyEpoch` ≠ the blobs' epoch). (v1 has no
+rotation, so the guard never fires, but it's specified + asserted.)
+
+**D2 [BLOCKER §14.3] Crash-safe bootstrap.** Order: generate MK/RK/device keys →
+**persist `device.json` + `mk.key` locally FIRST** (+ RK in a temp pending file) →
+`POST /v1/keys/bootstrap` → show phrase + forced ack → drop the temp RK unless
+`--cache-recovery`. A crash after the POST leaves local MK present ⇒ the account is
+recoverable. An **incomplete server key chain is FATAL** (never "already keyed,
+skip" — a missing genesis roster/key-state is a hard error, not a no-op).
+
+**D3 [BLOCKER §14.6] Crash-safe admission (pair + recover).** Persist a **pending
+join** (credential + generated device keypair + unwrapped MK) locally BEFORE
+`POST /v1/keys/admit`. On restart, if the roster already lists this device →
+finalize (promote pending → `device.json`/`mk.key`); else retry admit reusing the
+SAME keypair. Never leave an active roster device whose private keys weren't saved.
+
+**D4 [BLOCKER §14.6/14.7] Self-verify the candidate chain before posting.** After
+`buildAdmissionRoster`/`buildRecoveryAdmission`, the client runs `verifyAccount`
+over the EXTENDED roster/key-state chain (incl. C7 wrap-hash authorization) and
+`verifyCommitChain` of its own delta locally; only on success does it
+`POST /v1/keys/admit`. A chain that wouldn't verify is never published (can't wedge
+other clients at `verifyAccount`).
+
+**D5 [BLOCKER §14.7 + engine] Bind every device's MK-wrap hash in its signed
+roster entry.** Add `mkWrapHash` to `RosterEntry` (hash of that device's MK
+self-wrap). `bootstrapAccount`, `redeemPairing`, and the new
+`session.buildRecoveryAdmission` all set it. `verifyAccount`'s
+`authorizedMkWrapHashes` = `∪ keyStates.mkWrapHashes ∪ ∪ rosterEntries.mkWrapHash`
+— so recovery- and bootstrap-admitted device wraps are authorized uniformly, not
+only pairing's `admission.deviceWrapHash`. `buildRecoveryAdmission` produces an
+admin-signed (by RSK, an active recovery principal) roster adding the device with
+its `mkWrapHash`; C7 then authorizes the recovered wrap.
+
+**D6 [BLOCKER §14.4/14.5] Delete the plaintext sync branch (fail closed).**
+`sync.ts` MUST fail closed unless an E2EE write context is present: the
+`pushManifest` `else { uploadBlobs(plaintext) }` branch is removed — a non-E2EE
+config or a plain `RboxApi` reaching the core sync path throws
+`"E2EE required"` BEFORE any blob upload. `cfg.encrypted` is no longer optional;
+absence of an E2EE remote/context is a hard error.
+
+**D7 [SHOULD-FIX §14.1/14.6] Trust only the SIGNED accountId.** Validate
+`accountId` grammar, then cross-check the server-returned value against the
+**signed** accountId in the verified roster/key-state (and, for pairing, the
+A-signed admission grant). Persist the credential + choose the keystore namespace
+only AFTER that match; use a staging dir until verified. A server returning a
+mismatched accountId → abort.
+
+**D8 [SHOULD-FIX §14.2] Partial keystore ≠ pair/recover.** `device.json` present
+but `mk.key` missing → re-open this device's own authorized server MK wrap via
+`openOwnMasterKey` (C7-checked) and save MK. Only a MISSING `device.json` routes to
+pair/recover.
+
+**D9 [SHOULD-FIX §14.6] Pair-create refreshes + binds epoch.** `rbox pair` first
+`refreshAccount` + asserts the creator is `active` in the latest roster, and passes
+the current `accountEpoch` into `buildPairing` (no stale grants).
+
+**D10 [SHOULD-FIX §14.7] Recover needs an account credential first.** The E2EE key
+endpoints are credential-gated, so `rbox recover` first obtains a device credential
+via the normal account-identity path (web/Clerk session — M11 — or a device-code if
+another device still exists), THEN uses RK only for MK + RSK + self-admission.
+Honest residual: true total-device-loss recovery depends on the account-identity
+(web) login to get that first credential; the phrase alone unlocks data, not
+server auth.
+
+**D11 [SHOULD-FIX §14.9 + completeness] Explicit E2EE marker; versions/restore.**
+`workspace.json` carries `schema: "e2ee/v1"`; any workspace lacking it (old M5/
+plaintext) → fail before any blob op with a re-init message. `versions` lists from
+the verified commit chain (metadata only — seq/deviceId, no decrypt); `restore`
+fetches the target commit, `openCommit`-decrypts under its `keyEpoch`, and applies;
+both route through `E2eeRemote` or fail closed (never the old plaintext `manifestAt`).
+
 ## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and
    Argon2id(recovery-phrase), wrapping per-workspace KEKs — sound? Better than a
