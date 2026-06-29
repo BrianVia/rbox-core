@@ -55,6 +55,17 @@ describe("verifyAndParseManifest (release signature)", () => {
     expect(() => verifyAndParseManifest(tampered, new TextEncoder().encode(sig))).toThrow(/did not verify/);
   });
 
+  test("a malformed (non-b64url) signature surfaces the security refusal, not a decode error", () => {
+    const bytes = manifest();
+    const garbage = new TextEncoder().encode("!!!not-base64url!!!");
+    expect(() => verifyAndParseManifest(bytes, garbage)).toThrow(/did not verify/);
+  });
+
+  test("a non-JSON manifest body is rejected as tampered", () => {
+    const notJson = new TextEncoder().encode("<html>404</html>");
+    expect(() => verifyAndParseManifest(notJson, new TextEncoder().encode("AAAA"))).toThrow(/not valid JSON/);
+  });
+
   test("a manifest signed by the REAL embedded key verifies (round-trip via a matching keypair)", () => {
     // Build a keypair, point a local copy of the keyring entry at its pubkey, and
     // confirm the verify path accepts a correct signature. (We can't use the real

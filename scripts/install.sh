@@ -24,14 +24,23 @@ URL="$BASE/bin/$BIN"
 
 echo "Installing rbox ($OS/$ARCH) -> $DEST/rbox"
 mkdir -p "$DEST"
-if ! curl -fSL --proto '=https' "$URL" -o "$DEST/rbox"; then
+
+# Download to a temp file, then atomically move into place — a failed/partial
+# download never clobbers an existing working binary (design 14 U8). HTTPS only
+# (incl. redirects). The temp is cleaned up on any exit.
+TMP="$DEST/.rbox.install.$$"
+trap 'rm -f "$TMP"' EXIT INT TERM
+if ! curl -fSL --proto '=https' --proto-redir '=https' "$URL" -o "$TMP"; then
   echo "rbox: download failed from $URL" >&2
   exit 1
 fi
-chmod +x "$DEST/rbox"
+chmod +x "$TMP"
+mv -f "$TMP" "$DEST/rbox"
+trap - EXIT INT TERM
 
 echo ""
 echo "  ✓ rbox installed to $DEST/rbox"
+echo "  (verify integrity via the signed manifest: $BASE/version — rbox upgrade checks it automatically)"
 echo ""
 case ":$PATH:" in
   *":$DEST:"*)

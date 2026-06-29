@@ -45,21 +45,39 @@ export function releaseSigningInput(manifestBytes: Uint8Array): Uint8Array {
  * untrusted keyId only to select which embedded key to check against).
  */
 export function verifyAndParseManifest(manifestBytes: Uint8Array, sigBytes: Uint8Array): Manifest {
-  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Manifest;
+  const tampered = "refusing to upgrade (possible tampered update channel)";
+  let manifest: Manifest;
+  try {
+    manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Manifest;
+  } catch {
+    throw new Error(`release manifest is not valid JSON — ${tampered}`);
+  }
   const key = RELEASE_KEYS.find((k) => k.keyId === manifest.keyId);
   if (!key) throw new Error(`release manifest names an unknown signing key (${manifest.keyId}) — refusing`);
-  const sig = fromB64url(new TextDecoder().decode(sigBytes).trim());
-  if (!verify(fromB64url(key.pubKey), releaseSigningInput(manifestBytes), sig)) {
-    throw new Error("release signature did not verify — refusing to upgrade (possible tampered update channel)");
+  // A tampered channel may serve a malformed (non-b64url) signature; treat any
+  // decode/verify failure as the same security refusal rather than leaking a
+  // low-level "invalid characters" decode error to the user.
+  let ok = false;
+  try {
+    ok = verify(fromB64url(key.pubKey), releaseSigningInput(manifestBytes), fromB64url(new TextDecoder().decode(sigBytes).trim()));
+  } catch {
+    ok = false;
   }
+  if (!ok) throw new Error(`release signature did not verify — ${tampered}`);
   return manifest;
 }
 
 /** Bun standalone-executable check (design 14 U1'): only then is process.execPath
- *  the rbox binary; under `bun run` it's Bun itself and we must NOT touch it. */
+ *  the rbox binary; under `bun run` it's Bun itself and we must NOT touch it.
+ *  `Bun.isStandaloneExecutable` is the documented flag but isn't present in every
+ *  Bun (e.g. 1.3.5) — so we ALSO accept the load-bearing runtime signal that a
+ *  compiled binary runs from Bun's virtual FS (`Bun.main` under `/$bunfs/`).
+ *  Either signal + execPath not being `bun` ⇒ a real installed binary. */
 function isStandalone(): boolean {
-  const bun = (globalThis as { Bun?: { isStandaloneExecutable?: boolean } }).Bun;
-  return bun?.isStandaloneExecutable === true && path.basename(process.execPath) !== "bun";
+  const bun = (globalThis as { Bun?: { isStandaloneExecutable?: boolean; main?: string } }).Bun;
+  if (!bun) return false;
+  const compiled = bun.isStandaloneExecutable === true || (typeof bun.main === "string" && bun.main.startsWith("/$bunfs/"));
+  return compiled && path.basename(process.execPath) !== "bun";
 }
 
 function artifactName(): string {
