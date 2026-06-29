@@ -9,7 +9,8 @@ const RBOX_ACCOUNT_KEY = "rbox_account_id";
 // Plan deep-link from the marketing site (?plan=solo|pro|team). Stashed so it
 // survives the Clerk sign-in redirect, then consumed once the user is signed in.
 const PLAN_INTENT_KEY = "rbox_intent_plan";
-const VALID_PLANS = ["solo", "pro", "team"];
+// Team is "coming soon" (no per-seat billing or member invites yet) — not purchasable.
+const VALID_PLANS = ["solo", "pro"];
 
 const $ = (id) => document.getElementById(id);
 
