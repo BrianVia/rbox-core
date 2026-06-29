@@ -25,13 +25,28 @@ export { WorkspaceSync } from "./workspace-sync.js";
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    const cors = corsHeaders(req, env);
+    // CORS preflight: the browser dashboard sends OPTIONS before any cross-origin
+    // authed request (Authorization/content-type headers make it non-simple).
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    let res: Response;
     try {
-      return await route(req, env);
+      res = await route(req, env);
     } catch (e) {
-      if (e instanceof Response) return e; // thrown 4xx flows out as itself
-      console.error("unhandled", e);
-      return jsonResponse({ error: "internal", message: String((e as Error)?.message ?? e) }, 500);
+      if (e instanceof Response) res = e; // thrown 4xx flows out as itself
+      else {
+        console.error("unhandled", e);
+        res = jsonResponse({ error: "internal", message: String((e as Error)?.message ?? e) }, 500);
+      }
     }
+    // Echo CORS headers on the real response (incl. errors) so the browser fetch
+    // resolves instead of failing opaque. No-op when Origin isn't allowlisted.
+    if (cors["Access-Control-Allow-Origin"]) {
+      const h = new Headers(res.headers);
+      for (const [k, v] of Object.entries(cors)) h.set(k, v);
+      res = new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+    }
+    return res;
   },
   /**
    * Scheduled GC (cron). Plan-driven retention prune → mark → purge, in order:
@@ -201,4 +216,28 @@ function eq(a: string[], b: string[]): boolean {
 function badRequest(message: string): Response {
   return jsonResponse({ error: "bad_request", message }, 400);
 }
+
+/**
+ * CORS for the web dashboard. The browser dashboard (app.rbox.to in prod,
+ * localhost in dev) calls this API cross-origin, so its authed fetches need CORS
+ * headers plus an OPTIONS preflight. We reflect ONLY Origins on the
+ * CLERK_ALLOWED_ORIGINS allowlist — the same trusted web origins enforced as the
+ * Clerk JWT `azp`. CLI clients send no Origin and get no CORS headers (unchanged).
+ * Auth is via Bearer token, not cookies, so Allow-Credentials is intentionally
+ * omitted.
+ */
+function corsHeaders(req: Request, env: Env): Record<string, string> {
+  const origin = req.headers.get("Origin");
+  if (!origin) return {};
+  const allowed = (env.CLERK_ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!allowed.includes(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "authorization, content-type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
 const jsonResponse = json; // worker uses jsonResponse; shared impl is util.json

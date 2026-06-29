@@ -81,6 +81,10 @@
       <!-- Signed-out: Clerk SignIn mounts here -->
       <div id="signed-out" class="hidden">
         <div id="clerk-signin"></div>
+        <!-- Clerk renders its bot/Smart-CAPTCHA (Turnstile) challenge here. Without
+             this mount, a production instance's client-trust step can't complete
+             and sign-in silently resets. -->
+        <div id="clerk-captcha"></div>
       </div>
 
       <!-- Signed-in dashboard -->

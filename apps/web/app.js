@@ -57,7 +57,10 @@ function loadClerk() {
     s.async = true;
     s.crossOrigin = "anonymous";
     s.setAttribute("data-clerk-publishable-key", pk);
-    s.src = `https://${host}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js`;
+    // Pin major v5: `@latest` resolves to the legacy v4 on the FAPI CDN, which
+    // can't render the production client-trust (Turnstile) challenge → sign-in
+    // dead-ends at needs_client_trust. v5 handles it with the #clerk-captcha mount.
+    s.src = `https://${host}/npm/@clerk/clerk-js@5/dist/clerk.browser.js`;
     s.onerror = () => reject(new Error("ClerkJS failed to load"));
     s.onload = () => {
       const start = Date.now();
