@@ -48,7 +48,7 @@ jobs:
 
       - name: Test + typecheck (before we sign anything)
         run: |
-          bun test src
+          bun test ./src/
           npx tsc --noEmit
           (cd apps/api && npx tsc -p . --noEmit)
 

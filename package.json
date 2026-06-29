@@ -1,13 +1,13 @@
 {
   "name": "@rbox/core",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
-    "test": "bun test src",
+    "test": "bun test ./src/",
     "test:api": "cd apps/api && vitest run",
-    "test:all": "bun test src && cd apps/api && vitest run",
+    "test:all": "bun test ./src/ && cd apps/api && vitest run",
     "typecheck": "tsc --noEmit && tsc -p apps/api --noEmit"
   },
   "dependencies": {
