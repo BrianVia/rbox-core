@@ -36,6 +36,7 @@ this is what's left to flip the switch to a real, paid, public product.
 - [ ] Real browser sign-in smoke test on `https://app.rbox.to` (sign up → `/v1/web/session` exchange → usage renders → Subscribe redirects to a `cs_live` checkout).
 
 ## 📋 Backlog (your asks — not pressing)
+- [ ] **Rebuild `apps/web` as a real framework app (Svelte/SvelteKit + Vite)** — today it's a deliberately zero-build vanilla-JS static SPA (`index.html` + `config.js` + `app.js`). Fine for the current single-page dashboard, but it'll get unwieldy as account/billing UI grows (esp. Team management: member invites, roles, per-seat). A SvelteKit+Vite app buys components, routing, typed state, and a proper ClerkJS/`@clerk` integration. Do this when Team work starts; keep it deployed to the same `rbox-app` Pages project. (Deferred 2026-06-29.)
 - [ ] **CI/CD**: auto-build the `rbox` binaries (all platforms) + publish to R2 on tag/release; CLI self-update (`rbox upgrade`). (Today binaries are built locally with `bun build --compile` and uploaded by hand.)
 - [ ] **Two-VM sync e2e test**: spin up two VMs/containers, have them pair + sync a tree both ways, assert convergence. The richest integration coverage (today: engine unit tests + Miniflare worker tests + the FakeRemote client suite + manual cross-host runs).
 
