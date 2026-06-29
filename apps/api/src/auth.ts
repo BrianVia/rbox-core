@@ -186,7 +186,9 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   try {
     const minted = await mintDevice(env, consumed.account_id, consumed.user_id, deviceId, label);
     // Pass the opaque E2EE material straight through (null for legacy tokens).
-    return json({ token: minted, deviceId, mkWrap: consumed.mk_wrap, admissionGrant: consumed.admission_grant });
+    // accountId lets the redeemer namespace its keystore — but the client trusts
+    // only the SIGNED accountId (verified roster/grant), cross-checking this (D7).
+    return json({ token: minted, deviceId, accountId: consumed.account_id, mkWrap: consumed.mk_wrap, admissionGrant: consumed.admission_grant });
   } catch (e) {
     console.error("pair redeem: mint failed after consume (token burned):", String((e as Error)?.message ?? e));
     return json({ error: "internal" }, 500);

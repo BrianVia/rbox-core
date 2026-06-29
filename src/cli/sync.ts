@@ -27,7 +27,6 @@ const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
 
 const MAX_ATTEMPTS = 5;
-const UPLOAD_CONCURRENCY = 8; // bounded so a big push never opens thousands of fds
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
@@ -58,27 +57,6 @@ async function withCache(
   return { cache, save: () => cache.save(root) };
 }
 
-/** Upload blobs with bounded concurrency, streaming each file (single PUT or
- *  resumable multipart by size) so memory stays flat regardless of file size. */
-async function uploadBlobs(
-  api: SyncRemote,
-  root: string,
-  shas: string[],
-  shaToPath: Map<string, string>
-): Promise<void> {
-  const queue = [...shas];
-  const uploadsDir = path.join(root, ".rbox", "state", "uploads");
-  const worker = async () => {
-    for (let sha = queue.pop(); sha !== undefined; sha = queue.pop()) {
-      const rel = shaToPath.get(sha);
-      if (!rel) continue; // sha not among our local files (nothing to upload)
-      const abs = path.join(root, rel);
-      const st = await fs.stat(abs);
-      await api.putBlobFile(sha, abs, st.size, uploadsDir);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));
-}
 
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
@@ -153,13 +131,11 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const { cache, save } = await withCache(root, deps.cache);
   const local = await scanManifest(root, undefined, cache);
 
-  // Encryption is self-describing: if the remote manifest carries encSha, this is
-  // an encrypted workspace — load the key (even if our local config doesn't say so).
-  let kek = cfg.kek;
+  // E2EE is the only mode (D6): the KEK is injected by buildAuthedRemote. A remote
+  // manifest with encrypted entries but no key on this device → fail closed.
+  const kek = cfg.kek;
   if (!kek && remote.files.some((f) => f.encSha)) {
-    const { loadKek } = await import("./keystore.js");
-    kek = await loadKek(cfg.remoteWorkspaceId);
-    if (!kek) throw new Error("remote workspace is encrypted — run `rbox key import <recovery-phrase>` to get the key");
+    throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox recover`.");
   }
 
   const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
@@ -271,15 +247,12 @@ export async function pushManifest(
   }
   const d = diffManifests(state.lastSyncedManifest, local);
 
-  // Upload missing blobs — encrypted (by encSha, ciphertext) or plaintext (by sha).
+  // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
+  // E2EE is the only mode (design 12 D6): a non-encrypted config reaching the sync
+  // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
+  if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox recover`)");
   const doUpload = async () => {
-    if (cfg.encrypted) {
-      await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest);
-    } else {
-      const shaToPath = new Map<string, string>();
-      for (const f of local.files) if (f.type === "file") shaToPath.set(f.sha256, f.path);
-      await uploadBlobs(api, root, await api.missingBlobs([...shaToPath.keys()]), shaToPath);
-    }
+    await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest);
   };
   await doUpload();
 

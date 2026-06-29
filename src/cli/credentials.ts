@@ -12,6 +12,9 @@ export interface Credentials {
   token: string;
   deviceId: string;
   remoteUrl: string;
+  /** The account this device belongs to — namespaces the E2EE keystore. Trusted
+   *  only after cross-check against the SIGNED accountId in the roster (D7). */
+  accountId?: string;
 }
 
 const dir = () => path.join(os.homedir(), ".rbox");
@@ -24,6 +27,7 @@ export async function loadCredentials(): Promise<Credentials | undefined> {
       token: process.env.RBOX_TOKEN,
       deviceId: process.env.RBOX_DEVICE_ID ?? "env",
       remoteUrl: process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev",
+      accountId: process.env.RBOX_ACCOUNT_ID,
     };
   }
   try {

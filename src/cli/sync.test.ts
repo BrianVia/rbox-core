@@ -7,44 +7,48 @@ import { pull, push, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
-import type { BlobStore, Manifest } from "../engine/index.js";
+import type { BlobStore, FileEntry, Manifest } from "../engine/index.js";
+import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
+// Fixed test workspace KEK — E2EE is the only sync mode now (design 12 D6), so the
+// FakeRemote operates at the blob layer in CIPHERTEXT (by encSha) exactly as the
+// real server does; manifests are the post-decryption plaintext view the transport
+// hands sync.ts. `enc()` mirrors the V4-5 convergent blob derivation.
+const KEK = Buffer.alloc(32, 7);
+const enc = (content: string | Buffer) => encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+
 /**
- * Stateful in-memory server simulator (design 09 §1) — mirrors the real
- * WorkspaceSync DO invariants: a monotonic head sequence, parent-sequence
- * conflict detection (409), and blob-existence validation at commit (422). It is
- * NOT a scripted mock; the tests assert against its real state so they fail when
- * the client's conflict-retry / base-advance / echo-storm logic regresses.
+ * Stateful in-memory server simulator (design 09 §1) — monotonic head, 409 parent
+ * conflict, 422 blob-existence. Blobs are content-addressed by `encSha` (ciphertext)
+ * since the client always encrypts; manifests are plaintext (the transport decrypts
+ * before sync.ts sees them).
  */
 class FakeRemote implements SyncRemote {
   private head = 0;
   private readonly log = new Map<number, Manifest>(); // seq → manifest
-  private readonly blobs = new Map<string, Buffer>();
+  private readonly blobs = new Map<string, Buffer>(); // encSha → ciphertext
   commitCalls = 0;
-  /** Each true in this queue makes the NEXT commit return one 422 (then is consumed). */
   forceUnsatisfiedOnce = false;
-  /** Invoked just before a commit's parent check — lets a test advance the remote
-   *  underneath the client to force a real 409 race. */
   beforeCommit?: () => Promise<void>;
 
-  seedBlob(content: string): string {
-    const s = sha(content);
-    this.blobs.set(s, Buffer.from(content));
-    return s;
+  /** Encrypt + seed a blob (as the uploading client would); return its FileEntry. */
+  async seedEntry(rel: string, content: string): Promise<FileEntry> {
+    const p = await enc(content);
+    this.blobs.set(p.encSha, Buffer.from(p.ciphertext));
+    return { path: rel, type: "file", sha256: p.plaintextSha, encSha: p.encSha, size: content.length, mode: 0o644, mtimeMs: 1 };
   }
-  /** Simulate another device committing `manifest` (advances head). */
-  injectCommit(manifest: Manifest): void {
+  injectCommit(files: FileEntry[]): void {
     this.head += 1;
-    this.log.set(this.head, manifest);
+    this.log.set(this.head, { generatedAt: "", files });
   }
   headSeq(): number {
     return this.head;
   }
-  hasBlob(s: string): boolean {
-    return this.blobs.has(s);
+  hasBlob(encSha: string): boolean {
+    return this.blobs.has(encSha);
   }
 
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
@@ -54,9 +58,7 @@ class FakeRemote implements SyncRemote {
     return shas.filter((s) => !this.blobs.has(s));
   }
   async putBlobFile(sha256: string, absPath: string): Promise<void> {
-    // Verify RAW bytes match the claimed content address — exactly as the server
-    // does. (Hashing bytes.toString() would corrupt non-UTF8/binary content.)
-    const bytes = await fs.readFile(absPath);
+    const bytes = await fs.readFile(absPath); // ciphertext; encSha = sha256(ciphertext)
     if (shaBytes(bytes) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
     this.blobs.set(sha256, bytes);
   }
@@ -64,11 +66,13 @@ class FakeRemote implements SyncRemote {
     this.commitCalls += 1;
     if (this.beforeCommit) await this.beforeCommit();
     if (parentSequence !== this.head) return { conflict: true, head: this.head };
-    const missing = manifest.files.filter((f) => f.type === "file").map((f) => f.sha256).filter((s) => !this.blobs.has(s));
+    // Blob-existence is checked against the STORED address: encSha (ciphertext).
+    const addr = (f: FileEntry) => f.encSha ?? f.sha256;
+    const missing = manifest.files.filter((f) => f.type === "file").map(addr).filter((s) => !this.blobs.has(s));
     if (missing.length > 0) return { unsatisfiedBlobs: [...new Set(missing)] };
     if (this.forceUnsatisfiedOnce) {
       this.forceUnsatisfiedOnce = false;
-      return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map((f) => f.sha256) };
+      return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map(addr) };
     }
     this.head += 1;
     this.log.set(this.head, manifest);
@@ -108,7 +112,8 @@ const deps = (remote: SyncRemote): SyncDeps => ({ remote, backoff: noBackoff });
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
-  cfg = { remoteWorkspaceId: "ws_t", projectId: "root", deviceId: "devA", rootPath: root, remoteUrl: "http://x", token: "" };
+  // E2EE is the only mode (D6): a workspace always has an encryption key.
+  cfg = { remoteWorkspaceId: "ws_t", projectId: "root", deviceId: "devA", rootPath: root, remoteUrl: "http://x", token: "", encrypted: true, kek: KEK };
 });
 afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
@@ -121,12 +126,10 @@ const read = (rel: string) => fs.readFile(path.join(root, rel), "utf8");
 
 test("no-op: pull-then-push with no local changes makes ZERO commits, sequence stable", async () => {
   const remote = new FakeRemote();
-  // remote publishes one file
   const c = "hello\n";
-  const s = remote.seedBlob(c);
-  remote.injectCommit({ generatedAt: "", files: [{ path: "a.txt", type: "file", sha256: s, size: c.length, mode: 0o644, mtimeMs: 1 }] });
+  remote.injectCommit([await remote.seedEntry("a.txt", c)]);
 
-  await pull(root, cfg, deps(remote)); // writes a.txt, base → seq 1
+  await pull(root, cfg, deps(remote)); // writes a.txt (decrypted), base → seq 1
   expect(await read("a.txt")).toBe(c);
   const before = remote.commitCalls;
   const seq = await push(root, cfg, deps(remote)); // nothing changed on disk
@@ -137,48 +140,43 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
 
 // ── clean push ─────────────────────────────────────────────────────────────
 
-test("clean push uploads the blob, commits, advances base", async () => {
+test("clean push uploads the ciphertext blob, commits, advances base", async () => {
   const remote = new FakeRemote();
   await write("new.txt", "fresh content\n");
   const seq = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
-  expect(remote.hasBlob(sha("fresh content\n"))).toBe(true);
+  expect(remote.hasBlob((await enc("fresh content\n")).encSha)).toBe(true); // stored as ciphertext
+  expect(remote.hasBlob(sha("fresh content\n"))).toBe(false); // never the plaintext address
   expect((await loadState(root)).lastSyncedSequence).toBe(1);
 });
 
-test("binary (non-UTF8) content is uploaded + byte-verified by content address", async () => {
+test("binary (non-UTF8) content is encrypted + byte-verified by ciphertext address", async () => {
   const remote = new FakeRemote();
-  // Bytes that do NOT survive a UTF-8 round-trip — a toString()-based hash would
-  // mis-verify these and the push would wrongly fail.
   const binary = Buffer.from([0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f, 0xc3, 0x28]);
   await fs.writeFile(path.join(root, "blob.bin"), binary);
   const seq = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
-  expect(remote.hasBlob(shaBytes(binary))).toBe(true); // raw bytes addressed correctly
+  expect(remote.hasBlob((await enc(binary)).encSha)).toBe(true); // ciphertext addressed correctly
 });
 
 // ── 409 conflict-retry: the rescan is load-bearing ─────────────────────────
 
 test("409 conflict: client pulls + RE-SCANS + retries, and does NOT lose the remote change", async () => {
   const remote = new FakeRemote();
-  // Our local change:
   await write("mine.txt", "mine\n");
-  // A competing remote commit lands exactly once, right before our first commit:
   const theirs = "theirs\n";
-  const theirSha = remote.seedBlob(theirs);
   let injected = false;
   remote.beforeCommit = async () => {
     if (!injected) {
       injected = true;
-      remote.injectCommit({ generatedAt: "", files: [{ path: "theirs.txt", type: "file", sha256: theirSha, size: theirs.length, mode: 0o644, mtimeMs: 1 }] });
+      remote.injectCommit([await remote.seedEntry("theirs.txt", theirs)]);
     }
   };
   const seq = await push(root, cfg, deps(remote));
-  // Oracle: the retry pulled their file to disk AND kept ours — both survive.
   expect(await read("theirs.txt")).toBe(theirs); // remote change not clobbered
   expect(await read("mine.txt")).toBe("mine\n"); // our change preserved
   expect(seq).toBe(remote.headSeq());
-  expect(remote.commitCalls).toBeGreaterThanOrEqual(2); // first conflicted, retry succeeded
+  expect(remote.commitCalls).toBeGreaterThanOrEqual(2);
 });
 
 // ── 409 give-up leaves state untouched ─────────────────────────────────────
@@ -186,17 +184,12 @@ test("409 conflict: client pulls + RE-SCANS + retries, and does NOT lose the rem
 test("409 forever: exhausts retries, throws, never commits our change, never loses it", async () => {
   const remote = new FakeRemote();
   await write("mine.txt", "mine\n");
-  // Advance the remote before every commit → the parent check never matches.
   let n = 0;
   remote.beforeCommit = async () => {
-    const c = `other${n++}\n`;
-    const s = remote.seedBlob(c);
-    remote.injectCommit({ generatedAt: "", files: [{ path: `o${n}.txt`, type: "file", sha256: s, size: c.length, mode: 0o644, mtimeMs: 1 }] });
+    n++;
+    remote.injectCommit([await remote.seedEntry(`o${n}.txt`, `other${n}\n`)]);
   };
   await expect(push(root, cfg, deps(remote))).rejects.toThrow(/too many conflicts/);
-  // Oracle: our change was NEVER committed (no partial/torn commit) and is NOT
-  // lost — it's still on disk. (The base legitimately tracks pulled remote state;
-  // what must hold is no data loss and no phantom commit of ours.)
   const latest = await remote.latest();
   expect(latest.manifest.files.some((f) => f.path === "mine.txt")).toBe(false); // never committed
   expect(await read("mine.txt")).toBe("mine\n"); // never lost
@@ -209,13 +202,12 @@ test("onCommitConflict fires once per 409 (the metric the daemon tallies)", asyn
   remote.beforeCommit = async () => {
     if (injected < 2) {
       injected++;
-      const c = `o${injected}\n`;
-      remote.injectCommit({ generatedAt: "", files: [{ path: `o${injected}.txt`, type: "file", sha256: remote.seedBlob(c), size: c.length, mode: 0o644, mtimeMs: 1 }] });
+      remote.injectCommit([await remote.seedEntry(`o${injected}.txt`, `o${injected}\n`)]);
     }
   };
   let conflicts = 0;
   await push(root, cfg, { remote, backoff: noBackoff, onCommitConflict: () => conflicts++ });
-  expect(conflicts).toBe(2); // two 409s before the third commit succeeded
+  expect(conflicts).toBe(2);
 });
 
 // ── 422 unsatisfied-blobs → reupload + retry ───────────────────────────────
@@ -223,7 +215,7 @@ test("onCommitConflict fires once per 409 (the metric the daemon tallies)", asyn
 test("422 unsatisfied blobs: client re-uploads and retries to success", async () => {
   const remote = new FakeRemote();
   await write("x.txt", "payload\n");
-  remote.forceUnsatisfiedOnce = true; // first commit reports missing, even though uploaded
+  remote.forceUnsatisfiedOnce = true;
   const seq = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.commitCalls).toBe(2); // 422 then success
@@ -233,8 +225,9 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
 
 test("pull rejects an invalid remote manifest and does not advance base", async () => {
   const remote = new FakeRemote();
-  // Inject a manifest with a path-traversal entry (invalid) at head.
-  remote.injectCommit({ generatedAt: "", files: [{ path: "../escape", type: "file", sha256: sha("x"), size: 1, mode: 0o644, mtimeMs: 1 }] });
+  // Path-traversal entry (invalid) at head — rejected by client-side validation
+  // BEFORE any blob fetch/decrypt (the client is the sole validator under E2EE).
+  remote.injectCommit([{ path: "../escape", type: "file", sha256: sha("x"), encSha: sha("x"), size: 1, mode: 0o644, mtimeMs: 1 }]);
   await expect(pull(root, cfg, deps(remote))).rejects.toThrow(/invalid remote manifest/);
   expect((await loadState(root)).lastSyncedSequence).toBe(0); // base unchanged
 });
@@ -243,11 +236,9 @@ test("pull rejects an invalid remote manifest and does not advance base", async 
 
 test("a now-ignored, previously-synced file is carried forward (not seen as a deletion)", async () => {
   const remote = new FakeRemote();
-  // 1) clean-push the file → it's in the base + remote.
   await write("keep.env", "K=V\n");
   await push(root, cfg, deps(remote));
   expect((await remote.latest()).manifest.files.some((f) => f.path === "keep.env")).toBe(true);
-  // 2) now ignore it on disk and push again — it must be CARRIED, not deleted.
   await write(".rboxignore", "keep.env\n");
   await push(root, cfg, deps(remote));
   const latest = await remote.latest();
@@ -258,12 +249,10 @@ test("a now-ignored, previously-synced file is carried forward (not seen as a de
 
 test("sync = pull then push in one call", async () => {
   const remote = new FakeRemote();
-  const c = "remote\n";
-  const s = remote.seedBlob(c);
-  remote.injectCommit({ generatedAt: "", files: [{ path: "r.txt", type: "file", sha256: s, size: c.length, mode: 0o644, mtimeMs: 1 }] });
+  remote.injectCommit([await remote.seedEntry("r.txt", "remote\n")]);
   await write("local.txt", "local\n");
   const { pulled, pushedSequence } = await sync(root, cfg, deps(remote));
   expect(pulled.some((a) => a.kind === "write")).toBe(true); // pulled r.txt
-  expect(await read("r.txt")).toBe(c);
+  expect(await read("r.txt")).toBe("remote\n");
   expect(pushedSequence).toBe(remote.headSeq()); // pushed local.txt on top
 });

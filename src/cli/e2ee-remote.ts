@@ -92,12 +92,17 @@ export interface E2eeContext {
 export class E2eeRemote implements SyncRemote {
   private account?: VerifiedAccount;
   private readonly kekByEpoch = new Map<number, Uint8Array>();
+  /** The keyEpoch the KEK handed to `currentKek()` belongs to — blobs are
+   *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
+  private writeEpoch?: number;
 
   constructor(private readonly api: E2eeApi, private readonly ctx: E2eeContext, private readonly pins: PinStore) {}
 
-  /** The current-epoch workspace KEK — also used by sync.ts to encrypt blobs. */
+  /** The current-epoch workspace KEK — also used by sync.ts to encrypt blobs.
+   *  Snapshots the write epoch so `commit()` can reject a stale-KEK sign (D1). */
   async currentKek(): Promise<Uint8Array> {
     const account = await this.refreshAccount();
+    this.writeEpoch = account.currentKeyEpoch;
     return this.kekFor(account.currentKeyEpoch, account, true);
   }
 
@@ -136,6 +141,12 @@ export class E2eeRemote implements SyncRemote {
 
   async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
     const account = await this.refreshAccount(); // C4: refresh immediately before signing
+    // D1: if the epoch rotated between blob encryption (currentKek) and now, the
+    // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a
+    // commit whose keyEpoch ≠ the blobs' epoch. (v1 has no rotation; never fires.)
+    if (this.writeEpoch !== undefined && this.writeEpoch !== account.currentKeyEpoch) {
+      return { conflict: true, head: parentSequence };
+    }
     const epoch = account.currentKeyEpoch;
     const kek = await this.kekFor(epoch, account, true);
     const pin = await this.pins.load();

@@ -9,7 +9,7 @@
  * device holding MK (via its RSA key, a pairing token, or the recovery phrase)
  * can open a workspace KEK and decrypt.
  */
-import { generateSignKeyPair, generateWrapKeyPair, sign, signKeyPairFromSeed, signPrivateFromPkcs8, signPrivateToPkcs8, wrapPrivateFromPkcs8, wrapPrivateToPkcs8 } from "./asym.js";
+import { generateSignKeyPair, generateWrapKeyPair, sign, signKeyPairFromSeed, signPrivateFromPkcs8, signPrivateToPkcs8, wrapPrivateFromPkcs8, wrapPrivateToPkcs8, type SignKeyPair, type WrapKeyPair } from "./asym.js";
 import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type SignedCommit } from "./commit.js";
 import { buildKeyState, GENESIS_PREV_STATE_HASH, verifyKeyStateChain, type AccountKeyState, type SignedKeyState } from "./epoch.js";
 import { canonicalString, parseStrict } from "./jcs.js";
@@ -357,13 +357,15 @@ export async function redeemPairing(args: {
   material: PairingMaterial;
   prevRoster: SignedRoster; // current head roster (verified by the caller)
   now: number;
+  /** Reuse a pre-generated device keypair across 409 retries (crash-safe, D3). */
+  deviceKeys?: { sig: SignKeyPair; enc: WrapKeyPair };
 }): Promise<RedeemResult> {
   if (args.material.mkWrap.kind !== "aesgcm-wrap") throw new Error("pairing MK wrap must be aesgcm-wrap");
   const wrapKey = await hkdf(args.tokenSecret, PAIR_MK_WRAP_SALT, utf8("mk-wrap"), 32);
   const mk = await aesGcmUnwrap(wrapKey, args.material.mkWrap, pairingWrapCtx(args.accountId, args.accountEpoch));
 
-  const sig = generateSignKeyPair();
-  const enc = generateWrapKeyPair();
+  const sig = args.deviceKeys?.sig ?? generateSignKeyPair();
+  const enc = args.deviceKeys?.enc ?? generateWrapKeyPair();
   const selfWrap = await rsaDeviceWrap(enc.publicKeySpki, mk, deviceWrapCtx(args.accountId, args.accountEpoch));
   const selfWrapHash = await wrapHash(selfWrap);
 
@@ -420,11 +422,13 @@ export async function buildRecoveryAdmission(args: {
   recoveryWrap: Wrap;
   prevRoster: SignedRoster; // current head roster (caller verified it)
   now: number;
+  /** Reuse a pre-generated device keypair across 409 retries (crash-safe, D3). */
+  deviceKeys?: { sig: SignKeyPair; enc: WrapKeyPair };
 }): Promise<RedeemResult> {
   const mk = await recoverMasterKey(args.accountId, args.accountEpoch, args.recoveryKey, args.recoveryWrap);
   const rsk = await recoverySignKeyPair(args.recoveryKey);
-  const sig = generateSignKeyPair();
-  const enc = generateWrapKeyPair();
+  const sig = args.deviceKeys?.sig ?? generateSignKeyPair();
+  const enc = args.deviceKeys?.enc ?? generateWrapKeyPair();
   const selfWrap = await rsaDeviceWrap(enc.publicKeySpki, mk, deviceWrapCtx(args.accountId, args.accountEpoch));
   const selfWrapHash = await wrapHash(selfWrap);
 
