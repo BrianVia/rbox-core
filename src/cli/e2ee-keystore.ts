@@ -148,3 +148,8 @@ export async function loadPin(accountId: string, workspaceId: string): Promise<H
 export async function savePin(accountId: string, workspaceId: string, pin: HeadPin): Promise<void> {
   await writeSecret(path.join(root(accountId), "ws", `${workspaceId}.pin.json`), JSON.stringify(pin));
 }
+
+/** A keystore-backed PinStore for the E2EE transport (production). */
+export function keystorePinStore(accountId: string, workspaceId: string): { load(): Promise<HeadPin | undefined>; save(pin: HeadPin): Promise<void> } {
+  return { load: () => loadPin(accountId, workspaceId), save: (pin) => savePin(accountId, workspaceId, pin) };
+}

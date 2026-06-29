@@ -4,6 +4,8 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import type { BlobStore, Manifest } from "../engine/index.js";
+import type { SignedCommit } from "../engine/e2ee/index.js";
+import type { AccountKeysDTO, CommitChainResult } from "./e2ee-remote.js";
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
@@ -224,6 +226,96 @@ export class RboxApi implements SyncRemote {
     }
     if (!res.ok) throw new Error(`commit failed: ${res.status} ${await res.text()}`);
     return { sequence: ((await res.json()) as { sequence: number }).sequence };
+  }
+
+  // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
+
+  private async postJson(path: string, body: unknown): Promise<Response> {
+    return fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.auth, "content-type": "application/json" }, body: JSON.stringify(body) });
+  }
+
+  /** Upload opaque bytes by content address (the encrypted-manifest blob). */
+  async putBlobBytes(sha256: string, bytes: Uint8Array): Promise<void> {
+    await this.putBlob(sha256, bytes);
+  }
+
+  async bootstrapKeys(body: unknown): Promise<void> {
+    const r = await this.postJson("/v1/keys/bootstrap", body);
+    if (!r.ok) throw new Error(`keys/bootstrap failed: ${r.status} ${await r.text()}`);
+  }
+
+  async getAccountKeys(): Promise<AccountKeysDTO | null> {
+    const r = await fetch(`${this.baseUrl}/v1/keys/account`, { headers: this.auth });
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error(`keys/account failed: ${r.status}`);
+    return (await r.json()) as AccountKeysDTO;
+  }
+
+  async putDeviceKeys(body: unknown): Promise<void> {
+    const r = await this.postJson("/v1/keys/device", body);
+    if (!r.ok) throw new Error(`keys/device failed: ${r.status} ${await r.text()}`);
+  }
+
+  /** Atomic device-keys + roster admission (C5). 409 → caller refetches + retries. */
+  async admitDevice(body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {
+    const r = await this.postJson("/v1/keys/admit", body);
+    if (r.status === 409) return { ok: false, conflict: true };
+    if (!r.ok) throw new Error(`keys/admit failed: ${r.status} ${await r.text()}`);
+    return { ok: true };
+  }
+
+  async appendRoster(body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {
+    const r = await this.postJson("/v1/keys/roster", body);
+    if (r.status === 409) return { ok: false, conflict: true };
+    if (!r.ok) throw new Error(`keys/roster failed: ${r.status} ${await r.text()}`);
+    return { ok: true };
+  }
+
+  async getWorkspaceKeys(workspaceId: string): Promise<Array<{ keyEpoch: number; kekWrap: string }>> {
+    const r = await fetch(`${this.baseUrl}/v1/keys/workspace/${workspaceId}`, { headers: this.auth });
+    if (!r.ok) throw new Error(`keys/workspace GET failed: ${r.status}`);
+    return ((await r.json()) as { keys: Array<{ keyEpoch: number; kekWrap: string }> }).keys;
+  }
+
+  async putWorkspaceKey(workspaceId: string, keyEpoch: number, kekWrap: string): Promise<{ keyEpoch: number; kekWrap: string }> {
+    const r = await this.postJson("/v1/keys/workspace", { workspaceId, keyEpoch, kekWrap });
+    if (!r.ok) throw new Error(`keys/workspace POST failed: ${r.status} ${await r.text()}`);
+    return (await r.json()) as { keyEpoch: number; kekWrap: string };
+  }
+
+  async latestCommit(): Promise<{ sequence: number; commit: SignedCommit | null }> {
+    const r = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/latest`, { headers: this.auth });
+    if (!r.ok) throw new Error(`latest failed: ${r.status}`);
+    return (await r.json()) as { sequence: number; commit: SignedCommit | null };
+  }
+
+  async commitsSince(since: number): Promise<Array<SignedCommit>> {
+    const r = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/commits?since=${since}`, { headers: this.auth });
+    if (r.status === 409) throw new Error("needs_rebaseline: commit span too large or pruned — re-clone the workspace");
+    if (!r.ok) throw new Error(`commits?since failed: ${r.status}`);
+    return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
+  }
+
+  /** Post a signed commit envelope. Maps the server's 409 variants: a parent
+   *  conflict (pull+retry) vs `epoch_stale` (a rotation landed under us). */
+  async commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult> {
+    const r = await this.postJson(`/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests`, { parentSequence: parentSeq, commit });
+    if (r.status === 409) {
+      const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number };
+      if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0 };
+      return { conflict: true, head: b.head };
+    }
+    if (r.status === 422) return { unsatisfiedBlobs: ((await r.json()) as { missing?: string[] }).missing ?? [] };
+    if (!r.ok) throw new Error(`commit failed: ${r.status} ${await r.text()}`);
+    return { sequence: ((await r.json()) as { sequence: number }).sequence };
+  }
+
+  // ---- pairing (split-secret; tokenSecret never sent — design 12 §13.5) -----
+
+  async pairCreate(body: { tokenId: string; mkWrap: string; admissionGrant: string }): Promise<{ token: string }> {
+    const r = await this.postJson("/v1/auth/pair/create", body);
+    if (!r.ok) throw new Error(`pair/create failed: ${r.status} ${await r.text()}`);
+    return (await r.json()) as { token: string };
   }
 
   /** wss:// URL for the live notification channel. The daemon opens this with an
