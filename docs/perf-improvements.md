@@ -103,6 +103,17 @@ now; scalability is a server-side problem.**
 ---
 
 ## Tracked next (not yet done)
+- **[SERVER, highest-value] Batch per-blob D1 accounting at commit time.** Verified:
+  each blob PUT does **~5 D1 round-trips** — cap `SELECT` + `INSERT blobs` + `DELETE
+  gc_candidates` + `INSERT blob_refs` + `UPDATE used_bytes` (`apps/api/src/blobs.ts:52`,
+  `billing.ts:39`). A 1041-blob push ≈ ~5,200 D1 round-trips — the measured plateau +
+  the conc=4 "connection lost". Plan: PUT becomes ~R2-only (keep a cheap cap pre-check);
+  the COMMIT (which already lists all blobRefs) does the accounting once — one batched
+  blob/blob_ref insert, one `used_bytes` UPDATE, one gc-clear. Correctness to design:
+  `missingBlobs` semantics if `blobs` rows land at commit (idempotent re-upload is the
+  safe fallback), quota fail-fast vs orphan-R2-bytes, GC interaction. **Design +
+  codex adversarial review before implementing.** This is the client→server pivot's
+  first real server fix.
 - **Move blobRefs out of the signed commit body** → side R2 object referenced by
   hash. Unlocks 50k-file monorepos (the 1 MB cap is interim). Architectural —
   design + codex review first.

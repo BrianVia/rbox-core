@@ -118,7 +118,7 @@
     <div class="arrow">→</div>
     <div class="node compute"><div class="t">missingBlobs</div><div class="d">D1: which encShas absent / unentitled / condemned (chunked IN)</div></div>
     <div class="arrow">→</div>
-    <div class="node store"><div class="t">blob PUT</div><div class="k">per blob</div><div class="d">R2 put(sha-verified) + INSERT blobs + DELETE gc_candidates</div><span class="badge bottleneck">R2 + 2× D1 writes EACH blob → the plateau</span></div>
+    <div class="node store"><div class="t">blob PUT</div><div class="k">per blob</div><div class="d">R2 put(sha) · cap SELECT · INSERT blobs · DELETE gc_candidates · INSERT blob_refs · UPDATE used_bytes</div><span class="badge bottleneck">R2 + ~5 D1 round-trips EACH blob → the plateau</span></div>
     <div class="arrow">→</div>
     <div class="node compute"><div class="t">WorkspaceSync DO</div><div class="d">single sequencer; <code>seq=parent+1</code>; verifies blob presence; strong consistency</div><span class="badge decision">strong-consistency sequencing</span></div>
     <div class="arrow">→</div>
@@ -133,7 +133,7 @@
       <li><b>Opaque to the server</b> — it reads a few commit fields for validation, never decrypts.</li>
     </ul></div>
     <div class="card bn"><h3>Server bottlenecks &amp; next work</h3><ul>
-      <li><b>Per-blob D1 writes</b> — each PUT = R2 + 2 D1 writes; 1041 blobs ≈ 2082 D1 round-trips. <i>conc=4 already threw D1 "connection lost".</i> <span style="color:var(--decision)">NEXT: batch ref/entitlement writes (D1 <code>batch()</code> or move to commit-time).</span></li>
+      <li><b>Per-blob D1 round-trips (~5 each)</b> — every PUT does cap-SELECT + INSERT blobs + DELETE gc_candidates + INSERT blob_refs + UPDATE used_bytes; 1041 blobs ≈ <b>~5,200 D1 round-trips</b> in one push. <i>conc=4 already threw D1 "connection lost".</i> <span style="color:var(--decision)">NEXT (designed change): move per-blob accounting to a single batched step at COMMIT time (the commit already knows all blobRefs) — PUT becomes ~R2-only; one quota UPDATE, one batched ref insert.</span></li>
       <li><b>Commit body size</b> — blobRefs inlined in the signed body; 1 MB cap is interim. Move them to a side R2 object referenced by hash → unlocks 50k-file monorepos.</li>
       <li><b>Async candidates (Queues)</b> — GC of superseded blobs, usage aggregation off the commit hot path, webhook retry. Not transfer speed — robustness/cost.</li>
       <li><b>Observability gap</b> — no server timing today; can't attribute R2 vs D1 vs DO. Workers Analytics Engine + per-op spans (planned).</li>
