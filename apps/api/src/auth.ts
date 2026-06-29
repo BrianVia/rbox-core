@@ -11,6 +11,8 @@ import type { Principal } from "./authz.js";
  */
 
 const TOKEN_BYTES = 32;
+const DEVICE_ID_BYTES = 16; // 128-bit device_id space → collisions are negligible (P1)
+const MINT_MAX_ATTEMPTS = 5; // bounded retries when a unique INSERT collides (P1)
 const AUTH_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_S = 5;
 const LAST_SEEN_THROTTLE_MS = 10 * 60 * 1000;
@@ -58,25 +60,54 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer" };
 }
 
-/** Mint a device token into a specific account/user (returns the plaintext once).
- *  `expiresAt` (epoch ms) makes it a short-lived token (web sessions); omit for
- *  durable CLI/device tokens. */
-async function mintDevice(env: Env, accountId: string, userId: string, deviceId: string, label: string | null, expiresAt: number | null = null): Promise<string> {
-  const token = randomHex(TOKEN_BYTES);
-  const hash = await sha256Hex(token);
-  await env.rbox_dev_db
-    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(hash, deviceId, label, accountId, userId, Date.now(), expiresAt)
-    .run();
-  return token;
+/** True when a D1/SQLite write failed a UNIQUE constraint (token_hash or device_id). */
+function isUniqueViolation(e: unknown): boolean {
+  return /UNIQUE constraint failed/i.test(String((e as Error)?.message ?? e));
+}
+
+/** Mint a device token into a specific account/user (returns the plaintext once,
+ *  plus the generated `device_id`). `expiresAt` (epoch ms) makes it a short-lived
+ *  token (web sessions); omit for durable CLI/device tokens.
+ *
+ *  `device_id` is GLOBALLY UNIQUE (migration 0013), so a colliding INSERT throws.
+ *  We retry with a fresh token + device_id on a uniqueness violation (bounded), so
+ *  the astronomically-rare collision self-heals instead of surfacing a 500.
+ *  `genDeviceId` is the id source (default `${prefix}_<128-bit hex>`); it's
+ *  injectable so callers can seed a specific first candidate and tests can force a
+ *  collision. */
+export async function mintDevice(
+  env: Env,
+  accountId: string,
+  userId: string,
+  prefix: string,
+  label: string | null,
+  expiresAt: number | null = null,
+  genDeviceId: () => string = () => `${prefix}_${randomHex(DEVICE_ID_BYTES)}`,
+): Promise<{ token: string; deviceId: string }> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < MINT_MAX_ATTEMPTS; attempt++) {
+    const deviceId = genDeviceId();
+    const token = randomHex(TOKEN_BYTES);
+    const hash = await sha256Hex(token);
+    try {
+      await env.rbox_dev_db
+        .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(hash, deviceId, label, accountId, userId, Date.now(), expiresAt)
+        .run();
+      return { token, deviceId };
+    } catch (e) {
+      lastErr = e;
+      if (!isUniqueViolation(e)) throw e; // unrelated failure → surface immediately
+      // token_hash or device_id collided → regenerate both and retry
+    }
+  }
+  throw new Error(`mintDevice: exhausted ${MINT_MAX_ATTEMPTS} attempts: ${String((lastErr as Error)?.message ?? lastErr)}`);
 }
 
 /** Mint a SHORT-LIVED web session token (M11) for a Clerk-authenticated user.
  *  Returns the plaintext once; expires after `ttlMs` (default 1h). */
 export async function createWebSession(env: Env, accountId: string, userId: string, ttlMs = 60 * 60 * 1000): Promise<{ token: string; deviceId: string }> {
-  const deviceId = `web_${randomHex(4)}`;
-  const token = await mintDevice(env, accountId, userId, deviceId, "web", Date.now() + ttlMs);
-  return { token, deviceId };
+  return mintDevice(env, accountId, userId, "web", "web", Date.now() + ttlMs);
 }
 
 // ---- pairing tokens (M10): low-friction "connect a new machine" ----
@@ -182,9 +213,8 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     .first();
   if (!live) return json({ error: "unauthorized" }, 401); // source revoked / membership gone (token already burned)
 
-  const deviceId = `dev_${randomHex(4)}`;
   try {
-    const minted = await mintDevice(env, consumed.account_id, consumed.user_id, deviceId, label);
+    const { token: minted, deviceId } = await mintDevice(env, consumed.account_id, consumed.user_id, "dev", label);
     // Pass the opaque E2EE material straight through (null for legacy tokens).
     // accountId lets the redeemer namespace its keystore — but the client trusts
     // only the SIGNED accountId (verified roster/grant), cross-checking this (D7).
@@ -209,8 +239,7 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, ?, 'free', ?)").bind(accountId, body.accountName ?? "account", now).run();
   await env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
   await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
-  const deviceId = `dev_${randomHex(6)}`;
-  const token = await mintDevice(env, accountId, userId, deviceId, body.label ?? "bootstrap");
+  const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");
   return json({ token, deviceId, accountId });
 }
 
@@ -218,7 +247,7 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
 export async function startDeviceAuth(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { label?: string };
   const deviceCode = randomHex(TOKEN_BYTES);
-  const deviceId = `dev_${randomHex(6)}`;
+  const deviceId = `dev_${randomHex(DEVICE_ID_BYTES)}`; // proposed id; mint is the real uniqueness gate
   const now = Date.now();
   // Collision-retry the human user_code among active auths.
   let userCode = randomUserCode();
@@ -256,9 +285,20 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
       .bind(body.deviceCode)
       .run();
     if (claim.meta.changes !== 1) return json({ status: "claimed" }); // lost the race
-    // Mint into the APPROVER's account/user (device-to-device join).
-    const token = await mintDevice(env, row.account_id ?? "default", row.user_id ?? "", row.device_id, row.label);
-    return json({ status: "approved", token, deviceId: row.device_id, accountId: row.account_id });
+    // Mint into the APPROVER's account/user (device-to-device join). Seed the
+    // proposed id from device_auth as the first candidate, but fall back to a
+    // fresh wide id if it collides (mint is the real uniqueness gate).
+    let firstCandidate = true;
+    const { token, deviceId } = await mintDevice(
+      env,
+      row.account_id ?? "default",
+      row.user_id ?? "",
+      "dev",
+      row.label,
+      null,
+      () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
+    );
+    return json({ status: "approved", token, deviceId, accountId: row.account_id });
   }
   return json({ status: row.status });
 }

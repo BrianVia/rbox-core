@@ -1,6 +1,7 @@
 import { env, SELF, applyD1Migrations, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
+import { mintDevice } from "../src/auth.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const BASE = "https://example.com";
@@ -232,6 +233,65 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const a = await bootstrap("acct-pair-cap");
     for (let i = 0; i < 5; i++) expect((await pairCreate(a.token)).status).toBe(200);
     expect((await pairCreate(a.token)).status).toBe(429);
+  });
+
+  // ── P1: device_id is GLOBALLY unique (migration 0013) ────────────────────
+  const insertDevice = (tokenHash: string, deviceId: string, accountId: string) =>
+    env.rbox_dev_db
+      .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at) VALUES (?, ?, 'p1', ?, 'u', ?)")
+      .bind(tokenHash, deviceId, accountId, Date.now())
+      .run();
+
+  test("duplicate device_id in the SAME account is rejected by the unique index", async () => {
+    const a = await bootstrap("acct-dev-unique");
+    await expect(insertDevice(sha("p1-same-acct"), a.deviceId, a.accountId)).rejects.toThrow(/UNIQUE constraint failed/i);
+  });
+
+  test("duplicate device_id across DIFFERENT accounts is rejected (GLOBAL scope, reconciles device_keys PK)", async () => {
+    const a = await bootstrap("acct-dev-unique-a");
+    const b = await bootstrap("acct-dev-unique-b");
+    // device_keys.device_id is a global PRIMARY KEY, so devices must be global too:
+    // the same id may not exist under a second account.
+    await expect(insertDevice(sha("p1-cross-acct"), a.deviceId, b.accountId)).rejects.toThrow(/UNIQUE constraint failed/i);
+  });
+
+  test("mintDevice retries to a fresh id when its generated id collides", async () => {
+    const a = await bootstrap("acct-mint-retry");
+    const collide = "dev_collision_fixed";
+    await insertDevice(sha("p1-occupant"), collide, a.accountId); // occupy the first candidate
+    let calls = 0;
+    const { token, deviceId } = await mintDevice(env, a.accountId, "u", "dev", "retry", null, () =>
+      calls++ === 0 ? collide : "dev_fresh_after_retry",
+    );
+    expect(calls).toBe(2); // first candidate collided → retried exactly once
+    expect(deviceId).toBe("dev_fresh_after_retry");
+    // The minted token authenticates → the row really landed.
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(token) })).status).toBe(200);
+  });
+
+  test("mintDevice gives up after bounded retries when the id never frees up", async () => {
+    const a = await bootstrap("acct-mint-exhaust");
+    const collide = "dev_always_collide";
+    await insertDevice(sha("p1-occupant-2"), collide, a.accountId);
+    await expect(mintDevice(env, a.accountId, "u", "dev", "x", null, () => collide)).rejects.toThrow(/exhausted/);
+  });
+
+  test("revoking one device revokes EXACTLY one row; siblings keep working", async () => {
+    const a = await bootstrap("acct-revoke-one");
+    // Add a 2nd device in the same account via pairing.
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    const { token: token2, deviceId: dev2 } = (await (await pairRedeem(pair)).json()) as { token: string; deviceId: string };
+    expect(dev2).not.toBe(a.deviceId);
+    // Both authenticate before revoke.
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) })).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(token2) })).status).toBe(200);
+    // Revoke device 2 → unique device_id means exactly one row is touched.
+    const rev = await SELF.fetch(`${BASE}/v1/auth/devices/${dev2}/revoke`, { method: "POST", headers: authed(a.token) });
+    expect(rev.status).toBe(200);
+    expect(((await rev.json()) as { revoked: number }).revoked).toBe(1);
+    // Device 2 is now dead; device 1 (sibling) is untouched.
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(token2) })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) })).status).toBe(200);
   });
 
   // ── Stripe billing (M10) ─────────────────────────────────────────────────
