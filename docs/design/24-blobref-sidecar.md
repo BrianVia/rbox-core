@@ -35,3 +35,34 @@ ship §24 in the same protocol pass so 50k-file repos work end-to-end.
 ## Review gate
 Codex-review §24 with §23 (shared commit path). Then implement 18.1→18.3, dual-mode so
 existing inline commits keep verifying.
+
+---
+
+## Benchmarking this change (against **dev**, not prod)
+
+Validate on the **dev** worker `rbox-dev-api` — real Cloudflare D1/R2/DO, the only place
+the latency/contention this change targets actually shows up (local Miniflare has ~0
+network latency and would hide it). The dev deploy is a **separate, manual** step —
+**do NOT push to `main` to test**: push-to-`main` auto-deploys *prod* (`deploy-api.yml`).
+
+```bash
+# on a branch/worktree with the change (server + the client binary if it's a protocol change):
+cd apps/api && bunx wrangler deploy                  # → rbox-dev-api (dev only; prod untouched)
+bun build --compile --target=bun-darwin-arm64 \      # match your platform; only if the client changed
+  ./src/cli/index.ts --outfile /tmp/rbox
+bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
+  --remote https://rbox-dev-api.brian-via.workers.dev --conc 8,16,32,64
+```
+
+- **Compare base vs head back-to-back** (deploy baseline → sweep → deploy change → sweep) so
+  dev's shared-instance noise cancels — relative deltas are valid even though absolute dev
+  numbers wander vs prod.
+- **Drive the path this change affects:** push via `push-sweep.ts`; pull/clone-side changes
+  by timing a fresh `rbox init --workspace <id>` into an empty dir (a clone-sweep is a TODO).
+- **Success metric = this doc's Target/Goal section.** Once the §25 server metrics are live on
+  dev you can read the server-side split (`d1Calls` / `d1Ms` / `r2Ms` per op) directly instead
+  of inferring it from client wall-time — land §25 on dev first.
+- Only merge to `main` (→ prod) once it's proven on dev.
+- For an **isolated, repeatable** target (no contention with other dev work, wipe-and-repeat),
+  set up a dedicated `[env.bench]` → `rbox-bench-api` + throwaway `rbox-bench-db`/`-blobs` and
+  point `--remote` at it. (See the README "Benchmarking" section.)
