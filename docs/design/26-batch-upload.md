@@ -1,10 +1,30 @@
 # §26 — Small-blob batch upload endpoint (P1)
 
-> Status: **design (P1 — gated by post-§23 measurements)**. Decomposes into chunks
-> when scheduled.
+> Status: **NOT BUILT — measurement gate failed, a simpler lever won (2026-06-30)**. The
+> design below is preserved for the record. Codex review → **DONT-BUILD**, confirmed by data.
 > Depends on §23 (receipts) and §25 (server observability). **Do NOT build before
 > measuring §23's effect** — this endpoint is only justified if fixed per-request
 > overhead becomes the ceiling for small-blob pushes.
+
+## Resolution (2026-06-30): don't build it — raise upload concurrency instead
+
+The measurement gate below was run properly, and it failed: §25 shows a blob `PUT` is ~126 ms of
+which **~120 ms is the R2 write** (R2 bytes dominate, not fixed per-request overhead) — the doc's
+own "do NOT build if R2 dominates" condition. §26 still does one R2 `put` per blob, so its
+best-case client win was ≤13%, while it would add a high-risk streaming frame parser AND a
+quota-abuse surface (the receipts PUT path writes canonical R2 with no fail-fast over-cap guard,
+so a batch lets an over-cap account create orphan objects until commit rejects).
+
+**The simpler lever captured MORE for zero new code.** §23 moved D1 off the PUT hot path, which
+shifted the upload-concurrency knee: the old default 32 was the *pre-§23* knee (past it just
+multiplied the 7-D1-call contention). Post-§23 the PUT is a pure R2 write, so a measured
+savvy-core push (4287 blobs, dev) drops **~25% going conc 32→64 (31s→23s)**, then regresses at 96
+(R2/connection limits). So the fix was a one-line default bump (`uploadConcurrency` 32→64 in
+`src/cli/sync.ts`), not a new endpoint. Same lesson as §23: the simple lever beat the complex one.
+
+If a future profile ever shows request-overhead (not R2 bytes, not concurrency headroom) as the
+small-blob ceiling, this design is ready — but it must first add quota admission (a `wouldExceedCap`
+gate on the batch body) and a `FixedLengthStream`-based exact-frame parser (see codex notes).
 
 ## Problem
 After §23, a blob `PUT` is intentionally boring: auth + sha-verified R2 write + an upload

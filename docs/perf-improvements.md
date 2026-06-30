@@ -441,3 +441,25 @@ v1 still keeps the §23.4 accounting cap (6000 refs/commit), so it does NOT yet 
 ref count — that needs the separate deferred large-ref accounting design. The threshold
 (`SIDECAR_THRESHOLD`=4000) means small repos stay inline (full old/new-client interop); only large
 repos — which an old client couldn't commit anyway — use the sidecar, so nothing regresses.
+
+---
+
+## §26 batch-upload — NOT BUILT; the win was a concurrency default (2026-06-30)
+
+Took §26 through its cycle: codex review → **DONT-BUILD** + ran the measurement gate. The gate
+failed (R2 bytes are 95% of a PUT — the doc's own "don't build if R2 dominates" condition), and
+§26 would add a streaming frame parser + a quota-abuse surface for ≤13%. Instead, the gate
+surfaced a **free win bigger than §26's ceiling**: §23 had shifted the upload-concurrency knee.
+
+| upload concurrency | savvy-core push wall (4287 blobs, dev) |
+|---|---|
+| 32 (old default) | 31.3 s |
+| **64 (new default)** | **23.4 s — ~25% faster** |
+| 96 | 26.4 s (regresses — R2/connection limits) |
+
+**Why the knee moved:** the old default (32) was measured PRE-§23, when each PUT did ~7 D1
+round-trips and more concurrency just multiplied D1 contention. §23 moved D1 off the PUT (pure R2
+write now), so the upload scales to ~64 before R2/connection limits bite. One-line fix
+(`uploadConcurrency` 32→64 in `src/cli/sync.ts`) — no new endpoint, no parser, no abuse surface.
+**Third time the simple lever beat the complex one** (§23 direct-write > staging; §27 deferred;
+§26 concurrency > batch endpoint). Reaches CLI users on the next release.

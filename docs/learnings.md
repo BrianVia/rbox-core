@@ -517,3 +517,21 @@ count; parse u64 sizes via `BigInt` and reject `> Number.MAX_SAFE_INTEGER`; `new
 view into a larger ArrayBuffer reads the right window. GC `roots()` over sidecars must fail CLOSED
 — a missing/corrupt sidecar OR a retained-seq gap aborts the WHOLE pass (condemn nothing), and
 the sidecarSha is itself a GC root.
+
+## 2026-06-30 — §26: a perf "feature" whose real win was a constant, and a knee that MOVED
+
+Took §26 (batch-upload endpoint) through review+measurement; the answer was DON'T build it — but
+the investigation surfaced a real win. Two lessons:
+
+**A shipped tuning constant can silently go stale when a dependency changes.** The upload
+concurrency default (32) was the correct knee BEFORE §23 — back then each PUT did ~7 D1 round-trips
+and pushing past 32 just multiplied D1 contention. §23 moved D1 off the PUT, so the bottleneck that
+PINNED the knee at 32 disappeared, and the real knee moved to ~64 (measured ~25% faster on
+savvy-core). Lesson: when you remove a bottleneck, re-measure every constant that was tuned against
+it. The comment even *said* "32 is the knee / risks D1 contention" — that rationale died with §23.
+
+**Run a feature's own measurement gate before building it, and check the cheap lever first.** §26's
+doc said "don't build if R2 bytes dominate"; they do (120/126 ms). A new streaming-parser endpoint
+for ≤13% — when a one-line concurrency bump gets ~25% — is the §23 lesson again. Worker-side
+overhead (~6 ms/PUT) is NOT the same as client-observed per-blob cost (~19 ms incl. RTT); but the
+fix for the latter was more connections, not fewer requests.

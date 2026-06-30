@@ -60,10 +60,13 @@ const clampConc = (v: string | undefined, dflt: number): number => {
   return Number.isInteger(n) && n >= 1 && n <= 256 ? n : dflt;
 };
 const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, 8); // CPU/disk bound
-// 32 is the measured knee for upload (bench/push-sweep): 8→16→32 nearly halves wall
-// time each step, then 32/48/64 plateau (~30s) as server-side per-blob cost (R2+D1)
-// dominates. Past 32 buys ~nothing and risks D1 contention. Tunable via env.
-const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 32); // network/latency bound
+// 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
+// ~7 D1 round-trips and concurrency past 32 just multiplied D1 contention. §23 moved D1 off
+// the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
+// savvy-core push (4287 blobs, dev) drops ~25% going 32→64 (31s→23s), then regresses by 96
+// (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
+// win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
+const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
 async function withCache(
