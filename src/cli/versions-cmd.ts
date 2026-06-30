@@ -30,7 +30,7 @@ function fmtTime(ms: number | undefined): string {
 }
 
 export async function versionsCmd(root: string, pathArg: string | undefined, limit = DEFAULT_LIMIT): Promise<void> {
-  const { remote, api } = await buildAuthedRemote(root);
+  const { remote } = await buildAuthedRemote(root);
 
   if (pathArg) {
     const rel = toRelPath(pathArg);
@@ -48,18 +48,13 @@ export async function versionsCmd(root: string, pathArg: string | undefined, lim
     return;
   }
 
-  const versions = await remote.history(limit);
+  // The verified chain listing and the advisory display timestamps are independent —
+  // fetch them concurrently. Timestamps are best-effort (authenticity comes from the
+  // signed chain, never the D1 mirror); a failure/lag just shows an em-dash.
+  const [versions, times] = await Promise.all([remote.history(limit), remote.advisoryTimes(limit).catch(() => new Map<number, number>())]);
   if (versions.length === 0) {
     console.log("no versions yet — push something first");
     return;
-  }
-  // Advisory display timestamps from the best-effort D1 mirror (authenticity comes
-  // from the signed chain, never this); a lag/miss just shows an em-dash.
-  const times = new Map<number, number>();
-  try {
-    for (const v of await api.versions(limit)) times.set(v.sequence, v.created_at);
-  } catch {
-    /* advisory only — never block the verified listing on the mirror */
   }
   console.log(`${style.bold("versions")} ${style.dim("(newest first)")}`);
   for (const v of versions) {

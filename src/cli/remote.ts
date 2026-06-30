@@ -379,12 +379,13 @@ export class RboxApi implements SyncRemote {
 
   /** Best-effort D1 commit mirror — ADVISORY display timestamps for `rbox versions`
    *  only (the server-observed `created_at`; commit cadence is a documented residual).
-   *  Authenticity comes from the signed commit chain (`commitsSince`), NEVER this; a
-   *  missing/lagging row just shows no time. Returns server-shape rows by `sequence`. */
-  async versions(limit = 50): Promise<Array<{ sequence: number; commit_hash: string; device_id: string | null; created_at: number }>> {
+   *  Authenticity comes from the signed commit chain (`commitsSince`), NEVER this.
+   *  Returns seq → epoch-ms; a missing/lagging row just means no time for that seq. */
+  async commitTimes(limit = 50): Promise<Map<number, number>> {
     const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/versions?limit=${limit}`, { headers: this.auth });
     if (!res.ok) throw new Error(`versions failed: ${res.status}`);
-    return ((await res.json()) as { versions: Array<{ sequence: number; commit_hash: string; device_id: string | null; created_at: number }> }).versions;
+    const rows = ((await res.json()) as { versions: Array<{ sequence: number; created_at: number }> }).versions;
+    return new Map(rows.map((r) => [r.sequence, r.created_at]));
   }
 
   /** SyncRemote: a BlobStore backed by this client (pull / git apply path). */

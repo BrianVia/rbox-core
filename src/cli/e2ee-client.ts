@@ -200,7 +200,7 @@ async function ensureSecrets(api: RboxApi, accountId: string, now: number): Prom
  * marker / no enrollment → throw before any sync. Returns the cfg (with the
  * blob-encryption KEK set from the frozen write context) and the E2eeRemote.
  */
-export async function buildAuthedRemote(root: string, now: () => number = Date.now): Promise<{ cfg: WorkspaceConfig; deps: SyncDeps; remote: E2eeRemote; api: RboxApi }> {
+export async function buildAuthedRemote(root: string, now: () => number = Date.now): Promise<{ cfg: WorkspaceConfig; deps: SyncDeps; remote: E2eeRemote }> {
   const cfg = await loadConfig(root);
   if ((cfg as { schema?: string }).schema !== "e2ee/v1") {
     throw new Error("this workspace predates full E2EE — re-run `rbox init` to re-enroll (greenfield; dev data is wiped).");
@@ -213,10 +213,10 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   const secrets = await ensureSecrets(api, creds.accountId, now());
   const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
   const kek = await remote.currentKek(); // frozen write epoch (D1)
-  // `remote`/`api` are returned alongside `deps` so version-history commands can reach
-  // the E2eeRemote history/restore methods (and the advisory D1 timestamps) directly;
-  // push/pull/sync ignore them and use `deps` as before.
-  return { cfg: { ...cfg, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote }, remote, api };
+  // `remote` is returned alongside `deps` so version-history commands can reach the
+  // E2eeRemote history/restore/advisoryTimes methods directly (the raw transport stays
+  // encapsulated); push/pull/sync ignore it and use `deps` as before.
+  return { cfg: { ...cfg, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote }, remote };
 }
 
 export { hasDevice };
