@@ -108,17 +108,101 @@ export async function stopDaemon(root: string): Promise<void> {
   await fsp.rm(pidPath(root), { force: true });
 }
 
-export async function logsDaemon(root: string, follow: boolean): Promise<void> {
+/** How many trailing lines `rbox logs` shows by default (override with --lines). */
+export const DEFAULT_LOG_LINES = 50;
+
+/** Read the last `maxLines` lines of `filePath` without slurping the whole file:
+ *  seek from the end in chunks until we've collected enough newlines. Returns the
+ *  text plus the byte size we read up to — `follow` resumes streaming from there. */
+async function tailFile(filePath: string, maxLines: number): Promise<{ text: string; size: number }> {
+  const fd = await fsp.open(filePath, "r");
+  try {
+    const { size } = await fd.stat();
+    if (size === 0 || maxLines <= 0) return { text: "", size };
+    const CHUNK = 64 * 1024;
+    let pos = size;
+    let newlines = 0;
+    const parts: Buffer[] = [];
+    // Walk backwards a chunk at a time, counting line breaks, until we have one
+    // more than requested (the extra bounds the first kept line) or hit the start.
+    while (pos > 0 && newlines <= maxLines) {
+      const len = Math.min(CHUNK, pos);
+      pos -= len;
+      const buf = Buffer.alloc(len);
+      await fd.read(buf, 0, len, pos);
+      parts.unshift(buf);
+      for (let i = 0; i < len; i++) if (buf[i] === 0x0a) newlines++;
+    }
+    const all = Buffer.concat(parts).toString("utf8");
+    const lines = all.split("\n");
+    // A trailing newline yields a final empty element — drop it so it isn't counted.
+    if (lines[lines.length - 1] === "") lines.pop();
+    const text = lines.slice(-maxLines).join("\n");
+    return { text: text ? text + "\n" : "", size };
+  } finally {
+    await fd.close();
+  }
+}
+
+export interface LogsOptions {
+  follow: boolean;
+  lines: number;
+}
+
+/** `rbox logs` — tail the daemon's log. Prints the last `lines` lines, then (with
+ *  `follow`) streams appended output until Ctrl-C. Implemented natively (no `tail`
+ *  dependency) so it behaves the same everywhere the CLI runs. */
+export async function logsDaemon(root: string, opts: LogsOptions): Promise<void> {
   const lp = logPath(root);
   if (!fs.existsSync(lp)) {
-    console.log("(no daemon log yet)");
+    console.log("(no daemon log yet — start background sync with `rbox start`)");
     return;
   }
-  if (follow) {
-    // Hand off to `tail -f` for a live view; Ctrl-C to exit.
-    spawn("tail", ["-f", lp], { stdio: "inherit" });
-    await new Promise(() => {}); // tail owns the terminal until interrupted
-  } else {
-    process.stdout.write(fs.readFileSync(lp, "utf8"));
+
+  const { text, size } = await tailFile(lp, opts.lines);
+  process.stdout.write(text);
+
+  if (!opts.follow) return;
+
+  // A heads-up (to stderr, so it never pollutes piped log output) when there's no
+  // daemon producing new lines — otherwise `--follow` looks like a silent hang.
+  if (!isDaemonRunning(root).running) {
+    process.stderr.write("(daemon not running — waiting for new log lines; Ctrl-C to exit)\n");
   }
+
+  // Poll for appended bytes and stream them. Polling (vs fs.watch) is portable and
+  // robust to log rotation: if the file shrinks we treat it as truncation and reset.
+  await new Promise<void>((resolve) => {
+    let offset = size;
+    let reading = false;
+    const tick = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        const st = await fsp.stat(lp).catch(() => undefined);
+        if (!st) return; // file vanished (untrack/rotation) — keep waiting for it back
+        if (st.size < offset) offset = 0; // truncated/rotated → re-read from the top
+        if (st.size > offset) {
+          const fd = await fsp.open(lp, "r");
+          try {
+            const buf = Buffer.alloc(st.size - offset);
+            await fd.read(buf, 0, buf.length, offset);
+            process.stdout.write(buf);
+            offset = st.size;
+          } finally {
+            await fd.close();
+          }
+        }
+      } finally {
+        reading = false;
+      }
+    };
+    const timer = setInterval(tick, 250);
+    const stop = () => {
+      clearInterval(timer);
+      resolve();
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
 }

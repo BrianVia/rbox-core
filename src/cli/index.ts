@@ -2,7 +2,7 @@ import path from "node:path";
 import { scanManifest, type Action } from "../engine/index.js";
 import { findRoot, loadConfig, loadState, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
-import { isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
+import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -304,7 +304,10 @@ async function main(): Promise<void> {
       break;
     }
     case "logs": {
-      await logsDaemon(await resolveRoot(positional[0]), flags.follow === "true" || flags.f === "true");
+      const follow = flags.follow === "true" || flags.f === "true";
+      const n = flags.lines ?? flags.n;
+      const lines = n !== undefined && Number.isInteger(Number(n)) && Number(n) >= 0 ? Number(n) : DEFAULT_LOG_LINES;
+      await logsDaemon(await resolveRoot(positional[0]), { follow, lines });
       break;
     }
     case "ignore": {

@@ -102,9 +102,12 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "logs",
     group: "SYNCING",
-    summary: "background-sync logs",
-    usage: "rbox logs [path] [--follow]",
-    flags: [{ flag: "--follow", desc: "stream new log lines (Ctrl-C to exit)" }],
+    summary: "tail background-sync logs",
+    usage: "rbox logs [path] [--follow] [--lines N]",
+    flags: [
+      { flag: "--follow", desc: "stream new log lines (Ctrl-C to exit)" },
+      { flag: "--lines N", desc: "show the last N lines (default 50)" },
+    ],
   },
   {
     name: "sync",
