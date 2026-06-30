@@ -107,7 +107,7 @@ DEPENDENCIES
   deps install [path] [--allow-build] [--only <id>] [--manager <m>]   rebuild deps from synced lockfiles
   deps list [path] [--manager <m>]      list rebuildable projects (lockfiles found)
   deps check [path]           check this host is ready to rebuild deps
-  deps drift [path]           is this folder's install stale vs. its lockfile?
+  deps drift [path]           did this folder's lockfile change since rbox last saw it?
   deps notify <install|uninstall|status|on|off>   shell-hook drift notifications
 
 DEVICES & ACCOUNT
@@ -305,10 +305,13 @@ Resolves the workspace root (like every path command), then **locally unbinds** 
    removes the pidfile immediately (`daemon-control.ts:69`), so a naive `rm` would race a daemon
    mid-write. On timeout: abort with "daemon still running — stop it and retry" (or `--force` →
    escalate to SIGKILL after the timeout).
-2. **Safely** remove the binding: `lstat` `.rbox` first, **refuse if it's a symlink**, confirm the
-   realpath resolves to exactly `<root>/.rbox`, then delete the **known files** (`config.json`,
-   `state.json`, `daemon.pid`, `daemon.log`) and the dir — never a blind `rm -rf` on an attacker- or
-   corruption-controlled path.
+2. **Safely** remove the binding: `lstat` `.rbox` first, **refuse if it's a symlink**, and confirm the
+   realpath resolves to exactly `<root>/.rbox`. **Only after those guards pass**, recursively remove
+   the whole `.rbox/` tree. (The tree is nested and evolving — `workspace.json`, `state.json`,
+   `state/metrics.json`, `daemon.pid`, `daemon.log` today — so enumerating "known files" is brittle and
+   would leave the workspace still tracked if any file moved; a full remove **after** the symlink/
+   realpath proof is both correct and safe. The danger codex flagged was a *blind* `rm` on an
+   unverified path, which the guard eliminates.)
 3. Print that **local files are untouched** and the **remote workspace still exists** (other machines
    keep syncing; manage/delete it from the dashboard).
 
@@ -419,12 +422,22 @@ benchmarking, the hook ships disabled-by-default and the post-sync nudge stands 
 
 ### The shell hook (cheap + safe)
 
-The rc file gets **one stable line** inside fenced markers, sourcing a generated, rbox-managed snippet
-so `rbox upgrade` can update the logic without re-editing the rc:
+The rc file gets a small fenced block (rbox-managed, so `rbox upgrade` can update it) that **verifies
+the snippet before sourcing it** — the tamper check has to live in the rc itself, because the file
+being sourced is exactly the thing an attacker could replace. The check (regular file, **not a
+symlink**, owned by the current user, **not group/world-writable**) runs *before* `source`, so a
+swapped/symlinked `hook.zsh` is ignored rather than executed:
 
 ```sh
 # >>> rbox dep-drift >>>
-[ -f "$HOME/.config/rbox/hook.zsh" ] && source "$HOME/.config/rbox/hook.zsh"
+__rbox_hook="$HOME/.config/rbox/hook.zsh"
+if [ -f "$__rbox_hook" ] && [ ! -L "$__rbox_hook" ] && [ -O "$__rbox_hook" ]; then
+  # reject group/world-writable: mask 022 must be clear (stat format differs per OS;
+  # rbox writes the OS-correct stat invocation at install time)
+  __rbox_perm=$(stat -f '%Lp' "$__rbox_hook" 2>/dev/null || stat -c '%a' "$__rbox_hook" 2>/dev/null)
+  [ $(( 0${__rbox_perm:-777} & 022 )) -eq 0 ] && . "$__rbox_hook"
+fi
+unset __rbox_hook __rbox_perm
 # <<< rbox dep-drift <<<
 ```
 
@@ -441,8 +454,9 @@ prefilter only."
 executables (`hydrate-cmd.ts:39`); the hook must hold the same line. So the generated snippet:
 - invokes the **absolute installed binary path** (e.g. `$HOME/.rbox/bin/rbox`) baked in at install
   time — **never** a bare `rbox` resolved through `$PATH` (a repo could ship a `./rbox`);
-- **refuses to run** if the snippet file is a symlink, not owned by the user, or group/world-writable
-  (a tampered hook is ignored, not sourced);
+- is **verified by the rc block before it is `source`d** (regular file, not a symlink, owned by the
+  user, not group/world-writable — the guard shown above), so a swapped/symlinked `hook.zsh` is never
+  executed. The check must be in the rc, not in `hook.zsh`, since `hook.zsh` is the file at risk;
 - uses **no `eval`** and passes no repo-derived string to a shell; the check itself is no-network,
   no-auth, pure `stat`+hash over the lockfile.
 
@@ -544,9 +558,10 @@ Once this ships and is released, the public copy drops the jargon:
 4. `untrack`: stop daemon + remove `.rbox/`, with confirm/`--force`.
 5. Add a "background sync: running/stopped" line to `status` (reuse `isOurDaemon` from
    `daemon-control.ts`).
-6. Dependency-drift: a pure drift-check fn (manager matrix + marker/hash compare) reusing
-   `detectProjects`; `deps drift`/`deps notify` commands; the rc-snippet generator + shell detection;
-   the `setup` prompt; the `install.sh` consent step; and the post-sync nudge in `sync.ts`.
+6. Dependency-drift: a pure drift-check fn (engine-`ECOSYSTEM_RULES` matrix; signal = lockfile-hash vs.
+   the hash last recorded for the folder, with an optional local install-dir mtime suppressor) reusing
+   `detectProjects`; `deps drift`/`deps notify` commands; the verified rc-snippet generator + shell
+   detection; the `setup` prompt; the `install.sh` consent step; and the post-sync nudge in `sync.ts`.
 7. Update `README` design index + rbox.to copy as a release step.
 
 ---
@@ -618,7 +633,9 @@ Once this ships and is released, the public copy drops the jargon:
 - **M5 — secret prompts echo.** Fixed: documented that the masked prompts require a **no-echo input
   helper** (readline echoes by default) — a to-build, not a given.
 - **M6 — `untrack` blind `rm -rf .rbox`.** Fixed: `lstat` + refuse symlink + realpath-confirm
-  `<root>/.rbox` + delete known files only.
+  `<root>/.rbox`, **then** recursively remove the verified tree (the `.rbox` layout is nested/evolving
+  — `workspace.json`, `state/metrics.json`, … — so a guarded full remove beats brittle enumeration;
+  refined in round 2).
 - **M7 — `untrack` races a live daemon.** Fixed: stop, then **poll for exit** (bounded) before
   removing `.rbox`; `--force` escalates to SIGKILL after timeout.
 
@@ -626,3 +643,20 @@ Once this ships and is released, the public copy drops the jargon:
 **dispatcher↔registry parity test** and softened the "can't drift" claim; (m3) `notify install`
 records every rc it touched so `uninstall`/`status` cover all shells; (m4) global state documented as
 `0600`, atomic-write, never synced.
+
+### Round 2 (3 residual MAJORs → resolved)
+
+- **M1 (reopened) — rc sourced `hook.zsh` *before* the tamper check.** The verification lived inside
+  the file being sourced. Fixed: the **rc block itself** now verifies (not-a-symlink, owner-only,
+  `& 022 == 0`) *before* `. hook.zsh`; a swapped/symlinked snippet is never executed.
+- **B4 (residual) — two leftover overclaims.** Fixed: the `deps drift` help line now reads "did this
+  folder's lockfile change since rbox last saw it?" and the implementation sketch says "lockfile-hash
+  vs. last-recorded hash (+ optional install-dir mtime suppressor)" — no more "stale install" /
+  "marker/hash compare" wording.
+- **M6 (residual) — wrong/incomplete delete list.** The known-file list named `config.json` (actual:
+  `workspace.json`, `config.ts:43`) and missed nested `state/metrics.json` (`metrics.ts:25`). Fixed:
+  guard first, then recursively remove the verified `.rbox/` tree.
+
+> Round-2 also confirmed B1/B2/B3/B5/M2 substantively resolved and M3/M4/M5/M7 standing. The only
+> remaining items are normal implementation-time concerns (daemon PID-capture API for M7's exit-poll),
+> not design gaps.
