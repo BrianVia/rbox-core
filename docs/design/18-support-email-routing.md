@@ -13,15 +13,20 @@ forwarded to `brian.a.via@gmail.com` via **Cloudflare Email Routing**, configure
 does not break inbound now or outbound product mail later (doc 16), with a DMARC-correct
 (not accidentally broken) story for the eventual "reply *as* support@" path.
 
-> **DECISION (2026-06-29) — outbound provider = MailChannels (not Resend).** This doc
-> reconciled to doc 16's then-recommended **Resend** sender on `security.rbox.to`; the
-> product call (see doc 16's decision banner) is to **stay all-Cloudflare → MailChannels
-> Email API (paid)**. Inbound routing here is **unaffected** (it's pure Cloudflare Email
-> Routing on the apex). The only change at implementation: the **`security.rbox.to`
-> outbound SPF/DKIM** referenced below shifts from `include:_spf.resend.com` + Resend DKIM
-> to **`include:relay.mailchannels.net`** + the **`_mailchannels` Domain-Lockdown TXT** +
-> MailChannels DKIM. The apex-vs-subdomain DMARC split and the "no outbound sender on the
-> apex SPF" rule **still hold** — only the subdomain's include string changes.
+> **DECISION (2026-06-29, revised 2026-06-30) — outbound provider = Cloudflare Email
+> Service (first-party).** This doc reconciled to doc 16's then-recommended **Resend**
+> sender on `security.rbox.to`; the product call is **all-Cloudflare**, and as of
+> 2026-06-30 that means **first-party Cloudflare Email Service — Email Sending** (public
+> beta), **not** the interim MailChannels Email API (now superseded — see doc 16's
+> decision banner and §4, doc 30 §3.10). Inbound routing here is **unaffected** (it's
+> pure Cloudflare Email Routing on the apex). The only change at implementation: the
+> **`security.rbox.to`** outbound records are **CF-managed** — onboarding the sending
+> subdomain makes Cloudflare write + lock `cf-bounce` MX, SPF
+> `include:_spf.mx.cloudflare.net`, a CF-generated `cf-bounce._domainkey` DKIM, and a
+> `_dmarc` record (no `include:relay.mailchannels.net`, no `_mailchannels` Lockdown TXT,
+> no self-managed DKIM). The apex-vs-subdomain DMARC split and the "no outbound sender on
+> the apex SPF" rule **still hold** — the sending records live on the `cf-bounce`
+> subdomain, fully separate from the apex inbound records.
 
 ---
 
