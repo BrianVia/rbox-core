@@ -4,6 +4,7 @@ import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
+import { markedCandidateSet } from "./gc-phase1.js";
 import { dbFor } from "./db.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
@@ -64,6 +65,11 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
         .all<{ sha256: string }>();
       for (const row of rows.results ?? []) have.add(row.sha256);
     }
+    // §33 candidate-aware check: a Phase-1 prune-marked ref reads as missing → the client
+    // re-stages it → the re-stage's commit re-grants + clears the marker (resurrected before
+    // any new commit references it).
+    const marked = await markedCandidateSet(db, accountId, [...have]);
+    for (const m of marked) have.delete(m);
     const missing = uniq.filter((s) => !have.has(s));
     op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
     return json({ missing });
@@ -81,7 +87,9 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
     for (const r of cand.results ?? []) condemned.add(r.sha256);
   }
   const entitled = await entitledSubset(op.env, accountId, uniq);
-  const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s));
+  // §33 candidate-aware check (legacy path): a Phase-1 prune-marked ref reads as missing.
+  const marked = await markedCandidateSet(db, accountId, uniq);
+  const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s) || marked.has(s));
   // `missingBlobs` is the client preflight: count + missing ratio, never raw SHAs.
   op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
   return json({ missing });
@@ -118,7 +126,12 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 
   // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
   // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
-  const pre = await wouldExceedCap(op.env, accountId, len);
+  // §33: SKIP this advisory pre-check when the account is ALREADY entitled — a re-upload
+  // forced by the candidate-aware "missing" (a prune-marked but still-owned ref) charges 0
+  // at grant, so an at/over-cap account MUST be able to re-establish it (else it can't clear
+  // its own Phase-1 marker and purge would drop a ref it already paid for). The grant's
+  // cap-guard trigger is the authoritative gate and never trips on a 0-delta re-grant.
+  const pre = (await isEntitled(op.env, accountId, sha)) ? { over: false, used: 0, cap: 0 } : await wouldExceedCap(op.env, accountId, len);
   if (pre.over) {
     op.done("quota_exceeded", { bytes: len });
     return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
@@ -163,8 +176,11 @@ export async function multipartInit(req: Request, env: Env, sha: string, account
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
-  // Fail-fast over-cap before staging any multipart parts (design 13 G4).
-  const pre = await wouldExceedCap(op.env, accountId, size);
+  // Fail-fast over-cap before staging any multipart parts (design 13 G4). §33: skip when
+  // already entitled — a re-upload forced by the candidate-aware "missing" charges 0 at the
+  // multipartComplete grant, so an at/over-cap account must be able to re-establish its own
+  // prune-marked ref (else it can't clear the marker and purge drops a ref it owns).
+  const pre = (await isEntitled(op.env, accountId, sha)) ? { over: false, used: 0, cap: 0 } : await wouldExceedCap(op.env, accountId, size);
   if (pre.over) {
     op.done("quota_exceeded", { bytes: size });
     return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);

@@ -37,26 +37,47 @@ export async function wouldExceedCap(env: Env, accountId: string, incomingSize: 
  * Over quota → roll back the entitlement, return granted:false (caller 402s; the
  * canonical R2 blob is left as a GC-reclaimable orphan, never deleted).
  */
-export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number): Promise<{ granted: boolean; used: number; cap: number }> {
+export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number, nowMs: number = Date.now()): Promise<{ granted: boolean; used: number; cap: number }> {
   const cap = await storageCap(env, accountId);
-  const ins = await dbFor(env, accountId).prepare("INSERT OR IGNORE INTO blob_refs (account_id, sha256) VALUES (?, ?)").bind(accountId, sha).run();
-  if ((ins.meta.changes ?? 0) === 0) {
-    const a = await account(env, accountId); // already entitled → no charge (dedup)
-    return { granted: true, used: a.used, cap };
+  const db = dbFor(env, accountId);
+  // §33: the grant is ONE atomic db.batch (one D1 transaction), mirroring commitAccounting —
+  // NOT a split insert-then-charge. Statement order is charge → grant → un-mark/un-condemn:
+  //   1. CHARGE iff newly entitled (NOT-EXISTS, evaluated BEFORE the grant insert so it sees
+  //      the pre-insert state). The accounts_cap_guard trigger RAISE(ABORT)s an over-cap
+  //      INCREASE → the WHOLE batch rolls back → granted:false (no charge, no ref, no clear).
+  //   2. GRANT / re-stamp `granted_at` (was SQLite default 0 — which made a fresh ref instantly
+  //      satisfy any `granted_at < cutoff` grace; the marker, not granted_at, is the barrier).
+  //   3. CLEAR this account's Phase-1 prune marker + un-condemn `gc_candidates`, atomically.
+  // Atomicity closes two races §33 newly exposes (Phase 1 now deletes live blob_refs on cron):
+  //   (a) a concurrent same-sha grant can't see an uncharged insert (charge+insert are one txn);
+  //   (b) the grant is serialized WHOLE against phase1Purge's delete batch — purge either runs
+  //       fully before (then this re-charges + re-creates the ref) or fully after (then its
+  //       marker-existence guard sees the cleared marker → no-op). No "granted:true, ref gone".
+  try {
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE accounts SET used_bytes = used_bytes + (
+             CASE WHEN NOT EXISTS (SELECT 1 FROM blob_refs WHERE account_id = ? AND sha256 = ?) THEN ? ELSE 0 END)
+           WHERE id = ?`,
+        )
+        .bind(accountId, sha, size, accountId),
+      db
+        .prepare("INSERT INTO blob_refs (account_id, sha256, granted_at) VALUES (?, ?, ?) ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at")
+        .bind(accountId, sha, nowMs),
+      db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha),
+      db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha),
+    ]);
+  } catch (e) {
+    // accounts_cap_guard RAISE(ABORT,'over_cap') rolled the whole batch back → nothing granted.
+    if (e instanceof Error && /over_cap/i.test(e.message)) {
+      const a = await account(env, accountId);
+      return { granted: false, used: a.used, cap };
+    }
+    throw e;
   }
-  if (cap === Infinity) {
-    await dbFor(env, accountId).prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ?").bind(size, accountId).run();
-    const a = await account(env, accountId);
-    return { granted: true, used: a.used, cap };
-  }
-  const upd = await dbFor(env, accountId).prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ? AND used_bytes + ? <= ?").bind(size, accountId, size, cap).run();
-  if ((upd.meta.changes ?? 0) === 1) {
-    const a = await account(env, accountId);
-    return { granted: true, used: a.used, cap };
-  }
-  await dbFor(env, accountId).prepare("DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ?").bind(accountId, sha).run(); // roll back
   const a = await account(env, accountId);
-  return { granted: false, used: a.used, cap };
+  return { granted: true, used: a.used, cap };
 }
 
 /** Decrement an account's usage counter (called by GC purge per dropped entitlement). */

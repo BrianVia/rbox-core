@@ -481,6 +481,7 @@ export class WorkspaceSync {
   private async missingBlobs(db: D1Database, shas: string[], accountId: string): Promise<string[]> {
     const entitled = new Set<string>();
     const condemned = new Set<string>();
+    const marked = new Set<string>(); // §33: this account's Phase-1 prune candidates
     for (let i = 0; i < shas.length; i += 80) {
       const chunk = shas.slice(i, i + 80);
       if (chunk.length === 0) break;
@@ -492,8 +493,12 @@ export class WorkspaceSync {
       for (const r of rows.results ?? []) entitled.add(r.sha256);
       const cand = await db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
       for (const r of cand.results ?? []) condemned.add(r.sha256);
+      // §33: a prune-marked ref reads as MISSING → forces a re-upload that re-grants +
+      // clears the marker (same candidate-aware barrier as gc_candidates, per-account).
+      const pruneCand = await db.prepare(`SELECT sha256 FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${ph})`).bind(accountId, ...chunk).all<{ sha256: string }>();
+      for (const r of pruneCand.results ?? []) marked.add(r.sha256);
     }
-    return shas.filter((s) => !entitled.has(s) || condemned.has(s));
+    return shas.filter((s) => !entitled.has(s) || condemned.has(s) || marked.has(s));
   }
 
   // ---- WebSocket fanout (hibernatable) ----

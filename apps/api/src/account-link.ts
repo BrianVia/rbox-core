@@ -236,7 +236,12 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       // reclaim like the shell's own user row. (device_notifications can't exist on a
       // reclaimable shell — it implies a durable device, which blocks below — so it's a
       // COVERED blocker, not a cleaned row.) account-data plane (origin shell's shard).
-      dbFor(env, shell).prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
+      dbFor(env, shell).prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      // §33/§9.5: blob_ref_candidates is a transient Phase-1 GC marker. It can only exist
+      // alongside a blob_refs row (a COVERED blocker → br>0 fails judgeReclaimable), so this
+      // is defensive (no-op on a truly-reclaimable shell), but clean it like the other shell
+      // artifacts so no orphan GC marker survives reclaim. account-data plane (shell's shard).
+      dbFor(env, shell).prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
     );
   }
   try {

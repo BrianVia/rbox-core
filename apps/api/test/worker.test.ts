@@ -846,7 +846,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     }
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
     const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications"];
-    const EXPECTED_CLEANED = ["users", "account_notify_prefs"]; // shell-owned rows DELETEd on reclaim (not blockers)
+    const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates"]; // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient GC marker
     const EXCLUDED = ["audit_log"]; // append-only forensic log (§3.4) — never blocks
     const known = new Set([...COVERED, ...EXPECTED_CLEANED, ...EXCLUDED]);
     const uncategorized = accountScoped.filter((t) => !known.has(t));

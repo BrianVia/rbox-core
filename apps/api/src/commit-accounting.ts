@@ -10,6 +10,7 @@
 
 import type { Env } from "./env.js";
 import { verifyReceipt } from "./receipts.js";
+import { markedCandidateSet } from "./gc-phase1.js";
 
 export interface RefWithSize {
   sha: string;
@@ -74,6 +75,14 @@ export async function validateCommitRefs(
     const results = await db.batch<{ sha256: string }>(group);
     for (const r of results) for (const row of r.results ?? []) have.add(row.sha256);
   }
+
+  // §33 candidate-aware validate (the prune barrier): a ref this account has marked as a
+  // prune-candidate (`blob_ref_candidates`) reads as NOT-satisfied even though it is
+  // entitled+present — forcing it into `newRefs` so commitAccounting re-grants it and
+  // CLEARS the marker. Without this, a deduped commit (which never bumps `granted_at` —
+  // see below) could publish a head referencing a ref Phase-1 purge is about to drop.
+  const marked = await markedCandidateSet(db, accountId, [...have]);
+  for (const m of marked) have.delete(m);
 
   const newRefs: RefWithSize[] = [];
   const needsUpload: string[] = [];
@@ -146,6 +155,11 @@ export async function commitAccounting(
       );
       // Un-condemn: a re-uploaded blob clears its GC candidacy (the canonical object is fresh).
       stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE sha256 IN (${inList})`).bind(...shas));
+      // §33: a (re-)grant clears this account's Phase-1 prune marker, atomically with the
+      // grant — so a marked ref this commit re-establishes can NEVER be dropped by a later
+      // purge (its candidate row is gone). The dedup path bumps `granted_at` here too via
+      // the ON CONFLICT UPDATE above, but `granted_at` is NOT the barrier — the marker is.
+      stmts.push(db.prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${inList})`).bind(accountId, ...shas));
     }
 
     try {

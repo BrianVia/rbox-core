@@ -38,8 +38,11 @@
   // tail worker is provisioned — see tail/README.md.)
   // "tail_consumers": [{ "service": "rbox-dev-tail" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
+  // §33 founder decision: Phase 1 (per-account entitlement prune) runs HOURLY to drain
+  // the `used_bytes` leak promptly. retentionPrune + the notify sweep ride the same tick
+  // (both idempotent). Phase 2 (R2 delete) stays the manual `/v1/admin/gc?phase=purge` sweep.
   "triggers": {
-    "crons": ["0 4 * * *"]
+    "crons": ["0 * * * *"]
   },
   // New-device security email (design 16 / 30). The Worker has no ExecutionContext, so
   // the durable path is: outbox (D1) → Queue → consumer send → cron backstop.
@@ -91,7 +94,7 @@
       // Deploy `tail/ --env production` FIRST, then UNCOMMENT (see tail/README.md).
       // "tail_consumers": [{ "service": "rbox-prod-tail" }],
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
-      "triggers": { "crons": ["0 4 * * *"] },
+      "triggers": { "crons": ["0 * * * *"] }, // §33: hourly Phase-1 entitlement prune (see dev block)
       // New-device email infra in prod (reaches prod ONLY via merge→CI, never from a dev
       // deploy). Separate prod queue + DLQ; same EMAIL binding + sender domain.
       "queues": {

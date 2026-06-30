@@ -15,6 +15,7 @@ import { dbFor } from "./db.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
+import { runPhase1 } from "./gc-phase1.js";
 import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
@@ -27,6 +28,10 @@ import { adminOverview } from "./admin.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
 export { WorkspaceSync } from "./workspace-sync.js";
+
+// §33 GRACE_1: the Phase-1 mark→purge grace, sized to exceed the slowest in-flight
+// commit + clock skew (founder: ≈1h; the existing manual GC default, worker.ts).
+const GRACE_1_MS = 60 * 60 * 1000;
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -60,21 +65,39 @@ export default {
     return res;
   },
   /**
-   * Scheduled GC (cron). Plan-driven retention prune → mark → purge, in order:
-   * retention sets each workspace's prune floor from its account's plan, mark
-   * tags now-unreachable canonical objects past a grace window, purge deletes
-   * those still unreachable (and decrements usage). Idempotent + fail-safe; a
-   * thrown phase is logged and the next run retries.
+   * Scheduled GC (cron, hourly). Plan-driven retention prune → §33 Phase 1, in order:
+   * retention sets each workspace's prune floor from its account's plan, then Phase 1
+   * (per account, D1-only) marks now-unreachable `blob_refs`, purges those still
+   * unreachable past grace (releasing `used_bytes`), and reconciles. Idempotent +
+   * fail-safe + fail-closed per account; a thrown phase is logged and the next run retries.
+   *
+   * §33 founder decision: Phase 2 (canonical R2 + `blobs` reclaim) stays OFF the cron —
+   * R2 has no conditional/atomic delete, so a cron R2-delete races a concurrent direct
+   * PUT (irreducible TOCTOU). It remains the manual/quiescent `/v1/admin/gc?phase=purge`
+   * sweep. Phase 1 NEVER deletes an R2 object; it only condemns last-ref blobs into
+   * `gc_candidates` for that manual sweep.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
     try {
+      // Retention precedes Phase 1 (a just-pruned version's now-unreachable refs become
+      // visible to the mark). retentionPrune FAILS CLOSED on the first unreadable DO `/prune`
+      // (retention.ts) — so it gets its OWN try: a single broken workspace must NOT skip
+      // Phase 1 for every other account (that would defeat §33's per-account isolation;
+      // codex round-2). Any workspace left un-pruned just keeps its old floor → its refs stay
+      // reachable → not collected this cycle → retried next run.
       await retentionPrune(env);
-      // §23 (direct-write): the destructive canonical GC (gcMark/gcPurge, which R2-deletes
-      // blob objects) is OFF the cron — it races a concurrent direct PUT (R2 has no
-      // conditional delete). Canonical dedup-GC is deferred to a separate quiescent sweep
-      // (run manually via /v1/admin/gc while no push is active). (codex scaling review.)
     } catch (e) {
-      logErr("scheduled_gc_failed", e); // no raw message (GC touches account/blob metadata)
+      logErr("scheduled_retention_failed", e); // no raw message (touches account/workspace metadata)
+    }
+    try {
+      // §33 Phase 1: per-account entitlement prune (closes the design 30 §3 / 07b §d
+      // `used_bytes` leak) + reconciler. GRACE_1 = 1h (≥ the slowest in-flight commit + skew).
+      // D1-only → cron-safe with the candidate-aware commit barrier. Itself per-account
+      // fail-closed (one broken DO aborts only that account) — kept in its OWN try so a
+      // retention failure above can't starve it.
+      await runPhase1(env, GRACE_1_MS);
+    } catch (e) {
+      logErr("scheduled_phase1_failed", e); // no raw message (GC touches account/blob metadata)
     }
     try {
       // New-device-email backstop (design 16 §2.4): re-drive outbox rows whose enqueue was
@@ -157,6 +180,10 @@ async function route(req: Request, env: Env): Promise<Response> {
     // tier; mark/purge then reclaim. Operational order: retention → mark → purge.
     if (phase === "retention") return retentionPrune(env);
     const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
+    // §33 Phase 1 (per-account entitlement prune; D1-only, cron-safe). Same handler that
+    // runs on cron, exposed for on-demand runs/tests. Phase 2 (R2 delete) stays the manual
+    // `phase=purge` quiescent sweep below (gcPurge) — Phase 1 never touches R2.
+    if (phase === "phase1") return runPhase1(env, graceMs);
     return phase === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
   }
   // GET /v1/admin/overview — platform-admin cockpit (§32 Tier 3a). Gated by a
