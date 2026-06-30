@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
-import { ctEqual, json, sha256Hex } from "./util.js";
+import { ctEqual, json, logErr, sha256Hex } from "./util.js";
 import type { Principal } from "./authz.js";
+
 
 /**
  * Self-hosted device-token auth (M4). Per-device opaque tokens, stored only as
@@ -220,7 +221,7 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     // only the SIGNED accountId (verified roster/grant), cross-checking this (D7).
     return json({ token: minted, deviceId, accountId: consumed.account_id, mkWrap: consumed.mk_wrap, admissionGrant: consumed.admission_grant });
   } catch (e) {
-    console.error("pair redeem: mint failed after consume (token burned):", String((e as Error)?.message ?? e));
+    logErr("pair_redeem_mint_failed", e); // token burned; no raw message (touches account/device material)
     return json({ error: "internal" }, 500);
   }
 }

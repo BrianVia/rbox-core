@@ -61,9 +61,11 @@ blob3   = outcome      ("ok" | "conflict" | "epoch_stale" | "unsatisfied_blobs"
 double1 = ms           (primary latency)
 double2 = dbMs         (D1 time within the op)
 double3 = storeMs      (R2 time within the op)
-double4 = bytes        (commit body / blob size)
-double5 = count        (blobs per commit, parts)
-double6 = ratio        (0..1, e.g. missingBlobs / referenced)
+double4 = doMs         (Durable Object time, e.g. transactionSync hold)
+double5 = bytes        (commit body / blob size)
+double6 = count        (blobs per commit, parts)
+double7 = ratio        (0..1, e.g. missingBlobs / referenced)
+double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
 ```
 
 Query via the [AE SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
@@ -91,9 +93,9 @@ GROUP BY hour ORDER BY hour;
 watch how close p99 creeps to the 1 MB cap, and count `body_too_large` rejections)
 ```sql
 SELECT
-  quantileWeighted(0.50)(double4, _sample_interval) AS p50_bytes,
-  quantileWeighted(0.99)(double4, _sample_interval) AS p99_bytes,
-  max(double4) AS max_bytes,
+  quantileWeighted(0.50)(double5, _sample_interval) AS p50_bytes,
+  quantileWeighted(0.99)(double5, _sample_interval) AS p99_bytes,
+  max(double5) AS max_bytes,
   sumIf(_sample_interval, blob3 = 'body_too_large') AS rejected_too_large
 FROM rbox_prod_metrics
 WHERE blob1 = 'commit';
@@ -102,9 +104,9 @@ WHERE blob1 = 'commit';
 **3. Blobs per commit (p50/p99)**
 ```sql
 SELECT
-  quantileWeighted(0.50)(double5, _sample_interval) AS p50_blobs,
-  quantileWeighted(0.99)(double5, _sample_interval) AS p99_blobs,
-  max(double5) AS max_blobs
+  quantileWeighted(0.50)(double6, _sample_interval) AS p50_blobs,
+  quantileWeighted(0.99)(double6, _sample_interval) AS p99_blobs,
+  max(double6) AS max_blobs
 FROM rbox_prod_metrics
 WHERE blob1 = 'commit' AND blob3 = 'ok';
 ```
@@ -114,7 +116,7 @@ WHERE blob1 = 'commit' AND blob3 = 'ok';
 ```sql
 SELECT
   intDiv(toUInt32(timestamp), 3600) * 3600 AS hour,
-  avgWeighted(double6, _sample_interval) AS avg_missing_ratio,
+  avgWeighted(double7, _sample_interval) AS avg_missing_ratio,
   sumIf(_sample_interval, blob3 = 'unsatisfied_blobs') AS commits_with_missing,
   sum(_sample_interval) AS total_commits
 FROM rbox_prod_metrics
@@ -140,6 +142,28 @@ SELECT blob1 AS op,
 FROM rbox_prod_metrics
 WHERE blob1 LIKE 'blob.%' OR blob1 LIKE 'multipart.%'
 GROUP BY op;
+```
+
+**§23 success metric — D1 calls per op** (the headline: `blob.put` ≈ 5 today,
+should fall to ~0 once upload-receipts move accounting to commit-time)
+```sql
+SELECT blob1 AS op,
+  quantileWeighted(0.50)(double8, _sample_interval) AS p50_d1_calls,
+  quantileWeighted(0.99)(double8, _sample_interval) AS p99_d1_calls,
+  quantileWeighted(0.50)(double2, _sample_interval) AS p50_d1_ms
+FROM rbox_prod_metrics
+WHERE blob1 IN ('blob.put', 'blob.check', 'commit', 'request')
+GROUP BY op;
+```
+
+**Commit DO contention — `transactionSync` hold (doMs)**
+```sql
+SELECT
+  quantileWeighted(0.50)(double4, _sample_interval) AS p50_do_ms,
+  quantileWeighted(0.99)(double4, _sample_interval) AS p99_do_ms,
+  sumIf(_sample_interval, blob3 = 'conflict') AS conflicts
+FROM rbox_prod_metrics
+WHERE blob1 = 'commit';
 ```
 
 **Future §23/§24 validation panels** (add when the emitters land)

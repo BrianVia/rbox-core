@@ -2,6 +2,7 @@ import { env, SELF, applyD1Migrations, createExecutionContext, waitOnExecutionCo
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { mintDevice } from "../src/auth.js";
+import { routeTemplate } from "../src/worker.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const BASE = "https://example.com";
@@ -747,5 +748,79 @@ describe("release distribution (design 14)", () => {
     const missing = await SELF.fetch(`${BASE}/bin/v9.9.9/rbox-linux-x64`);
     expect(missing.status).toBe(404);
     expect(missing.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+// The telemetry layer's privacy contract: a route template fed to a metric
+// dimension must never carry a raw workspace/project/sha/device/account id (design
+// doc §5 metadata threat model). These are the dynamic-segment shapes this API mints.
+describe("routeTemplate privacy masking", () => {
+  const realSha = sha("some-content");
+  // Real id prefixes this API actually mints (auth.ts): acct_/user_/dev_/web_, ws_.
+  const cases: Array<[string, string]> = [
+    [`/v1/ws/ws_ab12cd34/proj/root/manifests/42`, "/v1/ws/:ws/proj/:proj/manifests/:n"],
+    [`/v1/ws/ws_ab12cd34/proj/my-secret-dir/latest`, "/v1/ws/:ws/proj/:proj/latest"],
+    [`/v1/blobs/${realSha}`, "/v1/blobs/:sha"],
+    [`/v1/blobs/${realSha}/multipart/3f9a1c2e-1b4d-4e6a-9c8b-0a1b2c3d4e5f/part/7`, "/v1/blobs/:sha/multipart/:uploadId/part/:n"],
+    [`/v1/auth/devices/dev_9f8e7d/revoke`, "/v1/auth/devices/:id/revoke"],
+    [`/v1/auth/devices/web_aabb/revoke`, "/v1/auth/devices/:id/revoke"],
+    [`/v1/admin/account/acct_11223344/plan`, "/v1/admin/account/:id/plan"],
+    [`/v1/keys/workspace/ws_zzz999`, "/v1/keys/workspace/:ws"],
+    [`/bin/v0.1.2/rbox-darwin-arm64`, "/bin/:ver/:bin"],
+    ["/health", "/health"], // static vocabulary is untouched
+    // A project literally NAMED after a vocab word must still be masked (the project
+    // id is user-chosen) — positional masking beats the allowlist for the proj slot.
+    [`/v1/ws/ws_ab/proj/latest/manifests`, "/v1/ws/:ws/proj/:proj/manifests"],
+    [`/v1/ws/ws_ab/proj/account/latest`, "/v1/ws/:ws/proj/:proj/latest"],
+    // Project named exactly "proj" must NOT clobber the action after it (index-pinned slot).
+    [`/v1/ws/ws_ab/proj/proj/latest`, "/v1/ws/:ws/proj/:proj/latest"],
+    // ...but real static routes that share a word with a slot are NOT clobbered:
+    ["/v1/account/usage", "/v1/account/usage"],
+    ["/v1/blobs/check", "/v1/blobs/check"],
+    // Allowlist guarantee: an entirely unknown / user-supplied segment is masked,
+    // never echoed — this is the case a blocklist would have leaked.
+    ["/v1/totally-made-up/../etc/passwd", "/v1/:x/:x/:x/:x"],
+    [`/v1/account/acct_secret_leak`, "/v1/account/:id"],
+  ];
+  for (const [input, expected] of cases) {
+    test(`${input} → ${expected}`, () => {
+      const out = routeTemplate(input);
+      expect(out).toBe(expected);
+      // Belt-and-suspenders: no concrete id/secret survives into the template.
+      for (const secret of ["ws_ab12cd34", "my-secret-dir", realSha, "dev_9f8e7d", "web_aabb", "acct_11223344", "acct_secret_leak", "ws_zzz999", "passwd", "made-up"]) {
+        if (input.includes(secret)) expect(out).not.toContain(secret);
+      }
+    });
+  }
+});
+
+describe("metrics OpSpan / D1 attribution", () => {
+  test("span.db proxy counts + times every D1 statement (incl. failures)", async () => {
+    const { OpSpan } = await import("../src/metrics.js");
+    const span = new OpSpan();
+    const db = span.db(env.rbox_dev_db);
+    // two successful statements through the proxy
+    await db.prepare("SELECT 1").first();
+    await db.prepare("SELECT sha256 FROM blobs WHERE sha256 = ?").bind(sha("nope")).all();
+    expect(span.dbCalls).toBe(2);
+    expect(span.dbMs).toBeGreaterThanOrEqual(0);
+    // a failing statement is STILL counted + timed (try/finally), not dropped
+    await expect(db.prepare("SELECT * FROM table_that_does_not_exist").all()).rejects.toBeDefined();
+    expect(span.dbCalls).toBe(3);
+  });
+
+  test("r2 span records on throw; ms + doMs accumulate", async () => {
+    const { OpSpan } = await import("../src/metrics.js");
+    const span = new OpSpan();
+    await span.r2(async () => "ok");
+    await expect(span.r2(async () => { throw new Error("boom"); })).rejects.toThrow("boom");
+    span.doMs += 1; // doMs is set directly (the only DO timing is the synchronous transactionSync)
+    expect(span.storeMs).toBeGreaterThanOrEqual(0);
+    expect(span.doMs).toBe(1);
+    expect(span.ms).toBeGreaterThanOrEqual(0); // span owns its own elapsed clock now
+    // bind-chaining through the proxy preserves counting
+    const span2 = new OpSpan();
+    await span2.db(env.rbox_dev_db).prepare("SELECT ?").bind(1).first();
+    expect(span2.dbCalls).toBe(1);
   });
 });

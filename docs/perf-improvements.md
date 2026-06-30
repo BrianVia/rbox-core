@@ -12,6 +12,27 @@ sweep harness is `scripts/bench/`.
 
 ---
 
+## 2026-06-29 — §25 server observability deployed → the bottleneck, measured
+
+Server-side per-op timing → Workers Analytics Engine (`apps/api/src/metrics.ts`,
+`OpSpan` + a D1-binding Proxy that times+counts every statement, incl. inside the
+billing/authz helpers). Deployed to dev; live metrics query (`rbox_dev_metrics`,
+small corpus push, conc 32) gave the first **measured** server baseline:
+
+| op | dbCalls | dbMs | r2Ms | doMs | ms |
+|---|---:|---:|---:|---:|---:|
+| **blob.put** | **7** | **956** | 120 | 0 | 1076 |
+| commit | 16 | 513 | 0 | ~0 | 513 |
+| request | 7.9 | 1116 | 0 | 0 | 1238 |
+
+**Findings that set up §23:** a single `blob.put` spends **~956 ms in D1 across 7
+calls — 89% of its wall time** (R2 only 120 ms). The 7 (vs the ~5 estimated) are the
+hidden `account()` SELECTs the proxy caught. `doMs≈0` proves the DO sequencer is NOT
+the bottleneck — D1 is. This is §23's target, now instrumented: dbCalls/dbMs on
+`blob.put` should fall to ~0 once upload-receipts move accounting to commit-time.
+(Absolute dbMs is inflated by single-threaded-D1 contention at conc 32 — relative
+before/after is the signal.)
+
 ## 2026-06-29 — Concurrent blob transfer (push + pull)
 
 **The big one.** Blob upload (`sync.ts`) and download (`apply.ts`) were sequential

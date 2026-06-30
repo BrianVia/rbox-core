@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
-import { json, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { startOp, type MetricEvent } from "./metrics.js";
 
 // Opaque body cap. The body inlines one blobRef ({encSha,size} ≈ 85B) per UNIQUE
 // blob, so a ~4k-file repo is ~350KB; 1MB covers ~12k unique blobs and fits D1's
@@ -115,6 +116,12 @@ export class WorkspaceSync {
   // ---- commit (the atomic sequencer) ----
 
   private async commit(req: Request, ws: string, proj: string): Promise<Response> {
+    const ROUTE = "/v1/ws/:ws/proj/:proj/manifests"; // templated (no ids) for telemetry
+    // op.span accumulates this commit's D1 (missingBlobs + mirror, incl. helpers) and
+    // DO (transactionSync) time + call count; op.done emits the one metric. Created up
+    // front so even the early body_too_large reject is attributed. Pre-op validation
+    // guards (bad envelope / non-JSON) return without a metric (the request row covers them).
+    const op = startOp(this.env, "commit", ROUTE);
     const body = (await req.json().catch(() => null)) as { parentSequence?: number | null; commit?: SignedCommit } | null;
     const commit = body?.commit;
     const parent = body?.parentSequence ?? 0;
@@ -129,7 +136,12 @@ export class WorkspaceSync {
     if (!commit || typeof commit.body !== "string" || typeof commit.commitHash !== "string" || typeof commit.sig !== "string") {
       return json({ error: "bad_request", message: "missing signed commit" }, 400);
     }
-    if (commit.body.length > MAX_COMMIT_BODY) return json({ error: "bad_request", message: "commit body too large" }, 400);
+    if (commit.body.length > MAX_COMMIT_BODY) {
+      // Directly relevant to the commit-body-scaling TODO: track how often bodies
+      // hit the cap (the signal that blobRefs need to move out of the signed body).
+      op.done("body_too_large", { bytes: commit.body.length });
+      return json({ error: "bad_request", message: "commit body too large" }, 400);
+    }
 
     // Parse the body ONLY to read the handful of fields the sequencer needs. We do
     // NOT verify the signature or canonicalization — clients do that on pull.
@@ -160,13 +172,21 @@ export class WorkspaceSync {
     // don't have (the encrypted manifest is itself a normal blob the client
     // uploaded first), or every future pull breaks. 422 → client uploads.
     const shas = [...new Set([cb.encManifestSha, ...refShas])];
-    const missing = await this.missingBlobs(shas, accountId); // account-scoped (M7)
-    if (missing.length > 0) return json({ error: "unsatisfied_blobs", missing }, 422);
+    const bodyBytes = commit.body.length;
+    const emitCommit = (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, { bytes: bodyBytes, count: shas.length, ...extra });
+
+    const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId); // account-scoped (M7)
+    if (missing.length > 0) {
+      // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
+      emitCommit("unsatisfied_blobs", { ratio: missing.length / shas.length });
+      return json({ error: "unsatisfied_blobs", missing }, 422);
+    }
 
     // Atomic head check + advance — synchronous, no await inside. We store the full
     // SignedCommit verbatim (opaque); parent===head guarantees next === cb.seq.
     const stored = JSON.stringify({ commitHash: commit.commitHash, sig: commit.sig, body: commit.body });
     let outcome: { sequence: number } | { conflict: number } | { epochStale: number };
+    const doT0 = performance.now();
     try {
       let next = 0;
       this.ctx.storage.transactionSync(() => {
@@ -189,24 +209,35 @@ export class WorkspaceSync {
       outcome = { sequence: next };
     } catch (e) {
       if (e !== ABORT) throw e;
+    } finally {
+      op.span.doMs += performance.now() - doT0; // DO transactionSync hold (contention signal)
     }
 
-    if ("conflict" in outcome!) return json({ error: "conflict", head: outcome!.conflict }, 409);
-    if ("epochStale" in outcome!) return json({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409);
+    if ("conflict" in outcome!) {
+      emitCommit("conflict");
+      return json({ error: "conflict", head: outcome!.conflict }, 409);
+    }
+    if ("epochStale" in outcome!) {
+      emitCommit("epoch_stale");
+      return json({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409);
+    }
     const sequence = outcome!.sequence;
 
     // Best-effort D1 commit mirror (not authoritative). Workspace ownership is
     // established at creation (POST /v1/workspaces), NOT here, so no registry write.
     try {
-      await this.env.rbox_dev_db
+      await op.env.rbox_dev_db
         .prepare("INSERT OR IGNORE INTO commits (workspace_id, project_id, sequence, commit_hash, body, sig, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(ws, proj, sequence, commit.commitHash, commit.body, commit.sig, deviceId)
         .run();
     } catch (e) {
-      console.error("D1 commit mirror failed (non-fatal)", e);
+      logErr("d1_commit_mirror_failed", e); // no raw error (binds carry ws/proj/body/device)
     }
 
     this.broadcast(JSON.stringify({ type: "committed", sequence, deviceId }), deviceId);
+    // Success: the headline commit-latency / body-size / blobs-per-commit + the
+    // R2/D1/DO split (dbMs+dbCalls from missingBlobs & mirror, doMs from the txn).
+    emitCommit("ok"); // ratio defaults to 0
     return json({ sequence, commitHash: commit.commitHash });
   }
 
@@ -284,19 +315,19 @@ export class WorkspaceSync {
   /** Account-scoped (M7): a sha is "have it" only if THIS account is entitled
    *  (blob_refs) and it's not a GC candidate (M6). Referencing an unentitled sha
    *  → reported missing → client must upload it (needs the bytes). */
-  private async missingBlobs(shas: string[], accountId: string): Promise<string[]> {
+  private async missingBlobs(db: D1Database, shas: string[], accountId: string): Promise<string[]> {
     const entitled = new Set<string>();
     const condemned = new Set<string>();
     for (let i = 0; i < shas.length; i += 80) {
       const chunk = shas.slice(i, i + 80);
       if (chunk.length === 0) break;
       const ph = chunk.map(() => "?").join(",");
-      const rows = await this.env.rbox_dev_db
+      const rows = await db
         .prepare(`SELECT sha256 FROM blob_refs WHERE account_id = ? AND sha256 IN (${ph})`)
         .bind(accountId, ...chunk)
         .all<{ sha256: string }>();
       for (const r of rows.results ?? []) entitled.add(r.sha256);
-      const cand = await this.env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+      const cand = await db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
       for (const r of cand.results ?? []) condemned.add(r.sha256);
     }
     return shas.filter((s) => !entitled.has(s) || condemned.has(s));

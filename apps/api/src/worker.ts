@@ -18,9 +18,10 @@ import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAcc
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
 import { webSession } from "./clerk.js";
-import { json, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
+import { startOp } from "./metrics.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export default {
@@ -29,16 +30,22 @@ export default {
     // CORS preflight: the browser dashboard sends OPTIONS before any cross-origin
     // authed request (Authorization/content-type headers make it non-simple).
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    // Wrap env's D1 for the whole request (via op.env) so pre-DO work (authz,
+    // account-epoch lookups in route()) is timed + counted into the `request` row.
+    // Per-op handlers (blobs.ts) wrap again → their row counts their own D1; the
+    // overlap with `request` is intended (request = total worker-side D1).
+    const op = startOp(env, "request", `${req.method} ${routeTemplate(new URL(req.url).pathname)}`);
     let res: Response;
     try {
-      res = await route(req, env);
+      res = await route(req, op.env);
     } catch (e) {
       if (e instanceof Response) res = e; // thrown 4xx flows out as itself
       else {
-        console.error("unhandled", e);
-        res = jsonResponse({ error: "internal", message: String((e as Error)?.message ?? e) }, 500);
+        logErr("unhandled", e); // no raw message/stack (may carry user metadata)
+        res = jsonResponse({ error: "internal" }, 500);
       }
     }
+    op.done(String(res.status));
     // Echo CORS headers on the real response (incl. errors) so the browser fetch
     // resolves instead of failing opaque. No-op when Origin isn't allowlisted.
     if (cors["Access-Control-Allow-Origin"]) {
@@ -62,7 +69,7 @@ export default {
       await gcMark(env, GRACE_MS);
       await gcPurge(env, GRACE_MS);
     } catch (e) {
-      console.error("scheduled GC failed (will retry next run):", String((e as Error)?.message ?? e));
+      logErr("scheduled_gc_failed", e); // no raw message (GC touches account/blob metadata)
     }
   },
 };
@@ -231,6 +238,58 @@ async function route(req: Request, env: Env): Promise<Response> {
 
 function eq(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * Collapse a request path into a low-cardinality, id-free template for telemetry
+ * (design doc §5: route templates, params stripped — never raw paths/ids in
+ * metric dimensions). ALLOWLIST design, deliberately: only the known static
+ * vocabulary of this router passes through; EVERYTHING else is masked. A blocklist
+ * of id prefixes is fragile (we mint `acct_`/`user_`/`dev_`/`web_`/`ws_`/`pair_`,
+ * and any new prefix would silently leak); an allowlist can't leak an unknown id
+ * shape, a user-chosen project name, or an arbitrary unmatched path segment, and
+ * it bounds dimension cardinality. e.g.
+ * `/v1/ws/ws_ab12/proj/my-dir/manifests/42` → `/v1/ws/:ws/proj/:proj/manifests/:n`.
+ * Exported for tests — this privacy contract is load-bearing for the whole layer.
+ */
+const ROUTE_VOCAB = new Set([
+  "v1", "health", "install.sh", "version", "version.sig", "bin",
+  "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
+  "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
+  "account", "usage", "admin", "gc", "plan", "workspaces",
+  "keys", "roster", "admit", "keystate", "workspace",
+  "blobs", "check", "multipart", "part", "complete",
+  "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
+]);
+export function routeTemplate(pathname: string): string {
+  const parts = pathname.split("/");
+  // The project id is the ONE fully user-chosen segment that can spell a vocab word
+  // (a project literally named "latest"/"manifests"/even "proj"). Its slot is fixed
+  // by the grammar `/v1/ws/:ws/proj/:proj/…`, so pin it by INDEX — using the raw
+  // previous string would wrongly clobber the action after a project named "proj".
+  const projIdx = parts[2] === "ws" && parts[4] === "proj" ? 5 : -1;
+  const masked = parts.map((s, i) => {
+    if (s === "") return s;
+    if (i === projIdx) return ":proj"; // before the allowlist so a vocab-named project can't leak
+    if (ROUTE_VOCAB.has(s)) return s;
+    // Release distribution (public, non-sensitive but variable): version + binary.
+    if (/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(s)) return ":ver";
+    if (/^rbox-(darwin|linux)-(arm64|x64)$/.test(s)) return ":bin";
+    if (/^\d+$/.test(s)) return ":n";
+    if (/^[0-9a-f]{64}$/.test(s)) return ":sha";
+    // Unknown ⇒ dynamic/user-influenced. Label by position for readable dashboards,
+    // but ALWAYS to a placeholder — the raw value never survives. (`proj` handled above.)
+    switch (parts[i - 1]) {
+      case "ws":
+      case "workspace": return ":ws";
+      case "blobs": return ":sha";
+      case "multipart": return ":uploadId";
+      case "account":
+      case "devices": return ":id";
+      default: return ":x";
+    }
+  });
+  return masked.join("/");
 }
 function badRequest(message: string): Response {
   return jsonResponse({ error: "bad_request", message }, 400);

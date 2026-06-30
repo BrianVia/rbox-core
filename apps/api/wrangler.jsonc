@@ -24,6 +24,10 @@
   "durable_objects": {
     "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
   },
+  // Server observability: per-op latency/size/count → queryable via the AE SQL API
+  // (dashboard: commit latency, commit-body size, blobs/commit, missingBlobs ratio).
+  // Only low-cardinality op/route/outcome dims are written — never user ids (metrics.ts).
+  "analytics_engine_datasets": [{ "binding": "rbox_metrics", "dataset": "rbox_dev_metrics" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
   "triggers": {
     "crons": ["0 4 * * *"]
@@ -51,6 +55,7 @@
       "durable_objects": {
         "bindings": [{ "name": "WORKSPACE_SYNC", "class_name": "WorkspaceSync" }]
       },
+      "analytics_engine_datasets": [{ "binding": "rbox_metrics", "dataset": "rbox_prod_metrics" }],
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
       "triggers": { "crons": ["0 4 * * *"] },
       "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]

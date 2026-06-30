@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import { blobKey, json } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
+import { startOp } from "./metrics.js";
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -30,75 +31,102 @@ export function partSizeFor(size: number): number {
 // "missing" → it must upload (which grants entitlement); it never learns whether
 // the platform already has another account's content.
 export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountId: string): Promise<Response> {
+  const op = startOp(env, "blob.check");
+  const db = op.env.rbox_dev_db;
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
+  const uniq = [...new Set(shas)];
   const present = new Set<string>();
   const condemned = new Set<string>();
   for (let i = 0; i < shas.length; i += 80) {
     const chunk = shas.slice(i, i + 80);
     if (chunk.length === 0) break;
     const ph = chunk.map(() => "?").join(",");
-    const rows = await env.rbox_dev_db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+    const rows = await db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of rows.results ?? []) present.add(r.sha256);
-    const cand = await env.rbox_dev_db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+    const cand = await db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of cand.results ?? []) condemned.add(r.sha256);
   }
-  const entitled = await entitledSubset(env, accountId, [...new Set(shas)]);
-  return json({ missing: [...new Set(shas)].filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s)) });
+  const entitled = await entitledSubset(op.env, accountId, uniq);
+  const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s));
+  // `missingBlobs` is the client preflight: count + missing ratio, never raw SHAs.
+  op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
+  return json({ missing });
 }
 
 // PUT /v1/blobs/:sha — single streaming PUT, R2 verifies the content hash.
 // Possessing+uploading the bytes is what grants this account read access (M7).
 export async function blobPut(req: Request, env: Env, sha: string, accountId: string): Promise<Response> {
+  const op = startOp(env, "blob.put");
   const len = Number(req.headers.get("content-length") ?? "0");
   if (len > SINGLE_PUT_MAX) return json({ error: "too_large", message: "use multipart", maxSingle: SINGLE_PUT_MAX }, 413);
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
   // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
   // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
-  const pre = await wouldExceedCap(env, accountId, len);
-  if (pre.over) return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
+  const pre = await wouldExceedCap(op.env, accountId, len);
+  if (pre.over) {
+    op.done("quota_exceeded", { bytes: len });
+    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
+  }
   let obj: R2Object;
   try {
-    obj = await env.rbox_dev_blobs.put(blobKey(sha), req.body, { sha256: sha });
-  } catch (e) {
-    return json({ error: "sha_mismatch", message: String((e as Error)?.message ?? e) }, 400);
+    obj = await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), req.body!, { sha256: sha }));
+  } catch {
+    op.done("sha_mismatch", { bytes: len });
+    return json({ error: "sha_mismatch" }, 400); // no raw R2 message (privacy)
   }
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
-  await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
-  const q = await grantEntitlementWithQuota(env, accountId, sha, obj.size); // verified upload → quota-checked read access
-  if (!q.granted) return json({ error: "quota_exceeded", used: q.used, cap: q.cap }, 402);
+  await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
+  await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+  const grant = await grantEntitlementWithQuota(op.env, accountId, sha, obj.size); // verified upload → quota-checked read access
+  if (!grant.granted) {
+    op.done("quota_exceeded", { bytes: obj.size });
+    return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap }, 402);
+  }
+  op.done("ok", { bytes: obj.size });
   return json({ ok: true, sha256: sha, sizeBytes: obj.size });
 }
 
 // GET /v1/blobs/:sha — streamed body. Entitlement checked BEFORE R2 (no timing/
 // existence oracle); an unentitled account gets 404 even if the blob exists (M7).
 export async function blobGet(env: Env, sha: string, accountId: string): Promise<Response> {
-  if (!(await isEntitled(env, accountId, sha))) return json({ error: "not_found" }, 404);
-  const obj = await env.rbox_dev_blobs.get(blobKey(sha));
-  if (!obj) return json({ error: "not_found" }, 404);
-  return new Response(obj.body, { headers: { "content-type": "application/octet-stream" } });
+  const op = startOp(env, "blob.get");
+  const notFound = () => {
+    op.done("not_found");
+    return json({ error: "not_found" }, 404);
+  };
+  if (!(await isEntitled(op.env, accountId, sha))) return notFound(); // entitlement BEFORE R2 (no existence oracle)
+  const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
+  if (!got) return notFound();
+  op.done("ok", { bytes: got.size });
+  return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
 // POST /v1/blobs/:sha/multipart  { size } -> { uploadId, partSize, totalParts }
 export async function multipartInit(req: Request, env: Env, sha: string, accountId: string): Promise<Response> {
+  const op = startOp(env, "multipart.init");
+  const db = op.env.rbox_dev_db;
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
   // Fail-fast over-cap before staging any multipart parts (design 13 G4).
-  const pre = await wouldExceedCap(env, accountId, size);
-  if (pre.over) return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
+  const pre = await wouldExceedCap(op.env, accountId, size);
+  if (pre.over) {
+    op.done("quota_exceeded", { bytes: size });
+    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
+  }
 
   // Best-effort GC of our own expired upload state.
-  await env.rbox_dev_db.prepare("DELETE FROM uploads WHERE created_at < ?").bind(Date.now() - UPLOAD_EXPIRY_MS).run().catch(() => {});
+  await db.prepare("DELETE FROM uploads WHERE created_at < ?").bind(Date.now() - UPLOAD_EXPIRY_MS).run().catch(() => {});
 
   const partSize = partSizeFor(size);
   const totalParts = Math.ceil(size / partSize);
   const stagingKey = `staging/${sha}/${crypto.randomUUID()}`;
-  const mpu = await env.rbox_dev_blobs.createMultipartUpload(stagingKey);
-  await env.rbox_dev_db
+  const mpu = await op.span.r2(() => env.rbox_dev_blobs.createMultipartUpload(stagingKey));
+  await db
     .prepare("INSERT INTO uploads (upload_id, sha256, staging_key, part_size, total_parts, size, created_at, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
     .bind(mpu.uploadId, sha, stagingKey, partSize, totalParts, size, Date.now(), accountId)
     .run();
+  op.done("ok", { bytes: size });
   return json({ uploadId: mpu.uploadId, partSize, totalParts });
 }
 
@@ -139,63 +167,90 @@ export async function multipartStatus(env: Env, sha: string, uploadId: string, a
 export async function multipartPart(req: Request, env: Env, sha: string, uploadId: string, n: number, accountId: string): Promise<Response> {
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
   if (!Number.isInteger(n) || n < 1) return json({ error: "bad_request", message: "bad part number" }, 400);
-  const up = await loadUpload(env, sha, uploadId, accountId);
+  const op = startOp(env, "multipart.part");
+  const up = await loadUpload(op.env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
   if (expired(up)) {
-    await cleanupUpload(env, uploadId);
+    await cleanupUpload(op.env, uploadId);
     return json({ error: "upload_expired" }, 410);
   }
+  const len = Number(req.headers.get("content-length") ?? "0");
   let part: R2UploadedPart;
   try {
     const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
-    part = await mpu.uploadPart(n, req.body);
-  } catch (e) {
-    // R2 MPU gone (expired/aborted) — tell the client to re-init.
-    await cleanupUpload(env, uploadId);
-    return json({ error: "upload_expired", message: String((e as Error)?.message ?? e) }, 410);
+    part = await op.span.r2(() => mpu.uploadPart(n, req.body!));
+  } catch {
+    // R2 MPU gone (expired/aborted) — tell the client to re-init. (No raw message:
+    // privacy; the elapsed R2 time is still recorded via span.r2's try/finally.)
+    await cleanupUpload(op.env, uploadId);
+    op.done("upload_expired", { bytes: len });
+    return json({ error: "upload_expired" }, 410);
   }
-  const len = Number(req.headers.get("content-length") ?? "0");
-  await env.rbox_dev_db
+  await op.env.rbox_dev_db
     .prepare("INSERT OR REPLACE INTO upload_parts (upload_id, part_number, etag, size) VALUES (?, ?, ?, ?)")
     .bind(uploadId, n, part.etag, len)
     .run();
+  op.done("ok", { bytes: len });
   return json({ partNumber: part.partNumber, etag: part.etag });
 }
 
 // POST /v1/blobs/:sha/multipart/:uploadId/complete
 export async function multipartComplete(env: Env, sha: string, uploadId: string, accountId: string): Promise<Response> {
-  const up = await loadUpload(env, sha, uploadId, accountId);
-  if (!up) return json({ error: "unknown_upload" }, 404);
+  // One data point, emitted in `finally` so `ms` covers the WHOLE op including the
+  // always-run R2 delete + D1 cleanup (which run before the response is returned).
+  // dbMs/storeMs accumulate across each phase so the dashboard's R2-vs-D1 split is real.
+  const op = startOp(env, "multipart.complete"); // span accumulates D1 (incl. helpers) + R2 across every phase, even on throw
+  let outcome = "error"; // default ⇒ an UNEXPECTED throw is recorded as "error", not "ok"
+  let bytes = 0;
+  let count = 0;
+  const up = await loadUpload(op.env, sha, uploadId, accountId);
+  if (!up) return json({ error: "unknown_upload" }, 404); // pre-op: not worth a metric
 
-  const rows = await env.rbox_dev_db
+  const sel = await op.env.rbox_dev_db
     .prepare("SELECT part_number, etag FROM upload_parts WHERE upload_id = ? ORDER BY part_number")
     .bind(uploadId)
     .all<{ part_number: number; etag: string }>();
-  const parts = (rows.results ?? []).map((r) => ({ partNumber: r.part_number, etag: r.etag }));
-  if (parts.length !== up.total_parts) return json({ error: "missing_parts", have: parts.length, want: up.total_parts }, 422);
+  const parts = (sel.results ?? []).map((r) => ({ partNumber: r.part_number, etag: r.etag }));
+  count = parts.length;
+  // Short upload: return BEFORE the consume-and-cleanup try so the MPU stays
+  // resumable (the client can upload the rest and retry). No staging delete here.
+  if (parts.length !== up.total_parts) {
+    op.done("missing_parts", { count });
+    return json({ error: "missing_parts", have: parts.length, want: up.total_parts }, 422);
+  }
 
-  // From here the MPU is consumed: assemble staging, publish→canonical with R2
-  // verify, and ALWAYS clean up (a completed MPU can't be retried).
   try {
-    const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
-    await mpu.complete(parts); // composite etag is NOT the content hash — only for assembly
-    const staged = await env.rbox_dev_blobs.get(up.staging_key);
-    if (!staged || !staged.body) return json({ error: "staged_missing" }, 500);
-    const actualSize = staged.size; // charge/record the ACTUAL bytes, not the declared size (M7b)
+    // From here the MPU is consumed: assemble staging, publish→canonical with R2 verify.
+    const staged = await op.span.r2(async () => {
+      const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
+      await mpu.complete(parts); // composite etag is NOT the content hash — only for assembly
+      return env.rbox_dev_blobs.get(up.staging_key);
+    });
+    if (!staged || !staged.body) {
+      outcome = "staged_missing";
+      return json({ error: "staged_missing" }, 500);
+    }
+    bytes = staged.size; // charge/record the ACTUAL bytes, not the declared size (M7b)
     try {
       // Publish to canonical; R2 verifies the whole-object sha server-side.
-      await env.rbox_dev_blobs.put(blobKey(sha), staged.body, { sha256: sha });
-    } catch (e) {
-      return json({ error: "sha_mismatch", message: String((e as Error)?.message ?? e) }, 412);
+      await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), staged.body!, { sha256: sha }));
+    } catch {
+      outcome = "sha_mismatch";
+      return json({ error: "sha_mismatch" }, 412); // no raw message (privacy)
     }
-    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, actualSize).run();
-    await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
-    const q = await grantEntitlementWithQuota(env, accountId, sha, actualSize);
-    if (!q.granted) return json({ error: "quota_exceeded", used: q.used, cap: q.cap }, 402);
-    return json({ ok: true, sha256: sha, sizeBytes: actualSize });
+    await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, bytes).run();
+    await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+    const grant = await grantEntitlementWithQuota(op.env, accountId, sha, bytes);
+    if (!grant.granted) {
+      outcome = "quota_exceeded";
+      return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap }, 402);
+    }
+    outcome = "ok";
+    return json({ ok: true, sha256: sha, sizeBytes: bytes });
   } finally {
-    await env.rbox_dev_blobs.delete(up.staging_key).catch(() => {});
-    await cleanupUpload(env, uploadId);
+    await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch(() => {}));
+    await cleanupUpload(op.env, uploadId);
+    op.done(outcome, { bytes, count });
   }
 }
 

@@ -11,6 +11,11 @@ export interface Env {
   RBOX_PLATFORM_SECRET: string;
   /** WorkspaceSync DO namespace — the per-(workspace,project) commit sequencer + WS fanout. */
   WORKSPACE_SYNC: DurableObjectNamespace;
+  /** Server observability sink (Workers Analytics Engine). Optional: absent in
+   *  local bun tests / before the dataset is provisioned, where emit() no-ops.
+   *  Only low-cardinality op/route/outcome dimensions + numeric metrics are
+   *  written — never user identifiers (see metrics.ts). */
+  rbox_metrics?: AnalyticsEngineDataset;
   /** Stripe secret key (sk_test_/sk_live_). Wrangler secret — absent until billing
    *  is provisioned; the billing routes 501 when missing (feature-gated). */
   STRIPE_SECRET?: string;

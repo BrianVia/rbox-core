@@ -3,6 +3,16 @@
 /** A lowercase-hex SHA-256 (32 bytes) — every content address / blob ref. */
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
+/** Stable error class for privacy-safe logging — never the raw message/stack. */
+export const errClass = (e: unknown): string => (e instanceof Error ? e.name : typeof e);
+
+/** Structured, metadata-safe error log. The ONLY way to log an error on a path that
+ *  touches user metadata (workspace/project/commit/body/device binds): name the event
+ *  + its error class, never the raw message/stack (privacy ban-list, design §5). */
+export function logErr(event: string, e: unknown): void {
+  console.error(JSON.stringify({ event, errorClass: errClass(e) }));
+}
+
 export function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
