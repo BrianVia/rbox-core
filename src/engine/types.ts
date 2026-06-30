@@ -34,22 +34,38 @@ export interface FileEntry {
  * addressed blobs, never materialized in the working tree. Absent when the repo
  * is ineligible (not opt-in / unsupported layout) or empty (no commits).
  */
+/** §28 — a git artifact stored as an E2EE blob: `encSha` is the ciphertext address (what the
+ *  server stores + what's charged/GC-rooted via blobRefs), `sha` is the plaintext content id
+ *  (decrypt-verify + the stable identity input), `cipherSize` is the ciphertext byte length
+ *  (upload size + the advisory blobRef size — NEVER the plaintext size, which would leak ≈repo
+ *  size). All three ride INSIDE the E2EE-encrypted manifest, so none is server-visible plaintext. */
+export interface GitArtifactRef {
+  sha: string;
+  encSha: string;
+  cipherSize: number;
+}
+
 export interface GitSection {
-  /** sha of the `git bundle` blob (all refs + stash + a temp ref making index blobs reachable). */
+  /** plaintext sha of the `git bundle` (all refs + stash + a temp ref making index blobs reachable). */
   bundleSha: string;
-  /** sha of the bundle blob's byte length, for streaming upload. */
-  bundleSize: number;
+  /** ciphertext address of the encrypted bundle blob (stored + charged). */
+  bundleEncSha: string;
+  /** ciphertext byte length of the bundle (upload size + advisory blobRef size). */
+  bundleCipherSize: number;
   /** HEAD file contents — "ref: refs/heads/x" or a detached 40-hex sha. */
   head: string;
   /** refname → commit sha for every published ref (identity + receiver publish set). */
   refs: Record<string, string>;
-  /** sha of the `.git/index` blob (staging) for exact restore, if present. */
+  /** plaintext sha of the `.git/index` blob (staging) for exact restore, if present. */
   indexSha?: string;
+  /** ciphertext address + size of the encrypted index blob (present iff indexSha is). */
+  indexEncSha?: string;
+  indexCipherSize?: number;
   /** `git write-tree` sha of the staging — a STABLE content identity (the raw index
    *  file hash is not: git refreshes its stat info). Used for change-detection. */
   indexTree?: string;
-  /** op-state file path (relative to .git) → blob sha: MERGE_HEAD, REBASE_HEAD, rebase-merge/**, etc. */
-  opState?: Record<string, string>;
+  /** op-state file path (relative to .git) → artifact ref: MERGE_HEAD, REBASE_HEAD, rebase-merge/**, etc. */
+  opState?: Record<string, GitArtifactRef>;
   generatedAt: string;
 }
 

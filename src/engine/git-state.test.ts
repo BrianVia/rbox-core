@@ -8,6 +8,7 @@ import { applyGitState, captureGitState, gitIdentity, gitIdentityKey, gitPreflig
 
 const exec = promisify(execFile);
 const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
+const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
 
 let tmp: string;
 let A: string;
@@ -58,12 +59,22 @@ test("capture→apply reproduces branches, staged state, and stash across repos"
   await fs.writeFile(path.join(A, "g.txt"), "staged");
   await git(A, "add", "g.txt");
 
-  const section = await captureGitState(A, store);
+  const section = await captureGitState(A, store, KEK);
   expect(section).toBeDefined();
+  // §28 zero-knowledge: the stored blobs are CIPHERTEXT — a stored bundle must not be a valid
+  // git bundle, and the plaintext content "v2" must not appear in ANY stored blob.
+  const bundleBytes = await store.get(section!.bundleEncSha);
+  expect(bundleBytes.subarray(0, 16).toString("utf8")).not.toContain("# v2 git bundle"); // git bundle magic header absent
+  for (const f of await fs.readdir(path.join(tmp, "store"), { recursive: true } as never).catch(() => [] as string[])) {
+    const p = path.join(tmp, "store", f as string);
+    if ((await fs.stat(p).catch(() => null))?.isFile()) {
+      expect((await fs.readFile(p)).toString("latin1")).not.toContain("staged"); // a known plaintext blob content
+    }
+  }
 
-  // Fresh repo B, apply the captured state.
+  // Fresh repo B, apply the captured (encrypted) state — decrypts + reproduces byte-identically.
   await initRepo(B);
-  const res = await applyGitState(B, section!, store);
+  const res = await applyGitState(B, section!, store, KEK);
   expect(res.applied).toBe(true);
 
   // Branches + commits match.
@@ -80,6 +91,27 @@ test("capture→apply reproduces branches, staged state, and stash across repos"
 
   // fsck clean.
   await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("apply with the WRONG key fails closed — no .git mutation (§28 decrypt-before-mutate)", async () => {
+  await initRepo(A);
+  await fs.writeFile(path.join(A, "f.txt"), "remote-content");
+  await git(A, "add", "f.txt");
+  await git(A, "commit", "-qm", "remote");
+  const section = await captureGitState(A, store, KEK);
+
+  // B has its own committed state that must survive a failed apply.
+  await initRepo(B);
+  await fs.writeFile(path.join(B, "local.txt"), "local");
+  await git(B, "add", "local.txt");
+  await git(B, "commit", "-qm", "local");
+  const bHeadBefore = await git(B, "rev-parse", "HEAD");
+
+  const res = await applyGitState(B, section!, store, Buffer.alloc(32, 99)); // WRONG key
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("decrypt"); // failed at decrypt, before any mutation
+  expect(await git(B, "rev-parse", "HEAD")).toBe(bHeadBefore); // B untouched
+  expect((await git(B, "branch", "--format=%(refname:short)")).split("\n")).toEqual(["main"]); // no remote refs leaked in
 });
 
 test("gitIdentity is stable across captures when nothing changed (no echo)", async () => {

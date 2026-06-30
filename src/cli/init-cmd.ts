@@ -105,6 +105,9 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
     rootPath: plan.root,
     remoteUrl: plan.remoteUrl,
     token: "",
+    // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a non-git root;
+    // pass --git false to opt out. This is the git-native sync the product is built around.
+    syncGit: plan.syncGit,
   };
   await saveConfig(plan.root, cfg);
 

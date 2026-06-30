@@ -6,7 +6,13 @@ import { promisify } from "node:util";
 import type { BlobStore } from "./blobstore.js";
 import { hashFile } from "./hash.js";
 import { writeFileAtomic } from "./fsutil.js";
-import type { GitSection } from "./types.js";
+import { encryptFileToTemp, decryptFileToPath } from "./crypto.js";
+import type { GitArtifactRef, GitSection } from "./types.js";
+
+/** The stable, plaintext-only identity of a repo's git state (no ciphertext addresses) —
+ *  what change-detection compares. Distinct from the stored `GitSection`, whose blob fields
+ *  are encShas. opState here is `rel → plaintext sha`. */
+export type GitIdentity = Pick<GitSection, "head" | "refs" | "indexTree"> & { opState?: Record<string, string> };
 
 const exec = promisify(execFile);
 
@@ -65,7 +71,7 @@ export async function gitPreflight(root: string): Promise<{ ok: boolean; reason?
 }
 
 /** Cheap, stable identity of the repo state (no bundling). Undefined if no commits. */
-export async function gitIdentity(root: string): Promise<Omit<GitSection, "bundleSha" | "bundleSize" | "generatedAt"> | undefined> {
+export async function gitIdentity(root: string): Promise<GitIdentity | undefined> {
   if (!(await gitOk(root, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
   const refs = await readRefs(root);
   const head = (await fs.readFile(path.join(root, ".git", "HEAD"), "utf8")).trim();
@@ -85,7 +91,7 @@ export async function gitIdentity(root: string): Promise<Omit<GitSection, "bundl
  * these files via atomic rename, so a copy is always an internally-consistent
  * snapshot.) History rides the bundle, which git produces consistently regardless.
  */
-export async function captureGitState(root: string, store: BlobStore): Promise<GitSection | undefined> {
+export async function captureGitState(root: string, store: BlobStore, kek: Buffer): Promise<GitSection | undefined> {
   if (!(await gitOk(root, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcap-"));
@@ -123,25 +129,33 @@ export async function captureGitState(root: string, store: BlobStore): Promise<G
       if (wip) await git(root, ["update-ref", "-d", "refs/rbox-wip"]).catch(() => {});
     }
 
-    // 4. Hash + upload everything from the staging copies (sha always matches bytes).
-    const bundleSha = await hashFile(bundlePath);
-    const bundleSize = (await fs.stat(bundlePath)).size;
-    await putBlobFromFile(store, bundleSha, bundlePath, bundleSize);
+    // 4. §28: ENCRYPT each staged artifact under the workspace KEK, upload the CIPHERTEXT by
+    //    encSha (convergent — same primitive as file blobs), and record (plaintext sha, encSha,
+    //    cipherSize). The server only ever sees ciphertext + encShas; the manifest carrying this
+    //    section is itself E2EE-encrypted, so refs/HEAD/object-shas stay private too.
+    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir);
 
-    let indexSha: string | undefined;
-    if (stagedIndex) {
-      indexSha = await hashFile(stagedIndex);
-      await putBlobFromFile(store, indexSha, stagedIndex);
-    }
+    let index: GitArtifactRef | undefined;
+    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir);
     const indexTree = (await git(root, ["write-tree"]).catch(() => "")) || undefined;
-    const opState: Record<string, string> = {};
+    const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
-      const sha = await hashFile(staged);
-      opState[rel] = sha;
-      await putBlobFromFile(store, sha, staged);
+      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir);
     }
 
-    return { bundleSha, bundleSize, head, refs, indexSha, indexTree, opState: Object.keys(opState).length ? opState : undefined, generatedAt: new Date().toISOString() };
+    return {
+      bundleSha: bundle.sha,
+      bundleEncSha: bundle.encSha,
+      bundleCipherSize: bundle.cipherSize,
+      head,
+      refs,
+      indexSha: index?.sha,
+      indexEncSha: index?.encSha,
+      indexCipherSize: index?.cipherSize,
+      indexTree,
+      opState: Object.keys(opState).length ? opState : undefined,
+      generatedAt: new Date().toISOString(),
+    };
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -149,10 +163,13 @@ export async function captureGitState(root: string, store: BlobStore): Promise<G
 
 /** A stable string fingerprint for reconcile/change-detection. Uses the write-tree
  *  staging identity (NOT the volatile raw index hash) and excludes bundle bytes. */
-export function gitIdentityKey(g: GitSection | { refs: Record<string, string>; head: string; indexTree?: string; opState?: Record<string, string> } | undefined): string {
+export function gitIdentityKey(g: GitSection | GitIdentity | undefined): string {
   if (!g) return "none";
   const refs = Object.entries(g.refs).sort().map(([k, v]) => `${k}=${v}`).join(",");
-  const ops = g.opState ? Object.entries(g.opState).sort().map(([k, v]) => `${k}=${v}`).join(",") : "";
+  // opState values are plaintext shas in a GitIdentity but {sha,encSha,cipherSize} in a stored
+  // GitSection — normalize to the PLAINTEXT sha so identity is stable across both shapes (and
+  // doesn't stringify a GitArtifactRef to "[object Object]", which would re-bundle every push).
+  const ops = g.opState ? Object.entries(g.opState).sort().map(([k, v]) => `${k}=${typeof v === "string" ? v : v.sha}`).join(",") : "";
   return `${g.head}|${g.indexTree ?? ""}|${refs}|${ops}`;
 }
 
@@ -166,18 +183,28 @@ const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 
 /** Reject a malformed/hostile section before it touches `.git`. */
+function validArtifactRef(r: GitArtifactRef | undefined): boolean {
+  return !!r && HEX64.test(r.sha) && HEX64.test(r.encSha) && Number.isInteger(r.cipherSize) && r.cipherSize >= 0;
+}
+
 export function validateGitSection(s: GitSection): { ok: boolean; reason?: string } {
-  if (!HEX64.test(s.bundleSha)) return { ok: false, reason: "bad bundleSha" };
-  if (s.indexSha && !HEX64.test(s.indexSha)) return { ok: false, reason: "bad indexSha" };
+  // §28: the bundle is mandatory and addressed by both its plaintext sha (decrypt-verify) and
+  // its encSha (the ciphertext blob actually fetched). Both must be well-formed.
+  if (!HEX64.test(s.bundleSha) || !HEX64.test(s.bundleEncSha)) return { ok: false, reason: "bad bundle sha/encSha" };
+  if (!Number.isInteger(s.bundleCipherSize) || s.bundleCipherSize < 0) return { ok: false, reason: "bad bundleCipherSize" };
+  // index is optional but, if present, both shas + size travel together.
+  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined) {
+    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize! })) return { ok: false, reason: "bad index ref" };
+  }
   if (!/^(ref: refs\/[A-Za-z0-9._\/-]+|[0-9a-f]{40})$/.test(s.head.trim())) return { ok: false, reason: "bad HEAD" };
   for (const [ref, sha] of Object.entries(s.refs)) {
     if (!isSyncableRef(ref) || ref.includes("..") || ref.includes("\0")) return { ok: false, reason: `bad ref ${ref}` };
     if (!HEX40.test(sha)) return { ok: false, reason: `bad ref sha ${ref}` };
   }
-  for (const [rel, sha] of Object.entries(s.opState ?? {})) {
+  for (const [rel, ref] of Object.entries(s.opState ?? {})) {
     const okRel = OP_STATE_FILES.includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
     if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };
-    if (!HEX64.test(sha)) return { ok: false, reason: `bad opState sha ${rel}` };
+    if (!validArtifactRef(ref)) return { ok: false, reason: `bad opState ref ${rel}` };
   }
   return { ok: true };
 }
@@ -217,7 +244,7 @@ async function restoreLocal(root: string, snap: LocalSnapshot): Promise<void> {
  * receiver quiescence, transactionally. On any failure or fsck-fail, ROLL BACK to
  * the pre-apply snapshot. Quarantines local first (fail-closed if that fails).
  */
-export async function applyGitState(root: string, section: GitSection, store: BlobStore): Promise<ApplyGitResult> {
+export async function applyGitState(root: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
 
@@ -225,10 +252,35 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
   if (await gitBusy(root)) return { applied: false, reason: "receiver git busy" };
 
   const gitDir = path.join(root, ".git");
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitap-"));
+  // Stage on the REPO's filesystem (under .rbox), NOT os.tmpdir() — the decrypted index/op-state
+  // are moved into .git with fs.rename, which throws EXDEV across mounts. On Linux/containers
+  // /tmp is commonly a separate tmpfs from the repo, so an os.tmpdir() staging would fail git
+  // apply on every pull (it only worked on macOS because $TMPDIR + the repo share one APFS volume).
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  const tmpDir = await fs.mkdtemp(path.join(root, ".rbox", "gitap-"));
   const hadHead = await gitOk(root, ["rev-parse", "--verify", "HEAD"]);
   const snap = await snapshotLocal(root);
   try {
+    // §28 (codex M4): fetch + DECRYPT + verify ALL artifacts into temp files BEFORE touching
+    // `.git`. A decrypt/fetch/verify failure (wrong key, swapped blob, corruption) returns
+    // {applied:false} with the local repo untouched — never aborts mid-mutation. GCM + the
+    // plaintext-sha check in decryptFileToPath authenticate each artifact here.
+    const bundlePath = path.join(tmpDir, "in.bundle");
+    const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;
+    const opTmp: Array<{ rel: string; tmp: string }> = [];
+    try {
+      await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
+      if (indexTmp) await getGitArtifact(store, kek, { sha: section.indexSha!, encSha: section.indexEncSha!, cipherSize: section.indexCipherSize! }, indexTmp, tmpDir);
+      for (const [rel, ref] of Object.entries(section.opState ?? {})) {
+        const tmp = path.join(tmpDir, "op", rel);
+        await getGitArtifact(store, kek, ref, tmp, tmpDir);
+        opTmp.push({ rel, tmp });
+      }
+    } catch (e) {
+      return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}` };
+    }
+    if (!(await gitOk(root, ["bundle", "verify", bundlePath]))) return { applied: false, reason: "bundle verify failed" };
+
     // Quarantine local committed state first — fail closed if we can't.
     let conflictBundle: string | undefined;
     if (hadHead) {
@@ -242,10 +294,7 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
       }
     }
 
-    // Import objects from the remote bundle into a non-checked-out namespace.
-    const bundlePath = path.join(tmpDir, "in.bundle");
-    await getBlobToFile(store, section.bundleSha, bundlePath);
-    if (!(await gitOk(root, ["bundle", "verify", bundlePath]))) return { applied: false, reason: "bundle verify failed", conflictBundle };
+    // Import objects from the (decrypted, verified) remote bundle into a non-checked-out namespace.
     await git(root, ["fetch", bundlePath, "refs/*:refs/rbox-incoming/*"], { maxBuffer: 64 * 1024 * 1024 });
 
     try {
@@ -256,9 +305,9 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
       }
       await writeFileAtomic(path.join(gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
 
-      // Restore index + op-state via temp→rename (never a torn live file).
-      if (section.indexSha) await getBlobAtomic(store, section.indexSha, path.join(gitDir, "index"));
-      await restoreOpState(root, section.opState ?? {}, store);
+      // Restore index + op-state from the pre-decrypted temp files via atomic rename.
+      if (indexTmp) await fs.rename(indexTmp, path.join(gitDir, "index"));
+      await restoreOpState(root, opTmp);
 
       if (!(await gitOk(root, ["fsck", "--connectivity-only", "--no-dangling"]))) {
         await restoreLocal(root, snap); // ROLLBACK
@@ -280,11 +329,11 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
  * CONFLICT preserve (both sides diverged): do NOT clobber local. Import the remote
  * refs into a recovery namespace and bundle, so the user can merge manually.
  */
-export async function preserveGitConflict(root: string, section: GitSection, store: BlobStore): Promise<{ recoveryBundle?: string }> {
+export async function preserveGitConflict(root: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<{ recoveryBundle?: string }> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcf-"));
   try {
     const bundlePath = path.join(tmpDir, "remote.bundle");
-    await getBlobToFile(store, section.bundleSha, bundlePath);
+    await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
     if (!(await gitOk(root, ["bundle", "verify", bundlePath]))) return {};
     const ts = `${Date.now()}`;
     await git(root, ["fetch", bundlePath, `refs/*:refs/rbox-conflict/${ts}/*`], { maxBuffer: 64 * 1024 * 1024 }).catch(() => {});
@@ -336,14 +385,19 @@ async function readOpState(root: string, hash: (absPath: string) => Promise<stri
   return out;
 }
 
-async function restoreOpState(root: string, opState: Record<string, string>, store: BlobStore): Promise<void> {
+async function restoreOpState(root: string, opTmp: Array<{ rel: string; tmp: string }>): Promise<void> {
   // Remove any op-state the sender no longer has (completed operation).
+  const want = new Set(opTmp.map((o) => o.rel));
   const existing = await readOpState(root, async () => "");
   for (const rel of Object.keys(existing)) {
-    if (!(rel in opState)) await fs.rm(path.join(root, ".git", rel), { force: true }).catch(() => {});
+    if (!want.has(rel)) await fs.rm(path.join(root, ".git", rel), { force: true }).catch(() => {});
   }
-  for (const [rel, sha] of Object.entries(opState)) {
-    await getBlobAtomic(store, sha, path.join(root, ".git", rel));
+  // Atomic-rename each PRE-DECRYPTED temp into place (decryption already happened + verified
+  // before any mutation, §28 codex M4) — never a torn or plaintext-less live file.
+  for (const { rel, tmp } of opTmp) {
+    const dest = path.join(root, ".git", rel);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.rename(tmp, dest);
   }
 }
 
@@ -378,30 +432,36 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-async function putBlobFromFile(store: BlobStore, sha: string, srcPath: string, size?: number): Promise<void> {
-  if (await store.has(sha)) return;
-  if (store.putFile) {
-    await store.putFile(sha, srcPath, size ?? (await fs.stat(srcPath)).size);
-  } else {
-    await store.put(sha, await fs.readFile(srcPath));
+/** §28: ENCRYPT a staged plaintext artifact under the workspace KEK, upload the CIPHERTEXT by
+ *  its encSha (convergent — same primitive + receipt-capturing store path as file blobs), and
+ *  return the (plaintext sha, encSha, cipherSize) ref. Skips the upload if the account already
+ *  has the ciphertext blob (entitled+present). The temp ciphertext is always cleaned up. */
+async function putGitArtifact(store: BlobStore, kek: Buffer, srcPath: string, tmpDir: string): Promise<GitArtifactRef> {
+  const enc = await encryptFileToTemp(srcPath, kek, tmpDir);
+  try {
+    if (!(await store.has(enc.encSha))) {
+      if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize);
+      else await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+    }
+  } finally {
+    await fs.rm(enc.ciphertextPath, { force: true });
   }
+  return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
 }
+
 async function getBlobToFile(store: BlobStore, sha: string, destPath: string): Promise<void> {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   if (store.getToFile) await store.getToFile(sha, destPath);
   else await fs.writeFile(destPath, await store.get(sha));
 }
 
-/** Download to a temp sibling, then atomic-rename into place — never a torn live
- *  `.git` file (HEAD/index/op-state). */
-async function getBlobAtomic(store: BlobStore, sha: string, destPath: string): Promise<void> {
+/** §28: fetch a git artifact's CIPHERTEXT by encSha, then decrypt+verify (GCM tag + plaintext-sha)
+ *  to `destPath`. Throws on any fetch/decrypt/verify failure — callers run this into temp files
+ *  BEFORE mutating `.git` (codex M4), so a bad/ swapped/ corrupt blob never half-applies. */
+async function getGitArtifact(store: BlobStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
+  const ct = path.join(tmpDir, `ct-${ref.encSha}`);
+  await getBlobToFile(store, ref.encSha, ct);
   await fs.mkdir(path.dirname(destPath), { recursive: true });
-  const tmp = `${destPath}.rbox-tmp-${process.pid}-${Math.abs(hashLite(sha + destPath))}`;
-  await getBlobToFile(store, sha, tmp);
-  await fs.rename(tmp, destPath);
-}
-function hashLite(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
-  return h;
+  await decryptFileToPath(ct, kek, ref.sha, destPath);
+  await fs.rm(ct, { force: true });
 }

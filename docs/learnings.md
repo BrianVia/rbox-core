@@ -549,3 +549,60 @@ yet directly swept" (literally in the comment). It had never been measured. When
 by analogy to another, write down that it's unverified — and actually sweep it before trusting it.
 Both concurrency defaults (upload AND download) turned out to be stale-low; the upload one because
 §23 moved its bottleneck, the download one because it was never measured at all.
+
+## 2026-06-30 — §28 git-sync under E2EE: the dormant feature, and where the config actually lived
+
+Lifted the M5 "encryption + git-sync unsupported" refusal by encrypting git artifacts
+(bundle/index/op-state) as convergent E2EE blobs — git-sync now works zero-knowledge + defaults on.
+
+**The feature was DORMANT, not missing.** git-native sync (M2) shipped, then the full-E2EE
+milestone made E2EE the only mode but never wired git artifacts into the encryption — so a core,
+built feature was unreachable (every push threw). Lesson: when a milestone changes a global
+invariant (here: "everything is encrypted"), grep for features that silently became unreachable
+under it. design 05 §6 had even flagged this exact follow-up; it just never got done.
+
+**The default lived in a different place than I first edited.** `init` routes to
+`runInit`→`executeInitPlan` (init-cmd.ts), NOT the `link` case (index.ts) where I first set
+`syncGit` default-on. The symptom: `workspace.json` had no `syncGit` field and git-sync silently
+no-op'd despite a green typecheck + passing tests. Lesson: when a setting "doesn't take," verify
+which code path actually constructs the persisted artifact (here: `executeInitPlan`, fed by
+`init-plan.ts` where "all decision logic lives") — a passing build doesn't prove the right path ran.
+
+**Verify E2EE features by grepping the SERVER's stored bytes, not just by round-trip.** A clone
+succeeding proves decryption works, but the zero-knowledge claim needs the inverse: fetch every
+blob the server stored and grep for known plaintext markers (commit message, branch name, file
+content, filenames, `refs/heads`, git-bundle magic) — all must be ABSENT. On a real repo
+(savvy-core: 762 commits, 246 tags, 17MB .git) the clone reproduced all 247 syncable refs + 585
+reachable commits byte-identically, while the 5 server blobs held only ciphertext.
+
+**Decrypt-before-mutate is the apply-atomicity rule.** Fetch+decrypt+verify ALL git artifacts into
+temp files BEFORE touching `.git`; a wrong-key/corrupt/swapped blob then aborts with the local repo
+untouched (proven: wrong-KEK apply → applied:false, HEAD unchanged). Inserting decryption ahead of
+the existing quarantine/fsck/rollback preserves those guarantees.
+
+**git-remote-gcrypt validates the model + names the scaling limit.** Encrypt-by-ciphertext-hash +
+refs-in-the-signed-encrypted-manifest is exactly gcrypt's format. gcrypt also warns the full-bundle-
+per-push model (which §28 v1 uses) re-uploads all history each git change → the future optimization
+is incremental encrypted packs (gcrypt's `L:` list). Deferred until measured.
+
+## 2026-06-30 — §28 post-impl scrutiny: two bugs my macOS e2e structurally could not catch
+
+Adversarial scrutiny of the §28 implementation found two real bugs invisible to a green test suite
+AND a passing macOS end-to-end:
+
+**EXDEV: stage temp files on the REPO's filesystem, not os.tmpdir().** `applyGitState` decrypted
+git artifacts into `os.tmpdir()` then `fs.rename`d them into `.git`. `fs.rename` throws `EXDEV`
+across filesystems — and on Linux/containers `/tmp` is usually a separate mount (tmpfs) from the
+repo. So git-sync would fail on EVERY pull on Linux, while passing on macOS (where `$TMPDIR` and
+`/Users` share one APFS volume) — a platform-shaped blind spot. The pre-§28 code deliberately used
+a temp SIBLING inside `.git`; §28 lost that. Fix: `mkdtemp` under `<root>/.rbox`. Verified on a
+Linux host with the repo on a ZFS mount and TMPDIR on ext4: old mechanism = `EXDEV`, fixed = clean
+clone. **Lesson: any decrypt-to-temp-then-rename-into-place must stage on the destination's fs, and
+a same-fs dev box (macOS APFS) will never surface the cross-fs bug — test on a real separate mount.**
+
+**A recovery path that's overwritten before it's used is dead code.** My 422 git-recapture set
+`local.git` in the retry branch, but the recursive `pushManifest` recomputes `local.git` at the top
+of every call — so the recapture was discarded (wasteful always; still looped in its target case).
+Fix: thread a `forceGitRecapture` flag through the recursion so the single capture site honors it.
+**Lesson: when a function recomputes state X at entry, setting X right before re-calling it is a
+no-op — pass intent (a flag), not the recomputed value.**

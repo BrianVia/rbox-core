@@ -46,6 +46,8 @@ export interface InitPlan {
   deviceId: ResolvedDeviceId;
   /** new→push (publish), join→sync (pull-first, surface conflicts), --no-sync→none. */
   firstSync: "push" | "sync" | "none";
+  /** §28: git-sync defaults ON (git artifacts are E2EE-encrypted); --git false opts out. */
+  syncGit: boolean;
 }
 
 export interface InitError {
@@ -117,5 +119,5 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   const firstSync: InitPlan["firstSync"] =
     flags["no-sync"] === TRUE ? "none" : workspace.kind === "new" ? "push" : "sync";
 
-  return { auth, workspace, root, remoteUrl, deviceId: unifyDeviceId(creds), firstSync };
+  return { auth, workspace, root, remoteUrl, deviceId: unifyDeviceId(creds), firstSync, syncGit: flags.git !== "false" };
 }

@@ -83,7 +83,8 @@ async function withCache(
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
  *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha). */
 async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest, onProgress?: SyncDeps["onProgress"]): Promise<void> {
-  if (cfg.syncGit) throw new Error("encryption + git-state sync aren't supported together yet (M5 limitation; full-E2EE milestone covers it)");
+  // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
+  // are now convergent-encrypted under the same KEK (captureGitForPush), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
   const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
@@ -139,11 +140,12 @@ async function captureGitForPush(
   api: SyncRemote
 ): Promise<GitSection | undefined> {
   if (!cfg.syncGit) return undefined;
+  if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
   if (!(await gitPreflight(root)).ok) return baseGit;
   const localId = await gitIdentity(root);
   if (!localId) return baseGit; // empty repo (no commits) → no git section yet
   if (baseGit && gitIdentityKey(localId) === gitIdentityKey(baseGit)) return baseGit; // unchanged → carry
-  return captureGitState(root, api.blobStore()); // changed → capture + upload artifacts
+  return captureGitState(root, api.blobStore(), cfg.kek); // changed → ENCRYPT + capture + upload artifacts
 }
 
 /**
@@ -198,17 +200,18 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     const baseKey = gitIdentityKey(baseGit);
     const remoteKey = gitIdentityKey(remote.git);
     if (remote.git && remoteKey !== baseKey) {
+      if (!kek) throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
       const store = api.blobStore();
       const localChanged = gitIdentityKey(await gitIdentity(root)) !== baseKey;
       if (localChanged) {
         // Both sides diverged → never auto-clobber local. Preserve remote for manual
         // merge and checkpoint the base to remote so we stop pull-conflict-looping.
-        const { recoveryBundle } = await preserveGitConflict(root, remote.git, store);
+        const { recoveryBundle } = await preserveGitConflict(root, remote.git, store, kek);
         appliedGit = remote.git;
         console.error(`rbox: git conflict — local kept; remote preserved at ${recoveryBundle} and refs/rbox-conflict/*. Resolve manually.`);
       } else {
         // Clean fast-forward (local == base): apply remote transactionally.
-        const res = await applyGitState(root, remote.git, store);
+        const res = await applyGitState(root, remote.git, store, kek);
         if (res.applied) appliedGit = remote.git;
         else {
           appliedGit = baseGit; // deferred/rolled-back → retry next pull
@@ -250,7 +253,8 @@ export async function pushManifest(
   local: Manifest,
   deps: SyncDeps = {},
   attempt = 0,
-  purgeIgnored = false
+  purgeIgnored = false,
+  forceGitRecapture = false
 ): Promise<{ sequence: number; manifest: Manifest }> {
   const api = deps.remote ?? apiFor(cfg);
   const backoff = deps.backoff ?? defaultBackoff;
@@ -271,7 +275,12 @@ export async function pushManifest(
 
   // Attach the git section (M2): capture only when its stable identity changed
   // vs the base (re-bundling unchanged state would echo forever); else carry it.
-  local = { ...local, git: await captureGitForPush(root, cfg, state.lastSyncedManifest.git, api) };
+  // §28: a 422-retry forces a git RE-CAPTURE (base=undefined ⇒ no identity-carry) so a git
+  // artifact missing server-side is re-bundled + re-uploaded — the recursive call recomputes
+  // local.git here, so the force MUST live at this single site (not after the commit) or it's
+  // overwritten and the recovery is dead (codex scrutiny).
+  const gitBase = forceGitRecapture ? undefined : state.lastSyncedManifest.git;
+  local = { ...local, git: await captureGitForPush(root, cfg, gitBase, api) };
 
   const filesUnchanged = (() => {
     const d = diffManifests(state.lastSyncedManifest, local);
@@ -306,8 +315,12 @@ export async function pushManifest(
   }
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
-    await doUpload(); // re-check + re-upload (encrypted or plaintext)
-    return pushManifest(root, cfg, local, deps, attempt + 1, purgeIgnored);
+    await doUpload(); // re-check + re-upload missing FILE ciphertext blobs
+    // §28 (codex M3): file re-upload alone can't satisfy a missing GIT artifact — the
+    // identity-carry in captureGitForPush would re-reference the absent bundle. Force a git
+    // re-capture on the retry (the recursion recomputes local.git, so the force is a flag, not
+    // a mutation here — that was dead code per scrutiny).
+    return pushManifest(root, cfg, local, deps, attempt + 1, purgeIgnored, cfg.syncGit);
   }
 
   await saveState(root, { lastSyncedSequence: res.sequence!, lastSyncedManifest: local });

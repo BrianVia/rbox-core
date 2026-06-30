@@ -93,14 +93,16 @@ async function main(): Promise<void> {
         rootPath: root,
         remoteUrl,
         token: "", // token comes from `rbox login` (per-machine credential), never config
-        syncGit: flags.git === "true",
+        // §28: git-sync defaults ON (git artifacts are now E2EE-encrypted). It no-ops on a
+        // non-git root (gitPreflight) and is byte-for-byte zero-knowledge; pass --git false to opt out.
+        syncGit: flags.git !== "false",
       };
       await saveConfig(root, cfg);
       console.log(`linked ${root}`);
       console.log(`  workspace: ${cfg.remoteWorkspaceId}`);
       console.log(`  device:    ${cfg.deviceId}`);
       console.log(`  remote:    ${cfg.remoteUrl}`);
-      if (cfg.syncGit) console.log(`  git-sync:  on (opt-in)`);
+      if (cfg.syncGit) console.log(`  git-sync:  on (default; encrypted — --git false to opt out)`);
       console.log(`\nLink another machine with:\n  rbox link <path> --workspace ${cfg.remoteWorkspaceId}`);
       break;
     }
