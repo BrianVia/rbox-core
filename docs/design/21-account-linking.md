@@ -408,6 +408,85 @@ link **blocks** rather than silently rebinds when the shell carries billing —
 never strand a paying customer's subscription on an unreachable account. (Blocking
 is the always-safe fallback; the auto-migration saga is the convenience path.)
 
+### 3.4.1 DECISION D1 — `rbox subscribe` is the PRIMARY billing path; re-point is the FALLBACK
+The billing-on-shell wart only exists because a user *paid web-side on a shell*.
+The decision (D1, recorded here) attacks it at the source **and** repairs the
+installed base:
+
+- **PRIMARY — `rbox subscribe` (no shell, no re-point).** A CLI user is already
+  authenticated on their real account X with a **durable** device token. Billing
+  binds the Stripe customer/subscription to **`Principal.accountId`**
+  (`stripe.ts` `billingCheckout`: `client_reference_id`, `metadata[account_id]`,
+  and `subscription_data[metadata][account_id]` are all `p.accountId`, and it
+  reuses the account's existing `stripe_customer_id`). So a durable token calling
+  `POST /v1/billing/checkout` yields a `cs_live` checkout **already bound to X** —
+  the payment lands on the right account with **no Clerk identity, no web shell,
+  and no re-point.** `rbox subscribe` simply opens that checkout URL in the
+  browser; `rbox billing` opens the customer portal (`/v1/billing/portal`). This
+  is a **billing handoff, not an identity handoff** — it binds no Clerk identity
+  and creates no link; it is deliberately kept separate from the `account link`
+  ceremony (which stays dashboard→CLI for takeover-safety, §5.2). The Slice-0
+  route gate already permits a durable token on `/v1/billing/*` (default-deny
+  applies only to `kind=='web'`), so no gate change is needed for the primary
+  path.
+- **FALLBACK — the re-point saga (§3.4.2).** For users who *already* subscribed on
+  a web shell before `rbox subscribe` existed, the link must still move that
+  subscription onto X. That is the re-point saga below. It is the **fallback**,
+  not the default UX — new paying CLI users never touch it.
+
+### 3.4.2 The re-point saga — buildable shape + the dual-routing-key trap
+When `link/confirm` finds the origin shell's **only** blocker is billing (the
+shell is otherwise §3.4-empty) **and** the destination X is **billing-empty**
+(`stripe_customer_id IS NULL` and no active sub), it runs the saga *in place of*
+the `409 origin_account_has_state` block, then reclaims the now-empty shell.
+
+**CRITICAL — the webhook routes by TWO independent keys; moving only D1 columns is
+a split-brain bug.** `stripe.ts`:
+- `customer.subscription.created/updated` route by the **subscription's
+  `metadata.account_id`** (`stripe.ts:177`).
+- `customer.subscription.deleted` (and every ownership guard
+  `WHERE … (stripe_customer_id IS NULL OR = ?)`) routes by the
+  **`accounts.stripe_customer_id`** column (`stripe.ts:189,196,205`).
+
+So if the saga moves only the D1 columns shell→X, the subscription's Stripe
+`metadata.account_id` **still says shell**. The next renewal's
+`subscription.updated` would then target the shell — and because the saga cleared
+the shell's `stripe_customer_id`, the guard `(stripe_customer_id IS NULL OR = ?)`
+**re-binds the customer back onto the shell** (split-brain). **The saga MUST update
+the subscription's Stripe metadata too**, so *both* routing keys point at X.
+
+**Saga steps (idempotent, replayable — modeled on the `stripe_events` discipline):**
+1. **Preflight (reads).** Shell has `stripe_customer_id` **and**
+   `stripe_subscription_id`; shell is otherwise §3.4-empty (the non-billing
+   predicate holds). Destination X has `stripe_customer_id IS NULL`. If X already
+   carries an active subscription → **do NOT merge two subscriptions** → block
+   `409 destination_has_subscription` (route to guided resolution). Any other
+   non-billing shell state → `409 origin_account_has_state` (unchanged block).
+2. **Stripe step (idempotent).** `POST /v1/subscriptions/{sub_id}` setting
+   `metadata[account_id]=X` (and the customer's `metadata[account_id]=X` if used).
+   Re-running sets the identical value — Stripe PATCH semantics make this a no-op
+   on replay. Gated on `STRIPE_SECRET`; if billing isn't provisioned the saga
+   can't run → fall back to the block.
+3. **D1 commit (one atomic `batch`, CAS-guarded).** Move the **full** billing set —
+   `stripe_customer_id, stripe_subscription_id, plan, grace_until,
+   extra_storage_bytes` — onto X **only if X is still billing-empty**
+   (`WHERE id=X AND stripe_customer_id IS NULL`), and clear those columns on the
+   shell **only if they still hold the values we read** (CAS on
+   `stripe_subscription_id`), so a racing webhook can't clobber the move.
+4. **Reclaim the shell** (the existing §3.4 confirm batch — the shell is now
+   billing-empty, so `isReclaimableShell` passes).
+5. **On any failure → block, never half-move.** The Stripe step before the D1
+   move means a failure leaves billing fully on the shell (retryable); a D1 move
+   after a successful Stripe update leaves both routing keys on X (also a
+   consistent, replayable state). Block stays the always-safe fallback.
+
+The order **Stripe-first, D1-second** is deliberate: the Stripe metadata update is
+the irreversible-once-renewed routing decision, so it must land before D1 claims
+the customer for X. A webhook arriving between step 2 and step 3 carries
+`metadata.account_id=X` and the guard `(X.stripe_customer_id IS NULL OR = cust)`
+holds (X is still billing-empty pre-move, then becomes `= cust`), so it routes to
+X either way — never back to the shell.
+
 ---
 
 ## 4. The link ceremony
@@ -788,6 +867,8 @@ and clean link auditing (here). 16/17's "device_id is non-unique" language preda
 | `POST /v1/account/link/confirm` | **PUBLIC** route; **fresh Clerk JWT** + `pollKey` in body (sub==C) | phase 2: one atomic conditional rebind clerk_users→X + shell-resolve + audit (§4.2.1) |
 | `POST /v1/account/unlink` | **AUTHED**; durable **or** web **owner** token on X | rebind C → fresh shell, audit; blocks `409 linked_account_has_billing` if X has Stripe state (§5.4); never touches devices/roster |
 | `GET  /v1/account/status` | **AUTHED**; any token on the account | report `{ accountId, linked }` — whether a `clerk_users` row maps this account (drives `rbox account status`) |
+| `POST /v1/billing/checkout` | **AUTHED**; durable **or** web token | binds the Stripe checkout to `Principal.accountId` (§3.4.1) — the surface `rbox subscribe` opens from a durable token (no new endpoint) |
+| `POST /v1/billing/portal` | **AUTHED**; durable **or** web token | customer-portal URL for `Principal.accountId` — the surface `rbox billing` opens |
 
 "PUBLIC route" = registered in `worker.ts` *before* the global `authenticate()`
 (like `/v1/web/session`), carrying no rbox Principal — so it is outside the §1.1
@@ -803,6 +884,9 @@ web-token gate and verifies its Clerk JWT internally (Round-3 finding 3).
 | `src/cli/index.ts` | new `account` command group (`link`/`status`/`unlink`) — must NOT collide with existing `link <path>` (§4.0) |
 | `src/cli/auth-cmd.ts` | `accountLink(code)`, `accountStatus()`, `accountUnlink()` |
 | `apps/web/` | dashboard "Link your CLI account": start → show code → poll → **confirm target account** (phase 2) |
+| `apps/api/src/stripe.ts` | new `repointBillingToAccount` saga (§3.4.2): idempotent Stripe `metadata[account_id]` update + CAS-guarded D1 billing-column move shell→X (the dual-routing-key fix) |
+| `apps/api/src/account-link.ts` | `confirmLink` runs the saga when the shell's ONLY blocker is billing AND X is billing-empty (else block); `409 destination_has_subscription` when X already has a sub |
+| `src/cli/subscribe-cmd.ts` (+ `index.ts`) | `rbox subscribe [plan]` / `rbox billing` — call `/v1/billing/{checkout,portal}` with the durable token and open the URL cross-platform (`open`/`xdg-open`; print as fallback) |
 
 **Tests (business logic, per CLAUDE.md — not type-checks):**
 - Two-phase happy path: start (fresh JWT) → redeem (durable owner) records
@@ -837,10 +921,15 @@ web-token gate and verifies its Clerk JWT internally (Round-3 finding 3).
 ---
 
 ## 9. Open questions for the human
-1. **Billing-on-shell migration (§3.4) — the real wart.** Re-point the Stripe
-   customer from shell→X automatically for active subs, or always force the guided
-   cancel+resubscribe? (Recommend re-point; needs a billing-row + Stripe metadata
-   move.) The link **blocks** until this is resolved either way.
+1. **Billing-on-shell migration (§3.4) — RESOLVED (D1).** Decision: **`rbox
+   subscribe` is the PRIMARY billing path** (a durable CLI token opens a checkout
+   already bound to X — no shell, no re-point; §3.4.1), and the **re-point saga is
+   the FALLBACK** for users who already paid web-side (§3.4.2, with the
+   dual-routing-key Stripe-metadata fix). Two sub-cases still block (the
+   always-safe fallback): a shell carrying **non-billing** state, and a destination
+   X that **already has an active subscription** (`409
+   destination_has_subscription` — we never auto-merge two subs). Guided
+   cancel+resubscribe (§3.4(b)) remains the manual escape hatch for those.
 2. **Token-kind route gate (§1.1) is now a hard prerequisite of the E2EE ceiling.**
    Ship the `Principal.kind` + mutating-route 403 policy *with* this (recommended —
    without it "web can never sync" is unenforced), or track it as its own

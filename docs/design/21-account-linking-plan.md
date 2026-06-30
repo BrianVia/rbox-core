@@ -8,12 +8,15 @@ These are doc 21 §9. Three actually block code; the rest have safe defaults bak
 
 | # | Decision | Blocks | Plan's default if unanswered |
 |---|----------|--------|------------------------------|
-| D1 | **Billing-on-shell migration** (§3.4/§9.1): auto re-point Stripe shell→X, or force cancel+resubscribe? | Slice 6 only | **Block the link on billing-bearing shells (`409`)** — the always-safe fallback. Saga deferred to Slice 6. |
+| D1 | **Billing-on-shell migration** (§3.4/§9.1) — **DECIDED.** | Slice 6 | **`rbox subscribe` is PRIMARY** (durable CLI token → checkout bound to X, no shell/re-point); **re-point saga is the FALLBACK** for already-paid web shells (§3.4.1/§3.4.2). Slice 6 is now **active**. Block stays the safe fallback (non-billing shell state, or destination-has-sub → `409`). |
 | D2 | **Code form** (§9.3): opaque full-entropy token vs human-typeable `XXXX-XXXX` over ≥128 bits? | Slice 2 (cosmetic) | Opaque ≥128-bit; grouped display is a later polish. |
 | D3 | **`link/start`/`confirm` auth** (§9.6): re-verify the short-lived Clerk JWT, or persist `clerk_user_id`+kind on the web session and authorize by rbox token? | Slice 2 | **Re-verify the Clerk JWT** (design's recommendation — simpler + stronger). |
 | D4 | **Genesis-into-shell** (§9.7): build the web-approved CLI bootstrap so the web shell becomes the crypto world? | — (future) | **Out of scope.** B = web signup + normal bootstrap + A. |
 
-D1 is the only one with real product weight; everything else has a defensible default. **The kind-gate (Slice 0) is non-negotiable — design §1.1/§9.2 say linking must not land without it.**
+D1 is the only one with real product weight; **it is now decided** (see the table) —
+`rbox subscribe` primary, re-point fallback. Everything else has a defensible
+default. **The kind-gate (Slice 0) is non-negotiable — design §1.1/§9.2 say linking
+must not land without it.**
 
 ---
 
@@ -72,11 +75,22 @@ The two-phase bind. Empty-shell reclamation only here; billing-bearing shells **
 
 ---
 
-## Slice 6 — Billing-on-shell migration saga (**deferred, gated on D1**)
-Only needed for the non-empty case where the shell carries a Stripe subscription. Until built, Slice 2 **blocks** those links (`409`) — safe, just not seamless.
-- [ ] If D1 = re-point: **preflight → Stripe update (idempotent, keyed) → D1 commit** saga moving the full billing set (`stripe_customer_id`, `stripe_subscription_id`, `plan`, `grace_until`, extras) shell→X, rebind gated on the Stripe step; then reclaim. Replayable; never half-moved.
-- [ ] If D1 = guided: cancel-at-period-end on shell + resubscribe on X.
-- [ ] Tests: saga idempotency/replay; link unblocks once billing moved; a mid-saga failure leaves a consistent, retryable state.
+## Slice 6 — Billing: `rbox subscribe` (PRIMARY) + re-point saga (FALLBACK) — **ACTIVE (D1 decided)**
+
+### 6a — `rbox subscribe` / `rbox billing` (PRIMARY billing path)
+A durable CLI token already authenticates on X, and `/v1/billing/checkout` binds the
+checkout to `Principal.accountId` — so the CLI can open a checkout bound to X with no
+shell and no re-point. **No new endpoint, no identity bind.**
+- [ ] `src/cli/subscribe-cmd.ts`: `rbox subscribe [plan]` → POST `/v1/billing/checkout?plan=` with the device token → open the returned URL (`open` macOS / `xdg-open` Linux; print URL as fallback when no opener / non-TTY). `rbox billing` → `/v1/billing/portal` likewise.
+- [ ] Verify Slice-0 gate ALLOWS durable on `/v1/billing/{checkout,portal}` (default-deny only hits `kind=='web'`); add a test that a durable token reaches billing and a `web_*` token's behavior is correct.
+- [ ] SECURITY: `subscribe` binds NO Clerk identity and creates NO link — billing handoff ≠ identity handoff. Keep entirely separate from `account link`.
+- [ ] Tests: a durable token hits checkout → account bound to its own X; gate lets `/v1/billing/*` through for durable.
+
+### 6b — re-point saga (FALLBACK, replaces the §3.4 billing block)
+Only for users who already subscribed on a web shell. `confirmLink` runs the saga when the shell's ONLY blocker is billing AND X is billing-empty.
+- [ ] `apps/api/src/stripe.ts` `repointBillingToAccount`: **preflight → Stripe `metadata[account_id]=X` update (idempotent) → CAS-guarded D1 move** of the full billing set (`stripe_customer_id`, `stripe_subscription_id`, `plan`, `grace_until`, `extra_storage_bytes`) shell→X; then reclaim. **MUST update the subscription's Stripe metadata** (dual-routing-key fix, §3.4.2) or the next webhook re-binds to the shell.
+- [ ] Preflight blocks: X already has an active sub → `409 destination_has_subscription` (never auto-merge); any non-billing shell state → `409 origin_account_has_state`.
+- [ ] Tests (Miniflare): re-point happy path (sub→X, **subscription metadata updated**, shell billing cleared, reclaimed); idempotent replay (re-run moves nothing twice); webhook-race (a `subscription.updated` after the metadata update routes to X, not the shell — no re-bind); destination-has-sub → 409; non-billing shell state → still 409.
 
 ---
 
