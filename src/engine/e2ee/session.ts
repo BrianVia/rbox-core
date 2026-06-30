@@ -10,7 +10,7 @@
  * can open a workspace KEK and decrypt.
  */
 import { generateSignKeyPair, generateWrapKeyPair, sign, signKeyPairFromSeed, signPrivateFromPkcs8, signPrivateToPkcs8, wrapPrivateFromPkcs8, wrapPrivateToPkcs8, type SignKeyPair, type WrapKeyPair } from "./asym.js";
-import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type BlobRefset, type SignedCommit } from "./commit.js";
+import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type BlobRefset, type CommitBody, type SignedCommit } from "./commit.js";
 import { buildKeyState, GENESIS_PREV_STATE_HASH, verifyKeyStateChain, type AccountKeyState, type SignedKeyState } from "./epoch.js";
 import { canonicalString, parseStrict } from "./jcs.js";
 import { aesGcmUnwrap, aesGcmWrap, generateMasterKey, generateWorkspaceKek, rsaDeviceUnwrap, rsaDeviceWrap, wrapHash, type Wrap, type WrapContext } from "./keys.js";
@@ -269,6 +269,19 @@ export async function assertMkWrapAuthorized(wrap: Wrap, account: VerifiedAccoun
   if (!account.authorizedMkWrapHashes.has(h)) throw new Error("MK wrap not authorized by the signed roster/key-state (possible server substitution)");
 }
 
+/** Verify a commit's signature against the device active in ITS OWN roster version
+ *  (authentic history — a link may predate a rotation). Throws on an unknown roster,
+ *  an inactive/unknown signer, or a bad signature. Shared by chain + history-segment
+ *  verification and historical decrypt; the head opener (`openCommit`) deliberately
+ *  gates on the CURRENT roster/epoch instead, so it does NOT use this. */
+async function assertSignedByOwnRoster(c: SignedCommit, body: CommitBody, account: VerifiedAccount): Promise<void> {
+  const roster = account.rosters[body.rosterVersion];
+  if (!roster) throw new Error(`commit seq ${body.seq} references unknown rosterVersion ${body.rosterVersion}`);
+  const pub = activeSigners(roster).get(body.deviceId);
+  if (!pub) throw new Error(`commit seq ${body.seq} signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
+  if (!(await verifyCommitSig(c, pub))) throw new Error(`commit seq ${body.seq} signature invalid`);
+}
+
 /**
  * Verify a commit chain descends from the pinned head (C1): hash-links forward
  * from `pin` (or genesis), each commit signed by a device active in ITS OWN
@@ -283,11 +296,7 @@ export async function verifyCommitChain(commits: SignedCommit[], pin: Pin | null
   for (const c of commits) {
     const body = parseCommit(c);
     if (body.parentSeq !== prevSeq || body.parentCommitHash !== prevHash) throw new Error(`commit chain break at seq ${body.seq} (rollback/splice evident)`);
-    const roster = account.rosters[body.rosterVersion];
-    if (!roster) throw new Error(`commit seq ${body.seq} references unknown rosterVersion ${body.rosterVersion}`);
-    const pub = activeSigners(roster).get(body.deviceId);
-    if (!pub) throw new Error(`commit seq ${body.seq} signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
-    if (!(await verifyCommitSig(c, pub))) throw new Error(`commit seq ${body.seq} signature invalid`);
+    await assertSignedByOwnRoster(c, body, account);
     prevHash = c.commitHash;
     prevSeq = body.seq;
   }
@@ -350,11 +359,7 @@ export async function verifyHistorySegment(
     if (prevHash !== null && (body.parentSeq !== prevSeq || body.parentCommitHash !== prevHash)) {
       throw new Error(`history segment chain break at seq ${body.seq} (rollback/splice evident)`);
     }
-    const roster = account.rosters[body.rosterVersion];
-    if (!roster) throw new Error(`history commit seq ${body.seq} references unknown rosterVersion ${body.rosterVersion}`);
-    const pub = activeSigners(roster).get(body.deviceId);
-    if (!pub) throw new Error(`history commit seq ${body.seq} signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
-    if (!(await verifyCommitSig(c, pub))) throw new Error(`history commit seq ${body.seq} signature invalid`);
+    await assertSignedByOwnRoster(c, body, account);
     prevHash = c.commitHash;
     prevSeq = body.seq;
     expectSeq++;
@@ -385,11 +390,7 @@ export async function openCommitHistorical(args: {
   workspaceId: string;
 }): Promise<Uint8Array> {
   const body = parseCommit(args.commit);
-  const roster = args.account.rosters[body.rosterVersion];
-  if (!roster) throw new Error(`historical commit references unknown rosterVersion ${body.rosterVersion}`);
-  const signerPub = activeSigners(roster).get(body.deviceId);
-  if (!signerPub) throw new Error(`historical commit signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
-  if (!(await verifyCommitSig(args.commit, signerPub))) throw new Error("historical commit signature invalid");
+  await assertSignedByOwnRoster(args.commit, body, args.account);
   if ((await sha256Hex(args.encManifest)) !== body.encManifestSha) throw new Error("encManifest does not match the signed encManifestSha");
   return decryptManifest(args.kek, args.secrets.accountId, args.workspaceId, body.keyEpoch, args.encManifest);
 }

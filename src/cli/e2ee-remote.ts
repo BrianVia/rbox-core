@@ -19,8 +19,12 @@ import {
   type Wrap,
 } from "../engine/e2ee/index.js";
 import { hashBytes } from "../engine/hash.js";
-import type { BlobStore, Manifest } from "../engine/index.js";
+import { poolMap, type BlobStore, type Manifest } from "../engine/index.js";
 import { NeedsRebaselineError, type CommitResult, type SyncRemote } from "./remote.js";
+
+/** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
+ *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
+const HISTORY_DECRYPT_CONCURRENCY = 8;
 
 /** §24: emit a sidecar (refs out of the signed body) once the unique ref set is large
  *  enough that the inline body would approach the server's 1 MB commit-body cap. At ~85 B
@@ -76,15 +80,19 @@ export interface E2eeApi {
   latestCommit(): Promise<{ sequence: number; commit: SignedCommit | null }>;
   commitsSince(seq: number): Promise<SignedCommit[]>;
   commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult>;
+  /** Advisory server-reported commit timestamps (seq → epoch-ms) for display only —
+   *  the best-effort D1 mirror, NOT authenticated. Used by `rbox versions` to show a
+   *  time column; the in-memory test fake returns an empty map. */
+  commitTimes(limit: number): Promise<Map<number, number>>;
 }
 
 /** One verified version-history entry (design 12 §15) — all fields from the SIGNED
- *  commit body (no decrypt). Server timestamps are joined in the CLI as advisory. */
+ *  commit body (no decrypt). Advisory server timestamps are fetched separately
+ *  (`advisoryTimes`) and joined by `seq` in the CLI, never commingled here. */
 export interface VersionInfo {
   seq: number;
   deviceId: string;
   keyEpoch: number;
-  commitHash: string;
 }
 
 export interface HeadPin {
@@ -133,11 +141,22 @@ export class E2eeRemote implements SyncRemote {
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     const vh = await this.verifiedHead();
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const body = parseCommit(vh.commit);
-    const kek = await this.kekFor(body.keyEpoch, vh.account, false);
+    const { manifest } = await this.decodeManifestAt(vh.commit, vh.account, false);
+    return { sequence: vh.sequence, manifest };
+  }
+
+  /** Fetch + decrypt ONE commit's manifest, returning it plus the per-epoch KEK (so
+   *  the caller can also decrypt that commit's file blobs). `historical=false` applies
+   *  the C4 head gate (`openCommit`); `true` opens an ancestor already authenticated by
+   *  `verifyHistorySegment` (`openCommitHistorical`, no current-epoch gate). Both openers
+   *  share one args shape, so the only difference is which gate runs. */
+  private async decodeManifestAt(commit: SignedCommit, account: VerifiedAccount, historical: boolean): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+    const body = parseCommit(commit);
+    const kek = await this.kekFor(body.keyEpoch, account, false);
     const encManifest = await this.api.blobStore().get(body.encManifestSha);
-    const json = await openCommit({ secrets: this.ctx.secrets, kek, account: vh.account, commit: vh.commit, encManifest, workspaceId: this.ctx.workspaceId });
-    return { sequence: vh.sequence, manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest };
+    const open = historical ? openCommitHistorical : openCommit;
+    const json = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
+    return { manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest, kek };
   }
 
   /**
@@ -189,20 +208,26 @@ export class E2eeRemote implements SyncRemote {
    * `rbox versions`: the verified commit history within the retained window,
    * newest-first. Each entry is metadata only (no decrypt) — `seq`/`deviceId`/
    * `keyEpoch` from the SIGNED commit body, authenticated as the true ancestry of
-   * the verified head (`verifyHistorySegment`). `commitHash` lets the caller align
-   * advisory server timestamps. Empty when the workspace has no history yet.
+   * the verified head (`verifyHistorySegment`). Empty when the workspace has no
+   * history yet.
    */
   async history(limit: number): Promise<VersionInfo[]> {
-    const vh = await this.verifiedHead();
-    if (!vh) return [];
-    const { account, sequence: head } = vh;
-    const seg = await this.retainedSegmentEndingAtHead(Math.max(0, head - limit), head, vh.commit.commitHash, account);
-    return seg
+    const win = await this.retainedWindow(limit);
+    if (!win) return [];
+    return win.seg
       .map((c) => {
         const b = parseCommit(c);
-        return { seq: b.seq, deviceId: b.deviceId, keyEpoch: b.keyEpoch, commitHash: c.commitHash };
+        return { seq: b.seq, deviceId: b.deviceId, keyEpoch: b.keyEpoch };
       })
       .reverse(); // newest-first
+  }
+
+  /** Advisory, server-reported commit timestamps (seq → epoch-ms) for display only.
+   *  Best-effort + UNVERIFIED (the D1 mirror; commit cadence is a documented residual)
+   *  — kept OUT of the signed `VersionInfo` so advisory data never rides a verified
+   *  field. The CLI joins it by sequence; a lag/miss just shows no time. */
+  advisoryTimes(limit: number): Promise<Map<number, number>> {
+    return this.api.commitTimes(limit);
   }
 
   /**
@@ -227,11 +252,7 @@ export class E2eeRemote implements SyncRemote {
       const chain = await this.api.commitsSince(seq - 1); // (seq-1, head] = seq..head
       target = await verifyHistorySegment(chain, seq, headCommit.commitHash, account);
     }
-    const body = parseCommit(target);
-    const kek = await this.kekFor(body.keyEpoch, account, false);
-    const encManifest = await this.api.blobStore().get(body.encManifestSha);
-    const json = await openCommitHistorical({ secrets: this.ctx.secrets, kek, account, commit: target, encManifest, workspaceId: this.ctx.workspaceId });
-    return { manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest, kek };
+    return this.decodeManifestAt(target, account, true);
   }
 
   /**
@@ -242,48 +263,68 @@ export class E2eeRemote implements SyncRemote {
    * (first appearance and deletion-within-window included; `sha256: null` = absent).
    */
   async pathHistory(relPath: string, limit: number): Promise<Array<{ seq: number; deviceId: string; sha256: string | null }>> {
-    const vh = await this.verifiedHead();
-    if (!vh) return [];
-    const { account, sequence: head } = vh;
-    const seg = await this.retainedSegmentEndingAtHead(Math.max(0, head - limit), head, vh.commit.commitHash, account);
+    const win = await this.retainedWindow(limit);
+    if (!win) return [];
+    const { account, seg } = win;
+    // Fetch + decrypt each commit's manifest through a bounded pool (each is one blob
+    // round-trip + an AEAD open); record this path's content sha per commit, indexed by
+    // position so the result stays in ascending-seq order for the change-detection pass.
+    const perSeq = new Array<{ seq: number; deviceId: string; sha256: string | null }>(seg.length);
+    await poolMap(seg, HISTORY_DECRYPT_CONCURRENCY, async (c, i) => {
+      const body = parseCommit(c);
+      const { manifest } = await this.decodeManifestAt(c, account, true);
+      perSeq[i] = { seq: body.seq, deviceId: body.deviceId, sha256: manifest.files.find((f) => f.path === relPath)?.sha256 ?? null };
+    });
+    // Emit a change-point whenever the path's content sha differs from the previous
+    // (older) version — first appearance and deletion-within-window included.
     const changes: Array<{ seq: number; deviceId: string; sha256: string | null }> = [];
     let lastSha: string | null | undefined; // undefined = nothing emitted yet
-    for (const c of seg) {
-      const body = parseCommit(c);
-      const kek = await this.kekFor(body.keyEpoch, account, false);
-      const encManifest = await this.api.blobStore().get(body.encManifestSha);
-      const json = await openCommitHistorical({ secrets: this.ctx.secrets, kek, account, commit: c, encManifest, workspaceId: this.ctx.workspaceId });
-      const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
-      const sha = manifest.files.find((f) => f.path === relPath)?.sha256 ?? null;
-      if (lastSha === undefined || sha !== lastSha) changes.push({ seq: body.seq, deviceId: body.deviceId, sha256: sha });
-      lastSha = sha;
+    for (const e of perSeq) {
+      if (lastSha === undefined || e.sha256 !== lastSha) changes.push(e);
+      lastSha = e.sha256;
     }
     return changes.reverse(); // newest-first
   }
 
+  /** The verified retained window ending at the trusted head (the shared prefix of
+   *  `history`/`pathHistory`): establish the head, then fetch + verify the last
+   *  `limit` commits. Null when there's no history yet. */
+  private async retainedWindow(limit: number): Promise<{ account: VerifiedAccount; seg: SignedCommit[] } | null> {
+    const vh = await this.verifiedHead();
+    if (!vh) return null;
+    const seg = await this.retainedSegmentEndingAtHead(Math.max(0, vh.sequence - limit), vh.sequence, vh.commit.commitHash, vh.account);
+    return { account: vh.account, seg };
+  }
+
   /**
    * Fetch the verified contiguous commit segment ending at the trusted head,
-   * starting as low as retention allows (≥ `desiredSince`). When the desired window
-   * dips below the prune floor the server 409s (`NeedsRebaselineError`); we
-   * binary-search the smallest `since` that the server can still serve — bounded by
-   * log2(window), so a few cheap probes — then verify the segment terminates at the
-   * trusted head. Never returns unverified commits.
+   * starting as low as retention allows (≥ `desiredSince`). The common case (nothing
+   * pruned) is a SINGLE optimistic fetch at `desiredSince`; only when that 409s
+   * (`NeedsRebaselineError` — the window dips below the prune floor) do we binary-search
+   * the smallest `since` the server can still serve (bounded by log2(window)). Then
+   * verify the segment terminates at the trusted head. Never returns unverified commits.
    */
   private async retainedSegmentEndingAtHead(desiredSince: number, head: number, headHash: string, account: VerifiedAccount): Promise<SignedCommit[]> {
-    let lo = desiredSince;
-    let hi = head - 1;
     let best: SignedCommit[] | null = null;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      try {
-        best = await this.api.commitsSince(mid); // success: try to reach lower (more history)
-        hi = mid - 1;
-      } catch (e) {
-        if (e instanceof NeedsRebaselineError) {
-          lo = mid + 1; // `mid` is below the retention floor → raise the floor
-          continue;
+    try {
+      best = await this.api.commitsSince(desiredSince); // optimistic: unpruned → one round-trip, done
+    } catch (e) {
+      if (!(e instanceof NeedsRebaselineError)) throw e;
+      // Below the prune floor: binary-search the lowest serveable `since` in (desiredSince, head-1].
+      let lo = desiredSince + 1;
+      let hi = head - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        try {
+          best = await this.api.commitsSince(mid); // success: try to reach lower (more history)
+          hi = mid - 1;
+        } catch (err) {
+          if (err instanceof NeedsRebaselineError) {
+            lo = mid + 1; // `mid` is still below the floor → raise it
+            continue;
+          }
+          throw err;
         }
-        throw e;
       }
     }
     if (!best) throw new Error("no retained version history available (pruned past the retention window)");

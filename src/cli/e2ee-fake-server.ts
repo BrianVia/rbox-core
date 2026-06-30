@@ -59,6 +59,7 @@ export class FakeServer implements E2eeApi {
     return this.wsKeys.get(k)!;
   };
 
+  commitTimes = async () => new Map<number, number>(); // no D1 mirror in tests — advisory only
   latestCommit = async () => (this.commits.length ? { sequence: this.commits.length, commit: this.commits[this.commits.length - 1]! } : { sequence: 0, commit: null });
   commitsSince = async (since: number) => {
     if (since < this.pruneFloor) throw new NeedsRebaselineError(this.commits.length); // pruned past retention
