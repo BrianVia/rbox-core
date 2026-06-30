@@ -387,3 +387,24 @@ savvy-core, conc=32, clean harness):
 | 2000 files | 83.6 s | 14.9 s | 5.6× |
 
 Passive sync (push host A → pull host B) byte-identical at both sizes.
+
+---
+
+## Convergence — the perf workstream's measured ceiling (2026-06-30)
+
+After §23 shipped, I measured each remaining doc against its own gate instead of building on faith.
+The data says the backend-perf workstream has **converged**: the one hot-path D1 storm (upload)
+is gone, and the rest is bytes-on-the-wire, which no server change removes.
+
+| doc | what it would do | measured ROI | verdict |
+|-----|------------------|--------------|---------|
+| **§23** upload-receipts | D1 off the upload hot path (7 calls→0) | **5–6× sync, grows with N** | ✅ shipped + released v0.2.0 |
+| **§25** observability | per-op AE metrics | enabled all the above measurements | ✅ shipped |
+| **§26** batch-upload | amortize per-request fixed overhead | post-§23 `blob.put`=126 ms of which **120 ms is the R2 write**; fixed overhead ≈6 ms → batching saves **<5%** of upload time | ⏸️ **fails its own gate** — R2 bytes dominate, not overhead |
+| **§27** download-caps | D1 off the pull hot path | pull D1 is a single **indexed** `blob_refs` read ≈8% of a 15.1 s/2000-blob clone; D1-free needs Merkle proofs + §24 | ⏸️ **deferred** — ~8% behind real complexity |
+| **§24** blobref-sidecar | move refs out of the 1 MB commit body | unblocks ~50k-file repos (today's cap ~12k); **no current repo needs it** (savvy-core=4.3k) | 🟡 **available** as a pure scaling unblock if/when repos get huge |
+
+**The through-line (also the §23 learning):** measure end-to-end before believing a design. §23's
+own 10-codex-round staging design was a 2.4× *regression*; the simple direct-write won. Same lens
+here kills three more speculative builds before they cost anything. The remaining wins are
+client-side (decrypt/write throughput, concurrency) and physics (R2 transfer), not server D1.
