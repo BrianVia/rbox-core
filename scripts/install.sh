@@ -42,6 +42,30 @@ echo ""
 echo "  ✓ rbox installed to $DEST/rbox"
 echo "  (verify integrity via the signed manifest: $BASE/version — rbox upgrade checks it automatically)"
 echo ""
+
+# Optional: dependency-change notifications (design 29). NEVER silent — we only
+# append the shell hook with explicit consent: an interactive y/N prompt, or a
+# `--with-dep-notify` flag / RBOX_DEP_NOTIFY=1 for non-interactive installs. The
+# hook itself runs no install; it just nudges you to re-install when a synced
+# lockfile changes. `rbox deps notify off|uninstall` disables/removes it later.
+case " $* " in *" --with-dep-notify "*) RBOX_DEP_NOTIFY=1 ;; esac
+WANT_DEP_NOTIFY=0
+if [ "${RBOX_DEP_NOTIFY:-0}" = "1" ]; then
+  WANT_DEP_NOTIFY=1
+elif [ -t 0 ]; then
+  printf "  Enable dependency-change notifications (a shell-cd hook)? [y/N] "
+  read -r REPLY
+  case "$REPLY" in [yY]|[yY][eE][sS]) WANT_DEP_NOTIFY=1 ;; esac
+fi
+if [ "$WANT_DEP_NOTIFY" = "1" ]; then
+  if "$DEST/rbox" deps notify install; then
+    echo "  ✓ dependency-change notifications enabled (rbox deps notify off to pause)"
+  else
+    echo "  (couldn't enable dep notifications now — run \`rbox deps notify install\` later)" >&2
+  fi
+fi
+echo ""
+
 case ":$PATH:" in
   *":$DEST:"*)
     echo "  Run: rbox" ;;

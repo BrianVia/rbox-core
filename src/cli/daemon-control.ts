@@ -2,7 +2,6 @@ import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { loadState } from "./config.js";
 
 const RBOX_DIR = ".rbox";
 const PID_FILE = "daemon.pid";
@@ -38,6 +37,34 @@ function readPid(root: string): number | undefined {
     return Number.isInteger(n) && n > 0 ? n : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** Is OUR background-sync daemon currently running for `root`? Used by `status`
+ *  (the folded-in `daemon status`) and `untrack` (decide whether to stop first). */
+export function isDaemonRunning(root: string): { running: boolean; pid?: number } {
+  const pid = readPid(root);
+  if (pid !== undefined && isOurDaemon(pid, root)) return { running: true, pid };
+  return { running: false };
+}
+
+/** Poll until `pid` is gone or `timeoutMs` elapses. Returns true if it exited.
+ *  `untrack` uses this to avoid racing a daemon mid-write before removing `.rbox/`. */
+export async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return !isAlive(pid);
+}
+
+/** Last-resort SIGKILL for a daemon that ignored SIGTERM (`untrack --force`). */
+export function forceKill(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone */
   }
 }
 
@@ -79,15 +106,6 @@ export async function stopDaemon(root: string): Promise<void> {
     console.log(`stale pidfile (pid ${pid} is not our daemon); cleaning up`);
   }
   await fsp.rm(pidPath(root), { force: true });
-}
-
-export async function statusDaemon(root: string): Promise<void> {
-  const pid = readPid(root);
-  const running = pid !== undefined && isOurDaemon(pid, root);
-  const state = await loadState(root);
-  console.log(`rbox daemon: ${running ? `running (pid ${pid})` : "stopped"}`);
-  console.log(`  workspace last-synced sequence: ${state.lastSyncedSequence}`);
-  console.log(`  logs: ${logPath(root)}`);
 }
 
 export async function logsDaemon(root: string, follow: boolean): Promise<void> {
