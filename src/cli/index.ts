@@ -308,7 +308,7 @@ async function main(): Promise<void> {
       await runDaemon(root);
       break;
     }
-    default:
+    default: {
       // Bare `rbox` in a terminal → the guided onboarding menu (setup / connect /
       // log in). Non-interactive or `rbox help` → the command list (never hangs).
       if (!cmd && process.stdin.isTTY) {
@@ -316,8 +316,12 @@ async function main(): Promise<void> {
         await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
         break;
       }
+      // `help`/`--help`/`-h` are an explicit, successful help request (exit 0, like
+      // `--version`). Only a genuinely unknown command is a usage error (exit 1).
+      const isHelp = cmd === "help" || cmd === "--help" || cmd === "-h";
       console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  account <link|status|unlink>     link this account to your web/dashboard login\n  subscribe <solo|pro>             open a checkout to subscribe this account\n  billing                          open the billing portal (manage/cancel)\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  versions [path]                  list version history (or a file's change history)\n  restore <path>@<seq>             restore a file from a past version\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
-      if (cmd && cmd !== "help") process.exitCode = 1;
+      if (cmd && !isHelp) process.exitCode = 1;
+    }
   }
 }
 
