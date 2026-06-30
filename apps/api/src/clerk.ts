@@ -4,6 +4,7 @@ import { capBytesFor } from "./plans.js";
 import { createWebSession } from "./auth.js";
 import { refreshOwnerEmail } from "./notify.js";
 import { dbFor, dirDb } from "./db.js";
+import { pingNewAccount } from "./slackpipes.js";
 
 /**
  * Web auth via Clerk (M11). The browser signs in with Clerk and POSTs its
@@ -149,13 +150,19 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // Clerk id is linked to a real account X — every login would silently re-grant
     // owner on X (privilege resurrection). A returning login only resolves + mints.
     // cap_bytes = the materialized §23 hard-cap (kept in sync with the plan by the trigger).
-    await dbFor(env, map.account_id)
+    const acctIns = await dbFor(env, map.account_id)
       .prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)")
       .bind(map.account_id, nowMs, capBytesFor("free"))
       .run();
     // users/memberships are directory-plane (authenticate JOINs memberships, §32 §2).
     await dirDb(env).prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
     await dirDb(env).prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
+    // §32 Tier 1 business ping (best-effort, never throws/blocks) — a new tenant via
+    // web first-login. Gate on the accounts INSERT actually creating the row: concurrent
+    // first-logins all resolve to the SAME won account_id, so only the one whose
+    // INSERT OR IGNORE materialized it (changes > 0) pings — the losers no-op + skip,
+    // so a race doesn't emit duplicate "new account" alerts.
+    if ((acctIns.meta.changes ?? 0) > 0) await pingNewAccount(env, { accountId: map.account_id, origin: "web" });
   }
 
   // Refresh the cached owner email for new-device-alert recipient resolution (design 16

@@ -4,6 +4,7 @@ import { capBytesFor } from "./plans.js";
 import { audit, type Principal } from "./authz.js";
 import { clientGeo, clientIp, enqueueNotify, prepareOutboxInsert } from "./notify.js";
 import { dbFor, dirDb } from "./db.js";
+import { pingNewAccount } from "./slackpipes.js";
 
 
 /**
@@ -337,6 +338,9 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   await dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
   await dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");
+  // §32 Tier 1 business ping (best-effort, never throws/blocks) — a new tenant via the
+  // CLI bootstrap path. Fires after the account is durably created.
+  await pingNewAccount(env, { accountId, origin: "bootstrap" });
   return json({ token, deviceId, accountId });
 }
 
