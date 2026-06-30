@@ -308,7 +308,10 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
   const newAcct = `acct_${randomHex(8)}`;
   const newUser = `user_${randomHex(8)}`;
   await env.rbox_dev_db.batch([
-    env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'free', 'web', ?)").bind(newAcct, nowMs),
+    // cap_bytes set explicitly (free plan) so the new shell is quota-guarded immediately —
+    // a 0 here would disable accounts_cap_guard (§30 codex BLOCKER 5). The 0016 AFTER INSERT
+    // trigger is the catch-all backstop; this keeps the intent visible at the insert site.
+    env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)").bind(newAcct, nowMs, 2 * 1024 * 1024 * 1024),
     env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
     env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
     env.rbox_dev_db.prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),

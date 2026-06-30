@@ -68,8 +68,21 @@ async function kidOf(key: string): Promise<string> {
   return k;
 }
 
+// Cache the imported HMAC CryptoKey per key string (§30 codex MAJOR4): verifying a large
+// commit's receipts (12k+) must not re-`importKey` once per receipt. The key set is tiny
+// (current + prev); caching the Promise also de-dupes concurrent first imports.
+const ckCache = new Map<string, Promise<CryptoKey>>();
+function importHmacKey(key: string): Promise<CryptoKey> {
+  let ck = ckCache.get(key);
+  if (!ck) {
+    ck = crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    ckCache.set(key, ck);
+  }
+  return ck;
+}
+
 async function hmac(key: string, msg: string): Promise<string> {
-  const ck = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const ck = await importHmacKey(key);
   return toHex(await crypto.subtle.sign("HMAC", ck, enc.encode(msg)));
 }
 

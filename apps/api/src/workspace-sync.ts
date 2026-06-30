@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { startOp, type MetricEvent } from "./metrics.js";
-import { validateCommitRefs, commitAccounting, MAX_ACCOUNTING_REFS_PER_COMMIT } from "./commit-accounting.js";
+import { validateCommitRefs, commitAccounting, MAX_REFS_PER_COMMIT } from "./commit-accounting.js";
 import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
 
 // Opaque body cap. With §24 the body is O(1) for large repos (the refs live in an R2
@@ -9,7 +9,40 @@ import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
 // inline blobRefs ({encSha,size} ≈ 85B each); 1MB covers ~12k inline refs + fits D1's ~2MB
 // row limit. The §24 client switches to the sidecar before bodies approach this cap.
 const MAX_COMMIT_BODY = 1024 * 1024; // 1MB
-const MAX_BLOB_REFS = 50000; // sanity cap on referenced blobs per commit (bounds sidecar bytes too)
+// §30: hard ceiling on the request body, enforced by ACTUAL bytes read before JSON.parse
+// (readBodyCapped) so a hostile/huge receipts map can't OOM the isolate (codex r3/r4 MAJOR).
+// Sized to keep the JSON.parse HEAP safe, not just the wire bytes: a pathological 8MB body
+// (millions of tiny keys) expands to only ~40-60MB of JS objects — well within the 128MB
+// isolate — whereas 32MB could threaten it. This is a SECOND axis from MAX_REFS_PER_COMMIT
+// (which bounds ref COUNT): a COLD push's receipt map (~375B/ref) must also fit here, so 8MB
+// covers the validated 12k (~4MB) with headroom; a cold push much past ~20k refs is bounded by
+// this and stays behind the same dev measurement as the 50k count ceiling. Incremental pushes
+// (few NEW receipts) reach MAX_REFS_PER_COMMIT freely — their body is small.
+const MAX_REQUEST_BODY = 8 * 1024 * 1024; // 8MB — parse-heap-safe
+
+// Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
+// Content-Length). Returns the decoded text, "" for an empty body, or null if it exceeds the cap.
+async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+  }
+  out += decoder.decode();
+  return out;
+}
 
 /** The opaque signed commit envelope the server stores verbatim (design 12, v4).
  *  The server reads a FEW fields out of `body` for validation but NEVER verifies
@@ -46,8 +79,10 @@ function readRefMode(cb: CommitBodyView): RefMode | null {
   const hasSidecar = !!rs && typeof rs === "object" && !Array.isArray(rs);
   if (hasInline === hasSidecar) return null; // both or neither
   if (hasInline) {
+    // NB: the > MAX_REFS_PER_COMMIT rejection lives in the commit handler (structured 413
+    // too_many_refs), NOT here — returning null here would mask it as a generic 400 (codex r3
+    // MINOR). Inline bodies are already bounded by MAX_COMMIT_BODY, so this array stays small.
     const refs = cb.blobRefs as Array<{ encSha?: unknown }>;
-    if (refs.length > MAX_BLOB_REFS) return null;
     const refShas: string[] = [];
     for (const r of refs) {
       if (!r || typeof r.encSha !== "string" || !SHA_RE.test(r.encSha)) return null;
@@ -57,7 +92,7 @@ function readRefMode(cb: CommitBodyView): RefMode | null {
   }
   const d = rs as { sidecarSha?: unknown; count?: unknown; totalBytes?: unknown };
   if (typeof d.sidecarSha !== "string" || !SHA_RE.test(d.sidecarSha)) return null;
-  if (!Number.isSafeInteger(d.count) || (d.count as number) < 0 || (d.count as number) > MAX_BLOB_REFS) return null;
+  if (!Number.isSafeInteger(d.count) || (d.count as number) < 0) return null; // > MAX → structured 413 in the handler, not a null/400 here
   if (!Number.isSafeInteger(d.totalBytes) || (d.totalBytes as number) < 0) return null;
   return { kind: "sidecar", sidecarSha: d.sidecarSha, count: d.count as number, totalBytes: d.totalBytes as number };
 }
@@ -156,11 +191,24 @@ export class WorkspaceSync {
     // front so even the early body_too_large reject is attributed. Pre-op validation
     // guards (bad envelope / non-JSON) return without a metric (the request row covers them).
     const op = startOp(this.env, "commit", ROUTE);
-    const body = (await req.json().catch(() => null)) as {
+    // §30 (codex r3 MAJOR): bound the body by ACTUAL bytes read — Content-Length is spoofable
+    // and absent under chunked/HTTP-2, so a hostile/huge receipts map could otherwise OOM the
+    // isolate via req.json(). readBodyCapped aborts the stream past MAX_REQUEST_BODY BEFORE parse.
+    const raw = await readBodyCapped(req, MAX_REQUEST_BODY);
+    if (raw === null) {
+      op.done("body_too_large", { bytes: MAX_REQUEST_BODY });
+      return json({ error: "bad_request", message: "request body too large" }, 413);
+    }
+    let body: {
       parentSequence?: number | null;
       commit?: SignedCommit;
       receipts?: Record<string, string>;
     } | null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = null;
+    }
     const commit = body?.commit;
     // §23.4 — clients on the receipts protocol carry per-sha upload receipts; the
     // commit then does the batched catalog+charge+grant+promote (D1 off the PUT path).
@@ -224,11 +272,12 @@ export class WorkspaceSync {
       // is already durable (benign: refs entitled+present; retry charges 0).
       const nowMs = Date.now();
       if (mode.kind === "sidecar") {
-        // Off-by-the-objects-accounted (codex M1): the accounting set is encManifest + sidecar
-        // + count data refs, so cap on count + 2. Cheap reject BEFORE the R2 fetch.
-        if (mode.count + 2 > MAX_ACCOUNTING_REFS_PER_COMMIT) {
+        // §30: cap the DATA-ref count directly (the 2 carriers — encManifest + sidecar — ride
+        // within the multi-batch accounting, no separate budget). Same bound readRefMode applies
+        // to count, so no dead band. Cheap reject BEFORE the R2 fetch.
+        if (mode.count > MAX_REFS_PER_COMMIT) {
           emit(mode.count)("too_many_refs");
-          return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
+          return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
         }
         const sc = await resolveSidecarBytes(this.env, op.env.rbox_dev_db, accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
         if (!sc.ok) {
@@ -242,9 +291,12 @@ export class WorkspaceSync {
         shas = [...new Set([cb.encManifestSha as string, mode.sidecarSha, ...sc.refShas])];
       } else {
         shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
-        if (shas.length > MAX_ACCOUNTING_REFS_PER_COMMIT) {
+        // Defensive backstop: inline can't actually reach this — >MAX_REFS_PER_COMMIT 64-hex
+        // shas blow the 1MB MAX_COMMIT_BODY first (→ 400). The §24 client uses the sidecar
+        // long before then; the real large-ref ceiling is enforced on the sidecar `count` above.
+        if (mode.refShas.length > MAX_REFS_PER_COMMIT) {
           emit(shas.length)("too_many_refs");
-          return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
+          return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
         }
       }
       const v = await validateCommitRefs(this.env, op.env.rbox_dev_db, accountId, shas, receipts, nowMs);
@@ -355,7 +407,7 @@ export class WorkspaceSync {
         continue;
       }
       // Sidecar: fetch+bound+verify+parse to recover the reachable data refs; sidecarSha is a root.
-      // (count is already ≤ MAX_BLOB_REFS via readRefMode, so loadSidecarRefs's size gate bounds the bytes.)
+      // (count is already ≤ MAX_REFS_PER_COMMIT via readRefMode, so loadSidecarRefs's size gate bounds the bytes.)
       const loaded = await loadSidecarRefs(this.env, mode.sidecarSha, mode.count);
       if (!loaded.ok) {
         logErr("roots_sidecar_unreadable", new Error(`seq ${s}: ${loaded.reason}`));

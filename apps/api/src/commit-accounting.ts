@@ -20,12 +20,20 @@ export interface RefWithSize {
 // per row = 2 params (granted_at is a server integer literal), so ≤49 rows; we use
 // 33 to stay well under across catalog/charge/grant in one chunk.
 const CHUNK = 33;
-// Soft cap on accounting OBJECTS per commit (D1 batch cost). The accounting set is the data
-// refs PLUS carriers: the encrypted manifest always, and (§24) the sidecar object when refs are
-// externalized. 6002 ≈ 6000 data refs + those 2 carriers, so a §24 sidecar commit accepts the
-// SAME data-ref ceiling an inline commit did (no dead band at the boundary). Beyond this, the
-// deferred large-ref accounting design (bounded set-checks + chunked present=1 barrier) is needed.
-export const MAX_ACCOUNTING_REFS_PER_COMMIT = 6002;
+// §30: refs charged/granted per atomic db.batch(). Each batch() is ONE D1 subrequest and
+// one SQLite transaction; this bounds its statement count (~MAX_REFS_PER_TXN/CHUNK·4 ≈ 364)
+// so a single transaction stays within the D1 isolate's CPU/memory budget. A commit with
+// more refs runs SEVERAL such batches in sequence — each independently atomic + cap-guarded,
+// and (because accounting is idempotent + account-then-publish) crash-/retry-safe.
+const MAX_REFS_PER_TXN = 3_000;
+// Validate IN-list SELECTs (≤90 refs each) grouped per db.batch() — one subrequest per group.
+const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / 90); // ~34
+// §30: hard sanity reject on total refs in one commit (was 6002). The REAL ceiling is the D1
+// isolate CPU/memory of the multi-batch pass + validate, not subrequests; validated against a
+// 12k-blob real workload, 50k kept "behind dev measurement" (telemetry: §25 commit count/ms).
+// The +carriers (encManifest, and §24 sidecar) ride within this bound — workspace-sync caps the
+// data-ref count so count + carriers ≤ this. One source of truth for every ref ceiling.
+export const MAX_REFS_PER_COMMIT = 50_000;
 
 const chunk = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];
@@ -49,17 +57,22 @@ export async function validateCommitRefs(
   receipts: Record<string, string>,
   nowMs: number,
 ): Promise<ValidateResult> {
+  // §30: entitled-AND-present read, batched. Each IN-list SELECT is ≤90 params; grouping them
+  // into db.batch() calls (one D1 subrequest each) makes validating N refs cost ~N/(90·SELECTS_
+  // PER_BATCH) subrequests instead of N/90 — the prior 90-per-round-trip loop was the subrequest
+  // hog that bounded large commits (§30 limits analysis).
   const have = new Set<string>(); // entitled AND present=1
-  for (const c of chunk(shas, 90)) {
-    const ph = c.map(() => "?").join(",");
-    const rows = await db
+  const selects = chunk(shas, 90).map((c) =>
+    db
       .prepare(
         `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
-         WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${ph})`,
+         WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${c.map(() => "?").join(",")})`,
       )
-      .bind(accountId, ...c)
-      .all<{ sha256: string }>();
-    for (const row of rows.results ?? []) have.add(row.sha256);
+      .bind(accountId, ...c),
+  );
+  for (const group of chunk(selects, SELECTS_PER_BATCH)) {
+    const results = await db.batch<{ sha256: string }>(group);
+    for (const r of results) for (const row of r.results ?? []) have.add(row.sha256);
   }
 
   const newRefs: RefWithSize[] = [];
@@ -94,62 +107,67 @@ export async function commitAccounting(
 ): Promise<AccountingResult> {
   if (newRefs.length === 0) return { ok: true };
 
-  // 1. One transactional batch: per chunk → catalog(present=1) → charge(NOT-EXISTS)
-  //    → grant(refresh granted_at) → un-condemn. Statements run in order within the txn,
-  //    so a later chunk's NOT-EXISTS sees earlier chunks' grants (no double-charge).
-  const stmts: D1PreparedStatement[] = [];
-  for (const c of chunk(newRefs, CHUNK)) {
-    const shas = c.map((r) => r.sha);
-    const inList = shas.map(() => "?").join(",");
-    // Direct-write (§23.2 v2): PUT already wrote the canonical object, so catalog present=1
-    // immediately — no promote, no present=0 window. Atomic with charge+grant in this batch.
-    stmts.push(
-      db
-        .prepare(`INSERT OR IGNORE INTO blobs(sha256, size_bytes, present) VALUES ${c.map(() => "(?,?,1)").join(",")}`)
-        .bind(...c.flatMap((r) => [r.sha, r.size])),
-    );
-    stmts.push(
-      db
-        .prepare(
-          `UPDATE accounts SET used_bytes = used_bytes + (
-             SELECT COALESCE(SUM(b.size_bytes),0) FROM blobs b
-              WHERE b.sha256 IN (${inList})
-                AND NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.account_id=? AND r.sha256=b.sha256))
-           WHERE id = ?`,
-        )
-        .bind(...shas, accountId, accountId),
-    );
-    stmts.push(
-      db
-        .prepare(
-          `INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES ${c.map(() => `(?,?,${nowMs})`).join(",")}
-           ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at`,
-        )
-        .bind(...c.flatMap((r) => [accountId, r.sha])),
-    );
-    // Un-condemn: a re-uploaded blob clears its GC candidacy (the canonical object is fresh).
-    stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE sha256 IN (${inList})`).bind(...shas));
-  }
-
-  try {
-    // `db` is the §25 span-wrapped binding — the Proxy times+counts batch() itself,
-    // so we do NOT wrap in span.d1() (that would double-count).
-    await db.batch(stmts);
-  } catch (e) {
-    // accounts_cap_guard RAISE(ABORT,'over_cap') → the whole batch rolled back.
-    if (e instanceof Error && /over_cap/i.test(e.message)) {
-      const acc = await db.prepare("SELECT used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
-        used_bytes: number;
-        cap_bytes: number;
-      }>();
-      return { overCap: { used: Number(acc?.used_bytes ?? 0), cap: Number(acc?.cap_bytes ?? 0) } };
+  // §30: charge+grant in SEQUENTIAL atomic super-batches of ≤MAX_REFS_PER_TXN refs. Each
+  // db.batch() is one transaction (cap-guarded); a commit larger than one transaction runs
+  // several. On over_cap, prior super-batches stay charged+granted — real, idempotent-
+  // retryable entitlements, NOT rolled back (design 30 §3: no compensation). The within-
+  // batch ordering (catalog present=1 → charge NOT-EXISTS → grant → un-condemn) is unchanged,
+  // so a later chunk's NOT-EXISTS still sees earlier chunks' grants (no double-charge).
+  for (const superBatch of chunk(newRefs, MAX_REFS_PER_TXN)) {
+    const stmts: D1PreparedStatement[] = [];
+    for (const c of chunk(superBatch, CHUNK)) {
+      const shas = c.map((r) => r.sha);
+      const inList = shas.map(() => "?").join(",");
+      // Direct-write (§23.2 v2): PUT already wrote the canonical object, so catalog present=1
+      // immediately — no promote, no present=0 window. Atomic with charge+grant in this batch.
+      stmts.push(
+        db
+          .prepare(`INSERT OR IGNORE INTO blobs(sha256, size_bytes, present) VALUES ${c.map(() => "(?,?,1)").join(",")}`)
+          .bind(...c.flatMap((r) => [r.sha, r.size])),
+      );
+      stmts.push(
+        db
+          .prepare(
+            `UPDATE accounts SET used_bytes = used_bytes + (
+               SELECT COALESCE(SUM(b.size_bytes),0) FROM blobs b
+                WHERE b.sha256 IN (${inList})
+                  AND NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.account_id=? AND r.sha256=b.sha256))
+             WHERE id = ?`,
+          )
+          .bind(...shas, accountId, accountId),
+      );
+      stmts.push(
+        db
+          .prepare(
+            `INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES ${c.map(() => `(?,?,${nowMs})`).join(",")}
+             ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at`,
+          )
+          .bind(...c.flatMap((r) => [accountId, r.sha])),
+      );
+      // Un-condemn: a re-uploaded blob clears its GC candidacy (the canonical object is fresh).
+      stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE sha256 IN (${inList})`).bind(...shas));
     }
-    throw e;
+
+    try {
+      // `db` is the §25 span-wrapped binding — the Proxy times+counts batch() itself,
+      // so we do NOT wrap in span.d1() (that would double-count).
+      await db.batch(stmts);
+    } catch (e) {
+      // accounts_cap_guard RAISE(ABORT,'over_cap') → THIS super-batch rolled back; earlier
+      // ones stayed committed (design 30 §3). Report over-cap; the client gets a 402.
+      if (e instanceof Error && /over_cap/i.test(e.message)) {
+        const acc = await db.prepare("SELECT used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
+          used_bytes: number;
+          cap_bytes: number;
+        }>();
+        return { overCap: { used: Number(acc?.used_bytes ?? 0), cap: Number(acc?.cap_bytes ?? 0) } };
+      }
+      throw e;
+    }
   }
 
   // Direct-write: NO promote phase. The bytes are already at the canonical key (the PUT
-  // wrote them, §23.2 v2), and the batch above cataloged present=1 + charged + granted
-  // atomically. The commit is now O(chunks) D1 work with zero R2 ops — eliminating the
-  // serial O(N) staging→canonical copy that made §23 regress at scale (codex scaling review).
+  // wrote them, §23.2 v2), and the batches above cataloged present=1 + charged + granted
+  // atomically. The commit is O(chunks) D1 work with zero R2 ops.
   return { ok: true };
 }

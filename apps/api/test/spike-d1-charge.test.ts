@@ -1,5 +1,6 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { commitAccounting } from "../src/commit-accounting.js";
 
 // §23.6 D1 SPIKE — the load-bearing assumptions the whole §23 accounting rests on,
 // exercised against the real D1 binding (workerd SQLite) through `.batch()`:
@@ -152,5 +153,82 @@ describe("§23.6 spike (b): over-cap trigger aborts the WHOLE batch", () => {
     await db().prepare("UPDATE accounts SET cap_bytes=50 WHERE id='acc'").run();
     await db().prepare("UPDATE accounts SET used_bytes = used_bytes - 30 WHERE id='acc'").run();
     expect(await used("acc")).toBe(50);
+  });
+});
+
+// §30: the REAL commitAccounting (not the inline helper) across MORE refs than fit in one
+// atomic super-batch (MAX_REFS_PER_TXN=3000). Proves the multi-batch loop charges/grants
+// every ref exactly once, is idempotent on retry, and — over cap — keeps the completed
+// super-batches charged (codex-endorsed "no compensation; idempotent retry") instead of
+// rolling the whole commit back.
+describe("§30 large-ref multi-batch accounting (real commitAccounting)", () => {
+  const refs = (n: number, size = 10, off = 0) =>
+    Array.from({ length: n }, (_, i) => ({ sha: `r${off + i}`, size }));
+
+  it("charges/grants every ref across 3+ super-batches, exactly once", async () => {
+    await mkAccount("acc", 10_000_000);
+    const N = 6500; // > 2·MAX_REFS_PER_TXN → 3 super-batches
+    const res = await commitAccounting(db(), "acc", refs(N), NOW);
+    expect(res).toEqual({ ok: true });
+    expect(await used("acc")).toBe(N * 10);
+    expect(await refCount("acc")).toBe(N);
+  });
+
+  it("is idempotent: re-running the same large set charges 0 new bytes", async () => {
+    await mkAccount("acc", 10_000_000);
+    const set = refs(6500);
+    await commitAccounting(db(), "acc", set, NOW);
+    const res2 = await commitAccounting(db(), "acc", set, NOW + 1000); // retry (e.g. after a head 409)
+    expect(res2).toEqual({ ok: true });
+    expect(await used("acc")).toBe(6500 * 10); // unchanged
+    expect(await refCount("acc")).toBe(6500);
+  });
+
+  it("over-cap mid-loop keeps completed super-batches charged (no rollback)", async () => {
+    // cap fits the first super-batch (3000·10=30000) but not the second.
+    await mkAccount("acc", 35_000);
+    const res = await commitAccounting(db(), "acc", refs(6000), NOW);
+    expect(res).toHaveProperty("overCap");
+    // The first super-batch persisted; the second rolled back. NOT 0 (no compensation),
+    // NOT 60000 (the guard stopped the over-cap batch).
+    expect(await used("acc")).toBe(30_000);
+    expect(await refCount("acc")).toBe(3000);
+  });
+
+  it("a retry after an over-cap partial, once cap is raised, completes the rest", async () => {
+    await mkAccount("acc", 35_000);
+    const set = refs(6000);
+    await commitAccounting(db(), "acc", set, NOW); // partial: 3000 charged
+    expect(await used("acc")).toBe(30_000);
+    await db().prepare("UPDATE accounts SET cap_bytes=100000 WHERE id='acc'").run();
+    const res2 = await commitAccounting(db(), "acc", set, NOW + 1000); // re-run: first 3000 charge 0, rest complete
+    expect(res2).toEqual({ ok: true });
+    expect(await used("acc")).toBe(60_000); // all 6000 now
+    expect(await refCount("acc")).toBe(6000);
+  });
+});
+
+// §30 codex BLOCKER 5: an account inserted without cap_bytes must NOT end up unguarded.
+describe("§30 cap_bytes is materialized on insert (0016 trigger)", () => {
+  const capOf = async (id: string) =>
+    Number((await db().prepare("SELECT cap_bytes FROM accounts WHERE id=?").bind(id).first())!.cap_bytes);
+
+  it("a tenant insert omitting cap_bytes gets its plan cap (free=2GiB), guard active", async () => {
+    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('t1','free',?)").bind(NOW).run();
+    expect(await capOf("t1")).toBe(2 * 1024 * 1024 * 1024);
+    // and the guard is now live: a charge over 2GiB aborts
+    await expect(
+      db().batch(commitBatch("t1", [{ sha: "big", size: 3 * 1024 * 1024 * 1024 }])),
+    ).rejects.toThrow(/over_cap|ABORT|constraint/i);
+  });
+
+  it("a 'pro' insert omitting cap_bytes gets 250GiB", async () => {
+    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('t2','pro',?)").bind(NOW).run();
+    expect(await capOf("t2")).toBe(250 * 1024 * 1024 * 1024);
+  });
+
+  it("the platform 'default' account stays cap_bytes=0 (deliberate unlimited)", async () => {
+    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('default','free',?)").bind(NOW).run();
+    expect(await capOf("default")).toBe(0);
   });
 });
