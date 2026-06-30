@@ -533,6 +533,24 @@ with `subscription.updated` / `subscription.deleted` / late
 `checkout.session.completed` either complete cleanly onto X or block — the shell
 never re-binds and two subs never merge.
 
+**Ordering vs the Clerk rebind, and the accepted residual race (codex-reviewed).**
+`confirm` proves X carries **no other Clerk identity** (`clerk_users WHERE
+account_id=X`, §4.2.1) **before** running the saga, so the deterministic
+"X-already-linked" case blocks with **no** billing move. The saga runs **before**
+the atomic Clerk rebind (so a saga failure means the rebind never happens → clean
+retry, billing untouched). The inverse order (rebind-first) was rejected: a
+**saga** failure would then strand billing on the shell with the link already
+committed — strictly worse and more likely than the residual below. The residual:
+a *second* Clerk identity mapping X in the sub-millisecond window between the
+pre-check and the rebind would make the rebind hit `uq_clerk_users_account` and
+roll back **after** the saga moved billing onto X. This is **bounded and benign**:
+redeem requires a **durable owner device token on X**, so that second identity is
+necessarily a **co-owner of X** — billing therefore lands on the **correct, shared,
+reachable** account X (the design's true worst-case — stranding a sub on an
+*unreachable* account — never occurs). The loser simply retries and gets
+`already_linked`. Fully closing it needs a transactional Stripe/D1 boundary that
+doesn't exist; the pre-check + this co-owner-only residual is the accepted trade.
+
 ---
 
 ## 4. The link ceremony
