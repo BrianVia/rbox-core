@@ -26,6 +26,15 @@ export function planFor(plan: string | null | undefined): PlanLimits {
   return PLANS[plan ?? "free"] ?? PLANS.free!;
 }
 
+/** §23: the materialized hard-cap (accounts.cap_bytes), = plan base + purchasable
+ *  extra. Kept in sync with the plan wherever the plan/extra changes (account
+ *  creation + the Stripe webhook). Infinity-storage plans → a large sentinel (the
+ *  cap-guard trigger only blocks INCREASES past it, so a sentinel never wedges). */
+export function capBytesFor(plan: string | null | undefined, extraStorageBytes = 0): number {
+  const base = planFor(plan).storageBytes;
+  return (Number.isFinite(base) ? base : 1e15) + extraStorageBytes;
+}
+
 /**
  * Stripe price lookup_keys per paid plan (M10/billing). We map by lookup_key —
  * stable across test/live — never by raw price id, so the same code works once

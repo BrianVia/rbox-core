@@ -24,9 +24,12 @@ CommitBody {
 - The canonical-JSON signing input includes whichever single field is present (JCS over the
   body as-is) — no change to the signing/verify mechanism, just the schema. A signature never
   floats over an implied/default ref set.
-- The server derives the mode from presence: `blobRefs` means legacy inline, `blobRefset`
-  means v2 sidecar. Bodies with both fields or neither field are malformed and are rejected
-  before grant, quota mutation, or head advance.
+- **Strict discriminator (codex M7).** The mode is decided by **own-property presence with a
+  valid type** — `blobRefs` is a valid array (legacy inline) XOR `blobRefset` is a valid object
+  (v2 sidecar). `blobRefs: null` + `blobRefset`, both present, neither present, or wrong types
+  are ALL malformed → rejected before receipts, grant, quota mutation, or head advance. Model
+  it as `CommitBodyInline | CommitBodySidecar` (or an explicit `refsKind` tag) and update
+  `parseCommit` + chain verification so old clients never silently misread a v2 body.
 
 ## Validation parity
 - `normalizeBlobRefs` invariants (unique, sorted, valid encSha, valid size) move to the
@@ -53,4 +56,4 @@ CommitBody {
   Tampered `sidecarSha` → fetch+hash mismatch (§24.3) → reject.
 
 ## Depends on / Status
-Depends on: §24.1. Status: **design**. Pairs with §23 (the commit handler reads this).
+Depends on: §24.1. Status: **design (v2, codex-resolved)**. Pairs with §23 (the commit handler reads this).

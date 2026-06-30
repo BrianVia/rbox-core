@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
+import { capBytesFor } from "./plans.js";
 import { createWebSession } from "./auth.js";
 
 /**
@@ -144,7 +145,11 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // RETURNING login must NOT re-run the owner INSERT OR IGNORE, or — once this
     // Clerk id is linked to a real account X — every login would silently re-grant
     // owner on X (privilege resurrection). A returning login only resolves + mints.
-    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'free', 'web', ?)").bind(map.account_id, nowMs).run();
+    // cap_bytes = the materialized §23 hard-cap (kept in sync with the plan by the trigger).
+    await env.rbox_dev_db
+      .prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)")
+      .bind(map.account_id, nowMs, capBytesFor("free"))
+      .run();
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
   }

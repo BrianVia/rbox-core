@@ -77,3 +77,46 @@ bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
 - For an **isolated, repeatable** target (no contention with other dev work, wipe-and-repeat),
   set up a dedicated `[env.bench]` → `rbox-bench-api` + throwaway `rbox-bench-db`/`-blobs` and
   point `--remote` at it. (See the README "Benchmarking" section.)
+
+---
+
+## v2 — codex adversarial review resolutions (2026-06-30)
+
+Codex reviewed §24 against the SHIPPED §23 path → NEEDS-WORK (5 BLOCKER + 3 MAJOR). Two
+BLOCKERs were actually bugs in §23's code (promote-failure didn't fail the commit; the cron
+still ran the destructive canonical GC) — both **fixed** in §23 (commit `38aba82`). The §24
+design resolutions:
+
+- **B1 — lock the canonical sidecar encoding (§24.1).** `rbox-refset-v1` magic, `u32be count`,
+  then exactly `count × (32 raw sha bytes ‖ u64be size)`, strict lexicographic sha order, NO
+  duplicates, NO trailing bytes, safe int bounds; the parser MUST reject anything else and MUST
+  assert parsed `count`/Σsize equal the body descriptor. Determinism = dedupable blob + stable
+  `sidecarSha`.
+- **B2 — resolve the sidecar staging chicken-and-egg (§24.1/§24.3).** The sidecar is itself a
+  §23 blob: a `resolveSidecarBytes` step runs BEFORE accounting — if `sidecarSha` is already
+  entitled+`present=1` → GET canonical; else require a valid receipt + GET the account staging
+  key, verify `sha256==sidecarSha`, parse. Then include `sidecarSha` in the §23 validate +
+  accounting + promote set (charged, promoted to `present=1`) so the published head's sidecar is
+  durable, not `present=0`.
+- **B3 — 50k vs the 6000 accounting cap (§24.3).** v1 caps sidecar commits at
+  `MAX_ACCOUNTING_REFS_PER_COMMIT` (6000) like inline; the "50k files" headline needs a separate
+  *measured* large-ref accounting design (bounded D1 set-checks, chunked promote, a post-accounting
+  `present=1` barrier over ALL refs) — explicitly future work, not claimed by v1.
+- **B4 (was §23 bug) — FIXED:** promote failure → commit 422, head not advanced.
+- **B5 (was §23 bug) — partially FIXED:** cron canonical GC removed. REMAINING for §24 impl:
+  `roots()` must, for `blobRefset` commits, fetch+hash+parse the sidecar, include `sidecarSha`
+  itself as a root, and fail **closed** (non-2xx → abort the whole GC pass) on any
+  missing/corrupt/unparseable sidecar.
+- **M6 — descriptors are advisory only.** `count`/`totalBytes` gate an early cheap reject; NEVER
+  accepted for billing. Bill from server-measured ciphertext sizes (receipts / `blobs.size_bytes`)
+  including the sidecar object's own measured size; after parse, require exact count/Σ match.
+- **M7 — strict dual-mode discriminator.** `CommitBodyInline | CommitBodySidecar` via a strict
+  own-property exactly-one rule (or an explicit `refsKind`); reject both/neither before
+  receipts/accounting/head-advance; update `parseCommit` + chain verification.
+- **M8 — GC DoS at scale.** Fetch-on-demand `roots()` needs a per-pass retained-sidecar cap, an
+  R2 `head` size check before GET, a streaming/bounded parser, or the retained-root index (Option
+  B) promoted to v1 if measurements demand it.
+
+> **Sequencing:** §24 implementation MODIFIES the §23 commit path (sidecar replaces inline refs),
+> so it lands AFTER §23 merges. This review + the two §23 bug fixes it surfaced are the immediate
+> value; full §24 design re-review happens when its implementation begins.

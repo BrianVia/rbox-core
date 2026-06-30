@@ -8,11 +8,23 @@ stable (same set → same bytes → same hash, so it's a normal dedupable blob),
 (c) is cheap for the DO to parse for grant/GC.
 
 ## Design
-- **Content:** the unique blobRefs, **sorted by encSha** (same normalization as the current
-  `normalizeBlobRefs`), as a compact canonical encoding. Candidates: length-prefixed binary
-  (`u32 count` then `count × (32-byte encSha ‖ u64 size)`) — ~40 B/blob, half the JSON form —
-  or canonical JSON for debuggability. **Prefer binary** for size; it's opaque to humans but
-  the server never needs to show it.
+- **Content — LOCKED canonical encoding (codex B1).** Ambiguity here lets two clients produce
+  different `sidecarSha` for the same set, or a parser accept malleable bytes. The format is
+  exactly:
+  ```
+  magic    "rbox-refset-v1"   (14 ASCII bytes, fixed)
+  count    u32be              (number of refs)
+  refs     count × ( 32 raw sha256 bytes ‖ size u64be )   // 40 bytes/ref
+  ```
+  with STRICT rules the parser MUST enforce (reject otherwise):
+  - refs **sorted ascending by the 32 raw sha bytes**, **no duplicate shas**;
+  - **no trailing bytes** (total length is exactly `14 + 4 + 40·count`);
+  - `size` is a non-negative `u64` within sane bounds (≤ the per-blob max);
+  - after parse, **`count` and `Σsize` MUST equal the body descriptor** (`blobRefset.count`,
+    `blobRefset.totalBytes`) — else reject before grant/head-advance.
+  Big-endian + fixed widths make the bytes reproducible across clients/languages; the magic
+  domain-separates + versions the format. ~40 B/blob (half the JSON form); opaque to humans,
+  which is fine — the server never displays it.
 - **Address:** `sidecarSha = sha256(sidecarBytes)`, where `sidecarBytes` is the full
   canonical unique/sorted ref set. `sidecarSha` identifies the sidecar object as a whole; it
   is not a per-blob checksum and not an R2 storage checksum. It's stored in R2 like any blob
@@ -40,4 +52,4 @@ stable (same set → same bytes → same hash, so it's a normal dedupable blob),
 - a tampered sidecar → `sidecarSha` mismatch → rejected at validate (§24.3).
 
 ## Depends on / Status
-Depends on: §23.2 (blob upload path) for shipping the sidecar. Status: **design**.
+Depends on: §23.2 (blob upload path) for shipping the sidecar. Status: **design (v2, codex-resolved)**.

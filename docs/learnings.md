@@ -1,5 +1,130 @@
 # rbox Build Learnings (append-only)
 
+## 2026-06-30 — §23 direct-write: the 6× win, and why the "elegant" design lost to the simple one
+
+The headline: §23 (move per-blob D1 accounting off the upload hot path) became a **6× faster
+push that scales** — but ONLY after throwing away the elaborate staging→promote→present design
+that 10 codex rounds had hardened. Lessons:
+
+- **MEASURE end-to-end before believing a design.** §23 with the codex-PASSED staging/promote
+  architecture was a **2.4× REGRESSION** on a real 500-file savvy-core push (41s vs 17s legacy).
+  The "D1 calls 7→0" win was real but the staging→canonical **promote** (an R2 copy per new blob
+  at commit) added a SERIAL O(N) phase that legacy didn't have. A synthetic 100-file test hid it
+  (fixed cost dominated); the real-repo head-to-head exposed it. Unit tests + "codex PASS on the
+  design" do NOT substitute for a measured head-to-head on the real corpus.
+- **The promote's cost was structural, not tunable.** R2's Workers binding has no server-side
+  copy, so get→put streams every byte through the worker (~560ms/blob, ~8× concurrency-capped).
+  R2 S3 CopyObject (server-side, SigV4 from the worker) helped (~217ms/op, ~22× conc) — enough to
+  beat legacy at 500 files (19s, 1.24×) but it STILL lost at 2000 files (137s, 0.6×) because the
+  commit-promote is O(N) and serial while legacy overlaps its per-PUT D1 with the pooled uploads.
+- **A second opinion reframed the whole thing.** Asked codex "how do I fix the scaling regression"
+  with the measured numbers. Its answer: **stop promoting. Direct-write.** PUT writes the CANONICAL
+  key directly (no staging); commit is a pure D1 batch (catalog present=1 + charge + grant). No
+  copy, no serial phase. Result: **500 files 23.6s→4.6s (5.1×), 2000 files 83.6s→14.0s (6.0×) —
+  the win GROWS with N.** The entire staging/promote/present/S3/reconcile apparatus existed to make
+  orphan GC race-free; for a single-user system that bought nothing the existing reachability GC
+  (kept quiescent) doesn't already cover. The 10-round-hardened design was **over-engineered for a
+  threat model (multi-user abuse) that didn't apply**. Simpler won decisively.
+- **When the user says "we're the only users," believe it.** The staging design's whole reason for
+  being was bounding adversarial orphan-parking. Single-user ⇒ moot ⇒ delete the machinery.
+- **Process: spend the adversarial reviewer on the PERF DECISION, not just correctness.** Codex
+  caught two real data-loss bugs in the shipped §23 (promote-failure not failing the commit; cron
+  canonical-GC racing the promote) when reviewed against §24, AND gave the decisive
+  direct-write recommendation. Ask it "what's the best architecture given THIS measured data,"
+  not only "is this correct."
+- **Pre-existing bug surfaced (not §23):** a full 4294-file savvy-core round-trip is blocked by a
+  shared-engine duplicate/empty/edge-content bug — `main`'s binary `sha_mismatch`es on the same
+  fileset and the pull 404s a few unique-content blobs. Independent of §23 (legacy path identical).
+  The duplicate-content/0-byte class from the v0.1.1 learnings, re-exposed at scale. Track + fix
+  separately before claiming a clean full-savvy round-trip.
+
+## 2026-06-30 — §23 implementation: measured the D1-off-PUT win + found the promote cost
+
+Implemented §23 server + client, deployed to dev, measured via §25 AE. Lessons:
+
+- **The win is real and measured: `blob.put` D1 round-trips 7 → 0, wall p50 956 ms → 126 ms
+  (7.6×).** Moving accounting to commit collapsed ~539 per-blob D1 calls (100-file push) into
+  ~6 batched calls. Verify server perf changes by deploying to dev + querying the §25 AE SQL API
+  (`POST /accounts/{id}/analytics_engine/sql`, `CLOUDFLARE_API_TOKEN` in env) — `avg(double8)` is
+  dbCalls, `quantileWeighted(0.5)(double1,_sample_interval)` is p50 ms. Unit tests can't measure this.
+- **The staging→canonical promote (R2 get→put through the Worker) is the new commit bottleneck**
+  (~5.5 s for ~80 blobs), and it offsets the PUT win at the total-push level for a cold first push.
+  The Workers R2 binding has **no server-side copy**, so get→put streams every byte through the
+  Worker. The design-noted fix (R2 **S3 `CopyObject`**, server-side, no Worker round-trip) is
+  needed for the net end-to-end speedup — don't claim a total-push win until it lands. Incremental
+  pushes (few new blobs) already win fully.
+- **R2 get→put copy hits the Workers simultaneous-connection limit** ("Response closed due to
+  connection limit") when you hold a source stream AND a dest stream open per blob at high
+  concurrency. Fix: **buffer each blob (`await src.arrayBuffer()`) BEFORE the put** — the get
+  stream closes first, so each task holds ONE connection at a time, letting you raise concurrency.
+  (Only safe because receipts-path blobs are the small-file hot path; large files go multipart.)
+- **SQLite/D1 can't `ALTER TABLE … ADD CHECK` on an existing wide table** (`accounts` has ~12
+  migrated columns). Use a **`BEFORE UPDATE … WHEN … RAISE(ABORT)` trigger** instead — same
+  "statement fails → `batch()` rolls back" semantics as a CHECK. Guard only INCREASES past a SET
+  cap (`NEW.used > OLD.used AND NEW.cap_bytes > 0 AND NEW.used > NEW.cap`) so no-op/refund/legacy
+  (cap unset) updates don't wedge. An `AFTER UPDATE OF plan` trigger auto-materializes `cap_bytes`
+  so billing code needs no edits.
+- **A new column with a DEFAULT only backfills EXISTING rows in the migration's explicit UPDATE;
+  rows INSERTed later by app code get the column DEFAULT.** `accounts.cap_bytes` defaulted to 0 for
+  new test/prod accounts → the cap trigger wedged legacy grants until account-creation set
+  `cap_bytes` explicitly (+ the `cap_bytes > 0` guard as defense). Always set a new not-defaulted-
+  by-plan column at every INSERT site, not just in the migration backfill.
+- **Decouple "charged" from "present" with a flag, set only after the side effect lands.**
+  `blob_refs` = billing (granted at the D1 batch), `blobs.present=1` = canonical confirmed (set
+  after promote). Reuse/missingBlobs/head-validate gate on `present=1`. Legacy paths that write
+  canonical directly must set `present=1` on their INSERT, else their blobs look absent to the new
+  present-gated validation.
+
+## 2026-06-30 — §23 upload-receipts: a 10-round adversarial design loop (codex PASS)
+
+Designing the "move per-blob D1 accounting off the PUT hot path to commit-time" change took **ten
+codex adversarial passes** to reach PASS. The value wasn't any single fix — it was that each pass
+surfaced the *next* facet of one hard problem: **atomically charging + dedup-promoting a
+content-addressed blob across D1 and R2, with no cross-system 2PC, while R2 has no conditional
+delete.** Distilled, reusable lessons:
+
+- **The killer constraint: R2 has no conditional delete; same-key PUT/DELETE is last-writer-wins.**
+  So you can NEVER safely delete a content-addressed object that a commit might concurrently
+  re-reference. Every "delete the orphan, but re-check first" scheme is a TOCTOU you can't win with
+  another observation (an R2 `head` is an observation, not a lock). The fix is *structural*: a
+  **staging/canonical split** — PUT writes a per-account `staging/{acct}/{sha}` key; commit
+  promotes (server-side R2 copy) to the shared canonical `blobKey(sha)`; **GC deletes ONLY staging**
+  (never head-reachable), and canonical is *never* deleted in-scope (dedup-GC is a separate
+  quiescent sweep). Don't narrow a delete race — remove the delete from the reachable namespace.
+- **Don't conflate two facts in one row.** `blob_refs` meaning both "charged" AND "bytes present"
+  was the source of a whole class of bugs (entitled-but-absent reuse → dangling head; unsafe
+  refunds). Split them: `blob_refs.granted_at` = billing/charged; **`blobs.present` = canonical
+  confirmed (set only after promote)**. Reuse / `missingBlobs` / head-validate gate on `present=1`,
+  never on entitlement alone. A `present=0` ref is *missing to every consumer*, so it can never
+  enter a published head — which is exactly what makes its cleanup (revoke/refund) safe without an
+  expensive head-reachability proof.
+- **Ordering across the two systems is forced by two invariants you must hold simultaneously:**
+  *committed head ⟹ canonical present* (so catalog/promote before head-advance) and *canonical
+  present ⟹ charged* (so charge before promote). The resolution: **charge+grant in one D1 batch
+  (under `CHECK(used_bytes<=cap_bytes)`, NOT-EXISTS sum for exactly-once) → promote → set
+  `present=1` → advance head.** Charge-before-promote means no uncharged canonical ever exists
+  (abandon-after-charge just spends the attacker's own quota, self-limiting at cap).
+- **D1 batch rolls back on statement *failure*, NOT on a 0-row UPDATE.** A `CHECK` constraint is the
+  right hard-quota gate (an over-cap charge *fails* the statement → whole batch rolls back); a
+  conditional `WHERE used+n<=cap` that matches 0 rows does NOT abort. This single fact killed two
+  earlier quota designs. (Confirm against real dev D1 in the impl spike — local SQLite isn't enough.)
+- **D1 is single-threaded per database** → two same-account batches are *serialized*, so an in-SQL
+  `UPDATE … WHERE NOT EXISTS(blob_refs)` charge is exactly-once without leases, RETURNING, or a DO.
+  But that only bounds *concurrent* work — it does NOT bound *cumulative* abuse across crash cycles.
+- **Crash-recovery reconcile must check canonical existence BEFORE refunding, and revoke atomically
+  with a timestamp lease.** The textbook closure for the final TOCTOU: reconcile R2-`head`s canonical
+  first (exists → adopt `present=1`, keep charge; never refund existing bytes); the grant refreshes
+  `granted_at` on every reference; revoke is ONE conditional statement (`DELETE … WHERE present=0 AND
+  granted_at < now-GRACE RETURNING …`) with the refund derived from *rows actually deleted*. D1
+  serialization then gives grant-refresh and reconcile-delete a total order → no in-flight ref is
+  ever revoked.
+- **Process: spend the adversarial reviewer on the DESIGN, not just the diff.** Ten cheap design
+  rounds (no code written) converged on an architecture whose invariants hold *before* implementing —
+  vastly cheaper than discovering the R2-no-conditional-delete wall mid-implementation. Give the
+  reviewer web access: codex grounding the D1/R2 claims in live Cloudflare docs (lifecycle ~24h
+  granularity, incomplete-MPU 7-day abort, read-replication) corrected real constants — `RECEIPT_TTL`
+  went from a made-up 30m to 12h (`< STAGING_GC_GRACE` ≈ 24h lifecycle floor).
+
 ## 2026-06-29 — §25 server observability: how to measure the D1 cost (and what it is)
 
 - **Count/time D1 without threading a span through business logic: wrap the D1 *binding* in a Proxy.** `OpSpan.db(d1)` returns a Proxy where every `prepare().bind().run()/first()/all()` and `batch()` is timed + counted into the span — including calls buried inside `billing.ts`/`authz.ts` helpers. Inject it per-op via a shallow env clone (`{...env, rbox_dev_db: span.db(env.rbox_dev_db)}`, exposed as `op.env` from a `startOp()` factory). The fragile alternative (per-call-site `span.d1(() => stmt.run())`) misses the hidden helper calls — which is exactly where the cost hides. Proxy overhead is µs vs the ms-scale D1 round-trip, so it's free in practice.

@@ -64,11 +64,12 @@ export default {
    * thrown phase is logged and the next run retries.
    */
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    const GRACE_MS = 60 * 60 * 1000; // protect brand-new uploads for 1h
     try {
       await retentionPrune(env);
-      await gcMark(env, GRACE_MS);
-      await gcPurge(env, GRACE_MS);
+      // §23 (direct-write): the destructive canonical GC (gcMark/gcPurge, which R2-deletes
+      // blob objects) is OFF the cron — it races a concurrent direct PUT (R2 has no
+      // conditional delete). Canonical dedup-GC is deferred to a separate quiescent sweep
+      // (run manually via /v1/admin/gc while no push is active). (codex scaling review.)
     } catch (e) {
       logErr("scheduled_gc_failed", e); // no raw message (GC touches account/blob metadata)
     }

@@ -14,24 +14,49 @@ Two server paths read blobRefs today and must work with the sidecar form:
 ### Commit validation (feeds §23.4)
 On a `blobRefset` commit:
 - First enforce §24.2 mode validity: exactly one of `blobRefs` or `blobRefset` must be
-  present. Reject both/neither before receipts, accounting, or head advance.
-- Reject early if `count > MAX_BLOB_REFS` or `totalBytes` over the cheap quota check (no
-  fetch needed — both are in the signed body, §24.2).
-- Fetch the sidecar by `sidecarSha` from R2 (one GET; the sidecar is itself a referenced
-  blob that must be present-or-422, like any blob). Verify `sha256(bytes) == sidecarSha`.
-- Parse → `[{encSha,size}]`, assert the §24.1 invariants. Hand to §23.4's grant batch.
-- Cache the parsed sidecar for the duration of the commit (don't re-fetch for GC in the
+  present (strict own-property, §24.2 M7). Reject both/neither before receipts, accounting,
+  or head advance.
+- Reject early (cheap, no fetch — both are in the signed body) if `count > MAX_BLOB_REFS` OR
+  **`count > MAX_ACCOUNTING_REFS_PER_COMMIT`** (the §23.4 accounting cap, 6000 — codex B3: v1
+  caps sidecar commits there too; 50k needs a separate measured large-ref accounting design)
+  OR `totalBytes` clearly over the advisory quota remaining.
+- **`resolveSidecarBytes` (codex B2 — the §23 staging chicken-and-egg).** The sidecar is
+  itself a §23 blob, so it must be readable BEFORE accounting yet durable BEFORE head advance:
+  - if `sidecarSha` is already entitled AND `blobs.present=1` → GET canonical `blobKey`;
+  - else require a valid **receipt** for `sidecarSha` (in the commit's `receipts` map) and GET
+    the account **staging** key; if absent → `422 needs_upload[sidecarSha]`.
+  - verify `sha256(bytes) == sidecarSha`; parse (§24.1 strict rules); assert `count`/`Σsize`
+    equal the descriptor.
+- **Include `sidecarSha` itself in the §23 validate + accounting + promote set** — it is
+  charged (server-measured size) and promoted to `present=1` alongside the data refs, so the
+  published head's sidecar is durable (never `present=0`). Bill from server-measured sizes,
+  NEVER the advisory descriptor (codex M6).
+- Hand the parsed `[{encSha,size}]` to §23.4's grant batch. Cache the parsed sidecar for the
+  duration of the commit (don't re-fetch for GC in the
   same request).
 
 ### GC reachability
-GC walks retained commits and unions their referenced blobs. For `blobRefset` commits it
-must fetch+parse the sidecar to get that union. Two options:
-- **A — fetch on demand:** GC fetches each retained commit's sidecar. Simple, but a full GC
-  pass over many commits = many R2 GETs.
-- **B — retained-root index:** maintain a compact D1/R2 index of "blobs reachable from the
-  current retained set," updated incrementally at commit time, so GC reads the index not
-  every sidecar. Faster GC, more moving parts.
-Start with **A** (correct + simple); move to **B** only if GC latency/cost shows up.
+> **NOTE (post-§23):** §23.5 already REMOVED the destructive canonical purge from the cron
+> (it raced the commit-promote). So "GC roots" here is for the *deferred* canonical dedup-GC
+> (or the DO `roots()` consumed by retention), not the per-blob purge §23 deleted. When that
+> canonical GC is (re)introduced, it must be sidecar-aware per below.
+
+GC walks retained commits and unions their referenced blobs. For `blobRefset` commits
+`roots()` must fetch+parse the sidecar to get that union, and:
+- **enforce exact mode** per commit; **include `sidecarSha` itself as a root** (losing the
+  sidecar must prevent condemnation, not be papered over);
+- **fail CLOSED** — if any retained commit's sidecar is missing, corrupt
+  (`sha256(bytes) != sidecarSha`), unparseable, or there's a retained-commit gap, return
+  non-2xx → **abort the whole pass, condemn nothing**, alert, retry (codex B5).
+- **bound the work (codex M8):** a 2 MB sidecar × many retained commits can blow the DO
+  CPU/30s limits. Cap retained-sidecar fetches per pass, R2-`head` the size before GET, use a
+  streaming/bounded parser with an exact max-bytes ceiling. If that's insufficient, promote the
+  **retained-root index** (Option B: a compact D1/R2 index of "blobs reachable from the current
+  retained set," updated at commit time) to v1.
+
+Options for the union: **A — fetch on demand** (simple, correct, bounded per above) vs
+**B — retained-root index** (faster, more moving parts). Start with **A**; move to **B** if GC
+latency/cost shows up.
 
 ## Correctness (the data-loss guard)
 - GC MUST NOT condemn a blob still referenced by any retained commit. With sidecars, "still
@@ -55,5 +80,5 @@ Start with **A** (correct + simple); move to **B** only if GC latency/cost shows
   grant/quota/head advance.
 
 ## Depends on / Status
-Depends on: §24.1, §24.2, §23.4. Status: **design** — **codex-review the GC fail-closed
+Depends on: §24.1, §24.2, §23.4. Status: **design (v2, codex-resolved)** — **codex-review the GC fail-closed
 logic specifically**; it's the load-bearing correctness risk.

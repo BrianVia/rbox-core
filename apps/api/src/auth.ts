@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { ctEqual, json, logErr, sha256Hex } from "./util.js";
+import { capBytesFor } from "./plans.js";
 import type { Principal } from "./authz.js";
 
 
@@ -241,9 +242,12 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   const now = Date.now();
   const accountId = `acct_${randomHex(8)}`;
   const userId = `user_${randomHex(8)}`;
-  // origin='bootstrap' marks this as a crypto-anchored account (design 21 §3.2) —
-  // it is NEVER auto-reclaimable, even before any E2EE genesis lands.
-  await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, ?, 'free', 'bootstrap', ?)").bind(accountId, body.accountName ?? "account", now).run();
+  // origin='bootstrap' marks this as a crypto-anchored account (design 21 §3.2) — never
+  // auto-reclaimable. cap_bytes is the materialized §23 hard-cap (kept in sync by the trigger).
+  await env.rbox_dev_db
+    .prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, ?, 'free', 'bootstrap', ?, ?)")
+    .bind(accountId, body.accountName ?? "account", now, capBytesFor("free"))
+    .run();
   await env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
   await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");

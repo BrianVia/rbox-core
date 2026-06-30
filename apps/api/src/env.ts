@@ -32,4 +32,10 @@ export interface Env {
   CLERK_SECRET_KEY?: string;
   /** CSV allowlist of acceptable `azp` (origins) on the Clerk session JWT. */
   CLERK_ALLOWED_ORIGINS?: string;
+  /** §23 upload-receipt HMAC key (≥32 bytes). Wrangler secret. FAIL CLOSED: the
+   *  receipt path throws when absent/short, so a misconfigured deploy can never
+   *  mint or accept forgeable receipts. */
+  RBOX_RECEIPT_KEY?: string;
+  /** Previous receipt key during rotation — accepted on verify, never minted with. */
+  RBOX_RECEIPT_KEY_PREV?: string;
 }

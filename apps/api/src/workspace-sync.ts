@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { startOp, type MetricEvent } from "./metrics.js";
+import { validateCommitRefs, commitAccounting, MAX_ACCOUNTING_REFS_PER_COMMIT } from "./commit-accounting.js";
 
 // Opaque body cap. The body inlines one blobRef ({encSha,size} ≈ 85B) per UNIQUE
 // blob, so a ~4k-file repo is ~350KB; 1MB covers ~12k unique blobs and fits D1's
@@ -122,8 +123,16 @@ export class WorkspaceSync {
     // front so even the early body_too_large reject is attributed. Pre-op validation
     // guards (bad envelope / non-JSON) return without a metric (the request row covers them).
     const op = startOp(this.env, "commit", ROUTE);
-    const body = (await req.json().catch(() => null)) as { parentSequence?: number | null; commit?: SignedCommit } | null;
+    const body = (await req.json().catch(() => null)) as {
+      parentSequence?: number | null;
+      commit?: SignedCommit;
+      receipts?: Record<string, string>;
+    } | null;
     const commit = body?.commit;
+    // §23.4 — clients on the receipts protocol carry per-sha upload receipts; the
+    // commit then does the batched catalog+charge+grant+promote (D1 off the PUT path).
+    const useReceipts = req.headers.get("x-rbox-protocol") === "upload-receipts-v1";
+    const receipts = body?.receipts ?? {};
     const parent = body?.parentSequence ?? 0;
     // Authenticated account, set by the Worker after authorizeWorkspace (the DO is
     // only reachable via the Worker, which overrides any client-provided value).
@@ -175,11 +184,32 @@ export class WorkspaceSync {
     const bodyBytes = commit.body.length;
     const emitCommit = (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, { bytes: bodyBytes, count: shas.length, ...extra });
 
-    const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId); // account-scoped (M7)
-    if (missing.length > 0) {
-      // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
-      emitCommit("unsatisfied_blobs", { ratio: missing.length / shas.length });
-      return json({ error: "unsatisfied_blobs", missing }, 422);
+    if (useReceipts) {
+      // §23.4: validate (present=1+entitled OR receipt) → catalog+charge+grant+promote
+      // +present=1, all BEFORE the head advance (account-then-publish). On head 409 the
+      // accounting is already durable (benign: refs entitled+present; retry charges 0).
+      if (shas.length > MAX_ACCOUNTING_REFS_PER_COMMIT) {
+        emitCommit("too_many_refs");
+        return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
+      }
+      const nowMs = Date.now();
+      const v = await validateCommitRefs(this.env, op.env.rbox_dev_db, accountId, shas, receipts, nowMs);
+      if (!v.ok) {
+        emitCommit("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
+        return json({ error: "unsatisfied_blobs", missing: v.needsUpload }, 422);
+      }
+      const acct = await commitAccounting(op.env.rbox_dev_db, accountId, v.newRefs, nowMs);
+      if ("overCap" in acct) {
+        emitCommit("quota_exceeded", { bytes: bodyBytes });
+        return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
+      }
+    } else {
+      const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId); // legacy (M7)
+      if (missing.length > 0) {
+        // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
+        emitCommit("unsatisfied_blobs", { ratio: missing.length / shas.length });
+        return json({ error: "unsatisfied_blobs", missing }, 422);
+      }
     }
 
     // Atomic head check + advance — synchronous, no await inside. We store the full

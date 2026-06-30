@@ -2,87 +2,151 @@
 
 > Chunk of [§23](../23-upload-receipts.md). Owns the consequence of moving the
 > authoritative quota charge to commit: uploaded-but-never-committed R2 bytes.
+> **v4:** the whole `gc_candidates` resurrection model is **gone**. Uploads land in a
+> per-account **staging** namespace; commit promotes them to canonical; GC deletes **only
+> staging orphans**, which no committed head ever references. That structurally closes the
+> B1/B5 data-loss race (no canonical delete can race a commit) instead of narrowing it.
 
 ## Problem
-With the charge at commit (§23.4), a push can upload N blobs to R2 then never commit
-(over quota, crash, ^C). Those R2 objects are unreferenced (no `blobs`/`blob_refs` row) =
-**orphans** that cost storage and, if a stale receipt outlived GC, could be wrongly grantable.
+With the charge at commit (§23.4), a push can upload N blobs to staging then never commit
+(over quota, crash, ^C). Those staging objects are unreferenced = **orphans** that cost storage
+until reclaimed.
 
-## Design — three phases
+## Two namespaces (the structural fix)
+- **Staging** `staging/{accountId}/{sha}` — where PUT writes (§23.2). Per-account, never
+  referenced by any committed head. Safe to delete unconditionally once stale.
+- **Canonical** `blobKey(sha)` — shared, content-addressed. Created ONLY by commit's promote step (§23.4 step 4). **§23 never deletes canonical objects.** A committed head
+  references canonical keys, and since nothing in §23 deletes them, no head can ever dangle.
 
-### A. Fail-fast preflight (cheap, advisory)
-Keep users from uploading a doomed push:
-- `missingBlobs`/check returns `{ used, cap, remaining }` (§23.3). The client knows its
-  total push size and refuses locally if `total > remaining` — **before** any upload.
-- This is advisory (a racing commit could change `used`); the authoritative gate is the
-  commit conditional `UPDATE` (§23.4). Advisory + authoritative = no surprise mid-upload,
-  no double-source-of-truth.
-- Explicitly NOT a reservation: reservations need their own cleanup/TTL and a second DO/D1
-  write per push. The advisory-remaining + commit-authority + GC-for-orphans combination is
-  simpler and self-healing.
+> Reclaiming *canonical* dedup'd blobs that reach zero `blob_refs` is a separate, rare,
+> offline mark-sweep that requires a quiescence/lease protocol — **explicitly out of scope for
+> §23** (tracked in backlog). Until it lands, canonical objects are retained. Storage is cheap;
+> this trades a little disk for the removal of an unsolvable-on-R2 delete race.
 
-### B. Commit-time authority
-- `PUT` creates only an R2 object + receipt (§23.2). It does not create `blobs`, grant
-  `blob_refs`, clear `gc_candidates`, or reserve quota.
-- Commit is the first authoritative metadata mutation: it validates entitlement/receipts,
-  inserts `blobs`/`blob_refs`, deletes `gc_candidates` for receipt-revived refs, and
-  conditionally charges `used_bytes` (§23.4).
-- If commit returns 402/422/409 or the client abandons the push, no entitlement exists and
-  any uploaded-only R2 objects remain temporary orphans. That is accepted by design.
+## §23 removes the existing destructive canonical GC (B5 closure)
+B5 stays closed ONLY if no in-scope code deletes canonical objects. So §23 **removes the
+current scheduled `gc_candidates`/canonical purge** (the `runScheduledGc` path in
+`apps/api/src/worker.ts` + `versions.ts`) and replaces it with staging-prefix reclamation
+below. There is also **no legacy canonical-write path** (§23.2 → `426`): every canonical write
+goes through the bounded commit promote. After §23 ships there is exactly one deleter (staging
+GC) and it never touches canonical.
 
-### C. Orphan reclamation (the coupling that makes it safe)
-- **Invariant: `RECEIPT_TTL < GC_GRACE`.** A receipt expires before the current R2 object
-  version can be orphan-purged. Therefore commit never accepts a receipt for bytes that
-  platform GC is allowed to have already deleted.
-- An R2 object with **no `blobs` row** whose current R2 `uploaded`/last-modified time is
-  older than `GC_GRACE` is an orphan eligible for deletion. A committed blob always has a
-  `blobs` row from §23.4's batch.
-- Reclamation runs as the §P2 **reconciliation Queue / cron** (`docs/backlog.md` #7): list
-  R2 by prefix, left-anti-join against `blobs`, and delete orphan objects older than
-  `GC_GRACE` via R2 batch delete (≤1000 keys/call). Never on the commit hot path.
+## No uncharged canonical (M7, via §23.4 v7 charge-before-promote)
+v7 charges + grants in a D1 batch under `CHECK(used_bytes <= cap_bytes)` **before** promoting
+staging→canonical. So **canonical bytes are only ever written after a durable charge** — there
+is no uncharged canonical to bound, and no reservation/lease machinery. The M7 cumulative-parking
+attack ("reserve up to cap, promote unique shas, let the lease expire, repeat") is impossible:
+nothing uncharged is ever promoted. An attacker who charges then abandons (crash before promote)
+just spends their *own* `used_bytes`, self-limiting at `cap`; their staging objects are reaped,
+and no canonical object was written.
 
-## `gc_candidates` lifecycle
-The old per-PUT path deleted `gc_candidates` to resurrect a condemned blob. The receipt path
-cannot do that without putting D1 back on the upload hot path, so ownership changes:
-- `missingBlobs` treats any candidate as `missing` (§23.3). The client must have a valid
-  receipt already or upload to get one.
-- `PUT` may overwrite the canonical R2 key and mint a receipt, but it still does **not**
-  delete the candidate row.
-- Successful commit deletes `gc_candidates` for receipt-revived refs in the same transaction
-  that inserts `blob_refs` and charges quota (§23.4).
-- GC purge must re-check the current R2 object before deletion. If the candidate row's
-  `marked_at` predates the current R2 object version/last-modified time, the candidate is
-  stale from before a new upload; clear/re-mark it, but do not purge it on that pass.
-- The purge rule is therefore: delete only when the current object is still unreferenced,
-  still candidate/uncataloged, and older than `GC_GRACE`. Since `RECEIPT_TTL < GC_GRACE`,
-  any receipt for that current object has already expired.
+### Reconcile sweep (the crash tail)
+A crash *after* the charge batch but *before* `present=1` leaves a **charged ref with
+`blobs.present=0`** (`blob_refs` exists for billing, canonical not confirmed). By the v8
+decoupling, a `present=0` ref is **missing to every consumer** — `missingBlobs`, commit-validate,
+and head-validate all gate on `present=1` — so it **can never be in a published head and nobody
+relies on it as present**. That is exactly what makes cleanup safe without proving
+head-reachability. A periodic **reconcile sweep** (D1-authoritative; read-only R2 `head`, never an
+R2 delete → no race) handles `present=0` rows older than a grace. It **checks canonical existence
+BEFORE any refund** — this is the load-bearing order (a crash *after* the R2 copy but *before*
+`present=1` leaves a real canonical object flagged `present=0`; refunding it would leave uncharged
+canonical bytes, reopening M7). For each `present=0` sha:
+1. **R2 `head(blobKey(sha))`** — does the canonical object exist?
+   - **Yes** → the promote actually succeeded; the crash was between copy and flag. **Adopt it:**
+     `UPDATE blobs SET present=1`. The charge is retained (correct — the bytes exist and are
+     entitled). Never refund a sha whose canonical object exists.
+   - **No** → canonical absent. Check staging:
+     - staging object present (within `STAGING_GC_GRACE`) → **re-promote** → `present=1`.
+     - staging gone → **revoke** (see the atomic guard below).
+Because §23 never deletes canonical, a `head`=present result is durable, so adopting is race-free.
+A `present=1` ref is never swept.
+
+#### Revoke is atomic + lease-guarded (closes the revoke TOCTOU)
+The R2 observations above are stale by the time the `DELETE` runs, so a concurrent commit could
+re-upload + re-validate + set `present=1` in between. Two guards make revoke safe:
+- **Lease timestamp.** Every grant / re-grant sets `blob_refs.granted_at = now` (§23.4 — the grant
+  is `INSERT … ON CONFLICT DO UPDATE SET granted_at = now`). Reconcile only revokes refs with
+  `granted_at < now − REVOKE_GRACE`, where `REVOKE_GRACE ≫ max commit duration` (a commit reaches
+  `present=1` within seconds; pick e.g. 1h). So **no in-flight or recently-touched commit's ref is
+  ever revoke-eligible** — a concurrent/retrying commit refreshes `granted_at`, pushing the ref
+  out of the revoke window. (In practice the revoke branch only fires >`STAGING_GC_GRACE`=24h after
+  upload, by which point the receipt has long expired (`RECEIPT_TTL`=12h) — but the lease guard is
+  the load-bearing invariant, not the timing coincidence.)
+- **Atomic conditional delete + refund-from-deleted.** The revoke is one statement:
+  `DELETE FROM blob_refs WHERE account_id=? AND sha256=? AND (SELECT present FROM blobs WHERE
+  sha256=?) = 0 AND granted_at < ? RETURNING sha256` — it deletes only if *still* `present=0` and
+  still stale, and the refund is computed from the **rows actually returned** (0 rows → 0 refund).
+  If a commit set `present=1` first, the DELETE matches nothing; if reconcile wins, the later
+  commit's `present=1`/head-advance still sees no entitlement and re-grants (it holds a receipt).
+This closes the "refund a sha whose canonical exists → uncharged parking" corner, the "revoke a
+still-used ref" hazard, AND the revoke TOCTOU.
+
+## Quota timing
+### A. Fail-fast preflight (advisory)
+`missingBlobs`/check returns `{ used, cap, remaining }` (§23.3). The client refuses a doomed
+push locally **before** uploading. Advisory only (a racing commit can change `used`); the
+authority is the commit-time `CHECK`.
+
+### B. Commit-time authority (account-then-publish, §23.4 v7)
+Commit charges + grants in one D1 batch under `CHECK (used_bytes <= cap_bytes)` (over-cap → 402,
+batch rolls back, nothing promoted), THEN promotes staging→canonical for receipt-refs, THEN
+advances head. Charge precedes promote, so canonical is only written after a durable charge.
+
+## Orphan reclamation — staging only (M7)
+A **staging** object older than `STAGING_GC_GRACE` is reclaimable with **zero data-loss race**,
+because no committed head references the staging namespace. Two hot-path-free mechanisms,
+either/both:
+- **R2 lifecycle rule on the `staging/` prefix** — auto-expire objects older than the grace
+  window (R2-native, zero Worker cost). Cloudflare lifecycle granularity is ~24h and multipart
+  abandon defaults to 7 days, so set `STAGING_GC_GRACE` to the lifecycle floor (e.g. **24h**),
+  NOT 1h — and derive `RECEIPT_TTL` from *that* (below). This is the backstop reaper.
+- **Per-account PUT rate limit** (Cloudflare native binding, keyed on `accountId`; not per-blob
+  D1). Caps PUT throughput, so the staging-orphan ceiling is bounded by
+  `PUT_RATE × max_object_size × STAGING_GC_GRACE`, after which lifecycle reclaims. Over-limit
+  PUTs → `429`. Sized so it only trips on abuse.
+- Multipart: incomplete multipart uploads under `staging/` are reaped by R2's **incomplete-MPU
+  abort rule**, whose default horizon is **7 days** (distinct from the ~24h object-age rule).
+  So the multipart-orphan bound is `PUT_RATE × max_object_size × 7d`, and `RECEIPT_TTL` for a
+  multipart-completed object must still be `< 7d` (12h satisfies both). Set the abort horizon
+  explicitly rather than relying on the default.
+
+Because deletion only ever targets staging, there is **no R2-head TOCTOU, no `marked_at`
+re-check, no resurrection** — those existed only to make canonical deletion "safe," which v4
+removes by not deleting canonical at all.
+
+Net: committed bytes bounded by the `CHECK` cap; uncommitted (staging) bytes bounded by rate
+limit + lifecycle. Neither touches the hot path; neither can lose a committed object.
 
 ## Correctness
-- A blob uploaded, referenced at commit within TTL → gets a `blobs` row → never orphaned. ✓
-- A blob uploaded, never committed → no `blobs` row → orphan, reaped after `GC_GRACE`. ✓
-- A blob uploaded, then commit over cap → no `blobs`/`blob_refs`/quota mutation → orphan,
-  reaped after `GC_GRACE`. ✓
-- A cataloged blob (already had a `blobs` row from a prior commit) is never an orphan even
-  if this push abandons. ✓
-- Convergent dedup: two accounts uploading the same content both create the same R2 object;
-  the first to commit creates the `blobs` row; the object is shared. Orphan logic keys on
-  the `blobs` row, not per-account — correct (R2 object is account-agnostic; entitlement is
-  per-account in `blob_refs`).
-- A candidate overwritten by a new PUT is not purged based on the old candidate mark; purge
-  sees the newer current R2 object version and leaves it for commit or the next orphan cycle. ✓
+- Uploaded + committed within `RECEIPT_TTL` → promoted to canonical (never deleted) → reachable
+  forever by the published head. ✓
+- Uploaded + never committed → staging object only → reaped after `STAGING_GC_GRACE`. ✓
+- Uploaded + commit over cap → CHECK rolls back the batch *before* promote; nothing written to
+  canonical; head not advanced; staging copy reaped. ✓
+- DO 409 after a durable grant → canonical already promoted, never deleted → retry publishes
+  with no re-upload. ✓
+- Convergent dedup: two accounts promote the same content to the same canonical key (identical
+  bytes, last-writer-wins harmless); each gets its own `blob_refs`; the shared object is never
+  deleted by §23. ✓
 
-## Open question
-Pick `RECEIPT_TTL` (e.g. 1h) and confirm `GC_GRACE` (current retention/GC condemnation
-window) is comfortably larger. Document the relationship next to both constants.
+## Constants (M11)
+Driven by the staging lifecycle floor: `STAGING_GC_GRACE` ≈ **24h** (R2 lifecycle granularity).
+`RECEIPT_TTL` MUST be **strictly less** so a valid receipt guarantees its staging object still
+exists for commit to promote — pin **12h** (≪ 24h, comfortable margin). Assert
+`RECEIPT_TTL < STAGING_GC_GRACE` at startup + in a unit test (fail closed). If the lifecycle
+window changes, the assertion forces `RECEIPT_TTL` to follow.
 
 ## Tests
-- Upload-then-abandon leaves an R2 object with no `blobs` row; reconciliation deletes it
-  after `GC_GRACE`, not before. Receipt expires before GC grace (assert TTL < grace in a test).
-- Over-cap push: advisory remaining warns; if forced, commit 402s; orphans reaped.
-- Candidate overwrite race: candidate marked at T0, PUT overwrites at T1>T0, purge at
-  T0+grace observes current R2 last-modified T1 and does not delete; successful commit
-  clears the candidate row.
+- PUT lands under `staging/{account}/`; never under canonical.
+- Upload-then-abandon: staging object reaped after `STAGING_GC_GRACE`; no canonical object ever
+  created; no `blobs` row.
+- Commit promotes staging→canonical, then catalogs; a subsequent staging-GC pass does not touch
+  the canonical object.
+- Over-cap commit: CHECK rolls back BEFORE promote; head unchanged; staging reaped; no
+  canonical object written.
+- `RECEIPT_TTL < STAGING_GC_GRACE` assertion fails the build if violated.
 
 ## Depends on / Status
-Depends on: §23.4 (commit owns the `blobs` row), backlog #7 (reconciliation worker).
-Status: **design**.
+Depends on: §23.2 (staging PUT), §23.4 (promote + catalog), an R2 lifecycle rule on `staging/`,
+the per-account PUT rate-limit binding. Canonical dedup-GC is a separate backlog item.
+Status: **design (v10)**.

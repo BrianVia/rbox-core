@@ -3,6 +3,13 @@ import { blobKey, json } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { startOp } from "./metrics.js";
+import { mintReceipt } from "./receipts.js";
+
+/** §23.2 — clients on the receipts protocol send this header; PUT then becomes
+ *  ~R2-only (staging write + receipt, ZERO D1). Absent → legacy per-PUT grant path
+ *  (kept during the §23 rollout; removed before the atomic merge once the CLI moves). */
+export const UPLOAD_RECEIPTS_V1 = "upload-receipts-v1";
+export const usesReceipts = (req: Request): boolean => req.headers.get("x-rbox-protocol") === UPLOAD_RECEIPTS_V1;
 
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
@@ -36,6 +43,31 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
   const uniq = [...new Set(shas)];
+
+  // §23.3 — receipts clients: "have it" = entitled AND canonical-present (blobs.present=1).
+  // No global-existence probe, no gc_candidates (M6 resurrection is gone in §23). A ref
+  // entitled-but-present=0 (an in-flight/crashed prior promote) is reported missing → the
+  // client re-stages it. blob_refs is queried FIRST → no existence oracle.
+  if (usesReceipts(req)) {
+    const have = new Set<string>();
+    for (let i = 0; i < uniq.length; i += 80) {
+      const chunk = uniq.slice(i, i + 80);
+      if (chunk.length === 0) break;
+      const ph = chunk.map(() => "?").join(",");
+      const rows = await db
+        .prepare(
+          `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
+           WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${ph})`,
+        )
+        .bind(accountId, ...chunk)
+        .all<{ sha256: string }>();
+      for (const row of rows.results ?? []) have.add(row.sha256);
+    }
+    const missing = uniq.filter((s) => !have.has(s));
+    op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
+    return json({ missing });
+  }
+
   const present = new Set<string>();
   const condemned = new Set<string>();
   for (let i = 0; i < shas.length; i += 80) {
@@ -61,6 +93,28 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   const len = Number(req.headers.get("content-length") ?? "0");
   if (len > SINGLE_PUT_MAX) return json({ error: "too_large", message: "use multipart", maxSingle: SINGLE_PUT_MAX }, 413);
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
+
+  // §23.2 (v2, direct-write) — receipts protocol: ~R2-only. Write the CANONICAL blob key
+  // directly (R2 verifies the sha) + return a receipt minted only after R2 accepts. ZERO D1:
+  // no blobs/blob_refs/used_bytes/gc_candidates writes, no quota read. Accounting (charge +
+  // grant + present=1) moves to commit (§23.4) as a pure D1 batch — NO staging→canonical
+  // promote. Dropping the promote removes the serial O(N) commit phase that made §23 regress
+  // at scale (measured: 2000-file promote = 19s). Single-user reality makes the canonical-
+  // orphan concern moot; online canonical GC is disabled (cron) so a stale purge can't race a
+  // direct PUT (codex scaling review). This removes the §25-measured 7-D1-call PUT plateau.
+  if (usesReceipts(req)) {
+    let obj: R2Object;
+    try {
+      obj = await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), req.body!, { sha256: sha }));
+    } catch {
+      op.done("sha_mismatch", { bytes: len });
+      return json({ error: "sha_mismatch" }, 400);
+    }
+    const receipt = await mintReceipt(env, { accountId, encSha: sha, size: obj.size, nowMs: Date.now() });
+    op.done("ok", { bytes: obj.size });
+    return json({ ok: true, sha256: sha, sizeBytes: obj.size, receipt });
+  }
+
   // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
   // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
   const pre = await wouldExceedCap(op.env, accountId, len);
@@ -75,7 +129,7 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
     op.done("sha_mismatch", { bytes: len });
     return json({ error: "sha_mismatch" }, 400); // no raw R2 message (privacy)
   }
-  await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, obj.size).run();
+  await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, obj.size).run();
   await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
   const grant = await grantEntitlementWithQuota(op.env, accountId, sha, obj.size); // verified upload → quota-checked read access
   if (!grant.granted) {
@@ -238,7 +292,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
       outcome = "sha_mismatch";
       return json({ error: "sha_mismatch" }, 412); // no raw message (privacy)
     }
-    await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes) VALUES (?, ?)").bind(sha, bytes).run();
+    await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, bytes).run();
     await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
     const grant = await grantEntitlementWithQuota(op.env, accountId, sha, bytes);
     if (!grant.granted) {

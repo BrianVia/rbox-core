@@ -44,28 +44,44 @@ export class RboxApi implements SyncRemote {
     private readonly projectId: string
   ) {}
 
+  // §23 upload-receipts: single-PUT/check/commit speak the receipts protocol. PUT
+  // returns a receipt (proof-of-staged-upload); we accumulate {encSha → receipt} and
+  // hand the map to commit, which does the batched accounting + staging→canonical
+  // promote. Cleared on a successful commit (so a daemon's RboxApi doesn't accrete).
+  private readonly receipts = new Map<string, string>();
+  private static readonly PROTO = "upload-receipts-v1";
+
   private get auth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}` };
+  }
+  private get protoAuth(): Record<string, string> {
+    return { authorization: `Bearer ${this.token}`, "x-rbox-protocol": RboxApi.PROTO };
   }
 
   async missingBlobs(shas: string[]): Promise<string[]> {
     if (shas.length === 0) return [];
     const res = await fetch(`${this.baseUrl}/v1/blobs/check`, {
       method: "POST",
-      headers: { ...this.auth, "content-type": "application/json" },
+      headers: { ...this.protoAuth, "content-type": "application/json" },
       body: JSON.stringify({ shas }),
     });
     if (!res.ok) throw new Error(`blobs/check failed: ${res.status} ${await res.text()}`);
     return ((await res.json()) as { missing: string[] }).missing;
   }
 
+  /** Record the receipt a §23 staging PUT returned (no-op for legacy responses). */
+  private captureReceipt(sha256: string, body: { receipt?: unknown }): void {
+    if (typeof body.receipt === "string") this.receipts.set(sha256, body.receipt);
+  }
+
   async putBlob(sha256: string, bytes: Uint8Array): Promise<void> {
     const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, {
       method: "PUT",
-      headers: this.auth,
+      headers: this.protoAuth,
       body: bytes,
     });
     if (!res.ok) throw new Error(`blob PUT failed: ${res.status} ${await res.text()}`);
+    this.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
   }
 
   async getBlob(sha256: string): Promise<Buffer> {
@@ -83,15 +99,17 @@ export class RboxApi implements SyncRemote {
     if (size <= SINGLE_PUT_MAX) {
       const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, {
         method: "PUT",
-        headers: { ...this.auth, "content-length": String(size) },
+        headers: { ...this.protoAuth, "content-length": String(size) },
         body: fileStream(absPath),
         duplex: "half",
       } as RequestInit);
       if (res.status !== 413) {
         if (!res.ok) throw new Error(`blob PUT failed: ${res.status} ${await res.text()}`);
+        this.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
         return;
       }
-      // 413: server says too big for single PUT → fall through to multipart.
+      // 413: server says too big for single PUT → fall through to multipart (legacy
+      // canonical+grant+present=1 path; large files aren't on the receipts hot path).
     }
     await this.putBlobMultipart(sha256, absPath, size, uploadsDir);
   }
@@ -299,7 +317,14 @@ export class RboxApi implements SyncRemote {
   /** Post a signed commit envelope. Maps the server's 409 variants: a parent
    *  conflict (pull+retry) vs `epoch_stale` (a rotation landed under us). */
   async commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult> {
-    const r = await this.postJson(`/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests`, { parentSequence: parentSeq, commit });
+    // §23.4: hand the accumulated upload receipts to commit (it does the batched
+    // catalog+charge+grant+promote). Sending all still-valid receipts each attempt is
+    // safe — the server charges 0 for already-entitled refs.
+    const r = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests`, {
+      method: "POST",
+      headers: { ...this.protoAuth, "content-type": "application/json" },
+      body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: Object.fromEntries(this.receipts) }),
+    });
     if (r.status === 409) {
       const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number };
       if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0 };
@@ -307,7 +332,9 @@ export class RboxApi implements SyncRemote {
     }
     if (r.status === 422) return { unsatisfiedBlobs: ((await r.json()) as { missing?: string[] }).missing ?? [] };
     if (!r.ok) throw new Error(`commit failed: ${r.status} ${await r.text()}`);
-    return { sequence: ((await r.json()) as { sequence: number }).sequence };
+    const seq = ((await r.json()) as { sequence: number }).sequence;
+    this.receipts.clear(); // published → receipts consumed
+    return { sequence: seq };
   }
 
   // ---- pairing (split-secret; tokenSecret never sent — design 12 §13.5) -----

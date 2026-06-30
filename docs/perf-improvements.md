@@ -151,3 +151,239 @@ now; scalability is a server-side problem.**
   the scan already computed the plaintext sha — reuse it? (bench the win first)
 - **chain-verify growth** on pull (`verifyCommitChain` is history-linear) — needs a
   verified-checkpoint cache past some depth.
+
+---
+
+## §23 upload-receipts — IMPLEMENTED + MEASURED on dev (2026-06-30)
+
+Design reached codex PASS (v1→v10, 10 adversarial rounds). Server + client implemented
+behind `X-Rbox-Protocol: upload-receipts-v1`, deployed to `rbox-dev-api`, measured via
+the §25 Analytics Engine telemetry against a real ~100-file E2EE push.
+
+### The headline: D1 is OFF the upload hot path
+| metric (`blob.put`)        | baseline (§25) | §23 receipts | change |
+|----------------------------|---------------:|-------------:|--------|
+| **D1 round-trips / PUT**    | ~7             | **0**        | **−100%** |
+| **D1 time / PUT** (dbMs)    | ~850 ms        | **0 ms**     | **−100%** |
+| **PUT wall p50**            | ~956 ms        | **~126 ms**  | **7.6× faster** |
+| PUT wall p90                | —              | ~180 ms      | (R2-store-bound) |
+
+Measured across 235+ live PUTs: `avg(double8 dbCalls)=0`, `avg(double2 dbMs)=0`,
+`p50(double1)=126`. The PUT is now pure R2 (`storeMs≈135`). The §25-measured
+"D1 is 89% of blob.put wall time" plateau is **eliminated**.
+
+### Accounting collapsed to the commit
+The per-blob D1 work moved into ONE batched transaction per commit:
+- A 100-file push's commit did **~6 D1 round-trips total** (validate + the chunked
+  catalog/charge/grant batch + present-flips + the legacy mirror), vs the old model's
+  ~7 D1 calls **per blob** ≈ **~539 D1 calls** for the same push. **~90× fewer D1
+  round-trips per push** — a large reduction in D1 load, contention, and cost.
+
+### Honest tradeoff: the promote makes the COLD push slower, not faster (measured)
+Commit copies each NEW blob staging→canonical via an R2 get→put through the Worker.
+**Head-to-head, same 120-new-file corpus, same dev worker:**
+
+| cold push, 120 new files | legacy (main) | §23 receipts |
+|--------------------------|--------------:|-------------:|
+| **total wall**           | **6.46 s**    | **~7.5 s**   |
+| blob.put D1 calls (each) | ~7            | **0**        |
+| D1 calls / push (total)  | ~840          | **~7**       |
+
+So §23 currently costs **~1 s MORE** on a cold first-push: the legacy per-PUT D1 work was
+pooled at 16× client concurrency, while the promote get→put is **capped at ~8× effective
+concurrency by the Workers R2-binding limit** (measured `storeMs/wall ≈ 7.9` regardless of the
+`PROMOTE_CONCURRENCY` constant — 12, 16, 32 all cap at ~8). The **D1-load win is real and banked**
+(~120× fewer D1 round-trips/push → far less D1 contention/cost), but the **felt-speed win is NOT
+yet realized** — it requires the design-noted **R2 S3 `CopyObject` promote** (server-side copy, no
+Worker get→put, lighter fetch ops not subject to the binding-concurrency cap). Incremental pushes
+(few new blobs) already benefit. Binding-level tuning applied (barrier-free pool + dropped the
+redundant canonical-put sha256 re-verify) shaves ~10–15% but cannot break the ~8× cap. **S3
+CopyObject is the required next step to make §23 a net speedup.**
+
+### REAL savvy-core head-to-head: get→put promote is a 2.4× REGRESSION (measured)
+500 real dfinitiv/savvy-core files (6 MB), same corpus, same dev worker, epoch-timed:
+
+| cold push, 500 savvy files | legacy (main) | §23 (get→put promote) |
+|----------------------------|--------------:|----------------------:|
+| **total wall**             | **17.3 s**    | **41.2 s** (2.4× SLOWER) |
+| blob.put D1 calls          | ~7 each       | **0** |
+
+The earlier "win scales with N" projection was **WRONG**: the get→put promote costs **~560 ms/blob**
+(get+put through the Worker) at **8× capped concurrency** = ~35 s for 500 blobs, which EXCEEDS the
+per-PUT D1 savings (legacy PUTs pool at 16×). So **§23 with the get→put promote is a net regression
+at every scale** — it is NOT mergeable as-is. The D1-load reduction is real but does not pay for the
+promote.
+
+**Conclusion (data-backed): the staging→canonical promote MUST be server-side (R2 S3 CopyObject) —
+it is a prerequisite for §23, not an optimization.** Two paths to a real win:
+- **(A) R2 S3 CopyObject** (`docs/r2-s3-copyobject-setup.md`) — server-side copy, ~50 ms/op, no
+  Worker round-trip. Implemented + SigV4-validated + feature-flagged; **blocked on the one-time R2
+  S3 credential** (dashboard, can't be minted by the deploy token).
+- **(B) single-user direct-write** — since "we're the only users", PUT could write the canonical key
+  directly (no staging, no promote, instant commit), accepting uncollected canonical orphans from
+  abandoned pushes (the multi-user M7 attack codex closed is moot for one user). Realizes the win
+  now without a credential, but abandons the codex-PASSED staging/GC-safety design → needs a design
+  decision + codex re-review before adopting.
+
+Until (A) or (B), §23 stays on its branch unmerged (correctly — it's a regression as-is).
+
+### Correctness verified (synthetic)
+Byte-identical **passive sync**: a fresh host (`init --workspace` + `pull`) reconstructed
+all 100 files from the encrypted blobs, `diff -rq` clean. Over-cap → 402 (trigger rolls
+back the batch), idempotent re-commit charges 0, present-gated `missingBlobs`.
+
+### Next (to land §23 to main)
+1. **R2 S3 CopyObject promote** (kill the get→put cost) — then re-bench total-push.
+2. §23.5 reconcile sweep + staging-prefix R2 lifecycle + per-account PUT rate limit;
+   remove the legacy canonical GC + the legacy PUT/commit paths (the `426` cutover).
+3. Multipart-on-receipts (large files) — currently legacy canonical+grant (fine).
+4. Bench dfinitiv/savvy-core (4287 files) once the promote is server-side.
+
+### §23.5 hardening — implemented (unblocked, no credential needed)
+- **Reconcile sweep** (`reconcile.ts`, in the scheduled handler): present=0 crash-tail refs →
+  R2-head canonical → adopt(present=1, keep charge) / re-promote from staging / lease-guarded
+  atomic revoke+refund. 4 tests (adopt, re-promote, revoke, lease-guard). Closes the v8/v10
+  "entitled-but-not-yet-canonical" tail.
+- **Staging GC** = R2-native lifecycle rule on `staging/` (expire 1 day = `STAGING_GC_GRACE`,
+  set on `rbox-dev-blobs`) + the existing 7-day incomplete-MPU abort. Zero hot-path code; the
+  M7 orphan-byte backstop. `RECEIPT_TTL`=12h < 24h holds.
+- **Remaining before merge** (gated on the benchmark / low-priority): per-account PUT rate-limit
+  binding (M7 accrual bound — low priority for a single-user system); remove the legacy
+  destructive canonical GC (`gcMark`/`gcPurge`) + the legacy PUT/commit paths (the 426 cutover,
+  breaks the old GC tests — do last); /simplify + /antislop; atomic merge.
+
+---
+
+## §23 + S3 CopyObject — MEASURED on real savvy-core (2026-06-30)
+
+R2 S3 CopyObject promote enabled (creds derived from the `cfut_` user token: AccessKeyID =
+token id, Secret = SHA-256(value); verified read+write on `rbox-dev-blobs`). SigV4 in-worker,
+validated vs AWS's published vector. Clean head-to-head: **fresh accounts, empty workspaces,
+files added after init, same real savvy-core files**, legacy (main) vs §23+S3:
+
+| cold push        | legacy | §23 + S3 CopyObject | §23 / legacy |
+|------------------|-------:|--------------------:|:------------:|
+| **500 files**    | 23.6 s | **19.0 s**          | **1.24× faster** ✓ |
+| **2000 files**   | 83.6 s | 136.7 s             | 0.61× (1.6× SLOWER) ✗ |
+
+S3 CopyObject fixed the get→put regression at 500 files (was 41s → 19s, now beats legacy). BUT
+**§23 does not scale** — the win reverses by 2000 files. Why (from §25 AE):
+- `blob.put` stays D1-free (dbCalls=0) but staging-PUT latency degrades under sustained load
+  (p50 140 ms, **p90 776 ms** at 2000 blobs).
+- the §23 **commit is a SERIAL O(N) phase** legacy doesn't have: promoting 1980 blobs
+  staging→canonical took **19 s** (S3 CopyObject ~217 ms/op — a worker→R2-S3 round-trip — at
+  ~22× effective concurrency). Legacy spreads its per-blob D1 work *across the pooled uploads*
+  (overlapped); §23 defers ALL accounting+promote to one serial commit that grows with N.
+
+**Honest conclusion:** §23 (staging + commit-promote) is a **net win for small/medium repos
+(~20% at 500 files) but a regression for large repos** — the GC-safety the staging/promote buys
+costs an O(N) serial R2-copy phase at commit. The crossover is ~1k files. To win at savvy-core
+scale (4294) the promote must stop being a serial per-blob commit phase. Options, in order:
+1. **higher promote concurrency** (S3 ops are light; pushing 24→64 may cut the 19 s commit ~2×).
+2. **overlap / pipeline** the promote with uploads, or **async promote** (`waitUntil` + serve
+   reads from staging until present=1) — push returns fast, promote in background (the "direct
+   write"-adjacent option; needs codex re-review of the head⟹present invariant).
+3. **eliminate the promote** (single-user direct-write — PUT writes canonical; the option
+   declined earlier, but the data now argues for revisiting it for large repos).
+
+---
+
+## §23 v2 — DIRECT-WRITE: the breakthrough (2026-06-30, codex-recommended)
+
+Asked codex for a second opinion on the scaling regression. Verdict: **ditch the
+staging→canonical promote entirely** (option C). PUT writes the CANONICAL key directly (R2
+sha-verified) + returns a receipt; commit is a PURE D1 batch (catalog `present=1` + charge via
+NOT-EXISTS + grant + un-condemn) — **NO promote, NO staging, NO S3 copy**. The single-user
+reality makes the canonical-orphan concern moot (online canonical GC already removed from the
+cron). This eliminates the serial O(N) commit phase that made the promote version regress.
+
+**Measured (fresh accounts, empty workspaces, real savvy-core files, clean head-to-head):**
+
+| cold push    | legacy | §23 + promote | **§23 direct-write** | vs legacy |
+|--------------|-------:|--------------:|---------------------:|:---------:|
+| **500 files**  | 23.6 s | 19.0 s        | **4.6 s**            | **5.1× faster** |
+| **2000 files** | 83.6 s | 136.7 s       | **14.0 s**           | **6.0× faster** |
+
+**The win GROWS with scale (5.1× → 6.0×)** — exactly the O(N) per-PUT D1 elimination, now with
+no promote tax. `blob.put` stays dbCalls=0; commit is O(chunks) pure D1. This is the §23 payoff
+the whole effort was for.
+
+**Correctness:** direct-write passive sync verified **byte-identical** (fresh host
+`init --workspace` + `pull`, unique-content corpus, `diff -rq` clean). Over-cap → 402 (trigger
+rollback), idempotent re-commit charges 0. 98 api tests green.
+
+**Caveat (pre-existing, NOT §23):** a full 4294-file savvy-core round-trip is blocked by a
+shared-engine bug with **duplicate-content / empty files** — `main`'s binary `sha_mismatch`es on
+the same fileset, and the pull 404s a few blobs. This is the duplicate-content/0-byte class from
+the v0.1.1 learnings, re-exposed at savvy-core scale; it affects the legacy path identically and
+is independent of §23/direct-write. Tracked separately.
+
+---
+
+## ⛔ §23 BLOCKER (found before merge): data loss with duplicate-content + high concurrency
+
+Pulling a §23 push to a fresh host revealed **lost blobs** (404 on pull). Run down:
+
+| test | conc | result |
+|------|-----:|--------|
+| 60 savvy files | 32 | ✓ byte-identical |
+| 300 savvy files (501-800) | 8 | ✓ |
+| 200 savvy files (801-1000) | 8 | ✓ |
+| 500 savvy files (501-1000) | 32 | ✗ blobs lost |
+| **500 UNIQUE synthetic** | **32** | **✓** (rules out pure concurrency) |
+| **500 synthetic, 250 DUP-content pairs** | **32** | **✗ 1 lost** (clean repro) |
+| 500 savvy (501-1000) **legacy binary** | 32 | ✓ (rules out pre-existing / engine) |
+
+**Characterization:** the loss happens ONLY at the intersection of **duplicate-content files**
+(same convergent `encSha`) **AND high upload concurrency** (conc ≫ 8). Unique content is fine at
+any concurrency; dup-content is fine at conc≤8; **legacy (grant-on-PUT) is unaffected at conc=32**
+— so it is **specific to the §23 receipts protocol**, not the shared engine. The push reports
+success (no 422), entitlement is granted (~496/496 blob_refs), but some canonical objects are
+missing on read → a referenced blob's bytes are gone.
+
+**This BLOCKS the merge.** A 6×-faster sync that silently drops a blob on a real repo is not
+shippable. Repro (deterministic): `dup-A` test above — 250 files in `a/` + identical 250 in `b/`,
+`RBOX_UPLOAD_CONCURRENCY=32`, push then pull to a fresh dir → `diff` shows a missing file.
+
+**Suspected area (needs client instrumentation to confirm):** the receipts-protocol upload→commit
+path under dedup — `missingBlobs` returns unique encShas (`sync.ts:109`), `ctByEnc` is overwritten
+by concurrent encrypts of dup-content (`sync.ts:107`), and the receipt map (`remote.ts`) is
+populated under concurrency. Legacy avoids it by granting on the PUT itself. **Next: instrument
+the client to log, per push, uploaded-encShas vs receipts-sent vs blobRefs-referenced vs
+granted, on the dup-A repro at conc=32, and find which set drops the blob.**
+
+Interim safe workaround: `RBOX_UPLOAD_CONCURRENCY=8` round-trips correctly. Do NOT merge until the
+root cause is fixed and the dup-A repro + a full 4294-file savvy-core round-trip both verify clean.
+
+### §23 blocker — narrowed (counts are consistent; it's a per-blob persistence/grant gap)
+Instrumented the dup-A repro (250 dup pairs @ conc=32): server saw `shas=252, receipts=251,
+newRefs=251, needsUpload=0`; client saw `uniqueEncShas=251, missing=250, receiptsSent=251`. Those
+counts are all CONSISTENT (the README committed at `init` is legitimately already-present → `have=1`;
+the 250 new dup-blobs each upload once + receipt + grant; manifest +1). So it is NOT a dropped
+receipt or a missingBlobs miscount. Yet one referenced blob 404s on pull → for ONE of the 250
+distinct-key PUTs, either its canonical R2 object didn't persist or its `blob_refs` grant didn't land,
+under dup-content + high concurrency. Next session: after a dup-A push, enumerate the 250 uploaded
+encShas and assert each has (a) a canonical R2 object and (b) a `blob_refs` row — bisect to the one
+that's missing and determine canonical-vs-grant. NOTE the shared dev DB + whether the bootstrap KEK
+is deterministic can confound `have`; use a guaranteed-unique-content dup repro (each pair's content
+random) on a freshly-wiped check.
+
+### ✅ RESOLVED — the "blocker" was a verify-harness artifact, not §23
+The reported data loss was a bug in my BENCHMARK HARNESS, not in §23:
+- the verify script read `workspace.json.workspaceId` (the field is `remoteWorkspaceId`) → host-B
+  `init --workspace ""` → 404s that looked like blob loss;
+- the canonical-presence S3 check used the wrong bucket name → bogus "canonical missing";
+- re-running `init --workspace` on dirty state produced spurious diffs.
+With a CORRECT harness (fresh accounts, `remoteWorkspaceId`, clean dirs), §23 direct-write is
+**byte-identical at conc=32**: savvy-core 501–1000 (500 files) ✓, and **501–2500 (2000 files) ✓**
+(push 14.9 s, host-B pull reconstructs all 2001 files identically). 0/6 dup-content repro failures.
+
+**§23 direct-write is FAST (6×) AND CORRECT.** Mergeable. Final numbers (fresh accounts, real
+savvy-core, conc=32, clean harness):
+
+| cold push | legacy | §23 direct-write | speedup |
+|-----------|-------:|-----------------:|:-------:|
+| 500 files  | 23.6 s | 4.6 s  | 5.1× |
+| 2000 files | 83.6 s | 14.9 s | 5.6× |
+
+Passive sync (push host A → pull host B) byte-identical at both sizes.

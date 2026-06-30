@@ -25,6 +25,7 @@ export default defineWorkersConfig(async () => {
               CLERK_JWKS_URL: "https://clerk.test/.well-known/jwks.json",
               CLERK_ALLOWED_ORIGINS: "https://app.test",
               CLERK_SECRET_KEY: "sk_test_clerk_dummy",
+              RBOX_RECEIPT_KEY: "test-receipt-key-at-least-32-bytes-long-xx",
               TEST_MIGRATIONS: migrations,
             },
           },
