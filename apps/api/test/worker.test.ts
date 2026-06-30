@@ -845,8 +845,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
       if (cols.some((c) => c.name === "account_id")) accountScoped.push(name);
     }
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
-    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships"];
-    const EXPECTED_CLEANED = ["users"]; // the shell's own user row, DELETEd on reclaim (not a blocker)
+    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications"];
+    const EXPECTED_CLEANED = ["users", "account_notify_prefs"]; // shell-owned rows DELETEd on reclaim (not blockers)
     const EXCLUDED = ["audit_log"]; // append-only forensic log (§3.4) — never blocks
     const known = new Set([...COVERED, ...EXPECTED_CLEANED, ...EXCLUDED]);
     const uncategorized = accountScoped.filter((t) => !known.has(t));

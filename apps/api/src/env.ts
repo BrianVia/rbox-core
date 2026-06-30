@@ -1,5 +1,45 @@
+/** A queued new-device notification job. Carries only the credential identity — no
+ *  PII on the wire; the consumer re-reads the authoritative `device_notifications`
+ *  row (design 16 §2.4). */
+export interface DeviceNotifyMessage {
+  tokenHash: string;
+}
+
+/** The Cloudflare Email Service — Email Sending `send()` payload (the NEW first-party
+ *  product, not the legacy MIME `send_email` binding). Cloudflare signs DKIM with the
+ *  CF-managed sending-subdomain key, so no API key / DKIM material is passed. */
+export interface EmailSendMessage {
+  to: string;
+  from: string;
+  subject: string;
+  html?: string;
+  text?: string;
+  headers?: Record<string, string>;
+}
+export interface EmailSendResult {
+  messageId: string;
+}
+export interface SendEmailBinding {
+  send(message: EmailSendMessage): Promise<EmailSendResult>;
+}
+
 export interface Env {
   rbox_dev_db: D1Database;
+  /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
+   *  in local bun tests and until the queue is provisioned — enqueue then no-ops and the
+   *  cron backstop drives delivery off the durable outbox instead. */
+  DEVICE_NOTIFY_Q?: Queue<DeviceNotifyMessage>;
+  /** Cloudflare Email Service — Email Sending binding (`send_email` in wrangler, the new
+   *  `send()` API). Optional: absent in tests / before the sending domain is onboarded,
+   *  in which case a delivery becomes retryable `failed` (never silently dropped, §4.2). */
+  EMAIL?: SendEmailBinding;
+  /** `From:` for the new-device email (e.g. `security@mail.rbox.to`). */
+  RBOX_NOTIFY_FROM?: string;
+  /** HMAC pepper for the per-recipient delivery idempotency key (internal dedupe tag, §4.4). */
+  NOTIFY_IDEMPOTENCY_PEPPER?: string;
+  /** Explicit kill-switch (local/dev only). When "1", deliveries terminally `skipped` —
+   *  the ONLY intentional-off path; a missing EMAIL binding is `failed`+retry, not this. */
+  DEVICE_NOTIFICATIONS_DISABLED?: string;
   rbox_dev_blobs: R2Bucket;
   /** Release artifacts (CLI binaries, install.sh, signed version manifest) — a
    *  SEPARATE bucket from user data (design 14 U6), so the release-write CI token

@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import { ctEqual, json, logErr, sha256Hex } from "./util.js";
 import { capBytesFor } from "./plans.js";
 import { audit, type Principal } from "./authz.js";
+import { clientGeo, clientIp, enqueueNotify, prepareOutboxInsert } from "./notify.js";
 
 
 /**
@@ -90,24 +91,84 @@ export async function mintDevice(
   expiresAt: number | null = null,
   genDeviceId: () => string = () => `${prefix}_${randomHex(DEVICE_ID_BYTES)}`,
 ): Promise<{ token: string; deviceId: string }> {
+  return mintWithRetry(env, "mintDevice", async () => {
+    const m = await prepareMintDevice(env, accountId, userId, prefix, label, expiresAt, genDeviceId);
+    return { value: { token: m.token, deviceId: m.deviceId }, statements: [m.insert] };
+  });
+}
+
+/** The bounded uniqueness-retry loop shared by every durable/web mint path. `attempt`
+ *  builds one attempt — a return value plus the statement list to commit ATOMICALLY (the
+ *  device INSERT alone, or device + notification outbox). On a `device_id`/`token_hash`
+ *  collision the WHOLE batch is retried (fresh token + id); any other error surfaces
+ *  immediately. Single-sourcing the loop keeps the attempt cap + violation matcher + the
+ *  exhaustion error in one place. */
+async function mintWithRetry<T>(env: Env, label: string, attempt: () => Promise<{ value: T; statements: D1PreparedStatement[] }>): Promise<T> {
   let lastErr: unknown;
-  for (let attempt = 0; attempt < MINT_MAX_ATTEMPTS; attempt++) {
-    const deviceId = genDeviceId();
-    const token = randomHex(TOKEN_BYTES);
-    const hash = await sha256Hex(token);
+  for (let i = 0; i < MINT_MAX_ATTEMPTS; i++) {
+    const { value, statements } = await attempt();
     try {
-      await env.rbox_dev_db
-        .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .bind(hash, deviceId, label, accountId, userId, Date.now(), expiresAt)
-        .run();
-      return { token, deviceId };
+      await env.rbox_dev_db.batch(statements);
+      return value;
     } catch (e) {
       lastErr = e;
       if (!isUniqueViolation(e)) throw e; // unrelated failure → surface immediately
       // token_hash or device_id collided → regenerate both and retry
     }
   }
-  throw new Error(`mintDevice: exhausted ${MINT_MAX_ATTEMPTS} attempts: ${String((lastErr as Error)?.message ?? lastErr)}`);
+  throw new Error(`${label}: exhausted ${MINT_MAX_ATTEMPTS} attempts: ${String((lastErr as Error)?.message ?? lastErr)}`);
+}
+
+/** A device mint, PREPARED (token generated, INSERT not yet run) so a caller can batch
+ *  it atomically with another statement — notably the new-device-notification outbox
+ *  row (design 30 §3.4). Returns the plaintext token + `token_hash` + `device_id`. The
+ *  caller owns the uniqueness-retry by re-calling this and rebuilding its batch. */
+export async function prepareMintDevice(
+  env: Env,
+  accountId: string,
+  userId: string,
+  prefix: string,
+  label: string | null,
+  expiresAt: number | null = null,
+  genDeviceId: () => string = () => `${prefix}_${randomHex(DEVICE_ID_BYTES)}`,
+): Promise<{ token: string; tokenHash: string; deviceId: string; insert: D1PreparedStatement }> {
+  const deviceId = genDeviceId();
+  const token = randomHex(TOKEN_BYTES);
+  const tokenHash = await sha256Hex(token);
+  const insert = env.rbox_dev_db
+    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt);
+  return { token, tokenHash, deviceId, insert };
+}
+
+export interface MintNotifyOpts {
+  accountId: string;
+  userId: string;
+  label: string | null;
+  event: "pair" | "device_code";
+  ip: string | null;
+  geo: string | null;
+  /** Optional first-candidate seeding (device-code reuses its proposed id first). */
+  genDeviceId?: () => string;
+}
+
+/** Mint a DURABLE device AND its notification outbox row in ONE atomic D1 batch, so
+ *  "if the device exists, its notification exists" (design 16 §2.3). The whole batch is
+ *  retried on a `device_id`/`token_hash` uniqueness collision (the mint retry, lifted up
+ *  a level), keeping device+outbox coextensive. The returned `tokenHash` is the enqueue
+ *  key — the credential verifier itself never egresses. */
+export async function mintDeviceWithNotification(env: Env, o: MintNotifyOpts): Promise<{ token: string; deviceId: string; tokenHash: string }> {
+  const createdAt = Date.now();
+  const minted = await mintWithRetry(env, "mintDeviceWithNotification", async () => {
+    const m = await prepareMintDevice(env, o.accountId, o.userId, "dev", o.label, null, o.genDeviceId);
+    const outbox = prepareOutboxInsert(env, { tokenHash: m.tokenHash, deviceId: m.deviceId, accountId: o.accountId, mintedUserId: o.userId, label: o.label, ip: o.ip, geo: o.geo, event: o.event, createdAt });
+    return { value: { token: m.token, deviceId: m.deviceId, tokenHash: m.tokenHash }, statements: [m.insert, outbox] };
+  });
+  // Fold the best-effort post-commit enqueue in here so a durable-mint call site can't
+  // forget it — the function owns the whole notification contract. A lost enqueue is
+  // re-driven by the cron backstop off the durable outbox row (enqueueNotify never throws).
+  await enqueueNotify(env, minted.tokenHash);
+  return minted;
 }
 
 /** Mint a SHORT-LIVED web session token (M11) for a Clerk-authenticated user.
@@ -220,7 +281,18 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   if (!live) return json({ error: "unauthorized" }, 401); // source revoked / membership gone (token already burned)
 
   try {
-    const { token: minted, deviceId } = await mintDevice(env, consumed.account_id, consumed.user_id, "dev", label);
+    // Durable credential mint → also write the new-device-notification outbox row in
+    // the SAME atomic batch, then enqueue (design 16 §1.1: notify on a durable mint via
+    // pairing-redeem). The owner — not the joining user — is the recipient (resolved in
+    // the consumer). Email is strictly downstream; it never blocks the join.
+    const { token: minted, deviceId } = await mintDeviceWithNotification(env, {
+      accountId: consumed.account_id,
+      userId: consumed.user_id,
+      label,
+      event: "pair",
+      ip: clientIp(req),
+      geo: clientGeo(req),
+    });
     // Pass the opaque E2EE material straight through (null for legacy tokens).
     // accountId lets the redeemer namespace its keystore — but the client trusts
     // only the SIGNED accountId (verified roster/grant), cross-checking this (D7).
@@ -298,17 +370,19 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
     if (claim.meta.changes !== 1) return json({ status: "claimed" }); // lost the race
     // Mint into the APPROVER's account/user (device-to-device join). Seed the
     // proposed id from device_auth as the first candidate, but fall back to a
-    // fresh wide id if it collides (mint is the real uniqueness gate).
+    // fresh wide id if it collides (mint is the real uniqueness gate). The device +
+    // notification outbox commit atomically; then enqueue (design 16 §1.1: notify on a
+    // durable mint via device-code claim).
     let firstCandidate = true;
-    const { token, deviceId } = await mintDevice(
-      env,
-      row.account_id ?? "default",
-      row.user_id ?? "",
-      "dev",
-      row.label,
-      null,
-      () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
-    );
+    const { token, deviceId } = await mintDeviceWithNotification(env, {
+      accountId: row.account_id ?? "default",
+      userId: row.user_id ?? "",
+      label: row.label,
+      event: "device_code",
+      ip: clientIp(req),
+      geo: clientGeo(req),
+      genDeviceId: () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
+    });
     return json({ status: "approved", token, deviceId, accountId: row.account_id });
   }
   return json({ status: row.status });
