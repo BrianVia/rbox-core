@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { loadCredentials } from "./credentials.js";
+import { requireCredentials } from "./credentials.js";
 
 /**
  * `rbox subscribe [plan]` / `rbox billing` (design 21 §3.4.1) — the PRIMARY billing
@@ -13,12 +13,6 @@ import { loadCredentials } from "./credentials.js";
  */
 
 const PLANS = ["solo", "pro", "team"] as const;
-
-async function creds() {
-  const c = await loadCredentials();
-  if (!c) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
-  return c;
-}
 
 /** Open a URL in the user's browser, cross-platform. Returns false (so the caller
  *  prints the URL) when there's no opener or we're not on a TTY — never blocks. */
@@ -36,16 +30,16 @@ function openInBrowser(url: string): boolean {
   }
 }
 
-function present(url: string, opened: boolean): void {
-  if (opened) console.log(`Opening your browser to complete checkout...\n  ${url}`);
-  else console.log(`Open this URL in your browser to complete checkout:\n  ${url}`);
+/** Open `url` (or fall back to printing it), with the verb-appropriate message. */
+function openAndShow(url: string, opening: string, fallback: string): void {
+  console.log(`${openInBrowser(url) ? opening : fallback}\n  ${url}`);
 }
 
 /** `rbox subscribe [plan]` — open a Stripe checkout bound to THIS account. */
 export async function subscribe(plan: string | undefined): Promise<void> {
   if (!plan) throw new Error(`usage: rbox subscribe <plan>  (one of: ${PLANS.join(", ")})`);
   if (!(PLANS as readonly string[]).includes(plan)) throw new Error(`unknown plan "${plan}" — choose one of: ${PLANS.join(", ")}`);
-  const c = await creds();
+  const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?plan=${encodeURIComponent(plan)}`, {
     method: "POST",
     headers: { authorization: `Bearer ${c.token}` },
@@ -59,12 +53,12 @@ export async function subscribe(plan: string | undefined): Promise<void> {
   if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
   if (!res.ok) throw new Error(`subscribe failed: ${res.status} ${await res.text()}`);
   const { url } = (await res.json()) as { url: string };
-  present(url, openInBrowser(url));
+  openAndShow(url, "Opening your browser to complete checkout...", "Open this URL in your browser to complete checkout:");
 }
 
 /** `rbox billing` — open the Stripe customer portal for THIS account (manage/cancel). */
 export async function billingPortal(): Promise<void> {
-  const c = await creds();
+  const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/billing/portal`, {
     method: "POST",
     headers: { authorization: `Bearer ${c.token}` },
@@ -73,6 +67,5 @@ export async function billingPortal(): Promise<void> {
   if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
   if (!res.ok) throw new Error(`billing portal failed: ${res.status} ${await res.text()}`);
   const { url } = (await res.json()) as { url: string };
-  if (openInBrowser(url)) console.log(`Opening your billing portal...\n  ${url}`);
-  else console.log(`Open your billing portal:\n  ${url}`);
+  openAndShow(url, "Opening your billing portal...", "Open your billing portal:");
 }

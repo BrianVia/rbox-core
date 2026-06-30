@@ -37,6 +37,14 @@ export async function loadCredentials(): Promise<Credentials | undefined> {
   }
 }
 
+/** Load the per-machine credential or throw the standard not-logged-in guidance.
+ *  Shared by the authed CLI command groups (account, subscribe/billing). */
+export async function requireCredentials(): Promise<Credentials> {
+  const c = await loadCredentials();
+  if (!c) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
+  return c;
+}
+
 export async function saveCredentials(c: Credentials): Promise<void> {
   await fs.mkdir(dir(), { recursive: true, mode: 0o700 });
   await fs.writeFile(file(), JSON.stringify(c, null, 2), { mode: 0o600 });
