@@ -23,6 +23,7 @@ import { accountStatus, confirmLink, linkStatus, redeemLink, startLink, unlinkAc
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
+import { adminOverview } from "./admin.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
 export { WorkspaceSync } from "./workspace-sync.js";
@@ -158,6 +159,12 @@ async function route(req: Request, env: Env): Promise<Response> {
     const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
     return phase === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
   }
+  // GET /v1/admin/overview — platform-admin cockpit (§32 Tier 3a). Gated by a
+  // Cloudflare Access JWT + an email allow-list INSIDE adminOverview (defense in
+  // depth; NOT the rbox bearer), so it sits before authenticate(). This is the only
+  // route with privileged cross-account read access.
+  if (req.method === "GET" && eq(seg, ["v1", "admin", "overview"])) return adminOverview(req, env, Date.now());
+
   // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N (platform secret; interim until Stripe).
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {
     if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
@@ -319,7 +326,7 @@ const ROUTE_VOCAB = new Set([
   "v1", "health", "install.sh", "version", "version.sig", "bin",
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
-  "account", "usage", "admin", "gc", "plan", "workspaces",
+  "account", "usage", "admin", "gc", "plan", "overview", "workspaces",
   "keys", "roster", "admit", "keystate", "workspace",
   "blobs", "check", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
@@ -389,6 +396,21 @@ function badRequest(message: string): Response {
 function corsHeaders(req: Request, env: Env): Record<string, string> {
   const origin = req.headers.get("Origin");
   if (!origin) return {};
+  // The admin cockpit SPA (admin.rbox.to) calls /v1/admin/* cross-origin and relies
+  // on the Cloudflare Access SSO cookie, so it needs credentialed CORS. It's a
+  // SEPARATE allowlist from the Clerk dashboard origins and is the only origin granted
+  // Allow-Credentials.
+  const adminOrigin = env.ADMIN_ALLOWED_ORIGIN?.trim();
+  if (adminOrigin && origin === adminOrigin) {
+    return {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "authorization, content-type",
+      "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Max-Age": "86400",
+      Vary: "Origin",
+    };
+  }
   const allowed = (env.CLERK_ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   if (!allowed.includes(origin)) return {};
   return {

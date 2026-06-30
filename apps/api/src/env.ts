@@ -78,4 +78,34 @@ export interface Env {
   RBOX_RECEIPT_KEY?: string;
   /** Previous receipt key during rotation — accepted on verify, never minted with. */
   RBOX_RECEIPT_KEY_PREV?: string;
+
+  // ── §32 observability ───────────────────────────────────────────────────────
+  /** Slackpipes BUSINESS webhook (#rbox) — new account / subscription / churn pings.
+   *  Wrangler secret; absent ⇒ business pings no-op (self-gating). NEVER in repo. */
+  SLACKPIPES_WEBHOOK_URL?: string;
+  /** Slackpipes ALERTS webhook (#rbox-alerts) — error/payment-failed pings, and the
+   *  Tail Worker's rare-important alerts. Wrangler secret; absent ⇒ no-op. NEVER in repo. */
+  SLACKPIPES_ALERTS_WEBHOOK_URL?: string;
+
+  // ── §32 Tier 3a: platform-admin cockpit (GET /v1/admin/overview) ─────────────
+  /** Cloudflare Access team domain, e.g. `https://rbox.cloudflareaccess.com`. The
+   *  admin route verifies the `Cf-Access-Jwt-Assertion` against `${domain}/cdn-cgi/access/certs`.
+   *  Absent ⇒ the admin route fail-closes (401) — it never serves without Access. */
+  CF_ACCESS_TEAM_DOMAIN?: string;
+  /** The Access application AUD tag the admin JWT must carry (audience pinning). */
+  CF_ACCESS_AUD?: string;
+  /** Optional raw JWKS JSON override (`{"keys":[...]}`). When set, used instead of
+   *  fetching the certs endpoint — lets the verifier run hermetically (tests / pinned
+   *  keys). Absent in prod ⇒ live fetch. */
+  CF_ACCESS_JWKS?: string;
+  /** Cloudflare GraphQL Analytics API token (Account Analytics:Read). Wrangler secret;
+   *  absent ⇒ the 5xx-rate figure is reported as null (best-effort). NEVER in repo. */
+  CF_ANALYTICS_TOKEN?: string;
+  /** Cloudflare account id (for the GraphQL Analytics query `accountTag`). Var, not a secret. */
+  CF_ACCOUNT_ID?: string;
+  /** This worker's script name (GraphQL `scriptName` filter for the 5xx query). Var. */
+  CF_WORKER_NAME?: string;
+  /** Browser origin of the admin SPA (e.g. `https://admin.rbox.to`) — CORS-allowed
+   *  WITH credentials for the admin route only. Var; absent ⇒ no admin CORS. */
+  ADMIN_ALLOWED_ORIGIN?: string;
 }

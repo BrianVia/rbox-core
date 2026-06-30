@@ -4,6 +4,7 @@ import { ctEqual, json } from "./util.js";
 import { PLAN_LOOKUP_KEYS, planForLookupKey } from "./plans.js";
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
+import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
 
 /**
  * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
@@ -204,10 +205,15 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // active/trialing → the purchased plan. Leave grace_until untouched (it's
         // only read when free; clearing it would let a cancel re-grant in-window — G6).
         const plan = planForLookupKey(lookupKey) ?? "free";
-        await dbFor(env, accountId)
+        const upd = await dbFor(env, accountId)
           .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(plan, obj.customer, obj.id, accountId, obj.customer)
           .run();
+        // §32 Tier 1 business ping (best-effort, never throws) — only on the INITIAL
+        // subscription, not every renewal `subscription.updated`, AND only when the
+        // write actually transitioned a row. A late webhook for a reclaimed/CAS-guarded
+        // shell no-ops the UPDATE (changes == 0) → no FALSE "new subscription" alert.
+        if (event.type === "customer.subscription.created" && (upd.meta.changes ?? 0) > 0) await pingNewSubscription(env, { accountId, plan });
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → free + grace + clear extras.
         await dbFor(env, accountId)
@@ -223,11 +229,26 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // §32 FLAG: this resolves the account by stripe_customer_id (a shard column under the
         // placement-constraint model) with NO account id in scope. Account-less at N=1 (one
         // shard); a sharded world needs a (stripe_customer_id → shard) directory index.
-        await dbFor(env, "")
+        const del = await dbFor(env, "")
           .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
           .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
+        // §32 Tier 1 churn ping (best-effort) — only when this delete actually
+        // downgraded an account; a stale/duplicate delete that matches no live row
+        // (changes == 0) must not emit a FALSE churn alert.
+        if ((del.meta.changes ?? 0) > 0) await pingChurn(env, { accountId: obj.metadata?.account_id ?? null });
       }
+      break;
+    }
+    case "invoice.payment_failed": {
+      // §32 Tier 1 — alert on a failed charge. NO authoritative state change here (a
+      // dunning failure flips plan via the subscription.* events); we only ping.
+      // §32 FLAG: account resolved by stripe_customer_id with no account id in scope —
+      // account-less at N=1 (dbFor(env, "")), like the subscription.deleted path above.
+      const acct = obj.customer
+        ? await dbFor(env, "").prepare("SELECT id FROM accounts WHERE stripe_customer_id = ?").bind(obj.customer).first<{ id: string }>()
+        : null;
+      await pingPaymentFailed(env, { accountId: acct?.id ?? null, amountCents: typeof obj.amount_due === "number" ? obj.amount_due : null });
       break;
     }
     default:

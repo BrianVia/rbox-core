@@ -35,6 +35,20 @@ export function capBytesFor(plan: string | null | undefined, extraStorageBytes =
 }
 
 /**
+ * Approximate list price per paid plan, in USD cents/month (from docs/pricing.md).
+ * Used ONLY for the admin cockpit's D1-derived MRR ESTIMATE (subscription counts ×
+ * list price). It is intentionally a rough number — the authoritative figure is the
+ * Stripe-reconciled MRR fetched live alongside it (real amounts, discounts, proration).
+ * `team` is per-seat ($12–15); we use a conservative midpoint and treat one
+ * subscription as one seat (the cockpit labels MRR an estimate).
+ */
+export const PLAN_MONTHLY_CENTS: Record<string, number> = {
+  solo: 800,
+  pro: 2000,
+  team: 1200,
+};
+
+/**
  * Stripe price lookup_keys per paid plan (M10/billing). We map by lookup_key —
  * stable across test/live — never by raw price id, so the same code works once
  * live prices are created with the same keys. `free` has no Stripe price.
