@@ -48,7 +48,7 @@ async function setup() {
 describe("genesis roster", () => {
   test("verifies and exposes active signers", async () => {
     const { genesis, accountId } = await setup();
-    const [v0] = await verifyRosterChain([genesis], { now: NOW });
+    const [v0] = await verifyRosterChain([genesis]);
     expect(v0!.accountId).toBe(accountId);
     expect([...activeSigners(v0!).keys()].sort()).toEqual(["devA", "recovery"]);
   });
@@ -56,7 +56,7 @@ describe("genesis roster", () => {
   test("rejects a tampered genesis signature", async () => {
     const { genesis } = await setup();
     const bad: SignedRoster = { ...genesis, rosterSig: toB64url(randomBytes(64)) };
-    await expect(verifyRosterChain([bad], { now: NOW })).rejects.toThrow(/signature invalid/);
+    await expect(verifyRosterChain([bad])).rejects.toThrow(/signature invalid/);
   });
 });
 
@@ -64,7 +64,7 @@ describe("pairing admission (V4-1)", () => {
   // Build a valid v1 where device B admits itself with A's grant.
   async function admitB(over?: { substituteKeys?: boolean }) {
     const { accountId, aSig, aEntry, genesis } = await setup();
-    const v0 = (await verifyRosterChain([genesis], { now: NOW }))[0]!;
+    const v0 = (await verifyRosterChain([genesis]))[0]!;
 
     // A mints a pairing token; admission key derives from tokenSecret.
     const tokenSecret = randomBytes(32);
@@ -103,25 +103,25 @@ describe("pairing admission (V4-1)", () => {
 
   test("a properly token-bound admission verifies; B becomes an active signer", async () => {
     const { genesis, v1 } = await admitB();
-    const bodies = await verifyRosterChain([genesis, v1], { now: NOW });
+    const bodies = await verifyRosterChain([genesis, v1]);
     expect([...activeSigners(bodies[1]!).keys()].sort()).toEqual(["devA", "devB", "recovery"]);
   });
 
   test("server key-substitution is rejected (admissionSig not from tokenSecret)", async () => {
     const { genesis, v1 } = await admitB({ substituteKeys: true });
-    await expect(verifyRosterChain([genesis, v1], { now: NOW })).rejects.toThrow(/admissionSig invalid/);
+    await expect(verifyRosterChain([genesis, v1])).rejects.toThrow(/admissionSig invalid/);
   });
 
   test("a replayed grantId is rejected", async () => {
     const { genesis, v1, accountId } = await admitB();
     // Forge a v2 reusing the same grantId.
-    const bodies = await verifyRosterChain([genesis, v1], { now: NOW });
+    const bodies = await verifyRosterChain([genesis, v1]);
     const replay: SignedRoster = JSON.parse(JSON.stringify(v1));
     // Mutating to v2 would need re-signing; simplest: feed [genesis, v1, v1-as-v2] is rejected by version gap,
     // so assert the single-use set catches an identical grantId at the same version path instead:
     expect(bodies[1]!.grantId).toBe("grant_1");
     // A second admission must use a fresh grantId; reusing grant_1 in a built v2 → replay throw.
-    await expect(verifyRosterChain([genesis, v1, replay], { now: NOW })).rejects.toThrow();
+    await expect(verifyRosterChain([genesis, v1, replay])).rejects.toThrow();
   });
 
   test("§31: a past-notAfter grant still verifies on REPLAY (the brick repro)", async () => {
@@ -129,7 +129,7 @@ describe("pairing admission (V4-1)", () => {
     // bricking every multi-device account ~10min after pairing. Replaying immutable history
     // has no trustworthy append timestamp, so the liveness bound must NOT be re-checked here.
     const { genesis, v1 } = await admitB();
-    const bodies = await verifyRosterChain([genesis, v1], { now: NOW + 10_000_000 }); // long past notAfter
+    const bodies = await verifyRosterChain([genesis, v1]); // long past notAfter
     expect([...activeSigners(bodies[1]!).keys()].sort()).toEqual(["devA", "devB", "recovery"]);
   });
 });
@@ -137,27 +137,27 @@ describe("pairing admission (V4-1)", () => {
 describe("admin-signed revocation", () => {
   test("an active admin can revoke a device", async () => {
     const { aSig, aEntry, recEntry, genesis } = await setup();
-    const v0 = (await verifyRosterChain([genesis], { now: NOW }))[0]!;
+    const v0 = (await verifyRosterChain([genesis]))[0]!;
     const revoked: RosterEntry = { ...aEntry, deviceId: "devA" };
     // revoke the recovery principal as a stand-in change, signed by A
     const v1 = await buildAdminRoster(v0, [aEntry, { ...recEntry, status: "revoked" }], "devA", aSig);
-    const bodies = await verifyRosterChain([genesis, v1], { now: NOW });
+    const bodies = await verifyRosterChain([genesis, v1]);
     expect([...activeSigners(bodies[1]!).keys()]).toEqual(["devA"]);
   });
 
   test("a non-member cannot sign a transition", async () => {
     const { genesis, aEntry } = await setup();
-    const v0 = (await verifyRosterChain([genesis], { now: NOW }))[0]!;
+    const v0 = (await verifyRosterChain([genesis]))[0]!;
     const stranger = generateSignKeyPair();
     const v1 = await buildAdminRoster(v0, [aEntry], "devEvil", stranger);
-    await expect(verifyRosterChain([genesis, v1], { now: NOW })).rejects.toThrow(/no admission proof|not active/);
+    await expect(verifyRosterChain([genesis, v1])).rejects.toThrow(/no admission proof|not active/);
   });
 });
 
 describe("commit chain bound to the roster", () => {
   test("a commit by an active device verifies; an unknown signer does not", async () => {
     const { genesis, accountId } = await setup();
-    const v0 = (await verifyRosterChain([genesis], { now: NOW }))[0]!;
+    const v0 = (await verifyRosterChain([genesis]))[0]!;
     const aSigners = activeSigners(v0);
     const aSig = generateSignKeyPair();
     // build a commit signed by a key — verify against the matching pubkey

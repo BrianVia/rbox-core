@@ -27,7 +27,7 @@ async function fixture() {
   const rk = randomBytes(32);
   const rsk = signKeyPairFromSeed(await hkdf(rk, utf8("rbox/recovery/v1"), utf8("recovery-sign"), 32));
   const genesis = await buildGenesisRoster({ accountId, bootstrap: await entry("devA", "device", aSig), recovery: await entry("recovery", "recovery", rsk), bootstrapSignKey: aSig });
-  const rosters = await verifyRosterChain([genesis], { now: NOW });
+  const rosters = await verifyRosterChain([genesis]);
   const rosterHashByVersion = new Map([[0, genesis.rosterHash]]);
   return { accountId, aSig, genesis, rosters, rosterHashByVersion };
 }
@@ -93,7 +93,7 @@ describe("accountKeyState genesis + chain", () => {
     const v0body = r0[0]!;
     const devB = await entry("devB", "device", bSig);
     const v1 = await buildAdminRoster(v0body, [...v0body.devices, devB], "devA", aSig);
-    const rosters = await verifyRosterChain([genesis, v1], { now: NOW });
+    const rosters = await verifyRosterChain([genesis, v1]);
     const rhbv = new Map([
       [0, genesis.rosterHash],
       [1, v1.rosterHash],

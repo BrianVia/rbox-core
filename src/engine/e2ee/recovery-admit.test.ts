@@ -21,7 +21,7 @@ describe("recovery admission (D5 / §14.7)", () => {
     });
 
     // The recovery-signed roster verifies, and the recovered device is active.
-    const account = await verifyAccount([boot.upload.genesisRoster, rec.admissionRoster], [boot.upload.genesisKeyState], NOW + 2000);
+    const account = await verifyAccount([boot.upload.genesisRoster, rec.admissionRoster], [boot.upload.genesisKeyState]);
     expect(account.rosters).toHaveLength(2);
     expect([...activeSigners(account.currentRoster).keys()].sort()).toEqual(["devA", "devRecovered", "recovery"]);
 
@@ -44,7 +44,7 @@ describe("recovery admission (D5 / §14.7)", () => {
       prevRoster: boot.upload.genesisRoster,
       now: NOW + 1000,
     });
-    await expect(verifyAccount([boot.upload.genesisRoster, rec.admissionRoster], [boot.upload.genesisKeyState], NOW + 2000)).rejects.toThrow(/duplicate deviceId/);
+    await expect(verifyAccount([boot.upload.genesisRoster, rec.admissionRoster], [boot.upload.genesisKeyState])).rejects.toThrow(/duplicate deviceId/);
   });
 
   test("a wrong recovery phrase cannot unwrap MK", async () => {

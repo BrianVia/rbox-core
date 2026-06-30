@@ -23,7 +23,7 @@ describe("session — account bootstrap", () => {
   test("emits a 24-word recovery phrase and a verifiable genesis roster+keystate", async () => {
     const boot = await bootedAccount();
     expect(boot.recoveryPhrase.split(" ")).toHaveLength(24);
-    const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState], NOW + 1000);
+    const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState]);
     expect(account.rosters).toHaveLength(1);
     expect([...account.rosters[0]!.devices.map((d) => d.deviceId)].sort()).toEqual(["devA", "recovery"]);
   });
@@ -53,7 +53,7 @@ describe("session — single-machine commit round-trip", () => {
   test("buildCommit → openCommit decrypts the manifest", async () => {
     const boot = await bootedAccount();
     const { kek } = await createWorkspaceKey(boot.secrets, "ws1");
-    const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState], NOW + 1000);
+    const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState]);
     const manifest = utf8(JSON.stringify({ files: [{ path: "a.ts" }] }));
     const built = await buildCommit({
       secrets: boot.secrets,

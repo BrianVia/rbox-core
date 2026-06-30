@@ -84,7 +84,6 @@ export {
   type RosterBody,
   type RosterEntry,
   type SignedRoster,
-  type VerifyOptions,
 } from "./roster.js";
 export {
   buildKeyState,

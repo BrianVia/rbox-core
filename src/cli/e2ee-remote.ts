@@ -430,7 +430,7 @@ export class E2eeRemote implements SyncRemote {
     if (!keys) throw new Error("workspace is E2EE but this account has no key material — run setup/connect first");
     const rosters = keys.rosters.map((s) => JSON.parse(s) as SignedRoster);
     const keyStates = keys.keyStates.map((s) => JSON.parse(s) as SignedKeyState);
-    const account = await verifyAccount(rosters, keyStates, this.ctx.now());
+    const account = await verifyAccount(rosters, keyStates);
 
     const pin = await this.pins.load();
     if (pin) {

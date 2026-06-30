@@ -133,7 +133,7 @@ describe("full E2EE — two machines + zero-knowledge server", () => {
     server.deviceKeys.push({ deviceId: "devB", mkWrap: redeem.device.mkWrap });
 
     // ---- Machine B pulls + verifies + decrypts ----
-    const account = await verifyAccount(server.rosters, server.keyStates, NOW + 2000);
+    const account = await verifyAccount(server.rosters, server.keyStates);
     expect(account.rosters).toHaveLength(2); // genesis + B's admission
     const kekWrap = server.workspaceKeys.get(a.workspaceId)!;
     const bKek = await openWorkspaceKey(redeem.secrets, kekWrap, a.workspaceId);
@@ -163,7 +163,7 @@ describe("full E2EE — two machines + zero-knowledge server", () => {
     const server = new FakeServer();
     const a = await machineAInit(server);
     await commitSecretTree(server, a);
-    const account = await verifyAccount(server.rosters, server.keyStates, NOW + 2000);
+    const account = await verifyAccount(server.rosters, server.keyStates);
     // forge a commit signed by a stranger key but claiming devA
     const stranger = await bootstrapAccount(a.accountId, "devA", NOW); // different keys, same deviceId
     const built = await buildCommit({

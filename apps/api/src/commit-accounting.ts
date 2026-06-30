@@ -10,7 +10,7 @@
 
 import type { Env } from "./env.js";
 import { verifyReceipt } from "./receipts.js";
-import { markedCandidateSet } from "./gc-phase1.js";
+import { isOverCapAbort } from "./auth.js";
 
 export interface RefWithSize {
   sha: string;
@@ -62,12 +62,19 @@ export async function validateCommitRefs(
   // into db.batch() calls (one D1 subrequest each) makes validating N refs cost ~N/(90·SELECTS_
   // PER_BATCH) subrequests instead of N/90 — the prior 90-per-round-trip loop was the subrequest
   // hog that bounded large commits (§30 limits analysis).
-  const have = new Set<string>(); // entitled AND present=1
+  const have = new Set<string>(); // entitled AND present=1 AND not a prune candidate
+  // §33 candidate-aware validate (the prune barrier), FOLDED into the have-set SELECT: a ref this
+  // account has marked as a prune-candidate (`blob_ref_candidates`) is excluded by the NOT EXISTS,
+  // so it reads as NOT-satisfied even though it is entitled+present — forcing it into `newRefs` so
+  // commitAccounting re-grants it and CLEARS the marker. Without this, a deduped commit (which
+  // never bumps `granted_at`) could publish a head referencing a ref Phase-1 purge is about to
+  // drop. Folding it into the existing query (vs a second pass) makes the barrier un-forgettable.
   const selects = chunk(shas, 90).map((c) =>
     db
       .prepare(
         `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
-         WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${c.map(() => "?").join(",")})`,
+         WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${c.map(() => "?").join(",")})
+           AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
       )
       .bind(accountId, ...c),
   );
@@ -75,14 +82,6 @@ export async function validateCommitRefs(
     const results = await db.batch<{ sha256: string }>(group);
     for (const r of results) for (const row of r.results ?? []) have.add(row.sha256);
   }
-
-  // §33 candidate-aware validate (the prune barrier): a ref this account has marked as a
-  // prune-candidate (`blob_ref_candidates`) reads as NOT-satisfied even though it is
-  // entitled+present — forcing it into `newRefs` so commitAccounting re-grants it and
-  // CLEARS the marker. Without this, a deduped commit (which never bumps `granted_at` —
-  // see below) could publish a head referencing a ref Phase-1 purge is about to drop.
-  const marked = await markedCandidateSet(db, accountId, [...have]);
-  for (const m of marked) have.delete(m);
 
   const newRefs: RefWithSize[] = [];
   const needsUpload: string[] = [];
@@ -169,7 +168,7 @@ export async function commitAccounting(
     } catch (e) {
       // accounts_cap_guard RAISE(ABORT,'over_cap') → THIS super-batch rolled back; earlier
       // ones stayed committed (design 30 §3). Report over-cap; the client gets a 402.
-      if (e instanceof Error && /over_cap/i.test(e.message)) {
+      if (isOverCapAbort(e)) {
         const acc = await db.prepare("SELECT used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
           used_bytes: number;
           cap_bytes: number;
