@@ -496,3 +496,14 @@ so it stays on the account shard with the credential it describes.
    be in scope for the first sharding milestone?
 </content>
 </invoke>
+
+---
+
+## Founder decisions (2026-06-30) — spec is now decision-complete
+
+- **accounts modeling:** **placement-constraint fallback** (NOT the identity/accounting split). Keep the `accounts` row whole on its shard; linked accounts are forced co-resident. Simpler; accepts limited whale-migration of linked accounts. §5's split is shelved.
+- **`account_id` on `blobs`/`gc_candidates`:** **ADD** the explicit nullable column (cheap, backfillable from the single `blob_refs` owner). Don't rely on implicit-by-colocation.
+- **When to shard:** triggered by D1 storage-% approaching the ~10 GB/DB cap OR a sustained overload-error signal from §25 telemetry. Phases 0–1 ship regardless of trigger.
+- **Cross-shard account-link:** the placement constraint (co-residence) handles it — no directory-plane cross-shard resolution needed in v1.
+- **Directory-plane KV cache:** deferred to the first actual sharding milestone (not Phase 0).
+- **BUILD NOW:** **Phase 0 only** — the `dbFor(env, accountId)` / `dirDb(env)` seam at N=1 (behavior-preserving). HRW routing + multi-shard provisioning wait for the shard trigger.

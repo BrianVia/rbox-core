@@ -363,3 +363,13 @@ protect old binaries — codex r1 MAJOR).**
    enforcement on client adoption.
 6. **Separate generous commit bucket** so §30 large pushes never trip at the commit step —
    confirm (recommended yes).
+
+---
+
+## Founder decisions (2026-06-30) — spec is now decision-complete
+
+- **Enforcement:** **enforce in v1** (founder choice — not observe-only). Ship with 429 + `Retry-After` active on the proposed budgets; calibrate from telemetry post-launch.
+- **Store:** Cloudflare **native rate-limit binding** (not a per-account DO).
+- **Backpressure:** 429 + `Retry-After` + advertised `x-rbox-max-concurrency`; client honors via AIMD (64 = ceiling, not constant).
+- **Per-plan budgets:** start at the proposed numbers in §"plan matrix".
+- **BUILD NOW:** **deferred** — implement after the §32 seam + §33 Phase 1 land and there's rate telemetry to calibrate against. Spec is ready when scheduled.

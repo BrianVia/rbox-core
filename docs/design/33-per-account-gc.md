@@ -505,3 +505,14 @@ existing un-condemn at `commit-accounting.ts:148`.
    a deliberate decision).
 5. **Reconciler cadence.** Run the 07b §c `SUM(blob_refs ⋈ blobs)` reconciler alongside GC
    to mop up R3 skew, or on a slower drift-correction schedule?
+
+---
+
+## Founder decisions (2026-06-30) — spec is now decision-complete
+
+- **Phase 2 R2 deletion:** **manual/quiescent** (NO delete barrier). R2's lack of atomic delete makes cron R2-reclaim a TOCTOU; given single-writer-per-account, the barrier isn't worth it. Phase 1 (billing reclaim) is the value; physical R2 free stays a manual `/v1/admin/gc?phase=purge` sweep, as today.
+- **Cadence:** Phase 1 on cron (start hourly); Phase 2 manual.
+- **Retention:** keep `plans.ts` values (free 0 / solo 30 / pro 90 / team 90).
+- **Grace:** `GRACE_1` ≈ 1h; `GRACE_2` ≥ `RECEIPT_TTL_MS + δ`.
+- **Reconciler (07b §c):** run alongside Phase 1.
+- **BUILD NOW:** **Phase 1** (per-account entitlement prune on cron + the candidate-aware commit barrier) — closes the live `used_bytes` leak. Phase 2 stays manual.
