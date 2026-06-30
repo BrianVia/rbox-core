@@ -22,7 +22,7 @@ its design doc. Updated 2026-06-29. Shipped work lives in `docs/learnings.md` +
 |---|------|--------|-----------|
 | 1 | Upload receipts + commit-time batched accounting | [`design/23-upload-receipts.md`](design/23-upload-receipts.md) | PUT → ~R2-only; account once at commit. Kills ~5 D1 trips/blob. **Biggest win.** |
 | 2 | blobRefs → R2 sidecar | [`design/24-blobref-sidecar.md`](design/24-blobref-sidecar.md) | Move the ref list out of the signed commit body; unlocks 50k-file repos. |
-| 3 | Server timing / observability | [`design/25-server-observability.md`](design/25-server-observability.md) | Per-op R2/D1/DO timing → Analytics Engine. Don't optimize blind; do this around #1. |
+| 3 | Server timing / observability **🚧** | [`design/25-server-observability.md`](design/25-server-observability.md) | Per-op R2/D1/DO timing → Analytics Engine. **Near-complete impl on branch `obs/server-instrumentation`** (pushed; metrics.ts + instrumentation + tests, ~347 lines) → resume/PR from there. Schema+SQL: [`observability-server-metrics.md`](observability-server-metrics.md). |
 
 ## 🟠 P1 — after P0 measurements
 | # | Item | Design | One-liner |

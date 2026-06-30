@@ -1,8 +1,16 @@
 # §25 — Server-side timing & observability (P0-adjacent)
 
-> Status: **design**. Implements the server half of `benchmarking-and-observability.md` §5,
-> pulled forward because you can't validate §23/§24 throughput wins without it.
-> **"Don't optimize blind."** Do the timing seam (19.1) before/around the §23 work.
+> Status: **🚧 implementation started** (not yet PR'd). A near-complete server
+> instrumentation already lives on branch **`obs/server-instrumentation`** (pushed):
+> `apps/api/src/metrics.ts` (one Analytics Engine datapoint per op) + instrumented
+> blobs/worker/workspace-sync + tests + the `wrangler` AE binding (~347 lines). The
+> shipped schema + dashboard SQL are in [`../observability-server-metrics.md`](../observability-server-metrics.md).
+> **Resume / open a PR from that branch — don't reimplement.** The design below is the
+> intent it realizes.
+>
+> Implements the server half of `benchmarking-and-observability.md` §5, pulled forward
+> because you can't validate §23/§24 throughput wins without it. **"Don't optimize
+> blind."** Do the timing seam (§25.1) before/around the §23 work.
 
 ## Problem
 The Worker has ~no observability — a handful of `console` calls, no request timing, no
