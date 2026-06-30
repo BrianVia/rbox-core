@@ -27,6 +27,15 @@ export function clearStaleTokens(currentSid: string | null): void {
 	}
 }
 
+/** Drop the CURRENT session's cached rbox token so the next authed() call re-mints
+ *  one. Used after unlink (design 22 §4.3): the old token now points at the account
+ *  we just disconnected from (and is server-revoked), so the SPA must re-exchange
+ *  against the fresh shell, not keep hitting X. */
+export function clearCurrentToken(clerk: Clerk): void {
+	const sid = sessionId(clerk);
+	if (sid) sessionStorage.removeItem(keyFor(sid));
+}
+
 // One in-flight exchange per session (SF1): concurrent callers for the SAME Clerk
 // session share its promise. It is keyed by sid so a caller that arrives mid-switch
 // can never receive a promise that resolves to a different account's token (B3).
@@ -80,6 +89,84 @@ export async function fetchUsage(clerk: Clerk): Promise<Usage> {
 	const res = await authed(clerk, '/v1/account/usage');
 	if (!res.ok) throw new Error(`usage failed (${res.status})`);
 	return res.json() as Promise<Usage>;
+}
+
+// ── devices & workspaces (design 22 §2) ──────────────────────────────────────
+
+export interface Device {
+	deviceId: string;
+	label: string | null;
+	kind: 'cli' | 'web';
+	createdAt: number;
+	lastSeenAt: number | null;
+	isCurrent: boolean;
+}
+export interface Workspace {
+	workspaceId: string;
+	projectId: string;
+	createdAt: number;
+}
+export interface Page<T> {
+	items: T[];
+	nextCursor: string | null;
+}
+
+export async function fetchDevices(
+	clerk: Clerk,
+	opts: { include?: 'cli' | 'all'; cursor?: string | null } = {}
+): Promise<Page<Device>> {
+	const q = new URLSearchParams();
+	if (opts.include) q.set('include', opts.include);
+	if (opts.cursor) q.set('cursor', opts.cursor);
+	const res = await authed(clerk, `/v1/account/devices${q.size ? `?${q}` : ''}`);
+	if (res.status === 404 || res.status === 501) throw new Error('WEB_AUTH_NOT_ENABLED');
+	if (!res.ok) throw new Error(`devices failed (${res.status})`);
+	const data = (await res.json()) as { devices: Device[]; nextCursor: string | null };
+	return { items: data.devices, nextCursor: data.nextCursor };
+}
+
+export async function fetchWorkspaces(
+	clerk: Clerk,
+	opts: { cursor?: string | null } = {}
+): Promise<Page<Workspace>> {
+	const q = new URLSearchParams();
+	if (opts.cursor) q.set('cursor', opts.cursor);
+	const res = await authed(clerk, `/v1/account/workspaces${q.size ? `?${q}` : ''}`);
+	if (res.status === 404 || res.status === 501) throw new Error('WEB_AUTH_NOT_ENABLED');
+	if (!res.ok) throw new Error(`workspaces failed (${res.status})`);
+	const data = (await res.json()) as { workspaces: Workspace[]; nextCursor: string | null };
+	return { items: data.workspaces, nextCursor: data.nextCursor };
+}
+
+/** Whether a Clerk identity manages this account (drives the empty-state nudge). */
+export async function fetchAccountStatus(clerk: Clerk): Promise<{ accountId: string; linked: boolean }> {
+	const res = await authed(clerk, '/v1/account/status');
+	if (!res.ok) throw new Error(`status failed (${res.status})`);
+	return res.json() as Promise<{ accountId: string; linked: boolean }>;
+}
+
+/** Revoke a device's access (design 22 §4.1). ACCESS-ONLY — it cuts the device off
+ *  the server but does NOT cryptographically evict its keys (E2EE epoch rotation is
+ *  unbuilt). The UI copy must say so; this helper does not overpromise. */
+export async function revokeDevice(clerk: Clerk, deviceId: string): Promise<void> {
+	const res = await authed(clerk, `/v1/auth/devices/${encodeURIComponent(deviceId)}/revoke`, {
+		method: 'POST'
+	});
+	if (res.status === 403) throw new Error('You don’t have permission to revoke this device.');
+	if (res.status === 404) throw new Error('That device no longer exists.');
+	if (!res.ok) throw new Error(`revoke failed (${res.status})`);
+}
+
+/** Disconnect this dashboard login from its rbox account (design 21 §5.4 + 22 §4.3).
+ *  The server also revokes the caller's live web session, so afterwards we drop the
+ *  cached token → the next call re-exchanges against the fresh shell. */
+export async function unlinkAccount(clerk: Clerk): Promise<string> {
+	const res = await authed(clerk, '/v1/account/unlink', { method: 'POST' });
+	if (res.status === 409) throw new Error('This account has billing — cancel the subscription before unlinking.');
+	if (res.status === 404) throw new Error('This login isn’t linked to an rbox account.');
+	if (!res.ok) throw new Error(`unlink failed (${res.status})`);
+	clearCurrentToken(clerk); // old token now points at (and is revoked on) the disconnected account
+	return ((await res.json()) as { account: string }).account;
 }
 
 export async function startCheckout(clerk: Clerk, plan: 'solo' | 'pro'): Promise<string> {

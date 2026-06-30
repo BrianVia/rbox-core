@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { ctEqual, json, logErr, sha256Hex } from "./util.js";
 import { capBytesFor } from "./plans.js";
-import type { Principal } from "./authz.js";
+import { audit, type Principal } from "./authz.js";
 
 
 /**
@@ -335,8 +335,173 @@ export async function listDevices(env: Env, self: Principal): Promise<Response> 
   return json({ devices: (rows.results ?? []).map((r) => ({ ...r, isSelf: r.device_id === self.deviceId })) });
 }
 
-// POST /v1/auth/devices/:deviceId/revoke  (authed) — only within the caller's account.
+/**
+ * POST /v1/auth/devices/:deviceId/revoke (authed, design 19a / design 22 §4.1).
+ *
+ * ACCESS revocation only — it flips `devices.revoked` so the token 401s on its next
+ * call, but it does NOT cryptographically evict the device's cached MK/KEKs (E2EE
+ * epoch rotation is unbuilt, design 22 §1.3/§4.2). Callers surface that ceiling in
+ * the UI; the server makes no claim beyond "the token is dead."
+ *
+ * Authorization is an ATOMIC guarded UPDATE (no SELECT-then-write race): any role
+ * may revoke ITS OWN device; only owner/admin may revoke ANOTHER device in the
+ * account. `device_id` is globally unique (migration 0013), so the WHERE matches at
+ * most one row. A `changes==0` outcome is then disambiguated by a follow-up READ
+ * (purely to pick the status code — it never gates the write): unknown-in-my-account
+ * → 404 (uniform with cross-account, no enumeration leak), already-revoked →
+ * idempotent 200, otherwise insufficient role → 403.
+ */
 export async function revokeDevice(env: Env, self: Principal, deviceId: string): Promise<Response> {
-  const res = await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ?").bind(deviceId, self.accountId).run();
-  return json({ ok: true, revoked: res.meta.changes });
+  const privileged = self.role === "owner" || self.role === "admin" ? 1 : 0;
+  const res = await env.rbox_dev_db
+    .prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
+    .bind(deviceId, self.accountId, self.deviceId, privileged)
+    .run();
+  if ((res.meta.changes ?? 0) === 1) {
+    await audit(env, self, deviceId === self.deviceId ? "device.revoke.self" : "device.revoke", deviceId);
+    return json({ ok: true, revoked: 1 });
+  }
+  // changes==0: choose the response without leaking cross-account existence.
+  const row = await env.rbox_dev_db
+    .prepare("SELECT revoked FROM devices WHERE device_id = ? AND account_id = ?")
+    .bind(deviceId, self.accountId)
+    .first<{ revoked: number }>();
+  if (!row) return json({ error: "not_found" }, 404); // no such device in MY account (== cross-account)
+  if (row.revoked === 1) return json({ ok: true, revoked: 0 }); // already revoked → idempotent, no audit spam
+  return json({ error: "forbidden", message: "insufficient role to revoke another device" }, 403);
+}
+
+// ── /devices dashboard surface (design 22 §2) ────────────────────────────────
+// Account-scoped, web-facing, camelCase, secret-free projections of the devices &
+// workspaces a Clerk web session owns. Deliberately SEPARATE from the snake_case
+// CLI contract `GET /v1/auth/devices` (`rbox device list` parses that) so neither
+// regresses. Responses NEVER include `token_hash`, `account_id`, `user_id`, raw
+// `expires_at`, or any key/roster material — `kind` is the only `expires_at`
+// projection, and the server makes no claim about E2EE roster status (design §2.1).
+
+const ACCOUNT_LIST_LIMIT_DEFAULT = 50;
+const ACCOUNT_LIST_LIMIT_MAX = 100;
+const DEVICE_LABEL_MAX = 256; // projection cap; the renderer also sanitizes (XSS/escaping)
+
+function parseLimit(url: URL): number {
+  const raw = Number(url.searchParams.get("limit"));
+  if (!Number.isFinite(raw) || raw <= 0) return ACCOUNT_LIST_LIMIT_DEFAULT;
+  return Math.min(Math.floor(raw), ACCOUNT_LIST_LIMIT_MAX);
+}
+
+/** Opaque keyset cursor over `(created_at, rowid)`. It encodes ONLY public ordering
+ *  position (never `token_hash` or any secret) and every query that consumes it is
+ *  account-scoped server-side, so a tampered cursor can at most re-page the caller's
+ *  OWN account from a different offset — never cross-tenant. The values are bound as
+ *  parameters (never string-interpolated), and a malformed cursor is rejected (400). */
+function encodeCursor(createdAt: number, rowid: number): string {
+  return btoa(`${createdAt}.${rowid}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function decodeCursor(raw: string): { createdAt: number; rowid: number } | null {
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const m = /^(\d{1,15})\.(\d{1,15})$/.exec(decoded);
+    if (!m) return null;
+    return { createdAt: Number(m[1]), rowid: Number(m[2]) };
+  } catch {
+    return null;
+  }
+}
+
+/** Slice a `limit+1`-fetched result set into a page plus the opaque cursor for the
+ *  next page (null when there's none). The off-by-one sentinel logic is identical for
+ *  every keyset list endpoint, so it lives in exactly one place. */
+function keysetPage<T extends { created_at: number; rid: number }>(results: T[] | undefined, limit: number): { page: T[]; nextCursor: string | null } {
+  const all = results ?? [];
+  const page = all.slice(0, limit);
+  const last = page[page.length - 1];
+  return { page, nextCursor: all.length > limit && last ? encodeCursor(last.created_at, last.rid) : null };
+}
+
+interface DeviceRow {
+  rid: number;
+  device_id: string;
+  label: string | null;
+  created_at: number;
+  last_seen_at: number | null;
+  expires_at: number | null;
+}
+
+/** GET /v1/account/devices?include=cli|all&limit&cursor — the caller's devices. */
+export async function accountDevices(env: Env, p: Principal, url: URL): Promise<Response> {
+  const includeAll = url.searchParams.get("include") === "all";
+  const limit = parseLimit(url);
+  const cursorRaw = url.searchParams.get("cursor");
+  const cursor = cursorRaw ? decodeCursor(cursorRaw) : null;
+  if (cursorRaw && !cursor) return json({ error: "bad_request", message: "invalid cursor" }, 400);
+
+  const binds: (string | number)[] = [p.accountId];
+  // The OR parentheses are LOAD-BEARING (design §2.1): without them `AND` binds
+  // tighter than `OR` and every account's live web sessions would leak cross-tenant.
+  let where = "revoked = 0 AND account_id = ?";
+  if (includeAll) {
+    where += " AND (expires_at IS NULL OR expires_at > ?)"; // durable OR a LIVE (unexpired) web session
+    binds.push(Date.now());
+  } else {
+    where += " AND expires_at IS NULL"; // default: durable CLI devices only, not browser tabs
+  }
+  if (cursor) {
+    where += " AND (created_at > ? OR (created_at = ? AND rowid > ?))";
+    binds.push(cursor.createdAt, cursor.createdAt, cursor.rowid);
+  }
+  binds.push(limit + 1); // +1 sentinel → is there a next page?
+
+  const rows = await env.rbox_dev_db
+    .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, expires_at FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .bind(...binds)
+    .all<DeviceRow>();
+  const { page, nextCursor } = keysetPage(rows.results, limit);
+
+  return json({
+    devices: page.map((r) => ({
+      deviceId: r.device_id,
+      label: r.label === null ? null : r.label.slice(0, DEVICE_LABEL_MAX),
+      kind: r.expires_at === null ? "cli" : "web", // the ONLY projection of expires_at
+      createdAt: r.created_at,
+      lastSeenAt: r.last_seen_at,
+      isCurrent: r.device_id === p.deviceId,
+    })),
+    nextCursor,
+  });
+}
+
+interface WorkspaceRow {
+  rid: number;
+  workspace_id: string;
+  project_id: string;
+  created_at: number;
+}
+
+/** GET /v1/account/workspaces?limit&cursor — the caller's sync roots. Under E2EE the
+ *  server holds NO folder name/path; `projectId` is a PK component returned verbatim. */
+export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promise<Response> {
+  const limit = parseLimit(url);
+  const cursorRaw = url.searchParams.get("cursor");
+  const cursor = cursorRaw ? decodeCursor(cursorRaw) : null;
+  if (cursorRaw && !cursor) return json({ error: "bad_request", message: "invalid cursor" }, 400);
+
+  const binds: (string | number)[] = [p.accountId];
+  let where = "account_id = ?";
+  if (cursor) {
+    where += " AND (created_at > ? OR (created_at = ? AND rowid > ?))";
+    binds.push(cursor.createdAt, cursor.createdAt, cursor.rowid);
+  }
+  binds.push(limit + 1);
+
+  const rows = await env.rbox_dev_db
+    .prepare(`SELECT rowid AS rid, workspace_id, project_id, created_at FROM workspaces WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .bind(...binds)
+    .all<WorkspaceRow>();
+  const { page, nextCursor } = keysetPage(rows.results, limit);
+
+  return json({
+    workspaces: page.map((r) => ({ workspaceId: r.workspace_id, projectId: r.project_id, createdAt: r.created_at })),
+    nextCursor,
+  });
 }

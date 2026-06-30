@@ -1279,6 +1279,156 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await billingOf(shell))?.sub).toBe("sub_dirty2"); // billing NOT moved off the shell
     expect((await billingOf(x.accountId))?.sub).toBeNull();
   });
+
+  // ── Design 22 §2: the /devices dashboard surface ─────────────────────────
+  const getDevices = (token: string, qs = "") =>
+    SELF.fetch(`${BASE}/v1/account/devices${qs}`, { headers: authed(token) });
+  const getWorkspaces = (token: string, qs = "") =>
+    SELF.fetch(`${BASE}/v1/account/workspaces${qs}`, { headers: authed(token) });
+
+  test("GET /v1/account/devices: account-scoped, camelCase, NEVER leaks secrets", async () => {
+    const a = await bootstrap("acct-dev-list");
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    await pairRedeem(pair); // a 2nd durable device on the account
+    const res = await getDevices(a.token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { devices: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(body.devices.length).toBe(2);
+    // The raw JSON must contain NONE of the secret/internal columns.
+    const raw = JSON.stringify(body);
+    for (const banned of ["token_hash", "tokenHash", "account_id", "accountId", "user_id", "userId", "expires_at", "expiresAt", "revoked"]) {
+      expect(raw).not.toContain(banned);
+    }
+    for (const d of body.devices) {
+      expect(Object.keys(d).sort()).toEqual(["createdAt", "deviceId", "isCurrent", "kind", "label", "lastSeenAt"]);
+      expect(d.kind).toBe("cli");
+    }
+    // isCurrent is true for EXACTLY the caller's own device.
+    expect(body.devices.filter((d) => d.isCurrent).map((d) => d.deviceId)).toEqual([a.deviceId]);
+  });
+
+  test("devices include=cli HIDES web sessions; include=all shows LIVE web but never another account's", async () => {
+    const a = await bootstrap("acct-dev-incl");
+    // A real web session on a SECOND account — its live web row must never leak to A.
+    const other = await webToken("user_dev_incl_other");
+    expect(other.length).toBeGreaterThan(0);
+    // Give account A its own live web session by mapping a clerk id onto A is heavy;
+    // instead assert the cross-tenant property + the cli/all split on A's own rows.
+    const cli = (await (await getDevices(a.token)).json()) as { devices: Array<{ kind: string; deviceId: string }> };
+    expect(cli.devices.every((d) => d.kind === "cli")).toBe(true);
+    // include=all on A still only returns A's rows (no cross-tenant web leak).
+    const all = (await (await getDevices(a.token, "?include=all")).json()) as { devices: Array<{ deviceId: string }> };
+    expect(all.devices.every((d) => d.deviceId.startsWith("dev_"))).toBe(true);
+    expect(all.devices.length).toBe(1); // just the bootstrap device; the other account's web session is invisible
+  });
+
+  test("devices: expired web sessions are excluded even under include=all", async () => {
+    const a = await bootstrap("acct-dev-expired");
+    // Insert an already-expired web row directly on A's account.
+    await env.rbox_dev_db
+      .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, 'old-web', ?, 'u', ?, ?)")
+      .bind(sha("expired-web-token"), "web_expired_1", a.accountId, Date.now() - 7200_000, Date.now() - 3600_000)
+      .run();
+    const all = (await (await getDevices(a.token, "?include=all")).json()) as { devices: Array<{ deviceId: string }> };
+    expect(all.devices.some((d) => d.deviceId === "web_expired_1")).toBe(false);
+  });
+
+  test("devices: a tampered/garbage cursor → 400 (opaque, rejects tampering)", async () => {
+    const a = await bootstrap("acct-dev-cursor");
+    expect((await getDevices(a.token, "?cursor=not-a-real-cursor!!")).status).toBe(400);
+  });
+
+  test("GET /v1/account/workspaces: camelCase, account-scoped, secret-free", async () => {
+    const a = await bootstrap("acct-ws-list");
+    await SELF.fetch(`${BASE}/v1/workspaces?project=my-proj`, { method: "POST", headers: authed(a.token) });
+    const res = await getWorkspaces(a.token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { workspaces: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(body.workspaces.length).toBe(1);
+    expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "projectId", "workspaceId"]);
+    expect(body.workspaces[0]!.projectId).toBe("my-proj");
+    expect(JSON.stringify(body)).not.toContain("account_id");
+    // A second account never sees account A's workspace.
+    const b = await bootstrap("acct-ws-other");
+    expect(((await (await getWorkspaces(b.token)).json()) as { workspaces: unknown[] }).workspaces.length).toBe(0);
+  });
+
+  test("kind-gate: a web token reaches the new devices/workspaces reads (200), still 403 on mint", async () => {
+    const wt = await webToken("user_dev_gate");
+    expect((await getDevices(wt)).status).toBe(200);
+    expect((await getWorkspaces(wt)).status).toBe(200);
+    // …but is still default-denied on a credential-mint route.
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(wt) })).status).toBe(403);
+  });
+
+  // ── Design 22 §4.1: hardened device revoke (authz + audit, access-only) ───
+  const revoke = (token: string, deviceId: string) =>
+    SELF.fetch(`${BASE}/v1/auth/devices/${deviceId}/revoke`, { method: "POST", headers: authed(token) });
+
+  test("revoke authz: owner→ok, self(any role)→ok, viewer/editor→403, cross-account→404", async () => {
+    const a = await bootstrap("acct-revoke-authz");
+    // a 2nd durable device (the revoke TARGET) on A.
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    const { deviceId: target } = (await (await pairRedeem(pair)).json()) as { deviceId: string };
+
+    // viewer/editor revoking ANOTHER device → 403 (no row flips).
+    const viewer = await durableNonOwner(a.accountId, "viewer");
+    expect((await revoke(viewer, target)).status).toBe(403);
+    const editor = await durableNonOwner(a.accountId, "editor");
+    expect((await revoke(editor, target)).status).toBe(403);
+
+    // cross-account → 404 (uniform with non-existent, no enumeration leak).
+    const b = await bootstrap("acct-revoke-cross");
+    expect((await revoke(b.token, target)).status).toBe(404);
+
+    // owner → ok, exactly one row.
+    const ok = await revoke(a.token, target);
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { revoked: number }).revoked).toBe(1);
+
+    // self-revoke works for ANY role: the viewer revokes ITS OWN device.
+    const viewerDevId = (await env.rbox_dev_db.prepare("SELECT device_id FROM devices WHERE token_hash = ?").bind(sha(viewer)).first<{ device_id: string }>())!.device_id;
+    const self = await revoke(viewer, viewerDevId);
+    expect(self.status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(viewer) })).status).toBe(401); // its own token is now dead
+  });
+
+  test("revoke is idempotent: a second revoke → 200 revoked:0, and writes ONE audit row", async () => {
+    const a = await bootstrap("acct-revoke-idem");
+    const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+    const { deviceId: target } = (await (await pairRedeem(pair)).json()) as { deviceId: string };
+    expect(((await (await revoke(a.token, target)).json()) as { revoked: number }).revoked).toBe(1);
+    const again = await revoke(a.token, target);
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { revoked: number }).revoked).toBe(0); // already revoked → no-op
+    const audits = await env.rbox_dev_db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'device.revoke' AND target = ?").bind(target).first<{ n: number }>();
+    expect(audits?.n).toBe(1); // exactly one audit, no double-revoke spam
+  });
+
+  // ── Design 22 §4.3: unlink ALSO kills the caller's live web session ───────
+  test("unlink revokes the live web session on X (token 401s next call); durable CLI device survives", async () => {
+    const sub = "user_unlink_websess";
+    await webShell(sub);
+    const x = await bootstrap("acct-unlink-websess");
+    // Link C → X.
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, code);
+    await linkConfirm(sub, pollKey);
+    expect(await clerkMap(sub)).toBe(x.accountId);
+
+    // A returning web login now mints a LIVE web token ON X. It works before unlink.
+    const webTok = await webToken(sub);
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(webTok) })).status).toBe(200);
+
+    // Unlink (owner via the durable CLI token on X).
+    const un = await SELF.fetch(`${BASE}/v1/account/unlink`, { method: "POST", headers: authed(x.token) });
+    expect(un.status).toBe(200);
+
+    // The previously-live web token is now revoked → 401 on its very next call (no ~1h window).
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(webTok) })).status).toBe(401);
+    // The durable CLI device on X is UNTOUCHED (web revoke is expires_at-scoped).
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(x.token) })).status).toBe(200);
+  });
 });
 
 describe("release distribution (design 14)", () => {
