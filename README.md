@@ -110,18 +110,51 @@ Details: [`docs/pricing.md`](docs/pricing.md).
 ```bash
 bun install
 bun run typecheck          # tsc (root) + tsc (apps/api)
-bun test src               # engine + client tests (bun:test)
+bun run test               # engine + client tests (bun:test, scoped to ./src/)
 bun run test:api           # Worker integration tests (Miniflare/workerd: D1+R2+DO)
 bun run test:all           # both suites
 ```
 
 The control plane deploys with `wrangler deploy` from `apps/api/`. Secrets (`RBOX_BOOTSTRAP_SECRET`, `RBOX_PLATFORM_SECRET`, and later `STRIPE_*`) are Wrangler secrets — never committed.
 
+### Benchmarking
+
+`scripts/bench/` measures real sync throughput against a running worker (network
+latency is the point — bench against the dev worker, not local Miniflare). The
+corpus generator seeds the shapes that stress the engine (duplicate + empty files).
+
+```bash
+# 1. be enrolled (E2EE) against the target remote — a fresh account avoids the
+#    1-workspace free-tier cap; the sweep creates its own workspace under ~/code/bench-ws
+rbox login --bootstrap "$RBOX_DEV_BOOTSTRAP_SECRET"
+
+# 2. upload-concurrency sweep — cold first-push of a fixed-shape corpus, fresh
+#    unique content per run (a true cold push each time)
+bun scripts/bench/push-sweep.ts \
+  --bin /path/to/rbox \          # the compiled binary to drive (defaults to /tmp/rbox-fixed)
+  --shape small \                # tiny | small | repo  (see scripts/bench/corpus.ts)
+  --conc 8,16,32,64 \            # RBOX_UPLOAD_CONCURRENCY values to sweep
+  --runs 1
+
+# generate a corpus standalone (e.g. for manual push/pull timing):
+bun scripts/bench/corpus.ts ~/code/bench-ws small 42   # <dir> <shape> <seed>
+```
+
+Output: a wall-time / blobs-per-sec table (best concurrency highlighted) plus a JSONL
+row in `bench-results/` (gitignored). Concurrency is also tunable at runtime via
+`RBOX_UPLOAD_CONCURRENCY` / `RBOX_DOWNLOAD_CONCURRENCY` / `RBOX_ENCRYPT_CONCURRENCY`.
+Methodology + the broader (micro-bench, e2e, observability) plan live in
+[`docs/benchmarking-and-observability.md`](docs/benchmarking-and-observability.md);
+measured wins are logged in [`docs/perf-improvements.md`](docs/perf-improvements.md).
+
 ## Docs
 
 - [`docs/roadmap.md`](docs/roadmap.md) — milestone status
 - [`docs/design/`](docs/design/) — one spec per milestone (each carries its codex review resolutions)
 - [`docs/learnings.md`](docs/learnings.md) — append-only build log of non-obvious findings
+- [`docs/backlog.md`](docs/backlog.md) — engineering backlog (not-done work, by priority)
+- [`docs/perf-improvements.md`](docs/perf-improvements.md) — measured perf wins (+ benchmarking how-to above)
+- [`docs/architecture.html`](docs/architecture.html) — client/server architecture + bottleneck diagram
 - [`docs/adr/`](docs/adr/) — architecture decision records
 - [`docs/rbox-architecture-v2.md`](docs/rbox-architecture-v2.md) — design + decision log
 - [`docs/pricing.md`](docs/pricing.md) — plans
