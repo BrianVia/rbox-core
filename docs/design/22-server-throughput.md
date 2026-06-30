@@ -1,4 +1,4 @@
-# §16 — Server-side throughput review (codex, research-grounded)
+# §22 — Server-side throughput review (codex, research-grounded)
 
 > Codex adversarial review of `docs/architecture.html` + `perf-improvements.md` +
 > `benchmarking-and-observability.md` + the server hot path, with **live research**
