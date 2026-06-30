@@ -1265,7 +1265,18 @@ the sole validator under E2EE). Then:
   separation; added a regression test. The "historical commits may predate rotation"
   decrypt is honestly scoped to v1's single account epoch (§15.2) — cross-rotation
   restore fails closed on the GCM AAD and is deferred with rotation.
-- codex round 3 → (pending; re-run after the round-2 fixes).
+- codex round 3 → **PASS** (no BLOCKER/MAJOR). Confirmed both round-2 fixes resolve
+  the MAJORs with no regressions; re-confirmed the terminal-hash ancestry proof,
+  `openCommitHistorical`'s safe epoch-gate drop, restore atomicity/path-safety, and
+  past-retention fail-closed; the cardinal test proves decrypted v1 bytes.
+
+**Format-change note (greenfield).** Binding `workspaceId` into the KEK-wrap AAD
+(round-2 fix #2) is a wire-format change — pre-existing dev workspaces' KEK wraps
+(created without it) now correctly **fail closed** on unwrap (`wrap context mismatch`).
+Like D5's `mkWrapHash`, this is an accepted pre-launch signed/wrapped-format change:
+landing it requires the documented greenfield dev D1+R2 wipe + re-`init` (§13.9). A
+live single-machine check against the dev worker surfaced exactly this (an existing
+old-format workspace refused to unwrap) — the correct behavior, not a regression.
 
 ## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and
