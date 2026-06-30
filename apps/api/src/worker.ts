@@ -12,7 +12,7 @@
  */
 import type { Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
-import { approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
+import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
 import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
 import { retentionPrune } from "./retention.js";
@@ -173,6 +173,9 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
   if (isDeviceRevoke(req.method, seg)) return revokeDevice(env, p, seg[3]!);
   if (req.method === "GET" && eq(seg, ["v1", "account", "usage"])) return usage(env, p);
+  // design 22 §2: the web-facing devices/workspaces lists (camelCase, secret-free).
+  if (req.method === "GET" && eq(seg, ["v1", "account", "devices"])) return accountDevices(env, p, url);
+  if (req.method === "GET" && eq(seg, ["v1", "account", "workspaces"])) return accountWorkspaces(env, p, url);
   // Account linking — AUTHED rbox-bearer routes (under the §1.1 web-token gate).
   if (req.method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) {
     const b = (await req.json().catch(() => ({}))) as { code?: unknown };
@@ -333,6 +336,8 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   if (method === "GET" && (eq(seg, ["v1", "account", "usage"]) || eq(seg, ["v1", "account", "status"]))) return true;
   if (method === "POST" && (eq(seg, ["v1", "billing", "checkout"]) || eq(seg, ["v1", "billing", "portal"]))) return true;
   if (method === "GET" && eq(seg, ["v1", "auth", "devices"])) return true;
+  // design 22 §2.4: the new web-facing reads — exact pairs, NOT a GET /v1/account/* wildcard.
+  if (method === "GET" && (eq(seg, ["v1", "account", "devices"]) || eq(seg, ["v1", "account", "workspaces"]))) return true;
   if (isDeviceRevoke(method, seg)) return true;
   if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='durable' check
   if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)

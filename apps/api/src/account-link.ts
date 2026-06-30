@@ -299,7 +299,7 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
   if (p.role !== "owner") return json({ error: "forbidden", message: "unlink requires an owner" }, 403);
   // The Clerk mapping and the billing state are independent reads on p.accountId → concurrent.
   const [map, billing] = await Promise.all([
-    env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>(),
+    env.rbox_dev_db.prepare("SELECT clerk_user_id, user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string; user_id: string }>(),
     env.rbox_dev_db.prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>(),
   ]);
   if (!map) return json({ error: "not_linked" }, 404);
@@ -312,6 +312,12 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
     env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
     env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
     env.rbox_dev_db.prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),
+    // design 22 §4.3: rebinding clerk_users alone leaves the caller's already-minted
+    // web_* token valid on X for up to its ~1h TTL — `authenticate()` resolves via
+    // `devices`+`memberships`, INDEPENDENT of `clerk_users`. So in the SAME atomic
+    // batch revoke the unlinked user's EPHEMERAL web sessions on X (never the durable
+    // CLI devices: `expires_at IS NOT NULL`), closing the residual-access window.
+    env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE account_id = ? AND user_id = ? AND expires_at IS NOT NULL").bind(p.accountId, map.user_id),
     env.rbox_dev_db.prepare("INSERT INTO account_link_events (clerk_user_id, from_account, to_account, method, actor_device, at) VALUES (?, ?, ?, 'unlink', ?, ?)").bind(map.clerk_user_id, p.accountId, newAcct, p.deviceId, nowMs),
   ]);
   return json({ ok: true, account: newAcct });

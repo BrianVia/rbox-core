@@ -80,6 +80,8 @@
 	];
 
 	const goLink = () => goto('/link');
+	const goDevices = () => goto('/devices');
+	const goSettings = () => goto('/settings');
 	const plan = $derived((usage?.plan as Tier) ?? 'free');
 	const isFree = $derived(plan === 'free');
 	const info = $derived(PLAN[plan] ?? PLAN.free);
@@ -127,6 +129,19 @@
 			</div>
 		</div>
 	</section>
+
+	<!-- Manage nav (design 22): devices/workspaces list + revoke live on their own
+	     route; account unlink lives in Settings — deliberately separate surfaces. -->
+	<nav class="manage-nav">
+		<button class="nav-tile" onclick={goDevices}>
+			<strong>Devices &amp; workspaces →</strong>
+			<span class="faint">See your machines and sync roots; revoke access.</span>
+		</button>
+		<button class="nav-tile" onclick={goSettings}>
+			<strong>Settings →</strong>
+			<span class="faint">Disconnect this dashboard from your account.</span>
+		</button>
+	</nav>
 
 	<!-- Discovery nudge (design 21 §6 / 17 §4.1): route CLI-first users to the
 	     possession-proof link flow. NEVER auto-detect-and-bind (that's option C). -->
@@ -374,6 +389,32 @@
 	.manage-note strong,
 	.team-note strong {
 		color: var(--text);
+	}
+
+	/* ---- manage nav ---- */
+	.manage-nav {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+		margin-bottom: 14px;
+	}
+	.nav-tile {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		text-align: left;
+		padding: 14px 16px;
+		border-radius: 12px;
+		border: 1px solid var(--border);
+		background: rgba(255, 255, 255, 0.02);
+		cursor: pointer;
+		transition: border-color 0.2s ease;
+	}
+	.nav-tile:hover {
+		border-color: rgba(124, 108, 255, 0.45);
+	}
+	.nav-tile .faint {
+		font-size: 12.5px;
 	}
 
 	/* ---- link nudge ---- */
