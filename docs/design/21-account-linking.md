@@ -1,6 +1,6 @@
 # Design 21 — Account identity model + web↔CLI account linking
 
-> **Implementation status: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Highest-leverage spec in the batch: docs 16/17/19 depend on it.
+> **Implementation status: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Highest-leverage spec in the batch: docs 16/17/19 depend on it. **Staged build plan: [`21-account-linking-plan.md`](./21-account-linking-plan.md).**
 
 Designs **16** (new-device emails), **17** (device/workspace dashboard) and **19**
 (revocation) all sit on top of "the Clerk session manages the user's *real*
@@ -699,8 +699,6 @@ and clean link auditing (here). 16/17's "device_id is non-unique" language preda
    enhancement (a new bootstrap-into-existing-account endpoint so the web shell
    itself becomes the crypto world, skipping the later reclaim), or keep B = "web
    signup + normal bootstrap + A"?
-</content>
-</invoke>
 
 ---
 

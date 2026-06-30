@@ -41,7 +41,7 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 | 18 | [Support email routing](./18-support-email-routing.md) | 🔴 NOT STARTED | — | `support@ → Gmail` via CF Email Routing; migration off Namecheap |
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
 | 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🔴 NOT STARTED | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
-| 21 | [Account linking / identity](./21-account-linking.md) | 🔴 NOT STARTED · design ✅ complete | — (P1 done) | web↔CLI link (`rbox account link`); recommends option A+B; unblocks 16/17/19 |
+| 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | 🔴 NOT STARTED · design ✅ complete | — (P1 done) | web↔CLI link (`rbox account link`); recommends option A+B; unblocks 16/17/19 |
 
 ## Cross-cutting prerequisites (gate the 16–21 batch)
 
