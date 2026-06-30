@@ -13,7 +13,7 @@
 ## 2. Version history (read APIs)
 - `GET /v1/ws/:ws/proj/:proj/versions?limit=N` → `[{ sequence, manifestSha, deviceId, createdAt }]` (from D1, newest first). Authed.
 - `GET /v1/ws/:ws/proj/:proj/manifests/:seq` → that sequence's manifest (DO reads `seq:<n>` → R2). Authed.
-- CLI: `rbox versions [path]` — list workspace commits (seq, time, device); with a path, show the versions where that path's content changed (diff its sha across recent manifests). `rbox restore <path>@<seq>` — fetch the file's entry from manifest `seq`, download+decrypt its blob, write it locally (atomic, as a restore; does not rewrite history).
+- CLI: `rbox versions [path]` — list workspace commits (seq, time, device); with a path, show the versions where that path's content changed (diff its sha across recent manifests). `rbox restore <path>@<seq>` — fetch the file's entry from manifest `seq`, download+decrypt its blob, write it locally (atomic, as a restore; does not rewrite history). **Under full E2EE (the only mode now) these route through the signed-commit-chain + per-epoch-KEK decrypt path — see design 12 §15 (D11 made real); the plaintext `manifestAt` path is never taken.** Restore fails closed past the plan's retention window (the commit pointer is pruned → `needs_rebaseline`).
 
 ## 3. Retention (time-windowed)
 - Per-workspace retention window `retentionDays` (default 30; **plan-gated in M7b** — Free 7 / Solo 30 / Pro 90). Stored in workspace/project config.

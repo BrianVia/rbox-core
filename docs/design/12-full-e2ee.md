@@ -1095,8 +1095,132 @@ server auth.
 `workspace.json` carries `schema: "e2ee/v1"`; any workspace lacking it (old M5/
 plaintext) → fail before any blob op with a re-init message. `versions` lists from
 the verified commit chain (metadata only — seq/deviceId, no decrypt); `restore`
-fetches the target commit, `openCommit`-decrypts under its `keyEpoch`, and applies;
+fetches the target commit, decrypts under its `keyEpoch`, and applies;
 both route through `E2eeRemote` or fail closed (never the old plaintext `manifestAt`).
+**The concrete wire flow is pinned in §15** (D11 made real): verified-head anchor +
+downward `verifyHistorySegment` + `openCommitHistorical` (no current-epoch gate for
+history) + atomic per-file restore + retention-window fail-closed.
+
+## 15. Version history + restore under E2EE (D11 made real)
+
+**Status:** DESIGN → codex review → implementing. Lifts the `rbox versions`/`rbox
+restore` refusal (`index.ts case "versions"/"restore"`) under E2EE-only. D11 above
+named the goal; this section pins the concrete wire flow, the crypto, and the
+fail-closed boundaries. Consumes the v4 wire spec + §13.12 (C1/C2) + §14.11 (D11).
+
+**No new server endpoint.** Everything needed is already exposed (verified in the
+built `apps/api/`): `GET .../latest` (head), `GET .../commits?since=<n>` (the stored
+`SignedCommit`s for `(since, head]`, or `409 needs_rebaseline` on a pruned gap /
+span > `MAX_COMMIT_SPAN`), blob `GET` (encManifest + file ciphertext),
+`GET /v1/keys/workspace/:ws` (per-epoch KEK wraps), `GET /v1/keys/account`
+(roster/key-state chains), and the best-effort D1 `GET .../versions` (advisory
+commit `created_at` for display only). The client adds the verification + decrypt.
+
+### 15.1 Trust anchor — verify the head, then a downward segment
+
+The authoritative anchor is the **verified head** the device already establishes on
+every pull (§13, C1/C2): `refreshAccount` (roster + key-state chains, anti-rollback
+vs the local pin) → `latest()` → verify the chain `(pin, head]` forward → the head
+`commitHash` is trusted and the pin is advanced. `versions`/`restore` reuse this
+exact path (`verifiedHead()`), so they inherit anti-rollback/anti-fork for free.
+
+To authenticate a **historical** commit at `seq ≤ head` we do NOT re-anchor at
+genesis (genesis is unreachable once retention has pruned `seq:1`, and a long
+history exceeds `MAX_COMMIT_SPAN`). Instead we fetch the contiguous segment
+`[seq..head]` = `commitsSince(seq-1)` and verify a **downward** property
+(`verifyHistorySegment`):
+- the segment is contiguous ascending `seq, seq+1, …, head` (no gaps);
+- each commit links to its predecessor (`parentSeq`/`parentCommitHash`);
+- each commit's `sig` verifies against the signer **active in that commit's OWN
+  `rosterVersion`** (authentic history — a historical link may predate a rotation);
+- the **last** commit's `commitHash` **equals the trusted head hash**.
+
+The terminal-hash match is load-bearing: head is already trusted, `head.parentCommitHash`
+commits to `head-1`, inductively down to `seq` — so the segment is the *true ancestry*
+of the verified head, not a server-fabricated alternate. This is strictly stronger
+than forward-from-genesis and needs no genesis reachability. `verifyCommitChain`
+(forward-from-pin) is unchanged and still drives `pull`; `verifyHistorySegment` is
+the new sibling for "authenticate ancestors of a trusted head."
+
+### 15.2 Historical decryption — `openCommitHistorical` (no current-epoch gate)
+
+`openCommit` (the pull-head opener) applies the C4 gate: reject unless the signer is
+active in the **current** roster AND `accountEpoch == current`. That gate is correct
+for the head but **wrong for history** — a legitimately-old commit may be signed by a
+since-revoked device and carry an older `accountEpoch`/`keyEpoch`. `verifyHistorySegment`
+already authenticated the commit (terminal-hash + own-roster sig), so historical
+decrypt uses a sibling, `openCommitHistorical`, that:
+- verifies the sig against the signer active in the commit's **own** `rosterVersion`;
+- checks `sha256(encManifest) == body.encManifestSha` (the signed address);
+- decrypts the manifest strictly under `body.keyEpoch` (`decryptManifest`).
+
+The per-epoch KEK is resolved read-only (`kekFor(body.keyEpoch, …, createIfMissing=false)`):
+memory → `getWorkspaceKeys` wrap → `openWorkspaceKey` under MK. `workspace_keys` rows
+are immutable (CAS-insert, never deleted), so an older epoch's KEK is always
+re-derivable while its wrap row exists. A **missing** epoch KEK → fail closed, never
+guess. (v1 fixes `keyEpoch=0`, but the epoch is threaded correctly so rotation is a
+no-op change here.)
+
+### 15.3 `rbox versions [path]`
+
+`buildAuthedRemote` (fail-closed: schema `e2ee/v1` + enrolled MK, else throw) →
+`verifiedHead()`. If no history → "no versions yet". Else fetch the retained window
+`[max(1, head-limit+1) .. head]` via `commitsSince` + `verifyHistorySegment`, and
+print newest-first `{ seq, deviceId, keyEpoch }` (all from the verified signed body),
+annotated with the **advisory** server `created_at` from the best-effort D1
+`versions` list (clearly server-reported; timing is already a documented residual).
+A `needs_rebaseline` (window dips below the plan's retention floor) is caught and the
+window is narrowed to what's retained, with a "older versions aged out of retention"
+note — never a hard failure of the whole command.
+
+With a `[path]`: decrypt each commit's manifest in the verified window
+(`openCommitHistorical`), read that path's entry, and print the seqs where its
+`sha256` (content identity) changed — i.e. the versions in which the file's content
+actually changed. (Bounded O(window) manifest decrypts; fine for the default limit.)
+
+### 15.4 `rbox restore <path>@<seq>`
+
+Parse `<path>@<seq>` (seq a positive integer; path a workspace-relative path,
+re-validated post-decrypt via the manifest validator's path-safety — the client is
+the sole validator under E2EE). Then:
+1. `verifiedHead()`; reject `seq < 1 || seq > head` ("no such version").
+2. Authenticate + decrypt the manifest at `seq` (§15.1/§15.2) → `{ manifest, kek }`
+   (kek = the per-epoch KEK bytes for that commit's `keyEpoch`).
+3. Find the `type:"file"` entry for `path` in that manifest. Absent → fail closed
+   ("`path` did not exist at version `seq`"). A symlink entry → restore the link
+   target (no blob).
+4. Download the ciphertext blob by `entry.encSha` (`blobStore().getToFile`, which
+   verifies the **ciphertext** sha) to a temp sibling of the target; `decryptFileToPath`
+   (verifies the **plaintext** `entry.sha256` after GCM-decrypt) into a second temp;
+   `fs.rename` atomically onto the target. The same decrypt+verify+atomic-publish the
+   pull path uses (`writeEntry`), minus reconcile — restore is an explicit overwrite.
+5. **Restore does NOT commit / rewrite history.** It writes one file from a past
+   version onto disk. The next `sync` then treats it as an ordinary local edit.
+
+**Fail-closed boundaries (all of these refuse, none fall back to plaintext):**
+- no E2EE marker / no MK → `buildAuthedRemote` throws before any network call;
+- head rollback / fork / bad sig / chain break / segment not terminating at the
+  verified head → throw (tamper-evident);
+- `seq` below the retention floor (commit pointer pruned) or beyond `MAX_COMMIT_SPAN`
+  → `needs_rebaseline` surfaced as "version `seq` has aged out of your retention
+  window" — the design-06 "fails closed past the retention window" requirement;
+- encManifest/blob hash mismatch, missing epoch KEK, or path absent at `seq` → throw;
+- the legacy plaintext `RboxApi.manifestAt`/`versions` paths are **never** taken.
+
+### 15.5 Files touched
+| File | Change |
+|---|---|
+| `src/engine/e2ee/session.ts` | **new** `verifyHistorySegment`, `openCommitHistorical`; export both |
+| `src/cli/e2ee-remote.ts` | refactor `verifiedHead()` out of `latest()`; add `history()`, `manifestAtSeq()` |
+| `src/cli/remote.ts` | typed `NeedsRebaselineError` from `commitsSince` (fail-closed signal) |
+| `src/cli/e2ee-client.ts` | `buildAuthedRemote` also returns the concrete `E2eeRemote` |
+| `src/cli/versions-cmd.ts` | **new** — `versionsCmd`, `restoreCmd` |
+| `src/cli/index.ts` | wire `case "versions"`/`"restore"` to the real commands |
+
+### 15.6 Review log
+- v1 (2026-06-30): authored. Pending codex adversarial review (chain-segment
+  verification, epoch/rotation decrypt, fetching past manifests without leaking
+  plaintext, restore atomicity, fail-closed). To be appended below.
 
 ## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and
