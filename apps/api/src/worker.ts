@@ -10,7 +10,7 @@
  *
  * Dev-harness shortcut (documented): auth is a shared bearer token (M4 replaces).
  */
-import type { Env } from "./env.js";
+import type { DeviceNotifyMessage, Env } from "./env.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
@@ -23,6 +23,7 @@ import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
 import { startOp } from "./metrics.js";
+import { processNotification, sweepNotifications } from "./notify.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export default {
@@ -72,6 +73,34 @@ export default {
       // (run manually via /v1/admin/gc while no push is active). (codex scaling review.)
     } catch (e) {
       logErr("scheduled_gc_failed", e); // no raw message (GC touches account/blob metadata)
+    }
+    try {
+      // New-device-email backstop (design 16 §2.4): re-drive outbox rows whose enqueue was
+      // lost + pending/failed deliveries, and purge delivered PII. Separate try so a GC
+      // failure above never starves the security-alert sweep (and vice-versa).
+      await sweepNotifications(env);
+    } catch (e) {
+      logErr("scheduled_notify_sweep_failed", e); // no raw message (touches device/account metadata)
+    }
+  },
+
+  /**
+   * New-device-email queue consumer (design 16 §2.4). Each message carries only a
+   * credential `token_hash`; the authoritative state is the D1 outbox row, which
+   * `processNotification` reads, resolves to owners, and delivers per-recipient (the
+   * per-delivery atomic claim/lease makes at-least-once redelivery send at most once).
+   * `ack()` on success; `retry()` on an UNEXPECTED throw (per-recipient transient
+   * failures are already recorded as `failed` inside, to be re-driven by queue+cron).
+   */
+  async queue(batch: MessageBatch<DeviceNotifyMessage>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      try {
+        await processNotification(env, msg.body.tokenHash);
+        msg.ack();
+      } catch (e) {
+        logErr("device_notify_consume_failed", e);
+        msg.retry();
+      }
     }
   },
 };

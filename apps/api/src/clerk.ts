@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { capBytesFor } from "./plans.js";
 import { createWebSession } from "./auth.js";
+import { refreshOwnerEmail } from "./notify.js";
 
 /**
  * Web auth via Clerk (M11). The browser signs in with Clerk and POSTs its
@@ -118,6 +119,7 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
     .bind(sub)
     .first<{ account_id: string; user_id: string }>();
+  const firstLogin = !map;
 
   if (!map) {
     // First provisioning. Gate on a verified email BEFORE creating anything — run
@@ -153,6 +155,13 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
     await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
   }
+
+  // Refresh the cached owner email for new-device-alert recipient resolution (design 16
+  // §3.2), throttled (≤ once/24h) and NON-FATAL — a cache refresh, not the auth path. Only
+  // on RETURNING logins: a first login already fetched Clerk for the verified-email gate
+  // above, so re-fetching here would just double the round-trip; the cache fills on the
+  // next login (or the consumer's live fallback) instead.
+  if (!firstLogin) await refreshOwnerEmail(env, sub, nowMs).catch(() => {});
 
   const { token } = await createWebSession(env, map.account_id, map.user_id);
   return json({ token, accountId: map.account_id });

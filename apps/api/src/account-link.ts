@@ -222,7 +222,12 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       env.rbox_dev_db.prepare(`UPDATE accounts SET reclaimed_at = ? WHERE id = ? AND ${orphan}`).bind(nowMs, shell, shell),
       env.rbox_dev_db.prepare(`DELETE FROM memberships WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       env.rbox_dev_db.prepare(`DELETE FROM users WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
-      env.rbox_dev_db.prepare(`DELETE FROM devices WHERE account_id = ? AND expires_at IS NOT NULL AND ${orphan}`).bind(shell, shell)
+      env.rbox_dev_db.prepare(`DELETE FROM devices WHERE account_id = ? AND expires_at IS NOT NULL AND ${orphan}`).bind(shell, shell),
+      // §9.5: account_notify_prefs is a settings artifact (not a blocker) — clean it on
+      // reclaim like the shell's own user row. (device_notifications can't exist on a
+      // reclaimable shell — it implies a durable device, which blocks below — so it's a
+      // COVERED blocker, not a cleaned row.)
+      env.rbox_dev_db.prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
     );
   }
   try {
@@ -267,6 +272,7 @@ async function loadShellState(env: Env, accountId: string, nowMs: number): Promi
          (SELECT COUNT(*) FROM uploads WHERE account_id = ?1) AS up,
          (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND consumed_at IS NULL AND expires_at > ?2) AS pt,
          (SELECT COUNT(*) FROM device_auth WHERE account_id = ?1 AND status IN ('pending','approved') AND expires_at > ?2) AS da,
+         (SELECT COUNT(*) FROM device_notifications WHERE account_id = ?1) AS dn,
          (SELECT COUNT(*) FROM commits WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE account_id = ?1)) AS cm,
          (SELECT COUNT(*) FROM clerk_users WHERE account_id = ?1) AS cu,
          (SELECT COUNT(*) FROM memberships WHERE account_id = ?1 AND role = 'owner') AS own
@@ -285,7 +291,7 @@ function judgeReclaimable(r: ShellState | null, opts: { ignoreBilling?: boolean 
   if (r.origin !== "web") return false;
   if (Number(r.used) !== 0) return false;
   if (!opts.ignoreBilling && (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
-  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "cm"]) if (Number(r[k]) !== 0) return false;
+  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "dn", "cm"]) if (Number(r[k]) !== 0) return false;
   if (Number(r.cu) > 1 || Number(r.own) > 1) return false; // only this Clerk id + its one owner membership
   return true;
 }

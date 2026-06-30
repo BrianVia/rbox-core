@@ -32,6 +32,28 @@
   "triggers": {
     "crons": ["0 4 * * *"]
   },
+  // New-device security email (design 16 / 30). The Worker has no ExecutionContext, so
+  // the durable path is: outbox (D1) → Queue → consumer send → cron backstop.
+  "queues": {
+    "producers": [{ "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-dev-device-notify" }],
+    "consumers": [
+      {
+        "queue": "rbox-dev-device-notify",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "rbox-dev-device-notify-dlq"
+      }
+    ]
+  },
+  // Cloudflare Email Service — Email Sending (the NEW first-party `send()` API, not the
+  // legacy MIME binding). No API key/DKIM material at runtime: CF signs DKIM with the
+  // CF-managed sending-subdomain key. Sender domain `mail.rbox.to` (onboarded + enabled).
+  "send_email": [{ "name": "EMAIL" }],
+  // From: for the new-device email; the idempotency pepper is a `wrangler secret`.
+  "vars": {
+    "RBOX_NOTIFY_FROM": "security@mail.rbox.to"
+  },
   // Production environment: separate worker (rbox-prod-api) + its own D1/R2/DO,
   // served at api.rbox.to. Binding NAMES are kept identical to dev so the code is
   // env-agnostic; only the underlying resources differ.
@@ -58,6 +80,22 @@
       "analytics_engine_datasets": [{ "binding": "rbox_metrics", "dataset": "rbox_prod_metrics" }],
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
       "triggers": { "crons": ["0 4 * * *"] },
+      // New-device email infra in prod (reaches prod ONLY via merge→CI, never from a dev
+      // deploy). Separate prod queue + DLQ; same EMAIL binding + sender domain.
+      "queues": {
+        "producers": [{ "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-prod-device-notify" }],
+        "consumers": [
+          {
+            "queue": "rbox-prod-device-notify",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "rbox-prod-device-notify-dlq"
+          }
+        ]
+      },
+      "send_email": [{ "name": "EMAIL" }],
+      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to" },
       "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]
     }
   }

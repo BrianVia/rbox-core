@@ -1,6 +1,16 @@
 # Design 16 — New-device security email ("a new device was added to your account")
 
-> **Implementation: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Status index: [`README.md`](./README.md).
+> **Implementation: 🟢 BUILT (slices 4–5)** — outbox + Cloudflare Queue + cron backstop
+> + the real Cloudflare Email Service send, on the API. Status index: [`README.md`](./README.md).
+>
+> **Sending-domain correction (2026-06-30):** the live, onboarded + enabled Email
+> Sending domain is **`mail.rbox.to`** (account-level, works on dev + prod). This doc's
+> earlier `security.rbox.to` references have been updated to `mail.rbox.to`; the `From:`
+> is `security@mail.rbox.to`. Binding is the NEW Email Service `send()` API
+> (`env.EMAIL.send({to,from,subject,html,text})`), wrangler `"send_email":[{"name":"EMAIL"}]`.
+> Deferred to slice 6 (not built): the owner-gated opt-out mutation endpoint + cross-notify,
+> and the over-cap coalescing summary (upstream caps — 5 pairing tokens/account,
+> device-code approval — bound volume; every device still gets its own alert, never dropped).
 
 **Status:** v2 — design only (no implementation). Revised after an adversarial
 codex review (VERDICT: FAIL → all 13 findings resolved; see §13).
@@ -20,7 +30,7 @@ designed there, not here).
 > first-party Cloudflare, **no separate vendor (no MailChannels)**.
 >
 > What this changes at implementation (full mechanics in §4): the `From:` stays on
-> **`security.rbox.to`**, so the apex/subdomain DMARC split in design 18 is unaffected;
+> **`mail.rbox.to`**, so the apex/subdomain DMARC split in design 18 is unaffected;
 > but the DNS is **CF-managed** — onboarding the sending subdomain (dashboard or the
 > `POST /zones/{zone}/email/sending/subdomains` API) makes Cloudflare write + **lock**
 > the records itself: `cf-bounce` MX, SPF `include:_spf.mx.cloudflare.net`, a
@@ -311,7 +321,7 @@ The Worker already runs on Cloudflare, so the **binding** is the natural choice 
 drops the `MAILCHANNELS_API_KEY`/`RESEND_API_KEY` secret entirely and needs no
 outbound `fetch`. (The binding also makes DKIM/alignment automatic, §4.3.)
 
-New config: `RBOX_NOTIFY_FROM` (e.g. `security@security.rbox.to`),
+New config: `RBOX_NOTIFY_FROM` (e.g. `security@mail.rbox.to`),
 `NOTIFY_IDEMPOTENCY_PEPPER` (secret, §4.4), reuse `RBOX_APP_URL` for the revoke-link
 base. With the binding there is **no provider API key** to manage.
 
@@ -332,18 +342,18 @@ The feature is only intentionally off — `skipped` — when an **explicit**
 
 ### 4.3 Deliverability — CF-managed DNS on the sending subdomain
 
-rbox.to is on Cloudflare DNS, so onboarding the **`security.rbox.to`** sending
+rbox.to is on Cloudflare DNS, so onboarding the **`mail.rbox.to`** sending
 subdomain (dashboard *Compute → Email Service → Email Sending → Onboard Domain*, or
 the `POST /zones/{zone}/email/sending/subdomains` API) makes Cloudflare **write and
 lock** the records itself — we do **not** hand-author SPF/DKIM. CF provisions:
 
-- **MX** on `cf-bounce.security.rbox.to` → Cloudflare's bounce servers (return-path).
-- **SPF** TXT on `cf-bounce.security.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`.
-- **DKIM** TXT on `cf-bounce._domainkey.security.rbox.to` — selector `cf-bounce`,
+- **MX** on `cf-bounce.mail.rbox.to` → Cloudflare's bounce servers (return-path).
+- **SPF** TXT on `cf-bounce.mail.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`.
+- **DKIM** TXT on `cf-bounce._domainkey.mail.rbox.to` — selector `cf-bounce`,
   **CF-generated** key (the `p=…` value is only known *after* onboarding; fetch it via
   `GET /zones/{zone}/email/sending/subdomains/{id}/dns` or the dashboard). CF signs
   every message and **manages alignment automatically** — no self-managed keypair.
-- **DMARC** TXT on `_dmarc.security.rbox.to`: `v=DMARC1; p=quarantine;
+- **DMARC** TXT on `_dmarc.mail.rbox.to`: `v=DMARC1; p=quarantine;
   rua=mailto:dmarc@rbox.to; adkim=s; aspf=s`, graduating to `p=reject` once aligned.
 
 These records are **fully separate** from Email Routing's apex inbound records (which
@@ -478,7 +488,7 @@ failure neither drops the other owner nor re-sends the succeeded one:
 - Per delivery: **`pending` → `sent`** on ESP 2xx (stamps `sent_at`).
 - **`pending`/`failed` → `failed` (retry)** on **transient** errors — CF Email
   Service send rejection / 5xx / 429, **Clerk API down/timeout**, network, **or the
-  `security.rbox.to` sending domain not yet onboarded/entitled in prod** (§4.2).
+  `mail.rbox.to` sending domain not yet onboarded/entitled in prod** (§4.2).
   Bounded `attempts`; queue backoff + cron re-drive. Transient failures must
   **retry**, never silently drop a security alert.
 - **`pending` → `skipped` (terminal, no retry)** only when the *answer is known*:
@@ -589,7 +599,7 @@ only the email *rate* is capped. Coalescing is **required** for v1's over-cap pa
 **`Env` / wrangler additions:** `DEVICE_NOTIFY_Q` (queue producer binding) +
 consumer config + DLQ; the **`send_email` binding** (`[[send_email]] name = "EMAIL"`)
 — no provider API key; `RBOX_NOTIFY_FROM`, `NOTIFY_IDEMPOTENCY_PEPPER` (secret),
-`DEVICE_NOTIFICATIONS_DISABLED` (flag); onboard the **`security.rbox.to`** sending
+`DEVICE_NOTIFICATIONS_DISABLED` (flag); onboard the **`mail.rbox.to`** sending
 subdomain (CF auto-writes + locks the `cf-bounce` MX/SPF/DKIM + `_dmarc`).
 **Worker:** add `queue(batch, env)` handler; extend `scheduled()` with the
 backstop sweep + PII purge + coalesce-summary emission.
@@ -641,11 +651,11 @@ indexes.
    cron-sweep-only path (higher latency, no new binding) and add Queues later?
 3. **Cloudflare Email Service enablement (the real external dependency).** Confirm
    the account is on **Workers Paid** (required for arbitrary recipients) and Email
-   Sending (public beta) is enabled, then **onboard `security.rbox.to`** (dashboard or
+   Sending (public beta) is enabled, then **onboard `mail.rbox.to`** (dashboard or
    the `POST /zones/{zone}/email/sending/subdomains` API). This is the only blocker for
    the send step; everything upstream (outbox/queue/cron) ships without it. *(The
    provider question is settled: first-party CF Email Service, no Resend/SES/MailChannels.)*
-4. **DMARC `p=quarantine` → `p=reject`** timeline on the `security.rbox.to`
+4. **DMARC `p=quarantine` → `p=reject`** timeline on the `mail.rbox.to`
    sending subdomain.
 5. Recipients = **owners only**, or **owners + admins** once an admin role exists?
 6. Keep new-device email **opt-out** (recommended, with a UI warning) or make it

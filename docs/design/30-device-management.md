@@ -1,6 +1,14 @@
 # Design 30 — Device management (devices route + new-device email + web unlink/revoke)
 
-> **Implementation status: 🟡 PARTIAL** — slices 1–3 (the `/devices` route, device revoke, unlink + live-web-session revoke) are **SHIPPED & live** (PR #8, `app.rbox.to/devices`). Slices 4–6 (new-device email) are **not started** — pending Cloudflare Email Service setup. Design + build plan, codex-reviewed (2026-06-30).
+> **Implementation status: 🟡 PARTIAL** — slices 1–3 (the `/devices` route, device revoke, unlink + live-web-session revoke) are **SHIPPED & live** (PR #8, `app.rbox.to/devices`). **Slices 4–5 (new-device email infra + the real Cloudflare Email Service send) are BUILT** on the API; slice 6 (owner-gated opt-out mutation UI + over-cap coalescing summary) is deferred. Design + build plan, codex-reviewed (2026-06-30).
+>
+> **Sending-domain correction (2026-06-30):** the live onboarded + enabled Email Sending
+> domain is **`mail.rbox.to`** (not `security.rbox.to` — references updated throughout).
+> `From: security@mail.rbox.to`. Send via the NEW Email Service `send()` binding
+> (`env.EMAIL.send`, wrangler `"send_email":[{"name":"EMAIL"}]`). Note: today
+> `uq_clerk_users_account` (migration 0014) binds exactly ONE Clerk identity per account,
+> so the per-recipient ledger fan-out resolves to a single recipient in practice — the
+> account's one Clerk-mapped owner — even with several owner memberships.
 
 > **Doc-number note (read first).** This workstream was scoped as "§22" before the
 > infra docs `22-server-throughput.md` … `28-git-sync-e2ee.md` landed on `main`, so
@@ -23,7 +31,7 @@ inbound SHIPPED), 21 (account linking — SHIPPED, PR #2).
 
 **Supersedes where appropriate:**
 - design 16 §4.2 (Resend recommendation) → **Cloudflare Email Service — Email
-  Sending** (first-party, public beta) on `security.rbox.to` (the all-Cloudflare
+  Sending** (first-party, public beta) on `mail.rbox.to` (the all-Cloudflare
   product decision, 16's own banner; supersedes the interim MailChannels call).
 - design 16 §5.2 / §12.7 and design 17 §8.5 ("`device_id` is non-unique, the
   revoke target is ambiguous") → **stale**; migration `0013` made `device_id`
@@ -118,7 +126,7 @@ audited widening, never a wildcard.
   **not** give us a transactional sender.
 - **Outbound transactional** decision: **all-Cloudflare → Cloudflare Email Service
   (Email Sending), first-party, public beta (2026-04-16)** on a dedicated
-  `security.rbox.to` sending subdomain. The interim "MailChannels" call is
+  `mail.rbox.to` sending subdomain. The interim "MailChannels" call is
   **superseded**: the premise that Cloudflare has no first-party send to arbitrary
   recipients was true only of the *old* `send_email` binding (verified-destinations
   only); **Email Service sends to any recipient** after the sending domain is
@@ -426,11 +434,11 @@ CREATE TABLE account_notify_prefs (account_id TEXT PRIMARY KEY, notify_new_devic
   then `const { messageId } = await env.EMAIL.send({ to, from, subject, html, text })`.
   This is an in-platform binding: **no outbound `fetch`, no provider API key, no
   per-message DKIM key to pass** — Cloudflare signs DKIM with its CF-managed
-  `cf-bounce._domainkey.security.rbox.to` key and ensures DMARC alignment
+  `cf-bounce._domainkey.mail.rbox.to` key and ensures DMARC alignment
   automatically (§3.10). So the MailChannels-era secrets are **deleted**:
   ~~`MAILCHANNELS_API_KEY`~~, ~~`MAILCHANNELS_DKIM_PRIVATE_KEY`~~, ~~`_DKIM_DOMAIN`~~,
   ~~`_DKIM_SELECTOR`~~. Remaining config: `RBOX_NOTIFY_FROM`
-  (`security@security.rbox.to`); `NOTIFY_IDEMPOTENCY_PEPPER` (secret, retained as an
+  (`security@mail.rbox.to`); `NOTIFY_IDEMPOTENCY_PEPPER` (secret, retained as an
   internal dedupe tag — see §3.4's no-provider-idempotency note); reuse `RBOX_APP_URL`
   for the revoke-link base. (REST alternative if the binding is unavailable: `POST
   …/accounts/{account_id}/email/sending/send` with a CF API token — but the binding is
@@ -454,7 +462,7 @@ the right target for a security alert).
 - `pending/failed → sending` via the atomic claim (§3.4), then:
 - `sending → sent` on a successful `env.EMAIL.send(...)` (binding returns `messageId`).
 - `pending/failed → failed (retry)` on **transient** errors: CF Email Service send
-  rejection / 5xx / 429, Clerk down/timeout, network, **or the `security.rbox.to`
+  rejection / 5xx / 429, Clerk down/timeout, network, **or the `mail.rbox.to`
   sending domain not yet onboarded/entitled in prod** — bounded `attempts`, queue
   backoff + cron re-drive. An un-onboarded sending domain is **failed+alarm**, never
   terminal `skipped` (that would permanently discard alerts until someone noticed).
@@ -494,28 +502,28 @@ unsliced). The renderer sanitizes **regardless of stored value**: strip CR/LF + 
 C0/C1 control chars (header-injection guard), clamp ~80 chars, HTML/text-escape per
 part. The label is **never** interpolated into the Subject (only the sanitized body).
 
-### 3.10 Provider DNS for `security.rbox.to` (Cloudflare-managed)
+### 3.10 Provider DNS for `mail.rbox.to` (Cloudflare-managed)
 Supersedes design 16 §4.3's Resend records and the interim MailChannels records with
 **Cloudflare Email Service's**. The records are **not hand-authored**: onboarding the
-`security.rbox.to` sending subdomain (dashboard *Compute → Email Service → Email
+`mail.rbox.to` sending subdomain (dashboard *Compute → Email Service → Email
 Sending → Onboard Domain*, or `POST /zones/{zone}/email/sending/subdomains`) makes
 Cloudflare **write and lock** them, since rbox.to is on CF DNS. CF provisions:
-- **MX** on `cf-bounce.security.rbox.to` → Cloudflare bounce servers (return-path).
-- **SPF** TXT on `cf-bounce.security.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`
+- **MX** on `cf-bounce.mail.rbox.to` → Cloudflare bounce servers (return-path).
+- **SPF** TXT on `cf-bounce.mail.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`
   — **not** `include:relay.mailchannels.net`.
-- **DKIM** TXT on `cf-bounce._domainkey.security.rbox.to` (selector `cf-bounce`),
+- **DKIM** TXT on `cf-bounce._domainkey.mail.rbox.to` (selector `cf-bounce`),
   **CF-generated** (the `p=…` value is known only after onboarding; fetch via `GET
   /zones/{zone}/email/sending/subdomains/{id}/dns`). Cloudflare signs every message
   with this key — there is **no** `_mailchannels` Domain-Lockdown TXT and **no**
   self-managed keypair; CF's locked, managed DKIM is the anti-spoof + auth mechanism.
-- **DMARC** TXT on `_dmarc.security.rbox.to`: `v=DMARC1; p=quarantine;
+- **DMARC** TXT on `_dmarc.mail.rbox.to`: `v=DMARC1; p=quarantine;
   rua=mailto:dmarc@rbox.to; adkim=s; aspf=s`, graduating to `p=reject` once aligned.
 
 These records are **separate from the apex/inbound records** (design 18 — Email
 Routing uses the apex MX/SPF + the `cf2024-1._domainkey` selector), so onboarding
 sending **does not touch** the shipped inbound routing; the subdomain split keeps
 transactional reputation isolated. CF "ensures proper [DMARC] alignment
-automatically," so the sending-subdomain DKIM (`d=security.rbox.to`) aligns under the
+automatically," so the sending-subdomain DKIM (`d=mail.rbox.to`) aligns under the
 subdomain's own DMARC without interacting with the apex `p=reject`.
 
 ---
@@ -630,7 +638,7 @@ button's real job.
 All four prerequisites this workstream needs (P1 unique id, P2 linking, P4 kind-gate,
 design 18 inbound + the outbound-provider decision = Cloudflare Email Service) are
 **satisfied** as *design* decisions. The one **outstanding external step** (Slice 5
-only) is enabling CF Email Service — Workers Paid + onboarding `security.rbox.to`
+only) is enabling CF Email Service — Workers Paid + onboarding `mail.rbox.to`
 (§6-Q2); Slices 1–4 ship without it. P3 (epoch rotation) is **not** required for any
 slice here — every slice is access-plane/metadata-plane.
 
@@ -657,7 +665,7 @@ first):
   email-refresh path; `queue()` consumer **stubbed** (writes status, no real send);
   cron backstop + PII purge. *Infra lands and is exercised without external email.*
 - **Slice 5 — Cloudflare Email Service send + onboarding (design 16 + §3.10).**
-  Onboard the `security.rbox.to` sending subdomain (CF auto-writes + locks the
+  Onboard the `mail.rbox.to` sending subdomain (CF auto-writes + locks the
   `cf-bounce` MX/SPF/DKIM + `_dmarc`); add the `send_email` binding (`name = "EMAIL"`);
   the consumer's real `env.EMAIL.send(...)` + label sanitization; feature-gate
   (`DEVICE_NOTIFICATIONS_DISABLED`; un-onboarded/un-entitled → failed+alarm).
@@ -723,7 +731,7 @@ infra**; 4–6 are the email. Ship 1→2→3, then 4→5→6.
 - **Q2 — Cloudflare Email Service enablement (the only external dependency).** Two
   things the founder must do for Slice 5: (a) put the account on **Workers Paid**
   (required for arbitrary recipients) with **Email Sending (public beta)** enabled, and
-  (b) **onboard `security.rbox.to`** (dashboard or `POST
+  (b) **onboard `mail.rbox.to`** (dashboard or `POST
   /zones/{zone}/email/sending/subdomains`) so CF provisions + locks the `cf-bounce`
   records. *Resolved sub-question:* whether the provider honours a client idempotency
   key — **it does not** (CF Email Service exposes none; §3.4), so the design uses the
@@ -732,7 +740,7 @@ infra**; 4–6 are the email. Ship 1→2→3, then 4→5→6.
   on 2026-06-30 the `$CLOUDFLARE_API_TOKEN` available to automation is Zone-Read only —
   it cannot add DNS or reach the `email/sending` API; a DNS-Edit + Email-scoped token,
   or a one-click dashboard onboard, is required to execute (a)/(b).)*
-- **Q3 — DMARC graduation.** Start `security.rbox.to` at `p=quarantine` and graduate
+- **Q3 — DMARC graduation.** Start `mail.rbox.to` at `p=quarantine` and graduate
   to `p=reject` after monitoring `rua` reports, or go straight to `reject`?
 - **Q4 — `/devices` vs `/dashboard` sections.** Confirmed: dedicated `/devices`
   route (this doc). Should `/dashboard` keep a condensed device count that links
