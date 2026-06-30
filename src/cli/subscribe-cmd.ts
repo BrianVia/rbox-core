@@ -12,7 +12,7 @@ import { requireCredentials } from "./credentials.js";
  * `rbox account link` (which stays dashboard→CLI for takeover-safety, §5.2).
  */
 
-const PLANS = ["solo", "pro", "team"] as const;
+const PLANS = ["solo", "pro"] as const;
 
 /** Open a URL in the user's browser, cross-platform. Returns false (so the caller
  *  prints the URL) when there's no opener or we're not on a TTY — never blocks. */
