@@ -9,18 +9,28 @@ codex review (VERDICT: FAIL → all 13 findings resolved; see §13).
 E2EE), design 19 (device revocation — the revoke link target; revocation itself is
 designed there, not here).
 
-> **DECISION (2026-06-29) — outbound provider = stay all-Cloudflare.** This doc's
-> body recommends **Resend**; the product call overrode it to keep email on the
-> Cloudflare-adjacent stack. Caveat captured at decision time: Cloudflare has **no
-> first-party transactional send** — Email Workers' `send_email` binding only reaches
-> **pre-verified** recipients, so it cannot email arbitrary users. The actual path is
-> the **MailChannels Email API (paid)**, historically the CF-integrated sender (note:
-> still a separate vendor signup/billing — not literally "no new vendor"). At
-> implementation, swap the provider-specific DNS in §(outbound) and design 18 from
-> Resend's `include:_spf.resend.com` + Resend DKIM to **MailChannels'** SPF
-> (`include:relay.mailchannels.net`) + the **Domain Lockdown** `_mailchannels` TXT +
-> MailChannels DKIM. The outbound `From:` stays on **`security.rbox.to`** either way,
-> so the apex/subdomain DMARC split in design 18 is unaffected.
+> **DECISION (2026-06-29, revised 2026-06-30) — outbound provider = Cloudflare Email
+> Service (first-party).** This doc's body recommended **Resend**; the product call
+> overrode it to keep email all-Cloudflare. The decision-time caveat ("Cloudflare has
+> no first-party transactional send; the path is the MailChannels Email API") is now
+> **stale**: **Cloudflare Email Service — Email Sending** graduated to **public beta
+> (2026-04-16)** and sends transactional email to **arbitrary recipients** after you
+> onboard a sending domain — it is *not* verified-destinations-only (that was the
+> *old* Email Workers `send_email` binding, now superseded). So outbound is genuinely
+> first-party Cloudflare, **no separate vendor (no MailChannels)**.
+>
+> What this changes at implementation (full mechanics in §4): the `From:` stays on
+> **`security.rbox.to`**, so the apex/subdomain DMARC split in design 18 is unaffected;
+> but the DNS is **CF-managed** — onboarding the sending subdomain (dashboard or the
+> `POST /zones/{zone}/email/sending/subdomains` API) makes Cloudflare write + **lock**
+> the records itself: `cf-bounce` MX, SPF `include:_spf.mx.cloudflare.net`, a
+> CF-generated `cf-bounce._domainkey` DKIM, and a `_dmarc` record. There is **no**
+> `include:relay.mailchannels.net`, **no** `_mailchannels` Domain-Lockdown TXT, and
+> **no** self-managed DKIM keypair (CF generates, signs, and manages DKIM). Send is via
+> the Workers `send_email` binding, the REST API, or SMTP — **no third-party API key**.
+> Two prerequisites the founder must satisfy (§12): the account on **Workers Paid**
+> (arbitrary recipients = "3,000 emails/mo included, then $0.35/1k"; verified
+> destinations are free on all plans) and Email Sending enabled on the account/zone.
 
 ---
 
@@ -272,61 +282,94 @@ if ever wanted, belong to Clerk's settings, not here.
 
 ## 4. Email infrastructure
 
-### 4.1 Cloudflare-native outbound is a dead end here
+### 4.1 Outbound provider = Cloudflare Email Service (first-party, public beta)
 
-- **MailChannels'** free Workers tier **ended (June 2024)** — no longer the default.
-- The **Email Routing / Email Workers `send_email` binding can only send TO
-  verified destination addresses** in your routing config (built for
-  forwarding to your own inboxes), **not** arbitrary customers. Useless here.
-- No first-party Cloudflare transactional-send for arbitrary recipients exists.
-  Outbound therefore goes to a third-party ESP via HTTPS `fetch` from the Worker.
+The decision-time premise ("Cloudflare-native outbound is a dead end; no first-party
+transactional send to arbitrary recipients exists") is **no longer true**:
 
-### 4.2 Recommendation: **Resend** (AWS SES as the scale fallback)
+- The **old** Email Workers `send_email` binding could only send TO **verified
+  destination addresses** (built for forwarding to your own inboxes). That product is
+  **superseded** by **Cloudflare Email Service — Email Sending** (public beta since
+  2026-04-16), which sends transactional email to **any recipient** once you onboard a
+  sending domain. Verified-only was the *old* binding's limit, not the new product's.
+- So outbound is **first-party Cloudflare** — no MailChannels, no Resend, no SES, no
+  third-party API key. (MailChannels' free Workers tier ended June 2024; it is now
+  irrelevant — we don't use it.)
 
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| **Resend** | One-`fetch` HTTPS API, Workers-first, strong transactional deliverability, DKIM/SPF/DMARC setup wizard, native `Idempotency-Key` + `List-Unsubscribe` | another vendor; cost grows at volume | **Recommended** |
-| AWS SES | cheapest at volume, mature | SigV4 in a Worker is fiddly; slower domain setup; needs reputation warm-up | scale fallback |
-| Postmark | best transactional deliverability | pricier, strict content rules | viable alt |
+### 4.2 Send mechanism + config
 
-Volume is tiny (one email per *new durable device* — rare), the repo already
-standardizes on Resend for server email, and the outbox/consumer split isolates
-the ESP behind the consumer's `send()` (swap = one function). Recommend Resend.
+Three equivalent send paths (the outbox/consumer split isolates whichever we pick
+behind the consumer's `send()`):
 
-New config: `RESEND_API_KEY` (Wrangler secret), `RBOX_NOTIFY_FROM` (e.g.
-`security@security.rbox.to`), `NOTIFY_IDEMPOTENCY_PEPPER` (secret, §4.4), reuse
-`RBOX_APP_URL` for the revoke-link base.
+| Path | How | Auth |
+|---|---|---|
+| **Workers `send_email` binding** (recommended) | `wrangler`: `[[send_email]] name = "EMAIL"`; then `const { messageId } = await env.EMAIL.send({ to, from, subject, html, text })` | **none** — no API key/secret in the Worker |
+| **REST API** | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/email/sending/send`, JSON `{ to, from, subject, html, text }` | `Authorization: Bearer <CF API token>` |
+| **SMTP** | `smtps://smtp.mx.cloudflare.net:465` | SMTP creds |
 
-**Feature gating — fail loud, not silent.** A *missing or rotated* `RESEND_API_KEY`
-in prod must **not** become a terminal `skipped` (that would permanently discard
-security alerts until someone notices). Instead: with the key unset the delivery is
-`failed` + an ops alarm, and the cron keeps re-driving it so it self-heals the
-moment the secret is restored. The feature is only intentionally off — `skipped` —
-when an **explicit** `DEVICE_NOTIFICATIONS_DISABLED=1` env flag is set. (Local/dev
-sets that flag; prod never should.)
+The Worker already runs on Cloudflare, so the **binding** is the natural choice — it
+drops the `MAILCHANNELS_API_KEY`/`RESEND_API_KEY` secret entirely and needs no
+outbound `fetch`. (The binding also makes DKIM/alignment automatic, §4.3.)
 
-### 4.3 Deliverability (rbox.to is on Cloudflare DNS)
+New config: `RBOX_NOTIFY_FROM` (e.g. `security@security.rbox.to`),
+`NOTIFY_IDEMPOTENCY_PEPPER` (secret, §4.4), reuse `RBOX_APP_URL` for the revoke-link
+base. With the binding there is **no provider API key** to manage.
 
-All records are one Cloudflare DNS change:
-- **Dedicated sending subdomain** (e.g. `security.rbox.to`) so transactional
-  reputation is isolated from the apex and any future marketing domain.
-- **SPF**: `v=spf1 include:_spf.resend.com ~all` on the sending subdomain.
-- **DKIM**: the CNAME keys Resend issues.
-- **DMARC**: `v=DMARC1; p=quarantine; rua=mailto:dmarc@rbox.to; adkim=s; aspf=s`,
-  graduating to `p=reject` once aligned and monitored.
-- `List-Unsubscribe` headers (§6) for inbox-provider compliance.
+**Limits & cost.** Sending to arbitrary recipients requires the **Workers Paid**
+plan: **3,000 emails/mo included, then $0.35 per 1,000**; max 50 recipients/email; new
+accounts get a conservative daily quota that scales with reputation. Verified-
+destination sends are free on all plans. Volume here is tiny (one email per *new
+durable device* — rare), so this sits in the free monthly allotment indefinitely.
 
-### 4.4 Idempotent send (without leaking `token_hash`)
+**Feature gating — fail loud, not silent.** With the binding the prod-misconfig case
+shifts from "missing API key" to "**sending domain not onboarded / not entitled**":
+the binding `send()` rejects, the delivery becomes `failed` + an ops alarm, and the
+cron keeps re-driving it so it self-heals the moment onboarding completes. It must
+**not** become a terminal `skipped` (that would permanently discard security alerts).
+The feature is only intentionally off — `skipped` — when an **explicit**
+`DEVICE_NOTIFICATIONS_DISABLED=1` env flag is set. (Local/dev sets that flag — and
+`wrangler dev` simulates the binding locally; prod never sets it.)
 
-The ESP `Idempotency-Key` is the **per-recipient** `idempotency_key =
-HMAC(NOTIFY_IDEMPOTENCY_PEPPER, token_hash ‖ recipient_hash)` stored on the
-delivery row — **not** the raw `token_hash`. `token_hash` is the server's stable
-credential *verifier*; even though it is irreversible, there is no reason to egress
-it to a third party. The HMAC is per-(event,recipient), so two owners get distinct
-keys (a redelivery to owner A can't be deduped against owner B's send), and it
-reveals nothing about the credential to the ESP. Combined with the per-delivery
-`status='sent'` check, at-least-once queue redelivery can never double-send a given
-recipient even if a status write loses a race.
+### 4.3 Deliverability — CF-managed DNS on the sending subdomain
+
+rbox.to is on Cloudflare DNS, so onboarding the **`security.rbox.to`** sending
+subdomain (dashboard *Compute → Email Service → Email Sending → Onboard Domain*, or
+the `POST /zones/{zone}/email/sending/subdomains` API) makes Cloudflare **write and
+lock** the records itself — we do **not** hand-author SPF/DKIM. CF provisions:
+
+- **MX** on `cf-bounce.security.rbox.to` → Cloudflare's bounce servers (return-path).
+- **SPF** TXT on `cf-bounce.security.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`.
+- **DKIM** TXT on `cf-bounce._domainkey.security.rbox.to` — selector `cf-bounce`,
+  **CF-generated** key (the `p=…` value is only known *after* onboarding; fetch it via
+  `GET /zones/{zone}/email/sending/subdomains/{id}/dns` or the dashboard). CF signs
+  every message and **manages alignment automatically** — no self-managed keypair.
+- **DMARC** TXT on `_dmarc.security.rbox.to`: `v=DMARC1; p=quarantine;
+  rua=mailto:dmarc@rbox.to; adkim=s; aspf=s`, graduating to `p=reject` once aligned.
+
+These records are **fully separate** from Email Routing's apex inbound records (which
+use the apex MX/SPF + the `cf2024-1._domainkey` selector), so onboarding sending
+**does not touch** the shipped apex inbound config (design 18). There is no
+`_mailchannels` Domain-Lockdown TXT and no `include:relay.mailchannels.net` — those
+were MailChannels constructs; CF's locked, managed DKIM is the anti-spoof mechanism.
+Add `List-Unsubscribe` headers (§6) for inbox-provider compliance.
+
+### 4.4 Idempotent send (the primary guard is server-side, not the provider)
+
+**Cloudflare Email Service does not document a client idempotency key** (the REST
+send returns per-recipient delivery status; the Workers binding returns a
+`messageId`). So — unlike the Resend/MailChannels assumption — we **cannot** lean on
+provider-side dedupe. The authoritative guard is therefore **server-side**: the
+per-delivery atomic claim/lease (`status → 'sending'`, design 30 §3.4) plus the
+per-delivery `status='sent'` check make at-least-once queue redelivery send at most
+once per recipient. The only residual is the "send succeeded, status write crashed"
+window, which (absent provider idempotency) yields at most one *rare* duplicate — and
+a security alert is safe to send twice, never to drop.
+
+We still compute and store the **per-recipient** `idempotency_key =
+HMAC(NOTIFY_IDEMPOTENCY_PEPPER, token_hash ‖ recipient_hash)` (never the raw
+`token_hash` — the credential verifier never egresses), so that if CF later exposes a
+client idempotency key we can pass it with zero schema change. Today it is an
+internal dedupe tag, not a provider contract.
 
 ---
 
@@ -433,10 +476,11 @@ failure neither drops the other owner nor re-sends the succeeded one:
   owner address (`INSERT OR IGNORE`, so re-resolution is idempotent), then stamps
   `device_notifications.resolved_at`.
 - Per delivery: **`pending` → `sent`** on ESP 2xx (stamps `sent_at`).
-- **`pending`/`failed` → `failed` (retry)** on **transient** errors — ESP 5xx/429,
-  **Clerk API down/timeout**, network, **or a missing `RESEND_API_KEY` in prod**
-  (§4.2). Bounded `attempts`; queue backoff + cron re-drive. Transient failures
-  must **retry**, never silently drop a security alert.
+- **`pending`/`failed` → `failed` (retry)** on **transient** errors — CF Email
+  Service send rejection / 5xx / 429, **Clerk API down/timeout**, network, **or the
+  `security.rbox.to` sending domain not yet onboarded/entitled in prod** (§4.2).
+  Bounded `attempts`; queue backoff + cron re-drive. Transient failures must
+  **retry**, never silently drop a security alert.
 - **`pending` → `skipped` (terminal, no retry)** only when the *answer is known*:
   the account genuinely resolves to **no** owner email (CLI-only, §3.3), the pref
   is disabled (§6), or `DEVICE_NOTIFICATIONS_DISABLED=1` is set (§4.2). The cron
@@ -543,9 +587,10 @@ only the email *rate* is capped. Coalescing is **required** for v1's over-cap pa
 ## 11. Implementation surface & test plan (for the eventual build)
 
 **`Env` / wrangler additions:** `DEVICE_NOTIFY_Q` (queue producer binding) +
-consumer config + DLQ; `RESEND_API_KEY` (secret), `RBOX_NOTIFY_FROM`,
-`NOTIFY_IDEMPOTENCY_PEPPER` (secret), `DEVICE_NOTIFICATIONS_DISABLED` (flag); DNS
-(SPF/DKIM/DMARC on `security.rbox.to`).
+consumer config + DLQ; the **`send_email` binding** (`[[send_email]] name = "EMAIL"`)
+— no provider API key; `RBOX_NOTIFY_FROM`, `NOTIFY_IDEMPOTENCY_PEPPER` (secret),
+`DEVICE_NOTIFICATIONS_DISABLED` (flag); onboard the **`security.rbox.to`** sending
+subdomain (CF auto-writes + locks the `cf-bounce` MX/SPF/DKIM + `_dmarc`).
 **Worker:** add `queue(batch, env)` handler; extend `scheduled()` with the
 backstop sweep + PII purge + coalesce-summary emission.
 **auth.ts:** `mintDevice` exposes a batchable INSERT statement; `pollDeviceAuth`
@@ -594,9 +639,14 @@ indexes.
    for v1, or fund one of these?
 2. **Adopt Cloudflare Queues** (new binding + `queue()` handler), or ship v1 on the
    cron-sweep-only path (higher latency, no new binding) and add Queues later?
-3. **Resend vs SES** — recommend Resend; any AWS/SES investment that tips it?
-4. **DMARC `p=quarantine` → `p=reject`** timeline and sending subdomain
-   (`security.rbox.to`?).
+3. **Cloudflare Email Service enablement (the real external dependency).** Confirm
+   the account is on **Workers Paid** (required for arbitrary recipients) and Email
+   Sending (public beta) is enabled, then **onboard `security.rbox.to`** (dashboard or
+   the `POST /zones/{zone}/email/sending/subdomains` API). This is the only blocker for
+   the send step; everything upstream (outbox/queue/cron) ships without it. *(The
+   provider question is settled: first-party CF Email Service, no Resend/SES/MailChannels.)*
+4. **DMARC `p=quarantine` → `p=reject`** timeline on the `security.rbox.to`
+   sending subdomain.
 5. Recipients = **owners only**, or **owners + admins** once an admin role exists?
 6. Keep new-device email **opt-out** (recommended, with a UI warning) or make it
    strictly non-disable-able as a pure security signal?

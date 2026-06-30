@@ -22,8 +22,9 @@ rbox token), 12 (full E2EE), 15 (SvelteKit dashboard), 18 (email routing —
 inbound SHIPPED), 21 (account linking — SHIPPED, PR #2).
 
 **Supersedes where appropriate:**
-- design 16 §4.2 (Resend recommendation) → **MailChannels Email API** on
-  `security.rbox.to` (the all-Cloudflare product decision, 16's own banner).
+- design 16 §4.2 (Resend recommendation) → **Cloudflare Email Service — Email
+  Sending** (first-party, public beta) on `security.rbox.to` (the all-Cloudflare
+  product decision, 16's own banner; supersedes the interim MailChannels call).
 - design 16 §5.2 / §12.7 and design 17 §8.5 ("`device_id` is non-unique, the
   revoke target is ambiguous") → **stale**; migration `0013` made `device_id`
   globally unique (§1.1). The revoke deep-link and single-row revoke are sound today.
@@ -111,15 +112,19 @@ in that allowlist yet, so a `web` token would currently get 403. **This workstre
 must add the two new GET pairs to `webTokenAllowed`** (§2.4) — a deliberate,
 audited widening, never a wildcard.
 
-### 1.5 Inbound email SHIPPED; outbound = MailChannels (design 18 + 16 banner)
+### 1.5 Inbound email SHIPPED; outbound = Cloudflare Email Service (design 18 + 16 banner)
 - **Inbound** (`support@`/`postmaster@`/`security@` → Gmail via Cloudflare Email
   Routing) is **SHIPPED** (design 18, 2026-06-30). It is *receive-only*; it does
   **not** give us a transactional sender.
-- **Outbound transactional** decision: **stay all-Cloudflare → MailChannels Email
-  API (paid)** on a dedicated `security.rbox.to` sending subdomain. Cloudflare has
-  no first-party transactional send to arbitrary recipients (the `send_email`
-  binding only reaches pre-verified destinations), so the new-device email goes out
-  via an HTTPS `fetch` to MailChannels from the queue consumer (§3.4).
+- **Outbound transactional** decision: **all-Cloudflare → Cloudflare Email Service
+  (Email Sending), first-party, public beta (2026-04-16)** on a dedicated
+  `security.rbox.to` sending subdomain. The interim "MailChannels" call is
+  **superseded**: the premise that Cloudflare has no first-party send to arbitrary
+  recipients was true only of the *old* `send_email` binding (verified-destinations
+  only); **Email Service sends to any recipient** after the sending domain is
+  onboarded. The new-device email goes out via the Workers **`send_email` binding**
+  from the queue consumer — **no MailChannels, no third-party API key** (§3.4).
+  Requires **Workers Paid** for arbitrary recipients (3,000/mo free, then $0.35/1k).
 
 ### 1.6 No `ExecutionContext` in the Worker (the queue is mandatory, not a nicety)
 Verified: the entrypoint is `async fetch(req: Request, env: Env)` (`worker.ts:25`) —
@@ -248,8 +253,10 @@ carried verbatim — it is correct against the current code.)
 
 When a new **durable bearer credential** is minted via a device-join path, email the
 account's owner(s) "a new device was added." This is design 16 in full; the changes
-here are (a) MailChannels instead of Resend, (b) the now-satisfied identity bridge
-and unique-id prerequisites, (c) re-grounding the hooks against the current `auth.ts`.
+here are (a) **Cloudflare Email Service (Email Sending)** instead of Resend/MailChannels
+— first-party, via the Workers `send_email` binding, (b) the now-satisfied identity
+bridge and unique-id prerequisites, (c) re-grounding the hooks against the current
+`auth.ts`.
 
 ### 3.1 The hook = durable-credential mint, NOT E2EE roster admission
 `mintDevice` (`auth.ts:84`) is where a `devices` row (a usable bearer token) is born.
@@ -399,29 +406,36 @@ CREATE TABLE account_notify_prefs (account_id TEXT PRIMARY KEY, notify_new_devic
      ('pending','failed') AND (claimed_at IS NULL OR claimed_at < ?leaseFloor)` — the
      conditional UPDATE is the mutex (D1 serializes writes); `changes==0` ⇒ another
      consumer owns it ⇒ skip.
-  2. **Send** via MailChannels with the per-recipient `idempotency_key`.
-  3. **Settle:** 2xx → `status='sent', sent_at=?`; transient → `status='failed'`
-     (cron/queue retries); terminal → `skipped`.
-  The **"send succeeded, status write crashed" window** is closed by *defence in
-  depth*: the claim already incremented `attempts` (so it isn't retried forever), and
-  the **MailChannels idempotency key makes a re-send a provider-side no-op** — so a
-  crashed settle yields at most one delivered email even though the row reverts to
-  `failed` and is retried. **Provider idempotency is an explicit, must-verify
-  prerequisite** (§6-Q2): if MailChannels' Email API does not honour an idempotency
-  key, the fallback is a pre-send `sent`-check plus accepting the rare duplicate (a
-  security alert is safe to send twice; never to drop) — design-time decision, flagged.
-- **MailChannels send config.** The consumer POSTs the MailChannels Email API over
-  HTTPS with the per-recipient `idempotency_key` (the HMAC over `token_hash ‖
-  recipient_clerk_id`, **not** the raw `token_hash` — no reason to egress the
-  credential verifier to a third party). New config: `MAILCHANNELS_API_KEY` (Wrangler
-  secret); **DKIM signing** (required by §3.10's strict DMARC) —
-  `MAILCHANNELS_DKIM_PRIVATE_KEY` (secret, the Ed25519/RSA private key passed in the
-  send request), `MAILCHANNELS_DKIM_DOMAIN` (`security.rbox.to`),
-  `MAILCHANNELS_DKIM_SELECTOR` (`mailchannels`, matching the published TXT, §3.10);
-  `RBOX_NOTIFY_FROM` (`security@security.rbox.to`); `NOTIFY_IDEMPOTENCY_PEPPER`
-  (secret); reuse `RBOX_APP_URL` for the revoke-link base. **DKIM key rotation:**
-  publish a second selector TXT, cut `MAILCHANNELS_DKIM_SELECTOR` over, retire the
-  old TXT after the DMARC `rua` shows no traffic on it — same play as any DKIM roll.
+  2. **Send** via the Cloudflare Email Service `send_email` binding (`env.EMAIL.send`).
+  3. **Settle:** success → `status='sent', sent_at=?` (the binding returns a
+     `messageId`); transient → `status='failed'` (cron/queue retries); terminal →
+     `skipped`.
+  The **"send succeeded, status write crashed" window**: **Cloudflare Email Service
+  exposes no client idempotency key** (the REST send returns per-recipient status; the
+  binding returns a `messageId`), so — unlike the MailChannels assumption — there is
+  **no provider-side dedupe** to lean on. The window is therefore closed by the
+  **server-side** guard alone: the claim already incremented `attempts` (so it isn't
+  retried forever) and the **pre-send `status='sent'` check** suppresses re-sends after
+  a successful settle. The only residual is a crash *between* a successful send and the
+  status write, which yields **at most one rare duplicate** — and a security alert is
+  safe to send twice, never to drop. (This settles design 30's former §6-Q2 "must-
+  verify provider idempotency": the answer is *no client idempotency key*, so the
+  pre-send-check-plus-accept-rare-duplicate path is the design, not a fallback.)
+- **Cloudflare Email Service send config.** The consumer calls the Workers
+  **`send_email` binding** — `wrangler.jsonc`: `"send_email": [{ "name": "EMAIL" }]`,
+  then `const { messageId } = await env.EMAIL.send({ to, from, subject, html, text })`.
+  This is an in-platform binding: **no outbound `fetch`, no provider API key, no
+  per-message DKIM key to pass** — Cloudflare signs DKIM with its CF-managed
+  `cf-bounce._domainkey.security.rbox.to` key and ensures DMARC alignment
+  automatically (§3.10). So the MailChannels-era secrets are **deleted**:
+  ~~`MAILCHANNELS_API_KEY`~~, ~~`MAILCHANNELS_DKIM_PRIVATE_KEY`~~, ~~`_DKIM_DOMAIN`~~,
+  ~~`_DKIM_SELECTOR`~~. Remaining config: `RBOX_NOTIFY_FROM`
+  (`security@security.rbox.to`); `NOTIFY_IDEMPOTENCY_PEPPER` (secret, retained as an
+  internal dedupe tag — see §3.4's no-provider-idempotency note); reuse `RBOX_APP_URL`
+  for the revoke-link base. (REST alternative if the binding is unavailable: `POST
+  …/accounts/{account_id}/email/sending/send` with a CF API token — but the binding is
+  preferred precisely because it needs no secret.) **DKIM rotation is Cloudflare's
+  responsibility**, not ours — keys are CF-generated/managed (rotation via CF support).
 
 ### 3.5 Web sessions excluded
 `createWebSession` mints a `web_*` token on every dashboard login — fresh id hourly,
@@ -438,10 +452,11 @@ retro-suppress or redirect the alert; only the *address* read at send time float
 (bounded by the §3.7 purge, and "the address you most recently authenticated with" is
 the right target for a security alert).
 - `pending/failed → sending` via the atomic claim (§3.4), then:
-- `sending → sent` on MailChannels 2xx.
-- `pending/failed → failed (retry)` on **transient** errors: ESP 5xx/429, Clerk
-  down/timeout, network, **or a missing `MAILCHANNELS_API_KEY` in prod** — bounded
-  `attempts`, queue backoff + cron re-drive. A missing key is **failed+alarm**, never
+- `sending → sent` on a successful `env.EMAIL.send(...)` (binding returns `messageId`).
+- `pending/failed → failed (retry)` on **transient** errors: CF Email Service send
+  rejection / 5xx / 429, Clerk down/timeout, network, **or the `security.rbox.to`
+  sending domain not yet onboarded/entitled in prod** — bounded `attempts`, queue
+  backoff + cron re-drive. An un-onboarded sending domain is **failed+alarm**, never
   terminal `skipped` (that would permanently discard alerts until someone noticed).
 - `pending → skipped (terminal)` only when the answer is *known*: account resolves
   to **no** owner email (unlinked CLI-only, §3.3), the pref is off (§3.8), or an
@@ -451,8 +466,8 @@ the right target for a security alert).
 - Coarse `request.cf` city/region/country + raw IP (the signal users recognize),
   mirroring GitHub/Google. **`request.cf` is fetch-only** → snapshotted into the
   outbox row at creation; the consumer/cron never recompute it.
-- **The email IS a new egress** (address + label + IP/geo to MailChannels + the
-  mailbox) — acknowledged, not "no new disclosure." We minimize the standing copy:
+- **The email IS a new egress** (address + label + IP/geo to Cloudflare Email Service
+  + the destination mailbox) — acknowledged, not "no new disclosure." We minimize the standing copy:
   the cron **nulls `label`, `ip`, `geo`** once a row is `sent`/`skipped` (or a 7-day
   TTL). We keep only non-PII audit fields. No permanent per-device IP/label history.
 - `token_hash` never leaves rbox; the delivery ledger stores **no email and no email
@@ -479,19 +494,29 @@ unsliced). The renderer sanitizes **regardless of stored value**: strip CR/LF + 
 C0/C1 control chars (header-injection guard), clamp ~80 chars, HTML/text-escape per
 part. The label is **never** interpolated into the Subject (only the sanitized body).
 
-### 3.10 Provider DNS for `security.rbox.to` (all on Cloudflare DNS)
-Supersedes design 16 §4.3's Resend records with **MailChannels'**:
-- **SPF** on the sending subdomain: `v=spf1 include:relay.mailchannels.net ~all`.
-- **Domain Lockdown** (MailChannels' anti-spoof): a `_mailchannels.security.rbox.to`
-  TXT naming the authorized account/sender (`v=mc1 auth=<account-handle>`), so only
-  our MailChannels account may send as the subdomain.
-- **DKIM**: generate a keypair, publish the public key as
-  `mailchannels._domainkey.security.rbox.to` TXT, sign with the private key in the
-  send request (`dkim_domain`/`dkim_selector`/`dkim_private_key`).
-- **DMARC**: `v=DMARC1; p=quarantine; rua=mailto:dmarc@rbox.to; adkim=s; aspf=s` on
-  the subdomain, graduating to `p=reject` once aligned. This is **separate from the
-  apex/inbound DMARC** (design 18) — the subdomain split keeps transactional
-  reputation isolated and doesn't touch the shipped inbound routing.
+### 3.10 Provider DNS for `security.rbox.to` (Cloudflare-managed)
+Supersedes design 16 §4.3's Resend records and the interim MailChannels records with
+**Cloudflare Email Service's**. The records are **not hand-authored**: onboarding the
+`security.rbox.to` sending subdomain (dashboard *Compute → Email Service → Email
+Sending → Onboard Domain*, or `POST /zones/{zone}/email/sending/subdomains`) makes
+Cloudflare **write and lock** them, since rbox.to is on CF DNS. CF provisions:
+- **MX** on `cf-bounce.security.rbox.to` → Cloudflare bounce servers (return-path).
+- **SPF** TXT on `cf-bounce.security.rbox.to`: `v=spf1 include:_spf.mx.cloudflare.net ~all`
+  — **not** `include:relay.mailchannels.net`.
+- **DKIM** TXT on `cf-bounce._domainkey.security.rbox.to` (selector `cf-bounce`),
+  **CF-generated** (the `p=…` value is known only after onboarding; fetch via `GET
+  /zones/{zone}/email/sending/subdomains/{id}/dns`). Cloudflare signs every message
+  with this key — there is **no** `_mailchannels` Domain-Lockdown TXT and **no**
+  self-managed keypair; CF's locked, managed DKIM is the anti-spoof + auth mechanism.
+- **DMARC** TXT on `_dmarc.security.rbox.to`: `v=DMARC1; p=quarantine;
+  rua=mailto:dmarc@rbox.to; adkim=s; aspf=s`, graduating to `p=reject` once aligned.
+
+These records are **separate from the apex/inbound records** (design 18 — Email
+Routing uses the apex MX/SPF + the `cf2024-1._domainkey` selector), so onboarding
+sending **does not touch** the shipped inbound routing; the subdomain split keeps
+transactional reputation isolated. CF "ensures proper [DMARC] alignment
+automatically," so the sending-subdomain DKIM (`d=security.rbox.to`) aligns under the
+subdomain's own DMARC without interacting with the apex `p=reject`.
 
 ---
 
@@ -603,8 +628,11 @@ button's real job.
 ## 5. Staged build plan
 
 All four prerequisites this workstream needs (P1 unique id, P2 linking, P4 kind-gate,
-design 18 inbound + the MailChannels decision) are **satisfied**. P3 (epoch rotation)
-is **not** required for any slice here — every slice is access-plane/metadata-plane.
+design 18 inbound + the outbound-provider decision = Cloudflare Email Service) are
+**satisfied** as *design* decisions. The one **outstanding external step** (Slice 5
+only) is enabling CF Email Service — Workers Paid + onboarding `security.rbox.to`
+(§6-Q2); Slices 1–4 ship without it. P3 (epoch rotation) is **not** required for any
+slice here — every slice is access-plane/metadata-plane.
 
 **Recommended slice ordering** (each independently shippable, smallest blast radius
 first):
@@ -628,11 +656,13 @@ first):
   outbox-on-mint batching in `pollDeviceAuth`/`redeemPairToken`; the returning-login
   email-refresh path; `queue()` consumer **stubbed** (writes status, no real send);
   cron backstop + PII purge. *Infra lands and is exercised without external email.*
-- **Slice 5 — MailChannels send + DNS (design 16 + §3.10).** Provider DNS on
-  `security.rbox.to` (SPF/Lockdown/DKIM/DMARC); the consumer's real MailChannels POST
-  with idempotency key + label sanitization; feature-gate (`DEVICE_NOTIFICATIONS_
-  DISABLED`, missing-key → failed+alarm). *Turns the stubbed pipe on; the externally
-  visible step, gated last.*
+- **Slice 5 — Cloudflare Email Service send + onboarding (design 16 + §3.10).**
+  Onboard the `security.rbox.to` sending subdomain (CF auto-writes + locks the
+  `cf-bounce` MX/SPF/DKIM + `_dmarc`); add the `send_email` binding (`name = "EMAIL"`);
+  the consumer's real `env.EMAIL.send(...)` + label sanitization; feature-gate
+  (`DEVICE_NOTIFICATIONS_DISABLED`; un-onboarded/un-entitled → failed+alarm).
+  **External prereq:** account on Workers Paid + Email Sending enabled. *Turns the
+  stubbed pipe on; the externally visible step, gated last.*
 - **Slice 6 — opt-out + coalescing polish (design 16 §3.8).** `account_notify_prefs`
   UI (owner-gated, cross-notify on disable), the coalesce summary email path.
   *Hardening, not blocking.*
@@ -668,7 +698,7 @@ infra**; 4–6 are the email. Ship 1→2→3, then 4→5→6.
 - **Recipients:** resolve to account **owners** even when a non-owner's device joins;
   multi-owner fan-out with independent per-delivery status; unlinked CLI-only account
   → `skipped`; `clerk_users.email` refresh is throttled + non-fatal on Clerk failure.
-- **skipped vs failed:** Clerk-down / missing MailChannels key → `failed`+retry;
+- **skipped vs failed:** Clerk-down / sending domain not yet onboarded → `failed`+retry;
   no-owner-email / pref-off / `DEVICE_NOTIFICATIONS_DISABLED` → `skipped`.
 - **Label sanitization:** CRLF/control chars stripped, clamped, escaped; hostile
   label can't inject a header or break the body; label never in the Subject.
@@ -690,14 +720,18 @@ infra**; 4–6 are the email. Ship 1→2→3, then 4→5→6.
   "notifiable once linked" for v1 (recommended — the alternative, collecting a contact
   email at bootstrap, dents the zero-PII CLI property), or fund a CLI-onboarding
   contact-email path?
-- **Q2 — MailChannels readiness + idempotency mechanism.** Confirm the paid
-  MailChannels Email API account is provisioned (DKIM keypair generated, Domain
-  Lockdown handle issued) and the `security.rbox.to` DNS records can be added.
-  **Also verify whether the Email API honours a client idempotency key** (§3.4): if
-  yes, the at-least-once pipeline is exactly-once-visible to the user; if no, we fall
-  back to the pre-send `sent`-check + accept rare duplicates (safe for a security
-  alert). This is the only external dependency for Slice 5; everything before it ships
-  without it.
+- **Q2 — Cloudflare Email Service enablement (the only external dependency).** Two
+  things the founder must do for Slice 5: (a) put the account on **Workers Paid**
+  (required for arbitrary recipients) with **Email Sending (public beta)** enabled, and
+  (b) **onboard `security.rbox.to`** (dashboard or `POST
+  /zones/{zone}/email/sending/subdomains`) so CF provisions + locks the `cf-bounce`
+  records. *Resolved sub-question:* whether the provider honours a client idempotency
+  key — **it does not** (CF Email Service exposes none; §3.4), so the design uses the
+  server-side pre-send `sent`-check + accept-rare-duplicate path (safe for a security
+  alert). Everything before Slice 5 ships without any of this. *(Note: as of research
+  on 2026-06-30 the `$CLOUDFLARE_API_TOKEN` available to automation is Zone-Read only —
+  it cannot add DNS or reach the `email/sending` API; a DNS-Edit + Email-scoped token,
+  or a one-click dashboard onboard, is required to execute (a)/(b).)*
 - **Q3 — DMARC graduation.** Start `security.rbox.to` at `p=quarantine` and graduate
   to `p=reject` after monitoring `rua` reports, or go straight to `reject`?
 - **Q4 — `/devices` vs `/dashboard` sections.** Confirmed: dedicated `/devices`
