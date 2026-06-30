@@ -179,8 +179,12 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
       // carry the price → plan, so we don't set the plan here (avoids a race).
       const accountId = obj.client_reference_id ?? obj.metadata?.account_id;
       if (accountId && obj.customer) {
+        // `reclaimed_at IS NULL`: never (re)bind billing onto a tombstoned shell. A
+        // late checkout.session.completed routes here by the ORIGINAL session's
+        // account (the shell); after the re-point saga clears+tombstones that shell
+        // (§3.4.2), this guard refuses the stale re-bind that would split-brain it.
         await env.rbox_dev_db
-          .prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+          .prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(obj.customer, obj.subscription ?? null, accountId, obj.customer)
           .run();
       }
@@ -200,13 +204,13 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // only read when free; clearing it would let a cancel re-grant in-window — G6).
         const plan = planForLookupKey(lookupKey) ?? "free";
         await env.rbox_dev_db
-          .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+          .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(plan, obj.customer, obj.id, accountId, obj.customer)
           .run();
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → free + grace + clear extras.
         await env.rbox_dev_db
-          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
+          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
           .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer)
           .run();
       }
@@ -271,18 +275,41 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
   await stripeApi(env, "POST", `/subscriptions/${shell.sub}`, { "metadata[account_id]": destId });
   await stripeApi(env, "POST", `/customers/${shell.cust}`, { "metadata[account_id]": destId });
 
-  // D1 move (one atomic batch). Claim onto X (tolerating an early webhook bind of
-  // the same customer); then unconditionally clear the shell's billing on the sub
-  // it still carries.
+  // D1 move (one atomic batch; later statements see earlier ones' writes). Both
+  // writes are guarded against concurrent webhooks racing the saga:
+  //  1. claim onto X only if X is free-or-already-ours AND the shell STILL holds
+  //     this exact subscription — so a concurrent `subscription.deleted` that
+  //     cleared the shell aborts the move instead of resurrecting a canceled sub.
+  //  2. clear + TOMBSTONE the shell only if X now actually holds this sub — so a
+  //     no-op claim (X raced to a DIFFERENT sub) leaves the shell intact, never
+  //     merging. The `reclaimed_at` stamp closes the §3.4.2 webhook re-bind window:
+  //     a late `checkout.session.completed` (routed to the shell by stale session
+  //     metadata) is refused by the `reclaimed_at IS NULL` guard on the bind paths.
   await env.rbox_dev_db.batch([
     env.rbox_dev_db
       .prepare(
-        "UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?, grace_until = ?, extra_storage_bytes = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)"
+        `UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?, grace_until = ?, extra_storage_bytes = ?
+         WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)
+           AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND stripe_subscription_id = ?)`
       )
-      .bind(shell.cust, shell.sub, shell.plan, shell.grace, shell.extra, destId, shell.cust),
+      .bind(shell.cust, shell.sub, shell.plan, shell.grace, shell.extra, destId, shell.cust, shellId, shell.sub),
     env.rbox_dev_db
-      .prepare("UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'free', grace_until = NULL, extra_storage_bytes = 0 WHERE id = ? AND stripe_subscription_id = ?")
-      .bind(shellId, shell.sub),
+      .prepare(
+        `UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'free', grace_until = NULL, extra_storage_bytes = 0, reclaimed_at = ?
+         WHERE id = ? AND stripe_subscription_id = ?
+           AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND stripe_subscription_id = ?)`
+      )
+      .bind(nowMs, shellId, shell.sub, destId, shell.sub),
   ]);
-  return "repointed";
+
+  // Post-batch verify: only report success if X holds EXACTLY our {customer, sub}
+  // and the shell is cleared. Else block — a race left a partial/conflicting state,
+  // and blocking (never merging) is the always-safe fallback.
+  const [x2, s2] = await Promise.all([
+    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
+    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust FROM accounts WHERE id = ?").bind(shellId).first<{ cust: string | null }>(),
+  ]);
+  if (x2?.cust === shell.cust && x2?.sub === shell.sub && s2?.cust == null) return "repointed";
+  if (x2?.cust && x2.cust !== shell.cust) return "destination_has_subscription"; // X raced to a different sub → never merge
+  return "not_migratable"; // shell raced away (concurrent delete) → block, retryable
 }
