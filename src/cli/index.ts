@@ -8,10 +8,11 @@ import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-cont
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { PROD_REMOTE } from "./credentials.js";
 import { style } from "./style.js";
 import { spinner } from "./spinner.js";
 
-const DEFAULT_REMOTE = process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev";
+const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
   const positional: string[] = [];

@@ -17,6 +17,13 @@ export interface Credentials {
   accountId?: string;
 }
 
+/** The production API. The released CLI talks to prod by default; point at dev
+ *  (or any other deployment) with `RBOX_API=…`. The single source of the default
+ *  so the binary and the credential fallback can never drift apart. Read the env
+ *  at each call site (not here) so a test/process that sets RBOX_API after import
+ *  still wins — this literal is only the fallback. */
+export const PROD_REMOTE = "https://api.rbox.to";
+
 const dir = () => path.join(os.homedir(), ".rbox");
 const file = () => path.join(dir(), "credentials.json");
 
@@ -26,7 +33,7 @@ export async function loadCredentials(): Promise<Credentials | undefined> {
     return {
       token: process.env.RBOX_TOKEN,
       deviceId: process.env.RBOX_DEVICE_ID ?? "env",
-      remoteUrl: process.env.RBOX_API ?? "https://rbox-dev-api.brian-via.workers.dev",
+      remoteUrl: process.env.RBOX_API ?? PROD_REMOTE,
       accountId: process.env.RBOX_ACCOUNT_ID,
     };
   }

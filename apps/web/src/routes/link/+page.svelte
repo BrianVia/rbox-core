@@ -18,7 +18,10 @@
 
 	requireAuth(); // not signed in → /
 
-	onDestroy(stopPolling);
+	onDestroy(() => {
+		stopPolling();
+		if (copiedTimer) clearTimeout(copiedTimer);
+	});
 	function stopPolling() {
 		if (poller) clearInterval(poller);
 		poller = null;
@@ -77,11 +80,19 @@
 		}
 	}
 
+	let copied = $state(false);
+	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+
 	async function copyCode() {
 		try {
-			await navigator.clipboard.writeText(code);
+			// Copy the whole command, not the bare code — the user is told to run
+			// `rbox account link <code>`, so that's what the button should hand them.
+			await navigator.clipboard.writeText(`rbox account link ${code}`);
+			copied = true;
+			if (copiedTimer) clearTimeout(copiedTimer);
+			copiedTimer = setTimeout(() => (copied = false), 2000);
 		} catch {
-			/* clipboard blocked — the code is visible to copy manually */
+			/* clipboard blocked — the command is visible to copy manually */
 		}
 	}
 </script>
@@ -108,7 +119,7 @@
 				Run this in a terminal signed in to your rbox account (an owner device):
 				<div class="code-row">
 					<code class="code">rbox account link {code}</code>
-					<button class="ghost small" onclick={copyCode}>Copy</button>
+					<button class="ghost small" onclick={copyCode}>{copied ? 'Copied ✓' : 'Copy'}</button>
 				</div>
 			</li>
 			<li>Come back here — we’ll show the account it proposes to link.</li>
