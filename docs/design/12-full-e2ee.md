@@ -1118,11 +1118,19 @@ commit `created_at` for display only). The client adds the verification + decryp
 
 ### 15.1 Trust anchor — verify the head, then a downward segment
 
-The authoritative anchor is the **verified head** the device already establishes on
-every pull (§13, C1/C2): `refreshAccount` (roster + key-state chains, anti-rollback
-vs the local pin) → `latest()` → verify the chain `(pin, head]` forward → the head
-`commitHash` is trusted and the pin is advanced. `versions`/`restore` reuse this
-exact path (`verifiedHead()`), so they inherit anti-rollback/anti-fork for free.
+The authoritative anchor is the **verified head** the device establishes on every
+pull (§13, C1/C2), now factored into `verifiedHead()` and shared by pull + versions
++ restore: `refreshAccount` (roster + key-state chains, anti-rollback vs the local
+pin) → `latest()` → verify the chain `(pin, head]` forward → the head `commitHash`
+is trusted and the pin is advanced. Two fail-closed invariants hardened here (codex
+round 1): (a) the verified chain's **terminal commit hash MUST equal what `/latest`
+reported** — a server cannot have the client verify one chain while claiming a
+different head; an empty chain under a non-zero reported head is a hard error, never
+a silent "empty manifest". (b) **C2 pins HASHES, not versions** — `refreshAccount`
+now also asserts the verified **key-state hash at the pinned epoch** equals the
+pinned `keyStateHash` (alongside the roster hash), catching a same-epoch key-state
+fork/substitution. `versions`/`restore` reuse this anchor, inheriting anti-rollback/
+anti-fork for free.
 
 To authenticate a **historical** commit at `seq ≤ head` we do NOT re-anchor at
 genesis (genesis is unreachable once retention has pruned `seq:1`, and a long
@@ -1155,11 +1163,23 @@ decrypt uses a sibling, `openCommitHistorical`, that:
 - decrypts the manifest strictly under `body.keyEpoch` (`decryptManifest`).
 
 The per-epoch KEK is resolved read-only (`kekFor(body.keyEpoch, …, createIfMissing=false)`):
-memory → `getWorkspaceKeys` wrap → `openWorkspaceKey` under MK. `workspace_keys` rows
-are immutable (CAS-insert, never deleted), so an older epoch's KEK is always
-re-derivable while its wrap row exists. A **missing** epoch KEK → fail closed, never
-guess. (v1 fixes `keyEpoch=0`, but the epoch is threaded correctly so rotation is a
-no-op change here.)
+memory → `getWorkspaceKeys` wrap → `openWorkspaceKey` under MK. A **missing** epoch
+KEK → fail closed, never guess.
+
+**Honest rotation scope (codex round 1 — corrects an over-claim).** A KEK wrap's AEAD
+context is **bound to the account epoch at which it was wrapped** (`kekWrapCtx`
+includes `accountEpoch`); `workspace_keys` stores only `(workspaceId, keyEpoch,
+kekWrap)`, **not** that account epoch, and a recovered/current device holds only the
+**current** MK (a rotation re-wraps MK). So restoring a commit whose `keyEpoch`
+belongs to a *prior account epoch* is **not** supported in v1: `openWorkspaceKey`
+(called with the current epoch) **fails closed on the GCM AAD** rather than returning
+wrong bytes. This is exactly the v1 rotation deferral already stated in C3 ("`keyEpoch`
+fixed at 0, no revocation path wired"): within a single account epoch (the shipped
+reality — all of `accountEpoch`/`keyEpoch` are 0) every historical KEK opens
+correctly and restore is fully functional. Cross-rotation historical restore is a
+follow-up that lands with revocation/rotation UX; it needs the wrap's `accountEpoch`
+(or the superseded MK) persisted so the old KEK can be reopened. The §15 flow threads
+`keyEpoch` correctly so that follow-up is additive, not a rework.
 
 ### 15.3 `rbox versions [path]`
 
@@ -1189,11 +1209,15 @@ the sole validator under E2EE). Then:
 3. Find the `type:"file"` entry for `path` in that manifest. Absent → fail closed
    ("`path` did not exist at version `seq`"). A symlink entry → restore the link
    target (no blob).
-4. Download the ciphertext blob by `entry.encSha` (`blobStore().getToFile`, which
-   verifies the **ciphertext** sha) to a temp sibling of the target; `decryptFileToPath`
-   (verifies the **plaintext** `entry.sha256` after GCM-decrypt) into a second temp;
-   `fs.rename` atomically onto the target. The same decrypt+verify+atomic-publish the
-   pull path uses (`writeEntry`), minus reconcile — restore is an explicit overwrite.
+4. Restore the bytes via the **new exported `restoreEntryToPath`** (engine `apply.ts`):
+   path-guard (`assertWithinRoot` — the symlinked-parent escape check), download the
+   ciphertext by `entry.encSha` (`getToFile` verifies the **ciphertext** sha),
+   `decryptFileToPath` (verifies the **plaintext** `entry.sha256` after GCM-decrypt)
+   into a temp sibling, then `fs.rename` atomically onto the target. It shares the
+   pull writer's staging helper (`stageEntryToTemp`) but is an **explicit overwrite**
+   — NO reconcile precondition / conflict-copy (the user asked for these exact bytes).
+   (codex round 1: `writeEntry` is private + carries move-aside semantics, so restore
+   gets its own thin public helper rather than reusing it.)
 5. **Restore does NOT commit / rewrite history.** It writes one file from a past
    version onto disk. The next `sync` then treats it as an ordinary local edit.
 
@@ -1218,9 +1242,19 @@ the sole validator under E2EE). Then:
 | `src/cli/index.ts` | wire `case "versions"`/`"restore"` to the real commands |
 
 ### 15.6 Review log
-- v1 (2026-06-30): authored. Pending codex adversarial review (chain-segment
-  verification, epoch/rotation decrypt, fetching past manifests without leaking
-  plaintext, restore atomicity, fail-closed). To be appended below.
+- v1 (2026-06-30): authored.
+- codex round 1 → **FAIL** (pre-implementation; §15 symbols not yet in source). Real
+  findings folded in: (1) **terminal-bind** the verified head to `/latest` + fail
+  closed on an empty chain under a non-zero head (`verifiedHead`); (2) **C2 key-state
+  hash pin** — `refreshAccount` now checks the key-state hash at the pinned epoch, not
+  just roster hash + epoch monotonicity (`keyStateHashByEpoch` added to
+  `VerifiedAccount`); (3) **honest rotation scope** — cross-account-epoch historical
+  KEK unwrap is NOT claimed for v1 (GCM-AAD fail-closed; deferred with rotation,
+  §15.2); (4) **typed `NeedsRebaselineError`** for retention-window fail-closed;
+  (5) deleted the dead/mismatched plaintext `RboxApi.manifestAt`, fixed `versions()`
+  to the real server shape (advisory only); (6) restore uses a new public
+  `restoreEntryToPath` (explicit overwrite), not the private reconcile `writeEntry`.
+- codex round 2 → (pending; re-run after implementation).
 
 ## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and

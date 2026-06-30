@@ -110,29 +110,7 @@ async function writeEntry(
 
   const tmp = tmpName(abs);
   try {
-    if (entry.type === "symlink") {
-      await fs.symlink(entry.symlinkTarget ?? "", tmp);
-    } else if (entry.encSha && kek) {
-      // Encrypted (M5): fetch ciphertext by encSha, decrypt+verify into tmp.
-      const ctTmp = `${tmp}.ct`;
-      try {
-        if (store.getToFile) await store.getToFile(entry.encSha, ctTmp);
-        else await fs.writeFile(ctTmp, await store.get(entry.encSha));
-        await decryptFileToPath(ctTmp, kek, entry.sha256, tmp);
-      } finally {
-        await fs.rm(ctTmp, { force: true }).catch(() => {});
-      }
-      await fs.chmod(tmp, entry.mode);
-    } else {
-      // Stream large blobs straight to the temp file (no whole-file buffer); the
-      // streaming download verifies the sha. Fall back to buffered get otherwise.
-      if (store.getToFile) {
-        await store.getToFile(entry.sha256, tmp);
-      } else {
-        await fs.writeFile(tmp, await store.get(entry.sha256));
-      }
-      await fs.chmod(tmp, entry.mode);
-    }
+    await stageEntryToTemp(tmp, entry, store, kek);
 
     // Final precondition: does the target still match what reconcile assumed?
     const current = await currentEntryAt(destRoot, entry.path);
@@ -141,6 +119,58 @@ async function writeEntry(
       await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
     }
     await fs.rename(tmp, abs);
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
+}
+
+/** Stage one entry's bytes into `tmp` (no publish). Symlink → create the link;
+ *  encrypted file → fetch ciphertext by `encSha`, decrypt+verify the plaintext sha
+ *  into `tmp`; plain file → stream by sha (download verifies it) + chmod. Shared by
+ *  the pull writer (precondition-checked publish) and the version-restore writer
+ *  (explicit overwrite). */
+async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore, kek?: Buffer): Promise<void> {
+  if (entry.type === "symlink") {
+    await fs.symlink(entry.symlinkTarget ?? "", tmp);
+    return;
+  }
+  if (entry.encSha && kek) {
+    // Encrypted (M5/E2EE): fetch ciphertext by encSha, decrypt+verify into tmp.
+    const ctTmp = `${tmp}.ct`;
+    try {
+      if (store.getToFile) await store.getToFile(entry.encSha, ctTmp);
+      else await fs.writeFile(ctTmp, await store.get(entry.encSha));
+      await decryptFileToPath(ctTmp, kek, entry.sha256, tmp);
+    } finally {
+      await fs.rm(ctTmp, { force: true }).catch(() => {});
+    }
+    await fs.chmod(tmp, entry.mode);
+    return;
+  }
+  // Stream large blobs straight to the temp file (no whole-file buffer); the
+  // streaming download verifies the sha. Fall back to buffered get otherwise.
+  if (store.getToFile) await store.getToFile(entry.sha256, tmp);
+  else await fs.writeFile(tmp, await store.get(entry.sha256));
+  await fs.chmod(tmp, entry.mode);
+}
+
+/**
+ * Restore ONE file from a past version onto disk (design 12 §15). Unlike the pull
+ * writer this is an EXPLICIT OVERWRITE — no reconcile precondition, no conflict-copy
+ * (the user asked for these exact bytes at this version). Still fully guarded: the
+ * symlink-parent traversal check, decrypt + plaintext-sha verify, and an atomic
+ * rename (so a partial/failed restore never leaves a truncated target). Does NOT
+ * commit or rewrite history — the next sync sees it as an ordinary local edit.
+ */
+export async function restoreEntryToPath(destRoot: string, entry: FileEntry, store: BlobStore, kek?: Buffer): Promise<void> {
+  const abs = path.join(destRoot, entry.path);
+  await assertWithinRoot(destRoot, abs); // defend symlinked-parent escape
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  const tmp = tmpName(abs);
+  try {
+    await stageEntryToTemp(tmp, entry, store, kek);
+    await fs.rename(tmp, abs); // atomic replace of any existing file/symlink
   } catch (e) {
     await fs.rm(tmp, { force: true }).catch(() => {});
     throw e;

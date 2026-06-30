@@ -6,6 +6,14 @@
 
 ---
 
+> **E2EE-era note (design 12 §15):** the prose below describes the M6 plaintext-manifest
+> era. Under full E2EE (the only mode now) the per-commit object is a **signed commit
+> envelope**, not a plaintext manifest: the DO stores `head` + `seq:<n> → SignedCommit`,
+> the D1 mirror is the `commits` table `(ws, proj, sequence, commit_hash, body, sig,
+> device_id, created_at)`, and workspace ownership is established at `POST /v1/workspaces`
+> (not on commit). Version history browse/restore therefore verify the signed chain +
+> KEK-decrypt per design 12 §15; retention/GC keep operating on the commit envelopes.
+
 ## 1. What already exists
 - The DO stores `head` + `seq:<n> → manifestSha` for **every** commit (`workspace-sync.ts`); D1 `manifests` mirrors `(ws, proj, sequence, manifest_blob_sha, device_id, created_at)`. So full version history is already persisted — M6 exposes + retains + GCs it.
 - Blobs are immutable + content-addressed; an old manifest referencing a now-deleted file still points at its (still-present) blob → restore is possible.

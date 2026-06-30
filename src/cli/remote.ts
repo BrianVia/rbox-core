@@ -10,6 +10,18 @@ import type { AccountKeysDTO, CommitChainResult } from "./e2ee-remote.js";
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
 
+/** The server can't serve a contiguous commit span (the `since` is below the
+ *  retention prune floor, so old `seq:<n>` pointers were dropped, OR the span
+ *  exceeds `MAX_COMMIT_SPAN`). A typed signal so `versions`/`restore` can fail
+ *  closed with a "aged out of your retention window" message (design 12 §15)
+ *  instead of leaking a raw HTTP error. */
+export class NeedsRebaselineError extends Error {
+  constructor(public readonly head?: number) {
+    super("needs_rebaseline: the requested commit span is below the retention window or too large");
+    this.name = "NeedsRebaselineError";
+  }
+}
+
 export interface CommitResult {
   sequence?: number;
   /** Parent-sequence conflict (HTTP 409): client must pull+reconcile, then retry. */
@@ -309,7 +321,7 @@ export class RboxApi implements SyncRemote {
 
   async commitsSince(since: number): Promise<Array<SignedCommit>> {
     const r = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/commits?since=${since}`, { headers: this.auth });
-    if (r.status === 409) throw new Error("needs_rebaseline: commit span too large or pruned — re-clone the workspace");
+    if (r.status === 409) throw new NeedsRebaselineError(((await r.json().catch(() => ({}))) as { head?: number }).head);
     if (!r.ok) throw new Error(`commits?since failed: ${r.status}`);
     return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
   }
@@ -365,16 +377,14 @@ export class RboxApi implements SyncRemote {
     return (await res.json()) as { sequence: number; manifest: Manifest };
   }
 
-  async versions(limit = 50): Promise<Array<{ sequence: number; manifest_blob_sha: string; device_id: string | null; created_at: string }>> {
+  /** Best-effort D1 commit mirror — ADVISORY display timestamps for `rbox versions`
+   *  only (the server-observed `created_at`; commit cadence is a documented residual).
+   *  Authenticity comes from the signed commit chain (`commitsSince`), NEVER this; a
+   *  missing/lagging row just shows no time. Returns server-shape rows by `sequence`. */
+  async versions(limit = 50): Promise<Array<{ sequence: number; commit_hash: string; device_id: string | null; created_at: number }>> {
     const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/versions?limit=${limit}`, { headers: this.auth });
     if (!res.ok) throw new Error(`versions failed: ${res.status}`);
-    return ((await res.json()) as { versions: [] }).versions;
-  }
-
-  async manifestAt(seq: number): Promise<Manifest> {
-    const res = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/manifests/${seq}`, { headers: this.auth });
-    if (!res.ok) throw new Error(`manifest@${seq} failed: ${res.status}`);
-    return ((await res.json()) as { manifest: Manifest }).manifest;
+    return ((await res.json()) as { versions: Array<{ sequence: number; commit_hash: string; device_id: string | null; created_at: number }> }).versions;
   }
 
   /** SyncRemote: a BlobStore backed by this client (pull / git apply path). */

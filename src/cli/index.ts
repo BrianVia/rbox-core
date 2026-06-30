@@ -6,7 +6,6 @@ import { pull, push, sync } from "./sync.js";
 import { runDaemon } from "./daemon.js";
 import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
-// versions/restore are temporarily unavailable under E2EE (design 12 D11).
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { style } from "./style.js";
@@ -268,13 +267,26 @@ async function main(): Promise<void> {
       await recoverCmd();
       break;
     }
-    case "versions":
+    case "versions": {
+      // E2EE version history (design 12 §15 / D11): verified signed-commit chain +
+      // per-epoch KEK decrypt, fail-closed — never the old plaintext manifestAt path.
+      // `rbox versions [path]` — root is the current workspace; an optional
+      // workspace-relative path scopes the listing to that file's change history.
+      const { versionsCmd } = await import("./versions-cmd.js");
+      const root = await resolveRoot(undefined);
+      const lim = flags.limit !== undefined && Number.isInteger(Number(flags.limit)) ? Number(flags.limit) : undefined;
+      await versionsCmd(root, positional[0], lim);
+      break;
+    }
     case "restore": {
-      // E2EE: version history needs signed-commit-chain verification + per-commit
-      // KEK decrypt (design 12 D11) — not yet wired. Fail closed, never the old
-      // plaintext manifestAt path.
-      console.error("`rbox versions`/`restore` aren't available yet under end-to-end encryption (coming in a follow-up). Your data is safe and syncing normally.");
-      process.exitCode = 1;
+      // `rbox restore <path>@<seq>` (design 12 §15 / D11): fetch + verify the commit
+      // at <seq>, KEK-decrypt the manifest under its keyEpoch, decrypt the blob, and
+      // atomically write the file. A restore, NOT a history rewrite. Fail-closed.
+      const { restoreCmd } = await import("./versions-cmd.js");
+      const spec = positional[0];
+      if (!spec) throw new Error("usage: rbox restore <path>@<seq>  (e.g. rbox restore src/app.ts@3)");
+      const root = await resolveRoot(undefined);
+      await restoreCmd(root, spec);
       break;
     }
     case "key": {
@@ -300,7 +312,7 @@ async function main(): Promise<void> {
         await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
         break;
       }
-      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  account <link|status|unlink>     link this account to your web/dashboard login\n  subscribe <solo|pro>             open a checkout to subscribe this account\n  billing                          open the billing portal (manage/cancel)\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
+      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  account <link|status|unlink>     link this account to your web/dashboard login\n  subscribe <solo|pro>             open a checkout to subscribe this account\n  billing                          open the billing portal (manage/cancel)\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  versions [path]                  list version history (or a file's change history)\n  restore <path>@<seq>             restore a file from a past version\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }
