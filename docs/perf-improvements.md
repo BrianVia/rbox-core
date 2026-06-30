@@ -495,3 +495,42 @@ clone for one line, env-tunable toward 128. §27 stays designed-but-unbuilt.
 The recurring lesson, four times over: **measure, and the simple lever usually beats the complex
 feature.** The big structural win (§23, D1 off the upload hot path) was real; the rest was either
 O(1)-correctness (§24) or a concurrency default that had gone stale when §23 moved the bottleneck.
+
+---
+
+## §30 — large-ref commit accounting (the cap that blocked real workspaces) + first cross-host benchmark
+
+**Dogfood discovery (2026-06-30).** Pushing a real dev folder (`~/conductor/workspaces`: 65,421
+files → **11,925 unique blobs** after per-account dedup, 2.68 GB ciphertext) uploaded every blob
+then failed the commit: `413 too_many_refs, max 6002`. §24 had made the commit *body* O(1), but a
+SECOND, hidden ceiling remained: `commitAccounting` charged/granted every ref in ONE atomic D1
+`batch()`, soft-capped at ~6000. Any workspace past ~6k unique blobs simply could not commit.
+
+**The platform-limit reality (codex round-1 framed it wrong; the CF docs corrected it):** D1
+`batch()` is **ONE subrequest**, not N statements counted toward a limit. The binding ceiling is
+**~1000 subrequests per Worker invocation**; the per-`batch()` ceiling is D1 **isolate CPU/memory**.
+The subrequest hog was `validateCommitRefs` (one SELECT per 90 refs). So the fix:
+- charge/grant in **sequential atomic super-batches** of ≤3000 refs (each one subrequest, cap-guarded);
+- **batch the validate SELECTs** (one `db.batch()` per group, not one round-trip per 90);
+- on over-cap, **keep the completed super-batches charged** (idempotent retry) — NO compensation
+  (codex's own endorsed path; the founder killed the gold-plated rollback: a near-cap concurrent
+  race is "a different problem" than the actual use case).
+- `MAX_REFS_PER_COMMIT = 50k` hard reject, but **12k validated, 50k behind measurement** (the real
+  ceiling is isolate CPU/mem, not subrequests).
+
+**First real large-workspace + cross-host benchmark (prod, v0.4.1):**
+
+| Stage | Result |
+|---|---|
+| Cold push (Mac → prod R2) | **192 s** — 65,421 files → 11,925 unique blobs, **2.68 GB** committed |
+| Commit | `sequence 1` at ~11,925 refs — **2× past the old 6,002 cap**; the commit's D1 work is a few super-batches, negligible vs transfer |
+| Cross-host pull (prod → flat-meadow x86 Linux) | **433 s** — 65,476 files, **0 conflicts** (each blob decrypt-verified vs `plaintextSha`) |
+| Byte-identity | 10/10 sampled files hash-identical across hosts |
+
+The push is bandwidth/CPU-bound exactly as §"how fast is fast enough" predicted (encrypt pass +
+~30 MB/s uplink); the §30 commit added negligible wall time. The pull is download + 65k-file write.
+
+**Lesson:** "we fixed commit-body scaling (§24)" did NOT mean "large repos work" — a separate
+accounting-cost cap silently blocked them. Two different scaling axes hid behind one feature; only
+pushing a *real* 65k-file workspace end-to-end surfaced it. (See also `learnings.md` §30/§31 — the
+same dogfood run exposed a P0 multi-device brick that no fresh-account test would catch.)

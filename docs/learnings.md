@@ -606,3 +606,57 @@ of every call — so the recapture was discarded (wasteful always; still looped 
 Fix: thread a `forceGitRecapture` flag through the recursion so the single capture site honors it.
 **Lesson: when a function recomputes state X at entry, setting X right before re-calling it is a
 no-op — pass intent (a flag), not the recomputed value.**
+
+## 2026-06-30 — §30: a feature that "fixed scaling" hid a second cap; D1 limits are about subrequests, not statements
+
+Dogfooding a real 65k-file workspace (`~/conductor/workspaces`, 11,925 unique blobs) surfaced
+`413 too_many_refs, max 6002` at COMMIT — after §24 had already made the commit body O(1). Two
+distinct scaling axes wore one feature's name: §24 fixed body SIZE; the per-commit ref-ACCOUNTING
+cost (one atomic D1 `batch()`, soft-capped ~6000) was untouched. **Lesson: "we fixed the scaling
+problem" usually means we fixed ONE of them. Push a real workload end-to-end before believing it.**
+
+**D1 platform limits, corrected:** codex framed the ceiling as "1000 D1 queries/invocation." The CF
+docs say `batch()` is **one subrequest** (executes N statements as one txn), and the limit is ~1000
+**subrequests**/invocation; the per-`batch()` ceiling is the D1 **isolate CPU/memory**. So the hog
+was `validateCommitRefs` doing one round-trip per 90 refs — not the accounting batch. Fix: loop
+**super-batches** (≤3000 refs, each one subrequest, cap-guarded) + **batch the validate SELECTs**.
+**Lesson: verify a platform limit against the vendor docs before designing around it — "queries"
+vs "subrequests" inverted which line was actually the bottleneck.**
+
+**Scope the edge to its blast radius.** I designed an over-cap "compensation" (nonce-stamped grants
++ rollback). Codex's two BLOCKERs were BOTH in that compensation; its endorsed fix was the SIMPLE
+one I'd over-engineered past — keep completed super-batches charged, idempotent retry, no rollback.
+The founder's "someone pushing 250 GB of dev files has a different problem" killed the gold-plating.
+**Lesson: a correctness edge (concurrent over-cap on a near-full account) deserves effort
+proportional to who actually hits it. The simplest correct path is often the one the reviewer
+already endorsed.** Also caught in passing: `cap_bytes=0` disabled the quota guard entirely
+(`unlinkAccount` created web shells without it) — a latent quota bypass.
+
+## 2026-06-30 — §31 (P0): a liveness bound re-checked on immutable-history replay bricks the system
+
+THE catch of the session. Every push/pull replays the roster chain from genesis and re-checked an
+admission grant's `notAfter < now` (`roster.ts`). `notAfter` is a one-time *liveness* bound
+(pair_time + 10min), but replaying IMMUTABLE history has **no trustworthy append timestamp**, so it
+was compared to the verifier's CURRENT clock — every time. Result: **every multi-device account
+bricked ~10 minutes after pairing** (all sync threw "admission grant expired" forever). A 55-min-old
+dogfood account failed in 1 second.
+
+**Why no test caught it:** unit tests pass a fixed `now`; a fresh-account benchmark never waits
+10min mid-run; the macOS same-session e2e can't age a grant past its TTL. **Only a real, AGED,
+multi-device account exposes it — exactly what dogfooding provides and synthetic tests structurally
+cannot.** A perf task (§30) surfaced a P0 only by trying to USE the system end-to-end.
+
+**The fix + the model:** drop the replay-time `notAfter` check (codex: "the right fix"). Freshness
+is gated where a trusted clock exists — the **pairing-token TTL at redeem** (it gates MK delivery;
+a useful admission needs the master key, delivered only by the in-window single-use token), and
+reuse by the single-use `grantId`. **Lesson: a liveness/expiry bound belongs at the point of
+APPLICATION (where a real clock exists), never re-evaluated on replay of already-accepted immutable
+history.**
+
+**Removing a wrong check audits what it masked.** Un-bricking made a no-MK rogue-admin residual
+*persist* (before, it also bricked, so it was moot). Codex MAJOR1: `epoch.ts` authorized a rotation's
+signer against the roster the new state ITSELF pins (so a just-admitted device could self-authorize
+its own rotation → strong DoS) — the code contradicted its own doc comment, which said "epoch e-1's
+roster." Fixed to `states[e-1].rosterVersion`. **Lesson: when you delete a (wrong) guard, audit what
+it was incidentally covering — the brick was hiding a latent epoch-authorization bug.** Also
+hardened: scrub `mk_wrap`/`admission_grant` on redeem (TTL is an API gate, not crypto expiry).
