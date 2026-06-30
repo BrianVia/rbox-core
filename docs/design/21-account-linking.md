@@ -531,10 +531,15 @@ never half-apply; the batch is atomic so a thrown UNIQUE rolls the whole thing b
 
 **Atomic `db.batch` (in order):**
 - **rebind:** `UPDATE clerk_users SET account_id=X, user_id=pending_user
-  WHERE clerk_user_id=C AND account_id=origin_account` — the `account_id=origin_account`
-  guard catches a concurrent move (→ no-op). If X already has a different Clerk row,
-  the `uq_clerk_users_account` UNIQUE index throws → **the whole batch rolls back**
-  → caught as `409 already_linked`.
+  WHERE clerk_user_id=C AND account_id=origin_account AND EXISTS(SELECT 1 FROM
+  account_link_codes WHERE poll_key=? AND consumed_at IS NOT NULL AND committed_at
+  IS NULL AND expires_at>now AND pending_account=X)` — the rebind **re-verifies the
+  full code validity inside its own WHERE** (pending, unexpired, still proposing X),
+  so the *write condition* (not just the prior JS read) gates the rebind — closing
+  the Round-3-finding-1 TOCTOU. The `account_id=origin_account` clause also makes it
+  **single-winner** (a concurrent second confirm finds C already on X → no-op). If X
+  already has a different Clerk row, the `uq_clerk_users_account` UNIQUE index throws
+  → **the whole batch rolls back** → caught as `409 already_linked`.
 - **commit code:** `UPDATE account_link_codes SET committed_at=now
   WHERE poll_key=? AND committed_at IS NULL
     AND EXISTS(SELECT 1 FROM clerk_users WHERE clerk_user_id=C AND account_id=X)` —
@@ -676,10 +681,14 @@ accounts, the *exact installed-base shells this design exists to repair* would b
 un-reclaimable — the link would block on them forever. So migration `0014` runs a
 deterministic backfill over existing `accounts`:
 
-The classifier must use the **same exhaustive predicate as §3.4** (Round-3 finding
-5 — the earlier 6-clause list was a fail-open subset). `commits` is checked via
-the `workspaces` join (no `account_id` column); the billing test covers all six
-real columns; `audit_log`/`account_link_events` are excluded (forensic logs):
+The classifier uses the **same exhaustive predicate as §3.4** (Round-3 finding 5 —
+the earlier 6-clause list was a fail-open subset), *literally* — including the
+**active-only** `pairing_tokens`/`device_auth` tests (Round-3 finding 3: §6 must
+not block on historical/consumed artifacts when §3.4 blocks only live ones; the
+migration uses `CAST(strftime('%s','now') AS INTEGER)*1000` for "now" in epoch ms).
+`commits` is checked via the `workspaces` join (no `account_id` column); the billing
+test covers all six real columns; `audit_log`/`account_link_events` are excluded
+(forensic logs):
 
 ```
 -- A real (crypto-anchored / data-bearing / billing-bearing) account → 'bootstrap'
@@ -693,9 +702,9 @@ UPDATE accounts SET origin='bootstrap'
       OR id IN (SELECT account_id FROM workspace_keys)
       OR id IN (SELECT account_id FROM workspaces)
       OR id IN (SELECT account_id FROM blob_refs)
-      OR id IN (SELECT account_id FROM uploads)
-      OR id IN (SELECT account_id FROM pairing_tokens)
-      OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL)
+      OR id IN (SELECT account_id FROM uploads WHERE account_id IS NOT NULL)
+      OR id IN (SELECT account_id FROM pairing_tokens WHERE consumed_at IS NULL AND expires_at > CAST(strftime('%s','now') AS INTEGER)*1000)
+      OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL AND status IN ('pending','approved') AND expires_at > CAST(strftime('%s','now') AS INTEGER)*1000)
       OR id IN (SELECT DISTINCT account_id FROM devices WHERE expires_at IS NULL)
       OR plan != 'free'
       OR stripe_customer_id IS NOT NULL
@@ -807,7 +816,9 @@ web-token gate and verifies its Clerk JWT internally (Round-3 finding 3).
   `admin` durable token → 403; durable owner → pending.
 - **Fresh-JWT gate:** `link/start`/`confirm` with only a stale rbox `web_*` bearer
   (no valid Clerk JWT) → 401.
-- Single-use: second redeem/confirm of a consumed code → 401; expired → 401.
+- Single-use REDEEM: a second redeem of a consumed code → 401; expired → 401.
+  (Distinct from CONFIRM idempotency below — Round-3 finding 2: redeem is strictly
+  single-use; a re-confirm of the *same already-committed target* is idempotent 200.)
 - Shell reclamation only when provably empty/unanchored (§3.4); a shell with a
   durable device / workspace / e2ee row / **subscription** → link **blocks**
   (`409 origin_account_has_state`), never silent-rebind or auto-delete.
@@ -942,3 +953,34 @@ resolved in the text above:
 requirements (new §3.5 and §4.2.1; corrected §1.1, §3.1, §3.2, §3.3, §3.4, §4.1,
 §5.3, §5.4, §6, §8). No finding is deferred. The design is now self-consistent with
 the real `auth.ts`/`clerk.ts`/`worker.ts`/migrations and unambiguous to implement.
+
+### 10.3 Round 3, re-review of the revised draft — VERDICT: FAIL → 3 sharper items folded
+
+The re-review confirmed the two-phase bind and the default-deny exact-match gate
+are resolved and match the built `Principal.kind`/`webTokenAllowed`. It surfaced
+three precise residuals on confirm/backfill, all now fixed in text **and code**:
+
+1. **§4.2.1 confirm was not *fully* self-guarded.** The batch writes gated on
+   `clerk_users[C]` state but not on the **code row's** pending/unexpired/X state, so
+   D1 batch atomicity didn't make the JS pre-read part of the write condition.
+   **Resolved §4.2.1:** the rebind now carries an inline `EXISTS(account_link_codes
+   … consumed_at NOT NULL AND committed_at IS NULL AND expires_at>now AND
+   pending_account=X)` guard — the write itself re-verifies code validity and is
+   single-winner. (Implemented in `confirmLink`.)
+2. **Idempotency was contradictory** — §4.2 said re-confirm same X = idempotent 200,
+   the test list said "second redeem/confirm of a consumed code → 401." **Resolved
+   §8 tests:** split into *redeem* (strictly single-use → 401) vs *confirm* (re-confirm
+   of the same committed target → idempotent 200). Both have tests.
+3. **§6 backfill ≠ §3.4 predicate** — §6 blocked on *any* historical
+   `pairing_tokens`/`device_auth` row while §3.4 blocks only *live* ones. **Resolved
+   §6 + migration 0014:** the backfill now uses the same **active-only** test
+   (`consumed_at IS NULL AND expires_at>now`; `status IN ('pending','approved') AND
+   expires_at>now`), with "now" as `CAST(strftime('%s','now') AS INTEGER)*1000`.
+
+**Disposition.** The three are fixed in the design *and* the implementation
+(`account-link.ts`, `0014_account_linking.sql`) with passing Miniflare tests
+(two-phase happy path incl. reclaim, confirm-mandatory, durable+owner redeem,
+fresh-JWT gate, single-use/expired, conditional-confirm abort, re-link guard,
+leaked-code property, dirty-shell block, E2EE-untouched, unlink+billing-guard,
+idempotent re-confirm). The implementability budget is spent; the design is
+self-consistent and built.

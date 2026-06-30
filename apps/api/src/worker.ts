@@ -18,6 +18,7 @@ import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAcc
 import { retentionPrune } from "./retention.js";
 import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
 import { webSession } from "./clerk.js";
+import { accountStatus, confirmLink, linkStatus, redeemLink, startLink, unlinkAccount } from "./account-link.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
@@ -143,6 +144,13 @@ async function route(req: Request, env: Env): Promise<Response> {
   // Web auth: exchange a Clerk session JWT for an rbox web session (PUBLIC, exact).
   if (req.method === "POST" && eq(seg, ["v1", "web", "session"])) return webSession(req, env, Date.now());
 
+  // Account linking (design 21) — start/status/confirm are PUBLIC: authenticated by
+  // a re-verified Clerk JWT (in body, or the Authorization header for the GET), NOT
+  // an rbox bearer, so they sit before authenticate() and outside the §1.1 gate.
+  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "start"])) return startLink(req, env, Date.now());
+  if (req.method === "GET" && eq(seg, ["v1", "account", "link", "status"])) return linkStatus(req, env, Date.now(), url.searchParams.get("pollKey") ?? "");
+  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "confirm"])) return confirmLink(req, env, Date.now());
+
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);
   if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
@@ -166,6 +174,13 @@ async function route(req: Request, env: Env): Promise<Response> {
     return revokeDevice(env, p, seg[3]!);
   }
   if (req.method === "GET" && eq(seg, ["v1", "account", "usage"])) return usage(env, p);
+  // Account linking — AUTHED rbox-bearer routes (under the §1.1 web-token gate).
+  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) {
+    const b = (await req.json().catch(() => ({}))) as { code?: unknown };
+    return redeemLink(env, p, typeof b.code === "string" ? b.code : "");
+  }
+  if (req.method === "POST" && eq(seg, ["v1", "account", "unlink"])) return unlinkAccount(env, p, Date.now());
+  if (req.method === "GET" && eq(seg, ["v1", "account", "status"])) return accountStatus(env, p);
   if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) {
     const limits = await planLimitsFor(env, p.accountId); // workspace-count quota (M7b)
     if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
