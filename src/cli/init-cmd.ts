@@ -42,10 +42,18 @@ async function promptMissing(flags: Record<string, string>, cwd: string): Promis
   }
 }
 
+/** What an executed init produced — returned so callers like `setup` can print a
+ *  unified summary (with `summary: false`) instead of init's own trailing block. */
+export interface InitOutcome {
+  workspaceId: string;
+  deviceId: string;
+  root: string;
+}
+
 export async function runInit(
   flags: Record<string, string>,
-  opts: { cwd: string; defaultRemote: string }
-): Promise<void> {
+  opts: { cwd: string; defaultRemote: string; summary?: boolean }
+): Promise<InitOutcome | undefined> {
   const creds = await loadCredentials();
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
 
@@ -57,12 +65,16 @@ export async function runInit(
     fail(plan.message);
     process.stderr.write(`${stderrStyle.dim("try:")} ${plan.headlessHint}\n`);
     process.exitCode = 2;
-    return;
+    return undefined;
   }
-  await executeInitPlan(plan, gathered.bootstrap);
+  return executeInitPlan(plan, gathered.bootstrap, { summary: opts.summary !== false });
 }
 
-async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefined): Promise<void> {
+async function executeInitPlan(
+  plan: InitPlan,
+  bootstrapSecret: string | undefined,
+  opts: { summary: boolean }
+): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
   if (plan.auth === "bootstrap-login") {
@@ -73,7 +85,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
   const creds = await loadCredentials();
   if (!creds) {
     fail("login did not produce a credential — aborting init.");
-    return;
+    return undefined;
   }
   const deviceId =
     plan.deviceId.kind === "fixed"
@@ -121,7 +133,7 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
     fail("this machine isn't enrolled for encryption yet.");
     process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
     process.exitCode = 2;
-    return;
+    return undefined;
   }
   const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
   if (plan.firstSync === "push") {
@@ -152,9 +164,13 @@ async function executeInitPlan(plan: InitPlan, bootstrapSecret: string | undefin
     }
   }
 
-  // 6. Done — show how to bring another machine online.
-  console.log(`\n${style.sym.ok} ${style.bold("rbox is set up.")}`);
-  console.log(`  ${style.dim("workspace:")} ${style.cyan(workspaceId)}`);
-  console.log(`  ${style.dim("device:")}    ${deviceId}`);
-  console.log(`\n${style.dim("Link another machine:")}\n  rbox login   ${style.dim("# on the other machine, then:")}\n  rbox init --workspace ${workspaceId} --root <path>`);
+  // 6. Done — show how to bring another machine online (unless the caller, e.g.
+  //    `setup`, prints its own unified summary instead).
+  if (opts.summary) {
+    console.log(`\n${style.sym.ok} ${style.bold("rbox is set up.")}`);
+    console.log(`  ${style.dim("workspace:")} ${style.cyan(workspaceId)}`);
+    console.log(`  ${style.dim("device:")}    ${deviceId}`);
+    console.log(`\n${style.dim("Link another machine:")}\n  rbox login   ${style.dim("# on the other machine, then:")}\n  rbox init --workspace ${workspaceId} --root <path>`);
+  }
+  return { workspaceId, deviceId, root: plan.root };
 }

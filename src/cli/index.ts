@@ -1,18 +1,70 @@
-import crypto from "node:crypto";
 import path from "node:path";
-import { scanManifest } from "../engine/index.js";
-import { findRoot, loadConfig, loadState, saveConfig, type WorkspaceConfig } from "./config.js";
+import { scanManifest, type Action } from "../engine/index.js";
+import { findRoot, loadConfig, loadState, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
-import { runDaemon } from "./daemon.js";
-import { logsDaemon, startDaemon, statusDaemon, stopDaemon } from "./daemon-control.js";
+import { isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { PROD_REMOTE } from "./credentials.js";
 import { style } from "./style.js";
 import { spinner } from "./spinner.js";
+import { resolveAlias } from "./deprecations.js";
+import { isKnownTopLevel } from "./command-catalog.js";
+import { helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
+
+/** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
+function printHelp(cmd: string | undefined, positional: string[]): void {
+  if (!cmd) {
+    console.log(renderGroupedHelp());
+    return;
+  }
+  const entries = helpFor(helpKeyFor(cmd, positional));
+  console.log(entries ? entries.map(renderCommand).join("\n\n") : renderGroupedHelp());
+}
+
+/** `rbox deps <sub>` group dispatch. `positional[0]` is the subcommand; the optional
+ *  path is `positional[1]` (for `notify` it's the notify subcommand instead). */
+async function runDeps(positional: string[], flags: Record<string, string>): Promise<void> {
+  const sub = positional[0];
+  const pathArg = path.resolve(positional[1] ?? process.cwd());
+  if (sub === "install") {
+    const { hydrateCmd } = await import("./hydrate-cmd.js");
+    await hydrateCmd(pathArg, { allowBuild: flags["allow-build"] === "true", manager: flags.manager, only: flags.only });
+  } else if (sub === "list") {
+    const { detectCmd } = await import("./hydrate-cmd.js");
+    await detectCmd(pathArg, flags.manager);
+  } else if (sub === "check") {
+    const { doctorCmd } = await import("./hydrate-cmd.js");
+    await doctorCmd(pathArg);
+  } else if (sub === "drift") {
+    const { driftCmd } = await import("./deps-drift.js");
+    await driftCmd(pathArg, flags.quiet === "true");
+  } else if (sub === "notify") {
+    const { notifyCmd } = await import("./deps-notify.js");
+    await notifyCmd(positional[1]);
+  } else {
+    console.log("usage: rbox deps <install | list | check | drift | notify> [path]");
+    process.exitCode = 1;
+  }
+}
+
+/** Post-sync drift nudge: if a pull/sync wrote a changed lockfile, print the
+ *  one-line drift notice (design 29). Best-effort — never breaks a sync. */
+async function postSyncNudge(root: string, actions: Action[], cfg: WorkspaceConfig): Promise<void> {
+  if (cfg.noDrift || process.env.RBOX_NO_DRIFT === "1") return;
+  const written = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write").map((a) => a.entry.path);
+  if (written.length === 0) return;
+  try {
+    const { nudgeForWrittenPaths, renderNotices } = await import("./deps-drift.js");
+    const notices = await nudgeForWrittenPaths(root, written);
+    if (notices.length) process.stderr.write(`${renderNotices(notices)}\n`);
+  } catch {
+    /* nudge is advisory; a failure here must not fail the sync */
+  }
+}
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
   const positional: string[] = [];
@@ -30,13 +82,16 @@ function parseFlags(args: string[]): { positional: string[]; flags: Record<strin
 
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox link <path>` first.");
+  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
   return root;
 }
 
 async function main(): Promise<void> {
-  const [cmd, ...rest] = process.argv.slice(2);
-  const { positional, flags } = parseFlags(rest);
+  let [cmd] = process.argv.slice(2) as [string | undefined];
+  const rest = process.argv.slice(3);
+  const parsed = parseFlags(rest);
+  let positional = parsed.positional;
+  const flags = parsed.flags;
 
   // `rbox --version` / `-v` / `version` → the binary's embedded version.
   if (cmd === "--version" || cmd === "-v" || cmd === "version") {
@@ -45,65 +100,67 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Help dispatch (design 29 §"Per-command help") — BEFORE running anything (so an
+  // alias's `--help` shows its own "deprecated → …" block):
+  //   `rbox help [<cmd>]`, `rbox --help`/`-h`, and `rbox <cmd> --help`/`-h`.
+  if (cmd === "help" || cmd === "--help" || cmd === "-h") {
+    printHelp(positional[0], positional.slice(1));
+    return;
+  }
+  if (cmd && (rest.includes("--help") || rest.includes("-h"))) {
+    printHelp(cmd, positional);
+    return;
+  }
+
+  // Deprecated aliases (design 29): rewrite to the canonical command in ONE pass and
+  // warn on stderr, so the switch below only ever handles canonical commands.
+  if (cmd) {
+    const alias = resolveAlias(cmd, positional);
+    if (alias) {
+      process.stderr.write(`${alias.notice}\n`);
+      cmd = alias.cmd;
+      positional = alias.positional;
+    }
+  }
+
   switch (cmd) {
     case "init": {
       const { runInit } = await import("./init-cmd.js");
       await runInit(flags, { cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
       break;
     }
-    case "detect": {
-      // Hydration works on any directory — it does not require a linked workspace.
-      const { detectCmd } = await import("./hydrate-cmd.js");
-      await detectCmd(path.resolve(positional[0] ?? process.cwd()), flags.manager);
+    case "setup": {
+      const { runSetup } = await import("./setup-cmd.js");
+      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
       break;
     }
-    case "doctor": {
-      const { doctorCmd } = await import("./hydrate-cmd.js");
-      await doctorCmd(path.resolve(positional[0] ?? process.cwd()));
+    case "track": {
+      const { track, printTrackResult } = await import("./track-cmd.js");
+      printTrackResult(await track(positional[0], flags, DEFAULT_REMOTE));
       break;
     }
-    case "hydrate": {
-      const { hydrateCmd } = await import("./hydrate-cmd.js");
-      await hydrateCmd(path.resolve(positional[0] ?? process.cwd()), {
-        allowBuild: flags["allow-build"] === "true",
-        manager: flags.manager,
-        only: flags.only,
+    case "untrack": {
+      const root = await resolveRoot(positional[0]);
+      const { untrack } = await import("./untrack-cmd.js");
+      await untrack({
+        root,
+        force: flags.force === "true",
+        confirm: async () => {
+          if (process.stdin.isTTY !== true) return true; // non-interactive → proceed
+          const readline = await import("node:readline/promises");
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          try {
+            const ans = (await rl.question(`Stop syncing ${root}? Local files stay. [y/N] `)).trim().toLowerCase();
+            return ans === "y" || ans === "yes";
+          } finally {
+            rl.close();
+          }
+        },
       });
       break;
     }
-    case "link": {
-      const root = path.resolve(positional[0] ?? process.cwd());
-      const remoteUrl = flags.remote ?? DEFAULT_REMOTE;
-      const projectId = flags.project ?? "root";
-      // New workspace → create it server-side (ownership at creation, M7). Joining
-      // an existing one (--workspace) requires the caller's account to own it.
-      let workspaceId = flags.workspace;
-      if (!workspaceId) {
-        const { loadCredentials } = await import("./credentials.js");
-        const { createRemoteWorkspace } = await import("./remote.js");
-        const creds = await loadCredentials();
-        if (!creds) throw new Error("run `rbox login` before creating a workspace");
-        workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
-      }
-      const cfg: WorkspaceConfig = {
-        schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
-        remoteWorkspaceId: workspaceId,
-        projectId,
-        deviceId: flags.device ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
-        rootPath: root,
-        remoteUrl,
-        token: "", // token comes from `rbox login` (per-machine credential), never config
-        // §28: git-sync defaults ON (git artifacts are now E2EE-encrypted). It no-ops on a
-        // non-git root (gitPreflight) and is byte-for-byte zero-knowledge; pass --git false to opt out.
-        syncGit: flags.git !== "false",
-      };
-      await saveConfig(root, cfg);
-      console.log(`linked ${root}`);
-      console.log(`  workspace: ${cfg.remoteWorkspaceId}`);
-      console.log(`  device:    ${cfg.deviceId}`);
-      console.log(`  remote:    ${cfg.remoteUrl}`);
-      if (cfg.syncGit) console.log(`  git-sync:  on (default; encrypted — --git false to opt out)`);
-      console.log(`\nLink another machine with:\n  rbox link <path> --workspace ${cfg.remoteWorkspaceId}`);
+    case "deps": {
+      await runDeps(positional, flags);
       break;
     }
     case "login": {
@@ -187,6 +244,7 @@ async function main(): Promise<void> {
         const actions = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", actions, root);
+        await postSyncNudge(root, actions, cfg);
       } catch (e) {
         sp.fail("pull failed");
         throw e;
@@ -203,6 +261,7 @@ async function main(): Promise<void> {
         sp.stop();
         summarize("pulled", pulled, root);
         console.log(`${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`);
+        await postSyncNudge(root, pulled, cfg);
       } catch (e) {
         sp.fail("sync failed");
         throw e;
@@ -218,6 +277,9 @@ async function main(): Promise<void> {
       console.log(`  ${style.dim("device:")} ${cfg.deviceId}`);
       console.log(`  ${style.dim("last-synced sequence:")} ${state.lastSyncedSequence}`);
       console.log(`  ${style.dim("local files:")} ${local.files.length}`);
+      // Folds in the old `daemon status` (design 29): background-sync state.
+      const bg = isDaemonRunning(root);
+      console.log(`  ${style.dim("background sync:")} ${bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
       if (cfg.syncGit) {
         const { gitPreflight } = await import("../engine/index.js");
         const pf = await gitPreflight(root);
@@ -233,17 +295,16 @@ async function main(): Promise<void> {
       }
       break;
     }
-    case "daemon": {
-      const sub = positional[0];
-      const root = await resolveRoot(positional[1]);
-      if (sub === "start") await startDaemon(root);
-      else if (sub === "stop") await stopDaemon(root);
-      else if (sub === "status") await statusDaemon(root);
-      else if (sub === "logs") await logsDaemon(root, flags.follow === "true" || flags.f === "true");
-      else {
-        console.log("usage: rbox daemon <start|stop|status|logs> [path] [--follow]");
-        process.exitCode = 1;
-      }
+    case "start": {
+      await startDaemon(await resolveRoot(positional[0]));
+      break;
+    }
+    case "stop": {
+      await stopDaemon(await resolveRoot(positional[0]));
+      break;
+    }
+    case "logs": {
+      await logsDaemon(await resolveRoot(positional[0]), flags.follow === "true" || flags.f === "true");
       break;
     }
     case "ignore": {
@@ -303,21 +364,25 @@ async function main(): Promise<void> {
       break;
     }
     case "__daemon-run": {
-      // Hidden: the actual in-process daemon loop (spawned detached by `daemon start`).
+      // Hidden: the actual in-process daemon loop (spawned detached by `start`).
+      // Imported lazily so chokidar/the watcher load ONLY in the daemon process,
+      // never on the hot `deps drift`/help paths that boot through this dispatcher.
+      const { runDaemon } = await import("./daemon.js");
       const root = path.resolve(positional[0] ?? process.cwd());
       await runDaemon(root);
       break;
     }
     default:
-      // Bare `rbox` in a terminal → the guided onboarding menu (setup / connect /
-      // log in). Non-interactive or `rbox help` → the command list (never hangs).
+      // Bare `rbox` in a terminal → the guided `setup` front door (design 29).
+      // Non-interactive bare `rbox`, or an unknown command → the grouped help
+      // screen (never hangs). An unknown command also exits non-zero.
       if (!cmd && process.stdin.isTTY) {
-        const { runMenu } = await import("./menu-cmd.js");
-        await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+        const { runSetup } = await import("./setup-cmd.js");
+        await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
         break;
       }
-      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  account <link|status|unlink>     link this account to your web/dashboard login\n  subscribe <solo|pro>             open a checkout to subscribe this account\n  billing                          open the billing portal (manage/cancel)\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  versions [path]                  list version history (or a file's change history)\n  restore <path>@<seq>             restore a file from a past version\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
-      if (cmd && cmd !== "help") process.exitCode = 1;
+      console.log(renderGroupedHelp());
+      if (cmd && !isKnownTopLevel(cmd)) process.exitCode = 1;
   }
 }
 

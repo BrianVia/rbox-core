@@ -27,6 +27,9 @@ export interface WorkspaceConfig {
   /** Opt-in git-state sync (M2). Default off — syncing git config could move
    *  machine-local settings; hooks are never synced regardless. */
   syncGit?: boolean;
+  /** Per-repo opt-out for dependency-drift nudges (design 29). When true, a sync
+   *  that writes a changed lockfile into this tree prints no drift notice. */
+  noDrift?: boolean;
   /** Opt-in blob-content encryption (M5). Persisted. */
   encrypted?: boolean;
   /** Workspace KEK — runtime only, loaded from the keystore; NEVER persisted. */
