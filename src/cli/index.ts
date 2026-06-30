@@ -137,6 +137,19 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "account": {
+      // Web↔CLI account linking (design 21). Distinct from `link <path>` (§4.0).
+      const sub = positional[0];
+      const { accountLink, accountStatus, accountUnlink } = await import("./account-cmd.js");
+      if (sub === "link") await accountLink(positional[1] ?? "");
+      else if (sub === "status") await accountStatus();
+      else if (sub === "unlink") await accountUnlink();
+      else {
+        console.log("usage: rbox account <link <code>|status|unlink>");
+        process.exitCode = 1;
+      }
+      break;
+    }
     case "push": {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pushing");
@@ -273,7 +286,7 @@ async function main(): Promise<void> {
         await runMenu({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
         break;
       }
-      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
+      console.log(`rbox — dev-aware sync (end-to-end encrypted)\n\nCommands:\n  ${style.bold("init")} [--new|--workspace <id>]     guided first-time setup (--no-interactive for CI)\n  login [--bootstrap <secret>]     authorize this device (bootstrap = new account + keys)\n  pair                             make a token to connect + enroll a new machine\n  recover                          re-enroll this machine from your recovery phrase\n  key <status|backup>              encryption status / re-show the recovery phrase\n  device <approve|list|revoke>     manage devices\n  account <link|status|unlink>     link this account to your web/dashboard login\n  link <path> [--workspace <id>]   bind a directory to a workspace\n  push [path]                      upload local changes\n  pull [path]                      apply remote changes\n  sync [path]                      pull then push\n  status [path]                    show workspace state\n  ignore <glob> | --list           manage .rboxignore\n  daemon <start|stop|status|logs>  passive continuous sync\n  detect [path]                    list hydratable projects (lockfiles)\n  doctor [path]                    check host readiness to hydrate\n  hydrate [path] [--allow-build]   reconstruct deps from synced lockfiles`);
       if (cmd && cmd !== "help") process.exitCode = 1;
   }
 }
