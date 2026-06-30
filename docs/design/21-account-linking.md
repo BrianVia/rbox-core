@@ -1,6 +1,6 @@
 # Design 21 — Account identity model + web↔CLI account linking
 
-> **Implementation status: 🔴 NOT STARTED** — design complete & codex-reviewed (2026-06-29). Highest-leverage spec in the batch: docs 16/17/19 depend on it. **Staged build plan: [`21-account-linking-plan.md`](./21-account-linking-plan.md).**
+> **Implementation status: ✅ SHIPPED** (2026-06-30, prod — PR #2). Web↔CLI account linking + the token-kind route gate (P4) + `rbox subscribe` + the billing re-point saga, live on `api.rbox.to` / `app.rbox.to` (migration `0014` applied). Unblocks docs 16/17/19. **Build plan: [`21-account-linking-plan.md`](./21-account-linking-plan.md).**
 
 Designs **16** (new-device emails), **17** (device/workspace dashboard) and **19**
 (revocation) all sit on top of "the Clerk session manages the user's *real*

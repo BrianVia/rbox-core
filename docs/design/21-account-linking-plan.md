@@ -1,6 +1,6 @@
 # Design 21 — Account linking: staged implementation plan
 
-> **Status: 🔴 NOT STARTED — build plan.** Execution plan for [`21-account-linking.md`](./21-account-linking.md) (the design). Slices are ordered by dependency + blast radius; each is independently buildable, testable, and committable. Section refs (`§`) point into the design doc.
+> **Status: ✅ SHIPPED (2026-06-30, PR #2).** Slices 0–6 built (including the re-point saga), plus `rbox subscribe` as the primary billing path. The plan below is retained as the record of how it was built. Section refs (`§`) point into [`21-account-linking.md`](./21-account-linking.md).
 
 ## Decisions needed before starting (gate the slices)
 
