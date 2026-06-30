@@ -170,9 +170,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (req.method === "POST" && eq(seg, ["v1", "billing", "portal"])) return billingPortal(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
   if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
-  if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") {
-    return revokeDevice(env, p, seg[3]!);
-  }
+  if (isDeviceRevoke(req.method, seg)) return revokeDevice(env, p, seg[3]!);
   if (req.method === "GET" && eq(seg, ["v1", "account", "usage"])) return usage(env, p);
   // Account linking — AUTHED rbox-bearer routes (under the §1.1 web-token gate).
   if (req.method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) {
@@ -264,6 +262,13 @@ function eq(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
+/** `POST /v1/auth/devices/:deviceId/revoke` — a wildcard route (`:deviceId`) `eq`
+ *  can't express, so it has its own matcher used by BOTH the dispatcher and the
+ *  web-token allowlist (kept in one place so the two never drift). */
+function isDeviceRevoke(method: string, seg: string[]): boolean {
+  return method === "POST" && seg.length === 5 && eq([seg[0]!, seg[1]!, seg[2]!, seg[4]!], ["v1", "auth", "devices", "revoke"]);
+}
+
 /**
  * Collapse a request path into a low-cardinality, id-free template for telemetry
  * (design doc §5: route templates, params stripped — never raw paths/ids in
@@ -327,7 +332,7 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   if (method === "GET" && (eq(seg, ["v1", "account", "usage"]) || eq(seg, ["v1", "account", "status"]))) return true;
   if (method === "POST" && (eq(seg, ["v1", "billing", "checkout"]) || eq(seg, ["v1", "billing", "portal"]))) return true;
   if (method === "GET" && eq(seg, ["v1", "auth", "devices"])) return true;
-  if (method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") return true;
+  if (isDeviceRevoke(method, seg)) return true;
   if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='durable' check
   if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)
   return false;

@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { json, sha256Hex } from "./util.js";
 import { verifyClerkJWT } from "./clerk.js";
+import { isUniqueViolation, randomHex } from "./auth.js";
 
 /**
  * Web↔CLI account linking (design 21). A two-phase bind attaches a live Clerk
@@ -20,21 +21,14 @@ const LINK_ACTIVE_CAP = 5; // max in-flight (uncommitted, unexpired) codes per C
 const LINK_PREFIX = "rbox-link_"; // human-recognizable; stripped before hashing
 const CODE_RE = /^[A-Za-z0-9_-]{43}$/; // base64url(32 random bytes) = 256 bits
 
-function randomBytes(n: number): Uint8Array {
+// The link code is 256 bits of base64url entropy (§5.3); `randomHex`/`isUniqueViolation`
+// are shared with auth.ts (the canonical id-minting + D1 error helpers).
+function randomB64url(n: number): string {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
-  return b;
-}
-function toB64url(b: Uint8Array): string {
   let s = "";
   for (const x of b) s += String.fromCharCode(x);
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-function randomHex(bytes: number): string {
-  return [...randomBytes(bytes)].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-function isUniqueViolation(e: unknown): boolean {
-  return /UNIQUE constraint failed/i.test(String((e as Error)?.message ?? e));
 }
 
 // ── phase: START ─────────────────────────────────────────────────────────────
@@ -54,7 +48,7 @@ export async function startLink(req: Request, env: Env, nowMs: number): Promise<
   const map = await env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
   if (!map) return json({ error: "web_session_required" }, 409);
 
-  const secret = toB64url(randomBytes(32));
+  const secret = randomB64url(32);
   const codeHash = await sha256Hex(secret);
   const pollKey = `plk_${randomHex(16)}`;
   const expiresAt = nowMs + LINK_TTL_MS;
@@ -143,13 +137,17 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
   const c = claims.sub;
   const pollKey = body.pollKey;
 
-  const code = await env.rbox_dev_db
-    .prepare("SELECT clerk_user_id, origin_account, pending_account, pending_user, pending_device, consumed_at, committed_at, expires_at FROM account_link_codes WHERE poll_key = ?")
-    .bind(pollKey)
-    .first<CodeRow>();
+  // The code row and C's current mapping are independent reads (keyed on pollKey
+  // and c) → fetch them concurrently (one round-trip latency, not two).
+  const [code, cur] = await Promise.all([
+    env.rbox_dev_db
+      .prepare("SELECT clerk_user_id, origin_account, pending_account, pending_user, pending_device, consumed_at, committed_at, expires_at FROM account_link_codes WHERE poll_key = ?")
+      .bind(pollKey)
+      .first<CodeRow>(),
+    env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>(),
+  ]);
   if (!code || code.clerk_user_id !== c) return json({ error: "not_found" }, 404);
   const x = code.pending_account;
-  const cur = await env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
 
   // Idempotent re-confirm: already committed to X and C still maps X → success.
   if (code.committed_at && cur?.account_id === x) return json({ account: x });
@@ -221,13 +219,9 @@ async function isReclaimableShell(env: Env, accountId: string, nowMs: number): P
   const r = await env.rbox_dev_db
     .prepare(
       `SELECT
-         (SELECT origin FROM accounts WHERE id = ?1) AS origin,
-         (SELECT plan FROM accounts WHERE id = ?1) AS plan,
-         (SELECT stripe_customer_id FROM accounts WHERE id = ?1) AS scid,
-         (SELECT stripe_subscription_id FROM accounts WHERE id = ?1) AS ssid,
-         (SELECT grace_until FROM accounts WHERE id = ?1) AS grace,
-         (SELECT extra_storage_bytes FROM accounts WHERE id = ?1) AS extra,
-         (SELECT used_bytes FROM accounts WHERE id = ?1) AS used,
+         a.origin AS origin, a.plan AS plan, a.stripe_customer_id AS scid,
+         a.stripe_subscription_id AS ssid, a.grace_until AS grace,
+         a.extra_storage_bytes AS extra, a.used_bytes AS used,
          (SELECT COUNT(*) FROM account_keys WHERE account_id = ?1) AS ak,
          (SELECT COUNT(*) FROM device_keys WHERE account_id = ?1) AS dk,
          (SELECT COUNT(*) FROM rosters WHERE account_id = ?1) AS ro,
@@ -241,11 +235,12 @@ async function isReclaimableShell(env: Env, accountId: string, nowMs: number): P
          (SELECT COUNT(*) FROM device_auth WHERE account_id = ?1 AND status IN ('pending','approved') AND expires_at > ?2) AS da,
          (SELECT COUNT(*) FROM commits WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE account_id = ?1)) AS cm,
          (SELECT COUNT(*) FROM clerk_users WHERE account_id = ?1) AS cu,
-         (SELECT COUNT(*) FROM memberships WHERE account_id = ?1 AND role = 'owner') AS own`
+         (SELECT COUNT(*) FROM memberships WHERE account_id = ?1 AND role = 'owner') AS own
+       FROM accounts a WHERE a.id = ?1`
     )
     .bind(accountId, nowMs)
     .first<Record<string, number | string | null>>();
-  if (!r) return false;
+  if (!r) return false; // no such account row → not reclaimable (same as origin != 'web')
   if (r.origin !== "web") return false;
   if (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0 || Number(r.used) !== 0) return false;
   for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "cm"]) if (Number(r[k]) !== 0) return false;
@@ -260,12 +255,12 @@ async function isReclaimableShell(env: Env, accountId: string, nowMs: number): P
  *  Blocks if X carries Stripe state (never strand a subscription, §5.4). */
 export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Promise<Response> {
   if (p.role !== "owner") return json({ error: "forbidden", message: "unlink requires an owner" }, 403);
-  const map = await env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>();
+  // The Clerk mapping and the billing state are independent reads on p.accountId → concurrent.
+  const [map, billing] = await Promise.all([
+    env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>(),
+    env.rbox_dev_db.prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>(),
+  ]);
   if (!map) return json({ error: "not_linked" }, 404);
-  const billing = await env.rbox_dev_db
-    .prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?")
-    .bind(p.accountId)
-    .first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>();
   if (billing?.stripe_customer_id || billing?.stripe_subscription_id) return json({ error: "linked_account_has_billing" }, 409);
 
   const newAcct = `acct_${randomHex(8)}`;
