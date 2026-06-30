@@ -3,6 +3,7 @@ import type { Principal } from "./authz.js";
 import { ctEqual, json } from "./util.js";
 import { PLAN_LOOKUP_KEYS, planForLookupKey } from "./plans.js";
 import { GRACE_PERIOD_MS } from "./billing.js";
+import { dbFor, dirDb } from "./db.js";
 
 /**
  * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
@@ -61,7 +62,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
   if (!PLAN_LOOKUP_KEYS[plan]) return json({ error: "bad_request", message: "unknown or non-purchasable plan" }, 400);
 
   // Reuse the account's existing customer if it has one (avoids duplicates).
-  const acct = await env.rbox_dev_db
+  const acct = await dbFor(env, p.accountId)
     .prepare("SELECT stripe_customer_id, stripe_subscription_id, plan FROM accounts WHERE id = ?")
     .bind(p.accountId)
     .first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null; plan: string }>();
@@ -102,7 +103,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
  *  plan changes / cancellation. Requires the account to have a Stripe customer. */
 export async function billingPortal(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!env.STRIPE_SECRET) return json({ error: "billing_not_configured" }, 501);
-  const acct = await env.rbox_dev_db.prepare("SELECT stripe_customer_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null }>();
+  const acct = await dbFor(env, p.accountId).prepare("SELECT stripe_customer_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null }>();
   if (!acct?.stripe_customer_id) return json({ error: "no_subscription", message: "no billing customer yet — subscribe first" }, 409);
   const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
   const session = await stripeApi(env, "POST", "/billing_portal/sessions", { customer: acct.stripe_customer_id, return_url: `${appUrl}/billing` });
@@ -155,10 +156,10 @@ export async function stripeWebhook(req: Request, env: Env, nowMs: number): Prom
   // applyStripeEvent is idempotent, so a concurrent double-delivery is harmless;
   // recording only AFTER a successful apply means a failed apply (which throws →
   // 500) is retried by Stripe rather than silently swallowed (at-least-once).
-  const seen = await env.rbox_dev_db.prepare("SELECT 1 FROM stripe_events WHERE id = ?").bind(event.id).first();
+  const seen = await dirDb(env).prepare("SELECT 1 FROM stripe_events WHERE id = ?").bind(event.id).first();
   if (seen) return json({ received: true, duplicate: true });
   await applyStripeEvent(env, event, nowMs);
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO stripe_events (id, type, received_at) VALUES (?, ?, ?)").bind(event.id, event.type, nowMs).run();
+  await dirDb(env).prepare("INSERT OR IGNORE INTO stripe_events (id, type, received_at) VALUES (?, ?, ?)").bind(event.id, event.type, nowMs).run();
   return json({ received: true });
 }
 
@@ -183,7 +184,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // late checkout.session.completed routes here by the ORIGINAL session's
         // account (the shell); after the re-point saga clears+tombstones that shell
         // (§3.4.2), this guard refuses the stale re-bind that would split-brain it.
-        await env.rbox_dev_db
+        await dbFor(env, accountId)
           .prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(obj.customer, obj.subscription ?? null, accountId, obj.customer)
           .run();
@@ -203,13 +204,13 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // active/trialing → the purchased plan. Leave grace_until untouched (it's
         // only read when free; clearing it would let a cancel re-grant in-window — G6).
         const plan = planForLookupKey(lookupKey) ?? "free";
-        await env.rbox_dev_db
+        await dbFor(env, accountId)
           .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(plan, obj.customer, obj.id, accountId, obj.customer)
           .run();
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → free + grace + clear extras.
-        await env.rbox_dev_db
+        await dbFor(env, accountId)
           .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
           .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer)
           .run();
@@ -219,7 +220,10 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
     case "customer.subscription.deleted": {
       // Downgrade + grace, only for the account that owns this customer+subscription.
       if (obj.customer && obj.id) {
-        await env.rbox_dev_db
+        // §32 FLAG: this resolves the account by stripe_customer_id (a shard column under the
+        // placement-constraint model) with NO account id in scope. Account-less at N=1 (one
+        // shard); a sharded world needs a (stripe_customer_id → shard) directory index.
+        await dbFor(env, "")
           .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
           .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
@@ -259,11 +263,11 @@ export type RepointResult = "repointed" | "destination_has_subscription" | "not_
 export async function repointBillingToAccount(env: Env, shellId: string, destId: string, nowMs: number): Promise<RepointResult> {
   if (!env.STRIPE_SECRET) return "unavailable"; // can't run the Stripe step → caller blocks
   const [shell, dest] = await Promise.all([
-    env.rbox_dev_db
+    dbFor(env, shellId)
       .prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub, plan, grace_until AS grace, extra_storage_bytes AS extra FROM accounts WHERE id = ?")
       .bind(shellId)
       .first<{ cust: string | null; sub: string | null; plan: string; grace: number | null; extra: number }>(),
-    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
+    dbFor(env, destId).prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
   ]);
   // Re-point needs a FULL {customer, subscription} on the shell; a partial billing
   // state (e.g. a stray customer with no sub) isn't a migratable subscription.
@@ -288,15 +292,18 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
   //     merging. The `reclaimed_at` stamp closes the §3.4.2 webhook re-bind window:
   //     a late `checkout.session.completed` (routed to the shell by stale session
   //     metadata) is refused by the `reclaimed_at IS NULL` guard on the bind paths.
-  await env.rbox_dev_db.batch([
-    env.rbox_dev_db
+  // §32: this batch mutates BOTH the shell and dest `accounts` rows. The §6a placement
+  // constraint forces a linkable target co-resident with its origin, so shell + dest share
+  // one shard and the batch stays atomic on a single D1. Routed by destId (== shellId's shard).
+  await dbFor(env, destId).batch([
+    dbFor(env, destId)
       .prepare(
         `UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?, grace_until = ?, extra_storage_bytes = ?
          WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)
            AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND stripe_subscription_id = ?)`
       )
       .bind(shell.cust, shell.sub, shell.plan, shell.grace, shell.extra, destId, shell.cust, shellId, shell.sub),
-    env.rbox_dev_db
+    dbFor(env, destId)
       .prepare(
         `UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'free', grace_until = NULL, extra_storage_bytes = 0, reclaimed_at = ?
          WHERE id = ? AND stripe_subscription_id = ?
@@ -309,8 +316,8 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
   // and the shell is cleared. Else block — a race left a partial/conflicting state,
   // and blocking (never merging) is the always-safe fallback.
   const [x2, s2] = await Promise.all([
-    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
-    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust FROM accounts WHERE id = ?").bind(shellId).first<{ cust: string | null }>(),
+    dbFor(env, destId).prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
+    dbFor(env, shellId).prepare("SELECT stripe_customer_id AS cust FROM accounts WHERE id = ?").bind(shellId).first<{ cust: string | null }>(),
   ]);
   if (x2?.cust === shell.cust && x2?.sub === shell.sub && s2?.cust == null) return "repointed";
   if (x2?.cust && x2.cust !== shell.cust) return "destination_has_subscription"; // X raced to a different sub → never merge

@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { planFor } from "./plans.js";
+import { dbFor } from "./db.js";
 
 /**
  * Resolve the EFFECTIVE plan for an account — the single seam where tier is
@@ -32,7 +33,11 @@ export async function resolveAccountPlan(_env: Env, _accountId: string, storedPl
  * so the current version always survives regardless of the window.
  */
 export async function retentionPrune(env: Env, nowMs: number = Date.now()): Promise<Response> {
-  const rows = await env.rbox_dev_db
+  // §32 FLAG: retention enumerates `workspaces × accounts` across ALL accounts — an
+  // account-data-plane CROSS-SHARD fan-out (design 32 §6c, daily cron fans out over
+  // liveShards). Account-less at N=1 (the one shard); the per-workspace floor query below
+  // routes by the row's owning account.
+  const rows = await dbFor(env, "")
     .prepare(
       "SELECT w.workspace_id AS ws, w.project_id AS proj, w.account_id AS acct, a.plan AS plan, a.grace_until AS grace_until " +
         "FROM workspaces w JOIN accounts a ON a.id = w.account_id"
@@ -58,7 +63,7 @@ export async function retentionPrune(env: Env, nowMs: number = Date.now()): Prom
     // floor at head-1, so the current state is never dropped. Source = `commits`
     // (E2EE writes there; created_at is epoch ms) — the legacy `manifests` table is
     // empty for E2EE workspaces (design 13 G2).
-    const floorRow = await env.rbox_dev_db
+    const floorRow = await dbFor(env, r.acct)
       .prepare("SELECT MAX(sequence) AS floor FROM commits WHERE workspace_id = ? AND project_id = ? AND created_at < ?")
       .bind(r.ws, r.proj, nowMs - days * 86_400_000)
       .first<{ floor: number | null }>();

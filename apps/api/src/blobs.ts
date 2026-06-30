@@ -4,6 +4,7 @@ import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
+import { dbFor } from "./db.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
  *  ~R2-only (staging write + receipt, ZERO D1). Absent → legacy per-PUT grant path
@@ -39,7 +40,7 @@ export function partSizeFor(size: number): number {
 // the platform already has another account's content.
 export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountId: string): Promise<Response> {
   const op = startOp(env, "blob.check");
-  const db = op.env.rbox_dev_db;
+  const db = dbFor(op.env, accountId);
   const body = (await req.json()) as { shas?: unknown };
   const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
   const uniq = [...new Set(shas)];
@@ -129,8 +130,8 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
     op.done("sha_mismatch", { bytes: len });
     return json({ error: "sha_mismatch" }, 400); // no raw R2 message (privacy)
   }
-  await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, obj.size).run();
-  await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+  await dbFor(op.env, accountId).prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, obj.size).run();
+  await dbFor(op.env, accountId).prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
   const grant = await grantEntitlementWithQuota(op.env, accountId, sha, obj.size); // verified upload → quota-checked read access
   if (!grant.granted) {
     op.done("quota_exceeded", { bytes: obj.size });
@@ -158,7 +159,7 @@ export async function blobGet(env: Env, sha: string, accountId: string): Promise
 // POST /v1/blobs/:sha/multipart  { size } -> { uploadId, partSize, totalParts }
 export async function multipartInit(req: Request, env: Env, sha: string, accountId: string): Promise<Response> {
   const op = startOp(env, "multipart.init");
-  const db = op.env.rbox_dev_db;
+  const db = dbFor(op.env, accountId);
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
@@ -195,7 +196,7 @@ interface UploadRow {
 /** Load an upload, scoped to the caller's account — a leaked uploadId from
  *  another account returns null (can't be completed cross-account). */
 function loadUpload(env: Env, sha: string, uploadId: string, accountId: string): Promise<UploadRow | null> {
-  return env.rbox_dev_db
+  return dbFor(env, accountId)
     .prepare("SELECT staging_key, part_size, total_parts, size, created_at, account_id FROM uploads WHERE upload_id = ? AND sha256 = ? AND account_id = ?")
     .bind(uploadId, sha, accountId)
     .first<UploadRow>();
@@ -207,10 +208,10 @@ export async function multipartStatus(env: Env, sha: string, uploadId: string, a
   const up = await loadUpload(env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
   if (expired(up)) {
-    await cleanupUpload(env, uploadId);
+    await cleanupUpload(env, accountId, uploadId);
     return json({ error: "upload_expired" }, 410);
   }
-  const rows = await env.rbox_dev_db
+  const rows = await dbFor(env, accountId)
     .prepare("SELECT part_number FROM upload_parts WHERE upload_id = ? ORDER BY part_number")
     .bind(uploadId)
     .all<{ part_number: number }>();
@@ -225,7 +226,7 @@ export async function multipartPart(req: Request, env: Env, sha: string, uploadI
   const up = await loadUpload(op.env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404);
   if (expired(up)) {
-    await cleanupUpload(op.env, uploadId);
+    await cleanupUpload(op.env, accountId, uploadId);
     return json({ error: "upload_expired" }, 410);
   }
   const len = Number(req.headers.get("content-length") ?? "0");
@@ -236,11 +237,11 @@ export async function multipartPart(req: Request, env: Env, sha: string, uploadI
   } catch {
     // R2 MPU gone (expired/aborted) — tell the client to re-init. (No raw message:
     // privacy; the elapsed R2 time is still recorded via span.r2's try/finally.)
-    await cleanupUpload(op.env, uploadId);
+    await cleanupUpload(op.env, accountId, uploadId);
     op.done("upload_expired", { bytes: len });
     return json({ error: "upload_expired" }, 410);
   }
-  await op.env.rbox_dev_db
+  await dbFor(op.env, accountId)
     .prepare("INSERT OR REPLACE INTO upload_parts (upload_id, part_number, etag, size) VALUES (?, ?, ?, ?)")
     .bind(uploadId, n, part.etag, len)
     .run();
@@ -260,7 +261,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
   const up = await loadUpload(op.env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404); // pre-op: not worth a metric
 
-  const sel = await op.env.rbox_dev_db
+  const sel = await dbFor(op.env, accountId)
     .prepare("SELECT part_number, etag FROM upload_parts WHERE upload_id = ? ORDER BY part_number")
     .bind(uploadId)
     .all<{ part_number: number; etag: string }>();
@@ -292,8 +293,8 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
       outcome = "sha_mismatch";
       return json({ error: "sha_mismatch" }, 412); // no raw message (privacy)
     }
-    await op.env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, bytes).run();
-    await op.env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
+    await dbFor(op.env, accountId).prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, bytes).run();
+    await dbFor(op.env, accountId).prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha).run(); // resurrect if condemned
     const grant = await grantEntitlementWithQuota(op.env, accountId, sha, bytes);
     if (!grant.granted) {
       outcome = "quota_exceeded";
@@ -303,12 +304,12 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     return json({ ok: true, sha256: sha, sizeBytes: bytes });
   } finally {
     await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch(() => {}));
-    await cleanupUpload(op.env, uploadId);
+    await cleanupUpload(op.env, accountId, uploadId);
     op.done(outcome, { bytes, count });
   }
 }
 
-async function cleanupUpload(env: Env, uploadId: string): Promise<void> {
-  await env.rbox_dev_db.prepare("DELETE FROM upload_parts WHERE upload_id = ?").bind(uploadId).run();
-  await env.rbox_dev_db.prepare("DELETE FROM uploads WHERE upload_id = ?").bind(uploadId).run();
+async function cleanupUpload(env: Env, accountId: string, uploadId: string): Promise<void> {
+  await dbFor(env, accountId).prepare("DELETE FROM upload_parts WHERE upload_id = ?").bind(uploadId).run();
+  await dbFor(env, accountId).prepare("DELETE FROM uploads WHERE upload_id = ?").bind(uploadId).run();
 }

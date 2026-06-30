@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import type { Principal } from "./authz.js";
+import { dbFor } from "./db.js";
 
 /**
  * E2EE key storage/serving (design 12, v4) — a DUMB ZERO-KNOWLEDGE STORE.
@@ -26,7 +27,7 @@ function nat(v: unknown): number | null {
 
 /** Does this workspace belong to the caller's account? (account-scoped authz.) */
 async function ownsWorkspace(env: Env, accountId: string, workspaceId: string): Promise<boolean> {
-  const row = await env.rbox_dev_db
+  const row = await dbFor(env, accountId)
     .prepare("SELECT 1 FROM workspaces WHERE workspace_id = ? AND account_id = ? LIMIT 1")
     .bind(workspaceId, accountId)
     .first();
@@ -58,17 +59,17 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
 
   const now = Date.now();
   // Claim the account_keys row first; changes===0 means already bootstrapped.
-  const claim = await env.rbox_dev_db
+  const claim = await dbFor(env, p.accountId)
     .prepare("INSERT OR IGNORE INTO account_keys (account_id, recovery_wrap, recovery_wrap_id, created_at) VALUES (?, ?, ?, ?)")
     .bind(p.accountId, recoveryWrap, recoveryWrapId, now)
     .run();
   if ((claim.meta.changes ?? 0) === 0) return json({ error: "already_bootstrapped" }, 409);
 
   // Genesis roster (v0) + genesis key-state (epoch 0) + the device's keys.
-  await env.rbox_dev_db.batch([
-    env.rbox_dev_db.prepare("INSERT OR IGNORE INTO rosters (account_id, version, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisRoster, now),
-    env.rbox_dev_db.prepare("INSERT OR IGNORE INTO account_key_states (account_id, account_epoch, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisKeyState, now),
-    env.rbox_dev_db
+  await dbFor(env, p.accountId).batch([
+    dbFor(env, p.accountId).prepare("INSERT OR IGNORE INTO rosters (account_id, version, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisRoster, now),
+    dbFor(env, p.accountId).prepare("INSERT OR IGNORE INTO account_key_states (account_id, account_epoch, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisKeyState, now),
+    dbFor(env, p.accountId)
       .prepare("INSERT OR IGNORE INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) VALUES (?, ?, ?, ?, ?, ?)")
       .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, now),
   ]);
@@ -81,15 +82,15 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
  * and every device's public keys + MK wrap. All account-scoped, all opaque.
  */
 export async function getAccountKeys(env: Env, p: Principal): Promise<Response> {
-  const acct = await env.rbox_dev_db
+  const acct = await dbFor(env, p.accountId)
     .prepare("SELECT recovery_wrap, recovery_wrap_id FROM account_keys WHERE account_id = ?")
     .bind(p.accountId)
     .first<{ recovery_wrap: string | null; recovery_wrap_id: string | null }>();
   if (!acct) return json({ error: "not_found" }, 404);
 
-  const rosters = await env.rbox_dev_db.prepare("SELECT signed FROM rosters WHERE account_id = ? ORDER BY version").bind(p.accountId).all<{ signed: string }>();
-  const keyStates = await env.rbox_dev_db.prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId).all<{ signed: string }>();
-  const devices = await env.rbox_dev_db
+  const rosters = await dbFor(env, p.accountId).prepare("SELECT signed FROM rosters WHERE account_id = ? ORDER BY version").bind(p.accountId).all<{ signed: string }>();
+  const keyStates = await dbFor(env, p.accountId).prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId).all<{ signed: string }>();
+  const devices = await dbFor(env, p.accountId)
     .prepare("SELECT device_id, sig_pubkey, enc_pubkey, mk_wrap FROM device_keys WHERE account_id = ? ORDER BY created_at")
     .bind(p.accountId)
     .all<{ device_id: string; sig_pubkey: string | null; enc_pubkey: string | null; mk_wrap: string | null }>();
@@ -115,7 +116,7 @@ export async function putDeviceKeys(env: Env, p: Principal, body: unknown): Prom
   const encPubKey = str(b.encPubKey);
   const mkWrap = str(b.mkWrap);
   if (!deviceId || !sigPubKey || !encPubKey || !mkWrap) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
-  await env.rbox_dev_db
+  await dbFor(env, p.accountId)
     .prepare("INSERT OR IGNORE INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, Date.now())
     .run();
@@ -133,7 +134,7 @@ export async function appendRoster(env: Env, p: Principal, body: unknown): Promi
   const version = nat(b.version);
   const signed = str(b.signed);
   if (version === null || !signed) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
-  const res = await env.rbox_dev_db
+  const res = await dbFor(env, p.accountId)
     .prepare(
       `INSERT INTO rosters (account_id, version, signed, created_at)
        SELECT ?, ?, ?, ?
@@ -154,7 +155,7 @@ export async function appendKeyState(env: Env, p: Principal, body: unknown): Pro
   const accountEpoch = nat(b.accountEpoch);
   const signed = str(b.signed);
   if (accountEpoch === null || !signed) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
-  const res = await env.rbox_dev_db
+  const res = await dbFor(env, p.accountId)
     .prepare(
       `INSERT INTO account_key_states (account_id, account_epoch, signed, created_at)
        SELECT ?, ?, ?, ?
@@ -182,13 +183,13 @@ export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Pr
   const kekWrap = str(b.kekWrap);
   if (!workspaceId || keyEpoch === null || !kekWrap) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
   if (!(await ownsWorkspace(env, p.accountId, workspaceId))) return json({ error: "not_found" }, 404);
-  await env.rbox_dev_db
+  await dbFor(env, p.accountId)
     .prepare("INSERT OR IGNORE INTO workspace_keys (workspace_id, account_id, key_epoch, kek_wrap, created_at) VALUES (?, ?, ?, ?, ?)")
     .bind(workspaceId, p.accountId, keyEpoch, kekWrap, Date.now())
     .run();
   // Read back the winning wrap (D1 serializes writes, so this is the value that
   // survived the CAS — ours iff we were first-writer, else the pre-existing one).
-  const row = await env.rbox_dev_db
+  const row = await dbFor(env, p.accountId)
     .prepare("SELECT kek_wrap FROM workspace_keys WHERE workspace_id = ? AND key_epoch = ?")
     .bind(workspaceId, keyEpoch)
     .first<{ kek_wrap: string }>();
@@ -221,12 +222,12 @@ export async function admitDevice(env: Env, p: Principal, body: unknown): Promis
   }
   const now = Date.now();
   const guard = `(SELECT COALESCE(MAX(version), -1) + 1 FROM rosters WHERE account_id = ?) = ?`;
-  const results = await env.rbox_dev_db.batch([
+  const results = await dbFor(env, p.accountId).batch([
     // Device first — its guard sees MAX(version) before the roster append below.
-    env.rbox_dev_db
+    dbFor(env, p.accountId)
       .prepare(`INSERT INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE ${guard}`)
       .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, now, p.accountId, version),
-    env.rbox_dev_db
+    dbFor(env, p.accountId)
       .prepare(`INSERT INTO rosters (account_id, version, signed, created_at) SELECT ?, ?, ?, ? WHERE ${guard}`)
       .bind(p.accountId, version, signed, now, p.accountId, version),
   ]);
@@ -242,7 +243,7 @@ export async function admitDevice(env: Env, p: Principal, body: unknown): Promis
  */
 export async function getWorkspaceKeys(env: Env, p: Principal, workspaceId: string): Promise<Response> {
   if (!(await ownsWorkspace(env, p.accountId, workspaceId))) return json({ error: "not_found" }, 404);
-  const rows = await env.rbox_dev_db
+  const rows = await dbFor(env, p.accountId)
     .prepare("SELECT key_epoch, kek_wrap FROM workspace_keys WHERE workspace_id = ? ORDER BY key_epoch")
     .bind(workspaceId)
     .all<{ key_epoch: number; kek_wrap: string }>();

@@ -4,6 +4,7 @@ import { json, sha256Hex } from "./util.js";
 import { verifyClerkJWT } from "./clerk.js";
 import { isUniqueViolation, randomHex } from "./auth.js";
 import { repointBillingToAccount } from "./stripe.js";
+import { dbFor, dirDb } from "./db.js";
 
 /**
  * Web↔CLI account linking (design 21). A two-phase bind attaches a live Clerk
@@ -46,7 +47,7 @@ export async function startLink(req: Request, env: Env, nowMs: number): Promise<
 
   // Require an existing web mapping — the dashboard always exchanges /v1/web/session
   // first, so origin_account (NOT NULL) is well-defined (design 21 §4.1, finding 11).
-  const map = await env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
+  const map = await dirDb(env).prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
   if (!map) return json({ error: "web_session_required" }, 409);
 
   const secret = randomB64url(32);
@@ -55,7 +56,7 @@ export async function startLink(req: Request, env: Env, nowMs: number): Promise<
   const expiresAt = nowMs + LINK_TTL_MS;
   // Atomic active-code cap per Clerk id (mirrors the pairing cap, auth.ts) — a
   // single INSERT…SELECT…WHERE count<cap, so concurrent starts can't both pass.
-  const res = await env.rbox_dev_db
+  const res = await dirDb(env)
     .prepare(
       `INSERT INTO account_link_codes (code_hash, poll_key, clerk_user_id, origin_account, created_at, expires_at)
        SELECT ?, ?, ?, ?, ?, ?
@@ -81,7 +82,7 @@ export async function redeemLink(env: Env, p: Principal, rawCode: string): Promi
   if (!CODE_RE.test(code)) return json({ error: "unauthorized" }, 401);
   const hash = await sha256Hex(code);
   const now = Date.now();
-  const consumed = await env.rbox_dev_db
+  const consumed = await dirDb(env)
     .prepare(
       `UPDATE account_link_codes
        SET consumed_at = ?, pending_account = ?, pending_device = ?, pending_user = ?, pending_at = ?
@@ -104,7 +105,7 @@ export async function linkStatus(req: Request, env: Env, nowMs: number, pollKey:
   if (!header.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
   const claims = await verifyClerkJWT(env, header.slice(7), Math.floor(nowMs / 1000));
   if (!claims) return json({ error: "unauthorized" }, 401);
-  const row = await env.rbox_dev_db
+  const row = await dirDb(env)
     .prepare("SELECT clerk_user_id, pending_account, committed_at, expires_at FROM account_link_codes WHERE poll_key = ?")
     .bind(pollKey)
     .first<{ clerk_user_id: string; pending_account: string | null; committed_at: number | null; expires_at: number }>();
@@ -141,11 +142,11 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
   // The code row and C's current mapping are independent reads (keyed on pollKey
   // and c) → fetch them concurrently (one round-trip latency, not two).
   const [code, cur] = await Promise.all([
-    env.rbox_dev_db
+    dirDb(env)
       .prepare("SELECT clerk_user_id, origin_account, pending_account, pending_user, pending_device, consumed_at, committed_at, expires_at FROM account_link_codes WHERE poll_key = ?")
       .bind(pollKey)
       .first<CodeRow>(),
-    env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>(),
+    dirDb(env).prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>(),
   ]);
   if (!code || code.clerk_user_id !== c) return json({ error: "not_found" }, 404);
   const x = code.pending_account;
@@ -164,7 +165,7 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
     // (uq_clerk_users_account) can never leave billing half-moved onto someone
     // else's X (the Stripe/D1 boundary isn't transactional). The atomic batch's
     // UNIQUE index stays the backstop for a concurrent map that races this read.
-    const xMap = await env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(x).first<{ clerk_user_id: string }>();
+    const xMap = await dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(x).first<{ clerk_user_id: string }>();
     if (xMap && xMap.clerk_user_id !== c) return json({ error: "already_linked" }, 409);
 
     // One snapshot answers both the full predicate and the ignoreBilling variant.
@@ -207,36 +208,44 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
   const landed = "EXISTS (SELECT 1 FROM clerk_users WHERE clerk_user_id = ? AND account_id = ?)";
   const codeValid =
     "EXISTS (SELECT 1 FROM account_link_codes WHERE poll_key = ? AND consumed_at IS NOT NULL AND committed_at IS NULL AND expires_at > ? AND pending_account = ?)";
+  // §32 FLAG (§6a): the rebind is the atomic commit and lives on the DIRECTORY plane
+  // (clerk_users + account_link_codes + account_link_events + the directory-plane
+  // memberships/users/devices shell rows). The reclaim ALSO mutates two account-data rows
+  // (`accounts.reclaimed_at`, `account_notify_prefs`) for the origin shell — prepared via
+  // dbFor(shell) below. At N=1 every helper returns the one binding, so this is a single
+  // atomic batch; under real sharding §6a splits it into a dirDb rebind + a best-effort
+  // per-shard teardown. The §6a placement constraint keeps origin + X co-resident.
   const stmts = [
-    env.rbox_dev_db
+    dirDb(env)
       .prepare(`UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ? AND ${codeValid}`)
       .bind(x, code.pending_user, c, code.origin_account, pollKey, nowMs, x),
-    env.rbox_dev_db.prepare(`UPDATE account_link_codes SET committed_at = ? WHERE poll_key = ? AND committed_at IS NULL AND ${landed}`).bind(nowMs, pollKey, c, x),
-    env.rbox_dev_db
+    dirDb(env).prepare(`UPDATE account_link_codes SET committed_at = ? WHERE poll_key = ? AND committed_at IS NULL AND ${landed}`).bind(nowMs, pollKey, c, x),
+    dirDb(env)
       .prepare(`INSERT INTO account_link_events (clerk_user_id, from_account, to_account, method, actor_device, at) SELECT ?, ?, ?, 'cli_link', ?, ? WHERE ${landed}`)
       .bind(c, code.origin_account, x, code.pending_device, nowMs, c, x),
   ];
   if (reclaimNeeded) {
     const shell = cur.account_id;
     stmts.push(
-      env.rbox_dev_db.prepare(`UPDATE accounts SET reclaimed_at = ? WHERE id = ? AND ${orphan}`).bind(nowMs, shell, shell),
-      env.rbox_dev_db.prepare(`DELETE FROM memberships WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
-      env.rbox_dev_db.prepare(`DELETE FROM users WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
-      env.rbox_dev_db.prepare(`DELETE FROM devices WHERE account_id = ? AND expires_at IS NOT NULL AND ${orphan}`).bind(shell, shell),
+      // account-data plane (origin shell's shard) — co-batched here only because N=1.
+      dbFor(env, shell).prepare(`UPDATE accounts SET reclaimed_at = ? WHERE id = ? AND ${orphan}`).bind(nowMs, shell, shell),
+      dirDb(env).prepare(`DELETE FROM memberships WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dirDb(env).prepare(`DELETE FROM users WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dirDb(env).prepare(`DELETE FROM devices WHERE account_id = ? AND expires_at IS NOT NULL AND ${orphan}`).bind(shell, shell),
       // §9.5: account_notify_prefs is a settings artifact (not a blocker) — clean it on
       // reclaim like the shell's own user row. (device_notifications can't exist on a
       // reclaimable shell — it implies a durable device, which blocks below — so it's a
-      // COVERED blocker, not a cleaned row.)
-      env.rbox_dev_db.prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
+      // COVERED blocker, not a cleaned row.) account-data plane (origin shell's shard).
+      dbFor(env, shell).prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
     );
   }
   try {
-    await env.rbox_dev_db.batch(stmts);
+    await dirDb(env).batch(stmts);
   } catch (e) {
     if (isUniqueViolation(e)) return json({ error: "already_linked" }, 409); // X already mapped by another Clerk id
     throw e;
   }
-  const after = await env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
+  const after = await dirDb(env).prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(c).first<{ account_id: string }>();
   if (after?.account_id !== x) return json({ error: "conflict" }, 409); // rebind guard no-op'd (concurrent move)
   return json({ account: x });
 }
@@ -255,7 +264,12 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
 type ShellState = Record<string, number | string | null>;
 
 async function loadShellState(env: Env, accountId: string, nowMs: number): Promise<ShellState | null> {
-  return env.rbox_dev_db
+  // §32 FLAG (§6a): this single SELECT mixes account-data (`accounts` + key/workspace/
+  // blob_ref/upload/notification counts) with directory-plane counts (clerk_users,
+  // memberships, devices, pairing_tokens, device_auth). Keyed by the shell account, so it
+  // routes by dbFor(accountId) at N=1; §6a splits it into two point reads (dirDb identity +
+  // dbFor(shell) data) under real sharding.
+  return dbFor(env, accountId)
     .prepare(
       `SELECT
          a.origin AS origin, a.plan AS plan, a.stripe_customer_id AS scid,
@@ -305,35 +319,39 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
   if (p.role !== "owner") return json({ error: "forbidden", message: "unlink requires an owner" }, 403);
   // The Clerk mapping and the billing state are independent reads on p.accountId → concurrent.
   const [map, billing] = await Promise.all([
-    env.rbox_dev_db.prepare("SELECT clerk_user_id, user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string; user_id: string }>(),
-    env.rbox_dev_db.prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>(),
+    dirDb(env).prepare("SELECT clerk_user_id, user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string; user_id: string }>(),
+    dbFor(env, p.accountId).prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>(),
   ]);
   if (!map) return json({ error: "not_linked" }, 404);
   if (billing?.stripe_customer_id || billing?.stripe_subscription_id) return json({ error: "linked_account_has_billing" }, 409);
 
   const newAcct = `acct_${randomHex(8)}`;
   const newUser = `user_${randomHex(8)}`;
-  await env.rbox_dev_db.batch([
+  // §32 FLAG (§6a): like confirmLink, this batch spans planes — a new account-data `accounts`
+  // row (the fresh web shell) plus the directory-plane clerk_users rebind + users/memberships/
+  // devices/account_link_events. One atomic batch at N=1; a future cross-plane saga under
+  // sharding. Run on dirDb (the rebind is the headline); the accounts INSERT routes by newAcct.
+  await dirDb(env).batch([
     // cap_bytes set explicitly (free plan) so the new shell is quota-guarded immediately —
     // a 0 here would disable accounts_cap_guard (§30 codex BLOCKER 5). The 0016 AFTER INSERT
     // trigger is the catch-all backstop; this keeps the intent visible at the insert site.
-    env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)").bind(newAcct, nowMs, 2 * 1024 * 1024 * 1024),
-    env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
-    env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
-    env.rbox_dev_db.prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),
+    dbFor(env, newAcct).prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)").bind(newAcct, nowMs, 2 * 1024 * 1024 * 1024),
+    dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
+    dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
+    dirDb(env).prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),
     // design 22 §4.3: rebinding clerk_users alone leaves the caller's already-minted
     // web_* token valid on X for up to its ~1h TTL — `authenticate()` resolves via
     // `devices`+`memberships`, INDEPENDENT of `clerk_users`. So in the SAME atomic
     // batch revoke the unlinked user's EPHEMERAL web sessions on X (never the durable
     // CLI devices: `expires_at IS NOT NULL`), closing the residual-access window.
-    env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE account_id = ? AND user_id = ? AND expires_at IS NOT NULL").bind(p.accountId, map.user_id),
-    env.rbox_dev_db.prepare("INSERT INTO account_link_events (clerk_user_id, from_account, to_account, method, actor_device, at) VALUES (?, ?, ?, 'unlink', ?, ?)").bind(map.clerk_user_id, p.accountId, newAcct, p.deviceId, nowMs),
+    dirDb(env).prepare("UPDATE devices SET revoked = 1 WHERE account_id = ? AND user_id = ? AND expires_at IS NOT NULL").bind(p.accountId, map.user_id),
+    dirDb(env).prepare("INSERT INTO account_link_events (clerk_user_id, from_account, to_account, method, actor_device, at) VALUES (?, ?, ?, 'unlink', ?, ?)").bind(map.clerk_user_id, p.accountId, newAcct, p.deviceId, nowMs),
   ]);
   return json({ ok: true, account: newAcct });
 }
 
 /** GET /v1/account/status — AUTHED. Whether a Clerk identity manages this account. */
 export async function accountStatus(env: Env, p: Principal): Promise<Response> {
-  const row = await env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>();
+  const row = await dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>();
   return json({ accountId: p.accountId, linked: !!row });
 }

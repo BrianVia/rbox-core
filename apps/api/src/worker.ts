@@ -11,6 +11,7 @@
  * Dev-harness shortcut (documented): auth is a shared bearer token (M4 replaces).
  */
 import type { DeviceNotifyMessage, Env } from "./env.js";
+import { dbFor } from "./db.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
 import { gcMark, gcPurge, versionsList } from "./versions.js";
@@ -264,7 +265,7 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (!az.ok) return jsonResponse({ error: az.status === 403 ? "forbidden" : "not_found" }, az.status);
 
     if (seg.length === 6 && action === "versions" && req.method === "GET") {
-      return versionsList(env, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
+      return versionsList(env, p.accountId, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
     }
     if (action === "manifests" || action === "latest" || action === "connect" || action === "commits") {
       const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
@@ -275,7 +276,7 @@ async function route(req: Request, env: Env): Promise<Response> {
         headers.set("x-rbox-account", p.accountId);
         // C4: also forward the account's CURRENT key epoch (MAX(account_epoch), 0 if
         // none); the DO asserts the commit's accountEpoch == this inside the txn.
-        const epochRow = await env.rbox_dev_db
+        const epochRow = await dbFor(env, p.accountId)
           .prepare("SELECT MAX(account_epoch) AS epoch FROM account_key_states WHERE account_id = ?")
           .bind(p.accountId)
           .first<{ epoch: number | null }>();
