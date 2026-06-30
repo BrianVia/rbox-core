@@ -476,3 +476,44 @@ Canonical launch: `coy exec --dangerously-bypass-approvals-and-sandbox "$PROMPT"
   5. **Low process priority** — `os.setPriority` (CPU) + best-effort `ionice` on Linux; the daemon never makes the laptop feel slow.
   6. **Adaptive coalescing debounce** — extend settle window during a burst (capped), don't scan a moving target.
   - This ELEVATED "scan only changed subtrees" from M9 into M1 (delivered via event-driven patching); monorepo-scale tuning of the *full* scan stays M9.
+
+## 2026-06-30 — §24 blobRef sidecar: implement-it-anyway, and the dual-mode rollout
+
+**Context.** After §23 shipped, a measurement pass concluded §24/§26/§27 were diminishing
+returns and I recommended stopping. The directive was explicit: take EVERY backend-perf doc
+through the full cycle. Lesson: when the user says "all of them," a defensible ROI argument is
+worth *recording* (it's real engineering signal) but is NOT a substitute for doing the work. I
+recorded the ROI finding in `perf-improvements.md` AND implemented §24. Both are valuable.
+
+**The design predated the §23 pivot.** §24's doc was written against §23's *staging/promote*
+architecture, which §23 later replaced with direct-write. The codex impl-review caught that the
+sidecar resolver still described staging. Lesson: a design doc reviewed-and-passed months ago is
+stale the moment a dependency pivots — re-review the design against the SHIPPED code right before
+implementing, not against the code as it was when the design was written.
+
+**Dual-mode is the safe way to change a signed, immutable, hash-chained body.** You cannot
+migrate old commits (they're signed + chained). The body became a discriminated union
+(`blobRefs` inline XOR `blobRefset` sidecar); `parseCommit` runs `verifyRoundTrip` (canonical
+re-serialize) BEFORE the discriminator so a duplicate JSON key can't collapse two modes into one.
+Old bodies are byte-unchanged → old hashes/sigs still verify. New bodies sign `sidecarSha`
+explicitly — no implied/default ref set ever floats under a signature.
+
+**Threshold-gate the new wire format to make a fail-closed rollout look transparent.** Emit the
+sidecar ONLY above `SIDECAR_THRESHOLD` (4000) refs. A repo big enough to need it already exceeds
+what a pre-§24 client could commit (it would blow the 1 MB body cap → 400), so "new format for
+big repos only" regresses no currently-working case. Deploy server dual-mode FIRST, then ship the
+client that emits it — the server understands the format before any client speaks it.
+
+**Share the security-critical codec, duplicate nothing.** The `rbox-refset-v1` parser validates
+untrusted bytes; a second copy in the Worker would drift. Put it in `src/engine/refset.ts` —
+dependency-free (pure byte ops, no hashing/crypto) so it bundles into BOTH the Bun client and the
+workerd Worker (added to the Worker tsconfig `include`). `import type` for any engine *type* the
+Worker needs, so esbuild never drags the e2ee crypto graph into the Worker bundle.
+
+**Parser hygiene for binary formats on the trust boundary:** bound allocation by the R2-REPORTED
+object size (and the exact `18 + 40·count` length) BEFORE buffering — never by the self-declared
+count; parse u64 sizes via `BigInt` and reject `> Number.MAX_SAFE_INTEGER`; `new DataView(bytes
+.buffer, bytes.byteOffset, bytes.byteLength)` (NOT `new DataView(bytes.buffer)`) so a subarray
+view into a larger ArrayBuffer reads the right window. GC `roots()` over sidecars must fail CLOSED
+— a missing/corrupt sidecar OR a retained-seq gap aborts the WHOLE pass (condemn nothing), and
+the sidecarSha is itself a GC root.

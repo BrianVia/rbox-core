@@ -1,7 +1,11 @@
 # §24 — blobRefs out of the signed commit body → R2 sidecar (P0)
 
-> Status: **design**. Basis: [`22-server-throughput.md`](22-server-throughput.md).
-> Unlocks large monorepos (50k files); the current 1 MB commit-body cap is interim.
+> Status: **implementing (v3, codex impl-review resolved)**. Basis: [`22-server-throughput.md`](22-server-throughput.md).
+> Removes the 1 MB signed-commit-body / D1-row pressure and prepares the protocol for large
+> monorepos. NOTE: v1 keeps the §23.4 accounting cap (`MAX_ACCOUNTING_REFS_PER_COMMIT`=6000),
+> so it does NOT by itself raise the accepted-ref count — the headline "50k files" needs the
+> separate deferred large-ref accounting design (B3). What v1 buys: bodies become O(1) and a
+> repo whose inline body would exceed the 1 MB cap (~12k refs) now commits via the sidecar.
 
 ## Problem
 The signed commit body inlines one `{encSha,size}` (~85 B) per unique blob. A ~4k-file
@@ -120,3 +124,52 @@ design resolutions:
 > **Sequencing:** §24 implementation MODIFIES the §23 commit path (sidecar replaces inline refs),
 > so it lands AFTER §23 merges. This review + the two §23 bug fixes it surfaced are the immediate
 > value; full §24 design re-review happens when its implementation begins.
+
+---
+
+## v3 — codex implementation-readiness review resolutions (2026-06-30)
+
+Codex re-reviewed §24 against the **shipped §23 direct-write** code (NEEDS-WORK; the design
+predated §23's staging→direct-write pivot). Resolutions, all folded into the implementation:
+
+- **B1 (BLOCKER) — `resolveSidecarBytes` is DIRECT-WRITE only.** No staging key, no promote
+  phase (§23 deleted both). The client PUTs the sidecar to the canonical key (`blobKey(sidecarSha)`)
+  + mints a receipt like any blob. At commit the server: requires the sidecar entitled-or-receipt
+  (it's in the `shas` set), GETs `blobKey(sidecarSha)`, verifies `sha256(bytes)==sidecarSha`, parses,
+  asserts `count`/`Σsize`==descriptor. `sidecarSha` flows through `validateCommitRefs` +
+  `commitAccounting` exactly like a data ref (charged from server-measured size, granted, present=1).
+- **M1 — off-by-the-objects-accounted cap (+ dead-band fix).** The accounting set is
+  `encManifestSha ∪ sidecarSha ∪ N data refs`. Early reject is `descriptor.count + 2 >
+  MAX_ACCOUNTING_REFS_PER_COMMIT` (inline stays `blobRefs.length + 1 > cap`). A later impl-scrutiny
+  pass caught that the sidecar carrier costs one extra slot, so under the old 6000 cap a 5999-ref
+  repo was committable inline (6000 ≤ 6000) but rejected on the sidecar path (6001 > 6000) — with
+  no inline fallback in the client. Fix: the cap absorbs BOTH carriers
+  (`MAX_ACCOUNTING_REFS_PER_COMMIT` = **6002** = ~6000 data refs + encManifest + sidecar), so the
+  sidecar path accepts the same data-ref ceiling inline does — no boundary dead band.
+- **M2 — a REAL discriminator + duplicate-key safety.** Parse the body as `CommitBodyInline |
+  CommitBodySidecar` by strict own-property XOR (`blobRefs` array XOR `blobRefset` object); both/
+  neither/wrong-type → reject before receipts/accounting/head-advance. The engine `parseCommit`
+  already runs through `verifyRoundTrip` (canonical re-serialize == input) which rejects
+  duplicate/again-ordered JSON keys; the worker's cheap body read does NOT, so the worker re-checks
+  the discriminator on the parsed object and never trusts a colliding key.
+- **M3 — `roots()` sidecar-aware + fail-closed (the data-loss guard).** `/v1/admin/gc` still
+  reaches `gcPurge` (deletes R2), so this is NOT merely forward-looking. `roots()` must, for a
+  `blobRefset` commit, fetch+hash+parse the sidecar, include `sidecarSha` ITSELF as a root, and
+  return non-2xx (abort the whole pass, condemn nothing) on ANY missing/corrupt/unparseable sidecar
+  OR retained-seq gap (today it silently `continue`s a gap — fixed: a gap now fails the pass).
+- **M4 — parser bounds allocation by ACTUAL bytes, not self-declared count.** `head` the R2 object
+  (or read its `size`), require `bytes.length === 18 + 40*count` (14 magic + 4 count), reject before
+  allocating; parse `size` as `u64` via `BigInt`, reject `> MAX_BLOB_SIZE` or unsafe-int; accumulate
+  `Σsize` overflow-safely (BigInt) for the descriptor-match.
+- **Rollout (MINOR) — server dual-mode FIRST, then threshold-gated client emission.** Deploy the
+  dual-mode server before any client emits sidecars. The client emits a sidecar ONLY when the ref
+  set is large enough that the inline body would approach the 1 MB cap (`SIDECAR_THRESHOLD` refs);
+  below it, inline (full old/new-client interop). A repo big enough to need a sidecar already
+  exceeds what an old client could commit (1 MB body → 400), so sidecar-for-large-only regresses
+  no currently-working case — and it's exactly §24's purpose. `parseCommit` becomes dual-mode so a
+  new client reading a peer's sidecar commit doesn't throw.
+
+**Confirmed by codex:** signature safety (old bodies unchanged → old hashes/sigs verify; new
+bodies sign `sidecarSha` explicitly, no implied ref set); billing (sidecarSha enters the same
+server-measured accounting set; descriptors stay advisory + match-checked); concurrent commits on
+the same sidecar (idempotent per-account grant + NOT-EXISTS charge).

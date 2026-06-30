@@ -59,12 +59,17 @@ export {
   GENESIS_PARENT_HASH,
   normalizeBlobRefs,
   parseCommit,
+  validateBlobRefset,
   verifyCommitSig,
   type BlobRef,
+  type BlobRefset,
   type CommitBody,
+  type CommitBodyInline,
+  type CommitBodySidecar,
   type CommitFields,
   type SignedCommit,
 } from "./commit.js";
+export { parseRefset, refsetByteLength, serializeRefset, REFSET_HEADER, REFSET_MAGIC, REFSET_REC, type Ref } from "../refset.js";
 export {
   activeSigners,
   admissionDelta,

@@ -408,3 +408,36 @@ is gone, and the rest is bytes-on-the-wire, which no server change removes.
 own 10-codex-round staging design was a 2.4× *regression*; the simple direct-write won. Same lens
 here kills three more speculative builds before they cost anything. The remaining wins are
 client-side (decrypt/write throughput, concurrency) and physics (R2 transfer), not server D1.
+
+---
+
+## §24 blobRef sidecar — SHIPPED (2026-06-30): the signed commit body is now O(1)
+
+Per the user's directive to take EVERY backend-perf doc through the full cycle (not just the
+ones with a speed win), §24 was implemented after the convergence note above. It is a
+**correctness/scaling** change, not a latency win — and the measurements say so honestly.
+
+**What it does.** The signed commit body used to inline one `{encSha,size}` (~85 B) per unique
+blob. Above a threshold the refs now live in a content-addressed R2 **sidecar** (`rbox-refset-v1`
+binary: magic ‖ u32be count ‖ count×(32 raw sha ‖ u64be size)); the body carries only the
+`{sidecarSha,count,totalBytes}` descriptor. The signature still commits to `sidecarSha`, so
+integrity is unchanged. Server resolves+validates the sidecar at commit (direct-write: GET the
+canonical blob, bound by R2-reported size, hash-verify, strict-parse, descriptor-match), charges
+`sidecarSha` like any blob, and `roots()` is sidecar-aware + fail-closed for GC.
+
+**Measured on dev (real D1/R2/DO), savvy-core 4287 files / 4217 unique blobs:**
+
+| metric | inline (pre-§24) | §24 sidecar | change |
+|---|---|---|---|
+| **signed commit body** | ~358 KB (4217×85 B) | **533 bytes** | **~670× smaller, now O(1)** |
+| cold push wall (4287 files) | ~37 s (extrapolated §23) | **38.9 s** | neutral (one sidecar PUT amortized over 4287 blobs) |
+| fresh-checkout clone | byte-identical | **byte-identical** | ✓ (0 content diffs; only default-ignored `.env`/`.DS_Store` differ) |
+| commit-body cap pressure | hits 1 MB at ~12k refs | **gone** (body O(1)) | unblocks repos past the inline cap |
+
+**The honest result:** §24 buys ZERO push/pull latency — the work (encrypt + upload N blobs +
+account) is identical; it just adds one small sidecar upload. What it buys is **the 1 MB / D1-row
+body ceiling disappearing** — a repo whose inline body would exceed ~1 MB (~12k refs) now commits.
+v1 still keeps the §23.4 accounting cap (6000 refs/commit), so it does NOT yet raise the accepted
+ref count — that needs the separate deferred large-ref accounting design. The threshold
+(`SIDECAR_THRESHOLD`=4000) means small repos stay inline (full old/new-client interop); only large
+repos — which an old client couldn't commit anyway — use the sidecar, so nothing regresses.

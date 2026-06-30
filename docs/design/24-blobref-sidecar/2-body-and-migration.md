@@ -56,4 +56,4 @@ CommitBody {
   Tampered `sidecarSha` → fetch+hash mismatch (§24.3) → reject.
 
 ## Depends on / Status
-Depends on: §24.1. Status: **design (v2, codex-resolved)**. Pairs with §23 (the commit handler reads this).
+Depends on: §24.1. Status: **IMPLEMENTED** (dual-mode `CommitBody` + `parseCommit` in `src/engine/e2ee/commit.ts`; client emits the sidecar above `SIDECAR_THRESHOLD` in `src/cli/e2ee-remote.ts`; tests in `commit-dualmode.test.ts`). Pairs with §23 (the commit handler reads this).

@@ -10,7 +10,7 @@
  * can open a workspace KEK and decrypt.
  */
 import { generateSignKeyPair, generateWrapKeyPair, sign, signKeyPairFromSeed, signPrivateFromPkcs8, signPrivateToPkcs8, wrapPrivateFromPkcs8, wrapPrivateToPkcs8, type SignKeyPair, type WrapKeyPair } from "./asym.js";
-import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type SignedCommit } from "./commit.js";
+import { buildSignedCommit, GENESIS_PARENT_HASH, parseCommit, verifyCommitSig, type BlobRef, type BlobRefset, type SignedCommit } from "./commit.js";
 import { buildKeyState, GENESIS_PREV_STATE_HASH, verifyKeyStateChain, type AccountKeyState, type SignedKeyState } from "./epoch.js";
 import { canonicalString, parseStrict } from "./jcs.js";
 import { aesGcmUnwrap, aesGcmWrap, generateMasterKey, generateWorkspaceKek, rsaDeviceUnwrap, rsaDeviceWrap, wrapHash, type Wrap, type WrapContext } from "./keys.js";
@@ -157,7 +157,10 @@ export interface BuiltCommit {
   commit: SignedCommit;
 }
 
-/** Encrypt a manifest and build a signed commit referencing it + its blobRefs. */
+/** Encrypt a manifest and build a signed commit referencing it + its ref set. The ref set
+ *  is carried inline (`blobRefs`) OR, for large repos, as a §24 sidecar descriptor
+ *  (`blobRefset`) — the caller uploads the sidecar blob and passes the descriptor. Exactly
+ *  one is supplied; `blobRefset` wins when present. */
 export async function buildCommit(args: {
   secrets: DeviceSecrets;
   workspaceId: string;
@@ -170,24 +173,23 @@ export async function buildCommit(args: {
   parentCommitHash: string;
   manifestJson: Uint8Array;
   blobRefs: BlobRef[];
+  blobRefset?: BlobRefset;
 }): Promise<BuiltCommit> {
   const enc = await encryptManifest(args.kek, args.secrets.accountId, args.workspaceId, args.keyEpoch, args.manifestJson);
-  const commit = await buildSignedCommit(
-    {
-      accountId: args.secrets.accountId,
-      accountEpoch: args.accountEpoch,
-      workspaceId: args.workspaceId,
-      seq: args.seq,
-      parentSeq: args.parentSeq,
-      parentCommitHash: args.parentCommitHash,
-      rosterVersion: args.rosterVersion,
-      keyEpoch: args.keyEpoch,
-      deviceId: args.secrets.deviceId,
-      encManifestSha: enc.encManifestSha,
-      blobRefs: args.blobRefs,
-    },
-    { publicKey: args.secrets.sigPubKey, privateKey: signPrivateFromPkcs8(args.secrets.sigPrivPkcs8) }
-  );
+  const base = {
+    accountId: args.secrets.accountId,
+    accountEpoch: args.accountEpoch,
+    workspaceId: args.workspaceId,
+    seq: args.seq,
+    parentSeq: args.parentSeq,
+    parentCommitHash: args.parentCommitHash,
+    rosterVersion: args.rosterVersion,
+    keyEpoch: args.keyEpoch,
+    deviceId: args.secrets.deviceId,
+    encManifestSha: enc.encManifestSha,
+  };
+  const signKey = { publicKey: args.secrets.sigPubKey, privateKey: signPrivateFromPkcs8(args.secrets.sigPrivPkcs8) };
+  const commit = await buildSignedCommit(args.blobRefset !== undefined ? { ...base, blobRefset: args.blobRefset } : { ...base, blobRefs: args.blobRefs }, signKey);
   return { encManifest: enc.bytes, encManifestSha: enc.encManifestSha, commit };
 }
 

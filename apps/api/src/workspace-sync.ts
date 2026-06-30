@@ -2,13 +2,14 @@ import type { Env } from "./env.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { startOp, type MetricEvent } from "./metrics.js";
 import { validateCommitRefs, commitAccounting, MAX_ACCOUNTING_REFS_PER_COMMIT } from "./commit-accounting.js";
+import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
 
-// Opaque body cap. The body inlines one blobRef ({encSha,size} ≈ 85B) per UNIQUE
-// blob, so a ~4k-file repo is ~350KB; 1MB covers ~12k unique blobs and fits D1's
-// ~2MB row limit. Beyond that, blobRefs should move out of the signed body (e.g.
-// a side R2 object referenced by hash) — see scaling notes; this cap is interim.
+// Opaque body cap. With §24 the body is O(1) for large repos (the refs live in an R2
+// sidecar, only its {sidecarSha,count,totalBytes} descriptor is inline). Small repos still
+// inline blobRefs ({encSha,size} ≈ 85B each); 1MB covers ~12k inline refs + fits D1's ~2MB
+// row limit. The §24 client switches to the sidecar before bodies approach this cap.
 const MAX_COMMIT_BODY = 1024 * 1024; // 1MB
-const MAX_BLOB_REFS = 50000; // sanity cap on referenced blobs per commit
+const MAX_BLOB_REFS = 50000; // sanity cap on referenced blobs per commit (bounds sidecar bytes too)
 
 /** The opaque signed commit envelope the server stores verbatim (design 12, v4).
  *  The server reads a FEW fields out of `body` for validation but NEVER verifies
@@ -27,6 +28,38 @@ interface CommitBodyView {
   encManifestSha?: unknown;
   deviceId?: unknown;
   blobRefs?: unknown;
+  blobRefset?: unknown; // §24 sidecar descriptor {sidecarSha,count,totalBytes}
+}
+
+/** §24 strict discriminator: a commit body carries EXACTLY ONE ref carrier — inline
+ *  `blobRefs` (array) XOR a `blobRefset` descriptor (object). Returns the validated mode,
+ *  or null if both/neither/wrong-type (→ caller rejects before accounting/head-advance).
+ *  Note: the body was JSON.parse'd; a duplicate JSON key would have collapsed, but the
+ *  client signs the canonical form and every honest reader runs the engine `parseCommit`
+ *  (verifyRoundTrip) — the server's accounting never trusts a key the signature didn't cover
+ *  because it re-derives the ref set from the receipt-authenticated sidecar bytes, not the body. */
+type RefMode = { kind: "inline"; refShas: string[] } | { kind: "sidecar"; sidecarSha: string; count: number; totalBytes: number };
+
+function readRefMode(cb: CommitBodyView): RefMode | null {
+  const hasInline = Array.isArray(cb.blobRefs);
+  const rs = cb.blobRefset;
+  const hasSidecar = !!rs && typeof rs === "object" && !Array.isArray(rs);
+  if (hasInline === hasSidecar) return null; // both or neither
+  if (hasInline) {
+    const refs = cb.blobRefs as Array<{ encSha?: unknown }>;
+    if (refs.length > MAX_BLOB_REFS) return null;
+    const refShas: string[] = [];
+    for (const r of refs) {
+      if (!r || typeof r.encSha !== "string" || !SHA_RE.test(r.encSha)) return null;
+      refShas.push(r.encSha);
+    }
+    return { kind: "inline", refShas };
+  }
+  const d = rs as { sidecarSha?: unknown; count?: unknown; totalBytes?: unknown };
+  if (typeof d.sidecarSha !== "string" || !SHA_RE.test(d.sidecarSha)) return null;
+  if (!Number.isSafeInteger(d.count) || (d.count as number) < 0 || (d.count as number) > MAX_BLOB_REFS) return null;
+  if (!Number.isSafeInteger(d.totalBytes) || (d.totalBytes as number) < 0) return null;
+  return { kind: "sidecar", sidecarSha: d.sidecarSha, count: d.count as number, totalBytes: d.totalBytes as number };
 }
 
 const MAX_COMMIT_SPAN = 5000; // commits?since span cap → over this, client re-baselines
@@ -168,49 +201,75 @@ export class WorkspaceSync {
     if (parent !== cb.parentSeq) return json({ error: "bad_request", message: "parentSequence mismatch" }, 400);
     if (!Number.isInteger(cb.accountEpoch)) return json({ error: "bad_request", message: "bad accountEpoch" }, 400);
     const commitEpoch = cb.accountEpoch as number;
-    const refs = Array.isArray(cb.blobRefs) ? (cb.blobRefs as Array<{ encSha?: unknown }>) : null;
-    if (!refs || refs.length > MAX_BLOB_REFS) return json({ error: "bad_request", message: "bad blobRefs" }, 400);
-    const refShas: string[] = [];
-    for (const r of refs) {
-      if (!r || typeof r.encSha !== "string" || !SHA_RE.test(r.encSha)) return json({ error: "bad_request", message: "bad blobRef encSha" }, 400);
-      refShas.push(r.encSha);
-    }
+    // §24 strict dual-mode: exactly one of inline blobRefs / sidecar descriptor.
+    const mode = readRefMode(cb);
+    if (!mode) return json({ error: "bad_request", message: "commit must carry exactly one of blobRefs / blobRefset" }, 400);
+    // A sidecar commit needs the receipts protocol (its refs come from a receipt-authenticated
+    // R2 object resolved at accounting time) — an old/legacy-protocol sidecar can't be charged.
+    if (mode.kind === "sidecar" && !useReceipts) return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
     const deviceId = typeof cb.deviceId === "string" ? cb.deviceId : null;
-
-    // Blob-existence: refuse to advance head past a commit referencing blobs we
-    // don't have (the encrypted manifest is itself a normal blob the client
-    // uploaded first), or every future pull breaks. 422 → client uploads.
-    const shas = [...new Set([cb.encManifestSha, ...refShas])];
     const bodyBytes = commit.body.length;
-    const emitCommit = (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, { bytes: bodyBytes, count: shas.length, ...extra });
+
+    // Blob-existence: refuse to advance head past a commit referencing blobs we don't have
+    // (the encrypted manifest is itself a normal blob the client uploaded first), or every
+    // future pull breaks. 422 → client uploads. For a sidecar commit the data refs come from
+    // the resolved sidecar (below); the existence set always includes encManifestSha and,
+    // for sidecar commits, sidecarSha itself (so the published head's sidecar is durable).
+    let shas: string[];
+    const emit = (count: number) => (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, { bytes: bodyBytes, count, ...extra });
 
     if (useReceipts) {
-      // §23.4: validate (present=1+entitled OR receipt) → catalog+charge+grant+promote
-      // +present=1, all BEFORE the head advance (account-then-publish). On head 409 the
-      // accounting is already durable (benign: refs entitled+present; retry charges 0).
-      if (shas.length > MAX_ACCOUNTING_REFS_PER_COMMIT) {
-        emitCommit("too_many_refs");
-        return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
-      }
+      // §23.4 + §24: resolve refs → validate (present=1+entitled OR receipt) → catalog+charge
+      // +grant, all BEFORE the head advance (account-then-publish). On head 409 the accounting
+      // is already durable (benign: refs entitled+present; retry charges 0).
       const nowMs = Date.now();
+      if (mode.kind === "sidecar") {
+        // Off-by-the-objects-accounted (codex M1): the accounting set is encManifest + sidecar
+        // + count data refs, so cap on count + 2. Cheap reject BEFORE the R2 fetch.
+        if (mode.count + 2 > MAX_ACCOUNTING_REFS_PER_COMMIT) {
+          emit(mode.count)("too_many_refs");
+          return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
+        }
+        const sc = await resolveSidecarBytes(this.env, op.env.rbox_dev_db, accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
+        if (!sc.ok) {
+          if ("needsUpload" in sc) {
+            emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
+            return json({ error: "unsatisfied_blobs", missing: sc.needsUpload }, 422);
+          }
+          emit(mode.count)("bad_sidecar");
+          return json({ error: "bad_sidecar", message: sc.badSidecar }, 400);
+        }
+        shas = [...new Set([cb.encManifestSha as string, mode.sidecarSha, ...sc.refShas])];
+      } else {
+        shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+        if (shas.length > MAX_ACCOUNTING_REFS_PER_COMMIT) {
+          emit(shas.length)("too_many_refs");
+          return json({ error: "too_many_refs", max: MAX_ACCOUNTING_REFS_PER_COMMIT }, 413);
+        }
+      }
       const v = await validateCommitRefs(this.env, op.env.rbox_dev_db, accountId, shas, receipts, nowMs);
       if (!v.ok) {
-        emitCommit("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
+        emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
         return json({ error: "unsatisfied_blobs", missing: v.needsUpload }, 422);
       }
       const acct = await commitAccounting(op.env.rbox_dev_db, accountId, v.newRefs, nowMs);
       if ("overCap" in acct) {
-        emitCommit("quota_exceeded", { bytes: bodyBytes });
+        emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
         return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
       }
     } else {
-      const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId); // legacy (M7)
+      // Legacy (M7): inline only — a sidecar commit was rejected above (requires receipts),
+      // so `mode` here is always inline; the guard narrows the type and is defensive.
+      if (mode.kind !== "inline") return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
+      shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+      const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId);
       if (missing.length > 0) {
         // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
-        emitCommit("unsatisfied_blobs", { ratio: missing.length / shas.length });
+        emit(shas.length)("unsatisfied_blobs", { ratio: missing.length / shas.length });
         return json({ error: "unsatisfied_blobs", missing }, 422);
       }
     }
+    const emitCommit = emit(shas.length);
 
     // Atomic head check + advance — synchronous, no await inside. We store the full
     // SignedCommit verbatim (opaque); parent===head guarantees next === cb.seq.
@@ -278,13 +337,31 @@ export class WorkspaceSync {
     const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
     const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> = [];
+    // FAIL CLOSED (§24.3 M3): GC condemns anything NOT named here, so any inability to
+    // enumerate a retained commit's reachable set (a gap in (floor, head], or a sidecar that's
+    // missing/oversized/corrupt/unparseable) must abort the WHOLE pass (non-2xx → gcMark throws),
+    // never silently omit roots. A sidecar commit's sidecarSha is itself a root (losing it must
+    // prevent condemnation, since future reachability proofs need it).
     for (let s = floor + 1; s <= head; s++) {
       const raw = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
-      if (!raw) continue;
+      if (!raw) return json({ error: "roots_incomplete", message: `retained gap at seq ${s}` }, 409);
       const sc = JSON.parse(raw) as SignedCommit;
       const cb = JSON.parse(sc.body) as CommitBodyView;
-      const encShas = Array.isArray(cb.blobRefs) ? (cb.blobRefs as Array<{ encSha?: unknown }>).map((r) => r.encSha).filter((x): x is string => typeof x === "string") : [];
-      roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha: typeof cb.encManifestSha === "string" ? cb.encManifestSha : "", encShas });
+      const mode = readRefMode(cb);
+      if (!mode) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+      const encManifestSha = typeof cb.encManifestSha === "string" ? cb.encManifestSha : "";
+      if (mode.kind === "inline") {
+        roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha, encShas: mode.refShas });
+        continue;
+      }
+      // Sidecar: fetch+bound+verify+parse to recover the reachable data refs; sidecarSha is a root.
+      // (count is already ≤ MAX_BLOB_REFS via readRefMode, so loadSidecarRefs's size gate bounds the bytes.)
+      const loaded = await loadSidecarRefs(this.env, mode.sidecarSha, mode.count);
+      if (!loaded.ok) {
+        logErr("roots_sidecar_unreadable", new Error(`seq ${s}: ${loaded.reason}`));
+        return json({ error: "roots_incomplete", message: `sidecar unreadable at seq ${s}` }, 409);
+      }
+      roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha, encShas: [mode.sidecarSha, ...loaded.refs.map((r) => r.encSha)] });
     }
     return json({ head, pruneFloor: floor, roots });
   }

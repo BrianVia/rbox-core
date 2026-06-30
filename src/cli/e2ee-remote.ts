@@ -5,8 +5,10 @@ import {
   openCommit,
   openWorkspaceKey,
   parseCommit,
+  serializeRefset,
   verifyAccount,
   verifyCommitChain,
+  type BlobRefset,
   type DeviceSecrets,
   type SignedCommit,
   type SignedKeyState,
@@ -14,8 +16,17 @@ import {
   type VerifiedAccount,
   type Wrap,
 } from "../engine/e2ee/index.js";
+import { hashBytes } from "../engine/hash.js";
 import type { BlobStore, Manifest } from "../engine/index.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
+
+/** §24: emit a sidecar (refs out of the signed body) once the unique ref set is large
+ *  enough that the inline body would approach the server's 1 MB commit-body cap. At ~85 B
+ *  JSON/ref, 4000 refs ≈ 340 KB — comfortably inline; above this we switch to the sidecar
+ *  so the body stays O(1). A repo big enough to need this already exceeds what a pre-§24
+ *  client could commit (it would hit the 1 MB cap), so sidecar-for-large-only regresses no
+ *  currently-working case. Below the threshold, inline keeps full old/new-client interop. */
+const SIDECAR_THRESHOLD = 4000;
 
 /**
  * E2EE sync transport (design 12 §13). Implements the SAME `SyncRemote` seam
@@ -161,6 +172,17 @@ export class E2eeRemote implements SyncRemote {
       if (f.type === "file" && f.encSha && !refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
     }
     const blobRefs = [...refByEnc.values()];
+    // §24: for a large ref set, move refs OUT of the signed body into a content-addressed
+    // sidecar blob (canonical rbox-refset-v1 bytes). The body then carries only the descriptor
+    // {sidecarSha,count,totalBytes}; the signature still commits to sidecarSha. Upload the
+    // sidecar like any blob FIRST (so it's resolvable at commit), then sign the descriptor.
+    let blobRefset: BlobRefset | undefined;
+    if (blobRefs.length >= SIDECAR_THRESHOLD) {
+      const sidecarBytes = serializeRefset(blobRefs);
+      const sidecarSha = hashBytes(sidecarBytes);
+      await this.api.putBlobBytes(sidecarSha, sidecarBytes);
+      blobRefset = { sidecarSha, count: blobRefs.length, totalBytes: blobRefs.reduce((n, r) => n + r.size, 0) };
+    }
     const built = await buildCommit({
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
@@ -173,6 +195,7 @@ export class E2eeRemote implements SyncRemote {
       parentCommitHash,
       manifestJson: new TextEncoder().encode(JSON.stringify(manifest)),
       blobRefs,
+      blobRefset,
     });
     await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
 

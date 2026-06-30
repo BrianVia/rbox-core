@@ -20,7 +20,12 @@ export interface RefWithSize {
 // per row = 2 params (granted_at is a server integer literal), so ≤49 rows; we use
 // 33 to stay well under across catalog/charge/grant in one chunk.
 const CHUNK = 33;
-export const MAX_ACCOUNTING_REFS_PER_COMMIT = 6000; // larger commits need §24 (sidecar) first
+// Soft cap on accounting OBJECTS per commit (D1 batch cost). The accounting set is the data
+// refs PLUS carriers: the encrypted manifest always, and (§24) the sidecar object when refs are
+// externalized. 6002 ≈ 6000 data refs + those 2 carriers, so a §24 sidecar commit accepts the
+// SAME data-ref ceiling an inline commit did (no dead band at the boundary). Beyond this, the
+// deferred large-ref accounting design (bounded set-checks + chunked present=1 barrier) is needed.
+export const MAX_ACCOUNTING_REFS_PER_COMMIT = 6002;
 
 const chunk = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];

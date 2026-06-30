@@ -80,5 +80,5 @@ latency/cost shows up.
   grant/quota/head advance.
 
 ## Depends on / Status
-Depends on: §24.1, §24.2, §23.4. Status: **design (v2, codex-resolved)** — **codex-review the GC fail-closed
+Depends on: §24.1, §24.2, §23.4. Status: **IMPLEMENTED** (`apps/api/src/sidecar.ts` resolveSidecarBytes direct-write + `workspace-sync.ts` dual-mode commit handler + sidecar-aware fail-closed `roots()`; tests in `apps/api/test/sidecar-flow.test.ts`). Original GC fail-closed
 logic specifically**; it's the load-bearing correctness risk.

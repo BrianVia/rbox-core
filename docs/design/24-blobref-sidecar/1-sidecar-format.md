@@ -52,4 +52,4 @@ stable (same set → same bytes → same hash, so it's a normal dedupable blob),
 - a tampered sidecar → `sidecarSha` mismatch → rejected at validate (§24.3).
 
 ## Depends on / Status
-Depends on: §23.2 (blob upload path) for shipping the sidecar. Status: **design (v2, codex-resolved)**.
+Depends on: §23.2 (blob upload path) for shipping the sidecar. Status: **IMPLEMENTED** (`src/engine/refset.ts`, shared with the Worker; golden-vector + strict-rejection tests in `src/engine/refset.test.ts`).
