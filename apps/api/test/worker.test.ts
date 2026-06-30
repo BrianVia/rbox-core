@@ -815,6 +815,225 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(await originOf("acct_bf_shell")).toBe("web");
     expect(await originOf("acct_bf_ambig")).toBeNull(); // fail-closed
   });
+
+  // ── Slice 2: the link ceremony (design 21 §4) ────────────────────────────
+  const freshJwt = (sub: string) => signJwt(claims({ sub }));
+  // Provision C's web shell (clerk_users row) the way the dashboard does, return its account.
+  async function webShell(sub: string): Promise<string> {
+    const r = await webExchange(await freshJwt(sub));
+    return ((await r.json()) as { accountId: string }).accountId;
+  }
+  const linkStart = async (sub: string) =>
+    SELF.fetch(`${BASE}/v1/account/link/start`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: await freshJwt(sub) }) });
+  const linkRedeem = (token: string, code: string) =>
+    SELF.fetch(`${BASE}/v1/account/link/redeem`, { method: "POST", headers: authed(token, { "content-type": "application/json" }), body: JSON.stringify({ code }) });
+  const linkStatusPoll = async (pollKey: string, sub: string) =>
+    SELF.fetch(`${BASE}/v1/account/link/status?pollKey=${pollKey}`, { headers: { authorization: `Bearer ${await freshJwt(sub)}` } });
+  const linkConfirm = async (sub: string, pollKey: string) =>
+    SELF.fetch(`${BASE}/v1/account/link/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: await freshJwt(sub), pollKey }) });
+  const clerkMap = async (sub: string) =>
+    (await env.rbox_dev_db.prepare("SELECT account_id FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ account_id: string }>())?.account_id ?? null;
+  // A durable device token with a NON-owner role in an existing account.
+  async function durableNonOwner(accountId: string, role: string): Promise<string> {
+    const u = `user_${role}_${Math.random().toString(16).slice(2, 8)}`;
+    await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, ?)").bind(accountId, u, role).run();
+    return (await mintDevice(env, accountId, u, "dev", role)).token;
+  }
+
+  test("two-phase happy path: start → redeem (pending, no rebind) → confirm (rebind + shell reclaimed)", async () => {
+    const sub = "user_link_happy";
+    const shell = await webShell(sub);
+    const x = await bootstrap("acct-link-x");
+    const start = await linkStart(sub);
+    expect(start.status).toBe(200);
+    const { code, pollKey } = (await start.json()) as { code: string; pollKey: string };
+    expect(code.startsWith("rbox-link_")).toBe(true);
+
+    // REDEEM (durable owner on X) records a pending proposal but rebinds NOTHING.
+    const rd = await linkRedeem(x.token, code);
+    expect(rd.status).toBe(200);
+    expect(((await rd.json()) as { account: string }).account).toBe(x.accountId);
+    expect(await clerkMap(sub)).toBe(shell); // still the shell — confirm is mandatory
+
+    // STATUS shows the proposed target before commit.
+    const st = await linkStatusPoll(pollKey, sub);
+    expect(st.status).toBe(200);
+    expect(((await st.json()) as { status: string; pendingAccount: string }).pendingAccount).toBe(x.accountId);
+
+    // CONFIRM (same C) commits the rebind.
+    const cf = await linkConfirm(sub, pollKey);
+    expect(cf.status).toBe(200);
+    expect(await clerkMap(sub)).toBe(x.accountId); // C now manages X
+
+    // The empty shell was reclaimed (tombstoned + memberships gone).
+    const reclaimed = await env.rbox_dev_db.prepare("SELECT reclaimed_at FROM accounts WHERE id = ?").bind(shell).first<{ reclaimed_at: number | null }>();
+    expect(reclaimed?.reclaimed_at).toBeGreaterThan(0);
+    const mem = await env.rbox_dev_db.prepare("SELECT COUNT(*) AS n FROM memberships WHERE account_id = ?").bind(shell).first<{ n: number }>();
+    expect(mem?.n).toBe(0);
+
+    // A returning web login now resolves C → X (mints a token on the real account).
+    const back = await webExchange(await freshJwt(sub));
+    expect(((await back.json()) as { accountId: string }).accountId).toBe(x.accountId);
+  });
+
+  test("confirm is MANDATORY: a redeem alone never rebinds clerk_users[C]", async () => {
+    const sub = "user_link_noconfirm";
+    const shell = await webShell(sub);
+    const x = await bootstrap("acct-link-noconfirm");
+    const { code } = (await (await linkStart(sub)).json()) as { code: string };
+    await linkRedeem(x.token, code);
+    expect(await clerkMap(sub)).toBe(shell); // unchanged without confirm
+  });
+
+  test("redeem requires DURABLE + OWNER: web owner → 403, durable viewer/admin → 403, durable owner → pending", async () => {
+    const sub = "user_link_authz";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-authz");
+    const webOwner = await webToken("user_link_authz_web");
+    const viewer = await durableNonOwner(x.accountId, "viewer");
+    const admin = await durableNonOwner(x.accountId, "admin");
+    const fresh = async () => ((await (await linkStart(sub)).json()) as { code: string }).code;
+
+    expect((await linkRedeem(webOwner, await fresh())).status).toBe(403); // web kind blocked by redeemLink
+    expect((await linkRedeem(viewer, await fresh())).status).toBe(403);
+    expect((await linkRedeem(admin, await fresh())).status).toBe(403);
+    expect((await linkRedeem(x.token, await fresh())).status).toBe(200); // durable owner OK
+  });
+
+  test("fresh-JWT gate: start/confirm with an invalid Clerk JWT → 401", async () => {
+    const good = await freshJwt("user_link_jwtgate");
+    const tampered = good.slice(0, -4) + (good.slice(-4) === "AAAA" ? "BBBB" : "AAAA");
+    expect((await SELF.fetch(`${BASE}/v1/account/link/start`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: tampered }) })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/account/link/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: tampered, pollKey: "plk_x" }) })).status).toBe(401);
+  });
+
+  test("single-use: a second redeem of a consumed code → 401; an expired code → 401", async () => {
+    const sub = "user_link_single";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-single");
+    const { code } = (await (await linkStart(sub)).json()) as { code: string };
+    expect((await linkRedeem(x.token, code)).status).toBe(200);
+    expect((await linkRedeem(x.token, code)).status).toBe(401); // already consumed
+    // Force-expire a fresh code directly in D1 → redeem rejects.
+    const { code: code2, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await env.rbox_dev_db.prepare("UPDATE account_link_codes SET expires_at = ? WHERE poll_key = ?").bind(Date.now() - 1000, pollKey).run();
+    expect((await linkRedeem(x.token, code2)).status).toBe(401);
+  });
+
+  test("conditional confirm aborts (409 already_linked) when another Clerk id already maps the target X", async () => {
+    const sub = "user_link_cond";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-cond");
+    // A different Clerk identity already owns X (manually mapped).
+    await env.rbox_dev_db.prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES ('user_other_clerk', ?, 'user_other', ?)").bind(x.accountId, Date.now()).run();
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    expect((await linkRedeem(x.token, code)).status).toBe(200); // pending recorded
+    const cf = await linkConfirm(sub, pollKey);
+    expect(cf.status).toBe(409); // uq_clerk_users_account → atomic rollback → already_linked
+    expect(((await cf.json()) as { error: string }).error).toBe("already_linked");
+  });
+
+  test("re-link guard: confirm onto a 2nd account while C is on a bootstrap account → 409 already_linked", async () => {
+    const sub = "user_link_relink";
+    await webShell(sub);
+    const x1 = await bootstrap("acct-relink-1");
+    // Link C → X1 first.
+    const a = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x1.token, a.code);
+    expect((await linkConfirm(sub, a.pollKey)).status).toBe(200);
+    expect(await clerkMap(sub)).toBe(x1.accountId);
+    // Now try to link C → X2 without unlinking — blocked.
+    const x2 = await bootstrap("acct-relink-2");
+    const b = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x2.token, b.code);
+    const cf = await linkConfirm(sub, b.pollKey);
+    expect(cf.status).toBe(409);
+    expect(((await cf.json()) as { error: string }).error).toBe("already_linked");
+  });
+
+  test("leaked-code property: a stranger redeeming onto their own account Y only creates a pending proposal; no rebind without C's confirm", async () => {
+    const sub = "user_link_leak";
+    const shell = await webShell(sub);
+    const attackerY = await bootstrap("acct-attacker-y");
+    // Attacker leaked C's code and redeems it onto their durable owner account Y.
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    expect((await linkRedeem(attackerY.token, code)).status).toBe(200);
+    // C is NOT rebound — it's only a pending proposal the victim would see + decline.
+    expect(await clerkMap(sub)).toBe(shell);
+    const st = await linkStatusPoll(pollKey, sub);
+    expect(((await st.json()) as { pendingAccount: string }).pendingAccount).toBe(attackerY.accountId);
+    // The attacker cannot confirm (no C Clerk JWT). The victim simply never confirms → no commit.
+    expect(await clerkMap(sub)).toBe(shell);
+  });
+
+  test("shell reclamation only when empty: a shell with a workspace or a subscription → link BLOCKS (409 origin_account_has_state)", async () => {
+    const sub = "user_link_dirtyshell";
+    const shell = await webShell(sub);
+    const x = await bootstrap("acct-link-dirtyshell");
+    // Dirty the shell with a workspace (a real account-scoped state row).
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES ('ws_dirty','root',?,?)").bind(shell, Date.now()).run();
+    const a = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, a.code);
+    const cf = await linkConfirm(sub, a.pollKey);
+    expect(cf.status).toBe(409);
+    expect(((await cf.json()) as { error: string }).error).toBe("origin_account_has_state");
+    expect(await clerkMap(sub)).toBe(shell); // never silently rebound
+
+    // Same for billing state on the shell.
+    await env.rbox_dev_db.prepare("DELETE FROM workspaces WHERE account_id = ?").bind(shell).run();
+    await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = 'cus_dirty' WHERE id = ?").bind(shell).run();
+    const b = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, b.code);
+    expect((await linkConfirm(sub, b.pollKey)).status).toBe(409);
+  });
+
+  test("E2EE untouched: redeem + confirm write NO account_keys / rosters / device_keys rows", async () => {
+    const sub = "user_link_e2ee";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-e2ee");
+    const count = async (t: string) => (await env.rbox_dev_db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE account_id = ?`).bind(x.accountId).first<{ n: number }>())?.n ?? 0;
+    const before = [await count("account_keys"), await count("rosters"), await count("device_keys")];
+    const a = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, a.code);
+    await linkConfirm(sub, a.pollKey);
+    expect([await count("account_keys"), await count("rosters"), await count("device_keys")]).toEqual(before); // unchanged (all 0)
+  });
+
+  test("unlink: rebinds C → a fresh shell (X no longer Clerk-mapped); blocks if X carries billing", async () => {
+    const sub = "user_link_unlink";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-unlink");
+    const a = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, a.code);
+    await linkConfirm(sub, a.pollKey);
+    expect(await clerkMap(sub)).toBe(x.accountId);
+    // Status reports linked.
+    expect(((await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()) as { linked: boolean }).linked).toBe(true);
+
+    // Billing on X → unlink blocks.
+    await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = 'cus_x' WHERE id = ?").bind(x.accountId).run();
+    expect((await SELF.fetch(`${BASE}/v1/account/unlink`, { method: "POST", headers: authed(x.token) })).status).toBe(409);
+    // Clear billing → unlink succeeds, C moves to a fresh shell.
+    await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = NULL WHERE id = ?").bind(x.accountId).run();
+    const un = await SELF.fetch(`${BASE}/v1/account/unlink`, { method: "POST", headers: authed(x.token) });
+    expect(un.status).toBe(200);
+    const fresh = ((await un.json()) as { account: string }).account;
+    expect(await clerkMap(sub)).toBe(fresh);
+    expect(fresh).not.toBe(x.accountId);
+    expect(((await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()) as { linked: boolean }).linked).toBe(false);
+  });
+
+  test("idempotent re-confirm: confirming the SAME committed target again → 200 (not 409)", async () => {
+    const sub = "user_link_idem";
+    await webShell(sub);
+    const x = await bootstrap("acct-link-idem");
+    const a = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, a.code);
+    expect((await linkConfirm(sub, a.pollKey)).status).toBe(200);
+    const again = await linkConfirm(sub, a.pollKey); // same poll key, same target
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { account: string }).account).toBe(x.accountId);
+  });
 });
 
 describe("release distribution (design 14)", () => {

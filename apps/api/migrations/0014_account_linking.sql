@@ -74,8 +74,11 @@ UPDATE accounts SET origin = 'bootstrap'
       OR id IN (SELECT account_id FROM workspaces)
       OR id IN (SELECT account_id FROM blob_refs)
       OR id IN (SELECT account_id FROM uploads WHERE account_id IS NOT NULL)
-      OR id IN (SELECT account_id FROM pairing_tokens)
-      OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL)
+      -- pairing_tokens / device_auth use the SAME active-only test as the runtime
+      -- §3.4 reclaim predicate (in-flight only); a consumed/expired artifact never
+      -- blocks, exactly as at link time. (now = epoch ms via strftime.)
+      OR id IN (SELECT account_id FROM pairing_tokens WHERE consumed_at IS NULL AND expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000)
+      OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL AND status IN ('pending','approved') AND expires_at > CAST(strftime('%s','now') AS INTEGER) * 1000)
       OR id IN (SELECT DISTINCT account_id FROM devices WHERE expires_at IS NULL)
       OR plan != 'free'
       OR stripe_customer_id IS NOT NULL
