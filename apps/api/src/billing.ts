@@ -2,13 +2,14 @@ import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { PLANS, planFor } from "./plans.js";
 import { audit, type Principal } from "./authz.js";
+import { dbFor } from "./db.js";
 
 /** Downgrade grace window (design 13): paid→free preserves all version history
  *  for this long before free-tier retention resumes. */
 export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
 async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null }> {
-  const r = await env.rbox_dev_db.prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null }>();
+  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null }>();
   return { plan: r?.plan ?? "free", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
 }
 
@@ -38,33 +39,33 @@ export async function wouldExceedCap(env: Env, accountId: string, incomingSize: 
  */
 export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number): Promise<{ granted: boolean; used: number; cap: number }> {
   const cap = await storageCap(env, accountId);
-  const ins = await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO blob_refs (account_id, sha256) VALUES (?, ?)").bind(accountId, sha).run();
+  const ins = await dbFor(env, accountId).prepare("INSERT OR IGNORE INTO blob_refs (account_id, sha256) VALUES (?, ?)").bind(accountId, sha).run();
   if ((ins.meta.changes ?? 0) === 0) {
     const a = await account(env, accountId); // already entitled → no charge (dedup)
     return { granted: true, used: a.used, cap };
   }
   if (cap === Infinity) {
-    await env.rbox_dev_db.prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ?").bind(size, accountId).run();
+    await dbFor(env, accountId).prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ?").bind(size, accountId).run();
     const a = await account(env, accountId);
     return { granted: true, used: a.used, cap };
   }
-  const upd = await env.rbox_dev_db.prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ? AND used_bytes + ? <= ?").bind(size, accountId, size, cap).run();
+  const upd = await dbFor(env, accountId).prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ? AND used_bytes + ? <= ?").bind(size, accountId, size, cap).run();
   if ((upd.meta.changes ?? 0) === 1) {
     const a = await account(env, accountId);
     return { granted: true, used: a.used, cap };
   }
-  await env.rbox_dev_db.prepare("DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ?").bind(accountId, sha).run(); // roll back
+  await dbFor(env, accountId).prepare("DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ?").bind(accountId, sha).run(); // roll back
   const a = await account(env, accountId);
   return { granted: false, used: a.used, cap };
 }
 
 /** Decrement an account's usage counter (called by GC purge per dropped entitlement). */
 export async function releaseUsage(env: Env, accountId: string, size: number): Promise<void> {
-  await env.rbox_dev_db.prepare("UPDATE accounts SET used_bytes = MAX(0, used_bytes - ?) WHERE id = ?").bind(size, accountId).run();
+  await dbFor(env, accountId).prepare("UPDATE accounts SET used_bytes = MAX(0, used_bytes - ?) WHERE id = ?").bind(size, accountId).run();
 }
 
 export async function countWorkspaces(env: Env, accountId: string): Promise<number> {
-  const r = await env.rbox_dev_db.prepare("SELECT COUNT(*) AS n FROM workspaces WHERE account_id = ?").bind(accountId).first<{ n: number }>();
+  const r = await dbFor(env, accountId).prepare("SELECT COUNT(*) AS n FROM workspaces WHERE account_id = ?").bind(accountId).first<{ n: number }>();
   return Number(r?.n ?? 0);
 }
 
@@ -100,15 +101,15 @@ export async function adminSetPlan(env: Env, accountId: string, plan: string, ex
     // Paid→free downgrade gets the same grace stamp as the webhook path (design 13
     // G7): same CASE predicate (only on a real paid→free transition, never re-extend
     // an unexpired window) + clear extras. extraGB is ignored when downgrading.
-    const r = await env.rbox_dev_db
+    const r = await dbFor(env, accountId)
       .prepare("UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'free' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
       .bind(nowMs, nowMs + GRACE_PERIOD_MS, accountId)
       .run();
-    await audit(env, null, "account.set_plan", `${accountId}:free`);
+    await audit(env, null, "account.set_plan", `${accountId}:free`, accountId);
     return json({ ok: true, accountId, plan: "free", changed: r.meta.changes });
   }
-  const r = await env.rbox_dev_db.prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId).run();
-  await audit(env, null, "account.set_plan", `${accountId}:${plan}`);
+  const r = await dbFor(env, accountId).prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId).run();
+  await audit(env, null, "account.set_plan", `${accountId}:${plan}`, accountId);
   return json({ ok: true, accountId, plan, changed: r.meta.changes });
 }
 

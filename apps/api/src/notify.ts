@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { hmacSha256Hex, logErr } from "./util.js";
+import { dbFor, dirDb } from "./db.js";
 
 /**
  * New-device security email (design 16 / 30, slices 4–5).
@@ -46,7 +47,10 @@ export interface OutboxFields {
  *  the `devices` INSERT — "if the device exists, its notification exists" (§2.3).
  *  `INSERT OR IGNORE` keyed on `token_hash` makes it idempotent under batch retry. */
 export function prepareOutboxInsert(env: Env, o: OutboxFields): D1PreparedStatement {
-  return env.rbox_dev_db
+  // device_notifications is account-data → route by the owning account. FLAG (§6f): the
+  // caller (auth.ts mint) batches this with the directory-plane `devices` INSERT — one
+  // binding at N=1, a cross-plane split under real sharding.
+  return dbFor(env, o.accountId)
     .prepare(
       "INSERT OR IGNORE INTO device_notifications (token_hash, device_id, account_id, minted_user_id, label, ip, geo, event, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -106,7 +110,10 @@ export interface NotifyResult {
  *  each pending/failed row via the atomic claim → send → settle. The device already
  *  exists and is usable regardless of the outcome here. */
 export async function processNotification(env: Env, tokenHash: string, now: number = Date.now()): Promise<NotifyResult> {
-  const row = await env.rbox_dev_db
+  // §32 FLAG: the outbox is account-data, but a queued job carries only token_hash — the
+  // owning account is unknown until this row is read. Account-less at N=1 (one shard); a
+  // sharded world needs the account/shard on the queue message or a token_hash→shard index.
+  const row = await dbFor(env, "")
     .prepare("SELECT token_hash, device_id, account_id, label, ip, geo, event, created_at, resolved_at FROM device_notifications WHERE token_hash = ?")
     .bind(tokenHash)
     .first<OutboxRow>();
@@ -117,7 +124,7 @@ export async function processNotification(env: Env, tokenHash: string, now: numb
   // The opt-out read and the pending-deliveries fetch are independent → overlap them.
   const [wants, pending] = await Promise.all([
     accountWantsNotifications(env, row.account_id),
-    env.rbox_dev_db
+    dbFor(env, row.account_id)
       .prepare("SELECT recipient_clerk_id FROM notification_deliveries WHERE token_hash = ? AND status IN ('pending','failed') AND attempts < ?")
       .bind(tokenHash, MAX_ATTEMPTS)
       .all<DeliveryRow>(),
@@ -144,19 +151,21 @@ async function resolveDeliveries(env: Env, row: OutboxRow, now: number): Promise
   const owners = await resolveOwners(env, row.account_id);
   const stmts = await Promise.all(
     owners.map(async (o) =>
-      env.rbox_dev_db
+      dbFor(env, row.account_id)
         .prepare("INSERT OR IGNORE INTO notification_deliveries (token_hash, recipient_user_id, recipient_clerk_id, idempotency_key, status, attempts) VALUES (?, ?, ?, ?, 'pending', 0)")
         .bind(row.token_hash, o.userId, o.clerkUserId, await idempotencyKey(env, row.token_hash, o.clerkUserId)),
     ),
   );
-  stmts.push(env.rbox_dev_db.prepare("UPDATE device_notifications SET resolved_at = ? WHERE token_hash = ?").bind(now, row.token_hash));
-  await env.rbox_dev_db.batch(stmts);
+  stmts.push(dbFor(env, row.account_id).prepare("UPDATE device_notifications SET resolved_at = ? WHERE token_hash = ?").bind(now, row.token_hash));
+  await dbFor(env, row.account_id).batch(stmts);
 }
 
 /** The account's owner identities (memberships role='owner' → clerk_users), deduped
  *  by the stable Clerk id. An owner with no clerk_users bridge is simply absent. */
 async function resolveOwners(env: Env, accountId: string): Promise<Array<{ userId: string; clerkUserId: string }>> {
-  const rows = await env.rbox_dev_db
+  // memberships + clerk_users are BOTH directory-plane, so this JOIN stays on dirDb
+  // (the §6f "two-plane read" boundary is between this and the account-shard outbox).
+  const rows = await dirDb(env)
     .prepare(
       `SELECT cu.user_id AS user_id, cu.clerk_user_id AS clerk_user_id
        FROM memberships m JOIN clerk_users cu ON cu.account_id = m.account_id AND cu.user_id = m.user_id
@@ -180,7 +189,7 @@ type DeliverOutcome = "sent" | "skipped" | "failed" | "contended";
 async function deliverOne(env: Env, row: OutboxRow, d: DeliveryRow, now: number, disabled: boolean): Promise<DeliverOutcome> {
   // Claim/lease: the conditional UPDATE is the mutex (D1 serializes writes). A concurrent
   // consumer that loses the race sees changes==0 and skips. Re-claimable only past the lease.
-  const claim = await env.rbox_dev_db
+  const claim = await dbFor(env, row.account_id)
     .prepare(
       `UPDATE notification_deliveries SET status = 'sending', claimed_at = ?, attempts = attempts + 1, last_attempt_at = ?
        WHERE token_hash = ? AND recipient_clerk_id = ? AND status IN ('pending','failed') AND (claimed_at IS NULL OR claimed_at < ?)`,
@@ -222,7 +231,7 @@ async function deliverOne(env: Env, row: OutboxRow, d: DeliveryRow, now: number,
 }
 
 async function settle(env: Env, row: OutboxRow, clerkId: string, status: "sent" | "skipped" | "failed", sentAt: number | null): Promise<DeliverOutcome> {
-  await env.rbox_dev_db.prepare("UPDATE notification_deliveries SET status = ?, sent_at = ? WHERE token_hash = ? AND recipient_clerk_id = ?").bind(status, sentAt, row.token_hash, clerkId).run();
+  await dbFor(env, row.account_id).prepare("UPDATE notification_deliveries SET status = ?, sent_at = ? WHERE token_hash = ? AND recipient_clerk_id = ?").bind(status, sentAt, row.token_hash, clerkId).run();
   return status;
 }
 
@@ -233,7 +242,7 @@ type EmailLookup = { kind: "ok"; address: string } | { kind: "absent" } | { kind
 /** Resolve the owner's primary verified email for a Clerk id: cached column first,
  *  else one live Clerk fetch (opportunistically caching the result). */
 async function ownerEmail(env: Env, clerkUserId: string, now: number): Promise<EmailLookup> {
-  const cached = await env.rbox_dev_db.prepare("SELECT email FROM clerk_users WHERE clerk_user_id = ?").bind(clerkUserId).first<{ email: string | null }>();
+  const cached = await dirDb(env).prepare("SELECT email FROM clerk_users WHERE clerk_user_id = ?").bind(clerkUserId).first<{ email: string | null }>();
   if (cached?.email) return { kind: "ok", address: cached.email };
   const fetched = await fetchClerkPrimaryEmail(env, clerkUserId);
   if (fetched.kind === "ok") await cacheOwnerEmail(env, clerkUserId, fetched.address, now);
@@ -242,7 +251,7 @@ async function ownerEmail(env: Env, clerkUserId: string, now: number): Promise<E
 
 /** Write-through the cached primary email (fire-and-forget; a cache miss self-heals). */
 async function cacheOwnerEmail(env: Env, clerkUserId: string, address: string, now: number): Promise<void> {
-  await env.rbox_dev_db.prepare("UPDATE clerk_users SET email = ?, email_updated_at = ? WHERE clerk_user_id = ?").bind(address, now, clerkUserId).run().catch(() => {});
+  await dirDb(env).prepare("UPDATE clerk_users SET email = ?, email_updated_at = ? WHERE clerk_user_id = ?").bind(address, now, clerkUserId).run().catch(() => {});
 }
 
 /** The Clerk Backend API primary-verified-email fetch. `ok` → an address; `absent` →
@@ -266,7 +275,7 @@ async function fetchClerkPrimaryEmail(env: Env, sub: string): Promise<EmailLooku
  *  is non-fatal — it's a cache refresh, not the auth path. Also populates the cache on
  *  first login (NULL `email_updated_at`). */
 export async function refreshOwnerEmail(env: Env, sub: string, now: number): Promise<void> {
-  const row = await env.rbox_dev_db.prepare("SELECT email_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ email_updated_at: number | null }>();
+  const row = await dirDb(env).prepare("SELECT email_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ email_updated_at: number | null }>();
   if (!row) return; // no mapping (shouldn't happen post-provision) → nothing to refresh
   if (row.email_updated_at && now - row.email_updated_at < EMAIL_REFRESH_MS) return; // throttled
   const fetched = await fetchClerkPrimaryEmail(env, sub);
@@ -282,7 +291,7 @@ export function notificationsDisabled(env: Env): boolean {
 
 /** Account opt-out (default ON — row absent ⇒ enabled). */
 async function accountWantsNotifications(env: Env, accountId: string): Promise<boolean> {
-  const row = await env.rbox_dev_db.prepare("SELECT notify_new_device FROM account_notify_prefs WHERE account_id = ?").bind(accountId).first<{ notify_new_device: number }>();
+  const row = await dbFor(env, accountId).prepare("SELECT notify_new_device FROM account_notify_prefs WHERE account_id = ?").bind(accountId).first<{ notify_new_device: number }>();
   return !row || row.notify_new_device !== 0;
 }
 
@@ -383,11 +392,14 @@ export function renderEmail(o: RenderInput): RenderedEmail {
  *  deliveries under the attempt cap (reverting dead 'sending' leases first), then purges
  *  PII for terminal/expired events. The outbox row is the source of truth. */
 export async function sweepNotifications(env: Env, now: number = Date.now()): Promise<{ reEnqueued: number; purged: number }> {
+  // §32 FLAG: the cron sweep scans device_notifications / notification_deliveries across
+  // ALL accounts — an account-data-plane CROSS-SHARD fan-out (§6f/§33). Account-less at N=1
+  // (the one shard); a sharded world fans this out over liveShards.
   // Revert dead leases so they re-enter the pending/failed selection.
-  await env.rbox_dev_db.prepare("UPDATE notification_deliveries SET status = 'failed' WHERE status = 'sending' AND claimed_at < ?").bind(now - LEASE_MS).run();
+  await dbFor(env, "").prepare("UPDATE notification_deliveries SET status = 'failed' WHERE status = 'sending' AND claimed_at < ?").bind(now - LEASE_MS).run();
 
-  const unresolved = await env.rbox_dev_db.prepare("SELECT token_hash FROM device_notifications WHERE resolved_at IS NULL LIMIT 200").all<{ token_hash: string }>();
-  const retry = await env.rbox_dev_db.prepare("SELECT DISTINCT token_hash FROM notification_deliveries WHERE status IN ('pending','failed') AND attempts < ? LIMIT 200").bind(MAX_ATTEMPTS).all<{ token_hash: string }>();
+  const unresolved = await dbFor(env, "").prepare("SELECT token_hash FROM device_notifications WHERE resolved_at IS NULL LIMIT 200").all<{ token_hash: string }>();
+  const retry = await dbFor(env, "").prepare("SELECT DISTINCT token_hash FROM notification_deliveries WHERE status IN ('pending','failed') AND attempts < ? LIMIT 200").bind(MAX_ATTEMPTS).all<{ token_hash: string }>();
 
   const tokenHashes = new Set<string>();
   for (const r of unresolved.results ?? []) tokenHashes.add(r.token_hash);
@@ -402,7 +414,7 @@ export async function sweepNotifications(env: Env, now: number = Date.now()): Pr
 
   // PII purge: null label/ip/geo once no non-terminal delivery remains for the event,
   // or past the TTL. Keep only non-PII audit fields (token_hash, device_id, ids, ts).
-  const purge = await env.rbox_dev_db
+  const purge = await dbFor(env, "") // §32 FLAG: global PII purge across all accounts (see above).
     .prepare(
       `UPDATE device_notifications SET label = NULL, ip = NULL, geo = NULL
        WHERE (label IS NOT NULL OR ip IS NOT NULL OR geo IS NOT NULL)

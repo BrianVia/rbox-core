@@ -3,6 +3,7 @@ import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { startOp, type MetricEvent } from "./metrics.js";
 import { validateCommitRefs, commitAccounting, MAX_REFS_PER_COMMIT } from "./commit-accounting.js";
 import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
+import { dbFor } from "./db.js";
 
 // Opaque body cap. With §24 the body is O(1) for large repos (the refs live in an R2
 // sidecar, only its {sidecarSha,count,totalBytes} descriptor is inline). Small repos still
@@ -167,7 +168,10 @@ export class WorkspaceSync {
     const head = this.ctx.storage.kv.get("head");
     if (head === undefined && ws && proj) {
       // Seed from any pre-DO D1 state so existing workspaces don't reconcile against empty.
-      const row = await this.env.rbox_dev_db
+      // §32 FLAG: `commits` is account-data, but this DO bootstrap only knows (ws, proj) —
+      // the owning account isn't forwarded on a first-touch read. Account-less at N=1 (one
+      // shard); a real shard cutover needs a (ws → shard) directory index here.
+      const row = await dbFor(this.env, "")
         .prepare("SELECT sequence, commit_hash, body, sig FROM commits WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT 1")
         .bind(ws, proj)
         .first<{ sequence: number; commit_hash: string; body: string; sig: string }>();
@@ -279,7 +283,7 @@ export class WorkspaceSync {
           emit(mode.count)("too_many_refs");
           return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
         }
-        const sc = await resolveSidecarBytes(this.env, op.env.rbox_dev_db, accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
+        const sc = await resolveSidecarBytes(this.env, dbFor(op.env, accountId), accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
         if (!sc.ok) {
           if ("needsUpload" in sc) {
             emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
@@ -299,12 +303,12 @@ export class WorkspaceSync {
           return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
         }
       }
-      const v = await validateCommitRefs(this.env, op.env.rbox_dev_db, accountId, shas, receipts, nowMs);
+      const v = await validateCommitRefs(this.env, dbFor(op.env, accountId), accountId, shas, receipts, nowMs);
       if (!v.ok) {
         emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
         return json({ error: "unsatisfied_blobs", missing: v.needsUpload }, 422);
       }
-      const acct = await commitAccounting(op.env.rbox_dev_db, accountId, v.newRefs, nowMs);
+      const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
       if ("overCap" in acct) {
         emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
         return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
@@ -314,7 +318,7 @@ export class WorkspaceSync {
       // so `mode` here is always inline; the guard narrows the type and is defensive.
       if (mode.kind !== "inline") return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
       shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
-      const missing = await this.missingBlobs(op.env.rbox_dev_db, shas, accountId);
+      const missing = await this.missingBlobs(dbFor(op.env, accountId), shas, accountId);
       if (missing.length > 0) {
         // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
         emit(shas.length)("unsatisfied_blobs", { ratio: missing.length / shas.length });
@@ -367,7 +371,7 @@ export class WorkspaceSync {
     // Best-effort D1 commit mirror (not authoritative). Workspace ownership is
     // established at creation (POST /v1/workspaces), NOT here, so no registry write.
     try {
-      await op.env.rbox_dev_db
+      await dbFor(op.env, accountId)
         .prepare("INSERT OR IGNORE INTO commits (workspace_id, project_id, sequence, commit_hash, body, sig, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(ws, proj, sequence, commit.commitHash, commit.body, commit.sig, deviceId)
         .run();

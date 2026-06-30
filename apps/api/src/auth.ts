@@ -3,6 +3,7 @@ import { ctEqual, json, logErr, sha256Hex } from "./util.js";
 import { capBytesFor } from "./plans.js";
 import { audit, type Principal } from "./authz.js";
 import { clientGeo, clientIp, enqueueNotify, prepareOutboxInsert } from "./notify.js";
+import { dbFor, dirDb } from "./db.js";
 
 
 /**
@@ -51,7 +52,7 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   // token KIND (design 21 §1.1): durable CLI token (expires_at IS NULL) vs a
   // short-lived browser web session. The worker default-denies `web` off every
   // crypto/sync/credential-mint route.
-  const row = await env.rbox_dev_db
+  const row = await dirDb(env)
     .prepare(
       `SELECT d.device_id, d.account_id, d.user_id, d.last_seen_at, d.expires_at, m.role AS role
        FROM devices d LEFT JOIN memberships m ON m.account_id = d.account_id AND m.user_id = d.user_id
@@ -62,7 +63,7 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   if (!row) return null;
   const now = Date.now();
   if (!row.last_seen_at || now - row.last_seen_at > LAST_SEEN_THROTTLE_MS) {
-    await env.rbox_dev_db.prepare("UPDATE devices SET last_seen_at = ? WHERE token_hash = ?").bind(now, hash).run().catch(() => {});
+    await dirDb(env).prepare("UPDATE devices SET last_seen_at = ? WHERE token_hash = ?").bind(now, hash).run().catch(() => {});
   }
   return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer", kind: row.expires_at === null ? "durable" : "web" };
 }
@@ -108,7 +109,11 @@ async function mintWithRetry<T>(env: Env, label: string, attempt: () => Promise<
   for (let i = 0; i < MINT_MAX_ATTEMPTS; i++) {
     const { value, statements } = await attempt();
     try {
-      await env.rbox_dev_db.batch(statements);
+      // §32: the device credential is directory-plane, so the batch runs on dirDb.
+      // FLAG: mintDeviceWithNotification rides an account-data `device_notifications`
+      // outbox INSERT in this same batch (§6f) — a cross-plane coupling that is one
+      // binding at N=1 but needs splitting under real sharding.
+      await dirDb(env).batch(statements);
       return value;
     } catch (e) {
       lastErr = e;
@@ -135,7 +140,7 @@ export async function prepareMintDevice(
   const deviceId = genDeviceId();
   const token = randomHex(TOKEN_BYTES);
   const tokenHash = await sha256Hex(token);
-  const insert = env.rbox_dev_db
+  const insert = dirDb(env)
     .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt);
   return { token, tokenHash, deviceId, insert };
@@ -202,7 +207,8 @@ const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
  */
 export async function createPairToken(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!p.userId) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
-  const member = await env.rbox_dev_db
+  // memberships is directory-plane (authenticate JOINs devices↔memberships, §32 §2).
+  const member = await dirDb(env)
     .prepare("SELECT 1 FROM memberships WHERE account_id = ? AND user_id = ?")
     .bind(p.accountId, p.userId)
     .first();
@@ -230,7 +236,7 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
   // Atomic active-token cap: insert ONLY while the account is under the cap, in a
   // single INSERT…SELECT…WHERE. D1 serializes writes, so concurrent creates can't
   // both pass a stale count (closes the check-then-insert race). changes===0 → over cap.
-  const res = await env.rbox_dev_db
+  const res = await dirDb(env)
     .prepare(
       `INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at, mk_wrap, admission_grant)
        SELECT ?, ?, ?, ?, 'pair', ?, ?, ?, ?
@@ -263,7 +269,7 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   // Atomic single-use consume + snapshot — only the row-winning redeem gets a row.
   // Also returns the opaque E2EE material (NULL for legacy tokens), handed back so
   // the new device can unwrap MK + author its admission roster delta (V4-1).
-  const consumed = await env.rbox_dev_db
+  const consumed = await dirDb(env)
     .prepare("UPDATE pairing_tokens SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING account_id, user_id, created_by, mk_wrap, admission_grant")
     .bind(now, hash, now)
     .first<{ account_id: string; user_id: string; created_by: string; mk_wrap: string | null; admission_grant: string | null }>();
@@ -274,10 +280,10 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   // already single-use-burned and a consumed-then-rejected row must not retain mk_wrap. The TTL
   // is an API freshness gate, NOT crypto expiry; retained wrap + a later tokenSecret leak could
   // recover MK. Best-effort: a scrub failure only weakens defense-in-depth, never blocks.
-  await env.rbox_dev_db.prepare("UPDATE pairing_tokens SET mk_wrap = NULL, admission_grant = NULL WHERE token_hash = ?").bind(hash).run().catch(() => {});
+  await dirDb(env).prepare("UPDATE pairing_tokens SET mk_wrap = NULL, admission_grant = NULL WHERE token_hash = ?").bind(hash).run().catch(() => {});
 
   // Fail-closed live authority check: creator device non-revoked AND user a member.
-  const live = await env.rbox_dev_db
+  const live = await dirDb(env)
     .prepare(
       `SELECT 1 FROM memberships m
        JOIN devices d ON d.account_id = m.account_id AND d.user_id = m.user_id
@@ -323,12 +329,13 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   const userId = `user_${randomHex(8)}`;
   // origin='bootstrap' marks this as a crypto-anchored account (design 21 §3.2) — never
   // auto-reclaimable. cap_bytes is the materialized §23 hard-cap (kept in sync by the trigger).
-  await env.rbox_dev_db
+  await dbFor(env, accountId)
     .prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, ?, 'free', 'bootstrap', ?, ?)")
     .bind(accountId, body.accountName ?? "account", now, capBytesFor("free"))
     .run();
-  await env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
-  await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
+  // users/memberships are directory-plane (authenticate JOINs memberships, §32 §2).
+  await dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
+  await dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");
   return json({ token, deviceId, accountId });
 }
@@ -342,14 +349,14 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
   // Collision-retry the human user_code among active auths.
   let userCode = randomUserCode();
   for (let i = 0; i < 5; i++) {
-    const clash = await env.rbox_dev_db
+    const clash = await dirDb(env)
       .prepare("SELECT 1 FROM device_auth WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
       .bind(userCode, now)
       .first();
     if (!clash) break;
     userCode = randomUserCode();
   }
-  await env.rbox_dev_db
+  await dirDb(env)
     .prepare("INSERT INTO device_auth (device_code, user_code, status, device_id, label, created_at, expires_at) VALUES (?, ?, 'pending', ?, ?, ?, ?)")
     .bind(deviceCode, userCode, deviceId, body.label ?? null, now, now + AUTH_TTL_MS)
     .run();
@@ -360,7 +367,7 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
 export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { deviceCode?: string };
   if (typeof body.deviceCode !== "string") return json({ error: "bad_request" }, 400);
-  const row = await env.rbox_dev_db
+  const row = await dirDb(env)
     .prepare("SELECT user_code, status, device_id, label, expires_at, account_id, user_id FROM device_auth WHERE device_code = ?")
     .bind(body.deviceCode)
     .first<{ user_code: string; status: string; device_id: string; label: string | null; expires_at: number; account_id: string | null; user_id: string | null }>();
@@ -370,7 +377,7 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
   if (row.status === "claimed") return json({ status: "claimed" }); // token already delivered, never again
   if (row.status === "approved") {
     // One-time claim: only the poll that wins the conditional UPDATE mints+returns.
-    const claim = await env.rbox_dev_db
+    const claim = await dirDb(env)
       .prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ? AND status = 'approved'")
       .bind(body.deviceCode)
       .run();
@@ -399,7 +406,7 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
 export async function approveDeviceAuth(req: Request, env: Env, approver: Principal): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { userCode?: string };
   if (typeof body.userCode !== "string") return json({ error: "bad_request" }, 400);
-  const res = await env.rbox_dev_db
+  const res = await dirDb(env)
     .prepare("UPDATE device_auth SET status = 'approved', account_id = ?, user_id = ? WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
     .bind(approver.accountId, approver.userId, body.userCode.toUpperCase(), Date.now())
     .run();
@@ -409,7 +416,7 @@ export async function approveDeviceAuth(req: Request, env: Env, approver: Princi
 
 // GET /v1/auth/devices  (authed) -> device list, SCOPED to the caller's account.
 export async function listDevices(env: Env, self: Principal): Promise<Response> {
-  const rows = await env.rbox_dev_db
+  const rows = await dirDb(env)
     .prepare("SELECT device_id, label, created_at, last_seen_at FROM devices WHERE revoked = 0 AND account_id = ? ORDER BY created_at")
     .bind(self.accountId)
     .all<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null }>();
@@ -434,7 +441,7 @@ export async function listDevices(env: Env, self: Principal): Promise<Response> 
  */
 export async function revokeDevice(env: Env, self: Principal, deviceId: string): Promise<Response> {
   const privileged = self.role === "owner" || self.role === "admin" ? 1 : 0;
-  const res = await env.rbox_dev_db
+  const res = await dirDb(env)
     .prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
     .bind(deviceId, self.accountId, self.deviceId, privileged)
     .run();
@@ -443,7 +450,7 @@ export async function revokeDevice(env: Env, self: Principal, deviceId: string):
     return json({ ok: true, revoked: 1 });
   }
   // changes==0: choose the response without leaking cross-account existence.
-  const row = await env.rbox_dev_db
+  const row = await dirDb(env)
     .prepare("SELECT revoked FROM devices WHERE device_id = ? AND account_id = ?")
     .bind(deviceId, self.accountId)
     .first<{ revoked: number }>();
@@ -533,7 +540,7 @@ export async function accountDevices(env: Env, p: Principal, url: URL): Promise<
   }
   binds.push(limit + 1); // +1 sentinel → is there a next page?
 
-  const rows = await env.rbox_dev_db
+  const rows = await dirDb(env)
     .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, expires_at FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
     .bind(...binds)
     .all<DeviceRow>();
@@ -575,7 +582,7 @@ export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promi
   }
   binds.push(limit + 1);
 
-  const rows = await env.rbox_dev_db
+  const rows = await dbFor(env, p.accountId)
     .prepare(`SELECT rowid AS rid, workspace_id, project_id, created_at FROM workspaces WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
     .bind(...binds)
     .all<WorkspaceRow>();

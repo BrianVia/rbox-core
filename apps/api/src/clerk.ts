@@ -3,6 +3,7 @@ import { json } from "./util.js";
 import { capBytesFor } from "./plans.js";
 import { createWebSession } from "./auth.js";
 import { refreshOwnerEmail } from "./notify.js";
+import { dbFor, dirDb } from "./db.js";
 
 /**
  * Web auth via Clerk (M11). The browser signs in with Clerk and POSTs its
@@ -115,7 +116,7 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
 
   // Already provisioned? A clerk_users row only ever exists AFTER the email gate
   // passed (below), so a returning user is known-verified — no re-check needed.
-  let map = await env.rbox_dev_db
+  let map = await dirDb(env)
     .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
     .bind(sub)
     .first<{ account_id: string; user_id: string }>();
@@ -132,11 +133,11 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // candidate ids ever materialize, so a lost race never orphans an account.
     const candAcct = randomId("acct", 8);
     const candUser = randomId("user", 8);
-    await env.rbox_dev_db
+    await dirDb(env)
       .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
       .bind(sub, candAcct, candUser, nowMs)
       .run();
-    map = await env.rbox_dev_db
+    map = await dirDb(env)
       .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
       .bind(sub)
       .first<{ account_id: string; user_id: string }>();
@@ -148,12 +149,13 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // Clerk id is linked to a real account X — every login would silently re-grant
     // owner on X (privilege resurrection). A returning login only resolves + mints.
     // cap_bytes = the materialized §23 hard-cap (kept in sync with the plan by the trigger).
-    await env.rbox_dev_db
+    await dbFor(env, map.account_id)
       .prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)")
       .bind(map.account_id, nowMs, capBytesFor("free"))
       .run();
-    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
-    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
+    // users/memberships are directory-plane (authenticate JOINs memberships, §32 §2).
+    await dirDb(env).prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
+    await dirDb(env).prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
   }
 
   // Refresh the cached owner email for new-device-alert recipient resolution (design 16
