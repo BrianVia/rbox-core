@@ -830,12 +830,12 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(await originOf("acct_bf_consumed")).toBe("web"); // consumed token ignored (active-only)
   });
 
-  // §9.5 maintenance invariant (design 21): isReclaimableShell gates a DESTRUCTIVE
+  // §9.5 maintenance invariant (design 21): loadShellState/judgeReclaimable gate a DESTRUCTIVE
   // delete, so EVERY account-scoped table must be categorized — covered (blocks
   // reclaim), cleaned (expected shell rows the reclaim deletes), or excluded
   // (append-only forensic log). This test introspects sqlite_master for tables with
   // an `account_id` column and FAILS when a new one appears uncategorized, forcing
-  // isReclaimableShell to be updated rather than trusted to reviewer memory.
+  // loadShellState+judgeReclaimable to be updated rather than trusted to reviewer memory.
   test("every account_id-scoped table is categorized in the reclaim predicate (§9.5)", async () => {
     const tables =
       (await env.rbox_dev_db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%'").all<{ name: string }>()).results ?? [];
@@ -844,13 +844,13 @@ describe("worker integration (real DO + D1 + R2)", () => {
       const cols = (await env.rbox_dev_db.prepare(`PRAGMA table_info(${name})`).all<{ name: string }>()).results ?? [];
       if (cols.some((c) => c.name === "account_id")) accountScoped.push(name);
     }
-    // Non-empty presence BLOCKS reclaim (counted in isReclaimableShell):
+    // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
     const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships"];
     const EXPECTED_CLEANED = ["users"]; // the shell's own user row, DELETEd on reclaim (not a blocker)
     const EXCLUDED = ["audit_log"]; // append-only forensic log (§3.4) — never blocks
     const known = new Set([...COVERED, ...EXPECTED_CLEANED, ...EXCLUDED]);
     const uncategorized = accountScoped.filter((t) => !known.has(t));
-    expect(uncategorized).toEqual([]); // ← a NEW account_id table: categorize it in isReclaimableShell + here
+    expect(uncategorized).toEqual([]); // ← a NEW account_id table: categorize it in loadShellState/judgeReclaimable + here
   });
 
   // ── Slice 2: the link ceremony (design 21 §4) ────────────────────────────

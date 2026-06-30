@@ -271,9 +271,12 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
   // Never auto-merge two subscriptions — block and route to guided resolution.
   if (dest?.cust || dest?.sub) return "destination_has_subscription";
 
-  // Stripe step (idempotent PATCH): point BOTH the subscription and its customer at X.
-  await stripeApi(env, "POST", `/subscriptions/${shell.sub}`, { "metadata[account_id]": destId });
-  await stripeApi(env, "POST", `/customers/${shell.cust}`, { "metadata[account_id]": destId });
+  // Stripe step (idempotent PATCH): point BOTH the subscription and its customer at
+  // X. Independent metadata writes (no read-after-write between them) → parallel.
+  await Promise.all([
+    stripeApi(env, "POST", `/subscriptions/${shell.sub}`, { "metadata[account_id]": destId }),
+    stripeApi(env, "POST", `/customers/${shell.cust}`, { "metadata[account_id]": destId }),
+  ]);
 
   // D1 move (one atomic batch; later statements see earlier ones' writes). Both
   // writes are guarded against concurrent webhooks racing the saga:

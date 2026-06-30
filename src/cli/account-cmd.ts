@@ -1,4 +1,4 @@
-import { loadCredentials } from "./credentials.js";
+import { requireCredentials } from "./credentials.js";
 
 /**
  * `rbox account <link|status|unlink>` (design 21 §4.0) — the web↔CLI account-link
@@ -7,17 +7,11 @@ import { loadCredentials } from "./credentials.js";
  * the per-machine device credential; the security lives server-side (§4.2).
  */
 
-async function creds() {
-  const c = await loadCredentials();
-  if (!c) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
-  return c;
-}
-
 /** `rbox account link <code>` — redeem a dashboard link code from this (durable
  *  OWNER) device. Records a PENDING proposal the user approves in the dashboard. */
 export async function accountLink(code: string): Promise<void> {
   if (!code) throw new Error("usage: rbox account link <code>  (copy the code from your rbox dashboard)");
-  const c = await creds();
+  const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/link/redeem`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${c.token}` },
@@ -33,7 +27,7 @@ export async function accountLink(code: string): Promise<void> {
 
 /** `rbox account status` — is a web login linked to this account? */
 export async function accountStatus(): Promise<void> {
-  const c = await creds();
+  const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
   if (!res.ok) throw new Error(`status failed: ${res.status}`);
   const { accountId, linked } = (await res.json()) as { accountId: string; linked: boolean };
@@ -43,7 +37,7 @@ export async function accountStatus(): Promise<void> {
 
 /** `rbox account unlink` — detach the web login (rebinds it to a fresh empty shell). */
 export async function accountUnlink(): Promise<void> {
-  const c = await creds();
+  const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/unlink`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${c.token}` },
