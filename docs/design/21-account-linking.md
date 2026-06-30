@@ -106,21 +106,35 @@ harmless; **after linking it sits on the user's real account X**, so the blast
 radius of an unscoped web token becomes the user's real workspaces.
 
 **Therefore this is a hard prerequisite, owned here:** thread a **session kind**
-into `Principal` (derive `kind = (expires_at IS NULL ? 'durable' : 'web')` in
-`authenticate`'s existing SELECT — the column is already read for the expiry
-check) and add a **DEFAULT-DENY route policy** for `kind=='web'`: a web token is
-permitted only on an **explicit allowlist** — `GET /v1/account/*`,
-`/v1/billing/checkout`, `/v1/billing/portal`, `GET /v1/auth/devices`,
-device-revoke, and the link/unlink endpoints (§8) — and is **403 on everything
-else**, including the routes that would let a web token *escalate into a durable
-credential* and thereby bypass the gate entirely: **`POST /v1/auth/pair/create`,
-`POST /v1/auth/device/approve`, `POST /v1/workspaces`**, plus all `v1/keys/*`,
-blob mutate/check, and `v1/ws/*` commit paths. Default-deny (not a deny-list) is
-load-bearing: a deny-list that enumerates only crypto/sync routes would let a web
-token mint/approve a CLI token and then act durably (the exact escalation codex
-flagged). The E2EE ceiling (§1) is only *true* once this exhaustive gate exists;
-without it "the dashboard can never sync" is a claim the API does not back. (This
-also underpins the link-redeem owner-proof in §4.2 — finding 4.)
+into `Principal` by deriving `kind = (expires_at IS NULL ? 'durable' : 'web')` in
+`authenticate` — which requires **adding `d.expires_at` to that SELECT's
+projection** (today it is referenced only in the `WHERE`, not returned —
+auth.ts:47-54; Round-3 finding 9 corrects the earlier "already read" wording) —
+and add a **DEFAULT-DENY route policy** for `kind=='web'`. A web token is permitted
+only on an **explicit, EXACT-MATCH allowlist of (method, path) pairs** (Round-3
+finding 8 — no `GET /v1/account/*` wildcard, which would silently expose any
+future account GET by path accident):
+- `GET  /v1/account/usage`
+- `GET  /v1/account/status`        (the CLI/account link-state probe, §8)
+- `POST /v1/billing/checkout`
+- `POST /v1/billing/portal`
+- `GET  /v1/auth/devices`
+- `POST /v1/auth/devices/:id/revoke`
+- `POST /v1/account/link/redeem`   (self-rejects a web token on its own `kind=='durable'` check)
+- `POST /v1/account/unlink`        (a web owner token may unlink, §5.4)
+
+Everything else is **403** — including the routes that would let a web token
+*escalate into a durable credential* and thereby bypass the gate entirely:
+**`POST /v1/auth/pair/create`, `POST /v1/auth/device/approve`,
+`POST /v1/workspaces`**, plus all `v1/keys/*`, blob mutate/check, and `v1/ws/*`
+commit paths. (`link/start`/`status`/`confirm` are **not** in this list because
+they are PUBLIC Clerk-JWT routes that never carry an rbox Principal — §4.1.)
+Default-deny (not a deny-list) is load-bearing: a deny-list that enumerates only
+crypto/sync routes would let a web token mint/approve a CLI token and then act
+durably (the exact escalation codex flagged). The E2EE ceiling (§1) is only *true*
+once this exhaustive gate exists; without it "the dashboard can never sync" is a
+claim the API does not back. (This also underpins the link-redeem owner-proof in
+§4.2 — finding 4.)
 
 ---
 
@@ -211,9 +225,11 @@ UPDATE clerk_users
 
 After the rebind, `webSession` resolves C → X for free (the `map` lookup at
 `clerk.ts:116-120` returns X; the trailing `INSERT OR IGNORE`s at 145-147 are
-no-ops because X's account/user/membership already exist). **No change to
-`webSession`'s happy path is required** — only the new link endpoints (§4) and
-shell reclamation (§3.4).
+no-ops because X's account/user/membership already exist). The **resolve path**
+(returning login) needs no change — but the **first-provision self-heal must be
+gated to `if (!map)`** so a returning login never re-grants owner on a real
+account (§3.5, Round-3 finding 1). Beyond that, only the new link endpoints (§4)
+and shell reclamation (§3.4) are added.
 
 ### 3.2 New tables/columns (migration `0014_account_linking.sql`)
 
@@ -232,6 +248,7 @@ CREATE TABLE IF NOT EXISTS account_link_codes (
   consumed_at    INTEGER,             -- NULL until redeemed; the single-use gate (phase 1)
   pending_account TEXT,               -- target X proposed by the redeeming owner device (phase 1 → awaiting confirm)
   pending_device  TEXT,               -- the redeeming durable owner device_id (audit; §6.4 caveat)
+  pending_user    TEXT,               -- the redeeming owner's user_id, captured at redeem (§3.3 — confirm maps C→this user; Round-3 finding 2)
   pending_at      INTEGER,
   committed_at    INTEGER             -- set when the dashboard (live C session) confirms the target (phase 2)
 );
@@ -283,28 +300,69 @@ who proved possession**, which is the only person whose intent we actually have.
 The shell's user row is reclaimed with the shell (§3.4). (Resolves the multi-owner
 hazard codex flagged.)
 
+**The redeemer's `p.userId` is captured at REDEEM into `pending_user`** (§3.2);
+confirm reads it back (`clerk_users.user_id = pending_user`) rather than
+re-deriving the user from `devices` at commit time (which would go stale if the
+device were revoked/re-paired between redeem and confirm). Because redeem already
+proved `pending_user` is an **owner** of X, the post-link `webSession` self-heal
+(which only `INSERT OR IGNORE`s an owner membership for the *currently mapped*
+user — and, post-Round-3, only on first provision, §3.5) is a **no-op** on X: it
+can never *grant* a new membership, only re-assert one that already exists.
+(Resolves Round-3 finding 2.)
+
+### 3.5 `webSession` must not re-grant owner on every returning login (Round-3 finding 1)
+Today `webSession` runs the `accounts`/`users`/`memberships` `INSERT OR IGNORE`
+self-heal (clerk.ts:143-147) on **every** login — including returning, already-
+provisioned ones. On an empty shell that is harmless, but once C maps to a real
+account X it is a **privilege-resurrection vector**: if an admin ever revoked the
+web user's owner membership on X, the next Clerk login would silently re-`INSERT
+OR IGNORE` it back. **Fix (owned here):** move the three `INSERT OR IGNORE`s
+**inside** the first-provision (`if (!map)`) branch, so a returning login only
+*resolves* the existing mapping and mints a token — it never re-asserts
+membership. Intact accounts are unaffected (the rows already exist); the only
+behavior dropped is a "self-heal" of a partially-provisioned account, which cannot
+arise because the three inserts run sequentially right after the mapping is
+claimed. This is the one **required** `webSession` change (correcting §3.1's "no
+happy-path change" for the returning path).
+
 ### 3.4 The empty shell already minted for web-first users — reclaim, don't strand
 Every Clerk-first login created a shell `(account 'web'/free, user, owner
 membership)` and possibly accumulated `web_*` session rows. On a successful link
 we **tombstone** the shell, but only when it is provably empty and unanchored:
 
-A shell is **reclaimable** iff ALL hold. The predicate is **derived
-exhaustively from every account-scoped state table and every billing/entitlement
-column** (a hand-picked partial list is a fail-*open* hazard — codex finding):
+A shell is **reclaimable** iff ALL hold. The predicate enumerates **every
+account-scoped *state* table and every billing/entitlement column that exists
+today** (Round-3 finding 5 — a hand-picked partial list is a fail-*open* hazard),
+with the **append-only forensic logs explicitly EXCLUDED** (Round-3 finding 6):
 - `accounts.origin = 'web'` (never reclaim a `'bootstrap'` account — that is
   someone's crypto-anchored data),
 - **no E2EE genesis:** no row keyed to it in `account_keys`, `device_keys`,
   `rosters`, `account_key_states`, **or `workspace_keys`** (migration 0011),
 - **no durable devices:** no `devices` row with `expires_at IS NULL` (only
   ephemeral `web_*` sessions, if any),
-- **no workspaces** (`workspaces.account_id`), **no `blob_refs`**, **no `commits`**,
-  **no in-flight `uploads`**, **no active `pairing_tokens`**, **no pending
-  `device_auth`** for it,
+- **no workspaces** (`workspaces.account_id`), **no `blob_refs`** (account_id),
+  **no in-flight `uploads`** (account_id, 0006), **no active `pairing_tokens`**
+  (`consumed_at IS NULL AND expires_at>now`), **no live `device_auth`**
+  (`status IN ('pending','approved') AND expires_at>now`), and **no `commits`** —
+  the real `commits` table (0011) has **no `account_id`**; ownership is via
+  `workspaces`, so it is checked as `commits.workspace_id IN
+  (SELECT workspace_id FROM workspaces WHERE account_id=shell)` (and is moot when
+  there are no workspaces),
 - **no billing/entitlement state:** `plan = 'free'` **and** `stripe_customer_id`
   IS NULL **and** `stripe_subscription_id` IS NULL **and** `grace_until` IS NULL
-  (migration 0012) **and** any extra-storage/entitlement column is unset,
+  (0012) **and** `extra_storage_bytes = 0` **and** `used_bytes = 0` (0007 — the two
+  real entitlement/usage columns),
 - the Clerk identity being relinked is its **only** `clerk_users` reference and its
   **only** owner membership.
+
+**Explicit EXCLUSIONS (do NOT block reclaim).** `audit_log` (0006) and
+`account_link_events` (0014) are **append-only forensic history**, keyed to an
+account by design; counting them would make every shell that ever logged in
+un-reclaimable (finding 6). They are deliberately *not* in the predicate — the
+tombstone (`reclaimed_at`) + these logs are what keep a mistaken reclaim
+recoverable. The maintenance invariant (§9.5) therefore reads: *every new
+account-scoped **live-state** table must be added to the predicate; every new
+append-only **log** table must be added to this exclusion list.*
 
 The canonical, maintainable form is "reclaimable = not referenced by **any**
 account-scoped row in **any** table and not carrying **any** non-default
@@ -365,31 +423,46 @@ is a real collision caught in the code, not a stylistic preference.)
 A **mandatory two-phase** bind (phase 2 is the fix for the leaked-code grief case,
 §5.2 / finding 2). Direction justified in §5.2.
 
+**Transport & routing (Round-3 finding 3).** `start`/`status`/`confirm` are
+authenticated **solely by a re-verified Clerk JWT** (no rbox bearer), so they are
+**PUBLIC routes** placed *before* `authenticate()` in `worker.ts` — alongside
+`/v1/web/session` — and verify the JWT internally. They are therefore **not**
+governed by the Slice-0 web-token allowlist (that gate only applies to rbox-bearer
+Principals; the link endpoints it lists are `redeem` + `unlink`). JWT transport:
+`start`/`confirm` carry `clerkToken` in the JSON **body**; `GET status` carries it
+in the **`Authorization: Bearer <jwt>`** header (a JWT has dots → fails the 64-hex
+`TOKEN_RE`, so it is never mistaken for an rbox token) plus `pollKey` in the query.
+The opaque link code is **≥128-bit** and shown once (`rbox-link_<base64url(32B)>`),
+**not** the short `XXXX` mnemonic (§5.3, finding 10).
+
 ```
 1. START — Dashboard, with a FRESH Clerk JWT (not just a stale rbox web token, §4.2)
-      POST /v1/account/link/start   { clerkToken }       (the Clerk session JWT)
+      POST /v1/account/link/start   { clerkToken }       (the Clerk session JWT) — PUBLIC
    → server re-runs verifyClerkJWT(clerkToken) → sub = C  (so the code is bound to a
-                                                            re-proven live Clerk identity)
+                                                            re-proven Clerk identity C)
+   → REQUIRE an existing clerk_users[C] mapping (the dashboard always exchanges a
+     /v1/web/session first, so it exists); else 409 web_session_required (finding 11)
    → INSERT account_link_codes{ code_hash, poll_key, clerk_user_id=C,
-                                origin_account=<C's current account>, expires_at=now+10min }
-   → returns { code (plaintext, once), pollKey }
+                                origin_account=clerk_users[C].account_id, expires_at=now+10min }
+   → returns { code (plaintext ≥128-bit, once), pollKey }
    → dashboard shows: "Run this in a terminal signed in to your rbox account:
-                          rbox account link RBQX-7F3K"
+                          rbox account link rbox-link_xK7…<opaque>"
 
 2. REDEEM (phase 1, → 'pending') — Terminal, a non-revoked OWNER + DURABLE device token on X
-      rbox account link RBQX-7F3K
-   → POST /v1/account/link/redeem  { code }   (Bearer: X's device token)
+      rbox account link rbox-link_xK7…
+   → POST /v1/account/link/redeem  { code }   (Bearer: X's device token) — AUTHED
    → server: atomic single-use consume; assert Principal.kind=='durable' && role=='owner'
-             on X (§4.2); record pending_account=X, pending_device=p.deviceId.
-             NOTHING is rebound yet. Returns { account: X } so the terminal shows
-             "Proposed link to account X — confirm it in your dashboard."
+             on X (§4.2); record pending_account=X, pending_device=p.deviceId,
+             pending_user=p.userId (§3.3). NOTHING is rebound yet. Returns { account: X }
+             so the terminal shows "Proposed link to account X — confirm in your dashboard."
 
-3. CONFIRM (phase 2, → committed) — Dashboard, SAME fresh Clerk session (C), shown the target
-      Dashboard polls GET /v1/account/link/status?pollKey=… → { pending_account: X, fingerprint }
+3. CONFIRM (phase 2, → committed) — Dashboard, SAME Clerk identity C, shown the target
+      Dashboard polls GET /v1/account/link/status?pollKey=…  (Authorization: Bearer <clerkJWT>)
+        → { status, pendingAccount: X, fingerprint }
    → shows: "A terminal on account <X fingerprint> wants to manage this login. Approve?"
-   → POST /v1/account/link/confirm { clerkToken, pollKey }   (re-verify sub==C)
-   → server: the ONE atomic conditional rebind transaction (§4.2). Now clerk_users[C]→X,
-             shell reclaimed/billing-resolved (§3.4), account_link_events written.
+   → POST /v1/account/link/confirm { clerkToken, pollKey }   (re-verify sub==C) — PUBLIC
+   → server: the ONE atomic conditional rebind transaction (§4.2.1). Now clerk_users[C]→X,
+             shell reclaimed (§3.4) / billing-bearing shell → 409, account_link_events written.
 ```
 
 Why phase 2 is not optional: it forces the **same live Clerk identity that
@@ -438,6 +511,50 @@ target-aware approval.
   an idempotent success. A Clerk identity manages **one** account at a time;
   last-write-wins is forbidden.
 
+### 4.2.1 The atomic conditional confirm — the exact buildable shape (Round-3 finding 4)
+"One transaction" is realized as **read-side pre-checks → one `db.batch([...])`
+(D1 batches run in a single atomic transaction) of self-guarded statements →
+post-batch verify**. Every write self-guards so a stale pre-check can only *no-op*,
+never half-apply; the batch is atomic so a thrown UNIQUE rolls the whole thing back.
+
+**Pre-checks (reads, all → `409`/`401` on failure, no writes):**
+1. Load the code by `poll_key`; require `clerk_user_id == C`, `consumed_at NOT NULL`,
+   `committed_at IS NULL`, `expires_at > now`, `pending_account` (=X) `NOT NULL`.
+   *Idempotency:* if `committed_at NOT NULL` **and** `clerk_users[C].account_id == X`
+   → return success (a re-confirm of the same target).
+2. Re-link guard: read `clerk_users[C].account_id` (= `cur`) and its account `origin`.
+   If `cur != origin_account` → `409 conflict` (concurrent move). If `cur` is a
+   **non-shell** (`origin='bootstrap'`) **and** `cur != X` → `409 already_linked`.
+3. Reclaim decision: `reclaimNeeded = (origin_account is a 'web' shell AND origin_account != X)`.
+   If `reclaimNeeded` and the origin shell is **not** reclaimable (§3.4 predicate)
+   → `409 origin_account_has_state` (the link blocks; never silent-rebind).
+
+**Atomic `db.batch` (in order):**
+- **rebind:** `UPDATE clerk_users SET account_id=X, user_id=pending_user
+  WHERE clerk_user_id=C AND account_id=origin_account` — the `account_id=origin_account`
+  guard catches a concurrent move (→ no-op). If X already has a different Clerk row,
+  the `uq_clerk_users_account` UNIQUE index throws → **the whole batch rolls back**
+  → caught as `409 already_linked`.
+- **commit code:** `UPDATE account_link_codes SET committed_at=now
+  WHERE poll_key=? AND committed_at IS NULL
+    AND EXISTS(SELECT 1 FROM clerk_users WHERE clerk_user_id=C AND account_id=X)` —
+  only marks committed if the rebind landed.
+- **audit:** `INSERT INTO account_link_events (...) SELECT C, origin_account, X, 'cli_link', pending_device, now
+  WHERE EXISTS(SELECT 1 FROM clerk_users WHERE clerk_user_id=C AND account_id=X)`.
+- **reclaim (only if `reclaimNeeded`)**, each guarded by `the shell is now Clerk-orphaned`:
+  `UPDATE accounts SET reclaimed_at=now WHERE id=origin_account
+     AND NOT EXISTS(SELECT 1 FROM clerk_users WHERE account_id=origin_account)`;
+  then `DELETE FROM memberships WHERE account_id=origin_account AND NOT EXISTS(…clerk_users…)`;
+  `DELETE FROM users WHERE account_id=origin_account AND NOT EXISTS(…clerk_users…)`;
+  `DELETE FROM devices WHERE account_id=origin_account AND expires_at IS NOT NULL` (ephemeral web
+  sessions only — there are no durable devices on a reclaimable shell, §3.4).
+
+**Post-batch verify:** re-read `clerk_users[C].account_id`; if `== X` → `200 { account: X }`,
+else (the rebind guard no-op'd on a concurrent move) → `409 conflict`. A thrown
+UNIQUE during the batch surfaces as `409 already_linked` (atomic rollback, no partial
+state). The reclaim deletes touch **only** the origin shell and only once it is
+Clerk-orphaned, so they can never delete X's rows.
+
 ### 4.3 Status polling = the confirm surface
 `link/start` returns a `pollKey`; the dashboard polls `GET
 /v1/account/link/status?pollKey=…` to learn the **proposed** `pending_account` and
@@ -479,10 +596,13 @@ a leaked code**:
 
 ### 5.3 Code strength & transport
 The code is a bearer binding for ~10 minutes — treat like the pairing token
-(design 10 §1, accepted scrollback risk). Use ≥128 bits of entropy; if a
-human-typeable `XXXX-XXXX` form is wanted, back the displayed string with full
-entropy server-side (or keep the device-code `user_code` form **only** behind the
-same interactive constraints device-auth uses). Uniform 401 for
+(design 10 §1, accepted scrollback risk). **v1 ships the opaque full-entropy form
+(D2): `rbox-link_<base64url(32 random bytes)>` = 256 bits**, stored only as
+`sha256(code)`, shown once. The short `XXXX-XXXX` mnemonic from earlier drafts is
+**rejected** for v1 (Round-3 finding 10): it carries nowhere near 128 bits, and
+since the server stores only `sha256(code)` the *displayed plaintext itself* must
+carry the entropy — a grouped human-typeable form would need a separate
+server-side indirection table, deferred as polish. Uniform 401 for
 invalid/expired/consumed (no enumeration), exactly like `redeemPairToken`.
 
 ### 5.4 Double-link / re-link / unlink
@@ -492,10 +612,21 @@ invalid/expired/consumed (no enumeration), exactly like `redeemPairToken`.
   account; requires explicit `rbox account unlink` first (or a confirmed
   `--force`), which records an `account_link_events` row. Prevents silent
   billing/identity migration off the user's real account.
-- **Unlink:** owner-gated (`role='owner'` on the currently linked account, via the
-  web or CLI). Rebinds C back to a fresh `'web'` shell (so the Clerk user still
-  has *an* account and billing continuity is explicit, not dangling), audited.
-  Unlink does **not** revoke CLI devices or touch the roster (E2EE untouched).
+- **Unlink:** owner-gated (`role='owner'` on the currently linked account X). Both
+  the CLI (durable owner token) and the dashboard (its rbox `web_*` owner token,
+  which authenticates on X *after* the link) reach the **same authed route**, so no
+  separate Clerk-JWT path is needed. Rebinds C back to a fresh `'web'` shell (so the
+  Clerk user still has *an* account; billing continuity is explicit, not dangling),
+  audited (`method='unlink'`). Unlink does **not** revoke CLI devices or touch the
+  roster (E2EE untouched).
+- **Unlink billing guard (Round-3 finding 7).** Symmetric to the link's
+  billing-on-shell block: if the linked account **X carries Stripe state**
+  (`stripe_customer_id` or `stripe_subscription_id` set), unlink would strand X's
+  subscription on an account that no longer has *any* Clerk login — the original
+  bug in reverse. Unlink therefore **BLOCKS** in that case with
+  `409 linked_account_has_billing`, routing the user to resolve/cancel billing
+  first (or, once Slice 6 lands, migrate it). Blocking is the always-safe fallback;
+  we never strand a paying customer's subscription behind no web login.
 
 ### 5.5 Multi-identity / multi-bootstrap edge cases
 - **One Clerk id → many bootstrap accounts:** `clerk_users` PK is
@@ -545,23 +676,40 @@ accounts, the *exact installed-base shells this design exists to repair* would b
 un-reclaimable — the link would block on them forever. So migration `0014` runs a
 deterministic backfill over existing `accounts`:
 
+The classifier must use the **same exhaustive predicate as §3.4** (Round-3 finding
+5 — the earlier 6-clause list was a fail-open subset). `commits` is checked via
+the `workspaces` join (no `account_id` column); the billing test covers all six
+real columns; `audit_log`/`account_link_events` are excluded (forensic logs):
+
 ```
--- A real (crypto-anchored / data-bearing) account → 'bootstrap' (never reclaimable):
+-- A real (crypto-anchored / data-bearing / billing-bearing) account → 'bootstrap'
+-- (never reclaimable). EXHAUSTIVE over every account-scoped state table + billing col:
 UPDATE accounts SET origin='bootstrap'
  WHERE origin IS NULL
    AND ( id IN (SELECT account_id FROM account_keys)
-      OR id IN (SELECT account_id FROM rosters)
       OR id IN (SELECT account_id FROM device_keys)
+      OR id IN (SELECT account_id FROM rosters)
+      OR id IN (SELECT account_id FROM account_key_states)
+      OR id IN (SELECT account_id FROM workspace_keys)
       OR id IN (SELECT account_id FROM workspaces)
+      OR id IN (SELECT account_id FROM blob_refs)
+      OR id IN (SELECT account_id FROM uploads)
+      OR id IN (SELECT account_id FROM pairing_tokens)
+      OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL)
       OR id IN (SELECT DISTINCT account_id FROM devices WHERE expires_at IS NULL)
-      OR stripe_customer_id IS NOT NULL );
+      OR plan != 'free'
+      OR stripe_customer_id IS NOT NULL
+      OR stripe_subscription_id IS NOT NULL
+      OR grace_until IS NOT NULL
+      OR extra_storage_bytes != 0
+      OR used_bytes != 0 );
 
--- A provably-empty web shell (a clerk_users-mapped account with name 'web', free
--- plan, no durable devices / workspaces / e2ee rows / billing) → 'web' (reclaimable):
+-- A provably-empty web shell (clerk_users-mapped, none of the above) → 'web'
+-- (reclaimable). The data/billing rows already became 'bootstrap' above, so any
+-- remaining NULL clerk-mapped account is empty:
 UPDATE accounts SET origin='web'
  WHERE origin IS NULL
-   AND id IN (SELECT account_id FROM clerk_users)
-   AND <none of the data/billing predicates above hold>;
+   AND id IN (SELECT account_id FROM clerk_users);
 -- Anything still NULL after this is an ambiguous legacy account → stays NULL =
 -- NOT reclaimable (fail-closed; a human can reclassify).
 ```
@@ -623,21 +771,26 @@ and clean link auditing (here). 16/17's "device_id is non-unique" language preda
 
 ## 8. Endpoints & files (surface, for the eventual build — not implemented here)
 
-| Endpoint | Auth | Purpose |
+| Endpoint | Routing / Auth | Purpose |
 |---|---|---|
-| `POST /v1/account/link/start` | **fresh Clerk JWT** (re-verified, §4.2) | mint a single-use link code bound to re-proven C; cap active codes/Clerk id |
-| `POST /v1/account/link/redeem` | **durable** CLI **owner** device token | phase 1: consume code, assert kind=durable+owner on X, record *pending* (no rebind yet) |
-| `GET  /v1/account/link/status` | fresh Clerk JWT (sub==C) | poll the *proposed* `pending_account` + fingerprint (drives the confirm) |
-| `POST /v1/account/link/confirm` | **fresh Clerk JWT** (sub==C) | phase 2: one atomic conditional rebind clerk_users→X + shell-resolve + audit |
-| `POST /v1/account/unlink` | durable owner device (or fresh Clerk JWT) | rebind C → fresh shell, audit; never touches devices/roster |
+| `POST /v1/account/link/start` | **PUBLIC** route; **fresh Clerk JWT** in body, re-verified (§4.2) | mint a single-use ≥128-bit link code bound to re-proven C; require existing `clerk_users[C]` (else 409 `web_session_required`); cap active codes/Clerk id |
+| `POST /v1/account/link/redeem` | **AUTHED**; **durable** CLI **owner** device token (Bearer) | phase 1: consume code, assert kind=durable+owner on X, record *pending* (account/device/`pending_user`) — no rebind yet |
+| `GET  /v1/account/link/status` | **PUBLIC** route; **fresh Clerk JWT** in `Authorization: Bearer` header, `pollKey` in query (sub==C) | poll the *proposed* `pendingAccount` + fingerprint (drives the confirm) |
+| `POST /v1/account/link/confirm` | **PUBLIC** route; **fresh Clerk JWT** + `pollKey` in body (sub==C) | phase 2: one atomic conditional rebind clerk_users→X + shell-resolve + audit (§4.2.1) |
+| `POST /v1/account/unlink` | **AUTHED**; durable **or** web **owner** token on X | rebind C → fresh shell, audit; blocks `409 linked_account_has_billing` if X has Stripe state (§5.4); never touches devices/roster |
+| `GET  /v1/account/status` | **AUTHED**; any token on the account | report `{ accountId, linked }` — whether a `clerk_users` row maps this account (drives `rbox account status`) |
+
+"PUBLIC route" = registered in `worker.ts` *before* the global `authenticate()`
+(like `/v1/web/session`), carrying no rbox Principal — so it is outside the §1.1
+web-token gate and verifies its Clerk JWT internally (Round-3 finding 3).
 
 | File | Change |
 |---|---|
 | `apps/api/migrations/0014_account_linking.sql` | new — `account_link_codes` (two-phase + `poll_key`), `account_link_events`, `accounts.origin`/`reclaimed_at`, `uq_clerk_users_account`, the **`origin` backfill** (§6) |
-| `apps/api/src/auth.ts` | thread **`Principal.kind` (`durable`/`web`)** from the existing `expires_at` read in `authenticate` (§1.1); `bootstrap` stamps `origin='bootstrap'`; new `redeemLink`/`unlink` helpers (reuse `sha256Hex`, atomic-cap + single-use-consume patterns) |
-| `apps/api/src/authz.ts` | add `kind` to `Principal`; helper to gate mutating routes to `kind=='durable'` |
-| `apps/api/src/clerk.ts` | `webSession` first-provision stamps `origin='web'`; new `startLink`/`linkStatus`/`confirmLink`/`unlink` on the **re-verified-Clerk-JWT** path (reuse `verifyClerkJWT`) |
-| `apps/api/src/worker.ts` | routes for the four link endpoints; **enforce the §1.1 route policy** (reject `kind=='web'` on `v1/keys/*`, blob upload, workspace commit) |
+| `apps/api/src/auth.ts` | thread **`Principal.kind` (`durable`/`web`)** by **adding `d.expires_at` to `authenticate`'s SELECT projection** (§1.1, finding 9); `bootstrap` stamps `origin='bootstrap'`; new `redeemLink`/`unlinkAccount`/`accountStatus` helpers (reuse `sha256Hex`, atomic-cap + single-use-consume patterns) |
+| `apps/api/src/authz.ts` | add `kind` to `Principal` |
+| `apps/api/src/clerk.ts` | `webSession`: stamp `origin='web'` **and gate the account/user/membership self-heal to `if (!map)`** (§3.5, finding 1); new `startLink`/`linkStatus`/`confirmLink` on the **re-verified-Clerk-JWT** path (reuse `verifyClerkJWT`) |
+| `apps/api/src/worker.ts` | PUBLIC routes for `start`/`status`/`confirm`; AUTHED routes for `redeem`/`unlink`/`status`; **enforce the §1.1 exact-match web-token gate** (default-deny; 403 a web token off everything but the allowlisted pairs) |
 | `src/cli/index.ts` | new `account` command group (`link`/`status`/`unlink`) — must NOT collide with existing `link <path>` (§4.0) |
 | `src/cli/auth-cmd.ts` | `accountLink(code)`, `accountStatus()`, `accountUnlink()` |
 | `apps/web/` | dashboard "Link your CLI account": start → show code → poll → **confirm target account** (phase 2) |
@@ -762,3 +915,30 @@ enumerated build requirement rather than a hidden gap. The residual the reviewer
 would still note (proving the allowlist/predicate are *exhaustive in code*, and the
 billing saga's exact idempotency keys) is implementation-surface, called out in
 §1.1, §3.4, §8, and §9, not omitted.
+
+### 10.2 Round 3 (implementability + correctness pass, on the revised draft) — VERDICT: FAIL → all 12 resolved
+
+Reviewer: `gpt-5.x`-class, foreground, no web search. A fresh adversarial pass for
+*buildability* (does a competent engineer have an unambiguous, non-contradictory
+spec, and does anything contradict the real code). 12 findings — all genuine, all
+resolved in the text above:
+
+| # | Sev | Finding | Resolution |
+|---|---|---|---|
+| 1 | Critical | `webSession` self-heals an **owner** membership on *every* login (clerk.ts:143-147); after C→X this re-grants owner on the real account → privilege resurrection. | **§3.5 (new) + §3.1 corrected:** gate the three `INSERT OR IGNORE`s to the first-provision `if (!map)` branch; a returning login only resolves+mints. The one required `webSession` change. |
+| 2 | Critical | Schema can't implement "map C to the redeeming owner": `account_link_codes` had no `pending_user`; re-deriving from `devices` at confirm is stale. | **§3.2/§3.3:** added `pending_user`, captured at redeem (`p.userId`), read back at confirm. Since redeem proved it's an owner of X, the §3.5 self-heal is a no-op. |
+| 3 | High | Endpoint auth/routing contradictory — JWT-only `start/status/confirm` vs "under the Slice-0 allowlist" (which only exists *after* `authenticate()`); `GET status` JWT transport unspecified. | **§4.1/§8:** `start/status/confirm` are **PUBLIC** routes (before `authenticate`), JWT in body (POST) or `Authorization: Bearer` header (GET status); the web-token gate applies only to the AUTHED `redeem`/`unlink`. |
+| 4 | High | "one atomic conditional confirm" asserted, no SQL shape / rollback story. | **§4.2.1 (new):** explicit pre-checks → one self-guarded `db.batch` (atomic) → post-batch verify; UNIQUE-violation rollback → 409; reclaim deletes guarded by "shell now Clerk-orphaned." |
+| 5 | High | Reclaim/backfill §6 SQL was a partial list; named `commits` as account-scoped (it has no `account_id`). | **§3.4/§6:** exhaustive over all real state tables; `commits` via the `workspaces` join; billing covers all six columns (`plan`,`stripe_customer_id`,`stripe_subscription_id`,`grace_until`,`extra_storage_bytes`,`used_bytes`). |
+| 6 | High | "any account-scoped row" is too broad — `audit_log` (+ new `account_link_events`) would make every shell un-reclaimable. | **§3.4:** explicit EXCLUSION list — append-only forensic logs (`audit_log`, `account_link_events`) never block reclaim; invariant in §9.5 split into state-table vs log-table rules. |
+| 7 | High | Unlink strands X's billing in reverse (subscription left on an account with no Clerk login). | **§5.4:** unlink **BLOCKS** `409 linked_account_has_billing` when X carries Stripe state — symmetric with the link-side block. |
+| 8 | Med | Default-deny gate used a `GET /v1/account/*` wildcard (future GETs leak to web by accident). | **§1.1:** replaced with an **exact (method,path) allowlist**; enumerated pairs. |
+| 9 | Med | "`expires_at` already read by `authenticate`" is false — it's only in the `WHERE`, not the projection. | **§1.1/§8:** corrected — the build **adds `d.expires_at` to the SELECT projection**, then derives `kind`. |
+| 10 | Med | Code example `RBQX-7F3K` is ≪128 bits; with `sha256(code)` storage the *plaintext* must carry the entropy. | **§4.1/§5.3:** v1 ships the opaque `rbox-link_<base64url(32B)>` (256-bit); the short mnemonic is rejected (would need a separate indirection table). |
+| 11 | Med | `link/start` assumes a `clerk_users` row exists (`origin_account NOT NULL`) but a fresh JWT doesn't guarantee one. | **§4.1/§8:** `start` **requires** an existing mapping (the dashboard always exchanges `/v1/web/session` first) → else `409 web_session_required`. |
+| 12 | Low | "same fresh Clerk session" isn't enforceable — `verifyClerkJWT` returns only `sub`. | Wording corrected throughout to "same Clerk **identity** C (sub)"; we bind at the user level, which is the property that matters. |
+
+**Disposition.** All 12 are folded into the text above as concrete, buildable
+requirements (new §3.5 and §4.2.1; corrected §1.1, §3.1, §3.2, §3.3, §3.4, §4.1,
+§5.3, §5.4, §6, §8). No finding is deferred. The design is now self-consistent with
+the real `auth.ts`/`clerk.ts`/`worker.ts`/migrations and unambiguous to implement.
