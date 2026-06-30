@@ -1,6 +1,7 @@
 # §29 — CLI command redesign (`rbox start` / `setup`, `track`/`untrack`, per-command `--help`)
 
-> **Status: 🟡 DESIGN — awaiting founder review (codex review pending, NOT yet run).**
+> **Status: 🟢 DESIGN — founder-approved + codex-reviewed (NEEDS-WORK → all findings resolved; see
+> "Codex review resolutions"). Ready for implementation.**
 >
 > Pure UX/surface redesign of the `rbox` CLI. No protocol, crypto, or transport changes — every
 > command keeps calling the same already-shipped primitives (`runInit`, `login`, `startDaemon`,
@@ -50,7 +51,7 @@ Grouping is for the help screen and mental model only; the dispatcher stays a fl
 | `rbox` (TTY → `runMenu`) | `rbox` (TTY → **`setup`**) | replaced | `menu-cmd.ts` absorbed into `setup` |
 | `init [--new\|--workspace] [--no-interactive]` | `init …` (**kept, repositioned**) | repositioned | stays as the headless/CI entry; interactive use promoted to `setup` |
 | — | **`setup`** | **new** | guided onboarding (the founder's flow, below) |
-| `link <path> [--workspace <id>]` | **`track <path> [--workspace <id>]`** | renamed | kills the `account link` collision |
+| `link <path> [--workspace <id>]` | **`track <path> [--workspace <id>]`** | renamed | **exact `link` behavior** — bind-only (create/join workspace + write config; **no** first sync). First sync happens via `setup`, `sync`, or `start`. Kills the `account link` collision |
 | — | **`untrack [path] [--force]`** | **new** | cleanly stop syncing a directory (local unbind) |
 | `daemon start [path]` | **`start [path]`** | renamed | drops "daemon" |
 | `daemon stop [path]` | **`stop [path]`** | renamed | drops "daemon" |
@@ -98,13 +99,13 @@ SYNCING
   sync  [path]                sync once (pull, then push)
   push  [path]                upload local changes
   pull  [path]                apply remote changes
-  track <path> [--workspace <id>]   sync a directory (create or join a workspace)
+  track <path> [--workspace <id>]   bind a directory to a workspace (create/join; no first sync)
   untrack [path] [--force]    stop syncing a directory
   ignore <glob> | --list      manage .rboxignore
 
 DEPENDENCIES
-  deps install [path] [--allow-build]   rebuild deps from synced lockfiles
-  deps list [path]            list rebuildable projects (lockfiles found)
+  deps install [path] [--allow-build] [--only <id>] [--manager <m>]   rebuild deps from synced lockfiles
+  deps list [path] [--manager <m>]      list rebuildable projects (lockfiles found)
   deps check [path]           check this host is ready to rebuild deps
   deps drift [path]           is this folder's install stale vs. its lockfile?
   deps notify <install|uninstall|status|on|off>   shell-hook drift notifications
@@ -175,10 +176,18 @@ $ rbox setup
    [p] Paste pairing token: ****************    → redeemPair()
        ✓ This machine is authorized and enrolled for encryption.
    [a] → login(remote)  (device-code flow; prints the approve code, polls)
-       ✓ This machine is authorized.
-       ⚠  Device-code login authorizes but does NOT enroll encryption. To read/sync
-          encrypted data, run `rbox pair` on a signed-in machine and `connect` it, or `rbox recover`.
+       ✓ This machine is authorized — but NOT yet enrolled for encryption.
+       ⚠  Device-code login can't carry your key. Setup STOPS here (it does not write a
+          workspace binding it can't sync). Next:
+            on a signed-in machine:  rbox pair        # prints a token
+            here:                    rbox connect     # paste it  (or: rbox recover)
+            then:                    rbox setup       # re-run — Step 2 continues
 ```
+
+> Why the hard stop: `runInit` writes `.rbox` and then **aborts before first sync** if the device
+> isn't enrolled (`init-cmd.ts:120`), and `login()` device-code authorizes without enrolling
+> (`auth-cmd.ts:78`). So the device-code branch must NOT promise success through Steps 2–3 — it
+> resolves enrollment first. The pairing-token path (`p`) enrolls inline, so it flows straight on.
 
 ```
 ── Step 2 of 3 · Workspace ─────────────────────────────────────────────
@@ -235,8 +244,20 @@ If the user answers `n` at Step 3, we skip `start` and print: `Run rbox start wh
 - Optionally, a background-sync daemon running.
 - Clear next step for a second machine (`pair` here → `setup` there).
 
-This is a strict superset of `runMenu`'s current three options ("set up / connect / just log in"), so
-`menu-cmd.ts` is deleted and its test coverage (`menu-cmd.test.ts`) migrates to `setup`.
+`setup` folds `runMenu`'s "set up" and "connect" options into one guided arc, so `menu-cmd.ts` is
+deleted and its coverage (`menu-cmd.test.ts`) migrates to `setup`. It is **not** a strict superset: the
+menu's third option, "just authorize this machine and stop," is intentionally dropped — that intent is
+served directly by `rbox login` (and bare `rbox` now runs `setup`, so the authorize-only path is one
+explicit command, not a menu branch).
+
+Two reused-primitive caveats the implementation must close before `setup` ships (both are existing
+behavior, not new bugs — but `setup` leans on the prompts being clean):
+- **stderr invariant:** `login()`'s device-code instructions currently print to **stdout**
+  (`auth-cmd.ts:66`), contradicting the "all prompts on stderr" rule. `setup` must route auth output
+  through an injectable stream (or the primitives move to stderr) before the invariant holds.
+- **No-echo secrets:** the bootstrap/pairing-token prompts use plain `readline`, which **echoes**
+  input (`menu-cmd.ts:79`). The masked `********` shown in the script above requires a no-echo input
+  helper; it's a to-build, not a given.
 
 ---
 
@@ -263,32 +284,43 @@ Dispatch order in `main()`:
 2. `rbox help [<command>]` → same block, or the grouped screen with no arg.
 3. Bare `rbox` non-TTY, or an unknown command → grouped screen (exit 1 for unknown), as today.
 
-The registry also feeds the grouped screen, so the help text has exactly one source of truth and can't
-drift from the dispatcher. This is presentation-only; no command's behavior changes.
+The registry also feeds the grouped screen, so the help text has a single source of truth. It can
+still drift from the actual `switch` (they're separate code), so a **dispatcher↔registry parity test**
+asserts every dispatched command (and group subcommand) has a non-hidden registry entry and vice
+versa. This is presentation-only; no command's behavior changes.
 
 ---
 
 ## `untrack` — new behavior
 
 ```
-rbox untrack [path] [--force] [--purge-remote]
+rbox untrack [path] [--force]
 ```
 
-Resolves the workspace root (like every path command), then **locally unbinds** it:
-1. If a background-sync daemon is running for this root → `stopDaemon(root)` first.
-2. Remove the `.rbox/` directory (config + state) for that root.
-3. Print what happened and that **local files are untouched** and the **remote workspace still
-   exists** (other machines keep syncing; manage/delete it from the dashboard).
+Resolves the workspace root (like every path command), then **locally unbinds** it. `untrack` is
+**local-only** — it never touches remote data or the device.
+
+1. If a background-sync daemon is running for this root → `stopDaemon(root)`, then **poll for the
+   process to actually exit** (bounded, ~5s) before touching `.rbox/`. `stopDaemon` sends SIGTERM and
+   removes the pidfile immediately (`daemon-control.ts:69`), so a naive `rm` would race a daemon
+   mid-write. On timeout: abort with "daemon still running — stop it and retry" (or `--force` →
+   escalate to SIGKILL after the timeout).
+2. **Safely** remove the binding: `lstat` `.rbox` first, **refuse if it's a symlink**, confirm the
+   realpath resolves to exactly `<root>/.rbox`, then delete the **known files** (`config.json`,
+   `state.json`, `daemon.pid`, `daemon.log`) and the dir — never a blind `rm -rf` on an attacker- or
+   corruption-controlled path.
+3. Print that **local files are untouched** and the **remote workspace still exists** (other machines
+   keep syncing; manage/delete it from the dashboard).
 
 Interactive runs confirm first (`Stop syncing ~/code/myapp? Local files stay. [y/N]`); `--force` skips
-the prompt for scripts. `untrack` is deliberately **local-only by default** — it never deletes remote
-data or revokes the device.
+the prompt for scripts.
 
-**`--purge-remote` (explicit opt-in — founder-approved):** additionally deletes the *remote* workspace
-for the whole account. This is destructive across **every** machine tracking that workspace, so it
-double-confirms even under `--force` (printing the workspace id + a "this removes it everywhere, on
-all machines" warning) and requires the operator to type the workspace id to proceed. Omitting the
-flag always leaves the remote intact — the safe default.
+> **Deferred — `--purge-remote`.** The founder wants an opt-in that also deletes the *remote*
+> workspace. That is **out of scope for this doc**: this redesign explicitly makes no protocol/backend
+> changes (header), and remote deletion needs a new authenticated `DELETE /v1/workspaces/:id` API,
+> authorization, an audit trail, and defined semantics for other machines still tracking it. Tracked
+> as a **separate backend design**; until then `untrack` is local-only and the dashboard is the path
+> to delete a workspace.
 
 ---
 
@@ -311,45 +343,59 @@ command; the human runs it. The drift check is pure `stat`/hash over local files
 anything derived from synced (untrusted) content, consistent with the `deps install` hardening
 (`hydrate-cmd.ts` header).
 
-### Detection signal — staleness without an install hook
+### Detection signal — honest staleness, no marker-format guessing
 
-We don't try to intercept every `npm install`. The robust, self-correcting signal is **lockfile
-content vs. the manager's install-output marker**:
+We do **not** try to intercept every `npm install`, and we do **not** claim to read each manager's
+internal install marker (those markers don't generally encode the source-lock hash — npm's hidden
+lockfile tracks the `node_modules` *tree*, cargo/go install into a *global* cache with no local
+artifact at all). The primary signal is deliberately simpler and manager-agnostic:
 
-> A folder is **drifted** if its manifest+lockfile content-hash differs from what the install marker
-> reflects — concretely, the lockfile is newer than (or hashes differently from) the marker the
-> manager writes when it installs.
+> A folder is flagged when its **lockfile content-hash differs from the hash rbox last recorded for
+> that folder**. In plain terms: *"this lockfile changed since you last saw it here."* That is the
+> exact, provable claim — and it's the one we put in the notice.
 
-Once the user runs the suggested command, the marker updates and the warning stops on its own — no
-state to manually clear. A small **global** dedupe store (`~/.config/rbox/deps-state.json`, see open
-Q 3) records, per absolute folder, the last lock-hash we *notified* for plus a `lastCheckedMtime`, so
-we nag **at most once per (folder, lock-hash)** and can skip the check entirely when nothing changed.
+- **State:** a small **global** store (`~/.config/rbox/deps-state.json`, see open Q 3) maps absolute
+  folder → `{ lockHash, lastCheckedMtime, dismissedHash }`. We record the new hash **only after we
+  notify**, so each lockfile change nudges **at most once** per folder; `lastCheckedMtime` lets the
+  check early-exit (no hash) when the lockfile's mtime is unchanged.
+- **Optional suppressor (false-positive guard), only where it's cheap and real:** for managers whose
+  engine rule has a **local** `installDir` (`node_modules` / `.venv` / `vendor/bundle`), we *suppress*
+  the notice if that dir's mtime is newer than the lockfile's — a "looks freshly installed" heuristic.
+  Cargo and Go install into a **global cache** (`installDir: null` in the engine), so they have **no**
+  local suppressor and rely on the lock-hash signal alone.
+- **Honest wording:** the notice says "lockfile changed — re-install to update," never "your install
+  is provably stale," because we can't prove the latter without running the manager. False negatives
+  (you changed the lock but we miss it) are acceptable — this is a nudge, not a guarantee.
 
-### Manager-detection matrix
+### Manager-detection matrix (generated from the engine, not hand-maintained)
 
-Checked in this order; first manifest present wins for the "full" tier (multiple distinct ecosystems
-in one folder are all reported — see monorepos):
+Tier-(a) detection and the suggested command are **generated from the shipped engine rule table**
+(`ECOSYSTEM_RULES` in `engine/detect.ts`, via `detectProjects`) — the same table that powers
+`deps install` — so drift and `deps install` can never disagree on which manager owns a folder or what
+command to run. The full-tier command is exactly the engine's `baseArgs`:
 
-| Ecosystem | Manifest + lock watched | Install marker (freshness anchor) | Full-tier command |
+| Engine rule | Manifest + lockfile(s) | Local `installDir` (suppressor) | Full-tier command (`baseArgs`) |
 |---|---|---|---|
-| pnpm | `package.json` + `pnpm-lock.yaml` | `node_modules/.modules.yaml` | `pnpm install --frozen-lockfile` |
-| yarn (berry) | `package.json` + `yarn.lock` + `.yarnrc.yml` | `node_modules/.yarn-state.yml` | `yarn install --immutable` |
-| yarn (classic) | `package.json` + `yarn.lock` | `node_modules/.yarn-integrity` | `yarn install --frozen-lockfile` |
-| npm | `package.json` + `package-lock.json` | `node_modules/.package-lock.json` | `npm ci` (lock present) else `npm install` |
-| bun | `package.json` + `bun.lockb` | `node_modules/.bun-tag` | `bun install` |
-| Cargo | `Cargo.toml` + `Cargo.lock` | `target/` mtime (or `~/.cargo` fetch) | `cargo fetch` (or `cargo build`) |
-| Go | `go.mod` + `go.sum` | `go.sum` vs. module cache touch | `go mod download` |
-| uv | `pyproject.toml` + `uv.lock` | `.venv/` | `uv sync` |
-| Poetry | `pyproject.toml` + `poetry.lock` | `.venv/` / poetry env | `poetry install` |
-| Pipenv | `Pipfile` + `Pipfile.lock` | `.venv/` | `pipenv sync` |
-| pip | `requirements*.txt` | `.venv/` (best-effort) | `pip install -r <file>` |
-| Bundler | `Gemfile` + `Gemfile.lock` | `vendor/bundle` / `.bundle` | `bundle install` |
-| Composer | `composer.json` + `composer.lock` | `vendor/` | `composer install` |
+| `node/pnpm` | `package.json` + `pnpm-lock.yaml` | `node_modules` | `pnpm install --frozen-lockfile` |
+| `node/yarn` | `package.json` + `yarn.lock` | `node_modules`† | `yarn install --immutable` |
+| `node/bun` | `package.json` + `bun.lock` / `bun.lockb` | `node_modules` | `bun install --frozen-lockfile` |
+| `node/npm` | `package.json` + `package-lock.json` / `npm-shrinkwrap.json` | `node_modules` | `npm ci` |
+| `rust/cargo` | `Cargo.toml` + `Cargo.lock` | — (global cache) | `cargo fetch --locked` |
+| `go/modules` | `go.mod` + `go.sum` | — (global cache) | `go mod download` |
+| `python/uv` | `pyproject.toml` + `uv.lock` | `.venv` | `uv sync --frozen` |
+| `python/poetry` | `pyproject.toml` + `poetry.lock` | `.venv` | `poetry install` |
+| `ruby/bundler` | `Gemfile` + `Gemfile.lock` | `vendor/bundle` | `bundle install` |
 
-Package-manager selection reuses the existing detection engine (`detectProjects` / `hydrateArgv`,
-design 08) — the same matrix that powers `deps install`, so drift and `deps install` never disagree on
-which manager owns a folder. Where the marker can't be located reliably (notably bare `pip`), we fall
-to **tier (b)**.
+† Yarn Berry/PnP often has **no** `node_modules` (it writes `.pnp.cjs` + `.yarn/install-state.gz`);
+when `node_modules` is absent the suppressor simply doesn't fire and we fall back to the lock-hash
+signal — never a false "fresh."
+
+**Tier (b)** is used for: ambiguous node dirs (multiple node lockfiles, which the engine already flags
+`ambiguous` and refuses to auto-pick), and **anything outside the 9 engine ecosystems** (pip
+`requirements*.txt`, Pipenv, Composer, Gradle/Maven). v1 deliberately does **not** invent a parallel
+matrix for those — covering exactly the engine's ecosystems keeps drift and `deps install` in
+lockstep. Tier (b) just says "`<lockfile>` changed — re-install to get the latest dependencies," with
+no command. (Extending tier-(b) to a small extra watchlist is a later, additive change.)
 
 ### Surfaces (all opt-in)
 
@@ -362,10 +408,19 @@ to **tier (b)**.
    workspace, print the same one-line drift notice immediately (no hook needed; this is the cheap,
    always-available half).
 
-### The shell hook (kept cheap)
+### Surface priority — post-sync nudge is primary, the `cd` hook is secondary
 
-The rc file gets **one stable line** inside fenced markers, sourcing a generated, rbox-managed
-snippet so `rbox upgrade` can update the logic without re-editing the rc:
+A Node/Bun CLI **cold start on every relevant `cd` cannot be promised to be invisible**, so the
+**post-sync nudge (surface 3) is the primary, always-available surface** — it's free (we already have
+the process open and just wrote the changed lockfile) and needs no shell integration. The `cd` hook is
+an *optional enhancement* for people who change deps outside rbox (branch switches, manual edits), and
+it is built to **never add latency to the prompt** (below). If the perf budget can't be met in
+benchmarking, the hook ships disabled-by-default and the post-sync nudge stands alone.
+
+### The shell hook (cheap + safe)
+
+The rc file gets **one stable line** inside fenced markers, sourcing a generated, rbox-managed snippet
+so `rbox upgrade` can update the logic without re-editing the rc:
 
 ```sh
 # >>> rbox dep-drift >>>
@@ -373,27 +428,46 @@ snippet so `rbox upgrade` can update the logic without re-editing the rc:
 # <<< rbox dep-drift <<<
 ```
 
-The snippet's `chpwd`/`PWD`-change handler does a **pure-shell pre-filter first** — a handful of
-`[[ -f package.json || -f Cargo.lock || -f go.mod || … ]]` tests (microseconds, no fork). Only when a
-known manifest is present does it spawn `rbox deps drift --quiet`, which is a no-network, no-auth local
-`stat`+hash that prints at most one line and self-debounces via `lastCheckedMtime` (skips the hash if
-the lockfile mtime is unchanged since the last check). Target budget: **< ~15 ms** on a relevant `cd`,
-**~0** (one shell test) on the overwhelming majority of `cd`s into manifest-free dirs.
+**Performance — the prompt is never blocked.** The handler does a **pure-shell prefilter** first (a
+handful of `[[ -f package.json || -f Cargo.lock || -f go.mod || … ]]` builtins — no fork, the ~0-cost
+common case for manifest-free dirs). Only when a manifest is present does it spawn the check
+**detached/async** (`&`, output buffered to print before the *next* prompt), so the CLI cold start is
+off the critical path. It's **throttled** (skip if this folder was checked within N seconds, via
+`lastCheckedMtime`) and the bounded monorepo up-walk happens **inside** the spawned process, not in the
+shell. No hard millisecond promise; the contract is "the synchronous shell cost is the builtin
+prefilter only."
+
+**Security — no workspace PATH-hijack, no `eval`.** Hydration already rejects workspace-local
+executables (`hydrate-cmd.ts:39`); the hook must hold the same line. So the generated snippet:
+- invokes the **absolute installed binary path** (e.g. `$HOME/.rbox/bin/rbox`) baked in at install
+  time — **never** a bare `rbox` resolved through `$PATH` (a repo could ship a `./rbox`);
+- **refuses to run** if the snippet file is a symlink, not owned by the user, or group/world-writable
+  (a tampered hook is ignored, not sourced);
+- uses **no `eval`** and passes no repo-derived string to a shell; the check itself is no-network,
+  no-auth, pure `stat`+hash over the lockfile.
 
 Per-shell wiring (shell resolved from `$SHELL`, falling back to `ps -p $PPID -o comm=`):
 - **zsh:** `autoload -Uz add-zsh-hook; add-zsh-hook chpwd __rbox_dep_drift`
 - **bash:** no `chpwd` — a `PROMPT_COMMAND` guard that runs the check only when `$PWD` differs from a
-  cached value (so it's not per-prompt).
+  cached value (so it's not per-prompt), spawning detached as above.
 - **fish:** `function __rbox_dep_drift --on-variable PWD; …; end` in `config.fish`.
 
 ### Disable / uninstall
 
 - **Instant toggle (no rc edit):** `rbox deps notify off` flips a flag in the global state; the hook
   reads it and no-ops. `rbox deps notify on` re-enables.
-- **Full removal:** `rbox deps notify uninstall` deletes the fenced marker block from the rc and the
-  generated snippet. The markers make removal exact and idempotent.
+- **Full removal:** `rbox deps notify uninstall` deletes the fenced marker block + generated snippet.
+  Because a user may have installed the hook in several shells (or switched shells), `notify install`
+  **records every rc file it touched** in the global state; `uninstall` enumerates and cleans **all**
+  of them (and `notify status` lists where hooks are installed). The markers make each removal exact
+  and idempotent.
 - **Per-repo opt-out:** `RBOX_NO_DRIFT=1` in the environment, or a `noDrift` flag in the workspace's
   `.rbox` config, suppresses notifications for that tree.
+
+The global state file (`~/.config/rbox/deps-state.json`) is written `0600`, created with the rbox
+config dir, updated via **atomic write** (temp + rename) to survive concurrent shells, and stores only
+absolute folder paths + lock-hashes locally — it is **never** synced or sent to the server (it lives
+outside any workspace; see open Q 3 on the privacy trade-off of a global path list).
 
 ### Multiple managers & monorepos
 
@@ -483,7 +557,9 @@ Once this ships and is released, the public copy drops the jargon:
   `install`.
 - **Keep `start`** (not `watch` / `sync --background`).
 - **`init` kept for CI but hidden from the main help** — documented only under `rbox help init`.
-- **`untrack` is local-only by default; `--purge-remote` is the explicit, double-confirmed opt-in.**
+- **`untrack` is local-only.** The founder-approved `--purge-remote` is **deferred to a separate
+  backend design** (remote workspace deletion needs a new API + authz + audit, out of scope here —
+  codex BLOCKER 5). The intent is recorded; the safe local-only behavior ships now.
 - **Deprecation window: aliases warn until `v0.3`.**
 - **Per-command `--help` via the static help registry** (as proposed above).
 - **`setup` Step 3 = start *background* sync** (`rbox start`); the one-shot populate-sync runs inside
@@ -499,5 +575,54 @@ Once this ships and is released, the public copy drops the jargon:
    below does both; the post-sync nudge is cheap, the `cd` hook is the always-on surface.)
 3. **Dep-drift state store location.** Per-workspace `.rbox/deps-state.json` (travels with the repo,
    but only covers tracked folders) vs. a global `~/.config/rbox/deps-state.json` (covers *any* folder
-   you `cd` into, even untracked ones). Design below recommends the **global** store so the hook works
+   you `cd` into, even untracked ones). Design recommends the **global** store so the hook works
    everywhere; confirm that's acceptable (it means a small global file outside any workspace).
+
+---
+
+## Codex review resolutions (round 1 → all resolved)
+
+> Codex adversarial review, 2026-06-30 → **VERDICT: NEEDS-WORK** (5 BLOCKER, 8 MAJOR, 4 MINOR). Every
+> finding was accepted and resolved in-doc — none were "won't fix." Summary + disposition below.
+
+**BLOCKERS**
+- **B1 — `track` ≠ a clean rename of `link`.** Today `link` is bind-only (no first sync); `runInit`
+  does the syncing. Fixed: `track` is documented as the **exact, bind-only** `link` behavior; first
+  sync happens via `setup`/`sync`/`start`. Help text and table corrected.
+- **B2 — `setup` device-code path was broken.** Device-code login authorizes but doesn't enroll, and
+  `runInit` aborts pre-sync if unenrolled (`init-cmd.ts:120`). Fixed: the "approve a code" branch now
+  **hard-stops** with pair/connect/recover next steps before Step 2; only the (enrolling) pairing-token
+  path flows straight through.
+- **B3 — drift matrix didn't match the shipped engine.** Fixed: the matrix is now **generated from
+  `ECOSYSTEM_RULES`** (9 ecosystems, exact lockfiles incl. `bun.lock`, exact `baseArgs` like
+  `cargo fetch --locked` / `uv sync --frozen`); pip/Pipenv/Composer dropped to tier-(b)-only; Yarn
+  Berry/PnP (no `node_modules`) handled.
+- **B4 — staleness signal overclaimed.** Fixed: primary signal reframed to "**lockfile hash changed
+  since rbox last saw it here**" (provable, manager-agnostic); install-dir mtime is only an optional
+  *suppressor* where a local `installDir` exists; cargo/go (global cache) rely on the hash alone;
+  wording says "lock changed," not "install stale."
+- **B5 — `--purge-remote` out of scope.** Fixed: **deferred to a separate backend design** (needs a
+  new authenticated workspace-delete API + authz + audit). `untrack` ships local-only.
+
+**MAJORS**
+- **M1 — hook PATH-hijack.** Fixed: snippet invokes the **absolute** installed binary, refuses
+  tampered (symlink / non-owner / group-or-world-writable) hook files, no `eval`.
+- **M2 — `<15 ms` budget not credible.** Fixed: **post-sync nudge is now the primary surface**; the
+  `cd` hook runs **detached/async** (never blocks the prompt), throttled, with the up-walk inside the
+  spawned process; hard-ms claim dropped; hook ships off-by-default if benchmarks fail.
+- **M3 — `setup` "strict superset" false.** Fixed: claim dropped; the menu's "just log in" intent is
+  served by `rbox login` directly.
+- **M4 — stderr invariant vs. stdout device-code prints.** Fixed: documented as an implementation
+  caveat — auth output must route through an injectable stream (or move to stderr) before the invariant
+  holds.
+- **M5 — secret prompts echo.** Fixed: documented that the masked prompts require a **no-echo input
+  helper** (readline echoes by default) — a to-build, not a given.
+- **M6 — `untrack` blind `rm -rf .rbox`.** Fixed: `lstat` + refuse symlink + realpath-confirm
+  `<root>/.rbox` + delete known files only.
+- **M7 — `untrack` races a live daemon.** Fixed: stop, then **poll for exit** (bounded) before
+  removing `.rbox`; `--force` escalates to SIGKILL after timeout.
+
+**MINORS** — all applied: (m1) help now shows `--only`/`--manager`; (m2) added a
+**dispatcher↔registry parity test** and softened the "can't drift" claim; (m3) `notify install`
+records every rc it touched so `uninstall`/`status` cover all shells; (m4) global state documented as
+`0600`, atomic-write, never synced.
