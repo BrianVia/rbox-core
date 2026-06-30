@@ -1244,6 +1244,24 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await billingOf(x.accountId))?.sub).toBe("sub_x_existing"); // X's sub untouched
   });
 
+  test("X already mapped to another Clerk id → confirm blocks 409 already_linked WITHOUT moving billing (no half-move)", async () => {
+    const sub = "user_repoint_xmapped";
+    const shell = await webShell(sub);
+    await setBilling(shell, "cus_xm", "sub_xm", "pro");
+    const x = await bootstrap("acct-repoint-xmapped");
+    // A different Clerk identity already manages X.
+    await env.rbox_dev_db.prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES ('user_other_xm', ?, 'user_other_xm_u', ?)").bind(x.accountId, Date.now()).run();
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, code);
+    await withStripe(async () => {
+      const cf = await confirmDirect(sub, pollKey);
+      expect(cf.status).toBe(409);
+      expect(((await cf.json()) as { error: string }).error).toBe("already_linked");
+      expect(stripeCalls.length).toBe(0); // X-mapped pre-check runs BEFORE the saga → no billing move
+    });
+    expect((await billingOf(shell))?.sub).toBe("sub_xm"); // billing stayed on the shell (no half-move)
+  });
+
   test("non-billing shell state still BLOCKS even with billing present (saga never half-moves a shell that would block anyway)", async () => {
     const sub = "user_repoint_dirty";
     const shell = await webShell(sub);

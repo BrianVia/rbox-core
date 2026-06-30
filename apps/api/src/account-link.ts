@@ -159,6 +159,14 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
   // Reclaim/guard decision over C's CURRENT account (the origin shell).
   let reclaimNeeded = false;
   if (cur.account_id !== x) {
+    // Target X must not already be managed by a DIFFERENT Clerk identity (design
+    // §4.2.1 pre-check). Checked HERE, before the billing saga, so a doomed rebind
+    // (uq_clerk_users_account) can never leave billing half-moved onto someone
+    // else's X (the Stripe/D1 boundary isn't transactional). The atomic batch's
+    // UNIQUE index stays the backstop for a concurrent map that races this read.
+    const xMap = await env.rbox_dev_db.prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(x).first<{ clerk_user_id: string }>();
+    if (xMap && xMap.clerk_user_id !== c) return json({ error: "already_linked" }, 409);
+
     const curOrigin = (await env.rbox_dev_db.prepare("SELECT origin FROM accounts WHERE id = ?").bind(cur.account_id).first<{ origin: string | null }>())?.origin ?? null;
     if (curOrigin === "web") {
       reclaimNeeded = true;
