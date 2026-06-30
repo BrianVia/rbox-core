@@ -1,6 +1,6 @@
-# Design 22 — Device management (devices route + new-device email + web unlink/revoke)
+# Design 30 — Device management (devices route + new-device email + web unlink/revoke)
 
-> **Implementation status: 🔴 NOT STARTED** — design + build plan, codex-reviewed (2026-06-30).
+> **Implementation status: 🟡 PARTIAL** — slices 1–3 (the `/devices` route, device revoke, unlink + live-web-session revoke) are **SHIPPED & live** (PR #8, `app.rbox.to/devices`). Slices 4–6 (new-device email) are **not started** — pending Cloudflare Email Service setup. Design + build plan, codex-reviewed (2026-06-30).
 
 > **Doc-number note (read first).** This workstream was scoped as "§22" before the
 > infra docs `22-server-throughput.md` … `28-git-sync-e2ee.md` landed on `main`, so
