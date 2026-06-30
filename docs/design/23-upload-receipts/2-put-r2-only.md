@@ -12,19 +12,22 @@ writes are the measured plateau. They belong at commit (§23.4), not per PUT.
 New `blobPut`:
 ```
 auth → account
-[cheap cap pre-check]   // see §23.5: advisory only, from cached/approx used_bytes
 R2 put(blobKey(sha), body, { sha256: sha })   // R2 verifies the hash; sha_mismatch → 400
 return 200 { ok, sha, size, receipt: mintReceipt(env,{account,sha,size,now}) }
 ```
-- **No** `blobs` / `blob_refs` / `used_bytes` / `gc_candidates` writes here.
+- **No** `blobs` / `blob_refs` / `used_bytes` / `gc_candidates` writes here. `PUT`
+  mutates only the R2 content object and returns proof that this account supplied bytes.
 - `size` from the R2 `put` result (`obj.size`) — authoritative, server-measured.
 - Same path for `multipartComplete` (`blobs.ts:166`) — it also returns a receipt.
+- Quota fail-fast moves to `missingBlobs`/preflight as advisory information (§23.3/§23.5).
+  The authoritative charge is only the commit transaction (§23.4). This intentionally
+  accepts temporary orphan R2 bytes for pushes that never commit.
 
 ## What this removes / keeps
 - Removes: lines 66–68 (INSERT blobs, DELETE gc_candidates, grantEntitlementWithQuota).
 - Keeps: R2 sha-verified put (content integrity), the `SINGLE_PUT_MAX` → multipart gate.
-- The cap pre-check stays but becomes a cheap advisory read (§23.5), not the authoritative
-  per-blob charge — that moves to §23.4.
+- The content-store boundary is strict: no canonical metadata, quota, entitlement, head, or
+  GC-condemnation state changes on the upload path.
 
 ## Backward compatibility
 Old clients ignore the `receipt` field and expect entitlement-on-PUT. Gate by a request
@@ -37,11 +40,17 @@ Deprecate after the min-CLI version moves past the receipts release.
   put by sha) → new receipt. Fine.
 - No entitlement is granted here, so an unentitled account uploading bytes gains **no read
   access** until commit — preserves the M7 "unentitled gets 404" property.
+- A PUT to an object that was previously in `gc_candidates` does not delete the candidate
+  row. The successful commit does that atomically (§23.4). Until then, GC safety comes from
+  object-age rechecks plus `RECEIPT_TTL < GC_GRACE` (§23.5), not from a per-PUT D1 mutation.
+- A successful PUT is not a quota reservation. If the later commit is over cap, the head does
+  not advance, no entitlement is granted, and the uploaded R2 bytes are reclaimed as orphans.
 
 ## Tests (worker / vitest)
 - PUT returns `{receipt}` and performs **zero D1 writes** (assert via a D1 spy / no row deltas).
 - Bad sha → 400 (R2 verify) and no receipt. Oversize → 413 → multipart.
 - Legacy-flag PUT still grants entitlement (fallback path) and returns ok.
+- Lost response / retry returns a fresh receipt without extra metadata writes.
 
 ## Depends on / Status
 Depends on: §23.1. Status: **design**. Pairs with §23.3 (missingBlobs) + §23.4 (commit grant).

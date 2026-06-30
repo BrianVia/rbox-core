@@ -13,8 +13,10 @@ stable (same set → same bytes → same hash, so it's a normal dedupable blob),
   (`u32 count` then `count × (32-byte encSha ‖ u64 size)`) — ~40 B/blob, half the JSON form —
   or canonical JSON for debuggability. **Prefer binary** for size; it's opaque to humans but
   the server never needs to show it.
-- **Address:** `sidecarSha = sha256(sidecarBytes)`. It's stored in R2 like any blob (content
-  -addressed). NOT encrypted with the workspace KEK necessarily — it contains encShas
+- **Address:** `sidecarSha = sha256(sidecarBytes)`, where `sidecarBytes` is the full
+  canonical unique/sorted ref set. `sidecarSha` identifies the sidecar object as a whole; it
+  is not a per-blob checksum and not an R2 storage checksum. It's stored in R2 like any blob
+  (content-addressed). NOT encrypted with the workspace KEK necessarily — it contains encShas
   (already ciphertext addresses) + sizes, which the server already sees in today's body; so
   it can be a plain content blob. (Confirm: does exposing the *set* of encShas as one object
   leak more than the inline body already does? No — same data, same server visibility.)
@@ -26,8 +28,11 @@ stable (same set → same bytes → same hash, so it's a normal dedupable blob),
 - Deterministic: identical ref set → identical bytes → identical `sidecarSha` (dedup; a
   no-op re-push reuses it).
 - The signed commit body commits to `sidecarSha`, so the sidecar can't be swapped.
-- Size cap: a 50k-blob sidecar at ~40 B = ~2 MB — fine as an R2 object (R2 has no small cap);
-  it is NOT bound by `MAX_COMMIT_BODY` (that's the D1 row, now O(1)).
+- Size cap: a 50k-blob sidecar at ~40 B = ~2 MB — fine as one immutable R2 object for v1
+  (R2 has no small cap); it is NOT bound by `MAX_COMMIT_BODY` (that's the D1 row, now O(1)).
+  Packing/chunking the sidecar would be only a storage/layout optimization, like Git
+  packfiles or backend bucket layouts, and should wait for measured need because it must not
+  change `sidecarSha` semantics.
 
 ## Tests
 - round-trip serialize→parse equals the input set (sorted, unique).

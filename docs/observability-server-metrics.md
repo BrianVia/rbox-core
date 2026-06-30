@@ -32,16 +32,23 @@ or pre-quota reject in `blobPut`, or a malformed-commit 400). Those are still ca
 the `request` metric (route + status), so the request panel is the source of truth for
 total request counts; op panels describe the work that actually ran.
 
+**§23/§24 follow-on signals:** the current schema should be extended, when those designs
+land, with low-cardinality rows for stale receipt rejects (`commit` outcome
+`receipt_stale`), orphan reclamation (`gc.orphan` candidate/deleted counts), sidecar fetch
+latency (`sidecar.fetch`), sidecar parse latency (`sidecar.parse`), and GC fail-closed
+sidecar aborts (`gc.sidecar` abort outcomes). These are validation signals, not a reason to
+rework the §23/§24 architecture.
+
 ## Privacy
 
-Dimensions carry **only** low-cardinality operational labels — op name, a
+Dimensions and logs carry **only** low-cardinality operational labels — op name, a
 **templated** route (`routeTemplate` masks shas / `ws_*` / `dev_*` / `acc_*` ids /
 the user-chosen project id / UUIDs / numbers), and a coarse outcome. **No** account/
-device/workspace id, path, path hash, or blob/commit hash ever enters a metric. The
-masking contract is unit-tested (`routeTemplate privacy masking` in `worker.test.ts`).
-Numeric facts (durations/sizes/counts) are raw so the dashboard can compute arbitrary
-percentiles — see the design doc for why raw numerics are acceptable where raw
-identifiers are not.
+device/workspace id, path, path hash, blob/commit hash, upload id, token, raw URL, or body
+ever enters a dimension or log field. The masking contract is unit-tested (`routeTemplate
+privacy masking` in `worker.test.ts`). Numeric AE blobs (durations/sizes/counts/ratios) are
+raw so the dashboard can compute arbitrary percentiles; raw numerics are acceptable as
+measures, not as join keys, labels, or identifiers.
 
 ## Schema (positional — AE columns are fixed)
 
@@ -50,7 +57,7 @@ index1  = op           (sampling key)
 blob1   = op           (GROUP BY op)
 blob2   = route        (templated; "" when N/A)
 blob3   = outcome      ("ok" | "conflict" | "epoch_stale" | "unsatisfied_blobs"
-                        | "body_too_large" | "<http status>" | ...)
+                        | "body_too_large" | "receipt_stale" | "<http status>" | ...)
 double1 = ms           (primary latency)
 double2 = dbMs         (D1 time within the op)
 double3 = storeMs      (R2 time within the op)
@@ -134,6 +141,13 @@ FROM rbox_prod_metrics
 WHERE blob1 LIKE 'blob.%' OR blob1 LIKE 'multipart.%'
 GROUP BY op;
 ```
+
+**Future §23/§24 validation panels** (add when the emitters land)
+- Stale receipt rejects: count `blob1 = 'commit' AND blob3 = 'receipt_stale'`.
+- Orphan reclaim: count/sum `blob1 = 'gc.orphan'` split by `blob3 = 'candidate'|'deleted'`.
+- Sidecar validation: p50/p99 `double1` for `blob1 IN ('sidecar.fetch','sidecar.parse')`.
+- GC fail-closed: count `blob1 = 'gc.sidecar'` abort outcomes; any sustained non-zero value
+  should page or at least alert because GC must abort rather than condemn on sidecar failure.
 
 ## Notes
 

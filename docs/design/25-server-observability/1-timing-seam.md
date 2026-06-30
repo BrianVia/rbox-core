@@ -15,6 +15,8 @@ line per request, WITHOUT leaking metadata.
   and the DO `fetch`/`transactionSync`. Aggregate into `r2Ms`, `d1Ms`, `doMs`, `d1Calls`.
 - **One JSON log line per request** at completion: `{ reqId, route(templated), method,
   status, durMs, r2Ms, d1Ms, doMs, d1Calls, sizeBucket }`. Replaces the ad-hoc `console`.
+  This line is emitted for early validation failures too, so request logs remain the total
+  request-count source even when no op-level work starts.
 - `reqId`: random per request (not derived from any principal). `route`: **templated** —
   params stripped (`/v1/ws/:ws/proj/:proj/...` → `/v1/ws/{ws}/proj/{proj}/...`).
 - Overhead: `performance.now()` + object pushes only; no I/O on the hot path beyond the
@@ -39,6 +41,8 @@ obs.finish(status, { sizeBucket });         // emits the one JSON line (+ §25.2
 - `time()` accumulates into the right bucket; concurrent ops don't cross-contaminate.
 - The emitted line contains only allow-listed fields; a route with params is templated;
   no raw sha/id/path can appear (assert via a redaction test over sample requests).
+- Early 4xx paths still emit the final request line with route + status and no leaked body,
+  URL, id, SHA, or token.
 
 ## Depends on / Status
 Depends on: nothing. Status: **design**. Land FIRST so §23/§24 changes are measurable.

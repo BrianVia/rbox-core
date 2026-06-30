@@ -13,6 +13,8 @@ Two server paths read blobRefs today and must work with the sidecar form:
 
 ### Commit validation (feeds §23.4)
 On a `blobRefset` commit:
+- First enforce §24.2 mode validity: exactly one of `blobRefs` or `blobRefset` must be
+  present. Reject both/neither before receipts, accounting, or head advance.
 - Reject early if `count > MAX_BLOB_REFS` or `totalBytes` over the cheap quota check (no
   fetch needed — both are in the signed body, §24.2).
 - Fetch the sidecar by `sidecarSha` from R2 (one GET; the sidecar is itself a referenced
@@ -34,16 +36,23 @@ Start with **A** (correct + simple); move to **B** only if GC latency/cost shows
 ## Correctness (the data-loss guard)
 - GC MUST NOT condemn a blob still referenced by any retained commit. With sidecars, "still
   referenced" requires reading sidecars — a bug that skips a sidecar = wrongful deletion.
-  → GC over sidecar commits must fail **closed**: if a retained commit's sidecar is
-  unfetchable/unparseable, **abort the GC pass** (don't condemn anything), alert, retry.
-- The sidecar of a retained commit is itself reachable (referenced by the commit) → GC must
-  also retain the sidecar object, not just the data blobs.
+  → GC over sidecar commits must fail **closed**: if any retained commit's sidecar is
+  missing, corrupt (`sha256(bytes) != sidecarSha`), or unparseable, **abort condemnation for
+  the pass** (don't condemn anything), alert, retry.
+- The sidecar object is itself a GC root while its commit is retained. Retaining only the
+  data blobs is insufficient; losing the sidecar would make future validation/GC unable to
+  prove reachability and must therefore prevent condemnation rather than be papered over.
 
 ## Tests (worker)
 - Sidecar commit: grant path gets the same refs as an equivalent inline commit would.
 - GC retains all blobs referenced by a sidecar commit; condemns only truly-unreferenced ones.
-- Missing/corrupt sidecar at commit → 422 (not advance). Missing sidecar at GC → abort pass,
-  condemn nothing (fail-closed). Sidecar object itself is retained while its commit is retained.
+- Missing/corrupt/unparseable sidecar at commit → 422 (not advance).
+- Missing/corrupt/unparseable sidecar at GC → abort condemnation, condemn nothing
+  (fail-closed).
+- Sidecar object itself is retained while its commit is retained; dropping only the sidecar
+  must fail a GC pass instead of deleting referenced data blobs.
+- Migration rejection: both `blobRefs` and `blobRefset`, or neither field, reject before
+  grant/quota/head advance.
 
 ## Depends on / Status
 Depends on: §24.1, §24.2, §23.4. Status: **design** — **codex-review the GC fail-closed

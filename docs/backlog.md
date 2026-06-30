@@ -22,7 +22,7 @@ its design doc. Updated 2026-06-29. Shipped work lives in `docs/learnings.md` +
 |---|------|--------|-----------|
 | 1 | Upload receipts + commit-time batched accounting | [`design/23-upload-receipts.md`](design/23-upload-receipts.md) | PUT → ~R2-only; account once at commit. Kills ~5 D1 trips/blob. **Biggest win.** |
 | 2 | blobRefs → R2 sidecar | [`design/24-blobref-sidecar.md`](design/24-blobref-sidecar.md) | Move the ref list out of the signed commit body; unlocks 50k-file repos. |
-| 3 | Server timing / observability **🚧** | [`design/25-server-observability.md`](design/25-server-observability.md) | Per-op R2/D1/DO timing → Analytics Engine. **Near-complete impl on branch `obs/server-instrumentation`** (pushed; metrics.ts + instrumentation + tests, ~347 lines) → resume/PR from there. Schema+SQL: [`observability-server-metrics.md`](observability-server-metrics.md). |
+| 3 | Server timing / observability **🚧** | [`design/25-server-observability.md`](design/25-server-observability.md) | Per-op R2/D1/DO timing → Analytics Engine. **Near-complete impl is on pushed branch `obs/server-instrumentation`** (metrics.ts + instrumentation + tests, ~347 lines); fetch/switch there to continue/PR, don't recreate it from another checkout. Schema+SQL: [`observability-server-metrics.md`](observability-server-metrics.md). |
 
 ## 🟠 P1 — after P0 measurements
 | # | Item | Design | One-liner |
@@ -37,6 +37,7 @@ its design doc. Updated 2026-06-29. Shipped work lives in `docs/learnings.md` +
 | 7 | Queues for reconciliation + GC | Orphan-R2 purge, used_bytes reconcile, webhook retry. **Never** on the commit-accept path (at-least-once/async). |
 | 8 | Smart Placement / route-split Workers | Split metadata vs blob Workers; placement may help D1-heavy routes, not user→R2 uploads. Measure separately. |
 | 9 | Cache API for post-auth blob reads | Only if pull stays R2-bound. Auth first, cache second, no negative caching. |
+| 10 | Block-level hashes / delta-index / streaming overlap | Future-only, gated behind P0 server-throughput work + measurements: Dropbox-style block hashes, rsync/Syncthing-style delta indexes, and need-block/upload-download overlap. Not part of the current server-D1 fix. |
 
 ## 🧪 Smaller perf items (tracked in `perf-improvements.md`)
 - **Encrypt double-pass** — `encryptFileToTemp` re-hashes plaintext the scan already hashed. Bench the win, then reuse the scan's sha. Small, client-side.

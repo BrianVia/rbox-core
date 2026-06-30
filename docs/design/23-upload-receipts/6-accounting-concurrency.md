@@ -32,6 +32,35 @@ The trick: D1 can't trivially "sum sizes of just-inserted rows" in one UPDATE. A
 
 If A is cleanly expressible → simplest (no new infra). **Spike this against D1 first.**
 
+#### D1 spike pass criteria
+Option A is acceptable only if the spike proves all of this against the real dev D1
+environment (local SQLite/Miniflare alone is not enough):
+- A single transactional D1 operation can capture the exact `sha256` rows inserted by
+  `INSERT OR IGNORE INTO blob_refs(account_id, sha256) ... RETURNING sha256`, excluding
+  duplicates and pre-existing entitlements.
+- The same transaction can compute `newBytes = SUM(blobs.size_bytes)` for exactly that
+  inserted set and use it in
+  `UPDATE accounts SET used_bytes = used_bytes + newBytes WHERE used_bytes + newBytes <= cap`.
+- If the cap update affects 0 rows or any later statement fails, the inserted `blob_refs`,
+  inserted `blobs`, and `DELETE gc_candidates` effects roll back together.
+- The implementation stays inside D1 limits after chunking (`≤100` bound params,
+  `≤100 KB` statements, `30 s` batch) without splitting one logical commit into
+  separately-committed charge phases.
+- Returned/affected-row metadata is available to the Worker so the response can distinguish
+  success, over-cap, and malformed/missing proof without a follow-up read that changes the
+  accounting decision.
+
+#### D1 spike fail criteria
+Choose Option B immediately if any of these are true:
+- D1 rejects `RETURNING` in `batch()`/transaction, or returns rows only after the transaction
+  commits in a way that cannot feed the conditional quota update.
+- The only workable D1 design computes `newBytes` from a Worker-side pre-read of
+  `blob_refs`, from total candidate refs, or from `changes()`/row counts that cannot map
+  rows to sizes. Those all reintroduce double-charge risk.
+- Over-cap handling requires committing `blob_refs` before discovering the cap failure.
+- Correctness depends on timing, retry order, or "D1 is single-threaded" without an atomic
+  data dependency between inserted rows and the quota update.
+
 ### Option B — AccountAccounting Durable Object (fallback, robust)
 One DO per account (`idFromName(accountId)`) owns `used_bytes` + the entitled-ref set in
 DO storage; serializes all grants in-memory; the commit calls it once with the candidate
@@ -46,11 +75,43 @@ Try **A** (D1 `RETURNING` + transactional batch). If D1 can't express the
 sum-of-just-inserted race-safely, adopt **B**. Either way the **conditional cap UPDATE**
 provides the overspend guard; the open question is only exact attribution of `newBytes`.
 
-## Tests
-- Two concurrent commits (same account, different workspaces) referencing an overlapping
-  new blob → charged exactly once total; used_bytes correct.
-- Concurrent commits that together exceed cap → exactly one fails (402); used_bytes ≤ cap.
-- Idempotent retry → 0 additional charge.
+## Required concurrency tests
+Run these against whichever option is chosen. For Option A, they are also the D1 spike's
+pass/fail suite and must run against dev D1, not only local SQLite.
+
+1. **Overlapping concurrent grants**
+   - Setup: same account, two different workspaces, no existing refs, cap comfortably high.
+   - Commit A refs: `{x:10, y:20}`. Commit B refs: `{x:10, z:30}`.
+   - Run A and B concurrently for many iterations from a clean DB.
+   - Expected: both commits can succeed; `blob_refs` has x/y/z once for the account;
+     `used_bytes` increases by exactly 60, never 70.
+
+2. **Concurrent cap race**
+   - Setup: same account, cap leaves room for only one of two disjoint commits.
+   - Commit A refs total 60; Commit B refs total 60; remaining cap 80.
+   - Run concurrently.
+   - Expected: exactly one succeeds and one returns 402; `used_bytes` increases by 60 and
+     never exceeds cap; failed commit leaves no `blob_refs`, `blobs` rows that were created
+     solely for the failed grant if no other account/ref needs them, or `gc_candidates`
+     cleanup from that failed transaction.
+
+3. **Idempotent retry / duplicate submit**
+   - Setup: same account/workspace parent conflict avoided by testing the grant helper or
+     by retrying after a simulated lost response before head advance.
+   - Submit the exact same ref set twice.
+   - Expected: first grant charges the unique new refs; second grant inserts 0 refs,
+     charges 0 bytes, and is safe whether it runs after or concurrently with the first.
+
+4. **Candidate rollback**
+   - Setup: candidate row exists for sha `x`; account has a valid receipt; cap too low.
+   - Commit referencing `x` returns 402.
+   - Expected: `gc_candidates(x)` remains. Repeat with sufficient cap: commit succeeds and
+     `gc_candidates(x)` is deleted in the same transaction as the grant.
+
+5. **Cross-account sharing**
+   - Setup: accounts A and B commit the same sha concurrently with valid receipts.
+   - Expected: one physical/catalog `blobs` row, one `blob_refs` row per account, and each
+     account's `used_bytes` changes according to its own first entitlement only.
 
 ## Depends on / Status
 Depends on: §23.4. Status: **design** — the A-vs-B spike is the first task here, and the

@@ -112,13 +112,13 @@
 
   <!-- ───────────────────────── SERVER ───────────────────────── -->
   <h2>Server (Cloudflare edge) <span class="tag">commit + storage</span></h2>
-  <p class="note">The Worker is a thin, zero-knowledge custodian. Strong-consistency sequencing lives in a Durable Object; bytes in R2; metadata in D1. <b>This is where scalability now lives</b> — the client sweep plateaus because per-blob server work dominates.</p>
+  <p class="note">The Worker is a thin, zero-knowledge custodian. R2 is dumb immutable content storage; DO/D1 own sequencing, accounting, and entitlement metadata. <b>This is where scalability now lives</b> — the client sweep plateaus because per-blob server work dominates.</p>
   <div class="flow">
     <div class="node net"><div class="k">worker</div><div class="t">routes</div><div class="d">device-token auth; account-scoped; exact public routes</div></div>
     <div class="arrow">→</div>
     <div class="node compute"><div class="t">missingBlobs</div><div class="d">D1: which encShas absent / unentitled / condemned (chunked IN)</div></div>
     <div class="arrow">→</div>
-    <div class="node store"><div class="t">blob PUT</div><div class="k">per blob</div><div class="d">R2 put(sha) · cap SELECT · INSERT blobs · DELETE gc_candidates · INSERT blob_refs · UPDATE used_bytes</div><span class="badge bottleneck">R2 + ~5 D1 round-trips EACH blob → the plateau</span></div>
+    <div class="node store"><div class="t">blob PUT</div><div class="k">per blob</div><div class="d">Today: R2 put(sha) · cap SELECT · INSERT blobs · DELETE gc_candidates · INSERT blob_refs · UPDATE used_bytes</div><span class="badge bottleneck">R2 + ~5 D1 round-trips EACH blob → the plateau</span></div>
     <div class="arrow">→</div>
     <div class="node compute"><div class="t">WorkspaceSync DO</div><div class="d">single sequencer; <code>seq=parent+1</code>; verifies blob presence; strong consistency</div><span class="badge decision">strong-consistency sequencing</span></div>
     <div class="arrow">→</div>
@@ -128,12 +128,12 @@
   <div class="cols">
     <div class="card dc"><h3>Server design decisions</h3><ul>
       <li><b>Durable Object as the sequencer</b> — commit ordering needs <i>strong</i> consistency; that's why it's a DO, not KV (KV is eventually consistent → split-brain).</li>
-      <li><b>R2 content-addressed blobs</b> — sha-verified on PUT; convergent ciphertext dedups across the account.</li>
-      <li><b>D1 for metadata only</b> — composite PKs cover the hot queries (commits by seq, blob_refs by account+sha). Indexes are <i>not</i> the bottleneck.</li>
+      <li><b>R2 content-addressed blobs</b> — sha-verified, immutable bytes. R2 should not own sequencing, quota, or entitlement decisions.</li>
+      <li><b>DO/D1 for metadata</b> — the DO sequences commits; D1 stores commit/accounting/entitlement rows. Composite PKs cover the hot queries (commits by seq, blob_refs by account+sha). Indexes are <i>not</i> the bottleneck.</li>
       <li><b>Opaque to the server</b> — it reads a few commit fields for validation, never decrypts.</li>
     </ul></div>
     <div class="card bn"><h3>Server bottlenecks &amp; next work</h3><ul>
-      <li><b>Per-blob D1 round-trips (~5 each)</b> — every PUT does cap-SELECT + INSERT blobs + DELETE gc_candidates + INSERT blob_refs + UPDATE used_bytes; 1041 blobs ≈ <b>~5,200 D1 round-trips</b> in one push. <i>conc=4 already threw D1 "connection lost".</i> <span style="color:var(--decision)">NEXT (designed change): move per-blob accounting to a single batched step at COMMIT time (the commit already knows all blobRefs) — PUT becomes ~R2-only; one quota UPDATE, one batched ref insert.</span></li>
+      <li><b>Per-blob D1 round-trips (~5 each)</b> — today every PUT does cap-SELECT + INSERT blobs + DELETE gc_candidates + INSERT blob_refs + UPDATE used_bytes; 1041 blobs ≈ <b>~5,200 D1 round-trips</b> in one push. <i>conc=4 already threw D1 "connection lost".</i> <span style="color:var(--decision)">NEXT (§23): authoritative metadata mutation moves to COMMIT time (the commit already knows all blobRefs). PUT becomes ~R2-only plus an upload receipt; DO/D1 account once with one quota UPDATE and one batched ref insert.</span></li>
       <li><b>Commit body size</b> — blobRefs inlined in the signed body; 1 MB cap is interim. Move them to a side R2 object referenced by hash → unlocks 50k-file monorepos.</li>
       <li><b>Async candidates (Queues)</b> — GC of superseded blobs, usage aggregation off the commit hot path, webhook retry. Not transfer speed — robustness/cost.</li>
       <li><b>Observability gap</b> — no server timing today; can't attribute R2 vs D1 vs DO. Workers Analytics Engine + per-op spans (planned).</li>
