@@ -3,6 +3,7 @@ import type { Principal } from "./authz.js";
 import { json, sha256Hex } from "./util.js";
 import { verifyClerkJWT } from "./clerk.js";
 import { isUniqueViolation, randomHex } from "./auth.js";
+import { repointBillingToAccount } from "./stripe.js";
 
 /**
  * Web↔CLI account linking (design 21). A two-phase bind attaches a live Clerk
@@ -161,7 +162,20 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
     const curOrigin = (await env.rbox_dev_db.prepare("SELECT origin FROM accounts WHERE id = ?").bind(cur.account_id).first<{ origin: string | null }>())?.origin ?? null;
     if (curOrigin === "web") {
       reclaimNeeded = true;
-      if (!(await isReclaimableShell(env, cur.account_id, nowMs))) return json({ error: "origin_account_has_state" }, 409);
+      if (!(await isReclaimableShell(env, cur.account_id, nowMs))) {
+        // The shell isn't reclaimable as-is. If its ONLY blocker is billing (it's
+        // §3.4-empty once the Stripe columns are ignored), run the re-point saga
+        // (§3.4.2) to move the subscription onto X — after which the shell is empty
+        // and reclaimable below. Any NON-billing state (or a saga that can't run)
+        // still blocks: we never half-move a shell that would block anyway.
+        if (!(await isReclaimableShell(env, cur.account_id, nowMs, { ignoreBilling: true }))) {
+          return json({ error: "origin_account_has_state" }, 409);
+        }
+        const repoint = await repointBillingToAccount(env, cur.account_id, x, nowMs);
+        if (repoint === "destination_has_subscription") return json({ error: "destination_has_subscription" }, 409); // never merge two subs
+        if (repoint !== "repointed") return json({ error: "origin_account_has_state" }, 409); // unavailable / not_migratable → block
+        if (!(await isReclaimableShell(env, cur.account_id, nowMs))) return json({ error: "origin_account_has_state" }, 409); // belt-and-suspenders: still dirty → block
+      }
     } else if (curOrigin === "bootstrap") {
       return json({ error: "already_linked" }, 409); // C is on a real account; explicit unlink required (§5.4)
     } else {
@@ -214,8 +228,14 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
  * no row in any account-scoped STATE table, and no non-default billing/entitlement
  * value. `commits` has no account_id → checked via the workspaces join. Append-only
  * forensic logs (audit_log, account_link_events) are deliberately EXCLUDED.
+ *
+ * `ignoreBilling` skips ONLY the Stripe-controlled billing columns (plan,
+ * stripe_customer_id, stripe_subscription_id, grace_until, extra_storage_bytes) —
+ * the set the re-point saga (§3.4.2) moves. It answers "is billing this shell's ONLY
+ * blocker?" so confirm can run the saga and reclaim afterward. `used_bytes` (actual
+ * stored data) is still checked — a shell with data is never "only billing."
  */
-async function isReclaimableShell(env: Env, accountId: string, nowMs: number): Promise<boolean> {
+async function isReclaimableShell(env: Env, accountId: string, nowMs: number, opts: { ignoreBilling?: boolean } = {}): Promise<boolean> {
   const r = await env.rbox_dev_db
     .prepare(
       `SELECT
@@ -242,7 +262,8 @@ async function isReclaimableShell(env: Env, accountId: string, nowMs: number): P
     .first<Record<string, number | string | null>>();
   if (!r) return false; // no such account row → not reclaimable (same as origin != 'web')
   if (r.origin !== "web") return false;
-  if (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0 || Number(r.used) !== 0) return false;
+  if (Number(r.used) !== 0) return false; // stored data → never "only billing" (checked even when ignoreBilling)
+  if (!opts.ignoreBilling && (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
   for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "cm"]) if (Number(r[k]) !== 0) return false;
   if (Number(r.cu) > 1 || Number(r.own) > 1) return false; // only this Clerk id + its one owner membership
   return true;

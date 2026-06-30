@@ -3,6 +3,9 @@ import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { mintDevice } from "../src/auth.js";
 import { routeTemplate } from "../src/worker.js";
+import { billingCheckout, repointBillingToAccount } from "../src/stripe.js";
+import { confirmLink } from "../src/account-link.js";
+import type { Principal } from "../src/authz.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const BASE = "https://example.com";
@@ -1067,6 +1070,178 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const again = await linkConfirm(sub, a.pollKey); // same poll key, same target
     expect(again.status).toBe(200);
     expect(((await again.json()) as { account: string }).account).toBe(x.accountId);
+  });
+
+  // ── Slice 6: rbox subscribe guard + re-point saga (design 21 §3.4.1/§3.4.2) ──
+  // These exercise the Stripe surface, which (a) needs STRIPE_SECRET present and
+  // (b) makes outbound Stripe calls. The miniflare binding has STRIPE_SECRET ABSENT
+  // (so the 501-gate test elsewhere stays valid) and mutating env.STRIPE_SECRET does
+  // NOT reach the SELF worker, so we drive the EXPORTED functions directly with the
+  // test env (where the mutation IS visible) and mock Stripe via fetchMock. D1, the
+  // Clerk JWKS mock, and the webhook (via SELF) are all real.
+  const stripeCalls: { path: string; method: string; body: string }[] = [];
+  beforeAll(async () => {
+    const { fetchMock } = await import("cloudflare:test");
+    const pool = fetchMock.get("https://api.stripe.com");
+    pool
+      .intercept({ path: /^\/v1\/prices/, method: "GET" })
+      .reply(200, JSON.stringify({ data: [{ id: "price_test" }] }))
+      .persist();
+    pool
+      .intercept({ path: /^\/v1\//, method: "POST" })
+      .reply((o: { path: string; method: string; body?: unknown }) => {
+        stripeCalls.push({ path: o.path, method: o.method, body: String(o.body ?? "") });
+        if (o.path.startsWith("/v1/checkout/sessions")) return { statusCode: 200, data: JSON.stringify({ url: "https://checkout.stripe.test/cs_test_123" }) };
+        return { statusCode: 200, data: JSON.stringify({ id: "obj_test" }) }; // subscriptions/customers PATCH echo
+      })
+      .persist();
+  });
+  // Run `fn` with STRIPE_SECRET present (restored after) and a fresh call log.
+  async function withStripe<T>(fn: () => Promise<T>): Promise<T> {
+    (env as { STRIPE_SECRET?: string }).STRIPE_SECRET = "sk_test_dummy";
+    stripeCalls.length = 0;
+    try {
+      return await fn();
+    } finally {
+      delete (env as { STRIPE_SECRET?: string }).STRIPE_SECRET;
+    }
+  }
+  const durablePrincipal = (a: { accountId: string; deviceId: string }, userId = "user_x"): Principal => ({ deviceId: a.deviceId, accountId: a.accountId, userId, role: "owner", kind: "durable" });
+  const setBilling = (id: string, cust: string, sub: string, plan = "pro") =>
+    env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ? WHERE id = ?").bind(cust, sub, plan, id).run();
+  const billingOf = (id: string) =>
+    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub, plan FROM accounts WHERE id = ?").bind(id).first<{ cust: string | null; sub: string | null; plan: string }>();
+  // Drive confirmLink DIRECTLY (so the worker sees our STRIPE_SECRET + Stripe mock).
+  const confirmDirect = async (sub: string, pollKey: string) =>
+    confirmLink(new Request(`${BASE}/v1/account/link/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: await freshJwt(sub), pollKey }) }), env, Date.now());
+
+  test("subscribe guard: an account with a live subscription → 409 already_subscribed, ZERO Stripe calls", async () => {
+    const a = await bootstrap("acct-sub-guard");
+    await setBilling(a.accountId, "cus_guard", "sub_guard", "pro");
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: string }).error).toBe("already_subscribed");
+      expect(stripeCalls.length).toBe(0); // guard runs before any Stripe call (no double-charge)
+    });
+  });
+
+  test("subscribe: a free account → checkout bound to ITS OWN account; a canceled/grace account may re-subscribe", async () => {
+    const a = await bootstrap("acct-sub-free");
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { url: string }).url).toContain("checkout.stripe.test");
+      // The checkout binds the subscription to THIS account (no shell, no identity).
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      expect(checkout.body).toContain(a.accountId); // client_reference_id + metadata[account_id]
+    });
+    // A canceled-but-in-grace account (sub NULL, grace set) is NOT blocked.
+    await env.rbox_dev_db.prepare("UPDATE accounts SET grace_until = ? WHERE id = ?").bind(Date.now() + 1e6, a.accountId).run();
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200); // grace ≠ subscribed
+    });
+  });
+
+  test("re-point happy path: confirm runs the saga → sub metadata→X, shell billing cleared, shell reclaimed, C→X", async () => {
+    const sub = "user_repoint_happy";
+    const shell = await webShell(sub);
+    await setBilling(shell, "cus_rp", "sub_rp", "pro"); // user subscribed on the web shell
+    const x = await bootstrap("acct-repoint-x"); // billing-empty CLI account
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, code);
+    await withStripe(async () => {
+      const cf = await confirmDirect(sub, pollKey);
+      expect(cf.status).toBe(200);
+    });
+    // C now manages X; billing moved onto X; the shell was cleared + reclaimed.
+    expect(await clerkMap(sub)).toBe(x.accountId);
+    const bx = await billingOf(x.accountId);
+    expect(bx).toMatchObject({ cust: "cus_rp", sub: "sub_rp", plan: "pro" });
+    const bs = await billingOf(shell);
+    expect(bs).toMatchObject({ cust: null, sub: null, plan: "free" });
+    const reclaimed = await env.rbox_dev_db.prepare("SELECT reclaimed_at FROM accounts WHERE id = ?").bind(shell).first<{ reclaimed_at: number | null }>();
+    expect(reclaimed?.reclaimed_at).toBeGreaterThan(0);
+    // THE DUAL-ROUTING-KEY FIX: the subscription's Stripe metadata was repointed to X.
+    const patch = stripeCalls.find((c) => c.path === "/v1/subscriptions/sub_rp")!;
+    expect(patch).toBeTruthy();
+    expect(patch.body).toContain(x.accountId); // metadata[account_id]=X
+  });
+
+  test("webhook-race: a subscription.updated carrying metadata.account_id=X (post-saga) routes to X, never re-binds the shell", async () => {
+    const shell = `acct_race_shell_${Math.random().toString(16).slice(2, 8)}`;
+    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'pro', 'web', ?)").bind(shell, Date.now()).run();
+    await setBilling(shell, "cus_race", "sub_race", "pro");
+    const x = await bootstrap("acct-race-x");
+    await withStripe(async () => {
+      expect(await repointBillingToAccount(env, shell, x.accountId, Date.now())).toBe("repointed");
+    });
+    // Billing now on X, shell cleared. A renewal webhook (metadata→X, as Stripe now holds it) arrives.
+    const t = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      id: `evt_race_${shell}`,
+      type: "customer.subscription.updated",
+      data: { object: { id: "sub_race", status: "active", customer: "cus_race", metadata: { account_id: x.accountId }, items: { data: [{ price: { lookup_key: "rbox_pro_monthly" } }] } } },
+    });
+    const { createHmac } = await import("node:crypto");
+    const sig = `t=${t},v1=${createHmac("sha256", "whsec_test_secret").update(`${t}.${body}`).digest("hex")}`;
+    expect((await SELF.fetch(`${BASE}/v1/stripe/webhook`, { method: "POST", headers: { "stripe-signature": sig, "content-type": "application/json" }, body })).status).toBe(200);
+    expect((await billingOf(x.accountId))?.plan).toBe("pro"); // routed to X
+    expect((await billingOf(shell))?.cust).toBeNull(); // shell NOT re-bound (the split-brain that the fix prevents)
+  });
+
+  test("idempotent replay: re-running the saga after a completed move does nothing (no second Stripe call, no double-bind)", async () => {
+    const shell = `acct_idem_shell_${Math.random().toString(16).slice(2, 8)}`;
+    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'pro', 'web', ?)").bind(shell, Date.now()).run();
+    await setBilling(shell, "cus_idem", "sub_idem", "pro");
+    const x = await bootstrap("acct-idem-x");
+    await withStripe(async () => {
+      expect(await repointBillingToAccount(env, shell, x.accountId, Date.now())).toBe("repointed");
+      const afterFirst = stripeCalls.length;
+      expect(afterFirst).toBeGreaterThan(0);
+      // Replay: the shell is now billing-empty → nothing to migrate, no Stripe call.
+      stripeCalls.length = 0;
+      expect(await repointBillingToAccount(env, shell, x.accountId, Date.now())).toBe("not_migratable");
+      expect(stripeCalls.length).toBe(0);
+    });
+    expect((await billingOf(x.accountId))?.sub).toBe("sub_idem"); // exactly one sub on X (no double)
+  });
+
+  test("destination_has_subscription: confirm BLOCKS (409, never merges) when X already has a sub; no Stripe write", async () => {
+    const sub = "user_repoint_destsub";
+    const shell = await webShell(sub);
+    await setBilling(shell, "cus_ds", "sub_ds", "pro");
+    const x = await bootstrap("acct-destsub-x");
+    await setBilling(x.accountId, "cus_x_existing", "sub_x_existing", "solo"); // X already pays
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, code);
+    await withStripe(async () => {
+      const cf = await confirmDirect(sub, pollKey);
+      expect(cf.status).toBe(409);
+      expect(((await cf.json()) as { error: string }).error).toBe("destination_has_subscription");
+      expect(stripeCalls.length).toBe(0); // blocked in preflight, before any metadata update
+    });
+    expect(await clerkMap(sub)).toBe(shell); // not rebound
+    expect((await billingOf(x.accountId))?.sub).toBe("sub_x_existing"); // X's sub untouched
+  });
+
+  test("non-billing shell state still BLOCKS even with billing present (saga never half-moves a shell that would block anyway)", async () => {
+    const sub = "user_repoint_dirty";
+    const shell = await webShell(sub);
+    await setBilling(shell, "cus_dirty2", "sub_dirty2", "pro");
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES ('ws_rp_dirty','root',?,?)").bind(shell, Date.now()).run();
+    const x = await bootstrap("acct-repoint-dirty-x");
+    const { code, pollKey } = (await (await linkStart(sub)).json()) as { code: string; pollKey: string };
+    await linkRedeem(x.token, code);
+    await withStripe(async () => {
+      const cf = await confirmDirect(sub, pollKey);
+      expect(cf.status).toBe(409);
+      expect(((await cf.json()) as { error: string }).error).toBe("origin_account_has_state");
+      expect(stripeCalls.length).toBe(0); // ignoreBilling check fails (workspace) → saga not run
+    });
+    expect((await billingOf(shell))?.sub).toBe("sub_dirty2"); // billing NOT moved off the shell
+    expect((await billingOf(x.accountId))?.sub).toBeNull();
   });
 });
 

@@ -428,7 +428,26 @@ installed base:
   ceremony (which stays dashboard→CLI for takeover-safety, §5.2). The Slice-0
   route gate already permits a durable token on `/v1/billing/*` (default-deny
   applies only to `kind=='web'`), so no gate change is needed for the primary
-  path.
+  path. **Note (review caveat):** the gate still also permits a *web* token on
+  `/v1/billing/*` — billing is intentionally reachable from both clients. "No
+  shell" is a property of the CLI `rbox subscribe` *path* (a durable token on X),
+  not an exclusivity property of the billing API.
+
+- **Double-charge guard (server-side, defends BOTH web and CLI).** `billingCheckout`
+  today has **no** guard against an account that *already* has an active
+  subscription — it reuses the customer (avoiding duplicate customers) but a second
+  checkout still creates a **second subscription on the same customer → a double
+  charge**. The web app only avoids this by hiding the button client-side; `rbox
+  subscribe` would walk straight into it. So `billingCheckout` **must 409
+  `already_subscribed`** (pointing at the portal) when the account already carries
+  a live subscription. Key the guard on **`stripe_subscription_id IS NOT NULL`** —
+  the reliable signal (set at checkout / `subscription.created`, cleared on
+  `subscription.deleted`, `stripe.ts:205`); `plan != 'free'` is a secondary tell. A
+  **canceled-but-in-grace** account has `stripe_subscription_id IS NULL` +
+  `grace_until` set and **must be allowed to re-subscribe**, so the guard keys on
+  `stripe_subscription_id`, never on `grace_until`. `rbox subscribe` surfaces the
+  409 as a friendly "you're already subscribed — `rbox billing` to manage" (exit 0,
+  not an error).
 - **FALLBACK — the re-point saga (§3.4.2).** For users who *already* subscribed on
   a web shell before `rbox subscribe` existed, the link must still move that
   subscription onto X. That is the re-point saga below. It is the **fallback**,
@@ -467,25 +486,39 @@ the subscription's Stripe metadata too**, so *both* routing keys point at X.
    Re-running sets the identical value — Stripe PATCH semantics make this a no-op
    on replay. Gated on `STRIPE_SECRET`; if billing isn't provisioned the saga
    can't run → fall back to the block.
-3. **D1 commit (one atomic `batch`, CAS-guarded).** Move the **full** billing set —
-   `stripe_customer_id, stripe_subscription_id, plan, grace_until,
-   extra_storage_bytes` — onto X **only if X is still billing-empty**
-   (`WHERE id=X AND stripe_customer_id IS NULL`), and clear those columns on the
-   shell **only if they still hold the values we read** (CAS on
-   `stripe_subscription_id`), so a racing webhook can't clobber the move.
+3. **D1 commit (one atomic `batch`, CAS-guarded — replay/race-safe).** Move the
+   **full** billing set — `stripe_customer_id, stripe_subscription_id, plan,
+   grace_until, extra_storage_bytes` — onto X with a claim guard that tolerates a
+   **webhook having already bound the same customer to X** (the race below):
+   `UPDATE accounts SET …<billing> WHERE id=X AND (stripe_customer_id IS NULL OR
+   stripe_customer_id = ?cust)`. Then **unconditionally clear the shell's billing**
+   with a CAS on the subscription it still carries: `UPDATE accounts SET
+   stripe_customer_id=NULL, stripe_subscription_id=NULL, plan='free',
+   grace_until=NULL, extra_storage_bytes=0 WHERE id=shell AND stripe_subscription_id
+   = ?sub`. The shell-clear is the load-bearing half: it always runs once Stripe
+   says X owns the sub, so the shell can never keep a stale customer the
+   `subscription.deleted` guard would later match.
 4. **Reclaim the shell** (the existing §3.4 confirm batch — the shell is now
    billing-empty, so `isReclaimableShell` passes).
-5. **On any failure → block, never half-move.** The Stripe step before the D1
-   move means a failure leaves billing fully on the shell (retryable); a D1 move
-   after a successful Stripe update leaves both routing keys on X (also a
-   consistent, replayable state). Block stays the always-safe fallback.
+5. **On any failure → retryable, never a stuck half-move.** Because the Stripe
+   metadata update lands **first**, a failure *after* it leaves billing's routing
+   pointed at X (both keys, once D1 lands) — **not** "fully on the shell." That is
+   deliberate and safe: re-running `confirm` re-reads, finds the shell now
+   billing-empty (or the D1 move idempotently re-applies via the
+   `stripe_customer_id = ?cust` arm), reclaims, and completes. A failure *before*
+   the Stripe step leaves everything on the shell (the link simply blocks and is
+   retried). There is no state in which a renewal can re-bind to the shell.
 
 The order **Stripe-first, D1-second** is deliberate: the Stripe metadata update is
 the irreversible-once-renewed routing decision, so it must land before D1 claims
-the customer for X. A webhook arriving between step 2 and step 3 carries
-`metadata.account_id=X` and the guard `(X.stripe_customer_id IS NULL OR = cust)`
-holds (X is still billing-empty pre-move, then becomes `= cust`), so it routes to
-X either way — never back to the shell.
+the customer for X. **The webhook race (called out by review):** a
+`customer.subscription.updated` arriving between step 2 and step 3 routes by
+`metadata.account_id = X` and its guard `(X.stripe_customer_id IS NULL OR = cust)`
+holds (X is billing-empty pre-move) → it **binds the customer onto X early**. The
+step-3 claim must therefore *also* accept `stripe_customer_id = cust` (not only
+`IS NULL`), and the **shell-clear must be unconditional-on-the-sub** so the shell
+is emptied regardless of who set X first. Either way both routing keys end on X;
+the shell never re-binds.
 
 ---
 
