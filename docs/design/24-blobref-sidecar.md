@@ -11,7 +11,16 @@ repo is ~350 KB; we raised `MAX_COMMIT_BODY` to 1 MB (≈12k blobs) but a 50k-fi
 ## Target
 The signed body carries a **hash + count + totalBytes** of a canonical blobRef **sidecar**;
 the sidecar is a normal content-addressed R2 object the client uploads before commit. The
+`sidecarSha` is the hash of the full canonical ref set (unique, sorted blobRefs), not a
+per-blob checksum and not a checksum of whatever R2 storage layout happens to hold it. The
 signature still covers the sidecar hash → integrity preserved. Body size becomes O(1).
+
+This matches the useful precedent from Dropbox/Git/Syncthing: identity is derived from
+canonical content/metadata bytes, while the backend may store those bytes as one object,
+packed objects, buckets, or some later optimized layout without changing the identity.
+For v1, the 50k-file target is small enough for a single immutable R2 sidecar object
+(~2 MB with the binary encoding). Packing/chunking sidecars is a future storage
+optimization only if measurements show it is needed.
 
 ## Chunks
 | # | Chunk | What | Depends |
@@ -28,7 +37,9 @@ ship §24 in the same protocol pass so 50k-file repos work end-to-end.
 ## Key risks
 - **GC correctness** — `versions.ts` GC currently derives reachable blobs from inline body
   refs. It must now fetch sidecars for retained commits (or maintain a compact retained-root
-  index). Getting this wrong = data loss or storage bloat. (18.3, codex-review.)
+  index). GC must fail closed: if any retained sidecar is missing, corrupt, or unparseable,
+  the pass aborts before condemning anything; the sidecar object itself is a root while its
+  commit is retained. Getting this wrong = data loss or storage bloat. (18.3, codex-review.)
 - **Sidecar availability** — a commit's sidecar must exist in R2 before head advances (treat
   it like any referenced blob: present-or-422).
 

@@ -10,7 +10,7 @@ existing commit on the server has inline refs and must keep verifying (the chain
 hash-linked and immutable).
 
 ## Design — dual-mode body
-The body gains an optional sidecar descriptor; exactly one of the two forms is present:
+The body gains an optional sidecar descriptor; **exactly one** of the two forms is present:
 ```
 CommitBody {
   …existing fields…
@@ -21,9 +21,12 @@ CommitBody {
 }
 ```
 - New clients emit `blobRefset` (sidecar). Old commits keep `blobRefs`.
-- The canonical-JSON signing input includes whichever field is present (JCS over the body
-  as-is) — no change to the signing/verify mechanism, just the schema.
-- A gate (`bodyVersion` or presence of `blobRefset`) tells the server which path to take.
+- The canonical-JSON signing input includes whichever single field is present (JCS over the
+  body as-is) — no change to the signing/verify mechanism, just the schema. A signature never
+  floats over an implied/default ref set.
+- The server derives the mode from presence: `blobRefs` means legacy inline, `blobRefset`
+  means v2 sidecar. Bodies with both fields or neither field are malformed and are rejected
+  before grant, quota mutation, or head advance.
 
 ## Validation parity
 - `normalizeBlobRefs` invariants (unique, sorted, valid encSha, valid size) move to the
@@ -33,18 +36,21 @@ CommitBody {
 ## Migration / compatibility
 - **Read path:** verify accepts both forms (old commits in the chain stay valid forever).
 - **Write path:** new CLI always writes `blobRefset`. A min-CLI-version gate ensures the
-  server understands it before clients emit it.
+  server understands it before clients emit it, and the server still enforces exactly-one
+  mode for every write before advancing head.
 - No data migration of existing commits (immutable, still valid). Only new commits change.
 
 ## Correctness
 - The body still commits to the full ref set — via `sidecarSha` instead of inline bytes —
-  so signature integrity + anti-tamper are unchanged.
+  so signature integrity + anti-tamper are unchanged. `sidecarSha` names the whole canonical
+  sidecar bytes, not individual payload blobs or an R2 storage checksum.
 - `count`/`totalBytes` in the body let the server bound work + pre-check quota WITHOUT
   fetching the sidecar (cheap reject before the R2 GET).
 
 ## Tests
-- Old inline commit verifies unchanged. New sidecar commit verifies. A body with neither /
-  both → reject. Tampered `sidecarSha` → fetch+hash mismatch (§24.3) → reject.
+- Old inline commit verifies unchanged. New sidecar commit verifies. Bodies with both
+  `blobRefs` and `blobRefset`, or with neither field, reject before grant/quota/head advance.
+  Tampered `sidecarSha` → fetch+hash mismatch (§24.3) → reject.
 
 ## Depends on / Status
 Depends on: §24.1. Status: **design**. Pairs with §23 (the commit handler reads this).

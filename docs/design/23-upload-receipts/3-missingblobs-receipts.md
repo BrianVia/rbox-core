@@ -1,51 +1,69 @@
-# §23.3 — `missingBlobs` returns receipts for already-present blobs
+# §23.3 — `missingBlobs` stays no-oracle; receipts stay client-held
 
 > Chunk of [§23](../23-upload-receipts.md). Depends on [§23.1](1-receipt-primitive.md).
-> Closes the "present in R2 but unentitled to me" gap so the client never re-uploads
-> existing content yet can still reference it at commit.
+> Keeps the M7 "unentitled sees missing" guarantee while letting a client use receipts it
+> already earned from upload.
 
 ## Problem
-`missingBlobs` (`blobs.ts:32`) is called *before* uploading to decide what to PUT. With
-receipts, three states exist per encSha:
-1. **absent** in R2 → client must upload (PUT → receipt).
-2. **present in R2, already entitled** to this account → reference directly at commit
-   (the `blob_refs` row exists). No upload, no receipt needed.
-3. **present in R2, NOT entitled** to this account (prior abandoned push, or convergent
-   dedup across accounts) → client should NOT re-upload, but has nothing to present at
-   commit. **This is the gap.**
+`missingBlobs` (`blobs.ts:32`) is called before uploading to decide which refs still need
+proof. §07 makes the privacy contract load-bearing: an unentitled caller must not learn
+whether a sha exists globally in R2. The old "present but unentitled → return receipt"
+shape would turn `missingBlobs` into a cross-account existence oracle.
 
 ## Design
-`missingBlobs` returns three buckets instead of one:
+`missingBlobs` remains account-scoped:
 ```
 POST /v1/blobs/check  { shas: [...] }
-→ { missing: [...],                  // absent in R2 → upload
-    present: [{ sha, receipt }, ...], // in R2, not entitled → carry receipt to commit
-    // (entitled shas are simply omitted: nothing to do)
-  }
+→ { missing: [...], quota: { used, cap, remaining } }
 ```
-For each `present` sha the server confirms R2/`blobs` existence and **mints a receipt**
-(§23.1) so the client can reference it at commit without uploading.
+- Entitled and not condemned: omitted. The client can reference it at commit with no
+  receipt because `blob_refs(account_id, sha256)` already exists.
+- Not entitled: returned in `missing`, even if the object exists globally in R2 or in
+  `blobs`. The client must either already hold a valid same-account upload receipt for
+  that sha+size, or upload the bytes to get one.
+- In `gc_candidates`: returned in `missing`. Candidate rows are not resurrected by check or
+  PUT; only a successful commit deletes them atomically (§23.4).
+- Advisory quota is returned here (§23.5). It is a user-experience preflight, not a
+  reservation and not the authoritative cap gate.
 
-It also returns advisory quota (§23.5): `{ used, cap, remaining }`.
+Implementation order must avoid timing/existence leaks:
+1. Query `blob_refs` for the caller's account and requested shas.
+2. Treat every non-entitled sha as `missing` without probing R2/global `blobs`.
+3. For entitled shas only, apply `gc_candidates` filtering so condemned content is treated
+   as needing a fresh proof path.
 
-## Why mint here (not let commit R2-head each blob)
-Alternative: commit verifies "present" refs by R2 `head` per blob. That reintroduces a
-per-blob server op at commit (the thing we're removing). Minting the receipt in the
-already-happening `check` call (which already does the `blobs IN (…)` lookup) is free-ish
-and keeps commit to O(chunks).
+## Why not mint receipts here
+Minting a receipt from global R2/`blobs` presence would assert "the platform has this sha"
+to an account that has not proved possession. That violates §07's rule that unentitled
+callers always see missing/404 and cannot distinguish "absent" from "belongs to another
+account."
+
+Receipts are therefore minted only after the server observes the caller upload hash-verified
+bytes (§23.2). If a client loses a receipt, it re-uploads; the R2 write is idempotent by key,
+and the extra bandwidth is the cost of preserving the no-existence-oracle guarantee. Commit
+also does not R2-`head` each ref, because that would reintroduce per-blob content-store work
+into the metadata-journal path (§23.4).
 
 ## Correctness
-- A receipt minted for a `present` blob asserts existence at check time; if GC condemns it
-  between check and commit, commit's `DELETE gc_candidates` + the `blobs` row keep it alive
-  (resurrect). RECEIPT_TTL < GC grace guarantees the window is safe (§23.5).
-- Entitlement is still NOT granted by `check` — only commit grants. `present` just means
-  "don't re-upload."
-- Privacy: returning "present" reveals cross-account byte-equality, which convergent
-  encryption already leaks within a key epoch (documented). No new leak.
+- No cross-account `present` bucket. `missing` intentionally conflates physically absent,
+  globally present-but-unentitled, and GC-condemned from the caller's perspective.
+- A same-account abandoned upload is usable only if the client still has the upload receipt.
+  If not, it must upload again and get a fresh receipt. This preserves privacy over the
+  optimization of avoiding all duplicate uploads.
+- Entitlement is still NOT granted by `check` — only commit grants. `check` is a planning
+  endpoint and advisory quota source.
+- Candidate-aware checks stay safe without PUT-side metadata writes: a condemned sha is
+  reported missing; a later successful commit deletes the candidate row, while a failed or
+  abandoned push leaves the object for orphan/candidate GC (§23.5).
 
 ## Tests
-- absent → `missing`; entitled → omitted; present-unentitled → `present` with a valid
-  receipt that §23.4 accepts. Quota fields present. Tampered returned receipt → commit rejects.
+- Absent → `missing`; entitled → omitted; globally present but unentitled → `missing`
+  with no receipt and indistinguishable body/status/timing budget from absent.
+- Entitled + `gc_candidates` → `missing`; successful commit with a valid receipt clears the
+  candidate; failed/over-cap commit does not.
+- Valid client-held PUT receipt for a `missing` sha is accepted by §23.4; tampered/expired
+  receipt is rejected.
+- Quota fields present and marked advisory; racing commit can make them stale.
 
 ## Depends on / Status
 Depends on: §23.1. Status: **design**. Required by §23.4 (commit accepts these receipts).

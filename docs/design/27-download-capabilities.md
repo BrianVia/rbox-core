@@ -10,33 +10,91 @@ entitlement reads on the pull path — the download-side mirror of the upload D1
 
 ## Target
 After the client verifies `latest()`/the commit (it already fetches + verifies the signed
-commit + sidecar), the server issues **short-lived capability tokens** scoped to that
-commit's blob set (or batches of it), so each subsequent blob GET is authorized by the
-**capability** (HMAC verify, no D1) instead of a per-blob D1 entitlement read.
+commit + sidecar), the server issues **short-lived capability tokens** scoped to the exact
+commit + sidecar root. Each subsequent blob GET is authorized by the **capability** (HMAC
+verify + sidecar membership, no per-blob D1) instead of a per-blob D1 entitlement read.
 
-## Sketch (to be chunked at scheduling time)
-- Reuse the §23.1 receipt/HMAC primitive: a **download capability** = HMAC over
-  `{accountId, scope, exp}` where `scope` is the commit's sidecarSha (or a batch root), so it
-  authorizes GET of any blob referenced by that commit the account is entitled to.
-- `latest()`/a `GET /v1/caps?commit=…` returns the capability after confirming the account is
-  entitled to that commit (one check, not per-blob).
-- `blobGet` accepts `?cap=` → verify HMAC + scope membership (the sha is in the scoped set)
-  + not expired → serve from R2. No D1.
-- Membership check without D1: the cap is scoped to a sidecarSha the client already has; the
-  server can verify "this sha ∈ that sidecar" cheaply if it caches/recomputes — OR scope the
-  cap to the account+epoch and rely on the fact that a clone only requests blobs it learned
-  from a verified manifest. Pick the model that keeps "unentitled → 404" intact (the key
-  property to preserve — codex-review this).
+Uncommitted uploads/sidecars are not pull-visible. Download capability issuance starts only
+from committed metadata the caller is already authorized to read.
 
-## Risks / open
-- **Must preserve the no-existence-oracle property** (M7): a cap must not let an account GET a
-  blob it isn't entitled to, nor reveal existence. This is the load-bearing security concern.
-- Revocation/expiry: caps are short-lived; a revoked device's caps expire fast. TTL vs UX.
-- GC interaction: a cap referencing a blob GC condemned mid-pull → 404 (acceptable; client re-pulls).
+## Decision
 
-## Chunks (when scheduled)
-21.1 capability format + scope model · 21.2 issue endpoint (one entitlement check) ·
-21.3 `blobGet` cap path (no D1) + the no-oracle proof. **Security-review heavy** — codex.
+### Authorization boundary
+Capability issuance is the only D1 authorization boundary:
+- `latest()` or `GET /v1/caps?commit=...` authenticates the caller and confirms the §07
+  workspace membership / role / entitlement to that committed metadata (one check, not
+  per-blob). Unauthorized workspace or commit access returns §07's indistinguishable 404
+  before any sidecar or R2 lookup.
+- The server fetches and validates the sidecar using §24.3 semantics: the sidecar object
+  must exist, `sha256(bytes) == sidecarSha`, and parse invariants must hold.
+- Missing, corrupt, or unparseable sidecar at issuance fails closed: issue no capability,
+  alert, and return a generic `503 cap_unavailable` to the already-authorized client. Never
+  mint a partial cap.
+- Reuse the §23.1 receipt/HMAC primitive: a **download capability** is HMAC-signed over
+  `{v, accountId, workspaceId, commitSha, sidecarSha, exp}`. The canonical scope is the
+  `commitSha` + `sidecarSha` pair.
+
+A download cap is not an account-wide grant. Do **not** use `account+epoch` as the default
+boundary, and do not treat a content hash as authorization; hashes provide integrity and
+equality, while authorization is the issuance decision tied to committed metadata.
+
+### Scope and membership
+- `blobGet?cap=...` verifies the HMAC and `exp`, then resolves `sidecarSha` to the parsed
+  immutable sidecar set. The cache key is `sidecarSha`, populated only after the §24 hash
+  and parse checks pass.
+- Membership truth for `blobGet` is exactly: `requestedSha in parsedSidecar.encShaSet`.
+  This check happens before any R2 read and replaces the per-blob D1 entitlement read on
+  the cap path.
+- There is no separate signed inclusion proof in v1. Add one only as future work if
+  sidecar parse/cache cost becomes a measured problem.
+- Batch roots may exist only as an internal packing optimization. A batch root must be a
+  deterministic content-addressed set of exact `{commitSha, sidecarSha}` roots; the server
+  expands it to those roots, and membership still bottoms out in parsed sidecar sets. It
+  must never mean "all blobs for account X" or "all blobs during epoch Y."
+
+### Revocation, expiry, and missing blobs
+Choose fast age-out, not immediate revocation on `blobGet`, so the hot pull path stays
+D1-free:
+- Maximum capability TTL: 60 seconds. Device/account revocation or epoch bump is enforced
+  at issuance, so revoked principals cannot receive new caps. Caps already issued before
+  revocation remain usable until `exp`.
+- Residual risk: a just-revoked principal can finish downloading blobs in an already-issued
+  commit/sidecar-root cap for at most the TTL. It still cannot learn blobs outside that
+  sidecar root because membership is checked before R2. If policy later requires instant
+  kill, add a revocation-epoch cache/denylist as a separate design and account for that new
+  hot-path lookup.
+- `blobGet` returns the same 404 status/body for invalid HMAC, expired caps, membership
+  misses, missing R2 blobs, GC-condemned blobs, and unauthorized requests. Missing or
+  condemned in-scope blobs are not retried through global existence or entitlement checks;
+  the client refreshes metadata/caps and re-pulls.
+
+## No-oracle proof sketch
+1. Without a valid cap, the existing §07 blob path remains: entitlement is checked before
+   R2 and unentitled callers get indistinguishable 404.
+2. With a valid cap, the only authorized blob universe is the parsed sidecar set committed
+   by the signed commit body (§24.1/§24.3). A guessed sha outside that set fails membership
+   before R2, so it cannot reveal whether the platform stores that blob.
+3. A guessed sha inside that set is already in committed metadata the cap holder was
+   authorized to read. If the object is missing or GC-condemned, the response is still the
+   same 404, so physical storage state is not exposed as a separate oracle.
+
+## Chunks / tests (when scheduled)
+- **27.1 capability format + scope model:** HMAC fields above, `commitSha` + `sidecarSha`
+  canonical scope, explicit rejection of account-wide / epoch-wide caps, optional internal
+  batch-root packing only for exact sidecar roots.
+- **27.2 issue endpoint:** one §07 authorization check; fetch/verify/parse sidecar per
+  §24.3; missing/corrupt sidecar issues no cap and alerts.
+- **27.3 `blobGet` cap path:** HMAC/expiry check, sidecar parse-cache lookup, `sha in
+  parsed sidecar set` before R2, no per-blob D1.
+- **27.4 security tests:** non-member sha with valid cap returns the same 404 and performs
+  no R2 read; missing R2 object and GC-condemned object return indistinguishable 404;
+  expired cap returns indistinguishable 404; revoked device cannot mint new caps and any
+  old cap ages out within TTL; missing/corrupt sidecar at issuance mints no cap; batch-root
+  cap rejects blobs not present in one of its exact parsed sidecar roots.
+
+**Security-review heavy**: the load-bearing properties are the single issuance boundary,
+parsed-sidecar membership truth, short TTL revocation semantics, and 404-before-R2
+no-existence-oracle behavior.
 
 ---
 

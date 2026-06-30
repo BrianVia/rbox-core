@@ -117,6 +117,15 @@ now; scalability is a server-side problem.**
 - **Move blobRefs out of the signed commit body** → side R2 object referenced by
   hash. Unlocks 50k-file monorepos (the 1 MB cap is interim). Architectural —
   design + codex review first.
+- **Future pull-side blocklist / delta-index work**: after the server-D1 P0 lands
+  and measurements say pull remains transfer-bound, evaluate block-level content
+  hashes and rsync/Syncthing-style indexes so clients can fetch only missing
+  blocks instead of whole encrypted blobs. This is explicitly **not** part of the
+  current server-D1 P0 commit-time accounting fix.
+- **Future streaming overlap**: after the same P0 + measurement gate, consider a
+  blocklist → need-blocks → upload/download overlap so clients can pipeline
+  metadata negotiation and blob transfer. This is also **not** part of the
+  current server-D1 P0.
 - **Encrypt double-pass**: `encryptFileToTemp` hashes plaintext then ciphertext;
   the scan already computed the plaintext sha — reuse it? (bench the win first)
 - **chain-verify growth** on pull (`verifyCommitChain` is history-linear) — needs a

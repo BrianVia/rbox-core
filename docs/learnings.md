@@ -14,6 +14,15 @@ First real-repo test (vs the tiny e2e fixtures) exposed five issues the fixtures
 - **chokidar v5 `ignored` (function form) PRUNES directories — verified.** A tiny watcher test confirmed `node_modules/`+`dist/` produce ZERO events (never descended) while real files fire. So passive/watch mode scales without watching regenerable trees; the matcher must return true for the DIR form (trailing slash) which our `ignored` fn does via `stats.isDirectory()`.
 - **Process win:** dogfooding found these in minutes by `diff -rq` of a real clone vs source. The first non-empty-content diff would have been a real bug; the only legitimate diffs are builtin-ignored dotfiles (`.env`, `.DS_Store`). Keep a "pull into fresh dir, diff vs source" smoke for sync work.
 
+## 2026-06-29 — Addendum: dogfood confirms the blob/journal split
+
+The savvy-core run rhymes with Dropbox, Git, Syncthing, and rsync: **content should stay immutable + content-addressed; mutable ordering, reachability, quota, and access accounting belong in metadata.** The fixes above should reinforce that boundary, not rewrite the design.
+
+- **R2 blobs stay dumb and stable.** Duplicate-content files, 0-byte files, and canonical upload verification all point to the same rule: the blob address is a hash of verified bytes, never a path, sequence, owner, or temp/upload attempt.
+- **Metadata carries mutability.** File path→blob mapping lives in the manifest; commit order/head lives in the DO; entitlement/quota/GC state lives in D1. Keep blobRefs as the unique blob set a commit needs, then move bulky ref lists to a hash-referenced sidecar instead of bloating the signed commit body.
+- **No-oracle boundaries still hold.** Cross-account "missing" must remain indistinguishable from absent content; upload/receipt/commit-time accounting can batch work, but it cannot turn global content-addressing into a presence oracle or let metadata advance without account-scoped possession.
+- **Streaming overlap and block/delta work are follow-ups, not a redesign.** Current whole-file blob sync is now viable with bounded transfer concurrency. Later prefetch/overlap, small-block batching, or rsync-style deltas should be measured protocol additions on top of the blob/journal split, not a replacement for it.
+
 ## 2026-06-27 — Billing (Stripe) + web auth (Clerk), provisioned via Stripe Projects
 
 - **Stripe Projects (`projects.dev`) provisions OTHER services (auth/db/hosting), NOT Stripe payments for your own product.** Payments = the regular `stripe` CLI authed to your account (`stripe config --list` shows test+live keys). Don't confuse the two.

@@ -14,7 +14,7 @@ Dropbox’s useful lesson is not “use their infra”; it is the separation of 
 
 Dropbox’s older sync protocol also had the same shape rbox wants: commit blocklist, receive “need blocks”, upload blocks, retry/finish commit. Crucially, the block data server is just hash-to-encrypted-content, while metadata/namespace sequencing is elsewhere. ([dropbox.tech](https://dropbox.tech/infrastructure/streaming-file-synchronization)) rbox should borrow the batching/journal shape, not Dropbox’s plaintext namespace model.
 
-Nucleus reinforces that correctness comes from a strict data model and one clear control thread for coordination. rbox’s WorkspaceSync DO is the right primitive for per-workspace commit sequencing. Do not weaken that with KV or Queue-based commit advancement. ([dropbox.tech](https://dropbox.tech/infrastructure/-testing-our-new-sync-engine))
+Nucleus reinforces that correctness comes from a clean data model, stable identifiers, tight invariants, and simple control flow. For rbox, the WorkspaceSync DO is the right place to enforce those invariants and sequence each workspace’s commits. Do not weaken that by moving commit advancement to KV or Queues. ([dropbox.tech](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine))
 
 The Dropbox metadata caching lesson also matters: clients relied on read-after-write metadata semantics, so weak caches were not acceptable. ([dropbox.tech](https://dropbox.tech/infrastructure/meet-chrono-our-scalable-consistent-metadata-caching-solution)) For rbox, KV is fine for read-mostly non-authoritative data, but wrong for commit heads, entitlements, GC condemnation, or quota.
 

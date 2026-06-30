@@ -277,12 +277,13 @@ but nowhere near sufficient. The review gate on every telemetry PR is this expli
   privacy-scoped, rotating identifiers — not the raw principal/device id.
 - **No blob/commit hashes, upload IDs, bearer tokens, raw URLs, or request/response/error
   bodies** in logs or analytics. These are direct content/identity handles.
-- **Sizes and counts are sensitive, bucket them.** The commit body already exposes `blobRefs`,
+- **Sizes and counts are sensitive as labels.** The commit body already exposes `blobRefs`,
   sizes, `encManifestSha`, sequence, epoch, and device id to the server
   (`apps/api/src/workspace-sync.ts:134`), and convergent blob encryption deliberately leaks
-  byte-equality within a workspace/key epoch (`src/engine/crypto.ts:10`). Telemetry must treat
-  exact sizes/counts as the sensitive metadata they are — emit size **buckets** and duration
-  **buckets**, not raw values, and define retention + sampling explicitly.
+  byte-equality within a workspace/key epoch (`src/engine/crypto.ts:10`). Log fields and
+  analytics dimensions use coarse buckets only. Analytics Engine numeric measures may keep
+  raw durations, sizes, counts, and ratios so percentiles remain queryable; do not mirror
+  those raw values into dimensions, logs, IDs, paths, hashes, tokens, or raw request material.
 
 This is non-negotiable and reviewed per-PR against the list above.
 
@@ -311,16 +312,22 @@ The Worker has almost no observability (`apps/api/src/`). Add, in priority order
 1. **Structured logging + request IDs.** One JSON log line per request: `reqId`, **templated**
    route (params stripped — `/v1/ws/{ws}/...`, never the raw path), status, duration,
    size-bucket, coarse/rotating principal, and `r2Ms`/`d1Ms`/`doMs` sub-timings. Replaces the
-   ad-hoc `console` calls. **Never** log raw URLs, bodies, tokens, blob/commit SHAs, upload IDs,
-   or raw error strings (per §5 ban list).
+   ad-hoc `console` calls. Emit it for early 4xx validation failures too; request rows/logs
+   are the source of truth for total request counts. **Never** log raw URLs, bodies, tokens,
+   blob/commit SHAs, upload IDs, or raw error strings (per §5 ban list).
 2. **Per-operation latency to Workers Analytics Engine.** Cheap, built-in, queryable.
    Dimensions: route, op (`blobPut`/`multipart*`/`commit`/`pull`), status, size-bucket.
    Blobs (`apps/api/src/blobs.ts:52,83-200`) and the DO `transactionSync`
-   (`apps/api/src/workspace-sync.ts`) are the must-instrument paths.
+   (`apps/api/src/workspace-sync.ts`) are the must-instrument paths. Op rows describe work
+   that actually ran, so some early 4xxs intentionally have only a request row.
 3. **Tail Worker** for error/exception aggregation + slow-request sampling (log requests
    over a p99 threshold with their sub-timings).
 4. **DO contention metrics.** 409 rate and `transactionSync` hold time — this is the
    sharpest "it's slow under concurrency" signal and currently invisible.
+5. **§23/§24 validation signals.** Add stale-receipt reject counts, orphan candidate/deletion
+   counts, sidecar fetch/parse latency, and GC sidecar fail-closed abort counts when those
+   paths land. These are observability hooks for the accepted designs, not architecture
+   changes.
 
 ### 5.3 Surfacing "what is slow"
 
@@ -331,6 +338,9 @@ The Worker has almost no observability (`apps/api/src/`). Add, in priority order
   **only where the unit is identical** — define the byte/duration basis first (§3.1), then
   unify names. A synthetic `bytesPerSec` and a prod `bytesPerSec` that mean different bases
   (plaintext vs wire) is worse than two clearly-different names.
+- **Future, out of core §25:** blocklist/streaming-overlap metrics belong in a later protocol
+  pass. If added, keep them bounded and low-cardinality: prefetched block counts, prefetch
+  cache size buckets, hit/miss rates, and block-index/download-progress overlap.
 
 ## 6. CI integration & regression gating
 
@@ -395,10 +405,11 @@ retention + no-p99-from-tiny-N (§3), the per-iteration reset contract (§3), co
 in the schema (§3.2), the "this is a Linux-VM client bench, not Mac↔Linux" honesty + ephemeral
 disk for cold runs + decorative second VM (§4), the metadata threat model replacing the privacy
 slogan — banning path hashes, raw IDs, raw routes, blob/commit hashes, and body/error logging
-(§5), the byte-basis-before-shared-names fix (§3.1/§5.3), report-only burn-in before CI gating
-(§6), moving server *timing* up to P1 (§8), and the missing bench classes (§2.2). Two factual
-errors it caught are corrected in §2.1 (chain-verify runs in `latest()`, not every
-`refreshAccount()`; `HASH_CONCURRENCY` lives in the drain path, not `hashFile`).
+while allowing raw numeric measures in AE blobs (§5), the byte-basis-before-shared-names fix
+(§3.1/§5.3), report-only burn-in before CI gating (§6), moving server *timing* up to P1 (§8),
+and the missing bench classes (§2.2). Two factual errors it caught are corrected in §2.1
+(chain-verify runs in `latest()`, not every `refreshAccount()`; `HASH_CONCURRENCY` lives in
+the drain path, not `hashFile`).
 
 ## 10. Open questions
 
