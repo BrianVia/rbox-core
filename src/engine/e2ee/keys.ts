@@ -31,6 +31,7 @@ export interface WrapContext {
   wrappedKeyKind: WrappedKeyKind;
   purpose: string;
   keyEpoch?: number; // present for KEK wraps
+  workspaceId?: string; // present for KEK wraps — binds the wrap to ITS workspace (key separation)
   recipientKeyHash?: string; // present for device (RSA) wraps — hash of the device enc pubkey
 }
 

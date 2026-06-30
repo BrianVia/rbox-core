@@ -136,7 +136,7 @@ describe("full E2EE — two machines + zero-knowledge server", () => {
     const account = await verifyAccount(server.rosters, server.keyStates, NOW + 2000);
     expect(account.rosters).toHaveLength(2); // genesis + B's admission
     const kekWrap = server.workspaceKeys.get(a.workspaceId)!;
-    const bKek = await openWorkspaceKey(redeem.secrets, kekWrap);
+    const bKek = await openWorkspaceKey(redeem.secrets, kekWrap, a.workspaceId);
     expect(toB64url(bKek)).toBe(toB64url(a.kek)); // B unwrapped the same KEK via paired MK
 
     const { commit } = server.latest();
