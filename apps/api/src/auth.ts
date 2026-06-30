@@ -19,7 +19,7 @@ const POLL_INTERVAL_S = 5;
 const LAST_SEEN_THROTTLE_MS = 10 * 60 * 1000;
 const USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
 
-function randomHex(bytes: number): string {
+export function randomHex(bytes: number): string {
   const b = new Uint8Array(bytes);
   crypto.getRandomValues(b);
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -66,7 +66,7 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
 }
 
 /** True when a D1/SQLite write failed a UNIQUE constraint (token_hash or device_id). */
-function isUniqueViolation(e: unknown): boolean {
+export function isUniqueViolation(e: unknown): boolean {
   return /UNIQUE constraint failed/i.test(String((e as Error)?.message ?? e));
 }
 
