@@ -45,20 +45,24 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   const token = header.slice(7);
   if (!TOKEN_RE.test(token)) return null; // reject malformed before hashing
   const hash = await sha256Hex(token);
+  // expires_at is now SELECTed (not just used in the WHERE) so we can derive the
+  // token KIND (design 21 §1.1): durable CLI token (expires_at IS NULL) vs a
+  // short-lived browser web session. The worker default-denies `web` off every
+  // crypto/sync/credential-mint route.
   const row = await env.rbox_dev_db
     .prepare(
-      `SELECT d.device_id, d.account_id, d.user_id, d.last_seen_at, m.role AS role
+      `SELECT d.device_id, d.account_id, d.user_id, d.last_seen_at, d.expires_at, m.role AS role
        FROM devices d LEFT JOIN memberships m ON m.account_id = d.account_id AND m.user_id = d.user_id
        WHERE d.token_hash = ? AND d.revoked = 0 AND (d.expires_at IS NULL OR d.expires_at > ?)`
     )
     .bind(hash, Date.now())
-    .first<{ device_id: string; account_id: string; user_id: string | null; last_seen_at: number | null; role: string | null }>();
+    .first<{ device_id: string; account_id: string; user_id: string | null; last_seen_at: number | null; expires_at: number | null; role: string | null }>();
   if (!row) return null;
   const now = Date.now();
   if (!row.last_seen_at || now - row.last_seen_at > LAST_SEEN_THROTTLE_MS) {
     await env.rbox_dev_db.prepare("UPDATE devices SET last_seen_at = ? WHERE token_hash = ?").bind(now, hash).run().catch(() => {});
   }
-  return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer" };
+  return { deviceId: row.device_id, accountId: row.account_id, userId: row.user_id, role: row.role ?? "viewer", kind: row.expires_at === null ? "durable" : "web" };
 }
 
 /** True when a D1/SQLite write failed a UNIQUE constraint (token_hash or device_id). */
@@ -237,7 +241,9 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   const now = Date.now();
   const accountId = `acct_${randomHex(8)}`;
   const userId = `user_${randomHex(8)}`;
-  await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, ?, 'free', ?)").bind(accountId, body.accountName ?? "account", now).run();
+  // origin='bootstrap' marks this as a crypto-anchored account (design 21 §3.2) —
+  // it is NEVER auto-reclaimable, even before any E2EE genesis lands.
+  await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, ?, 'free', 'bootstrap', ?)").bind(accountId, body.accountName ?? "account", now).run();
   await env.rbox_dev_db.prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
   await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");

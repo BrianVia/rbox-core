@@ -7,6 +7,12 @@ export interface Principal {
   accountId: string;
   userId: string | null;
   role: string; // owner | admin | editor | viewer (default 'owner' for the bootstrap account)
+  /** Token kind, derived from the device row's expiry (design 21 §1.1): a durable
+   *  CLI/device token (`expires_at IS NULL`) vs a short-lived browser web session
+   *  (`expires_at` set). The E2EE ceiling is only ENFORCED once routes can tell the
+   *  two apart — a `web` token is default-denied off every crypto/sync/credential-
+   *  mint route (see worker.ts `webTokenAllowed`). */
+  kind: "durable" | "web";
 }
 
 export type AuthzResult = { ok: true } | { ok: false; status: 404 | 403 };

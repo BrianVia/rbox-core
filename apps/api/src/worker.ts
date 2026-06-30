@@ -147,6 +147,15 @@ async function route(req: Request, env: Env): Promise<Response> {
   const p = await authenticate(req, env);
   if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
 
+  // DEFAULT-DENY token-kind route gate (design 21 §1.1): a short-lived browser
+  // `web` session may touch ONLY the exact-match allowlist below. Everything else —
+  // crucially the credential-mint routes (`pair/create`, `device/approve`,
+  // `POST /v1/workspaces`) and all crypto/sync surfaces — is 403, so a web token
+  // can never escalate into a durable credential and bypass the E2EE ceiling.
+  if (p.kind === "web" && !webTokenAllowed(req.method, seg)) {
+    return jsonResponse({ error: "forbidden", message: "web session not permitted on this route" }, 403);
+  }
+
   // Account ops (scoped to the caller's account).
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "billing", "checkout"])) return billingCheckout(req, env, p);
@@ -290,6 +299,23 @@ export function routeTemplate(pathname: string): string {
     }
   });
   return masked.join("/");
+}
+
+/**
+ * The EXACT (method, path) pairs a `kind=='web'` token may reach (design 21 §1.1).
+ * Intentionally NOT a `GET /v1/account/*` wildcard — a future account GET must be
+ * added here deliberately, never exposed to the browser by path accident. The
+ * PUBLIC link routes (start/status/confirm) aren't here because they carry no rbox
+ * Principal (they're verified by Clerk JWT before authenticate, §4.1).
+ */
+function webTokenAllowed(method: string, seg: string[]): boolean {
+  if (method === "GET" && (eq(seg, ["v1", "account", "usage"]) || eq(seg, ["v1", "account", "status"]))) return true;
+  if (method === "POST" && (eq(seg, ["v1", "billing", "checkout"]) || eq(seg, ["v1", "billing", "portal"]))) return true;
+  if (method === "GET" && eq(seg, ["v1", "auth", "devices"])) return true;
+  if (method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "auth" && seg[2] === "devices" && seg[4] === "revoke") return true;
+  if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='durable' check
+  if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)
+  return false;
 }
 function badRequest(message: string): Response {
   return jsonResponse({ error: "bad_request", message }, 400);
