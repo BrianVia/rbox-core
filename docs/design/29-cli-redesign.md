@@ -106,6 +106,8 @@ DEPENDENCIES
   deps install [path] [--allow-build]   rebuild deps from synced lockfiles
   deps list [path]            list rebuildable projects (lockfiles found)
   deps check [path]           check this host is ready to rebuild deps
+  deps drift [path]           is this folder's install stale vs. its lockfile?
+  deps notify <install|uninstall|status|on|off>   shell-hook drift notifications
 
 DEVICES & ACCOUNT
   pair                        create a token to add another machine
@@ -269,7 +271,7 @@ drift from the dispatcher. This is presentation-only; no command's behavior chan
 ## `untrack` — new behavior
 
 ```
-rbox untrack [path] [--force]
+rbox untrack [path] [--force] [--purge-remote]
 ```
 
 Resolves the workspace root (like every path command), then **locally unbinds** it:
@@ -279,8 +281,137 @@ Resolves the workspace root (like every path command), then **locally unbinds** 
    exists** (other machines keep syncing; manage/delete it from the dashboard).
 
 Interactive runs confirm first (`Stop syncing ~/code/myapp? Local files stay. [y/N]`); `--force` skips
-the prompt for scripts. `untrack` is deliberately **local-only** — it never deletes remote data or
-revokes the device. (Open Q: optional `--purge-remote`.)
+the prompt for scripts. `untrack` is deliberately **local-only by default** — it never deletes remote
+data or revokes the device.
+
+**`--purge-remote` (explicit opt-in — founder-approved):** additionally deletes the *remote* workspace
+for the whole account. This is destructive across **every** machine tracking that workspace, so it
+double-confirms even under `--force` (printing the workspace id + a "this removes it everywhere, on
+all machines" warning) and requires the operator to type the workspace id to proceed. Omitting the
+flag always leaves the remote intact — the safe default.
+
+---
+
+## Dependency-drift notifications (new feature)
+
+The natural complement to "we sync the **lockfile**, not `node_modules`": when a manifest/lockfile
+changes (you pulled a teammate's `pnpm-lock.yaml`, or switched branches), your installed dependencies
+are now stale and you don't find out until something breaks at runtime. rbox should **notice and
+nudge** — never silently install.
+
+### Two tiers (founder's words)
+
+- **(a) Full** — detect the package manager and suggest the *exact* command:
+  `> dependencies changed in ./api — run \`pnpm install --frozen-lockfile\` to update.`
+- **(b) Simple fallback** — manager unknown/ambiguous, a one-liner:
+  `> \`Cargo.lock\` changed — re-install to get the latest dependencies.`
+
+**Hard rule (MF5 / surprise-avoidance): rbox NEVER runs an install.** It prints a copy-pasteable
+command; the human runs it. The drift check is pure `stat`/hash over local files — it never executes
+anything derived from synced (untrusted) content, consistent with the `deps install` hardening
+(`hydrate-cmd.ts` header).
+
+### Detection signal — staleness without an install hook
+
+We don't try to intercept every `npm install`. The robust, self-correcting signal is **lockfile
+content vs. the manager's install-output marker**:
+
+> A folder is **drifted** if its manifest+lockfile content-hash differs from what the install marker
+> reflects — concretely, the lockfile is newer than (or hashes differently from) the marker the
+> manager writes when it installs.
+
+Once the user runs the suggested command, the marker updates and the warning stops on its own — no
+state to manually clear. A small **global** dedupe store (`~/.config/rbox/deps-state.json`, see open
+Q 3) records, per absolute folder, the last lock-hash we *notified* for plus a `lastCheckedMtime`, so
+we nag **at most once per (folder, lock-hash)** and can skip the check entirely when nothing changed.
+
+### Manager-detection matrix
+
+Checked in this order; first manifest present wins for the "full" tier (multiple distinct ecosystems
+in one folder are all reported — see monorepos):
+
+| Ecosystem | Manifest + lock watched | Install marker (freshness anchor) | Full-tier command |
+|---|---|---|---|
+| pnpm | `package.json` + `pnpm-lock.yaml` | `node_modules/.modules.yaml` | `pnpm install --frozen-lockfile` |
+| yarn (berry) | `package.json` + `yarn.lock` + `.yarnrc.yml` | `node_modules/.yarn-state.yml` | `yarn install --immutable` |
+| yarn (classic) | `package.json` + `yarn.lock` | `node_modules/.yarn-integrity` | `yarn install --frozen-lockfile` |
+| npm | `package.json` + `package-lock.json` | `node_modules/.package-lock.json` | `npm ci` (lock present) else `npm install` |
+| bun | `package.json` + `bun.lockb` | `node_modules/.bun-tag` | `bun install` |
+| Cargo | `Cargo.toml` + `Cargo.lock` | `target/` mtime (or `~/.cargo` fetch) | `cargo fetch` (or `cargo build`) |
+| Go | `go.mod` + `go.sum` | `go.sum` vs. module cache touch | `go mod download` |
+| uv | `pyproject.toml` + `uv.lock` | `.venv/` | `uv sync` |
+| Poetry | `pyproject.toml` + `poetry.lock` | `.venv/` / poetry env | `poetry install` |
+| Pipenv | `Pipfile` + `Pipfile.lock` | `.venv/` | `pipenv sync` |
+| pip | `requirements*.txt` | `.venv/` (best-effort) | `pip install -r <file>` |
+| Bundler | `Gemfile` + `Gemfile.lock` | `vendor/bundle` / `.bundle` | `bundle install` |
+| Composer | `composer.json` + `composer.lock` | `vendor/` | `composer install` |
+
+Package-manager selection reuses the existing detection engine (`detectProjects` / `hydrateArgv`,
+design 08) — the same matrix that powers `deps install`, so drift and `deps install` never disagree on
+which manager owns a folder. Where the marker can't be located reliably (notably bare `pip`), we fall
+to **tier (b)**.
+
+### Surfaces (all opt-in)
+
+1. **`setup` prompt** — after Step 3, ask once: `Be notified when dependencies change? [Y/n]`. Yes →
+   installs the shell hook for the detected shell (consent captured in the flow).
+2. **`install.sh`** — after install, detect the shell and **prompt** before appending the hook to the
+   rc; in non-interactive installs it appends **only** with an explicit `--with-dep-notify` (or
+   `RBOX_DEP_NOTIFY=1`). Never silent.
+3. **Post-sync nudge** — when a `sync`/`pull` writes a changed manifest/lockfile into the current
+   workspace, print the same one-line drift notice immediately (no hook needed; this is the cheap,
+   always-available half).
+
+### The shell hook (kept cheap)
+
+The rc file gets **one stable line** inside fenced markers, sourcing a generated, rbox-managed
+snippet so `rbox upgrade` can update the logic without re-editing the rc:
+
+```sh
+# >>> rbox dep-drift >>>
+[ -f "$HOME/.config/rbox/hook.zsh" ] && source "$HOME/.config/rbox/hook.zsh"
+# <<< rbox dep-drift <<<
+```
+
+The snippet's `chpwd`/`PWD`-change handler does a **pure-shell pre-filter first** — a handful of
+`[[ -f package.json || -f Cargo.lock || -f go.mod || … ]]` tests (microseconds, no fork). Only when a
+known manifest is present does it spawn `rbox deps drift --quiet`, which is a no-network, no-auth local
+`stat`+hash that prints at most one line and self-debounces via `lastCheckedMtime` (skips the hash if
+the lockfile mtime is unchanged since the last check). Target budget: **< ~15 ms** on a relevant `cd`,
+**~0** (one shell test) on the overwhelming majority of `cd`s into manifest-free dirs.
+
+Per-shell wiring (shell resolved from `$SHELL`, falling back to `ps -p $PPID -o comm=`):
+- **zsh:** `autoload -Uz add-zsh-hook; add-zsh-hook chpwd __rbox_dep_drift`
+- **bash:** no `chpwd` — a `PROMPT_COMMAND` guard that runs the check only when `$PWD` differs from a
+  cached value (so it's not per-prompt).
+- **fish:** `function __rbox_dep_drift --on-variable PWD; …; end` in `config.fish`.
+
+### Disable / uninstall
+
+- **Instant toggle (no rc edit):** `rbox deps notify off` flips a flag in the global state; the hook
+  reads it and no-ops. `rbox deps notify on` re-enables.
+- **Full removal:** `rbox deps notify uninstall` deletes the fenced marker block from the rc and the
+  generated snippet. The markers make removal exact and idempotent.
+- **Per-repo opt-out:** `RBOX_NO_DRIFT=1` in the environment, or a `noDrift` flag in the workspace's
+  `.rbox` config, suppresses notifications for that tree.
+
+### Multiple managers & monorepos
+
+- **Multiple ecosystems in one folder** (e.g. `package.json` + `Cargo.toml` + `go.mod`): each is
+  checked; drifted ones are listed, capped at the top 3 to avoid a wall of text — `… and N more`.
+- **Monorepos:** the check walks **up** from `$PWD` to the nearest manifest and to the workspace/git
+  root (a bounded walk — never a recursive descent into every package, which would blow the cd
+  budget). A pnpm/cargo workspace's root lock is the freshness anchor; entering a sub-package reports
+  the root drift once. (Open Q 2 covers whether per-sub-package granularity is worth the cost later.)
+
+### Command surface additions (under the `deps` group)
+
+| Command | Purpose |
+|---|---|
+| `rbox deps drift [path] [--quiet]` | run the drift check now; `--quiet` is the hook's one-line mode |
+| `rbox deps notify <install\|uninstall\|status\|on\|off>` | manage the shell hook + the instant toggle |
+
+Both join the DEPENDENCIES group in the help registry.
 
 ---
 
@@ -339,29 +470,34 @@ Once this ships and is released, the public copy drops the jargon:
 4. `untrack`: stop daemon + remove `.rbox/`, with confirm/`--force`.
 5. Add a "background sync: running/stopped" line to `status` (reuse `isOurDaemon` from
    `daemon-control.ts`).
-6. Update `README` design index + rbox.to copy as a release step.
+6. Dependency-drift: a pure drift-check fn (manager matrix + marker/hash compare) reusing
+   `detectProjects`; `deps drift`/`deps notify` commands; the rc-snippet generator + shell detection;
+   the `setup` prompt; the `install.sh` consent step; and the post-sync nudge in `sync.ts`.
+7. Update `README` design index + rbox.to copy as a release step.
 
 ---
 
+## Resolved (founder review — 2026-06-30)
+
+- **`hydrate`/`detect`/`doctor` → `deps install` / `deps list` / `deps check`.** Approved; keep
+  `install`.
+- **Keep `start`** (not `watch` / `sync --background`).
+- **`init` kept for CI but hidden from the main help** — documented only under `rbox help init`.
+- **`untrack` is local-only by default; `--purge-remote` is the explicit, double-confirmed opt-in.**
+- **Deprecation window: aliases warn until `v0.3`.**
+- **Per-command `--help` via the static help registry** (as proposed above).
+- **`setup` Step 3 = start *background* sync** (`rbox start`); the one-shot populate-sync runs inside
+  Step 2. (Confirmed by approving the flow.)
+
 ## Open questions for the founder
 
-1. **"start now?" semantics.** I read your "finish by prompting to start syncing → runs it" as
-   **start background sync** (`rbox start`) — the initial one-shot populate-sync already happens inside
-   Step 2. Is that right, or did you mean the final prompt should be the *one-shot* `sync` and
-   background sync stays manual?
-2. **`hydrate` replacement.** I'm proposing the `deps` group (`deps install` / `deps list` /
-   `deps check`). Alternatives: keep flat verbs (`rbox install-deps`), or keep `hydrate` if it's grown
-   on you. Does `deps install` read clearly, or does it falsely imply a plain `npm install`?
-3. **`start` clarity.** `rbox start` is short but a touch vague ("start what?"). Acceptable, or do you
-   prefer something self-describing like `rbox watch` / `rbox sync --background`? (You asked for
-   `start`, so that's the default.)
-4. **`init` visibility.** Keep `init` listed under `rbox help init` (current proposal), or fully hide
-   it as an internal/CI-only command so `setup` is the only documented entry?
-5. **`untrack` scope.** Local-only unbind (my default) — or should it offer `--purge-remote` to also
-   delete the remote workspace? The latter is destructive across machines; I'd keep it dashboard-only.
-6. **Deprecation window.** Two minor releases / through `v0.3` — long enough, or longer given how few
-   external users there are today (we could just rename hard)?
-7. **Billing grouping.** Leave `subscribe`/`billing` as top-level verbs, or group them
-   (`rbox billing <subscribe|portal|status>`) for symmetry with `device`/`account`/`key`?
-</content>
-</invoke>
+1. **Billing grouping.** Leave `subscribe`/`billing` as top-level verbs, or group them
+   (`rbox billing <subscribe|portal|status>`) for symmetry with `device`/`account`/`key`? (Low stakes;
+   default = leave as-is.)
+2. **Dep-drift hook scope (new — see §"Dependency-drift notifications").** Per-folder check on `cd`
+   only, or also a one-shot nudge printed right after a `sync`/`pull` that changed a manifest? (Design
+   below does both; the post-sync nudge is cheap, the `cd` hook is the always-on surface.)
+3. **Dep-drift state store location.** Per-workspace `.rbox/deps-state.json` (travels with the repo,
+   but only covers tracked folders) vs. a global `~/.config/rbox/deps-state.json` (covers *any* folder
+   you `cd` into, even untracked ones). Design below recommends the **global** store so the hook works
+   everywhere; confirm that's acceptable (it means a small global file outside any workspace).
