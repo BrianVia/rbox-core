@@ -149,3 +149,27 @@ Codex review (NEEDS-WORK) + a measurement gate (same discipline §26 specifies):
 **Decision: defer §27.** An ~8% pull win behind Merkle proofs + §24 is not worth it now. Revisit
 if/when (a) §24 (sidecar) lands (clean cacheable membership) AND (b) a measurement shows pull is
 D1-bound at scale. The codex review above is preserved for that future implementation.
+
+---
+
+## CONFIRMED DEFERRED — direct measurement (2026-06-30)
+
+The earlier deferral (above) was by inference; it's now confirmed by a direct **download-concurrency
+sweep** on a savvy-core clone (4287 blobs, dev), which is the cheap lever §27's capability scheme
+would compete with:
+
+| download concurrency | clone wall (2 sweeps) |
+|---|---|
+| 32 (old default) | 28.8s / 31.6s |
+| 64 (new default) | 26.4s / 27.2s |
+| 96 | 25.6s / 26.9s |
+| 128 | 22.9s / 23.7s |
+
+The clone time **falls monotonically as concurrency rises, with NO hard plateau** — which means the
+per-blob entitlement D1 read (the thing §27 removes) is **not** the clone bottleneck; download
+THROUGHPUT is. §27 would remove a read that isn't contended, behind real Merkle-inclusion-proof
+complexity, for ~8%. The actual pull win was a stale default: download concurrency was 32
+"by analogy with the old upload knee" — bumping it to 64 (`src/engine/apply.ts`) ships ~14% for one
+line, env-tunable toward 128. §27 stays deferred until a measurement shows pull is genuinely
+D1-bound at scale (and even then, §24's sidecar now gives a cacheable-membership path that may beat
+per-blob capabilities). **Third confirmation that the simple lever beats the complex feature.**

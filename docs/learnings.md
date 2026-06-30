@@ -535,3 +535,17 @@ doc said "don't build if R2 bytes dominate"; they do (120/126 ms). A new streami
 for ≤13% — when a one-line concurrency bump gets ~25% — is the §23 lesson again. Worker-side
 overhead (~6 ms/PUT) is NOT the same as client-observed per-blob cost (~19 ms incl. RTT); but the
 fix for the latter was more connections, not fewer requests.
+
+## 2026-06-30 — §27 deferred; and "swept by analogy" is not swept
+
+§27 (per-blob download capabilities to drop the entitlement D1 read on clone) — deferred again,
+now by DIRECT measurement. A download-concurrency sweep on a savvy-core clone falls monotonically
+32→128 (~25%) with no D1 plateau: the per-blob read §27 removes isn't the bottleneck, download
+throughput is. Lesson: before building a feature to remove a cost, prove that cost is on the
+critical path — a sweep of the cheap knob is far cheaper than a Merkle-inclusion-proof protocol.
+
+The download concurrency default was 32 "by analogy with the measured upload knee, download not
+yet directly swept" (literally in the comment). It had never been measured. When you tune one knob
+by analogy to another, write down that it's unverified — and actually sweep it before trusting it.
+Both concurrency defaults (upload AND download) turned out to be stale-low; the upload one because
+§23 moved its bottleneck, the download one because it was never measured at all.

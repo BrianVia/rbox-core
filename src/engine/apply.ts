@@ -70,9 +70,14 @@ export async function applyActions(
   // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
   let done = 0;
   const envDl = Number(process.env.RBOX_DOWNLOAD_CONCURRENCY);
-  // 32 by analogy with the measured upload knee (same latency-bound per-blob shape;
-  // download not yet directly swept). Tunable via RBOX_DOWNLOAD_CONCURRENCY.
-  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 32);
+  // 64 — now DIRECTLY swept (was 32 by analogy with the old upload knee). A savvy-core clone
+  // (4287 blobs, dev) drops ~14% going 32→64 and keeps improving to ~25% at 128 with NO D1
+  // plateau — i.e. the per-blob entitlement read is NOT the clone bottleneck (this is why the
+  // §27 download-capability scheme was deferred: it removes a read that isn't contended;
+  // download THROUGHPUT is the lever). 64 matches the upload knee and is the safe default
+  // (downloads are streamed to disk, but 128 concurrent large-file writes can spike a
+  // constrained client); power users on fast links bump RBOX_DOWNLOAD_CONCURRENCY toward 128.
+  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 64);
   await poolMap(rest, dlConc, async (a) => {
     if (a.kind === "write") {
       await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek);

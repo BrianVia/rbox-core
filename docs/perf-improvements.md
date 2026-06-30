@@ -463,3 +463,35 @@ write now), so the upload scales to ~64 before R2/connection limits bite. One-li
 (`uploadConcurrency` 32→64 in `src/cli/sync.ts`) — no new endpoint, no parser, no abuse surface.
 **Third time the simple lever beat the complex one** (§23 direct-write > staging; §27 deferred;
 §26 concurrency > batch endpoint). Reaches CLI users on the next release.
+
+---
+
+## §27 download-capabilities — CONFIRMED DEFERRED; pull win was download concurrency (2026-06-30)
+
+Closed §27 the same way as §26: measure the cheap lever before building the complex feature. A
+direct download-concurrency sweep on a savvy-core clone (4287 blobs, dev) settles it:
+
+| download concurrency | clone wall |
+|---|---|
+| 32 (old default) | 28.8s / 31.6s |
+| **64 (new default)** | 26.4s / 27.2s |
+| 96 | 25.6s / 26.9s |
+| 128 | 22.9s / 23.7s |
+
+Clone time falls monotonically with concurrency and **never plateaus on D1** — so the per-blob
+entitlement read §27 removes is NOT the clone bottleneck (download throughput is). §27's HMAC
+capability + Merkle-inclusion-proof scheme would remove an uncontended read for ~8%, behind real
+complexity. The actual pull win was a **stale default**: download concurrency was 32 "by analogy
+with the old upload knee," never directly swept. Bumped to 64 (`src/engine/apply.ts`) — ~14% off a
+clone for one line, env-tunable toward 128. §27 stays designed-but-unbuilt.
+
+### Scorecard for the backend-perf workstream (§22–27)
+- **§23** upload-receipts — SHIPPED, 5–6× push (the one real hot-path D1 win).
+- **§25** observability — SHIPPED (enabled every measurement here).
+- **§24** blobRef sidecar — SHIPPED, commit body O(1) (correctness/scaling, neutral latency).
+- **§26** batch-upload — NOT BUILT; upload-concurrency 32→64 (~25%) was the better lever.
+- **§27** download-caps — DEFERRED; download-concurrency 32→64 (~14%) was the better lever.
+- **§22** umbrella.
+The recurring lesson, four times over: **measure, and the simple lever usually beats the complex
+feature.** The big structural win (§23, D1 off the upload hot path) was real; the rest was either
+O(1)-correctness (§24) or a concurrency default that had gone stale when §23 moved the bottleneck.
