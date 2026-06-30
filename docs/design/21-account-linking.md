@@ -486,39 +486,52 @@ the subscription's Stripe metadata too**, so *both* routing keys point at X.
    Re-running sets the identical value — Stripe PATCH semantics make this a no-op
    on replay. Gated on `STRIPE_SECRET`; if billing isn't provisioned the saga
    can't run → fall back to the block.
-3. **D1 commit (one atomic `batch`, CAS-guarded — replay/race-safe).** Move the
-   **full** billing set — `stripe_customer_id, stripe_subscription_id, plan,
-   grace_until, extra_storage_bytes` — onto X with a claim guard that tolerates a
-   **webhook having already bound the same customer to X** (the race below):
-   `UPDATE accounts SET …<billing> WHERE id=X AND (stripe_customer_id IS NULL OR
-   stripe_customer_id = ?cust)`. Then **unconditionally clear the shell's billing**
-   with a CAS on the subscription it still carries: `UPDATE accounts SET
-   stripe_customer_id=NULL, stripe_subscription_id=NULL, plan='free',
-   grace_until=NULL, extra_storage_bytes=0 WHERE id=shell AND stripe_subscription_id
-   = ?sub`. The shell-clear is the load-bearing half: it always runs once Stripe
-   says X owns the sub, so the shell can never keep a stale customer the
-   `subscription.deleted` guard would later match.
+3. **D1 commit (one atomic `batch`, fully race-guarded).** Move the **full**
+   billing set — `stripe_customer_id, stripe_subscription_id, plan, grace_until,
+   extra_storage_bytes` — onto X, then clear **and tombstone** the shell. Both
+   writes are guarded so any concurrent webhook can only no-op the move, never wedge
+   or corrupt it (within a D1 batch later statements see earlier ones' writes):
+   - **claim onto X:** `… WHERE id=X AND (stripe_customer_id IS NULL OR
+     stripe_customer_id = ?cust) AND EXISTS(SELECT 1 FROM accounts WHERE id=shell
+     AND stripe_subscription_id = ?sub)`. The `= ?cust` arm tolerates a
+     `subscription.updated` (metadata→X) having already bound the same customer to X
+     early; the `EXISTS(shell still has ?sub)` arm aborts the claim if a concurrent
+     `subscription.deleted` already cleared the shell — **never resurrecting a
+     canceled sub onto X**.
+   - **clear + tombstone the shell:** `… SET …NULL, reclaimed_at=? WHERE id=shell
+     AND stripe_subscription_id = ?sub AND EXISTS(SELECT 1 FROM accounts WHERE id=X
+     AND stripe_subscription_id = ?sub)`. It runs **only if X actually now holds our
+     sub** (the claim landed), so a no-op claim — X having raced to a *different*
+     sub — leaves the shell intact and **never merges two subscriptions**.
+   - **post-batch verify:** re-read both. Return `repointed` only if X holds exactly
+     our `{customer, sub}` **and** the shell is cleared; if X carries a *different*
+     customer → `destination_has_subscription` (block); otherwise `not_migratable`
+     (a concurrent delete raced — block, retryable). The caller never reclaims on a
+     non-`repointed` result.
+   The `reclaimed_at` stamp + a **`reclaimed_at IS NULL` guard on every webhook
+   billing-bind** (`checkout.session.completed`, paying/non-paying
+   `subscription.updated`) close the last race: a **late
+   `checkout.session.completed`** routes to the shell by the *original session's*
+   account (metadata we can't rewrite), so without the guard it would re-bind the
+   just-cleared shell — the tombstone makes that bind a no-op.
 4. **Reclaim the shell** (the existing §3.4 confirm batch — the shell is now
-   billing-empty, so `isReclaimableShell` passes).
-5. **On any failure → retryable, never a stuck half-move.** Because the Stripe
-   metadata update lands **first**, a failure *after* it leaves billing's routing
-   pointed at X (both keys, once D1 lands) — **not** "fully on the shell." That is
-   deliberate and safe: re-running `confirm` re-reads, finds the shell now
-   billing-empty (or the D1 move idempotently re-applies via the
-   `stripe_customer_id = ?cust` arm), reclaims, and completes. A failure *before*
-   the Stripe step leaves everything on the shell (the link simply blocks and is
-   retried). There is no state in which a renewal can re-bind to the shell.
+   billing-empty and already tombstoned, so `isReclaimableShell` passes and the
+   reclaim deletes its membership/user/ephemeral-device rows).
+5. **On any failure → retryable, never a stuck half-move or a merge.** The Stripe
+   metadata update lands **first**, so a failure *after* it leaves billing's routing
+   pointed at X; re-running `confirm` re-reads, finds the shell billing-empty (the
+   normal reclaim path now applies) and completes. A failure *before* the Stripe
+   step leaves everything on the shell (the link blocks and is retried). The
+   post-batch verify guarantees a partial/raced D1 move reports a **block**, never a
+   false `repointed`.
 
 The order **Stripe-first, D1-second** is deliberate: the Stripe metadata update is
 the irreversible-once-renewed routing decision, so it must land before D1 claims
-the customer for X. **The webhook race (called out by review):** a
-`customer.subscription.updated` arriving between step 2 and step 3 routes by
-`metadata.account_id = X` and its guard `(X.stripe_customer_id IS NULL OR = cust)`
-holds (X is billing-empty pre-move) → it **binds the customer onto X early**. The
-step-3 claim must therefore *also* accept `stripe_customer_id = cust` (not only
-`IS NULL`), and the **shell-clear must be unconditional-on-the-sub** so the shell
-is emptied regardless of who set X first. Either way both routing keys end on X;
-the shell never re-binds.
+the customer for X. Together the three guards (claim's dual arms, the
+clear-only-if-X-holds-it, the `reclaimed_at` webhook fence) make every interleaving
+with `subscription.updated` / `subscription.deleted` / late
+`checkout.session.completed` either complete cleanly onto X or block — the shell
+never re-binds and two subs never merge.
 
 ---
 

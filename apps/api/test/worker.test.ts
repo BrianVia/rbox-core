@@ -1191,6 +1191,24 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await billingOf(shell))?.cust).toBeNull(); // shell NOT re-bound (the split-brain that the fix prevents)
   });
 
+  test("webhook-race: a LATE checkout.session.completed for the cleared shell cannot re-bind it (reclaimed_at fence)", async () => {
+    const shell = `acct_ccs_shell_${Math.random().toString(16).slice(2, 8)}`;
+    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'pro', 'web', ?)").bind(shell, Date.now()).run();
+    await setBilling(shell, "cus_ccs", "sub_ccs", "pro");
+    const x = await bootstrap("acct-ccs-x");
+    await withStripe(async () => {
+      expect(await repointBillingToAccount(env, shell, x.accountId, Date.now())).toBe("repointed");
+    });
+    // The shell is now cleared + tombstoned. A late checkout.session.completed
+    // (routed to the shell by the original session metadata) must be refused.
+    const t = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({ id: `evt_ccs_${shell}`, type: "checkout.session.completed", data: { object: { client_reference_id: shell, customer: "cus_ccs", subscription: "sub_ccs", metadata: { account_id: shell } } } });
+    const { createHmac } = await import("node:crypto");
+    const sig = `t=${t},v1=${createHmac("sha256", "whsec_test_secret").update(`${t}.${body}`).digest("hex")}`;
+    expect((await SELF.fetch(`${BASE}/v1/stripe/webhook`, { method: "POST", headers: { "stripe-signature": sig, "content-type": "application/json" }, body })).status).toBe(200);
+    expect((await billingOf(shell))?.cust).toBeNull(); // tombstoned shell NOT re-bound (the split-brain the fence prevents)
+  });
+
   test("idempotent replay: re-running the saga after a completed move does nothing (no second Stripe call, no double-bind)", async () => {
     const shell = `acct_idem_shell_${Math.random().toString(16).slice(2, 8)}`;
     await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'pro', 'web', ?)").bind(shell, Date.now()).run();
