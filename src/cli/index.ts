@@ -275,7 +275,10 @@ async function main(): Promise<void> {
       const { versionsCmd } = await import("./versions-cmd.js");
       const root = await resolveRoot(undefined);
       const lim = flags.limit !== undefined && Number.isInteger(Number(flags.limit)) ? Number(flags.limit) : undefined;
-      await versionsCmd(root, positional[0], lim);
+      // `.` / the workspace root means "the whole workspace" (full list), matching how
+      // the other commands treat a bare directory arg; only a real subpath scopes.
+      const pathArg = positional[0] === undefined || positional[0] === "." || path.resolve(positional[0]) === root ? undefined : positional[0];
+      await versionsCmd(root, pathArg, lim);
       break;
     }
     case "restore": {
