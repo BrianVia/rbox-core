@@ -38,7 +38,7 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 |---|-----|--------|-----------|-----------|
 | 16 | [New-device security emails](./16-new-device-emails.md) | 🔴 NOT STARTED | P1, P2 | "new device added" email; **MailChannels** send on `security.rbox.to` |
 | 17 | [Account devices/workspaces list](./17-account-devices-workspaces.md) | 🔴 NOT STARTED | P1, P2 | read-only dashboard list; new `GET /v1/account/devices\|workspaces` |
-| 18 | [Support email routing](./18-support-email-routing.md) | 🔴 NOT STARTED | — | `support@ → Gmail` via CF Email Routing; migration off Namecheap |
+| 18 | [Support email routing](./18-support-email-routing.md) | ✅ SHIPPED (2026-06-30) | — | `support@`/`postmaster@`/`security@` → Gmail via CF Email Routing; migrated off Namecheap; catch-all Drop |
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
 | 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🔴 NOT STARTED | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
 | 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | ✅ SHIPPED (PR #2, prod) | — | web↔CLI link (`rbox account link`) + `rbox subscribe` + re-point saga; closes P2 & P4; unblocks 16/17/19 |
@@ -58,7 +58,7 @@ Everything in **1–15 is shipped.** Open work, in dependency order:
 
 1. ~~**P1** (unique `device_id`)~~ — ✅ **DONE** (migration `0013`). Apply to prod D1 when ready.
 2. ~~**P2 / doc 21** (account linking)~~ — ✅ **DONE** (shipped PR #2, prod): `rbox account link` + `rbox subscribe` + re-point saga.
-3. **18** (support email) — standalone, ready to execute now; no prereqs.
+3. ~~**18** (support email)~~ — ✅ **DONE** (2026-06-30): `support@`/`postmaster@`/`security@` → Gmail via Cloudflare Email Routing.
 4. **16 / 17** — buildable now (P1 done); full coverage for CLI-born accounts needs P2.
 5. ~~**P4** (credential-kind route gate)~~ — ✅ **DONE** (shipped with doc 21).
 6. **P3** (epoch rotation) — then **19** (crypto-revoke) and **20** (API-key GA).
