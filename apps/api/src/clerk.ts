@@ -138,13 +138,16 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
       .bind(sub)
       .first<{ account_id: string; user_id: string }>();
     if (!map) return json({ error: "internal" }, 500);
-  }
 
-  // Ensure account/user/membership exist for the resolved ids (idempotent; also
-  // self-heals partial provisioning and guarantees membership before minting).
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO accounts (id, name, plan, created_at) VALUES (?, 'web', 'free', ?)").bind(map.account_id, nowMs).run();
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
-  await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
+    // First-provision ONLY: materialize the web shell (origin='web', reclaimable —
+    // design 21 §3.2). Gating this to `if (!map)` is load-bearing (§3.5): a
+    // RETURNING login must NOT re-run the owner INSERT OR IGNORE, or — once this
+    // Clerk id is linked to a real account X — every login would silently re-grant
+    // owner on X (privilege resurrection). A returning login only resolves + mints.
+    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at) VALUES (?, 'web', 'free', 'web', ?)").bind(map.account_id, nowMs).run();
+    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
+    await env.rbox_dev_db.prepare("INSERT OR IGNORE INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(map.account_id, map.user_id).run();
+  }
 
   const { token } = await createWebSession(env, map.account_id, map.user_id);
   return json({ token, accountId: map.account_id });

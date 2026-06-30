@@ -710,6 +710,111 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(body.workspaces).toBeGreaterThanOrEqual(1); // our workspace was in the pass
     expect(body.pruned).toBe(0); // nothing old enough to prune
   });
+
+  // ── Slice 0: token-kind route gate (design 21 §1.1) ──────────────────────
+  // Mint a real short-lived `web` session token (expires_at set) via the Clerk
+  // exchange, so the gate sees Principal.kind === 'web'.
+  async function webToken(sub: string): Promise<string> {
+    const r = await webExchange(await signJwt(claims({ sub })));
+    expect(r.status).toBe(200);
+    return ((await r.json()) as { token: string }).token;
+  }
+
+  test("kind-gate: a web session is 403 on credential-mint + crypto/sync routes", async () => {
+    const wt = await webToken("user_gate_block");
+    // Credential-mint escalation routes (the ones that would let web act durably).
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(wt) })).status).toBe(403);
+    expect(
+      (await SELF.fetch(`${BASE}/v1/auth/device/approve`, { method: "POST", headers: authed(wt, { "content-type": "application/json" }), body: JSON.stringify({ userCode: "AAAA-AAAA" }) })).status
+    ).toBe(403);
+    expect((await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(wt) })).status).toBe(403);
+    // E2EE key storage + blob mutate/check.
+    expect((await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(wt) })).status).toBe(403);
+    const s = sha("web-cannot-write");
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(wt, { "content-length": "16" }), body: "web-cannot-write" })).status).toBe(403);
+    expect((await SELF.fetch(`${BASE}/v1/blobs/check`, { method: "POST", headers: authed(wt, { "content-type": "application/json" }), body: JSON.stringify({ shas: [s] }) })).status).toBe(403);
+  });
+
+  test("kind-gate is DEFAULT-DENY: a web token is 403 on an unlisted route, not just named crypto ones", async () => {
+    const wt = await webToken("user_gate_default");
+    // /v1/keys/roster isn't individually enumerated anywhere — default-deny still 403s it.
+    const res = await SELF.fetch(`${BASE}/v1/keys/roster`, { method: "POST", headers: authed(wt, { "content-type": "application/json" }), body: JSON.stringify({ version: 1, signed: "x" }) });
+    expect(res.status).toBe(403);
+  });
+
+  test("kind-gate: a web session IS allowed on the read/billing/device allowlist", async () => {
+    const wt = await webToken("user_gate_allow");
+    expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(wt) })).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/auth/devices`, { headers: authed(wt) })).status).toBe(200);
+    // Reaches the billing handler (501 — STRIPE_SECRET absent in tests), proving it's NOT gate-blocked.
+    expect((await SELF.fetch(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST", headers: authed(wt) })).status).toBe(501);
+  });
+
+  test("kind-gate: a DURABLE token passes exactly where the web token is blocked", async () => {
+    const a = await bootstrap("acct-gate-durable");
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(a.token) })).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).status).toBe(200);
+  });
+
+  // ── Slice 1: schema + provenance (migration 0014, design 21 §3.2/§6) ──────
+  const originOf = async (id: string) =>
+    (await env.rbox_dev_db.prepare("SELECT origin FROM accounts WHERE id = ?").bind(id).first<{ origin: string | null }>())?.origin ?? null;
+
+  test("provenance: bootstrap stamps origin='bootstrap'; first web session stamps origin='web'", async () => {
+    const a = await bootstrap("acct-origin-boot");
+    expect(await originOf(a.accountId)).toBe("bootstrap");
+    const r = await webExchange(await signJwt(claims({ sub: "user_origin_web" })));
+    const { accountId } = (await r.json()) as { accountId: string };
+    expect(await originOf(accountId)).toBe("web");
+  });
+
+  test("uq_clerk_users_account: a 2nd Clerk id mapping the SAME account is rejected at the DB", async () => {
+    const a = await bootstrap("acct-uq");
+    await env.rbox_dev_db
+      .prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
+      .bind("user_uq_first", a.accountId, "user_uq_a", Date.now())
+      .run();
+    await expect(
+      env.rbox_dev_db
+        .prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind("user_uq_second", a.accountId, "user_uq_b", Date.now())
+        .run()
+    ).rejects.toThrow(/UNIQUE constraint failed/i);
+  });
+
+  test("origin backfill (§6): legacy NULL accounts classify data→bootstrap, empty-clerk→web, ambiguous→NULL", async () => {
+    // Seed three pre-0014 (origin NULL) accounts, then run the migration's two
+    // classification UPDATEs verbatim and assert the three-way split.
+    const seed = (id: string) =>
+      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'legacy', 'free', ?)").bind(id, Date.now()).run();
+    await seed("acct_bf_data");
+    await seed("acct_bf_shell");
+    await seed("acct_bf_ambig");
+    // data-bearing account → must classify 'bootstrap'
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES ('ws_bf','root',?,?)").bind("acct_bf_data", Date.now()).run();
+    // empty clerk-mapped shell → must classify 'web'
+    await env.rbox_dev_db.prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES ('user_bf','acct_bf_shell','user_bf',?)").bind(Date.now()).run();
+    // acct_bf_ambig is referenced by nothing and not clerk-mapped → stays NULL.
+
+    await env.rbox_dev_db
+      .prepare(
+        `UPDATE accounts SET origin='bootstrap' WHERE origin IS NULL AND (
+           id IN (SELECT account_id FROM account_keys) OR id IN (SELECT account_id FROM device_keys)
+           OR id IN (SELECT account_id FROM rosters) OR id IN (SELECT account_id FROM account_key_states)
+           OR id IN (SELECT account_id FROM workspace_keys) OR id IN (SELECT account_id FROM workspaces)
+           OR id IN (SELECT account_id FROM blob_refs) OR id IN (SELECT account_id FROM uploads WHERE account_id IS NOT NULL)
+           OR id IN (SELECT account_id FROM pairing_tokens) OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL)
+           OR id IN (SELECT DISTINCT account_id FROM devices WHERE expires_at IS NULL)
+           OR plan != 'free' OR stripe_customer_id IS NOT NULL OR stripe_subscription_id IS NOT NULL
+           OR grace_until IS NOT NULL OR extra_storage_bytes != 0 OR used_bytes != 0 )`
+      )
+      .run();
+    await env.rbox_dev_db.prepare("UPDATE accounts SET origin='web' WHERE origin IS NULL AND id IN (SELECT account_id FROM clerk_users)").run();
+
+    expect(await originOf("acct_bf_data")).toBe("bootstrap");
+    expect(await originOf("acct_bf_shell")).toBe("web");
+    expect(await originOf("acct_bf_ambig")).toBeNull(); // fail-closed
+  });
 });
 
 describe("release distribution (design 14)", () => {
