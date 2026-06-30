@@ -105,7 +105,7 @@ export async function verifyKeyStateChain(chain: SignedKeyState[], rosters: Rost
     if (!expectRosterHash || expectRosterHash !== body.rosterHash) throw new Error(`key-state ${e}: rosterHash does not match verified roster v${body.rosterVersion}`);
 
     // Signer must be active in the roster of epoch e-1 (genesis: roster v0).
-    const signerRoster = signerRosterFor(e, body, rosters);
+    const signerRoster = signerRosterFor(e, states, rosters);
     const signers = activeSigners(signerRoster);
     const pub = signers.get(sk.signerDeviceId);
     if (!pub) throw new Error(`key-state ${e}: signer ${sk.signerDeviceId} not active in the authorizing roster`);
@@ -116,16 +116,23 @@ export async function verifyKeyStateChain(chain: SignedKeyState[], rosters: Rost
 }
 
 /** The roster that authorizes epoch e's key-state: for genesis, roster v0; for a
- *  rotation, the roster from the PREVIOUS epoch's key-state. */
-function signerRosterFor(e: number, body: AccountKeyState, rosters: RosterBody[]): RosterBody {
+ *  rotation, the roster pinned by the PREVIOUS epoch's key-state (states[e-1]).
+ *
+ *  §31 (codex MAJOR): this MUST be e-1's roster, NOT the new state's own
+ *  `rosterVersion`. Using the new state's roster lets a device that was only just
+ *  admitted (e.g. a stale-grant no-MK rogue admin) sign the rotation that pins the
+ *  very roster containing itself — self-authorizing a rotation to attacker-chosen MK
+ *  material (a strong DoS: clients reject the prior epoch's heads). Authorizing
+ *  against e-1's roster requires the rotation be signed by a device that already held
+ *  authority BEFORE this rotation, which is the documented intent. */
+function signerRosterFor(e: number, states: AccountKeyState[], rosters: RosterBody[]): RosterBody {
   if (e === 0) {
     const v0 = rosters.find((r) => r.version === 0);
     if (!v0) throw new Error("genesis key-state: roster v0 missing");
     return v0;
   }
-  // The authorizing roster is the one pinned by epoch e (rotation is signed by an
-  // admin already active before the rotation took effect).
-  const r = rosters.find((x) => x.version === body.rosterVersion);
-  if (!r) throw new Error(`key-state ${e}: authorizing roster v${body.rosterVersion} missing`);
+  const prevRosterVersion = states[e - 1]!.rosterVersion;
+  const r = rosters.find((x) => x.version === prevRosterVersion);
+  if (!r) throw new Error(`key-state ${e}: authorizing roster v${prevRosterVersion} (epoch ${e - 1}) missing`);
   return r;
 }

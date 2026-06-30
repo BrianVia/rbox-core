@@ -198,7 +198,10 @@ export async function buildAdmissionRoster(args: {
 // ---- verification ---------------------------------------------------------
 
 export interface VerifyOptions {
-  /** `notAfter` comparison clock (ms). Admission grants past this are rejected. */
+  /** RESERVED. Was the admission-grant `notAfter` clock; §31 removed that check (replaying
+   *  immutable history against the verifier's current clock is unsound and bricked multi-device
+   *  accounts). Kept on the surface to avoid churning the verify-path signatures during a
+   *  security fix; threading it out is a follow-up cleanup. Currently read by nothing. */
   now: number;
 }
 
@@ -284,7 +287,11 @@ async function verifyAdmission(prev: RosterBody, sr: SignedRoster, body: RosterB
   if (grant.type !== "rbox/admission-grant/v1") throw new Error("bad admission grant type");
   if (canonicalString(grant) !== adm.grant) throw new Error("admission grant not canonical");
   if (grant.accountId !== prev.accountId || grant.accountEpoch !== prev.accountEpoch) throw new Error("admission grant account/epoch mismatch");
-  if (grant.notAfter < opts.now) throw new Error("admission grant expired");
+  // §31: NO `grant.notAfter < opts.now` here. This replays IMMUTABLE history; a roster
+  // version has no trustworthy append timestamp, so comparing a grant's liveness bound to the
+  // verifier's *current* clock is unsound — it bricks every multi-device account ~notAfter after
+  // pairing (P0). Freshness is gated where a trusted clock exists: the pairing-token TTL at
+  // redeem (MK delivery, auth.ts), and reuse is prevented by the single-use grantId below.
   if (seenGrantIds.has(grant.grantId) || body.grantId !== grant.grantId) throw new Error("admission grant replay / grantId mismatch");
 
   // grantSig: an active admin in prev authorized this admission.

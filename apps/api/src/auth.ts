@@ -269,6 +269,13 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     .first<{ account_id: string; user_id: string; created_by: string; mk_wrap: string | null; admission_grant: string | null }>();
   if (!consumed) return json({ error: "unauthorized" }, 401); // invalid / expired / already used
 
+  // §31 (codex MAJOR2, r2): scrub the at-rest MK/admission ciphertext the INSTANT `consumed`
+  // holds it — BEFORE any later return (e.g. the live-authority 401 below), since the token is
+  // already single-use-burned and a consumed-then-rejected row must not retain mk_wrap. The TTL
+  // is an API freshness gate, NOT crypto expiry; retained wrap + a later tokenSecret leak could
+  // recover MK. Best-effort: a scrub failure only weakens defense-in-depth, never blocks.
+  await env.rbox_dev_db.prepare("UPDATE pairing_tokens SET mk_wrap = NULL, admission_grant = NULL WHERE token_hash = ?").bind(hash).run().catch(() => {});
+
   // Fail-closed live authority check: creator device non-revoked AND user a member.
   const live = await env.rbox_dev_db
     .prepare(

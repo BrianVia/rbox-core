@@ -124,9 +124,13 @@ describe("pairing admission (V4-1)", () => {
     await expect(verifyRosterChain([genesis, v1, replay], { now: NOW })).rejects.toThrow();
   });
 
-  test("expired grant is rejected", async () => {
+  test("§31: a past-notAfter grant still verifies on REPLAY (the brick repro)", async () => {
+    // Pre-§31 this threw "admission grant expired" once now passed the grant's notAfter,
+    // bricking every multi-device account ~10min after pairing. Replaying immutable history
+    // has no trustworthy append timestamp, so the liveness bound must NOT be re-checked here.
     const { genesis, v1 } = await admitB();
-    await expect(verifyRosterChain([genesis, v1], { now: NOW + 10_000_000 })).rejects.toThrow(/expired/);
+    const bodies = await verifyRosterChain([genesis, v1], { now: NOW + 10_000_000 }); // long past notAfter
+    expect([...activeSigners(bodies[1]!).keys()].sort()).toEqual(["devA", "devB", "recovery"]);
   });
 });
 
