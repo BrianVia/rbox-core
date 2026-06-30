@@ -1,7 +1,7 @@
 # §29 — CLI command redesign (`rbox start` / `setup`, `track`/`untrack`, per-command `--help`)
 
-> **Status: 🟢 DESIGN — founder-approved + codex-reviewed (NEEDS-WORK → all findings resolved; see
-> "Codex review resolutions"). Ready for implementation.**
+> **Status: 🟢 DESIGN — founder-approved + codex-reviewed → PASS (rounds 1–3; NEEDS-WORK → all
+> findings resolved, see "Codex review resolutions"). Ready for implementation.**
 >
 > Pure UX/surface redesign of the `rbox` CLI. No protocol, crypto, or transport changes — every
 > command keeps calling the same already-shipped primitives (`runInit`, `login`, `startDaemon`,
