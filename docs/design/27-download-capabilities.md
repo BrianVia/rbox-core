@@ -126,3 +126,26 @@ bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
 - For an **isolated, repeatable** target (no contention with other dev work, wipe-and-repeat),
   set up a dedicated `[env.bench]` → `rbox-bench-api` + throwaway `rbox-bench-db`/`-blobs` and
   point `--remote` at it. (See the README "Benchmarking" section.)
+
+---
+
+## DEFERRED — measured low-ROI (2026-06-30)
+
+Codex review (NEEDS-WORK) + a measurement gate (same discipline §26 specifies):
+- **The pull D1 cost is small.** `blobGet`'s entitlement check is a single INDEXED `blob_refs`
+  lookup (PK on (account_id, sha256)) — ~20 ms, not the 7-call ~956 ms storm §23 fixed on the
+  upload side. A real clone of 2000 savvy-core blobs = **15.1 s wall**, of which the per-blob D1
+  is ~1.25 s (≈**8%**); the rest is R2 transfer + client decrypt/write. §27 would save ~8% at best.
+- **Inline membership is NOT D1-free (codex BLOCKER).** Workers have no shared cross-invocation
+  cache, so checking `sha ∈ commit.blobRefs` per GET means re-fetching+parsing the (up to 1 MB)
+  commit body from the DO each time — *worse* than today's indexed read. A genuinely D1-free cap
+  path needs **Merkle inclusion proofs** (cap binds a ref-set root; client sends a per-blob proof;
+  server verifies HMAC(root)+path, no fetch) — substantial client+server complexity.
+- Codex's other findings (membership must include `encManifestSha`; bind
+  {account,workspace,project,sequence,commitSha,iat,exp} + recompute sha256(body)==commitSha at
+  issuance; cap in a HEADER not the query string; pre-auth cap path with NO legacy fallback;
+  GC-condemned handling) are all correct and would need addressing.
+
+**Decision: defer §27.** An ~8% pull win behind Merkle proofs + §24 is not worth it now. Revisit
+if/when (a) §24 (sidecar) lands (clean cacheable membership) AND (b) a measurement shows pull is
+D1-bound at scale. The codex review above is preserved for that future implementation.
