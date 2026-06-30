@@ -198,6 +198,10 @@ export async function buildCommit(args: {
 export interface VerifiedAccount {
   rosters: RosterBody[];
   rosterHashByVersion: Map<number, string>;
+  /** stateHash of the verified key-state at each account epoch (C2 anti-rollback:
+   *  a fetched chain must agree with the device's pinned `keyStateHash` at its
+   *  pinned epoch — catches a same-epoch key-state fork/substitution). */
+  keyStateHashByEpoch: Map<number, string>;
   keyStates: AccountKeyState[];
   /** Highest-version roster — the authority for "is this device active NOW". */
   currentRoster: RosterBody;
@@ -226,6 +230,9 @@ export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: 
   const rosterHashByVersion = new Map<number, string>();
   for (let i = 0; i < rosterChain.length; i++) rosterHashByVersion.set(i, rosterChain[i]!.rosterHash);
   const keyStates = await verifyKeyStateChain(keyStateChain, rosters, rosterHashByVersion);
+  // The key-state chain is indexed by epoch (verifyKeyStateChain asserts body.accountEpoch === e).
+  const keyStateHashByEpoch = new Map<number, string>();
+  for (let e = 0; e < keyStateChain.length; e++) keyStateHashByEpoch.set(e, keyStateChain[e]!.stateHash);
 
   // The set of MK-wrap hashes the account has ever signed: key-state mkWrapHashes
   // (genesis device + recovery, and any rotation) ∪ each admission's deviceWrapHash.
@@ -240,6 +247,7 @@ export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: 
   return {
     rosters,
     rosterHashByVersion,
+    keyStateHashByEpoch,
     keyStates,
     currentRoster: rosters[currentRosterIdx]!,
     currentRosterHash: rosterChain[currentRosterIdx]!.rosterHash,
@@ -302,6 +310,82 @@ export async function openCommit(args: {
   }
   if (!(await verifyCommitSig(args.commit, signerPub))) throw new Error("commit signature invalid");
   // encManifest integrity: its hash must equal the signed encManifestSha.
+  if ((await sha256Hex(args.encManifest)) !== body.encManifestSha) throw new Error("encManifest does not match the signed encManifestSha");
+  return decryptManifest(args.kek, args.secrets.accountId, args.workspaceId, body.keyEpoch, args.encManifest);
+}
+
+/**
+ * Authenticate a HISTORICAL commit segment (version history / restore, design 12
+ * §15). Given the contiguous ascending segment `[fromSeq..head]` and the ALREADY-
+ * TRUSTED head hash (the caller verified the head forward from its pin — C1/C2),
+ * prove the whole segment is the true ancestry of that head: each commit links to
+ * its predecessor, each `sig` verifies against the signer active in its OWN roster
+ * version (a historical link may predate a rotation), and the LAST commit's hash
+ * equals `trustedHeadHash`. The terminal-hash match is load-bearing — head is
+ * trusted, its `parentCommitHash` commits to `head-1`, inductively down to
+ * `fromSeq`. Returns the commit at `fromSeq`. Throws (fail closed) on any gap,
+ * broken link, bad signature, unknown roster, or a non-terminating segment.
+ *
+ * This is the DOWNWARD sibling of `verifyCommitChain` (which anchors forward from a
+ * pin); it needs no genesis reachability, so it survives retention pruning of old
+ * `seq:<n>` pointers and long histories past `MAX_COMMIT_SPAN`.
+ */
+export async function verifyHistorySegment(
+  commits: SignedCommit[],
+  fromSeq: number,
+  trustedHeadHash: string,
+  account: VerifiedAccount
+): Promise<SignedCommit> {
+  if (commits.length === 0) throw new Error("empty history segment (server returned no commits for the range)");
+  let expectSeq = fromSeq;
+  let prevHash: string | null = null;
+  let prevSeq = 0;
+  for (const c of commits) {
+    const body = parseCommit(c);
+    if (body.seq !== expectSeq) throw new Error(`history segment gap at seq ${body.seq} (expected ${expectSeq})`);
+    if (prevHash !== null && (body.parentSeq !== prevSeq || body.parentCommitHash !== prevHash)) {
+      throw new Error(`history segment chain break at seq ${body.seq} (rollback/splice evident)`);
+    }
+    const roster = account.rosters[body.rosterVersion];
+    if (!roster) throw new Error(`history commit seq ${body.seq} references unknown rosterVersion ${body.rosterVersion}`);
+    const pub = activeSigners(roster).get(body.deviceId);
+    if (!pub) throw new Error(`history commit seq ${body.seq} signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
+    if (!(await verifyCommitSig(c, pub))) throw new Error(`history commit seq ${body.seq} signature invalid`);
+    prevHash = c.commitHash;
+    prevSeq = body.seq;
+    expectSeq++;
+  }
+  if (commits[commits.length - 1]!.commitHash !== trustedHeadHash) {
+    throw new Error("history segment does not terminate at the verified head (tamper/fork evident)");
+  }
+  return commits[0]!;
+}
+
+/**
+ * Decrypt a HISTORICAL commit's manifest (design 12 §15). Unlike `openCommit` (the
+ * head opener, which applies the C4 current-epoch/current-roster gate), this opens a
+ * commit whose authenticity was ALREADY proven by `verifyHistorySegment` (terminal-
+ * hash anchor + own-roster signature). It therefore drops the current-epoch gate — a
+ * legitimately-old commit may be signed by a since-revoked device and carry an older
+ * `accountEpoch`/`keyEpoch`. Still verifies: the sig against the signer active in the
+ * commit's OWN roster version, `sha256(encManifest) == encManifestSha`, and decrypts
+ * strictly under `body.keyEpoch` (the caller supplies that epoch's KEK; a missing
+ * epoch KEK is a fail-closed error upstream, never a guess).
+ */
+export async function openCommitHistorical(args: {
+  secrets: DeviceSecrets;
+  kek: Uint8Array;
+  account: VerifiedAccount;
+  commit: SignedCommit;
+  encManifest: Uint8Array;
+  workspaceId: string;
+}): Promise<Uint8Array> {
+  const body = parseCommit(args.commit);
+  const roster = args.account.rosters[body.rosterVersion];
+  if (!roster) throw new Error(`historical commit references unknown rosterVersion ${body.rosterVersion}`);
+  const signerPub = activeSigners(roster).get(body.deviceId);
+  if (!signerPub) throw new Error(`historical commit signer ${body.deviceId} not active in roster v${body.rosterVersion}`);
+  if (!(await verifyCommitSig(args.commit, signerPub))) throw new Error("historical commit signature invalid");
   if ((await sha256Hex(args.encManifest)) !== body.encManifestSha) throw new Error("encManifest does not match the signed encManifestSha");
   return decryptManifest(args.kek, args.secrets.accountId, args.workspaceId, body.keyEpoch, args.encManifest);
 }

@@ -3,11 +3,13 @@ import {
   createWorkspaceKey,
   GENESIS_PARENT_HASH,
   openCommit,
+  openCommitHistorical,
   openWorkspaceKey,
   parseCommit,
   serializeRefset,
   verifyAccount,
   verifyCommitChain,
+  verifyHistorySegment,
   type BlobRefset,
   type DeviceSecrets,
   type SignedCommit,
@@ -18,7 +20,7 @@ import {
 } from "../engine/e2ee/index.js";
 import { hashBytes } from "../engine/hash.js";
 import type { BlobStore, Manifest } from "../engine/index.js";
-import type { CommitResult, SyncRemote } from "./remote.js";
+import { NeedsRebaselineError, type CommitResult, type SyncRemote } from "./remote.js";
 
 /** §24: emit a sidecar (refs out of the signed body) once the unique ref set is large
  *  enough that the inline body would approach the server's 1 MB commit-body cap. At ~85 B
@@ -76,6 +78,15 @@ export interface E2eeApi {
   commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult>;
 }
 
+/** One verified version-history entry (design 12 §15) — all fields from the SIGNED
+ *  commit body (no decrypt). Server timestamps are joined in the CLI as advisory. */
+export interface VersionInfo {
+  seq: number;
+  deviceId: string;
+  keyEpoch: number;
+  commitHash: string;
+}
+
 export interface HeadPin {
   commitSeq: number;
   commitHash: string;
@@ -120,9 +131,28 @@ export class E2eeRemote implements SyncRemote {
   // ---- SyncRemote ----------------------------------------------------------
 
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+    const vh = await this.verifiedHead();
+    if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
+    const body = parseCommit(vh.commit);
+    const kek = await this.kekFor(body.keyEpoch, vh.account, false);
+    const encManifest = await this.api.blobStore().get(body.encManifestSha);
+    const json = await openCommit({ secrets: this.ctx.secrets, kek, account: vh.account, commit: vh.commit, encManifest, workspaceId: this.ctx.workspaceId });
+    return { sequence: vh.sequence, manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest };
+  }
+
+  /**
+   * Establish the TRUSTED HEAD (shared anti-rollback anchor for pull + versions +
+   * restore, C1/C2): verify the account roster/key-state chains, then verify the
+   * commit chain forward from the pin to `latest`, advance the pin, and return the
+   * verified head commit. Fail-closed/terminal-bound: the verified chain's terminal
+   * commit MUST equal what `latest()` reported (hash) — a server can't have us
+   * verify one chain while claiming a different head. Returns null only when the
+   * workspace genuinely has no commits yet.
+   */
+  private async verifiedHead(): Promise<{ account: VerifiedAccount; sequence: number; commit: SignedCommit } | null> {
     const account = await this.refreshAccount();
     const { sequence, commit } = await this.api.latestCommit();
-    if (!commit || sequence === 0) return { sequence: 0, manifest: EMPTY_MANIFEST };
+    if (!commit || sequence === 0) return null;
 
     const pin = await this.pins.load();
     const pinnedSeq = pin?.commitSeq ?? 0;
@@ -138,16 +168,123 @@ export class E2eeRemote implements SyncRemote {
       // Verify the whole chain from the pin (or genesis) forward to the head (C1).
       const chain = await this.api.commitsSince(pinnedSeq);
       const verified = await verifyCommitChain(chain, pin ? { commitSeq: pin.commitSeq, commitHash: pin.commitHash } : null, account);
-      if (!verified) return { sequence: 0, manifest: EMPTY_MANIFEST };
+      // /latest reported a non-zero head, so the chain MUST be non-empty AND its
+      // terminal commit MUST be that head — else the server is equivocating. Fail closed.
+      if (!verified) throw new Error("server reported a head but returned no commit chain to verify (inconsistent) — refusing");
+      if (verified.commitHash !== commit.commitHash) throw new Error("verified chain head does not match latest() (fork/equivocation) — refusing");
       head = verified;
     }
+    await this.pinFrom(head, account);
+    return { account, sequence, commit: head };
+  }
 
-    const body = parseCommit(head);
+  // ---- version history + restore (design 12 §15, D11) ----------------------
+
+  /**
+   * `rbox versions`: the verified commit history within the retained window,
+   * newest-first. Each entry is metadata only (no decrypt) — `seq`/`deviceId`/
+   * `keyEpoch` from the SIGNED commit body, authenticated as the true ancestry of
+   * the verified head (`verifyHistorySegment`). `commitHash` lets the caller align
+   * advisory server timestamps. Empty when the workspace has no history yet.
+   */
+  async history(limit: number): Promise<VersionInfo[]> {
+    const vh = await this.verifiedHead();
+    if (!vh) return [];
+    const { account, sequence: head } = vh;
+    const seg = await this.retainedSegmentEndingAtHead(Math.max(0, head - limit), head, vh.commit.commitHash, account);
+    return seg
+      .map((c) => {
+        const b = parseCommit(c);
+        return { seq: b.seq, deviceId: b.deviceId, keyEpoch: b.keyEpoch, commitHash: c.commitHash };
+      })
+      .reverse(); // newest-first
+  }
+
+  /**
+   * The verified + decrypted manifest at a historical sequence, plus the per-epoch
+   * KEK bytes for decrypting that commit's file blobs (design 12 §15). Authenticates
+   * `[seq..head]` as the true ancestry of the verified head, then decrypts under the
+   * commit's OWN `keyEpoch` (`openCommitHistorical` — no current-epoch gate, since a
+   * historical commit may predate a rotation). Throws (fail closed) on an out-of-range
+   * seq, a tampered/non-terminating chain, or a `seq` pruned past retention
+   * (`NeedsRebaselineError` from `commitsSince`).
+   */
+  async manifestAtSeq(seq: number): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+    const vh = await this.verifiedHead();
+    if (!vh) throw new Error("this workspace has no version history yet");
+    const { account, sequence: head, commit: headCommit } = vh;
+    if (!Number.isInteger(seq) || seq < 1 || seq > head) throw new Error(`no such version: ${seq} (history is 1..${head})`);
+
+    let target: SignedCommit;
+    if (seq === head) {
+      target = headCommit; // already verified by verifiedHead()
+    } else {
+      const chain = await this.api.commitsSince(seq - 1); // (seq-1, head] = seq..head
+      target = await verifyHistorySegment(chain, seq, headCommit.commitHash, account);
+    }
+    const body = parseCommit(target);
     const kek = await this.kekFor(body.keyEpoch, account, false);
     const encManifest = await this.api.blobStore().get(body.encManifestSha);
-    const json = await openCommit({ secrets: this.ctx.secrets, kek, account, commit: head, encManifest, workspaceId: this.ctx.workspaceId });
-    await this.pinFrom(head, account);
-    return { sequence, manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest };
+    const json = await openCommitHistorical({ secrets: this.ctx.secrets, kek, account, commit: target, encManifest, workspaceId: this.ctx.workspaceId });
+    return { manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest, kek };
+  }
+
+  /**
+   * `rbox versions <path>`: the versions in which `relPath`'s CONTENT changed,
+   * newest-first (design 06 §2). Single-pass over the verified retained window —
+   * decrypt each commit's manifest (`openCommitHistorical`) and emit a change-point
+   * whenever the path's plaintext `sha256` differs from the previous (older) version
+   * (first appearance and deletion-within-window included; `sha256: null` = absent).
+   */
+  async pathHistory(relPath: string, limit: number): Promise<Array<{ seq: number; deviceId: string; sha256: string | null }>> {
+    const vh = await this.verifiedHead();
+    if (!vh) return [];
+    const { account, sequence: head } = vh;
+    const seg = await this.retainedSegmentEndingAtHead(Math.max(0, head - limit), head, vh.commit.commitHash, account);
+    const changes: Array<{ seq: number; deviceId: string; sha256: string | null }> = [];
+    let lastSha: string | null | undefined; // undefined = nothing emitted yet
+    for (const c of seg) {
+      const body = parseCommit(c);
+      const kek = await this.kekFor(body.keyEpoch, account, false);
+      const encManifest = await this.api.blobStore().get(body.encManifestSha);
+      const json = await openCommitHistorical({ secrets: this.ctx.secrets, kek, account, commit: c, encManifest, workspaceId: this.ctx.workspaceId });
+      const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
+      const sha = manifest.files.find((f) => f.path === relPath)?.sha256 ?? null;
+      if (lastSha === undefined || sha !== lastSha) changes.push({ seq: body.seq, deviceId: body.deviceId, sha256: sha });
+      lastSha = sha;
+    }
+    return changes.reverse(); // newest-first
+  }
+
+  /**
+   * Fetch the verified contiguous commit segment ending at the trusted head,
+   * starting as low as retention allows (≥ `desiredSince`). When the desired window
+   * dips below the prune floor the server 409s (`NeedsRebaselineError`); we
+   * binary-search the smallest `since` that the server can still serve — bounded by
+   * log2(window), so a few cheap probes — then verify the segment terminates at the
+   * trusted head. Never returns unverified commits.
+   */
+  private async retainedSegmentEndingAtHead(desiredSince: number, head: number, headHash: string, account: VerifiedAccount): Promise<SignedCommit[]> {
+    let lo = desiredSince;
+    let hi = head - 1;
+    let best: SignedCommit[] | null = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      try {
+        best = await this.api.commitsSince(mid); // success: try to reach lower (more history)
+        hi = mid - 1;
+      } catch (e) {
+        if (e instanceof NeedsRebaselineError) {
+          lo = mid + 1; // `mid` is below the retention floor → raise the floor
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (!best) throw new Error("no retained version history available (pruned past the retention window)");
+    const fromSeq = head - best.length + 1;
+    await verifyHistorySegment(best, fromSeq, headHash, account);
+    return best;
   }
 
   async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
@@ -249,8 +386,12 @@ export class E2eeRemote implements SyncRemote {
     const pin = await this.pins.load();
     if (pin) {
       const rh = account.rosterHashByVersion.get(pin.rosterVersion);
-      if (rh !== pin.rosterHash || account.currentEpoch < pin.accountEpoch) {
-        throw new Error("account key rollback detected (roster/key-state moved backward) — refusing to sync");
+      // C2: pin HASHES, not versions. The roster hash at the pinned version and the
+      // key-state hash at the pinned epoch must both match — a same-version/same-epoch
+      // fork (different hash) is a rollback/substitution. Epoch must not move backward.
+      const ksh = account.keyStateHashByEpoch.get(pin.accountEpoch);
+      if (rh !== pin.rosterHash || ksh !== pin.keyStateHash || account.currentEpoch < pin.accountEpoch) {
+        throw new Error("account key rollback detected (roster/key-state moved backward or forked) — refusing to sync");
       }
     }
     if (!account.currentRoster.devices.some((d) => d.deviceId === this.ctx.secrets.deviceId && d.status === "active")) {
