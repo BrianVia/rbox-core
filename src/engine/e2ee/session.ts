@@ -60,8 +60,10 @@ function recoveryWrapCtx(accountId: string, accountEpoch: number): WrapContext {
 function pairingWrapCtx(accountId: string, accountEpoch: number): WrapContext {
   return { accountId, accountEpoch, wrappedKeyKind: "MK", purpose: "rbox/mk-wrap/pairing/v1" };
 }
-function kekWrapCtx(accountId: string, accountEpoch: number, keyEpoch: number): WrapContext {
-  return { accountId, accountEpoch, keyEpoch, wrappedKeyKind: "KEK", purpose: "rbox/kek-wrap/v1" };
+function kekWrapCtx(accountId: string, workspaceId: string, accountEpoch: number, keyEpoch: number): WrapContext {
+  // workspaceId is bound into the wrap AAD so a same-account/same-epoch KEK wrap from
+  // ANOTHER workspace can't be substituted (per-workspace key separation, codex r2).
+  return { accountId, workspaceId, accountEpoch, keyEpoch, wrappedKeyKind: "KEK", purpose: "rbox/kek-wrap/v1" };
 }
 
 // ---- account bootstrap ----------------------------------------------------
@@ -139,14 +141,16 @@ export async function bootstrapAccount(accountId: string, deviceId: string, now:
 /** Generate a workspace KEK and wrap it under MK (to store as workspace_keys). */
 export async function createWorkspaceKey(secrets: DeviceSecrets, workspaceId: string, keyEpoch = 0, accountEpoch = 0): Promise<{ kek: Uint8Array; kekWrap: Wrap }> {
   const kek = generateWorkspaceKek();
-  const kekWrap = await aesGcmWrap(secrets.mk, kek, kekWrapCtx(secrets.accountId, accountEpoch, keyEpoch));
+  const kekWrap = await aesGcmWrap(secrets.mk, kek, kekWrapCtx(secrets.accountId, workspaceId, accountEpoch, keyEpoch));
   return { kek, kekWrap };
 }
 
-/** Unwrap a workspace KEK from its stored wrap using MK. */
-export function openWorkspaceKey(secrets: DeviceSecrets, kekWrap: Wrap, keyEpoch = 0, accountEpoch = 0): Promise<Uint8Array> {
+/** Unwrap a workspace KEK from its stored wrap using MK. The `workspaceId` MUST be
+ *  the workspace this wrap belongs to — it's bound into the AAD, so passing a
+ *  different one (a server serving another workspace's wrap) fails closed. */
+export function openWorkspaceKey(secrets: DeviceSecrets, kekWrap: Wrap, workspaceId: string, keyEpoch = 0, accountEpoch = 0): Promise<Uint8Array> {
   if (kekWrap.kind !== "aesgcm-wrap") throw new Error("workspace KEK wrap must be aesgcm-wrap");
-  return aesGcmUnwrap(secrets.mk, kekWrap, kekWrapCtx(secrets.accountId, accountEpoch, keyEpoch));
+  return aesGcmUnwrap(secrets.mk, kekWrap, kekWrapCtx(secrets.accountId, workspaceId, accountEpoch, keyEpoch));
 }
 
 // ---- commit (push) --------------------------------------------------------

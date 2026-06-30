@@ -174,8 +174,13 @@ export class E2eeRemote implements SyncRemote {
       if (verified.commitHash !== commit.commitHash) throw new Error("verified chain head does not match latest() (fork/equivocation) — refusing");
       head = verified;
     }
+    // Bind to the SIGNED sequence, not the server's unsigned `latest.sequence` — a
+    // server could otherwise pair a valid signed commit with a bogus sequence and
+    // skew history bounds. The signed seq is authoritative (it's inside commitHash).
+    const signedSeq = parseCommit(head).seq;
+    if (signedSeq !== sequence) throw new Error("server's reported head sequence does not match the signed commit seq (equivocation) — refusing");
     await this.pinFrom(head, account);
-    return { account, sequence, commit: head };
+    return { account, sequence: signedSeq, commit: head };
   }
 
   // ---- version history + restore (design 12 §15, D11) ----------------------
@@ -354,6 +359,9 @@ export class E2eeRemote implements SyncRemote {
     if (res.conflict) return { conflict: true, head: res.head };
     if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs };
     if (res.epochStale !== undefined) return { conflict: true, head: parentSequence }; // rotated under us → pull+retry
+    // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
+    // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
+    if (res.sequence !== parentSequence + 1) throw new Error("server returned a sequence that does not match the signed commit seq — refusing to pin");
     await this.pinFrom(built.commit, account);
     return { sequence: res.sequence };
   }
@@ -409,7 +417,7 @@ export class E2eeRemote implements SyncRemote {
     const wraps = await this.api.getWorkspaceKeys(this.ctx.workspaceId);
     const found = wraps.find((w) => w.keyEpoch === keyEpoch);
     if (found) {
-      const kek = await openWorkspaceKey(this.ctx.secrets, JSON.parse(found.kekWrap) as Wrap, keyEpoch, account.currentEpoch);
+      const kek = await openWorkspaceKey(this.ctx.secrets, JSON.parse(found.kekWrap) as Wrap, this.ctx.workspaceId, keyEpoch, account.currentEpoch);
       this.kekByEpoch.set(keyEpoch, kek);
       return kek;
     }
@@ -418,7 +426,7 @@ export class E2eeRemote implements SyncRemote {
     // Create + publish via the immutable CAS; adopt whatever wrap actually won.
     const fresh = await createWorkspaceKey(this.ctx.secrets, this.ctx.workspaceId, keyEpoch, account.currentEpoch);
     const winner = await this.api.putWorkspaceKey(this.ctx.workspaceId, keyEpoch, JSON.stringify(fresh.kekWrap));
-    const kek = await openWorkspaceKey(this.ctx.secrets, JSON.parse(winner.kekWrap) as Wrap, keyEpoch, account.currentEpoch);
+    const kek = await openWorkspaceKey(this.ctx.secrets, JSON.parse(winner.kekWrap) as Wrap, this.ctx.workspaceId, keyEpoch, account.currentEpoch);
     this.kekByEpoch.set(keyEpoch, kek);
     return kek;
   }

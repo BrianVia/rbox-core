@@ -1254,7 +1254,18 @@ the sole validator under E2EE). Then:
   (5) deleted the dead/mismatched plaintext `RboxApi.manifestAt`, fixed `versions()`
   to the real server shape (advisory only); (6) restore uses a new public
   `restoreEntryToPath` (explicit overwrite), not the private reconcile `writeEntry`.
-- codex round 2 → (pending; re-run after implementation).
+- codex round 2 (post-implementation) → **FAIL**, 0 BLOCKER, 2 MAJOR (both pre-existing
+  core gaps the feature exercises), resolved: (1) **bind the head to the SIGNED
+  sequence** — `verifiedHead` asserts `parseCommit(head).seq === reported seq` and
+  returns the signed seq; `commit()` asserts the server's returned sequence ==
+  the signed `parentSeq+1` before pinning (a server can't skew history bounds with a
+  bogus unsigned sequence). (2) **bind `workspaceId` into the KEK-wrap AAD**
+  (`kekWrapCtx`/`createWorkspaceKey`/`openWorkspaceKey`) so a same-account/same-epoch
+  KEK wrap from another workspace can't be substituted — restoring per-workspace key
+  separation; added a regression test. The "historical commits may predate rotation"
+  decrypt is honestly scoped to v1's single account epoch (§15.2) — cross-rotation
+  restore fails closed on the GCM AAD and is deferred with rotation.
+- codex round 3 → (pending; re-run after the round-2 fixes).
 
 ## 12. Open questions for codex (crypto core — RESOLVED in v2–v4 above)
 1. **Key hierarchy:** MK (random) wrapped by both device-keypair and

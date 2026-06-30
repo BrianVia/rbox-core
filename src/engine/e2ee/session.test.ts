@@ -33,13 +33,19 @@ describe("session — workspace key round-trip", () => {
   test("createWorkspaceKey then openWorkspaceKey returns the same KEK", async () => {
     const boot = await bootedAccount();
     const { kek, kekWrap } = await createWorkspaceKey(boot.secrets, "ws1");
-    expect(toB64url(await openWorkspaceKey(boot.secrets, kekWrap))).toBe(toB64url(kek));
+    expect(toB64url(await openWorkspaceKey(boot.secrets, kekWrap, "ws1"))).toBe(toB64url(kek));
   });
 
   test("a wrong key epoch refuses to open the KEK", async () => {
     const boot = await bootedAccount();
     const { kekWrap } = await createWorkspaceKey(boot.secrets, "ws1", 0);
-    await expect(openWorkspaceKey(boot.secrets, kekWrap, 1)).rejects.toThrow();
+    await expect(openWorkspaceKey(boot.secrets, kekWrap, "ws1", 1)).rejects.toThrow();
+  });
+
+  test("another workspace's KEK wrap refuses to open (per-workspace key separation)", async () => {
+    const boot = await bootedAccount();
+    const { kekWrap } = await createWorkspaceKey(boot.secrets, "ws1");
+    await expect(openWorkspaceKey(boot.secrets, kekWrap, "ws2")).rejects.toThrow();
   });
 });
 
