@@ -229,8 +229,8 @@ export interface Pin {
 /** Verify the roster chain + key-state chain for an account (call once per pull
  *  session). Returns the verified, pinnable head facts. The caller MUST also
  *  check these extend its locally-pinned `rosterHash`/`keyStateHash` (C2). */
-export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: SignedKeyState[], now: number): Promise<VerifiedAccount> {
-  const rosters = await verifyRosterChain(rosterChain, { now });
+export async function verifyAccount(rosterChain: SignedRoster[], keyStateChain: SignedKeyState[]): Promise<VerifiedAccount> {
+  const rosters = await verifyRosterChain(rosterChain);
   const rosterHashByVersion = new Map<number, string>();
   for (let i = 0; i < rosterChain.length; i++) rosterHashByVersion.set(i, rosterChain[i]!.rosterHash);
   const keyStates = await verifyKeyStateChain(keyStateChain, rosters, rosterHashByVersion);

@@ -4,7 +4,6 @@ import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
-import { markedCandidateSet } from "./gc-phase1.js";
 import { dbFor } from "./db.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
@@ -56,20 +55,20 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
       const chunk = uniq.slice(i, i + 80);
       if (chunk.length === 0) break;
       const ph = chunk.map(() => "?").join(",");
+      // §33 candidate-aware check, FOLDED into the have-set query: a Phase-1 prune-marked ref
+      // (`blob_ref_candidates`) is excluded from "have" by the NOT EXISTS, so it reads as missing
+      // → the client re-stages it → the re-stage's commit re-grants + clears the marker. Folding
+      // it in (vs a second pass) makes the barrier one query and impossible to forget.
       const rows = await db
         .prepare(
           `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
-           WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${ph})`,
+           WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${ph})
+             AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
         )
         .bind(accountId, ...chunk)
         .all<{ sha256: string }>();
       for (const row of rows.results ?? []) have.add(row.sha256);
     }
-    // §33 candidate-aware check: a Phase-1 prune-marked ref reads as missing → the client
-    // re-stages it → the re-stage's commit re-grants + clears the marker (resurrected before
-    // any new commit references it).
-    const marked = await markedCandidateSet(db, accountId, [...have]);
-    for (const m of marked) have.delete(m);
     const missing = uniq.filter((s) => !have.has(s));
     op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
     return json({ missing });
@@ -81,15 +80,19 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
     const chunk = shas.slice(i, i + 80);
     if (chunk.length === 0) break;
     const ph = chunk.map(() => "?").join(",");
-    const rows = await db.prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+    // §33 candidate-aware check (legacy path), FOLDED into the present query: a Phase-1
+    // prune-marked ref (`blob_ref_candidates`) is excluded from `present` by the NOT EXISTS, so
+    // it reads as missing (one query, no separate pass — the barrier can't be forgotten).
+    const rows = await db
+      .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph}) AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = ? AND c.sha256 = blobs.sha256)`)
+      .bind(...chunk, accountId)
+      .all<{ sha256: string }>();
     for (const r of rows.results ?? []) present.add(r.sha256);
     const cand = await db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
     for (const r of cand.results ?? []) condemned.add(r.sha256);
   }
   const entitled = await entitledSubset(op.env, accountId, uniq);
-  // §33 candidate-aware check (legacy path): a Phase-1 prune-marked ref reads as missing.
-  const marked = await markedCandidateSet(db, accountId, uniq);
-  const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s) || marked.has(s));
+  const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s));
   // `missingBlobs` is the client preflight: count + missing ratio, never raw SHAs.
   op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
   return json({ missing });
@@ -126,12 +129,11 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 
   // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
   // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
-  // §33: SKIP this advisory pre-check when the account is ALREADY entitled — a re-upload
-  // forced by the candidate-aware "missing" (a prune-marked but still-owned ref) charges 0
-  // at grant, so an at/over-cap account MUST be able to re-establish it (else it can't clear
-  // its own Phase-1 marker and purge would drop a ref it already paid for). The grant's
-  // cap-guard trigger is the authoritative gate and never trips on a 0-delta re-grant.
-  const pre = (await isEntitled(op.env, accountId, sha)) ? { over: false, used: 0, cap: 0 } : await wouldExceedCap(op.env, accountId, len);
+  // §33: wouldExceedCap is entitlement-aware — a re-upload forced by the candidate-aware
+  // "missing" (a prune-marked but still-owned ref) charges 0 at grant, so it returns over:false
+  // for an already-entitled sha, letting an at/over-cap account re-establish + un-mark a ref it
+  // already paid for. The grant's cap-guard trigger is the authoritative gate.
+  const pre = await wouldExceedCap(op.env, accountId, sha, len);
   if (pre.over) {
     op.done("quota_exceeded", { bytes: len });
     return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
@@ -176,11 +178,11 @@ export async function multipartInit(req: Request, env: Env, sha: string, account
   const body = (await req.json()) as { size?: number };
   const size = Number(body.size ?? 0);
   if (!Number.isInteger(size) || size <= 0) return json({ error: "bad_request", message: "missing size" }, 400);
-  // Fail-fast over-cap before staging any multipart parts (design 13 G4). §33: skip when
-  // already entitled — a re-upload forced by the candidate-aware "missing" charges 0 at the
-  // multipartComplete grant, so an at/over-cap account must be able to re-establish its own
-  // prune-marked ref (else it can't clear the marker and purge drops a ref it owns).
-  const pre = (await isEntitled(op.env, accountId, sha)) ? { over: false, used: 0, cap: 0 } : await wouldExceedCap(op.env, accountId, size);
+  // Fail-fast over-cap before staging any multipart parts (design 13 G4). §33: wouldExceedCap
+  // is entitlement-aware — a re-upload forced by the candidate-aware "missing" charges 0 at the
+  // multipartComplete grant, so it returns over:false for an already-entitled sha, letting an
+  // at/over-cap account re-establish + un-mark its own prune-marked ref.
+  const pre = await wouldExceedCap(op.env, accountId, sha, size);
   if (pre.over) {
     op.done("quota_exceeded", { bytes: size });
     return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);

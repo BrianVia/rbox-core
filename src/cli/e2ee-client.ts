@@ -29,11 +29,11 @@ const ACCOUNT_ID_RE = /^acct_[a-z0-9]+$/i; // grammar gate before trusting the v
 const ADMIT_RETRIES = 4;
 
 /** Parse the verified account chains from the server DTO + verify them (C1/C2/C7). */
-async function verifyDto(dto: AccountKeysDTO, now: number) {
+async function verifyDto(dto: AccountKeysDTO) {
   const rosters = dto.rosters.map((s) => JSON.parse(s) as SignedRoster);
   const keyStates = dto.keyStates.map((s) => JSON.parse(s) as SignedKeyState);
   if (!rosters.length || !keyStates.length) throw new Error("account key chain incomplete — refusing (fatal)");
-  return { rosters, keyStates, account: await verifyAccount(rosters, keyStates, now) };
+  return { rosters, keyStates, account: await verifyAccount(rosters, keyStates) };
 }
 
 /** Cross-check a server-returned accountId against the SIGNED roster accountId (D7). */
@@ -68,10 +68,10 @@ export async function bootstrapNewAccount(api: RboxApi, accountId: string, devic
 
 /** Self-verify the candidate extended chain + wrap authorization BEFORE publishing
  *  (D4) — a chain that wouldn't verify must never wedge other clients. */
-async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedRoster, deviceWrap: Wrap, now: number): Promise<void> {
+async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedRoster, deviceWrap: Wrap): Promise<void> {
   const rosters = dto.rosters.map((s) => JSON.parse(s) as SignedRoster);
   const keyStates = dto.keyStates.map((s) => JSON.parse(s) as SignedKeyState);
-  const account = await verifyAccount([...rosters, admissionRoster], keyStates, now);
+  const account = await verifyAccount([...rosters, admissionRoster], keyStates);
   await assertMkWrapAuthorized(deviceWrap, account);
 }
 
@@ -122,14 +122,14 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
   const api = new RboxApi(remoteUrl, redeem.token, "", "");
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
-  const { account } = await verifyDto(dto, now);
+  const { account } = await verifyDto(dto);
   assertSignedAccountId(redeem.accountId, account.currentRoster.accountId); // D7
 
   const material = { mkWrap: JSON.parse(redeem.mkWrap) as Wrap, admissionGrant: JSON.parse(redeem.admissionGrant) as { grant: string; grantSig: string; admissionPubKey: string; grantSignerDeviceId: string } };
   const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
     const r = await redeemPairing({ accountId: redeem.accountId, deviceId: redeem.deviceId, tokenSecret, accountEpoch: account.currentEpoch, material, prevRoster: headRoster(curDto), now, deviceKeys: keys });
-    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap, now); // D4
+    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap); // D4
     return r;
   };
 
@@ -147,7 +147,7 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
   const api = new RboxApi(creds.remoteUrl, creds.token, "", "");
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
-  const { account } = await verifyDto(dto, now);
+  const { account } = await verifyDto(dto);
   assertSignedAccountId(creds.accountId, account.currentRoster.accountId);
   if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
 
@@ -160,7 +160,7 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
   const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
     const r = await buildRecoveryAdmission({ accountId: creds.accountId!, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
-    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap, now);
+    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap);
     return r;
   };
   const initial = await build(dto);
@@ -175,7 +175,7 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
  * device.json is present but mk.key is missing, re-open this device's own
  * server-stored MK wrap and save it. A MISSING device.json → not enrolled (D6).
  */
-async function ensureSecrets(api: RboxApi, accountId: string, now: number): Promise<DeviceSecrets> {
+async function ensureSecrets(api: RboxApi, accountId: string): Promise<DeviceSecrets> {
   const loaded = await loadDevice(accountId);
   if (loaded && "secrets" in loaded) return loaded.secrets;
   if (!loaded) {
@@ -185,7 +185,7 @@ async function ensureSecrets(api: RboxApi, accountId: string, now: number): Prom
   // using the account's verified current epoch (not a hardcoded 0).
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
-  const { account } = await verifyDto(dto, now);
+  const { account } = await verifyDto(dto);
   const mine = dto.devices.find((d) => d.deviceId === loaded.device.deviceId);
   if (!mine?.mkWrap) throw new Error("no MK wrap stored for this device — run `rbox recover`.");
   const wrap = JSON.parse(mine.mkWrap) as Wrap;
@@ -210,7 +210,7 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`");
 
   const api = new RboxApi(creds.remoteUrl ?? cfg.remoteUrl, creds.token, cfg.remoteWorkspaceId, cfg.projectId);
-  const secrets = await ensureSecrets(api, creds.accountId, now());
+  const secrets = await ensureSecrets(api, creds.accountId);
   const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
   const kek = await remote.currentKek(); // frozen write epoch (D1)
   // `remote` is returned alongside `deps` so version-history commands can reach the

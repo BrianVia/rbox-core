@@ -1,7 +1,8 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { PLANS, planFor } from "./plans.js";
-import { audit, type Principal } from "./authz.js";
+import { audit, isEntitled, type Principal } from "./authz.js";
+import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
 
 /** Downgrade grace window (design 13): paid→free preserves all version history
@@ -13,19 +14,20 @@ async function account(env: Env, accountId: string): Promise<{ plan: string; ext
   return { plan: r?.plan ?? "free", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
 }
 
-export async function storageCap(env: Env, accountId: string): Promise<number> {
-  const a = await account(env, accountId);
-  return planFor(a.plan).storageBytes + a.extra; // Infinity for unlimited plans
-}
-
 /** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
  *  accepting `incomingSize` more bytes would exceed the cap. Advisory — the
  *  authoritative, race-safe charge is still grantEntitlementWithQuota at finalize;
  *  this just stops a downgraded/over-cap account from staging orphan R2 cost and
- *  gives the client an immediate "you're over your plan" 402. */
-export async function wouldExceedCap(env: Env, accountId: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number }> {
+ *  gives the client an immediate "you're over your plan" 402.
+ *
+ *  §33: entitlement-aware. A ref this account is ALREADY entitled to charges 0 at the grant
+ *  (NOT-EXISTS), so it can never push the account over cap — including the candidate-aware
+ *  "missing" re-upload of a prune-marked but still-owned ref by an at/over-cap account. We
+ *  return `over:false` for it directly, so callers need no fake-sentinel bypass. */
+export async function wouldExceedCap(env: Env, accountId: string, sha: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number }> {
   const a = await account(env, accountId);
   const cap = planFor(a.plan).storageBytes + a.extra;
+  if (await isEntitled(env, accountId, sha)) return { over: false, used: a.used, cap };
   return { over: cap !== Infinity && a.used + incomingSize > cap, used: a.used, cap };
 }
 
@@ -38,7 +40,6 @@ export async function wouldExceedCap(env: Env, accountId: string, incomingSize: 
  * canonical R2 blob is left as a GC-reclaimable orphan, never deleted).
  */
 export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number, nowMs: number = Date.now()): Promise<{ granted: boolean; used: number; cap: number }> {
-  const cap = await storageCap(env, accountId);
   const db = dbFor(env, accountId);
   // §33: the grant is ONE atomic db.batch (one D1 transaction), mirroring commitAccounting —
   // NOT a split insert-then-charge. Statement order is charge → grant → un-mark/un-condemn:
@@ -70,14 +71,16 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
     ]);
   } catch (e) {
     // accounts_cap_guard RAISE(ABORT,'over_cap') rolled the whole batch back → nothing granted.
-    if (e instanceof Error && /over_cap/i.test(e.message)) {
+    if (isOverCapAbort(e)) {
       const a = await account(env, accountId);
-      return { granted: false, used: a.used, cap };
+      return { granted: false, used: a.used, cap: planFor(a.plan).storageBytes + a.extra };
     }
     throw e;
   }
+  // ONE post-batch accounts read is the authoritative used/cap (the cap-guard trigger, not an
+  // upfront cap fetch, is the gate) — `cap` is derived locally from the same row, no second read.
   const a = await account(env, accountId);
-  return { granted: true, used: a.used, cap };
+  return { granted: true, used: a.used, cap: planFor(a.plan).storageBytes + a.extra };
 }
 
 /** Decrement an account's usage counter (called by GC purge per dropped entitlement). */

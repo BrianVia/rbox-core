@@ -11,26 +11,38 @@ import { dbFor } from "./db.js";
 // fan-out. (`releaseUsage` below DOES carry the owning account → routes normally.)
 
 /**
- * Build the GLOBAL reachable set from AUTHORITATIVE DO roots (GC). Enumerates the
- * workspace registry and asks each DO for its retained roots (fail closed if any
- * can't be read). Under full E2EE the DO parses each retained commit body and
- * hands back the content addresses directly — the encrypted manifest sha and every
- * referenced encSha — so GC needs NO R2 manifest fetch and stays zero-knowledge.
+ * Build the reachable set from AUTHORITATIVE DO roots for a set of workspaces. Asks each
+ * per-(workspace, project) WorkspaceSync DO for its retained roots and unions every
+ * `encManifestSha` + referenced `encSha`. Under full E2EE the DO parses each retained
+ * commit body and hands back the content addresses directly, so GC needs NO R2 manifest
+ * fetch and stays zero-knowledge.
+ *
+ * FAIL CLOSED: a single unreadable DO (non-2xx) THROWS — `Promise.all` rejects on the first
+ * failure — so GC never treats a transient DO error as "unreachable" and wrongly reclaims
+ * live content. The DO fetches run in parallel (latency); `Set.add` is synchronous between
+ * awaits so the union stays race-free on JS's single thread.
  */
-async function computeReachable(env: Env): Promise<Set<string>> {
+export async function reachableFromWorkspaces(env: Env, rows: Array<{ workspace_id: string; project_id: string }>): Promise<Set<string>> {
   const reachable = new Set<string>();
-  const wss = await dbFor(env, "").prepare("SELECT workspace_id, project_id FROM workspaces").all<{ workspace_id: string; project_id: string }>();
-  for (const w of wss.results ?? []) {
-    const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
-    const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${w.workspace_id}/proj/${w.project_id}/roots`);
-    if (!res.ok) throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`);
-    const { roots } = (await res.json()) as { roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> };
-    for (const r of roots) {
-      if (r.encManifestSha) reachable.add(r.encManifestSha); // the encrypted manifest (itself a normal blob)
-      for (const s of r.encShas) reachable.add(s); // every referenced ciphertext blob
-    }
-  }
+  await Promise.all(
+    rows.map(async (w) => {
+      const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
+      const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${w.workspace_id}/proj/${w.project_id}/roots`);
+      if (!res.ok) throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`);
+      const { roots } = (await res.json()) as { roots: Array<{ encManifestSha: string; encShas: string[] }> };
+      for (const r of roots) {
+        if (r.encManifestSha) reachable.add(r.encManifestSha); // the encrypted manifest (itself a normal blob)
+        for (const s of r.encShas) reachable.add(s); // every referenced ciphertext blob
+      }
+    }),
+  );
   return reachable;
+}
+
+/** The GLOBAL reachable set (GC mark/purge): `reachableFromWorkspaces` over EVERY workspace. */
+async function computeReachable(env: Env): Promise<Set<string>> {
+  const wss = await dbFor(env, "").prepare("SELECT workspace_id, project_id FROM workspaces").all<{ workspace_id: string; project_id: string }>();
+  return reachableFromWorkspaces(env, wss.results ?? []);
 }
 
 const shaOfKey = (key: string) => key.split("/").pop() ?? "";

@@ -197,20 +197,17 @@ export async function buildAdmissionRoster(args: {
 
 // ---- verification ---------------------------------------------------------
 
-export interface VerifyOptions {
-  /** RESERVED. Was the admission-grant `notAfter` clock; §31 removed that check (replaying
-   *  immutable history against the verifier's current clock is unsound and bricked multi-device
-   *  accounts). Kept on the surface to avoid churning the verify-path signatures during a
-   *  security fix; threading it out is a follow-up cleanup. Currently read by nothing. */
-  now: number;
-}
-
 /**
  * Verify a roster chain from genesis. Returns the verified bodies (index = version)
  * or throws on the first inconsistency. Does NOT establish genesis trust — the
  * caller binds roster v0's hash to a MK-authenticated accountKeyState (epoch.ts).
+ *
+ * No clock parameter: §31 removed the admission-grant `notAfter` check (replaying immutable
+ * history against the verifier's current clock is unsound and bricked multi-device accounts).
+ * Freshness is gated where a trusted clock exists — the pairing-token TTL at redeem (auth.ts) —
+ * and grant reuse is prevented by the single-use grantId below.
  */
-export async function verifyRosterChain(chain: SignedRoster[], opts: VerifyOptions): Promise<RosterBody[]> {
+export async function verifyRosterChain(chain: SignedRoster[]): Promise<RosterBody[]> {
   if (chain.length === 0) throw new Error("empty roster chain");
   const bodies: RosterBody[] = [];
   const seenGrantIds = new Set<string>();
@@ -230,7 +227,7 @@ export async function verifyRosterChain(chain: SignedRoster[], opts: VerifyOptio
       if (body.prevRosterHash !== chain[i - 1]!.rosterHash) throw new Error(`roster ${i}: broken prev-hash link`);
       if (body.accountId !== prev.accountId) throw new Error(`roster ${i}: accountId changed`);
       if (body.accountEpoch < prev.accountEpoch) throw new Error(`roster ${i}: accountEpoch went backwards`);
-      await verifyTransition(prev, sr, body, seenGrantIds, opts);
+      await verifyTransition(prev, sr, body, seenGrantIds);
     }
     if (body.grantId) seenGrantIds.add(body.grantId);
     bodies.push(body);
@@ -264,7 +261,7 @@ async function requireSignerInRoster(sr: SignedRoster, body: RosterBody): Promis
   }
 }
 
-async function verifyTransition(prev: RosterBody, sr: SignedRoster, body: RosterBody, seenGrantIds: Set<string>, opts: VerifyOptions): Promise<void> {
+async function verifyTransition(prev: RosterBody, sr: SignedRoster, body: RosterBody, seenGrantIds: Set<string>): Promise<void> {
   const prevSigner = prev.devices.find((d) => d.deviceId === sr.signerDeviceId && d.status === "active");
 
   if (prevSigner) {
@@ -279,15 +276,15 @@ async function verifyTransition(prev: RosterBody, sr: SignedRoster, body: Roster
   // (b) admission grant: the signer is a brand-new device admitting itself.
   const adm = sr.admission;
   if (!adm) throw new Error(`roster ${body.version}: signer not active in prev and no admission proof`);
-  await verifyAdmission(prev, sr, body, adm, seenGrantIds, opts);
+  await verifyAdmission(prev, sr, body, adm, seenGrantIds);
 }
 
-async function verifyAdmission(prev: RosterBody, sr: SignedRoster, body: RosterBody, adm: AdmissionProof, seenGrantIds: Set<string>, opts: VerifyOptions): Promise<void> {
+async function verifyAdmission(prev: RosterBody, sr: SignedRoster, body: RosterBody, adm: AdmissionProof, seenGrantIds: Set<string>): Promise<void> {
   const grant = parseStrict(adm.grant) as AdmissionGrant;
   if (grant.type !== "rbox/admission-grant/v1") throw new Error("bad admission grant type");
   if (canonicalString(grant) !== adm.grant) throw new Error("admission grant not canonical");
   if (grant.accountId !== prev.accountId || grant.accountEpoch !== prev.accountEpoch) throw new Error("admission grant account/epoch mismatch");
-  // §31: NO `grant.notAfter < opts.now` here. This replays IMMUTABLE history; a roster
+  // §31: NO `grant.notAfter` vs current-clock check here. This replays IMMUTABLE history; a roster
   // version has no trustworthy append timestamp, so comparing a grant's liveness bound to the
   // verifier's *current* clock is unsound — it bricks every multi-device account ~notAfter after
   // pairing (P0). Freshness is gated where a trusted clock exists: the pairing-token TTL at

@@ -74,6 +74,12 @@ export function isUniqueViolation(e: unknown): boolean {
   return /UNIQUE constraint failed/i.test(String((e as Error)?.message ?? e));
 }
 
+/** True when the `accounts_cap_guard` trigger aborted a batch with RAISE(ABORT,'over_cap')
+ *  — the over-quota signal every charge/grant path catches to roll back and 402. */
+export function isOverCapAbort(e: unknown): boolean {
+  return e instanceof Error && /over_cap/i.test(e.message);
+}
+
 /** Mint a device token into a specific account/user (returns the plaintext once,
  *  plus the generated `device_id`). `expiresAt` (epoch ms) makes it a short-lived
  *  token (web sessions); omit for durable CLI/device tokens.

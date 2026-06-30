@@ -1,6 +1,12 @@
 import type { Env } from "./env.js";
 import { json, logErr } from "./util.js";
+import { isOverCapAbort } from "./auth.js";
+import { reachableFromWorkspaces } from "./versions.js";
 import { dbFor } from "./db.js";
+
+// Max rows per multi-row INSERT so bound params stay within D1's ≤100/statement limit
+// (≤3 params/row → 33 rows = 99). Shared by the batched mark + condemn inserts below.
+const INSERT_CHUNK = 33;
 
 // §33 Phase 1 — per-account reachability GC (the leak-closing, shardable, cron-safe
 // phase). PURE D1: it reclaims a `blob_refs` row + its `used_bytes` charge for refs
@@ -11,29 +17,13 @@ import { dbFor } from "./db.js";
 // This closes the design 30 §3 / design 07b §d entitlement leak (over-cap partial
 // charges + head-409 orphans that stranded `blob_refs` + `used_bytes` forever).
 //
-// The barrier that makes purge cron-safe is the candidate-aware commit preflight
-// (`markedCandidateSet` below, consulted by validateCommitRefs / blobsCheck /
-// missingBlobs): a marked (account, sha) reads as NOT-satisfied → re-grant → the
-// marker is cleared (commit-accounting.ts + billing.ts). `granted_at`/`marked_at`
-// grace is only a secondary skip + defense-in-depth, NOT the correctness argument.
-
-/** §33 round-1: the per-account prune-candidate set for `shas`, the entitlement-level
- *  analog of the `gc_candidates` consultation. The commit preflight subtracts this
- *  from its "have" set so a marked ref forces a re-grant (which clears the marker). */
-export async function markedCandidateSet(db: D1Database, accountId: string, shas: string[]): Promise<Set<string>> {
-  const marked = new Set<string>();
-  for (let i = 0; i < shas.length; i += 80) {
-    const chunk = shas.slice(i, i + 80);
-    if (chunk.length === 0) break;
-    const ph = chunk.map(() => "?").join(",");
-    const rows = await db
-      .prepare(`SELECT sha256 FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${ph})`)
-      .bind(accountId, ...chunk)
-      .all<{ sha256: string }>();
-    for (const r of rows.results ?? []) marked.add(r.sha256);
-  }
-  return marked;
-}
+// The barrier that makes purge cron-safe is the candidate-aware commit preflight: the
+// `blob_ref_candidates` marker is FOLDED (as a `NOT EXISTS`) directly into the have/missing
+// satisfiability queries of validateCommitRefs / blobsCheck / missingBlobs, so a marked
+// (account, sha) reads as NOT-satisfied → re-grant → the marker is cleared (commit-accounting.ts
+// + billing.ts). Folding it into the existing queries (vs a separate consultation pass) makes the
+// barrier impossible to forget. `granted_at`/`marked_at` grace is only a secondary skip +
+// defense-in-depth, NOT the correctness argument.
 
 /**
  * §33 §3.1 — the per-account reachable set, from AUTHORITATIVE DO roots. Enumerate the
@@ -44,24 +34,11 @@ export async function markedCandidateSet(db: D1Database, accountId: string, shas
  * THIS account's GC — every other account stays collectible (the §32 sharding win).
  */
 export async function perAccountReachable(env: Env, accountId: string): Promise<Set<string>> {
-  const reachable = new Set<string>();
   const wss = await dbFor(env, accountId)
     .prepare("SELECT workspace_id, project_id FROM workspaces WHERE account_id = ?")
     .bind(accountId)
     .all<{ workspace_id: string; project_id: string }>();
-  for (const w of wss.results ?? []) {
-    const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
-    const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${w.workspace_id}/proj/${w.project_id}/roots`);
-    // Fail closed: a single unreadable DO must NOT make this account's refs look
-    // unreachable (that would wrongly reclaim live entitlements). Abort this account.
-    if (!res.ok) throw new Error(`phase1 reachable abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id} (acct ${accountId})`);
-    const { roots } = (await res.json()) as { roots: Array<{ encManifestSha: string; encShas: string[] }> };
-    for (const r of roots) {
-      if (r.encManifestSha) reachable.add(r.encManifestSha);
-      for (const s of r.encShas) reachable.add(s);
-    }
-  }
-  return reachable;
+  return reachableFromWorkspaces(env, wss.results ?? []);
 }
 
 /** §33 §3.2 MARK (non-destructive, cron-safe today). Mark this account's `blob_refs`
@@ -78,15 +55,24 @@ export async function phase1Mark(
     .prepare("SELECT sha256, granted_at FROM blob_refs WHERE account_id = ?")
     .bind(accountId)
     .all<{ sha256: string; granted_at: number }>();
-  let marked = 0;
+  const toMark: string[] = [];
   for (const ref of refs.results ?? []) {
     if (reachable.has(ref.sha256)) continue; // still needed → never mark
     if (nowMs - Number(ref.granted_at) < graceMs) continue; // cheap skip of fresh refs
-    const r = await db
-      .prepare("INSERT OR IGNORE INTO blob_ref_candidates (account_id, sha256, marked_at) VALUES (?, ?, ?)")
-      .bind(accountId, ref.sha256, nowMs)
-      .run();
-    marked += r.meta.changes ?? 0;
+    toMark.push(ref.sha256);
+  }
+  // One chunked multi-row INSERT OR IGNORE per db.batch (≤33 rows × 3 bound params ≤ 100/stmt)
+  // instead of one INSERT per ref — trims cron subrequests. `marked` still counts inserted rows.
+  let marked = 0;
+  for (let i = 0; i < toMark.length; i += INSERT_CHUNK) {
+    const chunk = toMark.slice(i, i + INSERT_CHUNK);
+    if (chunk.length === 0) break;
+    const r = await db.batch([
+      db
+        .prepare(`INSERT OR IGNORE INTO blob_ref_candidates (account_id, sha256, marked_at) VALUES ${chunk.map(() => "(?, ?, ?)").join(", ")}`)
+        .bind(...chunk.flatMap((sha) => [accountId, sha, nowMs])),
+    ]);
+    marked += r[0]?.meta.changes ?? 0;
   }
   return { marked };
 }
@@ -112,14 +98,17 @@ export async function phase1Purge(
   graceMs: number,
   nowMs: number,
 ): Promise<{ purged: number; released: number; resurrected: number; condemned: number }> {
+  // Hoist each candidate's blob size into the candidates query (LEFT JOIN) — no per-candidate
+  // `SELECT size_bytes`. LEFT JOIN: an orphan marker with no `blobs` row yields NULL → 0 (the
+  // EXISTS(blob_refs) guard already makes its release a no-op).
   const cands = await db
-    .prepare("SELECT sha256, marked_at FROM blob_ref_candidates WHERE account_id = ?")
+    .prepare("SELECT c.sha256, c.marked_at, b.size_bytes FROM blob_ref_candidates c LEFT JOIN blobs b ON b.sha256 = c.sha256 WHERE c.account_id = ?")
     .bind(accountId)
-    .all<{ sha256: string; marked_at: number }>();
+    .all<{ sha256: string; marked_at: number; size_bytes: number | null }>();
   let purged = 0;
   let released = 0;
   let resurrected = 0;
-  let condemned = 0;
+  const dropped: string[] = []; // shas this purge removed this account's ref for (condemn-eligible)
   for (const cand of cands.results ?? []) {
     const sha = cand.sha256;
     if (reachable.has(sha)) {
@@ -129,19 +118,19 @@ export async function phase1Purge(
       continue;
     }
     if (nowMs - Number(cand.marked_at) < graceMs) continue; // not past grace yet
+    const size = Number(cand.size_bytes ?? 0);
 
-    const sizeRow = await db.prepare("SELECT size_bytes FROM blobs WHERE sha256 = ?").bind(sha).first<{ size_bytes: number }>();
-    const size = Number(sizeRow?.size_bytes ?? 0);
-
-    // ATOMIC re-confirm + delete + conditional release (one db.batch = one transaction).
-    // BOTH statements re-read `blob_ref_candidates` INSIDE the transaction (spec §3.3:
-    // "re-read inside the delete transaction, never from the stale mark-pass list"). This
-    // closes the race where a concurrent (re-)grant CLEARS the marker (un-condemns the ref)
-    // between this purge's candidate snapshot and its delete: if the marker is gone the batch
-    // no-ops, so we never drop a ref the commit path just re-established. The release also
-    // requires the ref to still EXIST, and runs BEFORE the delete, so a crash can't drop the
-    // row without the decrement, and two concurrent purges can't double-release (D1 serializes
-    // the batch; the second sees the marker/ref already gone).
+    // ATOMIC re-confirm + delete + conditional release + marker-clear (one db.batch = one
+    // transaction). The release/delete statements re-read `blob_ref_candidates` INSIDE the
+    // transaction (spec §3.3: "re-read inside the delete transaction, never from the stale
+    // mark-pass list"). This closes the race where a concurrent (re-)grant CLEARS the marker
+    // (un-condemns the ref) between this purge's candidate snapshot and its delete: if the marker
+    // is gone the batch no-ops, so we never drop a ref the commit path just re-established. The
+    // release requires the ref to still EXIST and runs BEFORE the delete, so a crash can't drop
+    // the row without the decrement, and two concurrent purges can't double-release (D1 serializes
+    // the batch; the second sees the marker/ref already gone). The marker-clear is the 3rd
+    // statement — folded into the same transaction so it's atomic with the drop (and the guard
+    // statements above read the marker before it's deleted, in order).
     const guard = "EXISTS (SELECT 1 FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?)";
     const batchRes = await db.batch([
       db
@@ -150,25 +139,38 @@ export async function phase1Purge(
         )
         .bind(size, accountId, accountId, sha, accountId, sha),
       db.prepare(`DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ? AND ${guard}`).bind(accountId, sha, accountId, sha),
+      db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha),
     ]);
-    const dropped = (batchRes[1]?.meta.changes ?? 0) === 1;
-    if (dropped) {
+    if ((batchRes[1]?.meta.changes ?? 0) === 1) {
       purged++;
       released += size;
-      // Last ref for this sha gone? `encSha` is account-unique (no cross-account
-      // sharing), so once this account's last ref drops the blob is GLOBALLY
-      // unreferenced. Condemn it for the MANUAL Phase 2 R2 sweep (never delete R2 here).
-      const cnt = await db.prepare("SELECT COUNT(*) AS c FROM blob_refs WHERE sha256 = ?").bind(sha).first<{ c: number }>();
-      if (Number(cnt?.c ?? 0) === 0) {
-        const c = await db
-          .prepare("INSERT OR IGNORE INTO gc_candidates (sha256, kind, marked_at) VALUES (?, 'blob', ?)")
-          .bind(sha, nowMs)
-          .run();
-        condemned += c.meta.changes ?? 0;
-      }
+      dropped.push(sha);
     }
-    // Done with this candidate (dropped or already gone) → clear the marker.
-    await db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha).run();
+  }
+
+  // Condemn (for the MANUAL Phase 2 R2 sweep — Phase 1 never deletes an R2 object) every dropped
+  // sha now GLOBALLY unreferenced. `encSha` is account-unique (no cross-account sharing), so once
+  // this account's last ref drops the blob is orphaned — but the COUNT guard holds regardless.
+  // ONE chunked existence probe + ONE batched INSERT, instead of per-candidate round-trips.
+  let condemned = 0;
+  const orphaned: string[] = [];
+  for (let i = 0; i < dropped.length; i += 80) {
+    const chunk = dropped.slice(i, i + 80);
+    if (chunk.length === 0) break;
+    const ph = chunk.map(() => "?").join(",");
+    const stillRef = await db.prepare(`SELECT DISTINCT sha256 FROM blob_refs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+    const referenced = new Set((stillRef.results ?? []).map((r) => r.sha256));
+    for (const sha of chunk) if (!referenced.has(sha)) orphaned.push(sha);
+  }
+  for (let i = 0; i < orphaned.length; i += INSERT_CHUNK) {
+    const chunk = orphaned.slice(i, i + INSERT_CHUNK);
+    if (chunk.length === 0) break;
+    const c = await db.batch([
+      db
+        .prepare(`INSERT OR IGNORE INTO gc_candidates (sha256, kind, marked_at) VALUES ${chunk.map(() => "(?, 'blob', ?)").join(", ")}`)
+        .bind(...chunk.flatMap((sha) => [sha, nowMs])),
+    ]);
+    condemned += c[0]?.meta.changes ?? 0;
   }
   return { purged, released, resurrected, condemned };
 }
@@ -192,7 +194,7 @@ export async function reconcileUsage(db: D1Database, accountId: string): Promise
       .bind(accountId, accountId)
       .run();
   } catch (e) {
-    if (e instanceof Error && /over_cap/i.test(e.message)) return; // under-count correction blocked by the cap guard; retried next run
+    if (isOverCapAbort(e)) return; // under-count correction blocked by the cap guard; retried next run
     throw e;
   }
 }

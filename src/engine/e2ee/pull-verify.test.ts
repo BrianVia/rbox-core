@@ -9,7 +9,7 @@ const NOW = 1_900_000_000_000;
 async function fixture() {
   const boot = await bootstrapAccount("acct_pv", "devA", NOW);
   const { kek } = await createWorkspaceKey(boot.secrets, "ws1");
-  const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState], NOW + 1000);
+  const account = await verifyAccount([boot.upload.genesisRoster], [boot.upload.genesisKeyState]);
   return { boot, kek, account };
 }
 
