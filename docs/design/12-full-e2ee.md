@@ -1270,6 +1270,18 @@ the sole validator under E2EE). Then:
   `openCommitHistorical`'s safe epoch-gate drop, restore atomicity/path-safety, and
   past-retention fail-closed; the cardinal test proves decrypted v1 bytes.
 
+**Live two-machine verification (2026-06-30, dev worker, non-destructive).** Done on a
+FRESH bootstrapped dev account (no wipe — isolated `HOME`/`RBOX_HOME`, so the shared dev
+backend was untouched). Device A (Mac) committed v1 (`seq 1`) then v2 (`seq 2`); `rbox
+versions notes.txt` listed both with matching plaintext shas; `rbox restore
+notes.txt@1` rewrote the on-disk file **byte-identical to v1** (`ee9fbbca…`) while v2
+(`7914d566…`) was head. Negatives failed closed: `restore notes.txt@99` → "no such
+version (history is 1..2)"; `restore extra.txt@1` → "did not exist at version @1".
+Device B (flat-meadow Linux) then paired in via the split-secret token, pulled v2
+byte-identically, and `restore notes.txt@1` produced **byte-identical v1** on a machine
+that never synced v1 — proving the cross-device historical decrypt (signed chain +
+per-epoch KEK). PASS. (This also exercised the live `rbox versions .` UX fix.)
+
 **Format-change note (greenfield).** Binding `workspaceId` into the KEK-wrap AAD
 (round-2 fix #2) is a wire-format change — pre-existing dev workspaces' KEK wraps
 (created without it) now correctly **fail closed** on unwrap (`wrap context mismatch`).
