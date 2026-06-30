@@ -60,12 +60,26 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
   const plan = new URL(req.url).searchParams.get("plan") ?? "";
   if (!PLAN_LOOKUP_KEYS[plan]) return json({ error: "bad_request", message: "unknown or non-purchasable plan" }, 400);
 
+  // Reuse the account's existing customer if it has one (avoids duplicates).
+  const acct = await env.rbox_dev_db
+    .prepare("SELECT stripe_customer_id, stripe_subscription_id, plan FROM accounts WHERE id = ?")
+    .bind(p.accountId)
+    .first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null; plan: string }>();
+  // Double-charge guard (design 21 §3.4.1): a second checkout on an account that
+  // already has a LIVE subscription would mint a SECOND subscription on the same
+  // customer (Stripe doesn't dedupe) → a double charge. Key on stripe_subscription_id
+  // (set at checkout/subscription.created, cleared on subscription.deleted) — NOT on
+  // grace_until, so a canceled-but-in-grace account (sub NULL) can still re-subscribe.
+  // The web button hides this client-side; this is the server backstop for both
+  // clients. Run BEFORE any Stripe call so an already-subscribed account makes none.
+  if (acct?.stripe_subscription_id) {
+    return json({ error: "already_subscribed", plan: acct.plan, message: "this account already has an active subscription — manage it from the billing portal" }, 409);
+  }
+
   const priceId = await priceIdForPlan(env, plan);
   if (!priceId) return json({ error: "price_unavailable", message: `no active price for ${plan}` }, 500);
 
   const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
-  // Reuse the account's existing customer if it has one (avoids duplicates).
-  const acct = await env.rbox_dev_db.prepare("SELECT stripe_customer_id FROM accounts WHERE id = ?").bind(p.accountId).first<{ stripe_customer_id: string | null }>();
   const session = await stripeApi(env, "POST", "/checkout/sessions", {
     mode: "subscription",
     "line_items[0][price]": priceId,
@@ -211,4 +225,64 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
     default:
       break; // ignore unrelated events
   }
+}
+
+// ---- re-point saga (design 21 §3.4.2) ----
+
+/** The outcome of an attempted shell→X billing re-point. The caller (confirmLink)
+ *  maps each to a confirm result: `repointed` → proceed to reclaim;
+ *  `destination_has_subscription` → 409 (never merge two subs); everything else →
+ *  409 origin_account_has_state (block, the always-safe fallback). */
+export type RepointResult = "repointed" | "destination_has_subscription" | "not_migratable" | "unavailable";
+
+/**
+ * Move a Stripe customer + subscription from a web `shell` onto the CLI account
+ * `dest` (X), idempotently. THE DUAL-ROUTING-KEY FIX (§3.4.2): the webhook routes
+ * `subscription.created/updated` by the subscription's `metadata.account_id` but
+ * `subscription.deleted` + every ownership guard by `accounts.stripe_customer_id`.
+ * Moving only the D1 columns would leave `metadata.account_id` = shell, so the next
+ * renewal's `subscription.updated` (still naming the shell, whose customer column we
+ * just cleared) would re-bind the customer onto the shell — split-brain. So we
+ * **update the subscription's Stripe metadata to X first**, then move the D1 columns.
+ *
+ * Order is Stripe-first, D1-second and every D1 write is CAS/race-guarded:
+ *  - claim onto X tolerates a webhook that already bound the same customer to X
+ *    (`stripe_customer_id IS NULL OR = cust`), so a mid-saga `subscription.updated`
+ *    can't wedge the move;
+ *  - the shell-clear is unconditional-on-the-sub it still carries, so the shell is
+ *    always emptied once Stripe says X owns the subscription.
+ */
+export async function repointBillingToAccount(env: Env, shellId: string, destId: string, nowMs: number): Promise<RepointResult> {
+  if (!env.STRIPE_SECRET) return "unavailable"; // can't run the Stripe step → caller blocks
+  const [shell, dest] = await Promise.all([
+    env.rbox_dev_db
+      .prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub, plan, grace_until AS grace, extra_storage_bytes AS extra FROM accounts WHERE id = ?")
+      .bind(shellId)
+      .first<{ cust: string | null; sub: string | null; plan: string; grace: number | null; extra: number }>(),
+    env.rbox_dev_db.prepare("SELECT stripe_customer_id AS cust, stripe_subscription_id AS sub FROM accounts WHERE id = ?").bind(destId).first<{ cust: string | null; sub: string | null }>(),
+  ]);
+  // Re-point needs a FULL {customer, subscription} on the shell; a partial billing
+  // state (e.g. a stray customer with no sub) isn't a migratable subscription.
+  if (!shell?.cust || !shell?.sub) return "not_migratable";
+  // Never auto-merge two subscriptions — block and route to guided resolution.
+  if (dest?.cust || dest?.sub) return "destination_has_subscription";
+
+  // Stripe step (idempotent PATCH): point BOTH the subscription and its customer at X.
+  await stripeApi(env, "POST", `/subscriptions/${shell.sub}`, { "metadata[account_id]": destId });
+  await stripeApi(env, "POST", `/customers/${shell.cust}`, { "metadata[account_id]": destId });
+
+  // D1 move (one atomic batch). Claim onto X (tolerating an early webhook bind of
+  // the same customer); then unconditionally clear the shell's billing on the sub
+  // it still carries.
+  await env.rbox_dev_db.batch([
+    env.rbox_dev_db
+      .prepare(
+        "UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ?, grace_until = ?, extra_storage_bytes = ? WHERE id = ? AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)"
+      )
+      .bind(shell.cust, shell.sub, shell.plan, shell.grace, shell.extra, destId, shell.cust),
+    env.rbox_dev_db
+      .prepare("UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'free', grace_until = NULL, extra_storage_bytes = 0 WHERE id = ? AND stripe_subscription_id = ?")
+      .bind(shellId, shell.sub),
+  ]);
+  return "repointed";
 }
