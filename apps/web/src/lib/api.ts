@@ -98,3 +98,63 @@ export async function openBillingPortal(clerk: Clerk): Promise<string> {
 	if (!url) throw new Error('portal returned no URL');
 	return url;
 }
+
+// ── account linking (design 21) ──────────────────────────────────────────────
+// start/status/confirm authenticate by a FRESH Clerk JWT (re-verified server-side),
+// NOT the rbox web token — so they send clerk.session.getToken() directly, never the
+// cached rbox bearer. The rbox token can't prove a specific Clerk identity (§4.2).
+
+export interface LinkStart {
+	code: string;
+	pollKey: string;
+}
+export interface LinkStatus {
+	status: 'awaiting' | 'pending' | 'committed' | 'expired';
+	pendingAccount: string | null;
+	fingerprint: string | null;
+}
+
+async function clerkJwt(clerk: Clerk): Promise<string> {
+	const t = await clerk.session?.getToken();
+	if (!t) throw new Error('not signed in');
+	return t;
+}
+
+/** Begin a link: mint a one-time code to type into `rbox account link <code>`. */
+export async function startLink(clerk: Clerk): Promise<LinkStart> {
+	const res = await fetch(`${config.apiBase}/v1/account/link/start`, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ clerkToken: await clerkJwt(clerk) })
+	});
+	if (res.status === 409) throw new Error('Finish signing in first, then try linking again.');
+	if (res.status === 429) throw new Error('Too many pending link codes — wait a few minutes and retry.');
+	if (!res.ok) throw new Error(`couldn’t start linking (${res.status})`);
+	return res.json() as Promise<LinkStart>;
+}
+
+/** Poll the proposed target a terminal redeemed the code onto (drives confirm). */
+export async function pollLinkStatus(clerk: Clerk, pollKey: string): Promise<LinkStatus> {
+	const res = await fetch(`${config.apiBase}/v1/account/link/status?pollKey=${encodeURIComponent(pollKey)}`, {
+		headers: { authorization: `Bearer ${await clerkJwt(clerk)}` }
+	});
+	if (!res.ok) throw new Error(`couldn’t check link status (${res.status})`);
+	return res.json() as Promise<LinkStatus>;
+}
+
+/** Approve the proposed target account — the phase-2 commit. */
+export async function confirmLink(clerk: Clerk, pollKey: string): Promise<string> {
+	const res = await fetch(`${config.apiBase}/v1/account/link/confirm`, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ clerkToken: await clerkJwt(clerk), pollKey })
+	});
+	if (res.status === 409) {
+		const { error } = (await res.json().catch(() => ({}))) as { error?: string };
+		if (error === 'already_linked') throw new Error('This login already manages another account — unlink it first.');
+		if (error === 'origin_account_has_state') throw new Error('Your web account already has data or billing — contact support to merge.');
+		throw new Error('The link couldn’t be confirmed — start over.');
+	}
+	if (!res.ok) throw new Error(`couldn’t confirm the link (${res.status})`);
+	return ((await res.json()) as { account: string }).account;
+}

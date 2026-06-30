@@ -79,6 +79,7 @@
 		}
 	];
 
+	const goLink = () => goto('/link');
 	const plan = $derived((usage?.plan as Tier) ?? 'free');
 	const isFree = $derived(plan === 'free');
 	const info = $derived(PLAN[plan] ?? PLAN.free);
@@ -126,6 +127,13 @@
 			</div>
 		</div>
 	</section>
+
+	<!-- Discovery nudge (design 21 §6 / 17 §4.1): route CLI-first users to the
+	     possession-proof link flow. NEVER auto-detect-and-bind (that's option C). -->
+	<button class="link-nudge" onclick={goLink}>
+		<span>Used the <code>rbox</code> CLI? <strong>Link your account →</strong></span>
+		<span class="faint">Manage your real devices, workspaces &amp; billing here.</span>
+	</button>
 
 	{#if isFree}
 		<!-- Free → upgrade. Cards make the choice + value obvious (vs bare buttons).
@@ -366,6 +374,31 @@
 	.manage-note strong,
 	.team-note strong {
 		color: var(--text);
+	}
+
+	/* ---- link nudge ---- */
+	.link-nudge {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		width: 100%;
+		text-align: left;
+		padding: 14px 16px;
+		margin-bottom: 22px;
+		border-radius: 12px;
+		border: 1px solid var(--border);
+		background: rgba(255, 255, 255, 0.02);
+		cursor: pointer;
+		transition: border-color 0.2s ease;
+	}
+	.link-nudge:hover {
+		border-color: rgba(124, 108, 255, 0.45);
+	}
+	.link-nudge strong {
+		color: var(--accent, #7c6cff);
+	}
+	.link-nudge .faint {
+		font-size: 13px;
 	}
 
 	/* ---- footer ---- */
