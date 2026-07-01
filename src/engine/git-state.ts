@@ -48,10 +48,11 @@ const exec = promisify(execFile);
 
 const HEX40 = /^[0-9a-f]{40}$/;
 
-/** Op-state files whose contents are commit shas that must be PINNED into the bundle's
+/** Op-state files whose contents are COMMIT shas that must be PINNED into the bundle's
  *  object closure (design 43 §5 [v2, B3]): `bundle create HEAD refs/heads/x` omits a
  *  MERGE_HEAD commit from another branch (codex repro), which would restore a pseudo-ref
- *  pointing at a missing object. NOT AUTO_MERGE (a tree, not a commit) or MERGE_MSG (text). */
+ *  pointing at a missing object. AUTO_MERGE (a TREE) is pinned separately in
+ *  collectPinShas; MERGE_MSG is plain text. */
 const PSEUDO_REF_SHA_FILES = [
   "MERGE_HEAD",
   "REBASE_HEAD",
@@ -288,12 +289,15 @@ async function pruneStaleScratchRefs(repoDir: string, ns: string): Promise<void>
   }
 }
 
-/** Commits the section references that a scoped bundle might not reach: the detached-HEAD
+/** Objects the section references that a scoped bundle might not reach: the detached-HEAD
  *  sha (a bundle's HEAD advertisement is NOT imported by `git fetch 'refs/*:…'` — codex
- *  verified) and every pseudo-ref sha the op-state references. Applied to DIR captures too
- *  (the pseudo-ref hole is latent in design 02: `--all` usually reaches those commits via a
- *  branch, but nothing guarantees it). Only shas that verify as commits are pinned — a stale
- *  pseudo-ref must not fail the whole bundle. */
+ *  verified), every pseudo-ref COMMIT sha the op-state references, and the AUTO_MERGE
+ *  TREE (ort writes it on conflict; restoring the file without its tree object leaves
+ *  `git diff AUTO_MERGE` broken on the receiver — codex repro. A ref may point at a tree
+ *  and `git bundle create` ships its closure — verified locally, git 2.50.1). Applied to
+ *  DIR captures too (the pseudo-ref hole is latent in design 02: `--all` usually reaches
+ *  those commits via a branch, but nothing guarantees it). Only shas whose objects verify
+ *  are pinned — a stale pseudo-ref must not fail the whole bundle. */
 async function collectPinShas(ctx: RepoCtx, head: string): Promise<string[]> {
   const shas = new Set<string>();
   const h = head.trim();
@@ -308,6 +312,10 @@ async function collectPinShas(ctx: RepoCtx, head: string): Promise<string[]> {
   const out: string[] = [];
   for (const s of shas) {
     if (await gitOk(ctx.repoDir, ["rev-parse", "--verify", "--quiet", `${s}^{commit}`])) out.push(s);
+  }
+  const autoMerge = (await fs.readFile(path.join(ctx.gitDir, "AUTO_MERGE"), "utf8").catch(() => "")).trim();
+  if (HEX40.test(autoMerge) && !out.includes(autoMerge) && (await gitOk(ctx.repoDir, ["rev-parse", "--verify", "--quiet", `${autoMerge}^{tree}`]))) {
+    out.push(autoMerge);
   }
   return out;
 }
@@ -455,6 +463,7 @@ async function restoreLocal(ctx: RepoCtx, snap: LocalSnapshot, onlyRefs?: Set<st
     await fs.mkdir(path.dirname(path.join(ctx.gitDir, rel)), { recursive: true });
     await writeFileAtomic(path.join(ctx.gitDir, rel), bytes);
   }
+  await pruneEmptyOpStateDirs(ctx.gitDir, Object.keys(snap.opState));
 }
 
 /** Branches (full refnames) checked out by a DIFFERENT worktree of the same store —
@@ -485,6 +494,9 @@ async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Set<string>> {
 async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): Promise<string> {
   await fs.mkdir(qDir, { recursive: true });
   const bundlePath = path.join(qDir, `${ts}.bundle`);
+  // Same stale-scratch prune as capture: a legacy exact `refs/rbox-wip` ref D/F-blocks
+  // the namespaced pins below and would fail the quarantine (→ spurious apply defer).
+  await pruneStaleScratchRefs(ctx.repoDir, WIP_NS);
   const head = await readHead(ctx);
   const pinShas = new Set(await collectPinShas(ctx, head));
   const wip = (await git(ctx.repoDir, ["stash", "create"]).catch(() => "")).trim();
@@ -535,20 +547,28 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
 
-  if (!(await detectGitKind(repoDir))) {
-    // fresh machine / standalone materialization of a worktree-origin section (design 43 §5)
-    await fs.mkdir(repoDir, { recursive: true });
-    await git(repoDir, ["init", "-q"]);
-  }
-  const ctx = await repoCtx(repoDir);
-  if (!ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
-  if (await gitBusy(ctx)) return { applied: false, reason: "receiver git busy" };
+  // Fresh target (no .git): the repo is materialized by `git init` — but only AFTER every
+  // artifact has been fetched+decrypted+verified (decrypt-before-mutate: a wrong-KEK apply
+  // must leave NO .git behind — codex repro'd the old init-first order doing exactly that).
+  const preKind = await detectGitKind(repoDir);
+  let ctx = preKind ? await repoCtx(repoDir) : undefined;
+  if (preKind && !ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
 
-  // Scope-gated publish set (design 43 §7).
+  // Scope-gated publish set (design 43 §7). A fresh target materializes as a dir repo.
   const publishRefs: Record<string, string> = { ...section.refs };
   const filteredRefs: string[] = [];
   let deleteAbsent = false;
-  if (ctx.kind === "dir") {
+  if (!ctx || ctx.kind === "dir") {
+    // Apply refuses the same dir shapes preflight refuses: publishing into a PRIMARY with
+    // linked worktrees would move branches its siblings have checked out (codex repro), and
+    // superproject/alternates stores have undefined apply semantics (design 43 §4, v1).
+    if (ctx) {
+      for (const bad of ["worktrees", "modules", "objects/info/alternates"]) {
+        if (await exists(path.join(ctx.commonDir, bad))) {
+          return { applied: false, reason: `.git/${bad} present — unsupported apply target` };
+        }
+      }
+    }
     deleteAbsent = section.refScope === "all";
   } else {
     for (const ref of Object.keys(publishRefs)) {
@@ -572,6 +592,7 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
       return { applied: false, reason: `ownership-deferred: ${headBranch} is checked out by another worktree`, filteredRefs };
     }
   }
+  if (ctx && (await gitBusy(ctx))) return { applied: false, reason: "receiver git busy" };
 
   // Stage on the REPO's filesystem (under .rbox), NOT os.tmpdir() — the decrypted index/op-state
   // are moved into the gitdir with rename, which throws EXDEV across mounts. On Linux/containers
@@ -579,13 +600,18 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
   // apply on every pull (it only worked on macOS because $TMPDIR + the repo share one APFS volume).
   await fs.mkdir(path.join(repoDir, ".rbox"), { recursive: true });
   const tmpDir = await fs.mkdtemp(path.join(repoDir, ".rbox", "gitap-"));
-  const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
-  const snap = await snapshotLocal(ctx);
+  let createdGit = false;
+  // Fail-closed for the fresh path: any failure after `git init` removes the .git WE created
+  // this call (nothing of the user's lives in it), restoring the strict no-mutation contract.
+  const removeFreshGit = async () => {
+    if (createdGit) await fs.rm(path.join(repoDir, ".git"), { recursive: true, force: true }).catch(() => {});
+  };
   try {
     // §28 (codex M4): fetch + DECRYPT + verify ALL artifacts into temp files BEFORE touching
-    // the gitdir. A decrypt/fetch/verify failure (wrong key, swapped blob, corruption) returns
-    // {applied:false} with the local repo untouched — never aborts mid-mutation. GCM + the
-    // plaintext-sha check in decryptFileToPath authenticate each artifact here.
+    // the gitdir (and before `git init` on a fresh target). A decrypt/fetch/verify failure
+    // (wrong key, swapped blob, corruption) returns {applied:false} with the target untouched
+    // — never aborts mid-mutation. GCM + the plaintext-sha check in decryptFileToPath
+    // authenticate each artifact here.
     const bundlePath = path.join(tmpDir, "in.bundle");
     const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;
     const opTmp: Array<{ rel: string; tmp: string }> = [];
@@ -600,7 +626,25 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
     } catch (e) {
       return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
-    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+
+    if (!ctx) {
+      // fresh machine / standalone materialization of a worktree-origin section (design 43 §5)
+      await git(repoDir, ["init", "-q"]);
+      createdGit = true;
+      ctx = await repoCtx(repoDir);
+      if (!ctx) {
+        await removeFreshGit();
+        return { applied: false, reason: "git init failed for fresh apply target" };
+      }
+    }
+
+    const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
+    const snap = await snapshotLocal(ctx);
+
+    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+      await removeFreshGit();
+      return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
 
     // Quarantine local committed+staged state first — fail closed if we can't (§9 [v5]:
     // bundle with capture-grade pinning PLUS index/op-state copies).
@@ -618,11 +662,18 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
     // a fixed namespace would race concurrent sibling applies, same hazard as rbox-wip).
     await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
     const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-    // --no-tags: fetch's tag-following would otherwise write the bundle's refs/tags/* DIRECTLY
-    // into refs/tags (outside the namespace refspec) — on a pointer target that is the shared
-    // tag store the §7 filter exists to protect. Tags still publish on dir targets via the
-    // explicit update-ref loop below (they're in section.refs).
-    await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    try {
+      // --no-tags: fetch's tag-following would otherwise write the bundle's refs/tags/* DIRECTLY
+      // into refs/tags (outside the namespace refspec) — on a pointer target that is the shared
+      // tag store the §7 filter exists to protect. Tags still publish on dir targets via the
+      // explicit update-ref loop below (they're in section.refs).
+      await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    } catch (e) {
+      // Nothing published yet — refs/HEAD/index are untouched; only namespaced scratch may exist.
+      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      await removeFreshGit();
+      return { applied: false, reason: `bundle fetch failed (no publish): ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
 
     try {
       // Publish refs per the scope-gated rules (see doc comment).
@@ -640,11 +691,15 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
       await restoreOpState(ctx.gitDir, opTmp);
 
       if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {
-        await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined); // ROLLBACK
+        // ROLLBACK (fresh target: removing the .git we created IS the rollback)
+        if (createdGit) await removeFreshGit();
+        else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined);
         return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
     } catch (e) {
-      await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {}); // ROLLBACK on any mutation error
+      // ROLLBACK on any mutation error (fresh target: remove the .git we created)
+      if (createdGit) await removeFreshGit();
+      else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {});
       return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     } finally {
       for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
@@ -782,6 +837,22 @@ async function restoreOpState(gitDir: string, opTmp: Array<{ rel: string; tmp: s
     const dest = path.join(gitDir, rel);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     await moveFileAtomic(tmp, dest);
+  }
+  await pruneEmptyOpStateDirs(gitDir, want);
+}
+
+/** Remove op-state DIRECTORIES the target should no longer have. Deleting only the files
+ *  (above) leaves an empty `.git/rebase-merge/` behind, and git treats the directory's
+ *  PRESENCE as "rebase in progress" (codex repro) — while rbox identity (file-based) sees
+ *  nothing, so the divergence would never heal. */
+async function pruneEmptyOpStateDirs(gitDir: string, keepRels: Iterable<string>): Promise<void> {
+  const keep = new Set<string>();
+  for (const rel of keepRels) {
+    const top = rel.split("/")[0]!;
+    if (rel.includes("/")) keep.add(top);
+  }
+  for (const d of OP_STATE_DIRS) {
+    if (!keep.has(d)) await fs.rm(path.join(gitDir, d), { recursive: true, force: true }).catch(() => {});
   }
 }
 

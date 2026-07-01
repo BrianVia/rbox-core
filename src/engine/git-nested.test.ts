@@ -216,6 +216,12 @@ test("mid-merge MERGE_HEAD from an UNBUNDLED branch survives a scoped round-trip
   // codex repro'd `bundle create HEAD refs/heads/x` omitting a MERGE_HEAD commit)
   expect((await fs.readFile(path.join(D, ".git", "MERGE_HEAD"), "utf8")).trim()).toBe(otherSha);
   await expect(git(D, "cat-file", "-e", `${otherSha}^{commit}`)).resolves.toBeDefined();
+  // AUTO_MERGE (ort, git >= 2.38): the file restores AND its TREE object rides the pin —
+  // without it `git diff AUTO_MERGE` on the receiver dies with "bad object" (codex repro)
+  if (section!.opState && "AUTO_MERGE" in section!.opState) {
+    const autoTree = (await fs.readFile(path.join(D, ".git", "AUTO_MERGE"), "utf8")).trim();
+    await expect(git(D, "cat-file", "-e", `${autoTree}^{tree}`)).resolves.toBeDefined();
+  }
   await expect(git(D, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
 });
 
@@ -317,6 +323,73 @@ test("apply into a POINTER repo filters stash/tags, ownership-guards sibling bra
   expect(res2.reason).toContain("ownership-deferred");
 });
 
+// ---- apply fail-closed + shape refusals (codex round-1 fixes) -------------------
+
+test("wrong-KEK apply into a FRESH target leaves NO .git behind (decrypt before init)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  const D = path.join(tmp, "D"); // does not exist at all
+  const res = await applyGitState(D, section!, store, Buffer.alloc(32, 99)); // WRONG key
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("no mutation");
+  expect(await fs.lstat(path.join(D, ".git")).catch(() => undefined)).toBeUndefined(); // nothing materialized
+});
+
+test("apply REFUSES a primary with linked worktrees (would move a sibling's checked-out branch)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  const M = path.join(tmp, "prim");
+  await initRepo(M);
+  await commit(M, "g.txt", "y", "c1");
+  await git(M, "worktree", "add", path.join(tmp, "prim-wt"), "-b", "sibling");
+  const siblingSha = await git(M, "rev-parse", "sibling");
+
+  const res = await applyGitState(M, section!, store, KEK);
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("worktrees");
+  expect(await git(M, "rev-parse", "sibling")).toBe(siblingSha); // untouched
+});
+
+test("apply removes op-state DIRECTORIES the sender no longer has (empty rebase-merge/ = phantom rebase)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK); // no op-state
+
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "g.txt", "y", "c1");
+  await fs.mkdir(path.join(B, ".git", "rebase-merge"), { recursive: true });
+  await fs.writeFile(path.join(B, ".git", "rebase-merge", "msgnum"), "1\n");
+
+  const res = await applyGitState(B, section!, store, KEK);
+  expect(res.applied).toBe(true);
+  // git treats the DIRECTORY's presence as rebase-in-progress; files-only cleanup left it behind
+  expect(await fs.lstat(path.join(B, ".git", "rebase-merge")).catch(() => undefined)).toBeUndefined();
+});
+
+test("a legacy exact refs/rbox-wip ref does not D/F-block the apply-time quarantine", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "g.txt", "y", "c1");
+  await git(B, "update-ref", "refs/rbox-wip", await git(B, "rev-parse", "HEAD")); // pre-§43 crash leftover
+
+  const res = await applyGitState(B, section!, store, KEK);
+  expect(res.applied).toBe(true); // quarantine pruned the legacy ref instead of failing
+  await expect(git(B, "rev-parse", "--verify", "refs/rbox-wip")).rejects.toThrow();
+});
+
 // ---- scope projection (design 43 §7) ------------------------------------------
 
 test("projectIdentity: an all-identity projected to scoped equals the scoped identity (convergence)", async () => {
@@ -390,6 +463,10 @@ test("validateManifest: gitRepos keys — '.', safe rel paths ok; traversal/dup/
   expect(validateManifest(m43({ "src/a.ts": section() })).ok).toBe(false); // collides with a FILE entry [v2, B5]
   expect(validateManifest(m43({ ".": { ...section(), refScope: undefined as never } })).ok).toBe(false); // refScope mandatory
   expect(validateManifest(m43({ ".": { ...section(), refs: { "refs/remotes/origin/x": "c".repeat(40) } } })).ok).toBe(false); // non-syncable ref
+  // symbolic HEAD must name a branch the section CARRIES (else apply leaves an unborn HEAD)
+  expect(validateManifest(m43({ ".": { ...section(), head: "ref: refs/heads/missing", refs: {} } })).ok).toBe(false);
+  expect(validateManifest(m43({ ".": { ...section(), head: "ref: refs/notheads/x" } })).ok).toBe(false); // symbolic HEAD outside refs/heads
+  expect(validateManifest(m43({ ".": { ...section(), head: "d".repeat(40), refs: {} } })).ok).toBe(true); // detached HEAD needs no refs
 });
 
 test("validateManifest: MAX_GIT_REPOS is a LOUD error at the boundary, not a silent drop", () => {

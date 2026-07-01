@@ -153,12 +153,18 @@ export function validateGitSection(s: GitSection): { ok: boolean; reason?: strin
   if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined) {
     if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize! })) return { ok: false, reason: "bad index ref" };
   }
-  if (typeof s.head !== "string" || !/^(ref: refs\/[A-Za-z0-9._\/-]+|[0-9a-f]{40})$/.test(s.head.trim())) return { ok: false, reason: "bad HEAD" };
+  // HEAD is either detached (40-hex) or symbolic onto a BRANCH the section itself carries —
+  // capture can produce nothing else (an unborn HEAD never captures), so a symbolic HEAD
+  // outside refs/heads/* or naming a branch absent from `refs` is malformed/hostile: applying
+  // it would leave an unborn HEAD over restored index entries (codex repro).
+  if (typeof s.head !== "string" || !/^(ref: refs\/heads\/[A-Za-z0-9._\/-]+|[0-9a-f]{40})$/.test(s.head.trim())) return { ok: false, reason: "bad HEAD" };
   if (s.refs === null || typeof s.refs !== "object" || Array.isArray(s.refs)) return { ok: false, reason: "bad refs" };
   for (const [ref, sha] of Object.entries(s.refs)) {
     if (!isSyncableRef(ref) || ref.includes("..") || ref.includes("\0")) return { ok: false, reason: `bad ref ${ref}` };
     if (typeof sha !== "string" || !HEX40.test(sha)) return { ok: false, reason: `bad ref sha ${ref}` };
   }
+  const headBranch = /^ref: (refs\/heads\/\S+)$/.exec(s.head.trim())?.[1];
+  if (headBranch && (s.refs as Record<string, unknown>)[headBranch] === undefined) return { ok: false, reason: `HEAD branch ${headBranch} not in refs` };
   for (const [rel, ref] of Object.entries(s.opState ?? {})) {
     const okRel = OP_STATE_FILES.includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
     if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };
