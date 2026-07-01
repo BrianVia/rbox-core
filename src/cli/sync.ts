@@ -344,7 +344,16 @@ async function captureGitForPush(
       removed,
     };
   };
-  if (!cfg.syncGit) return plan(); // out stays empty → any base entries read as removal (opt-out propagates)
+  if (!cfg.syncGit) {
+    // Opt-out: out stays empty → any base entries read as removal (the opt-out
+    // propagates), and the local-only bookkeeping is abandoned with it — a surviving
+    // pending entry would otherwise re-trigger the per-repo base restore every push
+    // (changed forever → echo-commit loop).
+    for (const k of Object.keys(pending)) delete pending[k];
+    for (const k of Object.keys(needsRes)) delete needsRes[k];
+    for (const k of Object.keys(removedMem)) delete removedMem[k];
+    return plan();
+  }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
   const kek = cfg.kek;
 
