@@ -1,6 +1,6 @@
 import os from "node:os";
-import readline from "node:readline/promises";
 import { clearCredentials, loadCredentials, saveCredentials } from "./credentials.js";
+import { isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
@@ -8,16 +8,15 @@ import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Show the recovery phrase once with a forced acknowledgement (no escrow). */
+/** Show the recovery phrase once with a forced acknowledgement (no escrow). The
+ *  confirm re-asks until it's a deliberate yes — pressing enter (default No) won't
+ *  slip past it — preserving the "you must acknowledge" beat without the literal
+ *  "yes" typing of the old readline loop. */
 async function showRecoveryPhrase(phrase: string): Promise<void> {
   process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
-  if (process.stdin.isTTY) {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-    try {
-      let ack = "";
-      while (ack.trim().toLowerCase() !== "yes") ack = await rl.question(`Type "yes" once you've saved it somewhere safe: `);
-    } finally {
-      rl.close();
+  if (isInteractive()) {
+    while (!(await promptConfirm({ message: "Have you saved this recovery phrase somewhere safe?", default: false }))) {
+      process.stderr.write(`    Save it first — it's the ONLY way back in if you lose every device.\n`);
     }
   } else {
     process.stderr.write(`(non-interactive: SAVE THE PHRASE ABOVE — it will not be shown again)\n`);
@@ -155,12 +154,16 @@ export async function redeemPair(remoteUrl: string, pairToken: string): Promise<
 /** `rbox recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
 export async function recoverCmd(): Promise<void> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   let phrase: string;
-  try {
-    phrase = (await rl.question(`Enter your 24-word recovery phrase: `)).trim();
-  } finally {
-    rl.close();
+  if (isInteractive()) {
+    // No-echo — the phrase is key material (mask:false = matches the old no-echo).
+    phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
+  } else {
+    // Piped (`echo "<phrase>" | rbox recover`) — drain stdin like `connect` does so
+    // recovery still works in CI / non-TTY, where inquirer can't run.
+    const chunks: Buffer[] = [];
+    for await (const c of process.stdin) chunks.push(c as Buffer);
+    phrase = Buffer.concat(chunks).toString("utf8").trim();
   }
   if (!phrase) throw new Error("no phrase entered");
   const { deviceId } = await enrollViaRecovery(phrase, Date.now());

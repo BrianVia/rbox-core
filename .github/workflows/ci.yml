@@ -42,6 +42,16 @@ jobs:
       - name: Install (frozen)
         run: bun install --frozen-lockfile
 
+      # The whole CLI's STDERR + Ctrl-C prompt invariants rest on `@inquirer` being
+      # imported from ONE file (src/cli/prompt.ts). A stray import elsewhere could
+      # miss the stderr `output` and silently pollute stdout — guard it structurally.
+      - name: Guard — only prompt.ts imports @inquirer
+        run: |
+          if grep -rn 'from "@inquirer' src/ | grep -v '^src/cli/prompt.ts:'; then
+            echo "::error::@inquirer may only be imported from src/cli/prompt.ts (STDERR + Ctrl-C invariant)"
+            exit 1
+          fi
+
       - name: Typecheck (root + apps/api)
         run: |
           npx tsc --noEmit

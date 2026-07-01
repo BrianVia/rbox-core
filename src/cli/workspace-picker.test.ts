@@ -4,8 +4,11 @@ import {
   relativeAge,
   workspacePickLabel,
   sortWorkspacesForPick,
-  renderWorkspacePickList,
-  resolveWorkspacePick,
+  pickerMode,
+  buildWorkspaceChoices,
+  filterWorkspaceChoices,
+  fetchAccountWorkspaces,
+  SELECT_MAX,
   type AccountWorkspace,
 } from "./workspace-picker.js";
 
@@ -58,56 +61,85 @@ test("sortWorkspacesForPick orders by createdAt desc without mutating the input"
   expect(input.map((w) => w.workspaceId)).toEqual(["ws_a", "ws_b", "ws_c"]); // unmutated
 });
 
-// ── rendering ─────────────────────────────────────────────────────────────────
+// ── inquirer picker: pure choice-building + mode selection ─────────────────────
 
-test("renderWorkspacePickList numbers rows 1..n, uses the label, shows a created-age", () => {
+test("pickerMode: a select up to SELECT_MAX, a search once past it", () => {
+  expect(pickerMode(1)).toBe("select");
+  expect(pickerMode(SELECT_MAX)).toBe("select"); // 8 → still a select
+  expect(pickerMode(SELECT_MAX + 1)).toBe("search"); // 9 → search box
+});
+
+test("buildWorkspaceChoices: value is the raw workspaceId; name is label · age · short-id", () => {
   const sorted = sortWorkspacesForPick([
-    ws({ name: "~/conductor/workspaces", createdAt: NOW - 21 * 3_600_000 }),
-    ws({ name: "~/projects/savvy-core", createdAt: NOW - 12 * 3_600_000 }),
+    ws({ workspaceId: "ws_deadbeef1234", name: "savvy-core", createdAt: NOW - 12 * 3_600_000 }),
+    ws({ workspaceId: "ws_cafef00d5678", name: null, createdAt: NOW - 21 * 3_600_000 }),
   ]);
-  const lines = renderWorkspacePickList(sorted, NOW);
-  expect(lines).toHaveLength(2);
-  // newest first → savvy-core is #1
-  expect(lines[0]).toContain("1");
-  expect(lines[0]).toContain("~/projects/savvy-core");
-  expect(lines[0]).toContain("created 12h ago");
-  expect(lines[1]).toContain("2");
-  expect(lines[1]).toContain("~/conductor/workspaces");
-  expect(lines[1]).toContain("created 21h ago");
+  const choices = buildWorkspaceChoices(sorted, NOW);
+  // value round-trips exactly to the id the picker returns.
+  expect(choices.map((c) => c.value)).toEqual(["ws_deadbeef1234", "ws_cafef00d5678"]);
+  // named workspace: label = name.
+  expect(choices[0]!.name).toBe("savvy-core · 12h ago · ws_deadbeef");
+  // unnamed workspace: label falls back to the short id.
+  expect(choices[1]!.name).toBe("ws_cafef00d · 21h ago · ws_cafef00d");
 });
 
-test("renderWorkspacePickList falls back to the short id for an unnamed workspace", () => {
-  const lines = renderWorkspacePickList([ws({ name: null, workspaceId: "ws_deadbeef1234" })], NOW);
-  expect(lines[0]).toContain("ws_deadbeef");
+test("filterWorkspaceChoices: case-insensitive substring; blank term keeps all", () => {
+  const choices = buildWorkspaceChoices(
+    sortWorkspacesForPick([
+      ws({ workspaceId: "ws_a", name: "savvy-core", createdAt: 300 }),
+      ws({ workspaceId: "ws_b", name: "conductor", createdAt: 200 }),
+      ws({ workspaceId: "ws_c", name: "SAVVY-web", createdAt: 100 }),
+    ]),
+    NOW
+  );
+  expect(filterWorkspaceChoices(choices, "savvy").map((c) => c.value)).toEqual(["ws_a", "ws_c"]);
+  expect(filterWorkspaceChoices(choices, "  ").map((c) => c.value)).toEqual(["ws_a", "ws_b", "ws_c"]);
+  expect(filterWorkspaceChoices(choices, undefined)).toHaveLength(3);
+  expect(filterWorkspaceChoices(choices, "nomatch")).toHaveLength(0);
 });
 
-test("renderWorkspacePickList is empty for an empty list (caller handles the empty case)", () => {
-  expect(renderWorkspacePickList([], NOW)).toEqual([]);
-});
+// ── fetch paging (injected fetch — no server) ──────────────────────────────────
 
-// ── resolving a typed pick ────────────────────────────────────────────────────
+/** A fetch stub that replays a scripted sequence of pages by cursor. */
+function pagedFetch(pages: Array<{ workspaces: AccountWorkspace[]; nextCursor: string | null }>): {
+  fetchFn: typeof fetch;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  let i = 0;
+  const fetchFn = (async (url: string) => {
+    calls.push(url);
+    const body = pages[i++]!;
+    return { ok: true, status: 200, json: async () => body, text: async () => "" } as Response;
+  }) as unknown as typeof fetch;
+  return { fetchFn, calls };
+}
 
-test("resolveWorkspacePick maps an in-range number to that workspace id + name", () => {
-  const sorted = sortWorkspacesForPick([
-    ws({ workspaceId: "ws_new", name: "newest", createdAt: 300 }),
-    ws({ workspaceId: "ws_old", name: null, createdAt: 100 }),
+test("fetchAccountWorkspaces follows nextCursor across pages, stops when it's null", async () => {
+  const { fetchFn, calls } = pagedFetch([
+    { workspaces: [ws({ workspaceId: "ws_1" })], nextCursor: "c1" },
+    { workspaces: [ws({ workspaceId: "ws_2" })], nextCursor: "c2" },
+    { workspaces: [ws({ workspaceId: "ws_3" })], nextCursor: null },
   ]);
-  expect(resolveWorkspacePick(sorted, "1")).toEqual({ kind: "pick", workspaceId: "ws_new", name: "newest" });
-  expect(resolveWorkspacePick(sorted, " 2 ")).toEqual({ kind: "pick", workspaceId: "ws_old", name: null });
+  const all = await fetchAccountWorkspaces("https://api", "tok", 10, fetchFn);
+  expect(all.map((w) => w.workspaceId)).toEqual(["ws_1", "ws_2", "ws_3"]);
+  expect(calls).toHaveLength(3);
+  expect(calls[1]).toContain("cursor=c1");
+  expect(calls[2]).toContain("cursor=c2");
 });
 
-test("resolveWorkspacePick recognizes the manual-entry escape hatch", () => {
-  const sorted = [ws()];
-  for (const s of ["m", "manual", "PASTE", " m "]) {
-    expect(resolveWorkspacePick(sorted, s)).toEqual({ kind: "manual" });
-  }
+test("fetchAccountWorkspaces is bounded by maxPages (won't spin on an endless cursor)", async () => {
+  const { fetchFn, calls } = pagedFetch([
+    { workspaces: [ws({ workspaceId: "ws_1" })], nextCursor: "c1" },
+    { workspaces: [ws({ workspaceId: "ws_2" })], nextCursor: "c2" },
+    { workspaces: [ws({ workspaceId: "ws_3" })], nextCursor: "c3" }, // still more, but capped
+  ]);
+  const all = await fetchAccountWorkspaces("https://api", "tok", 2, fetchFn);
+  expect(all.map((w) => w.workspaceId)).toEqual(["ws_1", "ws_2"]);
+  expect(calls).toHaveLength(2);
 });
 
-test("resolveWorkspacePick returns null for out-of-range / non-numeric answers (re-prompt)", () => {
-  const sorted = [ws(), ws()];
-  expect(resolveWorkspacePick(sorted, "0")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "3")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "abc")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "1x")).toBeNull();
+test("fetchAccountWorkspaces throws on a non-2xx (callers degrade to manual entry)", async () => {
+  const fetchFn = (async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => "boom" }) as Response) as unknown as typeof fetch;
+  await expect(fetchAccountWorkspaces("https://api", "tok", 10, fetchFn)).rejects.toThrow(/500/);
 });

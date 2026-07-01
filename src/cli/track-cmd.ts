@@ -1,11 +1,12 @@
 /**
- * `rbox track <path>` (design 29) — a faithful, BIND-ONLY rename of the old
- * `rbox link`. It creates/joins a workspace and writes the `.rbox/` binding, then
- * stops: NO first sync (that happens via `setup`, `sync`, or `start`). The rename
- * also retires the `link` ↔ `account link` collision.
+ * `rbox track <path>` (design 29) — BIND-ONLY: it creates/joins a workspace and
+ * writes the `.rbox/` binding, then stops (NO first sync — that's `setup`, `sync`,
+ * or `start`). A rename of the old `rbox link` (retiring the `link` ↔ `account
+ * link` collision); the `link` alias just forwards here.
  *
- * The behavior is byte-for-byte the previous `link` case, lifted out of the
- * dispatcher so it has one tested home (and the `link` alias just forwards here).
+ * With `--workspace` it adopts that id offline. Without one, on a TTY it now ASKS
+ * (create a new workspace, or pick an existing one by name) rather than silently
+ * creating — `--no-interactive` (or a non-TTY) keeps the unattended create-new path.
  */
 import crypto from "node:crypto";
 import path from "node:path";
@@ -36,12 +37,42 @@ export async function track(
   // existing one (--workspace) requires the caller's account to own it; that's
   // enforced on first sync, so binding stays offline here.
   let workspaceId = flags.workspace;
+  let pickedName: string | undefined; // picker-supplied label, cached locally for `rbox status`
   if (!workspaceId) {
     const { loadCredentials } = await import("./credentials.js");
-    const { createRemoteWorkspace } = await import("./remote.js");
     const creds = await loadCredentials();
-    if (!creds) throw new Error("run `rbox login` before creating a workspace");
-    workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
+
+    // On a TTY (and not explicitly --no-interactive), ASK before creating: a bare
+    // `rbox track <dir>` used to silently create a brand-new workspace even when you
+    // meant to attach an existing one. Now it offers create-or-pick-by-name.
+    const { isInteractive } = await import("./prompt.js");
+    if (isInteractive() && flags["no-interactive"] !== "true") {
+      const { promptSelect } = await import("./prompt.js");
+      const { promptWorkspacePick } = await import("./workspace-picker.js");
+      const choice = await promptSelect<"new" | "existing">({
+        message: "Track a new workspace, or an existing one?",
+        choices: [
+          { name: "Create a new workspace", value: "new" },
+          { name: "Track an existing workspace", value: "existing", description: "pick one you've already synced" },
+        ],
+      });
+      if (choice === "existing") {
+        // Picker degrades to a manual id prompt offline / no-creds / empty account;
+        // backing out (blank) falls through to the create-new path below.
+        const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? remoteUrl, token: creds?.token });
+        if (picked) {
+          workspaceId = picked.workspaceId;
+          pickedName = picked.name;
+        }
+      }
+    }
+
+    if (!workspaceId) {
+      // Create-new — also the non-interactive default. Needs a login.
+      const { createRemoteWorkspace } = await import("./remote.js");
+      if (!creds) throw new Error("run `rbox login` before creating a workspace");
+      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
+    }
   }
 
   const cfg: WorkspaceConfig = {
@@ -55,6 +86,9 @@ export async function track(
     // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
     // non-git root; pass --git false to opt out.
     syncGit: flags.git !== "false",
+    // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
+    // no round-trip (manual-id / --workspace entry has none → status falls back to id).
+    ...(pickedName ? { name: pickedName } : {}),
   };
   await saveConfig(root, cfg);
   return { cfg, root };

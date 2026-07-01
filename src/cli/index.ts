@@ -148,14 +148,8 @@ async function main(): Promise<void> {
         force: flags.force === "true",
         confirm: async () => {
           if (process.stdin.isTTY !== true) return true; // non-interactive → proceed
-          const readline = await import("node:readline/promises");
-          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-          try {
-            const ans = (await rl.question(`Stop syncing ${root}? Local files stay. [y/N] `)).trim().toLowerCase();
-            return ans === "y" || ans === "yes";
-          } finally {
-            rl.close();
-          }
+          const { promptConfirm } = await import("./prompt.js");
+          return promptConfirm({ message: `Stop syncing ${root}? Local files stay.`, default: false });
         },
       });
       break;
