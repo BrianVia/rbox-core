@@ -9,9 +9,16 @@
 import os from "node:os";
 import path from "node:path";
 
+/** The user's home directory. Prefers `process.env.HOME` (live) over `os.homedir()`:
+ *  under Bun `os.homedir()` is resolved once at startup and IGNORES a later `HOME`
+ *  mutation, so tests/overrides that set `process.env.HOME` would otherwise leak writes
+ *  (e.g. the dep-notify shell hook) into the real `~/.zshrc`. In a real login session
+ *  `HOME === os.homedir()`, so production behavior is unchanged. */
+export const homeDir = (): string => process.env.HOME || os.homedir();
+
 export function configDir(): string {
   if (process.env.RBOX_CONFIG_DIR) return process.env.RBOX_CONFIG_DIR;
-  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  const base = process.env.XDG_CONFIG_HOME || path.join(homeDir(), ".config");
   return path.join(base, "rbox");
 }
 
