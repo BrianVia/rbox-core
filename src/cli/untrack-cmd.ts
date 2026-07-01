@@ -13,13 +13,15 @@
  *      `rm` would race a daemon mid-write. `--force` escalates to SIGKILL on timeout.
  *   2. Before removing, `lstat` `.rbox`, REFUSE if it's a symlink, and confirm its
  *      realpath is exactly `<root>/.rbox`. Only then recursively remove the tree
- *      (the `.rbox/` layout is nested/evolving — workspace.json, state/metrics.json,
- *      daemon.{pid,log} — so a guarded full remove beats brittle file enumeration).
+ *      (the `.rbox/` layout is nested/evolving — workspace.json, state/metrics.json
+ *      — so a guarded full remove beats brittle file enumeration). The daemon's
+ *      pid/log live GLOBALLY under `~/.rbox/daemons/…`, so untrack also removes
+ *      that per-workspace dir (`removeDaemonRuntime`) to avoid orphaning them.
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { RBOX_DIR } from "./config.js";
-import { forceKill, isDaemonRunning, stopDaemon, waitForExit } from "./daemon-control.js";
+import { forceKill, isDaemonRunning, removeDaemonRuntime, stopDaemon, waitForExit } from "./daemon-control.js";
 import { style } from "./style.js";
 
 const STOP_TIMEOUT_MS = 5000;
@@ -63,6 +65,10 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
   //    and not a symlink (defeats a swapped/symlinked `.rbox` pointing elsewhere).
   const rboxPath = path.join(root, RBOX_DIR);
   await removeRboxDir(root, rboxPath);
+
+  // The daemon's pid/log live globally under ~/.rbox — remove them too so untrack
+  // leaves nothing orphaned outside the workspace.
+  await removeDaemonRuntime(root);
 
   console.log(`${style.sym.ok} untracked ${root}`);
   console.log(style.dim("  local files are untouched."));
