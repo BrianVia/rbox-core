@@ -33,13 +33,12 @@ import { stderrStyle as e } from "./style.js";
 export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string }): Record<string, string> {
   const flags: Record<string, string> = { root: plan.root, project: "root", "no-interactive": "true" };
   if (plan.kind === "new") flags.new = "true";
-  else {
-    flags.workspace = plan.workspace ?? "";
-    // A known name (from the picker) is cached LOCALLY by init — never re-sent to the
-    // server on a join (only createRemoteWorkspace carries a name). Manual-id entry
-    // has no name, so the flag is simply absent and status falls back to the id.
-    if (plan.name) flags.name = plan.name;
-  }
+  else flags.workspace = plan.workspace ?? "";
+  // On a CREATE the name is sent to the server (createRemoteWorkspace); on a JOIN it's
+  // a purely-LOCAL display label from the picker — never re-sent (the row already
+  // exists, first-writer-wins). Manual-id entry has no name, so the flag is simply
+  // absent and status falls back to the id.
+  if (plan.name) flags.name = plan.name;
   return flags;
 }
 

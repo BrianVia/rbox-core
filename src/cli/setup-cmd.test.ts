@@ -23,9 +23,10 @@ test("Step 2 → runInit flags: a picked name rides along as a LOCAL cache label
   expect(f).toMatchObject({ workspace: "ws_abc", name: "savvy-core", "no-interactive": "true" });
 });
 
-test("Step 2 → runInit flags: a name is NOT attached to a new-workspace create here", () => {
-  // (create names are prompted inside runInit, not passed via workspaceFlags)
-  const f = workspaceFlags({ kind: "new", root: "/code/app", name: "ignored" });
-  expect(f.name).toBeUndefined();
-  expect(f.new).toBe("true");
+test("Step 2 → runInit flags: a create carries the prompted name to the server", () => {
+  // Setup drives runInit with --no-interactive, so runInit's OWN name prompt never
+  // fires — the name MUST ride the flags or it's silently dropped (the v0.5.6 bug:
+  // the founder typed a name and the workspace was still created unnamed).
+  const f = workspaceFlags({ kind: "new", root: "/code/app", name: "Conductor Workspaces" });
+  expect(f).toMatchObject({ new: "true", name: "Conductor Workspaces", "no-interactive": "true" });
 });
