@@ -170,19 +170,23 @@ async function stepWorkspace(
   });
 
   let workspace: string | undefined;
+  let name: string | undefined;
   if (choice === "existing") {
     // Pick-by-name from the account's synced workspaces (degrades to a manual id
-    // prompt when offline / no creds / empty account).
+    // prompt when offline / no creds / empty account). The picked name is cached
+    // locally so `rbox status` shows it with no round-trip.
     const creds = await loadCredentials();
-    workspace = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token });
-    if (!workspace) {
+    const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token });
+    if (!picked) {
       process.stderr.write(e.yellow("no workspace selected — re-run `rbox setup` when you're ready.\n"));
       return undefined;
     }
+    workspace = picked.workspaceId;
+    name = picked.name;
   }
   const dir = await promptInput({ message: "Which directory should rbox sync?", default: opts.cwd });
 
-  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir } : { kind: "join", root: dir, workspace });
+  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir } : { kind: "join", root: dir, workspace, name });
   return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
 }
 

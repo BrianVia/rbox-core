@@ -37,6 +37,7 @@ export async function track(
   // existing one (--workspace) requires the caller's account to own it; that's
   // enforced on first sync, so binding stays offline here.
   let workspaceId = flags.workspace;
+  let pickedName: string | undefined; // picker-supplied label, cached locally for `rbox status`
   if (!workspaceId) {
     const { loadCredentials } = await import("./credentials.js");
     const creds = await loadCredentials();
@@ -59,7 +60,10 @@ export async function track(
         // Picker degrades to a manual id prompt offline / no-creds / empty account;
         // backing out (blank) falls through to the create-new path below.
         const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? remoteUrl, token: creds?.token });
-        if (picked) workspaceId = picked;
+        if (picked) {
+          workspaceId = picked.workspaceId;
+          pickedName = picked.name;
+        }
       }
     }
 
@@ -82,6 +86,9 @@ export async function track(
     // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
     // non-git root; pass --git false to opt out.
     syncGit: flags.git !== "false",
+    // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
+    // no round-trip (manual-id / --workspace entry has none → status falls back to id).
+    ...(pickedName ? { name: pickedName } : {}),
   };
   await saveConfig(root, cfg);
   return { cfg, root };

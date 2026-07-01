@@ -46,7 +46,11 @@ async function promptMissing(
       const picked = await promptWorkspacePick({ baseUrl: ctx.creds?.remoteUrl ?? ctx.defaultRemote, token: ctx.creds?.token });
       // Backing out of the picker (blank manual entry) falls through as a NEW
       // workspace — mirrors the old "[new]" default when nothing was entered.
-      if (picked) next.workspace = picked;
+      if (picked) {
+        next.workspace = picked.workspaceId;
+        // Cache the picked name locally so `rbox status` shows it (manual entry has none).
+        if (picked.name) next.name = picked.name;
+      }
     }
   }
   if (!next.project) {
