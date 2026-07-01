@@ -303,6 +303,12 @@ async function main(): Promise<void> {
           `  ${style.dim("sync metrics:")} ${m.syncs} syncs, ${conf ? style.yellow(`${m.commitConflicts409} commit-409 / ${m.fileConflicts} file-conflict`) : style.green("0 conflicts")}${m.lastConflictAt ? style.dim(` (last ${m.lastConflictAt})`) : ""}`
         );
       }
+      // ACCOUNT section (design 21) — which account/plan you're on and whether a web
+      // login is linked. Best-effort and local-first: fetchAccountSummary NEVER throws
+      // or blocks (short timeout, total error swallow), so an offline `rbox status`
+      // still shows all of the local workspace/sync state above.
+      const { fetchAccountSummary, formatAccountSummary } = await import("./account-cmd.js");
+      for (const line of formatAccountSummary(await fetchAccountSummary())) console.log(line);
       break;
     }
     case "start": {

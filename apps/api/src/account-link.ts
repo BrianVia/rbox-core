@@ -355,8 +355,14 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
   return json({ ok: true, account: newAcct });
 }
 
-/** GET /v1/account/status — AUTHED. Whether a Clerk identity manages this account. */
+/** GET /v1/account/status — AUTHED. Whether a Clerk identity manages this account,
+ *  plus the current plan tier so the CLI (`rbox status`) can show it at a glance.
+ *  `clerk_users` is directory-plane; `accounts.plan` is account-data — each read
+ *  routes through its own §32 seam (`dirDb` vs `dbFor`). */
 export async function accountStatus(env: Env, p: Principal): Promise<Response> {
-  const row = await dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>();
-  return json({ accountId: p.accountId, linked: !!row });
+  const [row, acct] = await Promise.all([
+    dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>(),
+    dbFor(env, p.accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(p.accountId).first<{ plan: string }>(),
+  ]);
+  return json({ accountId: p.accountId, linked: !!row, plan: acct?.plan ?? "free" });
 }
