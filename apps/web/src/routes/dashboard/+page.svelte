@@ -3,10 +3,15 @@
 	import { goto } from '$app/navigation';
 	import type { Clerk } from '@clerk/clerk-js';
 	import { authState, requireAuth } from '$lib/auth.svelte';
-	import { fetchUsage, startCheckout, openBillingPortal, type Usage } from '$lib/api';
+	import { fetchUsage, fetchAccountStatus, startCheckout, openBillingPortal, type Usage } from '$lib/api';
 	import { formatBytes, errMsg } from '$lib/format';
 
 	let usage = $state<Usage | null>(null);
+	// Whether this web login already manages a CLI account (design 21). Drives the
+	// "Used the rbox CLI?" link nudge below — it only makes sense for logins that
+	// AREN'T linked yet. `null` = unknown (not loaded / lookup failed) → nudge hidden,
+	// so an already-linked user is never told to "link your account" again.
+	let linked = $state<boolean | null>(null);
 	let error = $state('');
 	let busy = $state(false);
 
@@ -16,13 +21,18 @@
 
 	async function load() {
 		if (!authState.clerk) return;
-		try {
-			usage = await fetchUsage(authState.clerk);
+		const clerk = authState.clerk;
+		// Usage gates the page; link status only decides the nudge — fetch together,
+		// but never let a status hiccup blank out the dashboard (allSettled, not all).
+		const [u, s] = await Promise.allSettled([fetchUsage(clerk), fetchAccountStatus(clerk)]);
+		if (u.status === 'fulfilled') {
+			usage = u.value;
 			error = '';
-		} catch (e) {
-			const m = errMsg(e);
+		} else {
+			const m = errMsg(u.reason);
 			error = m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
 		}
+		linked = s.status === 'fulfilled' ? s.value.linked : null;
 	}
 
 	// One busy-lock + error-capture + redirect path for every billing action.
@@ -144,11 +154,15 @@
 	</nav>
 
 	<!-- Discovery nudge (design 21 §6 / 17 §4.1): route CLI-first users to the
-	     possession-proof link flow. NEVER auto-detect-and-bind (that's option C). -->
-	<button class="link-nudge" onclick={goLink}>
-		<span>Used the <code>rbox</code> CLI? <strong>Link your account →</strong></span>
-		<span class="faint">Manage your real devices, workspaces &amp; billing here.</span>
-	</button>
+	     possession-proof link flow. NEVER auto-detect-and-bind (that's option C).
+	     Shown ONLY to logins that aren't linked yet — an already-linked login is
+	     managing its real account here, so re-prompting it to "link" is nonsense. -->
+	{#if linked === false}
+		<button class="link-nudge" onclick={goLink}>
+			<span>Already using the <code>rbox</code> CLI? <strong>Link your account →</strong></span>
+			<span class="faint">Connect your machines to manage their devices, workspaces &amp; billing here.</span>
+		</button>
+	{/if}
 
 	{#if isFree}
 		<!-- Free → upgrade. Cards make the choice + value obvious (vs bare buttons).
