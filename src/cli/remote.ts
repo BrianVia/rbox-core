@@ -22,6 +22,36 @@ export class NeedsRebaselineError extends Error {
   }
 }
 
+/** A blob PUT was rejected because the streamed ciphertext no longer hashes to the
+ *  declared `encSha` (server: `R2.put(key, body, { sha256 })` → HTTP 400
+ *  `{"error":"sha_mismatch"}`). Under convergent encryption the `encSha` is fixed at
+ *  encrypt time; if the source file is edited before the streamed upload lands (rbox
+ *  syncs live, actively-edited dev workspaces), the fresh ciphertext no longer matches.
+ *  A TYPED signal so `pushManifest` can self-heal — re-scan the settled tree + retry —
+ *  instead of aborting the whole push on a raw `blob PUT failed: 400`. */
+export class BlobShaMismatchError extends Error {
+  constructor(public readonly encSha: string) {
+    super(`blob PUT rejected: ciphertext no longer hashes to declared encSha ${encSha} (source changed under sync)`);
+    this.name = "BlobShaMismatchError";
+  }
+}
+
+/** Distinguish R2's convergent-encryption hash guard (`{"error":"sha_mismatch"}`) from any
+ *  other 4xx. The server signals this SAME semantic error with two statuses (apps/api/src/blobs.ts):
+ *  400 on the single-PUT / direct-write path, 412 on the multipart-complete publish. Accept both,
+ *  but still require the JSON discriminator so unrelated 4xx bodies fall through to the generic
+ *  error path. Consumes the response body exactly once and returns it for that generic path so
+ *  callers keep their existing `status body` diagnostics. */
+async function readShaMismatch(res: Response): Promise<{ mismatch: boolean; text: string }> {
+  const text = await res.text();
+  if (res.status !== 400 && res.status !== 412) return { mismatch: false, text };
+  try {
+    return { mismatch: (JSON.parse(text) as { error?: string }).error === "sha_mismatch", text };
+  } catch {
+    return { mismatch: false, text };
+  }
+}
+
 export interface CommitResult {
   sequence?: number;
   /** Parent-sequence conflict (HTTP 409): client must pull+reconcile, then retry. */
@@ -130,7 +160,11 @@ export class RboxApi implements SyncRemote {
         duplex: "half",
       } as RequestInit);
       if (res.status !== 413) {
-        if (!res.ok) throw new Error(`blob PUT failed: ${res.status} ${await res.text()}`);
+        if (!res.ok) {
+          const { mismatch, text } = await readShaMismatch(res);
+          if (mismatch) throw new BlobShaMismatchError(sha256); // live-folder TOCTOU → let push re-scan + retry
+          throw new Error(`blob PUT failed: ${res.status} ${text}`);
+        }
         this.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
         return;
       }
@@ -144,6 +178,10 @@ export class RboxApi implements SyncRemote {
     try {
       await this.multipartAttempt(sha256, absPath, size, uploadsDir, true);
     } catch (e) {
+      // A live-folder TOCTOU sha_mismatch is NOT a dead-upload — re-initing multipart
+      // would re-read the same changed source and 400 again. Bubble it so the push
+      // re-scans the settled tree and retries with the file's fresh encSha.
+      if (e instanceof BlobShaMismatchError) throw e;
       // A resume against an expired/dead upload (or any mid-flight error) — clear
       // the token and retry once from a fresh init. If the second attempt fails,
       // surface it (the daemon's pump will retry later).
@@ -201,7 +239,11 @@ export class RboxApi implements SyncRemote {
         body: fileStream(absPath, start, end - 1), // createReadStream end is inclusive
         duplex: "half",
       } as RequestInit);
-      if (!res.ok) throw new Error(`multipart part ${n} failed: ${res.status} ${await res.text()}`);
+      if (!res.ok) {
+        const { mismatch, text } = await readShaMismatch(res);
+        if (mismatch) throw new BlobShaMismatchError(sha256); // source changed mid-upload → push re-scans + retries
+        throw new Error(`multipart part ${n} failed: ${res.status} ${text}`);
+      }
     }
 
     const done = await fetch(`${this.baseUrl}/v1/blobs/${sha256}/multipart/${uploadId}/complete`, {
@@ -216,7 +258,9 @@ export class RboxApi implements SyncRemote {
         if (tokenPath) await fsp.rm(tokenPath, { force: true });
         return;
       }
-      throw new Error(`multipart complete failed: ${done.status} ${await done.text()}`);
+      const { mismatch, text } = await readShaMismatch(done);
+      if (mismatch) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
+      throw new Error(`multipart complete failed: ${done.status} ${text}`);
     }
     if (tokenPath) await fsp.rm(tokenPath, { force: true });
   }
