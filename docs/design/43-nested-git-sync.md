@@ -1,8 +1,8 @@
 # Design 43 — Nested-Repo Git Sync (per-repo GitSections)
 
-**Status:** v5 — four codex design rounds (v1: 5 BLOCKER/4 MAJOR; v2: 3 BLOCKER/2 MAJOR;
-v3: 2 BLOCKER; v4: 1 BLOCKER/1 MAJOR — several verified with local git repros); every
-resolution folded in inline, marked **[v2]…[v5]**. Full history in §14.
+**Status:** v6 — five codex design rounds (v1: 5 BLOCKER/4 MAJOR → v5: 1 MAJOR — several
+verified with local git repros); every resolution folded in inline, marked **[v2]…[v6]**.
+Full history in §14.
 **Builds on:** design 02 (git-mirroring v3 — bundle-based capture/apply), §28 (git artifacts under
 E2EE), PR #38 (defer-churning-files partial-progress philosophy).
 **Supersedes:** the "repo toplevel === sync root" scope restriction of design 02 §3.
@@ -251,6 +251,18 @@ The pull-side git block iterates `remote.gitRepos ∪ base.gitRepos` per key:
   ownership stall (each machine's section names a branch a sibling worktree holds on the other)
   is therefore a visible, stable, non-destructive standoff surfaced in `rbox status` — an
   operator condition, not data loss.
+  - **Remote absence supersedes pending [v6].** A pull in which the remote manifest LACKS a
+    pending repo's key clears `gitPendingRemote[relPath]` (the deletion is newer truth than the
+    section we never managed to apply), records a removal memory if the local `.git` survives,
+    and suppresses any outbound carry — otherwise B's next file-only push would carry the stale
+    pending section and resurrect the repo A just deleted. Re-adding later follows the normal
+    §9 rules (identity change = intentional).
+  - **422 while pending [v6].** A pending section's encShas can go missing server-side (GC of a
+    never-committed upload). Pending repos are carried/capture-suppressed, so they take the
+    non-looping M5 drop path: the section is dropped from THIS commit and the pending entry is
+    left in place for the next pull to refresh (the remote either still has the repo — pending
+    re-establishes with fresh encShas — or doesn't, and absence-supersedes clears it). No loop,
+    no resurrection.
 - **Identity comparison is scope-projected — with precise sides [v2, B1; fixed v3].**
   *Projection* = HEAD + the refs the narrower side carries + indexTree + opState.
   - **Pull-side** (remote section vs base section vs local): compare after projecting onto the
@@ -410,6 +422,11 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ## 14. Review history
 
+- **v5 → codex round 5 (2026-07-01): FAIL, 1 MAJOR** — `gitPendingRemote` could resurrect a
+  repo the remote deleted (pending carried outbound after the deletion pulled) → v6:
+  remote absence supersedes pending (clear + removal memory + no carry); 422-while-pending
+  takes the M5 non-looping drop path and refreshes from the next pull. Codex confirmed the 409
+  path sound and the v5 shape-split/carry wording contradiction-free.
 - **v4 → codex round 4 (2026-07-01): FAIL, 1 BLOCKER + 1 MAJOR + 1 MINOR** — (a) clean
   materialization's ref-wipe on a POINTER leftover would delete shared main-clone
   branches/tags/stash → v5 shape-split (dir: quarantine incl. index/op-state + pinning, then
