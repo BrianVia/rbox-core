@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,19 +8,37 @@ import type { BlobStore } from "./blobstore.js";
 import { hashFile } from "./hash.js";
 import { writeFileAtomic } from "./fsutil.js";
 import { encryptFileToTemp, decryptFileToPath } from "./crypto.js";
-import type { GitArtifactRef, GitSection } from "./types.js";
+import { OP_STATE_DIRS, OP_STATE_FILES, isSyncableRef, validateGitSection } from "./manifest-validate.js";
+import type { GitArtifactRef, GitRefScope, GitSection } from "./types.js";
+
+// Re-exported for compat: these moved to manifest-validate.ts (pure — validateManifest
+// validates gitRepos values, and manifest-validate must stay node:*-free for the Worker).
+export { isSyncableRef, validateGitSection };
 
 /** The stable, plaintext-only identity of a repo's git state (no ciphertext addresses) —
  *  what change-detection compares. Distinct from the stored `GitSection`, whose blob fields
- *  are encShas. opState here is `rel → plaintext sha`. */
-export type GitIdentity = Pick<GitSection, "head" | "refs" | "indexTree"> & { opState?: Record<string, string> };
+ *  are encShas. opState here is `rel → plaintext sha`. Carries `refScope` so callers can
+ *  drive the design-43 §7 comparison matrix (project before comparing across scopes). */
+export type GitIdentity = Pick<GitSection, "head" | "refs" | "indexTree" | "refScope"> & { opState?: Record<string, string> };
+
+/** Repo shape: "dir" = ordinary repo (`.git` directory); "pointer" = worktree/submodule
+ *  checkout (`.git` gitfile whose state lives in the main clone's gitdir). */
+export type GitRepoKind = "dir" | "pointer";
+
+export interface GitPreflightResult {
+  ok: boolean;
+  reason?: string;
+  kind?: GitRepoKind;
+}
 
 const exec = promisify(execFile);
 
 /**
- * Git-native repo-state sync (M2 v3). History rides `git bundle` (consistent on a
- * live repo by design); index/HEAD/op-state are atomic single-file captures.
- * Nothing copies the live `.git` tree, so there is no torn-snapshot failure.
+ * Git-native repo-state sync (M2 v3, generalized per design 43 §§4-5). History rides
+ * `git bundle` (consistent on a live repo by design); index/HEAD/op-state are atomic
+ * single-file captures read from the RESOLVED gitdir (`git rev-parse --absolute-git-dir`)
+ * — for pointer repos (worktree/submodule checkouts) that lands in the main clone's
+ * `.git/worktrees/<n>/` (or `.git/modules/…`), never a hardcoded `repoDir/.git`.
  *
  * Change detection uses a STABLE identity (refs + HEAD + index hash + op-state),
  * NOT the bundle bytes — `git stash create` mints a fresh commit each capture, so
@@ -27,9 +46,24 @@ const exec = promisify(execFile);
  * the git section forever.
  */
 
-// Op-state paths (relative to .git) that let you continue a paused operation.
-const OP_STATE_FILES = ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "ORIG_HEAD", "MERGE_MSG"];
-const OP_STATE_DIRS = ["rebase-merge", "rebase-apply", "sequencer"];
+const HEX40 = /^[0-9a-f]{40}$/;
+
+/** Op-state files whose contents are commit shas that must be PINNED into the bundle's
+ *  object closure (design 43 §5 [v2, B3]): `bundle create HEAD refs/heads/x` omits a
+ *  MERGE_HEAD commit from another branch (codex repro), which would restore a pseudo-ref
+ *  pointing at a missing object. NOT AUTO_MERGE (a tree, not a commit) or MERGE_MSG (text). */
+const PSEUDO_REF_SHA_FILES = [
+  "MERGE_HEAD",
+  "REBASE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "ORIG_HEAD",
+  "rebase-merge/orig-head",
+  "rebase-apply/orig-head",
+];
+
+const WIP_NS = "refs/rbox-wip";
+const SCRATCH_MAX_AGE_MS = 60 * 60 * 1000; // 1h — see pruneStaleScratchRefs
 
 async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   const { stdout } = await exec("git", ["-C", root, ...args], {
@@ -47,87 +81,298 @@ async function gitOk(root: string, args: string[]): Promise<boolean> {
   }
 }
 
-/** Preflight: only ordinary, non-bare, in-root repos with a real `.git` dir. */
-export async function gitPreflight(root: string): Promise<{ ok: boolean; reason?: string }> {
-  let st;
-  try {
-    st = await fs.stat(path.join(root, ".git"));
-  } catch {
-    return { ok: false, reason: "no .git" };
-  }
-  if (!st.isDirectory()) return { ok: false, reason: ".git is a file (worktree/submodule) — unsupported" };
-  if (!(await gitOk(root, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree" };
-  if ((await git(root, ["rev-parse", "--is-bare-repository"])) !== "false") return { ok: false, reason: "bare repo — unsupported" };
-  const top = await git(root, ["rev-parse", "--show-toplevel"]).catch(() => "");
-  // git returns a realpath; the sync root may contain symlinks (e.g. macOS
-  // /var/folders -> /private/var/folders), so compare realpaths, not lexical paths.
-  const rootReal = await fs.realpath(root).catch(() => path.resolve(root));
-  const topReal = top ? await fs.realpath(top).catch(() => path.resolve(top)) : "";
-  if (topReal !== rootReal) return { ok: false, reason: "repo toplevel != sync root" };
-  for (const bad of ["objects/info/alternates", "worktrees", "modules"]) {
-    if (await exists(path.join(root, ".git", bad))) return { ok: false, reason: `.git/${bad} present — unsupported` };
-  }
-  return { ok: true };
+// ---- repo context -----------------------------------------------------------
+
+/** Everything path-shaped about a repo, resolved once. `gitDir` is the per-worktree
+ *  gitdir (HEAD/index/op-state live here); `commonDir` is the shared object/ref store
+ *  (== gitDir for dir repos; the main clone's `.git` for pointer repos). */
+interface RepoCtx {
+  repoDir: string;
+  kind: GitRepoKind;
+  gitDir: string;
+  commonDir: string;
 }
 
-/** Cheap, stable identity of the repo state (no bundling). Undefined if no commits. */
-export async function gitIdentity(root: string): Promise<GitIdentity | undefined> {
-  if (!(await gitOk(root, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
-  const refs = await readRefs(root);
-  const head = (await fs.readFile(path.join(root, ".git", "HEAD"), "utf8")).trim();
-  // Stable staging identity via write-tree (NOT the raw index file hash, which git
-  // refreshes). write-tree may refresh stat info — harmless, like `git status`.
-  const indexTree = (await git(root, ["write-tree"]).catch(() => "")) || undefined;
-  const opState = await readOpState(root, async (p) => hashFile(p));
-  return { refs, head, indexTree, opState: Object.keys(opState).length ? opState : undefined };
+async function detectGitKind(repoDir: string): Promise<GitRepoKind | undefined> {
+  const st = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+  if (!st) return undefined;
+  if (st.isDirectory()) return "dir";
+  if (st.isFile()) return "pointer";
+  return undefined; // symlinked `.git` — unsupported shape
 }
+
+/** Resolve the repo's gitdirs, or undefined when the repo is unusable (no `.git`,
+ *  dangling pointer — the Conductor incident — or not a repo at all). */
+async function repoCtx(repoDir: string): Promise<RepoCtx | undefined> {
+  const kind = await detectGitKind(repoDir);
+  if (!kind) return undefined;
+  let gitDir: string;
+  try {
+    gitDir = await git(repoDir, ["rev-parse", "--absolute-git-dir"]);
+  } catch {
+    return undefined; // dangling pointer / corrupt repo → caller skips cleanly
+  }
+  const commonRaw = await git(repoDir, ["rev-parse", "--git-common-dir"]).catch(() => gitDir);
+  return { repoDir, kind, gitDir, commonDir: path.resolve(repoDir, commonRaw) };
+}
+
+async function readHead(ctx: RepoCtx): Promise<string> {
+  return (await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8")).trim();
+}
+
+/** "ref: refs/heads/x" → "refs/heads/x"; detached (40-hex) → undefined. */
+function headBranchOf(head: string): string | undefined {
+  const m = /^ref: (refs\/heads\/\S+)$/.exec(head.trim());
+  return m?.[1];
+}
+
+// ---- preflight (design 43 §4) ------------------------------------------------
+
+/** Preflight: ordinary non-bare repos whose toplevel IS `repoDir` — as a real `.git`
+ *  dir ("dir") or a gitfile worktree/submodule checkout ("pointer"). Dir-repos with
+ *  linked worktrees (`.git/worktrees/`) or submodules (`.git/modules/`) stay refused
+ *  (v1; superprojects explicitly unsupported [v2, M1]); alternates refused for both
+ *  kinds (pointer: checked on the RESOLVED object store). Dangling pointers (main
+ *  clone deleted) fail cleanly — the repo is skipped this cycle. */
+export async function gitPreflight(repoDir: string): Promise<GitPreflightResult> {
+  const kind = await detectGitKind(repoDir);
+  if (!kind) {
+    const st = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+    if (!st) return { ok: false, reason: "no .git" };
+    return { ok: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported" };
+  }
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) {
+    return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
+  }
+  if (!(await gitOk(repoDir, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree", kind };
+  if ((await git(repoDir, ["rev-parse", "--is-bare-repository"]).catch(() => "")) !== "false") return { ok: false, reason: "bare repo — unsupported", kind };
+  const top = await git(repoDir, ["rev-parse", "--show-toplevel"]).catch(() => "");
+  // git returns a realpath; the repo dir may contain symlinks (e.g. macOS
+  // /var/folders -> /private/var/folders), so compare realpaths, not lexical paths.
+  const dirReal = await fs.realpath(repoDir).catch(() => path.resolve(repoDir));
+  const topReal = top ? await fs.realpath(top).catch(() => path.resolve(top)) : "";
+  if (topReal !== dirReal) return { ok: false, reason: "repo toplevel != repo dir", kind };
+  if (kind === "dir") {
+    for (const bad of ["objects/info/alternates", "worktrees", "modules"]) {
+      if (await exists(path.join(repoDir, ".git", bad))) return { ok: false, reason: `.git/${bad} present — unsupported`, kind };
+    }
+  } else {
+    // pointer: the object store is the main clone's — refuse if THAT uses alternates.
+    if (await exists(path.join(ctx.commonDir, "objects", "info", "alternates"))) {
+      return { ok: false, reason: "resolved gitdir uses objects/info/alternates — unsupported", kind };
+    }
+  }
+  return { ok: true, kind };
+}
+
+// ---- identity (design 43 §§6-7) -----------------------------------------------
+
+/** Cheap, stable identity of the repo state (no bundling). Undefined if no commits or
+ *  the repo is unusable. SCOPE-AWARE (design 43 §5): a pointer repo's identity is
+ *  HEAD + the current-branch ref + indexTree + opState only — the shared store's other
+ *  branches/tags/stash belong to the main clone, not this checkout. */
+export async function gitIdentity(repoDir: string): Promise<GitIdentity | undefined> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) return undefined;
+  if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
+  const head = await readHead(ctx);
+  const refs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, head);
+  const indexTree = await indexTreeOf(ctx);
+  const opState = await readOpState(ctx.gitDir, async (p) => hashFile(p));
+  return {
+    refScope: ctx.kind === "dir" ? "all" : "scoped",
+    refs,
+    head,
+    indexTree,
+    opState: Object.keys(opState).length ? opState : undefined,
+  };
+}
+
+/** Stable staging identity via write-tree (NOT the raw index file hash, which git
+ *  refreshes). write-tree may refresh stat info — harmless, like `git status`.
+ *  Fallback (design 43 §6.6 [v2, M3]): write-tree FAILS on an index with unmerged
+ *  entries, which would freeze the identity mid-conflict and never re-capture staged
+ *  conflict-resolution progress — so identity falls back to `raw:<sha256 of the
+ *  resolved-gitdir index bytes>`. Volatile (stat refreshes can over-capture) but
+ *  conservative: in the transient unmerged window, re-capturing beats carrying stale state. */
+async function indexTreeOf(ctx: RepoCtx): Promise<string | undefined> {
+  const wt = (await git(ctx.repoDir, ["write-tree"]).catch(() => "")) || undefined;
+  if (wt) return wt;
+  const idx = path.join(ctx.gitDir, "index");
+  if (!(await exists(idx))) return undefined;
+  return `raw:${await hashFile(idx)}`;
+}
+
+/**
+ * Project an identity/section onto a ref scope for cross-scope comparison (design 43 §7).
+ * Projection = HEAD + the refs the narrower side carries (HEAD's branch only) + indexTree
+ * + opState. Pure — never touches the repo. STEP-3 composes `gitIdentityKey(projectIdentity(x,
+ * narrowerScope))` per the §7 comparison matrix (pull-side: project onto the NARROWER of the
+ * two scopes; capture-side carry-forward: the normative shape×scope rules, incl. the explicit
+ * pointer/all-base wider-carry exception).
+ */
+export function projectIdentity<T extends GitSection | GitIdentity>(g: T, scope: GitRefScope): T {
+  if (scope === "all") return g;
+  const branch = headBranchOf(g.head);
+  const refs: Record<string, string> = {};
+  if (branch && g.refs[branch] !== undefined) refs[branch] = g.refs[branch]!;
+  return { ...g, refScope: "scoped", refs };
+}
+
+/** A stable string fingerprint for reconcile/change-detection. Uses the write-tree
+ *  staging identity (NOT the volatile raw index hash) and excludes bundle bytes.
+ *  Deliberately EXCLUDES refScope: cross-scope comparisons project both sides onto the
+ *  narrower scope first (see {@link projectIdentity}, design 43 §7) and must be able to
+ *  compare equal across shapes. */
+export function gitIdentityKey(g: GitSection | GitIdentity | undefined): string {
+  if (!g) return "none";
+  const refs = Object.entries(g.refs).sort().map(([k, v]) => `${k}=${v}`).join(",");
+  // opState values are plaintext shas in a GitIdentity but {sha,encSha,cipherSize} in a stored
+  // GitSection — normalize to the PLAINTEXT sha so identity is stable across both shapes (and
+  // doesn't stringify a GitArtifactRef to "[object Object]", which would re-bundle every push).
+  const ops = g.opState ? Object.entries(g.opState).sort().map(([k, v]) => `${k}=${typeof v === "string" ? v : v.sha}`).join(",") : "";
+  return `${g.head}|${g.indexTree ?? ""}|${refs}|${ops}`;
+}
+
+// ---- scratch-ref pinning (design 43 §5 [v2, B2/B3; v3]) ------------------------
+
+interface ScratchPins {
+  /** enumerated exact refs, e.g. refs/rbox-wip/<epochMs>-<rand>/0 — a literal glob arg
+   *  to `git bundle create` FAILS ("Refusing to create empty bundle"), so these are
+   *  passed to the bundle EXPLICITLY, never as a wildcard. */
+  refs: string[];
+}
+
+/** Pin every commit the section will reference under a CAPTURE-UNIQUE namespace
+ *  `refs/rbox-wip/<epochMs>-<rand>/<n>`: linked worktrees share one ref store, so a
+ *  single global scratch ref would race under concurrent sibling captures [v2, B2]. */
+async function createScratchPins(repoDir: string, shas: string[]): Promise<ScratchPins> {
+  const ns = `${WIP_NS}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const refs: string[] = [];
+  try {
+    let n = 0;
+    for (const sha of shas) {
+      const ref = `${ns}/${n++}`;
+      await git(repoDir, ["update-ref", ref, sha]);
+      refs.push(ref);
+    }
+  } catch (e) {
+    await deleteScratchPins(repoDir, { refs });
+    throw e;
+  }
+  return { refs };
+}
+
+async function deleteScratchPins(repoDir: string, pins: ScratchPins): Promise<void> {
+  for (const ref of pins.refs) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+}
+
+/** Prune stale scratch refs left by CRASHED runs — AGE-GUARDED [v3]: only entries whose
+ *  `<epochMs>-<rand>` id is older than 1h are deleted. A blind prune in a SHARED gitdir
+ *  would delete a concurrent sibling capture's live pins. */
+async function pruneStaleScratchRefs(repoDir: string, ns: string): Promise<void> {
+  const out = await git(repoDir, ["for-each-ref", "--format=%(refname)", ns]).catch(() => "");
+  const cutoff = Date.now() - SCRATCH_MAX_AGE_MS;
+  for (const ref of out.split("\n").filter(Boolean)) {
+    if (ref === ns) {
+      // legacy pre-§43 exact ref (`refs/rbox-wip`) from a crashed old capture — it D/F-blocks
+      // the namespaced refs below and old clients only ever ran on unshared root repos, so
+      // deleting it blindly is safe (and matches the old cleanup).
+      await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      continue;
+    }
+    const id = ref.slice(ns.length + 1).split("/")[0] ?? "";
+    const epoch = Number.parseInt(id, 10);
+    if (Number.isFinite(epoch) && epoch < cutoff) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+  }
+}
+
+/** Commits the section references that a scoped bundle might not reach: the detached-HEAD
+ *  sha (a bundle's HEAD advertisement is NOT imported by `git fetch 'refs/*:…'` — codex
+ *  verified) and every pseudo-ref sha the op-state references. Applied to DIR captures too
+ *  (the pseudo-ref hole is latent in design 02: `--all` usually reaches those commits via a
+ *  branch, but nothing guarantees it). Only shas that verify as commits are pinned — a stale
+ *  pseudo-ref must not fail the whole bundle. */
+async function collectPinShas(ctx: RepoCtx, head: string): Promise<string[]> {
+  const shas = new Set<string>();
+  const h = head.trim();
+  if (HEX40.test(h)) shas.add(h); // detached HEAD
+  for (const rel of PSEUDO_REF_SHA_FILES) {
+    const txt = await fs.readFile(path.join(ctx.gitDir, rel), "utf8").catch(() => "");
+    for (const line of txt.split("\n")) {
+      const s = line.trim();
+      if (HEX40.test(s)) shas.add(s); // MERGE_HEAD may list several (octopus)
+    }
+  }
+  const out: string[] = [];
+  for (const s of shas) {
+    if (await gitOk(ctx.repoDir, ["rev-parse", "--verify", "--quiet", `${s}^{commit}`])) out.push(s);
+  }
+  return out;
+}
+
+// ---- capture (design 43 §5) ----------------------------------------------------
 
 /** Full capture: build the bundle + upload all artifacts; return the manifest section.
  *
  * Small files (index, op-state) are STAGED (copied) into a temp dir FIRST and then
- * hashed+uploaded from those copies — never from the live `.git`. This avoids a
- * TOCTOU where `git stash create` (below) rewrites `.git/index` between hashing and
+ * hashed+uploaded from those copies — never from the live gitdir. This avoids a
+ * TOCTOU where `git stash create` (below) rewrites the index between hashing and
  * upload, making the claimed sha disagree with the uploaded bytes. (git writes
  * these files via atomic rename, so a copy is always an internally-consistent
  * snapshot.) History rides the bundle, which git produces consistently regardless.
+ *
+ * Scope split (design 43 §5):
+ * - dir repo → refScope "all": bundle `--all` + refs/stash + enumerated pins.
+ * - pointer repo → refScope "scoped": bundle `refs/heads/<current-branch>` + enumerated
+ *   pins ONLY — no `--all`, and `refs/stash` is NEVER captured (it lives in the SHARED
+ *   gitdir; per-worktree capture would fan one global stash stack out into N standalone
+ *   repos [v2, B2]). Uncommitted dirty state still transfers via the WIP commit + index.
  */
-export async function captureGitState(root: string, store: BlobStore, kek: Buffer): Promise<GitSection | undefined> {
-  if (!(await gitOk(root, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
+export async function captureGitState(repoDir: string, store: BlobStore, kek: Buffer): Promise<GitSection | undefined> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) return undefined; // unusable (dangling pointer etc.) → caller defers
+  if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcap-"));
+  let pins: ScratchPins | undefined;
   try {
-    const gitDir = path.join(root, ".git");
-    // Clean any stale internal scratch ref left by a prior crashed capture.
-    await git(root, ["update-ref", "-d", "refs/rbox-wip"]).catch(() => {});
+    // Age-guarded prune of scratch refs left by prior crashed captures (shared-store safe).
+    await pruneStaleScratchRefs(repoDir, WIP_NS);
 
-    // 1. Stage index + op-state immediately (atomic single-file snapshots).
+    // 1. Stage index + op-state immediately (atomic single-file snapshots) — from the
+    //    RESOLVED gitdir (pointer repos: `.git/worktrees/<n>/…`), never `repoDir/.git`.
     let stagedIndex: string | undefined;
-    if (await exists(path.join(gitDir, "index"))) {
+    if (await exists(path.join(ctx.gitDir, "index"))) {
       stagedIndex = path.join(tmpDir, "index");
-      await fs.copyFile(path.join(gitDir, "index"), stagedIndex);
+      await fs.copyFile(path.join(ctx.gitDir, "index"), stagedIndex);
     }
     const stagedOp: Array<{ rel: string; staged: string }> = [];
-    const liveOp = await readOpState(root, async () => ""); // just enumerate present op-state
+    const liveOp = await readOpState(ctx.gitDir, async () => ""); // just enumerate present op-state
     for (const rel of Object.keys(liveOp)) {
       const staged = path.join(tmpDir, "op", rel);
       await fs.mkdir(path.dirname(staged), { recursive: true });
-      await fs.copyFile(path.join(gitDir, rel), staged);
+      await fs.copyFile(path.join(ctx.gitDir, rel), staged);
       stagedOp.push({ rel, staged });
     }
 
-    // 2. refs + HEAD (read via git / atomic file).
-    const refs = await readRefs(root);
-    const head = (await fs.readFile(path.join(gitDir, "HEAD"), "utf8")).trim();
+    // 2. refs + HEAD (scope-aware) — read via git / atomic file from the resolved gitdir.
+    const head = await readHead(ctx);
+    const refs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, head);
 
-    // 3. Make dirty+staged state reachable so the bundle ships index blobs, then bundle.
-    const wip = (await git(root, ["stash", "create"]).catch(() => "")).trim();
-    if (wip) await git(root, ["update-ref", "refs/rbox-wip", wip]);
+    // 3. Make dirty+staged state + pseudo-ref commits reachable, then bundle.
+    //    `git stash create` works from a worktree context unchanged.
+    const wip = (await git(repoDir, ["stash", "create"]).catch(() => "")).trim();
+    const pinShas = new Set(await collectPinShas(ctx, head));
+    if (wip) pinShas.add(wip);
+    pins = await createScratchPins(repoDir, [...pinShas]);
     const bundlePath = path.join(tmpDir, "repo.bundle");
-    try {
-      await git(root, ["bundle", "create", bundlePath, "--all", ...(refs["refs/stash"] ? ["refs/stash"] : []), ...(wip ? ["refs/rbox-wip"] : [])]);
-    } finally {
-      if (wip) await git(root, ["update-ref", "-d", "refs/rbox-wip"]).catch(() => {});
-    }
+    const bundleArgs =
+      ctx.kind === "dir"
+        ? ["--all", ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
+        : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
+    await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs]);
 
     // 4. §28: ENCRYPT each staged artifact under the workspace KEK, upload the CIPHERTEXT by
     //    encSha (convergent — same primitive as file blobs), and record (plaintext sha, encSha,
@@ -137,7 +382,7 @@ export async function captureGitState(root: string, store: BlobStore, kek: Buffe
 
     let index: GitArtifactRef | undefined;
     if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir);
-    const indexTree = (await git(root, ["write-tree"]).catch(() => "")) || undefined;
+    const indexTree = await indexTreeOf(ctx);
     const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
       opState[rel] = await putGitArtifact(store, kek, staged, tmpDir);
@@ -154,59 +399,24 @@ export async function captureGitState(root: string, store: BlobStore, kek: Buffe
       indexCipherSize: index?.cipherSize,
       indexTree,
       opState: Object.keys(opState).length ? opState : undefined,
+      refScope: ctx.kind === "dir" ? "all" : "scoped",
       generatedAt: new Date().toISOString(),
     };
   } finally {
+    if (pins) await deleteScratchPins(repoDir, pins);
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 }
 
-/** A stable string fingerprint for reconcile/change-detection. Uses the write-tree
- *  staging identity (NOT the volatile raw index hash) and excludes bundle bytes. */
-export function gitIdentityKey(g: GitSection | GitIdentity | undefined): string {
-  if (!g) return "none";
-  const refs = Object.entries(g.refs).sort().map(([k, v]) => `${k}=${v}`).join(",");
-  // opState values are plaintext shas in a GitIdentity but {sha,encSha,cipherSize} in a stored
-  // GitSection — normalize to the PLAINTEXT sha so identity is stable across both shapes (and
-  // doesn't stringify a GitArtifactRef to "[object Object]", which would re-bundle every push).
-  const ops = g.opState ? Object.entries(g.opState).sort().map(([k, v]) => `${k}=${typeof v === "string" ? v : v.sha}`).join(",") : "";
-  return `${g.head}|${g.indexTree ?? ""}|${refs}|${ops}`;
-}
+// ---- apply (design 43 §7) -------------------------------------------------------
 
 export interface ApplyGitResult {
   applied: boolean;
   reason?: string;
   conflictBundle?: string;
-}
-
-const HEX40 = /^[0-9a-f]{40}$/;
-const HEX64 = /^[0-9a-f]{64}$/;
-
-/** Reject a malformed/hostile section before it touches `.git`. */
-function validArtifactRef(r: GitArtifactRef | undefined): boolean {
-  return !!r && HEX64.test(r.sha) && HEX64.test(r.encSha) && Number.isInteger(r.cipherSize) && r.cipherSize >= 0;
-}
-
-export function validateGitSection(s: GitSection): { ok: boolean; reason?: string } {
-  // §28: the bundle is mandatory and addressed by both its plaintext sha (decrypt-verify) and
-  // its encSha (the ciphertext blob actually fetched). Both must be well-formed.
-  if (!HEX64.test(s.bundleSha) || !HEX64.test(s.bundleEncSha)) return { ok: false, reason: "bad bundle sha/encSha" };
-  if (!Number.isInteger(s.bundleCipherSize) || s.bundleCipherSize < 0) return { ok: false, reason: "bad bundleCipherSize" };
-  // index is optional but, if present, both shas + size travel together.
-  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined) {
-    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize! })) return { ok: false, reason: "bad index ref" };
-  }
-  if (!/^(ref: refs\/[A-Za-z0-9._\/-]+|[0-9a-f]{40})$/.test(s.head.trim())) return { ok: false, reason: "bad HEAD" };
-  for (const [ref, sha] of Object.entries(s.refs)) {
-    if (!isSyncableRef(ref) || ref.includes("..") || ref.includes("\0")) return { ok: false, reason: `bad ref ${ref}` };
-    if (!HEX40.test(sha)) return { ok: false, reason: `bad ref sha ${ref}` };
-  }
-  for (const [rel, ref] of Object.entries(s.opState ?? {})) {
-    const okRel = OP_STATE_FILES.includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
-    if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };
-    if (!validArtifactRef(ref)) return { ok: false, reason: `bad opState ref ${rel}` };
-  }
-  return { ok: true };
+  /** Refs the pointer-target namespace/ownership filter refused to publish
+   *  (design 43 §7 [v3/v4]) — surfaced so the caller can log them. */
+  filteredRefs?: string[];
 }
 
 interface LocalSnapshot {
@@ -215,54 +425,165 @@ interface LocalSnapshot {
   indexBytes?: Buffer;
   opState: Record<string, Buffer>;
 }
-async function snapshotLocal(root: string): Promise<LocalSnapshot> {
-  const gitDir = path.join(root, ".git");
-  const refs = await readRefs(root);
-  const head = (await fs.readFile(path.join(gitDir, "HEAD"), "utf8").catch(() => "")).trim();
-  const indexBytes = (await exists(path.join(gitDir, "index"))) ? await fs.readFile(path.join(gitDir, "index")) : undefined;
+async function snapshotLocal(ctx: RepoCtx): Promise<LocalSnapshot> {
+  const refs = await readAllRefs(ctx.repoDir);
+  const head = (await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8").catch(() => "")).trim();
+  const indexBytes = (await exists(path.join(ctx.gitDir, "index"))) ? await fs.readFile(path.join(ctx.gitDir, "index")) : undefined;
   const opState: Record<string, Buffer> = {};
-  for (const rel of Object.keys(await readOpState(root, async () => ""))) opState[rel] = await fs.readFile(path.join(gitDir, rel));
+  for (const rel of Object.keys(await readOpState(ctx.gitDir, async () => ""))) opState[rel] = await fs.readFile(path.join(ctx.gitDir, rel));
   return { refs, head, indexBytes, opState };
 }
-async function restoreLocal(root: string, snap: LocalSnapshot): Promise<void> {
-  const gitDir = path.join(root, ".git");
-  // Reset syncable refs to the snapshot.
-  for (const ref of Object.keys(await readRefs(root))) if (!(ref in snap.refs)) await git(root, ["update-ref", "-d", ref]).catch(() => {});
-  for (const [ref, sha] of Object.entries(snap.refs)) await git(root, ["update-ref", ref, sha]).catch(() => {});
-  if (snap.head) await writeFileAtomic(path.join(gitDir, "HEAD"), snap.head.endsWith("\n") ? snap.head : `${snap.head}\n`);
-  if (snap.indexBytes) await writeFileAtomic(path.join(gitDir, "index"), snap.indexBytes);
-  for (const rel of Object.keys(await readOpState(root, async () => ""))) if (!(rel in snap.opState)) await fs.rm(path.join(gitDir, rel), { force: true }).catch(() => {});
-  for (const [rel, bytes] of Object.entries(snap.opState)) {
-    await fs.mkdir(path.dirname(path.join(gitDir, rel)), { recursive: true });
-    await writeFileAtomic(path.join(gitDir, rel), bytes);
+/** Roll back to the pre-apply snapshot. For a POINTER target, `onlyRefs` restricts the
+ *  ref restore to exactly the refs the apply touched — a full reset would clobber
+ *  concurrent sibling-worktree ref updates in the SHARED store. */
+async function restoreLocal(ctx: RepoCtx, snap: LocalSnapshot, onlyRefs?: Set<string>): Promise<void> {
+  if (onlyRefs) {
+    for (const ref of onlyRefs) {
+      const sha = snap.refs[ref];
+      if (sha) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
+      else await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    }
+  } else {
+    // Reset syncable refs to the snapshot.
+    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) if (!(ref in snap.refs)) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    for (const [ref, sha] of Object.entries(snap.refs)) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
   }
+  if (snap.head) await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), snap.head.endsWith("\n") ? snap.head : `${snap.head}\n`);
+  if (snap.indexBytes) await writeFileAtomic(path.join(ctx.gitDir, "index"), snap.indexBytes);
+  for (const rel of Object.keys(await readOpState(ctx.gitDir, async () => ""))) if (!(rel in snap.opState)) await fs.rm(path.join(ctx.gitDir, rel), { force: true }).catch(() => {});
+  for (const [rel, bytes] of Object.entries(snap.opState)) {
+    await fs.mkdir(path.dirname(path.join(ctx.gitDir, rel)), { recursive: true });
+    await writeFileAtomic(path.join(ctx.gitDir, rel), bytes);
+  }
+}
+
+/** Branches (full refnames) checked out by a DIFFERENT worktree of the same store —
+ *  `git update-ref refs/heads/x` from one worktree silently moves a branch a sibling
+ *  has checked out, leaving that sibling dirty (`git branch -f` refuses; `update-ref`
+ *  does not — codex repro, design 43 §7 [v4]). From `git worktree list --porcelain`. */
+async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Set<string>> {
+  const out = await git(ctx.repoDir, ["worktree", "list", "--porcelain"]).catch(() => "");
+  const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
+  const owned = new Set<string>();
+  let wtPath: string | undefined;
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length);
+    else if (line.startsWith("branch ") && wtPath) {
+      const real = await fs.realpath(wtPath).catch(() => path.resolve(wtPath!));
+      if (real !== selfReal) owned.add(line.slice("branch ".length));
+    }
+  }
+  return owned;
+}
+
+/** Quarantine the local repo's committed + staged state before a mutating apply —
+ *  a bundle with the SAME HEAD/pseudo-ref pinning discipline as capture, PLUS copies
+ *  of index/op-state (full recovery, not refs-only — design 43 §9 [v5]). Dir repos
+ *  bundle `--all`; pointer repos bundle their scoped line of work (an `--all` bundle
+ *  of a big SHARED clone would be huge and isn't ours to quarantine). Throws on
+ *  bundle failure — callers fail closed. */
+async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): Promise<string> {
+  await fs.mkdir(qDir, { recursive: true });
+  const bundlePath = path.join(qDir, `${ts}.bundle`);
+  const head = await readHead(ctx);
+  const pinShas = new Set(await collectPinShas(ctx, head));
+  const wip = (await git(ctx.repoDir, ["stash", "create"]).catch(() => "")).trim();
+  if (wip) pinShas.add(wip);
+  const pins = await createScratchPins(ctx.repoDir, [...pinShas]);
+  try {
+    const args =
+      ctx.kind === "dir"
+        ? ["--all", ...pins.refs]
+        : [...Object.keys(await readScopedRefs(ctx.repoDir, head)), ...pins.refs];
+    await git(ctx.repoDir, ["bundle", "create", bundlePath, ...args]);
+  } finally {
+    await deleteScratchPins(ctx.repoDir, pins);
+  }
+  if (await exists(path.join(ctx.gitDir, "index"))) {
+    await fs.copyFile(path.join(ctx.gitDir, "index"), path.join(qDir, `${ts}.index`));
+  }
+  for (const rel of Object.keys(await readOpState(ctx.gitDir, async () => ""))) {
+    const dest = path.join(qDir, `${ts}-op`, rel);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.copyFile(path.join(ctx.gitDir, rel), dest);
+  }
+  return bundlePath;
 }
 
 /**
  * CLEAN apply (caller guarantees local == base): import objects from the bundle,
- * publish refs/HEAD to exactly the remote set, restore index/op-state — under
+ * publish refs/HEAD per the SCOPE-GATED rules below, restore index/op-state — under
  * receiver quiescence, transactionally. On any failure or fsck-fail, ROLL BACK to
  * the pre-apply snapshot. Quarantines local first (fail-closed if that fails).
+ *
+ * Ref-publish semantics (design 43 §7 [v2, B1; v3; v4]):
+ * - deletion of absent local refs happens ONLY when section.refScope === "all" AND the
+ *   local repo is a dir-repo (both sides speak "complete set" — design-02 semantics);
+ * - a "scoped" section applied into a dir-repo is UPDATE-ONLY (extra local branches survive);
+ * - ANY section applied into a local POINTER repo touches a ref store SHARED with sibling
+ *   worktrees and the main clone: `refs/stash` + `refs/tags/*` are FILTERED, and
+ *   `refs/heads/*` publication is OWNERSHIP-GUARDED via `git worktree list --porcelain` —
+ *   a branch checked out by a DIFFERENT worktree is filtered (returned in filteredRefs);
+ *   if the section's own HEAD branch is blocked, the WHOLE apply defers
+ *   ({applied:false, reason: "ownership-deferred: …"}).
+ *
+ * NOTE (STEP 3): callers materializing a repo at `join(root, key)` must run
+ * {@link assertGitTargetWithinRoot} BEFORE this function and re-verify after `git init`
+ * (design 43 §7 [v2, B5; v3]) — this function trusts `repoDir`.
  */
-export async function applyGitState(root: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<ApplyGitResult> {
+export async function applyGitState(repoDir: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
 
-  if (!(await exists(path.join(root, ".git")))) await git(root, ["init", "-q"]); // fresh machine
-  if (await gitBusy(root)) return { applied: false, reason: "receiver git busy" };
+  if (!(await detectGitKind(repoDir))) {
+    // fresh machine / standalone materialization of a worktree-origin section (design 43 §5)
+    await fs.mkdir(repoDir, { recursive: true });
+    await git(repoDir, ["init", "-q"]);
+  }
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
+  if (await gitBusy(ctx)) return { applied: false, reason: "receiver git busy" };
 
-  const gitDir = path.join(root, ".git");
+  // Scope-gated publish set (design 43 §7).
+  const publishRefs: Record<string, string> = { ...section.refs };
+  const filteredRefs: string[] = [];
+  let deleteAbsent = false;
+  if (ctx.kind === "dir") {
+    deleteAbsent = section.refScope === "all";
+  } else {
+    for (const ref of Object.keys(publishRefs)) {
+      if (!ref.startsWith("refs/heads/")) {
+        // a standalone receiver's stash/tags must never overwrite the SHARED stash stack
+        // or tag namespace [v3]
+        filteredRefs.push(ref);
+        delete publishRefs[ref];
+      }
+    }
+    const owned = await branchesCheckedOutElsewhere(ctx);
+    for (const ref of Object.keys(publishRefs)) {
+      if (owned.has(ref)) {
+        filteredRefs.push(ref);
+        delete publishRefs[ref];
+      }
+    }
+    const headBranch = headBranchOf(section.head);
+    if (headBranch && owned.has(headBranch)) {
+      // applying a HEAD that points at a branch we refused to move would be incoherent [v4]
+      return { applied: false, reason: `ownership-deferred: ${headBranch} is checked out by another worktree`, filteredRefs };
+    }
+  }
+
   // Stage on the REPO's filesystem (under .rbox), NOT os.tmpdir() — the decrypted index/op-state
-  // are moved into .git with fs.rename, which throws EXDEV across mounts. On Linux/containers
+  // are moved into the gitdir with rename, which throws EXDEV across mounts. On Linux/containers
   // /tmp is commonly a separate tmpfs from the repo, so an os.tmpdir() staging would fail git
   // apply on every pull (it only worked on macOS because $TMPDIR + the repo share one APFS volume).
-  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
-  const tmpDir = await fs.mkdtemp(path.join(root, ".rbox", "gitap-"));
-  const hadHead = await gitOk(root, ["rev-parse", "--verify", "HEAD"]);
-  const snap = await snapshotLocal(root);
+  await fs.mkdir(path.join(repoDir, ".rbox"), { recursive: true });
+  const tmpDir = await fs.mkdtemp(path.join(repoDir, ".rbox", "gitap-"));
+  const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
+  const snap = await snapshotLocal(ctx);
   try {
     // §28 (codex M4): fetch + DECRYPT + verify ALL artifacts into temp files BEFORE touching
-    // `.git`. A decrypt/fetch/verify failure (wrong key, swapped blob, corruption) returns
+    // the gitdir. A decrypt/fetch/verify failure (wrong key, swapped blob, corruption) returns
     // {applied:false} with the local repo untouched — never aborts mid-mutation. GCM + the
     // plaintext-sha check in decryptFileToPath authenticate each artifact here.
     const bundlePath = path.join(tmpDir, "in.bundle");
@@ -277,49 +598,58 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
         opTmp.push({ rel, tmp });
       }
     } catch (e) {
-      return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}` };
+      return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
-    if (!(await gitOk(root, ["bundle", "verify", bundlePath]))) return { applied: false, reason: "bundle verify failed" };
+    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
 
-    // Quarantine local committed state first — fail closed if we can't.
+    // Quarantine local committed+staged state first — fail closed if we can't (§9 [v5]:
+    // bundle with capture-grade pinning PLUS index/op-state copies).
     let conflictBundle: string | undefined;
     if (hadHead) {
-      const qDir = path.join(root, ".rbox", "git-quarantine");
-      await fs.mkdir(qDir, { recursive: true });
-      conflictBundle = path.join(qDir, `${Date.now()}.bundle`);
       try {
-        await git(root, ["bundle", "create", conflictBundle, "--all"]);
+        conflictBundle = await quarantineLocal(ctx, path.join(repoDir, ".rbox", "git-quarantine"), `${Date.now()}`);
       } catch (e) {
-        return { applied: false, reason: `quarantine bundle failed; aborting: ${(e as Error)?.message ?? e}` };
+        return { applied: false, reason: `quarantine bundle failed; aborting: ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
     }
 
-    // Import objects from the (decrypted, verified) remote bundle into a non-checked-out namespace.
-    await git(root, ["fetch", bundlePath, "refs/*:refs/rbox-incoming/*"], { maxBuffer: 64 * 1024 * 1024 });
+    // Import objects from the (decrypted, verified) remote bundle into a non-checked-out,
+    // APPLY-UNIQUE namespace (pointer targets share the ref store with sibling worktrees —
+    // a fixed namespace would race concurrent sibling applies, same hazard as rbox-wip).
+    await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
+    const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    // --no-tags: fetch's tag-following would otherwise write the bundle's refs/tags/* DIRECTLY
+    // into refs/tags (outside the namespace refspec) — on a pointer target that is the shared
+    // tag store the §7 filter exists to protect. Tags still publish on dir targets via the
+    // explicit update-ref loop below (they're in section.refs).
+    await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
 
     try {
-      // Publish refs to exactly the remote set (syncable namespaces only).
-      for (const [ref, sha] of Object.entries(section.refs)) await git(root, ["update-ref", ref, sha]);
-      for (const ref of Object.keys(await readRefs(root))) {
-        if (!(ref in section.refs)) await git(root, ["update-ref", "-d", ref]).catch(() => {});
+      // Publish refs per the scope-gated rules (see doc comment).
+      for (const [ref, sha] of Object.entries(publishRefs)) await git(repoDir, ["update-ref", ref, sha]);
+      if (deleteAbsent) {
+        for (const ref of Object.keys(await readAllRefs(repoDir))) {
+          if (!(ref in section.refs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+        }
       }
-      await writeFileAtomic(path.join(gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
+      await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
 
-      // Restore index + op-state from the pre-decrypted temp files via atomic rename.
-      if (indexTmp) await fs.rename(indexTmp, path.join(gitDir, "index"));
-      await restoreOpState(root, opTmp);
+      // Restore index + op-state from the pre-decrypted temp files via atomic rename —
+      // into the RESOLVED gitdir.
+      if (indexTmp) await moveFileAtomic(indexTmp, path.join(ctx.gitDir, "index"));
+      await restoreOpState(ctx.gitDir, opTmp);
 
-      if (!(await gitOk(root, ["fsck", "--connectivity-only", "--no-dangling"]))) {
-        await restoreLocal(root, snap); // ROLLBACK
-        return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle };
+      if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {
+        await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined); // ROLLBACK
+        return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
     } catch (e) {
-      await restoreLocal(root, snap).catch(() => {}); // ROLLBACK on any mutation error
-      return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle };
+      await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {}); // ROLLBACK on any mutation error
+      return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     } finally {
-      for (const ref of await listRefs(root, "refs/rbox-incoming")) await git(root, ["update-ref", "-d", ref]).catch(() => {});
+      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
     }
-    return { applied: true, conflictBundle };
+    return { applied: true, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -329,15 +659,17 @@ export async function applyGitState(root: string, section: GitSection, store: Bl
  * CONFLICT preserve (both sides diverged): do NOT clobber local. Import the remote
  * refs into a recovery namespace and bundle, so the user can merge manually.
  */
-export async function preserveGitConflict(root: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<{ recoveryBundle?: string }> {
+export async function preserveGitConflict(repoDir: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<{ recoveryBundle?: string }> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcf-"));
   try {
     const bundlePath = path.join(tmpDir, "remote.bundle");
     await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
-    if (!(await gitOk(root, ["bundle", "verify", bundlePath]))) return {};
+    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) return {};
     const ts = `${Date.now()}`;
-    await git(root, ["fetch", bundlePath, `refs/*:refs/rbox-conflict/${ts}/*`], { maxBuffer: 64 * 1024 * 1024 }).catch(() => {});
-    const recDir = path.join(root, ".rbox", "git-conflicts");
+    // --no-tags: tag-following would write remote tags DIRECTLY into refs/tags, outside the
+    // recovery namespace — a silent local mutation the conflict flow must never make.
+    await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:refs/rbox-conflict/${ts}/*`], { maxBuffer: 64 * 1024 * 1024 }).catch(() => {});
+    const recDir = path.join(repoDir, ".rbox", "git-conflicts");
     await fs.mkdir(recDir, { recursive: true });
     const recoveryBundle = path.join(recDir, `remote-${ts}.bundle`);
     await fs.copyFile(bundlePath, recoveryBundle).catch(() => {});
@@ -347,16 +679,56 @@ export async function preserveGitConflict(root: string, section: GitSection, sto
   }
 }
 
-// ---- helpers --------------------------------------------------------------
+// ---- apply-target containment (design 43 §7 [v2, B5; v3]) ------------------------
 
-/** Only these ref namespaces sync. NOT refs/remotes (machine-local origins),
- *  refs/notes, refs/replace, or refs/rbox-* (our internal scratch). */
-export function isSyncableRef(ref: string): boolean {
-  return ref.startsWith("refs/heads/") || ref.startsWith("refs/tags/") || ref === "refs/stash";
+/**
+ * Refuse a git materialization/apply target that escapes the workspace root. Every
+ * EXISTING path component from root → target is lstat-checked (no symlink components —
+ * a symlinked parent smuggled via the file manifest must not redirect a repo
+ * materialization outside the workspace), and the deepest existing prefix's realpath
+ * must stay inside the root's realpath. Callers re-run this immediately after
+ * `git init` (cheap belt-and-braces re-verify); a *local*-attacker race between check
+ * and init is explicitly out of the threat model. Throws on violation; returns the
+ * absolute target path (`root` itself for relPath "."). Exported for STEP 3.
+ */
+export async function assertGitTargetWithinRoot(root: string, relPath: string): Promise<string> {
+  const rootReal = await fs.realpath(root);
+  if (relPath === ".") return root;
+  const abs = path.join(root, relPath);
+  let probe = root;
+  for (const seg of relPath.split("/")) {
+    probe = path.join(probe, seg);
+    let st;
+    try {
+      st = await fs.lstat(probe);
+    } catch {
+      break; // rest doesn't exist yet — it will be created under the verified prefix
+    }
+    if (st.isSymbolicLink()) throw new Error(`git apply target has a symlink component: ${probe}`);
+  }
+  // Belt-and-braces: realpath of the deepest existing prefix must stay inside the root.
+  let existing = abs;
+  for (;;) {
+    try {
+      const real = await fs.realpath(existing);
+      if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+        throw new Error(`git apply target escapes workspace root: ${abs}`);
+      }
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      const parent = path.dirname(existing);
+      if (parent === existing) break;
+      existing = parent;
+    }
+  }
+  return abs;
 }
 
-async function readRefs(root: string): Promise<Record<string, string>> {
-  const out = await git(root, ["show-ref"]).catch(() => "");
+// ---- helpers --------------------------------------------------------------
+
+async function readAllRefs(repoDir: string): Promise<Record<string, string>> {
+  const out = await git(repoDir, ["show-ref"]).catch(() => "");
   const refs: Record<string, string> = {};
   for (const line of out.split("\n")) {
     if (!line) continue;
@@ -365,19 +737,31 @@ async function readRefs(root: string): Promise<Record<string, string>> {
   }
   return refs;
 }
-async function listRefs(root: string, prefix: string): Promise<string[]> {
-  const out = await git(root, ["for-each-ref", "--format=%(refname)", prefix]).catch(() => "");
+
+/** Pointer-repo (scoped) refs: ONLY `refs/heads/<current-branch>` — the shared store's
+ *  other branches/tags/stash belong to the main clone. Detached HEAD → {}. */
+async function readScopedRefs(repoDir: string, head: string): Promise<Record<string, string>> {
+  const branch = headBranchOf(head);
+  if (!branch) return {};
+  const sha = await git(repoDir, ["rev-parse", "--verify", "--quiet", branch]).catch(() => "");
+  return sha && HEX40.test(sha) ? { [branch]: sha } : {};
+}
+
+async function listRefs(repoDir: string, prefix: string): Promise<string[]> {
+  const out = await git(repoDir, ["for-each-ref", "--format=%(refname)", prefix]).catch(() => "");
   return out.split("\n").filter(Boolean);
 }
 
-async function readOpState(root: string, hash: (absPath: string) => Promise<string>): Promise<Record<string, string>> {
+/** Enumerate/hash op-state under the RESOLVED gitdir (pointer repos: per-worktree state —
+ *  exactly what makes "continue the rebase on the other machine" work). */
+async function readOpState(gitDir: string, hash: (absPath: string) => Promise<string>): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const f of OP_STATE_FILES) {
-    const abs = path.join(root, ".git", f);
+    const abs = path.join(gitDir, f);
     if (await exists(abs)) out[f] = await hash(abs);
   }
   for (const d of OP_STATE_DIRS) {
-    const abs = path.join(root, ".git", d);
+    const abs = path.join(gitDir, d);
     if (await exists(abs)) {
       for (const rel of await walkFiles(abs)) out[`${d}/${rel}`] = await hash(path.join(abs, rel));
     }
@@ -385,28 +769,44 @@ async function readOpState(root: string, hash: (absPath: string) => Promise<stri
   return out;
 }
 
-async function restoreOpState(root: string, opTmp: Array<{ rel: string; tmp: string }>): Promise<void> {
+async function restoreOpState(gitDir: string, opTmp: Array<{ rel: string; tmp: string }>): Promise<void> {
   // Remove any op-state the sender no longer has (completed operation).
   const want = new Set(opTmp.map((o) => o.rel));
-  const existing = await readOpState(root, async () => "");
+  const existing = await readOpState(gitDir, async () => "");
   for (const rel of Object.keys(existing)) {
-    if (!want.has(rel)) await fs.rm(path.join(root, ".git", rel), { force: true }).catch(() => {});
+    if (!want.has(rel)) await fs.rm(path.join(gitDir, rel), { force: true }).catch(() => {});
   }
   // Atomic-rename each PRE-DECRYPTED temp into place (decryption already happened + verified
   // before any mutation, §28 codex M4) — never a torn or plaintext-less live file.
   for (const { rel, tmp } of opTmp) {
-    const dest = path.join(root, ".git", rel);
+    const dest = path.join(gitDir, rel);
     await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.rename(tmp, dest);
+    await moveFileAtomic(tmp, dest);
   }
 }
 
-async function gitBusy(root: string): Promise<boolean> {
-  for (const lock of ["index.lock", "HEAD.lock", "gc.pid"]) {
-    if (await exists(path.join(root, ".git", lock))) return true;
+/** rename, with an EXDEV fallback (copy to a temp in the DEST dir, then rename) — a
+ *  pointer repo's resolved gitdir (the main clone) may live on a different mount than
+ *  the worktree where the apply staged its temp files. */
+async function moveFileAtomic(src: string, dest: string): Promise<void> {
+  try {
+    await fs.rename(src, dest);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+    const tmp = path.join(path.dirname(dest), `.rbox-xdev-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+    await fs.copyFile(src, tmp);
+    await fs.rename(tmp, dest);
+    await fs.rm(src, { force: true }).catch(() => {});
   }
-  // any *.lock under refs/
-  const refsDir = path.join(root, ".git", "refs");
+}
+
+async function gitBusy(ctx: RepoCtx): Promise<boolean> {
+  // per-worktree locks live in the resolved gitdir; store-wide locks in the common dir
+  for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "gc.pid")]) {
+    if (await exists(lock)) return true;
+  }
+  // any *.lock under the SHARED refs/
+  const refsDir = path.join(ctx.commonDir, "refs");
   if (await exists(refsDir)) {
     for (const rel of await walkFiles(refsDir)) if (rel.endsWith(".lock")) return true;
   }
@@ -457,7 +857,7 @@ async function getBlobToFile(store: BlobStore, sha: string, destPath: string): P
 
 /** §28: fetch a git artifact's CIPHERTEXT by encSha, then decrypt+verify (GCM tag + plaintext-sha)
  *  to `destPath`. Throws on any fetch/decrypt/verify failure — callers run this into temp files
- *  BEFORE mutating `.git` (codex M4), so a bad/ swapped/ corrupt blob never half-applies. */
+ *  BEFORE mutating the gitdir (codex M4), so a bad/ swapped/ corrupt blob never half-applies. */
 async function getGitArtifact(store: BlobStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
   const ct = path.join(tmpDir, `ct-${ref.encSha}`);
   await getBlobToFile(store, ref.encSha, ct);

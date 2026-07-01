@@ -1,5 +1,21 @@
-export type { FileEntry, FileType, Manifest, GitSection } from "./types.js";
-export { gitPreflight, gitIdentity, captureGitState, applyGitState, preserveGitConflict, validateGitSection, isSyncableRef, gitIdentityKey, type ApplyGitResult } from "./git-state.js";
+export type { FileEntry, FileType, Manifest, GitSection, GitRefScope, GitArtifactRef } from "./types.js";
+export {
+  gitPreflight,
+  gitIdentity,
+  captureGitState,
+  applyGitState,
+  preserveGitConflict,
+  validateGitSection,
+  isSyncableRef,
+  gitIdentityKey,
+  projectIdentity,
+  assertGitTargetWithinRoot,
+  type ApplyGitResult,
+  type GitIdentity,
+  type GitRepoKind,
+  type GitPreflightResult,
+} from "./git-state.js";
+export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
 export { generateKek, kekToPhrase, kekFromPhrase, encryptFileToTemp, decryptFileToPath, type EncryptedBlob } from "./crypto.js";
 export { hashFile, hashBytes } from "./hash.js";
 export { BUILTIN_IGNORE, HARD_PRUNE_DIRS, nativePruneGlobs, buildIgnoreMatcher, effectiveIgnoreRules, isIgnoreRuleFile, type IgnoreMatcher, type IgnoreRule } from "./ignore.js";
@@ -20,6 +36,8 @@ export {
   MAX_ENTRIES,
   MAX_MANIFEST_BYTES,
   MAX_SYMLINK_TARGET_BYTES,
+  KNOWN_MANIFEST_SCHEMA,
+  MAX_GIT_REPOS,
 } from "./manifest-validate.js";
 export {
   detectProjects,
