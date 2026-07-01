@@ -670,9 +670,24 @@ export async function applyGitState(
       return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
 
-    // Artifacts are verified on disk — the caller's pre-mutation step (quarantine +
-    // ref-wipe for a clean materialization) may now run. Failure → no mutation yet,
-    // defer cleanly.
+    // GIT-LEVEL bundle verification BEFORE any mutation when a repo already exists at
+    // the target: decrypt + plaintext-sha authenticate the BYTES, not their bundle-ness
+    // — a sha-valid non-bundle would otherwise pass to `beforeMutate`, wipe a clean-
+    // materialization leftover, and only then fail `bundle verify` (codex step-3
+    // round-2 repro). Our bundles are self-contained (no prerequisites), so verifying
+    // against the pre-existing repo is equivalent to the post-init verify below, which
+    // stays as the fresh-target gate (nothing exists to verify against before init).
+    let bundleVerified = false;
+    if (ctx) {
+      if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+        return { applied: false, reason: "bundle verify failed (no mutation)", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
+      bundleVerified = true;
+    }
+
+    // Artifacts are decrypt-verified on disk and the bundle is git-verified — the
+    // caller's pre-mutation step (quarantine + ref-wipe for a clean materialization)
+    // may now run. Failure → no mutation yet, defer cleanly.
     if (opts.beforeMutate) {
       try {
         await opts.beforeMutate();
@@ -703,7 +718,9 @@ export async function applyGitState(
     const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
     const snap = await snapshotLocal(ctx);
 
-    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+    // Fresh targets verify here (a repo now exists); existing targets verified above —
+    // don't pay the full bundle read twice.
+    if (!bundleVerified && !(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
       await removeFreshGit();
       return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }

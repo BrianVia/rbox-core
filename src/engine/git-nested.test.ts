@@ -10,10 +10,12 @@ import {
   buildIgnoreMatcher,
   captureGitState,
   discoverGitRepos,
+  encryptFileToTemp,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
   projectIdentity,
+  quarantineAndWipeGitState,
   validateManifest,
   LocalBlobStore,
   MAX_GIT_REPOS,
@@ -471,6 +473,38 @@ test("a rolled-back apply leaks NO stash reflog entries (git stash list stays cl
   // otherwise `git stash list` would show a phantom remote stash after a failed apply
   expect(await git(B, "stash", "list")).toBe("");
   await expect(git(B, "rev-parse", "--verify", "refs/stash")).rejects.toThrow();
+});
+
+test("a sha-valid NON-BUNDLE artifact never reaches beforeMutate — the leftover survives (git-level verify precedes the wipe)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "n.txt", "new", "n1");
+  const section = await captureGitState(A, store, KEK);
+
+  // A structurally valid encrypted artifact whose PLAINTEXT is not a git bundle:
+  // decrypt + plaintext-sha checks pass; only `git bundle verify` can reject it.
+  const badPlain = path.join(tmp, "notabundle");
+  await fs.writeFile(badPlain, "this is not a git bundle");
+  const enc = await encryptFileToTemp(badPlain, KEK, tmp);
+  await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+  const badSec: GitSection = { ...section!, bundleSha: enc.plaintextSha, bundleEncSha: enc.encSha, bundleCipherSize: enc.cipherSize };
+
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "old.txt", "old", "o1");
+  await git(B, "branch", "leftover");
+  let hookRan = false;
+  const res = await applyGitState(B, badSec, store, KEK, {
+    beforeMutate: async () => {
+      hookRan = true;
+      await quarantineAndWipeGitState(B);
+    },
+  });
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("bundle verify failed");
+  expect(hookRan).toBe(false); // the wipe never ran
+  await expect(git(B, "rev-parse", "--verify", "leftover")).resolves.toBeDefined(); // refs intact
+  await expect(git(B, "rev-parse", "--verify", "main")).resolves.toBeDefined();
 });
 
 test("beforeMutate hook runs only AFTER artifact fetch+decrypt verify, and its failure defers with no mutation", async () => {
