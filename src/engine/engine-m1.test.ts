@@ -136,6 +136,30 @@ test("applyWatchEvents: file add/change/unlink patch the manifest", async () => 
   }
 });
 
+test("applyWatchEvents: `deferred` collects mid-write paths only — a settled or gone file never defers", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-wp-"));
+  try {
+    const matcher = buildIgnoreMatcher(dir);
+    let m = await scanManifest(dir, matcher);
+
+    // A file that hashes cleanly must NOT be deferred (§41 hot-path retry only fires
+    // for genuinely mid-write files — otherwise every save would spuriously re-push).
+    await fs.writeFile(path.join(dir, "settled.ts"), "stable");
+    const d1 = new Set<string>();
+    m = await applyWatchEvents(m, dir, matcher, [{ relPath: "settled.ts", kind: "add" }], undefined, d1);
+    expect(paths(m)).toEqual(["settled.ts"]);
+    expect([...d1]).toEqual([]);
+
+    // A change event for a path that has since vanished is "gone", not "mid-write":
+    // it must not be endlessly retried — the safety/unlink path handles it.
+    const d2 = new Set<string>();
+    m = await applyWatchEvents(m, dir, matcher, [{ relPath: "never-existed.ts", kind: "change" }], undefined, d2);
+    expect([...d2]).toEqual([]);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("applyWatchEvents: addDir scans the whole subtree; unlinkDir removes dir/** ", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-wp-"));
   try {

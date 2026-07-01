@@ -5,7 +5,7 @@ import path from "node:path";
 // dlopens nothing, so it's safe at module load on every platform. The NATIVE binding
 // is loaded lazily, per-host, in loadParcelWrapper() below. Types: parcel-watcher.d.ts.
 import { createWrapper } from "@parcel/watcher/wrapper";
-import { HARD_PRUNE_DIRS, type IgnoreMatcher, type WatchEvent, type WatchEventKind } from "../engine/index.js";
+import { nativePruneGlobs, type IgnoreMatcher, type WatchEvent, type WatchEventKind } from "../engine/index.js";
 
 export interface Watcher {
   close(): Promise<void>;
@@ -112,6 +112,11 @@ function createBatcher(onSettle: (events: WatchEvent[]) => void, debounceMs: num
 
 const toRelFor = (root: string) => (abs: string) => path.relative(root, abs).split(path.sep).join("/");
 
+/** True only when `rel` (POSIX, "/"-joined) escapes the root — the root itself is "".
+ *  Guards against a bare `startsWith("..")` that would wrongly drop legit files named
+ *  like `..keep` or paths under `..data/`. */
+const escapesRoot = (rel: string) => rel === ".." || rel.startsWith("../");
+
 /** realpath the root, tolerating a not-yet-existing path (fall back to the input). */
 function safeRealpath(root: string): string {
   try {
@@ -180,11 +185,6 @@ function loadHostBinding(): unknown {
   }
 }
 
-/** Coarse native prune globs — hard-pruned dirs at ANY depth (`** /node_modules`).
- *  Non-glob values would resolve to a root-only absolute path, missing the nested
- *  copies that dominate a monorepo; the glob form prunes every occurrence. */
-const PARCEL_IGNORE_GLOBS = HARD_PRUNE_DIRS.map((d) => `**/${d}`);
-
 async function startParcel(
   root: string,
   matcher: IgnoreMatcher,
@@ -211,7 +211,7 @@ async function startParcel(
       if (err || !events) return;
       for (const ev of events) {
         const rel = toRel(ev.path);
-        if (rel === "" || rel.startsWith("..")) continue;
+        if (rel === "" || escapesRoot(rel)) continue;
 
         if (ev.type === "delete") {
           // Parcel doesn't say file-vs-dir on delete (the path is gone). `unlinkDir`
@@ -234,7 +234,9 @@ async function startParcel(
         else batcher.push(rel, "change");
       }
     },
-    { ignore: PARCEL_IGNORE_GLOBS }
+    // Coarse native prune (volume optimization): hard-prune dirs + their subtrees,
+    // MINUS any the user could re-include under — those fall through to the JS matcher.
+    { ignore: nativePruneGlobs(root) }
   );
 
   return {
@@ -264,7 +266,7 @@ function startChokidar(
     awaitWriteFinish: { stabilityThreshold: 120, pollInterval: 20 }, // coalesce chunked writes
     ignored: (p: string, stats?: { isDirectory(): boolean }) => {
       const rel = toRel(p);
-      if (rel === "" || rel.startsWith("..")) return false; // the root itself
+      if (rel === "" || escapesRoot(rel)) return false; // the root itself
       return stats?.isDirectory() ? matcher.ignores(`${rel}/`) : matcher.ignores(rel);
     },
   });

@@ -34,8 +34,12 @@ jobs:
         with:
           bun-version: "1.3.5"
 
-      - name: Install (frozen)
-        run: bun install --frozen-lockfile
+      - name: Install (frozen, all platforms)
+        # `--os=* --cpu=*` force-installs every @parcel/watcher-<platform> package so this
+        # single Ubuntu host can cross-compile all 4 targets and embed each one's native
+        # binding (design §41 §6). Without it, bun os/cpu-filters and the darwin builds
+        # would silently ship without the live watcher.
+        run: bun install --frozen-lockfile --os=* --cpu=*
 
       - name: Version consistency (tag == package.json == embedded RBOX_VERSION)
         run: |

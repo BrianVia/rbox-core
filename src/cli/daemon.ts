@@ -53,6 +53,9 @@ export class RboxDaemon {
   private deepTimer?: ReturnType<typeof setInterval>;
   private reconnectAttempt = 0;
   private stopped = false;
+  /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
+   *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
+  private readonly writeFinishRetries = new Map<string, number>();
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
@@ -86,15 +89,22 @@ export class RboxDaemon {
     this.want.push = true;
     await this.pump();
 
-    // Arm the reconcile loops FIRST, unconditionally. These are the correctness
-    // floor: even if the live watcher below fails to start, sync must degrade to
-    // periodic full-scan reconciliation — never go silently dead (design §41).
+    await this.startLiveWatch();
+    this.connect();
+
+    log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
+  }
+
+  /**
+   * Arm the reconcile loops, then try the live watcher — in that order, so the
+   * correctness floor exists BEFORE the watcher can fail. A rejected watcher init
+   * (no native binding, inotify exhaustion, unsupported FS) is caught and degraded to
+   * periodic full-scan reconciliation; sync is NEVER left silently dead. This ordering
+   * is load-bearing and covered by a dedicated test.
+   */
+  private async startLiveWatch(): Promise<void> {
     this.safetyTimer = setInterval(() => this.request("fullScan"), jitter(SAFETY_SYNC_MS));
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
-
-    // Live watcher is a latency optimization on top of the floor. A rejected init
-    // (no native binding, inotify exhaustion, unsupported FS) degrades to the 60s
-    // safety tick rather than crashing or dropping to silent.
     try {
       this.watcher = await startWatcher(this.root, this.matcher, (events) => {
         this.pendingEvents.push(...events);
@@ -103,10 +113,6 @@ export class RboxDaemon {
     } catch (e) {
       log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
     }
-
-    this.connect();
-
-    log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
   }
 
   async stop(): Promise<void> {
@@ -174,7 +180,11 @@ export class RboxDaemon {
         this.matcher = buildIgnoreMatcher(this.root);
         this.manifest = await scanManifest(this.root, this.matcher, this.cache);
       } else {
-        this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache);
+        const deferred = new Set<string>();
+        this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
+        // A path that hashed cleanly this round is settled — clear any retry it accrued.
+        for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
+        if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
       }
     }
     const report = beginReport("push");
@@ -188,6 +198,34 @@ export class RboxDaemon {
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
     report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
+  }
+
+  /**
+   * Re-enqueue mid-write paths as `change` events after a short quiet, so a large save
+   * that was still being written when we hashed gets picked up promptly rather than
+   * waiting for the 60s safety scan. Bounded per path — after a few tries we give up and
+   * let the safety/deep scan be the floor, so a pathological never-settling file can't
+   * hot-loop the pump forever.
+   */
+  private scheduleWriteFinishRetry(paths: Set<string>): void {
+    const MAX_RETRIES = 15; // ~3s of retrying at RETRY_DELAY_MS before deferring to safety scan
+    const RETRY_DELAY_MS = 200;
+    const retryable: string[] = [];
+    for (const p of paths) {
+      const n = (this.writeFinishRetries.get(p) ?? 0) + 1;
+      if (n <= MAX_RETRIES) {
+        this.writeFinishRetries.set(p, n);
+        retryable.push(p);
+      } else {
+        this.writeFinishRetries.delete(p); // give up; the safety scan will heal it
+      }
+    }
+    if (retryable.length === 0 || this.stopped) return;
+    setTimeout(() => {
+      if (this.stopped) return;
+      for (const p of retryable) this.pendingEvents.push({ relPath: p, kind: "change" });
+      this.request("push");
+    }, RETRY_DELAY_MS);
   }
 
   private async doPull(): Promise<void> {

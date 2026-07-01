@@ -79,6 +79,41 @@ export const HARD_PRUNE_DIRS: string[] = [
   ".pnpm-store",
 ];
 
+/** Hard-prune dirs that are effectively never user-re-includable, so they stay safe to
+ *  hand a native watcher's coarse `ignore` even in the presence of negations. `.rbox` is
+ *  hard-excluded in code (no rule can re-include it); a `!node_modules/…`/`!.git/…`
+ *  re-include is pathological and still heals via the safety scan. */
+const ALWAYS_NATIVE_PRUNE = new Set(["node_modules", ".git", ".rbox"]);
+
+/**
+ * Globs for a native watcher's coarse `ignore` (design §41). Honors negations: a
+ * hard-prune dir the user could RE-INCLUDE under (e.g. a `.rboxignore` `!dist/keep.txt`
+ * or a bare `!keep.txt`) is DROPPED from the native set, so its live events still reach
+ * the AUTHORITATIVE JS {@link IgnoreMatcher} instead of being silently pruned before the
+ * matcher ever sees them. Each kept dir is pruned at every depth INCLUDING its children:
+ * `**​/d` matches the directory itself, `**​/d/**` its whole subtree (a native watcher
+ * emits child paths, so the subtree glob is required to keep them off the JS hot path).
+ */
+export function nativePruneGlobs(root: string): string[] {
+  const negations = effectiveIgnoreRules(root)
+    .filter((r) => r.pattern.startsWith("!"))
+    .map((r) => r.pattern.slice(1).replace(/^\/+/, "").replace(/\/+$/, ""));
+  const dirs = HARD_PRUNE_DIRS.filter(
+    (d) => ALWAYS_NATIVE_PRUNE.has(d) || !negations.some((neg) => negationReenters(neg, d))
+  );
+  return dirs.flatMap((d) => [`**/${d}`, `**/${d}/**`]);
+}
+
+/** Could a `!negation` (leading `!` already stripped) re-include a path INSIDE dir `d`? */
+function negationReenters(neg: string, d: string): boolean {
+  if (neg.length === 0) return false;
+  // A pattern with no slash matches at ANY depth under gitignore semantics — including
+  // inside `d` — so it could re-include there. Conservatively drop `d` from native prune.
+  if (!neg.includes("/")) return true;
+  // An anchored/relative pattern that names `d` as any path segment targets inside it.
+  return neg.split("/").filter(Boolean).includes(d);
+}
+
 export interface IgnoreMatcher {
   /** `relPath` is POSIX-relative; pass a trailing slash for directories. */
   ignores(relPath: string): boolean;

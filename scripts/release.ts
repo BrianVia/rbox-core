@@ -60,13 +60,33 @@ const sha256File = (p: string) => createHash("sha256").update(fs.readFileSync(p)
 fs.writeFileSync(path.join(ROOT, "src/cli/version.ts"), `export const RBOX_VERSION = ${JSON.stringify(version)};\n`);
 console.log(`[release] version.ts → ${version}`);
 
-// 2. compile each target
+// 2. compile each target.
+// The native @parcel/watcher binding is per-platform and its npm package is os/cpu-gated,
+// so a single (Ubuntu) build host would only have its own by default. Force-install ALL
+// four with `--os=* --cpu=*` so every target can embed its correct `.node` deterministically
+// (design §41 §6). release.yml passes the same flags on the frozen install; this repeats it
+// so `bun scripts/release.ts` works standalone too.
+console.log("[release] ensuring all-platform @parcel/watcher bindings are present");
+sh(["bun", "install", "--frozen-lockfile", "--os=*", "--cpu=*"]);
+
+/** Absolute path to a target's native binding, or undefined if not installed. */
+function nativeBindingPath(t: (typeof ALL)[number]): string | undefined {
+  const p = path.join(ROOT, "node_modules", PARCEL_PKG[t], "watcher.node");
+  return fs.existsSync(p) ? p : undefined;
+}
+
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
 const artifacts: Record<string, { sha256: string; path: string }> = {};
 for (const t of targets) {
   const out = path.join(dist, `rbox-${t}`);
-  console.log(`[release] build ${t}`);
+  // Fail LOUD if the target's native binding is missing — the binary would still boot
+  // (degraded to periodic-scan) but silently ship without the live watcher. A release
+  // must embed the real thing, so this is a hard error, not a warning.
+  if (!nativeBindingPath(t)) {
+    throw new Error(`[release] missing native watcher binding for ${t} (${PARCEL_PKG[t]}); run \`bun install --os=* --cpu=*\``);
+  }
+  console.log(`[release] build ${t} (embedding ${PARCEL_PKG[t]})`);
   sh(["bun", "build", "--compile", `--target=bun-${t}`, ...externalFlagsFor(t), "./src/cli/index.ts", "--outfile", out]);
   artifacts[`rbox-${t}`] = { sha256: sha256File(out), path: `${tag}/rbox-${t}` };
 }
