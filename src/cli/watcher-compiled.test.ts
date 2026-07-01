@@ -1,9 +1,8 @@
 import { expect, test } from "bun:test";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher } from "../engine/index.js";
-import { startWatcher } from "./watcher.js";
 
 // Finding 5(d) + Phase-0 gate for the HOST target: prove the native @parcel/watcher
 // binding survives `bun build --compile` and actually LOADS + DELIVERS an event from a
@@ -14,7 +13,6 @@ import { startWatcher } from "./watcher.js";
 const ROOT = path.resolve(import.meta.dir, "..", "..");
 const PARCEL_PKG: Record<string, string> = {
   "darwin-arm64": "@parcel/watcher-darwin-arm64",
-  "darwin-x64": "@parcel/watcher-darwin-x64",
   "linux-arm64": "@parcel/watcher-linux-arm64-glibc",
   "linux-x64": "@parcel/watcher-linux-x64-glibc",
 };
@@ -23,17 +21,19 @@ const hostPkgPresent = !!PARCEL_PKG[hostKey] && fs.existsSync(path.join(ROOT, "n
 
 // Skip ONLY when we genuinely can't exercise it: the host platform package isn't installed
 // (can't compile the target), or a macOS sandbox with no FSEvents. Linux/inotify + normal
-// macOS must RUN — a failure there is a real regression, not a silent skip.
-async function macSandboxNoFsevents(attempts = 3): Promise<boolean> {
-  if (process.platform !== "darwin") return false;
+// macOS must RUN — a failure there is a real regression, not a silent skip. Probe the native
+// @parcel/watcher DIRECTLY (not via the mockable `./watcher.js`) so daemon-watch-degrade's
+// process-global mock can't corrupt this signal.
+async function nativeParcelUnavailable(attempts = 3): Promise<boolean> {
+  if (process.platform !== "darwin") return false; // Linux/inotify must run
+  const req = createRequire(import.meta.url);
   let err = "";
-  // Retry: only a GENUINE sandbox fails every attempt; a transient FSEvents spike under
-  // full-suite contention must not trigger a skip (else CI loses this coverage silently).
   for (let i = 0; i < attempts; i++) {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-cprobe-")));
     try {
-      const w = await startWatcher(dir, buildIgnoreMatcher(dir), () => {}, { debounceMs: 20 });
-      await w.close();
+      const parcel = req("@parcel/watcher") as { subscribe: (d: string, f: () => void, o: object) => Promise<{ unsubscribe(): Promise<void> }> };
+      const sub = await parcel.subscribe(dir, () => {}, {});
+      await sub.unsubscribe();
       return false;
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
@@ -44,7 +44,7 @@ async function macSandboxNoFsevents(attempts = 3): Promise<boolean> {
   }
   return /fsevents|not permitted|sandbox|eperm/i.test(err);
 }
-const skipCompiled = !hostPkgPresent || (await macSandboxNoFsevents());
+const skipCompiled = !hostPkgPresent || (await nativeParcelUnavailable());
 
 test.skipIf(skipCompiled)(
   "compiled standalone binary loads the native watcher and delivers an event (host target)",

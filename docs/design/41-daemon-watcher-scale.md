@@ -247,22 +247,23 @@ paths no longer in the manifest. The deep scan already rebuilds a fresh, tight c
 The native `@parcel/watcher` binding is platform-specific, and its npm packages are
 os/cpu-gated, so a single Ubuntu release host (`release.yml`) would only install its own —
 `bun build --compile --target=bun-darwin-arm64` would then **fail to resolve**
-`@parcel/watcher-darwin-arm64`. Fix, verified by building all four targets on one macOS
-host:
+`@parcel/watcher-darwin-arm64`. **Release targets are darwin-arm64, linux-x64, linux-arm64
+— three; Intel Macs (darwin-x64) are intentionally unsupported.** Fix, verified by building
+all three targets on one host:
 
 - **`release.yml` installs with `bun install --frozen-lockfile --os=* --cpu=*`** — bun's
   documented override that force-installs **every** platform package regardless of host
-  (all four `.node`s land; `--frozen-lockfile` still honored). `release.ts` repeats it so a
+  (all three `.node`s land; `--frozen-lockfile` still honored). `release.ts` repeats it so a
   standalone `bun scripts/release.ts` also works.
-- **Per target, `--external` the three non-target packages**, embedding only the target's
-  `.node` (helper `externalFlagsFor(t)`). All four platform packages are declared in
+- **Per target, `--external` the two non-target packages**, embedding only the target's
+  `.node` (helper `externalFlagsFor(t)`). The three platform packages are declared in
   `optionalDependencies`.
 - **`release.ts` asserts the target's `watcher.node` is present before building** and fails
   loud if not — a release must embed the real binding, never silently ship the degraded
   periodic-scan fallback. (A binary that somehow lacks its binding still *boots*, degraded —
   see §4.2 — so users are never bricked; but a release shipping degraded is a hard error.)
 
-Confirmed: all four `--target`s resolve + embed on a single host after the all-platform
+Confirmed: all three `--target`s resolve + embed on a single host after the all-platform
 install.
 
 ---
@@ -288,18 +289,25 @@ nice-to-have follow-up.
 `watcher.ts`, run from an isolated dir with no `node_modules`, **loaded the embedded native
 addon, subscribed, received a create event, pruned `node_modules`, idled ~40 MB.**
 
-**All four targets are now smoke-gated in CI** — `release.yml` is a three-job DAG:
+**All three targets are now smoke-gated in CI** — `release.yml` is a three-job DAG:
 
 1. **`build`** (ubuntu): `bun install --frozen-lockfile --os=* --cpu=*` → cross-compile +
-   **sign** all four, each embedding its own `.node` (asserted present), `--no-upload`.
-   Uploads `dist/` as an artifact.
-2. **`smoke`** (matrix, one **native** runner per target — `macos-14`/`macos-13`/
-   `ubuntu-24.04`/`ubuntu-24.04-arm`, no QEMU): downloads the artifact and runs **that
-   target's** binary `__watcher-selftest` — a hidden subcommand that starts the watcher on a
-   temp dir, creates a file, and exits 0 iff the native watcher **loaded + delivered the
-   event** within a timeout and idle RSS is bounded. Prints `WATCHER_SELFTEST ok rss_mb=…`.
+   **sign** all three (darwin-arm64, linux-x64, linux-arm64), each embedding its own `.node`
+   (asserted present), `--no-upload`. Uploads `dist/` as an artifact.
+2. **`smoke`** (matrix, one **native** runner per target — `macos-14` /
+   `ubuntu-24.04` / `ubuntu-24.04-arm`, no QEMU): downloads the artifact and runs **that
+   target's** binary `__watcher-selftest` — a hidden subcommand that starts the watcher
+   **forcing `backend:"parcel"`** (so `RBOX_WATCHER=chokidar` can't let it pass via the
+   fallback — it must prove the *native* addon loads), creates a file, and exits 0 iff the
+   event is delivered within a timeout and idle RSS is bounded. Prints `WATCHER_SELFTEST ok
+   rss_mb=…` and cleans up its temp dir.
 3. **`publish`** (`needs: smoke`): uploads the **exact** built+signed+smoked bytes to R2 via
-   `release.ts --upload-only` (re-verifying each binary's sha against the signed manifest).
+   `release.ts --upload-only`, which **re-verifies the Ed25519 signature over `version.json`
+   against the embedded release keyring** (the same `verifyAndParseManifest` the client uses)
+   *before* trusting the manifest, then re-checks each binary's sha against it. The split
+   build→publish flow thus keeps the exact trust boundary the combined flow had — a tampered
+   `dist/version.json` or forged sig is **unpublishable** (verified: a garbage sig is refused
+   before any upload).
 
 A target whose native watcher can't load **fails its smoke leg and blocks the publish** — it
 never ships blind. `bun build` exit 0 is insufficient (the `.node` only fails at *load*), so
@@ -312,12 +320,15 @@ isolated dir. (The self-test's own logic is also covered by `watcher-compiled.te
 ## 7. Tests (CI-safe)
 
 Deterministic, bounded, on synthetic temp trees against the real parcel backend. The skip is
-**narrow** (round-3 finding 3): a probe (retried, so a transient spike doesn't count) skips
-**only** a genuinely-unsupported macOS sandbox with no FSEvents. **Linux/inotify and normal
-macOS always run** — a watcher that fails to start there is a real regression, not a silent
-skip. `src/engine/ignore.test.ts` adds a **`nativePruneGlobs` regression suite**: a default
-tree prunes all hard dirs incl. the build dirs; `!dist/keep.txt` drops only `dist`;
-`!.env.example` drops nothing (round-3 findings 1–2).
+**narrow**: a retried probe (so a transient spike doesn't count) that probes
+**`@parcel/watcher` directly** (never the mockable `./watcher.js`) skips **only** a
+genuinely-unsupported macOS sandbox with no FSEvents. **Linux/inotify and normal macOS always
+run** — a watcher that fails to start there is a real regression, not a silent skip. The
+degrade test no longer uses a process-global `mock.module` (which leaked across files);
+instead the daemon exposes an injectable `startWatcherFn` seam the test overrides — so
+nothing can corrupt another file's watcher import. `src/engine/ignore.test.ts` adds a
+**`nativePruneGlobs` regression suite**: a default tree prunes all hard dirs incl. the build
+dirs; `!dist/keep.txt` drops only `dist`; `!.env.example` drops nothing.
 
 `src/cli/watcher.test.ts` (10 cases):
 - create → `add`; modify → `change`.
@@ -350,8 +361,8 @@ target, run in an isolated dir (finding 5d). `src/engine/engine-m1.test.ts`: `ap
 | node_modules event leak | n/a (pruned) | **0** |
 
 Verification: `bun test ./src/` = **297 pass / 0 skip / 0 fail**; `tsc --noEmit` (root + apps/api)
-clean; all four release `--target`s resolve + embed on one host; compiled-binary smoke of
-the real `watcher.ts` passes standalone.
+clean; all three release `--target`s (darwin-arm64, linux-x64, linux-arm64) resolve + embed
+on one host; compiled-binary smoke of the real `watcher.ts` passes standalone.
 
 ---
 
@@ -359,7 +370,7 @@ the real `watcher.ts` passes standalone.
 
 | Risk | Mitigation |
 |---|---|
-| Non-darwin-arm64 native **runtime** load unproven locally | Build resolves + embeds for all 4 on one host (verified); runtime load is CI-gated per §6; absent-binding binary still degrades safely to periodic scan |
+| Non-darwin-arm64 native **runtime** load unproven locally | Build resolves + embeds for all 3 targets on one host (verified); runtime load is CI-gated per §6; absent-binding binary still degrades safely to periodic scan |
 | Linux inotify `max_user_watches` exhaustion | `subscribe()` rejection → degrade to periodic scan + log; validate real count in CI |
 | Native `ignore` hides a JS-re-included event | `nativePruneGlobs` **drops** any hard-prune dir with a possible negation (finding 2); node_modules/.git/.rbox always-prunable; JS matcher authoritative post-filter; asserted with `*.log`, `.env.example`, and live `!dist/` tests |
 | node_modules **children** flood the JS filter | Native prune emits `**/<dir>/**` subtree globs; re-measured 0 nm events reach JS (finding 3) |

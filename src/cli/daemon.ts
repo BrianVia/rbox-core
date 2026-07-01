@@ -56,6 +56,10 @@ export class RboxDaemon {
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
    *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
   private readonly writeFinishRetries = new Map<string, number>();
+  /** The watcher factory. Real native-backed `startWatcher` by default; an injectable seam
+   *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
+   *  a process-global module mock (which leaks across test files). */
+  private startWatcherFn: typeof startWatcher = startWatcher;
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
@@ -106,7 +110,7 @@ export class RboxDaemon {
     this.safetyTimer = setInterval(() => this.request("fullScan"), jitter(SAFETY_SYNC_MS));
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
     try {
-      this.watcher = await startWatcher(this.root, this.matcher, (events) => {
+      this.watcher = await this.startWatcherFn(this.root, this.matcher, (events) => {
         this.pendingEvents.push(...events);
         this.request("push");
       });

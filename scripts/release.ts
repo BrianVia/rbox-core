@@ -14,20 +14,20 @@
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { releaseSigningInput } from "../src/cli/upgrade-cmd.js";
+import { releaseSigningInput, verifyAndParseManifest } from "../src/cli/upgrade-cmd.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
-const ALL = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"] as const;
+// Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
+const ALL = ["darwin-arm64", "linux-arm64", "linux-x64"] as const;
 
 // The native `@parcel/watcher` binding is platform-specific (design §41). Each
-// target embeds ONLY its own package; the other three are `--external`ed so a
+// target embeds ONLY its own package; the other two are `--external`ed so a
 // single host can cross-`--compile` without their `.node` bytes being resolved.
 // NB: the TARGET's package must be installed on the build host for its watcher to
 // embed — otherwise that binary still runs, but degrades to periodic-scan-only.
 const PARCEL_PKG: Record<(typeof ALL)[number], string> = {
   "darwin-arm64": "@parcel/watcher-darwin-arm64",
-  "darwin-x64": "@parcel/watcher-darwin-x64",
   "linux-arm64": "@parcel/watcher-linux-arm64-glibc",
   "linux-x64": "@parcel/watcher-linux-x64-glibc",
 };
@@ -86,15 +86,24 @@ function uploadRelease(artifacts: Record<string, { sha256: string; path: string 
 // just upload those exact artifacts. Never rebuild here (the smoked bytes must ship).
 if (uploadOnly) {
   const manifestPath = path.join(dist, "version.json");
+  const sigPath = path.join(dist, "version.json.sig");
   if (!fs.existsSync(manifestPath)) throw new Error(`[release] --upload-only: ${manifestPath} missing (run the build job first and pass dist/ as an artifact)`);
-  const m = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { version: string; artifacts: Record<string, { sha256: string; path: string }> };
-  if (m.version !== version) throw new Error(`[release] --upload-only: dist manifest version ${m.version} != ${version}`);
-  if (!fs.existsSync(path.join(dist, "version.json.sig"))) throw new Error(`[release] --upload-only: missing dist/version.json.sig`);
+  if (!fs.existsSync(sigPath)) throw new Error(`[release] --upload-only: missing dist/version.json.sig`);
+  // SECURITY: VERIFY the Ed25519 signature over the EXACT version.json bytes against the
+  // embedded release keyring before trusting ANYTHING in the manifest. The split
+  // build→smoke→publish flow must keep the same trust boundary the combined flow had — a
+  // tampered dist/version.json (or a forged/mismatched sig) must be UNPUBLISHABLE. Using
+  // the very same verifier the client (`rbox upgrade`) uses so the checks can't diverge.
+  const manifestBytes = fs.readFileSync(manifestPath);
+  const sigBytes = fs.readFileSync(sigPath);
+  const m = verifyAndParseManifest(manifestBytes, sigBytes); // throws on bad/forged signature
+  if (m.version !== version) throw new Error(`[release] --upload-only: signed manifest version ${m.version} != ${version}`);
   for (const t of targets) {
     const bin = path.join(dist, `rbox-${t}`);
     if (!fs.existsSync(bin)) throw new Error(`[release] --upload-only: missing dist/rbox-${t}`);
     if (sha256File(bin) !== m.artifacts[`rbox-${t}`]?.sha256) throw new Error(`[release] --upload-only: dist/rbox-${t} sha != signed manifest — refusing to publish tampered/mismatched bytes`);
   }
+  console.log(`[release] --upload-only: signature verified (keyId ${m.keyId}); publishing ${Object.keys(m.artifacts).length} artifacts`);
   uploadRelease(m.artifacts);
   process.exit(0);
 }

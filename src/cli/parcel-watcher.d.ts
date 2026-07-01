@@ -15,10 +15,6 @@ declare module "@parcel/watcher-darwin-arm64" {
   const binding: unknown;
   export default binding;
 }
-declare module "@parcel/watcher-darwin-x64" {
-  const binding: unknown;
-  export default binding;
-}
 declare module "@parcel/watcher-linux-x64-glibc" {
   const binding: unknown;
   export default binding;

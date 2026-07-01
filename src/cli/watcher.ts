@@ -170,12 +170,12 @@ function loadParcelWrapper(): ParcelWrapper {
  * externalized-and-absent throws → the daemon degrades to periodic-scan-only.
  */
 function loadHostBinding(): unknown {
+  // Supported: Apple Silicon macOS + Linux (x64/arm64). Intel Macs and anything else
+  // fall through to the throw → the daemon catches it and degrades to periodic-scan.
   const key = `${process.platform}-${process.arch}`;
   switch (key) {
     case "darwin-arm64":
       return require("@parcel/watcher-darwin-arm64");
-    case "darwin-x64":
-      return require("@parcel/watcher-darwin-x64");
     case "linux-x64":
       return require("@parcel/watcher-linux-x64-glibc");
     case "linux-arm64":

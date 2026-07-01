@@ -25,8 +25,9 @@ permissions:
   contents: read
 
 jobs:
-  # 1) BUILD — cross-compile + sign all 4 binaries on one host, but DO NOT upload. Each
-  #    target embeds its own native @parcel/watcher.node (release.ts asserts presence).
+  # 1) BUILD — cross-compile + sign all 3 binaries (darwin-arm64, linux-x64, linux-arm64)
+  #    on one host, but DO NOT upload. Each embeds its own native @parcel/watcher.node
+  #    (release.ts asserts presence). Intel Macs (darwin-x64) are not a release target.
   build:
     runs-on: ubuntu-latest
     environment: release # scopes the signing secret to this env (no reviewer gate on free plan)
@@ -38,8 +39,8 @@ jobs:
 
       - name: Install (frozen, all platforms)
         # `--os=* --cpu=*` force-installs every @parcel/watcher-<platform> package so this
-        # single Ubuntu host can cross-compile all 4 targets and embed each one's native
-        # binding (design §41 §6). Without it, bun os/cpu-filters and the darwin builds
+        # single Ubuntu host can cross-compile all 3 targets and embed each one's native
+        # binding (design §41 §6). Without it, bun os/cpu-filters and the darwin build
         # would silently ship without the live watcher.
         run: bun install --frozen-lockfile --os=* --cpu=*
 
@@ -83,8 +84,6 @@ jobs:
         include:
           - target: darwin-arm64
             os: macos-14
-          - target: darwin-x64
-            os: macos-13
           - target: linux-x64
             os: ubuntu-24.04
           - target: linux-arm64

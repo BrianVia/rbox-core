@@ -19,6 +19,14 @@ case "$OS" in
   *) echo "rbox: unsupported OS: $OS (only macOS and Linux are supported)" >&2; exit 1 ;;
 esac
 
+# Intel Macs are not a release target — Apple Silicon only on macOS. Bail with a friendly
+# message rather than downloading a nonexistent/broken rbox-darwin-x64 binary.
+if [ "$OS" = "darwin" ] && [ "$ARCH" = "x64" ]; then
+  echo "rbox requires an Apple Silicon Mac (M1 or newer). Intel Macs are not supported." >&2
+  echo "(Linux x64 and arm64 are also supported.)" >&2
+  exit 1
+fi
+
 BIN="rbox-$OS-$ARCH"
 URL="$BASE/bin/$BIN"
 

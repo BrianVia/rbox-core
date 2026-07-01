@@ -72,6 +72,11 @@ function artifactName(): string {
   const osName = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? "linux" : null;
   const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
   if (!osName || !arch) throw new Error(`unsupported platform ${process.platform}/${process.arch}`);
+  // Intel Macs are not a release target — rbox ships for Apple Silicon + Linux only.
+  // Fail with a clear message instead of requesting a nonexistent rbox-darwin-x64 artifact.
+  if (osName === "darwin" && arch === "x64") {
+    throw new Error("rbox requires an Apple Silicon Mac (arm64); Intel Macs are not supported. Linux (x64/arm64) is also supported.");
+  }
   return `rbox-${osName}-${arch}`;
 }
 

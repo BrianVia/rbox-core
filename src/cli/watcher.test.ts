@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, type WatchEvent } from "../engine/index.js";
@@ -19,15 +20,19 @@ const DEBOUNCE = 40;
 let active: Watcher | undefined;
 let roots: string[] = [];
 
-// Retry a few times: a genuine sandbox fails every attempt, whereas a transient FSEvents
-// spike under full-suite CPU contention may fail once — we must not skip on that.
+// Probe the native @parcel/watcher DIRECTLY — never through `./watcher.js` — so the
+// process-global `mock.module("./watcher.js")` in daemon-watch-degrade.test.ts can't corrupt
+// this capability signal. Retry a few times: a genuine sandbox fails every attempt, a
+// transient FSEvents spike under full-suite CPU contention may fail once (must not skip on that).
 async function probeNativeWatch(attempts = 3): Promise<{ ok: boolean; err: string }> {
+  const req = createRequire(import.meta.url);
   let err = "";
   for (let i = 0; i < attempts; i++) {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-probe-")));
     try {
-      const w = await startWatcher(dir, buildIgnoreMatcher(dir), () => {}, { debounceMs: 20 });
-      await w.close();
+      const parcel = req("@parcel/watcher") as { subscribe: (d: string, f: () => void, o: object) => Promise<{ unsubscribe(): Promise<void> }> };
+      const sub = await parcel.subscribe(dir, () => {}, {});
+      await sub.unsubscribe();
       return { ok: true, err: "" };
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
@@ -76,7 +81,7 @@ async function watch(root: string, extraIgnore = "") {
 
 /** Poll until `pred()` or timeout; returns whether it became true. Generous default so a
  *  native-watcher latency spike under full-suite CPU contention doesn't flake the assert. */
-async function waitFor(pred: () => boolean, timeoutMs = 9000): Promise<boolean> {
+async function waitFor(pred: () => boolean, timeoutMs = 12000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (pred()) return true;
