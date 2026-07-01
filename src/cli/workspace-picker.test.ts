@@ -4,8 +4,6 @@ import {
   relativeAge,
   workspacePickLabel,
   sortWorkspacesForPick,
-  renderWorkspacePickList,
-  resolveWorkspacePick,
   pickerMode,
   buildWorkspaceChoices,
   filterWorkspaceChoices,
@@ -61,60 +59,6 @@ test("sortWorkspacesForPick orders by createdAt desc without mutating the input"
   const sorted = sortWorkspacesForPick(input);
   expect(sorted.map((w) => w.workspaceId)).toEqual(["ws_b", "ws_c", "ws_a"]);
   expect(input.map((w) => w.workspaceId)).toEqual(["ws_a", "ws_b", "ws_c"]); // unmutated
-});
-
-// ── rendering ─────────────────────────────────────────────────────────────────
-
-test("renderWorkspacePickList numbers rows 1..n, uses the label, shows a created-age", () => {
-  const sorted = sortWorkspacesForPick([
-    ws({ name: "~/conductor/workspaces", createdAt: NOW - 21 * 3_600_000 }),
-    ws({ name: "~/projects/savvy-core", createdAt: NOW - 12 * 3_600_000 }),
-  ]);
-  const lines = renderWorkspacePickList(sorted, NOW);
-  expect(lines).toHaveLength(2);
-  // newest first → savvy-core is #1
-  expect(lines[0]).toContain("1");
-  expect(lines[0]).toContain("~/projects/savvy-core");
-  expect(lines[0]).toContain("created 12h ago");
-  expect(lines[1]).toContain("2");
-  expect(lines[1]).toContain("~/conductor/workspaces");
-  expect(lines[1]).toContain("created 21h ago");
-});
-
-test("renderWorkspacePickList falls back to the short id for an unnamed workspace", () => {
-  const lines = renderWorkspacePickList([ws({ name: null, workspaceId: "ws_deadbeef1234" })], NOW);
-  expect(lines[0]).toContain("ws_deadbeef");
-});
-
-test("renderWorkspacePickList is empty for an empty list (caller handles the empty case)", () => {
-  expect(renderWorkspacePickList([], NOW)).toEqual([]);
-});
-
-// ── resolving a typed pick ────────────────────────────────────────────────────
-
-test("resolveWorkspacePick maps an in-range number to that workspace id + name", () => {
-  const sorted = sortWorkspacesForPick([
-    ws({ workspaceId: "ws_new", name: "newest", createdAt: 300 }),
-    ws({ workspaceId: "ws_old", name: null, createdAt: 100 }),
-  ]);
-  expect(resolveWorkspacePick(sorted, "1")).toEqual({ kind: "pick", workspaceId: "ws_new", name: "newest" });
-  expect(resolveWorkspacePick(sorted, " 2 ")).toEqual({ kind: "pick", workspaceId: "ws_old", name: null });
-});
-
-test("resolveWorkspacePick recognizes the manual-entry escape hatch", () => {
-  const sorted = [ws()];
-  for (const s of ["m", "manual", "PASTE", " m "]) {
-    expect(resolveWorkspacePick(sorted, s)).toEqual({ kind: "manual" });
-  }
-});
-
-test("resolveWorkspacePick returns null for out-of-range / non-numeric answers (re-prompt)", () => {
-  const sorted = [ws(), ws()];
-  expect(resolveWorkspacePick(sorted, "0")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "3")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "abc")).toBeNull();
-  expect(resolveWorkspacePick(sorted, "1x")).toBeNull();
 });
 
 // ── inquirer picker: pure choice-building + mode selection ─────────────────────

@@ -1,38 +1,9 @@
 import { test, expect } from "bun:test";
-import {
-  accountChoiceFor,
-  authMethodFor,
-  isYes,
-  workspaceChoiceFor,
-  workspaceFlags,
-} from "./setup-cmd.js";
+import { workspaceFlags } from "./setup-cmd.js";
 
-// The guided flow's STEP TRANSITIONS live in these pure input→intent mappers; the
-// readline/no-echo I/O around them is a thin shell. We test the transitions.
-
-test("Step 1 account choice: create vs existing, invalid reprompts", () => {
-  expect(accountChoiceFor("1")).toBe("create");
-  expect(accountChoiceFor("create")).toBe("create");
-  expect(accountChoiceFor("2")).toBe("existing");
-  expect(accountChoiceFor("Log in")).toBe("existing");
-  expect(accountChoiceFor("9")).toBeNull();
-  expect(accountChoiceFor("")).toBeNull();
-});
-
-test("Step 1 auth method: pairing token (enrolls) vs approve code (hard-stop path)", () => {
-  expect(authMethodFor("p")).toBe("pair");
-  expect(authMethodFor("paste")).toBe("pair");
-  expect(authMethodFor("a")).toBe("approve");
-  expect(authMethodFor("code")).toBe("approve");
-  expect(authMethodFor("x")).toBeNull();
-});
-
-test("Step 2 workspace choice: new vs existing", () => {
-  expect(workspaceChoiceFor("1")).toBe("new");
-  expect(workspaceChoiceFor("2")).toBe("existing");
-  expect(workspaceChoiceFor("track")).toBe("existing");
-  expect(workspaceChoiceFor("")).toBeNull();
-});
+// The guided flow's menus are now arrow-key `@inquirer` `select`s (thin widgets we
+// don't unit-test). The one pure step-transition left is `workspaceFlags` — the
+// map from a Step-2 workspace decision to the exact `runInit` flags.
 
 test("Step 2 → runInit flags: new workspace creates + pushes; both stay non-interactive", () => {
   const f = workspaceFlags({ kind: "new", root: "/code/app" });
@@ -52,17 +23,9 @@ test("Step 2 → runInit flags: a picked name rides along as a LOCAL cache label
   expect(f).toMatchObject({ workspace: "ws_abc", name: "savvy-core", "no-interactive": "true" });
 });
 
-test("Step 2 → runInit flags: a name is NOT attached to a new-workspace join-less create here", () => {
+test("Step 2 → runInit flags: a name is NOT attached to a new-workspace create here", () => {
   // (create names are prompted inside runInit, not passed via workspaceFlags)
   const f = workspaceFlags({ kind: "new", root: "/code/app", name: "ignored" });
   expect(f.name).toBeUndefined();
   expect(f.new).toBe("true");
-});
-
-test("Step 3 [Y/n] / [y/N]: blank takes the default, explicit answers win", () => {
-  expect(isYes("", true)).toBe(true); // [Y/n] default
-  expect(isYes("", false)).toBe(false); // [y/N] default
-  expect(isYes("n", true)).toBe(false);
-  expect(isYes("yes", false)).toBe(true);
-  expect(isYes("nope", true)).toBe(false); // anything non-yes is a no
 });
