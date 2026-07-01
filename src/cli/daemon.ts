@@ -269,6 +269,7 @@ export class RboxDaemon {
       cache: this.cache,
       onCommitConflict: () => this.bumpConflict("commit"),
       report,
+      onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
@@ -323,7 +324,8 @@ export class RboxDaemon {
 
   private async doPull(): Promise<void> {
     const report = beginReport("pull");
-    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report });
+    // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
+    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report, onGitLog: log });
     report?.logSummaryTo(log);
     // Forensic record: every mutation a pull applied to the LOCAL tree, path by path.
     // This is the line that answers "did sync change/delete my files?" after the fact.

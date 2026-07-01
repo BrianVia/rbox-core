@@ -4,16 +4,22 @@ import path from "node:path";
 import {
   applyActions,
   applyGitState,
+  assertGitTargetWithinRoot,
   buildIgnoreMatcher,
   captureGitState,
   diffManifests,
+  discoverGitRepos,
   encryptFileToTemp,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
+  isGitBusy,
   isIgnoreRuleFile,
   preserveGitConflict,
+  projectIdentity,
+  quarantineAndWipeGitState,
   HashCache,
+  MAX_GIT_REPOS,
   PhaseReport,
   poolMap,
   reconcile,
@@ -21,10 +27,14 @@ import {
   validateManifest,
   type Action,
   type FileEntry,
+  type GitIdentity,
+  type GitRefScope,
   type GitSection,
+  type IgnoreMatcher,
   type Manifest,
+  type BlobStore,
 } from "../engine/index.js";
-import { loadState, saveState, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, type SyncState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, RboxApi, type SyncRemote } from "./remote.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
@@ -67,6 +77,10 @@ export interface SyncDeps {
    *  the sync path uses a disabled no-op report that allocates nothing — so the daemon's
    *  hot path and no-op tick stay free unless metrics are explicitly enabled. */
   report?: PhaseReport;
+  /** Forensic git-sync log sink (design 43 §10): capture/carry/defer/remove summaries on
+   *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
+   *  injects its timestamped logger so the lines land in the daemon log. */
+  onGitLog?: (line: string) => void;
 }
 
 // Concurrency knobs (read at call-time so the bench harness + power users can tune
@@ -226,24 +240,455 @@ async function encryptAndUpload(
   return { deferred };
 }
 
-/** Capture/carry the git section for a push (M2). Capture+upload only when the
- *  repo's stable identity changed vs the base; otherwise carry the base section. */
+// ---- git-sync orchestration (design 43 §§6-7, 9, 13.5) ------------------------------
+
+/** Bundling is CPU/IO heavy — bound concurrent captures (design 43 §6.3). */
+const GIT_CAPTURE_CONCURRENCY = 4;
+const NO_GIT_FORCE: ReadonlySet<string> = new Set();
+
+/** The push-side new-repo admission cap (design 43 §3 [v2, M4]). Env-overridable for
+ *  tests/tuning; the manifest-validation bound stays the hard MAX_GIT_REPOS. The cap
+ *  bounds capture WORK for newly-discovered repos — base-carrying repos are ALWAYS
+ *  carried, so over-cap can never read as mass deletion on receivers. */
+const gitRepoCap = (): number => {
+  const n = Number(process.env.RBOX_GIT_REPO_CAP);
+  return Number.isInteger(n) && n >= 1 && n <= MAX_GIT_REPOS ? n : MAX_GIT_REPOS;
+};
+
+const repoDirOf = (root: string, relPath: string) => (relPath === "." ? root : path.join(root, relPath));
+/** The narrower of two ref scopes ("scoped" ⊂ "all") — the projection target for every
+ *  cross-scope identity comparison (design 43 §7). */
+const narrowerScope = (a: GitRefScope, b: GitRefScope | undefined): GitRefScope => (a === "scoped" || b === "scoped" ? "scoped" : "all");
+const projectedKey = (g: GitSection | GitIdentity | undefined, scope: GitRefScope): string => gitIdentityKey(g ? projectIdentity(g, scope) : undefined);
+/** Every ciphertext address a git section references (bundle + index + op-state). */
+const sectionEncShas = (s: GitSection): string[] => [s.bundleEncSha, ...(s.indexEncSha ? [s.indexEncSha] : []), ...Object.values(s.opState ?? {}).map((r) => r.encSha)];
+const emptyToUndef = <T,>(o: Record<string, T>): Record<string, T> | undefined => (Object.keys(o).length ? o : undefined);
+const errMsg = (e: unknown): string => (e as Error)?.message ?? String(e);
+
+/** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
+ *  No base → ANY local git identity is divergence-from-nothing (an independently
+ *  created local repo must never be clobbered). No local identity (no repo, empty
+ *  repo, deleted/unusable `.git`) → never diverged: there is no committed local work
+ *  to preserve, so a clean (re)materialization loses nothing. */
+function localDivergedFromBase(localId: GitIdentity | undefined, base: GitSection | undefined): boolean {
+  if (!localId) return false;
+  if (!base) return true;
+  const n = narrowerScope(localId.refScope, base.refScope);
+  return projectedKey(localId, n) !== projectedKey(base, n);
+}
+
+/** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
+ *  differs from what the last commit carried, the local-only state after this cycle
+ *  (persisted only on a successful commit — recomputed idempotently otherwise), and
+ *  the forensic counts for the §10 log line. */
+interface GitPushPlan {
+  gitRepos?: Record<string, GitSection>;
+  changed: boolean;
+  gitReposRemoved?: Record<string, string>;
+  gitNeedsResolution?: Record<string, string>;
+  gitPendingRemote?: Record<string, GitSection>;
+  captured: string[];
+  carried: string[];
+  deferred: Array<{ relPath: string; reason: string }>;
+  removed: string[];
+}
+
+/**
+ * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
+ * repo either CARRY (pending section, needs-resolution checkpoint, or unchanged identity
+ * per the §7 shape×scope matrix), CAPTURE (bounded pool), DEFER with base carry (any
+ * per-repo failure — never abort the push), or REMOVE (repo dir gone entirely, §9).
+ * `force` is the per-relPath 422 recapture set [v2, M5]: forced repos skip the carry
+ * fast-path; a forced repo that cannot recapture is DROPPED from this commit (the
+ * non-looping failure path [v3]) rather than re-referencing blobs the server lost.
+ */
 async function captureGitForPush(
   root: string,
   cfg: WorkspaceConfig,
-  baseGit: GitSection | undefined,
-  api: SyncRemote
-): Promise<GitSection | undefined> {
-  if (!cfg.syncGit) return undefined;
+  state: SyncState,
+  api: SyncRemote,
+  force: ReadonlySet<string>,
+  matcher: IgnoreMatcher
+): Promise<GitPushPlan> {
+  const base = state.lastSyncedManifest.gitRepos ?? {};
+  const removedMem = { ...(state.gitReposRemoved ?? {}) };
+  const needsRes = { ...(state.gitNeedsResolution ?? {}) };
+  const pending = { ...(state.gitPendingRemote ?? {}) };
+  const captured: string[] = [];
+  const carried: string[] = [];
+  const removed: string[] = [];
+  const deferred: Array<{ relPath: string; reason: string }> = [];
+  const out: Record<string, GitSection> = {};
+  const plan = (): GitPushPlan => {
+    // Changed = the outbound map differs from what the LAST COMMIT carried. For a
+    // pending repo the last commit carried the pending section itself (see the per-repo
+    // base-advance in pushManifest), so the expected-previous map is base ∪ pending —
+    // a steady pending carry is NOT a change (no echo-commit storm).
+    const prev: Record<string, GitSection> = { ...base, ...(state.gitPendingRemote ?? {}) };
+    let changed = false;
+    for (const k of new Set([...Object.keys(out), ...Object.keys(prev)])) {
+      if (!out[k] || !prev[k] || (out[k] !== prev[k] && JSON.stringify(out[k]) !== JSON.stringify(prev[k]))) {
+        changed = true;
+        break;
+      }
+    }
+    return {
+      gitRepos: emptyToUndef(out),
+      changed,
+      gitReposRemoved: emptyToUndef(removedMem),
+      gitNeedsResolution: emptyToUndef(needsRes),
+      gitPendingRemote: emptyToUndef(pending),
+      captured,
+      carried,
+      deferred,
+      removed,
+    };
+  };
+  if (!cfg.syncGit) return plan(); // out stays empty → any base entries read as removal (opt-out propagates)
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
-  if (!(await gitPreflight(root)).ok) return baseGit;
-  const localId = await gitIdentity(root);
-  if (!localId) return baseGit; // empty repo (no commits) → no git section yet
-  if (baseGit && gitIdentityKey(localId) === gitIdentityKey(baseGit)) return baseGit; // unchanged → carry
-  // changed → ENCRYPT + capture + upload artifacts. A deferred capture (repo vanished mid-cycle
-  // or failed the engine's self-validation race check) carries the base — never regress a
-  // synced repo to nothing because of one bad cycle (design 43 §6.4).
-  return (await captureGitState(root, api.blobStore(), cfg.kek)) ?? baseGit;
+  const kek = cfg.kek;
+
+  const discovered = await discoverGitRepos(root, matcher);
+  const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
+
+  // §9: removal memories are pruned when the local `.git` disappears.
+  for (const rel of Object.keys(removedMem)) if (!kindByPath.has(rel)) delete removedMem[rel];
+
+  const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
+  // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
+  const cap = gitRepoCap();
+  let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
+
+  const toCapture: string[] = [];
+  /** Per-repo failure → defer. Forced (422) repos take the M5 non-looping DROP instead:
+   *  their base section references exactly the blobs the server lost, so carrying it
+   *  would 422 forever — drop from THIS commit; the daemon re-captures when possible. */
+  const deferOne = (rel: string, reason: string) => {
+    if (force.has(rel)) {
+      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)` });
+      return;
+    }
+    const b = base[rel];
+    if (b) out[rel] = b; // defer-with-base-carry: never regress a synced repo (§6.4)
+    deferred.push({ relPath: rel, reason });
+  };
+
+  for (const rel of keys) {
+    const kind = kindByPath.get(rel);
+    const baseSec = base[rel];
+    const pend = pending[rel];
+
+    // Pending unapplied remote [v5]: carry THE PENDING SECTION (the newest known truth),
+    // capture suppressed. 422-while-pending [v6] → M5 drop; the pending entry stays for
+    // the next pull to refresh (remote re-establishes it or absence-supersedes clears it).
+    if (pend) {
+      if (force.has(rel)) {
+        deferred.push({ relPath: rel, reason: "pending remote section's blobs are missing server-side — dropped this commit; the next pull refreshes it" });
+      } else {
+        out[rel] = pend;
+        carried.push(rel);
+      }
+      continue;
+    }
+
+    if (!kind) {
+      if (!baseSec) continue; // never synced, nothing local → nothing to do
+      const dirPresent = await fs
+        .lstat(repoDirOf(root, rel))
+        .then((s) => s.isDirectory())
+        .catch(() => false);
+      if (!dirPresent) {
+        // §9: repo dir GONE ENTIRELY → the pusher drops the section (receivers drop
+        // their base entry but never touch local .git).
+        removed.push(rel);
+        delete needsRes[rel];
+        continue;
+      }
+      deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
+      continue;
+    }
+
+    // Removal memory [v2, B4]: a leftover whose identity still equals the memory is the
+    // untouched residue of a remote deletion — NOT re-added. Identity changed → the
+    // user worked there → re-adding is intentional; clear the memory and fall through.
+    if (!baseSec && removedMem[rel] !== undefined) {
+      const id = await gitIdentity(repoDirOf(root, rel));
+      if (gitIdentityKey(id) === removedMem[rel]) continue;
+      delete removedMem[rel];
+    }
+
+    // needsResolution [v2, M2]: carry the checkpointed base until the local identity
+    // CHANGES from the recorded conflict-time value (republish must be intentional).
+    if (needsRes[rel] !== undefined) {
+      const id = await gitIdentity(repoDirOf(root, rel));
+      if (gitIdentityKey(id) === needsRes[rel]) {
+        if (baseSec) {
+          out[rel] = baseSec;
+          carried.push(rel);
+        }
+        continue;
+      }
+      delete needsRes[rel];
+    }
+
+    const pf = await gitPreflight(repoDirOf(root, rel));
+    if (!pf.ok) {
+      deferOne(rel, pf.reason ?? "preflight failed");
+      continue;
+    }
+    const id = await gitIdentity(repoDirOf(root, rel));
+    if (!id) {
+      // empty repo (no commits yet): nothing to capture; keep any synced base.
+      if (baseSec) {
+        out[rel] = baseSec;
+        carried.push(rel);
+      }
+      continue;
+    }
+
+    // §7 capture-side carry-forward — the normative shape×scope matrix [v3; v4]:
+    //   dir/all-base      → carry on full-identity match (design-02 semantics)
+    //   dir/scoped-base   → ALWAYS capture fresh (a projected compare would hide a
+    //                       genuinely new local branch forever)
+    //   pointer/scoped    → carry on scoped-identity match
+    //   pointer/all-base  → the explicit wider-carry exception: carry when the base's
+    //                       SCOPED PROJECTION matches (terminates the convergence loop)
+    if (baseSec && !force.has(rel)) {
+      const carry =
+        pf.kind === "dir"
+          ? baseSec.refScope === "all" && gitIdentityKey(id) === gitIdentityKey(baseSec)
+          : baseSec.refScope === "scoped"
+            ? gitIdentityKey(id) === gitIdentityKey(baseSec)
+            : gitIdentityKey(id) === projectedKey(baseSec, "scoped");
+      if (carry) {
+        out[rel] = baseSec;
+        carried.push(rel);
+        continue;
+      }
+    }
+    if (!baseSec) {
+      if (admitted >= cap) {
+        deferred.push({ relPath: rel, reason: `over the ${cap}-repo cap — new repo not captured this cycle` });
+        continue;
+      }
+      admitted++;
+    }
+    toCapture.push(rel);
+  }
+
+  // Changed repos: bounded-concurrency capture. Any per-repo failure defers THAT repo
+  // (base carry) — the push itself always proceeds (PR #38 churn discipline).
+  await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
+    try {
+      const sec = await captureGitState(repoDirOf(root, rel), api.blobStore(), kek);
+      if (sec) {
+        out[rel] = sec;
+        captured.push(rel);
+      } else {
+        deferOne(rel, "capture returned nothing (repo vanished mid-capture or failed self-validation)");
+      }
+    } catch (e) {
+      deferOne(rel, `capture failed: ${errMsg(e)}`);
+    }
+  });
+
+  return plan();
+}
+
+/** Format the §10 forensic push line:
+ *  `git-sync: captured N (a, b) · carried N · deferred N (p: reason) · removed N (x)` */
+function formatGitPushLine(plan: GitPushPlan): string {
+  const names = (xs: string[]) => (xs.length ? ` (${xs.join(", ")})` : "");
+  const defer = plan.deferred.length ? ` (${plan.deferred.map((d) => `${d.relPath}: ${d.reason}`).join("; ")})` : "";
+  return `git-sync: captured ${plan.captured.length}${names(plan.captured)} · carried ${plan.carried.length} · deferred ${plan.deferred.length}${defer} · removed ${plan.removed.length}${names(plan.removed)}`;
+}
+
+/** The pull-side git outcome: the per-repo base to persist plus the updated local-only maps. */
+interface GitPullOutcome {
+  gitRepos?: Record<string, GitSection>;
+  gitReposRemoved?: Record<string, string>;
+  gitNeedsResolution?: Record<string, string>;
+  gitPendingRemote?: Record<string, GitSection>;
+}
+
+/**
+ * Pull-side git orchestration (design 43 §7, §9, §13.5): iterate
+ * `remote.gitRepos ∪ base.gitRepos ∪ gitPendingRemote` per key. Per repo:
+ *  - remote ABSENT → conflict-precedence first if a pending repo's local diverged
+ *    (§13.5), then clear pending ([v6] absence supersedes pending), record a removal
+ *    memory when the local `.git` survives, drop the base entry — NEVER touch local .git.
+ *  - unchanged (projected onto the narrower scope) → base advances, no apply.
+ *  - local diverged from base → per-repo CONFLICT: preserve remote, checkpoint base to
+ *    remote, record `needsResolution` with the conflict-time local identity [v2, M2].
+ *  - clean → applyGitState (containment + ignored-subtree refusal BEFORE any mutation);
+ *    a removal-memory-matching leftover is treated as ABSENT → clean materialization
+ *    (dir: quarantine + ref-wipe first; pointer: NEVER ref-wipe — guarded update-only).
+ *  - deferred apply → record `gitPendingRemote`; that repo's base does not advance;
+ *    every other repo advances independently.
+ */
+async function applyGitOnPull(
+  root: string,
+  cfg: WorkspaceConfig,
+  state: SyncState,
+  remote: Manifest,
+  store: BlobStore,
+  matcher: IgnoreMatcher,
+  glog: (line: string) => void
+): Promise<GitPullOutcome> {
+  const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
+  const applied: Record<string, GitSection> = { ...baseRepos };
+  const removedMem = { ...(state.gitReposRemoved ?? {}) };
+  const needsRes = { ...(state.gitNeedsResolution ?? {}) };
+  const pending = { ...(state.gitPendingRemote ?? {}) };
+  const pack = (): GitPullOutcome => ({
+    gitRepos: emptyToUndef(applied),
+    gitReposRemoved: emptyToUndef(removedMem),
+    gitNeedsResolution: emptyToUndef(needsRes),
+    gitPendingRemote: emptyToUndef(pending),
+  });
+  if (!cfg.syncGit) return pack();
+  const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  if (keys.length === 0) return pack();
+  const needKek = (): Buffer => {
+    if (!cfg.kek) throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
+    return cfg.kek;
+  };
+
+  for (const rel of keys) {
+    const remoteSec = remote.gitRepos?.[rel];
+    const baseSec = baseRepos[rel];
+    const pend = pending[rel];
+    const repoDir = repoDirOf(root, rel);
+    const dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+
+    // Receiver quiescence FIRST (design 43 §7): a busy repo defers only itself. This
+    // must run BEFORE any identity comparison — a lock makes write-tree fail, flipping
+    // gitIdentity onto the raw-index fallback, which would read as FALSE divergence
+    // (spurious conflict) or poison a removal memory with a transient key.
+    if (dotGit && (remoteSec !== undefined || baseSec !== undefined || pend !== undefined) && (await isGitBusy(repoDir))) {
+      if (remoteSec) pending[rel] = remoteSec; // retry next pull; outbound carries newest truth
+      glog(`git-sync deferred ${rel}: receiver git busy`);
+      continue;
+    }
+    const localId = dotGit ? await gitIdentity(repoDir) : undefined;
+
+    if (!remoteSec) {
+      // §9 removal + [v6] absence-supersedes-pending. §13.5 precedence: if the remote
+      // deleted a pending repo whose LOCAL identity also changed, the conflict path wins
+      // FIRST (preserve local + recovery from the pending section) — never stamp a
+      // removal memory over unexamined local divergence.
+      if (pend && localDivergedFromBase(localId, baseSec)) {
+        const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, needKek());
+        glog(
+          `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}`
+        );
+      }
+      delete pending[rel];
+      delete needsRes[rel];
+      if (rel in applied) {
+        delete applied[rel];
+        glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
+      }
+      if (dotGit) removedMem[rel] = gitIdentityKey(localId); // resurrection guard [v2, B4]
+      continue;
+    }
+
+    // Removal memory: a leftover whose identity still EQUALS the memory is treated as
+    // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
+    // the normal rules (conflict path) with the memory cleared.
+    let cleanMaterialize = false;
+    if (removedMem[rel] !== undefined) {
+      if (!dotGit) delete removedMem[rel]; // leftover gone → memory pruned; plain fresh target
+      else if (gitIdentityKey(localId) === removedMem[rel]) cleanMaterialize = true;
+      else delete removedMem[rel];
+    }
+
+    // Projected identity comparison on the NARROWER of the two scopes (§7) — what makes
+    // worktree→standalone→worktree round-trips converge without apply ping-pong.
+    const cmpScope = narrowerScope(remoteSec.refScope, baseSec?.refScope);
+    const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
+    if (!remoteChanged && !pend) {
+      applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
+      continue;
+    }
+
+    // Already converged? (e.g. a pending retry finding the user manually resolved, or a
+    // remote change that equals local work) → advance base, clear pending, no mutation.
+    // A removal-memory leftover never takes this shortcut: it must go through the §9
+    // clean-materialization path (wipe on dir targets) so stale refs can't survive.
+    if (localId && !cleanMaterialize) {
+      const n = narrowerScope(localId.refScope, remoteSec.refScope);
+      if (projectedKey(localId, n) === projectedKey(remoteSec, n)) {
+        applied[rel] = remoteSec;
+        delete pending[rel];
+        delete removedMem[rel];
+        continue;
+      }
+    }
+
+    const kek = needKek();
+    if (!cleanMaterialize && localDivergedFromBase(localId, baseSec)) {
+      // Per-repo conflict: never auto-clobber local. Preserve remote for manual merge,
+      // checkpoint base to remote (stop pull-conflict-looping), and suppress capture
+      // until the local identity changes from this recorded value [v2, M2].
+      const { recoveryBundle } = await preserveGitConflict(repoDir, remoteSec, store, kek);
+      applied[rel] = remoteSec;
+      needsRes[rel] = gitIdentityKey(localId);
+      delete pending[rel];
+      glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
+      continue;
+    }
+
+    // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
+    const defer = (reason: string) => {
+      pending[rel] = remoteSec; // [v5]: outbound pushes now carry THIS section; retry next pull
+      glog(`git-sync deferred ${rel}: ${reason}`);
+    };
+    if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
+      defer("target is inside an ignored subtree — refusing to materialize");
+      continue;
+    }
+    try {
+      await assertGitTargetWithinRoot(root, rel);
+    } catch (e) {
+      defer(errMsg(e));
+      continue;
+    }
+
+    if (cleanMaterialize && dotGit) {
+      if (dotGit.isDirectory()) {
+        // Dir leftover [v5]: quarantine (capture-grade pinning + index/op-state copies)
+        // then wipe syncable refs/index/op-state, so the leftover's old refs can never
+        // re-enter a later all-scope capture. Quarantine failure → defer, never wipe.
+        try {
+          await quarantineAndWipeGitState(repoDir);
+          delete removedMem[rel]; // leftover is quarantined + wiped — memory served its purpose
+        } catch (e) {
+          defer(`clean-materialization quarantine failed: ${errMsg(e)}`);
+          continue;
+        }
+      }
+      // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
+      // update-only apply below is the whole treatment; memory clears on success.
+    }
+
+    const res = await applyGitState(repoDir, remoteSec, store, kek);
+    if (res.applied) {
+      // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).
+      try {
+        await assertGitTargetWithinRoot(root, rel);
+      } catch (e) {
+        glog(`git-sync WARNING ${rel}: post-apply containment check failed: ${errMsg(e)}`);
+      }
+      applied[rel] = remoteSec;
+      delete pending[rel];
+      delete removedMem[rel];
+      glog(`git-sync applied ${rel}${res.filteredRefs?.length ? ` (filtered refs: ${res.filteredRefs.join(" ")})` : ""}`);
+    } else {
+      defer(res.reason ?? "apply deferred");
+    }
+  }
+  return pack();
 }
 
 /**
@@ -298,9 +743,11 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
   };
   let actions: Action[] = [];
+  let finalMatcher = matcher; // the post-pull rules — also gates git materialization below
   await report.phase("apply", async () => {
     if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
     const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
+    finalMatcher = fresh;
     const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
     await applyActions(root, rest, api.blobStore(), applyOpts);
     actions = [...ruleActions, ...rest];
@@ -323,45 +770,16 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   }
   await save();
 
-  // Git section (M2): apply remote git state if it changed; advance the git base
-  // ONLY if the apply actually succeeded (else keep base so the next pull retries
-  // — never record an unapplied remote git as the base and later push stale git).
-  // STEP-3 TODO(design 43 §7): per-repo loop over remote.gitRepos ∪ base.gitRepos ∪
-  // gitPendingRemote with scope-projected identity, per-repo base advance, removal
-  // memories, pending-remote carry. This shim keeps the pre-§43 root-repo behavior
-  // via gitRepos["."] only.
-  let appliedGit = state.lastSyncedManifest.gitRepos?.["."];
-  if (cfg.syncGit) {
-    const baseGit = state.lastSyncedManifest.gitRepos?.["."];
-    const remoteGit = remote.gitRepos?.["."];
-    const baseKey = gitIdentityKey(baseGit);
-    const remoteKey = gitIdentityKey(remoteGit);
-    if (remoteGit && remoteKey !== baseKey) {
-      if (!kek) throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
-      const store = api.blobStore();
-      const localChanged = gitIdentityKey(await gitIdentity(root)) !== baseKey;
-      if (localChanged) {
-        // Both sides diverged → never auto-clobber local. Preserve remote for manual
-        // merge and checkpoint the base to remote so we stop pull-conflict-looping.
-        const { recoveryBundle } = await preserveGitConflict(root, remoteGit, store, kek);
-        appliedGit = remoteGit;
-        console.error(`rbox: git conflict — local kept; remote preserved at ${recoveryBundle} and refs/rbox-conflict/*. Resolve manually.`);
-      } else {
-        // Clean fast-forward (local == base): apply remote transactionally.
-        const res = await applyGitState(root, remoteGit, store, kek);
-        if (res.applied) appliedGit = remoteGit;
-        else {
-          appliedGit = baseGit; // deferred/rolled-back → retry next pull
-          console.error(`rbox: git apply not done: ${res.reason}`);
-        }
-      }
-    } else if (remoteGit && remoteKey === baseKey) {
-      appliedGit = remoteGit; // unchanged
-    }
-  }
+  // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
+  // scope-projected identity, per-repo base advance (one busy repo never blocks the
+  // others), removal memories, needs-resolution checkpoints, pending-remote carry.
+  const gitOutcome = await applyGitOnPull(root, cfg, state, remote, api.blobStore(), finalMatcher, deps.onGitLog ?? ((l) => console.error(l)));
   await saveState(root, {
     lastSyncedSequence: sequence,
-    lastSyncedManifest: { ...remote, gitRepos: appliedGit ? { ".": appliedGit } : undefined },
+    lastSyncedManifest: { ...remote, gitRepos: gitOutcome.gitRepos },
+    gitReposRemoved: gitOutcome.gitReposRemoved,
+    gitNeedsResolution: gitOutcome.gitNeedsResolution,
+    gitPendingRemote: gitOutcome.gitPendingRemote,
   });
   return actions;
 }
@@ -402,18 +820,18 @@ export async function pushManifest(
   deps: SyncDeps = {},
   attempt = 0,
   purgeIgnored = false,
-  forceGitRecapture = false
+  forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE
 ): Promise<{ sequence: number; manifest: Manifest; deferred?: string[] }> {
   const api = deps.remote ?? apiFor(cfg);
   const backoff = deps.backoff ?? defaultBackoff;
   const state = await loadState(root);
+  const matcher = buildIgnoreMatcher(root); // shared: forward-only ignore carry + git discovery
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
   // NOT read as a deletion on other machines. Carry forward its last-synced entry
   // unless --purge explicitly requests propagating the deletion. (A real `rm` of a
   // non-ignored file is still absent-and-not-ignored → a genuine deletion.)
   if (!purgeIgnored) {
-    const matcher = buildIgnoreMatcher(root);
     const present = new Set(local.files.map((f) => f.path));
     const carried = state.lastSyncedManifest.files.filter((e) => !present.has(e.path) && matcher.ignores(e.path));
     if (carried.length) {
@@ -421,24 +839,19 @@ export async function pushManifest(
     }
   }
 
-  // Attach the git section (M2): capture only when its stable identity changed
-  // vs the base (re-bundling unchanged state would echo forever); else carry it.
-  // §28: a 422-retry forces a git RE-CAPTURE (base=undefined ⇒ no identity-carry) so a git
-  // artifact missing server-side is re-bundled + re-uploaded — the recursive call recomputes
-  // local.git here, so the force MUST live at this single site (not after the commit) or it's
-  // overwritten and the recovery is dead (codex scrutiny).
-  // STEP-3 TODO(design 43 §6): map orchestration (discoverGitRepos + carry/capture/defer per
-  // repo, bounded pool, per-relPath 422 recapture set). This shim keeps the pre-§43 root-repo
-  // behavior via gitRepos["."] only.
-  const gitBase = forceGitRecapture ? undefined : state.lastSyncedManifest.gitRepos?.["."];
-  const rootGit = await captureGitForPush(root, cfg, gitBase, api);
-  local = { ...local, manifestSchema: rootGit ? 2 : local.manifestSchema, gitRepos: rootGit ? { ".": rootGit } : undefined };
+  // Attach the git sections (design 43 §6): per-repo carry/capture/defer/remove map
+  // orchestration. `forceGitRecapture` is the per-relPath 422 recapture set [v2, M5]:
+  // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
+  // the repos whose sections reference the missing encShas recapture; the force lives
+  // at this single site (the recursion recomputes the map) or the recovery is dead.
+  const gitPlan = await captureGitForPush(root, cfg, state, api, forceGitRecapture, matcher);
+  local = { ...local, manifestSchema: gitPlan.gitRepos ? 2 : local.manifestSchema, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {
     const d = diffManifests(state.lastSyncedManifest, local);
     return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
   })();
-  const gitUnchanged = gitIdentityKey(local.gitRepos?.["."]) === gitIdentityKey(state.lastSyncedManifest.gitRepos?.["."]); // STEP-3 TODO: per-repo
+  const gitUnchanged = !gitPlan.changed;
   if (filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
     // (the 422 recovery): reaching here needs local == base, but to have hit the 422 at all
@@ -451,6 +864,10 @@ export async function pushManifest(
   }
   // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
   const report = deps.report ?? PhaseReport.disabled("push");
+  // §10 forensic line — only when git-sync did something beyond a steady carry.
+  if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
+    (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan));
+  }
 
   // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
   // E2EE is the only mode (design 12 D6): a non-encrypted config reaching the sync
@@ -477,7 +894,7 @@ export async function pushManifest(
   // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
   // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
   // that the artifact blobs were missing.
-  if (deferred.size > 0 && !forceGitRecapture) {
+  if (deferred.size > 0 && forceGitRecapture.size === 0) {
     const dd = diffManifests(state.lastSyncedManifest, committed);
     if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
       reportDeferred(deferred);
@@ -500,14 +917,37 @@ export async function pushManifest(
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
     // Retry the whole attempt: the recursion re-checks missingBlobs + re-uploads the missing
-    // FILE ciphertext (with the same per-file defer), and forces a git RE-CAPTURE — a missing
-    // GIT artifact can't be satisfied by a file re-upload, the identity-carry would re-reference
-    // the absent bundle (§28, codex M3). The force is a flag the recursion acts on, not a
-    // mutation here.
-    return pushManifest(root, cfg, local, deps, attempt + 1, purgeIgnored, cfg.syncGit);
+    // FILE ciphertext (with the same per-file defer), and forces a git RE-CAPTURE for exactly
+    // the repos whose sections reference the missing encShas [v2, M5] — a missing GIT artifact
+    // can't be satisfied by a file re-upload, and the identity-carry would re-reference the
+    // absent bundle (§28, codex M3). A naive "recapture everything" would drop exactly the
+    // repos the defer machinery is protecting.
+    const missing = new Set(res.unsatisfiedBlobs);
+    const gitForce = new Set<string>();
+    for (const [rel, sec] of Object.entries(committed.gitRepos ?? {})) {
+      if (sectionEncShas(sec).some((s) => missing.has(s))) gitForce.add(rel);
+    }
+    return pushManifest(root, cfg, local, deps, attempt + 1, purgeIgnored, gitForce);
   }
 
-  await saveState(root, { lastSyncedSequence: res.sequence!, lastSyncedManifest: committed });
+  // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
+  // remote's own unapplied truth — the saved git BASE must keep the OLD entry (or none)
+  // so the next pull still sees remote != base and retries the apply. Advancing the base
+  // to the pending section would make that pull read "unchanged" and clear pending
+  // without ever applying — silently regressing the other machine's work.
+  const stateGit = { ...(committed.gitRepos ?? {}) };
+  for (const rel of Object.keys(gitPlan.gitPendingRemote ?? {})) {
+    const old = state.lastSyncedManifest.gitRepos?.[rel];
+    if (old) stateGit[rel] = old;
+    else delete stateGit[rel];
+  }
+  await saveState(root, {
+    lastSyncedSequence: res.sequence!,
+    lastSyncedManifest: { ...committed, gitRepos: emptyToUndef(stateGit) },
+    gitReposRemoved: gitPlan.gitReposRemoved,
+    gitNeedsResolution: gitPlan.gitNeedsResolution,
+    gitPendingRemote: gitPlan.gitPendingRemote,
+  });
   if (deferred.size > 0) reportDeferred(deferred);
   return { sequence: res.sequence!, manifest: committed, deferred: [...deferred] };
 }
