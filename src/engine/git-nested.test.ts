@@ -446,6 +446,65 @@ test("a legacy exact refs/rbox-wip ref does not D/F-block the apply-time quarant
   await expect(git(B, "rev-parse", "--verify", "refs/rbox-wip")).rejects.toThrow();
 });
 
+test("a rolled-back apply leaks NO stash reflog entries (git stash list stays clean)", async () => {
+  // A: repo with a real stash (refs/stash + reflog publish on the receiver)
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "v1", "c1");
+  await fs.writeFile(path.join(A, "f.txt"), "wip");
+  await git(A, "stash", "-q");
+  const section = await captureGitState(A, store, KEK);
+  expect(section!.refs["refs/stash"]).toBeDefined();
+
+  // Sabotage: a syncable ref pointing at an object the bundle doesn't carry —
+  // update-ref fails AFTER refs/stash published (insertion order puts it last),
+  // forcing the rollback path.
+  const bogus: typeof section = { ...section!, refs: { ...section!.refs, "refs/heads/zzz": "f".repeat(40) } };
+
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "g.txt", "y", "c1");
+  const res = await applyGitState(B, bogus!, store, KEK);
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("rolled back");
+  // the ref rollback also rolled back the REFLOG the stash publish appended —
+  // otherwise `git stash list` would show a phantom remote stash after a failed apply
+  expect(await git(B, "stash", "list")).toBe("");
+  await expect(git(B, "rev-parse", "--verify", "refs/stash")).rejects.toThrow();
+});
+
+test("beforeMutate hook runs only AFTER artifact fetch+decrypt verify, and its failure defers with no mutation", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "g.txt", "y", "c1");
+  const bHead = await git(B, "rev-parse", "HEAD");
+
+  // 1) fetch/decrypt failure (wrong KEK) → the hook must never run
+  let hookRan = false;
+  const bad = await applyGitState(B, section!, store, Buffer.alloc(32, 9), {
+    beforeMutate: async () => {
+      hookRan = true;
+    },
+  });
+  expect(bad.applied).toBe(false);
+  expect(hookRan).toBe(false); // verified-before-mutate: no wipe on undecryptable remotes
+
+  // 2) hook throw → {applied:false}, target untouched
+  const res = await applyGitState(B, section!, store, KEK, {
+    beforeMutate: async () => {
+      throw new Error("quarantine failed");
+    },
+  });
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("pre-mutation");
+  expect(await git(B, "rev-parse", "HEAD")).toBe(bHead); // no mutation
+});
+
 // ---- scope projection (design 43 §7) ------------------------------------------
 
 test("projectIdentity: an all-identity projected to scoped equals the scoped identity (convergence)", async () => {

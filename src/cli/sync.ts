@@ -360,8 +360,14 @@ async function captureGitForPush(
   const discovered = await discoverGitRepos(root, matcher);
   const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
 
-  // §9: removal memories are pruned when the local `.git` disappears.
-  for (const rel of Object.keys(removedMem)) if (!kindByPath.has(rel)) delete removedMem[rel];
+  // §9: removal memories are pruned ONLY when the local `.git` genuinely disappears —
+  // never on mere discovery absence (an ignored-but-present leftover is undiscoverable
+  // yet must keep its resurrection guard for when it is unignored; codex step-3 MAJOR).
+  for (const rel of Object.keys(removedMem)) {
+    if (kindByPath.has(rel)) continue;
+    const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
+    if (!dotGit) delete removedMem[rel];
+  }
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
   // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
@@ -430,9 +436,11 @@ async function captureGitForPush(
     // Removal memory [v2, B4]: a leftover whose identity still equals the memory is the
     // untouched residue of a remote deletion — NOT re-added. Identity changed → the
     // user worked there → re-adding is intentional; clear the memory and fall through.
+    // An UNREADABLE leftover (dangling pointer, transient) keeps its guard and is
+    // skipped — clearing on a transient would re-add unchanged git once it heals.
     if (!baseSec && removedMem[rel] !== undefined) {
       const id = await gitIdentity(repoDirOf(root, rel));
-      if (gitIdentityKey(id) === removedMem[rel]) continue;
+      if (!id || gitIdentityKey(id) === removedMem[rel]) continue;
       delete removedMem[rel];
     }
 
@@ -581,22 +589,27 @@ async function applyGitOnPull(
     const repoDir = repoDirOf(root, rel);
     const dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
 
-    // Receiver quiescence FIRST (design 43 §7): a busy repo defers only itself. This
-    // must run BEFORE any identity comparison — a lock makes write-tree fail, flipping
-    // gitIdentity onto the raw-index fallback, which would read as FALSE divergence
-    // (spurious conflict) or poison a removal memory with a transient key.
-    if (dotGit && (remoteSec !== undefined || baseSec !== undefined || pend !== undefined) && (await isGitBusy(repoDir))) {
-      if (remoteSec) pending[rel] = remoteSec; // retry next pull; outbound carries newest truth
+    // Receiver quiescence (design 43 §7): a busy repo defers only itself, and the busy
+    // check must run BEFORE any identity comparison — a lock makes write-tree fail,
+    // flipping gitIdentity onto the raw-index fallback, which would read as FALSE
+    // divergence (spurious conflict) or poison a removal memory with a transient key.
+    const busy = dotGit !== undefined && (await isGitBusy(repoDir));
+    if (busy && remoteSec) {
+      pending[rel] = remoteSec; // apply needs quiescence — retry next pull; outbound carries newest truth
       glog(`git-sync deferred ${rel}: receiver git busy`);
       return;
     }
+    // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
+    // and skipping it would leave gitPendingRemote/base carrying a section the remote
+    // deleted, which the next file-only push would resurrect (codex step-3 BLOCKER).
     const localId = dotGit ? await gitIdentity(repoDir) : undefined;
 
     if (!remoteSec) {
       // §9 removal + [v6] absence-supersedes-pending. §13.5 precedence: if the remote
       // deleted a pending repo whose LOCAL identity also changed, the conflict path wins
       // FIRST (preserve local + recovery from the pending section) — never stamp a
-      // removal memory over unexamined local divergence.
+      // removal memory over unexamined local divergence. (On a busy repo the raw-index
+      // identity fallback can only over-trigger this preserve — a safe, logged no-clobber.)
       if (pend && localDivergedFromBase(localId, baseSec)) {
         const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, cfg.kek!);
         glog(
@@ -609,18 +622,35 @@ async function applyGitOnPull(
         delete applied[rel];
         glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
       }
-      if (dotGit) removedMem[rel] = gitIdentityKey(localId); // resurrection guard [v2, B4]
+      if (dotGit) {
+        // Resurrection guard [v2, B4]: the leftover's identity at removal. On a BUSY
+        // repo the live identity is the volatile raw-index fallback — record the base
+        // section's identity instead (projected onto the leftover's shape), which is
+        // lock-immune and equals the live identity whenever the leftover is untouched.
+        removedMem[rel] =
+          busy && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(localId);
+      }
       return;
     }
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
     // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
-    // the normal rules (conflict path) with the memory cleared.
+    // the normal rules (conflict path) with the memory cleared. An UNREADABLE pointer
+    // leftover (dangling gitfile — identity unknowable) defers instead: guessing would
+    // either wipe the guard or mis-run the conflict path.
     let cleanMaterialize = false;
     if (removedMem[rel] !== undefined) {
-      if (!dotGit) delete removedMem[rel]; // leftover gone → memory pruned; plain fresh target
-      else if (gitIdentityKey(localId) === removedMem[rel]) cleanMaterialize = true;
-      else delete removedMem[rel];
+      if (!dotGit) {
+        delete removedMem[rel]; // leftover gone → memory pruned; plain fresh target
+      } else if (gitIdentityKey(localId) === removedMem[rel]) {
+        cleanMaterialize = true;
+      } else if (!localId && dotGit.isFile()) {
+        pending[rel] = remoteSec;
+        glog(`git-sync deferred ${rel}: leftover pointer repo unreadable — keeping removal memory`);
+        return;
+      } else {
+        delete removedMem[rel]; // identity genuinely changed (incl. a re-init'd empty dir repo)
+      }
     }
 
     // Projected identity comparison on the NARROWER of the two scopes (§7) — what makes
@@ -675,24 +705,29 @@ async function applyGitOnPull(
       return;
     }
 
-    if (cleanMaterialize && dotGit) {
-      if (dotGit.isDirectory()) {
-        // Dir leftover [v5]: quarantine (capture-grade pinning + index/op-state copies)
-        // then wipe syncable refs/index/op-state, so the leftover's old refs can never
-        // re-enter a later all-scope capture. Quarantine failure → defer, never wipe.
-        try {
-          await quarantineAndWipeGitState(repoDir);
-          delete removedMem[rel]; // leftover is quarantined + wiped — memory served its purpose
-        } catch (e) {
-          defer(`clean-materialization quarantine failed: ${errMsg(e)}`);
-          return;
-        }
-      }
-      // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
-      // update-only apply below is the whole treatment; memory clears on success.
-    }
-
-    const res = await applyGitState(repoDir, remoteSec, store, kek);
+    // Dir leftover clean materialization [v5]: quarantine (capture-grade pinning +
+    // index/op-state copies) then wipe syncable refs/index/op-state, so the leftover's
+    // old refs can never re-enter a later all-scope capture. Runs as applyGitState's
+    // beforeMutate hook — i.e. ONLY after every remote artifact has been fetched,
+    // decrypted, and verified — so a missing/corrupt bundle can never strand a wiped
+    // repo (codex step-3 MAJOR). Hook/quarantine failure → defer, nothing wiped.
+    // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
+    // update-only apply is the whole treatment; the memory clears on success.
+    const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
+    const res = await applyGitState(
+      repoDir,
+      remoteSec,
+      store,
+      kek,
+      wipeLeftover
+        ? {
+            beforeMutate: async () => {
+              await quarantineAndWipeGitState(repoDir);
+              delete removedMem[rel]; // leftover quarantined + wiped — the memory served its purpose
+            },
+          }
+        : {}
+    );
     if (res.applied) {
       // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).
       try {

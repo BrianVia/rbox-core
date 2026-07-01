@@ -442,6 +442,10 @@ interface LocalSnapshot {
   head: string;
   indexBytes?: Buffer;
   opState: Record<string, Buffer>;
+  /** Bytes of the refs/stash REFLOG (logs/refs/stash), if present. Publishing
+   *  refs/stash appends a reflog entry (--create-reflog) — a rolled-back apply must
+   *  not leak remote entries into `git stash list` (codex step-3 MAJOR). */
+  stashReflog?: Buffer;
 }
 async function snapshotLocal(ctx: RepoCtx): Promise<LocalSnapshot> {
   const refs = await readAllRefs(ctx.repoDir);
@@ -449,7 +453,8 @@ async function snapshotLocal(ctx: RepoCtx): Promise<LocalSnapshot> {
   const indexBytes = (await exists(path.join(ctx.gitDir, "index"))) ? await fs.readFile(path.join(ctx.gitDir, "index")) : undefined;
   const opState: Record<string, Buffer> = {};
   for (const rel of Object.keys(await readOpState(ctx.gitDir, async () => ""))) opState[rel] = await fs.readFile(path.join(ctx.gitDir, rel));
-  return { refs, head, indexBytes, opState };
+  const stashReflog = await fs.readFile(path.join(ctx.commonDir, "logs", "refs", "stash")).catch(() => undefined);
+  return { refs, head, indexBytes, opState, stashReflog };
 }
 /** Roll back to the pre-apply snapshot. For a POINTER target, `onlyRefs` restricts the
  *  ref restore to exactly the refs the apply touched — a full reset would clobber
@@ -465,6 +470,15 @@ async function restoreLocal(ctx: RepoCtx, snap: LocalSnapshot, onlyRefs?: Set<st
     // Reset syncable refs to the snapshot.
     for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) if (!(ref in snap.refs)) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
     for (const [ref, sha] of Object.entries(snap.refs)) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
+    // The stash REFLOG must match the snapshot too: the publish appends an entry
+    // (--create-reflog) that `git stash list` would still show after a bare ref rollback.
+    const stashLog = path.join(ctx.commonDir, "logs", "refs", "stash");
+    if (snap.stashReflog) {
+      await fs.mkdir(path.dirname(stashLog), { recursive: true }).catch(() => {});
+      await writeFileAtomic(stashLog, snap.stashReflog);
+    } else {
+      await fs.rm(stashLog, { force: true }).catch(() => {});
+    }
   }
   if (snap.head) await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), snap.head.endsWith("\n") ? snap.head : `${snap.head}\n`);
   if (snap.indexBytes) await writeFileAtomic(path.join(ctx.gitDir, "index"), snap.indexBytes);
@@ -552,8 +566,20 @@ async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): Promise<
  * NOTE (STEP 3): callers materializing a repo at `join(root, key)` must run
  * {@link assertGitTargetWithinRoot} BEFORE this function and re-verify after `git init`
  * (design 43 §7 [v2, B5; v3]) — this function trusts `repoDir`.
+ *
+ * `opts.beforeMutate` (design 43 §9 [v5] clean materialization): invoked AFTER every
+ * artifact has been fetched+decrypted+verified but BEFORE any gitdir mutation — the
+ * caller's quarantine+ref-wipe of a removal-memory leftover runs here, so a missing or
+ * corrupt remote artifact can never strand a wiped repo (codex step-3 MAJOR). A hook
+ * throw returns {applied:false} with the target untouched.
  */
-export async function applyGitState(repoDir: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<ApplyGitResult> {
+export async function applyGitState(
+  repoDir: string,
+  section: GitSection,
+  store: BlobStore,
+  kek: Buffer,
+  opts: { beforeMutate?: () => Promise<void> } = {}
+): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
 
@@ -642,6 +668,17 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
       }
     } catch (e) {
       return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
+
+    // Artifacts are verified on disk — the caller's pre-mutation step (quarantine +
+    // ref-wipe for a clean materialization) may now run. Failure → no mutation yet,
+    // defer cleanly.
+    if (opts.beforeMutate) {
+      try {
+        await opts.beforeMutate();
+      } catch (e) {
+        return { applied: false, reason: `pre-mutation step failed (no apply): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
     }
 
     if (!ctx) {

@@ -474,6 +474,30 @@ test("pending + 422: M5 non-looping drop — section dropped from THIS commit, p
   expect(sB3.gitReposRemoved?.["r"]).toBeDefined();
 }, 20_000);
 
+test("pending + remote deletion while the repo is BUSY: absence still supersedes pending — no resurrection through pending or base", async () => {
+  const { a, b } = await makePending("r"); // index.lock still held on B
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA); // A deletes the repo
+
+  await pull(rootB, cfgB, depsB); // B's copy is BUSY — absence must still be processed
+  const sB = await st(rootB);
+  expect(sB.gitPendingRemote?.["r"]).toBeUndefined(); // [v6] absence supersedes pending, even busy
+  expect(sB.lastSyncedManifest.gitRepos).toBeUndefined(); // base dropped
+  expect(sB.gitReposRemoved?.["r"]).toBeDefined(); // lock-immune memory (base identity)
+
+  // outbound file push while still busy: neither pending nor base resurrects the repo
+  await fs.writeFile(path.join(rootB, "u.txt"), "x");
+  await push(rootB, cfgB, depsB);
+  expect((await remote.latest()).manifest.gitRepos).toBeUndefined();
+
+  // once quiesced, the unchanged leftover STILL doesn't re-add (memory matches live identity)
+  await fs.rm(path.join(b, ".git", "index.lock"));
+  await fs.writeFile(path.join(rootB, "u2.txt"), "y");
+  await push(rootB, cfgB, depsB);
+  expect((await remote.latest()).manifest.gitRepos).toBeUndefined();
+  await expect(git(b, "rev-parse", "HEAD")).resolves.toBeDefined(); // local .git never touched
+}, 20_000);
+
 test("pending + LOCAL divergence + remote deletion: conflict path wins FIRST, then removal memory (§13.5)", async () => {
   const { a, b, lock } = await makePending("r");
   await fs.rm(lock);
@@ -537,6 +561,61 @@ test("fresh re-create at a removed path: dir leftover is QUARANTINED then wiped,
   const sB = await st(rootB);
   expect(sB.gitReposRemoved?.["r"]).toBeUndefined(); // memory cleared
   expect(sB.lastSyncedManifest.gitRepos?.["r"]).toBeDefined(); // based again
+}, 20_000);
+
+test("clean materialization wipes ONLY after artifacts verify — a missing bundle leaves the leftover intact", async () => {
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "f.txt", "old", "c1");
+  await git(a, "branch", "leftover-branch");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, "r");
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB); // memory recorded, leftover intact
+
+  // A re-creates a fresh repo at the same path; the server then LOSES its bundle
+  await initRepo(a);
+  await commitFile(a, "n.txt", "new", "n1");
+  await push(rootA, cfgA, depsA);
+  const newSec = (await remote.latest()).manifest.gitRepos!["r"]!;
+  const saved = await remote.blobStore().get(newSec.bundleEncSha);
+  remote.deleteBlob(newSec.bundleEncSha);
+
+  await pull(rootB, cfgB, depsB); // fetch fails → the wipe must never have run
+  expect(await git(b, "rev-parse", "--verify", "leftover-branch")).toBeTruthy(); // NOT wiped
+  expect(await fs.readdir(path.join(b, ".rbox", "git-quarantine")).catch(() => [])).toEqual([]); // no quarantine cut
+  let sB = await st(rootB);
+  expect(sB.gitReposRemoved?.["r"]).toBeDefined(); // resurrection guard kept
+  expect(sB.gitPendingRemote?.["r"]).toBeDefined(); // deferred for retry
+
+  // the blob returns → the clean materialization completes on the next pull
+  await remote.blobStore().put(newSec.bundleEncSha, saved);
+  await pull(rootB, cfgB, depsB);
+  expect(await git(b, "rev-parse", "main")).toBe(await git(a, "rev-parse", "main"));
+  await expect(git(b, "rev-parse", "--verify", "leftover-branch")).rejects.toThrow(); // wiped post-verify
+  sB = await st(rootB);
+  expect(sB.gitReposRemoved?.["r"]).toBeUndefined();
+  expect(sB.gitPendingRemote?.["r"]).toBeUndefined();
+}, 20_000);
+
+test("an ignored-but-present leftover keeps its removal memory (guard survives being undiscoverable)", async () => {
+  const a = path.join(rootA, "gone");
+  await initRepo(a);
+  await commitFile(a, "f.txt", "x", "c1");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB); // B: memory recorded, leftover .git intact
+
+  // B now ignores the leftover's subtree — discovery can't see it, but the guard must survive
+  await fs.writeFile(path.join(rootB, ".rboxignore"), "gone/\n");
+  await fs.writeFile(path.join(rootB, "z.txt"), "z");
+  await push(rootB, cfgB, depsB);
+  expect((await st(rootB)).gitReposRemoved?.["gone"]).toBeDefined(); // NOT pruned
+  expect((await remote.latest()).manifest.gitRepos).toBeUndefined(); // and nothing resurrected
 }, 20_000);
 
 // ── (e) cap semantics [v2, M4] ─────────────────────────────────────────────────────
