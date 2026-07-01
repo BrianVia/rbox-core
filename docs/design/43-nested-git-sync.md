@@ -1,7 +1,8 @@
 # Design 43 — Nested-Repo Git Sync (per-repo GitSections)
 
-**Status:** v2 — codex design review round 1 = NEEDS-WORK (5 BLOCKER, 4 MAJOR, 2 MINOR, 1 NIT —
-several verified with local git repros); all resolutions folded in below and marked **[v2]**.
+**Status:** v4 — three codex design rounds (v1: 5 BLOCKER/4 MAJOR; v2: 3 BLOCKER/2 MAJOR;
+v3: 2 BLOCKER — several verified with local git repros); every resolution folded in inline,
+marked **[v2]/[v3]/[v4]**. Full history in §14.
 **Builds on:** design 02 (git-mirroring v3 — bundle-based capture/apply), §28 (git artifacts under
 E2EE), PR #38 (defer-churning-files partial-progress philosophy).
 **Supersedes:** the "repo toplevel === sync root" scope restriction of design 02 §3.
@@ -223,28 +224,40 @@ The pull-side git block iterates `remote.gitRepos ∪ base.gitRepos` per key:
     scoped apply; they simply don't propagate back through a worktree source (its main clone
     owns that namespace) — accepted and documented.
   - ANY section applied into a local *pointer* repo touches a ref store SHARED with sibling
-    worktrees and the main clone, so it is stricter than update-only [v3]: publish **only**
-    `refs/heads/*` entries the section lists — `refs/stash` and `refs/tags/*` from an "all"
-    section are FILTERED (logged, not applied): a standalone receiver's stash/tags must never
-    overwrite the main clone's shared stash stack or tag namespace. (Branch updates are the
-    sync's purpose; stash/tags in a shared store are the main clone's property.)
+    worktrees and the main clone, so it is stricter than update-only [v3; hardened v4]:
+    `refs/stash` and `refs/tags/*` are FILTERED (a standalone receiver's stash/tags must never
+    overwrite the shared stash stack or tag namespace), and `refs/heads/*` publication is
+    **ownership-guarded**: codex repro'd that `git update-ref refs/heads/x` from one worktree
+    silently moves a branch CHECKED OUT by a sibling worktree, leaving that sibling dirty
+    (`git branch -f` refuses; `update-ref` does not). So the publishable set is the section's
+    `refs/heads/*` entries **minus any branch checked out by a different worktree** (from
+    `git worktree list --porcelain`), which in practice projects publication to the target
+    worktree's own line of work. Filtered refs are logged. If the section's HEAD branch itself
+    is filtered (the source switched to a branch a sibling here has checked out), the whole
+    apply DEFERS with a clear reason — applying a HEAD that points at a branch we refused to
+    move would be incoherent.
 - **Identity comparison is scope-projected — with precise sides [v2, B1; fixed v3].**
   *Projection* = HEAD + the refs the narrower side carries + indexTree + opState.
   - **Pull-side** (remote section vs base section vs local): compare after projecting onto the
     NARROWER of the two scopes involved. This is what makes worktree→standalone→worktree
     round-trips converge (an unchanged branch/HEAD/index compares equal no matter how many
     extra branches the standalone side grew).
-  - **Capture-side carry-forward requires matching scope [v3]:** reuse the base section only
-    when `base.refScope` equals the local repo's shape-scope AND the identities match at that
-    scope. A dir-repo whose base is a *scoped* section (it just applied a worktree's push)
-    always captures fresh — codex's repro showed the projected comparison would otherwise hide
-    a genuinely new local branch forever. Cost: ONE extra capture cycle after a
-    scope-crossing apply, after which both sides are stable at the wider scope. Convergence
-    trace (Mac worktree W, flat-meadow standalone D): W captures scoped S1 → D applies
-    update-only, base=S1 → D's next push sees scope mismatch → captures all-A1 → W pulls A1,
-    projected(A1)==projected(S1) → base advances, no apply → W carries A1 (scope-projected
-    carry is allowed for the POINTER side, whose scoped identity is fully contained in A1)
-    → quiescent. Real change on either side re-enters the loop and converges the same way.
+  - **Capture-side carry-forward — normative rules per shape [v3; disambiguated v4]:**
+    - *dir-repo, base "all"* → carry when full identities match (design-02 semantics).
+    - *dir-repo, base "scoped"* → ALWAYS capture fresh (an all-capture): codex's repro showed
+      a projected comparison would otherwise hide a genuinely new local branch forever. Cost:
+      one extra capture cycle after a scope-crossing apply.
+    - *pointer repo, base "scoped"* → carry when scoped identities match.
+    - *pointer repo, base "all"* (**the explicit wider-carry exception**) → carry when the
+      base's SCOPED PROJECTION matches the local scoped identity — the pointer side's whole
+      identity is contained in the wider section, so carrying it loses nothing and is what
+      terminates the convergence loop.
+    Convergence trace (Mac worktree W, flat-meadow standalone D): W captures scoped S1 → D
+    applies update-only, base=S1 → D's next push hits *dir/scoped-base* → captures all-A1 →
+    W pulls A1, projected(A1)==projected(S1) → base advances, no apply → W hits
+    *pointer/all-base*, projection matches → carries A1 → quiescent. Pointer↔pointer stays
+    scoped/scoped throughout (no bounce). Real change on either side re-enters and converges
+    the same way.
 - **remote changed vs base** (projected `gitIdentityKey` differs):
   - local repo also diverged from base → **per-repo conflict**: `preserveGitConflict(repoDir)`
     (recovery bundle + `refs/rbox-conflict/*`), checkpoint base to remote, loud log, **and mark
@@ -306,12 +319,17 @@ any kind.
   identity has since CHANGED is re-added (the user did new work there — resurrection is now
   intentional). The memory is pruned when the local `.git` disappears or the repo is re-added.
   No manifest tombstones (nothing grows unboundedly, nothing new is server-visible).
-  - **Fresh re-create at the same path [v3]:** if A later creates a NEW repo at the deleted
-    path and pushes a section for it, B's conflict gate treats a local repo whose identity
-    still equals its removal memory as **absent** (clean apply target), not as diverged-from-
-    nothing — the apply proceeds (design 02's quarantine bundle preserves the leftover history
-    first, so nothing committed is ever lost), and the removal memory is cleared. No deadlock,
-    no manual cleanup required.
+  - **Fresh re-create at the same path [v3; completed v4]:** if A later creates a NEW repo at
+    the deleted path and pushes a section for it, B's conflict gate treats a local repo whose
+    identity still equals its removal memory as **absent** (clean apply target), not as
+    diverged-from-nothing. The apply is a **clean materialization**, not an update-only merge
+    into the leftover [v4] — codex traced that a scoped update-only apply would leave the
+    leftover's old refs live, and B's next all-scope capture would republish the deleted repo's
+    refs (resurrection through the side door). Sequence: quarantine-bundle the leftover
+    (committed history preserved), DELETE all its syncable refs + index/op-state (reset to
+    empty), then apply the fresh section at any scope, then clear the removal memory. (If the
+    leftover's identity CHANGED after the memory was recorded — the user worked in a "removed"
+    repo — it is NOT absent: the normal per-repo conflict path runs instead.)
 - **Repo becomes ineligible** (preflight fails: turned bare, gained alternates, pointer
   dangles): treated as deferred-with-base-carry (§6.4), surfaced in `rbox status`, never
   deleted from the manifest — transient states (mid-`git gc`, mid-archive) heal themselves.
@@ -370,6 +388,16 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ## 14. Review history
 
+- **v3 → codex round 3 (2026-07-01): FAIL, 2 BLOCKER** — (a) `git update-ref` from one worktree
+  silently moves a branch checked out by a SIBLING worktree (repro'd; `branch -f` refuses,
+  `update-ref` doesn't) → v4 ownership-guarded pointer-target publication (`git worktree list`
+  consulted; sibling-checked-out branches filtered; HEAD-branch filtered ⇒ defer whole apply);
+  (b) removal-memory clean apply via a SCOPED section left the leftover's old refs live →
+  resurrection through B's next all-capture → v4 clean-materialization rule (quarantine → wipe
+  syncable refs/index/op-state → apply → clear memory). Plus: the pointer-wider carry exception
+  made normative (was only in the trace), header status fixed. Round 3 confirmed: scratch-ref
+  enumeration + age-guarded prune, B4 changed-after-memory conflict path, B5, M5 all closed;
+  pointer↔pointer converges scoped/scoped.
 - **v2 → codex round 2 (2026-07-01): NEEDS-WORK** — 3 BLOCKER (bundle wildcard arg not
   implementable → enumerate exact scratch refs; scoped-apply base-identity underdefined → the
   v3 scope-matched carry-forward rule + convergence trace; pointer-target apply could write a
