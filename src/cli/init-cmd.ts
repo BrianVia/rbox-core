@@ -9,8 +9,7 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline/promises";
-import { loadCredentials } from "./credentials.js";
+import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
 import { saveConfig, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -20,44 +19,61 @@ import { push, sync } from "./sync.js";
 import { resolveInitPlan, isInitError, collapseHome, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
+import { promptSelect, promptInput, promptConfirm } from "./prompt.js";
+import { promptWorkspacePick } from "./workspace-picker.js";
 
-/** Prompt on stderr (so `rbox init > out.txt` never pollutes stdout). */
-async function promptMissing(flags: Record<string, string>, cwd: string): Promise<Record<string, string>> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    const next = { ...flags };
-    if (next.new !== "true" && !next.workspace) {
-      const ans = (await rl.question(`${stderrStyle.cyan("?")} New workspace, or an existing id to join? ${stderrStyle.dim("[new]")} `)).trim();
-      if (ans && ans !== "new") next.workspace = ans;
+/**
+ * Gather the missing init inputs interactively (all widgets render on stderr, so
+ * `rbox init > out.txt` never pollutes stdout). Callers gate this on a TTY —
+ * inquirer requires one. `ctx` carries the creds/remote the join picker needs.
+ */
+async function promptMissing(
+  flags: Record<string, string>,
+  cwd: string,
+  ctx: { creds: Credentials | undefined; defaultRemote: string }
+): Promise<Record<string, string>> {
+  const next = { ...flags };
+  if (next.new !== "true" && !next.workspace) {
+    const choice = await promptSelect<"new" | "join">({
+      message: "New workspace, or join an existing one?",
+      choices: [
+        { name: "Create a new workspace", value: "new" },
+        { name: "Join an existing workspace", value: "join", description: "pick one you've already synced" },
+      ],
+    });
+    if (choice === "join") {
+      // Pick by name (degrades to a manual id prompt offline / no creds / empty).
+      const picked = await promptWorkspacePick({ baseUrl: ctx.creds?.remoteUrl ?? ctx.defaultRemote, token: ctx.creds?.token });
+      // Backing out of the picker (blank manual entry) falls through as a NEW
+      // workspace — mirrors the old "[new]" default when nothing was entered.
+      if (picked) next.workspace = picked;
     }
-    if (!next.project) {
-      const ans = (await rl.question(`${stderrStyle.cyan("?")} Project id ${stderrStyle.dim("[root]")} `)).trim();
-      if (ans) next.project = ans;
-    }
-    if (!next.root) {
-      const ans = (await rl.question(`${stderrStyle.cyan("?")} Sync which directory? ${stderrStyle.dim(`[${cwd}]`)} `)).trim();
-      if (ans) next.root = ans;
-    }
-    // Workspace name — ALWAYS prompt on a TTY when CREATING (default-on for interactive;
-    // `--name` is the scripted/non-interactive opt-in and, when present, skips the prompt).
-    // Skipped only when JOINING (`--workspace <id>`): the row already exists, so a name here
-    // would never be stored. Enter accepts the pre-filled `~`-collapsed local path; editing
-    // sets a custom label; clearing it (backspace → empty) skips → no name → stays private.
-    if (!next.workspace && next.name == null) {
-      const resolvedRoot = path.resolve(cwd, next.root ?? cwd);
-      const suggestion = collapseHome(resolvedRoot, os.homedir());
-      process.stderr.write(
-        `${stderrStyle.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted). Press enter to accept, edit it, or clear it to skip (stays private).")}\n`
-      );
-      const p = rl.question(`${stderrStyle.cyan("?")} Workspace name ${stderrStyle.dim(`[${suggestion}]`)} `);
-      rl.write(suggestion); // pre-fill the editable line so enter=accept, backspace-clear=skip
-      const ans = (await p).trim();
+  }
+  if (!next.project) {
+    const ans = (await promptInput({ message: "Project id", default: "root" })).trim();
+    if (ans) next.project = ans;
+  }
+  if (!next.root) {
+    const ans = (await promptInput({ message: "Sync which directory?", default: cwd })).trim();
+    if (ans) next.root = ans;
+  }
+  // Workspace name — offered on a TTY only when CREATING. `--name` is the scripted
+  // opt-in and, when present (next.name != null), skips this whole block. Skipped
+  // when JOINING (`--workspace <id>`): the row already exists, so a name here would
+  // never be stored. A name is OPTIONAL — declining the confirm keeps it private
+  // (the label is server-side / NOT end-to-end encrypted, so skippability matters).
+  if (!next.workspace && next.name == null) {
+    const resolvedRoot = path.resolve(cwd, next.root ?? cwd);
+    const suggestion = collapseHome(resolvedRoot, os.homedir());
+    process.stderr.write(
+      `${stderrStyle.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`
+    );
+    if (await promptConfirm({ message: "Add a name for this workspace?", default: true })) {
+      const ans = (await promptInput({ message: "Workspace name", default: suggestion })).trim();
       if (ans) next.name = ans;
     }
-    return next;
-  } finally {
-    rl.close();
   }
+  return next;
 }
 
 /** What an executed init produced — returned so callers like `setup` can print a
@@ -76,7 +92,7 @@ export async function runInit(
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
 
   let gathered = flags;
-  if (interactive) gathered = await promptMissing(flags, opts.cwd);
+  if (interactive) gathered = await promptMissing(flags, opts.cwd, { creds, defaultRemote: opts.defaultRemote });
 
   const plan = resolveInitPlan({ flags: gathered, cwd: opts.cwd, creds, interactive, defaultRemote: opts.defaultRemote });
   if (isInitError(plan)) {
