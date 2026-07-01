@@ -420,8 +420,20 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ---
 
+## 13.5 Implementation notes (codex round-6 carry-ins)
+
+- The pull-side per-repo iteration is `remote.gitRepos ∪ base.gitRepos ∪ gitPendingRemote`
+  keys — pending-ONLY repos (never based) must see remote absence and clear correctly.
+- Precedence when remote deletes a pending repo whose LOCAL identity also changed: the
+  conflict path wins (preserve local + recovery), THEN removal memory — never stamp a removal
+  memory over unexamined local divergence.
+- Dedicated tests: pending+remote-deletion, pending-only deletion, pending+422,
+  pending+local-divergence+remote-deletion.
+
 ## 14. Review history
 
+- **v6 → codex round 6 (2026-07-01): PASS** — no BLOCKER/MAJOR remaining; three MINOR
+  implementation notes carried into §13.5.
 - **v5 → codex round 5 (2026-07-01): FAIL, 1 MAJOR** — `gitPendingRemote` could resurrect a
   repo the remote deleted (pending carried outbound after the deletion pulled) → v6:
   remote absence supersedes pending (clear + removal memory + no carry); 422-while-pending
