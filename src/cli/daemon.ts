@@ -198,7 +198,13 @@ export class RboxDaemon {
       onCommitConflict: () => this.bumpConflict("commit"),
       report,
     });
-    this.manifest = res.manifest; // stays fresh even across a conflict re-scan
+    this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
+    // Files deferred because they were still changing under the push: re-enqueue them
+    // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
+    // per-path retry budget as mid-write files — a pathologically-churning file gives up
+    // to the safety/deep scan instead of hot-looping. res.manifest already carries their
+    // base (or omits them), so a genuine settle is re-detected by the change event's re-hash.
+    if (res.deferred && res.deferred.length > 0) this.scheduleWriteFinishRetry(new Set(res.deferred));
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
     report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
