@@ -28,10 +28,20 @@ jobs:
         with:
           bun-version: '1.3.5'
       - run: bun install --frozen-lockfile
-      - name: Gate — typecheck + worker tests
+      - name: Gate — typecheck (root + api) + worker tests, in parallel
+        # These three are independent: the two `tsc --noEmit` projects write nothing
+        # to disk and the Miniflare vitest run is isolated, so run them concurrently
+        # and fail if any fails. On a multi-core runner this collapses the gate from
+        # ~sum (~25s on 2 vCPU) toward the slowest single unit.
         run: |
-          bun run typecheck
-          bun run test:api
+          set -uo pipefail
+          pids=()
+          bun x tsc --noEmit                 & pids+=($!)
+          bun x tsc -p apps/api --noEmit     & pids+=($!)
+          (cd apps/api && bun x vitest run)  & pids+=($!)
+          rc=0
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          exit $rc
       - name: Deploy to rbox-prod-api
         uses: cloudflare/wrangler-action@v3
         with:
