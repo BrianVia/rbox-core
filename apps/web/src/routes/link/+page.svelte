@@ -8,6 +8,7 @@
 	import PageHeader from '$lib/components/page-header.svelte';
 	import Callout from '$lib/components/callout.svelte';
 	import CommandRow from '$lib/components/command-row.svelte';
+	import Step from '$lib/components/step.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import LoaderIcon from '@lucide/svelte/icons/loader-circle';
 
@@ -105,17 +106,13 @@
 	</div>
 {:else if phase === 'showing-code'}
 	<ol class="flex flex-col gap-5">
-		<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
-			<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">1</span>
-			<div class="min-w-0">
-				<p class="text-sm">Run this in a terminal signed in to your rbox account (an owner device):</p>
-				<CommandRow command={`rbox account link ${code}`} />
-			</div>
-		</li>
-		<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
-			<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">2</span>
+		<Step n={1}>
+			<p class="text-sm">Run this in a terminal signed in to your rbox account (an owner device):</p>
+			<CommandRow command={`rbox account link ${code}`} />
+		</Step>
+		<Step n={2}>
 			<p class="text-sm">Come back here — we'll show the account it proposes to link.</p>
-		</li>
+		</Step>
 	</ol>
 	<p class="mt-6 flex items-center gap-2 text-sm text-muted-foreground">
 		<LoaderIcon class="size-4 animate-spin" /> Waiting for a terminal to redeem the code…

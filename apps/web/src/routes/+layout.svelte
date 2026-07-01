@@ -75,13 +75,12 @@
 	</div>
 {/snippet}
 
-{#snippet navLinks(onNavigate?: () => void)}
+{#snippet navLinks()}
 	{#each nav as item (item.href)}
 		{@const Icon = item.icon}
 		{@const active = isActive(item.href)}
 		<a
 			href={item.href}
-			onclick={onNavigate}
 			aria-current={active ? 'page' : undefined}
 			class={cn(
 				'flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
@@ -160,6 +159,13 @@
 			<div class="mb-6 flex justify-center">{@render wordmark('lg')}</div>
 			{@render children()}
 		</div>
+	</div>
+{:else if !authState.signedIn}
+	<!-- Signed-out but deep-linked to an app route: each page's requireAuth() is
+	     about to redirect to '/'. Show a neutral loader for that frame rather than
+	     flashing the authed sidebar/account chrome. -->
+	<div class="grid min-h-svh place-items-center p-6">
+		<Loading />
 	</div>
 {:else}
 	<!-- App shell: persistent sidebar (desktop) / top bar (mobile) + content. -->

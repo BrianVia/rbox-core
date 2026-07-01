@@ -18,7 +18,7 @@
 	let error = $state('');
 	let busy = $state(false);
 	let confirming = $state(false);
-	let done = $state('');
+	let done = $state(false);
 
 	// Danger zone — irreversible account deletion (design 37).
 	let dangerOpen = $state(false);
@@ -69,8 +69,8 @@
 		busy = true;
 		error = '';
 		try {
-			const fresh = await unlinkAccount(authState.clerk);
-			done = fresh;
+			await unlinkAccount(authState.clerk);
+			done = true;
 			confirming = false;
 			await loadStatus(); // now linked === false against the fresh shell
 		} catch (e) {

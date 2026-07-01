@@ -5,16 +5,15 @@
 	import CopyIcon from '@lucide/svelte/icons/copy';
 
 	// A copy-pasteable shell command: the code box + a copy button that owns its own
-	// "Copied ✓" state. `copyText` defaults to what's shown (used where the copied
-	// command differs from the displayed one is not needed, but kept flexible).
-	let { command, copyText }: { command: string; copyText?: string } = $props();
+	// "Copied ✓" state. Copies exactly what's displayed.
+	let { command }: { command: string } = $props();
 
 	let copied = $state(false);
 	let timer: ReturnType<typeof setTimeout> | null = null;
 
 	async function copy() {
 		try {
-			await navigator.clipboard.writeText(copyText ?? command);
+			await navigator.clipboard.writeText(command);
 			copied = true;
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(() => (copied = false), 2000);

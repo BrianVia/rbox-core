@@ -14,6 +14,7 @@
 	import Callout from '$lib/components/callout.svelte';
 	import Loading from '$lib/components/loading.svelte';
 	import CommandRow from '$lib/components/command-row.svelte';
+	import Step from '$lib/components/step.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import ArrowRightIcon from '@lucide/svelte/icons/arrow-right';
 	import Link2Icon from '@lucide/svelte/icons/link-2';
@@ -201,38 +202,29 @@
 		</summary>
 		<div class="border-t border-border px-4 py-4">
 			<ol class="flex flex-col gap-5">
-				<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
-					<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">1</span>
-					<div class="min-w-0">
-						<div class="text-sm font-medium">Install rbox</div>
-						<p class="mt-0.5 text-xs text-muted-foreground">One line — adds the <code class="rounded bg-muted px-1 py-0.5">rbox</code> command on macOS or Linux.</p>
-						<CommandRow command={INSTALL_CMD} />
-					</div>
-				</li>
-				<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
-					<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">2</span>
-					<div class="min-w-0">
-						<div class="text-sm font-medium">Run <code class="rounded bg-muted px-1 py-0.5">rbox setup</code></div>
-						<p class="mt-0.5 text-xs text-muted-foreground">
-							Creates your account, saves your recovery phrase, tracks a folder, and starts syncing in the background.
-						</p>
-						<CommandRow command={SETUP_CMD} />
-						<p class="mt-2 rounded-md bg-warning/10 px-2.5 py-1.5 text-xs text-warning">
-							Save your recovery phrase somewhere safe — it's the only way back into your account. No one can reset it for you.
-						</p>
-					</div>
-				</li>
-				<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
-					<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">3</span>
-					<div class="min-w-0">
-						<div class="text-sm font-medium">Link this dashboard</div>
-						<p class="mt-0.5 text-xs text-muted-foreground">Connect your machines so you can manage devices, workspaces &amp; billing here.</p>
-						<Button variant="outline" size="sm" class="mt-2" onclick={() => goto('/link')}>
-							Get your code
-							<ArrowRightIcon class="size-3.5" />
+				<Step n={1}>
+					<div class="text-sm font-medium">Install rbox</div>
+					<p class="mt-0.5 text-xs text-muted-foreground">One line — adds the <code class="rounded bg-muted px-1 py-0.5">rbox</code> command on macOS or Linux.</p>
+					<CommandRow command={INSTALL_CMD} />
+				</Step>
+				<Step n={2}>
+					<div class="text-sm font-medium">Run <code class="rounded bg-muted px-1 py-0.5">rbox setup</code></div>
+					<p class="mt-0.5 text-xs text-muted-foreground">
+						Creates your account, saves your recovery phrase, tracks a folder, and starts syncing in the background.
+					</p>
+					<CommandRow command={SETUP_CMD} />
+					<p class="mt-2 rounded-md bg-warning/10 px-2.5 py-1.5 text-xs text-warning">
+						Save your recovery phrase somewhere safe — it's the only way back into your account. No one can reset it for you.
+					</p>
+				</Step>
+				<Step n={3}>
+					<div class="text-sm font-medium">Link this dashboard</div>
+					<p class="mt-0.5 text-xs text-muted-foreground">Connect your machines so you can manage devices, workspaces &amp; billing here.</p>
+					<Button variant="outline" size="sm" class="mt-2" onclick={() => goto('/link')}>
+						Get your code
+						<ArrowRightIcon class="size-3.5" />
 						</Button>
-					</div>
-				</li>
+				</Step>
 			</ol>
 		</div>
 	</details>

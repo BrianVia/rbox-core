@@ -84,9 +84,10 @@
 		}
 	}
 
-	// Reset + reload when the browser-sessions filter flips (bind:checked already
-	// updated `includeWeb`, so this reload uses the new value).
-	async function onToggleWeb() {
+	// Reset + reload when the browser-sessions filter flips. Take the new value
+	// straight from the callback so we don't depend on bind ordering vs the reload.
+	async function onToggleWeb(checked: boolean) {
+		includeWeb = checked;
 		devices = [];
 		devicesCursor = null;
 		await loadDevices();
@@ -117,7 +118,7 @@
 	<div class="mb-3 flex items-center justify-between gap-4">
 		<h2 class="text-xs font-semibold tracking-wide text-muted-foreground uppercase">Devices</h2>
 		<label class="flex items-center gap-2 text-sm text-muted-foreground select-none">
-			<Switch bind:checked={includeWeb} onCheckedChange={onToggleWeb} aria-label="Show browser sessions" />
+			<Switch checked={includeWeb} onCheckedChange={onToggleWeb} aria-label="Show browser sessions" />
 			Show browser sessions
 		</label>
 	</div>
