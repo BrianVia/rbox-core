@@ -8,7 +8,9 @@ import {
   type Manifest,
   type WatchEvent,
 } from "../engine/index.js";
+import type { Action } from "../engine/reconcile.js";
 import { loadState, type WorkspaceConfig } from "./config.js";
+import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
@@ -21,6 +23,35 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
+
+/** How many changed paths a pull/push log line spells out before eliding. High on
+ *  purpose: the daemon log is the ONLY forensic record of what sync did to the tree
+ *  ("did rbox delete my files?" must be answerable from it), and pumps are rare. */
+const LOG_PATHS_MAX = 50;
+
+/** One-line forensic summary of the actions a pull APPLIED to the local tree:
+ *  counts by kind plus the paths themselves (`+`write `-`delete `!`conflict). */
+export function summarizeActions(actions: Action[]): string {
+  let writes = 0;
+  let deletes = 0;
+  let conflicts = 0;
+  const paths: string[] = [];
+  for (const a of actions) {
+    if (a.kind === "write") {
+      writes++;
+      paths.push(`+${a.entry.path}`);
+    } else if (a.kind === "delete") {
+      deletes++;
+      paths.push(`-${a.path}`);
+    } else {
+      conflicts++;
+      paths.push(`!${a.path}`);
+    }
+  }
+  const shown = paths.slice(0, LOG_PATHS_MAX).join(" ");
+  const more = paths.length > LOG_PATHS_MAX ? ` (+${paths.length - LOG_PATHS_MAX} more)` : "";
+  return `${writes} write, ${deletes} delete, ${conflicts} conflict — ${shown}${more}`;
+}
 
 interface Wants {
   pull: boolean;
@@ -56,6 +87,10 @@ export class RboxDaemon {
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
    *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
   private readonly writeFinishRetries = new Map<string, number>();
+  /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
+  private lastErrMsg = "";
+  private errRepeat = 0;
+  private lastLoggedSeq?: number;
   /** The watcher factory. Real native-backed `startWatcher` by default; an injectable seam
    *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
    *  a process-global module mock (which leaks across test files). */
@@ -84,6 +119,9 @@ export class RboxDaemon {
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
     log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})`);
+    // Record the binding so `rbox start` can tell a live daemon from a STALE one
+    // (bound to a workspace this root was since re-initialized away from).
+    await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId);
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
@@ -163,7 +201,15 @@ export class RboxDaemon {
             await this.doPush();
           }
         } catch (e) {
-          log(`pump op error: ${e instanceof Error ? e.message : String(e)}`);
+          // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
+          // first hit and every 10th after, with the running count — so the log stays
+          // readable while still showing exactly how long the failure has persisted.
+          const msg = e instanceof Error ? e.message : String(e);
+          this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
+          this.lastErrMsg = msg;
+          if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
+            log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+          }
           await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
         }
       }
@@ -199,6 +245,17 @@ export class RboxDaemon {
       report,
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
+    // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
+    // resulting tree size and anything it had to defer. A no-op push (sequence unchanged)
+    // stays silent so the steady state doesn't fill the log.
+    if (res.sequence !== this.lastLoggedSeq) {
+      const deferredNote =
+        res.deferred && res.deferred.length > 0
+          ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).join(" ")}`
+          : "";
+      log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
+      this.lastLoggedSeq = res.sequence;
+    }
     // Files deferred because they were still changing under the push: re-enqueue them
     // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
     // per-path retry budget as mid-write files — a pathologically-churning file gives up
@@ -242,6 +299,9 @@ export class RboxDaemon {
     const report = beginReport("pull");
     const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report });
     report?.logSummaryTo(log);
+    // Forensic record: every mutation a pull applied to the LOCAL tree, path by path.
+    // This is the line that answers "did sync change/delete my files?" after the fact.
+    if (actions.length > 0) log(`pull applied: ${summarizeActions(actions)}`);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;

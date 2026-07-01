@@ -8,7 +8,11 @@ import ignore from "ignore";
  * an atomic snapshot unit, handled separately (and intentionally not file-by-file).
  */
 export const BUILTIN_IGNORE: string[] = [
-  ".git/",
+  // No trailing slash: matches BOTH the `.git/` directory AND a `.git` FILE — a git
+  // worktree/submodule checkout uses a `.git` pointer file whose target is a local
+  // absolute path. Syncing it would materialize a dangling pointer on every other
+  // machine (git state transfers via git-sync snapshots, never as raw files).
+  ".git",
   ".rbox/",
   "node_modules/",
   ".venv/",

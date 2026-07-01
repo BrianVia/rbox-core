@@ -34,6 +34,41 @@ export const daemonRuntimeDir = (root: string) => path.join(rboxHome(), "daemons
 
 const pidPath = (root: string) => path.join(daemonRuntimeDir(root), PID_FILE);
 const logPath = (root: string) => path.join(daemonRuntimeDir(root), LOG_FILE);
+const boundPath = (root: string) => path.join(daemonRuntimeDir(root), BOUND_FILE);
+const BOUND_FILE = "workspace.bound";
+
+/** Called by the daemon at startup: record which workspace id THIS daemon bound.
+ *  `startDaemon` compares it against the root's current binding to detect a daemon
+ *  left over from a previous init of the same root (which would 404 on every op
+ *  forever — the observed "setup says started, nothing ever syncs" failure). */
+export async function recordDaemonBinding(root: string, workspaceId: string): Promise<void> {
+  await fsp.mkdir(daemonRuntimeDir(root), { recursive: true });
+  await fsp.writeFile(boundPath(root), workspaceId);
+}
+
+/** The workspace id the RUNNING daemon bound at startup (undefined: pre-binding
+ *  daemon or never started — callers must treat unknown as "can't tell", not stale). */
+export function readDaemonBinding(root: string): string | undefined {
+  try {
+    const id = fs.readFileSync(boundPath(root), "utf8").trim();
+    return id || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The workspace id `root` is CURRENTLY bound to — a plain read of
+ *  `<root>/.rbox/workspace.json` (no decryption; the id is not a secret). */
+export function currentWorkspaceId(root: string): string | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(root, RBOX_DIR, "workspace.json"), "utf8")) as {
+      remoteWorkspaceId?: unknown;
+    };
+    return typeof raw.remoteWorkspaceId === "string" && raw.remoteWorkspaceId ? raw.remoteWorkspaceId : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Pre-global location of the pid/log (inside the workspace). Kept only as a
  *  READ fallback so a daemon started before this change stays visible to `rbox
@@ -118,10 +153,23 @@ export function forceKill(pid: number): void {
 export async function startDaemon(root: string): Promise<void> {
   const existing = readPid(root);
   if (existing && isOurDaemon(existing, root)) {
-    console.log(`rbox daemon already running (pid ${existing})`);
-    return;
-  }
-  if (existing && !isOurDaemon(existing, root)) {
+    // A live daemon is only "already running" if it's bound to the CURRENT workspace.
+    // Re-initializing the root (a repeat `rbox setup`/`rbox init`) rebinds it to a new
+    // workspace id, but the old daemon keeps its startup binding and 404s on every op
+    // forever — while looking perfectly alive. Detect the rebind and restart instead.
+    // An unknown binding (pre-binding daemon) is treated as current — can't tell ≠ stale.
+    const bound = readDaemonBinding(root);
+    const current = currentWorkspaceId(root);
+    if (bound && current && bound !== current) {
+      console.log(`rbox daemon (pid ${existing}) is bound to ${bound}, but this root is now ${current} — restarting`);
+      process.kill(existing, "SIGTERM");
+      if (!(await waitForExit(existing, 5000))) forceKill(existing);
+      await fsp.rm(pidPath(root), { force: true });
+    } else {
+      console.log(`rbox daemon already running (pid ${existing})`);
+      return;
+    }
+  } else if (existing) {
     // Stale pidfile (process died, or pid reused by something else) — clean it.
     await fsp.rm(pidPath(root), { force: true });
   }

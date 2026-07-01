@@ -38,6 +38,17 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
     expect(m.ignores("src/index.ts")).toBe(false);
     expect(m.ignores("node_modules/")).toBe(true); // a normal builtin
   });
+
+  test("a `.git` pointer FILE (worktree/submodule) is ignored, not just the dir", () => {
+    // A worktree checkout has `.git` as a FILE whose content is a machine-local
+    // absolute path — syncing it plants a dangling pointer on every other machine.
+    const m = buildIgnoreMatcher(root);
+    expect(m.ignores(".git")).toBe(true); // file form at the root
+    expect(m.ignores("savvy-core/daegu/.git")).toBe(true); // nested worktree pointer
+    expect(m.ignores(".git/")).toBe(true); // dir form still excluded
+    expect(m.ignores("repo/.git/config")).toBe(true);
+    expect(m.ignores("src/git-state.ts")).toBe(false); // only the exact name matches
+  });
 });
 
 describe("nativePruneGlobs — coarse native watcher prune, negation-aware (design §41)", () => {
