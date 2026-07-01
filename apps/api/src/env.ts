@@ -90,6 +90,13 @@ export interface Env {
   RBOX_RECEIPT_KEY?: string;
   /** Previous receipt key during rotation — accepted on verify, never minted with. */
   RBOX_RECEIPT_KEY_PREV?: string;
+  /** §27 download-grant HMAC key (≥32 bytes). Wrangler secret. BEST-EFFORT (unlike the
+   *  receipt key's fail-closed contract): when absent/short, `latest()` simply omits the
+   *  grant and blob GETs fall back to the D1 `isEntitled` path — a misconfigured key
+   *  degrades to "no speedup", never a broken pull. A forged grant is still rejected. */
+  RBOX_GRANT_KEY?: string;
+  /** Previous grant key during rotation — accepted on verify, never minted with. */
+  RBOX_GRANT_KEY_PREV?: string;
 
   // ── §32 observability ───────────────────────────────────────────────────────
   /** Slackpipes BUSINESS webhook (#rbox) — new account / subscription / churn pings.

@@ -23,6 +23,7 @@ import { webSession } from "./clerk.js";
 import { accountStatus, confirmLink, linkStatus, redeemLink, startLink, unlinkAccount } from "./account-link.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
+import { mintGrant } from "./grants.js";
 import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
 import { adminOverview } from "./admin.js";
 import { startOp } from "./metrics.js";
@@ -309,7 +310,9 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (!SHA_RE.test(sha)) throw badRequest("invalid sha256");
     if (seg.length === 3) {
       if (req.method === "PUT") return blobPut(req, env, sha, p.accountId);
-      if (req.method === "GET") return blobGet(env, sha, p.accountId);
+      // §27 — an optional download grant (from `latest()`) lets blobGet skip the per-blob
+      // D1 entitlement read. Absent/invalid → blobGet falls back to the D1 path.
+      if (req.method === "GET") return blobGet(env, sha, p.accountId, req.headers.get("x-rbox-download-grant") ?? undefined);
     }
     if (seg[3] === "multipart") {
       const uploadId = seg[4];
@@ -348,11 +351,38 @@ async function route(req: Request, env: Env): Promise<Response> {
         headers.set("x-rbox-account-epoch", String(epochRow?.epoch ?? 0));
         return stub.fetch(new Request(req, { headers }));
       }
-      return stub.fetch(req);
+      const res = await stub.fetch(req);
+      // §27 — piggyback a download grant on the pull handshake (the ONE place the caller
+      // is already authorized to the workspace, so it costs no extra D1). Minted
+      // WORKER-SIDE so the HMAC key never enters the DO. Best-effort: on any hiccup the
+      // DO response passes through and the client uses the D1 entitlement path.
+      if (action === "latest") return withDownloadGrant(env, res, p.accountId, ws);
+      return res;
     }
   }
 
   return jsonResponse({ error: "not_found" }, 404);
+}
+
+/** §27 — splice a best-effort download grant into a successful `latest()` response,
+ *  WORKER-SIDE (the `RBOX_GRANT_KEY` HMAC key never enters the WorkspaceSync DO). Mint is
+ *  best-effort: no key / non-2xx / non-object body ⇒ the DO response passes through
+ *  untouched and the client falls back to the D1 entitlement path. On success the client's
+ *  subsequent blob GETs present the grant and skip the per-blob D1 read (§27). */
+async function withDownloadGrant(env: Env, res: Response, accountId: string, workspaceId: string): Promise<Response> {
+  if (!res.ok) return res;
+  let body: unknown;
+  try {
+    body = await res.clone().json();
+  } catch {
+    return res; // not JSON — leave the DO response untouched
+  }
+  if (typeof body !== "object" || body === null) return res;
+  const grant = await mintGrant(env, { accountId, workspaceId, nowMs: Date.now() });
+  if (!grant) return res; // no grant key configured — best-effort no-op
+  const headers = new Headers(res.headers);
+  headers.delete("content-length"); // body length changed
+  return new Response(JSON.stringify({ ...(body as Record<string, unknown>), grant }), { status: res.status, headers });
 }
 
 // ---- helpers ------------------------------------------------------------

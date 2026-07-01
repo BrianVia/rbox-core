@@ -63,8 +63,22 @@ export class RboxApi implements SyncRemote {
   private readonly receipts = new Map<string, string>();
   private static readonly PROTO = "upload-receipts-v1";
 
+  // §27 — short-lived download grant handed back on the pull handshake (`latest()` /
+  // `latestCommit()`). Presented on each blob GET so the server skips the per-blob D1
+  // entitlement read. Refreshed every handshake; harmless when stale (an expired grant
+  // makes the server fall back to the D1 path, still serving an entitled account).
+  private downloadGrant?: string;
+
   private get auth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}` };
+  }
+  /** `auth` plus the §27 download grant when held (so blob GETs skip the D1 read). */
+  private get authDownload(): Record<string, string> {
+    return this.downloadGrant ? { ...this.auth, "x-rbox-download-grant": this.downloadGrant } : this.auth;
+  }
+  /** Capture a §27 grant from a `/latest` response body (no-op when absent — old server). */
+  private captureGrant(body: { grant?: unknown }): void {
+    if (typeof body.grant === "string") this.downloadGrant = body.grant;
   }
   private get protoAuth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}`, "x-rbox-protocol": RboxApi.PROTO };
@@ -97,7 +111,7 @@ export class RboxApi implements SyncRemote {
   }
 
   async getBlob(sha256: string): Promise<Buffer> {
-    const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, { headers: this.auth });
+    const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, { headers: this.authDownload });
     if (!res.ok) throw new Error(`blob GET failed: ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -210,7 +224,7 @@ export class RboxApi implements SyncRemote {
   /** Stream a blob to `destPath`, hashing as it lands; verify before returning.
    *  Any failure (network, write, or hash mismatch) removes the partial file. */
   async getBlobToFile(sha256: string, destPath: string): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, { headers: this.auth });
+    const res = await fetch(`${this.baseUrl}/v1/blobs/${sha256}`, { headers: this.authDownload });
     if (!res.ok || !res.body) throw new Error(`blob GET failed: ${res.status}`);
     const hash = createHash("sha256");
     const out = fs.createWriteStream(destPath);
@@ -316,7 +330,9 @@ export class RboxApi implements SyncRemote {
   async latestCommit(): Promise<{ sequence: number; commit: SignedCommit | null }> {
     const r = await fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/latest`, { headers: this.auth });
     if (!r.ok) throw new Error(`latest failed: ${r.status}`);
-    return (await r.json()) as { sequence: number; commit: SignedCommit | null };
+    const body = (await r.json()) as { sequence: number; commit: SignedCommit | null; grant?: unknown };
+    this.captureGrant(body); // §27 — the pull handshake hands back a download grant
+    return { sequence: body.sequence, commit: body.commit };
   }
 
   async commitsSince(since: number): Promise<Array<SignedCommit>> {
@@ -374,7 +390,9 @@ export class RboxApi implements SyncRemote {
       headers: this.auth,
     });
     if (!res.ok) throw new Error(`latest failed: ${res.status} ${await res.text()}`);
-    return (await res.json()) as { sequence: number; manifest: Manifest };
+    const body = (await res.json()) as { sequence: number; manifest: Manifest; grant?: unknown };
+    this.captureGrant(body); // §27 — capture the download grant on the legacy manifest path too
+    return { sequence: body.sequence, manifest: body.manifest };
   }
 
   /** Best-effort D1 commit mirror — ADVISORY display timestamps for `rbox versions`

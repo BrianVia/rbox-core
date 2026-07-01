@@ -1,7 +1,9 @@
 # §27 — Signed download grants (take D1 off the blob-GET hot path) (P1)
 
-> Status: **design (codex round-1 NEEDS-WORK — 2 open founder decisions block implementation; v4)**.
-> See **OPEN QUESTIONS (founder decision required)** below before writing any code. Basis:
+> Status: **IMPLEMENTED (v4) — founder-approved 2026-07-01; codex round-2 PASS (conditional
+> on Q1+Q2, both now YES)**. PR-only; not yet deployed (founder review + coordinated
+> client/server ship). See **FOUNDER DECISIONS (resolved)** and **Prerequisites before
+> multi-tenant launch** below. Basis:
 > [`22-server-throughput.md`](22-server-throughput.md); write-side analogue:
 > [`23-upload-receipts.md`](23-upload-receipts.md).
 > The pull-side mirror of §23: §23 made `PUT` D1-free with an HMAC upload **receipt**;
@@ -31,42 +33,41 @@ account-scoped, with an HMAC signature instead of a D1 row read.
 
 ---
 
-## OPEN QUESTIONS (founder decision required — implementation is BLOCKED on these)
+## FOUNDER DECISIONS (resolved — 2026-07-01)
 
 Codex round-1 verified the core technical claims (isEntitled is account-scoped, `blobKey` is
-global, `encSha` is ciphertext under a secret per-workspace KEK, GET writes no quota) but raised
-two findings it classified as **product/architecture decisions**, not mechanical fixes. Both are
-escalated here; **do not implement until they are answered.**
+global, `encSha` is ciphertext under a secret per-workspace KEK, GET writes no quota) and raised two
+**product/architecture decisions**. Both were escalated and are now **answered YES**:
 
-**Q1 (BLOCKER) — Is the production R2 bucket provably ciphertext-only?** The grant's cross-account
-safety rests on "an account can only *name* its own `encSha`s" (Security §3). That holds because the
-official client is fail-closed E2EE (`sync.ts:336-343` throws without a KEK; uploads only by
-`encSha`; `buildAuthedRemote` refuses pre-E2EE workspaces) — **but the server is
-content-agnostic**: `blobGet`/`blobPut` cannot distinguish an `encSha` from a plaintext `sha256`
-(both are `/^[0-9a-f]{64}$/`, `blobKey` is global), and there is **no server-side E2EE/roster gate
-on PUT**. So the invariant is *client-enforced only*. If any **legacy plaintext blob** (pre-E2EE
-M5 era) still lingers in the shared prod bucket keyed by a *globally-guessable* plaintext sha, a
-valid account grant would turn that guessable key into a cross-account read (skipping the `isEntitled`
-gate that blocks it today). Design 12 §9/§13.9 **mandated a pre-launch prod D1+R2 wipe** precisely
-because E2EE was greenfield (no plaintext→ciphertext migration). **Founder must confirm that wipe
-was executed** (bucket contains only E2EE ciphertext). Options if it cannot be confirmed: (a) run
-the wipe now (greenfield, no real users per design 12); (b) put grant-eligible E2EE blobs under a
-**separate R2 prefix** so a grant can never authorize a legacy-prefix key; (c) keep §27 deferred.
+**Q1 — Is the production R2 bucket provably ciphertext-only? → YES, proceed now (with a documented
+pre-multi-tenant gate).** The cross-account-read risk is **moot at current scale**: prod has exactly
+**one** account with blob refs, and it is greenfield E2EE-era (oldest blob 2026-06-30, postdating
+E2EE-only mode) — there is no second tenant to leak to and no pre-E2EE plaintext sediment (verified
+in prod D1). So §27 ships now. The multi-tenant precondition is captured below.
 
-**Q2 (MAJOR) — Accept `encSha` as a bearer capability for ciphertext + existence?** The grant path
-intentionally converts "any `encSha` the caller can name" into "200 if present / 404 if absent,
-served without a D1 entitlement check." For the caller's *own* account this is exactly today's
-reachable set; the residual is: a *leaked or shared* `encSha` (out-of-band) becomes a
-ciphertext-read + existence capability for whoever holds a valid grant for the owning account —
-whereas today `isEntitled` still 404s a known-but-unentitled sha. The bytes are always E2EE
-ciphertext (no plaintext ever), so this is a **confidentiality-of-*existence* + ciphertext-blob**
-trade, deliberately swapping the per-GET accounting check for E2EE-backed unguessability. The task
-framing ("a leaked grant → opaque bytes; the entitlement check is quota/access-accounting, not
-confidentiality") reads as founder acceptance of exactly this posture — **please confirm explicitly**,
-since it is the load-bearing security assumption of the whole design.
+**Q2 — Accept `encSha` as a bearer capability for ciphertext + existence? → YES (explicit).** Since
+blobs are E2EE ciphertext under a secret per-account/epoch KEK, a grant only ever exposes the
+account's **own** unguessable ciphertext (a leaked grant → opaque bytes). The per-GET `isEntitled`
+read is quota/access **accounting**, not confidentiality — confidentiality is E2EE. This is the
+deliberate, accepted trade that lets the hot path go D1-free.
 
-> If Q1 is confirmed (or resolved via a separate prefix) and Q2 is accepted, the rest of this doc is
-> implementation-ready and the remaining codex findings (below) are already resolved mechanically.
+## Prerequisites before multi-tenant launch (Q1 gate — a pre-MULTI-USER gate, NOT a pre-code gate)
+
+The grant's cross-account safety rests on "an account can only *name* its own `encSha`s" (Security
+§3). Today that is trivially true (one tenant). **Before onboarding a SECOND account**, R2 must be
+**provably ciphertext-only**, because the server is content-agnostic — `blobGet`/`blobPut` cannot
+distinguish an `encSha` from a plaintext `sha256` (both are `/^[0-9a-f]{64}$/`, `blobKey` is global),
+and there is **no server-side E2EE/roster gate on PUT**. So the invariant is *client-enforced only*.
+Satisfy **at least one** before multi-tenant launch:
+- **(a)** Confirm the design-12 §9/§13.9 pre-launch prod R2 wipe was executed (bucket contains only
+  E2EE ciphertext) and that no non-E2EE client can write to the shared bucket; **or**
+- **(b)** Add a **server-side E2EE-only PUT gate** (reject/namespace plaintext writes); **or**
+- **(c)** Put grant-eligible E2EE blobs under a **separate R2 prefix** so a grant can never
+  authorize a legacy-prefix key.
+
+If none holds at the point a second tenant is added, a valid account grant could turn a
+globally-guessable plaintext key (legacy sediment) into a cross-account read. This is the ONLY
+residual and it is bounded to the multi-tenant transition.
 
 ---
 
@@ -174,19 +175,22 @@ bearer token that stands alone.
 - `getBlobToFile` / `getBlob` attach `x-rbox-download-grant` when a grant is held. One `RboxApi`
   instance backs every GET in a run (via `E2eeRemote` → `RemoteBlobStore` → `applyActions`), so a
   single stashed grant covers the whole pull, **including the git-section GETs** in `sync.ts`.
-- **Long-pull refresh:** if a GET returns `404` while a grant *was* presented and the grant is now
-  within `GRANT_SKEW` of expiry (or the client's clock says it is expired), the client re-calls
-  `latest()` once to obtain a fresh grant and retries the GET. This keeps `GRANT_TTL` short for
-  revocation while covering clones that outlast one TTL. (A 404 is also the legitimate
-  "blob genuinely gone" answer, so the refresh-and-retry is attempted **at most once per blob**;
-  a second 404 is surfaced as today.)
+- **Long-pull expiry needs NO client refresh (simplified in impl).** Because the server retains the
+  D1 `isEntitled` fallback for any invalid/expired grant, a grant that expires mid-pull does **not**
+  cause a failure: the server silently falls back to the D1 path and an entitled account is still
+  served 200. So a clone that outlasts `GRANT_TTL` simply runs its tail on the (correct, secure) D1
+  path — slower, never broken. Client-side grant refresh is therefore a pure **perf** optimization,
+  **deferred** (not implemented in v1): the client presents whatever grant it last captured; each new
+  `latestCommit()` naturally refreshes it. (A future daemon that pulls continuously can re-capture on
+  its periodic head check.) This removes the refresh-on-404 retry logic and its edge cases entirely.
 
 ### TTL
 
-`GRANT_TTL_MS = 300_000` (5 min). Rationale: long enough to cover a typical clone without a
-mid-pull refresh (a 4287-blob dev clone is ~23–28 s); short enough that the revocation residual
-(below) is a few minutes, not the receipt's 12 h. Big-monorepo clones that exceed 5 min are
-covered by the client refresh above. `CLOCK_SKEW_MS = 60_000` on `t`, matching receipts.
+`GRANT_TTL_MS = 300_000` (5 min). Rationale: long enough to cover a typical clone (a 4287-blob dev
+clone is ~23–28 s); short enough that a *stolen* grant (which also needs the account's device token
+to pass the account bind) is useful only briefly. Big-monorepo clones that exceed 5 min are not a
+problem — the tail runs on the D1 fallback (see Client). `CLOCK_SKEW_MS = 60_000` on `t`, matching
+receipts.
 
 ## Scope: account-scoped, and why that is the *correct* scope (not just simplest)
 
