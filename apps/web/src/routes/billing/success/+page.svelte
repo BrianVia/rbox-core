@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { fetchUsage } from '$lib/api';
+	import Loading from '$lib/components/loading.svelte';
 
 	// The plan flips on the Stripe subscription webhook, not on this browser return
 	// (SF4). Poll usage until it leaves `free`, then hand off to the dashboard — which
@@ -31,5 +32,5 @@
 </script>
 
 {#if !done}
-	<p class="muted">Finalizing your subscription…</p>
+	<Loading label="Finalizing your subscription…" />
 {/if}

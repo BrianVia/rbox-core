@@ -4,6 +4,13 @@
 	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { startLink, pollLinkStatus, confirmLink, type LinkStatus } from '$lib/api';
 	import { errMsg } from '$lib/format';
+	import { Button } from '$lib/components/ui/button';
+	import PageHeader from '$lib/components/page-header.svelte';
+	import Callout from '$lib/components/callout.svelte';
+	import CommandRow from '$lib/components/command-row.svelte';
+	import Step from '$lib/components/step.svelte';
+	import CheckIcon from '@lucide/svelte/icons/check';
+	import LoaderIcon from '@lucide/svelte/icons/loader-circle';
 
 	type Phase = 'idle' | 'showing-code' | 'pending' | 'done';
 
@@ -18,10 +25,7 @@
 
 	requireAuth(); // not signed in → /
 
-	onDestroy(() => {
-		stopPolling();
-		if (copiedTimer) clearTimeout(copiedTimer);
-	});
+	onDestroy(stopPolling);
 	function stopPolling() {
 		if (poller) clearInterval(poller);
 		poller = null;
@@ -80,147 +84,66 @@
 		}
 	}
 
-	let copied = $state(false);
-	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
-
-	async function copyCode() {
-		try {
-			// Copy the whole command, not the bare code — the user is told to run
-			// `rbox account link <code>`, so that's what the button should hand them.
-			await navigator.clipboard.writeText(`rbox account link ${code}`);
-			copied = true;
-			if (copiedTimer) clearTimeout(copiedTimer);
-			copiedTimer = setTimeout(() => (copied = false), 2000);
-		} catch {
-			/* clipboard blocked — the command is visible to copy manually */
-		}
-	}
 </script>
 
-<section class="wrap">
-	<h1>Link your CLI account</h1>
-	<p class="lead">
-		Connect the <code>rbox</code> account on your machines to this web login, so the dashboard
-		manages your real devices, workspaces, and billing.
+<PageHeader
+	title="Link your CLI account"
+	description="Connect the rbox account on your machines to this web login, so the dashboard manages your real devices, workspaces, and billing."
+/>
+
+{#if error}
+	<Callout class="mb-4">{error}</Callout>
+{/if}
+
+{#if phase === 'idle'}
+	<p class="text-sm text-muted-foreground">
+		You'll get a one-time code to paste into a terminal that's already signed in to your rbox account,
+		then approve the match here.
 	</p>
-
-	{#if error}<p class="error">{error}</p>{/if}
-
-	{#if phase === 'idle'}
-		<p class="muted">
-			You’ll get a one-time code to paste into a terminal that’s already signed in to your rbox
-			account, then approve the match here.
+	<div class="mt-5 flex gap-2">
+		<Button disabled={busy} onclick={begin}>Start linking</Button>
+		<Button variant="ghost" onclick={() => goto('/dashboard')}>Back to overview</Button>
+	</div>
+{:else if phase === 'showing-code'}
+	<ol class="flex flex-col gap-5">
+		<Step n={1}>
+			<p class="text-sm">Run this in a terminal signed in to your rbox account (an owner device):</p>
+			<CommandRow command={`rbox account link ${code}`} />
+		</Step>
+		<Step n={2}>
+			<p class="text-sm">Come back here — we'll show the account it proposes to link.</p>
+		</Step>
+	</ol>
+	<p class="mt-6 flex items-center gap-2 text-sm text-muted-foreground">
+		<LoaderIcon class="size-4 animate-spin" /> Waiting for a terminal to redeem the code…
+	</p>
+{:else if phase === 'pending' && proposed}
+	<div class="rounded-xl border border-border bg-card p-6">
+		<p class="text-sm">
+			A terminal wants to link this web login to account
+			<strong class="font-mono font-medium">{proposed.fingerprint}</strong>.
 		</p>
-		<button class="primary" disabled={busy} onclick={begin}>Start linking</button>
-		<button class="ghost" onclick={() => goto('/dashboard')}>Back to dashboard</button>
-	{:else if phase === 'showing-code'}
-		<ol class="steps">
-			<li>
-				Run this in a terminal signed in to your rbox account (an owner device):
-				<div class="code-row">
-					<code class="code">rbox account link {code}</code>
-					<button class="ghost small" onclick={copyCode}>{copied ? 'Copied ✓' : 'Copy'}</button>
-				</div>
-			</li>
-			<li>Come back here — we’ll show the account it proposes to link.</li>
-		</ol>
-		<p class="muted waiting">Waiting for a terminal to redeem the code…</p>
-	{:else if phase === 'pending' && proposed}
-		<div class="confirm-card">
-			<p>
-				A terminal wants to link this web login to account
-				<strong class="fp">{proposed.fingerprint}</strong>.
-			</p>
-			<p class="muted small">Account <code>{proposed.pendingAccount}</code></p>
-			<p class="muted small">
-				Only approve if you started this from your own machine. Approving moves billing and device
-				management to that account.
-			</p>
-			<div class="row">
-				<button class="primary" disabled={busy} onclick={approve}>Approve &amp; link</button>
-				<button class="ghost" disabled={busy} onclick={() => goto('/dashboard')}>Decline</button>
-			</div>
+		<p class="mt-1 text-sm text-muted-foreground">
+			Account <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{proposed.pendingAccount}</code>
+		</p>
+		<p class="mt-3 text-sm text-muted-foreground">
+			Only approve if you started this from your own machine. Approving moves billing and device
+			management to that account.
+		</p>
+		<div class="mt-5 flex gap-2">
+			<Button disabled={busy} onclick={approve}>Approve &amp; link</Button>
+			<Button variant="ghost" disabled={busy} onclick={() => goto('/dashboard')}>Decline</Button>
 		</div>
-	{:else if phase === 'done'}
-		<div class="done-card">
-			<p class="ok">✓ Linked.</p>
-			<p class="muted small">This login now manages account <code>{linkedAccount}</code>.</p>
-			<button class="primary" onclick={() => goto('/dashboard')}>Go to dashboard</button>
-		</div>
-	{/if}
-</section>
-
-<style>
-	.wrap {
-		max-width: 560px;
-	}
-	h1 {
-		font-size: 22px;
-		margin-bottom: 6px;
-	}
-	.lead {
-		color: var(--dim);
-		margin-bottom: 18px;
-	}
-	.muted {
-		color: var(--dim);
-	}
-	.small {
-		font-size: 13px;
-	}
-	.waiting {
-		margin-top: 14px;
-	}
-	.steps {
-		display: flex;
-		flex-direction: column;
-		gap: 14px;
-		padding-left: 18px;
-		margin: 8px 0 4px;
-	}
-	.code-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		margin-top: 8px;
-	}
-	.code {
-		flex: 1;
-		display: block;
-		padding: 10px 12px;
-		border-radius: 10px;
-		border: 1px solid var(--border);
-		background: rgba(255, 255, 255, 0.03);
-		font-family: ui-monospace, monospace;
-		font-size: 13px;
-		overflow-x: auto;
-		white-space: nowrap;
-	}
-	.confirm-card,
-	.done-card {
-		padding: 18px 20px;
-		border-radius: 14px;
-		border: 1px solid var(--border);
-		background: rgba(255, 255, 255, 0.02);
-	}
-	.fp {
-		font-family: ui-monospace, monospace;
-	}
-	.ok {
-		font-size: 18px;
-		font-weight: 700;
-		color: var(--accent-2, #36d6c3);
-	}
-	.row {
-		display: flex;
-		gap: 8px;
-		margin-top: 16px;
-	}
-	button {
-		margin-top: 12px;
-		margin-right: 8px;
-	}
-	button.small {
-		margin: 0;
-	}
-</style>
+	</div>
+{:else if phase === 'done'}
+	<div class="rounded-xl border border-border bg-card p-6">
+		<p class="flex items-center gap-2 text-base font-semibold">
+			<CheckIcon class="size-5 text-success" /> Linked
+		</p>
+		<p class="mt-2 text-sm text-muted-foreground">
+			This login now manages account
+			<code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{linkedAccount}</code>.
+		</p>
+		<Button class="mt-4" onclick={() => goto('/dashboard')}>Go to overview</Button>
+	</div>
+{/if}
