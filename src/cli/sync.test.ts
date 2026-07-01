@@ -3,11 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { pull, push, sync, type SyncDeps } from "./sync.js";
+import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { PhaseReport, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { PhaseReport, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -250,16 +250,98 @@ test("sha_mismatch once: a file that changes under the push RE-SCANS + retries +
   expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(true);
 });
 
-test("sha_mismatch forever: a file that keeps changing → bounded retries, typed error, NO infinite loop", async () => {
-  const remote = new FakeRemote();
-  const content = "never settles\n";
-  await write("f.txt", content);
-  remote.forceShaMismatchAlways = (await enc(content)).encSha; // every attempt 400s
+// ── live-folder partial progress: a churning file is DEFERRED, the rest commits ──
 
-  // noBackoff (via deps) means this resolves immediately if the bound holds; a missing
-  // bound would hang/stack-overflow instead of throwing.
-  await expect(push(root, cfg, deps(remote))).rejects.toThrow(/kept changing/);
-  expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(false); // never committed
+test("a file that NEVER settles is deferred; the push SUCCEEDS committing the OTHER (stable) files", async () => {
+  const remote = new FakeRemote();
+  await write("stable.txt", "stable content\n");
+  await write("churner.txt", "never settles\n");
+  // The churner's ciphertext is rejected on every attempt (it keeps changing under us);
+  // its bounded per-file retries exhaust → it's deferred, NOT a whole-push abort.
+  remote.forceShaMismatchAlways = (await enc("never settles\n")).encSha;
+
+  const local = await scanManifest(root, undefined, undefined);
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(res.sequence).toBe(1); // committed — the push made progress (did not abort)
+  expect(remote.headSeq()).toBe(1);
+  expect(res.deferred).toEqual(["churner.txt"]); // the churner is reported as deferred (count/paths)
+
+  const committed = (await remote.latest()).manifest;
+  expect(committed.files.some((f) => f.path === "churner.txt")).toBe(false); // never-synced deferred → OMITTED
+  expect(committed.files.some((f) => f.path === "stable.txt")).toBe(true); // the stable file committed
+  expect(remote.hasBlob((await enc("stable content\n")).encSha)).toBe(true);
+  // Invariant: the committed manifest references no blob that isn't present on the server.
+  for (const f of committed.files) if (f.type === "file") expect(remote.hasBlob(f.encSha!)).toBe(true);
+});
+
+test("a mismatch ONCE then settles is INCLUDED (bounded per-file retry heals it, not deferred)", async () => {
+  const remote = new FakeRemote();
+  const content = "flickers once\n";
+  await write("f.txt", content);
+  remote.forceShaMismatchOnce = (await enc(content)).encSha; // 400s once, then heals
+
+  const local = await scanManifest(root, undefined, undefined);
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(res.sequence).toBe(1);
+  expect(res.deferred).toEqual([]); // healed on retry → NOT deferred
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(true);
+});
+
+test("a previously-synced file that starts churning carries its BASE version (never a deletion)", async () => {
+  const remote = new FakeRemote();
+  await write("doc.txt", "v1\n");
+  await push(root, cfg, deps(remote)); // doc.txt synced at v1
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "doc.txt")).toBe(true);
+
+  // doc.txt now churns to v2 whose ciphertext never lands; a sibling changes cleanly.
+  await write("doc.txt", "v2\n");
+  await write("other.txt", "fresh\n");
+  remote.forceShaMismatchAlways = (await enc("v2\n")).encSha;
+
+  const local = await scanManifest(root, undefined, undefined);
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(res.deferred).toEqual(["doc.txt"]);
+  const committed = (await remote.latest()).manifest;
+  const doc = committed.files.find((f) => f.path === "doc.txt");
+  expect(doc).toBeDefined(); // carried forward — NOT read as a deletion on other machines
+  expect(doc!.sha256).toBe(sha("v1\n")); // its BASE (v1) entry, not the un-uploadable v2
+  expect(remote.hasBlob(doc!.encSha!)).toBe(true); // the carried base blob is present
+  expect(committed.files.some((f) => f.path === "other.txt")).toBe(true); // sibling committed
+});
+
+test("convergent duplicates (identical content) commit under ONE shared blob, both paths present", async () => {
+  const remote = new FakeRemote();
+  const content = "shared bytes\n";
+  await write("a.txt", content);
+  await write("b.txt", content); // identical → same encSha (convergent)
+
+  const local = await scanManifest(root, undefined, undefined);
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(res.deferred).toEqual([]);
+  const committed = (await remote.latest()).manifest;
+  expect(committed.files.some((f) => f.path === "a.txt")).toBe(true);
+  expect(committed.files.some((f) => f.path === "b.txt")).toBe(true);
+  const encSha = (await enc(content)).encSha;
+  expect(committed.files.filter((f) => f.type === "file").every((f) => f.encSha === encSha)).toBe(true);
+  expect(remote.hasBlob(encSha)).toBe(true);
+});
+
+test("when EVERY change is deferred and git is unchanged, the push makes NO (empty) commit", async () => {
+  const remote = new FakeRemote();
+  await write("churner.txt", "never\n");
+  remote.forceShaMismatchAlways = (await enc("never\n")).encSha;
+
+  const before = remote.commitCalls;
+  const local = await scanManifest(root, undefined, undefined);
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(remote.commitCalls).toBe(before); // no commit attempted — nothing stable to commit
+  expect(res.sequence).toBe(0); // base sequence unchanged
+  expect(res.deferred).toEqual(["churner.txt"]);
 });
 
 // ── pull validation: invalid remote manifest never touches disk / base ──────
