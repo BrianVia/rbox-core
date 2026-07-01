@@ -1,9 +1,14 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { accountLink, accountStatus, accountUnlink } from "./account-cmd.js";
+import { accountLink, accountStatus, accountUnlink, fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 
 // Drive the CLI account verbs against a stubbed control plane. loadCredentials()
 // honors RBOX_TOKEN/RBOX_API env overrides, so no file or module mock is needed —
 // we exercise the real status-code → behavior control flow.
+
+// `style` (imported by account-cmd) may emit ANSI when the test env forces color, so
+// strip escapes before substring/pattern assertions on rendered output.
+// eslint-disable-next-line no-control-regex
+const plain = (s: string) => s.replace(/\[[0-9;]*m/g, "");
 
 const origFetch = globalThis.fetch;
 const origLog = console.log;
@@ -66,11 +71,12 @@ describe("rbox account link", () => {
 });
 
 describe("rbox account status / unlink", () => {
-  test("status prints the account id and linked state", async () => {
-    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true } }));
+  test("status prints the account id, plan and linked state", async () => {
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro" } }));
     await accountStatus();
     const out = logs.join("\n");
     expect(out).toContain("acct_xyz");
+    expect(out).toMatch(/plan:\s*pro/i);
     expect(out).toMatch(/linked:\s*yes/i);
   });
 
@@ -85,5 +91,66 @@ describe("rbox account status / unlink", () => {
     stub(() => ({ status: 200, body: { ok: true, account: "acct_fresh" } }));
     await accountUnlink();
     expect(logs.join("\n").toLowerCase()).toContain("unlinked");
+  });
+});
+
+// The ACCOUNT section of `rbox status` (design 21). fetchAccountSummary is the
+// local-first, best-effort contract: it must resolve to a rendered state for every
+// input (online, offline, timeout, signed-out) and NEVER reject or hang — a throwing
+// account fetch would take the whole (otherwise-local) `rbox status` down with it.
+describe("rbox status — account section", () => {
+  test("ok: formats account id, plan and linked=yes", async () => {
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "solo" } }));
+    const summary = await fetchAccountSummary();
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_xyz", plan: "solo", linked: true } });
+    const out = plain(formatAccountSummary(summary).join("\n"));
+    expect(out).toContain("acct_xyz");
+    expect(out).toMatch(/plan:\s*solo/i);
+    expect(out).toMatch(/linked:\s*yes/i);
+  });
+
+  test("ok: an API without the plan field degrades to `free`, not a failure", async () => {
+    stub(() => ({ status: 200, body: { accountId: "acct_old", linked: false } }));
+    const summary = await fetchAccountSummary();
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "free", linked: false } });
+    expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*free/i);
+    expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/linked:\s*no/i);
+  });
+
+  test("graceful degradation: a thrown fetch resolves to `unavailable`, never rejects", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("ENETUNREACH");
+    }) as unknown as typeof fetch;
+    const summary = await fetchAccountSummary();
+    expect(summary).toEqual({ state: "unavailable" });
+    expect(plain(formatAccountSummary(summary).join("\n")).toLowerCase()).toContain("unavailable");
+  });
+
+  test("graceful degradation: a non-2xx (e.g. 500) is `unavailable`, not a throw", async () => {
+    stub(() => ({ status: 500 }));
+    expect(await fetchAccountSummary()).toEqual({ state: "unavailable" });
+  });
+
+  test("timeout: a hung request aborts and resolves to `unavailable` within the budget", async () => {
+    // A fetch that never resolves on its own — only the AbortSignal ends it. If the
+    // timeout weren't wired up this test would hang, so it also guards against a hang.
+    globalThis.fetch = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      })) as unknown as typeof fetch;
+    const started = Date.now();
+    const summary = await fetchAccountSummary(20);
+    expect(summary).toEqual({ state: "unavailable" });
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  test("signed-out renders a `not signed in` hint (no account id / plan lines)", () => {
+    // The signed-out branch is decided by loadCredentials() (file/env, not stubbable
+    // under Bun's real os.homedir), so assert the rendering contract directly.
+    const lines = formatAccountSummary({ state: "signed-out" });
+    expect(lines.length).toBe(1);
+    const out = plain(lines[0]!).toLowerCase();
+    expect(out).toContain("not signed in");
+    expect(out).toContain("rbox login");
   });
 });
