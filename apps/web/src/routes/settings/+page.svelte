@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { authState, requireAuth } from '$lib/auth.svelte';
-	import { fetchAccountStatus, unlinkAccount } from '$lib/api';
+	import { fetchAccountStatus, unlinkAccount, deleteAccount } from '$lib/api';
 	import { errMsg } from '$lib/format';
 
 	let linked = $state<boolean | null>(null);
@@ -11,6 +11,34 @@
 	let busy = $state(false);
 	let confirming = $state(false);
 	let done = $state('');
+
+	// Danger zone — irreversible account deletion (design 37).
+	let dangerOpen = $state(false);
+	let deleteInput = $state('');
+	let deleteBusy = $state(false);
+	let deleteError = $state('');
+	const ownerEmail = $derived(authState.clerk?.user?.primaryEmailAddress?.emailAddress ?? '');
+	// The confirmation the server accepts: the owner's email OR the account id.
+	const deleteArmed = $derived(
+		deleteInput.trim().length > 0 &&
+			(deleteInput.trim().toLowerCase() === ownerEmail.trim().toLowerCase() ||
+				deleteInput.trim().toLowerCase() === accountId.trim().toLowerCase())
+	);
+
+	async function doDelete() {
+		if (!authState.clerk || deleteBusy || !deleteArmed) return;
+		deleteBusy = true;
+		deleteError = '';
+		try {
+			await deleteAccount(authState.clerk, deleteInput.trim());
+			// Account is tombstoned + this session is revoked server-side — sign out and leave.
+			await authState.clerk.signOut();
+			goto('/');
+		} catch (e) {
+			deleteError = errMsg(e);
+			deleteBusy = false;
+		}
+	}
 
 	requireAuth(); // not signed in → /
 
@@ -98,6 +126,53 @@
 			<button class="primary" onclick={() => goto('/link')}>Link your CLI account</button>
 		{/if}
 	</section>
+
+	<!-- Danger zone — irreversible account + data deletion (design 37). Distinct from
+	     Disconnect above: this ERASES the account, its devices, workspaces, files, billing,
+	     and login. Owner-only on the server; typed-confirmation gated here. -->
+	<section class="block danger-zone">
+		<h2>Danger zone</h2>
+		<p class="lead">Delete this account and everything in it.</p>
+		<p class="faint small">
+			This permanently erases <strong>account {accountId}</strong>: every device and web
+			session, all workspaces and synced files, your billing/subscription, and this login.
+			It cannot be undone after a short grace window. Your other accounts (if any) are
+			untouched.
+		</p>
+		{#if !dangerOpen}
+			<button class="danger" onclick={() => (dangerOpen = true)}>Delete account…</button>
+		{:else}
+			<div class="confirm">
+				{#if deleteError}<p class="error">{deleteError}</p>{/if}
+				<label class="small" for="del-confirm">
+					Type your account {ownerEmail ? 'email' : 'id'}
+					<code>{ownerEmail || accountId}</code> to confirm:
+				</label>
+				<input
+					id="del-confirm"
+					class="del-input"
+					autocomplete="off"
+					bind:value={deleteInput}
+					placeholder={ownerEmail || accountId}
+					disabled={deleteBusy}
+				/>
+				<div class="row">
+					<button class="danger" disabled={!deleteArmed || deleteBusy} onclick={doDelete}>
+						{deleteBusy ? 'Deleting…' : 'Permanently delete this account'}
+					</button>
+					<button
+						class="ghost"
+						disabled={deleteBusy}
+						onclick={() => {
+							dangerOpen = false;
+							deleteInput = '';
+							deleteError = '';
+						}}>Cancel</button
+					>
+				</div>
+			</div>
+		{/if}
+	</section>
 {/if}
 
 <style>
@@ -165,5 +240,24 @@
 	}
 	.danger:hover:not(:disabled) {
 		border-color: rgba(255, 107, 107, 0.7);
+	}
+	.danger:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.danger-zone {
+		margin-top: 20px;
+		border-color: rgba(255, 107, 107, 0.3);
+	}
+	.del-input {
+		width: 100%;
+		margin: 8px 0 12px;
+		padding: 8px 10px;
+		border-radius: 8px;
+		border: 1px solid var(--border);
+		background: rgba(0, 0, 0, 0.2);
+		color: inherit;
+		font-family: ui-monospace, monospace;
+		font-size: 13px;
 	}
 </style>

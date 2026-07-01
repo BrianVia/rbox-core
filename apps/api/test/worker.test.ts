@@ -847,7 +847,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
     const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications"];
     const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates"]; // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient GC marker
-    const EXCLUDED = ["audit_log"]; // append-only forensic log (§3.4) — never blocks
+    // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
+    // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
+    // link-reclaimed), so neither blocks reclaim.
+    const EXCLUDED = ["audit_log", "account_deletions"];
     const known = new Set([...COVERED, ...EXPECTED_CLEANED, ...EXCLUDED]);
     const uncategorized = accountScoped.filter((t) => !known.has(t));
     expect(uncategorized).toEqual([]); // ← a NEW account_id table: categorize it in loadShellState/judgeReclaimable + here

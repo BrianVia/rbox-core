@@ -62,6 +62,16 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
     .bind(hash, Date.now())
     .first<{ device_id: string; account_id: string; user_id: string | null; last_seen_at: number | null; expires_at: number | null; role: string | null }>();
   if (!row) return null;
+  // design 37: a token is valid ONLY if its account row EXISTS and is not tombstoned
+  // (deleted_at IS NULL) — so a tombstoned account, OR an orphan device whose account row is
+  // gone (a redeem that raced the purge), rejects EVERY token (fail-closed). Account state is the
+  // ACCOUNT-DATA plane (dbFor), so this is a SEPARATE point read on the resolved account, never a
+  // cross-plane JOIN with the directory-plane device lookup above. The legacy platform account
+  // 'default' (which may have no `accounts` row) is the sole exception.
+  if (row.account_id !== "default") {
+    const acct = await dbFor(env, row.account_id).prepare("SELECT deleted_at FROM accounts WHERE id = ?").bind(row.account_id).first<{ deleted_at: number | null }>();
+    if (!acct || acct.deleted_at !== null) return null;
+  }
   const now = Date.now();
   if (!row.last_seen_at || now - row.last_seen_at > LAST_SEEN_THROTTLE_MS) {
     await dirDb(env).prepare("UPDATE devices SET last_seen_at = ? WHERE token_hash = ?").bind(now, hash).run().catch(() => {});
@@ -120,15 +130,31 @@ async function mintWithRetry<T>(env: Env, label: string, attempt: () => Promise<
       // FLAG: mintDeviceWithNotification rides an account-data `device_notifications`
       // outbox INSERT in this same batch (§6f) — a cross-plane coupling that is one
       // binding at N=1 but needs splitting under real sharding.
-      await dirDb(env).batch(statements);
+      const results = await dirDb(env).batch(statements);
+      // design 37: statements[0] is the liveness-guarded device INSERT. changes==0 means the
+      // account was tombstoned (or vanished) mid-flight, so NO `devices` row was written (and the
+      // outbox INSERT, guarded identically, also wrote nothing) → the mint FAILS, no orphan rows.
+      // A uniqueness collision THROWS (caught below) rather than returning 0, so 0 is unambiguous.
+      if ((results[0]?.meta.changes ?? 0) === 0) throw new AccountGoneError(label);
       return value;
     } catch (e) {
       lastErr = e;
+      if (e instanceof AccountGoneError) throw e; // account tombstoned mid-mint → surface (no retry)
       if (!isUniqueViolation(e)) throw e; // unrelated failure → surface immediately
       // token_hash or device_id collided → regenerate both and retry
     }
   }
   throw new Error(`${label}: exhausted ${MINT_MAX_ATTEMPTS} attempts: ${String((lastErr as Error)?.message ?? lastErr)}`);
+}
+
+/** Thrown when a mint is blocked because its target account was TOMBSTONED mid-flight (the
+ *  liveness-guarded device INSERT landed 0 rows). Public mint routes catch it and return a clean
+ *  "account deleted" error instead of a 500 — no `devices` row was written (design 37). */
+export class AccountGoneError extends Error {
+  constructor(label: string) {
+    super(`${label}: account tombstoned mid-mint`);
+    this.name = "AccountGoneError";
+  }
 }
 
 /** A device mint, PREPARED (token generated, INSERT not yet run) so a caller can batch
@@ -147,9 +173,20 @@ export async function prepareMintDevice(
   const deviceId = genDeviceId();
   const token = randomHex(TOKEN_BYTES);
   const tokenHash = await sha256Hex(token);
+  // design 37: COUPLE the device insert to account liveness so a mint can't create a `devices`
+  // row for a TOMBSTONED account even if deletion tombstones it AFTER a caller's pre-mint
+  // liveness read (the TOCTOU). The guarded INSERT…SELECT…WHERE EXISTS lands 0 rows when the
+  // account is gone; `mintWithRetry` detects changes==0 and fails the mint (no row written). The
+  // legacy platform account 'default' (which may have no `accounts` row) is the sole bypass,
+  // matching authenticate(). §32 FLAG: the `accounts` EXISTS sub-select is account-data plane
+  // while `devices` is directory-plane — one binding at N=1, a cross-plane coupling under sharding.
   const insert = dirDb(env)
-    .prepare("INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt);
+    .prepare(
+      `INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL) OR ? = 'default'`,
+    )
+    .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt, accountId, accountId);
   return { token, tokenHash, deviceId, insert };
 }
 
@@ -289,7 +326,9 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   // recover MK. Best-effort: a scrub failure only weakens defense-in-depth, never blocks.
   await dirDb(env).prepare("UPDATE pairing_tokens SET mk_wrap = NULL, admission_grant = NULL WHERE token_hash = ?").bind(hash).run().catch(() => {});
 
-  // Fail-closed live authority check: creator device non-revoked AND user a member.
+  // Fail-closed live authority check: creator device non-revoked AND user a member (directory
+  // plane). The account-liveness gate is a SEPARATE account-data-plane read below — never a
+  // cross-plane JOIN.
   const live = await dirDb(env)
     .prepare(
       `SELECT 1 FROM memberships m
@@ -299,6 +338,10 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     .bind(consumed.account_id, consumed.user_id, consumed.created_by)
     .first();
   if (!live) return json({ error: "unauthorized" }, 401); // source revoked / membership gone (token already burned)
+  // design 37: a pairing token must not mint a usable device into a TOMBSTONED account during
+  // its grace window. accounts is account-data plane → a point read on the resolved account.
+  const acctLive = await dbFor(env, consumed.account_id).prepare("SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(consumed.account_id).first();
+  if (!acctLive) return json({ error: "unauthorized" }, 401); // account tombstoned (token already burned)
 
   try {
     // Durable credential mint → also write the new-device-notification outbox row in
@@ -318,6 +361,9 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     // only the SIGNED accountId (verified roster/grant), cross-checking this (D7).
     return json({ token: minted, deviceId, accountId: consumed.account_id, mkWrap: consumed.mk_wrap, admissionGrant: consumed.admission_grant });
   } catch (e) {
+    // design 37: account tombstoned between the live-authority read and the device insert →
+    // the guarded mint wrote NO rows. Uniform unauthorized (token already burned).
+    if (e instanceof AccountGoneError) return json({ error: "unauthorized" }, 401);
     logErr("pair_redeem_mint_failed", e); // token burned; no raw message (touches account/device material)
     return json({ error: "internal" }, 500);
   }
@@ -386,6 +432,15 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
   if (row.status === "pending") return json({ status: "pending", interval: POLL_INTERVAL_S });
   if (row.status === "claimed") return json({ status: "claimed" }); // token already delivered, never again
   if (row.status === "approved") {
+    // design 37: never mint a device into a tombstoned/erased account. The approver's account
+    // ('default' legacy excepted) must still exist and be live. Checked before the claim so a
+    // doomed mint doesn't burn the one-time approval.
+    const acctId = row.account_id ?? "default";
+    if (acctId !== "default") {
+      // accounts is account-data plane → a point read on the approver's account (design 37).
+      const acctLive = await dbFor(env, acctId).prepare("SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(acctId).first();
+      if (!acctLive) return json({ status: "expired" }); // account tombstoned/gone → can't mint
+    }
     // One-time claim: only the poll that wins the conditional UPDATE mints+returns.
     const claim = await dirDb(env)
       .prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ? AND status = 'approved'")
@@ -398,16 +453,24 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
     // notification outbox commit atomically; then enqueue (design 16 §1.1: notify on a
     // durable mint via device-code claim).
     let firstCandidate = true;
-    const { token, deviceId } = await mintDeviceWithNotification(env, {
-      accountId: row.account_id ?? "default",
-      userId: row.user_id ?? "",
-      label: row.label,
-      event: "device_code",
-      ip: clientIp(req),
-      geo: clientGeo(req),
-      genDeviceId: () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
-    });
-    return json({ status: "approved", token, deviceId, accountId: row.account_id });
+    let minted: { token: string; deviceId: string };
+    try {
+      minted = await mintDeviceWithNotification(env, {
+        accountId: row.account_id ?? "default",
+        userId: row.user_id ?? "",
+        label: row.label,
+        event: "device_code",
+        ip: clientIp(req),
+        geo: clientGeo(req),
+        genDeviceId: () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
+      });
+    } catch (e) {
+      // design 37: account tombstoned between the liveness read and the device insert → the
+      // guarded mint wrote NO rows. The device-code is already claimed (dead); report expired.
+      if (e instanceof AccountGoneError) return json({ status: "expired" });
+      throw e;
+    }
+    return json({ status: "approved", token: minted.token, deviceId: minted.deviceId, accountId: row.account_id });
   }
   return json({ status: row.status });
 }

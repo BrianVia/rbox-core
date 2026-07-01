@@ -27,7 +27,12 @@ export async function reachableFromWorkspaces(env: Env, rows: Array<{ workspace_
   await Promise.all(
     rows.map(async (w) => {
       const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
-      const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${w.workspace_id}/proj/${w.project_id}/roots`);
+      // Slash-safe addressing (design 37 §4f follow-up): a positional `…/proj/:proj/roots` path
+      // mis-parses a project_id containing "/" → 404 → the fail-closed sweep reclaims NOTHING
+      // (indefinite leak of blobs the account-deletion path condemned). Use the DO's FIXED
+      // `/roots` path with ws/proj in the query instead.
+      const q = `?ws=${encodeURIComponent(w.workspace_id)}&proj=${encodeURIComponent(w.project_id)}`;
+      const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/roots${q}`);
       if (!res.ok) throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`);
       const { roots } = (await res.json()) as { roots: Array<{ encManifestSha: string; encShas: string[] }> };
       for (const r of roots) {

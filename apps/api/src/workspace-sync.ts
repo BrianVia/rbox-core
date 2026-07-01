@@ -131,6 +131,25 @@ export class WorkspaceSync {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+
+    // Account deletion (design 37 §4g): a FIXED, unambiguous path handled BEFORE bootstrap/seed
+    // and BEFORE any positional path parsing, so any projectId — including one containing "/" —
+    // purges without mis-parsing the action segment (the §3 wedge). deleteAll needs no ws/proj.
+    if (req.method === "POST" && url.pathname === "/purge") return this.purge();
+
+    // SERVER-INTERNAL roots/prune (design 37 §4f follow-up): the GC reachability scan and the
+    // retention prune address the DO from D1, where project_id may contain "/". A positional
+    // `…/proj/:proj/roots` path mis-parses such a projectId → 404 → gcPurge aborts fail-closed
+    // and reclaims NOTHING (an indefinite blob leak). So these use a FIXED action path with
+    // ws/proj carried in the QUERY (slash-safe), still bootstrap-seeded from D1. The legacy
+    // positional handlers below remain for any direct caller.
+    if (url.pathname === "/roots" || url.pathname === "/prune") {
+      await this.ensureBootstrap(url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
+      if (url.pathname === "/roots" && req.method === "GET") return this.roots();
+      if (url.pathname === "/prune" && req.method === "POST") return this.prune(req);
+      return json({ error: "not_found" }, 404);
+    }
+
     const seg = url.pathname.split("/").filter(Boolean); // v1 ws :ws proj :proj <action>
     const ws = seg[2] ?? "";
     const proj = seg[4] ?? "";
@@ -436,6 +455,18 @@ export class WorkspaceSync {
       this.ctx.storage.kv.put("pruneFloor", target);
     });
     return json({ pruned: target - curFloor, pruneFloor: target });
+  }
+
+  /** Account deletion (design 37 §4g): erase ALL DO storage for this workspace — the
+   *  authoritative commit log (`head`, `seq:*`, `pruneFloor`). The D1 `commits`/`workspaces`
+   *  mirror rows are dropped by the caller's purge batch; this wipes the source of truth the
+   *  GC reachability scan reads, so the workspace's blobs become unreferenced. Reachable only
+   *  via the Worker after a same-account authorize, then unconditionally on the deleted
+   *  account. Idempotent (deleteAll on an already-empty DO is a no-op). */
+  private async purge(): Promise<Response> {
+    await this.ctx.storage.deleteAll();
+    this.bootstrapped = true; // storage is now empty; don't re-seed from the (also-being-deleted) D1 mirror
+    return json({ ok: true });
   }
 
   /** C1: the stored SignedCommits for (since, head], so a client can verify the

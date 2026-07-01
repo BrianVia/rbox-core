@@ -50,11 +50,17 @@ export function prepareOutboxInsert(env: Env, o: OutboxFields): D1PreparedStatem
   // device_notifications is account-data → route by the owning account. FLAG (§6f): the
   // caller (auth.ts mint) batches this with the directory-plane `devices` INSERT — one
   // binding at N=1, a cross-plane split under real sharding.
+  // design 37: guarded by the SAME account-liveness condition as the device INSERT, so a mint
+  // blocked by a mid-flight tombstone writes NEITHER the device NOR its notification (the §2.3
+  // coextensivity holds in reverse). `accounts` is same-plane (account-data) here. 'default' bypass
+  // matches the device guard.
   return dbFor(env, o.accountId)
     .prepare(
-      "INSERT OR IGNORE INTO device_notifications (token_hash, device_id, account_id, minted_user_id, label, ip, geo, event, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      `INSERT OR IGNORE INTO device_notifications (token_hash, device_id, account_id, minted_user_id, label, ip, geo, event, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL) OR ? = 'default'`,
     )
-    .bind(o.tokenHash, o.deviceId, o.accountId, o.mintedUserId, o.label, o.ip, o.geo, o.event, o.createdAt);
+    .bind(o.tokenHash, o.deviceId, o.accountId, o.mintedUserId, o.label, o.ip, o.geo, o.event, o.createdAt, o.accountId, o.accountId);
 }
 
 /** Best-effort enqueue AFTER the batch commits. Never throws into device creation —

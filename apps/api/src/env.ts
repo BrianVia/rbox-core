@@ -5,6 +5,14 @@ export interface DeviceNotifyMessage {
   tokenHash: string;
 }
 
+/** A queued account-deletion continuation job (design 37 §7). Carries only the account
+ *  id — the authoritative state is the `account_deletions` outbox row, which the drain
+ *  re-reads. Used purely to promptly continue a large past-grace purge across
+ *  invocations; the cron backstop re-drives any that stall. */
+export interface AccountDeleteMessage {
+  accountId: string;
+}
+
 /** The Cloudflare Email Service — Email Sending `send()` payload (the NEW first-party
  *  product, not the legacy MIME `send_email` binding). Cloudflare signs DKIM with the
  *  CF-managed sending-subdomain key, so no API key / DKIM material is passed. */
@@ -29,6 +37,10 @@ export interface Env {
    *  in local bun tests and until the queue is provisioned — enqueue then no-ops and the
    *  cron backstop drives delivery off the durable outbox instead. */
   DEVICE_NOTIFY_Q?: Queue<DeviceNotifyMessage>;
+  /** Producer binding for the account-deletion continuation queue (design 37 §7). Optional:
+   *  absent in tests and until provisioned — the cron backstop (`sweepAccountDeletions`)
+   *  then drains every past-grace deletion off the durable `account_deletions` outbox. */
+  ACCOUNT_DELETE_Q?: Queue<AccountDeleteMessage>;
   /** Cloudflare Email Service — Email Sending binding (`send_email` in wrangler, the new
    *  `send()` API). Optional: absent in tests / before the sending domain is onboarded,
    *  in which case a delivery becomes retryable `failed` (never silently dropped, §4.2). */
