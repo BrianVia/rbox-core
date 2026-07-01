@@ -10,6 +10,8 @@ export {
   gitIdentityKey,
   projectIdentity,
   assertGitTargetWithinRoot,
+  isGitBusy,
+  quarantineAndWipeGitState,
   type ApplyGitResult,
   type GitIdentity,
   type GitRepoKind,

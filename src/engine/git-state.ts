@@ -702,7 +702,18 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
 
     try {
       // Publish refs per the scope-gated rules (see doc comment).
-      for (const [ref, sha] of Object.entries(publishRefs)) await git(repoDir, ["update-ref", ref, sha]);
+      for (const [ref, sha] of Object.entries(publishRefs)) {
+        if (ref === "refs/stash") {
+          // refs/stash is only usable through its REFLOG (`git stash list`/`pop` read
+          // stash@{N}, never the bare ref) — publish it WITH a reflog entry whose
+          // message is the stash commit's subject (`git stash` writes the same text to
+          // both), so the synced stash is listable/poppable on the receiver.
+          const subject = (await git(repoDir, ["log", "-1", "--format=%s", sha]).catch(() => "")) || "rbox: synced stash";
+          await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha]);
+        } else {
+          await git(repoDir, ["update-ref", ref, sha]);
+        }
+      }
       if (deleteAbsent) {
         for (const ref of Object.keys(await readAllRefs(repoDir))) {
           if (!(ref in section.refs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
@@ -733,6 +744,51 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * Receiver quiescence probe (design 43 §7): is the repo mid-operation (index/HEAD
+ * lock, gc, ref locks in the shared store)? Checked per repo BEFORE the pull-side
+ * divergence comparison — a lock makes `write-tree` fail, which flips gitIdentity
+ * onto the raw-index fallback and would otherwise read as false divergence (a
+ * spurious CONFLICT where the design demands "a busy repo defers only itself").
+ * A repo with no usable context is not busy (there is nothing to contend with).
+ */
+export async function isGitBusy(repoDir: string): Promise<boolean> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) return false;
+  return gitBusy(ctx);
+}
+
+/**
+ * Design 43 §9 [v5] — the DIR-leftover half of a CLEAN MATERIALIZATION (fresh re-create
+ * at a removed path): quarantine the local repo first (a bundle with the SAME
+ * HEAD/pseudo-ref pinning discipline as capture, PLUS index/op-state copies — full
+ * recovery, not refs-only), then DELETE its syncable refs + index + op-state (reset to
+ * empty). A following {@link applyGitState} then lands on a clean target, so the
+ * leftover's old refs can never re-enter a later all-scope capture (resurrection
+ * through the side door — codex round-4 BLOCKER). DIR repos only: a pointer repo's
+ * refs live in the SHARED main-clone store and must never be wiped — pointer leftovers
+ * go through the guarded update-only apply instead. Throws when the quarantine fails
+ * (callers defer the apply — fail closed, never wipe unquarantined state).
+ */
+export async function quarantineAndWipeGitState(repoDir: string): Promise<{ quarantineBundle?: string }> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) throw new Error("repo unusable — cannot quarantine for clean materialization");
+  if (ctx.kind !== "dir") throw new Error("refusing to ref-wipe a pointer repo (shared ref store)");
+  let quarantineBundle: string | undefined;
+  if (await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"])) {
+    quarantineBundle = await quarantineLocal(ctx, path.join(repoDir, ".rbox", "git-quarantine"), `${Date.now()}`);
+  }
+  for (const ref of Object.keys(await readAllRefs(repoDir))) {
+    await git(repoDir, ["update-ref", "-d", ref]);
+  }
+  await fs.rm(path.join(ctx.gitDir, "index"), { force: true });
+  for (const rel of Object.keys(await readOpState(ctx.gitDir, async () => ""))) {
+    await fs.rm(path.join(ctx.gitDir, rel), { force: true }).catch(() => {});
+  }
+  await pruneEmptyOpStateDirs(ctx.gitDir, []);
+  return { quarantineBundle };
 }
 
 /**
