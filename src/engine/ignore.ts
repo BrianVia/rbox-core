@@ -47,6 +47,83 @@ export const BUILTIN_IGNORE: string[] = [
   "!.env.template",
 ];
 
+/**
+ * The COARSE subset of {@link BUILTIN_IGNORE} that is safe to hard-prune at the
+ * OS-watcher level: pure directory excludes with **no negation / re-include**
+ * counterpart anywhere in the rule set. A native watcher (e.g. `@parcel/watcher`)
+ * is fed *only* these — as a volume optimization so it never watches the huge
+ * regenerable subtrees — while the full {@link IgnoreMatcher} stays the
+ * AUTHORITATIVE post-filter on every delivered event (see design §41). A path
+ * that a `.rboxignore` `!negation` re-includes lives outside these dirs, so
+ * pruning them can never hide an event the matcher would keep.
+ *
+ * Deliberately excludes file-level patterns (`.env`, `*.key`, `.DS_Store`, and the
+ * `!.env.example` negations): those must reach the JS matcher, not be silently
+ * dropped by a coarse native filter.
+ */
+export const HARD_PRUNE_DIRS: string[] = [
+  "node_modules",
+  ".git",
+  ".rbox",
+  ".venv",
+  "venv",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".turbo",
+  ".cache",
+  "coverage",
+  "target",
+  ".pnpm-store",
+];
+
+/** Hard-prune dirs that are effectively never user-re-includable, so they stay safe to
+ *  hand a native watcher's coarse `ignore` even in the presence of negations. `.rbox` is
+ *  hard-excluded in code (no rule can re-include it); a `!node_modules/…`/`!.git/…`
+ *  re-include is pathological and still heals via the safety scan. */
+const ALWAYS_NATIVE_PRUNE = new Set(["node_modules", ".git", ".rbox"]);
+
+/**
+ * Globs for a native watcher's coarse `ignore` (design §41). Honors negations: a
+ * hard-prune dir the user could RE-INCLUDE under (e.g. a `.rboxignore` `!dist/keep.txt`
+ * or a bare `!keep.txt`) is DROPPED from the native set, so its live events still reach
+ * the AUTHORITATIVE JS {@link IgnoreMatcher} instead of being silently pruned before the
+ * matcher ever sees them. Each kept dir is pruned at every depth INCLUDING its children:
+ * `**​/d` matches the directory itself, `**​/d/**` its whole subtree (a native watcher
+ * emits child paths, so the subtree glob is required to keep them off the JS hot path).
+ */
+export function nativePruneGlobs(root: string): string[] {
+  const negations = effectiveIgnoreRules(root)
+    .filter((r) => r.pattern.startsWith("!"))
+    .map((r) => r.pattern.slice(1).replace(/^\/+/, "").replace(/\/+$/, ""));
+  const dirs = HARD_PRUNE_DIRS.filter(
+    (d) => ALWAYS_NATIVE_PRUNE.has(d) || !negations.some((neg) => negationReenters(neg, d))
+  );
+  return dirs.flatMap((d) => [`**/${d}`, `**/${d}/**`]);
+}
+
+/**
+ * Could a `!negation` (leading `!` and surrounding slashes already stripped by the caller)
+ * re-include the directory `d` such that we must NOT native-prune it? PATH-AWARE: a
+ * negation only re-enters `d` if it is anchored to that specific directory —
+ *   - `d` itself (`!dist/` → `dist`, or bare `!dist`): re-includes the dir entry;
+ *   - `d/…` (`!dist/keep.txt`): targets a path under the dir;
+ *   - `…/d/…` (`!src/dist/x`): targets a nested occurrence the any-depth prune glob catches.
+ *
+ * A BARE-BASENAME negation with no slash whose name isn't a hard-prune dir (`!.env.example`,
+ * `!keep.txt`) matches files by name anywhere and must NOT un-prune dist/build/etc. — those
+ * built-in `!.env.*` negations would otherwise regress every build dir back to being watched.
+ * (Accepted consequence: a re-included file that happens to sit *inside* a hard-pruned dir —
+ * e.g. `dist/.env.example` via `!.env.example` — is healed by the 60s safety scan rather than
+ * delivered as a live event.)
+ */
+function negationReenters(neg: string, d: string): boolean {
+  if (neg.length === 0) return false;
+  return neg === d || neg.startsWith(`${d}/`) || neg.includes(`/${d}/`);
+}
+
 export interface IgnoreMatcher {
   /** `relPath` is POSIX-relative; pass a trailing slash for directories. */
   ignores(relPath: string): boolean;

@@ -45,7 +45,10 @@ export async function applyWatchEvents(
   root: string,
   matcher: IgnoreMatcher,
   events: WatchEvent[],
-  cache?: HashCache
+  cache?: HashCache,
+  /** Out-param: paths that were mid-write (mtime/size shifted across the hash) and
+   *  should be retried by the caller rather than left to the safety scan. */
+  deferred?: Set<string>
 ): Promise<Manifest> {
   const map = indexByPath(base);
 
@@ -76,9 +79,10 @@ export async function applyWatchEvents(
         cache?.invalidate(rel);
         continue;
       }
-      const entry = await statHashEntry(root, rel, cache);
-      if (entry) map.set(rel, entry);
-      // entry undefined ⇒ vanished or mid-write; leave it for the next settle.
+      const res = await statHashEntry(root, rel, cache);
+      if (res.kind === "entry") map.set(rel, res.entry);
+      else if (res.kind === "midwrite") deferred?.add(rel);
+      // "gone" ⇒ vanished after the event; leave it for the next unlink/settle.
     }
   }
 
@@ -86,33 +90,38 @@ export async function applyWatchEvents(
   return { generatedAt: new Date().toISOString(), files };
 }
 
+/** Discriminates a clean hash from a vanished path vs one still being written, so the
+ *  caller can RETRY a mid-write on the hot path instead of waiting for the safety scan. */
+type StatHashResult = { kind: "entry"; entry: FileEntry } | { kind: "gone" } | { kind: "midwrite" };
+
 /**
- * Stat → hash → stat-again for a single path. Returns the entry, or undefined if
- * the file vanished or is being actively written (mtime/size changed across the
- * hash) — never a torn snapshot. Symlinks and non-files handled too.
+ * Stat → hash → stat-again for a single path. Never returns a torn snapshot: if the
+ * file vanished it's `gone`; if mtime/size shifted across the hash (active write) it's
+ * `midwrite` (retry, don't bake). Symlinks and non-files handled too.
  */
-async function statHashEntry(root: string, rel: string, cache?: HashCache): Promise<FileEntry | undefined> {
+async function statHashEntry(root: string, rel: string, cache?: HashCache): Promise<StatHashResult> {
   const abs = path.join(root, rel);
   let st1;
   try {
     st1 = await fs.lstat(abs);
   } catch {
-    return undefined; // gone
+    return { kind: "gone" };
   }
   if (st1.isSymbolicLink()) {
     const target = await fs.readlink(abs);
-    return { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 };
+    return { kind: "entry", entry: { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 } };
   }
-  if (!st1.isFile()) return undefined;
+  if (!st1.isFile()) return { kind: "gone" };
 
   const cached = cache?.lookup(rel, st1.mtimeMs, st1.size);
-  if (cached) return { path: rel, type: "file", sha256: cached, size: st1.size, mode: st1.mode & 0o777, mtimeMs: st1.mtimeMs };
+  if (cached) return { kind: "entry", entry: { path: rel, type: "file", sha256: cached, size: st1.size, mode: st1.mode & 0o777, mtimeMs: st1.mtimeMs } };
 
   const sha256 = await hashFile(abs, st1.size);
-  const st2 = await fs.lstat(abs);
-  if (st2.mtimeMs !== st1.mtimeMs || st2.size !== st1.size) return undefined; // mid-write → defer
+  const st2 = await fs.lstat(abs).catch(() => undefined);
+  if (!st2) return { kind: "gone" };
+  if (st2.mtimeMs !== st1.mtimeMs || st2.size !== st1.size) return { kind: "midwrite" };
   cache?.record(rel, { mtimeMs: st2.mtimeMs, size: st2.size, sha256 });
-  return { path: rel, type: "file", sha256, size: st2.size, mode: st2.mode & 0o777, mtimeMs: st2.mtimeMs };
+  return { kind: "entry", entry: { path: rel, type: "file", sha256, size: st2.size, mode: st2.mode & 0o777, mtimeMs: st2.mtimeMs } };
 }
 
 /** A cache-miss file whose hashing is deferred to a bounded-parallel batch. */
