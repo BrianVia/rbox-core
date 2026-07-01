@@ -17,7 +17,9 @@
  * (init-cmd.ts). So the device-code branch resolves enrollment FIRST and stops with
  * pair/connect/recover next steps — it never promises Steps 2–3 it can't deliver.
  */
+import os from "node:os";
 import { runInit } from "./init-cmd.js";
+import { collapseHome } from "./init-plan.js";
 import { login, redeemPair } from "./auth-cmd.js";
 import { startDaemon } from "./daemon-control.js";
 import { loadCredentials } from "./credentials.js";
@@ -186,7 +188,20 @@ async function stepWorkspace(
   }
   const dir = await promptInput({ message: "Which directory should rbox sync?", default: opts.cwd });
 
-  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir } : { kind: "join", root: dir, workspace, name });
+  // Opt-in, server-visible workspace name — offered ONLY when creating (the row is
+  // INSERTed once, first-writer-wins). `rbox setup` drives runInit via FLAGS, which
+  // skips runInit's own interactive name prompt, so we must prompt here (mirrors
+  // init-cmd.ts). Declining keeps it private — the label is server-side / NOT E2EE.
+  // A join reuses the picker's already-known name.
+  if (choice === "new") {
+    process.stderr.write(`${e.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
+    if (await promptConfirm({ message: "Add a name for this workspace?", default: true })) {
+      const ans = (await promptInput({ message: "Workspace name", default: collapseHome(dir, os.homedir()) })).trim();
+      if (ans) name = ans;
+    }
+  }
+
+  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir, name } : { kind: "join", root: dir, workspace, name });
   return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
 }
 
