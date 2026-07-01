@@ -1,6 +1,7 @@
 import type { Env } from "./env.js";
 import { ctEqual, json } from "./util.js";
 import { dbFor } from "./db.js";
+import { batchedInLookup } from "./d1-batch.js";
 
 /** The authenticated caller: a device, its account, user, and role. */
 export interface Principal {
@@ -49,15 +50,18 @@ export async function isEntitled(env: Env, accountId: string, sha: string): Prom
 }
 export async function entitledSubset(env: Env, accountId: string, shas: string[]): Promise<Set<string>> {
   const out = new Set<string>();
-  for (let i = 0; i < shas.length; i += 80) {
-    const chunk = shas.slice(i, i + 80);
-    if (chunk.length === 0) break;
-    const rows = await dbFor(env, accountId)
-      .prepare(`SELECT sha256 FROM blob_refs WHERE account_id = ? AND sha256 IN (${chunk.map(() => "?").join(",")})`)
-      .bind(accountId, ...chunk)
-      .all<{ sha256: string }>();
-    for (const r of rows.results ?? []) out.add(r.sha256);
-  }
+  const db = dbFor(env, accountId);
+  // §30: batched dispatch — the per-80-sha IN-list SELECTs run grouped in db.batch() calls
+  // (one D1 subrequest per group) instead of one serial round-trip each. Only the legacy
+  // blobsCheck path calls this; the query text and set-membership math are unchanged.
+  await batchedInLookup<{ sha256: string }>(
+    db,
+    shas,
+    (chunk) => db.prepare(`SELECT sha256 FROM blob_refs WHERE account_id = ? AND sha256 IN (${chunk.map(() => "?").join(",")})`).bind(accountId, ...chunk),
+    (rows) => {
+      for (const r of rows) out.add(r.sha256);
+    },
+  );
   return out;
 }
 export async function grantEntitlement(env: Env, accountId: string, sha: string): Promise<void> {

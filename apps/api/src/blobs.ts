@@ -6,6 +6,7 @@ import { startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
 import { verifyGrant } from "./grants.js";
 import { dbFor } from "./db.js";
+import { batchedInLookup } from "./d1-batch.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
  *  ~R2-only (staging write + receipt, ZERO D1). Absent → legacy per-PUT grant path
@@ -52,24 +53,28 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
   // client re-stages it. blob_refs is queried FIRST → no existence oracle.
   if (usesReceipts(req)) {
     const have = new Set<string>();
-    for (let i = 0; i < uniq.length; i += 80) {
-      const chunk = uniq.slice(i, i + 80);
-      if (chunk.length === 0) break;
-      const ph = chunk.map(() => "?").join(",");
-      // §33 candidate-aware check, FOLDED into the have-set query: a Phase-1 prune-marked ref
-      // (`blob_ref_candidates`) is excluded from "have" by the NOT EXISTS, so it reads as missing
-      // → the client re-stages it → the re-stage's commit re-grants + clears the marker. Folding
-      // it in (vs a second pass) makes the barrier one query and impossible to forget.
-      const rows = await db
-        .prepare(
-          `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
-           WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${ph})
-             AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
-        )
-        .bind(accountId, ...chunk)
-        .all<{ sha256: string }>();
-      for (const row of rows.results ?? []) have.add(row.sha256);
-    }
+    // §30: batched dispatch — the per-80-sha IN-list SELECTs run grouped in db.batch()
+    // calls (one D1 subrequest per group) instead of one serial round-trip per chunk, so
+    // a 4k-sha push preflight no longer costs ~50 sequential D1 hops before uploads start.
+    // §33 candidate-aware check, FOLDED into the have-set query: a Phase-1 prune-marked ref
+    // (`blob_ref_candidates`) is excluded from "have" by the NOT EXISTS, so it reads as missing
+    // → the client re-stages it → the re-stage's commit re-grants + clears the marker. Folding
+    // it in (vs a second pass) makes the barrier one query and impossible to forget.
+    await batchedInLookup<{ sha256: string }>(
+      db,
+      uniq,
+      (chunk) =>
+        db
+          .prepare(
+            `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
+             WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${chunk.map(() => "?").join(",")})
+               AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
+          )
+          .bind(accountId, ...chunk),
+      (rows) => {
+        for (const row of rows) have.add(row.sha256);
+      },
+    );
     const missing = uniq.filter((s) => !have.has(s));
     op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
     return json({ missing });
@@ -77,21 +82,32 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
 
   const present = new Set<string>();
   const condemned = new Set<string>();
-  for (let i = 0; i < shas.length; i += 80) {
-    const chunk = shas.slice(i, i + 80);
-    if (chunk.length === 0) break;
-    const ph = chunk.map(() => "?").join(",");
-    // §33 candidate-aware check (legacy path), FOLDED into the present query: a Phase-1
-    // prune-marked ref (`blob_ref_candidates`) is excluded from `present` by the NOT EXISTS, so
-    // it reads as missing (one query, no separate pass — the barrier can't be forgotten).
-    const rows = await db
-      .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${ph}) AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = ? AND c.sha256 = blobs.sha256)`)
-      .bind(...chunk, accountId)
-      .all<{ sha256: string }>();
-    for (const r of rows.results ?? []) present.add(r.sha256);
-    const cand = await db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
-    for (const r of cand.results ?? []) condemned.add(r.sha256);
-  }
+  // §30: batched dispatch (see the receipts branch). The two IN-list SELECTs the legacy path
+  // needs (present-with-candidate-barrier, and gc_candidates) each run as their own grouped
+  // db.batch() pass over `shas` — bounded memory, one D1 subrequest per group, results merged
+  // by set membership exactly as the serial loop did.
+  // §33 candidate-aware check (legacy path), FOLDED into the present query: a Phase-1
+  // prune-marked ref (`blob_ref_candidates`) is excluded from `present` by the NOT EXISTS, so
+  // it reads as missing (one query, no separate pass — the barrier can't be forgotten).
+  await batchedInLookup<{ sha256: string }>(
+    db,
+    shas,
+    (chunk) =>
+      db
+        .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")}) AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = ? AND c.sha256 = blobs.sha256)`)
+        .bind(...chunk, accountId),
+    (rows) => {
+      for (const r of rows) present.add(r.sha256);
+    },
+  );
+  await batchedInLookup<{ sha256: string }>(
+    db,
+    shas,
+    (chunk) => db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${chunk.map(() => "?").join(",")})`).bind(...chunk),
+    (rows) => {
+      for (const r of rows) condemned.add(r.sha256);
+    },
+  );
   const entitled = await entitledSubset(op.env, accountId, uniq);
   const missing = uniq.filter((s) => !present.has(s) || !entitled.has(s) || condemned.has(s));
   // `missingBlobs` is the client preflight: count + missing ratio, never raw SHAs.
