@@ -328,11 +328,120 @@ export async function fetchFiveXxRate(env: Env, now: number): Promise<FiveXxRate
   }
 }
 
+// ── server op-timing metrics from the Analytics Engine SQL API (§25 read path) ─
+
+/** AE SQL timeout — a slow AE query must never hold the cockpit open. Shorter than
+ *  the 4s GraphQL/Stripe bound because it fans out three statements in parallel. */
+const AE_TIMEOUT_MS = 3000;
+
+export interface ServerMetricsPerOp {
+  op: string;
+  ops: number;
+  p50Ms: number;
+  p99Ms: number;
+  /** D1 (entitlement/accounting) time at p50 — the headline: for `blob.get` this is the
+   *  ~80% of latency spent in D1, vs `r2P50` (R2 open time). */
+  d1P50: number;
+  r2P50: number;
+}
+export interface ServerMetrics {
+  windowHours: number;
+  /** Per-op volume + latency + the D1-vs-R2 split (the headline panel). */
+  perOp: ServerMetricsPerOp[];
+  /** Coarse outcome histogram (drives the 429/error-rate view; `too_many_refs`, `conflict`, …). */
+  outcomes: Array<{ outcome: string; n: number }>;
+  /** Commit-path latency percentiles (ok-only), null when no commits in the window. */
+  commit: { p50Ms: number; p99Ms: number; commits: number } | null;
+  generatedAt: number;
+}
+
+/** AE returns UInt64 counts as JSON strings and quantiles as numbers; coerce either to a
+ *  finite number (NaN/undefined → 0) so the payload is always clean numerics. */
+function num(v: unknown): number {
+  const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Run one AE SQL statement, returning its `data` rows. Throws on any non-2xx / parse
+ *  failure so the caller's single try/catch can degrade the whole block to null. */
+async function aeSql(env: Env, token: string, sql: string): Promise<Array<Record<string, unknown>>> {
+  const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+    body: sql,
+    signal: AbortSignal.timeout(AE_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`ae_sql_${res.status}`);
+  const body = (await res.json()) as { data?: Array<Record<string, unknown>> };
+  return body.data ?? [];
+}
+
+/**
+ * Server op-timing metrics for the cockpit (§25 read path). Runs the AE SQL queries that
+ * surface per-op latency with the D1-vs-R2 split, the outcome histogram, and commit-path
+ * percentiles over a rolling 24h window. BEST-EFFORT + BOUNDED, mirroring fetchFiveXxRate:
+ * absent token/account or ANY query failure → null (the field is simply absent from
+ * /overview), never a throw. The dimensions read here are already §25-privacy-safe
+ * (op/route/outcome + numeric measures only — no ids/paths/hashes).
+ */
+export async function fetchServerMetrics(env: Env): Promise<ServerMetrics | null> {
+  const token = env.CF_AE_TOKEN;
+  if (!token || !env.CF_ACCOUNT_ID) return null;
+  // Dataset name is interpolated into SQL; it's operator-set (never user input), but pin it
+  // to an identifier charset so a stray value can't reshape the statement.
+  const dataset = env.CF_METRICS_DATASET ?? "rbox_prod_metrics";
+  if (!/^[A-Za-z0-9_]+$/.test(dataset)) return null;
+  const windowHours = 24;
+  const win = `timestamp > NOW() - INTERVAL '${windowHours}' HOUR`;
+  try {
+    const [perOpRows, outcomeRows, commitRows] = await Promise.all([
+      aeSql(
+        env,
+        token,
+        `SELECT blob1 AS op, sum(_sample_interval) AS ops,
+           round(quantileWeighted(0.50)(double1,_sample_interval)) AS p50_ms,
+           round(quantileWeighted(0.99)(double1,_sample_interval)) AS p99_ms,
+           round(quantileWeighted(0.50)(double2,_sample_interval)) AS d1_p50,
+           round(quantileWeighted(0.50)(double3,_sample_interval)) AS r2_p50
+         FROM ${dataset} WHERE ${win} GROUP BY op ORDER BY ops DESC`,
+      ),
+      aeSql(env, token, `SELECT blob3 AS outcome, sum(_sample_interval) AS n FROM ${dataset} WHERE ${win} GROUP BY outcome ORDER BY n DESC`),
+      aeSql(
+        env,
+        token,
+        `SELECT round(quantileWeighted(0.50)(double1,_sample_interval)) AS p50_ms,
+           round(quantileWeighted(0.99)(double1,_sample_interval)) AS p99_ms,
+           sum(_sample_interval) AS commits
+         FROM ${dataset} WHERE blob1 = 'commit' AND blob3 = 'ok' AND ${win}`,
+      ),
+    ]);
+
+    const perOp: ServerMetricsPerOp[] = perOpRows.map((r) => ({
+      op: String(r.op ?? ""),
+      ops: num(r.ops),
+      p50Ms: num(r.p50_ms),
+      p99Ms: num(r.p99_ms),
+      d1P50: num(r.d1_p50),
+      r2P50: num(r.r2_p50),
+    }));
+    const outcomes = outcomeRows.map((r) => ({ outcome: String(r.outcome ?? ""), n: num(r.n) }));
+    const c = commitRows[0];
+    const commits = c ? num(c.commits) : 0;
+    const commit = c && commits > 0 ? { p50Ms: num(c.p50_ms), p99Ms: num(c.p99_ms), commits } : null;
+
+    return { windowHours, perOp, outcomes, commit, generatedAt: Date.now() };
+  } catch (e) {
+    logErr("admin_server_metrics_failed", e);
+    return null;
+  }
+}
+
 // ── the route ─────────────────────────────────────────────────────────────────
 
 export interface AdminOverview extends AdminAggregates {
   mrrStripeCents: number | null;
   fiveXxRate: FiveXxRate | null;
+  serverMetrics: ServerMetrics | null;
   generatedAt: number;
 }
 
@@ -345,12 +454,13 @@ export async function adminOverview(req: Request, env: Env, nowMs: number = Date
   // D1 aggregates are authoritative + cheap; the two external figures are
   // best-effort and resolve to null on failure (already non-throwing), so one slow
   // dependency never blocks the others.
-  const [aggregates, mrrStripeCents, fiveXxRate] = await Promise.all([
+  const [aggregates, mrrStripeCents, fiveXxRate, serverMetrics] = await Promise.all([
     computeAggregates(env, nowMs),
     fetchStripeMrrCents(env),
     fetchFiveXxRate(env, nowMs),
+    fetchServerMetrics(env),
   ]);
 
-  const overview: AdminOverview = { ...aggregates, mrrStripeCents, fiveXxRate, generatedAt: nowMs };
+  const overview: AdminOverview = { ...aggregates, mrrStripeCents, fiveXxRate, serverMetrics, generatedAt: nowMs };
   return json(overview);
 }

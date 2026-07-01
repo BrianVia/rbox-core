@@ -24,6 +24,22 @@ Analytics Engine, under a strict metadata-privacy ban-list. Surfaces p50/p95/p99
 the conc/contention signal. Request rows are the source of truth for total request counts;
 op rows describe work that actually ran, so early 4xxs may have only a request row.
 
+## Read path (Plane A) — wired into the admin cockpit
+The write half above is only useful once someone can *read* it. Rather than stand up a
+separate Grafana, the read path lives inside the existing platform-admin cockpit
+(§32 Tier 3a, `GET /v1/admin/overview`): `fetchServerMetrics(env)` in `apps/api/src/admin.ts`
+runs the AE **SQL API** (`POST /accounts/{id}/analytics_engine/sql`) for per-op latency + the
+**D1-vs-R2 split** (the headline: `blob.get` p50 ≈ 228 ms of which ≈ 81% is D1), the outcome
+histogram (429/error view), and commit-path percentiles over a rolling 24h window, folded in
+as `serverMetrics`. It reuses the cockpit's external-dependency contract exactly
+(`fetchFiveXxRate`/`fetchStripeMrrCents`): **best-effort, bounded (3s per-query
+AbortController), never throws** — absent `CF_AE_TOKEN`/`CF_ACCOUNT_ID` or any failure →
+`serverMetrics: null`, so `/overview` never degrades. The dimensions read are already
+privacy-safe (op/route/outcome + numeric measures only). The read token is a separate
+`CF_AE_TOKEN` secret (Account Analytics read, AE-SQL grant) — distinct from the GraphQL
+`CF_ANALYTICS_TOKEN`. The external admin SPA (admin.rbox.to) renders the fields; the shape is
+documented in [`../observability-server-metrics.md`](../observability-server-metrics.md).
+
 ## Chunks
 | # | Chunk | What | Depends |
 |---|-------|------|---------|

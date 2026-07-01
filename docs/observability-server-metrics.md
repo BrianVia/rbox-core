@@ -173,9 +173,40 @@ WHERE blob1 = 'commit';
 - GC fail-closed: count `blob1 = 'gc.sidecar'` abort outcomes; any sustained non-zero value
   should page or at least alert because GC must abort rather than condemn on sidecar failure.
 
+## Read path — admin cockpit (§25 Plane A)
+
+The write path (above) is one side; the read path is wired into the platform-admin cockpit
+so the numbers surface without a separate Grafana. `fetchServerMetrics(env)` in
+`apps/api/src/admin.ts` runs three of the queries above (per-op latency + D1/R2 split, the
+outcome histogram, and commit-path percentiles) over a rolling 24h window and folds the
+result into `GET /v1/admin/overview` as `serverMetrics`:
+
+```jsonc
+"serverMetrics": {
+  "windowHours": 24,
+  "perOp":    [{ "op": "blob.get", "ops": 65406, "p50Ms": 228, "p99Ms": 446, "d1P50": 185, "r2P50": 40 }, …],
+  "outcomes": [{ "outcome": "ok", "n": 93809 }, { "outcome": "too_many_refs", "n": 1 }, …],
+  "commit":   { "p50Ms": 388, "p99Ms": 2361, "commits": 4 },
+  "generatedAt": 1751371200000
+}
+```
+
+The headline the panel must make visible is the **D1-vs-R2 split** (`d1P50` vs `r2P50`): e.g.
+`blob.get` p50 ≈ 228 ms of which ≈ 185 ms (81%) is D1 (one entitlement read per GET) vs ≈ 40 ms
+R2. The external admin SPA (admin.rbox.to — a separate repo) renders these fields.
+
+Contract, mirroring the other cockpit externals (Stripe MRR, 5xx rate): **best-effort +
+bounded + never throws.** Absent `CF_AE_TOKEN`/`CF_ACCOUNT_ID` or any query failure →
+`serverMetrics: null` (the field is simply absent), with a 3s per-query `AbortController` so a
+slow AE call can't hang `/overview`.
+
 ## Notes
 
 - AE writes are enabled in production via the `rbox_metrics` binding (wrangler.jsonc).
   Local bun unit tests have no binding → `emit()` no-ops, so nothing to mock.
-- A Cloudflare API token with Account Analytics read is needed to run the SQL API;
-  wire these queries into a Grafana/Workers dashboard once the token exists.
+- The SQL API needs a Cloudflare token with the **Account Analytics** read grant (AE SQL
+  scope). It's the `CF_AE_TOKEN` Wrangler **secret** — deliberately distinct from
+  `CF_ANALYTICS_TOKEN` (the GraphQL 5xx-rate token), since the two grants were minted
+  separately and conflating them silently breaks one path when the other's scope narrows. Set
+  it with `cd apps/api && bunx wrangler secret put CF_AE_TOKEN`. The read dataset is the
+  `CF_METRICS_DATASET` var (default `rbox_prod_metrics`; must match the `rbox_metrics` binding).
