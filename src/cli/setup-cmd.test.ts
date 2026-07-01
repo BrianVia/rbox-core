@@ -44,6 +44,19 @@ test("Step 2 → runInit flags: joining an existing workspace passes its id, not
   const f = workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc" });
   expect(f).toMatchObject({ workspace: "ws_abc", root: "/code/app", "no-interactive": "true" });
   expect(f.new).toBeUndefined();
+  expect(f.name).toBeUndefined(); // no picked name → status falls back to the id
+});
+
+test("Step 2 → runInit flags: a picked name rides along as a LOCAL cache label on join", () => {
+  const f = workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", name: "savvy-core" });
+  expect(f).toMatchObject({ workspace: "ws_abc", name: "savvy-core", "no-interactive": "true" });
+});
+
+test("Step 2 → runInit flags: a name is NOT attached to a new-workspace join-less create here", () => {
+  // (create names are prompted inside runInit, not passed via workspaceFlags)
+  const f = workspaceFlags({ kind: "new", root: "/code/app", name: "ignored" });
+  expect(f.name).toBeUndefined();
+  expect(f.new).toBe("true");
 });
 
 test("Step 3 [Y/n] / [y/N]: blank takes the default, explicit answers win", () => {

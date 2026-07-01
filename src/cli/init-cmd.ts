@@ -138,6 +138,9 @@ async function executeInitPlan(
     // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a non-git root;
     // pass --git false to opt out. This is the git-native sync the product is built around.
     syncGit: plan.syncGit,
+    // Cache the workspace name LOCALLY so `rbox status` shows it with no round-trip.
+    // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
+    ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
   };
   await saveConfig(plan.root, cfg);
 

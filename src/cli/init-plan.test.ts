@@ -119,8 +119,17 @@ test("--name with only control chars/whitespace → treated as no name (skip)", 
   expect((r.workspace as { name?: string }).name).toBeUndefined();
 });
 
-test("--name is ignored on a join (the row already exists — nothing to set it on)", () => {
-  const r = resolveInitPlan(input({ flags: { workspace: "ws_abc", name: "Whatever" } }));
+test("--name on a join is a LOCAL cache label (threaded through, never sent to the server)", () => {
+  // The picker passes the selected workspace's server name so init can cache it into
+  // WorkspaceConfig for `rbox status` — it's display-only, and createRemoteWorkspace
+  // (the sole name-writing call) is never invoked on a join.
+  const r = resolveInitPlan(input({ flags: { workspace: "ws_abc", name: "  savvy-core  " } }));
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect(r.workspace).toEqual({ kind: "join", id: "ws_abc", project: "root", name: "savvy-core" });
+});
+
+test("no --name on a join → no cached label (status falls back to the id)", () => {
+  const r = resolveInitPlan(input({ flags: { workspace: "ws_abc" } }));
   if (isInitError(r)) throw new Error("unexpected error");
   expect(r.workspace).toEqual({ kind: "join", id: "ws_abc", project: "root" });
   expect((r.workspace as { name?: string }).name).toBeUndefined();
