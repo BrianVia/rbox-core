@@ -1,6 +1,8 @@
 import { spawn, execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { isStandaloneBinary } from "./runtime.js";
 
@@ -9,8 +11,40 @@ const PID_FILE = "daemon.pid";
 const LOG_FILE = "daemon.log";
 const DAEMON_MARKER = "__daemon-run";
 
-const pidPath = (root: string) => path.join(root, RBOX_DIR, PID_FILE);
-const logPath = (root: string) => path.join(root, RBOX_DIR, LOG_FILE);
+/** Home rbox dir (`~/.rbox`). `RBOX_HOME` overrides it (tests; also lets a user
+ *  relocate global state) — same override the keystore/credentials honor. */
+const rboxHome = () => path.join(process.env.RBOX_HOME || os.homedir(), RBOX_DIR);
+
+/** A stable, human-scannable, collision-safe key for a workspace, derived purely
+ *  from its ABSOLUTE resolved root: `<basename>-<hash8>`. The basename keeps the
+ *  dir scannable by eye; the sha256 prefix disambiguates same-named workspaces in
+ *  different locations. Deterministic — the same root always maps to the same key. */
+export function workspaceKey(root: string): string {
+  const abs = path.resolve(root);
+  const hash = crypto.createHash("sha256").update(abs).digest("hex").slice(0, 8);
+  const base = path.basename(abs).replace(/[^A-Za-z0-9._-]/g, "_") || "root";
+  return `${base}-${hash}`;
+}
+
+/** GLOBAL per-workspace runtime dir for the daemon's pid/log — `~/.rbox/daemons/
+ *  <basename>-<hash8>`. Kept OUT of the tracked workspace so `rbox start` never
+ *  litters the project with `daemon.log`/`daemon.pid` (state.json/workspace.json
+ *  still live in `<root>/.rbox`, like `.git`). */
+export const daemonRuntimeDir = (root: string) => path.join(rboxHome(), "daemons", workspaceKey(root));
+
+const pidPath = (root: string) => path.join(daemonRuntimeDir(root), PID_FILE);
+const logPath = (root: string) => path.join(daemonRuntimeDir(root), LOG_FILE);
+
+/** Pre-global location of the pid/log (inside the workspace). Kept only as a
+ *  READ fallback so a daemon started before this change stays visible to `rbox
+ *  logs`; nothing new is ever written here. Pre-launch back-compat, not migration. */
+const legacyLogPath = (root: string) => path.join(root, RBOX_DIR, LOG_FILE);
+
+/** Remove the global pid/log dir for `root` — called by `untrack` so tearing down
+ *  a workspace leaves no orphaned runtime files behind under `~/.rbox`. */
+export async function removeDaemonRuntime(root: string): Promise<void> {
+  await fsp.rm(daemonRuntimeDir(root), { recursive: true, force: true });
+}
 
 /** argv for re-spawning THIS CLI as the detached daemon (with `process.execPath`).
  *
@@ -92,7 +126,7 @@ export async function startDaemon(root: string): Promise<void> {
     await fsp.rm(pidPath(root), { force: true });
   }
 
-  await fsp.mkdir(path.join(root, RBOX_DIR), { recursive: true });
+  await fsp.mkdir(daemonRuntimeDir(root), { recursive: true });
   const out = fs.openSync(logPath(root), "a");
   const args = daemonSpawnArgs(process.argv[1]!, root, isStandaloneBinary());
   const child = spawn(process.execPath, args, {
@@ -166,10 +200,17 @@ export interface LogsOptions {
  *  `follow`) streams appended output until Ctrl-C. Implemented natively (no `tail`
  *  dependency) so it behaves the same everywhere the CLI runs. */
 export async function logsDaemon(root: string, opts: LogsOptions): Promise<void> {
-  const lp = logPath(root);
+  // Prefer the global log; fall back to the pre-global in-workspace log so a
+  // daemon started before this change isn't invisible (read-only back-compat).
+  let lp = logPath(root);
   if (!fs.existsSync(lp)) {
-    console.log("(no daemon log yet — start background sync with `rbox start`)");
-    return;
+    const legacy = legacyLogPath(root);
+    if (fs.existsSync(legacy)) {
+      lp = legacy;
+    } else {
+      console.log("(no daemon log yet — start background sync with `rbox start`)");
+      return;
+    }
   }
 
   const { text, size } = await tailFile(lp, opts.lines);

@@ -5,19 +5,25 @@ import path from "node:path";
 import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
 import { findRoot, loadConfig } from "./config.js";
+import { daemonRuntimeDir } from "./daemon-control.js";
 
 let dir: string;
+let home: string;
 let logs: string[];
 const origLog = console.log;
 
 beforeEach(async () => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-"));
+  home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-home-"));
+  process.env.RBOX_HOME = home; // redirect ~/.rbox so daemon runtime files are inspectable
   logs = [];
   console.log = (...m: unknown[]) => void logs.push(m.map(String).join(" "));
 });
 afterEach(async () => {
   console.log = origLog;
+  delete process.env.RBOX_HOME;
   await fs.rm(dir, { recursive: true, force: true });
+  await fs.rm(home, { recursive: true, force: true });
 });
 
 test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async () => {
@@ -43,6 +49,20 @@ test("track is bind-only: it persists config but does NOT create state.json (no 
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
   // state.json is written by sync, not by track — proves no first sync happened.
   await expect(fs.access(path.join(root, ".rbox", "state.json"))).rejects.toThrow();
+});
+
+test("untrack also removes the global daemon runtime dir (no orphans under ~/.rbox)", async () => {
+  const { root } = await track(dir, { workspace: "ws_x" }, "https://api.test");
+  // Simulate a daemon having written its pid/log to the global per-workspace dir.
+  const runtimeDir = daemonRuntimeDir(root);
+  await fs.mkdir(runtimeDir, { recursive: true });
+  await fs.writeFile(path.join(runtimeDir, "daemon.log"), "sync\n");
+  await fs.writeFile(path.join(runtimeDir, "daemon.pid"), "12345");
+
+  await untrack({ root, force: true });
+
+  await expect(fs.access(runtimeDir)).rejects.toThrow(); // global runtime dir is gone
+  await expect(fs.access(path.join(root, ".rbox"))).rejects.toThrow(); // workspace binding too
 });
 
 test("untrack refuses when there is no binding to remove", async () => {
