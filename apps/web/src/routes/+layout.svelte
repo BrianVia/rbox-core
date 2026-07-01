@@ -42,6 +42,15 @@
 	// route lives inside the persistent dashboard shell (sidebar + content).
 	const isAuth = $derived(page.url.pathname === '/');
 
+	// Every non-"/" route is authenticated. The LAYOUT owns the signed-out redirect:
+	// the branch below renders a loader (not the page) for a signed-out deep-link, so
+	// the page never mounts and its own requireAuth() would never run. Redirect here
+	// instead. (Add a public-route set / route group before shipping a second public
+	// route — this assumes "/" is the only public one.)
+	$effect(() => {
+		if (ready && !isAuth && !authState.signedIn) goto('/');
+	});
+
 	const nav = [
 		{ href: '/dashboard', label: 'Overview', icon: LayoutDashboardIcon },
 		{ href: '/devices', label: 'Devices & workspaces', icon: HardDriveIcon },

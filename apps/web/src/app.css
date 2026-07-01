@@ -56,12 +56,9 @@
 	   as one persistent frame around the scrolling content. */
 	--sidebar: oklch(0.965 0.006 286);
 	--sidebar-foreground: oklch(0.32 0.018 286);
-	--sidebar-primary: oklch(0.53 0.19 288);
-	--sidebar-primary-foreground: oklch(0.985 0.008 286);
 	--sidebar-accent: oklch(0.93 0.01 286);
 	--sidebar-accent-foreground: oklch(0.28 0.02 286);
 	--sidebar-border: oklch(0.9 0.006 286);
-	--sidebar-ring: oklch(0.53 0.19 288);
 }
 
 .dark {
@@ -101,12 +98,9 @@
 
 	--sidebar: oklch(0.19 0.014 286);
 	--sidebar-foreground: oklch(0.9 0.006 286);
-	--sidebar-primary: oklch(0.66 0.17 288);
-	--sidebar-primary-foreground: oklch(0.17 0.02 286);
 	--sidebar-accent: oklch(0.28 0.018 286);
 	--sidebar-accent-foreground: oklch(0.95 0.006 286);
 	--sidebar-border: oklch(1 0 0 / 10%);
-	--sidebar-ring: oklch(0.66 0.17 288);
 }
 
 /* Map tokens onto Tailwind's color/radius scales so utilities like
@@ -140,12 +134,9 @@
 
 	--color-sidebar: var(--sidebar);
 	--color-sidebar-foreground: var(--sidebar-foreground);
-	--color-sidebar-primary: var(--sidebar-primary);
-	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
 	--color-sidebar-accent: var(--sidebar-accent);
 	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
 	--color-sidebar-border: var(--sidebar-border);
-	--color-sidebar-ring: var(--sidebar-ring);
 
 	--radius-sm: calc(var(--radius) - 4px);
 	--radius-md: calc(var(--radius) - 2px);

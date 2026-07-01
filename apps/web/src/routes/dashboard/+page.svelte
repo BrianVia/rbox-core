@@ -149,7 +149,9 @@
 						</span>
 					</span>
 				</div>
-				<Progress value={pct} class="mt-2.5 h-2" />
+				{#if usage.storageCap !== null}
+					<Progress value={pct} class="mt-2.5 h-2" />
+				{/if}
 			</div>
 
 			<Separator class="my-5" />
@@ -220,6 +222,7 @@
 				<Step n={3}>
 					<div class="text-sm font-medium">Link this dashboard</div>
 					<p class="mt-0.5 text-xs text-muted-foreground">Connect your machines so you can manage devices, workspaces &amp; billing here.</p>
+					<div class="mt-2 rounded-md border border-border bg-muted/50 px-3 py-2 font-mono text-xs text-muted-foreground">rbox account link &lt;code&gt;</div>
 					<Button variant="outline" size="sm" class="mt-2" onclick={() => goto('/link')}>
 						Get your code
 						<ArrowRightIcon class="size-3.5" />
