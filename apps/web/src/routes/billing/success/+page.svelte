@@ -31,5 +31,8 @@
 </script>
 
 {#if !done}
-	<p class="muted">Finalizing your subscription…</p>
+	<div class="flex items-center gap-2 text-sm text-muted-foreground">
+		<span class="size-2 animate-pulse rounded-full bg-primary"></span>
+		Finalizing your subscription…
+	</div>
 {/if}

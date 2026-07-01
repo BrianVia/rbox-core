@@ -11,6 +11,12 @@
 		type Workspace
 	} from '$lib/api';
 	import { relativeTime, errMsg } from '$lib/format';
+	import { Badge } from '$lib/components/ui/badge';
+	import { Button } from '$lib/components/ui/button';
+	import { Switch } from '$lib/components/ui/switch';
+	import { Skeleton } from '$lib/components/ui/skeleton';
+	import MonitorIcon from '@lucide/svelte/icons/monitor';
+	import FolderIcon from '@lucide/svelte/icons/folder';
 
 	let devices = $state<Device[]>([]);
 	let devicesCursor = $state<string | null>(null);
@@ -43,12 +49,12 @@
 	async function loadDevices(cursor: string | null = null) {
 		if (!authState.clerk) return;
 		try {
-			const page = await fetchDevices(authState.clerk, {
+			const pageRes = await fetchDevices(authState.clerk, {
 				include: includeWeb ? 'all' : 'cli',
 				cursor
 			});
-			devices = cursor ? [...devices, ...page.items] : page.items;
-			devicesCursor = page.nextCursor;
+			devices = cursor ? [...devices, ...pageRes.items] : pageRes.items;
+			devicesCursor = pageRes.nextCursor;
 			devicesError = '';
 		} catch (e) {
 			devicesError = friendly(errMsg(e));
@@ -58,9 +64,9 @@
 	async function loadWorkspaces(cursor: string | null = null) {
 		if (!authState.clerk) return;
 		try {
-			const page = await fetchWorkspaces(authState.clerk, { cursor });
-			workspaces = cursor ? [...workspaces, ...page.items] : page.items;
-			workspacesCursor = page.nextCursor;
+			const pageRes = await fetchWorkspaces(authState.clerk, { cursor });
+			workspaces = cursor ? [...workspaces, ...pageRes.items] : pageRes.items;
+			workspacesCursor = pageRes.nextCursor;
 			workspacesError = '';
 		} catch (e) {
 			workspacesError = friendly(errMsg(e));
@@ -76,8 +82,9 @@
 		}
 	}
 
-	async function toggleWeb() {
-		includeWeb = !includeWeb;
+	// Reset + reload when the browser-sessions filter flips (bind:checked already
+	// updated `includeWeb`, so this reload uses the new value).
+	async function onToggleWeb() {
 		devices = [];
 		devicesCursor = null;
 		await loadDevices();
@@ -98,284 +105,179 @@
 	}
 </script>
 
-<header class="page-head">
-	<button class="ghost back" onclick={() => goto('/dashboard')}>← Account</button>
-	<h1>Devices &amp; workspaces</h1>
+<header class="mb-8">
+	<h1 class="text-2xl font-semibold tracking-tight">Devices &amp; workspaces</h1>
+	<p class="mt-1 text-sm text-muted-foreground">
+		The machines connected to your account and the workspaces they sync.
+	</p>
 </header>
 
 <!-- ── Devices ─────────────────────────────────────────────────────────────── -->
-<section class="block">
-	<div class="block-head">
-		<h2>Devices</h2>
-		<label class="toggle">
-			<input type="checkbox" checked={includeWeb} onchange={toggleWeb} />
-			<span>Show browser sessions</span>
+<section class="mb-10">
+	<div class="mb-3 flex items-center justify-between gap-4">
+		<h2 class="text-xs font-semibold tracking-wide text-muted-foreground uppercase">Devices</h2>
+		<label class="flex items-center gap-2 text-sm text-muted-foreground select-none">
+			<Switch bind:checked={includeWeb} onCheckedChange={onToggleWeb} aria-label="Show browser sessions" />
+			Show browser sessions
 		</label>
 	</div>
 
 	{#if devicesError}
-		<p class="error">{devicesError}</p>
+		<div class="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+			{devicesError}
+		</div>
 	{/if}
 
 	{#if loading}
-		<div class="skeleton"></div>
-		<div class="skeleton"></div>
+		<div class="overflow-hidden rounded-lg border border-border">
+			{#each [0, 1] as i (i)}
+				<div class="flex items-center justify-between px-4 py-4 {i > 0 ? 'border-t border-border' : ''}">
+					<div class="space-y-2">
+						<Skeleton class="h-4 w-40" />
+						<Skeleton class="h-3 w-24" />
+					</div>
+					<Skeleton class="h-8 w-16" />
+				</div>
+			{/each}
+		</div>
 	{:else if devices.length === 0 && !devicesError}
-		<div class="empty">
+		<div class="rounded-lg border border-dashed border-border px-6 py-10 text-center">
 			{#if linked === false}
-				<p>No devices here yet — this login isn’t connected to your rbox CLI account.</p>
-				<button class="primary" onclick={() => goto('/link')}>Link your CLI account</button>
+				<p class="text-sm text-muted-foreground">
+					No devices here yet — this login isn't connected to your rbox CLI account.
+				</p>
+				<Button class="mt-4" onclick={() => goto('/link')}>Link your CLI account</Button>
 			{:else}
-				<p>No devices yet. Set up rbox on a machine with the CLI to see it here.</p>
+				<p class="text-sm text-muted-foreground">
+					No devices yet. Set up rbox on a machine with the CLI to see it here.
+				</p>
 			{/if}
 		</div>
 	{:else}
-		<ul class="rows">
+		<div class="divide-y divide-border overflow-hidden rounded-lg border border-border">
 			{#each devices as d (d.deviceId)}
-				<li class="row" class:current={d.isCurrent}>
-					<div class="row-main">
-						<span class="label">{d.label ?? d.deviceId}</span>
-						<span class="badges">
-							<span class="badge kind-{d.kind}">{d.kind === 'cli' ? 'CLI' : 'browser'}</span>
-							{#if d.isCurrent}<span class="badge current-badge">This device</span>{/if}
-						</span>
-						<span class="meta">Last seen {relativeTime(d.lastSeenAt)}</span>
-					</div>
-					<!-- Revoke is offered only for OTHER devices. The current session signs out
-					     via Clerk (the menu), never a self-revoke that the SPA would re-mint. -->
-					{#if !d.isCurrent}
-						<div class="row-action">
-							{#if confirmId === d.deviceId}
-								<span class="confirm-copy"
-									>Cut this device off the server? It can no longer sync. (This does
-									<strong>not</strong> evict its encryption keys — key rotation isn’t available yet.)</span
-								>
-								<button
-									class="danger small"
+				<div class="px-4 py-3.5 {d.isCurrent ? 'bg-primary/[0.03]' : ''}">
+					{#if confirmId === d.deviceId}
+						<!-- Inline confirm (no modal): revoke cuts sync but does NOT evict keys. -->
+						<div class="flex flex-col gap-3">
+							<p class="text-sm">
+								Cut <strong class="font-medium">{d.label ?? d.deviceId}</strong> off the server? It can no
+								longer sync. This does <strong class="font-medium">not</strong> evict its encryption keys — key
+								rotation isn't available yet.
+							</p>
+							<div class="flex gap-2">
+								<Button
+									variant="destructive"
+									size="sm"
 									disabled={revoking === d.deviceId}
 									onclick={() => doRevoke(d.deviceId)}
 								>
 									{revoking === d.deviceId ? 'Revoking…' : 'Revoke access'}
-								</button>
-								<button class="ghost small" onclick={() => (confirmId = null)}>Cancel</button>
-							{:else}
-								<button class="ghost small" onclick={() => (confirmId = d.deviceId)}>Revoke</button>
-							{/if}
+								</Button>
+								<Button variant="ghost" size="sm" onclick={() => (confirmId = null)}>Cancel</Button>
+							</div>
 						</div>
 					{:else}
-						<span class="self-note faint">Sign out from the account menu</span>
+						<div class="flex items-center justify-between gap-4">
+							<div class="flex min-w-0 items-center gap-3">
+								<span class="grid size-9 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+									<MonitorIcon class="size-4" />
+								</span>
+								<div class="min-w-0">
+									<div class="flex items-center gap-2">
+										<span class="truncate text-sm font-medium">{d.label ?? d.deviceId}</span>
+										<Badge variant="outline" class="px-1.5 py-0 text-[10px] uppercase">
+											{d.kind === 'cli' ? 'CLI' : 'Browser'}
+										</Badge>
+										{#if d.isCurrent}
+											<Badge variant="secondary" class="px-1.5 py-0 text-[10px]">This device</Badge>
+										{/if}
+									</div>
+									<div class="mt-0.5 text-xs text-muted-foreground">
+										Last seen {relativeTime(d.lastSeenAt)}
+									</div>
+								</div>
+							</div>
+							<!-- Revoke is offered only for OTHER devices. The current session signs out
+							     via the account menu, never a self-revoke the SPA would re-mint. -->
+							{#if !d.isCurrent}
+								<Button
+									variant="ghost"
+									size="sm"
+									class="shrink-0 text-muted-foreground hover:text-destructive"
+									onclick={() => (confirmId = d.deviceId)}
+								>
+									Revoke
+								</Button>
+							{:else}
+								<span class="shrink-0 text-xs text-muted-foreground">Sign out from the menu</span>
+							{/if}
+						</div>
 					{/if}
-				</li>
+				</div>
 			{/each}
-		</ul>
+		</div>
 		{#if devicesCursor}
-			<button class="ghost show-more" onclick={() => loadDevices(devicesCursor)}>Show more</button>
+			<Button variant="ghost" size="sm" class="mt-3" onclick={() => loadDevices(devicesCursor)}>
+				Show more
+			</Button>
 		{/if}
 	{/if}
 </section>
 
 <!-- ── Workspaces ──────────────────────────────────────────────────────────── -->
-<section class="block">
-	<div class="block-head">
-		<h2>Workspaces</h2>
-	</div>
-	<p class="faint folder-note">
-		rbox can’t see your files or folder contents — they’re end-to-end encrypted. A workspace
-		shows only its <code>project</code> id unless someone opted in to a name at setup.
+<section>
+	<h2 class="mb-2 text-xs font-semibold tracking-wide text-muted-foreground uppercase">Workspaces</h2>
+	<p class="mb-3 max-w-prose text-xs text-muted-foreground">
+		rbox can't see your files or folder contents — they're end-to-end encrypted. A workspace shows
+		only its <code class="rounded bg-muted px-1 py-0.5">project</code> id unless someone opted in to a
+		name at setup.
 	</p>
 
 	{#if workspacesError}
-		<p class="error">{workspacesError}</p>
+		<div class="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+			{workspacesError}
+		</div>
 	{/if}
 
 	{#if loading}
-		<div class="skeleton"></div>
+		<div class="overflow-hidden rounded-lg border border-border px-4 py-4">
+			<Skeleton class="h-4 w-32" />
+			<Skeleton class="mt-2 h-3 w-56" />
+		</div>
 	{:else if workspaces.length === 0 && !workspacesError}
-		<div class="empty">
-			<p>No workspaces yet — your first <code>rbox</code> sync creates one.</p>
+		<div class="rounded-lg border border-dashed border-border px-6 py-10 text-center">
+			<p class="text-sm text-muted-foreground">
+				No workspaces yet — your first <code class="rounded bg-muted px-1 py-0.5">rbox</code> sync creates
+				one.
+			</p>
 		</div>
 	{:else}
-		<ul class="rows">
+		<div class="divide-y divide-border overflow-hidden rounded-lg border border-border">
 			{#each workspaces as w (w.workspaceId)}
-				<li class="row">
-					<div class="row-main">
-						<span class="label" class:mono={!w.name}>{w.name ?? w.projectId}</span>
-						{#if w.name}
-							<span class="meta">Name is visible to rbox; contents stay end-to-end encrypted · Created {relativeTime(w.createdAt)}</span>
-						{:else}
-							<span class="meta">Private — name lives only on your devices · Created {relativeTime(w.createdAt)}</span>
-						{/if}
+				<div class="flex items-center gap-3 px-4 py-3.5">
+					<span class="grid size-9 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+						<FolderIcon class="size-4" />
+					</span>
+					<div class="min-w-0">
+						<span class="block truncate text-sm font-medium {w.name ? '' : 'font-mono'}">
+							{w.name ?? w.projectId}
+						</span>
+						<span class="mt-0.5 block text-xs text-muted-foreground">
+							{#if w.name}
+								Name is visible to rbox; contents stay end-to-end encrypted · Created {relativeTime(w.createdAt)}
+							{:else}
+								Private — name lives only on your devices · Created {relativeTime(w.createdAt)}
+							{/if}
+						</span>
 					</div>
-				</li>
+				</div>
 			{/each}
-		</ul>
+		</div>
 		{#if workspacesCursor}
-			<button class="ghost show-more" onclick={() => loadWorkspaces(workspacesCursor)}>Show more</button>
+			<Button variant="ghost" size="sm" class="mt-3" onclick={() => loadWorkspaces(workspacesCursor)}>
+				Show more
+			</Button>
 		{/if}
 	{/if}
 </section>
-
-<style>
-	.page-head {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		margin-bottom: 22px;
-	}
-	.back {
-		font-size: 13px;
-	}
-	h1 {
-		font-size: 20px;
-		margin: 0;
-	}
-	.block {
-		margin-bottom: 26px;
-	}
-	.block-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		margin-bottom: 12px;
-	}
-	h2 {
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--dim);
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		margin: 0;
-	}
-	.toggle {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 13px;
-		color: var(--dim);
-		cursor: pointer;
-	}
-	.folder-note {
-		font-size: 13px;
-		margin: -4px 0 12px;
-	}
-	.rows {
-		list-style: none;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		margin: 0;
-		padding: 0;
-	}
-	.row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		flex-wrap: wrap;
-		padding: 14px 16px;
-		border-radius: 12px;
-		border: 1px solid var(--border);
-		background: rgba(255, 255, 255, 0.02);
-	}
-	.row.current {
-		border-color: rgba(124, 108, 255, 0.4);
-	}
-	.row-main {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-		min-width: 0;
-	}
-	.label {
-		font-weight: 600;
-		overflow-wrap: anywhere;
-	}
-	.mono {
-		font-family: ui-monospace, monospace;
-		font-size: 14px;
-	}
-	.badges {
-		display: flex;
-		gap: 6px;
-	}
-	.badge {
-		font-size: 11px;
-		font-weight: 700;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-		padding: 2px 8px;
-		border-radius: 999px;
-		color: var(--dim);
-		background: rgba(255, 255, 255, 0.06);
-	}
-	.kind-cli {
-		color: var(--accent-2, #36d6c3);
-		background: rgba(54, 214, 195, 0.12);
-	}
-	.current-badge {
-		color: var(--accent, #7c6cff);
-		background: rgba(124, 108, 255, 0.14);
-	}
-	.meta {
-		font-size: 12.5px;
-		color: var(--dim);
-	}
-	.row-action {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		flex-wrap: wrap;
-		justify-content: flex-end;
-		max-width: 360px;
-	}
-	.confirm-copy {
-		font-size: 12px;
-		color: var(--dim);
-	}
-	.confirm-copy strong {
-		color: var(--text);
-	}
-	.self-note {
-		font-size: 12.5px;
-	}
-	.show-more {
-		margin-top: 12px;
-		font-size: 13px;
-	}
-	.empty {
-		padding: 22px 16px;
-		border-radius: 12px;
-		border: 1px dashed var(--border);
-		text-align: center;
-		color: var(--dim);
-	}
-	.empty .primary {
-		margin-top: 12px;
-	}
-	.skeleton {
-		height: 56px;
-		border-radius: 12px;
-		margin-bottom: 8px;
-		background: linear-gradient(
-			90deg,
-			rgba(255, 255, 255, 0.03),
-			rgba(255, 255, 255, 0.06),
-			rgba(255, 255, 255, 0.03)
-		);
-		background-size: 200% 100%;
-		animation: shimmer 1.3s infinite;
-	}
-	@keyframes shimmer {
-		to {
-			background-position: -200% 0;
-		}
-	}
-	.danger {
-		color: #ff6b6b;
-		border-color: rgba(255, 107, 107, 0.4);
-	}
-	.small {
-		font-size: 12.5px;
-		padding: 6px 10px;
-	}
-</style>

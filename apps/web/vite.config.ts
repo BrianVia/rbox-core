@@ -1,5 +1,6 @@
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
+import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 // Pure client-rendered SPA → static assets deployed to the rbox-app Pages project.
@@ -11,6 +12,7 @@ import { defineConfig } from 'vite';
 // prerender is off (no route emits a conflicting index.html) and there's no 404.html.
 export default defineConfig({
 	plugins: [
+		tailwindcss(),
 		sveltekit({
 			compilerOptions: {
 				runes: ({ filename }) =>
