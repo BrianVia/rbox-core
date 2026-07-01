@@ -11,6 +11,7 @@ import {
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
+  isIgnoreRuleFile,
   preserveGitConflict,
   HashCache,
   PhaseReport,
@@ -258,7 +259,8 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const state = await loadState(root);
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
+  const matcher = buildIgnoreMatcher(root);
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache));
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
@@ -271,14 +273,35 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox recover`.");
   }
 
-  const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
-  await report.phase("apply", () =>
-    applyActions(root, actions, api.blobStore(), {
-      device: cfg.deviceId,
-      kek,
-      onProgress: deps.onProgress ? (done, total) => deps.onProgress!(done, total, "download") : undefined,
-    })
-  );
+  // A remote entry that LOCAL rules ignore must never touch this tree — neither
+  // written (an old client may have synced a `.git` pointer file before it was a
+  // builtin ignore; applying it would plant a machine-local path here) nor deleted
+  // (a remote removal must not delete the REAL, never-synced artifact this machine
+  // has at that path). Ignored entries stay untouched in the recorded base, so they
+  // aren't pushed back as deletions either (same forward-only rule as push).
+  //
+  // TWO-PHASE apply when the pull itself changes the RULES: rule-file actions
+  // (.rboxignore/.gitignore writes/deletes) land first, the matcher is rebuilt
+  // from the updated disk state, and only then are the remaining actions filtered.
+  // Filtering everything through the PRE-pull matcher would drop a file a relaxed
+  // rule just un-ignored — it would never land locally, and the follow-up push
+  // would commit its deletion back to the remote (a data-loss echo).
+  const pathOf = (a: Action) => (a.kind === "write" ? a.entry.path : a.path);
+  const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
+  const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
+  const applyOpts = {
+    device: cfg.deviceId,
+    kek,
+    onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
+  };
+  let actions: Action[] = [];
+  await report.phase("apply", async () => {
+    if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
+    const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
+    const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+    await applyActions(root, rest, api.blobStore(), applyOpts);
+    actions = [...ruleActions, ...rest];
+  });
   if (report.enabled) {
     const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
     report.blobs = writeActions.length;

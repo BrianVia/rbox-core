@@ -149,6 +149,52 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.headSeq()).toBe(1);
 });
 
+test("pull never applies a remote entry that LOCAL rules ignore (legacy .git pointer files)", async () => {
+  const remote = new FakeRemote();
+  // An OLD client synced a worktree `.git` pointer file before `.git` (file form)
+  // became a builtin ignore. It's still in the remote manifest.
+  remote.injectCommit([
+    await remote.seedEntry("ok.txt", "fine\n"),
+    await remote.seedEntry("wt/.git", "gitdir: /Users/old-machine/repo/.git/worktrees/wt\n"),
+  ]);
+  // This machine has a REAL, machine-local pointer at that path — it must survive.
+  await fs.mkdir(path.join(root, "wt"), { recursive: true });
+  await write("wt/.git", "gitdir: /Users/me/repo/.git/worktrees/wt\n");
+
+  await pull(root, cfg, deps(remote));
+  expect(await read("ok.txt")).toBe("fine\n"); // non-ignored entries still apply
+  expect(await read("wt/.git")).toBe("gitdir: /Users/me/repo/.git/worktrees/wt\n"); // untouched
+
+  // The ignored remote entry stays in the recorded BASE (forward-only), so the next
+  // push neither echo-deletes it from the remote nor commits anything at all.
+  const st = await loadState(root);
+  expect(st.lastSyncedManifest.files.some((f) => f.path === "wt/.git")).toBe(true);
+  const before = remote.commitCalls;
+  await push(root, cfg, deps(remote));
+  expect(remote.commitCalls).toBe(before); // zero commits — no echo
+  expect(remote.headSeq()).toBe(1);
+});
+
+test("a pull that RELAXES ignore rules applies the newly-unignored files (two-phase matcher)", async () => {
+  // Filtering every action through the PRE-pull matcher would drop foo.txt here —
+  // it would never land locally and the next push would delete it from the remote
+  // (codex round-3 repro). Rule-file actions must apply first, then a FRESH matcher
+  // filters the rest.
+  const remote = new FakeRemote();
+  remote.injectCommit([await remote.seedEntry(".rboxignore", "foo.txt\n")]);
+  await pull(root, cfg, deps(remote)); // base: rules ignore foo.txt
+
+  // seq 2: the rules are relaxed (ignore file removed) AND foo.txt is added.
+  remote.injectCommit([await remote.seedEntry("foo.txt", "now visible\n")]);
+  await pull(root, cfg, deps(remote));
+  expect(await read("foo.txt")).toBe("now visible\n"); // landed despite the old rules
+
+  const before = remote.commitCalls;
+  await push(root, cfg, deps(remote));
+  expect(remote.commitCalls).toBe(before); // and no echo commit afterwards
+  expect(remote.headSeq()).toBe(2);
+});
+
 // ── clean push ─────────────────────────────────────────────────────────────
 
 test("clean push uploads the ciphertext blob, commits, advances base", async () => {

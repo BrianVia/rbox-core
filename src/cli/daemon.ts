@@ -2,13 +2,16 @@ import os from "node:os";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
+  isIgnoreRuleFile,
   HashCache,
   scanManifest,
   type IgnoreMatcher,
   type Manifest,
   type WatchEvent,
 } from "../engine/index.js";
+import type { Action } from "../engine/reconcile.js";
 import { loadState, type WorkspaceConfig } from "./config.js";
+import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
@@ -21,6 +24,42 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
+
+/** How many changed paths a pull/push log line spells out before eliding. High on
+ *  purpose: the daemon log is the ONLY forensic record of what sync did to the tree
+ *  ("did rbox delete my files?" must be answerable from it), and pumps are rare. */
+const LOG_PATHS_MAX = 50;
+
+/** Control chars in a filename must not forge extra log lines — render them as `?`. */
+const cleanPath = (p: string) => p.replace(/\p{Cc}/gu, "?");
+
+
+/** One-line forensic summary of the actions a pull APPLIED to the local tree:
+ *  counts by kind plus the paths themselves (`+`write `-`delete `!`conflict). */
+export function summarizeActions(actions: Action[]): string {
+  let writes = 0;
+  let deletes = 0;
+  let conflicts = 0;
+  const paths: string[] = [];
+  // Only the first LOG_PATHS_MAX paths are rendered at all (a huge pull stays cheap).
+  const keep = (prefix: string, p: string) => {
+    if (paths.length < LOG_PATHS_MAX) paths.push(prefix + cleanPath(p));
+  };
+  for (const a of actions) {
+    if (a.kind === "write") {
+      writes++;
+      keep("+", a.entry.path);
+    } else if (a.kind === "delete") {
+      deletes++;
+      keep("-", a.path);
+    } else {
+      conflicts++;
+      keep("!", a.path);
+    }
+  }
+  const more = actions.length > LOG_PATHS_MAX ? ` (+${actions.length - LOG_PATHS_MAX} more)` : "";
+  return `${writes} write, ${deletes} delete, ${conflicts} conflict — ${paths.join(" ")}${more}`;
+}
 
 interface Wants {
   pull: boolean;
@@ -56,6 +95,10 @@ export class RboxDaemon {
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
    *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
   private readonly writeFinishRetries = new Map<string, number>();
+  /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
+  private lastErrMsg = "";
+  private errRepeat = 0;
+  private lastLoggedSeq?: number;
   /** The watcher factory. Real native-backed `startWatcher` by default; an injectable seam
    *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
    *  a process-global module mock (which leaks across test files). */
@@ -84,6 +127,12 @@ export class RboxDaemon {
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
     log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})`);
+    // Record the binding so `rbox start` can tell a live daemon from a STALE one
+    // (bound to a workspace this root was since re-initialized away from).
+    await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId);
+    // Seed the push log's sequence memory so the first no-op push (re-publishing
+    // nothing) isn't logged as an advance.
+    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
@@ -129,6 +178,12 @@ export class RboxDaemon {
       /* ignore */
     }
     await this.watcher?.close();
+    // DRAIN the in-flight pump before declaring stopped: SIGTERM shutdown awaits
+    // stop(), so this is what makes termination actually graceful — the current
+    // op (an applyGitState, a write, an upload) COMPLETES; only queued work is
+    // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
+    // daemon restart could interrupt a mutation mid-flight.
+    await this.pumpRun.catch(() => {});
     await this.cache?.save(this.root).catch(() => {});
     log("rbox daemon stopped");
   }
@@ -140,11 +195,20 @@ export class RboxDaemon {
     void this.pump();
   }
 
+  /** The in-flight pump loop, if any — awaited by stop() so shutdown drains it. */
+  private pumpRun: Promise<void> = Promise.resolve();
+
   private async pump(): Promise<void> {
     if (this.pumping || this.stopped) return;
     this.pumping = true;
+    const run = this.pumpLoop();
+    this.pumpRun = run;
+    return run;
+  }
+
+  private async pumpLoop(): Promise<void> {
     try {
-      while (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan) {
+      while (!this.stopped && (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan)) {
         try {
           if (this.want.deepScan) {
             this.want.deepScan = false;
@@ -163,7 +227,15 @@ export class RboxDaemon {
             await this.doPush();
           }
         } catch (e) {
-          log(`pump op error: ${e instanceof Error ? e.message : String(e)}`);
+          // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
+          // first hit and every 10th after, with the running count — so the log stays
+          // readable while still showing exactly how long the failure has persisted.
+          const msg = e instanceof Error ? e.message : String(e);
+          this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
+          this.lastErrMsg = msg;
+          if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
+            log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+          }
           await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
         }
       }
@@ -180,7 +252,7 @@ export class RboxDaemon {
       // If the ignore rules themselves changed, rebuild the matcher and full-rescan
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
-      if (events.some((e) => e.relPath === ".rboxignore" || e.relPath.endsWith("/.rboxignore") || e.relPath === ".gitignore" || e.relPath.endsWith("/.gitignore"))) {
+      if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
         this.matcher = buildIgnoreMatcher(this.root);
         this.manifest = await scanManifest(this.root, this.matcher, this.cache);
       } else {
@@ -199,6 +271,17 @@ export class RboxDaemon {
       report,
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
+    // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
+    // resulting tree size and anything it had to defer. A no-op push (sequence unchanged)
+    // stays silent so the steady state doesn't fill the log.
+    if (res.sequence !== this.lastLoggedSeq) {
+      const deferredNote =
+        res.deferred && res.deferred.length > 0
+          ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
+          : "";
+      log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
+      this.lastLoggedSeq = res.sequence;
+    }
     // Files deferred because they were still changing under the push: re-enqueue them
     // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
     // per-path retry budget as mid-write files — a pathologically-churning file gives up
@@ -242,12 +325,24 @@ export class RboxDaemon {
     const report = beginReport("pull");
     const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report });
     report?.logSummaryTo(log);
+    // Forensic record: every mutation a pull applied to the LOCAL tree, path by path.
+    // This is the line that answers "did sync change/delete my files?" after the fact.
+    if (actions.length > 0) log(`pull applied: ${summarizeActions(actions)}`);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;
       this.metrics.lastConflictAt = new Date().toISOString();
       await saveMetrics(this.root, this.metrics);
     }
+    // A pull that WROTE an ignore-rule file must refresh the matcher before the rescan
+    // below and the pump's follow-up push — otherwise that push publishes files the
+    // freshly pulled rules exclude (same hazard doPush guards on watcher events).
+    if (actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path))) {
+      this.matcher = buildIgnoreMatcher(this.root);
+    }
+    // The pull advanced the local base sequence; remember it so the follow-up no-op
+    // push isn't logged as if THIS daemon published the remotely-produced sequence.
+    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
   }

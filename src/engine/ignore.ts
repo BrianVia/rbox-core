@@ -8,7 +8,11 @@ import ignore from "ignore";
  * an atomic snapshot unit, handled separately (and intentionally not file-by-file).
  */
 export const BUILTIN_IGNORE: string[] = [
-  ".git/",
+  // No trailing slash: matches BOTH the `.git/` directory AND a `.git` FILE — a git
+  // worktree/submodule checkout uses a `.git` pointer file whose target is a local
+  // absolute path. Syncing it would materialize a dangling pointer on every other
+  // machine (git state transfers via git-sync snapshots, never as raw files).
+  ".git",
   ".rbox/",
   "node_modules/",
   ".venv/",
@@ -129,16 +133,27 @@ export interface IgnoreMatcher {
   ignores(relPath: string): boolean;
 }
 
+/** Is `rel` a file whose CONTENT defines the ignore rules? Any change to one
+ *  invalidates every matcher built before it (daemon watch events, pulled
+ *  writes/deletes) — callers must rebuild before trusting another verdict. */
+export const isIgnoreRuleFile = (rel: string): boolean =>
+  rel === ".rboxignore" || rel.endsWith("/.rboxignore") || rel === ".gitignore" || rel.endsWith("/.gitignore");
+
 /**
  * Paths that are excluded UNCONDITIONALLY — no `.rboxignore`/`.gitignore`
- * negation (`!.rbox`) and no `--purge` can re-include them (design 12, C8).
+ * negation (`!.rbox`, `!.git`) and no `--purge` can re-include them (design 12, C8).
  * `.rbox/` holds `state.json` with the DECRYPTED base manifest; letting it into a
- * synced tree would leak the very metadata E2EE hides. Checked BEFORE the
+ * synced tree would leak the very metadata E2EE hides. `.git` (any depth, file OR
+ * dir) is equally non-negotiable: git state transfers ONLY via git-sync snapshots —
+ * a raw `.git` tree synced file-by-file arrives torn/corrupt, and a worktree
+ * pointer file carries a machine-local absolute path. A stray `!.git` in a
+ * project's `.gitignore` must not switch that hazard back on. Checked BEFORE the
  * overridable `ignore` ruleset, so it always wins.
  */
 function isHardExcluded(relPath: string): boolean {
   const p = relPath.replace(/\/+$/, ""); // tolerate a trailing slash (dir form)
-  return p === ".rbox" || p.startsWith(".rbox/");
+  if (p === ".rbox" || p.startsWith(".rbox/")) return true;
+  return p === ".git" || p.startsWith(".git/") || p.endsWith("/.git") || p.includes("/.git/");
 }
 
 export function buildIgnoreMatcher(root: string, extra: string[] = []): IgnoreMatcher {
