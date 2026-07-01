@@ -104,6 +104,9 @@ export interface Device {
 export interface Workspace {
 	workspaceId: string;
 	projectId: string;
+	/** Opt-in, server-visible label the first host set at `rbox init` (default-off).
+	 *  null = no name → the row keeps the private, zero-knowledge "root" display. */
+	name: string | null;
 	createdAt: number;
 }
 export interface Page<T> {

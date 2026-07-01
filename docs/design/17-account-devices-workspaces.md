@@ -257,9 +257,17 @@ filter). **A new migration adds:**
 
 ### 4.2 Workspaces
 - **Zero workspaces:** "No workspaces yet — your first `rbox` sync creates one."
-- Anonymous ids only: render `projectId` prominently and `workspaceId` as a muted
-  monospace id with copy-to-clipboard. Be explicit in copy that names are local and
-  encrypted ("rbox can't see your folder names — names live only on your devices").
+- Anonymous ids by default: render `projectId` prominently and `workspaceId` as a muted
+  monospace id with copy-to-clipboard.
+- **Opt-in name carve-out (design `workspace-names`, LOCKED).** A workspace MAY carry an
+  optional plaintext `name` the SERVER stores and this dashboard renders — a *deliberate,
+  consensual metadata trade* that is **opt-in / default-off**, set ONCE at create by the
+  first host (`rbox init`, first-writer-wins; no web edit / no PATCH route). When a row has
+  a name, render `name` and use a softer, truthful line ("name is visible to rbox; contents
+  stay end-to-end encrypted"). Unnamed rows keep `projectId` **and the strong private claim**
+  ("rbox can't see your folder names — names live only on your devices"). The privacy promise
+  is therefore per-row: unconditional for unnamed workspaces, an explicit user-controlled
+  carve-out for named ones. NEVER apply the strong claim to a named row — it would be false.
 
 ## 5. UI (SvelteKit + Svelte 5 runes, design 15)
 

@@ -198,11 +198,18 @@ carried verbatim — it is correct against the current code.)
 
 **`GET /v1/account/workspaces`**
 - Same authed + account-scoped pattern; `limit`/`cursor`; `WHERE account_id = ?`.
-- Response: `{ workspaces: [{ workspaceId, projectId, createdAt }], nextCursor }`.
+- Response: `{ workspaces: [{ workspaceId, projectId, name, createdAt }], nextCursor }`.
   `projectId` is a **PK component → returned verbatim** (truncation would collapse
-  two distinct workspaces); `workspaceId` is the server-assigned `ws_…`. Under E2EE
-  the server holds **no folder name/path** — copy says so ("rbox can't see your
-  folder names — names live only on your devices").
+  two distinct workspaces); `workspaceId` is the server-assigned `ws_…`.
+- **`name`** is the **opt-in, server-visible** dashboard label (design `workspace-names`,
+  LOCKED): `null` by default, and non-null ONLY when the first host set it at create
+  (`rbox init`, first-writer-wins — a single INSERT; no web edit / no PATCH). It's opaque
+  user text, sanitized (control chars stripped) + length-bounded (≤128) on write. Under
+  E2EE the server still holds **no folder name/path** for unnamed rows — copy keeps the
+  strong claim there ("rbox can't see your folder names — names live only on your devices").
+  For a **named** row the strong claim is FALSE, so the UI shows a softer, truthful line
+  ("name is visible to rbox; contents stay end-to-end encrypted"). The zero-knowledge
+  guarantee narrows to "we can't see names/paths *unless you opt in to a name*."
 - `lastActivityAt`/`commitCount` are **deferred** (17 §2.2): the `commits` mirror
   has no maintained per-workspace summary, so a page of busy workspaces would scan
   large ranges. v1 shows creation time only.

@@ -282,7 +282,8 @@ async function route(req: Request, env: Env): Promise<Response> {
     if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
       return jsonResponse({ error: "quota_exceeded", limit: "workspaces", cap: limits.workspaces }, 402);
     }
-    return createWorkspace(env, p, url.searchParams.get("project") ?? "root");
+    // `name` is the OPT-IN, server-visible dashboard label (§ workspace-names); absent → private default.
+    return createWorkspace(env, p, url.searchParams.get("project") ?? "root", url.searchParams.get("name"));
   }
 
   // E2EE opaque key storage (design 12) — all authed + account-scoped via Principal.

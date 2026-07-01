@@ -70,17 +70,34 @@ export function isPlatform(req: Request, env: Env): boolean {
   return !!env.RBOX_PLATFORM_SECRET && ctEqual(h, env.RBOX_PLATFORM_SECRET);
 }
 
+/** Max stored length of the opt-in workspace name (a label, not a path). */
+export const MAX_WORKSPACE_NAME = 128;
+
+/** Sanitize the opt-in, server-visible workspace name (defense-in-depth; the CLI
+ *  also sanitizes). `name` is OPAQUE user text — strip control chars/newlines so it
+ *  stays a single label line, trim, and bound length. Empty/absent → null (no name,
+ *  the private default). It is NOT a path with server meaning — just a label. */
+export function sanitizeWorkspaceName(raw: string | null | undefined): string | null {
+  if (raw == null) return null;
+  // eslint-disable-next-line no-control-regex -- strip C0/C1 control chars (incl. \n\r\t)
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
+  return cleaned ? cleaned.slice(0, MAX_WORKSPACE_NAME) : null;
+}
+
 /** POST /v1/workspaces — create a workspace OWNED by the caller's account, with a
- *  high-entropy server-assigned id. Ownership is established here (not first-commit). */
-export async function createWorkspace(env: Env, p: Principal, projectId: string): Promise<Response> {
+ *  high-entropy server-assigned id. Ownership is established here (not first-commit).
+ *  `name` is the OPT-IN, server-visible dashboard label (default-off): set once here on
+ *  the single INSERT (first-writer-wins); absent → NULL (zero-knowledge default). */
+export async function createWorkspace(env: Env, p: Principal, projectId: string, name?: string | null): Promise<Response> {
   if (p.role === "viewer") return json({ error: "forbidden" }, 403);
   const ws = `ws_${crypto.randomUUID().replace(/-/g, "")}`; // high-entropy, unguessable
+  const cleanName = sanitizeWorkspaceName(name);
   await dbFor(env, p.accountId)
-    .prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES (?, ?, ?, ?)")
-    .bind(ws, projectId, p.accountId, Date.now())
+    .prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at, name) VALUES (?, ?, ?, ?, ?)")
+    .bind(ws, projectId, p.accountId, Date.now(), cleanName)
     .run();
   await audit(env, p, "workspace.create", ws);
-  return json({ workspaceId: ws, projectId });
+  return json({ workspaceId: ws, projectId, name: cleanName });
 }
 
 export async function audit(env: Env, p: Principal | null, action: string, target: string, routeAccountId?: string): Promise<void> {
