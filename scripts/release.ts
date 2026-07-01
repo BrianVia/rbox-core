@@ -14,7 +14,8 @@
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { releaseSigningInput, verifyAndParseManifest } from "../src/cli/upgrade-cmd.js";
+import { releaseSigningInput } from "../src/cli/upgrade-cmd.js";
+import { verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -59,19 +60,26 @@ function sh(cmd: string[]): void {
 }
 const sha256File = (p: string) => createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 
-/** Upload a pre-built + pre-signed dist/ to R2 (binaries first, manifest+sig LAST — U9),
- *  fetch-back-verifying the signed shas before the manifest goes live. */
-function uploadRelease(artifacts: Record<string, { sha256: string; path: string }>): void {
+/**
+ * Publish dist/ to R2 (binaries first, manifest+sig LAST — U9). VERIFICATION IS INTRINSIC:
+ * the artifacts uploaded are derived from `verifyReleaseArtifacts` (Ed25519 signature over
+ * version.json checked against the release keyring, each binary's sha bound to the signed
+ * manifest), so NO caller — split `--upload-only` or single-shot — can reach an upload with
+ * unverified bytes (design §41). Fetch-back-verifies the shas before the manifest goes live.
+ */
+function uploadRelease(): void {
+  const m = verifyReleaseArtifacts(dist, version); // throws on missing/forged/wrong-key/tampered
+  console.log(`[release] signature verified (keyId ${m.keyId}); publishing ${Object.keys(m.artifacts).length} artifacts`);
   // Pin wrangler to an exact version so the publish step can't pull a surprise "latest".
   const WRANGLER = "wrangler@4.27.0";
   const put = (key: string, file: string, ct: string) =>
     sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
-  for (const t of targets) {
-    put(`releases/${tag}/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // immutable versioned
-    put(`releases/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // mutable latest alias
+  for (const [key, a] of Object.entries(m.artifacts)) {
+    put(`releases/${a.path}`, key, "application/octet-stream"); // immutable versioned (e.g. releases/v0.5.0/rbox-linux-x64)
+    put(`releases/${key}`, key, "application/octet-stream"); // mutable latest alias (releases/rbox-linux-x64)
   }
   put("releases/install.sh", "../scripts/install.sh", "text/x-shellscript");
-  for (const [name, a] of Object.entries(artifacts)) {
+  for (const [name, a] of Object.entries(m.artifacts)) {
     const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
     if (got.exitCode !== 0) throw new Error(`fetch-back failed for ${name}`);
     if (createHash("sha256").update(got.stdout).digest("hex") !== a.sha256) throw new Error(`fetch-back sha mismatch for ${name} — refusing to publish manifest`);
@@ -82,29 +90,10 @@ function uploadRelease(artifacts: Record<string, { sha256: string; path: string 
   console.log(`[release] published ${tag}`);
 }
 
-// PUBLISH-ONLY path: the build+smoke jobs already produced + signed + validated dist/;
-// just upload those exact artifacts. Never rebuild here (the smoked bytes must ship).
+// PUBLISH-ONLY path: the build+smoke jobs already produced + signed + smoke-tested dist/;
+// upload those exact bytes. uploadRelease() re-verifies the signature before anything ships.
 if (uploadOnly) {
-  const manifestPath = path.join(dist, "version.json");
-  const sigPath = path.join(dist, "version.json.sig");
-  if (!fs.existsSync(manifestPath)) throw new Error(`[release] --upload-only: ${manifestPath} missing (run the build job first and pass dist/ as an artifact)`);
-  if (!fs.existsSync(sigPath)) throw new Error(`[release] --upload-only: missing dist/version.json.sig`);
-  // SECURITY: VERIFY the Ed25519 signature over the EXACT version.json bytes against the
-  // embedded release keyring before trusting ANYTHING in the manifest. The split
-  // build→smoke→publish flow must keep the same trust boundary the combined flow had — a
-  // tampered dist/version.json (or a forged/mismatched sig) must be UNPUBLISHABLE. Using
-  // the very same verifier the client (`rbox upgrade`) uses so the checks can't diverge.
-  const manifestBytes = fs.readFileSync(manifestPath);
-  const sigBytes = fs.readFileSync(sigPath);
-  const m = verifyAndParseManifest(manifestBytes, sigBytes); // throws on bad/forged signature
-  if (m.version !== version) throw new Error(`[release] --upload-only: signed manifest version ${m.version} != ${version}`);
-  for (const t of targets) {
-    const bin = path.join(dist, `rbox-${t}`);
-    if (!fs.existsSync(bin)) throw new Error(`[release] --upload-only: missing dist/rbox-${t}`);
-    if (sha256File(bin) !== m.artifacts[`rbox-${t}`]?.sha256) throw new Error(`[release] --upload-only: dist/rbox-${t} sha != signed manifest — refusing to publish tampered/mismatched bytes`);
-  }
-  console.log(`[release] --upload-only: signature verified (keyId ${m.keyId}); publishing ${Object.keys(m.artifacts).length} artifacts`);
-  uploadRelease(m.artifacts);
+  uploadRelease();
   process.exit(0);
 }
 
@@ -171,5 +160,6 @@ if (noUpload) {
   process.exit(0);
 }
 
-// 5. upload to rbox-releases (default single-shot local path).
-uploadRelease(artifacts);
+// 5. upload to rbox-releases (default single-shot local path). uploadRelease() re-reads and
+//    re-verifies the just-signed version.json before uploading — same gate as --upload-only.
+uploadRelease();

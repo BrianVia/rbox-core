@@ -69,7 +69,8 @@ function resolveBackend(): WatcherBackend {
 
 // ---- shared coalescing batcher -------------------------------------------------
 
-interface Batcher {
+/** Exported for deterministic unit tests of coalescing/last-kind-wins (backend-agnostic). */
+export interface Batcher {
   push(relPath: string, kind: WatchEventKind): void;
   dispose(): void;
 }
@@ -77,9 +78,10 @@ interface Batcher {
 /**
  * last-kind-wins per path; the engine re-derives true state from disk on flush.
  * Flush immediately once a sustained burst runs past `maxWaitMs`; otherwise wait
- * for `debounceMs` of quiet. Identical semantics across both backends.
+ * for `debounceMs` of quiet. Identical semantics across both backends. Exported so the
+ * coalescing invariant can be tested deterministically, independent of OS event timing.
  */
-function createBatcher(onSettle: (events: WatchEvent[]) => void, debounceMs: number, maxWaitMs: number): Batcher {
+export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounceMs: number, maxWaitMs: number): Batcher {
   const pending = new Map<string, WatchEventKind>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let firstEventAt = 0;
