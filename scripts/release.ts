@@ -41,11 +41,14 @@ function arg(name: string): string | undefined {
 
 const version = process.argv[2];
 if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-  console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload]");
+  console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]");
   process.exit(2);
 }
 const targets = (arg("targets")?.split(",") ?? [...ALL]).filter((t): t is (typeof ALL)[number] => (ALL as readonly string[]).includes(t));
-const upload = !process.argv.includes("--no-upload");
+const noUpload = process.argv.includes("--no-upload");
+// `--upload-only`: publish a dist/ that an EARLIER job already built + signed + smoke-tested,
+// without rebuilding — so the published bytes are exactly the smoked bytes (design §41 §6).
+const uploadOnly = process.argv.includes("--upload-only");
 const keyId = process.env.RBOX_RELEASE_KEY_ID ?? RELEASE_KEYS[0]!.keyId;
 const tag = `v${version}`;
 const dist = path.join(ROOT, "dist");
@@ -55,6 +58,46 @@ function sh(cmd: string[]): void {
   if (r.exitCode !== 0) throw new Error(`command failed: ${cmd.join(" ")}`);
 }
 const sha256File = (p: string) => createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+
+/** Upload a pre-built + pre-signed dist/ to R2 (binaries first, manifest+sig LAST — U9),
+ *  fetch-back-verifying the signed shas before the manifest goes live. */
+function uploadRelease(artifacts: Record<string, { sha256: string; path: string }>): void {
+  // Pin wrangler to an exact version so the publish step can't pull a surprise "latest".
+  const WRANGLER = "wrangler@4.27.0";
+  const put = (key: string, file: string, ct: string) =>
+    sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
+  for (const t of targets) {
+    put(`releases/${tag}/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // immutable versioned
+    put(`releases/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // mutable latest alias
+  }
+  put("releases/install.sh", "../scripts/install.sh", "text/x-shellscript");
+  for (const [name, a] of Object.entries(artifacts)) {
+    const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
+    if (got.exitCode !== 0) throw new Error(`fetch-back failed for ${name}`);
+    if (createHash("sha256").update(got.stdout).digest("hex") !== a.sha256) throw new Error(`fetch-back sha mismatch for ${name} — refusing to publish manifest`);
+  }
+  console.log("[release] fetch-back sha verify OK");
+  put("releases/version.json", "version.json", "application/json");
+  put("releases/version.json.sig", "version.json.sig", "text/plain");
+  console.log(`[release] published ${tag}`);
+}
+
+// PUBLISH-ONLY path: the build+smoke jobs already produced + signed + validated dist/;
+// just upload those exact artifacts. Never rebuild here (the smoked bytes must ship).
+if (uploadOnly) {
+  const manifestPath = path.join(dist, "version.json");
+  if (!fs.existsSync(manifestPath)) throw new Error(`[release] --upload-only: ${manifestPath} missing (run the build job first and pass dist/ as an artifact)`);
+  const m = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { version: string; artifacts: Record<string, { sha256: string; path: string }> };
+  if (m.version !== version) throw new Error(`[release] --upload-only: dist manifest version ${m.version} != ${version}`);
+  if (!fs.existsSync(path.join(dist, "version.json.sig"))) throw new Error(`[release] --upload-only: missing dist/version.json.sig`);
+  for (const t of targets) {
+    const bin = path.join(dist, `rbox-${t}`);
+    if (!fs.existsSync(bin)) throw new Error(`[release] --upload-only: missing dist/rbox-${t}`);
+    if (sha256File(bin) !== m.artifacts[`rbox-${t}`]?.sha256) throw new Error(`[release] --upload-only: dist/rbox-${t} sha != signed manifest — refusing to publish tampered/mismatched bytes`);
+  }
+  uploadRelease(m.artifacts);
+  process.exit(0);
+}
 
 // 1. embed the version
 fs.writeFileSync(path.join(ROOT, "src/cli/version.ts"), `export const RBOX_VERSION = ${JSON.stringify(version)};\n`);
@@ -113,29 +156,11 @@ const sig = edSign(null, Buffer.from(releaseSigningInput(manifestBytes)), priv).
 fs.writeFileSync(path.join(dist, "version.json.sig"), sig);
 console.log(`[release] signed manifest (keyId ${keyId})`);
 
-if (!upload) {
-  console.log(`[release] --no-upload: artifacts in ${dist}`);
+// `--no-upload`: stop after build+sign so a separate (smoke-gated) job can publish dist/.
+if (noUpload) {
+  console.log(`[release] --no-upload: built + signed artifacts in ${dist}`);
   process.exit(0);
 }
 
-// 5. upload to rbox-releases (binaries first, then manifest+sig last — U9).
-// Pin wrangler to an exact version so the signing/publish step can't pull a
-// surprise "latest" off npm at release time (supply-chain hardening).
-const WRANGLER = "wrangler@4.27.0";
-const put = (key: string, file: string, ct: string) =>
-  sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
-for (const t of targets) {
-  put(`releases/${tag}/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // immutable versioned
-  put(`releases/rbox-${t}`, `rbox-${t}`, "application/octet-stream"); // mutable latest alias
-}
-put("releases/install.sh", "../scripts/install.sh", "text/x-shellscript");
-// fetch-back the binaries and re-verify the signed shas before publishing the manifest
-for (const [name, a] of Object.entries(artifacts)) {
-  const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
-  if (got.exitCode !== 0) throw new Error(`fetch-back failed for ${name}`);
-  if (createHash("sha256").update(got.stdout).digest("hex") !== a.sha256) throw new Error(`fetch-back sha mismatch for ${name} — refusing to publish manifest`);
-}
-console.log("[release] fetch-back sha verify OK");
-put("releases/version.json", "version.json", "application/json");
-put("releases/version.json.sig", "version.json.sig", "text/plain");
-console.log(`[release] published ${tag}`);
+// 5. upload to rbox-releases (default single-shot local path).
+uploadRelease(artifacts);

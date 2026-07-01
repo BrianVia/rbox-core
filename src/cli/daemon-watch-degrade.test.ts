@@ -17,9 +17,12 @@ afterAll(() => {
 });
 
 test("watcher init rejects → reconcile timers stay armed (never silently dead)", async () => {
+  // Neutral message on purpose: it must NOT contain "fsevents"/"sandbox"/etc, or if this
+  // process-global mock momentarily leaks into another file's native-capability probe it
+  // would be mistaken for a real unsupported environment and wrongly skip that suite.
   mock.module("./watcher.js", () => ({
     ...realWatcher,
-    startWatcher: () => Promise.reject(new Error("subscribe failed: FSEvents unavailable")),
+    startWatcher: () => Promise.reject(new Error("forced watcher-init failure (degrade test stub)")),
   }));
 
   const { RboxDaemon } = await import("./daemon.js");

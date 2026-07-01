@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { buildIgnoreMatcher } from "../engine/index.js";
+import { startWatcher } from "./watcher.js";
 
 // Finding 5(d) + Phase-0 gate for the HOST target: prove the native @parcel/watcher
 // binding survives `bun build --compile` and actually LOADS + DELIVERS an event from a
@@ -19,7 +21,32 @@ const PARCEL_PKG: Record<string, string> = {
 const hostKey = `${process.platform}-${process.arch}`;
 const hostPkgPresent = !!PARCEL_PKG[hostKey] && fs.existsSync(path.join(ROOT, "node_modules", PARCEL_PKG[hostKey]!, "watcher.node"));
 
-test.skipIf(!hostPkgPresent)(
+// Skip ONLY when we genuinely can't exercise it: the host platform package isn't installed
+// (can't compile the target), or a macOS sandbox with no FSEvents. Linux/inotify + normal
+// macOS must RUN — a failure there is a real regression, not a silent skip.
+async function macSandboxNoFsevents(attempts = 3): Promise<boolean> {
+  if (process.platform !== "darwin") return false;
+  let err = "";
+  // Retry: only a GENUINE sandbox fails every attempt; a transient FSEvents spike under
+  // full-suite contention must not trigger a skip (else CI loses this coverage silently).
+  for (let i = 0; i < attempts; i++) {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-cprobe-")));
+    try {
+      const w = await startWatcher(dir, buildIgnoreMatcher(dir), () => {}, { debounceMs: 20 });
+      await w.close();
+      return false;
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  return /fsevents|not permitted|sandbox|eperm/i.test(err);
+}
+const skipCompiled = !hostPkgPresent || (await macSandboxNoFsevents());
+
+test.skipIf(skipCompiled)(
   "compiled standalone binary loads the native watcher and delivers an event (host target)",
   async () => {
     const entry = path.join(ROOT, `.rbox-watch-smoke-${process.pid}.ts`);

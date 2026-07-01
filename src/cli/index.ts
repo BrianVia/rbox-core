@@ -391,6 +391,13 @@ async function main(): Promise<void> {
       await runDaemon(root);
       break;
     }
+    case "__watcher-selftest": {
+      // Hidden: release-CI self-check (design §41 §6). Proves the native watcher loads
+      // from THIS (compiled) binary on this OS/arch and delivers an event. Not in help.
+      const { watcherSelfTest } = await import("./watcher-selftest.js");
+      process.exit(await watcherSelfTest(positional[0]));
+      break;
+    }
     default:
       // Bare `rbox` in a terminal → the guided `setup` front door (design 29).
       // Non-interactive bare `rbox`, or an unknown command → the grouped help

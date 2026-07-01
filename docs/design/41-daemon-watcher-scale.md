@@ -4,9 +4,12 @@
 Root-caused by reproduced measurement on the founder's machine; the `@parcel/watcher`
 swap is built, Phase-0-gated on darwin-arm64, and re-measured on the same 17 GB corpus:
 **11,106 MB / 330 s → 60 MB / <0.1 s.** This doc is the design **and** the record of what
-shipped. Closes codex **round 1** (async lifecycle / floor, symlink realpath, HashCache.prune)
-**and round 2** (deterministic all-platform release embedding, negation-aware + recursive
-native prune, hot-path write-finish retry, robust/expanded tests, root-containment guard).
+shipped. Closes codex **round 1** (async lifecycle / floor, symlink realpath, HashCache.prune),
+**round 2** (deterministic all-platform release embedding, recursive native prune, hot-path
+write-finish retry, expanded tests), and **round 3** (path-aware negation prune so the build
+dirs aren't regressed, chokidar event-time root guard parity, narrowed test-skips that
+hard-fail where the watcher should work). A **per-target runtime smoke matrix** now gates the
+release publish (§6).
 
 **Implements:** the deferred watcher-backend swap flagged in `watcher.ts:30` and
 `docs/design/09-hardening-scale.md` (M9 "scale"). **Composes with:** the swappable
@@ -175,13 +178,19 @@ mapping correctly covers a deleted file or directory.
   `/**` form, node_modules **children would flood the JS filter** (statSync + matcher on the
   hot path). Re-measured on the founder's corpus: a file written deep inside
   `…/node_modules/pako` now yields **0 events reaching JS, 0 matcher consults** (finding 3).
-- **Negation-aware pruning.** A hard-prune dir the user could **re-include** under (e.g. a
-  `.rboxignore` `!dist/`) is **dropped** from the native set, so its live events still reach
-  the authoritative JS matcher instead of being silently pruned before it. `node_modules` /
-  `.git` / `.rbox` are treated as always-prunable (never realistically re-included; `.rbox`
-  is hard-excluded in code); `dist`/`build`/`.next`/… are conditional on there being no
-  negation that could match inside them (finding 2). Confirmed live: with `!dist/`,
-  `dist/keep.txt` is delivered as a live event, not merely healed by the safety scan.
+- **Negation-aware pruning (PATH-AWARE).** A hard-prune dir the user could **re-include**
+  under is **dropped** from the native set, so its live events still reach the authoritative
+  JS matcher. The re-entry test is anchored to the specific dir: a negation drops `d` only if
+  it is `d` itself (`!dist/`), `d/…` (`!dist/keep.txt`), or `…/d/…` — **not** a bare-basename
+  negation whose name isn't a hard-prune dir. This matters because the built-ins carry
+  `!.env.example`/`!.env.sample`/`!.env.template`: an over-broad "any negation un-prunes
+  everything" rule would regress **dist/build/.next/target back to being watched** on a
+  *default* tree (round-3 finding 1). Verified: a default tree prunes all 15 hard dirs
+  (node_modules, .git, .rbox, dist, build, .next, target, …); `!dist/` or `!dist/keep.txt`
+  drops only `dist`; `!.env.example` drops nothing. `node_modules`/`.git`/`.rbox` are
+  always-prunable. Accepted consequence: a file re-included *inside* a hard-pruned dir (e.g.
+  `dist/.env.example` via `!.env.example`) is healed by the 60 s safety scan, not delivered
+  live.
 
 The full `IgnoreMatcher` remains the authoritative **post-filter** on every delivered
 create/update — native prune is a *volume* optimization only, never the thing that decides
@@ -266,40 +275,49 @@ by `fs.inotify.max_user_watches` (defaults 8k–128k). Post-prune this corpus is
 dirs — likely under a modern default but not guaranteed on stock distros. The
 degrade-to-periodic-scan path (§4.2) is exactly the inotify-exhaustion handler: an
 `ENOSPC`/limit failure at `subscribe()` rejects → daemon logs + degrades, never crashes or
-silently under-watches. **Still to validate in CI on a real Linux target** (watch count
-post-prune, exhaustion behavior); tracked in §6.
+silently under-watches. The §6 smoke matrix now runs the linux-x64 + linux-arm64 binaries on
+native runners and asserts the inotify-backed watcher **loads + delivers an event**;
+measuring the actual watch count post-prune / forcing `max_user_watches` exhaustion remains a
+nice-to-have follow-up.
 
 ---
 
-## 6. Phase 0 result + target coverage
+## 6. Phase 0 + the per-target runtime smoke matrix (release gate)
 
-**Phase 0 (the hard gate): PASS on darwin-arm64.** Proven end-to-end, not just "build
-exits 0": the compiled standalone binary of the real `watcher.ts`, run from an isolated dir
-with no `node_modules`, **loaded the embedded native addon, subscribed, received a create
-event, pruned `node_modules`, and idled at ~40 MB.**
+**Phase 0 (host, local): PASS on darwin-arm64.** The compiled standalone binary of the real
+`watcher.ts`, run from an isolated dir with no `node_modules`, **loaded the embedded native
+addon, subscribed, received a create event, pruned `node_modules`, idled ~40 MB.**
 
-| Target | Native embed proven | How |
-|---|---|---|
-| **darwin-arm64** | ✅ locally (compile + run + event) | this machine |
-| darwin-x64 | ⚠️ CI-gated | build with `--external` the 3 others; run the compiled binary on a mac-x64 runner, subscribe, assert an event |
-| linux-x64 | ⚠️ CI-gated | build on/for linux-x64 with its package installed; run compiled binary on a linux-x64 runner, subscribe, assert an event; also assert inotify count post-prune |
-| linux-arm64 | ⚠️ CI-gated | same, linux-arm64 runner |
+**All four targets are now smoke-gated in CI** — `release.yml` is a three-job DAG:
 
-**CI requirement:** each target must run its compiled binary on native hardware (or
-faithful emulation) and confirm the watcher **loads + delivers an event** — `bun build`
-exit 0 is insufficient (the native `.node` only fails at load). A target whose package is
-absent at build time still produces a working binary that **degrades to periodic-scan**
-(the binding `require` throws → caught → floor), so no target ships broken; it either has
-the native watcher or the safe fallback.
+1. **`build`** (ubuntu): `bun install --frozen-lockfile --os=* --cpu=*` → cross-compile +
+   **sign** all four, each embedding its own `.node` (asserted present), `--no-upload`.
+   Uploads `dist/` as an artifact.
+2. **`smoke`** (matrix, one **native** runner per target — `macos-14`/`macos-13`/
+   `ubuntu-24.04`/`ubuntu-24.04-arm`, no QEMU): downloads the artifact and runs **that
+   target's** binary `__watcher-selftest` — a hidden subcommand that starts the watcher on a
+   temp dir, creates a file, and exits 0 iff the native watcher **loaded + delivered the
+   event** within a timeout and idle RSS is bounded. Prints `WATCHER_SELFTEST ok rss_mb=…`.
+3. **`publish`** (`needs: smoke`): uploads the **exact** built+signed+smoked bytes to R2 via
+   `release.ts --upload-only` (re-verifying each binary's sha against the signed manifest).
+
+A target whose native watcher can't load **fails its smoke leg and blocks the publish** — it
+never ships blind. `bun build` exit 0 is insufficient (the `.node` only fails at *load*), so
+the gate runs the real binary on real hardware. The host-target `__watcher-selftest` was
+verified locally: `WATCHER_SELFTEST ok rss_mb=45 platform=darwin-arm64`, exit 0, from an
+isolated dir. (The self-test's own logic is also covered by `watcher-compiled.test.ts`.)
 
 ---
 
 ## 7. Tests (CI-safe)
 
-Deterministic, bounded, on synthetic temp trees against the real parcel backend. The
-watcher tests **probe once and `skipIf` the native watcher can't start** (sandboxed CI with
-no FSEvents), so they run on Linux/inotify CI and dev machines but never hard-fail in a
-headless box (finding 5a).
+Deterministic, bounded, on synthetic temp trees against the real parcel backend. The skip is
+**narrow** (round-3 finding 3): a probe (retried, so a transient spike doesn't count) skips
+**only** a genuinely-unsupported macOS sandbox with no FSEvents. **Linux/inotify and normal
+macOS always run** — a watcher that fails to start there is a real regression, not a silent
+skip. `src/engine/ignore.test.ts` adds a **`nativePruneGlobs` regression suite**: a default
+tree prunes all hard dirs incl. the build dirs; `!dist/keep.txt` drops only `dist`;
+`!.env.example` drops nothing (round-3 findings 1–2).
 
 `src/cli/watcher.test.ts` (10 cases):
 - create → `add`; modify → `change`.
@@ -331,7 +349,7 @@ target, run in an isolated dir (finding 5d). `src/engine/engine-m1.test.ts`: `ap
 | Live create synced | dropped | **delivered** |
 | node_modules event leak | n/a (pruned) | **0** |
 
-Verification: `bun test ./src/` = **292 pass / 0 fail**; `tsc --noEmit` (root + apps/api)
+Verification: `bun test ./src/` = **297 pass / 0 skip / 0 fail**; `tsc --noEmit` (root + apps/api)
 clean; all four release `--target`s resolve + embed on one host; compiled-binary smoke of
 the real `watcher.ts` passes standalone.
 

@@ -104,14 +104,24 @@ export function nativePruneGlobs(root: string): string[] {
   return dirs.flatMap((d) => [`**/${d}`, `**/${d}/**`]);
 }
 
-/** Could a `!negation` (leading `!` already stripped) re-include a path INSIDE dir `d`? */
+/**
+ * Could a `!negation` (leading `!` and surrounding slashes already stripped by the caller)
+ * re-include the directory `d` such that we must NOT native-prune it? PATH-AWARE: a
+ * negation only re-enters `d` if it is anchored to that specific directory —
+ *   - `d` itself (`!dist/` → `dist`, or bare `!dist`): re-includes the dir entry;
+ *   - `d/…` (`!dist/keep.txt`): targets a path under the dir;
+ *   - `…/d/…` (`!src/dist/x`): targets a nested occurrence the any-depth prune glob catches.
+ *
+ * A BARE-BASENAME negation with no slash whose name isn't a hard-prune dir (`!.env.example`,
+ * `!keep.txt`) matches files by name anywhere and must NOT un-prune dist/build/etc. — those
+ * built-in `!.env.*` negations would otherwise regress every build dir back to being watched.
+ * (Accepted consequence: a re-included file that happens to sit *inside* a hard-pruned dir —
+ * e.g. `dist/.env.example` via `!.env.example` — is healed by the 60s safety scan rather than
+ * delivered as a live event.)
+ */
 function negationReenters(neg: string, d: string): boolean {
   if (neg.length === 0) return false;
-  // A pattern with no slash matches at ANY depth under gitignore semantics — including
-  // inside `d` — so it could re-include there. Conservatively drop `d` from native prune.
-  if (!neg.includes("/")) return true;
-  // An anchored/relative pattern that names `d` as any path segment targets inside it.
-  return neg.split("/").filter(Boolean).includes(d);
+  return neg === d || neg.startsWith(`${d}/`) || neg.includes(`/${d}/`);
 }
 
 export interface IgnoreMatcher {

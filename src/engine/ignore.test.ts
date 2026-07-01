@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher } from "./ignore.js";
+import { buildIgnoreMatcher, nativePruneGlobs } from "./ignore.js";
 
 let root: string;
 beforeAll(async () => {
@@ -37,5 +37,62 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
     const m = buildIgnoreMatcher(root);
     expect(m.ignores("src/index.ts")).toBe(false);
     expect(m.ignores("node_modules/")).toBe(true); // a normal builtin
+  });
+});
+
+describe("nativePruneGlobs — coarse native watcher prune, negation-aware (design §41)", () => {
+  const mkroot = async (rboxignore?: string): Promise<string> => {
+    const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-np-"));
+    if (rboxignore !== undefined) await fs.writeFile(path.join(d, ".rboxignore"), rboxignore);
+    return d;
+  };
+  const prunes = (globs: string[], dir: string) => globs.includes(`**/${dir}`) && globs.includes(`**/${dir}/**`);
+
+  test("a DEFAULT tree native-prunes node_modules, .git, .rbox AND the build dirs", async () => {
+    const d = await mkroot();
+    try {
+      const g = nativePruneGlobs(d);
+      // The regression guard: the built-in `!.env.*` negations must NOT un-prune build dirs.
+      for (const dir of ["node_modules", ".git", ".rbox", "dist", "build", ".next", "target"]) {
+        expect(prunes(g, dir)).toBe(true);
+      }
+      // subtree form is present so a native watcher's CHILD events are pruned too
+      expect(g).toContain("**/node_modules/**");
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("a user `!dist/keep.txt` un-prunes `dist` (only), leaving other build dirs pruned", async () => {
+    const d = await mkroot("!dist/keep.txt\n");
+    try {
+      const g = nativePruneGlobs(d);
+      expect(prunes(g, "dist")).toBe(false); // dropped → live events reach the JS matcher
+      expect(prunes(g, "build")).toBe(true);
+      expect(prunes(g, "node_modules")).toBe(true);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("a user `!dist/` un-prunes `dist`", async () => {
+    const d = await mkroot("!dist/\n");
+    try {
+      expect(prunes(nativePruneGlobs(d), "dist")).toBe(false);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("a BARE-BASENAME negation (`!.env.example`) removes NOTHING from the prune set", async () => {
+    const d = await mkroot("!.env.example\n!keep.txt\n");
+    try {
+      const g = nativePruneGlobs(d);
+      for (const dir of ["node_modules", ".git", ".rbox", "dist", "build", ".next", "target"]) {
+        expect(prunes(g, dir)).toBe(true);
+      }
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
   });
 });

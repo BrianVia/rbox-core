@@ -19,20 +19,31 @@ const DEBOUNCE = 40;
 let active: Watcher | undefined;
 let roots: string[] = [];
 
-async function nativeWatchAvailable(): Promise<boolean> {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-probe-")));
-  try {
-    const w = await startWatcher(dir, buildIgnoreMatcher(dir), () => {}, { debounceMs: 20 });
-    await w.close();
-    return true;
-  } catch {
-    return false;
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+// Retry a few times: a genuine sandbox fails every attempt, whereas a transient FSEvents
+// spike under full-suite CPU contention may fail once — we must not skip on that.
+async function probeNativeWatch(attempts = 3): Promise<{ ok: boolean; err: string }> {
+  let err = "";
+  for (let i = 0; i < attempts; i++) {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-probe-")));
+    try {
+      const w = await startWatcher(dir, buildIgnoreMatcher(dir), () => {}, { debounceMs: 20 });
+      await w.close();
+      return { ok: true, err: "" };
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
+  return { ok: false, err };
 }
-const NATIVE_OK = await nativeWatchAvailable();
-const wtest = test.skipIf(!NATIVE_OK);
+// Skip ONLY a genuinely-unsupported macOS sandbox (no FSEvents stream). Linux/inotify and a
+// normal macOS MUST run the native suite — a watcher that fails to start there is a real
+// regression, never a silent skip (positive-capability gate, not "any error").
+const cap = await probeNativeWatch();
+const skipNative = !cap.ok && process.platform === "darwin" && /fsevents|not permitted|sandbox|eperm/i.test(cap.err);
+const wtest = test.skipIf(skipNative);
 
 afterEach(async () => {
   await active?.close().catch(() => {});

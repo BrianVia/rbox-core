@@ -274,7 +274,9 @@ function startChokidar(
   watcher.on("all", (event: string, abs: string) => {
     const kind = EVENT_KIND[event];
     if (!kind) return;
-    batcher.push(toRel(abs), kind);
+    const rel = toRel(abs);
+    if (rel === "" || escapesRoot(rel)) return; // parity with the parcel path
+    batcher.push(rel, kind);
   });
 
   return {
