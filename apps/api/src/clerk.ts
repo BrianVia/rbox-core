@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { capBytesFor } from "./plans.js";
-import { createWebSession } from "./auth.js";
+import { AccountGoneError, createWebSession } from "./auth.js";
 import { refreshOwnerEmail } from "./notify.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingNewAccount } from "./slackpipes.js";
@@ -172,8 +172,38 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
   // next login (or the consumer's live fallback) instead.
   if (!firstLogin) await refreshOwnerEmail(env, sub, nowMs).catch(() => {});
 
-  const { token } = await createWebSession(env, map.account_id, map.user_id);
+  // design 37: never mint a web session into a tombstoned account (a returning login whose
+  // account is mid-deletion). First-login just created the account (live), so this only ever
+  // rejects a returning login on a deleted account during its grace window.
+  const live = await dbFor(env, map.account_id).prepare("SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(map.account_id).first();
+  if (!live) return json({ error: "account_deleted", message: "this account has been deleted" }, 403);
+
+  // design 37: the liveness read above is a fast-fail; the mint itself is liveness-COUPLED, so a
+  // tombstone landing between the read and the device insert writes no row and throws here →
+  // return the same clean "account deleted" rather than a 500.
+  let token: string;
+  try {
+    ({ token } = await createWebSession(env, map.account_id, map.user_id));
+  } catch (e) {
+    if (e instanceof AccountGoneError) return json({ error: "account_deleted", message: "this account has been deleted" }, 403);
+    throw e;
+  }
   return json({ token, accountId: map.account_id });
+}
+
+/** Delete a Clerk user as part of account erasure (design 37 §4h). Idempotent +
+ *  best-effort: a 404 (already gone) counts as success; any other non-2xx (or no
+ *  CLERK_SECRET_KEY configured) returns false so the drain retries rather than leaving the
+ *  identity behind. Deleting the user erases their PII at Clerk and signs them out
+ *  everywhere. */
+export async function deleteClerkUser(env: Env, sub: string): Promise<boolean> {
+  if (!env.CLERK_SECRET_KEY) return false; // can't erase the identity → retry (fail loud, never silently skip)
+  try {
+    const res = await fetch(`https://api.clerk.com/v1/users/${sub}`, { method: "DELETE", headers: { authorization: `Bearer ${env.CLERK_SECRET_KEY}` } });
+    return res.ok || res.status === 404; // 404 = already deleted → idempotent success
+  } catch {
+    return false; // network/transient → retry
+  }
 }
 
 async function clerkEmailVerified(env: Env, sub: string): Promise<boolean> {

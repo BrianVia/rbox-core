@@ -47,7 +47,11 @@
   // New-device security email (design 16 / 30). The Worker has no ExecutionContext, so
   // the durable path is: outbox (D1) → Queue → consumer send → cron backstop.
   "queues": {
-    "producers": [{ "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-dev-device-notify" }],
+    "producers": [
+      { "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-dev-device-notify" },
+      // Account-deletion continuation (design 33 §7); the cron backstop drains it if absent.
+      { "binding": "ACCOUNT_DELETE_Q", "queue": "rbox-dev-account-delete" }
+    ],
     "consumers": [
       {
         "queue": "rbox-dev-device-notify",
@@ -55,6 +59,13 @@
         "max_batch_timeout": 5,
         "max_retries": 5,
         "dead_letter_queue": "rbox-dev-device-notify-dlq"
+      },
+      {
+        "queue": "rbox-dev-account-delete",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "rbox-dev-account-delete-dlq"
       }
     ]
   },
@@ -98,7 +109,10 @@
       // New-device email infra in prod (reaches prod ONLY via merge→CI, never from a dev
       // deploy). Separate prod queue + DLQ; same EMAIL binding + sender domain.
       "queues": {
-        "producers": [{ "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-prod-device-notify" }],
+        "producers": [
+          { "binding": "DEVICE_NOTIFY_Q", "queue": "rbox-prod-device-notify" },
+          { "binding": "ACCOUNT_DELETE_Q", "queue": "rbox-prod-account-delete" }
+        ],
         "consumers": [
           {
             "queue": "rbox-prod-device-notify",
@@ -106,6 +120,13 @@
             "max_batch_timeout": 5,
             "max_retries": 5,
             "dead_letter_queue": "rbox-prod-device-notify-dlq"
+          },
+          {
+            "queue": "rbox-prod-account-delete",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "rbox-prod-account-delete-dlq"
           }
         ]
       },

@@ -28,18 +28,18 @@ function encode(params: Record<string, unknown>, prefix = ""): string {
   return parts.filter(Boolean).join("&");
 }
 
-async function stripeApi(env: Env, method: "GET" | "POST", path: string, params?: Record<string, unknown>): Promise<any> {
+async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: string, params?: Record<string, unknown>): Promise<any> {
   const secret = env.STRIPE_SECRET!;
-  const isGet = method === "GET";
+  const sendsBody = method === "POST"; // GET puts params in the query; DELETE carries none
   const body = params ? encode(params) : "";
-  const url = isGet && body ? `${API}${path}?${body}` : `${API}${path}`;
+  const url = !sendsBody && body ? `${API}${path}?${body}` : `${API}${path}`;
   const res = await fetch(url, {
     method,
     headers: {
       authorization: `Bearer ${secret}`,
-      ...(isGet ? {} : { "content-type": "application/x-www-form-urlencoded" }),
+      ...(sendsBody ? { "content-type": "application/x-www-form-urlencoded" } : {}),
     },
-    body: isGet ? undefined : body || undefined,
+    body: sendsBody ? body || undefined : undefined,
   });
   const data = (await res.json()) as any;
   if (!res.ok) throw new Error(`stripe ${path} ${res.status}: ${data?.error?.message ?? "error"}`);
@@ -254,6 +254,32 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
     default:
       break; // ignore unrelated events
   }
+}
+
+// ---- account deletion: cancel + erase the Stripe footprint (design 37 §4h) ----
+
+/** Cancel the subscription and delete the customer for an account being erased. Idempotent
+ *  and best-effort: a missing/already-canceled sub or customer (Stripe `resource_missing`
+ *  → 404) is treated as success, so a retried purge never wedges. Returns true on a clean
+ *  pass (nothing left at Stripe), false if a transient error should make the caller retry.
+ *  No-op (true) when STRIPE_SECRET is unset (billing not provisioned). A late
+ *  `customer.subscription.deleted` webhook then matches no live account row → no-op. */
+export async function purgeStripeForAccount(env: Env, subscriptionId: string | null, customerId: string | null): Promise<boolean> {
+  if (!env.STRIPE_SECRET) return true; // billing not provisioned → nothing to erase
+  try {
+    if (subscriptionId) await stripeApi(env, "DELETE", `/subscriptions/${subscriptionId}`).catch((e) => rethrowUnlessMissing(e));
+    if (customerId) await stripeApi(env, "DELETE", `/customers/${customerId}`).catch((e) => rethrowUnlessMissing(e));
+    return true;
+  } catch {
+    return false; // transient Stripe error → caller retries the whole drain
+  }
+}
+
+/** Swallow a Stripe `resource_missing`/404 (already gone = success for an idempotent
+ *  purge); re-throw anything else so the caller can mark the drain retryable. */
+function rethrowUnlessMissing(e: unknown): void {
+  if (/\b404\b|resource_missing|No such/i.test(String((e as Error)?.message ?? e))) return;
+  throw e;
 }
 
 // ---- re-point saga (design 21 §3.4.2) ----

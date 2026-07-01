@@ -169,6 +169,26 @@ export async function unlinkAccount(clerk: Clerk): Promise<string> {
 	return ((await res.json()) as { account: string }).account;
 }
 
+/** Irreversibly delete this account + all its data (design 37). OWNER-ONLY and
+ *  confirmation-gated: `confirm` must be the owner's email or the account id. On success the
+ *  account is tombstoned immediately (every device/session revoked) and hard-purged after a
+ *  grace window — so the caller MUST sign out afterward (the token is already dead). */
+export async function deleteAccount(
+	clerk: Clerk,
+	confirm: string
+): Promise<{ status: string; purgeAfter: number }> {
+	const res = await authed(clerk, '/v1/account', {
+		method: 'DELETE',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ confirm })
+	});
+	if (res.status === 400) throw new Error('That didn’t match — type your account email or account id exactly.');
+	if (res.status === 403) throw new Error('Only the account owner can delete this account.');
+	if (res.status === 404) throw new Error('This account no longer exists.');
+	if (!res.ok) throw new Error(`delete failed (${res.status})`);
+	return res.json() as Promise<{ status: string; purgeAfter: number }>;
+}
+
 export async function startCheckout(clerk: Clerk, plan: 'solo' | 'pro'): Promise<string> {
 	const res = await authed(clerk, `/v1/billing/checkout?plan=${plan}`, { method: 'POST' });
 	if (!res.ok) throw new Error(`checkout failed (${res.status})`);

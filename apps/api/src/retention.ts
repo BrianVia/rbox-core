@@ -71,7 +71,11 @@ export async function retentionPrune(env: Env, nowMs: number = Date.now()): Prom
     if (floor <= 0) continue; // nothing old enough to prune
 
     const id = env.WORKSPACE_SYNC.idFromName(`${r.ws}/${r.proj}`);
-    const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/v1/ws/${r.ws}/proj/${r.proj}/prune`, {
+    // Slash-safe addressing (design 37 §4f follow-up): like the GC roots scan, a positional
+    // `…/proj/:proj/prune` mis-parses a project_id containing "/". Use the DO's FIXED `/prune`
+    // path with ws/proj in the query (floor stays in the body), so retention can't wedge either.
+    const q = `?ws=${encodeURIComponent(r.ws)}&proj=${encodeURIComponent(r.proj)}`;
+    const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/prune${q}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ floor }),

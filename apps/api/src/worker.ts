@@ -10,7 +10,7 @@
  *
  * Dev-harness shortcut (documented): auth is a shared bearer token (M4 replaces).
  */
-import type { DeviceNotifyMessage, Env } from "./env.js";
+import type { AccountDeleteMessage, DeviceNotifyMessage, Env } from "./env.js";
 import { dbFor } from "./db.js";
 import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
 import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
@@ -27,6 +27,7 @@ import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.j
 import { adminOverview } from "./admin.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
+import { deleteAccount, driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 // §33 GRACE_1: the Phase-1 mark→purge grace, sized to exceed the slowest in-flight
@@ -107,6 +108,15 @@ export default {
     } catch (e) {
       logErr("scheduled_notify_sweep_failed", e); // no raw message (touches device/account metadata)
     }
+    try {
+      // Account-deletion backstop (design 37 §7): hard-purge every account whose grace
+      // window has elapsed, in bounded re-entrant chunks (the durable `account_deletions`
+      // ledger is the source of truth). Separate try so it never starves / is starved by
+      // the sweeps above.
+      await sweepAccountDeletions(env);
+    } catch (e) {
+      logErr("scheduled_account_delete_sweep_failed", e); // no raw message (touches account metadata)
+    }
   },
 
   /**
@@ -117,8 +127,26 @@ export default {
    * `ack()` on success; `retry()` on an UNEXPECTED throw (per-recipient transient
    * failures are already recorded as `failed` inside, to be re-driven by queue+cron).
    */
-  async queue(batch: MessageBatch<DeviceNotifyMessage>, env: Env): Promise<void> {
-    for (const msg of batch.messages) {
+  async queue(batch: MessageBatch<DeviceNotifyMessage | AccountDeleteMessage>, env: Env): Promise<void> {
+    // Dispatch by queue name — both consumers share this one handler (design 37 §7 reuses
+    // the design-16 shape). The message bodies are disjoint; we route on `batch.queue`.
+    if (batch.queue.includes("account-delete")) {
+      for (const msg of batch.messages as Message<AccountDeleteMessage>[]) {
+        try {
+          const res = await driveAccountDeletion(env, msg.body.accountId);
+          msg.ack();
+          // Prompt continuation: re-enqueue only while a chunk made progress (lease
+          // released). "blocked"/"skip"/"done" stop the loop; the cron backstop re-drives
+          // a blocked (external-outage) row later.
+          if (res === "progress" && env.ACCOUNT_DELETE_Q) await env.ACCOUNT_DELETE_Q.send({ accountId: msg.body.accountId }).catch((e) => logErr("account_delete_reenqueue_failed", e));
+        } catch (e) {
+          logErr("account_delete_consume_failed", e);
+          msg.retry();
+        }
+      }
+      return;
+    }
+    for (const msg of batch.messages as Message<DeviceNotifyMessage>[]) {
       try {
         await processNotification(env, msg.body.tokenHash);
         msg.ack();
@@ -247,6 +275,8 @@ async function route(req: Request, env: Env): Promise<Response> {
   }
   if (req.method === "POST" && eq(seg, ["v1", "account", "unlink"])) return unlinkAccount(env, p, Date.now());
   if (req.method === "GET" && eq(seg, ["v1", "account", "status"])) return accountStatus(env, p);
+  // Self-serve account + data deletion (design 37) — OWNER-ONLY, confirmation-gated.
+  if (req.method === "DELETE" && eq(seg, ["v1", "account"])) return deleteAccount(env, p, req, Date.now());
   if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) {
     const limits = await planLimitsFor(env, p.accountId); // workspace-count quota (M7b)
     if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
@@ -405,6 +435,9 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   if (isDeviceRevoke(method, seg)) return true;
   if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='durable' check
   if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)
+  // design 37: a web OWNER session may delete the account; deleteAccount() re-checks the
+  // owner role + confirmation. A non-owner web session is rejected there, not here.
+  if (method === "DELETE" && eq(seg, ["v1", "account"])) return true;
   return false;
 }
 function badRequest(message: string): Response {
@@ -442,7 +475,7 @@ function corsHeaders(req: Request, env: Env): Record<string, string> {
   if (!allowed.includes(origin)) return {};
   return {
     "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "authorization, content-type",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
