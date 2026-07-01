@@ -11,6 +11,7 @@ import {
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
+  isIgnoreRuleFile,
   preserveGitConflict,
   HashCache,
   PhaseReport,
@@ -278,16 +279,29 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // (a remote removal must not delete the REAL, never-synced artifact this machine
   // has at that path). Ignored entries stay untouched in the recorded base, so they
   // aren't pushed back as deletions either (same forward-only rule as push).
-  const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString()).filter(
-    (a) => !matcher.ignores(a.kind === "write" ? a.entry.path : a.path)
-  );
-  await report.phase("apply", () =>
-    applyActions(root, actions, api.blobStore(), {
-      device: cfg.deviceId,
-      kek,
-      onProgress: deps.onProgress ? (done, total) => deps.onProgress!(done, total, "download") : undefined,
-    })
-  );
+  //
+  // TWO-PHASE apply when the pull itself changes the RULES: rule-file actions
+  // (.rboxignore/.gitignore writes/deletes) land first, the matcher is rebuilt
+  // from the updated disk state, and only then are the remaining actions filtered.
+  // Filtering everything through the PRE-pull matcher would drop a file a relaxed
+  // rule just un-ignored — it would never land locally, and the follow-up push
+  // would commit its deletion back to the remote (a data-loss echo).
+  const pathOf = (a: Action) => (a.kind === "write" ? a.entry.path : a.path);
+  const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
+  const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
+  const applyOpts = {
+    device: cfg.deviceId,
+    kek,
+    onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
+  };
+  let actions: Action[] = [];
+  await report.phase("apply", async () => {
+    if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
+    const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
+    const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+    await applyActions(root, rest, api.blobStore(), applyOpts);
+    actions = [...ruleActions, ...rest];
+  });
   if (report.enabled) {
     const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
     report.blobs = writeActions.length;

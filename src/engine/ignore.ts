@@ -133,6 +133,12 @@ export interface IgnoreMatcher {
   ignores(relPath: string): boolean;
 }
 
+/** Is `rel` a file whose CONTENT defines the ignore rules? Any change to one
+ *  invalidates every matcher built before it (daemon watch events, pulled
+ *  writes/deletes) — callers must rebuild before trusting another verdict. */
+export const isIgnoreRuleFile = (rel: string): boolean =>
+  rel === ".rboxignore" || rel.endsWith("/.rboxignore") || rel === ".gitignore" || rel.endsWith("/.gitignore");
+
 /**
  * Paths that are excluded UNCONDITIONALLY — no `.rboxignore`/`.gitignore`
  * negation (`!.rbox`, `!.git`) and no `--purge` can re-include them (design 12, C8).

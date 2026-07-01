@@ -2,6 +2,7 @@ import os from "node:os";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
+  isIgnoreRuleFile,
   HashCache,
   scanManifest,
   type IgnoreMatcher,
@@ -32,10 +33,6 @@ const LOG_PATHS_MAX = 50;
 /** Control chars in a filename must not forge extra log lines — render them as `?`. */
 const cleanPath = (p: string) => p.replace(/\p{Cc}/gu, "?");
 
-/** Is `rel` a file whose content DEFINES the ignore rules? Any change to one demands
- *  a matcher rebuild + full rescan (used by both the watcher-event and pull paths). */
-const isIgnoreRuleFile = (rel: string) =>
-  rel === ".rboxignore" || rel.endsWith("/.rboxignore") || rel === ".gitignore" || rel.endsWith("/.gitignore");
 
 /** One-line forensic summary of the actions a pull APPLIED to the local tree:
  *  counts by kind plus the paths themselves (`+`write `-`delete `!`conflict). */

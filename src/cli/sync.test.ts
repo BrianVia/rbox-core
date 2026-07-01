@@ -175,6 +175,26 @@ test("pull never applies a remote entry that LOCAL rules ignore (legacy .git poi
   expect(remote.headSeq()).toBe(1);
 });
 
+test("a pull that RELAXES ignore rules applies the newly-unignored files (two-phase matcher)", async () => {
+  // Filtering every action through the PRE-pull matcher would drop foo.txt here —
+  // it would never land locally and the next push would delete it from the remote
+  // (codex round-3 repro). Rule-file actions must apply first, then a FRESH matcher
+  // filters the rest.
+  const remote = new FakeRemote();
+  remote.injectCommit([await remote.seedEntry(".rboxignore", "foo.txt\n")]);
+  await pull(root, cfg, deps(remote)); // base: rules ignore foo.txt
+
+  // seq 2: the rules are relaxed (ignore file removed) AND foo.txt is added.
+  remote.injectCommit([await remote.seedEntry("foo.txt", "now visible\n")]);
+  await pull(root, cfg, deps(remote));
+  expect(await read("foo.txt")).toBe("now visible\n"); // landed despite the old rules
+
+  const before = remote.commitCalls;
+  await push(root, cfg, deps(remote));
+  expect(remote.commitCalls).toBe(before); // and no echo commit afterwards
+  expect(remote.headSeq()).toBe(2);
+});
+
 // ── clean push ─────────────────────────────────────────────────────────────
 
 test("clean push uploads the ciphertext blob, commits, advances base", async () => {
