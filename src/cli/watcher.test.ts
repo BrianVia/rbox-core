@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, type WatchEvent } from "../engine/index.js";
-import { startWatcher, type Watcher } from "./watcher.js";
+import { createBatcher, startWatcher, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp
 // tree: the design-§41 swap that took the founder's workspace from ~11 GB / 330 s
@@ -48,7 +48,11 @@ async function probeNativeWatch(attempts = 3): Promise<{ ok: boolean; err: strin
 // regression, never a silent skip (positive-capability gate, not "any error").
 const cap = await probeNativeWatch();
 const skipNative = !cap.ok && process.platform === "darwin" && /fsevents|not permitted|sandbox|eperm/i.test(cap.err);
-const wtest = test.skipIf(skipNative);
+// Every native-watch test gets a GENEROUS explicit timeout — the bun-test default is 5s, but
+// `waitFor` polls up to 12s, and inotify on a loaded CI runner delivers events noticeably
+// slower than macOS FSEvents. Without this, a slow-but-correct delivery times out at 5001ms.
+const gated = test.skipIf(skipNative);
+const wtest = (name: string, fn: () => void | Promise<void>, timeoutMs = 20_000) => gated(name, fn, timeoutMs);
 
 afterEach(async () => {
   await active?.close().catch(() => {});
@@ -164,15 +168,47 @@ wtest("directory delete removes the whole subtree via `unlinkDir`", async () => 
   expect(await waitFor(() => has(settled, "sub", "unlinkDir"))).toBe(true);
 });
 
-wtest("create-then-delete within one debounce window coalesces to the delete (last-kind-wins)", async () => {
-  const root = tmpRoot();
-  const { settled } = await watch(root);
-  const f = path.join(root, "ephemeral.txt");
-  fs.writeFileSync(f, "x");
-  fs.rmSync(f, { force: true });
-  expect(await waitFor(() => settled.some((e) => e.relPath === "ephemeral.txt"))).toBe(true);
-  const last = [...settled].reverse().find((e) => e.relPath === "ephemeral.txt");
-  expect(last?.kind).toBe("unlinkDir");
+// Coalescing / last-kind-wins is tested DETERMINISTICALLY against the shared batcher rather
+// than via OS events: a create-then-delete blip is reported inconsistently across backends
+// (inotify may sample after the file is already gone and emit nothing), so an OS-timing test
+// is inherently flaky. The batcher is what actually implements the invariant, and it's the
+// same code path both backends feed — so this is real coverage, just backend-independent.
+test("batcher last-kind-wins: create-then-delete in one window coalesces to a single delete", async () => {
+  const batches: WatchEvent[][] = [];
+  const b = createBatcher((evs) => batches.push(evs), 20, 3000);
+  b.push("ephemeral.txt", "add");
+  b.push("ephemeral.txt", "unlinkDir"); // same path, same window → overwrites the add
+  await new Promise((r) => setTimeout(r, 80)); // > debounce → one flush
+  b.dispose();
+  expect(batches).toHaveLength(1);
+  expect(batches[0]).toEqual([{ relPath: "ephemeral.txt", kind: "unlinkDir" }]);
+});
+
+test("batcher coalesces a burst of many events across paths into one settled batch", async () => {
+  const batches: WatchEvent[][] = [];
+  const b = createBatcher((evs) => batches.push(evs), 20, 3000);
+  b.push("a.ts", "add");
+  b.push("b.ts", "add");
+  b.push("a.ts", "change"); // last-kind-wins for a.ts
+  await new Promise((r) => setTimeout(r, 80));
+  b.dispose();
+  expect(batches).toHaveLength(1);
+  expect(new Map(batches[0]!.map((e) => [e.relPath, e.kind]))).toEqual(new Map([["a.ts", "change"], ["b.ts", "add"]]));
+});
+
+test("batcher maxWait cap flushes a sustained burst even without a quiet gap", async () => {
+  const batches: WatchEvent[][] = [];
+  const b = createBatcher((evs) => batches.push(evs), 1000, 60); // debounce >> maxWait
+  b.push("x.ts", "add");
+  await new Promise((r) => setTimeout(r, 20));
+  b.push("y.ts", "add"); // still within maxWait; no flush yet
+  await new Promise((r) => setTimeout(r, 90)); // now past maxWait (60ms) → forced flush on next push
+  b.push("z.ts", "add");
+  await new Promise((r) => setTimeout(r, 10));
+  b.dispose();
+  // The cap forced a flush that included the earlier events (not stuck behind the long debounce).
+  expect(batches.length).toBeGreaterThanOrEqual(1);
+  expect(batches.flat().some((e) => e.relPath === "x.ts")).toBe(true);
 });
 
 wtest("SCALE (design §41): monorepo-shaped tree — ready fast, memory flat, node_modules subtree pruned", async () => {
@@ -205,4 +241,4 @@ wtest("SCALE (design §41): monorepo-shaped tree — ready fast, memory flat, no
   expect(await waitFor(() => has(settled, "src/mod0/live.ts"))).toBe(true);
   await new Promise((r) => setTimeout(r, 500));
   expect(settled.some((e) => e.relPath.includes("node_modules"))).toBe(false);
-});
+}, 40_000); // builds ~10k files + waits — extra headroom on a loaded CI runner

@@ -302,12 +302,17 @@ addon, subscribed, received a create event, pruned `node_modules`, idled ~40 MB.
    event is delivered within a timeout and idle RSS is bounded. Prints `WATCHER_SELFTEST ok
    rss_mb=…` and cleans up its temp dir.
 3. **`publish`** (`needs: smoke`): uploads the **exact** built+signed+smoked bytes to R2 via
-   `release.ts --upload-only`, which **re-verifies the Ed25519 signature over `version.json`
-   against the embedded release keyring** (the same `verifyAndParseManifest` the client uses)
-   *before* trusting the manifest, then re-checks each binary's sha against it. The split
-   build→publish flow thus keeps the exact trust boundary the combined flow had — a tampered
-   `dist/version.json` or forged sig is **unpublishable** (verified: a garbage sig is refused
-   before any upload).
+   `release.ts --upload-only`.
+
+**Signature verification is INTRINSIC to the upload, not just the caller.** `uploadRelease()`
+begins by calling `verifyReleaseArtifacts(dist, version)` (`src/cli/release-verify.ts`), which
+**verifies the Ed25519 signature over `version.json` against the embedded release keyring**
+(the same `verifyAndParseManifest` the client uses), binds it to the release version, and
+confirms every signed artifact's binary matches its signed sha — then **derives the uploaded
+artifacts from that verified manifest.** Both publish paths (`--upload-only` *and* the
+single-shot build→sign→upload) go through this one function, so **no code path can upload
+unverified bytes.** A missing / forged / wrong-key / tampered manifest is unpublishable
+(unit-tested; and an end-to-end forged-sig probe is refused before any upload).
 
 A target whose native watcher can't load **fails its smoke leg and blocks the publish** — it
 never ships blind. `bun build` exit 0 is insufficient (the `.node` only fails at *load*), so
@@ -339,7 +344,14 @@ dirs; `!dist/keep.txt` drops only `dist`; `!.env.example` drops nothing.
 - **Dotdot-named file** (`..keep`) is delivered, not treated as escaping root (finding 6).
 - **Atomic write-then-rename** surfaces the final path, not the temp.
 - **Directory delete** removes the subtree via `unlinkDir`.
-- **create-then-delete** in one window coalesces to the delete (never a stale `add`).
+- **Coalescing / last-kind-wins** is tested **deterministically against the exported
+  `createBatcher`** (create-then-delete → single `unlinkDir`; multi-path burst → one batch;
+  `maxWait` cap flushes a sustained burst) — *not* via OS events, since a create-then-delete
+  blip is reported inconsistently across backends (inotify may sample after the file is gone
+  and emit nothing). Same code path both backends feed, so it's real coverage without the
+  flakiness. Each native-watch test also carries a generous explicit timeout (bun's 5 s
+  default is below `waitFor`'s 12 s poll; inotify on a loaded runner delivers slower than
+  FSEvents — this was the v0.5.0 CI flake).
 - **SCALE (§41):** a ~10k-file monorepo-shaped tree (source + large `node_modules`) —
   asserts **ready < 10 s**, **RSS < 300 MB**, a create **deep under an existing
   node_modules** yields **zero events** (native subtree prune, finding 3), and a source
