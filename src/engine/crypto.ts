@@ -57,24 +57,74 @@ export interface EncryptedBlob {
  * Encrypt `srcPath` to a temp ciphertext file. Re-hashes the actual bytes for key
  * derivation (review finding #1) and returns the ciphertext content-address
  * (`encSha = sha256(ciphertext||tag)`), known only after encryption (finding #3).
+ *
+ * Snapshot-first (concurrent-write safety): the source is copied to an IMMUTABLE
+ * snapshot temp ONCE, and `plaintextSha`, the ciphertext, and `encSha` all derive
+ * from that single image. Without this, a live-edited file (agents / builds writing
+ * constantly in a dev workspace) could change BETWEEN the key-deriving hash and the
+ * encrypting read, so the ciphertext would encrypt bytes that don't match the
+ * recorded `plaintextSha` — the blob uploads + commits fine but fails its download
+ * integrity check (`decryptFileToPath` asserts the recovered plaintext hashes to
+ * `plaintextSha`), leaving the file permanently un-pullable. With the snapshot,
+ * `plaintextSha` recorded in the manifest ALWAYS matches the plaintext that decrypts
+ * from the blob. `copyFile` is not an atomic filesystem snapshot, so a file changed
+ * DURING the copy can land a torn image — but that image is self-consistent (hashing
+ * and encrypting both read the completed copy), so it still round-trips cleanly; the
+ * daemon's churn detection re-queues the file and a later sync commits the settled
+ * bytes. No integrity error either way.
+ *
+ * `tmpDir` MUST be a private (owner-only) directory: the snapshot is a transient
+ * plaintext copy of the source. All callers pass an `fs.mkdtemp` dir (mode 0700),
+ * and the default below is likewise `mkdtemp` — same protection as the ciphertext
+ * temps that already lived here, and no plaintext beyond what the source file itself
+ * already exposes on this disk. The snapshot is deleted the moment encryption
+ * finishes (below), bounding that transient copy.
  */
 export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string): Promise<EncryptedBlob> {
-  const plaintextSha = await hashFile(srcPath); // fresh hash of the real bytes
-  const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
+  // Track whether WE created the dir: on the default path an early error must not
+  // leak an empty `rbox-enc-*` temp dir (the caller can't clean a dir it never saw).
+  const ownDir = tmpDir === undefined;
   const dir = tmpDir ?? (await fs.mkdtemp(path.join(os.tmpdir(), "rbox-enc-")));
-  // Unique per CALL, not per content: concurrent encryption of two identical-
-  // content files (same plaintextSha — common: empty files, boilerplate) must not
-  // write the same temp path, or the interleaved writes corrupt it (sha mismatch).
-  const ctPath = path.join(dir, `${plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
+  // Immutable snapshot: read `srcPath` ONCE into a per-call temp so hashing and
+  // encrypting see identical bytes even if the live file keeps changing. Named by
+  // random bytes (not content — the plaintext sha isn't known until after hashing)
+  // so concurrent calls never share a path.
+  const snapPath = path.join(dir, `${randomBytes(8).toString("hex")}.snap`);
+  let snapDone = false;
+  let ctPath: string | undefined;
+  try {
+    await fs.copyFile(srcPath, snapPath); // single read of the live file → immutable copy
+    const plaintextSha = await hashFile(snapPath); // fresh hash of the snapshot bytes
+    const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
+    // Unique per CALL, not per content: concurrent encryption of two identical-
+    // content files (same plaintextSha — common: empty files, boilerplate) must not
+    // write the same temp path, or the interleaved writes corrupt it (sha mismatch).
+    ctPath = path.join(dir, `${plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
 
-  const cipher = createCipheriv("aes-256-gcm", dek, nonce);
-  cipher.setAAD(AAD);
-  await pipeline(fsSync.createReadStream(srcPath), cipher, fsSync.createWriteStream(ctPath));
-  await fs.appendFile(ctPath, cipher.getAuthTag()); // tag at EOF
+    const cipher = createCipheriv("aes-256-gcm", dek, nonce);
+    cipher.setAAD(AAD);
+    await pipeline(fsSync.createReadStream(snapPath), cipher, fsSync.createWriteStream(ctPath));
+    await fs.appendFile(ctPath, cipher.getAuthTag()); // tag at EOF
+    // Snapshot is consumed — delete it NOW (before hashing/stat'ing the ciphertext)
+    // to bound peak disk to a single extra copy rather than snapshot + ciphertext.
+    await fs.rm(snapPath, { force: true }).catch(() => {});
+    snapDone = true;
 
-  const encSha = await hashFile(ctPath);
-  const cipherSize = (await fs.stat(ctPath)).size;
-  return { plaintextSha, encSha, ciphertextPath: ctPath, cipherSize };
+    const encSha = await hashFile(ctPath);
+    const cipherSize = (await fs.stat(ctPath)).size;
+    return { plaintextSha, encSha, ciphertextPath: ctPath, cipherSize };
+  } catch (e) {
+    // On any failure, don't leak the ciphertext temp either (the snapshot is cleaned
+    // in `finally`); the caller only removes the ciphertext on success. If we created
+    // the temp dir, remove it too so the default path leaves nothing behind.
+    if (ctPath) await fs.rm(ctPath, { force: true }).catch(() => {});
+    if (ownDir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw e;
+  } finally {
+    // Safety net: no-op if already deleted after the pipeline; guarantees the
+    // plaintext snapshot never outlives this call even on the error path.
+    if (!snapDone) await fs.rm(snapPath, { force: true }).catch(() => {});
+  }
 }
 
 /**
