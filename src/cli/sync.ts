@@ -258,7 +258,8 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const state = await loadState(root);
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
+  const matcher = buildIgnoreMatcher(root);
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache));
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
@@ -271,7 +272,15 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox recover`.");
   }
 
-  const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
+  // A remote entry that LOCAL rules ignore must never touch this tree — neither
+  // written (an old client may have synced a `.git` pointer file before it was a
+  // builtin ignore; applying it would plant a machine-local path here) nor deleted
+  // (a remote removal must not delete the REAL, never-synced artifact this machine
+  // has at that path). Ignored entries stay untouched in the recorded base, so they
+  // aren't pushed back as deletions either (same forward-only rule as push).
+  const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString()).filter(
+    (a) => !matcher.ignores(a.kind === "write" ? a.entry.path : a.path)
+  );
   await report.phase("apply", () =>
     applyActions(root, actions, api.blobStore(), {
       device: cfg.deviceId,

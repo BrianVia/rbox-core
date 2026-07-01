@@ -149,6 +149,23 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.headSeq()).toBe(1);
 });
 
+test("pull never applies a remote entry that LOCAL rules ignore (legacy .git pointer files)", async () => {
+  const remote = new FakeRemote();
+  // An OLD client synced a worktree `.git` pointer file before `.git` (file form)
+  // became a builtin ignore. It's still in the remote manifest.
+  remote.injectCommit([
+    await remote.seedEntry("ok.txt", "fine\n"),
+    await remote.seedEntry("wt/.git", "gitdir: /Users/old-machine/repo/.git/worktrees/wt\n"),
+  ]);
+  // This machine has a REAL, machine-local pointer at that path — it must survive.
+  await fs.mkdir(path.join(root, "wt"), { recursive: true });
+  await write("wt/.git", "gitdir: /Users/me/repo/.git/worktrees/wt\n");
+
+  await pull(root, cfg, deps(remote));
+  expect(await read("ok.txt")).toBe("fine\n"); // non-ignored entries still apply
+  expect(await read("wt/.git")).toBe("gitdir: /Users/me/repo/.git/worktrees/wt\n"); // untouched
+});
+
 // ── clean push ─────────────────────────────────────────────────────────────
 
 test("clean push uploads the ciphertext blob, commits, advances base", async () => {

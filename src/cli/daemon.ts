@@ -36,21 +36,25 @@ export function summarizeActions(actions: Action[]): string {
   let deletes = 0;
   let conflicts = 0;
   const paths: string[] = [];
+  // Control chars in a filename must not forge extra log lines — render them as `?`.
+  // Only the first LOG_PATHS_MAX paths are rendered at all (a huge pull stays cheap).
+  const keep = (prefix: string, p: string) => {
+    if (paths.length < LOG_PATHS_MAX) paths.push(prefix + p.replace(/\p{Cc}/gu, "?"));
+  };
   for (const a of actions) {
     if (a.kind === "write") {
       writes++;
-      paths.push(`+${a.entry.path}`);
+      keep("+", a.entry.path);
     } else if (a.kind === "delete") {
       deletes++;
-      paths.push(`-${a.path}`);
+      keep("-", a.path);
     } else {
       conflicts++;
-      paths.push(`!${a.path}`);
+      keep("!", a.path);
     }
   }
-  const shown = paths.slice(0, LOG_PATHS_MAX).join(" ");
-  const more = paths.length > LOG_PATHS_MAX ? ` (+${paths.length - LOG_PATHS_MAX} more)` : "";
-  return `${writes} write, ${deletes} delete, ${conflicts} conflict — ${shown}${more}`;
+  const more = actions.length > LOG_PATHS_MAX ? ` (+${actions.length - LOG_PATHS_MAX} more)` : "";
+  return `${writes} write, ${deletes} delete, ${conflicts} conflict — ${paths.join(" ")}${more}`;
 }
 
 interface Wants {
@@ -122,6 +126,9 @@ export class RboxDaemon {
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
     await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId);
+    // Seed the push log's sequence memory so the first no-op push (re-publishing
+    // nothing) isn't logged as an advance.
+    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);

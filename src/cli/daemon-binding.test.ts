@@ -46,9 +46,16 @@ test("currentWorkspaceId reads the root's live binding; missing/invalid → unde
 });
 
 test("the stale-daemon signal: recorded binding differs from the root's current workspace", async () => {
+  // Self-contained setup: the root was re-initialized to ws_current AFTER a daemon
+  // bound ws_old — the exact v0.5.6 incident shape.
+  await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, ".rbox", "workspace.json"),
+    JSON.stringify({ schema: "e2ee/v1", remoteWorkspaceId: "ws_current", projectId: "root" })
+  );
   await recordDaemonBinding(root, "ws_old");
   const bound = readDaemonBinding(root);
-  const current = currentWorkspaceId(root); // ws_current from the previous test's write
+  const current = currentWorkspaceId(root);
   expect(bound).toBe("ws_old");
   expect(current).toBe("ws_current");
   expect(bound !== current).toBe(true); // ← startDaemon restarts on exactly this

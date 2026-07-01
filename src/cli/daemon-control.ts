@@ -162,8 +162,20 @@ export async function startDaemon(root: string): Promise<void> {
     const current = currentWorkspaceId(root);
     if (bound && current && bound !== current) {
       console.log(`rbox daemon (pid ${existing}) is bound to ${bound}, but this root is now ${current} — restarting`);
-      process.kill(existing, "SIGTERM");
-      if (!(await waitForExit(existing, 5000))) forceKill(existing);
+      try {
+        // Re-verify ownership at the moment of signalling (PID-reuse window), and
+        // swallow ESRCH — "already exited" is success here, not an error.
+        if (isOurDaemon(existing, root)) process.kill(existing, "SIGTERM");
+      } catch {
+        /* gone between check and signal */
+      }
+      if (!(await waitForExit(existing, 5000))) {
+        // Never escalate to SIGKILL: a forced kill can land mid git-sync `.git`
+        // mutation, whose rollback is JS-level and dies with the process. SIGTERM
+        // shutdown is graceful (awaits the pump) — just try again shortly.
+        console.log(`old daemon (pid ${existing}) hasn't exited yet — re-run \`rbox start\` in a moment`);
+        return;
+      }
       await fsp.rm(pidPath(root), { force: true });
     } else {
       console.log(`rbox daemon already running (pid ${existing})`);
