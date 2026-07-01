@@ -2,6 +2,7 @@ import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { isStandaloneBinary } from "./runtime.js";
 
 const RBOX_DIR = ".rbox";
 const PID_FILE = "daemon.pid";
@@ -10,6 +11,18 @@ const DAEMON_MARKER = "__daemon-run";
 
 const pidPath = (root: string) => path.join(root, RBOX_DIR, PID_FILE);
 const logPath = (root: string) => path.join(root, RBOX_DIR, LOG_FILE);
+
+/** argv for re-spawning THIS CLI as the detached daemon (with `process.execPath`).
+ *
+ *  A compiled binary IS its own entry — `process.execPath` is the rbox binary and Bun
+ *  re-injects the `$bunfs` entry as argv[1] itself — so re-passing our own argv[1] would
+ *  shift the marker out of the child's command slot, the dispatcher would read a bogus
+ *  command and print help, and the daemon would exit without syncing. Under `bun run`
+ *  (dev) `process.execPath` is Bun, so the script path (`entry`) IS required. Either
+ *  way `DAEMON_MARKER` leads so `isOurDaemon` can match it in `ps` for PID ownership. */
+export function daemonSpawnArgs(entry: string, root: string, standalone: boolean): string[] {
+  return standalone ? [DAEMON_MARKER, root] : [entry, DAEMON_MARKER, root];
+}
 
 function isAlive(pid: number): boolean {
   try {
@@ -81,8 +94,8 @@ export async function startDaemon(root: string): Promise<void> {
 
   await fsp.mkdir(path.join(root, RBOX_DIR), { recursive: true });
   const out = fs.openSync(logPath(root), "a");
-  const entry = process.argv[1]!; // this CLI script (dev: src/cli/index.ts)
-  const child = spawn(process.execPath, [entry, DAEMON_MARKER, root], {
+  const args = daemonSpawnArgs(process.argv[1]!, root, isStandaloneBinary());
+  const child = spawn(process.execPath, args, {
     detached: true,
     stdio: ["ignore", out, out],
   });
