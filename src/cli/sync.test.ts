@@ -7,7 +7,7 @@ import { pull, push, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
-import type { BlobStore, FileEntry, Manifest } from "../engine/index.js";
+import { PhaseReport, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -255,4 +255,55 @@ test("sync = pull then push in one call", async () => {
   expect(pulled.some((a) => a.kind === "write")).toBe(true); // pulled r.txt
   expect(await read("r.txt")).toBe("remote\n");
   expect(pushedSequence).toBe(remote.headSeq()); // pushed local.txt on top
+});
+
+// ── §35 phase metrics: an enabled report is populated across the real phases ──
+
+test("§35: an enabled report times push phases and attributes the byte bases", async () => {
+  const remote = new FakeRemote();
+  const content = "payload\n";
+  await write("x.txt", content);
+
+  const report = PhaseReport.push();
+  await push(root, cfg, { remote, backoff: noBackoff, report });
+
+  const j = report.toJSON();
+  // Every coarse push phase was timed (scan from push(), the rest from pushManifest).
+  expect(Object.keys(j.phases).sort()).toEqual(["commit", "encrypt", "scan", "upload"]);
+  expect(j.files).toBe(1);
+  expect(j.blobs).toBe(1);
+  // Bases attributed to the right phase: plaintext on scan, ciphertext/changed on
+  // encrypt, wire on upload — each strictly positive for a real one-file push.
+  expect(j.phases.scan!.plaintextBytes).toBe(Buffer.byteLength(content));
+  expect(j.phases.encrypt!.count).toBe(1);
+  expect(j.phases.encrypt!.ciphertextBytes).toBeGreaterThan(0);
+  expect(j.phases.encrypt!.changedBytes).toBe(j.phases.encrypt!.ciphertextBytes);
+  expect(j.phases.upload!.wireBytes).toBeGreaterThan(0);
+  // The summary line is emitted (a phase was recorded) and stays PII-free.
+  const lines: string[] = [];
+  report.logSummaryTo((l) => lines.push(l));
+  expect(lines.length).toBe(1);
+  expect(lines[0]).not.toContain("x.txt");
+});
+
+test("§35: an enabled report times pull phases (scan + apply) with plaintext bytes", async () => {
+  const remote = new FakeRemote();
+  const content = "remote\n";
+  remote.injectCommit([await remote.seedEntry("r.txt", content)]);
+
+  const report = PhaseReport.pull();
+  await pull(root, cfg, { remote, backoff: noBackoff, report });
+
+  const j = report.toJSON();
+  expect(Object.keys(j.phases).sort()).toEqual(["apply", "scan"]);
+  expect(j.blobs).toBe(1); // one write action applied
+  expect(j.phases.apply!.plaintextBytes).toBe(Buffer.byteLength(content));
+});
+
+test("§35: with no report, the sync path is unaffected (disabled fallback records nothing)", async () => {
+  const remote = new FakeRemote();
+  await write("y.txt", "z\n");
+  // No `report` in deps → sync uses PhaseReport.disabled internally; push still works.
+  const seq = await push(root, cfg, deps(remote));
+  expect(seq).toBe(1);
 });

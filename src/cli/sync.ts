@@ -13,6 +13,7 @@ import {
   gitPreflight,
   preserveGitConflict,
   HashCache,
+  PhaseReport,
   poolMap,
   reconcile,
   scanManifest,
@@ -33,6 +34,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
 const defaultBackoff = (attempt: number) => sleep(Math.min(2000, 100 * 2 ** attempt) * (0.5 + Math.random()));
 
+/** Plaintext byte total / file-entry count of a manifest (the §35 "plaintext bytes" basis
+ *  + file count). Computed only on the metrics-enabled path (each is an O(files) pass). */
+const plaintextBytesOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.type === "file" ? f.size : 0), 0);
+const fileCountOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.type === "file" ? 1 : 0), 0);
+
 /**
  * Injectable dependencies for the sync entry points (design 09 §1). Defaults
  * give production behavior; tests inject an in-memory `SyncRemote` and a no-op
@@ -50,6 +56,10 @@ export interface SyncDeps {
    *  pull). The CLI renders it on the spinner; the daemon ignores it. `done`/`total`
    *  are blob/entry counts. */
   onProgress?: (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
+  /** Optional per-run phase-timing collector (design §35). Defaulted off; when absent,
+   *  the sync path uses a disabled no-op report that allocates nothing — so the daemon's
+   *  hot path and no-op tick stay free unless metrics are explicitly enabled. */
+  report?: PhaseReport;
 }
 
 // Concurrency knobs (read at call-time so the bench harness + power users can tune
@@ -82,7 +92,7 @@ async function withCache(
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
  *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha). */
-async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest, onProgress?: SyncDeps["onProgress"]): Promise<void> {
+async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceConfig, local: Manifest, base: Manifest, report: PhaseReport, onProgress?: SyncDeps["onProgress"]): Promise<void> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
   // are now convergent-encrypted under the same KEK (captureGitForPush), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
@@ -101,31 +111,43 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
     }
     // Encrypt changed files concurrently (was sequential — slow on a big first push).
     let enc = 0;
-    await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
-      const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
-      f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
-      f.encSha = e.encSha;
-      ctByEnc.set(e.encSha, e.ciphertextPath);
-      onProgress?.(++enc, toEncrypt.length, "encrypt");
+    let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
+    await report.phase("encrypt", async () => {
+      await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
+        const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+        f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
+        f.encSha = e.encSha;
+        ctByEnc.set(e.encSha, e.ciphertextPath);
+        encCtBytes += e.cipherSize;
+        onProgress?.(++enc, toEncrypt.length, "encrypt");
+      });
     });
+    report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
 
     const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
     const missing = await api.missingBlobs(encShas);
+    report.blobs = encShas.length;
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
     // Upload missing blobs concurrently — THE dominant cost on a first push (each
     // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
     let up = 0;
-    await poolMap(missing, uploadConcurrency(), async (encSha) => {
-      let ct = ctByEnc.get(encSha);
-      if (!ct) {
-        // Missing on the server but reused-from-base (server lost it) → re-encrypt.
-        const f = local.files.find((x) => x.encSha === encSha);
-        if (!f) return;
-        ct = (await encryptFileToTemp(path.join(root, f.path), kek, tmpDir)).ciphertextPath;
-      }
-      await api.putBlobFile(encSha, ct, (await fs.stat(ct)).size, uploadsDir);
-      onProgress?.(++up, missing.length, "upload");
+    let upWireBytes = 0; // ciphertext bytes actually sent over the wire this run
+    await report.phase("upload", async () => {
+      await poolMap(missing, uploadConcurrency(), async (encSha) => {
+        let ct = ctByEnc.get(encSha);
+        if (!ct) {
+          // Missing on the server but reused-from-base (server lost it) → re-encrypt.
+          const f = local.files.find((x) => x.encSha === encSha);
+          if (!f) return;
+          ct = (await encryptFileToTemp(path.join(root, f.path), kek, tmpDir)).ciphertextPath;
+        }
+        const size = (await fs.stat(ct)).size;
+        await api.putBlobFile(encSha, ct, size, uploadsDir);
+        upWireBytes += size;
+        onProgress?.(++up, missing.length, "upload");
+      });
     });
+    report.record("upload", { count: missing.length, wireBytes: upWireBytes });
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -162,8 +184,13 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
   const state = await loadState(root);
+  const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await scanManifest(root, undefined, cache);
+  const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
+  if (report.enabled) {
+    report.files = fileCountOf(local);
+    report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
+  }
 
   // E2EE is the only mode (D6): the KEK is injected by buildAuthedRemote. A remote
   // manifest with encrypted entries but no key on this device → fail closed.
@@ -173,11 +200,18 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   }
 
   const actions = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
-  await applyActions(root, actions, api.blobStore(), {
-    device: cfg.deviceId,
-    kek,
-    onProgress: deps.onProgress ? (done, total) => deps.onProgress!(done, total, "download") : undefined,
-  });
+  await report.phase("apply", () =>
+    applyActions(root, actions, api.blobStore(), {
+      device: cfg.deviceId,
+      kek,
+      onProgress: deps.onProgress ? (done, total) => deps.onProgress!(done, total, "download") : undefined,
+    })
+  );
+  if (report.enabled) {
+    const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
+    report.blobs = writeActions.length;
+    report.record("apply", { count: writeActions.length, plaintextBytes: writeActions.reduce((n, a) => n + a.entry.size, 0) });
+  }
 
   // Paths we just wrote/removed changed on disk — invalidate so the next scan
   // re-hashes them from real disk truth (never trust a stale cache entry there).
@@ -231,9 +265,14 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
  * {@link pushManifest} directly with its incrementally-patched in-memory manifest.
  */
 export async function push(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}, purgeIgnored = false): Promise<number> {
+  const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await scanManifest(root, undefined, cache);
+  const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
   await save();
+  if (report.enabled) {
+    report.files = fileCountOf(local);
+    report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
+  }
   return (await pushManifest(root, cfg, local, deps, 0, purgeIgnored)).sequence;
 }
 
@@ -290,6 +329,8 @@ export async function pushManifest(
   if (filesUnchanged && gitUnchanged) {
     return { sequence: state.lastSyncedSequence, manifest: local }; // no-op (files AND git)
   }
+  // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
+  const report = deps.report ?? PhaseReport.disabled("push");
   const d = diffManifests(state.lastSyncedManifest, local);
 
   // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
@@ -297,11 +338,11 @@ export async function pushManifest(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox recover`)");
   const doUpload = async () => {
-    await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, deps.onProgress);
+    await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, report, deps.onProgress);
   };
   await doUpload();
 
-  const res = await api.commit(state.lastSyncedSequence, cfg.deviceId, local);
+  const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, local));
 
   if (res.conflict) {
     deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)

@@ -11,7 +11,7 @@ import {
 import { loadState, type WorkspaceConfig } from "./config.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
+import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
@@ -166,18 +166,23 @@ export class RboxDaemon {
         this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache);
       }
     }
+    const report = beginReport("push");
     const res = await pushManifest(this.root, this.cfg, this.manifest, {
       ...this.e2ee,
       cache: this.cache,
       onCommitConflict: () => this.bumpConflict("commit"),
+      report,
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
+    report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
   }
 
   private async doPull(): Promise<void> {
-    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache });
+    const report = beginReport("pull");
+    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report });
+    report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;

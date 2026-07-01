@@ -2,6 +2,7 @@ import path from "node:path";
 import { scanManifest, type Action } from "../engine/index.js";
 import { findRoot, loadConfig, loadState, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
+import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
@@ -227,8 +228,11 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
+        const report = beginReport("push");
+        deps.report = report;
         const seq = await push(root, cfg, deps);
         sp.succeed(`pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
+        report?.logSummaryTo((l) => console.log(style.dim(l)));
       } catch (e) {
         sp.fail("push failed");
         throw e;
@@ -241,9 +245,12 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(phase === "download" ? `downloading ${done}/${total}` : `${phase} ${done}/${total}`);
+        const report = beginReport("pull");
+        deps.report = report;
         const actions = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", actions, root);
+        report?.logSummaryTo((l) => console.log(style.dim(l)));
         await postSyncNudge(root, actions, cfg);
       } catch (e) {
         sp.fail("pull failed");
@@ -257,10 +264,13 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
+        const report = beginReport("sync");
+        deps.report = report;
         const { pulled, pushedSequence } = await sync(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);
         console.log(`${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`);
+        report?.logSummaryTo((l) => console.log(style.dim(l)));
         await postSyncNudge(root, pulled, cfg);
       } catch (e) {
         sp.fail("sync failed");
