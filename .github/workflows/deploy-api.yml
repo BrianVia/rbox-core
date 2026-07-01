@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, flatmeadow]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
