@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type { Clerk } from '@clerk/clerk-js';
 	import { authState, requireAuth } from '$lib/auth.svelte';
@@ -89,6 +89,32 @@
 		}
 	];
 
+	// Getting-started commands — the exact, copy-pasteable onboarding a brand-new
+	// login needs. Install one-liner is the canonical TOFU installer (scripts/install.sh
+	// header; served from https://rbox.to/install.sh). `rbox setup` is the single
+	// guided front door (src/cli/setup-cmd.ts). Kept as consts so the copy button
+	// hands over byte-for-byte what's shown.
+	const INSTALL_CMD = 'curl -fsSL https://rbox.to/install.sh | sh';
+	const SETUP_CMD = 'rbox setup';
+
+	// Copy-to-clipboard for the command blocks (mirrors /link's copy affordance).
+	// `copied` holds the text of the just-copied command so only its button flips.
+	let copied = $state('');
+	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+	async function copy(text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			copied = text;
+			if (copiedTimer) clearTimeout(copiedTimer);
+			copiedTimer = setTimeout(() => (copied = ''), 2000);
+		} catch {
+			/* clipboard blocked — the command is visible to copy manually */
+		}
+	}
+	onDestroy(() => {
+		if (copiedTimer) clearTimeout(copiedTimer);
+	});
+
 	const goLink = () => goto('/link');
 	const goDevices = () => goto('/devices');
 	const goSettings = () => goto('/settings');
@@ -163,6 +189,57 @@
 			<span class="faint">Connect your machines to manage their devices, workspaces &amp; billing here.</span>
 		</button>
 	{/if}
+
+	<!-- Getting started (design 21/29): the CLI-first onboarding a brand-new web
+	     login needs — install → `rbox setup` → link. Complements the link nudge
+	     above, which assumes you ALREADY run the CLI; this covers the case where
+	     you don't have rbox yet. Collapsible so it stays out of an established
+	     user's way, but open by default until a CLI account is linked. -->
+	<details class="getting-started" open={linked === false}>
+		<summary>
+			<span><strong>New to rbox?</strong> Set up the CLI in three steps</span>
+			<span class="chev" aria-hidden="true">▾</span>
+		</summary>
+		<ol class="gs-steps">
+			<li>
+				<div class="gs-head">Install rbox</div>
+				<p class="faint">One line — adds the <code>rbox</code> command on macOS or Linux.</p>
+				<div class="code-row">
+					<code class="code">{INSTALL_CMD}</code>
+					<button class="ghost small" onclick={() => copy(INSTALL_CMD)}>
+						{copied === INSTALL_CMD ? 'Copied ✓' : 'Copy'}
+					</button>
+				</div>
+			</li>
+			<li>
+				<div class="gs-head">Run <code>rbox setup</code></div>
+				<p class="faint">
+					One command: creates your account, saves your recovery phrase, tracks a folder, and
+					starts syncing in the background.
+				</p>
+				<div class="code-row">
+					<code class="code">{SETUP_CMD}</code>
+					<button class="ghost small" onclick={() => copy(SETUP_CMD)}>
+						{copied === SETUP_CMD ? 'Copied ✓' : 'Copy'}
+					</button>
+				</div>
+				<p class="gs-warn">
+					Save your recovery phrase somewhere safe — it’s the only way back into your account. No
+					one can reset it for you.
+				</p>
+			</li>
+			<li>
+				<div class="gs-head">Link this dashboard</div>
+				<p class="faint">
+					Connect your machines so you can manage devices, workspaces &amp; billing here.
+				</p>
+				<div class="code-row">
+					<code class="code">rbox account link &lt;code&gt;</code>
+				</div>
+				<button class="ghost small gs-link" onclick={goLink}>Get your code →</button>
+			</li>
+		</ol>
+	</details>
 
 	{#if isFree}
 		<!-- Free → upgrade. Cards make the choice + value obvious (vs bare buttons).
@@ -454,6 +531,88 @@
 	}
 	.link-nudge .faint {
 		font-size: 13px;
+	}
+
+	/* ---- getting started ---- */
+	.getting-started {
+		margin-bottom: 22px;
+		border-radius: 12px;
+		border: 1px solid var(--border);
+		background: rgba(255, 255, 255, 0.02);
+		overflow: hidden;
+	}
+	.getting-started > summary {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		padding: 14px 16px;
+		cursor: pointer;
+		list-style: none;
+		user-select: none;
+		font-size: 14px;
+	}
+	.getting-started > summary::-webkit-details-marker {
+		display: none;
+	}
+	.getting-started > summary strong {
+		color: var(--accent, #7c6cff);
+	}
+	.getting-started .chev {
+		color: var(--dim);
+		transition: transform 0.2s ease;
+	}
+	.getting-started[open] .chev {
+		transform: rotate(180deg);
+	}
+	.gs-steps {
+		margin: 0;
+		padding: 2px 20px 18px 40px;
+		display: flex;
+		flex-direction: column;
+		gap: 18px;
+	}
+	.gs-steps li {
+		color: var(--dim);
+	}
+	.gs-head {
+		font-weight: 600;
+		color: var(--text);
+		margin-bottom: 4px;
+	}
+	.gs-steps p {
+		margin: 0 0 8px;
+		font-size: 13px;
+	}
+	.gs-warn {
+		color: #f0a868;
+		font-size: 12.5px !important;
+		margin: 8px 0 0 !important;
+	}
+	.gs-link {
+		margin-top: 4px;
+	}
+	.code-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.code {
+		flex: 1;
+		display: block;
+		padding: 10px 12px;
+		border-radius: 10px;
+		border: 1px solid var(--border);
+		background: rgba(255, 255, 255, 0.03);
+		font-family: ui-monospace, monospace;
+		font-size: 13px;
+		color: var(--text);
+		overflow-x: auto;
+		white-space: nowrap;
+	}
+	.small {
+		font-size: 13px;
+		flex-shrink: 0;
 	}
 
 	/* ---- footer ---- */
