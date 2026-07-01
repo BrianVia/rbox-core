@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { pull, push, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState } from "./config.js";
-import type { CommitResult, SyncRemote } from "./remote.js";
+import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { PhaseReport, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
@@ -33,6 +33,12 @@ class FakeRemote implements SyncRemote {
   commitCalls = 0;
   forceUnsatisfiedOnce = false;
   beforeCommit?: () => Promise<void>;
+  // Live-folder TOCTOU simulation: reject a given encSha's PUT with a 400 sha_mismatch
+  // (as R2 does when the streamed ciphertext no longer hashes to the declared encSha).
+  // `…Once` clears itself after firing (heals on retry); `…Always` never clears (a file
+  // that keeps changing — exercises the bounded-retry give-up).
+  forceShaMismatchOnce?: string;
+  forceShaMismatchAlways?: string;
 
   /** Encrypt + seed a blob (as the uploading client would); return its FileEntry. */
   async seedEntry(rel: string, content: string): Promise<FileEntry> {
@@ -58,6 +64,11 @@ class FakeRemote implements SyncRemote {
     return shas.filter((s) => !this.blobs.has(s));
   }
   async putBlobFile(sha256: string, absPath: string): Promise<void> {
+    if (this.forceShaMismatchAlways === sha256) throw new BlobShaMismatchError(sha256);
+    if (this.forceShaMismatchOnce === sha256) {
+      this.forceShaMismatchOnce = undefined; // heal on the re-scan retry
+      throw new BlobShaMismatchError(sha256);
+    }
     const bytes = await fs.readFile(absPath); // ciphertext; encSha = sha256(ciphertext)
     if (shaBytes(bytes) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
     this.blobs.set(sha256, bytes);
@@ -219,6 +230,36 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
   const seq = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.commitCalls).toBe(2); // 422 then success
+});
+
+// ── live-folder TOCTOU: 400 sha_mismatch → re-scan + retry (self-heal) ──────
+
+test("sha_mismatch once: a file that changes under the push RE-SCANS + retries + commits (does NOT abort)", async () => {
+  const remote = new FakeRemote();
+  const content = "live edit in progress\n";
+  await write("f.txt", content);
+  // The server rejects the first PUT of this ciphertext (as if the source moved between
+  // encrypt-time and the streamed upload); the client must not abort the whole push.
+  remote.forceShaMismatchOnce = (await enc(content)).encSha;
+
+  const seq = await push(root, cfg, deps(remote));
+
+  expect(seq).toBe(1); // committed — the push self-healed
+  expect(remote.headSeq()).toBe(1);
+  expect(remote.hasBlob((await enc(content)).encSha)).toBe(true); // ciphertext landed on retry
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(true);
+});
+
+test("sha_mismatch forever: a file that keeps changing → bounded retries, typed error, NO infinite loop", async () => {
+  const remote = new FakeRemote();
+  const content = "never settles\n";
+  await write("f.txt", content);
+  remote.forceShaMismatchAlways = (await enc(content)).encSha; // every attempt 400s
+
+  // noBackoff (via deps) means this resolves immediately if the bound holds; a missing
+  // bound would hang/stack-overflow instead of throwing.
+  await expect(push(root, cfg, deps(remote))).rejects.toThrow(/kept changing/);
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(false); // never committed
 });
 
 // ── pull validation: invalid remote manifest never touches disk / base ──────

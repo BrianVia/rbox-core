@@ -23,7 +23,7 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
-import { RboxApi, type SyncRemote } from "./remote.js";
+import { BlobShaMismatchError, RboxApi, type SyncRemote } from "./remote.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
@@ -139,7 +139,14 @@ async function encryptAndUpload(api: SyncRemote, root: string, cfg: WorkspaceCon
           // Missing on the server but reused-from-base (server lost it) → re-encrypt.
           const f = local.files.find((x) => x.encSha === encSha);
           if (!f) return;
-          ct = (await encryptFileToTemp(path.join(root, f.path), kek, tmpDir)).ciphertextPath;
+          const re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+          // Live-folder TOCTOU: if the source changed since the manifest was built, the
+          // fresh ciphertext addresses a DIFFERENT encSha than the one committed. Uploading
+          // it under the old encSha is a guaranteed server 400 (sha_mismatch). Convert that
+          // certain failure into a clean local signal so pushManifest re-scans + retries —
+          // never upload bytes that don't hash to the committed encSha.
+          if (re.encSha !== encSha) throw new BlobShaMismatchError(encSha);
+          ct = re.ciphertextPath;
         }
         const size = (await fs.stat(ct)).size;
         await api.putBlobFile(encSha, ct, size, uploadsDir);
@@ -340,7 +347,34 @@ export async function pushManifest(
   const doUpload = async () => {
     await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, report, deps.onProgress);
   };
-  await doUpload();
+
+  // Live-folder TOCTOU self-heal: a file edited between encrypt-time (which fixed its
+  // encSha in `local`) and the streamed PUT uploads ciphertext that no longer hashes to
+  // that encSha, so R2 rejects it (400 sha_mismatch → BlobShaMismatchError). Re-SCAN the
+  // now-settled tree (the file's current sha/encSha make the re-encrypt match) and retry.
+  // No pull() needed (unlike a 409 parent conflict) — the remote didn't move, only our own
+  // working tree did. Bounded by the SAME MAX_ATTEMPTS/backoff as the 409/422 paths; after
+  // the bound (file never settles) surface a clear error — the daemon retries later anyway.
+  const rescanRetry = async () => {
+    if (attempt >= MAX_ATTEMPTS) throw new Error("push: file kept changing under sync — gave up after too many re-scans");
+    await backoff(attempt);
+    const { cache, save } = await withCache(root, deps.cache);
+    const fresh = await scanManifest(root, undefined, cache); // disk changed under us
+    await save();
+    return pushManifest(root, cfg, fresh, deps, attempt + 1, purgeIgnored);
+  };
+  const uploadOrRescan = async (): Promise<{ sequence: number; manifest: Manifest } | null> => {
+    try {
+      await doUpload();
+      return null; // uploaded cleanly — continue this attempt
+    } catch (e) {
+      if (e instanceof BlobShaMismatchError) return rescanRetry();
+      throw e;
+    }
+  };
+
+  const rescanned = await uploadOrRescan();
+  if (rescanned) return rescanned;
 
   const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, local));
 
@@ -356,7 +390,8 @@ export async function pushManifest(
   }
   if (res.unsatisfiedBlobs) {
     if (attempt >= MAX_ATTEMPTS) throw new Error("push: server keeps reporting missing blobs after re-upload");
-    await doUpload(); // re-check + re-upload missing FILE ciphertext blobs
+    const rescannedOn422 = await uploadOrRescan(); // re-check + re-upload missing FILE ciphertext blobs
+    if (rescannedOn422) return rescannedOn422; // a file changed under the re-upload → re-scan + retry
     // §28 (codex M3): file re-upload alone can't satisfy a missing GIT artifact — the
     // identity-carry in captureGitForPush would re-reference the absent bundle. Force a git
     // re-capture on the retry (the recursion recomputes local.git, so the force is a flag, not
