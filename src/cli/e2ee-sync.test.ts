@@ -1,12 +1,18 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { buildPairing, redeemPairing, type DeviceSecrets, type SignedRoster } from "../engine/e2ee/index.js";
+import type { GitSection } from "../engine/index.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { pull, push } from "./sync.js";
-import type { WorkspaceConfig } from "./config.js";
+import { loadState, type WorkspaceConfig } from "./config.js";
+
+const exec = promisify(execFile);
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
 
 const NOW = 1_900_000_000_000;
 const ACCT = "acct_sync";
@@ -99,4 +105,63 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     expect(await fs.readFile(path.join(root2, "a.txt"), "utf8")).toBe("two\n");
     expect(await fs.readFile(path.join(root2, "b.txt"), "utf8")).toBe("new\n");
   });
+
+  test("design 43: gitRepos artifact blobs join the commit blobRefs (union, deduped across repos); server sees zero git plaintext", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA", NOW);
+    const rootA = await tmp();
+
+    // Two nested repos with IDENTICAL content + pinned dates → identical bundle bytes →
+    // ONE convergent encSha referenced by BOTH sections (the §6.5 union-dedup case).
+    const DATE = "2026-01-01T00:00:00 +0000";
+    for (const r of ["repo1", "repo2"]) {
+      const d = path.join(rootA, r);
+      await fs.mkdir(d, { recursive: true });
+      await git(d, "init", "-qb", "main");
+      await fs.writeFile(path.join(d, "f.txt"), "git-secret-content\n");
+      await git(d, "add", "f.txt");
+      await exec("git", ["-C", d, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "c1"], {
+        env: { ...process.env, GIT_AUTHOR_DATE: DATE, GIT_COMMITTER_DATE: DATE },
+      });
+      await git(d, "branch", "secret-branch");
+    }
+
+    const remoteA = await remoteFor(server, secrets);
+    const cfgA: WorkspaceConfig = { ...(await cfgFor(rootA, secrets, remoteA)), syncGit: true };
+    await push(rootA, cfgA, { remote: remoteA });
+
+    const sections = (await loadState(rootA)).lastSyncedManifest.gitRepos!;
+    expect(Object.keys(sections).sort()).toEqual(["repo1", "repo2"]);
+    expect(sections["repo1"]!.bundleEncSha).toBe(sections["repo2"]!.bundleEncSha); // convergent bundles
+
+    // G3 invariant, extended by §28/§43: every git artifact encSha is a GC root via
+    // blobRefs — union across repos, the shared convergent encSha counted ONCE.
+    const body = JSON.parse(server.commits.at(-1)!.body) as { blobRefs: { encSha: string }[] };
+    const refShas = body.blobRefs.map((r) => r.encSha);
+    expect(new Set(refShas).size).toBe(refShas.length); // no duplicate refs
+    const gitShas = (s: GitSection) => [s.bundleEncSha, ...(s.indexEncSha ? [s.indexEncSha] : []), ...Object.values(s.opState ?? {}).map((r) => r.encSha)];
+    for (const s of Object.values(sections)) {
+      for (const e of gitShas(s)) {
+        expect(refShas).toContain(e);
+        expect(server.store.blobs.has(e)).toBe(true);
+      }
+    }
+
+    // ZERO-KNOWLEDGE: no repo path, branch name, or content anywhere the server holds.
+    for (const needle of ["repo1", "repo2", "secret-branch", "git-secret-content"]) {
+      for (const bytes of server.allBytes()) {
+        expect(Buffer.from(bytes).includes(Buffer.from(needle))).toBe(false);
+      }
+    }
+
+    // A fresh machine pulls: both repos materialize fsck-clean with matching history.
+    const rootB = await tmp();
+    const remoteB = await remoteFor(server, secrets);
+    const cfgB: WorkspaceConfig = { ...(await cfgFor(rootB, secrets, remoteB)), syncGit: true };
+    await pull(rootB, cfgB, { remote: remoteB });
+    for (const r of ["repo1", "repo2"]) {
+      expect(await git(path.join(rootB, r), "rev-parse", "main")).toBe(await git(path.join(rootA, r), "rev-parse", "main"));
+      await expect(git(path.join(rootB, r), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+    }
+  }, 20_000);
 });
