@@ -1,8 +1,8 @@
 # Design 43 — Nested-Repo Git Sync (per-repo GitSections)
 
-**Status:** v4 — three codex design rounds (v1: 5 BLOCKER/4 MAJOR; v2: 3 BLOCKER/2 MAJOR;
-v3: 2 BLOCKER — several verified with local git repros); every resolution folded in inline,
-marked **[v2]/[v3]/[v4]**. Full history in §14.
+**Status:** v5 — four codex design rounds (v1: 5 BLOCKER/4 MAJOR; v2: 3 BLOCKER/2 MAJOR;
+v3: 2 BLOCKER; v4: 1 BLOCKER/1 MAJOR — several verified with local git repros); every
+resolution folded in inline, marked **[v2]…[v5]**. Full history in §14.
 **Builds on:** design 02 (git-mirroring v3 — bundle-based capture/apply), §28 (git artifacts under
 E2EE), PR #38 (defer-churning-files partial-progress philosophy).
 **Supersedes:** the "repo toplevel === sync root" scope restriction of design 02 §3.
@@ -180,9 +180,12 @@ namespaced per capture and deleted after, exactly as today.
 `captureGitForPush` generalizes to:
 
 1. `discoverGitRepos(root, matcher)` (cheap: piggybacks on directory walk).
-2. Per repo, **carry-forward check first** (unchanged fast path): `gitIdentity(repoDir)` vs
-   `baseGitRepos[relPath]` via `gitIdentityKey` — identical → reuse the base section without
-   bundling (this is what makes N-repo scans affordable per push cycle).
+2. Per repo, **carry-forward check first** (unchanged fast path) — per the normative
+   shape×scope matrix in §7 [v5]: matching scope + matching identity at that scope → reuse the
+   base section without bundling (pointer repos may also carry a WIDER base whose scoped
+   projection matches; a dir-repo with a scoped base always captures fresh). A repo with a
+   pending unapplied remote section carries THAT, and is not captured (§7 [v5]). This is what
+   makes N-repo scans affordable per push cycle.
 3. Changed repos: `captureGitState(repoDir, …)` under **bounded concurrency**
    (`GIT_CAPTURE_CONCURRENCY = 4` — bundling is CPU/IO heavy).
 4. **Churn discipline (PR #38 philosophy):** any per-repo failure — dir vanished mid-capture
@@ -236,6 +239,18 @@ The pull-side git block iterates `remote.gitRepos ∪ base.gitRepos` per key:
     is filtered (the source switched to a branch a sibling here has checked out), the whole
     apply DEFERS with a clear reason — applying a HEAD that points at a branch we refused to
     move would be incoherent.
+- **Deferred applies carry the PENDING REMOTE section outbound, never the stale base [v5].**
+  Codex traced the hazard: "defer + base-doesn't-advance" alone means a later file-only push
+  republishes the OLD git section over remote git state this machine hasn't applied yet —
+  silently regressing the other machine's work. Rule: when an apply defers (ownership block,
+  receiver busy, decrypt failure, …), the unapplied remote section is recorded as
+  `gitPendingRemote[relPath]` in local state; while pending, outbound pushes CARRY that pending
+  remote section for the repo (the newest known truth), capture is suppressed, and apply
+  retries each pull. Pending clears on successful apply. If the LOCAL repo's identity changes
+  while pending, both sides have diverged → the normal per-repo conflict path runs. A mutual
+  ownership stall (each machine's section names a branch a sibling worktree holds on the other)
+  is therefore a visible, stable, non-destructive standoff surfaced in `rbox status` — an
+  operator condition, not data loss.
 - **Identity comparison is scope-projected — with precise sides [v2, B1; fixed v3].**
   *Projection* = HEAD + the refs the narrower side carries + indexTree + opState.
   - **Pull-side** (remote section vs base section vs local): compare after projecting onto the
@@ -325,11 +340,18 @@ any kind.
     diverged-from-nothing. The apply is a **clean materialization**, not an update-only merge
     into the leftover [v4] — codex traced that a scoped update-only apply would leave the
     leftover's old refs live, and B's next all-scope capture would republish the deleted repo's
-    refs (resurrection through the side door). Sequence: quarantine-bundle the leftover
-    (committed history preserved), DELETE all its syncable refs + index/op-state (reset to
-    empty), then apply the fresh section at any scope, then clear the removal memory. (If the
-    leftover's identity CHANGED after the memory was recorded — the user worked in a "removed"
-    repo — it is NOT absent: the normal per-repo conflict path runs instead.)
+    refs (resurrection through the side door). **Shape-split [v5]:**
+    - *dir-repo leftover:* quarantine first — a bundle with the same HEAD/pseudo-ref pinning
+      discipline as capture, PLUS copies of index/op-state (full recovery, not refs-only) —
+      then DELETE its syncable refs + index/op-state (reset to empty), apply the fresh section
+      at any scope, clear the memory.
+    - *pointer-repo leftover:* **never ref-wipe** — its refs live in the SHARED main-clone
+      store, and a wipe would delete sibling/main-clone branches, tags, or stash. Apply through
+      the pointer ownership/filter rules (update-only, guarded) instead. Stale sibling branches
+      that survive are NOT a resurrection vector here: a pointer repo's next capture is scoped
+      (current branch only), so they never re-enter the manifest.
+    (If the leftover's identity CHANGED after the memory was recorded — the user worked in a
+    "removed" repo — it is NOT absent: the normal per-repo conflict path runs instead.)
 - **Repo becomes ineligible** (preflight fails: turned bare, gained alternates, pointer
   dangles): treated as deferred-with-base-carry (§6.4), surfaced in `rbox status`, never
   deleted from the manifest — transient states (mid-`git gc`, mid-archive) heal themselves.
@@ -351,7 +373,7 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 | `src/engine/git-state.ts` | `gitPreflight(repoDir)` relaxation; resolved-gitdir reads (`--absolute-git-dir`); pointer-repo capture mode (HEAD+branch bundle, per-worktree op-state); everything else already takes `root` as a param and generalizes for free |
 | `src/engine/git-discover.ts` | **new** — ignore-aware repo discovery |
 | `src/cli/sync.ts` | `captureGitForPush` → map orchestration (carry/capture/defer per repo, bounded pool); pull git block → per-repo loop with per-repo base advance + scope-gated ref publish; blobRefs union; per-repo 422 recapture set |
-| `src/cli/config.ts` (state) | `gitReposRemoved` removal memories [v2, B4]; `gitNeedsResolution` conflict suppressions [v2, M2] — both local-only, never synced |
+| `src/cli/config.ts` (state) | `gitReposRemoved` removal memories [v2, B4]; `gitNeedsResolution` conflict suppressions [v2, M2]; `gitPendingRemote` unapplied-remote sections [v5] — all local-only, never synced |
 | `src/cli/e2ee-remote.ts` | commit blobRefs: iterate `gitRepos[*]` artifact encShas |
 | `src/cli/daemon.ts` / `index.ts` | forensic log lines; `rbox status` git summary |
 
@@ -388,6 +410,15 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ## 14. Review history
 
+- **v4 → codex round 4 (2026-07-01): FAIL, 1 BLOCKER + 1 MAJOR + 1 MINOR** — (a) clean
+  materialization's ref-wipe on a POINTER leftover would delete shared main-clone
+  branches/tags/stash → v5 shape-split (dir: quarantine incl. index/op-state + pinning, then
+  wipe; pointer: never ref-wipe, guarded update-only apply — stale siblings aren't a
+  resurrection vector since pointer captures are scoped); (b) defer-with-old-base-carry lets a
+  later push republish stale git over unapplied remote state → v5 `gitPendingRemote` (outbound
+  pushes carry the pending remote section, capture suppressed, retry until applied; mutual
+  ownership stall = visible non-destructive standoff); (c) §6 generic carry-forward wording
+  contradicted the matrix → now references it.
 - **v3 → codex round 3 (2026-07-01): FAIL, 2 BLOCKER** — (a) `git update-ref` from one worktree
   silently moves a branch checked out by a SIBLING worktree (repro'd; `branch -f` refuses,
   `update-ref` doesn't) → v4 ownership-guarded pointer-target publication (`git worktree list`
