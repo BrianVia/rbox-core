@@ -14,6 +14,12 @@ export interface WorkspaceConfig {
   schema?: "e2ee/v1";
   /** Shared across machines — identifies the manifest stream on the server. */
   remoteWorkspaceId: string;
+  /** OPT-IN, human-readable workspace label — cached LOCALLY so `rbox status` can
+   *  show it with NO server round-trip. Names are set-once-at-create (immutable),
+   *  so this cache never goes stale. Absent = no name was set (stays the opaque id).
+   *  Populated at the two points the CLI already knows it: creating+naming a
+   *  workspace (`rbox init --name`), or picking one from the "track existing" list. */
+  name?: string;
   /** Single project for now ("root" = the whole linked tree). */
   projectId: string;
   /** This machine's device id. */

@@ -21,6 +21,13 @@ import { login, redeemPair } from "./auth-cmd.js";
 import { startDaemon } from "./daemon-control.js";
 import { loadCredentials } from "./credentials.js";
 import { hasDevice } from "./e2ee-keystore.js";
+import {
+  fetchAccountWorkspaces,
+  renderWorkspacePickList,
+  resolveWorkspacePick,
+  sortWorkspacesForPick,
+  type AccountWorkspace,
+} from "./workspace-picker.js";
 import { stderrStyle as e } from "./style.js";
 
 // ── pure input → intent mappers (the step transitions) ───────────────────────
@@ -51,10 +58,16 @@ export function workspaceChoiceFor(input: string): WorkspaceChoice {
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
-export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string }): Record<string, string> {
+export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string }): Record<string, string> {
   const flags: Record<string, string> = { root: plan.root, project: "root", "no-interactive": "true" };
   if (plan.kind === "new") flags.new = "true";
-  else flags.workspace = plan.workspace ?? "";
+  else {
+    flags.workspace = plan.workspace ?? "";
+    // A known name (from the picker) is cached LOCALLY by init — never re-sent to the
+    // server on a join (only createRemoteWorkspace carries a name). Manual-id entry
+    // has no name, so the flag is simply absent and status falls back to the id.
+    if (plan.name) flags.name = plan.name;
+  }
   return flags;
 }
 
@@ -237,23 +250,78 @@ async function stepWorkspace(
   while (choice === null) {
     process.stderr.write(`${e.cyan("?")} What do you want to track here?\n`);
     process.stderr.write(`   ${e.cyan("1")}  Create a new workspace from a directory\n`);
-    process.stderr.write(`   ${e.cyan("2")}  Track an existing workspace   ${e.dim("· paste its id from another machine")}\n`);
+    process.stderr.write(`   ${e.cyan("2")}  Track an existing workspace   ${e.dim("· pick one you've already synced")}\n`);
     choice = workspaceChoiceFor(await ask(rl, `${e.cyan("›")} `));
     if (choice === null) process.stderr.write(e.yellow("   enter 1 or 2\n"));
   }
 
   let workspace: string | undefined;
+  let name: string | undefined;
   if (choice === "existing") {
-    workspace = await ask(rl, `${e.dim("Workspace id to track:")} `);
-    if (!workspace) {
-      process.stderr.write(e.yellow("no workspace id — re-run `rbox setup` when you have it.\n"));
+    const picked = await pickExistingWorkspace(rl, opts.defaultRemote);
+    if (!picked) {
+      process.stderr.write(e.yellow("no workspace selected — re-run `rbox setup` when you're ready.\n"));
       return undefined;
     }
+    workspace = picked.workspace;
+    name = picked.name;
   }
   const dir = (await ask(rl, `${e.cyan("?")} Which directory should rbox sync? ${e.dim(`[${opts.cwd}]`)} `)) || opts.cwd;
 
-  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir } : { kind: "join", root: dir, workspace });
+  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir } : { kind: "join", root: dir, workspace, name });
   return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
+}
+
+/**
+ * Pick a workspace to track from the account's synced list (Feature B). Lists the
+ * caller's workspaces newest-first and lets them choose a number; keeps a manual-id
+ * escape hatch (`m`) for cross-account or already-known ids. Degrades gracefully:
+ * an empty list or a failed fetch (offline) drops straight to manual entry.
+ * Returns the chosen id (+ its server name, when known, for the local cache), or
+ * `undefined` if the user declined to enter anything.
+ */
+async function pickExistingWorkspace(
+  rl: readline.Interface,
+  defaultRemote: string
+): Promise<{ workspace: string; name?: string } | undefined> {
+  const creds = await loadCredentials();
+  const remote = creds?.remoteUrl ?? defaultRemote;
+
+  let sorted: AccountWorkspace[] = [];
+  if (creds) {
+    try {
+      sorted = sortWorkspacesForPick(await fetchAccountWorkspaces(remote, creds.token));
+    } catch {
+      process.stderr.write(e.yellow("couldn't list your workspaces (offline?) — enter an id manually.\n"));
+    }
+  }
+
+  if (sorted.length === 0) {
+    // Empty account, no creds, or a failed fetch → manual entry still works (and is
+    // the only path for a cross-account id anyway).
+    return manualWorkspaceEntry(rl);
+  }
+
+  process.stderr.write(`${e.dim("Your synced workspaces:")}\n`);
+  for (const line of renderWorkspacePickList(sorted, Date.now())) process.stderr.write(`${line}\n`);
+  process.stderr.write(`  ${e.dim("m  paste an id instead (another account, or an id you already have)")}\n`);
+
+  for (;;) {
+    const res = resolveWorkspacePick(sorted, await ask(rl, `${e.cyan("›")} `));
+    if (res === null) {
+      process.stderr.write(e.yellow(`   enter 1–${sorted.length}, or m\n`));
+      continue;
+    }
+    if (res.kind === "manual") return manualWorkspaceEntry(rl);
+    return { workspace: res.workspaceId, name: res.name ?? undefined };
+  }
+}
+
+/** The kept manual-id fallback: prompt for a raw workspace id (cross-account / edge
+ *  cases). No name is known this way, so status falls back to the id. */
+async function manualWorkspaceEntry(rl: readline.Interface): Promise<{ workspace: string } | undefined> {
+  const id = await ask(rl, `${e.dim("Workspace id to track:")} `);
+  return id ? { workspace: id } : undefined;
 }
 
 function printSummary(workspaceId: string, deviceId: string): void {

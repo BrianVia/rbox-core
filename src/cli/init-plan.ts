@@ -30,7 +30,11 @@ export interface InitInput {
 
 export type WorkspaceChoice =
   | { kind: "new"; project: string; name?: string }
-  | { kind: "join"; id: string; project: string };
+  // `name` on a JOIN is a purely-LOCAL display label (never sent to the server —
+  // only `createRemoteWorkspace` carries a name, and that's the create path). The
+  // picker ("track existing") passes the selected workspace's server name through
+  // here so it can be cached into WorkspaceConfig for `rbox status`.
+  | { kind: "join"; id: string; project: string; name?: string };
 
 /** Max stored length of the OPT-IN, server-visible workspace name (mirrors the
  *  server bound in apps/api/src/authz.ts). It's a label, not a path. */
@@ -137,7 +141,7 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   // `project_id` is a SEPARATE PK field and stays "root"; this is just a dashboard label.
   const name = sanitizeWorkspaceName(flags.name);
   const workspace: WorkspaceChoice = joinId
-    ? { kind: "join", id: joinId, project }
+    ? { kind: "join", id: joinId, project, ...(name ? { name } : {}) }
     : { kind: "new", project, ...(name ? { name } : {}) };
 
   // Resolve against the input cwd (NOT process.cwd) so the planner stays pure.

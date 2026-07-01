@@ -283,7 +283,14 @@ async function main(): Promise<void> {
       const cfg = await loadConfig(root);
       const state = await loadState(root);
       const local = await scanManifest(root);
-      console.log(`${style.bold("workspace")} ${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`);
+      // Prefer the locally-cached name (set-once-at-create, never stale) over the
+      // opaque id; keep the short id alongside for copy/paste. Falls back to the id
+      // when no name was set.
+      const { shortWorkspaceId } = await import("./workspace-picker.js");
+      const wsLabel = cfg.name
+        ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
+        : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
+      console.log(`${style.bold("workspace")} ${wsLabel}`);
       console.log(`  ${style.dim("device:")} ${cfg.deviceId}`);
       console.log(`  ${style.dim("last-synced sequence:")} ${state.lastSyncedSequence}`);
       console.log(`  ${style.dim("local files:")} ${local.files.length}`);
