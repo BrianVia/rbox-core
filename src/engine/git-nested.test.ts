@@ -1,0 +1,402 @@
+import { test, expect, beforeEach, afterEach } from "bun:test";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import {
+  applyGitState,
+  assertGitTargetWithinRoot,
+  buildIgnoreMatcher,
+  captureGitState,
+  discoverGitRepos,
+  gitIdentity,
+  gitIdentityKey,
+  gitPreflight,
+  projectIdentity,
+  validateManifest,
+  LocalBlobStore,
+  MAX_GIT_REPOS,
+  type FileEntry,
+  type GitSection,
+} from "./index.js";
+
+const exec = promisify(execFile);
+const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
+const KEK = Buffer.alloc(32, 7);
+
+let tmp: string;
+let store: LocalBlobStore;
+
+beforeEach(async () => {
+  tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-g43-"));
+  store = new LocalBlobStore(path.join(tmp, "store"));
+});
+afterEach(async () => {
+  await fs.rm(tmp, { recursive: true, force: true });
+});
+
+async function initRepo(dir: string) {
+  await fs.mkdir(dir, { recursive: true });
+  await git(dir, "init", "-qb", "main");
+  await git(dir, "config", "user.email", "t@t.t");
+  await git(dir, "config", "user.name", "t");
+}
+async function commit(dir: string, file: string, content: string, msg: string) {
+  await fs.writeFile(path.join(dir, file), content);
+  await git(dir, "add", file);
+  await git(dir, "commit", "-qm", msg);
+}
+
+/** Main clone at tmp/main (outside the "sync root") + a real worktree at tmp/root/wt on branch `feat`. */
+async function makeMainWithWorktree(): Promise<{ M: string; W: string }> {
+  const M = path.join(tmp, "main");
+  await initRepo(M);
+  await commit(M, "f.txt", "base", "c1");
+  const W = path.join(tmp, "root", "wt");
+  await fs.mkdir(path.join(tmp, "root"), { recursive: true });
+  await git(M, "worktree", "add", W, "-b", "feat");
+  return { M, W };
+}
+
+// ---- discovery (design 43 §3) ----------------------------------------------
+
+test("discoverGitRepos finds nested repos + pointers, prunes ignored subtrees, sorts", async () => {
+  const root = path.join(tmp, "root");
+  await initRepo(root); // the sync root itself is a repo → "."
+  await initRepo(path.join(root, "a"));
+  await initRepo(path.join(root, "a", "vendor")); // repo inside another repo's working tree — still discovered
+  await initRepo(path.join(root, "b", "c"));
+  await initRepo(path.join(root, "node_modules", "dep")); // under a builtin-ignored dir → NOT discovered
+  await initRepo(path.join(root, "skipme", "x")); // under a .rboxignore'd dir → NOT discovered
+  await fs.writeFile(path.join(root, ".rboxignore"), "skipme/\n");
+  await fs.mkdir(path.join(root, "wt"), { recursive: true });
+  await fs.writeFile(path.join(root, "wt", ".git"), "gitdir: /nowhere/at/all\n"); // gitfile pointer
+
+  const found = await discoverGitRepos(root, buildIgnoreMatcher(root));
+  expect(found).toEqual([
+    { relPath: ".", kind: "dir" },
+    { relPath: "a", kind: "dir" },
+    { relPath: "a/vendor", kind: "dir" },
+    { relPath: "b/c", kind: "dir" },
+    { relPath: "wt", kind: "pointer" },
+  ]);
+});
+
+// ---- preflight matrix (design 43 §4) -----------------------------------------
+
+test("preflight: ordinary dir repo ok (kind dir); real worktree ok (kind pointer)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  expect(await gitPreflight(A)).toEqual({ ok: true, kind: "dir" });
+
+  const { W } = await makeMainWithWorktree();
+  expect(await gitPreflight(W)).toEqual({ ok: true, kind: "pointer" });
+});
+
+test("preflight refusals: no .git, dangling pointer, bare, alternates (both kinds), worktrees/modules, toplevel mismatch", async () => {
+  // no .git
+  const plain = path.join(tmp, "plain");
+  await fs.mkdir(plain);
+  expect((await gitPreflight(plain)).ok).toBe(false);
+
+  // dangling pointer (main clone deleted — the Conductor incident): clean {ok:false}, no throw
+  const dangling = path.join(tmp, "dangling");
+  await fs.mkdir(dangling);
+  await fs.writeFile(path.join(dangling, ".git"), "gitdir: /nonexistent/clone/.git/worktrees/x\n");
+  const dp = await gitPreflight(dangling);
+  expect(dp.ok).toBe(false);
+  expect(dp.kind).toBe("pointer");
+
+  // bare `.git`
+  const bare = path.join(tmp, "bare");
+  await fs.mkdir(bare);
+  await exec("git", ["init", "-q", "--bare", path.join(bare, ".git")]);
+  expect((await gitPreflight(bare)).ok).toBe(false);
+
+  // alternates on a dir repo
+  const alt = path.join(tmp, "alt");
+  await initRepo(alt);
+  await commit(alt, "f.txt", "x", "c1");
+  await fs.writeFile(path.join(alt, ".git", "objects", "info", "alternates"), "/somewhere/objects\n");
+  const ar = await gitPreflight(alt);
+  expect(ar.ok).toBe(false);
+  expect(ar.reason).toContain("alternates");
+
+  // alternates on a pointer repo's RESOLVED object store (the main clone's)
+  const { M, W } = await makeMainWithWorktree();
+  await fs.writeFile(path.join(M, ".git", "objects", "info", "alternates"), "/somewhere/objects\n");
+  const wr = await gitPreflight(W);
+  expect(wr.ok).toBe(false);
+  expect(wr.reason).toContain("alternates");
+  await fs.rm(path.join(M, ".git", "objects", "info", "alternates"));
+
+  // a PRIMARY with linked worktrees stays refused (v1)
+  const mr = await gitPreflight(M);
+  expect(mr.ok).toBe(false);
+  expect(mr.reason).toContain("worktrees");
+
+  // .git/modules (submodule superproject) stays refused (v1 [v2, M1])
+  const sup = path.join(tmp, "sup");
+  await initRepo(sup);
+  await commit(sup, "f.txt", "x", "c1");
+  await fs.mkdir(path.join(sup, ".git", "modules"));
+  expect((await gitPreflight(sup)).reason).toContain("modules");
+
+  // toplevel mismatch: core.worktree pointing above the repo dir — git resolves the
+  // toplevel to the parent, so `repoDir` is not the repo's root
+  const V = path.join(tmp, "vparent", "v");
+  await initRepo(V);
+  await commit(V, "f.txt", "x", "c1");
+  await git(V, "config", "core.worktree", "../.."); // relative to the .git dir → vparent
+  const vr = await gitPreflight(V);
+  expect(vr.ok).toBe(false);
+  expect(vr.reason).toContain("toplevel");
+});
+
+// ---- worktree round-trip (design 43 §5) ---------------------------------------
+
+test("worktree capture is SCOPED (branch only, never the shared stash) and applies as a standalone repo", async () => {
+  const { M, W } = await makeMainWithWorktree();
+  // a stash in the SHARED gitdir must never ride a pointer capture
+  await fs.writeFile(path.join(M, "f.txt"), "dirty-main");
+  await git(M, "stash", "-q");
+  expect(await git(M, "rev-parse", "--verify", "refs/stash")).toBeTruthy();
+  // work in the worktree: a commit on feat + a staged file
+  await commit(W, "w.txt", "wt-work", "wt c1");
+  await fs.writeFile(path.join(W, "staged.txt"), "staged");
+  await git(W, "add", "staged.txt");
+
+  const section = await captureGitState(W, store, KEK);
+  expect(section).toBeDefined();
+  expect(section!.refScope).toBe("scoped");
+  expect(Object.keys(section!.refs)).toEqual(["refs/heads/feat"]); // no refs/stash, no main
+  expect(section!.head).toBe("ref: refs/heads/feat");
+
+  // materializes as a full STANDALONE repo on the receiving side
+  const D = path.join(tmp, "D");
+  const res = await applyGitState(D, section!, store, KEK);
+  expect(res.applied).toBe(true);
+  expect((await fs.lstat(path.join(D, ".git"))).isDirectory()).toBe(true); // real .git dir, not a pointer
+  expect(await git(D, "symbolic-ref", "HEAD")).toBe("refs/heads/feat");
+  expect(await git(D, "rev-parse", "feat")).toBe(await git(W, "rev-parse", "feat"));
+  expect((await git(D, "branch", "--format=%(refname:short)")).split("\n")).toEqual(["feat"]); // main did NOT leak in
+  expect(await git(D, "diff", "--cached", "--name-only")).toBe("staged.txt"); // staged state restored
+  await expect(git(D, "rev-parse", "--verify", "refs/stash")).rejects.toThrow(); // shared stash filtered at capture
+  await expect(git(D, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+// ---- pseudo-ref pinning (design 43 §5 [v2, B3]) -------------------------------
+
+test("mid-merge MERGE_HEAD from an UNBUNDLED branch survives a scoped round-trip (object-closure pin)", async () => {
+  const { M, W } = await makeMainWithWorktree();
+  // branch `other` diverges from base with a conflicting change — NOT part of feat's line of work
+  await git(M, "branch", "other");
+  await git(M, "checkout", "-q", "other");
+  await commit(M, "f.txt", "other-change", "other c1");
+  await git(M, "checkout", "-q", "main");
+  // conflicting change on feat, then merge other → conflict, MERGE_HEAD set (per-worktree)
+  await commit(W, "f.txt", "feat-change", "feat c1");
+  await expect(git(W, "merge", "other")).rejects.toThrow(); // conflict
+  const otherSha = await git(M, "rev-parse", "other");
+  const wGitDir = await git(W, "rev-parse", "--absolute-git-dir");
+  expect((await fs.readFile(path.join(wGitDir, "MERGE_HEAD"), "utf8")).trim()).toBe(otherSha);
+
+  const section = await captureGitState(W, store, KEK);
+  expect(section).toBeDefined();
+  expect(Object.keys(section!.opState ?? {})).toContain("MERGE_HEAD");
+  // §6.6 [v2, M3]: write-tree fails on the unmerged index → raw-index identity fallback
+  expect(section!.indexTree?.startsWith("raw:")).toBe(true);
+
+  const D = path.join(tmp, "D");
+  const res = await applyGitState(D, section!, store, KEK);
+  expect(res.applied).toBe(true);
+  // MERGE_HEAD restored AND its commit object actually exists (this is what the pin buys —
+  // codex repro'd `bundle create HEAD refs/heads/x` omitting a MERGE_HEAD commit)
+  expect((await fs.readFile(path.join(D, ".git", "MERGE_HEAD"), "utf8")).trim()).toBe(otherSha);
+  await expect(git(D, "cat-file", "-e", `${otherSha}^{commit}`)).resolves.toBeDefined();
+  await expect(git(D, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("unmerged-index identity fallback is stable in the window and clears on resolution", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "base", "c1");
+  await git(A, "checkout", "-qb", "side");
+  await commit(A, "f.txt", "side-change", "side c1");
+  await git(A, "checkout", "-q", "main");
+  await commit(A, "f.txt", "main-change", "main c2");
+  await expect(git(A, "merge", "side")).rejects.toThrow(); // conflict → unmerged index
+
+  const id1 = await gitIdentity(A);
+  const id2 = await gitIdentity(A);
+  expect(id1!.indexTree?.startsWith("raw:")).toBe(true);
+  expect(gitIdentityKey(id1)).toBe(gitIdentityKey(id2)); // no git ops between → stable, no echo
+
+  await git(A, "checkout", "--theirs", "f.txt");
+  await git(A, "add", "f.txt"); // staged resolution progress MUST change the identity
+  const id3 = await gitIdentity(A);
+  expect(gitIdentityKey(id3)).not.toBe(gitIdentityKey(id1));
+  expect(/^[0-9a-f]{40}$/.test(id3!.indexTree ?? "")).toBe(true); // write-tree works again
+});
+
+// ---- scope-gated ref publish + ownership guard (design 43 §7 [v2,B1; v3; v4]) ---
+
+test("scope-gated deletion matrix: all→dir deletes absent refs; scoped→dir is update-only", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "v1", "c1");
+  const all = await captureGitState(A, store, KEK);
+  expect(all!.refScope).toBe("all");
+
+  // all→dir: both sides speak "complete set" → absent local refs are deleted (design-02 semantics)
+  const B = path.join(tmp, "B");
+  await initRepo(B);
+  await commit(B, "own.txt", "own", "b1");
+  await git(B, "branch", "junk");
+  const r1 = await applyGitState(B, all!, store, KEK);
+  expect(r1.applied).toBe(true);
+  expect(r1.conflictBundle).toBeTruthy(); // local committed state was quarantined first
+  expect((await git(B, "branch", "--format=%(refname:short)")).split("\n").sort()).toEqual(["main"]);
+  expect(await git(B, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  // §9 [v5]: quarantine is full recovery — the bundle is accompanied by an index copy
+  expect(await fs.readFile(r1.conflictBundle!.replace(/\.bundle$/, ".index"))).toBeDefined();
+
+  // scoped→dir: update-only — a standalone receiver's extra local branches SURVIVE
+  const { W } = await makeMainWithWorktree();
+  await commit(W, "w.txt", "wt", "wt c1");
+  const scoped = await captureGitState(W, store, KEK);
+  expect(scoped!.refScope).toBe("scoped");
+  const C = path.join(tmp, "C");
+  await initRepo(C);
+  await commit(C, "own.txt", "own", "c1");
+  const cMain = await git(C, "rev-parse", "main");
+  const r2 = await applyGitState(C, scoped!, store, KEK);
+  expect(r2.applied).toBe(true);
+  expect((await git(C, "branch", "--format=%(refname:short)")).split("\n").sort()).toEqual(["feat", "main"]);
+  expect(await git(C, "rev-parse", "main")).toBe(cMain); // untouched
+  expect(await git(C, "rev-parse", "feat")).toBe(await git(W, "rev-parse", "feat"));
+  expect(await git(C, "symbolic-ref", "HEAD")).toBe("refs/heads/feat");
+});
+
+test("apply into a POINTER repo filters stash/tags, ownership-guards sibling branches, defers on blocked HEAD", async () => {
+  const { M, W } = await makeMainWithWorktree();
+  await git(M, "branch", "keepme"); // shared branch not in the incoming section — must survive
+  await commit(W, "w.txt", "wt", "wt c1");
+
+  // Build a standalone "all"-scope sender D from W's scoped section (the §5 round-trip shape)
+  const D = path.join(tmp, "D");
+  expect((await applyGitState(D, (await captureGitState(W, store, KEK))!, store, KEK)).applied).toBe(true);
+  await git(D, "config", "user.email", "t@t.t");
+  await git(D, "config", "user.name", "t");
+  await git(D, "checkout", "-qf", "feat");
+  await commit(D, "d.txt", "new-on-D", "d c1"); // feat advances on D
+  await git(D, "branch", "-f", "main"); // D also has `main` — checked out by M on the other side
+  await git(D, "tag", "v1");
+  const allFromD = await captureGitState(D, store, KEK);
+  expect(allFromD!.refScope).toBe("all");
+  expect(Object.keys(allFromD!.refs).sort()).toEqual(["refs/heads/feat", "refs/heads/main", "refs/tags/v1"]);
+
+  const mMainBefore = await git(M, "rev-parse", "main");
+  const res = await applyGitState(W, allFromD!, store, KEK);
+  expect(res.applied).toBe(true);
+  // refs/tags/* filtered (shared namespace) + refs/heads/main filtered (checked out by main clone)
+  expect(res.filteredRefs?.sort()).toEqual(["refs/heads/main", "refs/tags/v1"]);
+  expect(await git(M, "rev-parse", "main")).toBe(mMainBefore); // sibling's checked-out branch NOT moved
+  expect(await git(M, "tag", "-l", "v1")).toBe(""); // tag never written to the shared store
+  expect(await git(M, "rev-parse", "--verify", "keepme")).toBeTruthy(); // no deletion on pointer targets, even from an "all" section
+  expect(await git(W, "rev-parse", "feat")).toBe(await git(D, "rev-parse", "feat")); // own line of work updated
+
+  // HEAD-branch blocked → the WHOLE apply defers [v4]
+  await git(D, "checkout", "-q", "main");
+  const headBlocked = await captureGitState(D, store, KEK);
+  expect(headBlocked!.head).toBe("ref: refs/heads/main");
+  const res2 = await applyGitState(W, headBlocked!, store, KEK);
+  expect(res2.applied).toBe(false);
+  expect(res2.reason).toContain("ownership-deferred");
+});
+
+// ---- scope projection (design 43 §7) ------------------------------------------
+
+test("projectIdentity: an all-identity projected to scoped equals the scoped identity (convergence)", async () => {
+  const { W } = await makeMainWithWorktree();
+  await commit(W, "w.txt", "wt", "wt c1");
+  const scoped = await captureGitState(W, store, KEK);
+  const D = path.join(tmp, "D");
+  expect((await applyGitState(D, scoped!, store, KEK)).applied).toBe(true);
+  // D grows an extra branch — the §7 trace: projected(all) must still equal projected(scoped)
+  await git(D, "branch", "extra");
+  const allId = await gitIdentity(D);
+  expect(allId!.refScope).toBe("all");
+  expect(gitIdentityKey(allId)).not.toBe(gitIdentityKey(scoped)); // full identities differ…
+  expect(gitIdentityKey(projectIdentity(allId!, "scoped"))).toBe(gitIdentityKey(projectIdentity(scoped!, "scoped"))); // …projections converge
+});
+
+// ---- apply-target containment (design 43 §7 [v2, B5; v3]) ----------------------
+
+test("assertGitTargetWithinRoot: ok for nested + '.', throws on symlink components/escape", async () => {
+  const root = path.join(tmp, "root");
+  await fs.mkdir(path.join(root, "a"), { recursive: true });
+  expect(await assertGitTargetWithinRoot(root, ".")).toBe(root);
+  expect(await assertGitTargetWithinRoot(root, "a/repo")).toBe(path.join(root, "a/repo")); // not-yet-created tail ok
+  const outside = path.join(tmp, "outside");
+  await fs.mkdir(outside);
+  await fs.symlink(outside, path.join(root, "link"));
+  await expect(assertGitTargetWithinRoot(root, "link/repo")).rejects.toThrow(/symlink/);
+  await expect(assertGitTargetWithinRoot(root, "link")).rejects.toThrow(/symlink/);
+});
+
+// ---- schema + gitRepos validation (design 43 §2) -------------------------------
+
+const fileEntry = (p: string): FileEntry => ({ path: p, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 0, type: "file" });
+const section = (over: Partial<GitSection> = {}): GitSection => ({
+  bundleSha: "a".repeat(64),
+  bundleEncSha: "b".repeat(64),
+  bundleCipherSize: 10,
+  head: "ref: refs/heads/main",
+  refs: { "refs/heads/main": "c".repeat(40) },
+  refScope: "all",
+  generatedAt: "",
+  ...over,
+});
+const m43 = (gitRepos: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+  generatedAt: "",
+  files: [fileEntry("src/a.ts")],
+  manifestSchema: 2,
+  gitRepos,
+  ...extra,
+});
+
+test("validateManifest: schema gate — legacy `git` refused, newer schema refused, v1 manifests still pass", () => {
+  expect(validateManifest({ generatedAt: "", files: [] }).ok).toBe(true); // pre-§43 manifest
+  const legacy = validateManifest({ generatedAt: "", files: [], git: section() });
+  expect(legacy.ok).toBe(false);
+  expect(!legacy.ok && legacy.error).toContain("older rbox");
+  const future = validateManifest({ generatedAt: "", files: [], manifestSchema: 3 });
+  expect(future.ok).toBe(false);
+  expect(!future.ok && future.error).toContain("upgrade rbox");
+  expect(validateManifest({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: {} }).ok).toBe(true);
+});
+
+test("validateManifest: gitRepos keys — '.', safe rel paths ok; traversal/dup/file-collision/bad-section refused", () => {
+  expect(validateManifest(m43({ ".": section(), "a/b": section() })).ok).toBe(true);
+  // gitRepos without the schema stamp is refused (loud break, never silent)
+  expect(validateManifest({ generatedAt: "", files: [], gitRepos: { ".": section() } }).ok).toBe(false);
+  for (const bad of ["../x", "/abs", "a/../b", ""]) {
+    expect(validateManifest(m43({ [bad]: section() })).ok).toBe(false);
+  }
+  expect(validateManifest(m43({ Repo: section(), repo: section() })).ok).toBe(false); // case-insensitive dup
+  expect(validateManifest(m43({ "src/a.ts": section() })).ok).toBe(false); // collides with a FILE entry [v2, B5]
+  expect(validateManifest(m43({ ".": { ...section(), refScope: undefined as never } })).ok).toBe(false); // refScope mandatory
+  expect(validateManifest(m43({ ".": { ...section(), refs: { "refs/remotes/origin/x": "c".repeat(40) } } })).ok).toBe(false); // non-syncable ref
+});
+
+test("validateManifest: MAX_GIT_REPOS is a LOUD error at the boundary, not a silent drop", () => {
+  const at = Object.fromEntries(Array.from({ length: MAX_GIT_REPOS }, (_, i) => [`r${i}`, section()]));
+  expect(validateManifest(m43(at)).ok).toBe(true);
+  const over = { ...at, overflow: section() };
+  const r = validateManifest(m43(over));
+  expect(r.ok).toBe(false);
+  expect(!r.ok && r.error).toContain("too many git repos");
+});
