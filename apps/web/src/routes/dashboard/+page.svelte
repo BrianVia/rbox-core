@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type { Clerk } from '@clerk/clerk-js';
 	import { authState, requireAuth } from '$lib/auth.svelte';
@@ -10,8 +10,11 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Progress } from '$lib/components/ui/progress';
 	import { Separator } from '$lib/components/ui/separator';
+	import PageHeader from '$lib/components/page-header.svelte';
+	import Callout from '$lib/components/callout.svelte';
+	import Loading from '$lib/components/loading.svelte';
+	import CommandRow from '$lib/components/command-row.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
-	import CopyIcon from '@lucide/svelte/icons/copy';
 	import ArrowRightIcon from '@lucide/svelte/icons/arrow-right';
 	import Link2Icon from '@lucide/svelte/icons/link-2';
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
@@ -96,22 +99,6 @@
 	const INSTALL_CMD = 'curl -fsSL https://rbox.to/install.sh | sh';
 	const SETUP_CMD = 'rbox setup';
 
-	let copied = $state('');
-	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
-	async function copy(text: string) {
-		try {
-			await navigator.clipboard.writeText(text);
-			copied = text;
-			if (copiedTimer) clearTimeout(copiedTimer);
-			copiedTimer = setTimeout(() => (copied = ''), 2000);
-		} catch {
-			/* clipboard blocked — the command is visible to copy manually */
-		}
-	}
-	onDestroy(() => {
-		if (copiedTimer) clearTimeout(copiedTimer);
-	});
-
 	const plan = $derived((usage?.plan as Tier) ?? 'free');
 	const isFree = $derived(plan === 'free');
 	const info = $derived(PLAN[plan] ?? PLAN.free);
@@ -120,15 +107,10 @@
 	);
 </script>
 
-<header class="mb-8">
-	<h1 class="text-2xl font-semibold tracking-tight">Overview</h1>
-	<p class="mt-1 text-sm text-muted-foreground">Your plan, usage, and account at a glance.</p>
-</header>
+<PageHeader title="Overview" description="Your plan, usage, and account at a glance." />
 
 {#if error}
-	<div class="mb-6 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-		{error}
-	</div>
+	<Callout class="mb-6">{error}</Callout>
 {/if}
 
 {#if usage}
@@ -224,7 +206,7 @@
 					<div class="min-w-0">
 						<div class="text-sm font-medium">Install rbox</div>
 						<p class="mt-0.5 text-xs text-muted-foreground">One line — adds the <code class="rounded bg-muted px-1 py-0.5">rbox</code> command on macOS or Linux.</p>
-						{@render cmdRow(INSTALL_CMD)}
+						<CommandRow command={INSTALL_CMD} />
 					</div>
 				</li>
 				<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">
@@ -234,8 +216,8 @@
 						<p class="mt-0.5 text-xs text-muted-foreground">
 							Creates your account, saves your recovery phrase, tracks a folder, and starts syncing in the background.
 						</p>
-						{@render cmdRow(SETUP_CMD)}
-						<p class="mt-2 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-700">
+						<CommandRow command={SETUP_CMD} />
+						<p class="mt-2 rounded-md bg-warning/10 px-2.5 py-1.5 text-xs text-warning">
 							Save your recovery phrase somewhere safe — it's the only way back into your account. No one can reset it for you.
 						</p>
 					</div>
@@ -301,23 +283,5 @@
 		</p>
 	{/if}
 {:else if !error}
-	<div class="flex items-center gap-2 text-sm text-muted-foreground">
-		<span class="size-2 animate-pulse rounded-full bg-primary"></span>
-		Loading account…
-	</div>
+	<Loading label="Loading account…" />
 {/if}
-
-{#snippet cmdRow(cmd: string)}
-	<div class="mt-2 flex items-center gap-2">
-		<code class="min-w-0 flex-1 overflow-x-auto rounded-md border border-border bg-muted/50 px-3 py-2 font-mono text-xs whitespace-nowrap">
-			{cmd}
-		</code>
-		<Button variant="outline" size="sm" class="shrink-0" onclick={() => copy(cmd)}>
-			{#if copied === cmd}
-				<CheckIcon class="size-3.5 text-success" /> Copied
-			{:else}
-				<CopyIcon class="size-3.5" /> Copy
-			{/if}
-		</Button>
-	</div>
-{/snippet}

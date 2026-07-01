@@ -15,6 +15,8 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Switch } from '$lib/components/ui/switch';
 	import { Skeleton } from '$lib/components/ui/skeleton';
+	import PageHeader from '$lib/components/page-header.svelte';
+	import Callout from '$lib/components/callout.svelte';
 	import MonitorIcon from '@lucide/svelte/icons/monitor';
 	import FolderIcon from '@lucide/svelte/icons/folder';
 
@@ -105,12 +107,10 @@
 	}
 </script>
 
-<header class="mb-8">
-	<h1 class="text-2xl font-semibold tracking-tight">Devices &amp; workspaces</h1>
-	<p class="mt-1 text-sm text-muted-foreground">
-		The machines connected to your account and the workspaces they sync.
-	</p>
-</header>
+<PageHeader
+	title="Devices & workspaces"
+	description="The machines connected to your account and the workspaces they sync."
+/>
 
 <!-- ── Devices ─────────────────────────────────────────────────────────────── -->
 <section class="mb-10">
@@ -123,9 +123,7 @@
 	</div>
 
 	{#if devicesError}
-		<div class="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-			{devicesError}
-		</div>
+		<Callout class="mb-3">{devicesError}</Callout>
 	{/if}
 
 	{#if loading}
@@ -235,9 +233,7 @@
 	</p>
 
 	{#if workspacesError}
-		<div class="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-			{workspacesError}
-		</div>
+		<Callout class="mb-3">{workspacesError}</Callout>
 	{/if}
 
 	{#if loading}

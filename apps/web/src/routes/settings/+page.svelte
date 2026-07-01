@@ -7,6 +7,9 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
+	import PageHeader from '$lib/components/page-header.svelte';
+	import Callout from '$lib/components/callout.svelte';
+	import Loading from '$lib/components/loading.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
 
@@ -78,15 +81,10 @@
 	}
 </script>
 
-<header class="mb-8">
-	<h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
-	<p class="mt-1 text-sm text-muted-foreground">Manage how this dashboard connects to your account.</p>
-</header>
+<PageHeader title="Settings" description="Manage how this dashboard connects to your account." />
 
 {#if error}
-	<div class="mb-6 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-		{error}
-	</div>
+	<Callout class="mb-6">{error}</Callout>
 {/if}
 
 {#if done}
@@ -101,10 +99,7 @@
 		<Button class="mt-4" onclick={() => goto('/dashboard')}>Back to overview</Button>
 	</div>
 {:else if linked === null}
-	<div class="flex items-center gap-2 text-sm text-muted-foreground">
-		<span class="size-2 animate-pulse rounded-full bg-primary"></span>
-		Loading…
-	</div>
+	<Loading />
 {:else}
 	<!-- Account connection — acts on the dashboard↔account MAPPING (design 22 §4). -->
 	<section class="rounded-xl border border-border bg-card p-6">
@@ -170,9 +165,7 @@
 		{:else}
 			<div class="mt-4 border-t border-destructive/20 pt-4">
 				{#if deleteError}
-					<div class="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-						{deleteError}
-					</div>
+					<Callout class="mb-3">{deleteError}</Callout>
 				{/if}
 				<Label for="del-confirm" class="text-sm font-normal">
 					Type your account {ownerEmail ? 'email' : 'id'}

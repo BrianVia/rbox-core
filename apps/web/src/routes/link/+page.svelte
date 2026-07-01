@@ -5,8 +5,10 @@
 	import { startLink, pollLinkStatus, confirmLink, type LinkStatus } from '$lib/api';
 	import { errMsg } from '$lib/format';
 	import { Button } from '$lib/components/ui/button';
+	import PageHeader from '$lib/components/page-header.svelte';
+	import Callout from '$lib/components/callout.svelte';
+	import CommandRow from '$lib/components/command-row.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
-	import CopyIcon from '@lucide/svelte/icons/copy';
 	import LoaderIcon from '@lucide/svelte/icons/loader-circle';
 
 	type Phase = 'idle' | 'showing-code' | 'pending' | 'done';
@@ -22,10 +24,7 @@
 
 	requireAuth(); // not signed in → /
 
-	onDestroy(() => {
-		stopPolling();
-		if (copiedTimer) clearTimeout(copiedTimer);
-	});
+	onDestroy(stopPolling);
 	function stopPolling() {
 		if (poller) clearInterval(poller);
 		poller = null;
@@ -84,35 +83,15 @@
 		}
 	}
 
-	let copied = $state(false);
-	let copiedTimer: ReturnType<typeof setTimeout> | null = null;
-
-	async function copyCode() {
-		try {
-			// Copy the whole command, not the bare code — the user is told to run
-			// `rbox account link <code>`, so that's what the button should hand them.
-			await navigator.clipboard.writeText(`rbox account link ${code}`);
-			copied = true;
-			if (copiedTimer) clearTimeout(copiedTimer);
-			copiedTimer = setTimeout(() => (copied = false), 2000);
-		} catch {
-			/* clipboard blocked — the command is visible to copy manually */
-		}
-	}
 </script>
 
-<header class="mb-6">
-	<h1 class="text-2xl font-semibold tracking-tight">Link your CLI account</h1>
-	<p class="mt-1 max-w-prose text-sm text-muted-foreground">
-		Connect the <code class="rounded bg-muted px-1 py-0.5">rbox</code> account on your machines to this
-		web login, so the dashboard manages your real devices, workspaces, and billing.
-	</p>
-</header>
+<PageHeader
+	title="Link your CLI account"
+	description="Connect the rbox account on your machines to this web login, so the dashboard manages your real devices, workspaces, and billing."
+/>
 
 {#if error}
-	<div class="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-		{error}
-	</div>
+	<Callout class="mb-4">{error}</Callout>
 {/if}
 
 {#if phase === 'idle'}
@@ -130,18 +109,7 @@
 			<span class="grid size-6 place-items-center rounded-full bg-secondary text-xs font-semibold tabular">1</span>
 			<div class="min-w-0">
 				<p class="text-sm">Run this in a terminal signed in to your rbox account (an owner device):</p>
-				<div class="mt-2 flex items-center gap-2">
-					<code class="min-w-0 flex-1 overflow-x-auto rounded-md border border-border bg-muted/50 px-3 py-2 font-mono text-xs whitespace-nowrap">
-						rbox account link {code}
-					</code>
-					<Button variant="outline" size="sm" class="shrink-0" onclick={copyCode}>
-						{#if copied}
-							<CheckIcon class="size-3.5 text-success" /> Copied
-						{:else}
-							<CopyIcon class="size-3.5" /> Copy
-						{/if}
-					</Button>
-				</div>
+				<CommandRow command={`rbox account link ${code}`} />
 			</div>
 		</li>
 		<li class="grid grid-cols-[1.5rem_1fr] gap-x-3">

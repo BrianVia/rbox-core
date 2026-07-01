@@ -12,6 +12,7 @@
 	import LogOutIcon from '@lucide/svelte/icons/log-out';
 	import ChevronsUpDownIcon from '@lucide/svelte/icons/chevrons-up-down';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import Loading from '$lib/components/loading.svelte';
 	import { cn } from '$lib/utils';
 	import '@fontsource-variable/hanken-grotesk/index.css';
 	import '../app.css';
@@ -46,8 +47,8 @@
 		{ href: '/devices', label: 'Devices & workspaces', icon: HardDriveIcon },
 		{ href: '/settings', label: 'Settings', icon: SettingsIcon }
 	];
-	// Highlight the deepest matching item (so /billing/success keeps Overview lit
-	// isn't needed — those aren't in nav — but /devices etc. match exactly).
+	// Active = exact path match. Nested/transient routes (billing/success, link)
+	// aren't in the nav, so they simply light nothing — no prefix logic needed.
 	const isActive = (href: string) => page.url.pathname === href;
 
 	const email = $derived(authState.clerk?.user?.primaryEmailAddress?.emailAddress ?? '');
@@ -77,13 +78,14 @@
 {#snippet navLinks(onNavigate?: () => void)}
 	{#each nav as item (item.href)}
 		{@const Icon = item.icon}
+		{@const active = isActive(item.href)}
 		<a
 			href={item.href}
 			onclick={onNavigate}
-			aria-current={isActive(item.href) ? 'page' : undefined}
+			aria-current={active ? 'page' : undefined}
 			class={cn(
 				'flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-				isActive(item.href)
+				active
 					? 'bg-sidebar-accent text-sidebar-accent-foreground'
 					: 'text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'
 			)}
@@ -149,10 +151,7 @@
 	</div>
 {:else if !ready}
 	<div class="grid min-h-svh place-items-center p-6">
-		<div class="flex items-center gap-2 text-sm text-muted-foreground">
-			<span class="size-2 animate-pulse rounded-full bg-primary"></span>
-			Loading…
-		</div>
+		<Loading />
 	</div>
 {:else if isAuth}
 	<!-- Signed-out landing: focused, centered auth card. -->
