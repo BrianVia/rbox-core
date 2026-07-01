@@ -1,5 +1,14 @@
 import { test, expect } from "bun:test";
-import { resolveInitPlan, isInitError, unifyDeviceId, type InitInput, type CredsView } from "./init-plan.js";
+import {
+  resolveInitPlan,
+  isInitError,
+  unifyDeviceId,
+  collapseHome,
+  sanitizeWorkspaceName,
+  MAX_WORKSPACE_NAME,
+  type InitInput,
+  type CredsView,
+} from "./init-plan.js";
 
 const REMOTE = "https://example.invalid";
 const creds = (over: Partial<CredsView> = {}): CredsView => ({ deviceId: "dev_server1", remoteUrl: REMOTE, ...over });
@@ -87,6 +96,54 @@ test("remote precedence: --remote > creds.remoteUrl > defaultRemote", () => {
   expect(flagWin.remoteUrl).toBe("https://flag.invalid");
   expect(credWin.remoteUrl).toBe("https://creds.invalid");
   expect(fallback.remoteUrl).toBe("https://default.invalid");
+});
+
+// ── opt-in workspace name (server-visible dashboard label) ─────────────────
+
+test("no --name → new workspace carries NO name (private, zero-knowledge default)", () => {
+  const r = resolveInitPlan(input());
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect(r.workspace).toEqual({ kind: "new", project: "root" });
+  expect((r.workspace as { name?: string }).name).toBeUndefined();
+});
+
+test("--name on create → sanitized name threaded onto the new choice", () => {
+  const r = resolveInitPlan(input({ flags: { name: "  Conductor workspaces  " } }));
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect(r.workspace).toEqual({ kind: "new", project: "root", name: "Conductor workspaces" });
+});
+
+test("--name with only control chars/whitespace → treated as no name (skip)", () => {
+  const r = resolveInitPlan(input({ flags: { name: "  \t\n  " } }));
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect((r.workspace as { name?: string }).name).toBeUndefined();
+});
+
+test("--name is ignored on a join (the row already exists — nothing to set it on)", () => {
+  const r = resolveInitPlan(input({ flags: { workspace: "ws_abc", name: "Whatever" } }));
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect(r.workspace).toEqual({ kind: "join", id: "ws_abc", project: "root" });
+  expect((r.workspace as { name?: string }).name).toBeUndefined();
+});
+
+test("sanitizeWorkspaceName: strips control chars/newlines, trims, bounds length", () => {
+  expect(sanitizeWorkspaceName(undefined)).toBeUndefined();
+  expect(sanitizeWorkspaceName("")).toBeUndefined();
+  expect(sanitizeWorkspaceName("   ")).toBeUndefined();
+  expect(sanitizeWorkspaceName("~/code/rbox")).toBe("~/code/rbox");
+  // newlines/tabs/other control chars are removed so it stays a single label line
+  expect(sanitizeWorkspaceName("line1\nline2\tend")).toBe("line1line2end");
+  const long = "x".repeat(MAX_WORKSPACE_NAME + 50);
+  expect(sanitizeWorkspaceName(long)!.length).toBe(MAX_WORKSPACE_NAME);
+});
+
+test("collapseHome: collapses the home prefix to ~, leaves outside paths untouched", () => {
+  expect(collapseHome("/Users/via/conductor/workspaces", "/Users/via")).toBe("~/conductor/workspaces");
+  expect(collapseHome("/Users/via", "/Users/via")).toBe("~");
+  expect(collapseHome("/Users/via", "/Users/via/")).toBe("~"); // trailing slash on home
+  expect(collapseHome("/etc/hosts", "/Users/via")).toBe("/etc/hosts");
+  expect(collapseHome("/Users/viacom/x", "/Users/via")).toBe("/Users/viacom/x"); // no false prefix match
+  expect(collapseHome("/any/path", "")).toBe("/any/path"); // no home known
 });
 
 // ── device-id unification (review #9) ──────────────────────────────────────

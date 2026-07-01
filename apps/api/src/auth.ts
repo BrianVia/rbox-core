@@ -637,10 +637,13 @@ interface WorkspaceRow {
   workspace_id: string;
   project_id: string;
   created_at: number;
+  name: string | null;
 }
 
 /** GET /v1/account/workspaces?limit&cursor — the caller's sync roots. Under E2EE the
- *  server holds NO folder name/path; `projectId` is a PK component returned verbatim. */
+ *  server holds NO folder name/path; `projectId` is a PK component returned verbatim.
+ *  `name` is the OPT-IN, server-visible dashboard label (default-off): null unless the
+ *  first host set one at create — the deliberate, consensual metadata carve-out. */
 export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promise<Response> {
   const limit = parseLimit(url);
   const cursorRaw = url.searchParams.get("cursor");
@@ -656,13 +659,13 @@ export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promi
   binds.push(limit + 1);
 
   const rows = await dbFor(env, p.accountId)
-    .prepare(`SELECT rowid AS rid, workspace_id, project_id, created_at FROM workspaces WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .prepare(`SELECT rowid AS rid, workspace_id, project_id, created_at, name FROM workspaces WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
     .bind(...binds)
     .all<WorkspaceRow>();
   const { page, nextCursor } = keysetPage(rows.results, limit);
 
   return json({
-    workspaces: page.map((r) => ({ workspaceId: r.workspace_id, projectId: r.project_id, createdAt: r.created_at })),
+    workspaces: page.map((r) => ({ workspaceId: r.workspace_id, projectId: r.project_id, name: r.name ?? null, createdAt: r.created_at })),
     nextCursor,
   });
 }

@@ -29,8 +29,33 @@ export interface InitInput {
 }
 
 export type WorkspaceChoice =
-  | { kind: "new"; project: string }
+  | { kind: "new"; project: string; name?: string }
   | { kind: "join"; id: string; project: string };
+
+/** Max stored length of the OPT-IN, server-visible workspace name (mirrors the
+ *  server bound in apps/api/src/authz.ts). It's a label, not a path. */
+export const MAX_WORKSPACE_NAME = 128;
+
+/** Collapse a leading home-dir prefix to `~` for the opt-in name's suggested
+ *  default (drops the OS username; keeps the local structure the user opts to share).
+ *  PURE — home is passed in (os.homedir() stays in the impure shell). */
+export function collapseHome(p: string, home: string): string {
+  if (!home) return p;
+  const h = home.replace(/[/\\]+$/, "");
+  if (p === h) return "~";
+  if (p.startsWith(h + "/")) return "~" + p.slice(h.length);
+  return p;
+}
+
+/** Sanitize the OPT-IN, server-visible workspace name: it's OPAQUE user text, so
+ *  strip control chars/newlines (single label line), trim, and bound length. Empty/
+ *  absent → undefined = no name (the private, zero-knowledge default). */
+export function sanitizeWorkspaceName(raw: string | undefined): string | undefined {
+  if (raw == null) return undefined;
+  // eslint-disable-next-line no-control-regex -- strip C0/C1 control chars (incl. \n\r\t)
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
+  return cleaned ? cleaned.slice(0, MAX_WORKSPACE_NAME) : undefined;
+}
 
 /** `from-credentials` = resolve from the credential saved by the login the
  *  executor will run (auth was "need-interactive-login"). */
@@ -107,7 +132,13 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   }
 
   const project = flags.project ?? "root";
-  const workspace: WorkspaceChoice = joinId ? { kind: "join", id: joinId, project } : { kind: "new", project };
+  // Opt-in, server-visible name — only meaningful when CREATING (the single INSERT is
+  // first-writer-wins). Absent/blank → no name = the private, zero-knowledge default.
+  // `project_id` is a SEPARATE PK field and stays "root"; this is just a dashboard label.
+  const name = sanitizeWorkspaceName(flags.name);
+  const workspace: WorkspaceChoice = joinId
+    ? { kind: "join", id: joinId, project }
+    : { kind: "new", project, ...(name ? { name } : {}) };
 
   // Resolve against the input cwd (NOT process.cwd) so the planner stays pure.
   const root = path.resolve(cwd, flags.root ?? cwd);

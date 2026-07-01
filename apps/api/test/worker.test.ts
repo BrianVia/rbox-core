@@ -1348,12 +1348,48 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { workspaces: Array<Record<string, unknown>>; nextCursor: string | null };
     expect(body.workspaces.length).toBe(1);
-    expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "projectId", "workspaceId"]);
+    expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "name", "projectId", "workspaceId"]);
     expect(body.workspaces[0]!.projectId).toBe("my-proj");
+    // Opt-in name is default-off: a create without ?name → null (the private default).
+    expect(body.workspaces[0]!.name).toBeNull();
     expect(JSON.stringify(body)).not.toContain("account_id");
     // A second account never sees account A's workspace.
     const b = await bootstrap("acct-ws-other");
     expect(((await (await getWorkspaces(b.token)).json()) as { workspaces: unknown[] }).workspaces.length).toBe(0);
+  });
+
+  test("opt-in workspace name: ?name stored + returned; sanitized + length-bounded", async () => {
+    const a = await bootstrap("acct-ws-name");
+    // Raw contains newlines/tabs/control chars (should be stripped to a single label line)
+    // and is over-long (should be bounded to 128 chars). encodeURIComponent for transport.
+    const raw = "  Conductor\nworkspaces\t" + "x".repeat(200) + "  ";
+    const createRes = await SELF.fetch(`${BASE}/v1/workspaces?project=root&name=${encodeURIComponent(raw)}`, {
+      method: "POST",
+      headers: authed(a.token),
+    });
+    expect(createRes.status).toBe(200);
+    const created = (await createRes.json()) as { workspaceId: string; projectId: string; name: string };
+    // control chars gone, trimmed, bounded to 128
+    expect(created.name.includes("\n")).toBe(false);
+    expect(created.name.includes("\t")).toBe(false);
+    expect(created.name.startsWith("Conductorworkspaces")).toBe(true);
+    expect(created.name.length).toBe(128);
+    expect(created.name).not.toMatch(/^\s|\s$/); // trimmed
+
+    // Round-trips through the read: the stored, sanitized value comes back verbatim.
+    const listed = (await (await getWorkspaces(a.token)).json()) as { workspaces: Array<{ name: string | null }> };
+    expect(listed.workspaces.length).toBe(1);
+    expect(listed.workspaces[0]!.name).toBe(created.name);
+  });
+
+  test("opt-in workspace name: blank/whitespace-only ?name → null (stays private)", async () => {
+    const a = await bootstrap("acct-ws-name-blank");
+    const createRes = await SELF.fetch(`${BASE}/v1/workspaces?project=root&name=${encodeURIComponent("   \n\t ")}`, {
+      method: "POST",
+      headers: authed(a.token),
+    });
+    expect(createRes.status).toBe(200);
+    expect(((await createRes.json()) as { name: string | null }).name).toBeNull();
   });
 
   test("kind-gate: a web token reaches the new devices/workspaces reads (200), still 403 on mint", async () => {

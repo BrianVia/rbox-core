@@ -395,9 +395,12 @@ export class RboxApi implements SyncRemote {
 }
 
 /** Create a server-owned workspace (M7) — ownership is established here, not at
- *  first commit. Returns the high-entropy server-assigned workspace id. */
-export async function createRemoteWorkspace(baseUrl: string, token: string, project: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/v1/workspaces?project=${encodeURIComponent(project)}`, {
+ *  first commit. Returns the high-entropy server-assigned workspace id.
+ *  `name` is the OPT-IN, server-visible dashboard label (default-off); when set it is
+ *  sent as plaintext (the deliberate, consensual metadata trade) and stored once. */
+export async function createRemoteWorkspace(baseUrl: string, token: string, project: string, name?: string): Promise<string> {
+  const nameQs = name ? `&name=${encodeURIComponent(name)}` : "";
+  const res = await fetch(`${baseUrl}/v1/workspaces?project=${encodeURIComponent(project)}${nameQs}`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
   });

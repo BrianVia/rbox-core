@@ -7,6 +7,8 @@
  * All decision logic lives in init-plan.ts; this file is presentation + I/O.
  */
 import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline/promises";
 import { loadCredentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
@@ -15,7 +17,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { push, sync } from "./sync.js";
-import { resolveInitPlan, isInitError, type InitPlan } from "./init-plan.js";
+import { resolveInitPlan, isInitError, collapseHome, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 
@@ -35,6 +37,22 @@ async function promptMissing(flags: Record<string, string>, cwd: string): Promis
     if (!next.root) {
       const ans = (await rl.question(`${stderrStyle.cyan("?")} Sync which directory? ${stderrStyle.dim(`[${cwd}]`)} `)).trim();
       if (ans) next.root = ans;
+    }
+    // Workspace name — ALWAYS prompt on a TTY when CREATING (default-on for interactive;
+    // `--name` is the scripted/non-interactive opt-in and, when present, skips the prompt).
+    // Skipped only when JOINING (`--workspace <id>`): the row already exists, so a name here
+    // would never be stored. Enter accepts the pre-filled `~`-collapsed local path; editing
+    // sets a custom label; clearing it (backspace → empty) skips → no name → stays private.
+    if (!next.workspace && next.name == null) {
+      const resolvedRoot = path.resolve(cwd, next.root ?? cwd);
+      const suggestion = collapseHome(resolvedRoot, os.homedir());
+      process.stderr.write(
+        `${stderrStyle.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted). Press enter to accept, edit it, or clear it to skip (stays private).")}\n`
+      );
+      const p = rl.question(`${stderrStyle.cyan("?")} Workspace name ${stderrStyle.dim(`[${suggestion}]`)} `);
+      rl.write(suggestion); // pre-fill the editable line so enter=accept, backspace-clear=skip
+      const ans = (await p).trim();
+      if (ans) next.name = ans;
     }
     return next;
   } finally {
@@ -100,7 +118,7 @@ async function executeInitPlan(
   try {
     workspaceId =
       plan.workspace.kind === "new"
-        ? await createRemoteWorkspace(plan.remoteUrl, creds.token, plan.workspace.project)
+        ? await createRemoteWorkspace(plan.remoteUrl, creds.token, plan.workspace.project, plan.workspace.name)
         : plan.workspace.id;
     ws.succeed(`workspace ${style.cyan(workspaceId)}`);
   } catch (e) {

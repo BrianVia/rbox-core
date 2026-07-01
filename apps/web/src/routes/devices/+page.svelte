@@ -179,7 +179,10 @@
 	<div class="block-head">
 		<h2>Workspaces</h2>
 	</div>
-	<p class="faint folder-note">rbox can’t see your folder names — names live only on your devices.</p>
+	<p class="faint folder-note">
+		rbox can’t see your files or folder contents — they’re end-to-end encrypted. A workspace
+		shows only its <code>project</code> id unless someone opted in to a name at setup.
+	</p>
 
 	{#if workspacesError}
 		<p class="error">{workspacesError}</p>
@@ -196,8 +199,12 @@
 			{#each workspaces as w (w.workspaceId)}
 				<li class="row">
 					<div class="row-main">
-						<span class="label mono">{w.projectId}</span>
-						<span class="meta">Created {relativeTime(w.createdAt)}</span>
+						<span class="label" class:mono={!w.name}>{w.name ?? w.projectId}</span>
+						{#if w.name}
+							<span class="meta">Name is visible to rbox; contents stay end-to-end encrypted · Created {relativeTime(w.createdAt)}</span>
+						{:else}
+							<span class="meta">Private — name lives only on your devices · Created {relativeTime(w.createdAt)}</span>
+						{/if}
 					</div>
 				</li>
 			{/each}
