@@ -1,6 +1,6 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
-import { adminOverview, computeAggregates, isAllowlisted, isJwksFresh, normalizeJwks, verifyAccessJwt } from "../src/admin.js";
+import { adminOverview, computeAggregates, fetchServerMetrics, isAllowlisted, isJwksFresh, normalizeJwks, verifyAccessJwt } from "../src/admin.js";
 import type { Env } from "../src/env.js";
 
 const realFetch = globalThis.fetch;
@@ -162,10 +162,93 @@ describe("admin route — Access JWT + allow-list authz (defense in depth)", () 
     for (const k of ["totalAccounts", "activeDevices", "durableDevices", "storageUsedBytes", "activeSubscriptions", "subscriptionsByPlan", "mrrLiveCents", "signups", "generatedAt"]) {
       expect(body).toHaveProperty(k);
     }
-    // No STRIPE_SECRET / CF_ANALYTICS_TOKEN in the test env → those degrade to null.
+    // No STRIPE_SECRET / CF_ANALYTICS_TOKEN / CF_AE_TOKEN in the test env → those degrade to null.
     expect(body.mrrStripeCents).toBeNull();
     expect(body.fiveXxRate).toBeNull();
+    expect(body.serverMetrics).toBeNull();
     expect(body.signups).toHaveProperty("last24h");
+  });
+});
+
+// ── §25 read path: AE SQL server op-timing metrics (best-effort, never throws) ──
+describe("fetchServerMetrics — AE SQL read path", () => {
+  const AE_ENV = (): Env => Object.assign({}, env, { CF_AE_TOKEN: "cfut_test", CF_ACCOUNT_ID: "acct_test", CF_METRICS_DATASET: "rbox_prod_metrics" }) as Env;
+
+  test("missing CF_AE_TOKEN → null, with NO network call", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("{}");
+    }) as typeof fetch;
+    // Base test env carries no CF_AE_TOKEN.
+    expect(await fetchServerMetrics(env)).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  test("missing CF_ACCOUNT_ID → null", async () => {
+    const e = Object.assign({}, env, { CF_AE_TOKEN: "cfut_test" }) as Env; // no account id
+    expect(await fetchServerMetrics(e)).toBeNull();
+  });
+
+  test("bad dataset name (SQL-injection-shaped) → null, never queries", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("{}");
+    }) as typeof fetch;
+    const e = Object.assign({}, env, { CF_AE_TOKEN: "cfut_test", CF_ACCOUNT_ID: "acct_test", CF_METRICS_DATASET: "rbox; DROP" }) as Env;
+    expect(await fetchServerMetrics(e)).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  test("happy path → parses per-op split, outcomes, and commit percentiles", async () => {
+    // The three statements fan out to the same URL in parallel; route by SQL text.
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      const sql = String(init.body);
+      if (sql.includes("GROUP BY op")) {
+        // UInt64 counts arrive as JSON strings; quantiles as numbers — exercise both.
+        return new Response(JSON.stringify({ data: [{ op: "blob.get", ops: "65406", p50_ms: 228, p99_ms: 446, d1_p50: 185, r2_p50: 40 }] }));
+      }
+      if (sql.includes("GROUP BY outcome")) {
+        return new Response(JSON.stringify({ data: [{ outcome: "ok", n: "93809" }, { outcome: "too_many_refs", n: "1" }] }));
+      }
+      return new Response(JSON.stringify({ data: [{ p50_ms: 388, p99_ms: 2361, commits: "4" }] }));
+    }) as unknown as typeof fetch;
+
+    const m = await fetchServerMetrics(AE_ENV());
+    expect(m).not.toBeNull();
+    expect(m!.windowHours).toBe(24);
+    expect(m!.perOp).toHaveLength(1);
+    const blobGet = m!.perOp[0]!;
+    expect(blobGet).toMatchObject({ op: "blob.get", ops: 65406, p50Ms: 228, d1P50: 185, r2P50: 40 });
+    expect(typeof blobGet.ops).toBe("number"); // coerced from the "65406" string
+    expect(m!.outcomes).toEqual([{ outcome: "ok", n: 93809 }, { outcome: "too_many_refs", n: 1 }]);
+    expect(m!.commit).toEqual({ p50Ms: 388, p99Ms: 2361, commits: 4 });
+  });
+
+  test("zero commits in window → commit is null (not a 0/0 row)", async () => {
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      const sql = String(init.body);
+      if (sql.includes("GROUP BY op")) return new Response(JSON.stringify({ data: [] }));
+      if (sql.includes("GROUP BY outcome")) return new Response(JSON.stringify({ data: [] }));
+      return new Response(JSON.stringify({ data: [{ p50_ms: 0, p99_ms: 0, commits: "0" }] }));
+    }) as unknown as typeof fetch;
+    const m = await fetchServerMetrics(AE_ENV());
+    expect(m).not.toBeNull();
+    expect(m!.commit).toBeNull();
+    expect(m!.perOp).toEqual([]);
+  });
+
+  test("AE returns non-2xx → null (never throws into the cockpit)", async () => {
+    globalThis.fetch = (async () => new Response("bad request", { status: 400 })) as typeof fetch;
+    expect(await fetchServerMetrics(AE_ENV())).toBeNull();
+  });
+
+  test("fetch throws (timeout/outage) → null", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("AE outage");
+    }) as typeof fetch;
+    expect(await fetchServerMetrics(AE_ENV())).toBeNull();
   });
 });
 

@@ -113,7 +113,18 @@ export interface Env {
   /** Cloudflare GraphQL Analytics API token (Account Analytics:Read). Wrangler secret;
    *  absent ⇒ the 5xx-rate figure is reported as null (best-effort). NEVER in repo. */
   CF_ANALYTICS_TOKEN?: string;
-  /** Cloudflare account id (for the GraphQL Analytics query `accountTag`). Var, not a secret. */
+  /** Analytics Engine SQL API token (Account Analytics:Read, AE-SQL-scoped). Wrangler secret;
+   *  absent ⇒ the server-metrics figure (§25 read path) is reported as null (best-effort).
+   *  Kept DISTINCT from `CF_ANALYTICS_TOKEN`: the GraphQL-Analytics token does not necessarily
+   *  carry the AE SQL grant (they were minted separately), so conflating them would silently
+   *  break one path when the other's scope narrows. NEVER in repo. */
+  CF_AE_TOKEN?: string;
+  /** Analytics Engine dataset the Worker writes to (and this route reads back). Var, not a
+   *  secret. Must match the `rbox_metrics` binding's dataset in wrangler.jsonc — prod is
+   *  `rbox_prod_metrics` (the default), dev overrides to `rbox_dev_metrics`. */
+  CF_METRICS_DATASET?: string;
+  /** Cloudflare account id (for the GraphQL Analytics query `accountTag` and the AE SQL
+   *  endpoint path). Var, not a secret. */
   CF_ACCOUNT_ID?: string;
   /** This worker's script name (GraphQL `scriptName` filter for the 5xx query). Var. */
   CF_WORKER_NAME?: string;
