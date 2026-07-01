@@ -49,7 +49,7 @@ export interface PhaseBytes {
 }
 
 export interface PhaseReportJson {
-  op: "push" | "pull";
+  op: "push" | "pull" | "sync";
   wallMs: number;
   files: number;
   blobs: number;
@@ -65,12 +65,12 @@ export class PhaseReport {
   readonly enabled: boolean;
   files = 0;
   blobs = 0;
-  private readonly op: "push" | "pull";
+  private readonly op: "push" | "pull" | "sync";
   private readonly startedAt: number;
   private readonly phases = new Map<PhaseName, PhaseTotals>();
   private peakRss = 0;
 
-  private constructor(op: "push" | "pull", enabled: boolean) {
+  private constructor(op: "push" | "pull" | "sync", enabled: boolean) {
     this.op = op;
     this.enabled = enabled;
     this.startedAt = Date.now();
@@ -83,20 +83,31 @@ export class PhaseReport {
   static pull(): PhaseReport {
     return new PhaseReport("pull", true);
   }
+  /** A full pull-then-push cycle (`rbox sync`): both legs accumulate into one report. */
+  static sync(): PhaseReport {
+    return new PhaseReport("sync", true);
+  }
   /** The no-op report used on the daemon hot path: runs wrapped work, records nothing. */
-  static disabled(op: "push" | "pull" = "push"): PhaseReport {
+  static disabled(op: "push" | "pull" | "sync" = "push"): PhaseReport {
     return new PhaseReport(op, false);
   }
 
-  /** Time an async phase, attributing its wall time + bytes to `name`. ALWAYS runs `fn`
-   *  (so a disabled report is transparent); only accumulates when enabled. */
-  async phase<T>(name: PhaseName, fn: () => Promise<T>, bytes?: PhaseBytes): Promise<T> {
+  /** Emit the one-line summary to `sink`, but ONLY if at least one phase was recorded —
+   *  so a run that did no work (e.g. a no-op push tick) logs nothing. */
+  logSummaryTo(sink: (line: string) => void): void {
+    if (this.phases.size > 0) sink(this.summaryLine());
+  }
+
+  /** Time an async phase, attributing its wall time to `name`. ALWAYS runs `fn` (so a
+   *  disabled report is transparent); only accumulates when enabled. Bytes/counts for the
+   *  phase are attributed separately via {@link record} (they aren't known until `fn` runs). */
+  async phase<T>(name: PhaseName, fn: () => Promise<T>): Promise<T> {
     if (!this.enabled) return fn();
     const t0 = Date.now();
     try {
       return await fn();
     } finally {
-      this.bump(name, Date.now() - t0, bytes);
+      this.bump(name, Date.now() - t0);
       this.sampleRss();
     }
   }

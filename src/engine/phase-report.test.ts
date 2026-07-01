@@ -4,8 +4,10 @@ import { PhaseReport } from "./phase-report.js";
 describe("PhaseReport", () => {
   test("accumulates ms + bytes + count per phase across repeated hits", async () => {
     const r = PhaseReport.push();
-    await r.phase("encrypt", async () => {}, { count: 3, ciphertextBytes: 100, changedBytes: 100 });
-    await r.phase("encrypt", async () => {}, { count: 2, ciphertextBytes: 50, changedBytes: 50 });
+    await r.phase("encrypt", async () => {});
+    r.record("encrypt", { count: 3, ciphertextBytes: 100, changedBytes: 100 });
+    await r.phase("encrypt", async () => {});
+    r.record("encrypt", { count: 2, ciphertextBytes: 50, changedBytes: 50 });
     r.record("upload", { count: 5, wireBytes: 150 });
 
     const j = r.toJSON();
@@ -31,7 +33,8 @@ describe("PhaseReport", () => {
     const out = await r.phase("encrypt", async () => {
       calls++;
       return "ok";
-    }, { ciphertextBytes: 999 });
+    });
+    r.record("encrypt", { ciphertextBytes: 999 });
     r.record("upload", { wireBytes: 999 });
 
     expect(out).toBe("ok");
@@ -39,6 +42,27 @@ describe("PhaseReport", () => {
     const j = r.toJSON();
     expect(j.phases).toEqual({});
     expect(j.peakRssBytes).toBe(0);
+  });
+
+  test("logSummaryTo emits only when a phase was recorded", () => {
+    const lines: string[] = [];
+
+    // enabled but nothing recorded → no emit (the no-op-tick guarantee)
+    PhaseReport.push().logSummaryTo((l) => lines.push(l));
+    expect(lines).toEqual([]);
+
+    // enabled + recorded → one line
+    const r = PhaseReport.push();
+    r.record("scan", { count: 1 });
+    r.logSummaryTo((l) => lines.push(l));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("rbox push");
+
+    // disabled records nothing → no emit even after a record() call
+    const off = PhaseReport.disabled("push");
+    off.record("scan", { count: 1 });
+    off.logSummaryTo((l) => lines.push(l));
+    expect(lines.length).toBe(1);
   });
 
   test("summary line sums each basis across phases and carries no PII", async () => {
