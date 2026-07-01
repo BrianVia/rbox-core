@@ -7,6 +7,7 @@ import { fromB64url, utf8, verify } from "../engine/e2ee/index.js";
 import { RELEASE_KEYS } from "./release-key.js";
 import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
+import { isStandaloneBinary } from "./runtime.js";
 
 /**
  * `rbox upgrade` (design 14) — self-update the installed binary, SAFELY:
@@ -65,19 +66,6 @@ export function verifyAndParseManifest(manifestBytes: Uint8Array, sigBytes: Uint
   }
   if (!ok) throw new Error(`release signature did not verify — ${tampered}`);
   return manifest;
-}
-
-/** Bun standalone-executable check (design 14 U1'): only then is process.execPath
- *  the rbox binary; under `bun run` it's Bun itself and we must NOT touch it.
- *  `Bun.isStandaloneExecutable` is the documented flag but isn't present in every
- *  Bun (e.g. 1.3.5) — so we ALSO accept the load-bearing runtime signal that a
- *  compiled binary runs from Bun's virtual FS (`Bun.main` under `/$bunfs/`).
- *  Either signal + execPath not being `bun` ⇒ a real installed binary. */
-function isStandalone(): boolean {
-  const bun = (globalThis as { Bun?: { isStandaloneExecutable?: boolean; main?: string } }).Bun;
-  if (!bun) return false;
-  const compiled = bun.isStandaloneExecutable === true || (typeof bun.main === "string" && bun.main.startsWith("/$bunfs/"));
-  return compiled && path.basename(process.execPath) !== "bun";
 }
 
 function artifactName(): string {
@@ -166,7 +154,7 @@ async function downloadToTemp(url: string, dir: string): Promise<{ tmp: string; 
 }
 
 export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean } = {}): Promise<void> {
-  if (!isStandalone()) {
+  if (!isStandaloneBinary()) {
     throw new Error("`rbox upgrade` only works on an installed binary — you're running from source. Use git, or install via the one-liner.");
   }
   if (!/^https:\/\//.test(remoteUrl) && !/^http:\/\/localhost(:|\/|$)/.test(remoteUrl)) {
