@@ -137,13 +137,18 @@ tomorrow. So we capture it **as if it were a standalone repo**:
   (`MERGE_HEAD`, `REBASE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `ORIG_HEAD`, rebase
   `orig-head`) — codex repro'd that `bundle create HEAD refs/heads/x` omits a `MERGE_HEAD`
   commit from another branch, which would restore a pseudo-ref pointing at a missing object.
-  Then `git -C repoDir bundle create tmp.bundle refs/heads/<full-branch-ref>
-  refs/rbox-wip/<captureId>/*`. The unique namespace also fixes the **shared-gitdir race**:
-  linked worktrees share one ref store, so a single global `refs/rbox-wip` raced under
-  concurrent sibling captures (B2). The namespace is deleted in `finally`; stale `rbox-wip/*`
-  leftovers from crashed captures are pruned at capture start. **The same pinning applies to
-  dir-repo captures** (the pseudo-ref hole is latent in design 02 today — `--all` usually
-  reaches those commits via a branch, but nothing guarantees it).
+  Then `git -C repoDir bundle create tmp.bundle refs/heads/<branch>` plus the **enumerated
+  exact scratch refs** (each `refs/rbox-wip/<captureId>/<n>` listed explicitly — codex verified
+  a literal `…/*` wildcard arg fails with `Refusing to create empty bundle`; `--glob=` also
+  works but we know the exact refs we just created, so enumerate them) [v3]. The unique
+  namespace also fixes the **shared-gitdir race**: linked worktrees share one ref store, so a
+  single global `refs/rbox-wip` raced under concurrent sibling captures (B2). The namespace is
+  deleted in `finally`; stale `rbox-wip/*` leftovers from crashed captures are pruned at
+  capture start **age-guarded [v3]**: `captureId = <epochMs>-<rand>`, and the pruner only
+  deletes entries older than 1 hour — a blind prune in a SHARED gitdir would delete a
+  concurrent sibling capture's live pins. **The same pinning applies to dir-repo captures**
+  (the pseudo-ref hole is latent in design 02 today — `--all` usually reaches those commits
+  via a branch, but nothing guarantees it).
 - **refs [v2, B1/B2]:** only `refs/heads/<current-branch>` (full ref name). **`refs/stash` is
   NOT captured for pointer repos** — codex verified it lives in the SHARED gitdir: capturing it
   per-worktree would fan one global stash stack out into N standalone repos and any divergence
@@ -194,33 +199,52 @@ namespaced per capture and deleted after, exactly as today.
    fails, identity uses `raw:<sha256 of the index file bytes>` — volatile (stat refreshes can
    over-capture) but conservative: during the rare, transient unmerged window we'd rather
    re-capture than silently carry stale state.
-7. **Per-repo 422 recovery [v2, M5]:** when a commit bounces `unsatisfiedBlobs` containing git
-   encShas, ONLY the repos whose sections reference those missing encShas are recaptured
+7. **Per-repo 422 recovery [v2, M5; v3]:** when a commit bounces `unsatisfiedBlobs` containing
+   git encShas, ONLY the repos whose sections reference those missing encShas are recaptured
    (`forceGitRecapture` becomes a per-relPath set, not the current boolean) — deferred/carried
    repos keep their base sections; a naive "recapture everything" would drop exactly the repos
-   the defer machinery is protecting.
+   the defer machinery is protecting. **Non-looping failure path [v3]:** if a missing encSha
+   belongs to a CARRIED repo that cannot currently recapture (deferred, ineligible, vanished),
+   that repo's section is dropped from THIS commit (deferred like any churner, loudly logged)
+   rather than retrying a 422 the client can never satisfy — the daemon re-captures it once the
+   repo is capturable again.
 
 ## 7. Apply orchestration on pull — per-repo bases, design-02 discipline each
 
 The pull-side git block iterates `remote.gitRepos ∪ base.gitRepos` per key:
 
-- **Ref-publish semantics are scope-gated [v2, B1].** Design 02's "publish refs to exactly the
-  remote set, deleting absent locals" (`git-state.ts:301`) is only sound when the section
-  carries the complete ref set. Rules:
+- **Ref-publish semantics are scope-gated [v2, B1; tightened v3].** Design 02's "publish refs
+  to exactly the remote set, deleting absent locals" (`git-state.ts:301`) is only sound when
+  the section carries the complete ref set. Rules:
   - ref **deletion** happens ONLY when `section.refScope === "all"` AND the local repo is a
     dir-repo (both sides speak "complete set").
-  - a `"scoped"` section — or ANY section applied into a local *pointer* repo (its ref store is
-    shared with sibling worktrees/the main clone!) — is applied **update-only**: create/update
-    exactly the listed refs, never delete others. A standalone receiver's extra local branches
-    survive a scoped apply; they simply don't propagate back through a worktree source (its
-    main clone owns that namespace) — accepted and documented.
-- **Identity comparison is scope-projected [v2, B1].** When the two sides' shapes differ (Mac
-  pointer repo vs flat-meadow standalone dir repo at the same path), `gitIdentityKey` is
-  computed over the **projection onto the scoped subset**: HEAD + the refs the scoped side
-  carries + indexTree + opState. This is what makes worktree→standalone→worktree round-trips
-  CONVERGE instead of conflict-looping on ref-set differences (codex's #1 check): an unchanged
-  branch/HEAD/index compares equal regardless of how many extra branches the standalone side
-  grew.
+  - a `"scoped"` section applied into a dir-repo is **update-only**: create/update exactly the
+    listed refs, never delete others. A standalone receiver's extra local branches survive a
+    scoped apply; they simply don't propagate back through a worktree source (its main clone
+    owns that namespace) — accepted and documented.
+  - ANY section applied into a local *pointer* repo touches a ref store SHARED with sibling
+    worktrees and the main clone, so it is stricter than update-only [v3]: publish **only**
+    `refs/heads/*` entries the section lists — `refs/stash` and `refs/tags/*` from an "all"
+    section are FILTERED (logged, not applied): a standalone receiver's stash/tags must never
+    overwrite the main clone's shared stash stack or tag namespace. (Branch updates are the
+    sync's purpose; stash/tags in a shared store are the main clone's property.)
+- **Identity comparison is scope-projected — with precise sides [v2, B1; fixed v3].**
+  *Projection* = HEAD + the refs the narrower side carries + indexTree + opState.
+  - **Pull-side** (remote section vs base section vs local): compare after projecting onto the
+    NARROWER of the two scopes involved. This is what makes worktree→standalone→worktree
+    round-trips converge (an unchanged branch/HEAD/index compares equal no matter how many
+    extra branches the standalone side grew).
+  - **Capture-side carry-forward requires matching scope [v3]:** reuse the base section only
+    when `base.refScope` equals the local repo's shape-scope AND the identities match at that
+    scope. A dir-repo whose base is a *scoped* section (it just applied a worktree's push)
+    always captures fresh — codex's repro showed the projected comparison would otherwise hide
+    a genuinely new local branch forever. Cost: ONE extra capture cycle after a
+    scope-crossing apply, after which both sides are stable at the wider scope. Convergence
+    trace (Mac worktree W, flat-meadow standalone D): W captures scoped S1 → D applies
+    update-only, base=S1 → D's next push sees scope mismatch → captures all-A1 → W pulls A1,
+    projected(A1)==projected(S1) → base advances, no apply → W carries A1 (scope-projected
+    carry is allowed for the POINTER side, whose scoped identity is fully contained in A1)
+    → quiescent. Real change on either side re-enters the loop and converges the same way.
 - **remote changed vs base** (projected `gitIdentityKey` differs):
   - local repo also diverged from base → **per-repo conflict**: `preserveGitConflict(repoDir)`
     (recovery bundle + `refs/rbox-conflict/*`), checkpoint base to remote, loud log, **and mark
@@ -244,12 +268,15 @@ The pull-side git block iterates `remote.gitRepos ∪ base.gitRepos` per key:
   **per repo** instead of globally (one busy repo no longer blocks the other 16 from advancing,
   which design 02's single-section model would).
 - Receiver quiescence (`gitBusy`) is checked per repo; a busy repo defers only itself.
-- **Apply-time containment [v2, B5]:** before `git init`/apply at `join(root, key)`, the
-  resolved realpath of the target (and every parent component) must be inside the root
-  realpath — the same `assertWithinRoot` discipline file writes already have (`apply.ts:107`);
-  a symlinked parent smuggled via the file manifest cannot redirect a repo materialization
-  outside the workspace. A key that collides with an existing manifest FILE/symlink entry is
-  rejected before any mutation.
+- **Apply-time containment [v2, B5; v3]:** before `git init`/apply at `join(root, key)`, the
+  resolved realpath of the target (and every parent component, `lstat`-checked so no component
+  is a symlink) must be inside the root realpath — the same `assertWithinRoot` discipline file
+  writes already have (`apply.ts:107`); a symlinked parent smuggled via the file manifest
+  cannot redirect a repo materialization outside the workspace. The realpath is re-verified
+  immediately after `git init` (cheap belt-and-braces); a *local*-attacker race between check
+  and init is explicitly out of the threat model (it's the user's own machine — the manifest,
+  not the local fs, is the untrusted input). A key that collides with an existing manifest
+  FILE/symlink entry is rejected before any mutation.
 
 ## 8. E2EE / server surface — zero change
 
@@ -270,15 +297,21 @@ any kind.
   entry but **never touch local `.git`** — a receiver's materialized repo becomes untracked
   residue for the user to delete, which is the conservative choice (deleting a repo remotely
   must not destroy committed local work — design 02's prime directive outranks tidiness).
-- **Resurrection guard [v2, B4].** Codex traced the ping-pong: B's leftover local repo would be
-  rediscovered as "new" on B's next push (base entry gone) and re-add the section A just
-  deleted. Rule: when a receiver drops a base entry for a repo whose local `.git` survives, it
-  records a **removal memory** in local state — `gitReposRemoved[relPath] =
+- **Resurrection guard [v2, B4; completed v3].** Codex traced the ping-pong: B's leftover local
+  repo would be rediscovered as "new" on B's next push (base entry gone) and re-add the section
+  A just deleted. Rule: when a receiver drops a base entry for a repo whose local `.git`
+  survives, it records a **removal memory** in local state — `gitReposRemoved[relPath] =
   <local identity key at removal>`. Discovery consults it: a repo whose current identity still
   EQUALS the removal memory is **not re-added** (it's the untouched leftover); a repo whose
   identity has since CHANGED is re-added (the user did new work there — resurrection is now
   intentional). The memory is pruned when the local `.git` disappears or the repo is re-added.
   No manifest tombstones (nothing grows unboundedly, nothing new is server-visible).
+  - **Fresh re-create at the same path [v3]:** if A later creates a NEW repo at the deleted
+    path and pushes a section for it, B's conflict gate treats a local repo whose identity
+    still equals its removal memory as **absent** (clean apply target), not as diverged-from-
+    nothing — the apply proceeds (design 02's quarantine bundle preserves the leftover history
+    first, so nothing committed is ever lost), and the removal memory is cleared. No deadlock,
+    no manual cleanup required.
 - **Repo becomes ineligible** (preflight fails: turned bare, gained alternates, pointer
   dangles): treated as deferred-with-base-carry (§6.4), surfaced in `rbox status`, never
   deleted from the manifest — transient states (mid-`git gc`, mid-archive) heal themselves.
@@ -337,6 +370,16 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ## 14. Review history
 
+- **v2 → codex round 2 (2026-07-01): NEEDS-WORK** — 3 BLOCKER (bundle wildcard arg not
+  implementable → enumerate exact scratch refs; scoped-apply base-identity underdefined → the
+  v3 scope-matched carry-forward rule + convergence trace; pointer-target apply could write a
+  shared stash/tag → strict refs/heads-only filter), 2 MAJOR (blind wip-prune races sibling
+  captures → age-guarded prune; fresh re-create after removal deadlocks → removal-memory match
+  = clean apply target), 1 MINOR (local TOCTOU → lstat components + post-init reverify; local
+  attacker out of threat model). **All folded into v3**, marked `[v3]` inline. Codex also
+  confirmed: scratch refs land under `refs/rbox-incoming/…` on receivers and are never
+  published (publish writes only `section.refs`); M2 suppression, M3 fallback, M4 cap-carry
+  sound; M5 needed the non-looping path (added).
 - **v1 → codex round 1 (2026-07-01): NEEDS-WORK** — 5 BLOCKER (pointer ref-scope unsound /
   shared-ref deletion; shared `refs/stash` + `rbox-wip` race; scoped bundles missing
   pseudo-ref/detached-HEAD objects; deletion-resurrection ping-pong; apply-time root
