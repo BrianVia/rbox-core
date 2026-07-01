@@ -311,6 +311,25 @@ test("a repo whose capture fails mid-push is DEFERRED with base carry; the push 
   expect((await remote.latest()).manifest.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
 }, 20_000);
 
+test("push: a locked (busy) repo defers with base carry — no raw-identity capture while mid-operation", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitFile(r, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  const base = (await st(rootA)).lastSyncedManifest.gitRepos!["r"]!;
+
+  await commitFile(r, "f.txt", "v2", "c2");
+  await fs.writeFile(path.join(r, ".git", "index.lock"), ""); // repo is mid-operation
+  await fs.writeFile(path.join(rootA, "x.txt"), "x");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).toBe(base.bundleEncSha); // base carried
+  expect(logsA.some((l) => l.includes("r: git busy"))).toBe(true);
+
+  await fs.rm(path.join(r, ".git", "index.lock"));
+  await push(rootA, cfgA, depsA); // quiesced → captures v2
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).not.toBe(base.bundleEncSha);
+}, 20_000);
+
 test("repo dir GONE ENTIRELY → pusher drops the section (§9); receiver drops base, records removal memory, never touches local .git", async () => {
   const r = path.join(rootA, "gone");
   await initRepo(r);

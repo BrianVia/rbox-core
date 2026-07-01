@@ -408,6 +408,16 @@ async function captureGitForPush(
       continue;
     }
 
+    // Quiescence before ANY identity-based decision (mirrors the pull side): a lock
+    // makes write-tree fail → raw-index identity fallback, which would spuriously
+    // CLEAR a needsResolution suppression (republishing the conflicted state — the
+    // exact [v2, M2] hazard) or a removal memory (resurrection), or re-capture a
+    // mid-operation repo. Busy → defer with base carry; next cycle re-examines.
+    if (await isGitBusy(repoDirOf(root, rel))) {
+      deferOne(rel, "git busy (lock present)");
+      continue;
+    }
+
     // Removal memory [v2, B4]: a leftover whose identity still equals the memory is the
     // untouched residue of a remote deletion — NOT re-added. Identity changed → the
     // user worked there → re-adding is intentional; clear the memory and fall through.
@@ -549,12 +559,13 @@ async function applyGitOnPull(
   if (!cfg.syncGit) return pack();
   const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
   if (keys.length === 0) return pack();
-  const needKek = (): Buffer => {
-    if (!cfg.kek) throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
-    return cfg.kek;
-  };
+  // Fail closed ONCE, before any per-repo work: git sections (incl. pending ones) are
+  // E2EE artifacts — without the key nothing below can decrypt-verify.
+  if (!cfg.kek && keys.some((k) => remote.gitRepos?.[k] !== undefined || pending[k] !== undefined)) {
+    throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
+  }
 
-  for (const rel of keys) {
+  const processRepo = async (rel: string): Promise<void> => {
     const remoteSec = remote.gitRepos?.[rel];
     const baseSec = baseRepos[rel];
     const pend = pending[rel];
@@ -568,7 +579,7 @@ async function applyGitOnPull(
     if (dotGit && (remoteSec !== undefined || baseSec !== undefined || pend !== undefined) && (await isGitBusy(repoDir))) {
       if (remoteSec) pending[rel] = remoteSec; // retry next pull; outbound carries newest truth
       glog(`git-sync deferred ${rel}: receiver git busy`);
-      continue;
+      return;
     }
     const localId = dotGit ? await gitIdentity(repoDir) : undefined;
 
@@ -578,7 +589,7 @@ async function applyGitOnPull(
       // FIRST (preserve local + recovery from the pending section) — never stamp a
       // removal memory over unexamined local divergence.
       if (pend && localDivergedFromBase(localId, baseSec)) {
-        const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, needKek());
+        const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, cfg.kek!);
         glog(
           `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}`
         );
@@ -590,7 +601,7 @@ async function applyGitOnPull(
         glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
       }
       if (dotGit) removedMem[rel] = gitIdentityKey(localId); // resurrection guard [v2, B4]
-      continue;
+      return;
     }
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
@@ -609,7 +620,7 @@ async function applyGitOnPull(
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
     if (!remoteChanged && !pend) {
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
-      continue;
+      return;
     }
 
     // Already converged? (e.g. a pending retry finding the user manually resolved, or a
@@ -622,11 +633,11 @@ async function applyGitOnPull(
         applied[rel] = remoteSec;
         delete pending[rel];
         delete removedMem[rel];
-        continue;
+        return;
       }
     }
 
-    const kek = needKek();
+    const kek = cfg.kek!; // guaranteed by the fail-closed gate above
     if (!cleanMaterialize && localDivergedFromBase(localId, baseSec)) {
       // Per-repo conflict: never auto-clobber local. Preserve remote for manual merge,
       // checkpoint base to remote (stop pull-conflict-looping), and suppress capture
@@ -636,7 +647,7 @@ async function applyGitOnPull(
       needsRes[rel] = gitIdentityKey(localId);
       delete pending[rel];
       glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
-      continue;
+      return;
     }
 
     // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
@@ -646,13 +657,13 @@ async function applyGitOnPull(
     };
     if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
       defer("target is inside an ignored subtree — refusing to materialize");
-      continue;
+      return;
     }
     try {
       await assertGitTargetWithinRoot(root, rel);
     } catch (e) {
       defer(errMsg(e));
-      continue;
+      return;
     }
 
     if (cleanMaterialize && dotGit) {
@@ -665,7 +676,7 @@ async function applyGitOnPull(
           delete removedMem[rel]; // leftover is quarantined + wiped — memory served its purpose
         } catch (e) {
           defer(`clean-materialization quarantine failed: ${errMsg(e)}`);
-          continue;
+          return;
         }
       }
       // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
@@ -686,6 +697,19 @@ async function applyGitOnPull(
       glog(`git-sync applied ${rel}${res.filteredRefs?.length ? ` (filtered refs: ${res.filteredRefs.join(" ")})` : ""}`);
     } else {
       defer(res.reason ?? "apply deferred");
+    }
+  };
+
+  for (const rel of keys) {
+    try {
+      await processRepo(rel);
+    } catch (e) {
+      // Per-repo failures defer only THAT repo — one bad repo (a blob missing mid
+      // conflict-preserve, an ENOTDIR/hostile target, an fs error) must never abort
+      // the whole pull or block the other repos' base advance.
+      const remoteSec = remote.gitRepos?.[rel];
+      if (remoteSec) pending[rel] = remoteSec;
+      glog(`git-sync deferred ${rel}: ${errMsg(e)}`);
     }
   }
   return pack();
