@@ -135,14 +135,19 @@ export interface IgnoreMatcher {
 
 /**
  * Paths that are excluded UNCONDITIONALLY — no `.rboxignore`/`.gitignore`
- * negation (`!.rbox`) and no `--purge` can re-include them (design 12, C8).
+ * negation (`!.rbox`, `!.git`) and no `--purge` can re-include them (design 12, C8).
  * `.rbox/` holds `state.json` with the DECRYPTED base manifest; letting it into a
- * synced tree would leak the very metadata E2EE hides. Checked BEFORE the
+ * synced tree would leak the very metadata E2EE hides. `.git` (any depth, file OR
+ * dir) is equally non-negotiable: git state transfers ONLY via git-sync snapshots —
+ * a raw `.git` tree synced file-by-file arrives torn/corrupt, and a worktree
+ * pointer file carries a machine-local absolute path. A stray `!.git` in a
+ * project's `.gitignore` must not switch that hazard back on. Checked BEFORE the
  * overridable `ignore` ruleset, so it always wins.
  */
 function isHardExcluded(relPath: string): boolean {
   const p = relPath.replace(/\/+$/, ""); // tolerate a trailing slash (dir form)
-  return p === ".rbox" || p.startsWith(".rbox/");
+  if (p === ".rbox" || p.startsWith(".rbox/")) return true;
+  return p === ".git" || p.startsWith(".git/") || p.endsWith("/.git") || p.includes("/.git/");
 }
 
 export function buildIgnoreMatcher(root: string, extra: string[] = []): IgnoreMatcher {

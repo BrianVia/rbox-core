@@ -164,6 +164,15 @@ test("pull never applies a remote entry that LOCAL rules ignore (legacy .git poi
   await pull(root, cfg, deps(remote));
   expect(await read("ok.txt")).toBe("fine\n"); // non-ignored entries still apply
   expect(await read("wt/.git")).toBe("gitdir: /Users/me/repo/.git/worktrees/wt\n"); // untouched
+
+  // The ignored remote entry stays in the recorded BASE (forward-only), so the next
+  // push neither echo-deletes it from the remote nor commits anything at all.
+  const st = await loadState(root);
+  expect(st.lastSyncedManifest.files.some((f) => f.path === "wt/.git")).toBe(true);
+  const before = remote.commitCalls;
+  await push(root, cfg, deps(remote));
+  expect(remote.commitCalls).toBe(before); // zero commits — no echo
+  expect(remote.headSeq()).toBe(1);
 });
 
 // ── clean push ─────────────────────────────────────────────────────────────

@@ -187,6 +187,11 @@ export async function startDaemon(root: string): Promise<void> {
   }
 
   await fsp.mkdir(daemonRuntimeDir(root), { recursive: true });
+  // Clear the PREVIOUS daemon's binding record before spawning: until the child
+  // writes its own, a concurrent `rbox start` must read "unknown" (= already
+  // running), not the old id — which would misclassify the fresh daemon as stale
+  // and SIGTERM it mid-startup.
+  await fsp.rm(boundPath(root), { force: true });
   const out = fs.openSync(logPath(root), "a");
   const args = daemonSpawnArgs(process.argv[1]!, root, isStandaloneBinary());
   const child = spawn(process.execPath, args, {

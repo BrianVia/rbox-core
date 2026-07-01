@@ -49,6 +49,16 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
     expect(m.ignores("repo/.git/config")).toBe(true);
     expect(m.ignores("src/git-state.ts")).toBe(false); // only the exact name matches
   });
+
+  test("a `!.git` negation CANNOT re-include it (hard exclusion, like .rbox)", () => {
+    // Raw `.git` trees synced file-by-file arrive torn; a project's stray `!.git`
+    // must not switch that hazard back on — git state transfers via git-sync only.
+    const m = buildIgnoreMatcher(root, ["!.git", "!.git/", "!wt/.git", "!.git/config"]);
+    expect(m.ignores(".git")).toBe(true);
+    expect(m.ignores(".git/config")).toBe(true);
+    expect(m.ignores("wt/.git")).toBe(true);
+    expect(m.ignores("repo/.git/HEAD")).toBe(true);
+  });
 });
 
 describe("nativePruneGlobs — coarse native watcher prune, negation-aware (design §41)", () => {

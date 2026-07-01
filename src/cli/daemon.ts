@@ -29,6 +29,14 @@ const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
  *  ("did rbox delete my files?" must be answerable from it), and pumps are rare. */
 const LOG_PATHS_MAX = 50;
 
+/** Control chars in a filename must not forge extra log lines — render them as `?`. */
+const cleanPath = (p: string) => p.replace(/\p{Cc}/gu, "?");
+
+/** Is `rel` a file whose content DEFINES the ignore rules? Any change to one demands
+ *  a matcher rebuild + full rescan (used by both the watcher-event and pull paths). */
+const isIgnoreRuleFile = (rel: string) =>
+  rel === ".rboxignore" || rel.endsWith("/.rboxignore") || rel === ".gitignore" || rel.endsWith("/.gitignore");
+
 /** One-line forensic summary of the actions a pull APPLIED to the local tree:
  *  counts by kind plus the paths themselves (`+`write `-`delete `!`conflict). */
 export function summarizeActions(actions: Action[]): string {
@@ -36,10 +44,9 @@ export function summarizeActions(actions: Action[]): string {
   let deletes = 0;
   let conflicts = 0;
   const paths: string[] = [];
-  // Control chars in a filename must not forge extra log lines — render them as `?`.
   // Only the first LOG_PATHS_MAX paths are rendered at all (a huge pull stays cheap).
   const keep = (prefix: string, p: string) => {
-    if (paths.length < LOG_PATHS_MAX) paths.push(prefix + p.replace(/\p{Cc}/gu, "?"));
+    if (paths.length < LOG_PATHS_MAX) paths.push(prefix + cleanPath(p));
   };
   for (const a of actions) {
     if (a.kind === "write") {
@@ -174,6 +181,12 @@ export class RboxDaemon {
       /* ignore */
     }
     await this.watcher?.close();
+    // DRAIN the in-flight pump before declaring stopped: SIGTERM shutdown awaits
+    // stop(), so this is what makes termination actually graceful — the current
+    // op (an applyGitState, a write, an upload) COMPLETES; only queued work is
+    // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
+    // daemon restart could interrupt a mutation mid-flight.
+    await this.pumpRun.catch(() => {});
     await this.cache?.save(this.root).catch(() => {});
     log("rbox daemon stopped");
   }
@@ -185,11 +198,20 @@ export class RboxDaemon {
     void this.pump();
   }
 
+  /** The in-flight pump loop, if any — awaited by stop() so shutdown drains it. */
+  private pumpRun: Promise<void> = Promise.resolve();
+
   private async pump(): Promise<void> {
     if (this.pumping || this.stopped) return;
     this.pumping = true;
+    const run = this.pumpLoop();
+    this.pumpRun = run;
+    return run;
+  }
+
+  private async pumpLoop(): Promise<void> {
     try {
-      while (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan) {
+      while (!this.stopped && (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan)) {
         try {
           if (this.want.deepScan) {
             this.want.deepScan = false;
@@ -233,7 +255,7 @@ export class RboxDaemon {
       // If the ignore rules themselves changed, rebuild the matcher and full-rescan
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
-      if (events.some((e) => e.relPath === ".rboxignore" || e.relPath.endsWith("/.rboxignore") || e.relPath === ".gitignore" || e.relPath.endsWith("/.gitignore"))) {
+      if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
         this.matcher = buildIgnoreMatcher(this.root);
         this.manifest = await scanManifest(this.root, this.matcher, this.cache);
       } else {
@@ -258,7 +280,7 @@ export class RboxDaemon {
     if (res.sequence !== this.lastLoggedSeq) {
       const deferredNote =
         res.deferred && res.deferred.length > 0
-          ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).join(" ")}`
+          ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
           : "";
       log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
       this.lastLoggedSeq = res.sequence;
@@ -315,6 +337,15 @@ export class RboxDaemon {
       this.metrics.lastConflictAt = new Date().toISOString();
       await saveMetrics(this.root, this.metrics);
     }
+    // A pull that WROTE an ignore-rule file must refresh the matcher before the rescan
+    // below and the pump's follow-up push — otherwise that push publishes files the
+    // freshly pulled rules exclude (same hazard doPush guards on watcher events).
+    if (actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path))) {
+      this.matcher = buildIgnoreMatcher(this.root);
+    }
+    // The pull advanced the local base sequence; remember it so the follow-up no-op
+    // push isn't logged as if THIS daemon published the remotely-produced sequence.
+    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
   }
