@@ -4,6 +4,7 @@ import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
+import { verifyGrant } from "./grants.js";
 import { dbFor } from "./db.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
@@ -158,13 +159,23 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 
 // GET /v1/blobs/:sha — streamed body. Entitlement checked BEFORE R2 (no timing/
 // existence oracle); an unentitled account gets 404 even if the blob exists (M7).
-export async function blobGet(env: Env, sha: string, accountId: string): Promise<Response> {
+//
+// §27 — a valid download grant (HMAC, account-bound, unexpired) authorizes the read
+// WITHOUT the per-blob D1 `isEntitled` read (the 81%-of-p50 hot-path cost), so the grant
+// path emits dbCalls=0. The grant's account must equal the authenticated principal's
+// account (verifyGrant binds `a == accountId`). Any absent/invalid/expired grant falls
+// through to the existing D1 path — old clients and a misconfigured grant key are
+// unaffected, and an entitled account is still served. `blobGet` never 500s on a bad
+// grant: an invalid grant is treated exactly like no grant.
+export async function blobGet(env: Env, sha: string, accountId: string, grant?: string): Promise<Response> {
   const op = startOp(env, "blob.get");
   const notFound = () => {
     op.done("not_found");
     return json({ error: "not_found" }, 404);
   };
-  if (!(await isEntitled(op.env, accountId, sha))) return notFound(); // entitlement BEFORE R2 (no existence oracle)
+  const granted = grant ? (await verifyGrant(op.env, grant, { accountId, nowMs: Date.now() })).ok : false;
+  // No valid grant → the legacy D1 entitlement gate (BEFORE R2, no existence oracle).
+  if (!granted && !(await isEntitled(op.env, accountId, sha))) return notFound();
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
   op.done("ok", { bytes: got.size });

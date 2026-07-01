@@ -26,6 +26,7 @@ export default defineWorkersConfig(async () => {
               CLERK_ALLOWED_ORIGINS: "https://app.test",
               CLERK_SECRET_KEY: "sk_test_clerk_dummy",
               RBOX_RECEIPT_KEY: "test-receipt-key-at-least-32-bytes-long-xx",
+              RBOX_GRANT_KEY: "test-grant-key-at-least-32-bytes-long-xxxxx",
               TEST_MIGRATIONS: migrations,
             },
           },
