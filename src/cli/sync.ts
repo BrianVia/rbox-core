@@ -240,7 +240,10 @@ async function captureGitForPush(
   const localId = await gitIdentity(root);
   if (!localId) return baseGit; // empty repo (no commits) → no git section yet
   if (baseGit && gitIdentityKey(localId) === gitIdentityKey(baseGit)) return baseGit; // unchanged → carry
-  return captureGitState(root, api.blobStore(), cfg.kek); // changed → ENCRYPT + capture + upload artifacts
+  // changed → ENCRYPT + capture + upload artifacts. A deferred capture (repo vanished mid-cycle
+  // or failed the engine's self-validation race check) carries the base — never regress a
+  // synced repo to nothing because of one bad cycle (design 43 §6.4).
+  return (await captureGitState(root, api.blobStore(), cfg.kek)) ?? baseGit;
 }
 
 /**

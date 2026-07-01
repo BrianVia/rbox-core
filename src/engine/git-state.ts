@@ -69,7 +69,10 @@ const SCRATCH_MAX_AGE_MS = 60 * 60 * 1000; // 1h — see pruneStaleScratchRefs
 async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
-    env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined } as NodeJS.ProcessEnv,
+    // Strip every repo-redirecting env var: rbox may be invoked from a git hook or wrapper,
+    // and a leaked GIT_COMMON_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would point commonDir (now
+    // load-bearing for the apply shape refusal + gitBusy) at a FOREIGN repo.
+    env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv,
   });
   return stdout.toString().trim();
 }
@@ -396,7 +399,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       opState[rel] = await putGitArtifact(store, kek, staged, tmpDir);
     }
 
-    return {
+    const section: GitSection = {
       bundleSha: bundle.sha,
       bundleEncSha: bundle.encSha,
       bundleCipherSize: bundle.cipherSize,
@@ -410,6 +413,13 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       refScope: ctx.kind === "dir" ? "all" : "scoped",
       generatedAt: new Date().toISOString(),
     };
+    // Engine self-check (scrutiny M4): a capture race (branch deleted between the HEAD and
+    // refs reads by a concurrent git/sibling worktree, or an exotic symbolic-ref outside
+    // refs/heads) can assemble a section apply-side validation refuses. Defer this repo —
+    // undefined, identical to the empty-repo path; the next cycle re-captures — rather than
+    // commit a section every receiver will reject.
+    if (!validateGitSection(section).ok) return undefined;
+    return section;
   } finally {
     if (pins) await deleteScratchPins(repoDir, pins);
     await fs.rm(tmpDir, { recursive: true, force: true });
@@ -550,7 +560,14 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
   // Fresh target (no .git): the repo is materialized by `git init` — but only AFTER every
   // artifact has been fetched+decrypted+verified (decrypt-before-mutate: a wrong-KEK apply
   // must leave NO .git behind — codex repro'd the old init-first order doing exactly that).
+  // "Fresh" strictly means NO `.git` entry at all: a symlinked `.git` (kind undefined but
+  // lstat-present) must be REFUSED, not initialized — `git init` through the symlink would
+  // reinitialize the LINKED repo, and the fresh-cleanup would then delete the user's symlink,
+  // hijacking the directory on the next cycle (scrutiny M1).
   const preKind = await detectGitKind(repoDir);
+  if (!preKind && (await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined))) {
+    return { applied: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported apply target" };
+  }
   let ctx = preKind ? await repoCtx(repoDir) : undefined;
   if (preKind && !ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
 
@@ -628,6 +645,14 @@ export async function applyGitState(repoDir: string, section: GitSection, store:
     }
 
     if (!ctx) {
+      // TOCTOU recheck (scrutiny M2): the artifact download above can take a long time on a
+      // big bundle. If a repo APPEARED at repoDir in that window (user ran git init/clone —
+      // this is a live-folder daemon), `git init` would "reinitialize" IT and createdGit
+      // would claim a .git this call did NOT create — every later failure path would then
+      // rm -rf the USER's .git. Absence must be re-confirmed immediately before init.
+      if (await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined)) {
+        return { applied: false, reason: "target repo appeared mid-apply — deferred" };
+      }
       // fresh machine / standalone materialization of a worktree-origin section (design 43 §5)
       await git(repoDir, ["init", "-q"]);
       createdGit = true;

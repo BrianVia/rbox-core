@@ -335,7 +335,63 @@ test("wrong-KEK apply into a FRESH target leaves NO .git behind (decrypt before 
   const res = await applyGitState(D, section!, store, Buffer.alloc(32, 99)); // WRONG key
   expect(res.applied).toBe(false);
   expect(res.reason).toContain("no mutation");
+  // NB: D/ + an empty hard-ignored D/.rbox/ MAY exist (staging happens pre-decrypt by
+  // design); the fail-closed contract is about `.git` — no repo may be materialized.
   expect(await fs.lstat(path.join(D, ".git")).catch(() => undefined)).toBeUndefined(); // nothing materialized
+});
+
+test("apply refuses a SYMLINKED .git target (never inits through it, never deletes the link)", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  // real repo R elsewhere; target T whose .git is a symlink to R's gitdir
+  const R = path.join(tmp, "R");
+  await initRepo(R);
+  await commit(R, "r.txt", "r", "r1");
+  const rHead = await git(R, "rev-parse", "HEAD");
+  const T = path.join(tmp, "T");
+  await fs.mkdir(T);
+  await fs.symlink(path.join(R, ".git"), path.join(T, ".git"));
+
+  const res = await applyGitState(T, section!, store, KEK);
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("unsupported");
+  expect((await fs.lstat(path.join(T, ".git"))).isSymbolicLink()).toBe(true); // link survives
+  expect(await git(R, "rev-parse", "HEAD")).toBe(rHead); // linked repo untouched
+});
+
+test("a repo APPEARING at a fresh target during artifact download defers — its .git is never claimed", async () => {
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "f.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK);
+
+  const D = path.join(tmp, "D");
+  // Simulate the mid-apply race deterministically: the FIRST blob fetch creates a real
+  // repo at D (as a user's `git init` + commit would), then delegates to the real store.
+  let raced = false;
+  const racingStore = {
+    has: (sha: string) => store.has(sha),
+    put: (sha: string, data: Buffer) => store.put(sha, data),
+    get: async (sha: string) => {
+      if (!raced) {
+        raced = true;
+        await initRepo(D);
+        await commit(D, "user.txt", "user work", "user c1");
+      }
+      return store.get(sha);
+    },
+  };
+
+  const res = await applyGitState(D, section!, racingStore, KEK);
+  expect(res.applied).toBe(false);
+  expect(res.reason).toContain("appeared mid-apply");
+  // the user's repo is fully intact — createdGit was never asserted over it
+  expect(await fs.lstat(path.join(D, ".git")).then((s) => s.isDirectory())).toBe(true);
+  await expect(git(D, "rev-parse", "HEAD")).resolves.toBeTruthy();
+  expect(await fs.readFile(path.join(D, "user.txt"), "utf8")).toBe("user work");
 });
 
 test("apply REFUSES a primary with linked worktrees (would move a sibling's checked-out branch)", async () => {
