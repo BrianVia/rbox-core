@@ -18,10 +18,9 @@
  */
 import { execFileSync } from "node:child_process";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
-import { configDir } from "./rbox-paths.js";
+import { configDir, homeDir } from "./rbox-paths.js";
 import { loadDepsState, saveDepsState } from "./deps-drift.js";
 import { style } from "./style.js";
 
@@ -62,7 +61,7 @@ function shellFromString(s: string | undefined): Shell | undefined {
 }
 
 export function rcFileFor(shell: Shell): string {
-  const home = os.homedir();
+  const home = homeDir();
   if (shell === "zsh") return path.join(home, ".zshrc");
   if (shell === "fish") return path.join(home, ".config", "fish", "config.fish");
   return path.join(home, ".bashrc");
@@ -78,7 +77,7 @@ export function hookFilePath(shell: Shell): string {
 export function resolveBinPath(): string {
   if (process.env.RBOX_BIN) return process.env.RBOX_BIN;
   if (path.basename(process.execPath) === "rbox") return process.execPath;
-  return path.join(os.homedir(), ".rbox", "bin", "rbox");
+  return path.join(homeDir(), ".rbox", "bin", "rbox");
 }
 
 // ── generated snippets (pure) ─────────────────────────────────────────────────
