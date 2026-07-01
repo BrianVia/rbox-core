@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { Manifest } from "../engine/index.js";
+import type { GitSection, Manifest } from "../engine/index.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 
 function isENOENT(e: unknown): boolean {
@@ -42,10 +42,28 @@ export interface WorkspaceConfig {
   kek?: Buffer;
 }
 
-/** Last point this device and the server agreed on — the reconcile base. */
+/** Last point this device and the server agreed on — the reconcile base.
+ *  The three `git*` maps are LOCAL-ONLY (design 43 §11): they never ride a manifest
+ *  or leave this machine — they are this device's memory of per-repo sync posture. */
 export interface SyncState {
   lastSyncedSequence: number;
   lastSyncedManifest: Manifest;
+  /** Removal memories (design 43 §9 [v2, B4]): relPath → the LOCAL identity key at the
+   *  moment the remote deleted the repo. A leftover local repo whose identity still
+   *  equals the memory is not re-added by push (it's the untouched leftover) and is
+   *  treated as ABSENT (clean materialization target) by pull. Pruned when the local
+   *  `.git` disappears or the repo is re-added. */
+  gitReposRemoved?: Record<string, string>;
+  /** Conflict suppressions (design 43 §7 [v2, M2]): relPath → the conflict-time LOCAL
+   *  identity key. Capture carries the checkpointed base (never republishes the
+   *  conflicted local state) until the local identity CHANGES from this value. */
+  gitNeedsResolution?: Record<string, string>;
+  /** Unapplied remote sections (design 43 §7 [v5]): relPath → the remote GitSection a
+   *  pull could not apply (ownership block, receiver busy, decrypt failure, …). While
+   *  pending: outbound pushes CARRY this section (the newest known truth), capture is
+   *  suppressed, and each pull retries the apply. Cleared on successful apply or when
+   *  the remote deletes the repo ([v6] absence supersedes pending). */
+  gitPendingRemote?: Record<string, GitSection>;
 }
 
 export const RBOX_DIR = ".rbox";
