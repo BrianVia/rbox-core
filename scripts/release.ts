@@ -20,6 +20,20 @@ import { RELEASE_KEYS } from "../src/cli/release-key.js";
 const ROOT = path.resolve(import.meta.dir, "..");
 const ALL = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"] as const;
 
+// The native `@parcel/watcher` binding is platform-specific (design §41). Each
+// target embeds ONLY its own package; the other three are `--external`ed so a
+// single host can cross-`--compile` without their `.node` bytes being resolved.
+// NB: the TARGET's package must be installed on the build host for its watcher to
+// embed — otherwise that binary still runs, but degrades to periodic-scan-only.
+const PARCEL_PKG: Record<(typeof ALL)[number], string> = {
+  "darwin-arm64": "@parcel/watcher-darwin-arm64",
+  "darwin-x64": "@parcel/watcher-darwin-x64",
+  "linux-arm64": "@parcel/watcher-linux-arm64-glibc",
+  "linux-x64": "@parcel/watcher-linux-x64-glibc",
+};
+const externalFlagsFor = (t: (typeof ALL)[number]): string[] =>
+  ALL.filter((o) => o !== t).flatMap((o) => ["--external", PARCEL_PKG[o]]);
+
 function arg(name: string): string | undefined {
   const a = process.argv.find((x) => x.startsWith(`--${name}=`));
   return a ? a.slice(name.length + 3) : undefined;
@@ -53,7 +67,7 @@ const artifacts: Record<string, { sha256: string; path: string }> = {};
 for (const t of targets) {
   const out = path.join(dist, `rbox-${t}`);
   console.log(`[release] build ${t}`);
-  sh(["bun", "build", "--compile", `--target=bun-${t}`, "./src/cli/index.ts", "--outfile", out]);
+  sh(["bun", "build", "--compile", `--target=bun-${t}`, ...externalFlagsFor(t), "./src/cli/index.ts", "--outfile", out]);
   artifacts[`rbox-${t}`] = { sha256: sha256File(out), path: `${tag}/rbox-${t}` };
 }
 

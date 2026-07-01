@@ -80,22 +80,33 @@ export class RboxDaemon {
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+    this.pruneCache();
     await this.cache.save(this.root);
     this.want.pull = true;
     this.want.push = true;
     await this.pump();
 
-    this.watcher = startWatcher(this.root, this.matcher, (events) => {
-      this.pendingEvents.push(...events);
-      this.request("push");
-    });
-
-    this.connect();
-
+    // Arm the reconcile loops FIRST, unconditionally. These are the correctness
+    // floor: even if the live watcher below fails to start, sync must degrade to
+    // periodic full-scan reconciliation — never go silently dead (design §41).
     this.safetyTimer = setInterval(() => this.request("fullScan"), jitter(SAFETY_SYNC_MS));
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
 
-    log("rbox daemon ready");
+    // Live watcher is a latency optimization on top of the floor. A rejected init
+    // (no native binding, inotify exhaustion, unsupported FS) degrades to the 60s
+    // safety tick rather than crashing or dropping to silent.
+    try {
+      this.watcher = await startWatcher(this.root, this.matcher, (events) => {
+        this.pendingEvents.push(...events);
+        this.request("push");
+      });
+    } catch (e) {
+      log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
+    }
+
+    this.connect();
+
+    log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
   }
 
   async stop(): Promise<void> {
@@ -200,13 +211,24 @@ export class RboxDaemon {
 
   private async doFullScan(): Promise<void> {
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+    this.pruneCache();
   }
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
   private async doDeepScan(): Promise<void> {
     const fresh = new HashCache();
     this.manifest = await scanManifest(this.root, this.matcher, fresh);
-    this.cache = fresh; // replace cache with freshly-verified truth
+    this.cache = fresh; // replace cache with freshly-verified truth (already tight)
+  }
+
+  /**
+   * Bound the on-disk HashCache: after a full scan the manifest is the complete set
+   * of live paths, so drop cache entries for anything no longer present (deleted,
+   * renamed, branch-switched-away). Without this the cache grows monotonically over
+   * a workspace's lifetime — real disk bloat on fast-churning monorepos.
+   */
+  private pruneCache(): void {
+    this.cache.prune(new Set(this.manifest.files.map((f) => f.path)));
   }
 
   // ---- live notification channel (optional; correctness never depends on it) ----

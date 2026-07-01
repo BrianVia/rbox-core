@@ -47,6 +47,38 @@ export const BUILTIN_IGNORE: string[] = [
   "!.env.template",
 ];
 
+/**
+ * The COARSE subset of {@link BUILTIN_IGNORE} that is safe to hard-prune at the
+ * OS-watcher level: pure directory excludes with **no negation / re-include**
+ * counterpart anywhere in the rule set. A native watcher (e.g. `@parcel/watcher`)
+ * is fed *only* these — as a volume optimization so it never watches the huge
+ * regenerable subtrees — while the full {@link IgnoreMatcher} stays the
+ * AUTHORITATIVE post-filter on every delivered event (see design §41). A path
+ * that a `.rboxignore` `!negation` re-includes lives outside these dirs, so
+ * pruning them can never hide an event the matcher would keep.
+ *
+ * Deliberately excludes file-level patterns (`.env`, `*.key`, `.DS_Store`, and the
+ * `!.env.example` negations): those must reach the JS matcher, not be silently
+ * dropped by a coarse native filter.
+ */
+export const HARD_PRUNE_DIRS: string[] = [
+  "node_modules",
+  ".git",
+  ".rbox",
+  ".venv",
+  "venv",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".turbo",
+  ".cache",
+  "coverage",
+  "target",
+  ".pnpm-store",
+];
+
 export interface IgnoreMatcher {
   /** `relPath` is POSIX-relative; pass a trailing slash for directories. */
   ignores(relPath: string): boolean;
