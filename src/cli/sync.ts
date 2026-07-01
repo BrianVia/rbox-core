@@ -323,35 +323,43 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // Git section (M2): apply remote git state if it changed; advance the git base
   // ONLY if the apply actually succeeded (else keep base so the next pull retries
   // — never record an unapplied remote git as the base and later push stale git).
-  let appliedGit = state.lastSyncedManifest.git;
+  // STEP-3 TODO(design 43 §7): per-repo loop over remote.gitRepos ∪ base.gitRepos ∪
+  // gitPendingRemote with scope-projected identity, per-repo base advance, removal
+  // memories, pending-remote carry. This shim keeps the pre-§43 root-repo behavior
+  // via gitRepos["."] only.
+  let appliedGit = state.lastSyncedManifest.gitRepos?.["."];
   if (cfg.syncGit) {
-    const baseGit = state.lastSyncedManifest.git;
+    const baseGit = state.lastSyncedManifest.gitRepos?.["."];
+    const remoteGit = remote.gitRepos?.["."];
     const baseKey = gitIdentityKey(baseGit);
-    const remoteKey = gitIdentityKey(remote.git);
-    if (remote.git && remoteKey !== baseKey) {
+    const remoteKey = gitIdentityKey(remoteGit);
+    if (remoteGit && remoteKey !== baseKey) {
       if (!kek) throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
       const store = api.blobStore();
       const localChanged = gitIdentityKey(await gitIdentity(root)) !== baseKey;
       if (localChanged) {
         // Both sides diverged → never auto-clobber local. Preserve remote for manual
         // merge and checkpoint the base to remote so we stop pull-conflict-looping.
-        const { recoveryBundle } = await preserveGitConflict(root, remote.git, store, kek);
-        appliedGit = remote.git;
+        const { recoveryBundle } = await preserveGitConflict(root, remoteGit, store, kek);
+        appliedGit = remoteGit;
         console.error(`rbox: git conflict — local kept; remote preserved at ${recoveryBundle} and refs/rbox-conflict/*. Resolve manually.`);
       } else {
         // Clean fast-forward (local == base): apply remote transactionally.
-        const res = await applyGitState(root, remote.git, store, kek);
-        if (res.applied) appliedGit = remote.git;
+        const res = await applyGitState(root, remoteGit, store, kek);
+        if (res.applied) appliedGit = remoteGit;
         else {
           appliedGit = baseGit; // deferred/rolled-back → retry next pull
           console.error(`rbox: git apply not done: ${res.reason}`);
         }
       }
-    } else if (remote.git && remoteKey === baseKey) {
-      appliedGit = remote.git; // unchanged
+    } else if (remoteGit && remoteKey === baseKey) {
+      appliedGit = remoteGit; // unchanged
     }
   }
-  await saveState(root, { lastSyncedSequence: sequence, lastSyncedManifest: { ...remote, git: appliedGit } });
+  await saveState(root, {
+    lastSyncedSequence: sequence,
+    lastSyncedManifest: { ...remote, gitRepos: appliedGit ? { ".": appliedGit } : undefined },
+  });
   return actions;
 }
 
@@ -416,14 +424,18 @@ export async function pushManifest(
   // artifact missing server-side is re-bundled + re-uploaded — the recursive call recomputes
   // local.git here, so the force MUST live at this single site (not after the commit) or it's
   // overwritten and the recovery is dead (codex scrutiny).
-  const gitBase = forceGitRecapture ? undefined : state.lastSyncedManifest.git;
-  local = { ...local, git: await captureGitForPush(root, cfg, gitBase, api) };
+  // STEP-3 TODO(design 43 §6): map orchestration (discoverGitRepos + carry/capture/defer per
+  // repo, bounded pool, per-relPath 422 recapture set). This shim keeps the pre-§43 root-repo
+  // behavior via gitRepos["."] only.
+  const gitBase = forceGitRecapture ? undefined : state.lastSyncedManifest.gitRepos?.["."];
+  const rootGit = await captureGitForPush(root, cfg, gitBase, api);
+  local = { ...local, manifestSchema: rootGit ? 2 : local.manifestSchema, gitRepos: rootGit ? { ".": rootGit } : undefined };
 
   const filesUnchanged = (() => {
     const d = diffManifests(state.lastSyncedManifest, local);
     return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
   })();
-  const gitUnchanged = gitIdentityKey(local.git) === gitIdentityKey(state.lastSyncedManifest.git);
+  const gitUnchanged = gitIdentityKey(local.gitRepos?.["."]) === gitIdentityKey(state.lastSyncedManifest.gitRepos?.["."]); // STEP-3 TODO: per-repo
   if (filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
     // (the 422 recovery): reaching here needs local == base, but to have hit the 422 at all
