@@ -74,6 +74,12 @@ eval "$(rbox shell-init zsh)"
 RPROMPT='%~ $RBOX_PROMPT'
 ```
 
+Note on prompt options: the default auto-append runs `setopt prompt_subst` (stock
+zsh has it off, and `$RBOX_PROMPT` inside a prompt only expands at render time
+under that option — most prompt frameworks enable it already). With
+`RBOX_NO_RPROMPT=1`, rbox leaves your prompt options entirely untouched; if you
+embed `$RBOX_PROMPT` yourself, make sure your setup has `prompt_subst` on.
+
 `$RBOX_PROMPT` holds the colored glyph (or empty string outside a workspace) and is
 refreshed on every prompt. In a p10k `prompt_*` function, just echo `$RBOX_PROMPT`.
 

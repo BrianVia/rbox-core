@@ -164,8 +164,12 @@ add-zsh-hook chpwd _rbox_chpwd
 add-zsh-hook precmd _rbox_precmd
 
 # Append the glyph to RPROMPT once (idempotent, double-eval safe), unless the user
-# opts out to place \$RBOX_PROMPT themselves (p10k / custom themes).
+# opts out to place \$RBOX_PROMPT themselves (p10k / custom themes). The embedded
+# \$RBOX_PROMPT only expands at render time under PROMPT_SUBST (off in stock zsh —
+# without it the right prompt shows the literal string), so auto-append enables it.
+# Opting out with RBOX_NO_RPROMPT=1 leaves prompt options entirely untouched.
 if [[ \${RBOX_NO_RPROMPT:-0} != 1 && \${RPROMPT-} != *'\$RBOX_PROMPT'* ]]; then
+  setopt prompt_subst
   RPROMPT="\${RPROMPT-}"' \$RBOX_PROMPT'
 fi
 

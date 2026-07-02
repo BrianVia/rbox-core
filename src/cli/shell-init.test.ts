@@ -58,6 +58,23 @@ test("the script embeds both hooks, root discovery, the version guard, and compl
   expect(s).toContain("compdef _rbox rbox");
 });
 
+test("auto-append enables PROMPT_SUBST (stock zsh has it off — the embedded $RBOX_PROMPT would render literally); opting out leaves options untouched", () => {
+  if (!ZSH) return;
+  const file = writeScript();
+  const probe = (env: Record<string, string>) => {
+    const res = Bun.spawnSync([ZSH, "-f", "-c", `source ${file}; [[ -o prompt_subst ]] && print ON || print OFF; print -r -- "R:$RPROMPT"`], {
+      env: { ...process.env, ...env },
+    });
+    return new TextDecoder().decode(res.stdout);
+  };
+  const auto = probe({});
+  expect(auto).toContain("ON");
+  expect(auto).toContain("$RBOX_PROMPT"); // appended, unexpanded in the stored value
+  const optOut = probe({ RBOX_NO_RPROMPT: "1" });
+  expect(optOut).toContain("OFF");
+  expect(optOut).not.toContain("$RBOX_PROMPT");
+});
+
 test("the full output parses cleanly under `zsh -n`", () => {
   if (!ZSH) {
     console.warn("zsh not on PATH — skipping `zsh -n` syntax check");
