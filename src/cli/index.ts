@@ -1,9 +1,11 @@
 import path from "node:path";
-import { scanManifest, type Action } from "../engine/index.js";
+import { buildIgnoreMatcher, diffManifests, scanManifest, type Action } from "../engine/index.js";
+import { loadActivity } from "./activity.js";
+import { healthLine, lastSyncLines, progressLabel } from "./status-view.js";
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
-import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
+import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, readDaemonBinding, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -24,6 +26,43 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
   }
   const entries = helpFor(helpKeyFor(cmd, positional));
   console.log(entries ? entries.map(renderCommand).join("\n\n") : renderGroupedHelp());
+}
+
+/**
+ * Best-effort remote-head probe for the status verdict (design 45): the sequence
+ * from the workspace's `/latest`, or undefined on ANY failure (signed out, offline,
+ * timeout, non-OK) — status renders local-first and must never block or throw.
+ * Aborted (not just raced) on timeout so a black-holed connection can't keep the
+ * process alive. Auth + base URL come from the per-machine credential, with the
+ * config as fallback — the same effective-remote rule as buildAuthedRemote.
+ */
+async function fetchRemoteSequence(
+  cfg: WorkspaceConfig,
+  creds: { token: string; remoteUrl?: string } | undefined,
+  timeoutMs = 2500
+): Promise<number | undefined> {
+  try {
+    const token = creds?.token || cfg.token;
+    if (!token) return undefined;
+    const base = creds?.remoteUrl ?? cfg.remoteUrl;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      // Same endpoint as RboxApi.latestCommit — inlined for the abort signal; only
+      // the sequence is read (the envelope is ignored, nothing is decrypted).
+      const res = await fetch(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return undefined;
+      const seq = ((await res.json()) as { sequence?: number }).sequence;
+      return typeof seq === "number" ? seq : undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 /** `rbox deps <sub>` group dispatch. `positional[0]` is the subcommand; the optional
@@ -221,7 +260,7 @@ async function main(): Promise<void> {
       const sp = spinner("pushing");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
+        deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
         const report = beginReport("push");
         deps.report = report;
         const { sequence: seq, committed } = await push(root, cfg, deps);
@@ -242,7 +281,7 @@ async function main(): Promise<void> {
       const sp = spinner("pulling");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase) => sp.update(phase === "download" ? `downloading ${done}/${total}` : `${phase} ${done}/${total}`);
+        deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
         deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("pull");
         deps.report = report;
@@ -262,7 +301,7 @@ async function main(): Promise<void> {
       const sp = spinner("syncing");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
+        deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
         deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("sync");
         deps.report = report;
@@ -284,9 +323,33 @@ async function main(): Promise<void> {
     }
     case "status": {
       const root = await resolveRoot(positional[0]);
-      const cfg = await loadConfig(root);
+      // The EFFECTIVE remote is the credential's (buildAuthedRemote's rule, design 44
+      // R3): sync stamps its baseline with it, so status must load state under the
+      // SAME stream id — the raw config URL would read a valid baseline as foreign
+      // and misreport every file as pending (codex R1).
+      const { loadCredentials } = await import("./credentials.js");
+      const creds = await loadCredentials().catch(() => undefined);
+      const rawCfg = await loadConfig(root);
+      const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
       const state = await loadState(root, syncStreamId(cfg));
-      const local = await scanManifest(root);
+      const matcher = buildIgnoreMatcher(root);
+      const local = await scanManifest(root, matcher);
+      // A running daemon BOUND TO A PREVIOUS WORKSPACE is not background sync for
+      // this one (codex R4): its liveness must not read "running", and its activity
+      // sidecar (halt, trail, progress) describes the old binding — suppress both.
+      // Unknown binding (pre-binding daemon) is treated as current: can't tell ≠ stale.
+      const alive = isDaemonRunning(root);
+      const bound = alive.running ? readDaemonBinding(root) : undefined;
+      const daemonStale = alive.running && bound !== undefined && bound !== cfg.remoteWorkspaceId;
+      const bg = { running: alive.running && !daemonStale, pid: alive.pid };
+      // The daemon's activity sidecar, the remote-head probe, and the git-divergence
+      // walk are independent best-effort reads — concurrent so status stays snappy.
+      const { gitDivergenceCount } = await import("./sync-git.js");
+      const [activity, remoteSequence, gitChanged] = await Promise.all([
+        daemonStale ? Promise.resolve(undefined) : loadActivity(root),
+        fetchRemoteSequence(cfg, creds),
+        gitDivergenceCount(root, cfg, state, matcher).catch(() => 0),
+      ]);
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id
       // when no name was set.
@@ -295,12 +358,38 @@ async function main(): Promise<void> {
         ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
         : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
       console.log(`${style.bold("workspace")} ${wsLabel}`);
-      console.log(`  ${style.dim("device:")} ${cfg.deviceId}`);
-      console.log(`  ${style.dim("last-synced sequence:")} ${state.lastSyncedSequence}`);
-      console.log(`  ${style.dim("local files:")} ${local.files.length}`);
+      // Health verdict FIRST (design 45): derived from the actual local-vs-baseline
+      // diff, the daemon's recorded activity, and the remote head — never from
+      // internals the user has to interpret. Mirror push's forward-only ignore
+      // carry (M3b): a baseline file that is now ignored is carried, not deleted —
+      // it must not read as a pending change here.
+      const d = diffManifests(state.lastSyncedManifest, local);
+      const now = Date.now();
+      console.log(
+        `  ${healthLine({
+          added: d.added.length,
+          changed: d.changed.length,
+          deleted: d.deleted.filter((p) => !matcher.ignores(p)).length,
+          gitChanged,
+          trackedFiles: local.files.length,
+          daemonRunning: bg.running,
+          localSequence: state.lastSyncedSequence,
+          remoteSequence,
+          activity,
+          now,
+        })}`
+      );
+      for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
       // Folds in the old `daemon status` (design 29): background-sync state.
-      const bg = isDaemonRunning(root);
-      console.log(`  ${style.dim("background sync:")} ${bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
+      console.log(
+        `  ${style.dim("background sync:")} ${
+          daemonStale
+            ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
+            : bg.running
+              ? style.green(`running (pid ${bg.pid})`)
+              : style.yellow("stopped")
+        }`
+      );
       if (cfg.syncGit) {
         // design 43 §10: per-workspace git-sync summary from the per-repo sync state.
         const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
@@ -319,6 +408,9 @@ async function main(): Promise<void> {
           `  ${style.dim("sync metrics:")} ${m.syncs} syncs, ${conf ? style.yellow(`${m.commitConflicts409} commit-409 / ${m.fileConflicts} file-conflict`) : style.green("0 conflicts")}${m.lastConflictAt ? style.dim(` (last ${m.lastConflictAt})`) : ""}`
         );
       }
+      // Internals demoted to one dim detail line (design 45): essential for forensics
+      // (the 2026-07-01 incident was reconstructed from exactly these), noise as a headline.
+      console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${local.files.length.toLocaleString("en-US")} files on disk`)}`);
       // ACCOUNT section (design 21) — which account/plan you're on and whether a web
       // login is linked. Best-effort and local-first: fetchAccountSummary NEVER throws
       // or blocks (short timeout, total error swallow), so an offline `rbox status`

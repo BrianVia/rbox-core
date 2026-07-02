@@ -10,6 +10,7 @@ import {
   type WatchEvent,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
+import { saveActivity, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -107,6 +108,13 @@ export class RboxDaemon {
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
   private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0 };
+  /** In-memory activity record mirrored to `.rbox/state/activity.json` (design 45) —
+   *  what `rbox status` reads for the health verdict, last-sync trail, live transfer
+   *  progress, and (crucially) the mass-delete-guard halt warning. */
+  private readonly activity: DaemonActivity = { at: new Date().toISOString() };
+  private activityDirty = false; // a `last`/halt change that must persist un-throttled
+  private lastActivityWrite = 0;
+  private lastProgressWrite = 0;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
@@ -184,6 +192,7 @@ export class RboxDaemon {
     // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
     // daemon restart could interrupt a mutation mid-flight.
     await this.pumpRun.catch(() => {});
+    await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
     await this.cache?.save(this.root).catch(() => {});
     log("rbox daemon stopped");
   }
@@ -209,23 +218,41 @@ export class RboxDaemon {
   private async pumpLoop(): Promise<void> {
     try {
       while (!this.stopped && (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan)) {
+        // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
+        // is keyed on it (a halt is only healed by a success of the SAME kind).
+        const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
         try {
-          if (this.want.deepScan) {
-            this.want.deepScan = false;
+          this.want[op] = false;
+          if (op === "deepScan") {
             await this.doDeepScan();
             this.want.push = true;
-          } else if (this.want.fullScan) {
-            this.want.fullScan = false;
+          } else if (op === "fullScan") {
             await this.doFullScan();
             this.want.push = true;
-          } else if (this.want.pull) {
-            this.want.pull = false;
+          } else if (op === "pull") {
             await this.doPull();
             this.want.push = true; // publish any local divergence after taking remote
-          } else if (this.want.push) {
-            this.want.push = false;
+          } else {
             await this.doPush();
           }
+          // Op completed: any live progress is over. A standing halt is healed ONLY by
+          // a success of the op kind that recorded it — a mass-delete-guard halt from a
+          // pull must survive the queued push's no-op success and every safety scan
+          // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
+          // Persist when something visible changed (or as a throttled heartbeat, so
+          // `rbox status` can say "last checked: Ns ago" without idle disk churn).
+          const heals = this.activity.halt !== undefined && this.activity.halt.op === op;
+          const cleared = this.activity.active !== undefined || heals;
+          this.activity.active = undefined;
+          if (heals) {
+            this.activity.halt = undefined;
+            // The healed failure's dedup streak ends with it: a LATER failure with the
+            // same message is a new episode that must log and persist a fresh halt —
+            // not silently count as repeat 2..9 and leave activity.json healed (codex R4).
+            this.lastErrMsg = "";
+            this.errRepeat = 0;
+          }
+          if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
         } catch (e) {
           // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
           // first hit and every 10th after, with the running count — so the log stays
@@ -233,8 +260,14 @@ export class RboxDaemon {
           const msg = e instanceof Error ? e.message : String(e);
           this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
           this.lastErrMsg = msg;
+          // The halt record is the failure's user-visible surface (design 45): without
+          // it a mass-delete-guard refusal (design 44) stalls background sync with no
+          // indicator anywhere but this log. Persisted on the log-line schedule.
+          this.activity.active = undefined;
+          this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
           if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
             log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+            this.writeActivity();
           }
           await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
         }
@@ -270,6 +303,8 @@ export class RboxDaemon {
       onCommitConflict: () => this.bumpConflict("commit"),
       report,
       onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
+      onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
+      onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
@@ -285,6 +320,12 @@ export class RboxDaemon {
       log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
     }
     this.lastLoggedSeq = res.sequence;
+    if (res.committed) {
+      // The status trail: "last push: 2m ago — N files → sequence S" (design 45).
+      // Its own slot — it must never mask what a recovery pull applied (codex R2).
+      this.activity.lastPush = { at: new Date().toISOString(), files: res.manifest.files.length, sequence: res.sequence };
+      this.activityDirty = true;
+    }
     // Files deferred because they were still changing under the push: re-enqueue them
     // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
     // per-path retry budget as mid-write files — a pathologically-churning file gives up
@@ -327,11 +368,18 @@ export class RboxDaemon {
   private async doPull(): Promise<void> {
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
-    const actions = await pull(this.root, this.cfg, { ...this.e2ee, cache: this.cache, report, onGitLog: log });
+    // onPullApplied carries BOTH the forensic log line and the status trail — wired
+    // here and in doPush's deps so the pull inside push's 409 recovery is recorded
+    // identically (codex R2: its actions are discarded by the retry loop).
+    const actions = await pull(this.root, this.cfg, {
+      ...this.e2ee,
+      cache: this.cache,
+      report,
+      onGitLog: log,
+      onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45
+      onPullApplied: (a) => this.recordPullApplied(a),
+    });
     report?.logSummaryTo(log);
-    // Forensic record: every mutation a pull applied to the LOCAL tree, path by path.
-    // This is the line that answers "did sync change/delete my files?" after the fact.
-    if (actions.length > 0) log(`pull applied: ${summarizeActions(actions)}`);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;
@@ -354,6 +402,52 @@ export class RboxDaemon {
   private bumpConflict(_kind: "commit"): void {
     this.metrics.commitConflicts409 += 1;
     this.metrics.lastConflictAt = new Date().toISOString();
+  }
+
+  /** Pending activity persistence — writes CHAIN on this promise so overlapping
+   *  saves can never land out of order (an older record must not win). NEVER awaited
+   *  on the sync path (a slow sidecar write must not delay a single op — codex R1);
+   *  drained only by stop() so graceful shutdown flushes the final record. */
+  private activityWrite: Promise<void> = Promise.resolve();
+
+  /** Persist the in-memory activity record. Non-blocking for the caller, and
+   *  saveActivity swallows all errors by contract — visibility must never break
+   *  (or slow) sync. Snapshot-shallow-copied: `last`/`active`/`halt` are always
+   *  replaced wholesale (never mutated in place), so a later mutation of
+   *  `this.activity` can't bleed into an in-flight write. */
+  private writeActivity(): void {
+    this.activity.at = new Date().toISOString();
+    this.activityDirty = false;
+    this.lastActivityWrite = Date.now();
+    const snapshot = { ...this.activity };
+    this.activityWrite = this.activityWrite.then(() => saveActivity(this.root, snapshot));
+  }
+
+  /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
+   *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
+   *  is the record that answers "did sync change/delete my files?" after the fact. */
+  private recordPullApplied(actions: Action[]): void {
+    log(`pull applied: ${summarizeActions(actions)}`);
+    let writes = 0;
+    let deletes = 0;
+    let conflicts = 0;
+    for (const a of actions) {
+      if (a.kind === "write") writes++;
+      else if (a.kind === "delete") deletes++;
+      else conflicts++;
+    }
+    this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts };
+    this.activityDirty = true;
+  }
+
+  /** Live transfer progress → activity sidecar, throttled to ~2 writes/s (plus the
+   *  final tick) so a big upload isn't bottlenecked on progress bookkeeping. */
+  private onTransferProgress(done: number, total: number, phase: "encrypt" | "upload" | "download"): void {
+    const now = Date.now();
+    if (done < total && now - this.lastProgressWrite < 500) return;
+    this.lastProgressWrite = now;
+    this.activity.active = { at: new Date().toISOString(), phase, done, total };
+    this.writeActivity();
   }
 
   private async doFullScan(): Promise<void> {
