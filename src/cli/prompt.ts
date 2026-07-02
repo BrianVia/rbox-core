@@ -36,6 +36,25 @@ async function run<T>(p: Promise<T>): Promise<T> {
 }
 
 export const promptSelect = <V>(cfg: Parameters<typeof select<V>>[0]) => run(select<V>(cfg, STDERR));
+
+/** A fire-and-forget `select` for the rare case where an EXTERNAL event can make the
+ *  choice moot before the user answers — the browser-login flow shows this alongside
+ *  its poll loop and cancels it the instant approval lands (design 47), so the prompt
+ *  never blocks polling and never outlives the flow. `onChoice` runs only if the user
+ *  actually picks; the returned `cancel()` aborts the widget (inquirer clears its
+ *  line), and the abort/Ctrl-C rejections are handled here so nothing leaks as an
+ *  unhandled rejection. A real SIGINT still exits 130, matching the awaited wrappers. */
+export function cancelableSelect<V>(cfg: Parameters<typeof select<V>>[0], onChoice: (value: V) => void): { cancel: () => void } {
+  const controller = new AbortController();
+  select<V>(cfg, { ...STDERR, signal: controller.signal })
+    .then(onChoice)
+    .catch((err) => {
+      if (err instanceof ExitPromptError) process.exit(CANCEL_EXIT);
+      // AbortPromptError (external cancel()) or an already-settled abort → the flow
+      // moved on without the user; nothing to do.
+    });
+  return { cancel: () => controller.abort() };
+}
 export const promptSearch = <V>(cfg: Parameters<typeof search<V>>[0]) => run(search<V>(cfg, STDERR));
 export const promptInput = (cfg: Parameters<typeof input>[0]) => run(input(cfg, STDERR));
 export const promptConfirm = (cfg: Parameters<typeof confirm>[0]) => run(confirm(cfg, STDERR));

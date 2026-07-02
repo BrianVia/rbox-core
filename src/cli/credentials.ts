@@ -24,6 +24,14 @@ export interface Credentials {
  *  still wins — this literal is only the fallback. */
 export const PROD_REMOTE = "https://api.rbox.to";
 
+/** The production web dashboard (where a browser session approves a CLI login —
+ *  design 47). The API base (`PROD_REMOTE`) and the dashboard are different hosts,
+ *  so this is the only place the CLI ever needs to construct a dashboard URL.
+ *  Overridable with `RBOX_APP=…`; read the env at each call site (not here) for the
+ *  same reason `PROD_REMOTE` does — a test that sets `RBOX_APP` after import must
+ *  still win. This literal is only the fallback. */
+export const PROD_WEB = "https://app.rbox.to";
+
 const dir = () => path.join(os.homedir(), ".rbox");
 const file = () => path.join(dir(), "credentials.json");
 

@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('$lib/config', () => ({ config: { apiBase: 'https://api.test' } }));
 vi.mock('$lib/clerk', () => ({ sessionId: (c: { session?: { id?: string } }) => c?.session?.id ?? null }));
 
-import { fetchUsage, clearStaleTokens } from './api';
+import { fetchUsage, clearStaleTokens, lookupDeviceAuth, approveDeviceAuth } from './api';
 
 function makeStorage() {
 	const m = new Map<string, string>();
@@ -118,5 +118,57 @@ describe('rbox token cache (B3 / SF1)', () => {
 		expect(store.getItem('rbox_token:B')).toBe('tokenB');
 		const usageCall = f.mock.calls.find((c) => String(c[0]).includes('/v1/account/usage'));
 		expect((usageCall![1] as RequestInit).headers).toMatchObject({ authorization: 'Bearer tokenB' });
+	});
+});
+
+describe('CLI browser login — device-code (design 47)', () => {
+	it('lookup returns { label, status } for a pending code — public, no bearer, no exchange', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValue({ ok: true, status: 200, json: async () => ({ label: 'my-macbook', status: 'pending' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		const r = await lookupDeviceAuth('ABCD-2345');
+		expect(r).toEqual({ label: 'my-macbook', status: 'pending' });
+		// It's the deliberately-public route: no session exchange, no Authorization header.
+		expect(sessionCalls(f)).toBe(0);
+		expect(String(f.mock.calls[0][0])).toContain('/v1/auth/device/lookup?code=ABCD-2345');
+		const init = f.mock.calls[0][1] as RequestInit | undefined;
+		expect((init?.headers ?? {}) as Record<string, string>).not.toHaveProperty('authorization');
+	});
+
+	it('lookup surfaces an already-approved code (e.g. a page refresh after confirming)', async () => {
+		const f = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ label: null, status: 'approved' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		expect(await lookupDeviceAuth('WXYZ-6789')).toEqual({ label: null, status: 'approved' });
+	});
+
+	it('lookup returns null on 404 (expired or unknown code)', async () => {
+		const f = vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: 'not_found' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		expect(await lookupDeviceAuth('ZZZZ-0000')).toBeNull();
+	});
+
+	it('approve POSTs { userCode } with the rbox web bearer (the existing authed() path)', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) }) // session exchange
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true }) }); // approve
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		await approveDeviceAuth(clerk('A') as never, 'ABCD-2345');
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/auth/device/approve'));
+		expect(call).toBeTruthy();
+		const init = call![1] as RequestInit;
+		expect(init.method).toBe('POST');
+		expect(JSON.parse(init.body as string)).toEqual({ userCode: 'ABCD-2345' });
+		expect(init.headers).toMatchObject({ authorization: 'Bearer rbox_A' });
+	});
+
+	it('approve maps 404 (no pending auth) to a clear, actionable error', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: 'no_pending_auth' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+		await expect(approveDeviceAuth(clerk('A') as never, 'GONE-0000')).rejects.toThrow(/expired|already/i);
 	});
 });

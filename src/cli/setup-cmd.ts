@@ -122,15 +122,16 @@ async function stepAccount(remote: string): Promise<boolean> {
   }
 
   // Existing account.
-  const method = await promptSelect<"pair" | "approve">({
+  const method = await promptSelect<"pair" | "browser" | "approve">({
     message: "How do you want to authorize this machine?",
     choices: [
       { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` — fewest steps, also enrolls encryption" },
+      { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
       { name: "Approve a code", value: "approve", description: "this machine shows a code you approve elsewhere" },
     ],
   });
 
-  if (method === "pair") {
+  if (authorizePath(method) === "pair-token") {
     const token = await promptPassword({ message: "Paste pairing token" });
     if (!token) {
       process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
@@ -140,8 +141,20 @@ async function stepAccount(remote: string): Promise<boolean> {
     return enrollmentOk();
   }
 
-  await login(remote, undefined); // device-code: authorizes but does not enroll
+  // "browser" and "approve" are the SAME device-code grant (authorize-only) — the
+  // browser option is just a friendlier front door onto login()'s own printed UX
+  // (design 47). Both authorize but do NOT enroll for encryption.
+  await login(remote, undefined);
   return enrollmentOk();
+}
+
+/** Which authorize path an existing-account method takes. "pair" redeems a pairing
+ *  token (enrolls encryption inline); "browser" and "approve" are both the
+ *  device-code grant (authorize-only) — same `login(remote, undefined)` call, just a
+ *  different front door. Pure so the three-way routing is pinned by a unit test
+ *  without driving the inquirer widget (mirrors `workspaceFlags`). */
+export function authorizePath(method: "pair" | "browser" | "approve"): "pair-token" | "device-code" {
+  return method === "pair" ? "pair-token" : "device-code";
 }
 
 /** Re-check enrollment (the robust signal init also uses). On the device-code path

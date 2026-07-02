@@ -1,5 +1,5 @@
 import { eq, isDeviceRevoke, type RouteCtx } from "./shared.js";
-import { approveDeviceAuth, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "../auth.js";
+import { approveDeviceAuth, bootstrap, createPairToken, listDevices, lookupDeviceAuth, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "../auth.js";
 import type { Principal } from "../authz.js";
 
 /**
@@ -10,6 +10,11 @@ import type { Principal } from "../authz.js";
 export async function authPublicRoutes({ req, env, seg }: RouteCtx): Promise<Response | null> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
+  // design 47: the web confirm page only has the userCode from the URL — this lets
+  // it show "approve login for <label>?" before requiring a session. Query-string
+  // route (no path param), so it's `seg`-matched like the others; `code` is read
+  // inside the handler.
+  if (req.method === "GET" && eq(seg, ["v1", "auth", "device", "lookup"])) return lookupDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
   // Pairing redeem is PUBLIC (the pasted token IS the credential) — exact route.
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);

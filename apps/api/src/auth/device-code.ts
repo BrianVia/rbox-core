@@ -107,3 +107,20 @@ export async function approveDeviceAuth(req: Request, env: Env, approver: Princi
   if (res.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
   return json({ ok: true });
 }
+
+// GET /v1/auth/device/lookup?code=XXXX-XXXX -> { label, status } | 404  (design 47)
+// PUBLIC (no Principal, carries only a guessable-but-inert user_code — same
+// guess-space as approve) — lets the web confirm page show "approve login for
+// <label>?" before the user has necessarily signed in. Never returns
+// account_id/user_id/tokens; a caller can at most confirm a pending login
+// exists, not act on it (approving still requires an authed session).
+export async function lookupDeviceAuth(req: Request, env: Env): Promise<Response> {
+  const userCode = new URL(req.url).searchParams.get("code")?.toUpperCase();
+  if (!userCode) return json({ error: "bad_request" }, 400);
+  const row = await dirDb(env)
+    .prepare("SELECT label, status, expires_at FROM device_auth WHERE user_code = ?")
+    .bind(userCode)
+    .first<{ label: string | null; status: string; expires_at: number }>();
+  if (!row || (Date.now() > row.expires_at && row.status === "pending")) return json({ error: "not_found" }, 404);
+  return json({ label: row.label, status: row.status });
+}

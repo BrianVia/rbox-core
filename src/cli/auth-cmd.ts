@@ -1,6 +1,7 @@
 import os from "node:os";
-import { clearCredentials, loadCredentials, saveCredentials } from "./credentials.js";
-import { isInteractive, promptConfirm, promptPassword } from "./prompt.js";
+import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
+import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
+import { copyToClipboard, openInBrowser } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
@@ -62,25 +63,72 @@ export async function login(remoteUrl: string, bootstrapSecret?: string): Promis
   const startRes = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
   if (!startRes.ok) throw new Error(`login start failed: ${startRes.status}`);
   const start = (await startRes.json()) as { deviceCode: string; userCode: string; interval: number; expiresIn: number };
-  console.log(`\nTo authorize this device, run on an already-signed-in machine:\n`);
-  console.log(`    rbox device approve ${start.userCode}\n`);
-  console.log(`Waiting for approval (expires in ${start.expiresIn}s)...`);
 
-  const deadline = Date.now() + start.expiresIn * 1000;
-  while (Date.now() < deadline) {
-    await sleep(start.interval * 1000);
-    const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
-    const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
-    if (p.status === "approved" && p.token) {
-      await saveCredentials({ token: p.token, deviceId: p.deviceId ?? "unknown", remoteUrl, accountId: p.accountId });
-      console.log(`device authorized: ${p.deviceId}`);
-      console.error(`note: device-code login authorizes this machine but does NOT enroll it for encryption. To read/sync encrypted data, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
-      return;
+  // Browser-optional approval (design 47): print a dashboard URL a web session can
+  // approve from any browser (laptop/phone, need not be this machine — the SSH case),
+  // while keeping the terminal-to-terminal path for those who prefer it. Read RBOX_APP
+  // at the call site so a test/override set after import still wins.
+  const approveUrl = `${process.env.RBOX_APP ?? PROD_WEB}/cli-login?code=${start.userCode}`;
+  console.log(`\nTo authorize this device, visit:\n`);
+  console.log(`    ${approveUrl}\n`);
+  console.log(`    (or run \`rbox device approve ${start.userCode}\` on an already-signed-in machine)`);
+  console.log(`\nWaiting for approval (expires in ${start.expiresIn}s)...`);
+
+  // The open/copy prompt runs CONCURRENTLY with polling — it never gates a single
+  // tick. We keep the cancelable prompt so we can close it the instant approval
+  // lands (or on timeout), so it never blocks or outlives the flow.
+  const prompt = offerApprovalOpen(approveUrl);
+  try {
+    const deadline = Date.now() + start.expiresIn * 1000;
+    while (Date.now() < deadline) {
+      await sleep(start.interval * 1000);
+      const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
+      const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
+      if (p.status === "approved" && p.token) {
+        await saveCredentials({ token: p.token, deviceId: p.deviceId ?? "unknown", remoteUrl, accountId: p.accountId });
+        console.log(`device authorized: ${p.deviceId}`);
+        console.error(`note: device-code login authorizes this machine but does NOT enroll it for encryption. To read/sync encrypted data, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
+        return;
+      }
+      if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
+      // pending → keep polling
     }
-    if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
-    // pending → keep polling
+    throw new Error("authorization timed out");
+  } finally {
+    try {
+      prompt?.cancel();
+    } catch {
+      // already resolved / non-interactive → nothing to close
+    }
   }
-  throw new Error("authorization timed out");
+}
+
+/** Best-effort, non-blocking "open the approval page" helper for the browser-login
+ *  flow. Auto-opens the URL opportunistically (a headless spawn just no-ops — there's
+ *  no reliable headed/headless signal, so we don't gate on one), then, on a TTY,
+ *  shows an [open]/[copy]/[wait] choice WITHOUT the caller awaiting it, so polling
+ *  proceeds regardless of whether the user ever answers. Returns the cancelable
+ *  prompt (or undefined off-TTY) so the caller can close it once approval lands. */
+function offerApprovalOpen(url: string): { cancel: () => void } | undefined {
+  openInBrowser(url); // opportunistic; silently no-ops on a headless box
+  if (!isInteractive()) return undefined;
+  return cancelableSelect<"open" | "copy" | "wait">(
+    {
+      message: "Open the approval page?",
+      choices: [
+        { name: "Open in browser", value: "open", description: "launch the URL above in your default browser" },
+        { name: "Copy URL to clipboard", value: "copy", description: "paste into a browser on another device (e.g. over SSH)" },
+        { name: "I'll approve it another way", value: "wait", description: "keep waiting — approve from any browser or another terminal" },
+      ],
+    },
+    (choice) => {
+      if (choice === "open") {
+        if (!openInBrowser(url)) console.log(`Open this URL to approve:\n    ${url}`);
+      } else if (choice === "copy") {
+        console.log(copyToClipboard(url) ? "URL copied to clipboard." : `Copy this URL to approve:\n    ${url}`);
+      }
+    }
+  );
 }
 
 export async function logout(): Promise<void> {

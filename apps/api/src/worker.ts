@@ -194,9 +194,14 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   // DEFAULT-DENY token-kind route gate (design 21 §1.1): a short-lived browser
   // `web` session may touch ONLY the exact-match allowlist below. Everything else —
-  // crucially the credential-mint routes (`pair/create`, `device/approve`,
-  // `POST /v1/workspaces`) and all crypto/sync surfaces — is 403, so a web token
-  // can never escalate into a durable credential and bypass the E2EE ceiling.
+  // crucially the credential-mint routes (`pair/create`, `POST /v1/workspaces`) and
+  // all crypto/sync surfaces — is 403, so a web token can never escalate into a
+  // durable credential and bypass the E2EE ceiling. `device/approve` is a DELIBERATE
+  // exception (design 47, allowlisted below): it doesn't mint a durable credential
+  // for the *approving* web session, it only lets that session authorize a PENDING
+  // device-code request onto its own account — the exact same
+  // authorized-but-not-E2EE-enrolled grant `rbox device approve` (a durable token)
+  // already produces today, so it isn't a new escalation.
   if (p.kind === "web" && !webTokenAllowed(req.method, seg)) {
     return jsonResponse({ error: "forbidden", message: "web session not permitted on this route" }, 403);
   }
@@ -285,6 +290,14 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   // design 37: a web OWNER session may delete the account; deleteAccount() re-checks the
   // owner role + confirmation. A non-owner web session is rejected there, not here.
   if (method === "DELETE" && eq(seg, ["v1", "account"])) return true;
+  // design 47: a web session may approve a PENDING device-code request for its OWN
+  // account — this is not a new privilege. approveDeviceAuth only ever reads
+  // approver.accountId/userId and grants exactly the authorized-but-NOT-E2EE-enrolled
+  // state that `rbox device approve` (a durable CLI token) already grants today; it
+  // cannot mint E2EE admission material (§1's ceiling is unaffected). This is what
+  // lets `rbox login`'s device-code flow be approved from a browser instead of a
+  // second terminal.
+  if (method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return true;
   return false;
 }
 

@@ -726,16 +726,77 @@ describe("worker integration (real DO + D1 + R2)", () => {
   test("kind-gate: a web session is 403 on credential-mint + crypto/sync routes", async () => {
     const wt = await webToken("user_gate_block");
     // Credential-mint escalation routes (the ones that would let web act durably).
+    // NOTE: device/approve is deliberately NOT here — design 47 allowlists it (a web
+    // session may approve a pending device-code request onto its own account without
+    // that being a durable-credential escalation for the APPROVER); see the dedicated
+    // "web session CAN approve a device-code login" test below.
     expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(wt) })).status).toBe(403);
-    expect(
-      (await SELF.fetch(`${BASE}/v1/auth/device/approve`, { method: "POST", headers: authed(wt, { "content-type": "application/json" }), body: JSON.stringify({ userCode: "AAAA-AAAA" }) })).status
-    ).toBe(403);
     expect((await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(wt) })).status).toBe(403);
     // E2EE key storage + blob mutate/check.
     expect((await SELF.fetch(`${BASE}/v1/keys/account`, { headers: authed(wt) })).status).toBe(403);
     const s = sha("web-cannot-write");
     expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(wt, { "content-length": "16" }), body: "web-cannot-write" })).status).toBe(403);
     expect((await SELF.fetch(`${BASE}/v1/blobs/check`, { method: "POST", headers: authed(wt, { "content-type": "application/json" }), body: JSON.stringify({ shas: [s] }) })).status).toBe(403);
+  });
+
+  // ── design 47: browser-approved device-code login ─────────────────────────
+  test("web session CAN approve a device-code login (design 47) — same grant a durable approver produces", async () => {
+    const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label: "mac-mini.local" }),
+    });
+    expect(start.status).toBe(200);
+    const { deviceCode, userCode } = (await start.json()) as { deviceCode: string; userCode: string };
+
+    // Public lookup — the web confirm page's only way to know what it's approving.
+    const lookupPending = await SELF.fetch(`${BASE}/v1/auth/device/lookup?code=${userCode}`);
+    expect(lookupPending.status).toBe(200);
+    expect((await lookupPending.json()) as { label: string | null; status: string }).toMatchObject({ label: "mac-mini.local", status: "pending" });
+
+    // Approve via a WEB session (this is the route this design admits).
+    const wt = await webToken("user_web_approver");
+    const approve = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+      method: "POST",
+      headers: authed(wt, { "content-type": "application/json" }),
+      body: JSON.stringify({ userCode }),
+    });
+    expect(approve.status).toBe(200);
+
+    // Lookup now reflects the new status.
+    const lookupApproved = await SELF.fetch(`${BASE}/v1/auth/device/lookup?code=${userCode}`);
+    expect((await lookupApproved.json()) as { status: string }).toMatchObject({ status: "approved" });
+
+    // The CLI's poll (unchanged code path) picks it up and mints exactly the
+    // authorized-but-not-E2EE-enrolled device a durable-approver flow would.
+    const poll = await SELF.fetch(`${BASE}/v1/auth/device/poll`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deviceCode }),
+    });
+    expect(poll.status).toBe(200);
+    const polled = (await poll.json()) as { status: string; token?: string; deviceId?: string };
+    expect(polled.status).toBe("approved");
+    expect(polled.token).toBeTruthy();
+
+    // The minted token is a real durable device token, scoped to the web
+    // approver's account — e.g. it can list devices (an authed-only route).
+    const list = await SELF.fetch(`${BASE}/v1/auth/devices`, { headers: authed(polled.token!) });
+    expect(list.status).toBe(200);
+  });
+
+  test("device/lookup: unknown code -> 404, never leaks account/user ids", async () => {
+    const res = await SELF.fetch(`${BASE}/v1/auth/device/lookup?code=ZZZZ-ZZZZ`);
+    expect(res.status).toBe(404);
+  });
+
+  test("device/lookup: expired code -> 404", async () => {
+    const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+    const { userCode } = (await start.json()) as { userCode: string };
+    // Force it into the past directly — this test doesn't need to wait out the real 10-minute TTL.
+    await env.rbox_dev_db.prepare("UPDATE device_auth SET expires_at = ? WHERE user_code = ?").bind(Date.now() - 1000, userCode).run();
+    const res = await SELF.fetch(`${BASE}/v1/auth/device/lookup?code=${userCode}`);
+    expect(res.status).toBe(404);
   });
 
   test("kind-gate is DEFAULT-DENY: a web token is 403 on an unlisted route, not just named crypto ones", async () => {
