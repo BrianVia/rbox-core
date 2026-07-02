@@ -1,5 +1,14 @@
 # Lessons
 
+## 2026-07-02 — design 50 (trash tier) CI
+
+- **`process.exitCode = undefined` is a NO-OP in Bun** — the process still
+  exits with the previously-set code. A test that intentionally exercises an
+  exit-1 path must reset with `process.exitCode = 0`, or the whole suite
+  reports "516 pass / 0 fail" and STILL exits 1 (CI red, zero diagnostics —
+  the evil twin of the tail-pipe lesson). Verify with
+  `bun -e 'process.exitCode=1; process.exitCode=undefined;'; echo $?`.
+
 ## 2026-07-02 — design 49 (daemon IO priority / concurrent releases)
 
 - **Check origin tags before picking a release number.** Another agent shipped
