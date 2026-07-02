@@ -18,10 +18,23 @@ hogs, rbox already CPU-niced — this ships the earmarked IO half + scan backoff
       the suite)
 - [x] full suite green in worktree (459 pass; watcher.test.ts self-skipped: FSEvents
       probe fails under current machine load — env, runs on CI inotify)
-- [ ] self-found hole to fix: watcher error AFTER init leaves watcherLive true →
+- [x] self-found hole to fix: watcher error AFTER init leaves watcherLive true →
       backoff stretches the only healer to 5m; thread onError → pin 60s floor
-- [ ] codex adversarial rounds → PASS
+- [x] codex adversarial rounds → PASS (3 rounds)
 - [ ] PR → merge → v0.6.5 → upgrade both machines
+
+## Review
+
+3 codex rounds → PASS; 460 tests green; constants/arity verified against SDK
+headers + kernel sources by codex R1. Findings fixed en route: R1 M1 churn
+didn't re-arm an armed backed-off timer → noteChurn; R1 M2 post-init watcher
+death trusted forever → WatchOptions.onError (parcel+chokidar) flips
+watcherHealthy permanently; R1 M3 linux ioprio_set who=0 set only the calling
+thread, missing Bun's pre-spawned IO workers → iterate /proc/self/task (+
+verifyIoPriority reads back every tid); R1 MINOR darwin-arm64/linux-arm64 FFI
+untested by any gate → IOPRIO_SELFTEST leg in __watcher-selftest (exit 4),
+runs natively on all 3 release targets; R2 onError didn't pull the ARMED
+timer forward → shared pinSafetyFloor() (no-op at floor, stop-guarded).
 
 ---
 
