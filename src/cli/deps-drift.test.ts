@@ -1,4 +1,4 @@
-// NOTE (design 50): `deps-drift.ts` is only PARTLY dormant. `nudgeForWrittenPaths`
+// NOTE (design 51): `deps-drift.ts` is only PARTLY dormant. `nudgeForWrittenPaths`
 // / `renderNotices` stay live via the automatic post-sync drift nudge
 // (`postSyncNudge` in index.ts, unaffected by the `deps` group being disabled).
 // `driftCmd` (and `rbox deps drift` itself) is unreachable until `deps` is

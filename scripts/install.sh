@@ -52,7 +52,7 @@ echo "  (verify integrity via the signed manifest: $BASE/version — rbox upgrad
 echo ""
 
 # Optional: dependency-change notifications (design 29) — commented out
-# (design 50): `rbox deps notify install` runs through the `deps` CLI group,
+# (design 51): `rbox deps notify install` runs through the `deps` CLI group,
 # which is currently disabled (src/cli/index.ts). Offering this now would
 # either silently fail or install a hook that always fails. Re-enable together
 # with `deps` itself.

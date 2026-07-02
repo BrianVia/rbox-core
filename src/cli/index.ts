@@ -65,14 +65,14 @@ async function fetchRemoteSequence(
   }
 }
 
-// `rbox deps <sub>` group dispatch — commented out (design 50): the whole `deps`
+// `rbox deps <sub>` group dispatch — commented out (design 51): the whole `deps`
 // CLI surface (install/list/check/drift/notify, plus the hydrate/detect/doctor
 // aliases in deprecations.ts and their entries in help-registry.ts) is disabled
 // for now. The underlying implementations (hydrate-cmd.ts, deps-drift.ts,
 // deps-notify.ts) are untouched, so re-enabling is: uncomment this function +
 // its `case "deps"` below + the registry/alias entries. `postSyncNudge` below is
 // UNAFFECTED — it's the automatic post-sync drift notice, not a `deps` command,
-// and is the future home of design 50's `notifyOfDepsChange` project setting.
+// and is the future home of design 51's `notifyOfDepsChange` project setting.
 //
 // async function runDeps(positional: string[], flags: Record<string, string>): Promise<void> {
 //   const sub = positional[0];
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
       });
       break;
     }
-    // case "deps": disabled (design 50) — see runDeps above. Falls through to
+    // case "deps": disabled (design 51) — see runDeps above. Falls through to
     // `default:`, which prints the grouped help and exits 1 (unknown command),
     // same as any other command the dispatcher doesn't recognize.
     case "login": {

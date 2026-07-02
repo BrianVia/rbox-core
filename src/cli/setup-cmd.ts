@@ -82,7 +82,7 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
   }
 
   // Opt-in dependency-change notifications (drift surface 1) — commented out
-  // (design 50): the shell hook this installs runs `rbox deps drift --quiet`,
+  // (design 51): the shell hook this installs runs `rbox deps drift --quiet`,
   // and the whole `deps` CLI group is currently disabled (index.ts). Prompting
   // for and silently installing a hook that always fails is worse than not
   // asking. Re-enable together with `deps` itself.

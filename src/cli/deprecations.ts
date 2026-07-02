@@ -3,7 +3,7 @@
  * a hidden alias for one deprecation window (until v0.3): the alias does the exact
  * same work, then prints a one-line notice to STDERR — never stdout, so a piped
  * `rbox link | …` is byte-for-byte unaffected. (`detect` was this kind of alias too,
- * before `deps` — and `detect` with it — was commented out; design 50.)
+ * before `deps` — and `detect` with it — was commented out; design 51.)
  *
  * Every alias is the SAME operation: rewrite `(cmd, positional)` into the canonical
  * `(cmd, positional)` and emit a notice. Resolving that in ONE pass before the
@@ -25,7 +25,7 @@ export interface ResolvedAlias {
  *  a group path ("deps install") — the subcommand is prepended to the positionals. */
 const SIMPLE_ALIASES: Record<string, string> = {
   link: "track",
-  // hydrate/detect/doctor commented out along with `deps` itself (design 50) —
+  // hydrate/detect/doctor commented out along with `deps` itself (design 51) —
   // their forward target (the `deps` group) is currently disabled in index.ts.
   // hydrate: "deps install",
   // detect: "deps list",

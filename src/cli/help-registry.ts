@@ -153,7 +153,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
 
   // ── DEPENDENCIES ─────────────────────────────────────────────────────────
-  // The whole `deps` group is commented out (design 50) — dispatcher wiring is
+  // The whole `deps` group is commented out (design 51) — dispatcher wiring is
   // disabled in index.ts (see the note above `runDeps`). Uncomment here + there
   // + the three aliases below (in "hidden: deprecated aliases") to re-enable.
   // {
@@ -292,7 +292,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   // ── hidden: deprecated aliases (warn on stderr; removed at v0.3) ──────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
   { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
-  // hydrate/detect/doctor aliases commented out along with `deps` itself (design 50)
+  // hydrate/detect/doctor aliases commented out along with `deps` itself (design 51)
   // — their forward target no longer exists, so keeping them would dangle.
   // { name: "hydrate", group: "DEPENDENCIES", summary: "deprecated → rbox deps install", usage: "rbox hydrate [path]", hidden: true, alias: "deps install" },
   // { name: "detect", group: "DEPENDENCIES", summary: "deprecated → rbox deps list", usage: "rbox detect [path]", hidden: true, alias: "deps list" },

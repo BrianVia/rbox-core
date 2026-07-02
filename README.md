@@ -6,7 +6,7 @@ Built as a **SaaS** on Cloudflare (Workers + D1 + R2 + Durable Objects), with a 
 
 ## Why it's different from Dropbox/Syncthing
 
-- **It doesn't sync `node_modules`.** It syncs the lockfile and rebuilds dependencies locally (`rbox deps install`, temporarily disabled — design 50) — no OS-specific binaries over the wire, no multi-GB transfers, no conflicts in regenerable trees.
+- **It doesn't sync `node_modules`.** It syncs the lockfile and rebuilds dependencies locally (`rbox deps install`, temporarily disabled — design 51) — no OS-specific binaries over the wire, no multi-GB transfers, no conflicts in regenerable trees.
 - **It syncs uncommitted git state safely.** Index, HEAD, stashes, and rebase state ride along via `git bundle` (never a torn copy of a live `.git`).
 - **Secrets never leave by default.** `.env`, `*.pem`, keys are ignored; opt-in secret sync is E2EE-only (arrives with full-manifest encryption).
 - **It's daemon-friendly.** The watcher debounces and prunes ignored dirs, so an `npm ci` or a giant clone never pegs your machine.
@@ -24,7 +24,7 @@ All milestones (M1–M9) are implemented, codex-reviewed, and verified live agai
 | **Multi-tenancy** | account isolation, blob entitlement, cross-account 404, audit log |
 | **Billing** | plan-gated storage/workspace quotas, atomic usage accounting (Stripe pending keys) |
 | **Onboarding** | `rbox init` guided wizard (zero-dep), fully scriptable for CI |
-| **Hydration** | `rbox deps install/list/check` — reconstruct deps from lockfiles (CLI surface temporarily disabled, design 50) |
+| **Hydration** | `rbox deps install/list/check` — reconstruct deps from lockfiles (CLI surface temporarily disabled, design 51) |
 | **Hardening** | client conflict-retry tests, cold-scan tuned (50k files in ~2.4s), Miniflare worker tests |
 
 **Pending human setup:** Stripe keys + price IDs (billing), `rbox.to` nameservers → Cloudflare, and the IdP decision (Cloudflare Zero Trust/Access + BetterAuth vs Clerk).
@@ -53,7 +53,7 @@ rbox start
 rbox status                      # workspace state + sync metrics
 
 # Dependency rebuild (`rbox deps ...` / `doctor` / `hydrate`) is temporarily
-# disabled — see design 50 (docs/design/50-rbox-yml-config.md).
+# disabled — see design 51 (docs/design/51-rbox-yml-config.md).
 ```
 
 Everything interactive has a `--no-interactive` flag-driven path (CI/Docker never depends on a TTY). `NO_COLOR` / `FORCE_COLOR` honored.

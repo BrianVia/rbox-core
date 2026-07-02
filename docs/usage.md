@@ -100,7 +100,7 @@ applying what could be a corrupted or mistaken remote state.
 > respectively) and print a warning — they're slated for removal at v0.3
 > (design 29). Use the names above in new scripts. `hydrate`/`detect`/`doctor`
 > used to alias `deps install`/`list`/`check` the same way, but the whole `deps`
-> group is currently commented out of the CLI (design 50, §7 below) — those
+> group is currently commented out of the CLI (design 51, §7 below) — those
 > three are unknown commands for now, not just deprecated ones.
 
 ## 5. `.rboxignore` — shared, cross-machine ignore rules
@@ -138,7 +138,7 @@ effective ignore rules with no separate distribution mechanism.
 
 **Planned, not yet shipped:** an interactive/flag-driven option to scaffold
 `.rboxignore` at `rbox init` time instead of waiting for the first `rbox
-ignore` call — see [design 50](./design/50-rbox-yml-config.md) §4.
+ignore` call — see [design 51](./design/51-rbox-yml-config.md) §4.
 
 ## 6. `rbox.yml` — does not exist yet
 
@@ -151,7 +151,7 @@ shipped — ignore rules live in `.rboxignore` (§5) instead, and hydration
 project-defined shell commands (design 08 — untrusted recipe commands are a
 `rm -rf ~` risk sitting in a synced file everyone's daemon reads).
 
-A scoped revival is proposed in [design 50](./design/50-rbox-yml-config.md),
+A scoped revival is proposed in [design 51](./design/51-rbox-yml-config.md),
 not yet implemented: a synced `name:` (fixes headless joins not picking up a
 workspace's display name) plus `syncGit`/`notifyOfDepsChange` as project-level
 *defaults* that an individual device can still override locally. It still
@@ -189,7 +189,7 @@ described in §6.
 **`rbox deps notify <install|uninstall|status|on|off>`** — the old imperative
 shell-hook toggle command — is *not* coming back in that form. Its job (turn
 the post-sync drift nudge on/off) is being replaced by a declarative config
-field instead: `notifyOfDepsChange` in [design 50](./design/50-rbox-yml-config.md)
+field instead: `notifyOfDepsChange` in [design 51](./design/51-rbox-yml-config.md)
 §3, synced via `rbox.yml` once that exists, same idea as `syncGit` there. The
 automatic post-sync nudge itself (the one-line notice printed after a
 `push`/`pull`/`sync` that wrote a changed lockfile) is unaffected by any of

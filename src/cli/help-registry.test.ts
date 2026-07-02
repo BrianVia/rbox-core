@@ -13,7 +13,7 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track![0]!.usage).toContain("rbox track");
 });
 
-test("per-command help: the deps group is currently empty (commented out, design 50)", () => {
+test("per-command help: the deps group is currently empty (commented out, design 51)", () => {
   // Was "returns all its subcommands" while `deps` was live; the whole group is
   // disabled for now (index.ts, help-registry.ts), so there's nothing to return.
   expect(helpFor("deps")).toBeUndefined();
@@ -60,13 +60,13 @@ test("the registry's alias targets agree with the deprecations resolver (no drif
 
 test("grouped screen renders every public group and omits hidden commands", () => {
   const screen = renderGroupedHelp();
-  // DEPENDENCIES omitted: the whole `deps` group is commented out (design 50),
+  // DEPENDENCIES omitted: the whole `deps` group is commented out (design 51),
   // so that group has zero entries and renderGroupedHelp skips its header.
   for (const g of ["GETTING STARTED", "SYNCING", "DEVICES & ACCOUNT", "BILLING & MAINTENANCE"]) {
     expect(screen).toContain(g);
   }
   expect(screen).not.toContain("DEPENDENCIES");
   expect(screen).toContain("setup");
-  expect(screen).not.toContain("hydrate"); // disabled alongside `deps` (design 50)
+  expect(screen).not.toContain("hydrate"); // disabled alongside `deps` (design 51)
   expect(screen).not.toMatch(/^\s*init\s/m); // init is hidden from the main screen
 });

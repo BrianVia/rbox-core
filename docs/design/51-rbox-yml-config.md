@@ -1,4 +1,4 @@
-# Design 50 — `rbox.yml` (synced project config) + optional `.rboxignore` at init
+# Design 51 — `rbox.yml` (synced project config) + optional `.rboxignore` at init
 
 **Status:** draft (not scheduled).
 **Depends on:** design 03b (`.rboxignore`, shipped), design 08 (hydration trust boundary, shipped), design 07c (init wizard / `resolveInitPlan`, shipped).
@@ -77,7 +77,7 @@ which any one device can still override locally. It is:
   keeps this from reopening design 08 (see the `deps` section below).
 
 ```yaml
-# rbox.yml — synced project config (design 50). Safe to hand-edit and commit.
+# rbox.yml — synced project config (design 51). Safe to hand-edit and commit.
 schema: rbox.yml/v1
 
 name: my-project

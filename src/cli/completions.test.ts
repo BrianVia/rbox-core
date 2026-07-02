@@ -19,7 +19,7 @@ test("script contains every public top-level command as a completion entry", () 
 
 // "multi-word names surface as subcommands with descriptions" is commented out:
 // its only live example was "deps install" under the "deps" group, and the whole
-// `deps` group is currently disabled (design 50, index.ts/help-registry.ts).
+// `deps` group is currently disabled (design 51, index.ts/help-registry.ts).
 // Reinstate once `deps` (or another multi-word command) returns:
 //
 // test("multi-word names surface as subcommands with descriptions", () => {
