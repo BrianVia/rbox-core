@@ -107,6 +107,27 @@ export function healthLine(s: StatusSnapshot): string {
   return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
 }
 
+/** Human byte size: `847 B` / `12.3 KB` / `312.4 MB` / `1.4 GB` (decimal units, one
+ *  decimal place above bytes). Pure — the status trash line and any future size surface
+ *  share one formatting rule. */
+export function humanBytes(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = Math.max(0, bytes);
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) {
+    v /= 1000;
+    i++;
+  }
+  return i === 0 ? `${Math.round(v)} B` : `${v.toFixed(1)} ${units[i]}`;
+}
+
+/** The `rbox status` trash line (design 50 §2), or undefined when trash is empty — the
+ *  caller passes {@link TrashStats}-shaped data so this stays a pure view. */
+export function trashLine(stats: { files: number; bytes: number } | undefined): string | undefined {
+  if (!stats || stats.files <= 0) return undefined;
+  return `${style.dim("trash:")} ${n(stats.files)} file${stats.files === 1 ? "" : "s"} (${humanBytes(stats.bytes)}) ${style.dim("— rbox trash list")}`;
+}
+
 /** Human trail of what background sync last did (from the activity sidecar), most
  *  recent first. TWO slots on purpose (codex R2): a commit right after a
  *  409-recovery pull must not mask the local-tree mutations that pull applied.

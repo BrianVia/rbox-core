@@ -11,7 +11,8 @@ import {
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { pruneTrash } from "../engine/trash.js";
 import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -356,6 +357,7 @@ export class RboxDaemon {
   }
 
   private async doPush(): Promise<void> {
+    this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
       this.pendingEvents = [];
@@ -382,6 +384,7 @@ export class RboxDaemon {
       onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
       onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
       onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
+      onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
@@ -443,6 +446,7 @@ export class RboxDaemon {
   }
 
   private async doPull(): Promise<void> {
+    this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
@@ -455,6 +459,7 @@ export class RboxDaemon {
       onGitLog: log,
       onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45
       onPullApplied: (a) => this.recordPullApplied(a),
+      onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
     });
     report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
@@ -519,6 +524,21 @@ export class RboxDaemon {
       .then(() => saveShellLine(this.root, line));
   }
 
+  /** Type-flip evictions seen since the last recorded pull (design 50 §3, review M2).
+   *  onTypeFlip fires DURING applyActions (before the pull's onPullApplied), so it
+   *  accumulates here and recordPullApplied folds it into `lastPull.conflicts` and resets. */
+  private typeFlipsSincePull = 0;
+
+  /** A pull moved an obstructing local directory to trash so an incoming file/symlink
+   *  could land (the EISDIR-flip heal). Forensic log line + folded into the conflict
+   *  count so `rbox status`'s last-pull trail surfaces it. */
+  private noteTypeFlip(relPath: string): void {
+    // Fires for BOTH eviction shapes: an obstructing directory (→ trash) and an
+    // obstructing ancestor file (→ visible conflict copy) — word it generically.
+    log(`pull type-flip conflict: ${cleanPath(relPath)} — local obstruction moved aside (see rbox trash / conflict copies)`);
+    this.typeFlipsSincePull++;
+  }
+
   /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
    *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
    *  is the record that answers "did sync change/delete my files?" after the fact. */
@@ -532,7 +552,10 @@ export class RboxDaemon {
       else if (a.kind === "delete") deletes++;
       else conflicts++;
     }
-    this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts };
+    // Type-flip evictions are conflicts too (a local dir was moved aside), but they arrive
+    // out-of-band via onTypeFlip rather than as `conflict` actions — fold + reset the tally.
+    this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts: conflicts + this.typeFlipsSincePull };
+    this.typeFlipsSincePull = 0;
     this.activityDirty = true;
   }
 
@@ -556,6 +579,14 @@ export class RboxDaemon {
     const fresh = new HashCache();
     this.manifest = await scanManifest(this.root, this.matcher, fresh);
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
+    // Trash retention (design 50 §2): the daemon owns pruning, on the infrequent deep tick
+    // ONLY — never the sync hot path. Fire-and-forget: a prune failure must never surface as
+    // a pump error. `.active`/young-batch protection (B3) lives in pruneTrash itself.
+    void pruneTrash(this.root, trashConfig(this.cfg))
+      .then((r) => {
+        if (r.removedBatches) log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
+      })
+      .catch(() => {});
   }
 
   /**

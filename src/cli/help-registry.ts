@@ -120,7 +120,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "push",
     group: "SYNCING",
     summary: "upload local changes",
-    usage: "rbox push [path]",
+    usage: "rbox push [path] [--allow-mass-delete]",
+    flags: [{ flag: "--allow-mass-delete", desc: "consent to publishing a delete of half or more of the tracked files" }],
   },
   {
     name: "pull",
@@ -150,6 +151,25 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "manage .rboxignore",
     usage: "rbox ignore <glob> | --list",
     flags: [{ flag: "--list", desc: "print the effective ignore rules" }],
+  },
+  {
+    name: "trash list",
+    group: "SYNCING",
+    summary: "list files rbox moved to the local trash",
+    usage: "rbox trash list",
+  },
+  {
+    name: "trash restore",
+    group: "SYNCING",
+    summary: "restore a trashed file back into the workspace",
+    usage: "rbox trash restore <path> [--batch <name>]",
+    flags: [{ flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)" }],
+  },
+  {
+    name: "trash empty",
+    group: "SYNCING",
+    summary: "permanently delete trashed files (frees disk)",
+    usage: "rbox trash empty",
   },
 
   // ── DEPENDENCIES ─────────────────────────────────────────────────────────

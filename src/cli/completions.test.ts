@@ -41,12 +41,16 @@ test("known flags are completed from registry metadata", () => {
 test("no hidden or internal tokens leak into the script", () => {
   const script = zshCompletions();
   expect(script).not.toContain("__daemon-run");
-  // Every hidden / deprecated-alias command must be absent as a completion value.
+  // Scope the leak check to the TOP-LEVEL command list. A hidden top-level command
+  // (e.g. the version-history `restore`) can legitimately share a token with a PUBLIC
+  // subcommand leaf (`trash restore`), which appears as a nested `_describe` value —
+  // that nested value is not a leak, so only the top-level array is asserted here.
+  const topBlock = script.slice(script.indexOf("_rbox_cmds=("), script.indexOf("_arguments -C"));
   const suppressed = COMMAND_HELP.filter((c) => c.hidden || c.alias);
   for (const c of suppressed) {
     const head = firstWord(c.name);
     if (publicHeads.includes(head)) continue; // head is also a public group (none today)
-    expect(script, `hidden/alias token '${head}' leaked`).not.toContain(`'${head}:`);
+    expect(topBlock, `hidden/alias token '${head}' leaked`).not.toContain(`'${head}:`);
   }
 });
 

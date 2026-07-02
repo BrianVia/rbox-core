@@ -1,7 +1,7 @@
 import path from "node:path";
 import { buildIgnoreMatcher, diffManifests, scanManifest, type Action } from "../engine/index.js";
 import { loadActivity } from "./activity.js";
-import { healthLine, lastSyncLines, progressLabel } from "./status-view.js";
+import { healthLine, lastSyncLines, progressLabel, trashLine } from "./status-view.js";
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
@@ -267,6 +267,9 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
+        // Push-side consent (design 50 §4, review B2): op-scoped — NEVER the pull-side
+        // `allowMassDelete`, which the 409-recovery pull inside pushManifest would inherit.
+        deps.allowMassDeletePush = flags["allow-mass-delete"] === "true";
         const report = beginReport("push");
         deps.report = report;
         const { sequence: seq, committed } = await push(root, cfg, deps);
@@ -351,10 +354,12 @@ async function main(): Promise<void> {
       // The daemon's activity sidecar, the remote-head probe, and the git-divergence
       // walk are independent best-effort reads — concurrent so status stays snappy.
       const { gitDivergenceCount } = await import("./sync-git.js");
-      const [activity, remoteSequence, gitChanged] = await Promise.all([
+      const { trashStats } = await import("../engine/trash.js");
+      const [activity, remoteSequence, gitChanged, trash] = await Promise.all([
         daemonStale ? Promise.resolve(undefined) : loadActivity(root),
         fetchRemoteSequence(cfg, creds),
         gitDivergenceCount(root, cfg, state, matcher).catch(() => 0),
+        trashStats(root).catch(() => undefined),
       ]);
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id
@@ -414,6 +419,9 @@ async function main(): Promise<void> {
           `  ${style.dim("sync metrics:")} ${m.syncs} syncs, ${conf ? style.yellow(`${m.commitConflicts409} commit-409 / ${m.fileConflicts} file-conflict`) : style.green("0 conflicts")}${m.lastConflictAt ? style.dim(` (last ${m.lastConflictAt})`) : ""}`
         );
       }
+      // Local recoverable-delete tier (design 50 §2): one line only when trash holds bytes.
+      const trashStatus = trashLine(trash);
+      if (trashStatus) console.log(`  ${trashStatus}`);
       // Internals demoted to one dim detail line (design 45): essential for forensics
       // (the 2026-07-01 incident was reconstructed from exactly these), noise as a headline.
       console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${local.files.length.toLocaleString("en-US")} files on disk`)}`);
@@ -444,6 +452,13 @@ async function main(): Promise<void> {
       const root = await resolveRoot(flags.path);
       if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
       else await addIgnorePattern(root, positional[0]!);
+      break;
+    }
+    case "trash": {
+      // Local trash tier (design 50 §2): list | restore <path> [--batch <name>] | empty.
+      const root = await resolveRoot(flags.path);
+      const { trashCmd } = await import("./trash-cmd.js");
+      await trashCmd(root, positional, flags);
       break;
     }
     case "connect": {

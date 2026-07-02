@@ -57,14 +57,64 @@ export async function applyWatchEvents(
     if (rel.length === 0) continue;
 
     if (ev.kind === "unlink") {
-      map.delete(rel);
-      cache?.invalidate(rel);
+      // A stale unlink can never delete an entry whose path is still present on
+      // disk (design 50 B1): a pull-side eviction+rewrite emits an unlink for the
+      // original path that may land after the rewrite. Re-derive truth from disk —
+      // only a genuinely-absent path drops the entry.
+      if (matcher.ignores(rel)) {
+        map.delete(rel);
+        cache?.invalidate(rel);
+        continue;
+      }
+      const res = await statHashEntry(root, rel, cache);
+      if (res.kind === "entry") map.set(rel, res.entry);
+      else if (res.kind === "midwrite") deferred?.add(rel); // present but churning — not a delete
+      else {
+        map.delete(rel);
+        cache?.invalidate(rel);
+      }
     } else if (ev.kind === "unlinkDir") {
+      // Same invariant for a directory unlink: whatever occupies the path NOW is
+      // the truth. Three disk states, three answers:
+      //  - still a dir → AUTHORITATIVE subtree rescan: fresh children upsert AND
+      //    vanished `dir/**` entries drop (the walk is the whole truth for the
+      //    subtree, not a merge);
+      //  - now a file/symlink (a type flip — the pull-eviction echo, design 50 B1)
+      //    → `dir/**` children are impossible under a file, drop them; the path
+      //    itself re-derives from disk exactly like a stale `unlink`;
+      //  - genuinely gone → drop the exact path + `dir/**` prefix.
       const prefix = `${rel}/`;
-      for (const k of [...map.keys()]) {
-        if (k === rel || k.startsWith(prefix)) {
-          map.delete(k);
-          cache?.invalidate(k);
+      const st = await fs.lstat(path.join(root, rel)).catch(() => undefined);
+      if (st?.isDirectory()) {
+        if (matcher.ignores(`${rel}/`)) continue;
+        const sub: FileEntry[] = [];
+        await walk(root, rel, matcher, sub, cache);
+        const fresh = new Set(sub.map((e) => e.path));
+        for (const k of [...map.keys()]) {
+          if ((k === rel || k.startsWith(prefix)) && !fresh.has(k)) {
+            map.delete(k);
+            cache?.invalidate(k);
+          }
+        }
+        for (const e of sub) map.set(e.path, e);
+      } else {
+        for (const k of [...map.keys()]) {
+          if (k.startsWith(prefix)) {
+            map.delete(k);
+            cache?.invalidate(k);
+          }
+        }
+        if (st && !matcher.ignores(rel)) {
+          const res = await statHashEntry(root, rel, cache);
+          if (res.kind === "entry") map.set(rel, res.entry);
+          else if (res.kind === "midwrite") deferred?.add(rel);
+          else {
+            map.delete(rel);
+            cache?.invalidate(rel);
+          }
+        } else {
+          map.delete(rel);
+          cache?.invalidate(rel);
         }
       }
     } else if (ev.kind === "addDir") {

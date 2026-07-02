@@ -1,6 +1,7 @@
 # 50 — Destructive-apply safety: type-flip conflicts + the local trash tier
 
-Status: draft (spec only — codex design review pending)
+Status: implemented — design review round 1 (3 BLOCKER + 4 MAJOR + 1 MINOR → §7)
++ 4 implementation review rounds → PASS. See tasks/todo.md for the full log.
 Origin: two 2026-07-02 events. (1) flat-meadow's pulls halted for ~5 hours on
 EISDIR: the Mac had a Conductor *symlink* (`savvy-core/pr-5-plat-1282-snapshot-list`
 → `amarillo-v1`) where flat-meadow had a materialized *directory* — the pull
@@ -137,3 +138,43 @@ syncing trash between machines (explicitly never).
   as `push`; consent flag applies once.
 - Live validation: reproduce the Conductor symlink-over-directory flip on a
   second device and watch the pull heal instead of halt.
+
+## 7. Design-review resolutions (codex round 1 → v2)
+
+- **B1 — eviction echo (BLOCKER).** A pull-side dir eviction + write at the
+  same path emits watcher events for the ORIGINAL path; if the coalesced
+  `unlinkDir` lands in a later batch than the write, the manifest patch
+  deletes the freshly pulled entry and the next push propagates that
+  deletion. Fix at the root: **`applyWatchEvents` verifies unlink events
+  against disk** — an unlink for a path that still exists (lstat) is treated
+  as add/change (the engine's own motto: re-derive truth from disk). Kills
+  the entire stale-unlink class, not just eviction echoes.
+- **B2 — consent leak (BLOCKER).** Push consent must NOT ride
+  `SyncDeps.allowMassDelete`, which pushManifest's 409-recovery pull also
+  reads. New op-scoped field `allowMassDeletePush`; `rbox push
+  --allow-mass-delete` sets only it; `rbox sync --allow-mass-delete` keeps
+  its historical pull-only meaning.
+- **B3 — cross-process prune race (BLOCKER).** A one-shot `rbox pull` can be
+  mid-eviction while the daemon's deep-scan pruner enforces the size cap.
+  Protocol: each batch dir carries an **`.active` marker** from first rename
+  until the pull's apply phase completes; the pruner skips marked batches
+  (unless the marker is >24h stale — a crashed pull) and NEVER prunes any
+  batch younger than 15 minutes, cap pressure or not.
+- **M1 — ENOTDIR after eviction.** `currentEntryAt` treats ENOTDIR as
+  "absent" (a descendant delete under an evicted dir is already preserved in
+  the trash batch).
+- **M2 — surfacing.** `ApplyOptions.onTypeFlip?: (relPath) => void`;
+  `pull` threads it via SyncDeps; the daemon logs a forensic line and counts
+  it into `lastPull.conflicts`.
+- **M3 — ancestor race.** Obstructing-ancestor resolution is a serial,
+  deduped **preflight** over the whole write set (walk each entry's dirname
+  chain once) BEFORE the parallel write pool — no per-write ENOTDIR handling
+  in the hot path.
+- **M4 — restore collision.** `restoreFromTrash` never overwrites: an
+  existing target (lstat, ENOTDIR-aware — also catches case-folding FS)
+  diverts the restore to a visible `conflictName` and reports where it went.
+- **MINOR — config bounds.** Trash settings normalize on load: `days`
+  int-clamped 0–365 (default 30; 0 = classic immediate delete), `maxBytes`
+  clamped 0–1 TiB (default 2 GiB); anything invalid → defaults.
+- Eviction fallback: with trash disabled (`days: 0`) a dir eviction moves to
+  a visible `conflictName` instead (something must receive the bytes).

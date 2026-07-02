@@ -26,3 +26,29 @@ export async function writeFileAtomic(absPath: string, data: string | Uint8Array
   }
   await fs.rename(tmp, absPath);
 }
+
+/** Refuse to operate on a path whose real parent escapes the workspace — e.g. a
+ *  synced symlink `foo -> /etc` followed by a file entry `foo/passwd`. Static
+ *  manifest validation can't catch this (it's runtime FS state), so this is the
+ *  complementary runtime guard. */
+export async function assertWithinRoot(destRoot: string, abs: string): Promise<void> {
+  const rootReal = await fs.realpath(destRoot);
+  let probe = path.dirname(abs);
+  for (;;) {
+    try {
+      const real = await fs.realpath(probe);
+      if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+        throw new Error(`refusing to write outside workspace via symlinked parent: ${abs}`);
+      }
+      return;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+        const parent = path.dirname(probe);
+        if (parent === probe) return; // reached FS root without escaping
+        probe = parent;
+        continue;
+      }
+      throw e;
+    }
+  }
+}

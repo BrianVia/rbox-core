@@ -40,6 +40,33 @@ export interface WorkspaceConfig {
   encrypted?: boolean;
   /** Workspace KEK — runtime only, loaded from the keystore; NEVER persisted. */
   kek?: Buffer;
+  /** Local trash-tier retention (design 50 §2). Both fields optional; normalized
+   *  by {@link trashConfig} on read (never trusted raw). `days: 0` = classic
+   *  immediate delete (no trash, for the space-constrained). */
+  trash?: { days?: number; maxBytes?: number };
+}
+
+/** Trash retention defaults + bounds (design 50 §7 MINOR). Persisted overrides are
+ *  UNTRUSTED — a hand-edited workspace.json must never let a typo disable retention
+ *  or blow the size cap — so each field clamps to its range and any non-finite /
+ *  invalid value falls back to the default for THAT field independently. */
+const TRASH_DAYS_DEFAULT = 30;
+const TRASH_DAYS_MAX = 365;
+const TRASH_MAXBYTES_DEFAULT = 2 * 2 ** 30; // 2 GiB
+const TRASH_MAXBYTES_MAX = 2 ** 40; // 1 TiB
+
+export function trashConfig(cfg: WorkspaceConfig): { days: number; maxBytes: number } {
+  const rawDays = cfg.trash?.days;
+  const days =
+    typeof rawDays === "number" && Number.isFinite(rawDays)
+      ? Math.min(TRASH_DAYS_MAX, Math.max(0, Math.trunc(rawDays)))
+      : TRASH_DAYS_DEFAULT;
+  const rawBytes = cfg.trash?.maxBytes;
+  const maxBytes =
+    typeof rawBytes === "number" && Number.isFinite(rawBytes)
+      ? Math.min(TRASH_MAXBYTES_MAX, Math.max(0, Math.trunc(rawBytes)))
+      : TRASH_MAXBYTES_DEFAULT;
+  return { days, maxBytes };
 }
 
 /** Last point this device and the server agreed on — the reconcile base.
