@@ -118,8 +118,11 @@ interface WorkspaceRow {
  *  first host set one at create — the deliberate, consensual metadata carve-out.
  *  `lastCommitAt` is the ADDITIVE last-activity signal (epoch ms) — MAX(created_at)
  *  over the D1 commit mirror for this workspace, null when it has never synced. It
- *  disambiguates the picker's created-vs-active time; the correlated subselect rides
- *  the commits PK's `(workspace_id, project_id)` prefix (one query, no N+1). */
+ *  disambiguates the picker's created-vs-active time. Derived as the created_at of
+ *  the MAX-sequence commit — sequence is the PK suffix AND monotonic per workspace,
+ *  so the subselect is a single backward index seek per row (codex: a MAX(created_at)
+ *  aggregate would scan the workspace's whole commit history — created_at is not
+ *  indexed). One query, no N+1, no migration. */
 export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promise<Response> {
   const limit = parseLimit(url);
   const cursorRaw = url.searchParams.get("cursor");
@@ -137,7 +140,8 @@ export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promi
   const rows = await dbFor(env, p.accountId)
     .prepare(
       `SELECT w.rowid AS rid, w.workspace_id, w.project_id, w.created_at, w.name,
-        (SELECT MAX(c.created_at) FROM commits c WHERE c.workspace_id = w.workspace_id AND c.project_id = w.project_id) AS last_commit_at
+        (SELECT c.created_at FROM commits c WHERE c.workspace_id = w.workspace_id AND c.project_id = w.project_id
+          ORDER BY c.sequence DESC LIMIT 1) AS last_commit_at
        FROM workspaces w WHERE ${where} ORDER BY w.created_at ASC, w.rowid ASC LIMIT ?`
     )
     .bind(...binds)
