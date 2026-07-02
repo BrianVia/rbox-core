@@ -58,16 +58,31 @@ Daemon wiring:
 - **`active`**: written from `onProgress` (throttled to ~500ms, plus the final
   tick), cleared when the op ends. `rbox status` treats `active` older than 60s
   as stale (a crashed daemon must not show "syncing" forever).
-- **`halt`**: set in the pump's error path with the error message and repeat
-  count; cleared on the next successful op. This is the mass-delete guard's
-  indicator light, and covers persistent auth/network failures for free.
+- **`halt`**: set in the pump's error path with the error message, repeat count,
+  and the OP KIND that failed; healed only by a later success of the SAME kind
+  (codex R1 BLOCKER: "any success clears" let the queued no-op push — or any
+  60s safety scan — flap a mass-delete-guard warning off within seconds of every
+  trip). This is the guard's indicator light, and covers persistent auth/network
+  failures for free. A pull-guard trip inside push's internal 409-recovery
+  records as a push halt — sound, because that push can only succeed once its
+  internal pull does.
+- Sidecar writes are never awaited on the sync path (a slow write must not delay
+  an op — codex R1 MAJOR); they chain on one promise (ordered) and stop() drains
+  the chain so shutdown flushes the final record.
 
 The file lives under the workspace's `.rbox/state/` (already ignored by sync).
 
 ### 2. Status leads with a health verdict
 
 `rbox status` computes `diffManifests(state.lastSyncedManifest, localScan)` —
-both sides were already in hand — and renders, in priority order:
+both sides were already in hand — plus `gitDivergenceCount` (a READ-ONLY mirror
+of `planGitSections`' per-repo capture decision: pending carry, removal
+memories, needs-resolution suppression, preflight skip, the §7 shape×scope
+carry matrix — codex R1: without it a clean file tree with an unpushed local
+git commit read "in sync"). State is loaded under the CREDENTIAL'S effective
+remote (`creds.remoteUrl ?? cfg.remoteUrl`), the same rule buildAuthedRemote
+applies when sync stamps the baseline (codex R1, echoing design 44 R3). It
+renders, in priority order:
 
 ```
 ⚠ sync halted: pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard). …
