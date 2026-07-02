@@ -220,7 +220,27 @@ fi
 _rbox_chpwd
 `;
 
+// compinit-order safety (codex R3): eval'd BEFORE compinit — the common stock-.zshrc
+// ordering — `compdef` doesn't exist yet, so the completions footer's guarded
+// registration silently skipped and compinit does NOT retroactively pick up an
+// inline function. Retry at each prompt (one hash lookup) until compinit has run,
+// then self-remove. If compinit never runs, completions can't exist anyway and the
+// retry stays a ~free no-op.
+const COMPDEF_RETRY = `
+# Register completions even when this file was eval'd before compinit (see docs).
+_rbox_compdef_retry() {
+  emulate -L zsh
+  (( \$+functions[compdef] )) || return 0
+  compdef _rbox rbox 2>/dev/null
+  add-zsh-hook -d precmd _rbox_compdef_retry
+  unfunction _rbox_compdef_retry
+}
+if [[ -z \${_comps[rbox]-} ]]; then
+  add-zsh-hook precmd _rbox_compdef_retry
+fi
+`;
+
 /** The complete zsh integration script: prompt plugin + embedded completions. */
 export function shellInitZsh(): string {
-  return `${PLUGIN}\n${zshCompletions()}`;
+  return `${PLUGIN}\n${zshCompletions()}\n${COMPDEF_RETRY}`;
 }

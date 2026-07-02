@@ -226,3 +226,28 @@ test("opt-out removal never deletes a USER-owned ' $RBOX_PROMPT' placement (code
   const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
   expect(new TextDecoder().decode(res.stdout)).toContain("R:[pre $RBOX_PROMPT post]");
 });
+
+test("completions register even when eval'd BEFORE compinit (codex R3)", () => {
+  if (!ZSH) return;
+  const file = writeScript();
+  // eval → compinit later → first prompt (retry hook) → registered.
+  const before = Bun.spawnSync([
+    ZSH,
+    "-f",
+    "-c",
+    `source ${file}; autoload -Uz compinit; compinit -D; _rbox_compdef_retry; print -r -- "COMP:\${_comps[rbox]-MISSING}"`,
+  ]);
+  expect(new TextDecoder().decode(before.stdout)).toContain("COMP:_rbox");
+  // eval AFTER compinit: the inline guarded compdef registers immediately.
+  const after = Bun.spawnSync([
+    ZSH,
+    "-f",
+    "-c",
+    `autoload -Uz compinit; compinit -D; source ${file}; print -r -- "COMP:\${_comps[rbox]-MISSING}"`,
+  ]);
+  expect(new TextDecoder().decode(after.stdout)).toContain("COMP:_rbox");
+  // no compinit at all: the retry is a silent no-op at each prompt.
+  const never = Bun.spawnSync([ZSH, "-f", "-c", `source ${file}; _rbox_compdef_retry; print -r -- "OK"`]);
+  expect(new TextDecoder().decode(never.stdout)).toContain("OK");
+  expect(new TextDecoder().decode(never.stderr)).toBe("");
+});
