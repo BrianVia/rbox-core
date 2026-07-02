@@ -490,6 +490,30 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "shell-init": {
+      // design 46: print the zsh prompt integration + completions to stdout, for
+      // `eval "$(rbox shell-init zsh)"` in .zshrc. Only zsh today (bash/fish use the
+      // starship snippet in docs/shell-integration.md).
+      if (positional[0] !== "zsh") {
+        process.stderr.write("usage: rbox shell-init zsh\n");
+        process.exitCode = 1;
+        break;
+      }
+      const { shellInitZsh } = await import("./shell-init.js");
+      process.stdout.write(shellInitZsh());
+      break;
+    }
+    case "completions": {
+      // design 46: print the zsh completion script (generated from COMMAND_HELP).
+      if (positional[0] !== "zsh") {
+        process.stderr.write("usage: rbox completions zsh\n");
+        process.exitCode = 1;
+        break;
+      }
+      const { zshCompletions } = await import("./completions.js");
+      process.stdout.write(zshCompletions());
+      break;
+    }
     case "__daemon-run": {
       // Hidden: the actual in-process daemon loop (spawned detached by `start`).
       // Imported lazily so chokidar/the watcher load ONLY in the daemon process,

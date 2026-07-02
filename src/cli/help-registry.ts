@@ -256,6 +256,19 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "print the rbox version",
     usage: "rbox version",
   },
+  {
+    name: "shell-init",
+    group: "BILLING & MAINTENANCE",
+    summary: "print shell integration (prompt status + completions)",
+    usage: "rbox shell-init zsh",
+    examples: ['eval "$(rbox shell-init zsh)"'],
+  },
+  {
+    name: "completions",
+    group: "BILLING & MAINTENANCE",
+    summary: "print shell completions",
+    usage: "rbox completions zsh",
+  },
 
   // ── hidden: version-history stubs (fail-closed under E2EE, design 12 D11) ──
   {
