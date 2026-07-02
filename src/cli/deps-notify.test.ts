@@ -1,3 +1,9 @@
+// NOTE (design 50): `deps-notify.ts` is currently unreachable from the CLI —
+// `rbox deps notify`, `rbox setup`'s notify prompt, and `install.sh`'s
+// --with-dep-notify are all commented out (the whole `deps` group is
+// disabled). These tests intentionally keep exercising the module directly:
+// the implementation is untouched, only its callers are disconnected, so this
+// coverage stays meaningful for when it's re-wired.
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";

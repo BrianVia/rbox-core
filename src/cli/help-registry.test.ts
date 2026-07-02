@@ -13,21 +13,13 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track![0]!.usage).toContain("rbox track");
 });
 
-test("per-command help: a bare group token returns all its subcommands", () => {
-  const deps = helpFor("deps");
-  expect(deps!.map((c) => c.name).sort()).toEqual([
-    "deps check",
-    "deps drift",
-    "deps install",
-    "deps list",
-    "deps notify",
-  ]);
+test("per-command help: the deps group is currently empty (commented out, design 50)", () => {
+  // Was "returns all its subcommands" while `deps` was live; the whole group is
+  // disabled for now (index.ts, help-registry.ts), so there's nothing to return.
+  expect(helpFor("deps")).toBeUndefined();
 });
 
 test("helpKeyFor resolves group subcommands to the leaf, else the group", () => {
-  expect(helpKeyFor("deps", ["install"])).toBe("deps install");
-  expect(helpKeyFor("deps", [])).toBe("deps");
-  expect(helpKeyFor("deps", ["bogus"])).toBe("deps"); // unknown sub → group help
   expect(helpKeyFor("track", ["~/x"])).toBe("track"); // a path positional is not a subcommand
   expect(helpKeyFor("device", ["approve"])).toBe("device"); // device has no per-sub entry
 });
@@ -68,11 +60,13 @@ test("the registry's alias targets agree with the deprecations resolver (no drif
 
 test("grouped screen renders every public group and omits hidden commands", () => {
   const screen = renderGroupedHelp();
-  for (const g of ["GETTING STARTED", "SYNCING", "DEPENDENCIES", "DEVICES & ACCOUNT", "BILLING & MAINTENANCE"]) {
+  // DEPENDENCIES omitted: the whole `deps` group is commented out (design 50),
+  // so that group has zero entries and renderGroupedHelp skips its header.
+  for (const g of ["GETTING STARTED", "SYNCING", "DEVICES & ACCOUNT", "BILLING & MAINTENANCE"]) {
     expect(screen).toContain(g);
   }
+  expect(screen).not.toContain("DEPENDENCIES");
   expect(screen).toContain("setup");
-  expect(screen).toContain("deps drift");
-  expect(screen).not.toContain("hydrate"); // deprecated alias is hidden
+  expect(screen).not.toContain("hydrate"); // disabled alongside `deps` (design 50)
   expect(screen).not.toMatch(/^\s*init\s/m); // init is hidden from the main screen
 });

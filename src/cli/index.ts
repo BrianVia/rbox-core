@@ -65,31 +65,38 @@ async function fetchRemoteSequence(
   }
 }
 
-/** `rbox deps <sub>` group dispatch. `positional[0]` is the subcommand; the optional
- *  path is `positional[1]` (for `notify` it's the notify subcommand instead). */
-async function runDeps(positional: string[], flags: Record<string, string>): Promise<void> {
-  const sub = positional[0];
-  const pathArg = path.resolve(positional[1] ?? process.cwd());
-  if (sub === "install") {
-    const { hydrateCmd } = await import("./hydrate-cmd.js");
-    await hydrateCmd(pathArg, { allowBuild: flags["allow-build"] === "true", manager: flags.manager, only: flags.only });
-  } else if (sub === "list") {
-    const { detectCmd } = await import("./hydrate-cmd.js");
-    await detectCmd(pathArg, flags.manager);
-  } else if (sub === "check") {
-    const { doctorCmd } = await import("./hydrate-cmd.js");
-    await doctorCmd(pathArg);
-  } else if (sub === "drift") {
-    const { driftCmd } = await import("./deps-drift.js");
-    await driftCmd(pathArg, flags.quiet === "true");
-  } else if (sub === "notify") {
-    const { notifyCmd } = await import("./deps-notify.js");
-    await notifyCmd(positional[1]);
-  } else {
-    console.log("usage: rbox deps <install | list | check | drift | notify> [path]");
-    process.exitCode = 1;
-  }
-}
+// `rbox deps <sub>` group dispatch — commented out (design 50): the whole `deps`
+// CLI surface (install/list/check/drift/notify, plus the hydrate/detect/doctor
+// aliases in deprecations.ts and their entries in help-registry.ts) is disabled
+// for now. The underlying implementations (hydrate-cmd.ts, deps-drift.ts,
+// deps-notify.ts) are untouched, so re-enabling is: uncomment this function +
+// its `case "deps"` below + the registry/alias entries. `postSyncNudge` below is
+// UNAFFECTED — it's the automatic post-sync drift notice, not a `deps` command,
+// and is the future home of design 50's `notifyOfDepsChange` project setting.
+//
+// async function runDeps(positional: string[], flags: Record<string, string>): Promise<void> {
+//   const sub = positional[0];
+//   const pathArg = path.resolve(positional[1] ?? process.cwd());
+//   if (sub === "install") {
+//     const { hydrateCmd } = await import("./hydrate-cmd.js");
+//     await hydrateCmd(pathArg, { allowBuild: flags["allow-build"] === "true", manager: flags.manager, only: flags.only });
+//   } else if (sub === "list") {
+//     const { detectCmd } = await import("./hydrate-cmd.js");
+//     await detectCmd(pathArg, flags.manager);
+//   } else if (sub === "check") {
+//     const { doctorCmd } = await import("./hydrate-cmd.js");
+//     await doctorCmd(pathArg);
+//   } else if (sub === "drift") {
+//     const { driftCmd } = await import("./deps-drift.js");
+//     await driftCmd(pathArg, flags.quiet === "true");
+//   } else if (sub === "notify") {
+//     const { notifyCmd } = await import("./deps-notify.js");
+//     await notifyCmd(positional[1]);
+//   } else {
+//     console.log("usage: rbox deps <install | list | check | drift | notify> [path]");
+//     process.exitCode = 1;
+//   }
+// }
 
 /** Post-sync drift nudge: if a pull/sync wrote a changed lockfile, print the
  *  one-line drift notice (design 29). Best-effort — never breaks a sync. */
@@ -193,10 +200,9 @@ async function main(): Promise<void> {
       });
       break;
     }
-    case "deps": {
-      await runDeps(positional, flags);
-      break;
-    }
+    // case "deps": disabled (design 50) — see runDeps above. Falls through to
+    // `default:`, which prints the grouped help and exits 1 (unknown command),
+    // same as any other command the dispatcher doesn't recognize.
     case "login": {
       // `--bootstrap` MUST carry a secret. A value-less/empty flag (parsed as
       // "true") used to silently fall through to the device-approval flow and

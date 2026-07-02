@@ -17,14 +17,18 @@ test("script contains every public top-level command as a completion entry", () 
   }
 });
 
-test("multi-word names surface as subcommands with descriptions", () => {
-  const script = zshCompletions();
-  // "deps install" → subcommand "install" under the "deps" group.
-  const depsInstall = COMMAND_HELP.find((c) => c.name === "deps install");
-  expect(depsInstall).toBeDefined();
-  expect(script).toContain("_rbox_deps_cmds");
-  expect(script).toContain(`'install:${depsInstall!.summary}`);
-});
+// "multi-word names surface as subcommands with descriptions" is commented out:
+// its only live example was "deps install" under the "deps" group, and the whole
+// `deps` group is currently disabled (design 50, index.ts/help-registry.ts).
+// Reinstate once `deps` (or another multi-word command) returns:
+//
+// test("multi-word names surface as subcommands with descriptions", () => {
+//   const script = zshCompletions();
+//   const depsInstall = COMMAND_HELP.find((c) => c.name === "deps install");
+//   expect(depsInstall).toBeDefined();
+//   expect(script).toContain("_rbox_deps_cmds");
+//   expect(script).toContain(`'install:${depsInstall!.summary}`);
+// });
 
 test("known flags are completed from registry metadata", () => {
   const script = zshCompletions();
