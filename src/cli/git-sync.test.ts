@@ -762,3 +762,31 @@ test("one busy repo defers only itself; every other repo's base advances indepen
   expect(sB.gitPendingRemote?.["r2"]).toBeUndefined(); // applied
   expect(await git(path.join(rootB, "r2"), "rev-parse", "main")).toBe(await git(path.join(rootA, "r2"), "rev-parse", "main"));
 }, 20_000);
+
+// ── live-validation finding (design 43 §14 v6.1): shallow clones ─────────────────
+
+test("structural preflight refusal (shallow clone): section DROPPED, not carried — never poisons receivers", async () => {
+  // Live validation caught this: `bundle --all` from a SHALLOW clone silently omits
+  // parents beyond the shallow boundary; receivers fail-close on every apply, forever,
+  // because identity can't see shallowness. Structural refusals must DROP the section.
+  const origin = path.join(tmp, "shallow-origin");
+  await initRepo(origin);
+  await commitFile(origin, "s.txt", "1", "c1");
+  await commitFile(origin, "s.txt", "2", "c2");
+
+  const p = path.join(rootA, "sh");
+  await initRepo(p);
+  await commitFile(p, "x.txt", "x", "c1");
+  await push(rootA, cfgA, depsA); // full repo → section captured into base
+  expect((await st(rootA)).lastSyncedManifest.gitRepos?.["sh"]).toBeDefined();
+
+  // Swap in a SHALLOW clone at the same path — simulating a base section whose repo
+  // is now structurally unsyncable (the exact shape the old client authored live).
+  await fs.rm(p, { recursive: true, force: true });
+  await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p]);
+
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  expect(state.lastSyncedManifest.gitRepos?.["sh"]).toBeUndefined(); // dropped, not carried
+  expect(logsA.some((l) => l.includes("shallow clone"))).toBe(true); // loud, with the un-shallow hint
+});

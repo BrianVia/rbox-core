@@ -460,6 +460,20 @@ async function captureGitForPush(
 
     const pf = await gitPreflight(repoDirOf(root, rel));
     if (!pf.ok) {
+      // STRUCTURAL refusal (shallow/bare/alternates/…): the shape can't sync and won't
+      // heal by waiting — DROP the section instead of carrying it. Carrying would be
+      // permanent poison: identity can't see the structural property, so a base section
+      // authored before the shape was detected (e.g. a shallow clone's incomplete
+      // bundle, found by live validation) would carry — and fail-close on every
+      // receiver — forever. Dropping self-heals: receivers clean their bookkeeping via
+      // absence (never touching local .git), and when the user fixes the shape a fresh
+      // preflight passes with no base tie to the old bad section.
+      if (pf.structural) {
+        if (baseSec) removed.push(rel);
+        deferred.push({ relPath: rel, reason: `${pf.reason} — section ${baseSec ? "dropped" : "not captured"}` });
+        delete needsRes[rel];
+        continue;
+      }
       deferOne(rel, pf.reason ?? "preflight failed");
       continue;
     }

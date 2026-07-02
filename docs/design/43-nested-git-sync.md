@@ -105,6 +105,7 @@ time (§7 [v2, B5]) — validation-time string checks alone can't see symlinks.
 | Check | dir-repo | pointer-repo (worktree/submodule) |
 |---|---|---|
 | `--is-inside-work-tree`, not bare | keep | keep |
+| **shallow / incomplete object store** [v6.1] | **refuse, STRUCTURAL** — `bundle --all` from a shallow clone silently omits parents beyond the shallow boundary (live-validation finding); receivers fail-close forever since identity can't see shallowness | same (shared store's shallowness) |
 | `--show-toplevel === repoDir` | **relaxed:** `=== repoDir` (was `=== sync root`) | same |
 | `.git` real dir | required | n/a (pointer expected) |
 | `objects/info/alternates` | refuse (unchanged) | refuse if the *resolved* gitdir's object store uses alternates |
@@ -432,6 +433,16 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
 
 ## 14. Review history
 
+- **v6.1 — LIVE-VALIDATION finding (2026-07-01, Step 4).** Real push of the founder's
+  `~/conductor/workspaces`: the worktree (`savvy-core/caracas`, actively agent-edited) captured
+  and applied cleanly on the receiver; `savvy-core/madison-v1` — a SHALLOW clone — produced a
+  `bundle --all` missing parent objects, which the receiver correctly fail-closed on
+  ("did not send all necessary objects", deferred, zero mutation). Fix: preflight refusals are
+  now split **structural vs transient** — structural (shallow, bare, alternates, superproject,
+  toplevel-mismatch) DROP the section (self-heals when the shape is fixed: fresh preflight, no
+  base tie to the poisoned section) while transient (busy, dangling pointer, vanished) keep the
+  defer-with-base-carry rule. Regression test: shallow swap at a based path → section dropped,
+  loud log with the `--unshallow` hint.
 - **v6 → codex round 6 (2026-07-01): PASS** — no BLOCKER/MAJOR remaining; three MINOR
   implementation notes carried into §13.5.
 - **v5 → codex round 5 (2026-07-01): FAIL, 1 MAJOR** — `gitPendingRemote` could resurrect a

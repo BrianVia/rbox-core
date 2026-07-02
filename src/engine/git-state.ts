@@ -29,6 +29,15 @@ export interface GitPreflightResult {
   ok: boolean;
   reason?: string;
   kind?: GitRepoKind;
+  /** True when the refusal is STRUCTURAL — the repo's shape cannot sync (shallow/bare/
+   *  alternates/superproject/toplevel-mismatch) and won't heal by waiting. Push-side
+   *  treats structural refusals as section DROPS (self-heals when the user fixes the
+   *  shape: fresh preflight passes, no base ties to the old bad section), while
+   *  transient refusals (busy, dangling pointer, vanished) defer-with-base-carry.
+   *  Live-validation finding (design 43 §14 v6.1): a shallow clone's `bundle --all`
+   *  silently omits history — the receiver fail-closes, but a carried shallow-authored
+   *  section would retry-defer forever since identity can't see shallowness. */
+  structural?: boolean;
 }
 
 const exec = promisify(execFile);
@@ -143,28 +152,36 @@ export async function gitPreflight(repoDir: string): Promise<GitPreflightResult>
   if (!kind) {
     const st = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     if (!st) return { ok: false, reason: "no .git" };
-    return { ok: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported" };
+    return { ok: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported", structural: true };
   }
   const ctx = await repoCtx(repoDir);
   if (!ctx) {
     return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
   }
-  if (!(await gitOk(repoDir, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree", kind };
-  if ((await git(repoDir, ["rev-parse", "--is-bare-repository"]).catch(() => "")) !== "false") return { ok: false, reason: "bare repo — unsupported", kind };
+  if (!(await gitOk(repoDir, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree", kind, structural: true };
+  if ((await git(repoDir, ["rev-parse", "--is-bare-repository"]).catch(() => "")) !== "false") return { ok: false, reason: "bare repo — unsupported", kind, structural: true };
+  // A shallow (or promisor/partial) clone's object store is INCOMPLETE: `git bundle
+  // create --all` silently produces a bundle missing parents beyond the shallow
+  // boundary, which every receiver then fail-closes on ("did not send all necessary
+  // objects" — found by design-43 live validation on a real shallow worktree clone).
+  // Structural: refuse until the user unshallows (`git fetch --unshallow`).
+  if ((await git(repoDir, ["rev-parse", "--is-shallow-repository"]).catch(() => "")) === "true") {
+    return { ok: false, reason: "shallow clone — unsupported (git fetch --unshallow to sync history)", kind, structural: true };
+  }
   const top = await git(repoDir, ["rev-parse", "--show-toplevel"]).catch(() => "");
   // git returns a realpath; the repo dir may contain symlinks (e.g. macOS
   // /var/folders -> /private/var/folders), so compare realpaths, not lexical paths.
   const dirReal = await fs.realpath(repoDir).catch(() => path.resolve(repoDir));
   const topReal = top ? await fs.realpath(top).catch(() => path.resolve(top)) : "";
-  if (topReal !== dirReal) return { ok: false, reason: "repo toplevel != repo dir", kind };
+  if (topReal !== dirReal) return { ok: false, reason: "repo toplevel != repo dir", kind, structural: true };
   if (kind === "dir") {
     for (const bad of ["objects/info/alternates", "worktrees", "modules"]) {
-      if (await exists(path.join(repoDir, ".git", bad))) return { ok: false, reason: `.git/${bad} present — unsupported`, kind };
+      if (await exists(path.join(repoDir, ".git", bad))) return { ok: false, reason: `.git/${bad} present — unsupported`, kind, structural: true };
     }
   } else {
     // pointer: the object store is the main clone's — refuse if THAT uses alternates.
     if (await exists(path.join(ctx.commonDir, "objects", "info", "alternates"))) {
-      return { ok: false, reason: "resolved gitdir uses objects/info/alternates — unsupported", kind };
+      return { ok: false, reason: "resolved gitdir uses objects/info/alternates — unsupported", kind, structural: true };
     }
   }
   return { ok: true, kind };
