@@ -1,5 +1,26 @@
 # Lessons
 
+## 2026-07-02 — design 45 (status health / activity sidecar) review arc
+
+- **"Cosmetic" visibility features deserve data-safety-grade review.** 6 codex
+  rounds on a status/observability PR found a real BLOCKER (any pump success
+  cleared the mass-delete-guard halt — the indicator light we built the feature
+  for would flap off within seconds) plus 8 more findings. If a surface is how
+  users learn the truth, a bug in it is a truth bug, not a cosmetic one.
+- **Every per-binding cache must join the rebind reset.** activity.json repeated
+  state.json's design-44 lesson within a day of being invented: any new sidecar
+  keyed to a workspace binding must be cleared in `resetSyncState` (and its
+  consumers must suppress stale-bound daemons). When adding a sidecar, grep for
+  `resetSyncState` and ask "does mine belong here?" — the answer is yes.
+- **A derived-status walk must mirror the planner's ORDER, not just its rules.**
+  gitDivergenceCount had all of planGitSections' suppression rules but ran
+  preflight before needsResolution — same predicates, different order, different
+  verdict. When mirroring a decision procedure read-only, copy the sequence.
+- **The effective-remote rule (`creds.remoteUrl ?? cfg.remoteUrl`) has now bitten
+  three times** (design 44 R3, track, status R1). Any NEW code that touches
+  syncStreamId/loadState must resolve the effective remote first — grep
+  buildAuthedRemote for the canonical rule.
+
 ## 2026-07-02 — the setup-rebind mass-delete incident (design 44)
 
 - **Any cached diff baseline must be stamped with the FULL identity of the stream it
