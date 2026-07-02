@@ -1,0 +1,307 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { BlobStore } from "../blobstore.js";
+import { writeFileAtomic } from "../fsutil.js";
+import { validateGitSection } from "../manifest-validate.js";
+import type { GitSection } from "../types.js";
+import {
+  type RepoCtx,
+  detectGitKind,
+  exists,
+  getGitArtifact,
+  git,
+  gitBusy,
+  gitOk,
+  headBranchOf,
+  moveFileAtomic,
+  repoCtx,
+} from "./shared.js";
+import { listRefs, readAllRefs, restoreOpState } from "./refs.js";
+import { pruneStaleScratchRefs } from "./pins.js";
+import { quarantineLocal } from "./quarantine.js";
+import { restoreLocal, snapshotLocal } from "./rollback.js";
+
+// ---- apply (design 43 §7) -------------------------------------------------------
+
+export interface ApplyGitResult {
+  applied: boolean;
+  reason?: string;
+  conflictBundle?: string;
+  /** Refs the pointer-target namespace/ownership filter refused to publish
+   *  (design 43 §7 [v3/v4]) — surfaced so the caller can log them. */
+  filteredRefs?: string[];
+}
+
+/** Branches (full refnames) checked out by a DIFFERENT worktree of the same store —
+ *  `git update-ref refs/heads/x` from one worktree silently moves a branch a sibling
+ *  has checked out, leaving that sibling dirty (`git branch -f` refuses; `update-ref`
+ *  does not — codex repro, design 43 §7 [v4]). From `git worktree list --porcelain`. */
+async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Set<string>> {
+  const out = await git(ctx.repoDir, ["worktree", "list", "--porcelain"]).catch(() => "");
+  const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
+  const owned = new Set<string>();
+  let wtPath: string | undefined;
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length);
+    else if (line.startsWith("branch ") && wtPath) {
+      const real = await fs.realpath(wtPath).catch(() => path.resolve(wtPath!));
+      if (real !== selfReal) owned.add(line.slice("branch ".length));
+    }
+  }
+  return owned;
+}
+
+/**
+ * CLEAN apply (caller guarantees local == base): import objects from the bundle,
+ * publish refs/HEAD per the SCOPE-GATED rules below, restore index/op-state — under
+ * receiver quiescence, transactionally. On any failure or fsck-fail, ROLL BACK to
+ * the pre-apply snapshot. Quarantines local first (fail-closed if that fails).
+ *
+ * Ref-publish semantics (design 43 §7 [v2, B1; v3; v4]):
+ * - deletion of absent local refs happens ONLY when section.refScope === "all" AND the
+ *   local repo is a dir-repo (both sides speak "complete set" — design-02 semantics);
+ * - a "scoped" section applied into a dir-repo is UPDATE-ONLY (extra local branches survive);
+ * - ANY section applied into a local POINTER repo touches a ref store SHARED with sibling
+ *   worktrees and the main clone: `refs/stash` + `refs/tags/*` are FILTERED, and
+ *   `refs/heads/*` publication is OWNERSHIP-GUARDED via `git worktree list --porcelain` —
+ *   a branch checked out by a DIFFERENT worktree is filtered (returned in filteredRefs);
+ *   if the section's own HEAD branch is blocked, the WHOLE apply defers
+ *   ({applied:false, reason: "ownership-deferred: …"}).
+ *
+ * NOTE (STEP 3): callers materializing a repo at `join(root, key)` must run
+ * {@link assertGitTargetWithinRoot} BEFORE this function and re-verify after `git init`
+ * (design 43 §7 [v2, B5; v3]) — this function trusts `repoDir`.
+ *
+ * `opts.beforeMutate` (design 43 §9 [v5] clean materialization): invoked AFTER every
+ * artifact has been fetched+decrypted+verified but BEFORE any gitdir mutation — the
+ * caller's quarantine+ref-wipe of a removal-memory leftover runs here, so a missing or
+ * corrupt remote artifact can never strand a wiped repo (codex step-3 MAJOR). A hook
+ * throw returns {applied:false} with the target untouched.
+ */
+export async function applyGitState(
+  repoDir: string,
+  section: GitSection,
+  store: BlobStore,
+  kek: Buffer,
+  opts: { beforeMutate?: () => Promise<void> } = {}
+): Promise<ApplyGitResult> {
+  const v = validateGitSection(section);
+  if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
+
+  // Fresh target (no .git): the repo is materialized by `git init` — but only AFTER every
+  // artifact has been fetched+decrypted+verified (decrypt-before-mutate: a wrong-KEK apply
+  // must leave NO .git behind — codex repro'd the old init-first order doing exactly that).
+  // "Fresh" strictly means NO `.git` entry at all: a symlinked `.git` (kind undefined but
+  // lstat-present) must be REFUSED, not initialized — `git init` through the symlink would
+  // reinitialize the LINKED repo, and the fresh-cleanup would then delete the user's symlink,
+  // hijacking the directory on the next cycle (scrutiny M1).
+  const preKind = await detectGitKind(repoDir);
+  if (!preKind && (await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined))) {
+    return { applied: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported apply target" };
+  }
+  let ctx = preKind ? await repoCtx(repoDir) : undefined;
+  if (preKind && !ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
+
+  // Scope-gated publish set (design 43 §7). A fresh target materializes as a dir repo.
+  const publishRefs: Record<string, string> = { ...section.refs };
+  const filteredRefs: string[] = [];
+  let deleteAbsent = false;
+  if (!ctx || ctx.kind === "dir") {
+    // Apply refuses the same dir shapes preflight refuses: publishing into a PRIMARY with
+    // linked worktrees would move branches its siblings have checked out (codex repro), and
+    // superproject/alternates stores have undefined apply semantics (design 43 §4, v1).
+    if (ctx) {
+      for (const bad of ["worktrees", "modules", "objects/info/alternates"]) {
+        if (await exists(path.join(ctx.commonDir, bad))) {
+          return { applied: false, reason: `.git/${bad} present — unsupported apply target` };
+        }
+      }
+    }
+    deleteAbsent = section.refScope === "all";
+  } else {
+    for (const ref of Object.keys(publishRefs)) {
+      if (!ref.startsWith("refs/heads/")) {
+        // a standalone receiver's stash/tags must never overwrite the SHARED stash stack
+        // or tag namespace [v3]
+        filteredRefs.push(ref);
+        delete publishRefs[ref];
+      }
+    }
+    const owned = await branchesCheckedOutElsewhere(ctx);
+    for (const ref of Object.keys(publishRefs)) {
+      if (owned.has(ref)) {
+        filteredRefs.push(ref);
+        delete publishRefs[ref];
+      }
+    }
+    const headBranch = headBranchOf(section.head);
+    if (headBranch && owned.has(headBranch)) {
+      // applying a HEAD that points at a branch we refused to move would be incoherent [v4]
+      return { applied: false, reason: `ownership-deferred: ${headBranch} is checked out by another worktree`, filteredRefs };
+    }
+  }
+  if (ctx && (await gitBusy(ctx))) return { applied: false, reason: "receiver git busy" };
+
+  // Stage on the REPO's filesystem (under .rbox), NOT os.tmpdir() — the decrypted index/op-state
+  // are moved into the gitdir with rename, which throws EXDEV across mounts. On Linux/containers
+  // /tmp is commonly a separate tmpfs from the repo, so an os.tmpdir() staging would fail git
+  // apply on every pull (it only worked on macOS because $TMPDIR + the repo share one APFS volume).
+  await fs.mkdir(path.join(repoDir, ".rbox"), { recursive: true });
+  const tmpDir = await fs.mkdtemp(path.join(repoDir, ".rbox", "gitap-"));
+  let createdGit = false;
+  // Fail-closed for the fresh path: any failure after `git init` removes the .git WE created
+  // this call (nothing of the user's lives in it), restoring the strict no-mutation contract.
+  const removeFreshGit = async () => {
+    if (createdGit) await fs.rm(path.join(repoDir, ".git"), { recursive: true, force: true }).catch(() => {});
+  };
+  try {
+    // §28 (codex M4): fetch + DECRYPT + verify ALL artifacts into temp files BEFORE touching
+    // the gitdir (and before `git init` on a fresh target). A decrypt/fetch/verify failure
+    // (wrong key, swapped blob, corruption) returns {applied:false} with the target untouched
+    // — never aborts mid-mutation. GCM + the plaintext-sha check in decryptFileToPath
+    // authenticate each artifact here.
+    const bundlePath = path.join(tmpDir, "in.bundle");
+    const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;
+    const opTmp: Array<{ rel: string; tmp: string }> = [];
+    try {
+      await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
+      if (indexTmp) await getGitArtifact(store, kek, { sha: section.indexSha!, encSha: section.indexEncSha!, cipherSize: section.indexCipherSize! }, indexTmp, tmpDir);
+      for (const [rel, ref] of Object.entries(section.opState ?? {})) {
+        const tmp = path.join(tmpDir, "op", rel);
+        await getGitArtifact(store, kek, ref, tmp, tmpDir);
+        opTmp.push({ rel, tmp });
+      }
+    } catch (e) {
+      return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
+
+    // GIT-LEVEL bundle verification BEFORE any mutation when a repo already exists at
+    // the target: decrypt + plaintext-sha authenticate the BYTES, not their bundle-ness
+    // — a sha-valid non-bundle would otherwise pass to `beforeMutate`, wipe a clean-
+    // materialization leftover, and only then fail `bundle verify` (codex step-3
+    // round-2 repro). Our bundles are self-contained (no prerequisites), so verifying
+    // against the pre-existing repo is equivalent to the post-init verify below, which
+    // stays as the fresh-target gate (nothing exists to verify against before init).
+    let bundleVerified = false;
+    if (ctx) {
+      if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+        return { applied: false, reason: "bundle verify failed (no mutation)", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
+      bundleVerified = true;
+    }
+
+    // Artifacts are decrypt-verified on disk and the bundle is git-verified — the
+    // caller's pre-mutation step (quarantine + ref-wipe for a clean materialization)
+    // may now run. Failure → no mutation yet, defer cleanly.
+    if (opts.beforeMutate) {
+      try {
+        await opts.beforeMutate();
+      } catch (e) {
+        return { applied: false, reason: `pre-mutation step failed (no apply): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
+    }
+
+    if (!ctx) {
+      // TOCTOU recheck (scrutiny M2): the artifact download above can take a long time on a
+      // big bundle. If a repo APPEARED at repoDir in that window (user ran git init/clone —
+      // this is a live-folder daemon), `git init` would "reinitialize" IT and createdGit
+      // would claim a .git this call did NOT create — every later failure path would then
+      // rm -rf the USER's .git. Absence must be re-confirmed immediately before init.
+      if (await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined)) {
+        return { applied: false, reason: "target repo appeared mid-apply — deferred" };
+      }
+      // fresh machine / standalone materialization of a worktree-origin section (design 43 §5)
+      await git(repoDir, ["init", "-q"]);
+      createdGit = true;
+      ctx = await repoCtx(repoDir);
+      if (!ctx) {
+        await removeFreshGit();
+        return { applied: false, reason: "git init failed for fresh apply target" };
+      }
+    }
+
+    const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
+    const snap = await snapshotLocal(ctx);
+
+    // Fresh targets verify here (a repo now exists); existing targets verified above —
+    // don't pay the full bundle read twice.
+    if (!bundleVerified && !(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+      await removeFreshGit();
+      return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
+
+    // Quarantine local committed+staged state first — fail closed if we can't (§9 [v5]:
+    // bundle with capture-grade pinning PLUS index/op-state copies).
+    let conflictBundle: string | undefined;
+    if (hadHead) {
+      try {
+        conflictBundle = await quarantineLocal(ctx, path.join(repoDir, ".rbox", "git-quarantine"), `${Date.now()}`);
+      } catch (e) {
+        return { applied: false, reason: `quarantine bundle failed; aborting: ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
+    }
+
+    // Import objects from the (decrypted, verified) remote bundle into a non-checked-out,
+    // APPLY-UNIQUE namespace (pointer targets share the ref store with sibling worktrees —
+    // a fixed namespace would race concurrent sibling applies, same hazard as rbox-wip).
+    await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
+    const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    try {
+      // --no-tags: fetch's tag-following would otherwise write the bundle's refs/tags/* DIRECTLY
+      // into refs/tags (outside the namespace refspec) — on a pointer target that is the shared
+      // tag store the §7 filter exists to protect. Tags still publish on dir targets via the
+      // explicit update-ref loop below (they're in section.refs).
+      await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    } catch (e) {
+      // Nothing published yet — refs/HEAD/index are untouched; only namespaced scratch may exist.
+      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      await removeFreshGit();
+      return { applied: false, reason: `bundle fetch failed (no publish): ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    }
+
+    try {
+      // Publish refs per the scope-gated rules (see doc comment).
+      for (const [ref, sha] of Object.entries(publishRefs)) {
+        if (ref === "refs/stash") {
+          // refs/stash is only usable through its REFLOG (`git stash list`/`pop` read
+          // stash@{N}, never the bare ref) — publish it WITH a reflog entry whose
+          // message is the stash commit's subject (`git stash` writes the same text to
+          // both), so the synced stash is listable/poppable on the receiver.
+          const subject = (await git(repoDir, ["log", "-1", "--format=%s", sha]).catch(() => "")) || "rbox: synced stash";
+          await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha]);
+        } else {
+          await git(repoDir, ["update-ref", ref, sha]);
+        }
+      }
+      if (deleteAbsent) {
+        for (const ref of Object.keys(await readAllRefs(repoDir))) {
+          if (!(ref in section.refs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+        }
+      }
+      await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
+
+      // Restore index + op-state from the pre-decrypted temp files via atomic rename —
+      // into the RESOLVED gitdir.
+      if (indexTmp) await moveFileAtomic(indexTmp, path.join(ctx.gitDir, "index"));
+      await restoreOpState(ctx.gitDir, opTmp);
+
+      if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {
+        // ROLLBACK (fresh target: removing the .git we created IS the rollback)
+        if (createdGit) await removeFreshGit();
+        else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined);
+        return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+      }
+    } catch (e) {
+      // ROLLBACK on any mutation error (fresh target: remove the .git we created)
+      if (createdGit) await removeFreshGit();
+      else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {});
+      return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    } finally {
+      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    }
+    return { applied: true, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
