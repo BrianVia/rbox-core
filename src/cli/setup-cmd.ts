@@ -185,7 +185,7 @@ async function stepWorkspace(
     message: "What do you want to track here?",
     choices: [
       { name: "Create a new workspace from a directory", value: "new" },
-      { name: "Track an existing workspace", value: "existing", description: "pick one you've already synced" },
+      { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced" },
     ],
   });
 
@@ -221,7 +221,7 @@ async function stepWorkspace(
       });
       if (!rebind) {
         process.stderr.write(
-          `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Track an existing workspace".`)}\n`
+          `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Sync an existing workspace".`)}\n`
         );
         return undefined;
       }

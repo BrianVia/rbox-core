@@ -69,18 +69,27 @@ test("pickerMode: a select up to SELECT_MAX, a search once past it", () => {
   expect(pickerMode(SELECT_MAX + 1)).toBe("search"); // 9 → search box
 });
 
-test("buildWorkspaceChoices: value is the raw workspaceId; name is label · age · short-id", () => {
+test("buildWorkspaceChoices: value is the raw workspaceId; name labels created + last synced", () => {
   const sorted = sortWorkspacesForPick([
-    ws({ workspaceId: "ws_deadbeef1234", name: "savvy-core", createdAt: NOW - 12 * 3_600_000 }),
-    ws({ workspaceId: "ws_cafef00d5678", name: null, createdAt: NOW - 21 * 3_600_000 }),
+    ws({ workspaceId: "ws_deadbeef1234", name: "savvy-core", createdAt: NOW - 12 * 3_600_000, lastCommitAt: NOW - 2 * 60_000 }),
+    ws({ workspaceId: "ws_cafef00d5678", name: null, createdAt: NOW - 21 * 3_600_000, lastCommitAt: NOW - 3 * 86_400_000 }),
   ]);
   const choices = buildWorkspaceChoices(sorted, NOW);
   // value round-trips exactly to the id the picker returns.
   expect(choices.map((c) => c.value)).toEqual(["ws_deadbeef1234", "ws_cafef00d5678"]);
-  // named workspace: label = name.
-  expect(choices[0]!.name).toBe("savvy-core · 12h ago · ws_deadbeef");
+  // named workspace: label = name; both timestamps are labelled (the ambiguity fix).
+  expect(choices[0]!.name).toBe("savvy-core · created 12h ago · last synced 2m ago · ws_deadbeef");
   // unnamed workspace: label falls back to the short id.
-  expect(choices[1]!.name).toBe("ws_cafef00d · 21h ago · ws_cafef00d");
+  expect(choices[1]!.name).toBe("ws_cafef00d · created 21h ago · last synced 3d ago · ws_cafef00d");
+});
+
+test("buildWorkspaceChoices: a never-synced workspace degrades to 'never synced', still labelled", () => {
+  // lastCommitAt null (no commits yet) AND absent (older server omits the field) both
+  // render the same graceful, labelled fallback — never a bare/ambiguous age.
+  const nullSynced = buildWorkspaceChoices([ws({ workspaceId: "ws_fresh0000000", name: "brand-new", createdAt: NOW - 5 * 60_000, lastCommitAt: null })], NOW);
+  expect(nullSynced[0]!.name).toBe("brand-new · created 5m ago · never synced · ws_fresh000");
+  const absentSynced = buildWorkspaceChoices([ws({ workspaceId: "ws_fresh0000000", name: "brand-new", createdAt: NOW - 5 * 60_000 })], NOW);
+  expect(absentSynced[0]!.name).toBe("brand-new · created 5m ago · never synced · ws_fresh000");
 });
 
 test("filterWorkspaceChoices: case-insensitive substring; blank term keeps all", () => {

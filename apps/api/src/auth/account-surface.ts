@@ -109,12 +109,20 @@ interface WorkspaceRow {
   project_id: string;
   created_at: number;
   name: string | null;
+  last_commit_at: number | null;
 }
 
 /** GET /v1/account/workspaces?limit&cursor — the caller's sync roots. Under E2EE the
  *  server holds NO folder name/path; `projectId` is a PK component returned verbatim.
  *  `name` is the OPT-IN, server-visible dashboard label (default-off): null unless the
- *  first host set one at create — the deliberate, consensual metadata carve-out. */
+ *  first host set one at create — the deliberate, consensual metadata carve-out.
+ *  `lastCommitAt` is the ADDITIVE last-activity signal (epoch ms) — MAX(created_at)
+ *  over the D1 commit mirror for this workspace, null when it has never synced. It
+ *  disambiguates the picker's created-vs-active time. Derived as the created_at of
+ *  the MAX-sequence commit — sequence is the PK suffix AND monotonic per workspace,
+ *  so the subselect is a single backward index seek per row (codex: a MAX(created_at)
+ *  aggregate would scan the workspace's whole commit history — created_at is not
+ *  indexed). One query, no N+1, no migration. */
 export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promise<Response> {
   const limit = parseLimit(url);
   const cursorRaw = url.searchParams.get("cursor");
@@ -130,13 +138,24 @@ export async function accountWorkspaces(env: Env, p: Principal, url: URL): Promi
   binds.push(limit + 1);
 
   const rows = await dbFor(env, p.accountId)
-    .prepare(`SELECT rowid AS rid, workspace_id, project_id, created_at, name FROM workspaces WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .prepare(
+      `SELECT w.rowid AS rid, w.workspace_id, w.project_id, w.created_at, w.name,
+        (SELECT c.created_at FROM commits c WHERE c.workspace_id = w.workspace_id AND c.project_id = w.project_id
+          ORDER BY c.sequence DESC LIMIT 1) AS last_commit_at
+       FROM workspaces w WHERE ${where} ORDER BY w.created_at ASC, w.rowid ASC LIMIT ?`
+    )
     .bind(...binds)
     .all<WorkspaceRow>();
   const { page, nextCursor } = keysetPage(rows.results, limit);
 
   return json({
-    workspaces: page.map((r) => ({ workspaceId: r.workspace_id, projectId: r.project_id, name: r.name ?? null, createdAt: r.created_at })),
+    workspaces: page.map((r) => ({
+      workspaceId: r.workspace_id,
+      projectId: r.project_id,
+      name: r.name ?? null,
+      createdAt: r.created_at,
+      lastCommitAt: r.last_commit_at ?? null,
+    })),
     nextCursor,
   });
 }
