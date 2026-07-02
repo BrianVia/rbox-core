@@ -310,3 +310,31 @@ test("restore divert never clobbers an existing same-second conflict copy", asyn
   const both = [await fs.readFile(path.join(root, r1.restoredTo), "utf8"), await fs.readFile(path.join(root, r2.restoredTo), "utf8")];
   expect(both.sort()).toEqual(["trashed-1", "trashed-2"]);
 });
+
+// --- codex impl-round-2 regressions -----------------------------------------
+
+test("restore refuses a destination whose real parent escapes the workspace (symlinked dir)", async () => {
+  await write("out/pwn.txt", "payload");
+  const batch = openTrashBatch(root);
+  await batch.put("out/pwn.txt");
+  await batch.finish();
+
+  // Replace the (now empty) out/ with a symlink pointing OUTSIDE the workspace.
+  const victim = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-victim-"));
+  try {
+    await fs.rm(path.join(root, "out"), { recursive: true, force: true });
+    await fs.symlink(victim, path.join(root, "out"));
+    await expect(restoreFromTrash(root, "out/pwn.txt")).rejects.toThrow(/outside workspace/);
+    expect(await fs.readdir(victim)).toEqual([]); // nothing teleported out
+  } finally {
+    await fs.rm(victim, { recursive: true, force: true });
+  }
+});
+
+test("a sibling DIRECTORY named <batch>.active is not mistaken for an active marker", async () => {
+  const now = Date.now();
+  const dir = await seedBatch(new Date(now - 40 * DAY), { "a.txt": "x" });
+  await fs.mkdir(`${dir}.active`); // a directory, not a marker file
+  const res = await pruneTrash(root, { days: 30, maxBytes: Infinity, now });
+  expect(res.removedBatches).toBeGreaterThanOrEqual(1); // the 40-day batch must NOT be protected
+});

@@ -4,7 +4,7 @@ import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
 import { decryptFileToPath } from "./crypto.js";
-import { RBOX_TMP_PREFIX } from "./fsutil.js";
+import { assertWithinRoot, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
 import type { TrashBatch } from "./trash.js";
@@ -293,31 +293,6 @@ async function moveAside(destRoot: string, fromRel: string, toRel: string): Prom
   await fs.rename(from, to);
 }
 
-/** Refuse to operate on a path whose real parent escapes the workspace — e.g. a
- *  synced symlink `foo -> /etc` followed by a file entry `foo/passwd`. Static
- *  manifest validation can't catch this (it's runtime FS state), so this is the
- *  complementary runtime guard. */
-async function assertWithinRoot(destRoot: string, abs: string): Promise<void> {
-  const rootReal = await fs.realpath(destRoot);
-  let probe = path.dirname(abs);
-  for (;;) {
-    try {
-      const real = await fs.realpath(probe);
-      if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
-        throw new Error(`refusing to write outside workspace via symlinked parent: ${abs}`);
-      }
-      return;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-        const parent = path.dirname(probe);
-        if (parent === probe) return; // reached FS root without escaping
-        probe = parent;
-        continue;
-      }
-      throw e;
-    }
-  }
-}
 
 let tmpCounter = 0;
 function tmpName(abs: string): string {

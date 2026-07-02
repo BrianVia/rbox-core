@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { assertWithinRoot } from "./fsutil.js";
 import { conflictName } from "./reconcile.js";
 
 /**
@@ -123,7 +124,7 @@ async function listBatches(root: string, nowMs: number): Promise<BatchInfo[]> {
     const born = m ? Date.parse(`${m[1]}:${m[2]}:${m[3]}.${m[4]}Z`) : NaN;
     let active = false;
     const marker = await fs.lstat(markerFor(dir)).catch(() => undefined);
-    if (marker) active = nowMs - marker.mtimeMs < STALE_ACTIVE_MS;
+    if (marker?.isFile()) active = nowMs - marker.mtimeMs < STALE_ACTIVE_MS;
     const { bytes, files } = await duDir(dir);
     out.push({ name, dir, bornMs: Number.isFinite(born) ? born : st.mtimeMs, active, bytes, files });
   }
@@ -249,22 +250,43 @@ export async function restoreFromTrash(root: string, relPath: string, opts: { ba
       if (code === "ENOTDIR") throw new Error(`cannot restore ${relPath}: a parent path component is a file — move it aside first`);
       if (code !== "ENOENT") throw e;
     }
-    // conflictName is second-precision — the divert itself must not clobber an
-    // earlier conflict copy either. Probe and suffix, same idiom as put().
+    // conflictName is second-precision and a plain rename clobbers — claim each
+    // candidate name ATOMICALLY (link/symlink/mkdir are all EEXIST-atomic), so two
+    // concurrent restores can never overwrite each other's copy. The destination's
+    // real parent is guarded like every apply-side write: a symlinked dir must not
+    // teleport the restore outside the workspace.
     const baseRel = toRel;
-    let to = path.join(root, toRel);
     for (let i = 2; ; i++) {
-      try {
-        await fs.access(to);
-        toRel = `${baseRel}~${i}`;
-        to = path.join(root, toRel);
-      } catch {
-        break;
-      }
+      const to = path.join(root, toRel);
+      await assertWithinRoot(root, to);
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      if (await moveNoClobber(from, to, st)) return { restoredTo: toRel };
+      toRel = `${baseRel}~${i}`;
     }
-    await fs.mkdir(path.dirname(to), { recursive: true });
-    await fs.rename(from, to);
-    return { restoredTo: toRel };
   }
   throw new Error(`${relPath} not found in trash${opts.batch ? ` batch ${opts.batch}` : ""}`);
+}
+
+/** Move `from` to `to` iff `to` does not exist, ATOMICALLY (no check-then-rename
+ *  window): files hard-link (EEXIST-atomic) then drop the source; symlinks
+ *  recreate via symlink(2) (EEXIST-atomic); directories claim the name with
+ *  mkdir (EEXIST-atomic) then rename over the just-made empty dir (POSIX allows
+ *  dir→empty-dir). Returns false when the name was taken. */
+async function moveNoClobber(from: string, to: string, st: { isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
+  try {
+    if (st.isDirectory()) {
+      await fs.mkdir(to);
+      await fs.rename(from, to);
+    } else if (st.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(from), to);
+      await fs.unlink(from);
+    } else {
+      await fs.link(from, to);
+      await fs.unlink(from);
+    }
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw e;
+  }
 }
