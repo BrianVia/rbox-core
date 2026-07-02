@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import { requireCredentials } from "./credentials.js";
+import { openAndShow } from "./browser-open.js";
 
 /**
  * `rbox subscribe [plan]` / `rbox billing` (design 21 §3.4.1) — the PRIMARY billing
@@ -13,27 +13,6 @@ import { requireCredentials } from "./credentials.js";
  */
 
 const PLANS = ["solo", "pro"] as const;
-
-/** Open a URL in the user's browser, cross-platform. Returns false (so the caller
- *  prints the URL) when there's no opener or we're not on a TTY — never blocks. */
-function openInBrowser(url: string): boolean {
-  if (!process.stdout.isTTY) return false; // CI / piped → just print the URL
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  try {
-    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-    child.on("error", () => {}); // a missing opener rejects async — handled by the printed fallback
-    child.unref();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Open `url` (or fall back to printing it), with the verb-appropriate message. */
-function openAndShow(url: string, opening: string, fallback: string): void {
-  console.log(`${openInBrowser(url) ? opening : fallback}\n  ${url}`);
-}
 
 /** `rbox subscribe [plan]` — open a Stripe checkout bound to THIS account. */
 export async function subscribe(plan: string | undefined): Promise<void> {
