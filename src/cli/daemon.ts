@@ -190,9 +190,12 @@ export class RboxDaemon {
           onError: (err) => {
             // One backend error and the watcher is no longer TRUSTED (codex R1): a
             // dead FSEvents/inotify stream must not let the safety scan — now the
-            // only healer — sit backed off at 5m. Sync itself is unaffected.
+            // only healer — sit backed off at 5m. Sync itself is unaffected. An
+            // already-armed backed-off timer is pulled forward too (codex R2) —
+            // the flag alone would wait out the remaining timeout.
             if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
             this.watcherHealthy = false;
+            this.pinSafetyFloor();
           },
         }
       );
@@ -206,6 +209,13 @@ export class RboxDaemon {
    *  the scan must return to its 60s cadence the moment there is churn to protect. */
   private noteChurn(): void {
     this.churnSinceSafety = true;
+    this.pinSafetyFloor();
+  }
+
+  /** Re-arm a backed-off safety timer at the 60s floor NOW. Shared by churn and
+   *  watcher-error (codex R2): both mean "the next scan matters — don't wait out
+   *  an armed 5m timeout". No-op at the floor, so it can never double-schedule. */
+  private pinSafetyFloor(): void {
     if (this.safetyDelay > SAFETY_SYNC_MS && !this.stopped) {
       this.safetyDelay = SAFETY_SYNC_MS;
       if (this.safetyTimer) clearTimeout(this.safetyTimer);

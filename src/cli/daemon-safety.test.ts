@@ -98,8 +98,15 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
   try {
     await daemon.startLiveWatch();
     expect(daemon.watcherHealthy).toBe(true);
+    // Simulate a fully backed-off idle daemon at the moment the stream dies.
+    daemon.safetyDelay = CAP;
+    const armedBefore = daemon.safetyTimer;
     onError!(new Error("FSEvents stream died"));
     expect(daemon.watcherHealthy).toBe(false); // …and stays false: trust is not restored
+    // codex R2: the error must also pull the ARMED backed-off timer forward — the
+    // flag alone would wait out the remaining (up to 5m) timeout.
+    expect(daemon.safetyDelay).toBe(FLOOR);
+    expect(daemon.safetyTimer).not.toBe(armedBefore);
     // With trust revoked, quiet intervals must NOT back off — the scan is now the
     // only healer for anything the (possibly dead) watcher misses.
     expect(nextSafetyDelay(CAP, { watcherLive: daemon.watcher !== undefined && daemon.watcherHealthy, churned: false })).toBe(FLOOR);
