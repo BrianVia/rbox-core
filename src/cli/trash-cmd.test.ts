@@ -34,7 +34,7 @@ async function capture(fn: () => Promise<void>): Promise<{ out: string; err: str
   const err: string[] = [];
   const origLog = console.log;
   const origWrite = process.stderr.write.bind(process.stderr);
-  process.exitCode = undefined;
+  process.exitCode = 0; // NOT `undefined`: in Bun that assignment is a no-op — a prior 1 would leak into the suite's exit code
   console.log = (...a: unknown[]) => void out.push(a.map(String).join(" "));
   process.stderr.write = ((s: string | Uint8Array) => {
     err.push(String(s));
@@ -47,8 +47,8 @@ async function capture(fn: () => Promise<void>): Promise<{ out: string; err: str
     process.stderr.write = origWrite;
   }
   const code = process.exitCode;
-  process.exitCode = undefined;
-  return { out: stripAnsi(out.join("\n")), err: stripAnsi(err.join("")), code };
+  process.exitCode = 0; // same no-op trap as above — 0 is the only real reset
+  return { out: stripAnsi(out.join("\n")), err: stripAnsi(err.join("")), code: code === 0 ? undefined : code };
 }
 
 beforeEach(async () => {
