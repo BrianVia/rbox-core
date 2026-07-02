@@ -498,6 +498,57 @@ test("pending + remote deletion while the repo is BUSY: absence still supersedes
   await expect(git(b, "rev-parse", "HEAD")).resolves.toBeDefined(); // local .git never touched
 }, 20_000);
 
+test("deleting a leftover .git prunes its removal memory even on a NO-OP push; an identical re-create then re-adds (§9)", async () => {
+  const DATE = "2026-01-01T00:00:00 +0000"; // fixed dates → the re-create has the SAME identity
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "f.txt", "same", "c1", DATE);
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB); // memory recorded on B, leftover intact
+  expect((await st(rootB)).gitReposRemoved?.["r"]).toBeDefined();
+
+  // B deletes the leftover .git — no synced file changes → EXACTLY a no-op push,
+  // which must still persist the §9 memory prune ("pruned when .git disappears").
+  await fs.rm(path.join(rootB, "r"), { recursive: true, force: true });
+  const head = remote.headSeq();
+  await push(rootB, cfgB, depsB);
+  expect(remote.headSeq()).toBe(head); // no commit burned
+  expect((await st(rootB)).gitReposRemoved?.["r"]).toBeUndefined(); // memory pruned anyway
+
+  // B re-creates an IDENTICAL repo: a stale memory would suppress this legitimate re-add.
+  const b = path.join(rootB, "r");
+  await initRepo(b);
+  await commitFile(b, "f.txt", "same", "c1", DATE);
+  await push(rootB, cfgB, depsB);
+  expect((await remote.latest()).manifest.gitRepos?.["r"]).toBeDefined(); // re-added
+}, 20_000);
+
+test("absence supersedes pending even when the conflict preserve FAILS (crash-safe — no stale pending to resurrect)", async () => {
+  const { a, b, lock } = await makePending("r");
+  await fs.rm(lock);
+  await commitFile(b, "g.txt", "local-work", "b c1"); // local diverges while pending
+  const pendSec = (await st(rootB)).gitPendingRemote!["r"]!;
+  const localHead = await git(b, "rev-parse", "HEAD");
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA); // remote deletes the repo
+  remote.deleteBlob(pendSec.bundleEncSha); // the preserve's bundle fetch will now throw
+
+  await pull(rootB, cfgB, depsB);
+  const sB = await st(rootB);
+  expect(sB.gitPendingRemote?.["r"]).toBeUndefined(); // cleared DESPITE the preserve failure
+  expect(sB.lastSyncedManifest.gitRepos).toBeUndefined(); // base dropped
+  expect(sB.gitReposRemoved?.["r"]).toBeDefined(); // guard stamped after the divergence was examined
+  expect(logsB.some((l) => l.includes("WARNING r") && l.includes("preserve"))).toBe(true); // loud
+  expect(await git(b, "rev-parse", "HEAD")).toBe(localHead); // local work untouched
+
+  await fs.writeFile(path.join(rootB, "u.txt"), "x");
+  await push(rootB, cfgB, depsB);
+  expect((await remote.latest()).manifest.gitRepos).toBeUndefined(); // v6 class stays closed
+}, 20_000);
+
 test("pending + LOCAL divergence + remote deletion: conflict path wins FIRST, then removal memory (§13.5)", async () => {
   const { a, b, lock } = await makePending("r");
   await fs.rm(lock);

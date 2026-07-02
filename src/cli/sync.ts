@@ -605,17 +605,14 @@ async function applyGitOnPull(
     const localId = dotGit ? await gitIdentity(repoDir) : undefined;
 
     if (!remoteSec) {
-      // §9 removal + [v6] absence-supersedes-pending. §13.5 precedence: if the remote
-      // deleted a pending repo whose LOCAL identity also changed, the conflict path wins
-      // FIRST (preserve local + recovery from the pending section) — never stamp a
-      // removal memory over unexamined local divergence. (On a busy repo the raw-index
-      // identity fallback can only over-trigger this preserve — a safe, logged no-clobber.)
-      if (pend && localDivergedFromBase(localId, baseSec)) {
-        const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, cfg.kek!);
-        glog(
-          `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}`
-        );
-      }
+      // §9 removal + [v6] absence-supersedes-pending. The DIVERGENCE EXAMINATION runs
+      // first (§13.5: never stamp a removal memory over unexamined local divergence),
+      // then the pure state transitions apply UNCONDITIONALLY — absence is the newer
+      // truth no matter what else succeeds — and only then the best-effort recovery
+      // preserve. Ordering is crash-safety (codex step-3 round-3 MAJOR): if the
+      // preserve throws (blob/fs failure), the per-repo catch must not leave a stale
+      // pending/base entry for the next push to resurrect.
+      const diverged = pend !== undefined && localDivergedFromBase(localId, baseSec);
       delete pending[rel];
       delete needsRes[rel];
       if (rel in applied) {
@@ -629,6 +626,21 @@ async function applyGitOnPull(
         // lock-immune and equals the live identity whenever the leftover is untouched.
         removedMem[rel] =
           busy && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(localId);
+      }
+      // §13.5 conflict precedence: the pending remote section is preserved for manual
+      // recovery. Best-effort — preserve never mutates local branches/index/identity,
+      // so a failure loses only the convenience recovery bundle (logged loudly); the
+      // user's diverged local work is untouched either way. (On a busy repo the
+      // raw-index fallback can only over-trigger this — a safe, logged no-clobber.)
+      if (diverged && pend) {
+        try {
+          const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, cfg.kek!);
+          glog(
+            `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}`
+          );
+        } catch (e) {
+          glog(`git-sync WARNING ${rel}: could not preserve the pending remote section after the remote deletion (local work untouched): ${errMsg(e)}`);
+        }
       }
       return;
     }
@@ -928,6 +940,27 @@ export async function pushManifest(
     // or gitUnchanged is false) → this no-op is unreachable whenever there is anything to
     // commit; when it IS reachable, local == base and committing would just echo. So the git
     // recapture's re-uploaded artifacts are never silently dropped by this branch.
+    //
+    // LOCAL-ONLY git bookkeeping may still have moved even though nothing needs
+    // committing — deleting a leftover .git is usually EXACTLY a no-op push (a .git
+    // removal changes no synced files), yet §9 requires its removal memory to be
+    // pruned then, or the stale memory suppresses a later legitimate re-add at that
+    // path (codex step-3 round-3 MAJOR). Persist the bookkeeping commit-free.
+    const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    if (
+      cfg.syncGit &&
+      (!same(gitPlan.gitReposRemoved, state.gitReposRemoved) ||
+        !same(gitPlan.gitNeedsResolution, state.gitNeedsResolution) ||
+        !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
+    ) {
+      await saveState(root, {
+        lastSyncedSequence: state.lastSyncedSequence,
+        lastSyncedManifest: state.lastSyncedManifest,
+        gitReposRemoved: gitPlan.gitReposRemoved,
+        gitNeedsResolution: gitPlan.gitNeedsResolution,
+        gitPendingRemote: gitPlan.gitPendingRemote,
+      });
+    }
     return { sequence: state.lastSyncedSequence, manifest: local };
   }
   // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
