@@ -41,7 +41,8 @@ fi
 
 # Walk up from \$PWD for the workspace marker (git-style); result in \$REPLY, no fork.
 _rbox_find_root() {
-  local d=\$PWD
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  local d="\$PWD"
   while true; do
     if [[ -r \$d/.rbox/workspace.json ]]; then
       REPLY=\$d
@@ -56,6 +57,7 @@ _rbox_find_root() {
 
 # Humanize (now - <epoch>) into "just now" / "Nm ago" / "Nh ago" / "Nd ago"; \$REPLY.
 _rbox_rel() {
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
   local secs=\$(( EPOCHSECONDS - \$1 ))
   (( secs < 0 )) && secs=0
   if (( secs < 60 )); then REPLY="just now"
@@ -69,8 +71,13 @@ _rbox_rel() {
 # stale|missing|none) plus _RBOX_NAME/_RBOX_PCT/_RBOX_SEQ/_RBOX_OPEP/_RBOX_OPKIND.
 # Any parse problem (unreadable line, wrong version tag, malformed) → none (silent).
 _rbox_read() {
-  local file=\$1/.rbox/state/shell.line line
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  local file="\$1/.rbox/state/shell.line" line
   local ver ep st pct seq opep opkind name
+  # =~ writes MATCH/match/MBEGIN/... — localize so a sidecar read never clobbers
+  # the user's own regex state (codex R2).
+  local MATCH MBEGIN MEND
+  local -a match mbegin mend
   _RBOX_KIND=none
   _RBOX_NAME=""
   _RBOX_PCT=""
@@ -82,12 +89,15 @@ _rbox_read() {
     _RBOX_KIND=missing
     return
   fi
-  IFS= read -r line < \$file || return          # unreadable → none (silent)
+  IFS= read -r line < "\$file" || return        # unreadable → none (silent)
   # WHOLE-LINE shape gate before any field is used (codex R1 MAJOR: naive peeling
   # recycles fields on truncated input — 'v1 <ep> ok' parsed as a valid ok line).
   # The regex pins every field's alphabet, so pct/seq/epochs are digits-or-dash and
   # the state is a known enum BY CONSTRUCTION; anything else → none (silent).
-  local pat='^v1 [0-9]+ (ok|pending|active|halt) ([0-9]+|-) ([0-9]+|-) ([0-9]+|-) (push|pull|-) .+\$'
+  # Digit counts are CAPPED: an absurd hand-edited epoch would pass an unbounded
+  # gate and then make the arithmetic below print "number truncated" at prompt
+  # time (codex R2). 12 digits outlives the epoch by ~29k years.
+  local pat='^v1 [0-9]{1,12} (ok|pending|active|halt) ([0-9]{1,3}|-) ([0-9]{1,12}|-) ([0-9]{1,12}|-) (push|pull|-) .+\$'
   [[ \$line =~ \$pat ]] || return
   # Peel the 7 fixed fields; \`name\` is the (possibly spacey) remainder.
   ver=\${line%% *};    line=\${line#* }
@@ -119,15 +129,16 @@ _rbox_read() {
 # backticks/\$() in the (tainted) workspace name under PROMPT_SUBST (codex R1 BLOCKER),
 # and even our own halt message's backticks would execute.
 _rbox_banner() {
-  _rbox_read \$1
-  local n=\$_RBOX_NAME
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  _rbox_read "\$1"
+  local n="\$_RBOX_NAME"
   local msg
   case \$_RBOX_KIND in
     ok)
       msg="\${_RBOX_C_GREEN}rbox: \$n ✓ in sync"
       [[ \$_RBOX_SEQ != - ]] && msg+=" (seq \$_RBOX_SEQ)"
       if [[ \$_RBOX_OPKIND != - && \$_RBOX_OPEP != - ]]; then
-        _rbox_rel \$_RBOX_OPEP
+        _rbox_rel "\$_RBOX_OPEP"
         msg+=" · last \$_RBOX_OPKIND \$REPLY"
       fi
       msg+=\$_RBOX_C_OFF
@@ -139,7 +150,7 @@ _rbox_banner() {
     missing) msg="\${_RBOX_C_DIM}rbox: ○ background sync not running — rbox start\$_RBOX_C_OFF" ;;
     *) return ;;                                 # none → silent, no banner
   esac
-  print -r -u2 -- \$msg
+  print -r -u2 -- "\$msg"
 }
 
 # Set \$RBOX_PROMPT to the colored glyph ONLY (for RPROMPT or a custom theme slot).
@@ -148,7 +159,8 @@ _rbox_banner() {
 # never enters it. The active pct is interpolated NOW (not at render), so the stored
 # value contains no \$-references of its own.
 _rbox_glyph() {
-  _rbox_read \$1
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  _rbox_read "\$1"
   case \$_RBOX_KIND in
     ok)            RBOX_PROMPT="%F{green}✓%f" ;;
     pending)       RBOX_PROMPT="%F{yellow}↑%f" ;;
@@ -162,18 +174,20 @@ _rbox_glyph() {
 
 # chpwd hook: recompute the cached workspace root; banner ONCE on ENTERING a new one.
 _rbox_chpwd() {
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
   _rbox_find_root
-  local newroot=\$REPLY
+  local newroot="\$REPLY"
   if [[ \$newroot != \$_RBOX_ROOT ]]; then
     _RBOX_ROOT=\$newroot
-    [[ -n \$_RBOX_ROOT ]] && _rbox_banner \$_RBOX_ROOT
+    [[ -n \$_RBOX_ROOT ]] && _rbox_banner "\$_RBOX_ROOT"
   fi
 }
 
 # precmd hook: refresh the prompt glyph every prompt (cheap: one \`read\` builtin).
 _rbox_precmd() {
+  emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
   if [[ -n \$_RBOX_ROOT ]]; then
-    _rbox_glyph \$_RBOX_ROOT
+    _rbox_glyph "\$_RBOX_ROOT"
   else
     RBOX_PROMPT=""
   fi
@@ -187,14 +201,19 @@ add-zsh-hook precmd _rbox_precmd
 # opts out to place \$RBOX_PROMPT themselves (p10k / custom themes). The embedded
 # \$RBOX_PROMPT only expands at render time under PROMPT_SUBST (off in stock zsh —
 # without it the right prompt shows the literal string), so auto-append enables it.
-# RBOX_NO_RPROMPT=1 is RETROACTIVE (codex R1): a re-eval with it set removes a
-# previously auto-appended segment (prompt options are otherwise left untouched —
-# we can't know whether an earlier prompt_subst was ours).
+# RBOX_NO_RPROMPT=1 is RETROACTIVE (codex R1): a re-eval with it set removes the
+# segment — but ONLY when WE auto-appended it in this shell (_RBOX_RPROMPT_APPENDED),
+# so a user's own hand-placed ' \$RBOX_PROMPT' is never deleted (codex R2). Prompt
+# options are otherwise left untouched — we can't know whether prompt_subst was ours.
 if [[ \${RBOX_NO_RPROMPT:-0} == 1 ]]; then
-  RPROMPT=\${RPROMPT//' \$RBOX_PROMPT'/}
+  if [[ \${_RBOX_RPROMPT_APPENDED:-0} == 1 ]]; then
+    RPROMPT=\${RPROMPT/' \$RBOX_PROMPT'/}
+    _RBOX_RPROMPT_APPENDED=0
+  fi
 elif [[ \${RPROMPT-} != *'\$RBOX_PROMPT'* ]]; then
   setopt prompt_subst
   RPROMPT="\${RPROMPT-}"' \$RBOX_PROMPT'
+  typeset -g _RBOX_RPROMPT_APPENDED=1
 fi
 
 # Prime state so a terminal opened already inside a workspace shows the banner now.

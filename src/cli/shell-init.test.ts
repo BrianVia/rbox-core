@@ -52,7 +52,7 @@ test("the script embeds both hooks, root discovery, the version guard, and compl
   expect(s).toContain("_rbox_find_root");
   expect(s).toContain("RBOX_PROMPT");
   // The v1 whole-line shape gate — refuses any other version tag AND malformed fields.
-  expect(s).toContain("^v1 [0-9]+ (ok|pending|active|halt)");
+  expect(s).toContain("^v1 [0-9]{1,12} (ok|pending|active|halt)");
   // The completions are appended verbatim (ends with the #compdef header + footer).
   expect(s).toContain("#compdef rbox");
   expect(s).toContain("compdef _rbox rbox");
@@ -178,4 +178,51 @@ test("RBOX_NO_RPROMPT=1 is retroactive: a re-eval removes the auto-appended segm
   const out = new TextDecoder().decode(res.stdout);
   expect(out).toContain("FIRST:[ $RBOX_PROMPT]");
   expect(out.match(/SECOND:\[(.*)\]/)?.[1]).not.toContain("$RBOX_PROMPT");
+});
+
+// ── codex R2 regressions ─────────────────────────────────────────────────────
+
+test("hostile shell options (SH_WORD_SPLIT, GLOB_SUBST) cannot glob-expand a '*' name or split spacey roots (codex R2)", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - *\n`); // a name of literally '*'
+  const file = writeScript();
+  const cmd = [`setopt sh_word_split glob_subst`, `source ${file}`, `cd ${ws}`, "_rbox_chpwd", "_rbox_precmd", 'print -r -- "GLYPH:${RBOX_PROMPT}"'].join("; ");
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  const banner = new TextDecoder().decode(res.stderr);
+  expect(banner).toContain("rbox: * ✓"); // literal star, not a filename listing
+  expect(banner).not.toContain("workspace.json"); // globbing would have matched files
+});
+
+test("_rbox_read never clobbers the user's regex match globals (codex R2)", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`);
+  const file = writeScript();
+  const cmd = [`source ${file}`, `MATCH=keepme`, `cd ${ws}`, "_rbox_chpwd", "_rbox_precmd", 'print -r -- "MATCH:${MATCH}"'].join("; ");
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  expect(new TextDecoder().decode(res.stdout)).toContain("MATCH:keepme");
+});
+
+test("an absurd hand-edited epoch is refused by the gate — no 'number truncated' at prompt time (codex R2)", () => {
+  if (!ZSH) return;
+  const ws = makeWorkspace(`v1 ${"9".repeat(1000)} ok - 80 - - ws\n`);
+  const { glyph, banner } = driveHooks(writeScript(), ws);
+  expect(glyph).toBe("");
+  expect(banner).toBe("");
+  expect(banner).not.toContain("truncated");
+});
+
+test("opt-out removal never deletes a USER-owned ' $RBOX_PROMPT' placement (codex R2)", () => {
+  if (!ZSH) return;
+  const file = writeScript();
+  const cmd = [
+    `RPROMPT='pre $RBOX_PROMPT post'`, // user placed it themselves
+    `source ${file}`, // guard sees it → no auto-append, no flag
+    `RBOX_NO_RPROMPT=1`,
+    `source ${file}`, // retroactive path must be a no-op (flag unset)
+    'print -r -- "R:[$RPROMPT]"',
+  ].join("; ");
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  expect(new TextDecoder().decode(res.stdout)).toContain("R:[pre $RBOX_PROMPT post]");
 });
