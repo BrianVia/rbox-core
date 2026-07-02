@@ -81,16 +81,21 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
     process.stderr.write(`${e.dim("Run `rbox start` whenever you're ready.")}\n`);
   }
 
-  // Opt-in dependency-change notifications (drift surface 1).
-  const notify = await promptConfirm({ message: "Be notified when dependencies change?", default: true });
-  if (notify) {
-    const { installNotify } = await import("./deps-notify.js");
-    try {
-      await installNotify();
-    } catch (err) {
-      process.stderr.write(`${e.yellow("!")} ${err instanceof Error ? err.message : String(err)}\n`);
-    }
-  }
+  // Opt-in dependency-change notifications (drift surface 1) — commented out
+  // (design 51): the shell hook this installs runs `rbox deps drift --quiet`,
+  // and the whole `deps` CLI group is currently disabled (index.ts). Prompting
+  // for and silently installing a hook that always fails is worse than not
+  // asking. Re-enable together with `deps` itself.
+  //
+  // const notify = await promptConfirm({ message: "Be notified when dependencies change?", default: true });
+  // if (notify) {
+  //   const { installNotify } = await import("./deps-notify.js");
+  //   try {
+  //     await installNotify();
+  //   } catch (err) {
+  //     process.stderr.write(`${e.yellow("!")} ${err instanceof Error ? err.message : String(err)}\n`);
+  //   }
+  // }
 
   printSummary(outcome.workspaceId, outcome.deviceId);
 }

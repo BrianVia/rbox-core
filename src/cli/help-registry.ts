@@ -153,44 +153,47 @@ export const COMMAND_HELP: CommandHelp[] = [
   },
 
   // ── DEPENDENCIES ─────────────────────────────────────────────────────────
-  {
-    name: "deps install",
-    group: "DEPENDENCIES",
-    summary: "rebuild deps from synced lockfiles",
-    usage: "rbox deps install [path] [--allow-build] [--only <id>] [--manager <m>]",
-    flags: [
-      { flag: "--allow-build", desc: "permit steps that run project build/lifecycle code" },
-      { flag: "--only <id>", desc: "limit to one ecosystem or rule id (e.g. node, node/pnpm)" },
-      { flag: "--manager <m>", desc: "disambiguate when multiple lockfiles coexist" },
-    ],
-  },
-  {
-    name: "deps list",
-    group: "DEPENDENCIES",
-    summary: "list rebuildable projects (lockfiles found)",
-    usage: "rbox deps list [path] [--manager <m>]",
-    flags: [{ flag: "--manager <m>", desc: "disambiguate when multiple lockfiles coexist" }],
-  },
-  {
-    name: "deps check",
-    group: "DEPENDENCIES",
-    summary: "check this host is ready to rebuild deps",
-    usage: "rbox deps check [path]",
-  },
-  {
-    name: "deps drift",
-    group: "DEPENDENCIES",
-    summary: "did this folder's lockfile change since rbox last saw it?",
-    usage: "rbox deps drift [path] [--quiet]",
-    flags: [{ flag: "--quiet", desc: "one-line mode used by the shell hook; honors the notify toggle" }],
-  },
-  {
-    name: "deps notify",
-    group: "DEPENDENCIES",
-    summary: "shell-hook drift notifications",
-    usage: "rbox deps notify <install | uninstall | status | on | off>",
-    examples: ["rbox deps notify install", "rbox deps notify off", "rbox deps notify uninstall"],
-  },
+  // The whole `deps` group is commented out (design 51) — dispatcher wiring is
+  // disabled in index.ts (see the note above `runDeps`). Uncomment here + there
+  // + the three aliases below (in "hidden: deprecated aliases") to re-enable.
+  // {
+  //   name: "deps install",
+  //   group: "DEPENDENCIES",
+  //   summary: "rebuild deps from synced lockfiles",
+  //   usage: "rbox deps install [path] [--allow-build] [--only <id>] [--manager <m>]",
+  //   flags: [
+  //     { flag: "--allow-build", desc: "permit steps that run project build/lifecycle code" },
+  //     { flag: "--only <id>", desc: "limit to one ecosystem or rule id (e.g. node, node/pnpm)" },
+  //     { flag: "--manager <m>", desc: "disambiguate when multiple lockfiles coexist" },
+  //   ],
+  // },
+  // {
+  //   name: "deps list",
+  //   group: "DEPENDENCIES",
+  //   summary: "list rebuildable projects (lockfiles found)",
+  //   usage: "rbox deps list [path] [--manager <m>]",
+  //   flags: [{ flag: "--manager <m>", desc: "disambiguate when multiple lockfiles coexist" }],
+  // },
+  // {
+  //   name: "deps check",
+  //   group: "DEPENDENCIES",
+  //   summary: "check this host is ready to rebuild deps",
+  //   usage: "rbox deps check [path]",
+  // },
+  // {
+  //   name: "deps drift",
+  //   group: "DEPENDENCIES",
+  //   summary: "did this folder's lockfile change since rbox last saw it?",
+  //   usage: "rbox deps drift [path] [--quiet]",
+  //   flags: [{ flag: "--quiet", desc: "one-line mode used by the shell hook; honors the notify toggle" }],
+  // },
+  // {
+  //   name: "deps notify",
+  //   group: "DEPENDENCIES",
+  //   summary: "shell-hook drift notifications",
+  //   usage: "rbox deps notify <install | uninstall | status | on | off>",
+  //   examples: ["rbox deps notify install", "rbox deps notify off", "rbox deps notify uninstall"],
+  // },
 
   // ── DEVICES & ACCOUNT ────────────────────────────────────────────────────
   {
@@ -289,9 +292,11 @@ export const COMMAND_HELP: CommandHelp[] = [
   // ── hidden: deprecated aliases (warn on stderr; removed at v0.3) ──────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
   { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
-  { name: "hydrate", group: "DEPENDENCIES", summary: "deprecated → rbox deps install", usage: "rbox hydrate [path]", hidden: true, alias: "deps install" },
-  { name: "detect", group: "DEPENDENCIES", summary: "deprecated → rbox deps list", usage: "rbox detect [path]", hidden: true, alias: "deps list" },
-  { name: "doctor", group: "DEPENDENCIES", summary: "deprecated → rbox deps check", usage: "rbox doctor [path]", hidden: true, alias: "deps check" },
+  // hydrate/detect/doctor aliases commented out along with `deps` itself (design 51)
+  // — their forward target no longer exists, so keeping them would dangle.
+  // { name: "hydrate", group: "DEPENDENCIES", summary: "deprecated → rbox deps install", usage: "rbox hydrate [path]", hidden: true, alias: "deps install" },
+  // { name: "detect", group: "DEPENDENCIES", summary: "deprecated → rbox deps list", usage: "rbox detect [path]", hidden: true, alias: "deps list" },
+  // { name: "doctor", group: "DEPENDENCIES", summary: "deprecated → rbox deps check", usage: "rbox doctor [path]", hidden: true, alias: "deps check" },
 ];
 
 const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));

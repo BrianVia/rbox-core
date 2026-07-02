@@ -1,3 +1,9 @@
+// NOTE (design 51): `deps-drift.ts` is only PARTLY dormant. `nudgeForWrittenPaths`
+// / `renderNotices` stay live via the automatic post-sync drift nudge
+// (`postSyncNudge` in index.ts, unaffected by the `deps` group being disabled).
+// `driftCmd` (and `rbox deps drift` itself) is unreachable until `deps` is
+// re-wired. Both halves are still tested directly here — implementation is
+// untouched either way, only the `deps drift` CLI entry point is disconnected.
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";

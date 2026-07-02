@@ -6,7 +6,7 @@ Built as a **SaaS** on Cloudflare (Workers + D1 + R2 + Durable Objects), with a 
 
 ## Why it's different from Dropbox/Syncthing
 
-- **It doesn't sync `node_modules`.** It syncs the lockfile and rebuilds dependencies locally (`rbox hydrate`) — no OS-specific binaries over the wire, no multi-GB transfers, no conflicts in regenerable trees.
+- **It doesn't sync `node_modules`.** It syncs the lockfile and rebuilds dependencies locally (`rbox deps install`, temporarily disabled — design 51) — no OS-specific binaries over the wire, no multi-GB transfers, no conflicts in regenerable trees.
 - **It syncs uncommitted git state safely.** Index, HEAD, stashes, and rebase state ride along via `git bundle` (never a torn copy of a live `.git`).
 - **Secrets never leave by default.** `.env`, `*.pem`, keys are ignored; opt-in secret sync is E2EE-only (arrives with full-manifest encryption).
 - **It's daemon-friendly.** The watcher debounces and prunes ignored dirs, so an `npm ci` or a giant clone never pegs your machine.
@@ -18,13 +18,13 @@ All milestones (M1–M9) are implemented, codex-reviewed, and verified live agai
 | Area | What works |
 |---|---|
 | **Sync** | continuous daemon (chokidar + content-addressed manifests), three-way reconcile, conflict copies, optimistic-concurrency commits via a Durable Object sequencer |
-| **Git** | uncommitted index/HEAD/stash/op-state via `git bundle` (opt-in `--git`) |
+| **Git** | uncommitted index/HEAD/stash/op-state via `git bundle` (on by default, `--git false` to opt out) |
 | **Blobs** | content-addressed R2, streaming PUT + resumable multipart, convergent AES-256-GCM encryption |
 | **Auth** | per-device tokens (device-code + bootstrap flows), revocation |
 | **Multi-tenancy** | account isolation, blob entitlement, cross-account 404, audit log |
 | **Billing** | plan-gated storage/workspace quotas, atomic usage accounting (Stripe pending keys) |
 | **Onboarding** | `rbox init` guided wizard (zero-dep), fully scriptable for CI |
-| **Hydration** | `rbox detect` / `hydrate` / `doctor` — reconstruct deps from lockfiles |
+| **Hydration** | `rbox deps install/list/check` — reconstruct deps from lockfiles (CLI surface temporarily disabled, design 51) |
 | **Hardening** | client conflict-retry tests, cold-scan tuned (50k files in ~2.4s), Miniflare worker tests |
 
 **Pending human setup:** Stripe keys + price IDs (billing), `rbox.to` nameservers → Cloudflare, and the IdP decision (Cloudflare Zero Trust/Access + BetterAuth vs Clerk).
@@ -49,12 +49,11 @@ RBOX_PAIR_TOKEN=<token> rbox login            # redeem a pairing token headlessl
 rbox init --workspace <id> --no-interactive   # join
 
 # Continuous background sync:
-rbox daemon start
+rbox start
 rbox status                      # workspace state + sync metrics
 
-# Rebuild dependencies on a fresh machine (deps aren't synced — lockfiles are):
-rbox doctor                      # is this host ready? (node/pnpm/go/… versions)
-rbox hydrate                     # runs npm ci / pnpm install / cargo fetch / …
+# Dependency rebuild (`rbox deps ...` / `doctor` / `hydrate`) is temporarily
+# disabled — see design 51 (docs/design/51-rbox-yml-config.md).
 ```
 
 Everything interactive has a `--no-interactive` flag-driven path (CI/Docker never depends on a TTY). `NO_COLOR` / `FORCE_COLOR` honored.
@@ -67,17 +66,17 @@ init    [--new|--workspace <id>]   guided first-time setup (--no-interactive for
 login   [--bootstrap <secret>]     authorize this device
 pair                               mint a token to connect a new machine (~2 steps)
 device  <approve|list|revoke>      manage devices
-link    <path> [--workspace <id>]  bind a directory to a workspace
+track   <path> [--workspace <id>]  bind a directory to a workspace
 push | pull | sync [path]          upload / apply / both
 status  [path]                     workspace state + conflict metrics
 ignore  <glob> | --list            manage .rboxignore
-daemon  <start|stop|status|logs>   passive continuous sync
-detect  [path]                     list hydratable projects (by lockfile)
-doctor  [path]                     host readiness to hydrate
-hydrate [path] [--allow-build]     reconstruct deps from synced lockfiles
-key     <export|import>            workspace encryption key
+start | stop | logs [path]         background sync (daemon)
+key     <status|backup>            encryption status / recovery phrase
 versions <path> | restore <p>@<n>  version history & restore
 ```
+
+Full reference (always in sync with the binary): `rbox help`, or
+[`docs/usage.md`](docs/usage.md) for the narrative version.
 
 ## Architecture
 
@@ -171,6 +170,7 @@ repeatable target, add a dedicated `[env.bench]` (`rbox-bench-api` + throwaway
 
 ## Docs
 
+- [`docs/usage.md`](docs/usage.md) — CLI usage guide (commands, config files, `.rboxignore` semantics)
 - [`docs/roadmap.md`](docs/roadmap.md) — milestone status
 - [`docs/design/`](docs/design/) — one spec per milestone (each carries its codex review resolutions)
 - [`docs/learnings.md`](docs/learnings.md) — append-only build log of non-obvious findings
