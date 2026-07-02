@@ -1,7 +1,7 @@
 # 50 — Destructive-apply safety: type-flip conflicts + the local trash tier
 
-Status: v2 — codex design round 1 (NEEDS-WORK: 3 BLOCKER + 4 MAJOR + 1 MINOR)
-resolved in §7; implementation on feat/destructive-apply-safety-50
+Status: implemented — design review round 1 (3 BLOCKER + 4 MAJOR + 1 MINOR → §7)
++ 4 implementation review rounds → PASS. See tasks/todo.md for the full log.
 Origin: two 2026-07-02 events. (1) flat-meadow's pulls halted for ~5 hours on
 EISDIR: the Mac had a Conductor *symlink* (`savvy-core/pr-5-plat-1282-snapshot-list`
 → `amarillo-v1`) where flat-meadow had a materialized *directory* — the pull

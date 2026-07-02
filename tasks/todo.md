@@ -1,3 +1,26 @@
+# Design 50 — destructive-apply safety (trash tier)
+
+Branch feat/destructive-apply-safety-50 (worktree). Spec: docs/design/50-destructive-apply-safety.md.
+Orchestration: efficient-frontier — trash.ts core kept central (data-safety judgment);
+apply/manifest slice + CLI slice built by 2 parallel opus subagents, disjoint ownership.
+
+## Review
+
+Codex DESIGN round: NEEDS-WORK → 3 BLOCKERs (eviction echo via stale watcher events →
+applyWatchEvents disk-verifies unlinks; consent leak into 409-recovery pull → op-scoped
+allowMassDeletePush; cross-process prune race → sibling .active marker + 15min floor +
+24h stale override) + 4 MAJORs resolved in spec §7 BEFORE implementation.
+Codex IMPLEMENTATION rounds (4 → PASS): R1 BLOCKER unlinkDir-now-a-file still fell to
+the delete branch (the exact eviction-echo shape) → three-state unlinkDir handling;
+R1 MAJORs: authoritative dir rescan, marker out of the restore namespace, restore path
+traversal (lexical), conflict-copy same-second clobber; R2: restore DESTINATION realpath
+guard + atomic no-clobber moves (link/symlink/mkdir-claim, EEXIST-atomic) + marker must
+be a file; R3: restore SOURCE realpath guard (trashed symlink would exfiltrate AND
+unlink an outside file). Self-found: same-millisecond batch-name collision (pid+seq tail).
+Every finding has a dedicated regression test. Full suite 516 pass / 0 fail.
+
+---
+
 # Design 49 — daemon IO priority + idle safety-scan backoff
 
 Branch feat/daemon-io-priority-49 (worktree — other agents own the main checkout).
