@@ -66,9 +66,11 @@ export function healthLine(s: StatusSnapshot): string {
     return `${style.red("⚠ sync halted")} ${style.dim(`(${relTime(halt.at, s.now)}${times})`)} ${halt.reason}`;
   }
 
-  // 2. A transfer is live right now. Staleness-gated: a daemon that died mid-op
-  //    must not show "syncing" forever.
-  const active = s.activity?.active;
+  // 2. A transfer is live right now. Gated on BOTH daemon liveness and freshness
+  //    (codex R5): only the daemon writes `active`, so with the daemon stopped —
+  //    even freshly killed mid-op — there is no live transfer to report; and a
+  //    daemon that died with its pidfile intact must not show "syncing" forever.
+  const active = s.daemonRunning ? s.activity?.active : undefined;
   if (active && s.now - Date.parse(active.at) < ACTIVE_STALE_MS) {
     return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total)}`);
   }

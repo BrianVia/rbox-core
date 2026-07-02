@@ -84,6 +84,13 @@ test("stale live progress is ignored (a crashed daemon must not show syncing for
   expect(healthLine(base({ activity }))).toContain("in sync");
 });
 
+test("a stopped daemon never renders syncing, even with fresh active progress (codex R5)", () => {
+  const activity: DaemonActivity = { at: iso(1), active: { at: iso(1), phase: "upload", done: 1, total: 2 } };
+  const line = healthLine(base({ activity, daemonRunning: false }));
+  expect(line).not.toContain("syncing");
+  expect(line).toContain("in sync");
+});
+
 test("local divergence: counts by kind, hint only when the daemon is stopped", () => {
   const running = healthLine(base({ added: 3, changed: 9, deleted: 1 }));
   expect(running).toContain("13 local changes to sync");
