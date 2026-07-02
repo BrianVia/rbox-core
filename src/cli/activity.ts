@@ -40,11 +40,33 @@ export const ACTIVE_STALE_MS = 60_000;
 
 const activityPath = (root: string) => path.join(root, RBOX_DIR, "state", "activity.json");
 
-/** Best-effort read: absent/corrupt → undefined (status renders nothing extra). */
+/** Best-effort read: absent/corrupt → undefined, and each nested slot is SHAPE-
+ *  VALIDATED individually — a malformed slot is dropped, never handed to a render
+ *  helper (codex R3: `{"at":"…","lastPush":{}}` crashed `rbox status` on
+ *  `undefined.toLocaleString`). The file is daemon-written but user-editable. */
 export async function loadActivity(root: string): Promise<DaemonActivity | undefined> {
   try {
-    const parsed = JSON.parse(await fs.readFile(activityPath(root), "utf8")) as DaemonActivity;
-    return typeof parsed?.at === "string" ? parsed : undefined;
+    const raw = JSON.parse(await fs.readFile(activityPath(root), "utf8")) as Partial<DaemonActivity>;
+    if (typeof raw?.at !== "string") return undefined;
+    const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+    const a: DaemonActivity = { at: raw.at };
+    const push = raw.lastPush;
+    if (push && typeof push.at === "string" && num(push.files) && num(push.sequence)) {
+      a.lastPush = { at: push.at, files: push.files, sequence: push.sequence };
+    }
+    const pull = raw.lastPull;
+    if (pull && typeof pull.at === "string" && num(pull.writes) && num(pull.deletes) && num(pull.conflicts)) {
+      a.lastPull = { at: pull.at, writes: pull.writes, deletes: pull.deletes, conflicts: pull.conflicts };
+    }
+    const act = raw.active;
+    if (act && typeof act.at === "string" && (act.phase === "encrypt" || act.phase === "upload" || act.phase === "download") && num(act.done) && num(act.total)) {
+      a.active = { at: act.at, phase: act.phase, done: act.done, total: act.total };
+    }
+    const halt = raw.halt;
+    if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
+      a.halt = { at: halt.at, reason: halt.reason, count: halt.count, op: halt.op };
+    }
+    return a;
   } catch {
     return undefined;
   }

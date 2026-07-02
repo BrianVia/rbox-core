@@ -37,6 +37,23 @@ test("corrupt or shape-invalid file → undefined, never a throw", async () => {
   expect(await loadActivity(root)).toBeUndefined();
 });
 
+test("malformed nested slots are dropped individually, never handed to render (codex R3)", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(
+    p,
+    JSON.stringify({
+      at,
+      lastPush: {}, // the R3 repro: rendered as `undefined.toLocaleString` crash
+      lastPull: { at, writes: 1, deletes: 0, conflicts: 0 }, // valid — must survive
+      active: { at, phase: "teleport", done: 1, total: 2 }, // bogus phase
+      halt: { at, reason: 7, count: 1, op: "pull" }, // non-string reason
+    })
+  );
+  expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
+});
+
 test("save is best-effort: an unwritable destination is swallowed", async () => {
   // Make `.rbox` a FILE so mkdir(.rbox/state) inside saveActivity must fail.
   await fs.writeFile(path.join(root, ".rbox"), "");

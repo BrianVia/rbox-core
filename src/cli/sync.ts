@@ -193,7 +193,14 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     gitNeedsResolution: gitOutcome.gitNeedsResolution,
     gitPendingRemote: gitOutcome.gitPendingRemote,
   });
-  if (actions.length > 0) deps.onPullApplied?.(actions);
+  if (actions.length > 0) {
+    try {
+      deps.onPullApplied?.(actions);
+    } catch {
+      // Observability only: a hook failure must never fail a pull that has already
+      // applied and saved — the daemon would misread it as a pull halt (codex R3).
+    }
+  }
   return actions;
 }
 

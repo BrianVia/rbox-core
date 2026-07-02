@@ -7,6 +7,7 @@ import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity } from "./activity.js";
 import type { WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
+import { pull } from "./sync.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
@@ -177,4 +178,29 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   expect(after?.lastPush?.sequence).toBe(3);
   expect(after?.lastPush?.files).toBe(3); // a.txt + b.txt + c.txt
   expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("theirs");
+});
+
+test("a throwing onPullApplied hook never fails a completed pull (codex R3)", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("x.txt", "hi")]);
+  const cfg: WorkspaceConfig = {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: "ws_act",
+    projectId: "root",
+    deviceId: "dev_act",
+    rootPath: root,
+    remoteUrl: "mem://",
+    token: "",
+    encrypted: true,
+    kek: KEK,
+  };
+  const actions = await pull(root, cfg, {
+    remote,
+    backoff: async () => {},
+    onPullApplied: () => {
+      throw new Error("observability boom");
+    },
+  });
+  expect(actions).toHaveLength(1); // the pull itself succeeded…
+  expect(await fs.readFile(path.join(root, "x.txt"), "utf8")).toBe("hi"); // …and applied
 });
