@@ -238,6 +238,11 @@ export async function restoreFromTrash(root: string, relPath: string, opts: { ba
   const candidates = opts.batch ? batches.filter((b) => b.name === opts.batch) : batches;
   for (const b of candidates) {
     const from = path.join(b.dir, relPath);
+    // The SOURCE needs the same symlinked-parent guard as the destination: a
+    // trashed symlink `out -> /elsewhere` makes `batch/out/secret` resolve
+    // OUTSIDE the batch — following it would exfiltrate (and then unlink!) a
+    // file the trash never held. Real parent must stay inside this batch.
+    await assertWithinRoot(b.dir, from);
     const st = await fs.lstat(from).catch(() => undefined);
     if (!st) continue;
     let toRel = relPath;

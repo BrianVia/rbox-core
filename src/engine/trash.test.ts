@@ -338,3 +338,21 @@ test("a sibling DIRECTORY named <batch>.active is not mistaken for an active mar
   const res = await pruneTrash(root, { days: 30, maxBytes: Infinity, now });
   expect(res.removedBatches).toBeGreaterThanOrEqual(1); // the 40-day batch must NOT be protected
 });
+
+test("restore refuses a SOURCE that resolves through a trashed symlink to outside the batch (round-3)", async () => {
+  const victim = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-victim-"));
+  try {
+    await fs.writeFile(path.join(victim, "secret.txt"), "outside");
+    await fs.symlink(victim, path.join(root, "out"));
+    const batch = openTrashBatch(root);
+    await batch.put("out"); // the batch now holds symlink out -> victim
+    await batch.finish();
+
+    // Following the trashed symlink would exfiltrate AND unlink victim/secret.txt.
+    await expect(restoreFromTrash(root, "out/secret.txt")).rejects.toThrow(/outside workspace/);
+    expect(await fs.readFile(path.join(victim, "secret.txt"), "utf8")).toBe("outside"); // untouched
+    expect(await exists("out/secret.txt")).toBe(false); // nothing smuggled in
+  } finally {
+    await fs.rm(victim, { recursive: true, force: true });
+  }
+});
