@@ -9,26 +9,32 @@
  *  - top-level error boundary turns thrown Responses into real responses.
  *
  * Dev-harness shortcut (documented): auth is a shared bearer token (M4 replaces).
+ *
+ * This file is the THIN entry: env plumbing (fetch/scheduled/queue), the route
+ * dispatch, and the shared cross-cutting helpers (route-template telemetry, the
+ * web-token gate, CORS). The per-domain matchers live in ./routes/* — each a
+ * `(ctx[, p]) => Promise<Response | null>` group called below in the SAME order as
+ * the original if-chain (first match wins). The order is load-bearing for the
+ * documented overlapping-prefix cases; see ./routes/shared.ts.
  */
 import type { AccountDeleteMessage, DeviceNotifyMessage, Env } from "./env.js";
-import { dbFor } from "./db.js";
-import { blobsCheck, blobGet, blobPut, multipartComplete, multipartInit, multipartPart, multipartStatus } from "./blobs.js";
-import { accountDevices, accountWorkspaces, approveDeviceAuth, authenticate, bootstrap, createPairToken, listDevices, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "./auth.js";
-import { gcMark, gcPurge, versionsList } from "./versions.js";
+import { authenticate } from "./auth.js";
 import { runPhase1 } from "./gc-phase1.js";
-import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "./keys.js";
 import { retentionPrune } from "./retention.js";
-import { billingCheckout, billingPortal, stripeWebhook } from "./stripe.js";
-import { webSession } from "./clerk.js";
-import { accountStatus, confirmLink, linkStatus, redeemLink, startLink, unlinkAccount } from "./account-link.js";
-import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
-import { authorizeWorkspace, createWorkspace, isPlatform } from "./authz.js";
-import { mintGrant } from "./grants.js";
-import { adminSetPlan, countWorkspaces, planLimitsFor, usage } from "./billing.js";
-import { adminOverview } from "./admin.js";
+import { json, logErr } from "./util.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
-import { deleteAccount, driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
+import { driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
+import { eq, isDeviceRevoke, type RouteCtx } from "./routes/shared.js";
+import { releaseRoutes } from "./routes/release.js";
+import { adminRoutes } from "./routes/admin.js";
+import { authDeviceRoutes, authPublicRoutes } from "./routes/auth.js";
+import { billingRoutes, billingWebhookRoutes } from "./routes/billing.js";
+import { webRoutes } from "./routes/web.js";
+import { accountLinkPublicRoutes, accountRoutes } from "./routes/account.js";
+import { keysRoutes } from "./routes/keys.js";
+import { blobsRoutes } from "./routes/blobs.js";
+import { syncRoutes } from "./routes/sync.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 // §33 GRACE_1: the Phase-1 mark→purge grace, sized to exceed the slowest in-flight
@@ -159,91 +165,28 @@ export default {
   },
 };
 
+/**
+ * Route dispatch. Groups are tried in the SAME order as the original if-chain
+ * (first non-null Response wins), with authenticate() + the §1.1 web-token gate
+ * splicing the public groups from the authed ones. Precedence is load-bearing for
+ * the documented overlapping-prefix cases (e.g. blobs/check before blobs/:sha);
+ * exact-match routes across groups are mutually exclusive.
+ */
 async function route(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const seg = url.pathname.split("/").filter(Boolean);
+  const ctx: RouteCtx = { req, env, url, seg };
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-api" });
 
-  // ---- Public release distribution (design 14), served from the SEPARATE
-  // rbox_releases bucket. Never cache a 404 (a cached 404 could mask a just-
-  // published object on the edge — design 14 U7).
-  const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-
-  // `curl -fsSL https://api.rbox.to/install.sh | sh`
-  if (url.pathname === "/install.sh" && req.method === "GET") {
-    const obj = await env.rbox_releases.get("releases/install.sh");
-    if (!obj) return releaseNotFound();
-    return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" } });
-  }
-  // The signed release manifest + its detached signature (no-cache; `rbox upgrade`
-  // verifies the signature against an embedded key before trusting it).
-  if ((url.pathname === "/version" || url.pathname === "/version.sig") && req.method === "GET") {
-    const key = url.pathname === "/version" ? "releases/version.json" : "releases/version.json.sig";
-    const obj = await env.rbox_releases.get(key);
-    if (!obj) return releaseNotFound();
-    const type = url.pathname === "/version" ? "application/json" : "text/plain; charset=utf-8";
-    return new Response(obj.body, { headers: { "content-type": type, "cache-control": "no-cache" } });
-  }
-  // Binaries: `/bin/rbox-<os>-<arch>` (mutable "latest" alias, short cache — for
-  // install.sh only) OR `/bin/v<ver>/rbox-<os>-<arch>` (immutable versioned — what
-  // `rbox upgrade` downloads from the signed manifest). Name/version validated.
-  if (seg[0] === "bin" && req.method === "GET" && (seg.length === 2 || seg.length === 3)) {
-    const versioned = seg.length === 3;
-    const ver = versioned ? seg[1]! : null;
-    const name = versioned ? seg[2]! : seg[1]!;
-    if (!/^rbox-(darwin|linux)-(arm64|x64)$/.test(name)) return releaseNotFound();
-    if (versioned && !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(ver!)) return releaseNotFound();
-    const obj = await env.rbox_releases.get(versioned ? `releases/${ver}/${name}` : `releases/${name}`);
-    if (!obj) return releaseNotFound();
-    const cacheControl = versioned ? "public, max-age=31536000, immutable" : "public, max-age=300";
-    return new Response(obj.body, { headers: { "content-type": "application/octet-stream", "content-disposition": `attachment; filename="rbox"`, "cache-control": cacheControl } });
-  }
-
-  // Platform-only internal op (M7): GC requires the PLATFORM secret, NOT a tenant
-  // device token. roots/prune are not exposed by the public router (GC calls the DO directly).
-  if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
-    if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
-    const phase = url.searchParams.get("phase");
-    // Plan-driven retention: set per-workspace prune floors from each account's
-    // tier; mark/purge then reclaim. Operational order: retention → mark → purge.
-    if (phase === "retention") return retentionPrune(env);
-    const graceMs = Number(url.searchParams.get("graceMs") ?? String(60 * 60 * 1000));
-    // §33 Phase 1 (per-account entitlement prune; D1-only, cron-safe). Same handler that
-    // runs on cron, exposed for on-demand runs/tests. Phase 2 (R2 delete) stays the manual
-    // `phase=purge` quiescent sweep below (gcPurge) — Phase 1 never touches R2.
-    if (phase === "phase1") return runPhase1(env, graceMs);
-    return phase === "purge" ? gcPurge(env, graceMs) : gcMark(env, graceMs);
-  }
-  // GET /v1/admin/overview — platform-admin cockpit (§32 Tier 3a). Gated by a
-  // Cloudflare Access JWT + an email allow-list INSIDE adminOverview (defense in
-  // depth; NOT the rbox bearer), so it sits before authenticate(). This is the only
-  // route with privileged cross-account read access.
-  if (req.method === "GET" && eq(seg, ["v1", "admin", "overview"])) return adminOverview(req, env, Date.now());
-
-  // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N (platform secret; interim until Stripe).
-  if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {
-    if (!isPlatform(req, env)) return jsonResponse({ error: "not_found" }, 404);
-    return adminSetPlan(env, seg[3]!, url.searchParams.get("plan") ?? "free", Number(url.searchParams.get("extraGB") ?? "0"));
-  }
-
-  // Public auth endpoints (EXACT routes only — start the device-authorization flow).
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
-  // Pairing redeem is PUBLIC (the pasted token IS the credential) — exact route.
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);
-  // Stripe webhook is PUBLIC but signature-verified (exact route).
-  if (req.method === "POST" && eq(seg, ["v1", "stripe", "webhook"])) return stripeWebhook(req, env, Date.now());
-  // Web auth: exchange a Clerk session JWT for an rbox web session (PUBLIC, exact).
-  if (req.method === "POST" && eq(seg, ["v1", "web", "session"])) return webSession(req, env, Date.now());
-
-  // Account linking (design 21) — start/status/confirm are PUBLIC: authenticated by
-  // a re-verified Clerk JWT (in body, or the Authorization header for the GET), NOT
-  // an rbox bearer, so they sit before authenticate() and outside the §1.1 gate.
-  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "start"])) return startLink(req, env, Date.now());
-  if (req.method === "GET" && eq(seg, ["v1", "account", "link", "status"])) return linkStatus(req, env, Date.now(), url.searchParams.get("pollKey") ?? "");
-  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "confirm"])) return confirmLink(req, env, Date.now());
+  // ---- PUBLIC groups (before authenticate) ----
+  let r: Response | null;
+  if ((r = await releaseRoutes(ctx))) return r;
+  if ((r = await adminRoutes(ctx))) return r;
+  if ((r = await authPublicRoutes(ctx))) return r;
+  if ((r = await billingWebhookRoutes(ctx))) return r;
+  if ((r = await webRoutes(ctx))) return r;
+  if ((r = await accountLinkPublicRoutes(ctx))) return r;
 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);
@@ -258,145 +201,18 @@ async function route(req: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: "forbidden", message: "web session not permitted on this route" }, 403);
   }
 
-  // Account ops (scoped to the caller's account).
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(req, env, p);
-  if (req.method === "POST" && eq(seg, ["v1", "billing", "checkout"])) return billingCheckout(req, env, p);
-  if (req.method === "POST" && eq(seg, ["v1", "billing", "portal"])) return billingPortal(req, env, p);
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p);
-  if (req.method === "GET" && eq(seg, ["v1", "auth", "devices"])) return listDevices(env, p);
-  if (isDeviceRevoke(req.method, seg)) return revokeDevice(env, p, seg[3]!);
-  if (req.method === "GET" && eq(seg, ["v1", "account", "usage"])) return usage(env, p);
-  // design 22 §2: the web-facing devices/workspaces lists (camelCase, secret-free).
-  if (req.method === "GET" && eq(seg, ["v1", "account", "devices"])) return accountDevices(env, p, url);
-  if (req.method === "GET" && eq(seg, ["v1", "account", "workspaces"])) return accountWorkspaces(env, p, url);
-  // Account linking — AUTHED rbox-bearer routes (under the §1.1 web-token gate).
-  if (req.method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) {
-    const b = (await req.json().catch(() => ({}))) as { code?: unknown };
-    return redeemLink(env, p, typeof b.code === "string" ? b.code : "");
-  }
-  if (req.method === "POST" && eq(seg, ["v1", "account", "unlink"])) return unlinkAccount(env, p, Date.now());
-  if (req.method === "GET" && eq(seg, ["v1", "account", "status"])) return accountStatus(env, p);
-  // Self-serve account + data deletion (design 37) — OWNER-ONLY, confirmation-gated.
-  if (req.method === "DELETE" && eq(seg, ["v1", "account"])) return deleteAccount(env, p, req, Date.now());
-  if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) {
-    const limits = await planLimitsFor(env, p.accountId); // workspace-count quota (M7b)
-    if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
-      return jsonResponse({ error: "quota_exceeded", limit: "workspaces", cap: limits.workspaces }, 402);
-    }
-    // `name` is the OPT-IN, server-visible dashboard label (§ workspace-names); absent → private default.
-    return createWorkspace(env, p, url.searchParams.get("project") ?? "root", url.searchParams.get("name"));
-  }
-
-  // E2EE opaque key storage (design 12) — all authed + account-scoped via Principal.
-  // The server is zero-knowledge: it stores/serves these blobs verbatim, never decrypts.
-  if (seg[0] === "v1" && seg[1] === "keys") {
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "bootstrap"])) return bootstrapAccountKeys(env, p, await req.json().catch(() => ({})));
-    if (req.method === "GET" && eq(seg, ["v1", "keys", "account"])) return getAccountKeys(env, p);
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "device"])) return putDeviceKeys(env, p, await req.json().catch(() => ({})));
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "roster"])) return appendRoster(env, p, await req.json().catch(() => ({})));
-    // C5: atomic device-keys + roster append (admission) in one D1 batch.
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "admit"])) return admitDevice(env, p, await req.json().catch(() => ({})));
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "keystate"])) return appendKeyState(env, p, await req.json().catch(() => ({})));
-    if (req.method === "POST" && eq(seg, ["v1", "keys", "workspace"])) return putWorkspaceKey(env, p, await req.json().catch(() => ({})));
-    if (req.method === "GET" && seg.length === 4 && seg[2] === "workspace") return getWorkspaceKeys(env, p, seg[3]!);
-  }
-
-  // POST /v1/blobs/check — entitlement-scoped to the caller's account.
-  if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE, p.accountId);
-
-  // /v1/blobs/:sha[...] — all entitlement-gated by p.accountId.
-  if (seg[0] === "v1" && seg[1] === "blobs" && seg.length >= 3) {
-    const sha = seg[2]!;
-    if (!SHA_RE.test(sha)) throw badRequest("invalid sha256");
-    if (seg.length === 3) {
-      if (req.method === "PUT") return blobPut(req, env, sha, p.accountId);
-      // §27 — an optional download grant (from `latest()`) lets blobGet skip the per-blob
-      // D1 entitlement read. Absent/invalid → blobGet falls back to the D1 path.
-      if (req.method === "GET") return blobGet(env, sha, p.accountId, req.headers.get("x-rbox-download-grant") ?? undefined);
-    }
-    if (seg[3] === "multipart") {
-      const uploadId = seg[4];
-      if (seg.length === 4 && req.method === "POST") return multipartInit(req, env, sha, p.accountId);
-      if (seg.length === 5 && uploadId && req.method === "GET") return multipartStatus(env, sha, uploadId, p.accountId);
-      if (seg.length === 7 && uploadId && seg[5] === "part" && req.method === "PUT") return multipartPart(req, env, sha, uploadId, Number(seg[6]), p.accountId);
-      if (seg.length === 6 && uploadId && seg[5] === "complete" && req.method === "POST") return multipartComplete(env, sha, uploadId, p.accountId);
-    }
-  }
-
-  // /v1/ws/:ws/proj/:proj/... — authorize (cross-account → 404) before any access.
-  if (seg[0] === "v1" && seg[1] === "ws" && seg[3] === "proj" && seg.length >= 6) {
-    const ws = seg[2]!;
-    const proj = seg[4]!;
-    const action = seg[5]!;
-    const write = action === "manifests" && req.method === "POST"; // commit
-    const az = await authorizeWorkspace(env, p, ws, proj, write);
-    if (!az.ok) return jsonResponse({ error: az.status === 403 ? "forbidden" : "not_found" }, az.status);
-
-    if (seg.length === 6 && action === "versions" && req.method === "GET") {
-      return versionsList(env, p.accountId, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
-    }
-    if (action === "manifests" || action === "latest" || action === "connect" || action === "commits") {
-      const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
-      if (write) {
-        // Commit: forward with the authenticated account (DO does account-scoped
-        // blob-existence). Clean header set by the Worker (overrides any client value).
-        const headers = new Headers(req.headers);
-        headers.set("x-rbox-account", p.accountId);
-        // C4: also forward the account's CURRENT key epoch (MAX(account_epoch), 0 if
-        // none); the DO asserts the commit's accountEpoch == this inside the txn.
-        const epochRow = await dbFor(env, p.accountId)
-          .prepare("SELECT MAX(account_epoch) AS epoch FROM account_key_states WHERE account_id = ?")
-          .bind(p.accountId)
-          .first<{ epoch: number | null }>();
-        headers.set("x-rbox-account-epoch", String(epochRow?.epoch ?? 0));
-        return stub.fetch(new Request(req, { headers }));
-      }
-      const res = await stub.fetch(req);
-      // §27 — piggyback a download grant on the pull handshake (the ONE place the caller
-      // is already authorized to the workspace, so it costs no extra D1). Minted
-      // WORKER-SIDE so the HMAC key never enters the DO. Best-effort: on any hiccup the
-      // DO response passes through and the client uses the D1 entitlement path.
-      if (action === "latest") return withDownloadGrant(env, res, p.accountId, ws);
-      return res;
-    }
-  }
+  // ---- AUTHED groups (Principal-scoped, under the §1.1 gate) ----
+  if ((r = await authDeviceRoutes(ctx, p))) return r;
+  if ((r = await billingRoutes(ctx, p))) return r;
+  if ((r = await accountRoutes(ctx, p))) return r;
+  if ((r = await keysRoutes(ctx, p))) return r;
+  if ((r = await blobsRoutes(ctx, p))) return r;
+  if ((r = await syncRoutes(ctx, p))) return r;
 
   return jsonResponse({ error: "not_found" }, 404);
 }
 
-/** §27 — splice a best-effort download grant into a successful `latest()` response,
- *  WORKER-SIDE (the `RBOX_GRANT_KEY` HMAC key never enters the WorkspaceSync DO). Mint is
- *  best-effort: no key / non-2xx / non-object body ⇒ the DO response passes through
- *  untouched and the client falls back to the D1 entitlement path. On success the client's
- *  subsequent blob GETs present the grant and skip the per-blob D1 read (§27). */
-async function withDownloadGrant(env: Env, res: Response, accountId: string, workspaceId: string): Promise<Response> {
-  if (!res.ok) return res;
-  let body: unknown;
-  try {
-    body = await res.clone().json();
-  } catch {
-    return res; // not JSON — leave the DO response untouched
-  }
-  if (typeof body !== "object" || body === null) return res;
-  const grant = await mintGrant(env, { accountId, workspaceId, nowMs: Date.now() });
-  if (!grant) return res; // no grant key configured — best-effort no-op
-  const headers = new Headers(res.headers);
-  headers.delete("content-length"); // body length changed
-  return new Response(JSON.stringify({ ...(body as Record<string, unknown>), grant }), { status: res.status, headers });
-}
-
-// ---- helpers ------------------------------------------------------------
-
-function eq(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i]);
-}
-
-/** `POST /v1/auth/devices/:deviceId/revoke` — a wildcard route (`:deviceId`) `eq`
- *  can't express, so it has its own matcher used by BOTH the dispatcher and the
- *  web-token allowlist (kept in one place so the two never drift). */
-function isDeviceRevoke(method: string, seg: string[]): boolean {
-  return method === "POST" && seg.length === 5 && eq([seg[0]!, seg[1]!, seg[2]!, seg[4]!], ["v1", "auth", "devices", "revoke"]);
-}
+// ---- shared cross-cutting helpers ---------------------------------------
 
 /**
  * Collapse a request path into a low-cardinality, id-free template for telemetry
@@ -470,9 +286,6 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   // owner role + confirmation. A non-owner web session is rejected there, not here.
   if (method === "DELETE" && eq(seg, ["v1", "account"])) return true;
   return false;
-}
-function badRequest(message: string): Response {
-  return jsonResponse({ error: "bad_request", message }, 400);
 }
 
 /**

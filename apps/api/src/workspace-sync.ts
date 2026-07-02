@@ -5,101 +5,16 @@ import { validateCommitRefs, commitAccounting, MAX_REFS_PER_COMMIT } from "./com
 import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
-
-// Opaque body cap. With §24 the body is O(1) for large repos (the refs live in an R2
-// sidecar, only its {sidecarSha,count,totalBytes} descriptor is inline). Small repos still
-// inline blobRefs ({encSha,size} ≈ 85B each); 1MB covers ~12k inline refs + fits D1's ~2MB
-// row limit. The §24 client switches to the sidecar before bodies approach this cap.
-const MAX_COMMIT_BODY = 1024 * 1024; // 1MB
-// §30: hard ceiling on the request body, enforced by ACTUAL bytes read before JSON.parse
-// (readBodyCapped) so a hostile/huge receipts map can't OOM the isolate (codex r3/r4 MAJOR).
-// Sized to keep the JSON.parse HEAP safe, not just the wire bytes: a pathological 8MB body
-// (millions of tiny keys) expands to only ~40-60MB of JS objects — well within the 128MB
-// isolate — whereas 32MB could threaten it. This is a SECOND axis from MAX_REFS_PER_COMMIT
-// (which bounds ref COUNT): a COLD push's receipt map (~375B/ref) must also fit here, so 8MB
-// covers the validated 12k (~4MB) with headroom; a cold push much past ~20k refs is bounded by
-// this and stays behind the same dev measurement as the 50k count ceiling. Incremental pushes
-// (few NEW receipts) reach MAX_REFS_PER_COMMIT freely — their body is small.
-const MAX_REQUEST_BODY = 8 * 1024 * 1024; // 8MB — parse-heap-safe
-
-// Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
-// Content-Length). Returns the decoded text, "" for an empty body, or null if it exceeds the cap.
-async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
-  if (!req.body) return "";
-  const reader = req.body.getReader();
-  const decoder = new TextDecoder();
-  let out = "";
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel().catch(() => {});
-        return null;
-      }
-      out += decoder.decode(value, { stream: true });
-    }
-  }
-  out += decoder.decode();
-  return out;
-}
-
-/** The opaque signed commit envelope the server stores verbatim (design 12, v4).
- *  The server reads a FEW fields out of `body` for validation but NEVER verifies
- *  the signature — clients verify from genesis. */
-interface SignedCommit {
-  body: string; // canonical JSON of the commitBody (opaque)
-  commitHash: string; // hex
-  sig: string; // b64url Ed25519 (opaque)
-}
-/** The minimal slice of commitBody the server inspects. Everything else is opaque. */
-interface CommitBodyView {
-  type?: unknown;
-  seq?: unknown;
-  parentSeq?: unknown;
-  accountEpoch?: unknown;
-  encManifestSha?: unknown;
-  deviceId?: unknown;
-  blobRefs?: unknown;
-  blobRefset?: unknown; // §24 sidecar descriptor {sidecarSha,count,totalBytes}
-}
-
-/** §24 strict discriminator: a commit body carries EXACTLY ONE ref carrier — inline
- *  `blobRefs` (array) XOR a `blobRefset` descriptor (object). Returns the validated mode,
- *  or null if both/neither/wrong-type (→ caller rejects before accounting/head-advance).
- *  Note: the body was JSON.parse'd; a duplicate JSON key would have collapsed, but the
- *  client signs the canonical form and every honest reader runs the engine `parseCommit`
- *  (verifyRoundTrip) — the server's accounting never trusts a key the signature didn't cover
- *  because it re-derives the ref set from the receipt-authenticated sidecar bytes, not the body. */
-type RefMode = { kind: "inline"; refShas: string[] } | { kind: "sidecar"; sidecarSha: string; count: number; totalBytes: number };
-
-function readRefMode(cb: CommitBodyView): RefMode | null {
-  const hasInline = Array.isArray(cb.blobRefs);
-  const rs = cb.blobRefset;
-  const hasSidecar = !!rs && typeof rs === "object" && !Array.isArray(rs);
-  if (hasInline === hasSidecar) return null; // both or neither
-  if (hasInline) {
-    // NB: the > MAX_REFS_PER_COMMIT rejection lives in the commit handler (structured 413
-    // too_many_refs), NOT here — returning null here would mask it as a generic 400 (codex r3
-    // MINOR). Inline bodies are already bounded by MAX_COMMIT_BODY, so this array stays small.
-    const refs = cb.blobRefs as Array<{ encSha?: unknown }>;
-    const refShas: string[] = [];
-    for (const r of refs) {
-      if (!r || typeof r.encSha !== "string" || !SHA_RE.test(r.encSha)) return null;
-      refShas.push(r.encSha);
-    }
-    return { kind: "inline", refShas };
-  }
-  const d = rs as { sidecarSha?: unknown; count?: unknown; totalBytes?: unknown };
-  if (typeof d.sidecarSha !== "string" || !SHA_RE.test(d.sidecarSha)) return null;
-  if (!Number.isSafeInteger(d.count) || (d.count as number) < 0) return null; // > MAX → structured 413 in the handler, not a null/400 here
-  if (!Number.isSafeInteger(d.totalBytes) || (d.totalBytes as number) < 0) return null;
-  return { kind: "sidecar", sidecarSha: d.sidecarSha, count: d.count as number, totalBytes: d.totalBytes as number };
-}
-
-const MAX_COMMIT_SPAN = 5000; // commits?since span cap → over this, client re-baselines
+import {
+  MAX_COMMIT_BODY,
+  MAX_COMMIT_SPAN,
+  MAX_REQUEST_BODY,
+  readBodyCapped,
+  readRefMode,
+  type CommitBodyView,
+  type SignedCommit,
+} from "./commit-envelope.js";
+import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
 
 /**
  * WorkspaceSync — the per-(workspace, project) Durable Object (D2).
@@ -111,11 +26,13 @@ const MAX_COMMIT_SPAN = 5000; // commits?since span cap → over this, client re
  *     DO's single thread makes them genuinely atomic. Blob-existence checks happen
  *     BEFORE the transaction.
  *  2. Live notification fanout over hibernatable WebSockets. Notification-only —
- *     clients never depend on delivery for correctness.
+ *     clients never depend on delivery for correctness. (See ws-fanout.ts.)
  *
  * Under full E2EE the server is ZERO-KNOWLEDGE: a commit carries a SIGNED COMMIT
  * ENVELOPE (opaque body + hash + sig), not a plaintext manifest. The DO stores it
- * verbatim and never decrypts or verifies signatures.
+ * verbatim and never decrypts or verifies signatures. The envelope's wire types +
+ * parsing (caps, capped body read, §24 ref-mode discriminator) live in
+ * commit-envelope.ts; this class orchestrates.
  *
  * DO storage (SQLite-backed, synchronous KV): `head` (number) and `seq:<n>`
  * (JSON of the full SignedCommit). Authoritative; D1 `commits` is a best-effort
@@ -159,7 +76,7 @@ export class WorkspaceSync {
     await this.ensureBootstrap(ws, proj);
 
     if (action === "connect" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      return this.connect(url);
+      return acceptConnection(this.ctx, url);
     }
     if (action === "latest" && req.method === "GET") return this.latest();
     // C1: the stored SignedCommits for (since, head] so a client can verify the
@@ -399,7 +316,7 @@ export class WorkspaceSync {
       logErr("d1_commit_mirror_failed", e); // no raw error (binds carry ws/proj/body/device)
     }
 
-    this.broadcast(JSON.stringify({ type: "committed", sequence, deviceId }), deviceId);
+    wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }), deviceId);
     // Success: the headline commit-latency / body-size / blobs-per-commit + the
     // R2/D1/DO split (dbMs+dbCalls from missingBlobs & mirror, doMs from the txn).
     emitCommit("ok"); // ratio defaults to 0
@@ -546,33 +463,11 @@ export class WorkspaceSync {
     return shas.filter((s) => !entitled.has(s) || condemned.has(s));
   }
 
-  // ---- WebSocket fanout (hibernatable) ----
-
-  private connect(url: URL): Response {
-    const deviceId = url.searchParams.get("device");
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-    this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ deviceId });
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  private broadcast(message: string, fromDeviceId: string | null): void {
-    for (const ws of this.ctx.getWebSockets()) {
-      if (ws.readyState !== WebSocket.OPEN) continue; // set can include CLOSING sockets
-      const att = ws.deserializeAttachment() as { deviceId: string | null } | null;
-      if (fromDeviceId && att?.deviceId === fromDeviceId) continue; // don't echo to the committer
-      try {
-        ws.send(message);
-      } catch {
-        // one dead socket must not abort the fanout
-      }
-    }
-  }
+  // ---- WebSocket hibernation handlers (see ws-fanout.ts for connect/broadcast) ----
 
   // Hibernation handlers. Clients never drive state over WS, so messages are ignored
-  // (protocol pings are auto-answered via setWebSocketAutoResponse).
+  // (protocol pings are auto-answered via setWebSocketAutoResponse). The runtime calls
+  // these by name on the instance, so they MUST live on the class.
   webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): void {}
   webSocketClose(ws: WebSocket, code: number): void {
     try {
