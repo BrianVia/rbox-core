@@ -178,3 +178,48 @@ test("unlinkDir removes children only when the directory is genuinely gone", asy
   const gone = await applyWatchEvents(base, root, matcher, [{ relPath: "d", kind: "unlinkDir" }]);
   expect(gone.files.some((f) => f.path.startsWith("d/"))).toBe(false);
 });
+
+// --- codex impl-round-1 regressions -----------------------------------------
+
+test("unlinkDir for a path that is NOW A FILE (the eviction-echo flip) re-derives the file, drops only dir children", async () => {
+  // Base: foo/ is a directory with a child. Then the pull evicts foo/ and writes FILE foo.
+  await write("foo/child.txt", "old");
+  const base = await buildManifest();
+  expect(base.files.some((f) => f.path === "foo/child.txt")).toBe(true);
+  await fs.rm(path.join(root, "foo"), { recursive: true, force: true });
+  await write("foo", "now a file");
+
+  // The stale queued `unlinkDir foo` must NOT delete the fresh `foo` entry
+  // (impl-review BLOCKER: this exact case pushed a sub-threshold delete).
+  const after = await applyWatchEvents(base, root, buildIgnoreMatcher(root), [{ relPath: "foo", kind: "unlinkDir" }]);
+  expect(after.files.some((f) => f.path === "foo")).toBe(true);
+  expect(after.files.some((f) => f.path === "foo/child.txt")).toBe(false); // children impossible under a file
+});
+
+test("stale unlinkDir on a still-present dir is AUTHORITATIVE: vanished children drop, fresh ones upsert", async () => {
+  await write("d/old.txt", "x");
+  const base = await buildManifest();
+  await fs.rm(path.join(root, "d/old.txt"));
+  await write("d/new.txt", "y");
+
+  const after = await applyWatchEvents(base, root, buildIgnoreMatcher(root), [{ relPath: "d", kind: "unlinkDir" }]);
+  expect(after.files.some((f) => f.path === "d/new.txt")).toBe(true);
+  expect(after.files.some((f) => f.path === "d/old.txt")).toBe(false); // rescan is truth, not a merge
+});
+
+test("two conflict move-asides for the same path in the same second never clobber each other", async () => {
+  // deleteEntry's dirty branch names the copy with second-precision conflictName —
+  // drive it twice with the same wall-second and device.
+  const mkDelete = (expected: FileEntry): Action => ({ kind: "delete", path: "c.txt", expectedLocal: expected });
+  const staleExpected: FileEntry = { path: "c.txt", type: "file", sha256: hashBytes(Buffer.from("other")), size: 5, mode: 0o644, mtimeMs: 0 };
+
+  await write("c.txt", "v1");
+  await applyActions(root, [mkDelete(staleExpected)], store, { device: "dev" });
+  await write("c.txt", "v2");
+  await applyActions(root, [mkDelete(staleExpected)], store, { device: "dev" });
+
+  const copies = (await fs.readdir(root)).filter((n) => n.includes("conflict"));
+  expect(copies.length).toBe(2); // both preserved — second got a ~2 suffix
+  const contents = await Promise.all(copies.map((n) => read(n)));
+  expect(contents.sort()).toEqual(["v1", "v2"]);
+});

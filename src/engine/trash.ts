@@ -19,7 +19,10 @@ import { conflictName } from "./reconcile.js";
  */
 
 export const TRASH_REL = ".rbox/trash";
-const ACTIVE_MARKER = ".active";
+/** The in-flight marker is a SIBLING file (`<batchDir>.active`), NOT inside the
+ *  batch — the batch's namespace belongs entirely to trashed user paths (a user
+ *  file legitimately named `.active` must trash, list, and restore cleanly). */
+const markerFor = (dir: string) => `${dir}.active`;
 const MIN_PRUNE_AGE_MS = 15 * 60_000;
 const STALE_ACTIVE_MS = 24 * 60 * 60_000;
 
@@ -35,6 +38,16 @@ export interface TrashBatch {
   readonly dir: string;
 }
 
+/** A trash path must stay inside the workspace/batch: relative, no `..`
+ *  escapes, no NUL. Guards both put() (engine-internal, cheap insurance) and
+ *  restoreFromTrash() (raw CLI input). */
+function assertSafeRel(rel: string): void {
+  const norm = path.normalize(rel);
+  if (rel.length === 0 || path.isAbsolute(norm) || norm === ".." || norm.startsWith(`..${path.sep}`) || rel.includes("\0")) {
+    throw new Error(`unsafe trash path: ${rel}`);
+  }
+}
+
 /** Batch dir names lead with the pull's wall-clock (filesystem-safe ISO) and end
  *  with a pid+counter tail: two pulls in the same millisecond (daemon + one-shot,
  *  or a fast test) must NOT share a batch dir — they'd trample each other's
@@ -48,13 +61,15 @@ export function openTrashBatch(root: string, now: Date = new Date()): TrashBatch
   return {
     dir,
     async put(relPath: string): Promise<void> {
+      assertSafeRel(relPath);
       const from = path.join(root, relPath);
       let to = path.join(dir, relPath);
-      await fs.mkdir(path.dirname(to), { recursive: true });
       if (!armed) {
-        await fs.writeFile(path.join(dir, ACTIVE_MARKER), "");
+        await fs.mkdir(path.dirname(markerFor(dir)), { recursive: true });
+        await fs.writeFile(markerFor(dir), "");
         armed = true;
       }
+      await fs.mkdir(path.dirname(to), { recursive: true });
       for (let i = 2; ; i++) {
         try {
           // rename(2) over an EXISTING dest would clobber a same-batch entry —
@@ -75,7 +90,7 @@ export function openTrashBatch(root: string, now: Date = new Date()): TrashBatch
     },
     async finish(): Promise<void> {
       if (!armed) return;
-      await fs.rm(path.join(dir, ACTIVE_MARKER), { force: true }).catch(() => {});
+      await fs.rm(markerFor(dir), { force: true }).catch(() => {});
     },
   };
 }
@@ -107,7 +122,7 @@ async function listBatches(root: string, nowMs: number): Promise<BatchInfo[]> {
     const m = name.match(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
     const born = m ? Date.parse(`${m[1]}:${m[2]}:${m[3]}.${m[4]}Z`) : NaN;
     let active = false;
-    const marker = await fs.lstat(path.join(dir, ACTIVE_MARKER)).catch(() => undefined);
+    const marker = await fs.lstat(markerFor(dir)).catch(() => undefined);
     if (marker) active = nowMs - marker.mtimeMs < STALE_ACTIVE_MS;
     const { bytes, files } = await duDir(dir);
     out.push({ name, dir, bornMs: Number.isFinite(born) ? born : st.mtimeMs, active, bytes, files });
@@ -121,7 +136,6 @@ async function duDir(dir: string): Promise<{ bytes: number; files: number }> {
   const entries = await fs.readdir(dir, { withFileTypes: true, recursive: true }).catch(() => []);
   for (const e of entries) {
     if (!e.isFile() && !e.isSymbolicLink()) continue;
-    if (e.name === ACTIVE_MARKER) continue;
     const st = await fs.lstat(path.join(e.parentPath, e.name)).catch(() => undefined);
     if (!st) continue;
     bytes += st.size;
@@ -148,6 +162,7 @@ export async function pruneTrash(root: string, opts: { days: number; maxBytes: n
   const result: TrashPruneResult = { removedBatches: 0, freedBytes: 0 };
   const remove = async (b: BatchInfo) => {
     await fs.rm(b.dir, { recursive: true, force: true });
+    await fs.rm(markerFor(b.dir), { force: true }).catch(() => {}); // stale-override case
     result.removedBatches++;
     result.freedBytes += b.bytes;
   };
@@ -195,7 +210,7 @@ export async function listTrash(root: string): Promise<TrashEntry[]> {
   for (const b of [...batches].reverse()) {
     const entries = await fs.readdir(b.dir, { withFileTypes: true, recursive: true }).catch(() => []);
     for (const e of entries) {
-      if ((!e.isFile() && !e.isSymbolicLink()) || e.name === ACTIVE_MARKER) continue;
+      if (!e.isFile() && !e.isSymbolicLink()) continue;
       const abs = path.join(e.parentPath, e.name);
       const st = await fs.lstat(abs).catch(() => undefined);
       if (!st) continue;
@@ -217,6 +232,7 @@ export interface RestoreResult {
  * first unless `batch` pins one.
  */
 export async function restoreFromTrash(root: string, relPath: string, opts: { batch?: string; now?: Date } = {}): Promise<RestoreResult> {
+  assertSafeRel(relPath);
   const batches = (await listBatches(root, Date.now())).reverse(); // newest first
   const candidates = opts.batch ? batches.filter((b) => b.name === opts.batch) : batches;
   for (const b of candidates) {
@@ -233,7 +249,19 @@ export async function restoreFromTrash(root: string, relPath: string, opts: { ba
       if (code === "ENOTDIR") throw new Error(`cannot restore ${relPath}: a parent path component is a file — move it aside first`);
       if (code !== "ENOENT") throw e;
     }
-    const to = path.join(root, toRel);
+    // conflictName is second-precision — the divert itself must not clobber an
+    // earlier conflict copy either. Probe and suffix, same idiom as put().
+    const baseRel = toRel;
+    let to = path.join(root, toRel);
+    for (let i = 2; ; i++) {
+      try {
+        await fs.access(to);
+        toRel = `${baseRel}~${i}`;
+        to = path.join(root, toRel);
+      } catch {
+        break;
+      }
+    }
     await fs.mkdir(path.dirname(to), { recursive: true });
     await fs.rename(from, to);
     return { restoredTo: toRel };

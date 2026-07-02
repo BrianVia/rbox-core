@@ -275,10 +275,21 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   return undefined; // directory or special file
 }
 
+/** A conflict-copy destination must never clobber an EARLIER copy: conflictName
+ *  has one-second precision, so two conflicts on the same path in the same second
+ *  (same device) collide — probe and suffix `~2`, `~3`… (design-50 review). */
 async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
   const from = path.join(destRoot, fromRel);
-  const to = path.join(destRoot, toRel);
+  let to = path.join(destRoot, toRel);
   await fs.mkdir(path.dirname(to), { recursive: true });
+  for (let i = 2; ; i++) {
+    try {
+      await fs.access(to);
+      to = path.join(destRoot, `${toRel}~${i}`);
+    } catch {
+      break;
+    }
+  }
   await fs.rename(from, to);
 }
 

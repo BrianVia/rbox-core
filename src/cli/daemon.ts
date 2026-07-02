@@ -357,6 +357,7 @@ export class RboxDaemon {
   }
 
   private async doPush(): Promise<void> {
+    this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
       this.pendingEvents = [];
@@ -445,6 +446,7 @@ export class RboxDaemon {
   }
 
   private async doPull(): Promise<void> {
+    this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
@@ -531,7 +533,9 @@ export class RboxDaemon {
    *  could land (the EISDIR-flip heal). Forensic log line + folded into the conflict
    *  count so `rbox status`'s last-pull trail surfaces it. */
   private noteTypeFlip(relPath: string): void {
-    log(`pull type-flip conflict: ${cleanPath(relPath)} — local directory moved to trash`);
+    // Fires for BOTH eviction shapes: an obstructing directory (→ trash) and an
+    // obstructing ancestor file (→ visible conflict copy) — word it generically.
+    log(`pull type-flip conflict: ${cleanPath(relPath)} — local obstruction moved aside (see rbox trash / conflict copies)`);
     this.typeFlipsSincePull++;
   }
 

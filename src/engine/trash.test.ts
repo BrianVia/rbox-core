@@ -80,9 +80,11 @@ test("finish removes the .active marker; a zero-put batch leaves nothing on disk
   await write("a.txt", "hi");
   const batch = openTrashBatch(root);
   await batch.put("a.txt");
-  expect(await exists(path.join(TRASH_REL, path.basename(batch.dir), ".active"))).toBe(true);
+  // The marker is a SIBLING file (`<batchDir>.active`) — the batch's inside
+  // belongs entirely to trashed user paths.
+  expect(await exists(path.join(TRASH_REL, `${path.basename(batch.dir)}.active`))).toBe(true);
   await batch.finish();
-  expect(await exists(path.join(TRASH_REL, path.basename(batch.dir), ".active"))).toBe(false);
+  expect(await exists(path.join(TRASH_REL, `${path.basename(batch.dir)}.active`))).toBe(false);
 
   // A batch that never received a put arms nothing — its dir is never created.
   const empty = openTrashBatch(root);
@@ -140,7 +142,7 @@ test("size cap evicts oldest-first until under maxBytes", async () => {
 test("a fresh .active batch is protected from both age and size passes", async () => {
   const now = Date.now();
   const dir = await seedBatch(new Date(now - 40 * DAY), { "a": "a".repeat(500) });
-  await fs.writeFile(path.join(dir, ".active"), ""); // fresh marker
+  await fs.writeFile(`${dir}.active`, ""); // fresh sibling marker
 
   const res = await pruneTrash(root, { days: 30, maxBytes: 1, now });
   expect(res.removedBatches).toBe(0);
@@ -172,7 +174,7 @@ test("days<=0 removes every unprotected batch (rbox trash empty)", async () => {
   const now = Date.now();
   const old = await seedBatch(new Date(now - 2 * DAY), { "a": "x" });
   const active = await seedBatch(new Date(now - 3 * DAY), { "b": "y" });
-  await fs.writeFile(path.join(active, ".active"), ""); // protected
+  await fs.writeFile(`${active}.active`, ""); // protected (sibling marker)
   const young = await seedBatch(new Date(now - 60_000), { "c": "z" }); // <15min, protected
 
   const res = await pruneTrash(root, { days: 0, maxBytes: Infinity, now });
@@ -188,7 +190,7 @@ test("trashStats and listTrash count files across batches (ignoring markers)", a
   const now = Date.now();
   await seedBatch(new Date(now - 3 * DAY), { "one.txt": "aa", "sub/two.txt": "bbb" });
   const b2 = await seedBatch(new Date(now - 1 * DAY), { "three.txt": "cccc" });
-  await fs.writeFile(path.join(b2, ".active"), "x"); // markers must not count as files
+  await fs.writeFile(`${b2}.active`, "x"); // sibling markers never count as files
 
   const stats = await trashStats(root);
   expect(stats.batches).toBe(2);
@@ -257,4 +259,54 @@ test("restore without a pin searches newest batch first", async () => {
   const res = await restoreFromTrash(root, "shared.txt");
   expect(res.restoredTo).toBe("shared.txt");
   expect(await readTrash(root, "shared.txt")).toBe("from-newer");
+});
+
+// --- codex impl-round-1 regressions -----------------------------------------
+
+test("a user file literally named .active trashes, lists, and restores cleanly (marker is a sibling, not an inmate)", async () => {
+  await write(".active", "user bytes");
+  const batch = openTrashBatch(root);
+  await batch.put(".active");
+  // The in-flight marker lives BESIDE the batch dir; the user's file keeps its name inside.
+  expect(await exists(`${path.relative(root, batch.dir)}.active`)).toBe(true);
+  expect(await readTrash(batch.dir, ".active")).toBe("user bytes");
+  await batch.finish();
+
+  const listed = await listTrash(root);
+  expect(listed.some((e) => e.path === ".active")).toBe(true);
+  const res = await restoreFromTrash(root, ".active");
+  expect(res.restoredTo).toBe(".active");
+  expect(await fs.readFile(path.join(root, ".active"), "utf8")).toBe("user bytes");
+});
+
+test("unsafe relative paths are rejected at the trash boundary (put and restore)", async () => {
+  const batch = openTrashBatch(root);
+  await expect(batch.put("../victim")).rejects.toThrow(/unsafe trash path/);
+  await expect(batch.put("/etc/hosts")).rejects.toThrow(/unsafe trash path/);
+  await expect(batch.put("a/../../victim")).rejects.toThrow(/unsafe trash path/);
+  await batch.finish();
+  await expect(restoreFromTrash(root, "../victim")).rejects.toThrow(/unsafe trash path/);
+  await expect(restoreFromTrash(root, "")).rejects.toThrow(/unsafe trash path/);
+});
+
+test("restore divert never clobbers an existing same-second conflict copy", async () => {
+  const now = new Date();
+  await write("f.txt", "trashed-1");
+  const b1 = openTrashBatch(root);
+  await b1.put("f.txt");
+  await b1.finish();
+  await write("f.txt", "trashed-2");
+  const b2 = openTrashBatch(root);
+  await b2.put("f.txt");
+  await b2.finish();
+  await write("f.txt", "current");
+
+  // Both restores collide with the live f.txt AND (second) with the first divert's name.
+  const r1 = await restoreFromTrash(root, "f.txt", { now });
+  const r2 = await restoreFromTrash(root, "f.txt", { now });
+  expect(r1.restoredTo).not.toBe("f.txt");
+  expect(r2.restoredTo).not.toBe(r1.restoredTo); // ~2 suffix, no clobber
+  expect(await fs.readFile(path.join(root, "f.txt"), "utf8")).toBe("current");
+  const both = [await fs.readFile(path.join(root, r1.restoredTo), "utf8"), await fs.readFile(path.join(root, r2.restoredTo), "utf8")];
+  expect(both.sort()).toEqual(["trashed-1", "trashed-2"]);
 });

@@ -74,22 +74,47 @@ export async function applyWatchEvents(
         cache?.invalidate(rel);
       }
     } else if (ev.kind === "unlinkDir") {
-      // Same invariant for a directory unlink: a still-present dir means the event
-      // is stale, so rescan the subtree as truth (never drop children still on
-      // disk). Only a vanished dir removes the `dir/**` prefix.
+      // Same invariant for a directory unlink: whatever occupies the path NOW is
+      // the truth. Three disk states, three answers:
+      //  - still a dir → AUTHORITATIVE subtree rescan: fresh children upsert AND
+      //    vanished `dir/**` entries drop (the walk is the whole truth for the
+      //    subtree, not a merge);
+      //  - now a file/symlink (a type flip — the pull-eviction echo, design 50 B1)
+      //    → `dir/**` children are impossible under a file, drop them; the path
+      //    itself re-derives from disk exactly like a stale `unlink`;
+      //  - genuinely gone → drop the exact path + `dir/**` prefix.
+      const prefix = `${rel}/`;
       const st = await fs.lstat(path.join(root, rel)).catch(() => undefined);
       if (st?.isDirectory()) {
         if (matcher.ignores(`${rel}/`)) continue;
         const sub: FileEntry[] = [];
         await walk(root, rel, matcher, sub, cache);
-        for (const e of sub) map.set(e.path, e);
-      } else {
-        const prefix = `${rel}/`;
+        const fresh = new Set(sub.map((e) => e.path));
         for (const k of [...map.keys()]) {
-          if (k === rel || k.startsWith(prefix)) {
+          if ((k === rel || k.startsWith(prefix)) && !fresh.has(k)) {
             map.delete(k);
             cache?.invalidate(k);
           }
+        }
+        for (const e of sub) map.set(e.path, e);
+      } else {
+        for (const k of [...map.keys()]) {
+          if (k.startsWith(prefix)) {
+            map.delete(k);
+            cache?.invalidate(k);
+          }
+        }
+        if (st && !matcher.ignores(rel)) {
+          const res = await statHashEntry(root, rel, cache);
+          if (res.kind === "entry") map.set(rel, res.entry);
+          else if (res.kind === "midwrite") deferred?.add(rel);
+          else {
+            map.delete(rel);
+            cache?.invalidate(rel);
+          }
+        } else {
+          map.delete(rel);
+          cache?.invalidate(rel);
         }
       }
     } else if (ev.kind === "addDir") {
