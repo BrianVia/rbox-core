@@ -10,7 +10,7 @@ import {
   type WatchEvent,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
-import { saveActivity, type DaemonActivity } from "./activity.js";
+import { renderShellLine, saveActivity, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -273,6 +273,13 @@ export class RboxDaemon {
         }
       }
       await this.cache.save(this.root);
+      // Settle the sidecar (codex R4 P1): all wants are drained here, so re-render if
+      // the state CHANGED from the last write — the mid-pump write said `pending`
+      // (push still queued) and the no-op push wrote nothing; an idle workspace must
+      // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
+      const settledNow =
+        !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
+      if (shellStateOf(this.activity, settledNow) !== this.lastShellState) this.writeActivity();
     } finally {
       this.pumping = false;
     }
@@ -409,6 +416,11 @@ export class RboxDaemon {
    *  on the sync path (a slow sidecar write must not delay a single op — codex R1);
    *  drained only by stop() so graceful shutdown flushes the final record. */
   private activityWrite: Promise<void> = Promise.resolve();
+  /** The shell.line state most recently WRITTEN — compared at pump exit so an idle
+   *  workspace settles back to `ok` (codex R4 P1: the last op's write can render
+   *  `pending` because the follow-up push was still queued, and the no-op push
+   *  never writes — without the settle pass the glyph reads pending forever). */
+  private lastShellState?: string;
 
   /** Persist the in-memory activity record. Non-blocking for the caller, and
    *  saveActivity swallows all errors by contract — visibility must never break
@@ -420,7 +432,21 @@ export class RboxDaemon {
     this.activityDirty = false;
     this.lastActivityWrite = Date.now();
     const snapshot = { ...this.activity };
-    this.activityWrite = this.activityWrite.then(() => saveActivity(this.root, snapshot));
+    // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
+    // onto the same promise so BOTH files preserve write ordering and neither is ever
+    // awaited on the sync path. `settled` = nothing queued and no watcher events left.
+    const settled =
+      !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
+    this.lastShellState = shellStateOf(snapshot, settled);
+    const line = renderShellLine(snapshot, {
+      settled,
+      sequence: this.lastLoggedSeq,
+      name: this.cfg.name ?? this.cfg.remoteWorkspaceId,
+      now: Date.now(),
+    });
+    this.activityWrite = this.activityWrite
+      .then(() => saveActivity(this.root, snapshot))
+      .then(() => saveShellLine(this.root, line));
   }
 
   /** Every pull that mutated the local tree — whichever path ran it (doPull, or the

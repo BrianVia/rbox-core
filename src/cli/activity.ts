@@ -39,6 +39,7 @@ export interface DaemonActivity {
 export const ACTIVE_STALE_MS = 60_000;
 
 const activityPath = (root: string) => path.join(root, RBOX_DIR, "state", "activity.json");
+const shellLinePath = (root: string) => path.join(root, RBOX_DIR, "state", "shell.line");
 
 /** Best-effort read: absent/corrupt → undefined, and each nested slot is SHAPE-
  *  VALIDATED individually — a malformed slot is dropped, never handed to a render
@@ -77,6 +78,76 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   try {
     await fs.mkdir(path.join(root, RBOX_DIR, "state"), { recursive: true });
     await writeFileAtomic(activityPath(root), JSON.stringify(a, null, 2));
+  } catch {
+    /* best-effort by contract */
+  }
+}
+
+/** The sidecar's state field — halt > active > pending (unsettled) > ok. Exported
+ *  so the daemon can compare "what would render now" against what it last wrote
+ *  (the codex R4 settle fix) without duplicating the precedence. */
+export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "active" | "pending" | "ok" =>
+  a.halt ? "halt" : a.active ? "active" : settled ? "ok" : "pending";
+
+/**
+ * Design 46: render the daemon's activity record into the one-line prompt sidecar
+ * (`.rbox/state/shell.line`). PURE — all display judgment (state precedence, pct
+ * clamping, op-recency) lives HERE next to the code that owns the data, so the zsh
+ * prompt hook can stay a single `read` builtin that never re-derives (and drifts
+ * from) the verdict rules. See {@link saveShellLine} for the write side.
+ *
+ * Format (v1), single-space separated, `name` LAST because it may contain spaces:
+ *   `v1 <epochSeconds> <state> <pct> <sequence> <lastOpEpoch> <lastOpKind> <name>`
+ *
+ * - `state` precedence: `halt` > `active` > `pending` (unsettled) > `ok` (settled).
+ * - `pct` — floor(done/total*100) clamped 0–100 for `active` (total<=0 → 100), else `-`.
+ * - `sequence` — last synced sequence; `-` when none (0 = never synced ⇒ `-`).
+ * - `lastOpEpoch`/`lastOpKind` — the MORE RECENT of lastPush/lastPull (`push`/`pull`);
+ *   `- -` when neither.
+ */
+export function renderShellLine(
+  a: DaemonActivity,
+  opts: { settled: boolean; sequence?: number; name: string; now: number }
+): string {
+  const epochSeconds = Math.floor(opts.now / 1000);
+  const state = shellStateOf(a, opts.settled);
+
+  let pct: string | number = "-";
+  if (a.active) {
+    const { done, total } = a.active;
+    pct = total <= 0 ? 100 : Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
+  }
+
+  // Sequence 0 = never synced (the daemon seeds it from a fresh baseline) — that's
+  // "no sequence", not "(seq 0)" in the banner (codex R1).
+  const sequence = opts.sequence !== undefined && opts.sequence > 0 ? opts.sequence : "-";
+
+  let lastOpEpoch: string | number = "-";
+  let lastOpKind = "-";
+  const pushAt = a.lastPush ? Date.parse(a.lastPush.at) : NaN;
+  const pullAt = a.lastPull ? Date.parse(a.lastPull.at) : NaN;
+  if (a.lastPush && (!a.lastPull || pushAt >= pullAt)) {
+    lastOpEpoch = Math.floor(pushAt / 1000);
+    lastOpKind = "push";
+  } else if (a.lastPull) {
+    lastOpEpoch = Math.floor(pullAt / 1000);
+    lastOpKind = "pull";
+  }
+
+  // Strip control chars (incl. newlines) so the sidecar stays exactly one line.
+  const name = opts.name.replace(/\p{Cc}/gu, "?");
+  return `v1 ${epochSeconds} ${state} ${pct} ${sequence} ${lastOpEpoch} ${lastOpKind} ${name}`;
+}
+
+/**
+ * Design 46: write the pre-rendered prompt sidecar — the daemon renders, the zsh
+ * side just reads. Same best-effort contract as {@link saveActivity} (mkdir
+ * recursive, atomic write, all errors swallowed): visibility must never break sync.
+ */
+export async function saveShellLine(root: string, line: string): Promise<void> {
+  try {
+    await fs.mkdir(path.join(root, RBOX_DIR, "state"), { recursive: true });
+    await writeFileAtomic(shellLinePath(root), line + "\n");
   } catch {
     /* best-effort by contract */
   }
