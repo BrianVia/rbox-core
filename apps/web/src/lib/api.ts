@@ -209,6 +209,43 @@ export async function openBillingPortal(clerk: Clerk): Promise<string> {
 	return url;
 }
 
+// ── CLI browser login (design 47) ────────────────────────────────────────────
+// The CLI's device-code flow prints app.rbox.to/cli-login?code=XXXX-XXXX; the web
+// confirm page reads the code, shows which device is asking, and approves it.
+
+export interface DeviceAuthLookup {
+	label: string | null;
+	status: 'pending' | 'approved' | 'claimed';
+}
+
+/** PUBLIC, unauthenticated lookup for the /cli-login confirm page. Sends NO bearer:
+ *  the userCode is guessable-but-inert and the route returns only a hostname label +
+ *  status — never account/user ids or tokens. `null` = 404 (unknown, or expired while
+ *  still pending). */
+export async function lookupDeviceAuth(userCode: string): Promise<DeviceAuthLookup | null> {
+	const res = await fetch(`${config.apiBase}/v1/auth/device/lookup?code=${encodeURIComponent(userCode)}`);
+	if (res.status === 404 || res.status === 400) return null;
+	if (!res.ok) throw new Error(`couldn’t look up this login (${res.status})`);
+	return res.json() as Promise<DeviceAuthLookup>;
+}
+
+/** Approve a pending device-code login from this web session. Uses the rbox web
+ *  bearer via authed() — the same POST `rbox device approve` makes; the server now
+ *  admits it for kind=='web' principals (design 47 webTokenAllowed change). Grants
+ *  only authorized-but-not-E2EE-enrolled access, exactly like CLI-to-CLI approval. */
+export async function approveDeviceAuth(clerk: Clerk, userCode: string): Promise<void> {
+	const res = await authed(clerk, '/v1/auth/device/approve', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ userCode })
+	});
+	// no_pending_auth: the row is no longer pending — expired, or already approved/
+	// claimed by another approval between page-load and this click.
+	if (res.status === 404)
+		throw new Error('This code is no longer pending — it may have expired or already been approved. Run `rbox login` again.');
+	if (!res.ok) throw new Error(`couldn’t approve this login (${res.status})`);
+}
+
 // ── account linking (design 21) ──────────────────────────────────────────────
 // start/status/confirm authenticate by a FRESH Clerk JWT (re-verified server-side),
 // NOT the rbox web token — so they send clerk.session.getToken() directly, never the
