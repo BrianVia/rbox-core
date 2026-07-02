@@ -1,5 +1,25 @@
 # Lessons
 
+## 2026-07-02 — design 49 (daemon IO priority / concurrent releases)
+
+- **Check origin tags before picking a release number.** Another agent shipped
+  v0.6.5 while this branch was in review; `git tag v0.6.5` failed only LOCALLY
+  after the version-bump commit was already made. `git ls-remote origin
+  'refs/tags/v*'` first, then bump — and never reuse a failed tag's number.
+- **Linux io priority is per-TASK.** `ioprio_set(WHO_PROCESS, 0, …)` sets only
+  the calling thread; Bun's IO worker threads (the ones doing the disk work)
+  already exist by daemon start. Iterate /proc/self/task — and make the verify
+  getter walk every tid too, or the test proves nothing.
+- **A backoff that trusts a signal must react to that signal's DEATH — and to
+  its own armed timer.** Two codex MAJORs were the same shape: churn/error set
+  a flag the next tick would read, while the already-armed 5m timer kept
+  ticking. State changes that shorten a delay must re-arm the timer NOW
+  (pinSafetyFloor), not at the next natural wakeup.
+- **Put per-platform FFI behind the release smoke gate.** PR CI runs one
+  platform; symbols/syscall numbers differ per target. __watcher-selftest
+  already runs natively on all 3 release targets — one IOPRIO_SELFTEST line +
+  a distinct exit code closed the gap for free.
+
 ## 2026-07-02 — design 46 (zsh shell integration)
 
 - **Never `print -P` (or otherwise prompt-expand) tainted data.** Under
