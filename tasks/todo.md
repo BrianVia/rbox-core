@@ -1,48 +1,47 @@
-# Design 45 — status health & live sync visibility
+# Design 46 — shell integration (ambient prompt status)
 
-Follow-on to design 44: the incident showed `rbox status` reports internals
-(sequence, raw counts) instead of health, the daemon is a black box, and the
-new mass-delete guard can silently stall background sync with no indicator.
+Branch feat/shell-integration-46. Spec: docs/design/46-shell-integration.md.
+Orchestration: efficient-frontier — slices farmed to opus subagents with
+disjoint file ownership; integration/review/codex kept central.
 
 ## Plan
 
-- [x] `docs/design/45-status-health.md` — design doc
-- [x] `src/cli/activity.ts` — daemon activity sidecar (`.rbox/state/activity.json`,
-      best-effort like metrics.json): last completed op, live progress, halt warning
-- [x] `src/cli/status-view.ts` — PURE render helpers (unit-testable):
-      health verdict line, last-sync line, progress % label, relative time
-- [x] `src/cli/daemon.ts` — write activity: op summaries, throttled live progress
-      (via onProgress), halt set on pump error / clear on success (writes CHAINED
-      so they can't land out of order; drained at pump end)
-- [x] `src/cli/index.ts` — status leads with verdict + warning + last activity;
-      sequence/device demoted to detail; push/pull/sync spinners show percentages
-- [x] `src/cli/init-cmd.ts` — populate-sync spinners show percentages
-- [x] best-effort remote-sequence probe (abortable fetch of `/latest`, 2.5s timeout,
-      never throws) → "behind remote" detection in status
-- [x] tests: status-view pure helpers (13), activity round-trip (4), daemon halt
-      lifecycle + push trail (2) — 413 total green, tsc clean, live smoke on
-      ~/conductor/workspaces renders the verdict
-- [x] typecheck + full test suite green
-- [x] codex adversarial review → PR
+- [x] design doc 46 (architecture decision: daemon pre-renders `.rbox/state/shell.line`;
+      zsh reads one line with builtins — no JSON parsing, no duplicated verdict rules)
+- [x] **Slice A (agent)**: shell.line sidecar — renderShellLine (pure) + saveShellLine
+      in activity.ts; daemon writeActivity chains it; resetSyncState removes it; tests
+      (owns: activity.ts, daemon.ts, config.ts, activity.test.ts, daemon-activity.test.ts)
+- [x] **Slice C (agent)**: `zshCompletions()` generator from COMMAND_HELP + tests
+      (owns: completions.ts, completions.test.ts — NO index/help wiring)
+- [x] **Slice B (agent, after A+C)**: `rbox shell-init zsh` emitting plugin
+      (chpwd banner + precmd RPROMPT glyph, builtins-only, RBOX_NO_RPROMPT escape) +
+      embedded completions; `rbox completions zsh` command; index.ts + help-registry
+      wiring; docs snippet incl. starship module
+- [x] integrate: full suite + tsc, live smoke (eval shell-init in a real zsh, cd into
+      ~/conductor/workspaces, verify banner + glyph + shell.line freshness)
+- [x] codex adversarial rounds → PASS (5 rounds)
+- [x] PR #51 merged → v0.6.4 tagged → machine upgrade+validation delegated
 
 ## Review
 
-Shipped through 6 codex rounds → PASS. 421 tests green. Findings fixed en route:
-- R1 BLOCKER: any successful pump op cleared the halt — now op-keyed (a pull
-  halt survives no-op pushes and safety scans; only a successful pull heals it).
-- R1 MAJOR ×3: sidecar writes were awaited at pump tail (now never awaited on
-  the sync path; stop() drains); status loaded state under the raw config
-  remote instead of the credential's effective remote (the design-44 R3 rule);
-  the verdict ignored git divergence (added gitDivergenceCount — a read-only
-  mirror of planGitSections' capture decision).
-- R2 MAJOR ×2: structural preflight drops over a synced base now count as
-  divergence; the 409-recovery pull inside push is recorded via the new
-  SyncDeps.onPullApplied hook, and the trail split into lastPush/lastPull
-  slots so a commit can't mask its recovery pull's mutations.
-- R3: per-slot shape validation in loadActivity (malformed lastPush crashed
-  status); onPullApplied made throw-safe.
-- R4: heal resets the error-dedup streak (same-message re-failure persists a
-  fresh halt); resetSyncState clears activity.json; status suppresses a
-  stale-bound daemon's liveness + sidecar; git walk reordered to match the
-  planner (suppressions before preflight).
-- R5: a stopped daemon never renders a live "syncing" verdict.
+5 codex rounds → PASS; 453 tests green; PR #51 squash-merged; v0.6.4 tagged.
+Findings fixed en route: R1 BLOCKER print -P command-substitution (hostile
+workspace name EXECUTED under PROMPT_SUBST; halt message's own backticks ran) →
+raw print -r + literal ANSI; R1 field-recycling parse → whole-line regex gate;
+R2 emulate -L zsh + quoting (SH_WORD_SPLIT/GLOB_SUBST glob-expanded a '*' name),
+localized MATCH globals, digit-capped gate, flag-gated retroactive opt-out;
+R3 compinit-order completion registration (self-removing precmd retry);
+R4 stuck-pending settle at pump exit (idle glyph would lie yellow forever).
+One unreproduced full-suite flake observed locally (exit 1 masked by a tail
+pipe — caught on re-read); 6 repeat runs + PR CI all green. Orchestration:
+3 parallel opus subagents with disjoint file ownership; PROMPT_SUBST gap and
+all codex fixes handled centrally.
+
+---
+
+## Done earlier this session (design 45, v0.6.3 — shipped)
+
+Status health verdict + activity sidecar + transfer percentages; PR #50 merged;
+6 codex rounds → PASS; v0.6.3 released and live-validated on both machines
+(canary round-trip ~5s; madison-v1 un-shallowed post-release → git-sync now 2
+repos synced on both machines). Full review log in git history of this file.

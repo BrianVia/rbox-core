@@ -1,5 +1,28 @@
 # Lessons
 
+## 2026-07-02 — design 46 (zsh shell integration)
+
+- **Never `print -P` (or otherwise prompt-expand) tainted data.** Under
+  PROMPT_SUBST — which WE enable, and every prompt framework enables — prompt
+  expansion performs command substitution: a workspace name with backticks
+  EXECUTED. Style and data must ride separate channels: raw `print -r` +
+  literal ANSI for anything containing external strings; prompt escapes only in
+  strings whose every character is plugin-authored or regex-pinned.
+- **Emitted shell code needs `emulate -L zsh` in every function** — user options
+  (SH_WORD_SPLIT, GLOB_SUBST) silently change expansion semantics, and `=~`
+  clobbers MATCH/match globals unless localized. Test emitted scripts by
+  DRIVING them in `zsh -f` with hostile inputs and hostile setopts, not just
+  `zsh -n`.
+- **A pipe to `tail` eats exit codes.** `bun run test | tail` reported green
+  while a test failed (exit 1 visible only in the captured text). Gate on the
+  test command itself, or grep for the fail count — never trust a piped tail
+  as a success signal.
+- **Steady-state loops need a settle write.** Every pump tick queued a
+  follow-up push before writing (settled=false) and the no-op push never wrote
+  — so the idle glyph would read `pending` forever. When a loop's last
+  observable write happens mid-cycle, add an exit-of-loop state-compared
+  reconciliation.
+
 ## 2026-07-02 — design 45 (status health / activity sidecar) review arc
 
 - **"Cosmetic" visibility features deserve data-safety-grade review.** 6 codex
