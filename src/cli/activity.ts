@@ -83,6 +83,12 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   }
 }
 
+/** The sidecar's state field — halt > active > pending (unsettled) > ok. Exported
+ *  so the daemon can compare "what would render now" against what it last wrote
+ *  (the codex R4 settle fix) without duplicating the precedence. */
+export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "active" | "pending" | "ok" =>
+  a.halt ? "halt" : a.active ? "active" : settled ? "ok" : "pending";
+
 /**
  * Design 46: render the daemon's activity record into the one-line prompt sidecar
  * (`.rbox/state/shell.line`). PURE — all display judgment (state precedence, pct
@@ -104,7 +110,7 @@ export function renderShellLine(
   opts: { settled: boolean; sequence?: number; name: string; now: number }
 ): string {
   const epochSeconds = Math.floor(opts.now / 1000);
-  const state = a.halt ? "halt" : a.active ? "active" : opts.settled ? "ok" : "pending";
+  const state = shellStateOf(a, opts.settled);
 
   let pct: string | number = "-";
   if (a.active) {

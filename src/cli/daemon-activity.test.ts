@@ -252,3 +252,18 @@ test("a throwing onPullApplied hook never fails a completed pull (codex R3)", as
   expect(actions).toHaveLength(1); // the pull itself succeeded…
   expect(await fs.readFile(path.join(root, "x.txt"), "utf8")).toBe("hi"); // …and applied
 });
+
+test("an idle pull + no-op push settles shell.line back to ok (codex R4)", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+
+  // The classic steady-state tick: pull queues a follow-up push; the pull's write
+  // renders `pending` (push still queued) and the no-op push writes nothing.
+  daemon.want.pull = true;
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  const line = await fs.readFile(path.join(root, ".rbox", "state", "shell.line"), "utf8");
+  expect(line.split(" ")[2]).toBe("ok");
+});
