@@ -19,7 +19,8 @@ import {
   planGitSections,
 } from "./sync-git.js";
 import { deferManifest, encryptAndUpload, reportDeferred } from "./sync-recovery.js";
-import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { openTrashBatch } from "../engine/trash.js";
 import { RboxApi, type SyncRemote } from "./remote.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
@@ -73,6 +74,16 @@ export interface SyncDeps {
    *  Set ONLY by `rbox pull/sync --allow-mass-delete`; the daemon never sets it, so a
    *  runaway mass delete halts background sync instead of destroying the tree. */
   allowMassDelete?: boolean;
+  /** Explicit human consent to a PUSH that deletes ≥half the baseline (design 50 §4).
+   *  Deliberately SEPARATE from {@link allowMassDelete} (design-review B2): pushManifest's
+   *  409-recovery reuses this same deps object to PULL, and pull-side consent must NOT be
+   *  implied by push consent — a `rbox push --allow-mass-delete` must never let the recovery
+   *  pull silently apply a mass delete. Set ONLY by `rbox push --allow-mass-delete`. */
+  allowMassDeletePush?: boolean;
+  /** A pull evicted a local directory that the remote now flips to a file/symlink
+   *  (design 50 §3, review M2): the dir moved to trash. The CLI/daemon logs it and
+   *  counts it into `lastPull.conflicts`. Threaded into applyActions via `onTypeFlip`. */
+  onTypeFlip?: (relPath: string) => void;
   /** Fired by EVERY pull that applied actions to the local tree — including the pull
    *  inside pushManifest's 409 recovery, whose actions the retry loop discards
    *  (design 45, codex R2: the daemon's forensic log and activity trail must record
@@ -148,21 +159,33 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     );
   }
   const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
+  // Trash tier (design 50 §2): ONE batch per pull receives every propagated deletion and
+  // type-flip dir eviction as an atomic rename instead of `fs.rm`. `days === 0` disables it
+  // (classic immediate delete / visible conflict eviction). `finish()` settles the `.active`
+  // marker and MUST run after the apply phase even on throw, or a crashed pull leaves the
+  // batch marked in-flight for 24h (the pruner's stale window).
+  const batch = trashConfig(cfg).days > 0 ? openTrashBatch(root) : undefined;
   const applyOpts = {
     device: cfg.deviceId,
     kek,
+    trash: batch,
+    onTypeFlip: deps.onTypeFlip,
     onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
   };
   let actions: Action[] = [];
   let finalMatcher = matcher; // the post-pull rules — also gates git materialization below
-  await report.phase("apply", async () => {
-    if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
-    const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
-    finalMatcher = fresh;
-    const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
-    await applyActions(root, rest, api.blobStore(), applyOpts);
-    actions = [...ruleActions, ...rest];
-  });
+  try {
+    await report.phase("apply", async () => {
+      if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
+      const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
+      finalMatcher = fresh;
+      const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+      await applyActions(root, rest, api.blobStore(), applyOpts);
+      actions = [...ruleActions, ...rest];
+    });
+  } finally {
+    if (batch) await batch.finish();
+  }
   if (report.enabled) {
     const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
     report.blobs = writeActions.length;
@@ -427,6 +450,19 @@ async function runPushAttempt(
       reportDeferred(deferred);
       return { done: true, result: { sequence: state.lastSyncedSequence, manifest: committed, deferred: [...deferred], committed: false } };
     }
+  }
+
+  // Push-side mass-delete guard (design 50 §4): symmetry with the pull guard. A push that
+  // would delete ≥half the baseline is far likelier a stray `rm -rf` on THIS machine than an
+  // intended cleanup — publishing it wedges every OTHER device (each halts ⚠ on its next pull).
+  // Refuse to COMMIT until a human consents. Counted on `committed` (post-defer) so the number
+  // is exact, and gated on the op-scoped consent field so the recovery pull can't inherit it.
+  const pushDeletes = diffManifests(state.lastSyncedManifest, committed).deleted.length;
+  if (!deps.allowMassDeletePush && pushDeletes >= MASS_DELETE_MIN_FILES && pushDeletes * 2 >= state.lastSyncedManifest.files.length) {
+    throw new Error(
+      `push would delete ${pushDeletes} of ${state.lastSyncedManifest.files.length} tracked files — refusing (mass-delete guard). ` +
+        `If this deletion is intentional, run \`rbox push --allow-mass-delete\` to publish it once.`
+    );
   }
 
   const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed));

@@ -7,6 +7,7 @@ import { decryptFileToPath } from "./crypto.js";
 import { RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
+import type { TrashBatch } from "./trash.js";
 import type { FileEntry, Manifest } from "./types.js";
 
 /**
@@ -42,6 +43,12 @@ export interface ApplyOptions {
   concurrency?: number;
   /** Progress over the write phase (download+decrypt). `done`/`total` are entries. */
   onProgress?: (done: number, total: number) => void;
+  /** Local trash tier (design 50). When set, propagated clean deletes and type-flip
+   *  directory evictions RENAME here instead of `fs.rm` — bytes stay recoverable. */
+  trash?: TrashBatch;
+  /** Fired once per type-flip resolved at apply (obstructing dir evicted, or an
+   *  ancestor file moved aside). The daemon logs it and counts `lastPull.conflicts`. */
+  onTypeFlip?: (relPath: string) => void;
 }
 
 /**
@@ -65,6 +72,31 @@ export async function applyActions(
   const deletes = actions.filter((a) => a.kind === "delete");
   const rest = actions.filter((a) => a.kind !== "delete");
 
+  // Ancestor preflight (§3, design-review M3): a FILE or SYMLINK squatting on a
+  // path component a write needs as a directory makes mkdir throw ENOTDIR. Resolve
+  // it once, serially, shallowest-first, BEFORE the parallel write pool — poolMap
+  // runs writes concurrently, so two children under one obstruction must never
+  // race the same move. These go to a VISIBLE conflict copy (files are cheap; the
+  // design deliberately does NOT trash them).
+  const needDirs = new Set<string>();
+  for (const a of rest) {
+    const p = a.kind === "write" ? a.entry.path : a.path;
+    const parts = p.split("/");
+    let acc = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      acc = acc ? `${acc}/${parts[i]!}` : parts[i]!;
+      needDirs.add(acc);
+    }
+  }
+  const shallowFirst = [...needDirs].sort((a, b) => a.split("/").length - b.split("/").length);
+  for (const comp of shallowFirst) {
+    const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
+    if (st && (st.isFile() || st.isSymbolicLink())) {
+      opts.onTypeFlip?.(comp);
+      await moveAside(destRoot, comp, conflictName(comp, device, now));
+    }
+  }
+
   // Writes/conflicts target distinct paths and are independent, so fetch+decrypt
   // them through a bounded pool — a pull was a sequential per-blob download, which
   // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
@@ -80,16 +112,16 @@ export async function applyActions(
   const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 64);
   await poolMap(rest, dlConc, async (a) => {
     if (a.kind === "write") {
-      await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek);
+      await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
     } else if (a.kind === "conflict") {
       // Reconcile already decided both sides diverged: keep local aside, take remote.
       await moveAside(destRoot, a.path, a.keepLocalAs);
-      await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek);
+      await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
     }
     opts.onProgress?.(++done, rest.length);
   });
   for (const a of deletes) {
-    await deleteEntry(destRoot, a.path, a.expectedLocal, device, now);
+    await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
   }
 }
 
@@ -102,7 +134,9 @@ async function writeEntry(
   store: BlobStore,
   device: string,
   now: string,
-  kek?: Buffer
+  kek?: Buffer,
+  trash?: TrashBatch,
+  onTypeFlip?: (relPath: string) => void
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -117,6 +151,19 @@ async function writeEntry(
     if (!sameContent(current, expectedLocal) && current) {
       // The user created/edited it in the window — preserve those bytes.
       await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+    }
+
+    // Type-flip eviction (§3): currentEntryAt returns undefined for a directory,
+    // so the conflict-copy branch above never sees one. A materialized directory
+    // squatting on an incoming file/symlink path must be evicted whole before the
+    // rename (else `rename(tmp, dir)` is EISDIR — the flat-meadow outage). It goes
+    // to trash when present (a visible in-workspace conflict copy would re-push the
+    // entire subtree as new adds — a churn bomb), else to a visible conflict copy.
+    const obstruction = await fs.lstat(abs).catch(() => undefined);
+    if (obstruction?.isDirectory()) {
+      onTypeFlip?.(entry.path);
+      if (trash) await trash.put(entry.path);
+      else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
     }
     await fs.rename(tmp, abs);
   } catch (e) {
@@ -179,20 +226,25 @@ export async function restoreEntryToPath(destRoot: string, entry: FileEntry, sto
 
 /** Remove the target only if it still matches what reconcile expected; if it
  *  changed under us, a concurrent edit beats the propagated delete — move it
- *  aside so the user's bytes survive (real trash tier is M6). */
+ *  aside so the user's bytes survive. A clean-matching delete routes through the
+ *  local trash tier when present (design 50) so a cross-machine `rm -rf` stays
+ *  recoverable; the dirty branch keeps its VISIBLE conflict copy (cross-machine
+ *  visibility is the point there). */
 async function deleteEntry(
   destRoot: string,
   rel: string,
   expectedLocal: FileEntry | undefined,
   device: string,
-  now: string
+  now: string,
+  trash?: TrashBatch
 ): Promise<void> {
   const abs = path.join(destRoot, rel);
   await assertWithinRoot(destRoot, abs);
   const current = await currentEntryAt(destRoot, rel);
   if (!current) return; // already gone
   if (sameContent(current, expectedLocal)) {
-    await fs.rm(abs, { force: true });
+    if (trash) await trash.put(rel);
+    else await fs.rm(abs, { force: true });
   } else {
     await moveAside(destRoot, rel, conflictName(rel, device, now));
   }
@@ -207,7 +259,10 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   try {
     st = await fs.lstat(abs);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    const code = (e as NodeJS.ErrnoException).code;
+    // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
+    // can't exist, so it's already gone (design-review M1).
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
     throw e;
   }
   if (st.isSymbolicLink()) {

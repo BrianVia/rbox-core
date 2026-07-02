@@ -57,14 +57,39 @@ export async function applyWatchEvents(
     if (rel.length === 0) continue;
 
     if (ev.kind === "unlink") {
-      map.delete(rel);
-      cache?.invalidate(rel);
+      // A stale unlink can never delete an entry whose path is still present on
+      // disk (design 50 B1): a pull-side eviction+rewrite emits an unlink for the
+      // original path that may land after the rewrite. Re-derive truth from disk —
+      // only a genuinely-absent path drops the entry.
+      if (matcher.ignores(rel)) {
+        map.delete(rel);
+        cache?.invalidate(rel);
+        continue;
+      }
+      const res = await statHashEntry(root, rel, cache);
+      if (res.kind === "entry") map.set(rel, res.entry);
+      else if (res.kind === "midwrite") deferred?.add(rel); // present but churning — not a delete
+      else {
+        map.delete(rel);
+        cache?.invalidate(rel);
+      }
     } else if (ev.kind === "unlinkDir") {
-      const prefix = `${rel}/`;
-      for (const k of [...map.keys()]) {
-        if (k === rel || k.startsWith(prefix)) {
-          map.delete(k);
-          cache?.invalidate(k);
+      // Same invariant for a directory unlink: a still-present dir means the event
+      // is stale, so rescan the subtree as truth (never drop children still on
+      // disk). Only a vanished dir removes the `dir/**` prefix.
+      const st = await fs.lstat(path.join(root, rel)).catch(() => undefined);
+      if (st?.isDirectory()) {
+        if (matcher.ignores(`${rel}/`)) continue;
+        const sub: FileEntry[] = [];
+        await walk(root, rel, matcher, sub, cache);
+        for (const e of sub) map.set(e.path, e);
+      } else {
+        const prefix = `${rel}/`;
+        for (const k of [...map.keys()]) {
+          if (k === rel || k.startsWith(prefix)) {
+            map.delete(k);
+            cache?.invalidate(k);
+          }
         }
       }
     } else if (ev.kind === "addDir") {
