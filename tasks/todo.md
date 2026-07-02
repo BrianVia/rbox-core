@@ -1,3 +1,43 @@
+# Design 49 — daemon IO priority + idle safety-scan backoff
+
+Branch feat/daemon-io-priority-49 (worktree — other agents own the main checkout).
+Spec: docs/design/49-daemon-io-priority.md. Origin: 2026-07-02 machine-contention
+incident (Conductor 5s shell budget blown; profiling showed AV+Spotlight as the
+hogs, rbox already CPU-niced — this ships the earmarked IO half + scan backoff).
+
+## Plan
+
+- [x] design doc 49
+- [x] src/cli/io-priority.ts — darwin setiopolicy_np THROTTLE / linux ioprio_set BE-7
+      via bun:ffi, best-effort, daemon-only (+ bun-ffi.d.ts minimal shim)
+- [x] daemon: log io outcome at start; safety scan setInterval → self-rescheduling
+      setTimeout, quiet doubles 60s→5m cap, churn/degraded pins 60s floor
+      (pure nextSafetyDelay + wiring)
+- [x] tests: nextSafetyDelay table, churn-flag wiring, spawned platform probes
+      asserting the policy TOOK via OS getters (never in-process — would throttle
+      the suite)
+- [x] full suite green in worktree (459 pass; watcher.test.ts self-skipped: FSEvents
+      probe fails under current machine load — env, runs on CI inotify)
+- [x] self-found hole to fix: watcher error AFTER init leaves watcherLive true →
+      backoff stretches the only healer to 5m; thread onError → pin 60s floor
+- [x] codex adversarial rounds → PASS (3 rounds)
+- [ ] PR → merge → v0.6.5 → upgrade both machines
+
+## Review
+
+3 codex rounds → PASS; 460 tests green; constants/arity verified against SDK
+headers + kernel sources by codex R1. Findings fixed en route: R1 M1 churn
+didn't re-arm an armed backed-off timer → noteChurn; R1 M2 post-init watcher
+death trusted forever → WatchOptions.onError (parcel+chokidar) flips
+watcherHealthy permanently; R1 M3 linux ioprio_set who=0 set only the calling
+thread, missing Bun's pre-spawned IO workers → iterate /proc/self/task (+
+verifyIoPriority reads back every tid); R1 MINOR darwin-arm64/linux-arm64 FFI
+untested by any gate → IOPRIO_SELFTEST leg in __watcher-selftest (exit 4),
+runs natively on all 3 release targets; R2 onError didn't pull the ARMED
+timer forward → shared pinSafetyFloor() (no-op at floor, stop-guarded).
+
+---
+
 # Design 46 — shell integration (ambient prompt status)
 
 Branch feat/shell-integration-46. Spec: docs/design/46-shell-integration.md.
