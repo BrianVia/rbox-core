@@ -28,6 +28,17 @@ const PLUGIN = `# rbox shell integration (design 46) — ambient sync status in 
 # Millisecond-free clock (\$EPOCHSECONDS) without ever spawning \`date\`.
 zmodload zsh/datetime 2>/dev/null
 
+# Banner colors as LITERAL ANSI escapes for \`print -r\` (raw, expansion-free output).
+# NEVER use \`print -P\` on strings containing sidecar data: under PROMPT_SUBST,
+# prompt expansion performs command substitution — a workspace NAME containing
+# backticks would EXECUTE (codex R1 BLOCKER). Honors NO_COLOR.
+if [[ -n \${NO_COLOR-} ]]; then
+  typeset -g _RBOX_C_GREEN='' _RBOX_C_YELLOW='' _RBOX_C_CYAN='' _RBOX_C_RED='' _RBOX_C_DIM='' _RBOX_C_OFF=''
+else
+  typeset -g _RBOX_C_GREEN=\$'\\e[32m' _RBOX_C_YELLOW=\$'\\e[33m' _RBOX_C_CYAN=\$'\\e[36m' \\
+             _RBOX_C_RED=\$'\\e[31m' _RBOX_C_DIM=\$'\\e[90m' _RBOX_C_OFF=\$'\\e[0m'
+fi
+
 # Walk up from \$PWD for the workspace marker (git-style); result in \$REPLY, no fork.
 _rbox_find_root() {
   local d=\$PWD
@@ -72,6 +83,12 @@ _rbox_read() {
     return
   fi
   IFS= read -r line < \$file || return          # unreadable → none (silent)
+  # WHOLE-LINE shape gate before any field is used (codex R1 MAJOR: naive peeling
+  # recycles fields on truncated input — 'v1 <ep> ok' parsed as a valid ok line).
+  # The regex pins every field's alphabet, so pct/seq/epochs are digits-or-dash and
+  # the state is a known enum BY CONSTRUCTION; anything else → none (silent).
+  local pat='^v1 [0-9]+ (ok|pending|active|halt) ([0-9]+|-) ([0-9]+|-) ([0-9]+|-) (push|pull|-) .+\$'
+  [[ \$line =~ \$pat ]] || return
   # Peel the 7 fixed fields; \`name\` is the (possibly spacey) remainder.
   ver=\${line%% *};    line=\${line#* }
   ep=\${line%% *};     line=\${line#* }
@@ -80,19 +97,15 @@ _rbox_read() {
   seq=\${line%% *};    line=\${line#* }
   opep=\${line%% *};   line=\${line#* }
   opkind=\${line%% *}; line=\${line#* }
-  name=\$line
-  [[ \$ver == v1 ]] || return                    # wrong/absent version tag → none
-  [[ \$ep == <-> ]] || return                    # non-numeric heartbeat → none
+  # Defense-in-depth: the renderer already strips control chars from the name, but a
+  # hand-tampered file must not be able to smuggle terminal escapes to the banner.
+  name=\${line//[^[:print:]]/?}
   # Older than 180s: the daemon heartbeats <=60s while alive, so 3x that is dead.
   if (( EPOCHSECONDS - ep > 180 )); then
     _RBOX_KIND=stale
     _RBOX_NAME=\$name
     return
   fi
-  case \$st in
-    ok|pending|active|halt) ;;
-    *) return ;;                                 # unknown state → none
-  esac
   _RBOX_KIND=\$st
   _RBOX_NAME=\$name
   _RBOX_PCT=\$pct
@@ -101,39 +114,46 @@ _rbox_read() {
   _RBOX_OPKIND=\$opkind
 }
 
-# Print the one-line entry banner to stderr, colored via prompt escapes (print -P).
+# Print the one-line entry banner to stderr. RAW output (\`print -r\`) with literal
+# ANSI color variables — never \`print -P\`: prompt expansion would command-substitute
+# backticks/\$() in the (tainted) workspace name under PROMPT_SUBST (codex R1 BLOCKER),
+# and even our own halt message's backticks would execute.
 _rbox_banner() {
   _rbox_read \$1
-  # Double any '%' in the name so it can't inject a prompt escape under \`print -P\`.
-  local n=\${_RBOX_NAME//\\%/%%}
+  local n=\$_RBOX_NAME
   local msg
   case \$_RBOX_KIND in
     ok)
-      msg="%F{green}rbox: \$n ✓ in sync"
+      msg="\${_RBOX_C_GREEN}rbox: \$n ✓ in sync"
       [[ \$_RBOX_SEQ != - ]] && msg+=" (seq \$_RBOX_SEQ)"
-      if [[ \$_RBOX_OPKIND != - && \$_RBOX_OPEP == <-> ]]; then
+      if [[ \$_RBOX_OPKIND != - && \$_RBOX_OPEP != - ]]; then
         _rbox_rel \$_RBOX_OPEP
         msg+=" · last \$_RBOX_OPKIND \$REPLY"
       fi
-      msg+="%f"
+      msg+=\$_RBOX_C_OFF
       ;;
-    pending) msg="%F{yellow}rbox: \$n ↑ syncing…%f" ;;
-    active)  msg="%F{cyan}rbox: \$n ↻ \${_RBOX_PCT}%%%f" ;;
-    halt)    msg="%F{red}rbox: \$n ⚠ sync halted — run \\\`rbox status\\\`%f" ;;
-    stale)   msg="%F{8}rbox: \$n ○ background sync not running — rbox start%f" ;;
-    missing) msg="%F{8}rbox: ○ background sync not running — rbox start%f" ;;
+    pending) msg="\${_RBOX_C_YELLOW}rbox: \$n ↑ syncing…\$_RBOX_C_OFF" ;;
+    active)  msg="\${_RBOX_C_CYAN}rbox: \$n ↻ \${_RBOX_PCT}%\$_RBOX_C_OFF" ;;
+    halt)    msg="\${_RBOX_C_RED}rbox: \$n ⚠ sync halted — run \\\`rbox status\\\`\$_RBOX_C_OFF" ;;
+    stale)   msg="\${_RBOX_C_DIM}rbox: \$n ○ background sync not running — rbox start\$_RBOX_C_OFF" ;;
+    missing) msg="\${_RBOX_C_DIM}rbox: ○ background sync not running — rbox start\$_RBOX_C_OFF" ;;
     *) return ;;                                 # none → silent, no banner
   esac
-  print -P -u2 -- \$msg
+  print -r -u2 -- \$msg
 }
 
 # Set \$RBOX_PROMPT to the colored glyph ONLY (for RPROMPT or a custom theme slot).
+# Prompt escapes (%F) are safe HERE — and only here — because every character of the
+# glyph is plugin-authored or regex-pinned to digits (_RBOX_PCT); the tainted name
+# never enters it. The active pct is interpolated NOW (not at render), so the stored
+# value contains no \$-references of its own.
 _rbox_glyph() {
   _rbox_read \$1
   case \$_RBOX_KIND in
     ok)            RBOX_PROMPT="%F{green}✓%f" ;;
     pending)       RBOX_PROMPT="%F{yellow}↑%f" ;;
-    active)        RBOX_PROMPT="%F{cyan}↻ \${_RBOX_PCT}%%%f" ;;
+    active)        RBOX_PROMPT="%F{cyan}↻ \${_RBOX_PCT}%%%f"
+                   [[ \$_RBOX_PCT == - ]] && RBOX_PROMPT="%F{cyan}↻%f" ;;
     halt)          RBOX_PROMPT="%F{red}⚠%f" ;;
     stale|missing) RBOX_PROMPT="%F{8}○%f" ;;
     *)             RBOX_PROMPT="" ;;             # outside/none → empty (segment vanishes)
@@ -167,8 +187,12 @@ add-zsh-hook precmd _rbox_precmd
 # opts out to place \$RBOX_PROMPT themselves (p10k / custom themes). The embedded
 # \$RBOX_PROMPT only expands at render time under PROMPT_SUBST (off in stock zsh —
 # without it the right prompt shows the literal string), so auto-append enables it.
-# Opting out with RBOX_NO_RPROMPT=1 leaves prompt options entirely untouched.
-if [[ \${RBOX_NO_RPROMPT:-0} != 1 && \${RPROMPT-} != *'\$RBOX_PROMPT'* ]]; then
+# RBOX_NO_RPROMPT=1 is RETROACTIVE (codex R1): a re-eval with it set removes a
+# previously auto-appended segment (prompt options are otherwise left untouched —
+# we can't know whether an earlier prompt_subst was ours).
+if [[ \${RBOX_NO_RPROMPT:-0} == 1 ]]; then
+  RPROMPT=\${RPROMPT//' \$RBOX_PROMPT'/}
+elif [[ \${RPROMPT-} != *'\$RBOX_PROMPT'* ]]; then
   setopt prompt_subst
   RPROMPT="\${RPROMPT-}"' \$RBOX_PROMPT'
 fi

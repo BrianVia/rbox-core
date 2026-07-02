@@ -95,7 +95,7 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
  *
  * - `state` precedence: `halt` > `active` > `pending` (unsettled) > `ok` (settled).
  * - `pct` — floor(done/total*100) clamped 0–100 for `active` (total<=0 → 100), else `-`.
- * - `sequence` — last synced sequence, `-` if none.
+ * - `sequence` — last synced sequence; `-` when none (0 = never synced ⇒ `-`).
  * - `lastOpEpoch`/`lastOpKind` — the MORE RECENT of lastPush/lastPull (`push`/`pull`);
  *   `- -` when neither.
  */
@@ -112,7 +112,9 @@ export function renderShellLine(
     pct = total <= 0 ? 100 : Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
   }
 
-  const sequence = opts.sequence ?? "-";
+  // Sequence 0 = never synced (the daemon seeds it from a fresh baseline) — that's
+  // "no sequence", not "(seq 0)" in the banner (codex R1).
+  const sequence = opts.sequence !== undefined && opts.sequence > 0 ? opts.sequence : "-";
 
   let lastOpEpoch: string | number = "-";
   let lastOpKind = "-";

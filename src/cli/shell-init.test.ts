@@ -51,8 +51,8 @@ test("the script embeds both hooks, root discovery, the version guard, and compl
   expect(s).toContain("add-zsh-hook precmd _rbox_precmd");
   expect(s).toContain("_rbox_find_root");
   expect(s).toContain("RBOX_PROMPT");
-  // The v1 version guard — the sidecar contract is refused for any other tag.
-  expect(s).toContain("== v1");
+  // The v1 whole-line shape gate — refuses any other version tag AND malformed fields.
+  expect(s).toContain("^v1 [0-9]+ (ok|pending|active|halt)");
   // The completions are appended verbatim (ends with the #compdef header + footer).
   expect(s).toContain("#compdef rbox");
   expect(s).toContain("compdef _rbox rbox");
@@ -128,4 +128,54 @@ test("a malformed / wrong-version sidecar degrades silently (no glyph, no banner
   const { glyph, banner } = driveHooks(writeScript(), ws);
   expect(glyph).toBe("");
   expect(banner).toBe("");
+});
+
+// ── codex R1 regressions ─────────────────────────────────────────────────────
+
+test("a hostile workspace name NEVER executes: backticks / $() / prompt escapes are inert text (codex R1 BLOCKER)", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - evil \`id\` $(id) %F{red}$HOME\n`);
+  const { glyph, banner } = driveHooks(writeScript(), ws);
+  expect(banner).not.toContain("uid="); // `id` did not run
+  expect(banner).toContain("`id`"); // rendered as literal text
+  expect(banner).toContain("$(id)");
+  expect(banner).toContain("%F{red}"); // no prompt expansion either
+  expect(banner).toContain("$HOME"); // no parameter expansion of the name
+  expect(banner).not.toContain("command not found");
+  expect(glyph).toContain("✓"); // the name never enters the glyph
+});
+
+test("the halt banner's own backticks are literal, not a command (codex R1 BLOCKER)", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(`v1 ${now} halt - 80 - - My Workspace\n`);
+  const { banner } = driveHooks(writeScript(), ws);
+  expect(banner).toContain("`rbox status`");
+  expect(banner).not.toContain("command not found");
+});
+
+test("a truncated line is refused whole — field recycling must not fake an ok state (codex R1 MAJOR)", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  for (const line of [`v1 ${now} ok\n`, `v1 ${now} ok 12\n`, `v1 ${now} teleport - 80 - - ws\n`, `v1 ${now} ok twelve 80 - - ws\n`]) {
+    const ws = makeWorkspace(line);
+    const { glyph, banner } = driveHooks(writeScript(), ws);
+    expect(glyph, `line: ${line.trim()}`).toBe("");
+    expect(banner, `line: ${line.trim()}`).toBe("");
+  }
+});
+
+test("RBOX_NO_RPROMPT=1 is retroactive: a re-eval removes the auto-appended segment (codex R1)", () => {
+  if (!ZSH) return;
+  const file = writeScript();
+  const res = Bun.spawnSync([
+    ZSH,
+    "-f",
+    "-c",
+    `source ${file}; print -r -- "FIRST:[$RPROMPT]"; RBOX_NO_RPROMPT=1; source ${file}; print -r -- "SECOND:[$RPROMPT]"`,
+  ]);
+  const out = new TextDecoder().decode(res.stdout);
+  expect(out).toContain("FIRST:[ $RBOX_PROMPT]");
+  expect(out.match(/SECOND:\[(.*)\]/)?.[1]).not.toContain("$RBOX_PROMPT");
 });

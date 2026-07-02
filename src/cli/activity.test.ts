@@ -103,6 +103,12 @@ test("renderShellLine placeholders: no sequence and no ops render `-` and `- -`"
   expect(parts.slice(0, 8)).toEqual(["v1", "1800000000", "ok", "-", "-", "-", "-", "ws"]);
 });
 
+test("renderShellLine: sequence 0 (never synced) renders `-`, not `(seq 0)` fodder (codex R1)", () => {
+  const parts = renderShellLine({ at: "" }, { settled: true, sequence: 0, name: "ws", now: NOW }).split(" ");
+  expect(parts[4]).toBe("-");
+  expect(renderShellLine({ at: "" }, { settled: true, sequence: 80, name: "ws", now: NOW }).split(" ")[4]).toBe("80");
+});
+
 test("renderShellLine lastOp picks the NEWER of push/pull", () => {
   const lastPush = { at: at(1799990000), files: 3, sequence: 80 };
   const lastPull = { at: at(1799995000), writes: 1, deletes: 0, conflicts: 0 };
