@@ -1,3 +1,30 @@
+# Design 49 — daemon IO priority + idle safety-scan backoff
+
+Branch feat/daemon-io-priority-49 (worktree — other agents own the main checkout).
+Spec: docs/design/49-daemon-io-priority.md. Origin: 2026-07-02 machine-contention
+incident (Conductor 5s shell budget blown; profiling showed AV+Spotlight as the
+hogs, rbox already CPU-niced — this ships the earmarked IO half + scan backoff).
+
+## Plan
+
+- [x] design doc 49
+- [x] src/cli/io-priority.ts — darwin setiopolicy_np THROTTLE / linux ioprio_set BE-7
+      via bun:ffi, best-effort, daemon-only (+ bun-ffi.d.ts minimal shim)
+- [x] daemon: log io outcome at start; safety scan setInterval → self-rescheduling
+      setTimeout, quiet doubles 60s→5m cap, churn/degraded pins 60s floor
+      (pure nextSafetyDelay + wiring)
+- [x] tests: nextSafetyDelay table, churn-flag wiring, spawned platform probes
+      asserting the policy TOOK via OS getters (never in-process — would throttle
+      the suite)
+- [x] full suite green in worktree (459 pass; watcher.test.ts self-skipped: FSEvents
+      probe fails under current machine load — env, runs on CI inotify)
+- [ ] self-found hole to fix: watcher error AFTER init leaves watcherLive true →
+      backoff stretches the only healer to 5m; thread onError → pin 60s floor
+- [ ] codex adversarial rounds → PASS
+- [ ] PR → merge → v0.6.5 → upgrade both machines
+
+---
+
 # Design 46 — shell integration (ambient prompt status)
 
 Branch feat/shell-integration-46. Spec: docs/design/46-shell-integration.md.

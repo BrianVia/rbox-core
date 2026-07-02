@@ -29,19 +29,32 @@ test("no live watcher never backs off — the periodic scan IS the sync mechanis
   expect(nextSafetyDelay(CAP, { watcherLive: false, churned: false })).toBe(FLOOR);
 });
 
-test("watcher events mark churn (wiring: the NEXT tick sees it and resets)", async () => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+interface SafetyInternals {
+  startWatcherFn: (
+    root: string,
+    matcher: unknown,
+    cb: (events: unknown[]) => void,
+    opts?: { onError?: (err: Error) => void }
+  ) => Promise<{ close(): Promise<void> }>;
+  startLiveWatch(): Promise<void>;
+  churnSinceSafety: boolean;
+  watcherHealthy: boolean;
+  safetyDelay: number;
+  pumping: boolean;
+  want: { push: boolean };
+  watcher?: { close(): Promise<void> };
+  safetyTimer?: ReturnType<typeof setTimeout>;
+  deepTimer?: ReturnType<typeof setInterval>;
+}
+
+function makeDaemon(root: string): SafetyInternals {
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  const daemon = new RboxDaemon(root, cfg as never, {} as never) as unknown as {
-    startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void) => Promise<{ close(): Promise<void> }>;
-    startLiveWatch(): Promise<void>;
-    churnSinceSafety: boolean;
-    pumping: boolean;
-    want: { push: boolean };
-    watcher?: { close(): Promise<void> };
-    safetyTimer?: ReturnType<typeof setTimeout>;
-    deepTimer?: ReturnType<typeof setInterval>;
-  };
+  return new RboxDaemon(root, cfg as never, {} as never) as unknown as SafetyInternals;
+}
+
+test("watcher events mark churn AND pull a backed-off timer forward (codex R1)", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
   let deliver: ((events: unknown[]) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, cb) => {
     deliver = cb;
@@ -54,9 +67,42 @@ test("watcher events mark churn (wiring: the NEXT tick sees it and resets)", asy
   try {
     await daemon.startLiveWatch();
     expect(daemon.churnSinceSafety).toBe(false); // boots quiet
+    // Simulate a fully backed-off idle daemon, then a churn storm at T+1s.
+    daemon.safetyDelay = CAP;
+    const armedBefore = daemon.safetyTimer;
     deliver!([{ type: "update", path: path.join(root, "a.txt") }]);
     expect(daemon.churnSinceSafety).toBe(true); // churn recorded for the next tick
     expect(daemon.want.push).toBe(true); // hot path still queued the push
+    // The codex R1 repro: the flag alone would let a drop from THIS storm wait out
+    // the armed 5m timer. The timer must be re-armed at the floor immediately.
+    expect(daemon.safetyDelay).toBe(FLOOR);
+    expect(daemon.safetyTimer).not.toBe(armedBefore);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a post-init watcher error revokes trust: backoff treats the watcher as dead (codex R1)", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  let onError: ((err: Error) => void) | undefined;
+  daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
+    onError = opts?.onError;
+    return Promise.resolve({ close: async () => {} });
+  };
+  daemon.pumping = true;
+
+  try {
+    await daemon.startLiveWatch();
+    expect(daemon.watcherHealthy).toBe(true);
+    onError!(new Error("FSEvents stream died"));
+    expect(daemon.watcherHealthy).toBe(false); // …and stays false: trust is not restored
+    // With trust revoked, quiet intervals must NOT back off — the scan is now the
+    // only healer for anything the (possibly dead) watcher misses.
+    expect(nextSafetyDelay(CAP, { watcherLive: daemon.watcher !== undefined && daemon.watcherHealthy, churned: false })).toBe(FLOOR);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);

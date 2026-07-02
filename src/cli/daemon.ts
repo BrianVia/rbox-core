@@ -97,6 +97,10 @@ export class RboxDaemon {
   private safetyDelay = SAFETY_SYNC_MS;
   /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
   private churnSinceSafety = false;
+  /** Flips false on ANY post-init backend error and stays false: a watcher that has
+   *  errored once is no longer trusted to have delivered everything, so the safety
+   *  scan never backs off again (fail-safe toward pre-design-49 behavior). */
+  private watcherHealthy = true;
   private reconnectAttempt = 0;
   private stopped = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
@@ -174,13 +178,38 @@ export class RboxDaemon {
     this.scheduleSafetyScan();
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
     try {
-      this.watcher = await this.startWatcherFn(this.root, this.matcher, (events) => {
-        this.churnSinceSafety = true; // churn observed → next safety scan snaps back to the 60s floor
-        this.pendingEvents.push(...events);
-        this.request("push");
-      });
+      this.watcher = await this.startWatcherFn(
+        this.root,
+        this.matcher,
+        (events) => {
+          this.noteChurn();
+          this.pendingEvents.push(...events);
+          this.request("push");
+        },
+        {
+          onError: (err) => {
+            // One backend error and the watcher is no longer TRUSTED (codex R1): a
+            // dead FSEvents/inotify stream must not let the safety scan — now the
+            // only healer — sit backed off at 5m. Sync itself is unaffected.
+            if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
+            this.watcherHealthy = false;
+          },
+        }
+      );
     } catch (e) {
       log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
+    }
+  }
+
+  /** Record watcher churn AND pull a backed-off safety timer forward (codex R1):
+   *  the flag alone would let a drop from THIS storm wait out an armed 5m timer —
+   *  the scan must return to its 60s cadence the moment there is churn to protect. */
+  private noteChurn(): void {
+    this.churnSinceSafety = true;
+    if (this.safetyDelay > SAFETY_SYNC_MS && !this.stopped) {
+      this.safetyDelay = SAFETY_SYNC_MS;
+      if (this.safetyTimer) clearTimeout(this.safetyTimer);
+      this.scheduleSafetyScan();
     }
   }
 
@@ -189,15 +218,16 @@ export class RboxDaemon {
    * watcher events, and drops happen under churn — so quiet intervals (zero
    * watcher events since the previous tick) double the next delay up to 5m,
    * instead of stat-sweeping every tracked file each minute on an idle
-   * machine, forever. Any event snaps the delay back to the 60s floor, and a
-   * missing live watcher never backs off (there, the scan IS the sync
-   * mechanism). The 30m deep scan stays the unconditional floor beneath both.
+   * machine, forever. Any event snaps the delay back to the 60s floor (armed
+   * timers are pulled forward by noteChurn), and a missing OR unhealthy live
+   * watcher never backs off (there, the scan IS the sync mechanism). The 30m
+   * deep scan stays the unconditional floor beneath both.
    */
   private scheduleSafetyScan(): void {
     this.safetyTimer = setTimeout(() => {
       if (this.stopped) return;
       this.safetyDelay = nextSafetyDelay(this.safetyDelay, {
-        watcherLive: this.watcher !== undefined,
+        watcherLive: this.watcher !== undefined && this.watcherHealthy,
         churned: this.churnSinceSafety,
       });
       this.churnSinceSafety = false;

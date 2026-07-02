@@ -28,11 +28,15 @@ never a throw, never fatal.
   under contention — an idle disk still serves the daemon at full speed, so
   sync latency is unchanged except exactly when the user's foreground work
   needs the disk.
-- **linux**: `ioprio_set(IOPRIO_WHO_PROCESS=1, 0=self, (BE<<13)|7)` via the
-  libc `syscall` symbol (`__NR_ioprio_set`: 251 on x64, 30 on arm64 —
-  asm-generic). Best-effort class level 7 (lowest), NOT the IDLE class: IDLE
-  can starve indefinitely under sustained foreign IO, and the daemon still
-  has real-time pulls to apply.
+- **linux**: `ioprio_set(IOPRIO_WHO_PROCESS, tid, (BE<<13)|7)` for **every
+  existing tid in `/proc/self/task`**, via the libc `syscall` symbol
+  (`__NR_ioprio_set`: 251 on x64, 30 on arm64 — asm-generic). IO priority is
+  per-*task* on Linux and `who=0` targets only the calling thread — which
+  would miss Bun's already-spawned IO worker threads, the ones doing the
+  actual disk work (codex R1 MAJOR). Threads spawned later inherit from
+  their spawner. Best-effort class level 7 (lowest), NOT the IDLE class:
+  IDLE can starve indefinitely under sustained foreign IO, and the daemon
+  still has real-time pulls to apply.
 
 Only the **daemon** calls this. One-shot `rbox push/pull/sync` are foreground
 commands the user is actively waiting on — they keep default priority.
@@ -56,13 +60,21 @@ fixed `setInterval`):
 
 - A **quiet** interval (zero watcher events since the previous safety tick)
   doubles the next delay: 60s → 2m → 4m → 5m (cap).
-- **Any** watcher event snaps the next delay back to 60s — churn is exactly
-  when the scan's protection matters, so the floor returns the moment there
-  is anything to protect.
+- **Any** watcher event snaps the delay back to 60s, **including an armed
+  timer**: `noteChurn` pulls a backed-off timeout forward immediately (codex
+  R1 MAJOR — the flag alone would let a drop from *this* storm wait out an
+  armed 5m timer). Churn is exactly when the scan's protection matters, so
+  the floor returns the moment there is anything to protect.
 - **Degraded mode never backs off**: with no live watcher the periodic scan
   IS the sync mechanism, so it stays at 60s regardless of quiet.
+- **A post-init watcher error revokes trust permanently** (codex R1 MAJOR +
+  self-found): backend errors are surfaced via a new `WatchOptions.onError`
+  (both parcel and chokidar), and one error flips `watcherHealthy` false for
+  the daemon's lifetime — a possibly-dead FSEvents/inotify stream must not
+  let the safety scan, now the only healer, sit backed off at 5m. Fail-safe
+  toward pre-design-49 behavior: worst case is the old 60s cadence.
 - The deep scan (30m, cache-bypassing re-hash) is untouched — it remains the
-  unconditional floor under everything, including a silently-dead watcher.
+  unconditional floor under everything.
 
 Cost of the trade: a watcher event dropped while otherwise fully idle now
 heals in up to 5m instead of up to 60s (bounded above, as always, by the 30m
@@ -77,9 +89,17 @@ without timers.
 ## 3. Testing
 
 - `nextSafetyDelay`: doubling from 60s, 5m cap, churn reset, degraded reset.
-- Wiring: watcher events mark the churn flag (existing MiniRemote harness).
-- `lowerIoPriority`: platform probes run in a **spawned** bun process (the
-  test asserts the policy actually took: `getiopolicy_np == 3` on darwin,
-  `ioprio_get == 16391` on linux) — spawned so the throttle never applies to
-  the test-suite process itself. CI's ubuntu runner exercises the linux leg;
-  local + release smoke (macos-14) exercise darwin.
+- Wiring: watcher events mark churn AND re-arm a backed-off timer at the
+  floor; a post-init `onError` revokes watcher trust.
+- `lowerIoPriority` / `verifyIoPriority`: platform probes run in a
+  **spawned** bun process (spawned so the throttle never applies to the
+  test-suite process itself), asserting via the OS getters that the policy
+  actually took — `getiopolicy_np == 3` on darwin; on linux, `ioprio_get ==
+  16391` for **every** tid in `/proc/self/task`, with IO worker threads
+  forced to exist before the set (the codex R1 repro). CI's ubuntu runner
+  exercises the linux-x64 leg.
+- **Release smoke** (codex R1 MINOR): `__watcher-selftest` — which already
+  runs natively on all 3 release targets and gates publish — now also runs
+  `lowerIoPriority` + `verifyIoPriority` and exits 4 on failure, printing an
+  `IOPRIO_SELFTEST` line. A darwin-arm64 symbol typo or a wrong arm64
+  syscall number can no longer ship.

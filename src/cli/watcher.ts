@@ -20,6 +20,12 @@ export interface WatchOptions {
   maxWaitMs?: number;
   /** Force a backend; defaults to env `RBOX_WATCHER` then `parcel`. */
   backend?: WatcherBackend;
+  /** Post-init backend error (FSEvents stream died, inotify overflow). Correctness
+   *  is unaffected (the reconcile scans are the floor) but the daemon uses this to
+   *  stop TRUSTING the watcher — a dead stream must not back the safety scan off
+   *  (design 49 / codex R1). Events may well keep flowing after a transient error;
+   *  the callback is a health signal, not a teardown. */
+  onError?: (err: Error) => void;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -209,8 +215,13 @@ async function startParcel(
     realRoot,
     (err, events) => {
       // A watcher error is not fatal to correctness — the reconcile loop is the
-      // floor. Swallow here; the daemon's periodic full scan heals any gap.
-      if (err || !events) return;
+      // floor. Surface it as a health signal, then continue; the daemon's
+      // periodic full scan heals any gap.
+      if (err) {
+        opts.onError?.(err);
+        return;
+      }
+      if (!events) return;
       for (const ev of events) {
         const rel = toRel(ev.path);
         if (rel === "" || escapesRoot(rel)) continue;
@@ -273,6 +284,7 @@ function startChokidar(
     },
   });
 
+  watcher.on("error", (e) => opts.onError?.(e instanceof Error ? e : new Error(String(e))));
   watcher.on("all", (event: string, abs: string) => {
     const kind = EVENT_KIND[event];
     if (!kind) return;

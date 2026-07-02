@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher } from "../engine/index.js";
+import { lowerIoPriority, verifyIoPriority } from "./io-priority.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
 /**
@@ -9,10 +10,11 @@ import { startWatcher, type Watcher } from "./watcher.js";
  * matching OS/arch to prove the native `@parcel/watcher` binding actually LOADS from that
  * binary and delivers a real filesystem event — the thing `bun build` exit-0 can't prove.
  *
- * Prints one machine-greppable line (`WATCHER_SELFTEST ok|fail=… rss_mb=… platform=…`) and
- * returns a process exit code: 0 = watcher loaded + event delivered + memory bounded; 1 = no
- * event; 2 = watcher failed to start; 3 = idle RSS over the ceiling (a per-path-backend-class
- * regression). No account, network, or filesystem beyond a throwaway temp dir.
+ * Prints machine-greppable lines (`WATCHER_SELFTEST …` and `IOPRIO_SELFTEST …`) and returns
+ * a process exit code: 0 = watcher loaded + event delivered + memory bounded + IO policy
+ * verified; 1 = no event; 2 = watcher failed to start; 3 = idle RSS over the ceiling (a
+ * per-path-backend-class regression); 4 = IO-priority FFI didn't take on this target
+ * (design 49). No account, network, or filesystem beyond a throwaway temp dir.
  */
 export async function watcherSelfTest(dirArg?: string, opts: { timeoutMs?: number; maxRssMb?: number } = {}): Promise<number> {
   const timeoutMs = opts.timeoutMs ?? 8000;
@@ -54,6 +56,15 @@ export async function watcherSelfTest(dirArg?: string, opts: { timeoutMs?: numbe
     console.log(`WATCHER_SELFTEST ${status} rss_mb=${rssMb} platform=${process.platform}-${process.arch}`);
     if (!delivered) return 1;
     if (rssMb > maxRssMb) return 3;
+
+    // Design 49: same native gate, second duty — prove the IO-priority FFI works on
+    // THIS target's compiled binary (symbols/syscall numbers are per-platform; PR CI
+    // only ever runs linux-x64, so a darwin-arm64 or linux-arm64 typo would otherwise
+    // ship). The getter must confirm the policy actually took, on every thread.
+    const set = lowerIoPriority();
+    const check = verifyIoPriority();
+    console.log(`IOPRIO_SELFTEST ${check.ok ? "ok" : "fail"} set="${set}" ${check.detail} platform=${process.platform}-${process.arch}`);
+    if (!check.ok) return 4;
     return 0;
   } finally {
     await watcher?.close().catch(() => {});
