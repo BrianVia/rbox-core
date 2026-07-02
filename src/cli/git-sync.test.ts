@@ -159,7 +159,7 @@ async function commitFile(dir: string, file: string, content: string, msg: strin
   if (date) await gitAt(dir, date, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
   else await git(dir, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
 }
-const st = (root: string) => loadState(root, "ws_g43");
+const st = (root: string) => loadState(root, "http://x::ws_g43::root");
 const syncCycle = async () => {
   await sync(rootA, cfgA, depsA);
   await sync(rootB, cfgB, depsB);

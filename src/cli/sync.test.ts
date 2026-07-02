@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
-import { loadState } from "./config.js";
+import { loadState, syncStreamId } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { PhaseReport, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
@@ -167,7 +167,7 @@ test("pull never applies a remote entry that LOCAL rules ignore (legacy .git poi
 
   // The ignored remote entry stays in the recorded BASE (forward-only), so the next
   // push neither echo-deletes it from the remote nor commits anything at all.
-  const st = await loadState(root, "ws_t");
+  const st = await loadState(root, syncStreamId(cfg));
   expect(st.lastSyncedManifest.files.some((f) => f.path === "wt/.git")).toBe(true);
   const before = remote.commitCalls;
   await push(root, cfg, deps(remote));
@@ -204,7 +204,7 @@ test("clean push uploads the ciphertext blob, commits, advances base", async () 
   expect(seq).toBe(1);
   expect(remote.hasBlob((await enc("fresh content\n")).encSha)).toBe(true); // stored as ciphertext
   expect(remote.hasBlob(sha("fresh content\n"))).toBe(false); // never the plaintext address
-  expect((await loadState(root, "ws_t")).lastSyncedSequence).toBe(1);
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1);
 });
 
 test("binary (non-UTF8) content is encrypted + byte-verified by ciphertext address", async () => {
@@ -398,7 +398,7 @@ test("pull rejects an invalid remote manifest and does not advance base", async 
   // BEFORE any blob fetch/decrypt (the client is the sole validator under E2EE).
   remote.injectCommit([{ path: "../escape", type: "file", sha256: sha("x"), encSha: sha("x"), size: 1, mode: 0o644, mtimeMs: 1 }]);
   await expect(pull(root, cfg, deps(remote))).rejects.toThrow(/invalid remote manifest/);
-  expect((await loadState(root, "ws_t")).lastSyncedSequence).toBe(0); // base unchanged
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(0); // base unchanged
 });
 
 // ── forward-only ignore carry (M3b) ────────────────────────────────────────
@@ -511,18 +511,18 @@ test("state ownership: another workspace's baseline reads as fresh; same workspa
   await write("a.txt", "aaa\n");
   await push(root, cfg, deps(remote)); // stamps workspaceId: ws_t at seq 1
 
-  expect((await loadState(root, "ws_t")).lastSyncedSequence).toBe(1); // kept
-  const foreign = await loadState(root, "ws_other"); // mismatch → no baseline
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1); // kept
+  const foreign = await loadState(root, syncStreamId({ ...cfg, remoteWorkspaceId: "ws_other" })); // mismatch → no baseline
   expect(foreign.lastSyncedSequence).toBe(0);
   expect(foreign.lastSyncedManifest.files).toHaveLength(0);
 
   // Legacy state file written before the stamp existed: adopted as-is.
   const statePath = path.join(root, ".rbox", "state.json");
   const legacy = JSON.parse(await fs.readFile(statePath, "utf8"));
-  delete legacy.workspaceId;
+  delete legacy.stream;
   await fs.writeFile(statePath, JSON.stringify(legacy));
-  expect((await loadState(root, "ws_t")).lastSyncedSequence).toBe(1);
-  expect((await loadState(root, "ws_t")).workspaceId).toBe("ws_t");
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1);
+  expect((await loadState(root, syncStreamId(cfg))).stream).toBe(syncStreamId(cfg));
 });
 
 test("mass-delete guard: a pull deleting ≥half the baseline fails closed until --allow-mass-delete", async () => {

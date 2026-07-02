@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
-import { loadConfig, resetSyncState, saveConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
@@ -151,9 +151,10 @@ async function executeInitPlan(
   //    its sync baseline describes the OLD stream — reconciling the new one against
   //    it reads every old file as remotely deleted (the 2026-07-01 mass-delete
   //    incident). Reset the baseline explicitly (loadState also guards via the
-  //    workspaceId stamp; this keeps the on-disk state truthful) and say so.
+  //    stream stamp; this keeps the on-disk state truthful) and say so.
   const prev = await loadConfig(plan.root).catch(() => undefined);
-  if (prev && prev.remoteWorkspaceId !== workspaceId) {
+  const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
+  if (prev && syncStreamId(prev) !== nextStream) {
     await resetSyncState(plan.root);
     process.stderr.write(
       `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +

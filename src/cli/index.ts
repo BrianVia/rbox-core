@@ -1,6 +1,6 @@
 import path from "node:path";
 import { scanManifest, type Action } from "../engine/index.js";
-import { findRoot, loadConfig, loadState, type WorkspaceConfig } from "./config.js";
+import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
@@ -285,7 +285,7 @@ async function main(): Promise<void> {
     case "status": {
       const root = await resolveRoot(positional[0]);
       const cfg = await loadConfig(root);
-      const state = await loadState(root, cfg.remoteWorkspaceId);
+      const state = await loadState(root, syncStreamId(cfg));
       const local = await scanManifest(root);
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id

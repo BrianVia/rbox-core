@@ -27,21 +27,29 @@ is only meaningful against the manifest stream it was built from.
 
 ## 2. Mechanism 1 — state ownership (the root-cause fix)
 
-`SyncState` now carries `workspaceId`: the workspace the baseline belongs to.
+`SyncState` now carries `stream`: the identity of the manifest stream the
+baseline belongs to — `syncStreamId(cfg)` = `remoteUrl::workspaceId::projectId`.
+The FULL identity matters (codex round 2): the server keys manifests by
+`(workspace_id, project_id)` and `init`/`track` accept `--project`, so a
+workspace-only stamp would let a `--project` rebind poison the reconcile; and
+different remotes are different worlds entirely.
 
-- `saveState` sites always stamp it (`cfg.remoteWorkspaceId`).
-- `loadState(root, workspaceId)` requires the expected id. A stored state whose
+- `saveState` sites always stamp it.
+- `loadState(root, stream)` requires the expected identity. A stored state whose
   stamp differs is treated as **no baseline at all** (logged, never deleted from
   disk by the loader): the rebound root pulls without deleting (empty base = no
   delete diffs) and pushes its full tree — exactly right for a fresh binding.
-- A legacy pre-stamp state file (no `workspaceId`) is adopted as-is; every save
-  since stamps it. (Pre-launch: the only two live machines are correctly bound.)
-- `runInit` additionally resets the state file explicitly when it rebinds a root
-  to a different workspace (`resetSyncState`), so the on-disk state is truthful
-  and the transition is announced to the user.
+- A legacy pre-stamp state file (no `stream`) is adopted as-is; every save since
+  stamps it. (Pre-launch: the only two live machines are correctly bound.)
+- `runInit` AND `rbox track` additionally reset the state file explicitly when
+  they rebind a root to a different stream (`resetSyncState`) — required for the
+  LEGACY case, where the unstamped baseline would otherwise be adopted by the
+  new binding (codex round 1 BLOCKER) — and announce the transition. Re-tracking
+  the same stream keeps both the baseline and the existing device id.
 
 Defense-in-depth ordering matters: the LOADER guard is the invariant (any future
-caller is covered); the init reset is hygiene + UX.
+caller is covered); the init/track reset closes the legacy-adoption hole and is
+the honest-UX moment.
 
 ## 3. Mechanism 2 — the mass-delete guard (the safety net)
 

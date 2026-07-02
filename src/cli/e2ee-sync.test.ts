@@ -130,7 +130,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const cfgA: WorkspaceConfig = { ...(await cfgFor(rootA, secrets, remoteA)), syncGit: true };
     await push(rootA, cfgA, { remote: remoteA });
 
-    const sections = (await loadState(rootA, "ws_sync")).lastSyncedManifest.gitRepos!;
+    const sections = (await loadState(rootA, `mem://::${WS}::root`)).lastSyncedManifest.gitRepos!;
     expect(Object.keys(sections).sort()).toEqual(["repo1", "repo2"]);
     expect(sections["repo1"]!.bundleEncSha).toBe(sections["repo2"]!.bundleEncSha); // convergent bundles
 

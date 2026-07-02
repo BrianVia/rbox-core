@@ -19,7 +19,7 @@ import {
   planGitSections,
 } from "./sync-git.js";
 import { deferManifest, encryptAndUpload, reportDeferred } from "./sync-recovery.js";
-import { loadState, saveState, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { RboxApi, type SyncRemote } from "./remote.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
@@ -98,7 +98,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = await loadState(root, cfg.remoteWorkspaceId);
+  const state = await loadState(root, syncStreamId(cfg));
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = buildIgnoreMatcher(root);
@@ -181,7 +181,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
   const gitOutcome = await applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, deps.onGitLog ?? ((l) => console.error(l)));
   await saveState(root, {
-    workspaceId: cfg.remoteWorkspaceId,
+    stream: syncStreamId(cfg),
     lastSyncedSequence: sequence,
     lastSyncedManifest: { ...remote, gitRepos: gitOutcome.gitRepos },
     gitReposRemoved: gitOutcome.gitReposRemoved,
@@ -316,7 +316,7 @@ async function runPushAttempt(
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
-  const state = await loadState(root, cfg.remoteWorkspaceId);
+  const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root); // shared: forward-only ignore carry + git discovery
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
@@ -366,7 +366,7 @@ async function runPushAttempt(
         !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
     ) {
       await saveState(root, {
-        workspaceId: cfg.remoteWorkspaceId,
+        stream: syncStreamId(cfg),
         lastSyncedSequence: state.lastSyncedSequence,
         lastSyncedManifest: state.lastSyncedManifest,
         gitReposRemoved: gitPlan.gitReposRemoved,
@@ -441,7 +441,7 @@ async function runPushAttempt(
   // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
   const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, state.lastSyncedManifest.gitRepos);
   await saveState(root, {
-    workspaceId: cfg.remoteWorkspaceId,
+    stream: syncStreamId(cfg),
     lastSyncedSequence: res.sequence!,
     lastSyncedManifest: { ...committed, gitRepos: stateGit },
     gitReposRemoved: gitPlan.gitReposRemoved,

@@ -107,7 +107,7 @@ test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unsta
   await expect(fs.access(statePath)).rejects.toThrow(); // poisoned baseline gone
 
   // Re-tracking the SAME workspace keeps an existing baseline untouched.
-  await fs.writeFile(statePath, JSON.stringify({ workspaceId: "ws_new", lastSyncedSequence: 3, lastSyncedManifest: { generatedAt: "", files: [] } }));
+  await fs.writeFile(statePath, JSON.stringify({ stream: "https://api.test::ws_new::root", lastSyncedSequence: 3, lastSyncedManifest: { generatedAt: "", files: [] } }));
   await track(dir, { workspace: "ws_new" }, "https://api.test");
   expect(JSON.parse(await fs.readFile(statePath, "utf8")).lastSyncedSequence).toBe(3);
 });

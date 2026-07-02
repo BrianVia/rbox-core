@@ -10,7 +10,7 @@
  */
 import crypto from "node:crypto";
 import path from "node:path";
-import { loadConfig, resetSyncState, saveConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
 
 export interface TrackResult {
@@ -82,7 +82,7 @@ export async function track(
   // track must reset explicitly). A re-track of the SAME workspace keeps both the
   // baseline and the existing device id (re-tracking must not mint a new device).
   const prev = await loadConfig(root).catch(() => undefined);
-  if (prev && prev.remoteWorkspaceId !== workspaceId) {
+  if (prev && syncStreamId(prev) !== syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId })) {
     await resetSyncState(root);
     console.error(
       `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
