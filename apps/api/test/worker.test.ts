@@ -1421,17 +1421,19 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await (await getWorkspaces(b.token)).json()) as { workspaces: unknown[] }).workspaces.length).toBe(0);
   });
 
-  test("GET /v1/account/workspaces: lastCommitAt is MAX(commit.created_at), per (workspace,project)", async () => {
+  test("GET /v1/account/workspaces: lastCommitAt follows the MAX-SEQUENCE commit (head order), not wall-clock MAX", async () => {
     const a = await bootstrap("acct-ws-activity");
     const wsId = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
-    // Seed the D1 commit mirror out of order; the endpoint must return the MAX, not the last inserted.
-    const older = Date.now() - 3_600_000;
-    const newest = Date.now() - 60_000;
-    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 1, ?)").bind(wsId, newest).run();
-    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 2, ?)").bind(wsId, older).run();
+    // Sequence is assigned by the DO under transactionSync — it IS activity order.
+    // Seed created_at DISAGREEING with sequence (mirror-timing skew): the endpoint
+    // must report the head commit's (max sequence) timestamp, not the max wall-clock.
+    const seq1WallClock = Date.now() - 60_000; // later wall-clock, OLDER sequence
+    const headWallClock = Date.now() - 3_600_000; // earlier wall-clock, but the HEAD
+    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 1, ?)").bind(wsId, seq1WallClock).run();
+    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 2, ?)").bind(wsId, headWallClock).run();
     const listed = (await (await getWorkspaces(a.token)).json()) as { workspaces: Array<{ workspaceId: string; lastCommitAt: number | null }> };
     const row = listed.workspaces.find((w) => w.workspaceId === wsId)!;
-    expect(row.lastCommitAt).toBe(newest);
+    expect(row.lastCommitAt).toBe(headWallClock);
   });
 
   test("opt-in workspace name: ?name stored + returned; sanitized + length-bounded", async () => {
