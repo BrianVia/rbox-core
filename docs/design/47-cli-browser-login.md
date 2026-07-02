@@ -141,6 +141,36 @@ carry no notion of "who approved" beyond `account_id`/`user_id`
 device-code from a CLI-approved one server-side — which is correct, since
 they grant identically-scoped access.
 
+**Device label — resolved.** `login()` already sets `label = os.hostname()`
+and sends it to `device/start` (`auth-cmd.ts:36,62`) — no CLI change needed
+there. But that label is only ever returned to the *CLI* today; the web
+confirm page only has the `userCode` from the URL query string and has no way
+to look up which label it belongs to. That needs one small new **public,
+unauthenticated** GET route — it carries no rbox Principal, same category as
+the account-link start/status/confirm routes design 21 notes don't need the
+`webTokenAllowed` gate:
+
+```ts
+// GET /v1/auth/device/lookup?code=XXXX-XXXX -> { label, status } | 404
+export async function lookupDeviceAuth(req: Request, env: Env): Promise<Response> {
+  const userCode = new URL(req.url).searchParams.get("code")?.toUpperCase();
+  if (!userCode) return json({ error: "bad_request" }, 400);
+  const row = await dirDb(env)
+    .prepare("SELECT label, status, expires_at FROM device_auth WHERE user_code = ?")
+    .bind(userCode)
+    .first<{ label: string | null; status: string; expires_at: number }>();
+  if (!row || (Date.now() > row.expires_at && row.status === "pending")) return json({ error: "not_found" }, 404);
+  return json({ label: row.label, status: row.status });
+}
+```
+
+Returns only a hostname label and a status enum — no account id, no token,
+nothing an attacker can do anything with beyond what guessing a valid
+`userCode` already lets them do today (confirm a login prompt exists; they
+still can't approve it without a Clerk session on the target account). Same
+guessability profile as the existing `device/approve` route, not a new
+exposure.
+
 ## CLI change
 
 - Extract `openInBrowser`/`openAndShow` out of `subscribe-cmd.ts` into a
@@ -161,9 +191,12 @@ they grant identically-scoped access.
 - New SvelteKit route, `apps/web/src/routes/cli-login/+page.svelte` (or
   similar), gated behind the existing Clerk `signedIn` check
   (`+layout.svelte` already owns the signed-out redirect per the web
-  dashboard stack). Reads `code` from the query string, shows a confirm UI,
-  POSTs to `/v1/auth/device/approve` using the existing authenticated fetch
-  pattern already used for other web-session dashboard calls.
+  dashboard stack). Reads `code` from the query string, calls the new public
+  `GET /v1/auth/device/lookup?code=…` to render "Approve login for
+  `<label>`?" (falling back to just showing the code if `label` is null —
+  older CLI versions or a non-hostname label), then POSTs to
+  `/v1/auth/device/approve` using the existing authenticated fetch pattern
+  already used for other web-session dashboard calls.
 
 ## Non-goals
 
@@ -183,12 +216,8 @@ they grant identically-scoped access.
 
 ## Open questions
 
-- Should `device/start` accept and return a human-readable device label up
-  front (e.g. hostname) so the web confirm page can show "Approve login for
-  `mac-mini.local`?" instead of just the code? Today `label` is passed but
-  not surfaced back in `device/start`'s response — a small additive change if
-  wanted, not required for v1.
-- Rate limiting on `/v1/auth/device/start` and the new web-reachable
+- Rate limiting on `/v1/auth/device/start`, the new public
+  `/v1/auth/device/lookup`, and the web-reachable
   `/v1/auth/device/approve` — device-code start/poll presumably already has
   some abuse-resistance given it predates this doc (design 04), but worth
   confirming the web-session path doesn't open a new brute-force angle on
@@ -210,3 +239,5 @@ they grant identically-scoped access.
   approved).
 - Web: `/cli-login` redirects unauthenticated visitors through Clerk sign-in
   and preserves the `code` param across that round trip.
+- `lookupDeviceAuth`: returns `{ label, status }` for a pending code, 404 for
+  unknown/expired codes, never leaks `account_id`/`user_id`/tokens.
