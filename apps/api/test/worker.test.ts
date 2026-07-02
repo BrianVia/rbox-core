@@ -1409,14 +1409,29 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { workspaces: Array<Record<string, unknown>>; nextCursor: string | null };
     expect(body.workspaces.length).toBe(1);
-    expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "name", "projectId", "workspaceId"]);
+    expect(Object.keys(body.workspaces[0]!).sort()).toEqual(["createdAt", "lastCommitAt", "name", "projectId", "workspaceId"]);
     expect(body.workspaces[0]!.projectId).toBe("my-proj");
     // Opt-in name is default-off: a create without ?name → null (the private default).
     expect(body.workspaces[0]!.name).toBeNull();
+    // Never synced (no commits yet) → lastCommitAt null, not a bogus timestamp.
+    expect(body.workspaces[0]!.lastCommitAt).toBeNull();
     expect(JSON.stringify(body)).not.toContain("account_id");
     // A second account never sees account A's workspace.
     const b = await bootstrap("acct-ws-other");
     expect(((await (await getWorkspaces(b.token)).json()) as { workspaces: unknown[] }).workspaces.length).toBe(0);
+  });
+
+  test("GET /v1/account/workspaces: lastCommitAt is MAX(commit.created_at), per (workspace,project)", async () => {
+    const a = await bootstrap("acct-ws-activity");
+    const wsId = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    // Seed the D1 commit mirror out of order; the endpoint must return the MAX, not the last inserted.
+    const older = Date.now() - 3_600_000;
+    const newest = Date.now() - 60_000;
+    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 1, ?)").bind(wsId, newest).run();
+    await env.rbox_dev_db.prepare("INSERT INTO commits (workspace_id, project_id, sequence, created_at) VALUES (?, 'root', 2, ?)").bind(wsId, older).run();
+    const listed = (await (await getWorkspaces(a.token)).json()) as { workspaces: Array<{ workspaceId: string; lastCommitAt: number | null }> };
+    const row = listed.workspaces.find((w) => w.workspaceId === wsId)!;
+    expect(row.lastCommitAt).toBe(newest);
   });
 
   test("opt-in workspace name: ?name stored + returned; sanitized + length-bounded", async () => {
