@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { loadActivity, saveActivity, type DaemonActivity } from "./activity.js";
+import { resetSyncState } from "./config.js";
 
 let root: string;
 beforeEach(async () => {
@@ -52,6 +53,15 @@ test("malformed nested slots are dropped individually, never handed to render (c
     })
   );
   expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
+});
+
+test("resetSyncState clears the sidecar too — a rebind must not inherit the old trail (codex R4)", async () => {
+  await saveActivity(root, {
+    at: "2026-07-02T12:00:00.000Z",
+    halt: { at: "2026-07-02T12:00:00.000Z", reason: "old workspace's halt", count: 1, op: "pull" },
+  });
+  await resetSyncState(root);
+  expect(await loadActivity(root)).toBeUndefined();
 });
 
 test("save is best-effort: an unwritable destination is swallowed", async () => {

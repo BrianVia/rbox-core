@@ -5,9 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
-import { loadState, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, type WorkspaceConfig } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, gitIdentity, gitIdentityKey, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitDivergenceCount } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
@@ -824,4 +824,28 @@ test("gitDivergenceCount mirrors push's capture decision (read-only, no state mu
 
   // git-sync off → the dimension is simply absent.
   expect(await gitDivergenceCount(rootA, { ...cfgA, syncGit: false }, await st(rootA), matcher)).toBe(0);
+});
+
+test("gitDivergenceCount honors needsResolution suppression before preflight (codex R4)", async () => {
+  const p1 = path.join(rootA, "proj1");
+  await initRepo(p1);
+  await commitFile(p1, "a.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  // Diverge locally → pending work…
+  await commitFile(p1, "b.txt", "v2", "c2");
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
+
+  // …until a conflict checkpoint suppresses it: push CARRIES the base while the
+  // identity equals the recorded conflict-time value, so status must read 0 —
+  // and the suppression must be honored BEFORE preflight, matching the planner.
+  const state = await st(rootA);
+  await saveState(rootA, { ...state, gitNeedsResolution: { proj1: gitIdentityKey(await gitIdentity(p1)) } });
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+
+  // The user touches the repo → identity leaves the checkpoint → republish is
+  // intentional and the divergence shows again.
+  await commitFile(p1, "c.txt", "v3", "c3");
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
 });

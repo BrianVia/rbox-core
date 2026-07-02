@@ -131,6 +131,17 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   const healed = await loadActivity(root);
   expect(healed?.halt).toBeUndefined();
   expect(healed?.at).toBeDefined();
+
+  // Codex R4 regression: a NEW failure with the SAME message after a heal is a new
+  // episode — it must persist a fresh halt (not silently count as dedup repeat 2..9
+  // and leave activity.json healed).
+  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  daemon.want.pull = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  const rehalted = await loadActivity(root);
+  expect(rehalted?.halt?.reason).toContain("mass-delete guard");
+  expect(rehalted?.halt?.count).toBe(1);
 });
 
 test("a committed push records the last-sync trail; a no-op push does not", async () => {

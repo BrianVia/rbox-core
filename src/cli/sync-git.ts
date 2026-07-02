@@ -652,6 +652,17 @@ export async function gitDivergenceCount(
       continue;
     }
     if (await isGitBusy(repoDirOf(root, rel))) continue; // indeterminate this instant
+    // Suppressions FIRST, preflight second — planGitSections' exact order (codex R4:
+    // a needsResolution-suppressed repo that turns structurally unsyncable is CARRIED
+    // by push, so counting it here would drift the verdict from the planner).
+    if (!baseSec && removedMem[rel] !== undefined) {
+      const id = await gitIdentity(repoDirOf(root, rel));
+      if (!id || gitIdentityKey(id) === removedMem[rel]) continue; // untouched removal residue
+    }
+    if (needsRes[rel] !== undefined) {
+      const id = await gitIdentity(repoDirOf(root, rel));
+      if (gitIdentityKey(id) === needsRes[rel]) continue; // conflict-suppressed until touched
+    }
     const pf = await gitPreflight(repoDirOf(root, rel));
     if (!pf.ok) {
       // A STRUCTURAL refusal (shallow/bare/…) over a synced base is not a skip:
@@ -663,8 +674,6 @@ export async function gitDivergenceCount(
     const id = await gitIdentity(repoDirOf(root, rel));
     if (!id) continue; // empty repo: nothing to capture, base (if any) carries
     const key = gitIdentityKey(id);
-    if (!baseSec && removedMem[rel] !== undefined && key === removedMem[rel]) continue; // untouched removal residue
-    if (needsRes[rel] !== undefined && key === needsRes[rel]) continue; // conflict-suppressed until touched
     if (!baseSec) {
       n++; // never-synced local repo → a push would publish it
       continue;

@@ -5,7 +5,7 @@ import { healthLine, lastSyncLines, progressLabel } from "./status-view.js";
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
-import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
+import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, readDaemonBinding, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -334,12 +334,19 @@ async function main(): Promise<void> {
       const state = await loadState(root, syncStreamId(cfg));
       const matcher = buildIgnoreMatcher(root);
       const local = await scanManifest(root, matcher);
-      const bg = isDaemonRunning(root);
+      // A running daemon BOUND TO A PREVIOUS WORKSPACE is not background sync for
+      // this one (codex R4): its liveness must not read "running", and its activity
+      // sidecar (halt, trail, progress) describes the old binding — suppress both.
+      // Unknown binding (pre-binding daemon) is treated as current: can't tell ≠ stale.
+      const alive = isDaemonRunning(root);
+      const bound = alive.running ? readDaemonBinding(root) : undefined;
+      const daemonStale = alive.running && bound !== undefined && bound !== cfg.remoteWorkspaceId;
+      const bg = { running: alive.running && !daemonStale, pid: alive.pid };
       // The daemon's activity sidecar, the remote-head probe, and the git-divergence
       // walk are independent best-effort reads — concurrent so status stays snappy.
       const { gitDivergenceCount } = await import("./sync-git.js");
       const [activity, remoteSequence, gitChanged] = await Promise.all([
-        loadActivity(root),
+        daemonStale ? Promise.resolve(undefined) : loadActivity(root),
         fetchRemoteSequence(cfg, creds),
         gitDivergenceCount(root, cfg, state, matcher).catch(() => 0),
       ]);
@@ -374,7 +381,15 @@ async function main(): Promise<void> {
       );
       for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
       // Folds in the old `daemon status` (design 29): background-sync state.
-      console.log(`  ${style.dim("background sync:")} ${bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
+      console.log(
+        `  ${style.dim("background sync:")} ${
+          daemonStale
+            ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
+            : bg.running
+              ? style.green(`running (pid ${bg.pid})`)
+              : style.yellow("stopped")
+        }`
+      );
       if (cfg.syncGit) {
         // design 43 §10: per-workspace git-sync summary from the per-repo sync state.
         const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;

@@ -179,11 +179,15 @@ export async function saveState(root: string, state: SyncState): Promise<void> {
 /** Discard the local sync baseline (used when a root is REBOUND to a different
  *  workspace — the old baseline describes the old stream). Files on disk are
  *  untouched; the next pull writes without deleting and the next push publishes
- *  the full tree. Missing file = already reset. */
+ *  the full tree. The daemon-activity sidecar goes with it (design 45, codex R4):
+ *  its halt/trail describe the OLD binding and must not render under the new one.
+ *  Missing files = already reset. */
 export async function resetSyncState(root: string): Promise<void> {
-  try {
-    await fs.rm(statePath(root));
-  } catch (e) {
-    if (!isENOENT(e)) throw e;
+  for (const p of [statePath(root), path.join(root, RBOX_DIR, "state", "activity.json")]) {
+    try {
+      await fs.rm(p);
+    } catch (e) {
+      if (!isENOENT(e)) throw e;
+    }
   }
 }

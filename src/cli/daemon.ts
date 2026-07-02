@@ -244,7 +244,14 @@ export class RboxDaemon {
           const heals = this.activity.halt !== undefined && this.activity.halt.op === op;
           const cleared = this.activity.active !== undefined || heals;
           this.activity.active = undefined;
-          if (heals) this.activity.halt = undefined;
+          if (heals) {
+            this.activity.halt = undefined;
+            // The healed failure's dedup streak ends with it: a LATER failure with the
+            // same message is a new episode that must log and persist a fresh halt —
+            // not silently count as repeat 2..9 and leave activity.json healed (codex R4).
+            this.lastErrMsg = "";
+            this.errRepeat = 0;
+          }
           if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
         } catch (e) {
           // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
