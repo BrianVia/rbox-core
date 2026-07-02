@@ -17,7 +17,7 @@ test("round-trips the full record", async () => {
     at: "2026-07-02T12:00:00.000Z",
     last: { at: "2026-07-02T11:58:00.000Z", op: "push", files: 3, sequence: 78 },
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
-    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2 },
+    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull" },
   };
   await saveActivity(root, a);
   expect(await loadActivity(root)).toEqual(a);

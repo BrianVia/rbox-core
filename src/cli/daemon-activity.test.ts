@@ -54,6 +54,9 @@ interface DaemonInternals {
   manifest: Manifest;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pump(): Promise<void>;
+  /** The chained sidecar-write promise — the pump never awaits it (best-effort
+   *  by contract), so tests drain it explicitly before reading the file. */
+  activityWrite: Promise<void>;
 }
 
 let root: string;
@@ -82,20 +85,31 @@ async function makeDaemon(remote: MiniRemote): Promise<DaemonInternals> {
   return daemon;
 }
 
-test("pump error records a halt; the next success clears it", async () => {
+test("pump error records a halt; only a same-kind success clears it", async () => {
   const remote = new MiniRemote();
   remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   const daemon = await makeDaemon(remote);
 
   daemon.want.pull = true;
   await daemon.pump();
+  await daemon.activityWrite;
   const halted = await loadActivity(root);
   expect(halted?.halt?.reason).toContain("mass-delete guard");
   expect(halted?.halt?.count).toBe(1);
+  expect(halted?.halt?.op).toBe("pull");
 
-  remote.latestError = undefined; // heal → the next pull succeeds and self-clears
+  // Codex R1 BLOCKER regression: a successful op of a DIFFERENT kind (the queued
+  // no-op push, every safety scan) must NOT heal a pull halt — the guard warning
+  // would flap off within seconds of every trip.
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  expect((await loadActivity(root))?.halt?.reason).toContain("mass-delete guard");
+
+  remote.latestError = undefined; // heal → a SUCCESSFUL PULL is what clears it
   daemon.want.pull = true;
   await daemon.pump();
+  await daemon.activityWrite;
   const healed = await loadActivity(root);
   expect(healed?.halt).toBeUndefined();
   expect(healed?.at).toBeDefined();
@@ -109,11 +123,13 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
 
   daemon.want.push = true;
   await daemon.pump();
+  await daemon.activityWrite;
   const after = await loadActivity(root);
   expect(after?.last).toEqual({ at: expect.any(String), op: "push", files: 1, sequence: 1 });
   expect(after?.active).toBeUndefined(); // live progress never outlives its op
 
   daemon.want.push = true; // steady state: no changes → no-op → trail unchanged
   await daemon.pump();
+  await daemon.activityWrite;
   expect((await loadActivity(root))?.last?.sequence).toBe(1);
 });

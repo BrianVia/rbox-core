@@ -19,6 +19,10 @@ export interface StatusSnapshot {
   added: number;
   changed: number;
   deleted: number;
+  /** Repos whose local git state a push would publish (`gitDivergenceCount`) —
+   *  without it a clean file tree + a fresh local commit reads "in sync" while
+   *  push would commit a git section (codex R1). Optional: 0 when git-sync is off. */
+  gitChanged?: number;
   trackedFiles: number;
   daemonRunning: boolean;
   localSequence: number;
@@ -44,7 +48,9 @@ export function relTime(iso: string, now: number): string {
 /** `uploading 42% (3,612/8,603)` — shared by spinners and the live status line. */
 export function progressLabel(phase: "encrypt" | "upload" | "download", done: number, total: number): string {
   const verb = phase === "encrypt" ? "encrypting" : phase === "upload" ? "uploading" : "downloading";
-  const pct = total > 0 ? Math.floor((done / total) * 100) : 100;
+  // Clamped: a misbehaving producer must render at worst a wrong-but-sane percent,
+  // never `150%` or `NaN%` (total ≤ 0 degenerates to done).
+  const pct = total > 0 ? Math.min(100, Math.max(0, Math.floor((done / total) * 100))) : 100;
   return `${verb} ${pct}% (${n(done)}/${n(total)})`;
 }
 
@@ -68,20 +74,25 @@ export function healthLine(s: StatusSnapshot): string {
   }
 
   const localChanges = s.added + s.changed + s.deleted;
+  const gitChanged = s.gitChanged ?? 0;
   const behind = s.remoteSequence !== undefined && s.remoteSequence > s.localSequence;
   const behindNote = `behind remote (sequence ${s.localSequence} vs ${s.remoteSequence})`;
 
-  // 3. Local divergence from the baseline — files waiting to upload. With the
-  //    daemon running this is normally transient; stopped, it needs a nudge.
-  if (localChanges > 0) {
+  // 3. Local divergence from the baseline — file and/or git changes waiting to
+  //    upload. With the daemon running this is normally transient; stopped, it
+  //    needs a nudge.
+  if (localChanges > 0 || gitChanged > 0) {
     const parts = [
       s.added ? `${n(s.added)} new` : "",
       s.changed ? `${n(s.changed)} changed` : "",
       s.deleted ? `${n(s.deleted)} deleted` : "",
+      gitChanged ? `git changes in ${n(gitChanged)} repo${gitChanged === 1 ? "" : "s"}` : "",
     ].filter(Boolean);
+    const head =
+      localChanges > 0 ? `↑ ${n(localChanges)} local change${localChanges === 1 ? "" : "s"} to sync` : "↑ git changes to sync";
     const extra = behind ? ` · ${behindNote}` : "";
     const hint = s.daemonRunning ? "" : ` ${style.dim("— background sync stopped; run `rbox start`")}`;
-    return `${style.yellow(`↑ ${n(localChanges)} local change${localChanges === 1 ? "" : "s"} to sync`)} ${style.dim(`(${parts.join(", ")})`)}${extra}${hint}`;
+    return `${style.yellow(head)} ${style.dim(`(${parts.join(", ")})`)}${extra}${hint}`;
   }
 
   // 4. Clean locally but the remote has moved on.

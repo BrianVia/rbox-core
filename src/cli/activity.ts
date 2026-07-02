@@ -31,9 +31,11 @@ export interface DaemonActivity {
   /** Live transfer progress; present only mid-op. Status ignores it when older
    *  than {@link ACTIVE_STALE_MS} — a crashed daemon must not show "syncing" forever. */
   active?: { at: string; phase: "encrypt" | "upload" | "download"; done: number; total: number };
-  /** Standing warning set by the pump's error path, cleared by the next success.
-   *  This is how a mass-delete-guard refusal (design 44) becomes visible. */
-  halt?: { at: string; reason: string; count: number };
+  /** Standing warning set by the pump's error path, cleared ONLY by a later success
+   *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
+   *  no-op push successes and safety scans. This is how a guard refusal (design 44)
+   *  becomes visible. */
+  halt?: { at: string; reason: string; count: number; op: "pull" | "push" | "fullScan" | "deepScan" };
 }
 
 /** An `active` entry older than this is ignored by status (stale = daemon died mid-op). */

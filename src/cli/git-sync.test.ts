@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, type WorkspaceConfig } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
-import { scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { gitDivergenceCount } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
@@ -789,4 +790,32 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   const state = await st(rootA);
   expect(state.lastSyncedManifest.gitRepos?.["sh"]).toBeUndefined(); // dropped, not carried
   expect(logsA.some((l) => l.includes("shallow clone"))).toBe(true); // loud, with the un-shallow hint
+});
+
+// ── design 45: the status verdict's advisory git-divergence walk ─────────────────
+
+test("gitDivergenceCount mirrors push's capture decision (read-only, no state mutation)", async () => {
+  const p1 = path.join(rootA, "proj1");
+  await initRepo(p1);
+  await commitFile(p1, "a.txt", "v1", "c1");
+  const matcher = buildIgnoreMatcher(rootA);
+
+  // Never-synced local repo → a push would publish it.
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
+  // …and the walk itself must not have created/advanced any sync state.
+  expect((await st(rootA)).lastSyncedSequence).toBe(0);
+
+  // Push, then identity matches base → in sync.
+  await push(rootA, cfgA, depsA);
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+
+  // A fresh local commit diverges the identity while the base stands → 1
+  // (codex R1: a clean file tree + unpushed git state must not read "in sync").
+  await commitFile(p1, "b.txt", "v2", "c2");
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
+  await push(rootA, cfgA, depsA);
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+
+  // git-sync off → the dimension is simply absent.
+  expect(await gitDivergenceCount(rootA, { ...cfgA, syncGit: false }, await st(rootA), matcher)).toBe(0);
 });

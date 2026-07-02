@@ -40,6 +40,8 @@ test("progressLabel renders percent + counts per phase", () => {
   expect(progressLabel("encrypt", 1, 4)).toBe("encrypting 25% (1/4)");
   expect(progressLabel("download", 4, 4)).toBe("downloading 100% (4/4)");
   expect(progressLabel("upload", 0, 0)).toBe("uploading 100% (0/0)"); // degenerate: no work = done
+  expect(progressLabel("upload", 3, 2)).toBe("uploading 100% (3/2)"); // clamped, never 150%
+  expect(progressLabel("upload", -1, 2)).toBe("uploading 0% (-1/2)"); // clamped, never negative
 });
 
 // ── healthLine priority order ────────────────────────────────────────────────
@@ -53,7 +55,7 @@ test("in sync — clean local diff, remote agrees", () => {
 test("halt outranks everything when the daemon is running", () => {
   const activity: DaemonActivity = {
     at: iso(10),
-    halt: { at: iso(300), reason: "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).", count: 4 },
+    halt: { at: iso(300), reason: "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).", count: 4, op: "pull" },
     active: { at: iso(1), phase: "upload", done: 1, total: 2 },
   };
   const line = healthLine(base({ activity, added: 5, remoteSequence: 99 }));
@@ -64,7 +66,7 @@ test("halt outranks everything when the daemon is running", () => {
 });
 
 test("a stopped daemon's leftover halt is dropped (stopped already says sync is off)", () => {
-  const activity: DaemonActivity = { at: iso(10), halt: { at: iso(300), reason: "boom", count: 1 } };
+  const activity: DaemonActivity = { at: iso(10), halt: { at: iso(300), reason: "boom", count: 1, op: "pull" } };
   const line = healthLine(base({ activity, daemonRunning: false }));
   expect(line).not.toContain("halted");
   expect(line).toContain("in sync");
@@ -91,6 +93,16 @@ test("local divergence: counts by kind, hint only when the daemon is stopped", (
   const stopped = healthLine(base({ added: 1, daemonRunning: false }));
   expect(stopped).toContain("1 local change to sync");
   expect(stopped).toContain("rbox start");
+});
+
+test("git divergence: clean file tree with unpushed git state is NOT in sync", () => {
+  const gitOnly = healthLine(base({ gitChanged: 1 }));
+  expect(gitOnly).toContain("git changes to sync");
+  expect(gitOnly).toContain("git changes in 1 repo");
+
+  const both = healthLine(base({ changed: 2, gitChanged: 3 }));
+  expect(both).toContain("2 local changes to sync");
+  expect(both).toContain("git changes in 3 repos");
 });
 
 test("local divergence + behind remote are reported together", () => {

@@ -192,6 +192,7 @@ export class RboxDaemon {
     // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
     // daemon restart could interrupt a mutation mid-flight.
     await this.pumpRun.catch(() => {});
+    await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
     await this.cache?.save(this.root).catch(() => {});
     log("rbox daemon stopped");
   }
@@ -217,29 +218,33 @@ export class RboxDaemon {
   private async pumpLoop(): Promise<void> {
     try {
       while (!this.stopped && (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan)) {
+        // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
+        // is keyed on it (a halt is only healed by a success of the SAME kind).
+        const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
         try {
-          if (this.want.deepScan) {
-            this.want.deepScan = false;
+          this.want[op] = false;
+          if (op === "deepScan") {
             await this.doDeepScan();
             this.want.push = true;
-          } else if (this.want.fullScan) {
-            this.want.fullScan = false;
+          } else if (op === "fullScan") {
             await this.doFullScan();
             this.want.push = true;
-          } else if (this.want.pull) {
-            this.want.pull = false;
+          } else if (op === "pull") {
             await this.doPull();
             this.want.push = true; // publish any local divergence after taking remote
-          } else if (this.want.push) {
-            this.want.push = false;
+          } else {
             await this.doPush();
           }
-          // Op completed: any live progress is over and any standing halt is healed.
+          // Op completed: any live progress is over. A standing halt is healed ONLY by
+          // a success of the op kind that recorded it — a mass-delete-guard halt from a
+          // pull must survive the queued push's no-op success and every safety scan
+          // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
           // Persist when something visible changed (or as a throttled heartbeat, so
           // `rbox status` can say "last checked: Ns ago" without idle disk churn).
-          const cleared = this.activity.active !== undefined || this.activity.halt !== undefined;
+          const heals = this.activity.halt !== undefined && this.activity.halt.op === op;
+          const cleared = this.activity.active !== undefined || heals;
           this.activity.active = undefined;
-          this.activity.halt = undefined;
+          if (heals) this.activity.halt = undefined;
           if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
         } catch (e) {
           // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
@@ -252,7 +257,7 @@ export class RboxDaemon {
           // it a mass-delete-guard refusal (design 44) stalls background sync with no
           // indicator anywhere but this log. Persisted on the log-line schedule.
           this.activity.active = undefined;
-          this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat };
+          this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
           if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
             log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
             this.writeActivity();
@@ -261,7 +266,6 @@ export class RboxDaemon {
         }
       }
       await this.cache.save(this.root);
-      await this.activityWrite; // pump completion ⇒ the sidecar reflects it (status + tests rely on this)
     } finally {
       this.pumping = false;
     }
@@ -404,8 +408,9 @@ export class RboxDaemon {
   }
 
   /** Pending activity persistence — writes CHAIN on this promise so overlapping
-   *  saves can never land out of order (an older record must not win). Drained at
-   *  the end of each pump run; never awaited on the hot path. */
+   *  saves can never land out of order (an older record must not win). NEVER awaited
+   *  on the sync path (a slow sidecar write must not delay a single op — codex R1);
+   *  drained only by stop() so graceful shutdown flushes the final record. */
   private activityWrite: Promise<void> = Promise.resolve();
 
   /** Persist the in-memory activity record. Non-blocking for the caller, and

@@ -36,10 +36,12 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
  * process alive. Auth + base URL come from the per-machine credential, with the
  * config as fallback — the same effective-remote rule as buildAuthedRemote.
  */
-async function fetchRemoteSequence(cfg: WorkspaceConfig, timeoutMs = 2500): Promise<number | undefined> {
+async function fetchRemoteSequence(
+  cfg: WorkspaceConfig,
+  creds: { token: string; remoteUrl?: string } | undefined,
+  timeoutMs = 2500
+): Promise<number | undefined> {
   try {
-    const { loadCredentials } = await import("./credentials.js");
-    const creds = await loadCredentials();
     const token = creds?.token || cfg.token;
     if (!token) return undefined;
     const base = creds?.remoteUrl ?? cfg.remoteUrl;
@@ -321,14 +323,26 @@ async function main(): Promise<void> {
     }
     case "status": {
       const root = await resolveRoot(positional[0]);
-      const cfg = await loadConfig(root);
+      // The EFFECTIVE remote is the credential's (buildAuthedRemote's rule, design 44
+      // R3): sync stamps its baseline with it, so status must load state under the
+      // SAME stream id — the raw config URL would read a valid baseline as foreign
+      // and misreport every file as pending (codex R1).
+      const { loadCredentials } = await import("./credentials.js");
+      const creds = await loadCredentials().catch(() => undefined);
+      const rawCfg = await loadConfig(root);
+      const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
       const state = await loadState(root, syncStreamId(cfg));
       const matcher = buildIgnoreMatcher(root);
       const local = await scanManifest(root, matcher);
       const bg = isDaemonRunning(root);
-      // The daemon's activity sidecar and the remote-head probe are independent
-      // best-effort reads — fetched concurrently so status stays snappy.
-      const [activity, remoteSequence] = await Promise.all([loadActivity(root), fetchRemoteSequence(cfg)]);
+      // The daemon's activity sidecar, the remote-head probe, and the git-divergence
+      // walk are independent best-effort reads — concurrent so status stays snappy.
+      const { gitDivergenceCount } = await import("./sync-git.js");
+      const [activity, remoteSequence, gitChanged] = await Promise.all([
+        loadActivity(root),
+        fetchRemoteSequence(cfg, creds),
+        gitDivergenceCount(root, cfg, state, matcher).catch(() => 0),
+      ]);
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id
       // when no name was set.
@@ -349,6 +363,7 @@ async function main(): Promise<void> {
           added: d.added.length,
           changed: d.changed.length,
           deleted: d.deleted.filter((p) => !matcher.ignores(p)).length,
+          gitChanged,
           trackedFiles: local.files.length,
           daemonRunning: bg.running,
           localSequence: state.lastSyncedSequence,

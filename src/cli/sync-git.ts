@@ -606,3 +606,71 @@ export async function applyGitSections(
   }
   return pack();
 }
+
+/**
+ * READ-ONLY advisory count of repos whose LOCAL git state a push would publish —
+ * the `rbox status` verdict's git dimension (design 45, codex R1). Mirrors
+ * {@link planGitSections}'s per-repo capture decision (pending carry, removal
+ * memories, needs-resolution suppression, preflight, the §7 shape×scope carry
+ * matrix) without any of its work or side effects: no bundling, no state
+ * mutation, no memory pruning. Two accepted approximations, both toward
+ * UNDER-claiming "in sync" never over-claiming it: repos beyond the new-repo
+ * admission cap still count (push defers them, but they ARE unpublished local
+ * work), and a busy (locked) repo counts zero (indeterminate — status must not
+ * guess). Identity reads use `git write-tree`, which may add unreferenced tree
+ * objects — the same "harmless, like `git status`" footprint sync itself has.
+ */
+export async function gitDivergenceCount(
+  root: string,
+  cfg: WorkspaceConfig,
+  state: SyncState,
+  matcher: IgnoreMatcher
+): Promise<number> {
+  if (!cfg.syncGit) return 0;
+  const base = state.lastSyncedManifest.gitRepos ?? {};
+  const pending = state.gitPendingRemote ?? {};
+  const needsRes = state.gitNeedsResolution ?? {};
+  const removedMem = state.gitReposRemoved ?? {};
+  const discovered = await discoverGitRepos(root, matcher);
+  const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
+  const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base)])].sort();
+
+  let n = 0;
+  for (const rel of keys) {
+    if (pending[rel]) continue; // unapplied remote truth is carried, never local divergence
+    const kind = kindByPath.get(rel);
+    const baseSec = base[rel];
+    if (!kind) {
+      if (!baseSec) continue;
+      // Repo dir gone entirely → push would publish the removal. Present-but-
+      // undiscoverable (ignored leftover) → push carries; not divergence.
+      const dirPresent = await fs
+        .lstat(repoDirOf(root, rel))
+        .then((s) => s.isDirectory())
+        .catch(() => false);
+      if (!dirPresent) n++;
+      continue;
+    }
+    if (await isGitBusy(repoDirOf(root, rel))) continue; // indeterminate this instant
+    const pf = await gitPreflight(repoDirOf(root, rel));
+    if (!pf.ok) continue; // structural/transient refusal: push won't capture it either
+    const id = await gitIdentity(repoDirOf(root, rel));
+    if (!id) continue; // empty repo: nothing to capture, base (if any) carries
+    const key = gitIdentityKey(id);
+    if (!baseSec && removedMem[rel] !== undefined && key === removedMem[rel]) continue; // untouched removal residue
+    if (needsRes[rel] !== undefined && key === needsRes[rel]) continue; // conflict-suppressed until touched
+    if (!baseSec) {
+      n++; // never-synced local repo → a push would publish it
+      continue;
+    }
+    // The §7 capture-side carry matrix (see planGitSections for the normative copy).
+    const carry =
+      pf.kind === "dir"
+        ? baseSec.refScope === "all" && key === gitIdentityKey(baseSec)
+        : baseSec.refScope === "scoped"
+          ? key === gitIdentityKey(baseSec)
+          : key === projectedKey(baseSec, "scoped");
+    if (!carry) n++;
+  }
+  return n;
+}
