@@ -297,6 +297,7 @@ export class RboxDaemon {
       report,
       onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
       onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
+      onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
@@ -313,8 +314,9 @@ export class RboxDaemon {
     }
     this.lastLoggedSeq = res.sequence;
     if (res.committed) {
-      // The status trail: "last sync: 2m ago — pushed N files → sequence S" (design 45).
-      this.activity.last = { at: new Date().toISOString(), op: "push", files: res.manifest.files.length, sequence: res.sequence };
+      // The status trail: "last push: 2m ago — N files → sequence S" (design 45).
+      // Its own slot — it must never mask what a recovery pull applied (codex R2).
+      this.activity.lastPush = { at: new Date().toISOString(), files: res.manifest.files.length, sequence: res.sequence };
       this.activityDirty = true;
     }
     // Files deferred because they were still changing under the push: re-enqueue them
@@ -359,30 +361,18 @@ export class RboxDaemon {
   private async doPull(): Promise<void> {
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
+    // onPullApplied carries BOTH the forensic log line and the status trail — wired
+    // here and in doPush's deps so the pull inside push's 409 recovery is recorded
+    // identically (codex R2: its actions are discarded by the retry loop).
     const actions = await pull(this.root, this.cfg, {
       ...this.e2ee,
       cache: this.cache,
       report,
       onGitLog: log,
       onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45
+      onPullApplied: (a) => this.recordPullApplied(a),
     });
     report?.logSummaryTo(log);
-    // Forensic record: every mutation a pull applied to the LOCAL tree, path by path.
-    // This is the line that answers "did sync change/delete my files?" after the fact.
-    if (actions.length > 0) {
-      log(`pull applied: ${summarizeActions(actions)}`);
-      // The status trail (design 45): the same counts, machine-readable.
-      let writes = 0;
-      let deletes = 0;
-      let conflicts = 0;
-      for (const a of actions) {
-        if (a.kind === "write") writes++;
-        else if (a.kind === "delete") deletes++;
-        else conflicts++;
-      }
-      this.activity.last = { at: new Date().toISOString(), op: "pull", writes, deletes, conflicts };
-      this.activityDirty = true;
-    }
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;
@@ -424,6 +414,23 @@ export class RboxDaemon {
     this.lastActivityWrite = Date.now();
     const snapshot = { ...this.activity };
     this.activityWrite = this.activityWrite.then(() => saveActivity(this.root, snapshot));
+  }
+
+  /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
+   *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
+   *  is the record that answers "did sync change/delete my files?" after the fact. */
+  private recordPullApplied(actions: Action[]): void {
+    log(`pull applied: ${summarizeActions(actions)}`);
+    let writes = 0;
+    let deletes = 0;
+    let conflicts = 0;
+    for (const a of actions) {
+      if (a.kind === "write") writes++;
+      else if (a.kind === "delete") deletes++;
+      else conflicts++;
+    }
+    this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts };
+    this.activityDirty = true;
   }
 
   /** Live transfer progress → activity sidecar, throttled to ~2 writes/s (plus the

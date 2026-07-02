@@ -786,10 +786,16 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   await fs.rm(p, { recursive: true, force: true });
   await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p]);
 
+  // Design 45 (codex R2): the pending structural DROP is an unpublished change —
+  // status must not read "in sync" while the next push would commit a removal.
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(1);
+
   await push(rootA, cfgA, depsA);
   const state = await st(rootA);
   expect(state.lastSyncedManifest.gitRepos?.["sh"]).toBeUndefined(); // dropped, not carried
   expect(logsA.some((l) => l.includes("shallow clone"))).toBe(true); // loud, with the un-shallow hint
+  // …and once the drop is published, the still-shallow repo is no longer pending work.
+  expect(await gitDivergenceCount(rootA, cfgA, state, buildIgnoreMatcher(rootA))).toBe(0);
 });
 
 // ── design 45: the status verdict's advisory git-divergence walk ─────────────────

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type Manifest } from "../engine/index.js";
+import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity } from "./activity.js";
 import type { WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
@@ -22,15 +23,28 @@ const KEK = Buffer.alloc(32, 7);
 class MiniRemote implements SyncRemote {
   head = 0;
   latestError?: Error; // when set, latest() throws it (and it stays set until cleared)
-  private manifests = new Map<number, Manifest>();
+  private readonly manifests = new Map<number, Manifest>();
+  private readonly blobs = new Map<string, Buffer>();
+  /** Encrypt + store content as another writer would; returns its manifest entry. */
+  async seedEntry(rel: string, content: string): Promise<FileEntry> {
+    const p = await encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+    this.blobs.set(p.encSha, Buffer.from(p.ciphertext));
+    return { path: rel, type: "file", sha256: p.plaintextSha, encSha: p.encSha, size: content.length, mode: 0o644, mtimeMs: 1 };
+  }
+  injectCommit(files: FileEntry[]): void {
+    this.head += 1;
+    this.manifests.set(this.head, { generatedAt: "", files });
+  }
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     if (this.latestError) throw this.latestError;
     return { sequence: this.head, manifest: this.manifests.get(this.head) ?? { generatedAt: "", files: [] } };
   }
-  async missingBlobs(): Promise<string[]> {
-    return [];
+  async missingBlobs(shas: string[]): Promise<string[]> {
+    return shas.filter((s) => !this.blobs.has(s));
   }
-  async putBlobFile(): Promise<void> {}
+  async putBlobFile(sha256: string, absPath: string): Promise<void> {
+    this.blobs.set(sha256, await fs.readFile(absPath));
+  }
   async commit(parentSequence: number, _device: string, manifest: Manifest): Promise<CommitResult> {
     if (parentSequence !== this.head) return { conflict: true, head: this.head };
     this.head += 1;
@@ -38,13 +52,16 @@ class MiniRemote implements SyncRemote {
     return { sequence: this.head };
   }
   blobStore(): BlobStore {
-    // Touched by pull's git-section pass even when nothing transfers — inert is fine.
+    const blobs = this.blobs;
     return {
-      has: async () => false,
-      get: async () => {
-        throw new Error("no blobs in these scenarios");
+      has: async (s) => blobs.has(s),
+      put: async (s, bytes) => void blobs.set(s, Buffer.from(bytes)),
+      get: async (s) => {
+        const b = blobs.get(s);
+        if (!b) throw new Error(`blob missing: ${s}`);
+        return b;
       },
-    } as unknown as BlobStore;
+    };
   }
 }
 
@@ -125,11 +142,39 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   await daemon.pump();
   await daemon.activityWrite;
   const after = await loadActivity(root);
-  expect(after?.last).toEqual({ at: expect.any(String), op: "push", files: 1, sequence: 1 });
+  expect(after?.lastPush).toEqual({ at: expect.any(String), files: 1, sequence: 1 });
   expect(after?.active).toBeUndefined(); // live progress never outlives its op
 
   daemon.want.push = true; // steady state: no changes → no-op → trail unchanged
   await daemon.pump();
   await daemon.activityWrite;
-  expect((await loadActivity(root))?.last?.sequence).toBe(1);
+  expect((await loadActivity(root))?.lastPush?.sequence).toBe(1);
+});
+
+test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "mine");
+  daemon.manifest = await scanManifest(root);
+  daemon.want.push = true;
+  await daemon.pump(); // baseline: sequence 1
+  await daemon.activityWrite;
+
+  // Another writer advances the remote (adds b.txt) → our next push 409s.
+  const current = (await remote.latest()).manifest.files;
+  remote.injectCommit([...current, await remote.seedEntry("b.txt", "theirs")]);
+
+  await fs.writeFile(path.join(root, "c.txt"), "more local work");
+  daemon.manifest = await scanManifest(root);
+  daemon.want.push = true;
+  await daemon.pump(); // 409 → internal pull writes b.txt → re-scan → commit seq 3
+  await daemon.activityWrite;
+
+  const after = await loadActivity(root);
+  // The recovery pull's local-tree mutation is recorded in ITS OWN slot — the
+  // subsequent successful push must not mask it.
+  expect(after?.lastPull).toEqual({ at: expect.any(String), writes: 1, deletes: 0, conflicts: 0 });
+  expect(after?.lastPush?.sequence).toBe(3);
+  expect(after?.lastPush?.files).toBe(3); // a.txt + b.txt + c.txt
+  expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("theirs");
 });

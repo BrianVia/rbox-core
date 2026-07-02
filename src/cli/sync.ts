@@ -73,6 +73,11 @@ export interface SyncDeps {
    *  Set ONLY by `rbox pull/sync --allow-mass-delete`; the daemon never sets it, so a
    *  runaway mass delete halts background sync instead of destroying the tree. */
   allowMassDelete?: boolean;
+  /** Fired by EVERY pull that applied actions to the local tree — including the pull
+   *  inside pushManifest's 409 recovery, whose actions the retry loop discards
+   *  (design 45, codex R2: the daemon's forensic log and activity trail must record
+   *  every local-tree mutation, whichever path performed it). */
+  onPullApplied?: (actions: Action[]) => void;
 }
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
@@ -188,6 +193,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     gitNeedsResolution: gitOutcome.gitNeedsResolution,
     gitPendingRemote: gitOutcome.gitPendingRemote,
   });
+  if (actions.length > 0) deps.onPullApplied?.(actions);
   return actions;
 }
 

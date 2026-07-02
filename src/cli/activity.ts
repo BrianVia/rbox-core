@@ -18,16 +18,13 @@ import { RBOX_DIR } from "./config.js";
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
   at: string;
-  /** Last op that CHANGED something (a pull that applied, a push that committed). */
-  last?: {
-    at: string;
-    op: "pull" | "push";
-    writes?: number;
-    deletes?: number;
-    conflicts?: number;
-    files?: number;
-    sequence?: number;
-  };
+  /** Last push that COMMITTED. Separate slot from `lastPull` (codex R2): a single
+   *  most-recent-op slot let the commit that follows a 409-recovery pull mask the
+   *  local-tree mutations that pull had just applied. */
+  lastPush?: { at: string; files: number; sequence: number };
+  /** Last pull that APPLIED actions to the local tree — including the pull inside
+   *  push's 409 recovery (recorded via the SyncDeps.onPullApplied hook). */
+  lastPull?: { at: string; writes: number; deletes: number; conflicts: number };
   /** Live transfer progress; present only mid-op. Status ignores it when older
    *  than {@link ACTIVE_STALE_MS} — a crashed daemon must not show "syncing" forever. */
   active?: { at: string; phase: "encrypt" | "upload" | "download"; done: number; total: number };

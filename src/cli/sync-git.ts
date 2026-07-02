@@ -653,7 +653,13 @@ export async function gitDivergenceCount(
     }
     if (await isGitBusy(repoDirOf(root, rel))) continue; // indeterminate this instant
     const pf = await gitPreflight(repoDirOf(root, rel));
-    if (!pf.ok) continue; // structural/transient refusal: push won't capture it either
+    if (!pf.ok) {
+      // A STRUCTURAL refusal (shallow/bare/…) over a synced base is not a skip:
+      // planGitSections DROPS the section, and that drop is an unpublished change
+      // (codex R2). Transient failures defer-with-carry → genuinely nothing pending.
+      if (pf.structural && baseSec) n++;
+      continue;
+    }
     const id = await gitIdentity(repoDirOf(root, rel));
     if (!id) continue; // empty repo: nothing to capture, base (if any) carries
     const key = gitIdentityKey(id);

@@ -105,22 +105,26 @@ export function healthLine(s: StatusSnapshot): string {
   return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
 }
 
-/** Human trail of what background sync last did (from the activity sidecar).
- *  Undefined when there is no activity record (daemon never ran here). */
-export function lastSyncLine(activity: DaemonActivity | undefined, now: number): string | undefined {
-  if (!activity) return undefined;
-  const last = activity.last;
-  if (!last) return `last checked: ${relTime(activity.at, now)}`;
-  let what: string;
-  if (last.op === "push") {
-    what = `pushed ${n(last.files ?? 0)} files → sequence ${last.sequence}`;
-  } else {
-    const parts = [
-      last.writes ? `${n(last.writes)} written` : "",
-      last.deletes ? `${n(last.deletes)} deleted` : "",
-      last.conflicts ? `${n(last.conflicts)} conflict${last.conflicts === 1 ? "" : "s"}` : "",
-    ].filter(Boolean);
-    what = `pulled: ${parts.length ? parts.join(", ") : "nothing changed"}`;
+/** Human trail of what background sync last did (from the activity sidecar), most
+ *  recent first. TWO slots on purpose (codex R2): a commit right after a
+ *  409-recovery pull must not mask the local-tree mutations that pull applied.
+ *  Empty when there is no activity record (daemon never ran here). */
+export function lastSyncLines(activity: DaemonActivity | undefined, now: number): string[] {
+  if (!activity) return [];
+  const lines: Array<{ at: string; text: string }> = [];
+  if (activity.lastPush) {
+    const p = activity.lastPush;
+    lines.push({ at: p.at, text: `last push: ${relTime(p.at, now)} — ${n(p.files)} files → sequence ${p.sequence}` });
   }
-  return `last sync: ${relTime(last.at, now)} — ${what}`;
+  if (activity.lastPull) {
+    const p = activity.lastPull;
+    const parts = [
+      p.writes ? `${n(p.writes)} written` : "",
+      p.deletes ? `${n(p.deletes)} deleted` : "",
+      p.conflicts ? `${n(p.conflicts)} conflict${p.conflicts === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    lines.push({ at: p.at, text: `last pull: ${relTime(p.at, now)} — ${parts.length ? parts.join(", ") : "nothing changed"}` });
+  }
+  if (lines.length === 0) return [`last checked: ${relTime(activity.at, now)}`];
+  return lines.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0)).map((l) => l.text);
 }

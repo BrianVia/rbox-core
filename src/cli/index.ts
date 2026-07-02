@@ -1,7 +1,7 @@
 import path from "node:path";
 import { buildIgnoreMatcher, diffManifests, scanManifest, type Action } from "../engine/index.js";
 import { loadActivity } from "./activity.js";
-import { healthLine, lastSyncLine, progressLabel } from "./status-view.js";
+import { healthLine, lastSyncLines, progressLabel } from "./status-view.js";
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
@@ -372,8 +372,7 @@ async function main(): Promise<void> {
           now,
         })}`
       );
-      const trail = lastSyncLine(activity, now);
-      if (trail) console.log(`  ${style.dim(trail)}`);
+      for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
       // Folds in the old `daemon status` (design 29): background-sync state.
       console.log(`  ${style.dim("background sync:")} ${bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
       if (cfg.syncGit) {

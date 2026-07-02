@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
-import { healthLine, lastSyncLine, progressLabel, relTime, type StatusSnapshot } from "./status-view.js";
+import { healthLine, lastSyncLines, progressLabel, relTime, type StatusSnapshot } from "./status-view.js";
 
 // Assertions match plain substrings so they hold with or without ANSI styling
 // (style auto-disables off a TTY, which is how bun test runs).
@@ -124,19 +124,32 @@ test("unknown remote (offline probe) never renders behind-remote", () => {
   expect(healthLine(base({ remoteSequence: undefined }))).toContain("in sync");
 });
 
-// ── lastSyncLine ──────────────────────────────────────────────────────────────
+// ── lastSyncLines ─────────────────────────────────────────────────────────────
 
-test("lastSyncLine: push trail", () => {
-  const activity: DaemonActivity = { at: iso(5), last: { at: iso(120), op: "push", files: 8603, sequence: 78 } };
-  expect(lastSyncLine(activity, NOW)).toBe("last sync: 2m ago — pushed 8,603 files → sequence 78");
+test("lastSyncLines: push and pull have separate slots, most recent first", () => {
+  // codex R2 regression: the commit after a 409-recovery pull must not mask the
+  // local-tree mutations that pull applied — both render, newest on top.
+  const activity: DaemonActivity = {
+    at: iso(5),
+    lastPush: { at: iso(118), files: 8603, sequence: 78 },
+    lastPull: { at: iso(120), writes: 2, deletes: 1, conflicts: 0 },
+  };
+  expect(lastSyncLines(activity, NOW)).toEqual([
+    "last push: 1m ago — 8,603 files → sequence 78",
+    "last pull: 2m ago — 2 written, 1 deleted",
+  ]);
 });
 
-test("lastSyncLine: pull trail with counts", () => {
-  const activity: DaemonActivity = { at: iso(5), last: { at: iso(30), op: "pull", writes: 2, deletes: 1, conflicts: 0 } };
-  expect(lastSyncLine(activity, NOW)).toBe("last sync: 30s ago — pulled: 2 written, 1 deleted");
+test("lastSyncLines: single slot renders alone", () => {
+  expect(lastSyncLines({ at: iso(5), lastPush: { at: iso(120), files: 3, sequence: 9 } }, NOW)).toEqual([
+    "last push: 2m ago — 3 files → sequence 9",
+  ]);
+  expect(lastSyncLines({ at: iso(5), lastPull: { at: iso(30), writes: 2, deletes: 1, conflicts: 0 } }, NOW)).toEqual([
+    "last pull: 30s ago — 2 written, 1 deleted",
+  ]);
 });
 
-test("lastSyncLine: heartbeat only / no activity at all", () => {
-  expect(lastSyncLine({ at: iso(30) }, NOW)).toBe("last checked: 30s ago");
-  expect(lastSyncLine(undefined, NOW)).toBeUndefined();
+test("lastSyncLines: heartbeat only / no activity at all", () => {
+  expect(lastSyncLines({ at: iso(30) }, NOW)).toEqual(["last checked: 30s ago"]);
+  expect(lastSyncLines(undefined, NOW)).toEqual([]);
 });
