@@ -354,16 +354,17 @@ export class E2eeRemote implements SyncRemote {
     for (const f of manifest.files) {
       if (f.type === "file" && f.encSha && !refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
     }
-    // §28: git artifact blobs (bundle/index/op-state) live in manifest.git, NOT manifest.files,
-    // so they must be added to blobRefs explicitly — else they're uploaded but never granted/
-    // charged and GC could reclaim a live bundle. Use the CIPHERTEXT size (codex M2): the `size`
-    // is advisory (server bills measured R2 bytes) and the ciphertext size is what the server sees
-    // anyway, so no plaintext git size (≈ repo size) enters a server-visible ref/sidecar.
-    const g = manifest.git;
-    if (g) {
-      const addGit = (encSha: string | undefined, size: number | undefined) => {
-        if (encSha && !refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size: size ?? 0 });
-      };
+    // §28: git artifact blobs (bundle/index/op-state) live in manifest.gitRepos, NOT
+    // manifest.files, so they must be added to blobRefs explicitly — else they're uploaded but
+    // never granted/charged and GC could reclaim a live bundle. Union across repos (design 43
+    // §6.5): two repos referencing the same convergent encSha contribute ONE ref. Use the
+    // CIPHERTEXT size (codex M2): the `size` is advisory (server bills measured R2 bytes) and
+    // the ciphertext size is what the server sees anyway, so no plaintext git size (≈ repo
+    // size) enters a server-visible ref/sidecar.
+    const addGit = (encSha: string | undefined, size: number | undefined) => {
+      if (encSha && !refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size: size ?? 0 });
+    };
+    for (const g of Object.values(manifest.gitRepos ?? {})) {
       addGit(g.bundleEncSha, g.bundleCipherSize);
       addGit(g.indexEncSha, g.indexCipherSize);
       for (const ref of Object.values(g.opState ?? {})) addGit(ref.encSha, ref.cipherSize);

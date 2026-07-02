@@ -292,9 +292,14 @@ async function main(): Promise<void> {
       const bg = isDaemonRunning(root);
       console.log(`  ${style.dim("background sync:")} ${bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
       if (cfg.syncGit) {
-        const { gitPreflight } = await import("../engine/index.js");
-        const pf = await gitPreflight(root);
-        console.log(`  ${style.dim("git-sync:")} ${pf.ok ? style.green("on (eligible)") : style.yellow(`on but skipped — ${pf.reason}`)}`);
+        // design 43 §10: per-workspace git-sync summary from the per-repo sync state.
+        const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
+        const pending = Object.keys(state.gitPendingRemote ?? {}).length;
+        const conflicts = Object.keys(state.gitNeedsResolution ?? {}).length;
+        const parts = [style.green(`${synced} repo${synced === 1 ? "" : "s"} synced`)];
+        if (pending) parts.push(style.yellow(`${pending} pending`));
+        if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
+        console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
       }
       const { loadMetrics } = await import("./metrics.js");
       const m = await loadMetrics(root);

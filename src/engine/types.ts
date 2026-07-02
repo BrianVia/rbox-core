@@ -45,6 +45,13 @@ export interface GitArtifactRef {
   cipherSize: number;
 }
 
+/** Which ref semantics a {@link GitSection} carries (design 43 §2 [v2, B1]).
+ *  "all"    — the section's refs are the repo's COMPLETE syncable ref set (dir-repo
+ *             capture; design-02 semantics: apply may delete absent refs).
+ *  "scoped" — the section carries only HEAD's line of work (pointer-repo capture);
+ *             apply must ONLY update the listed refs, NEVER delete others. */
+export type GitRefScope = "all" | "scoped";
+
 export interface GitSection {
   /** plaintext sha of the `git bundle` (all refs + stash + a temp ref making index blobs reachable). */
   bundleSha: string;
@@ -66,6 +73,10 @@ export interface GitSection {
   indexTree?: string;
   /** op-state file path (relative to .git) → artifact ref: MERGE_HEAD, REBASE_HEAD, rebase-merge/**, etc. */
   opState?: Record<string, GitArtifactRef>;
+  /** Ref semantics of this section (design 43 §2): stamped "all" for dir-repo captures,
+   *  "scoped" for pointer-repo (worktree/submodule) captures. Gates apply-side ref
+   *  deletion and identity projection (§7). */
+  refScope: GitRefScope;
   generatedAt: string;
 }
 
@@ -73,6 +84,12 @@ export interface GitSection {
 export interface Manifest {
   generatedAt: string;
   files: FileEntry[];
-  /** Present only when git-state sync is enabled and the repo is eligible (M2). */
-  git?: GitSection;
+  /** Manifest schema version. Absent (v1) = pre-§43. `gitRepos` requires >= 2.
+   *  Clients refuse schemas newer than KNOWN_MANIFEST_SCHEMA ("upgrade rbox") so
+   *  every future schema break fails loudly (design 43 §2). */
+  manifestSchema?: number;
+  /** POSIX relPath of each git repo dir inside the tree (sync root = ".") → its git
+   *  state (design 43 §2). Replaces the pre-§43 single `git` section — legacy
+   *  manifests carrying `git` are REFUSED (clean break, validated loudly). */
+  gitRepos?: Record<string, GitSection>;
 }
