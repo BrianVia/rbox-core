@@ -1,0 +1,115 @@
+/**
+ * Pure render helpers for `rbox status` (design 45 §2) and transfer spinners (§3).
+ *
+ * The verdict logic lives here — not inline in the status command — so priority
+ * ordering (halt > live progress > local divergence > behind remote > in sync)
+ * and time formatting are unit-testable without console capture. Everything is
+ * a pure function of a {@link StatusSnapshot}; `now` is injected, never read.
+ *
+ * Design 44's lesson applies to rendering too: the verdict is DERIVED from the
+ * actual local-vs-baseline diff and the daemon's recorded activity — never from
+ * "the command ran to completion".
+ */
+import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
+import { style } from "./style.js";
+
+/** Everything the status verdict needs, precomputed by the caller. */
+export interface StatusSnapshot {
+  /** Local scan vs last-synced baseline (`diffManifests`) — counts only. */
+  added: number;
+  changed: number;
+  deleted: number;
+  trackedFiles: number;
+  daemonRunning: boolean;
+  localSequence: number;
+  /** Best-effort remote probe; undefined = offline/unknown (renders nothing). */
+  remoteSequence?: number;
+  activity?: DaemonActivity;
+  now: number;
+}
+
+const n = (v: number) => v.toLocaleString("en-US");
+
+/** "just now" / "42s ago" / "5m ago" / "3h ago" / "2d ago". */
+export function relTime(iso: string, now: number): string {
+  const s = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  if (Number.isNaN(s)) return "unknown";
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+/** `uploading 42% (3,612/8,603)` — shared by spinners and the live status line. */
+export function progressLabel(phase: "encrypt" | "upload" | "download", done: number, total: number): string {
+  const verb = phase === "encrypt" ? "encrypting" : phase === "upload" ? "uploading" : "downloading";
+  const pct = total > 0 ? Math.floor((done / total) * 100) : 100;
+  return `${verb} ${pct}% (${n(done)}/${n(total)})`;
+}
+
+/** The top-line health verdict, highest-priority state wins. */
+export function healthLine(s: StatusSnapshot): string {
+  // 1. A halted pump is the one state that must never be missable: the mass-delete
+  //    guard (design 44) or a persistent error has background sync refusing to run.
+  //    A stopped daemon's leftover halt is dropped — "stopped" already says sync is
+  //    not running, and the next start re-evaluates.
+  const halt = s.daemonRunning ? s.activity?.halt : undefined;
+  if (halt) {
+    const times = halt.count > 1 ? `, ×${halt.count}` : "";
+    return `${style.red("⚠ sync halted")} ${style.dim(`(${relTime(halt.at, s.now)}${times})`)} ${halt.reason}`;
+  }
+
+  // 2. A transfer is live right now. Staleness-gated: a daemon that died mid-op
+  //    must not show "syncing" forever.
+  const active = s.activity?.active;
+  if (active && s.now - Date.parse(active.at) < ACTIVE_STALE_MS) {
+    return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total)}`);
+  }
+
+  const localChanges = s.added + s.changed + s.deleted;
+  const behind = s.remoteSequence !== undefined && s.remoteSequence > s.localSequence;
+  const behindNote = `behind remote (sequence ${s.localSequence} vs ${s.remoteSequence})`;
+
+  // 3. Local divergence from the baseline — files waiting to upload. With the
+  //    daemon running this is normally transient; stopped, it needs a nudge.
+  if (localChanges > 0) {
+    const parts = [
+      s.added ? `${n(s.added)} new` : "",
+      s.changed ? `${n(s.changed)} changed` : "",
+      s.deleted ? `${n(s.deleted)} deleted` : "",
+    ].filter(Boolean);
+    const extra = behind ? ` · ${behindNote}` : "";
+    const hint = s.daemonRunning ? "" : ` ${style.dim("— background sync stopped; run `rbox start`")}`;
+    return `${style.yellow(`↑ ${n(localChanges)} local change${localChanges === 1 ? "" : "s"} to sync`)} ${style.dim(`(${parts.join(", ")})`)}${extra}${hint}`;
+  }
+
+  // 4. Clean locally but the remote has moved on.
+  if (behind) {
+    const hint = s.daemonRunning ? "will sync on the next pull" : "run `rbox pull` or `rbox start`";
+    return `${style.yellow(`↓ ${behindNote}`)} ${style.dim(`— ${hint}`)}`;
+  }
+
+  // 5. In sync: no local divergence, and the remote (when reachable) agrees.
+  return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
+}
+
+/** Human trail of what background sync last did (from the activity sidecar).
+ *  Undefined when there is no activity record (daemon never ran here). */
+export function lastSyncLine(activity: DaemonActivity | undefined, now: number): string | undefined {
+  if (!activity) return undefined;
+  const last = activity.last;
+  if (!last) return `last checked: ${relTime(activity.at, now)}`;
+  let what: string;
+  if (last.op === "push") {
+    what = `pushed ${n(last.files ?? 0)} files → sequence ${last.sequence}`;
+  } else {
+    const parts = [
+      last.writes ? `${n(last.writes)} written` : "",
+      last.deletes ? `${n(last.deletes)} deleted` : "",
+      last.conflicts ? `${n(last.conflicts)} conflict${last.conflicts === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    what = `pulled: ${parts.length ? parts.join(", ") : "nothing changed"}`;
+  }
+  return `last sync: ${relTime(last.at, now)} — ${what}`;
+}

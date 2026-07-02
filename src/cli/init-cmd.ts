@@ -19,6 +19,7 @@ import { push, sync } from "./sync.js";
 import { resolveInitPlan, isInitError, collapseHome, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
+import { progressLabel } from "./status-view.js";
 import { promptSelect, promptInput, promptConfirm } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 
@@ -194,7 +195,7 @@ async function executeInitPlan(
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot");
     try {
-      deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
+      deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
       const { sequence: seq, committed } = await push(plan.root, authed, deps);
       // Never report a publish that didn't happen (design 44): the incident setup
       // printed "published → sequence 75" for a push that uploaded zero bytes.
@@ -210,7 +211,7 @@ async function executeInitPlan(
   } else if (plan.firstSync === "sync") {
     const sp = spinner("syncing from remote");
     try {
-      deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
+      deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
       const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
       sp.stop();
       const conflicts = pulled.filter((a) => a.kind === "conflict");
