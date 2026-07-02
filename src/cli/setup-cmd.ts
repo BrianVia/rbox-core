@@ -12,15 +12,20 @@
  * STDERR (so `rbox setup > log` never pollutes stdout). The lone pure mapper that
  * remains, `workspaceFlags`, carries the Step-2 transition and is unit-tested.
  *
- * Hard stop: a device-code login authorizes but does NOT enroll this machine for
- * encryption (auth-cmd.ts:78), and `runInit` aborts pre-sync when unenrolled
- * (init-cmd.ts). So the device-code branch resolves enrollment FIRST and stops with
- * pair/connect/recover next steps — it never promises Steps 2–3 it can't deliver.
+ * Enrollment gap: a device-code login authorizes but does NOT enroll this machine
+ * for encryption (auth-cmd.ts:78), and `runInit` aborts pre-sync when unenrolled
+ * (init-cmd.ts). So when a device is authorized-but-unenrolled — either freshly after
+ * a device-code login inside Step 1, or on a later re-run of `rbox setup` — the flow
+ * offers inline enrollment resolution (paste a pairing token, or recover with the
+ * 24-word phrase), or lets the user defer and re-run later. It never restarts the
+ * new/existing account picker for a machine that's already signed in, and never
+ * promises Steps 2–3 it can't deliver.
  */
 import os from "node:os";
 import { runInit } from "./init-cmd.js";
 import { collapseHome } from "./init-plan.js";
 import { login, redeemPair } from "./auth-cmd.js";
+import { enrollViaRecovery } from "./e2ee-client.js";
 import { startDaemon } from "./daemon-control.js";
 import { loadCredentials } from "./credentials.js";
 import { loadConfig } from "./config.js";
@@ -59,12 +64,16 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
 
   process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
 
-  // Step 1 · Account — unless this machine is already enrolled.
-  if (!(await alreadyEnrolled())) {
-    const enrolled = await stepAccount(opts.defaultRemote);
-    if (!enrolled) return; // device-code hard stop already printed
-  } else {
+  // Step 1 · Account — unless this machine is already enrolled. When credentials
+  // already exist but enrollment doesn't (authorized-but-unenrolled from a prior
+  // device-code login), resolve enrollment inline instead of restarting the full
+  // new/existing picker as if the user had never signed in.
+  if (await alreadyEnrolled()) {
     process.stderr.write(`${e.dim("This machine is already signed in and enrolled. Continuing to your workspace.")}\n`);
+  } else {
+    const hasCreds = Boolean((await loadCredentials())?.accountId);
+    const ok = hasCreds ? await resolveEnrollment(opts.defaultRemote) : await stepAccount(opts.defaultRemote);
+    if (!ok) return;
   }
 
   // Step 2 · Workspace — bind a directory + run the initial populate-sync.
@@ -121,9 +130,9 @@ async function stepAccount(remote: string): Promise<boolean> {
   if (choice === "create") {
     const secret = await promptPassword({ message: "Account bootstrap secret (enter to approve from another machine instead)" });
     // A secret bootstraps the genesis device (shows the recovery phrase); blank falls
-    // back to device-code, which authorizes but can't enroll → enrollmentOk hard-stops.
+    // back to device-code, which authorizes but can't enroll → resolve inline.
     await login(remote, secret || undefined);
-    return enrollmentOk();
+    return resolveEnrollment(remote);
   }
 
   // Existing account.
@@ -142,15 +151,15 @@ async function stepAccount(remote: string): Promise<boolean> {
       process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
       return false;
     }
-    await redeemPair(remote, token); // enrolls inline → flows straight on
-    return enrollmentOk();
+    await redeemPair(remote, token); // enrolls inline → resolveEnrollment short-circuits true
+    return resolveEnrollment(remote);
   }
 
   // "browser" and "approve" are the SAME device-code grant (authorize-only) — the
   // browser option is just a friendlier front door onto login()'s own printed UX
-  // (design 47). Both authorize but do NOT enroll for encryption.
+  // (design 47). Both authorize but do NOT enroll for encryption → resolve inline.
   await login(remote, undefined);
-  return enrollmentOk();
+  return resolveEnrollment(remote);
 }
 
 /** Which authorize path an existing-account method takes. "pair" redeems a pairing
@@ -162,18 +171,55 @@ export function authorizePath(method: "pair" | "browser" | "approve"): "pair-tok
   return method === "pair" ? "pair-token" : "device-code";
 }
 
-/** Re-check enrollment (the robust signal init also uses). On the device-code path
- *  this is false → print the hard-stop next steps and end Step 1 here. */
-async function enrollmentOk(): Promise<boolean> {
+/** Resolve enrollment for an authorized-but-unenrolled machine (device-code login
+ *  authorizes but can't carry the key). Returns true once enrolled (flow continues),
+ *  false if the user defers or provides no input. Offered both freshly after a
+ *  device-code login inside Step 1 and on a later re-run of `rbox setup`. */
+async function resolveEnrollment(remote: string): Promise<boolean> {
   if (await alreadyEnrolled()) return true;
+
+  // There must be credentials here — this is only reached once we know we're authorized.
+  const creds = await loadCredentials();
   process.stderr.write(
-    `\n${e.yellow("⚠")}  This machine is authorized — but NOT yet enrolled for encryption.\n` +
-      `   Device-code login can't carry your key, so setup stops here. Next:\n` +
-      `     on a signed-in machine:  rbox pair        ${e.dim("# prints a token")}\n` +
-      `     here:                    rbox connect     ${e.dim("# paste it  (or: rbox recover)")}\n` +
-      `     then:                    rbox setup       ${e.dim("# re-run — Step 2 continues")}\n`
+    `\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) but NOT yet enrolled for encryption. Enroll it now:\n`
   );
-  return false;
+
+  const method = await promptSelect<"pair" | "recover" | "later">({
+    message: "How do you want to enroll this machine for encryption?",
+    choices: [
+      { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
+      { name: "Recover with my 24-word phrase", value: "recover" },
+      { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
+    ],
+  });
+
+  if (method === "later") {
+    process.stderr.write(
+      `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox recover` with your phrase — then re-run `rbox setup`.")}\n`
+    );
+    return false;
+  }
+
+  if (method === "pair") {
+    const token = await promptPassword({ message: "Paste pairing token" });
+    if (!token) {
+      process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
+      return false;
+    }
+    await redeemPair(remote, token);
+  } else {
+    // Recover — same no-echo phrase prompt as `rbox recover` (auth-cmd.ts).
+    const phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
+    if (!phrase) {
+      process.stderr.write(e.yellow("no phrase entered — re-run `rbox setup` when you're ready.\n"));
+      return false;
+    }
+    await enrollViaRecovery(phrase, Date.now());
+  }
+
+  // A bad token/phrase throws (propagates to the top-level handler); recheck the
+  // robust signal init also uses.
+  return alreadyEnrolled();
 }
 
 /** Step 2 · Workspace. Returns the init outcome, or undefined if the user backed out. */
