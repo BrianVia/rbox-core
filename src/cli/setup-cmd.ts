@@ -23,6 +23,7 @@ import { collapseHome } from "./init-plan.js";
 import { login, redeemPair } from "./auth-cmd.js";
 import { startDaemon } from "./daemon-control.js";
 import { loadCredentials } from "./credentials.js";
+import { loadConfig } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prompt.js";
@@ -186,6 +187,28 @@ async function stepWorkspace(
     name = picked.name;
   }
   const dir = await promptInput({ message: "Which directory should rbox sync?", default: opts.cwd });
+
+  // REBIND GUARD (design 44): creating a NEW workspace over a directory that already
+  // syncs to one is almost never what the user wants (the 2026-07-01 incident: a
+  // re-run of setup to name a workspace created a second, empty one). Make the
+  // consequence explicit and default to NO.
+  if (choice === "new") {
+    const bound = await loadConfig(dir).catch(() => undefined);
+    if (bound) {
+      const label = bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId;
+      process.stderr.write(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+      const rebind = await promptConfirm({
+        message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
+        default: false,
+      });
+      if (!rebind) {
+        process.stderr.write(
+          `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Track an existing workspace".`)}\n`
+        );
+        return undefined;
+      }
+    }
+  }
 
   // Opt-in, server-visible workspace name — offered ONLY when creating (the row is
   // INSERTed once, first-writer-wins). `rbox setup` drives runInit via FLAGS, which

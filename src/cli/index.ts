@@ -1,6 +1,6 @@
 import path from "node:path";
 import { scanManifest, type Action } from "../engine/index.js";
-import { findRoot, loadConfig, loadState, type WorkspaceConfig } from "./config.js";
+import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
@@ -224,8 +224,12 @@ async function main(): Promise<void> {
         deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
         const report = beginReport("push");
         deps.report = report;
-        const seq = await push(root, cfg, deps);
-        sp.succeed(`pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
+        const { sequence: seq, committed } = await push(root, cfg, deps);
+        sp.succeed(
+          committed
+            ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
+            : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+        );
         report?.logSummaryTo((l) => console.log(style.dim(l)));
       } catch (e) {
         sp.fail("push failed");
@@ -239,6 +243,7 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(phase === "download" ? `downloading ${done}/${total}` : `${phase} ${done}/${total}`);
+        deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("pull");
         deps.report = report;
         const actions = await pull(root, cfg, deps);
@@ -258,12 +263,17 @@ async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : phase === "download" ? "downloading" : phase} ${done}/${total}`);
+        deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("sync");
         deps.report = report;
-        const { pulled, pushedSequence } = await sync(root, cfg, deps);
+        const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);
-        console.log(`${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`);
+        console.log(
+          pushCommitted
+            ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
+            : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
+        );
         report?.logSummaryTo((l) => console.log(style.dim(l)));
         await postSyncNudge(root, pulled, cfg);
       } catch (e) {
@@ -275,7 +285,7 @@ async function main(): Promise<void> {
     case "status": {
       const root = await resolveRoot(positional[0]);
       const cfg = await loadConfig(root);
-      const state = await loadState(root);
+      const state = await loadState(root, syncStreamId(cfg));
       const local = await scanManifest(root);
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id

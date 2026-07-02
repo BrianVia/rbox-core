@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
-import { loadState } from "./config.js";
+import { loadState, syncStreamId } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { PhaseReport, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
@@ -143,7 +143,7 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   await pull(root, cfg, deps(remote)); // writes a.txt (decrypted), base → seq 1
   expect(await read("a.txt")).toBe(c);
   const before = remote.commitCalls;
-  const seq = await push(root, cfg, deps(remote)); // nothing changed on disk
+  const { sequence: seq } = await push(root, cfg, deps(remote)); // nothing changed on disk
   expect(remote.commitCalls).toBe(before); // ZERO new commits — no echo
   expect(seq).toBe(1);
   expect(remote.headSeq()).toBe(1);
@@ -167,7 +167,7 @@ test("pull never applies a remote entry that LOCAL rules ignore (legacy .git poi
 
   // The ignored remote entry stays in the recorded BASE (forward-only), so the next
   // push neither echo-deletes it from the remote nor commits anything at all.
-  const st = await loadState(root);
+  const st = await loadState(root, syncStreamId(cfg));
   expect(st.lastSyncedManifest.files.some((f) => f.path === "wt/.git")).toBe(true);
   const before = remote.commitCalls;
   await push(root, cfg, deps(remote));
@@ -200,18 +200,18 @@ test("a pull that RELAXES ignore rules applies the newly-unignored files (two-ph
 test("clean push uploads the ciphertext blob, commits, advances base", async () => {
   const remote = new FakeRemote();
   await write("new.txt", "fresh content\n");
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.hasBlob((await enc("fresh content\n")).encSha)).toBe(true); // stored as ciphertext
   expect(remote.hasBlob(sha("fresh content\n"))).toBe(false); // never the plaintext address
-  expect((await loadState(root)).lastSyncedSequence).toBe(1);
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1);
 });
 
 test("binary (non-UTF8) content is encrypted + byte-verified by ciphertext address", async () => {
   const remote = new FakeRemote();
   const binary = Buffer.from([0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f, 0xc3, 0x28]);
   await fs.writeFile(path.join(root, "blob.bin"), binary);
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.hasBlob((await enc(binary)).encSha)).toBe(true); // ciphertext addressed correctly
 });
@@ -229,7 +229,7 @@ test("409 conflict: client pulls + RE-SCANS + retries, and does NOT lose the rem
       remote.injectCommit([await remote.seedEntry("theirs.txt", theirs)]);
     }
   };
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(await read("theirs.txt")).toBe(theirs); // remote change not clobbered
   expect(await read("mine.txt")).toBe("mine\n"); // our change preserved
   expect(seq).toBe(remote.headSeq());
@@ -273,7 +273,7 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
   const remote = new FakeRemote();
   await write("x.txt", "payload\n");
   remote.forceUnsatisfiedOnce = true;
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.commitCalls).toBe(2); // 422 then success
 });
@@ -288,7 +288,7 @@ test("sha_mismatch once: a file that changes under the push RE-SCANS + retries +
   // encrypt-time and the streamed upload); the client must not abort the whole push.
   remote.forceShaMismatchOnce = (await enc(content)).encSha;
 
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
 
   expect(seq).toBe(1); // committed — the push self-healed
   expect(remote.headSeq()).toBe(1);
@@ -398,7 +398,7 @@ test("pull rejects an invalid remote manifest and does not advance base", async 
   // BEFORE any blob fetch/decrypt (the client is the sole validator under E2EE).
   remote.injectCommit([{ path: "../escape", type: "file", sha256: sha("x"), encSha: sha("x"), size: 1, mode: 0o644, mtimeMs: 1 }]);
   await expect(pull(root, cfg, deps(remote))).rejects.toThrow(/invalid remote manifest/);
-  expect((await loadState(root)).lastSyncedSequence).toBe(0); // base unchanged
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(0); // base unchanged
 });
 
 // ── forward-only ignore carry (M3b) ────────────────────────────────────────
@@ -473,6 +473,93 @@ test("§35: with no report, the sync path is unaffected (disabled fallback recor
   const remote = new FakeRemote();
   await write("y.txt", "z\n");
   // No `report` in deps → sync uses PhaseReport.disabled internally; push still works.
-  const seq = await push(root, cfg, deps(remote));
+  const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
+});
+
+// ── design 44: rebind state-poisoning + the mass-delete guard ────────────────
+// Incident (2026-07-01): `rbox setup` rebound a synced root to a brand-new EMPTY
+// workspace while the old 8,600-file baseline survived in state.json — the next
+// pull read every baseline file as "remotely deleted" and wiped the local tree.
+// These tests pin the two independent layers that each prevent a recurrence.
+
+test("REBIND regression: a root rebound to a new EMPTY workspace pulls without deleting, then publishes the full tree", async () => {
+  const remoteOld = new FakeRemote();
+  await write("a.txt", "aaa\n");
+  await write("b.txt", "bbb\n");
+  await push(root, cfg, deps(remoteOld)); // baseline now belongs to ws_t
+
+  // Rebind: same root + stale state.json, different workspace, empty remote —
+  // exactly what `setup → create new workspace` does over an already-synced dir.
+  const cfgNew: WorkspaceConfig = { ...cfg, remoteWorkspaceId: "ws_new" };
+  const remoteNew = new FakeRemote();
+  const actions = await pull(root, cfgNew, deps(remoteNew));
+  expect(actions.filter((a) => a.kind === "delete")).toHaveLength(0); // NEVER deletes
+  expect(await read("a.txt")).toBe("aaa\n");
+  expect(await read("b.txt")).toBe("bbb\n");
+
+  // And the first push to the new workspace is a REAL publish of everything.
+  const { sequence, committed } = await push(root, cfgNew, deps(remoteNew));
+  expect(committed).toBe(true);
+  expect(sequence).toBe(1);
+  const published = (await remoteNew.latest()).manifest.files.map((f) => f.path).sort();
+  expect(published).toEqual(["a.txt", "b.txt"]);
+});
+
+test("state ownership: another workspace's baseline reads as fresh; same workspace kept; legacy unstamped adopted", async () => {
+  const remote = new FakeRemote();
+  await write("a.txt", "aaa\n");
+  await push(root, cfg, deps(remote)); // stamps workspaceId: ws_t at seq 1
+
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1); // kept
+  const foreign = await loadState(root, syncStreamId({ ...cfg, remoteWorkspaceId: "ws_other" })); // mismatch → no baseline
+  expect(foreign.lastSyncedSequence).toBe(0);
+  expect(foreign.lastSyncedManifest.files).toHaveLength(0);
+
+  // Legacy state file written before the stamp existed: adopted as-is.
+  const statePath = path.join(root, ".rbox", "state.json");
+  const legacy = JSON.parse(await fs.readFile(statePath, "utf8"));
+  delete legacy.stream;
+  await fs.writeFile(statePath, JSON.stringify(legacy));
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1);
+  expect((await loadState(root, syncStreamId(cfg))).stream).toBe(syncStreamId(cfg));
+});
+
+test("mass-delete guard: a pull deleting ≥half the baseline fails closed until --allow-mass-delete", async () => {
+  const remote = new FakeRemote();
+  for (let i = 0; i < 120; i++) await write(`f${i}.txt`, `${i}\n`);
+  await push(root, cfg, deps(remote)); // baseline: 120 files
+
+  remote.injectCommit([]); // the remote head becomes EMPTY (poisoned/reset stream)
+  await expect(pull(root, cfg, deps(remote))).rejects.toThrow(/mass-delete guard/);
+  expect(await read("f0.txt")).toBe("0\n"); // fails closed BEFORE touching disk
+  expect(await read("f119.txt")).toBe("119\n");
+
+  // Explicit consent applies the deletion wave once.
+  await pull(root, cfg, { ...deps(remote), allowMassDelete: true });
+  await expect(fs.access(path.join(root, "f0.txt"))).rejects.toThrow();
+});
+
+test("mass-delete guard: normal-scale deletions (under half the baseline) apply without consent", async () => {
+  const remote = new FakeRemote();
+  for (let i = 0; i < 120; i++) await write(`f${i}.txt`, `${i}\n`);
+  await push(root, cfg, deps(remote));
+
+  // Remote deletes 30 of 120 (a big-but-legit cleanup): survives the guard.
+  const head = (await remote.latest()).manifest;
+  remote.injectCommit(head.files.filter((f) => Number(f.path.slice(1, -4)) < 90));
+  const actions = await pull(root, cfg, deps(remote));
+  expect(actions.filter((a) => a.kind === "delete")).toHaveLength(30);
+  await expect(fs.access(path.join(root, "f90.txt"))).rejects.toThrow();
+  expect(await read("f89.txt")).toBe("89\n");
+});
+
+test("push reports committed=false on a no-op (the setup flow must never claim a publish that didn't happen)", async () => {
+  const remote = new FakeRemote();
+  await write("x.txt", "x\n");
+  const first = await push(root, cfg, deps(remote));
+  expect(first.committed).toBe(true);
+  const second = await push(root, cfg, deps(remote)); // nothing changed
+  expect(second.committed).toBe(false);
+  expect(second.sequence).toBe(first.sequence);
 });

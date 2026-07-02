@@ -209,14 +209,20 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   if (!creds) throw new Error("not logged in — run `rbox login`");
   if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`");
 
-  const api = new RboxApi(creds.remoteUrl ?? cfg.remoteUrl, creds.token, cfg.remoteWorkspaceId, cfg.projectId);
+  // ONE effective remote for both the network client and the returned cfg (design 44
+  // §2, codex R3): the sync-state stream stamp derives from cfg.remoteUrl, so the cfg
+  // must name the remote actually being talked to — otherwise a baseline built against
+  // prod could be accepted while syncing a same-id workspace on a different server,
+  // and its divergent (or empty) head would reconcile as local deletes.
+  const remoteUrl = creds.remoteUrl ?? cfg.remoteUrl;
+  const api = new RboxApi(remoteUrl, creds.token, cfg.remoteWorkspaceId, cfg.projectId);
   const secrets = await ensureSecrets(api, creds.accountId);
   const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
   const kek = await remote.currentKek(); // frozen write epoch (D1)
   // `remote` is returned alongside `deps` so version-history commands can reach the
   // E2eeRemote history/restore/advisoryTimes methods directly (the raw transport stays
   // encapsulated); push/pull/sync ignore it and use `deps` as before.
-  return { cfg: { ...cfg, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote }, remote };
+  return { cfg: { ...cfg, remoteUrl, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote }, remote };
 }
 
 export { hasDevice };

@@ -10,7 +10,7 @@
  */
 import crypto from "node:crypto";
 import path from "node:path";
-import { saveConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
 
 export interface TrackResult {
@@ -75,11 +75,25 @@ export async function track(
     }
   }
 
+  // REBIND (design 44 §2): if this root was already bound to a DIFFERENT workspace,
+  // its sync baseline describes the OLD stream — reset it or the next reconcile reads
+  // every old file as remotely deleted (the loadState ownership stamp also guards
+  // this, but a LEGACY unstamped baseline would be adopted by the new binding, so
+  // track must reset explicitly). A re-track of the SAME workspace keeps both the
+  // baseline and the existing device id (re-tracking must not mint a new device).
+  const prev = await loadConfig(root).catch(() => undefined);
+  if (prev && syncStreamId(prev) !== syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId })) {
+    await resetSyncState(root);
+    console.error(
+      `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
+    );
+  }
   const cfg: WorkspaceConfig = {
     schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
     remoteWorkspaceId: workspaceId,
     projectId,
-    deviceId: flags.device ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
+    deviceId: flags.device ?? prev?.deviceId ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
     rootPath: root,
     remoteUrl,
     token: "", // token comes from `rbox login` (per-machine credential), never config

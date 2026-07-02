@@ -113,7 +113,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "sync",
     group: "SYNCING",
     summary: "sync once (pull, then push)",
-    usage: "rbox sync [path]",
+    usage: "rbox sync [path] [--allow-mass-delete]",
+    flags: [{ flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" }],
   },
   {
     name: "push",
@@ -125,7 +126,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "pull",
     group: "SYNCING",
     summary: "apply remote changes",
-    usage: "rbox pull [path]",
+    usage: "rbox pull [path] [--allow-mass-delete]",
+    flags: [{ flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" }],
   },
   {
     name: "track",

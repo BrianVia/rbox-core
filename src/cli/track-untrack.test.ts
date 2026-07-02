@@ -87,3 +87,27 @@ test("untrack honors an interactive 'no' (confirm returns false) and changes not
   await untrack({ root, force: false, confirm: async () => false });
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
 });
+
+// ── design 44 §2: track rebind resets the sync baseline ─────────────────────
+
+test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unstamped one) and keeps the device id", async () => {
+  const { cfg: first } = await track(dir, { workspace: "ws_old" }, "https://api.test");
+
+  // A LEGACY (pre-stamp) baseline from the old workspace: the ownership check can't
+  // tell it apart, so track itself must reset it on rebind (codex BLOCKER).
+  const statePath = path.join(dir, ".rbox", "state.json");
+  await fs.writeFile(
+    statePath,
+    JSON.stringify({ lastSyncedSequence: 9, lastSyncedManifest: { generatedAt: "", files: [{ path: "old.txt", type: "file", sha256: "x", size: 1, mode: 420, mtimeMs: 1 }] } })
+  );
+
+  const { cfg: rebound } = await track(dir, { workspace: "ws_new" }, "https://api.test");
+  expect(rebound.remoteWorkspaceId).toBe("ws_new");
+  expect(rebound.deviceId).toBe(first.deviceId); // rebinding must not mint a new device
+  await expect(fs.access(statePath)).rejects.toThrow(); // poisoned baseline gone
+
+  // Re-tracking the SAME workspace keeps an existing baseline untouched.
+  await fs.writeFile(statePath, JSON.stringify({ stream: "https://api.test::ws_new::root", lastSyncedSequence: 3, lastSyncedManifest: { generatedAt: "", files: [] } }));
+  await track(dir, { workspace: "ws_new" }, "https://api.test");
+  expect(JSON.parse(await fs.readFile(statePath, "utf8")).lastSyncedSequence).toBe(3);
+});
