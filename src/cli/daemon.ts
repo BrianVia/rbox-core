@@ -16,10 +16,12 @@ import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
+import { lowerIoPriority } from "./io-priority.js";
 import { RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
+const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
 const DEEP_SCAN_MS = 30 * 60_000; // infrequent cache-bypassing re-hash (heals mtime+size-stable drift)
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
@@ -89,8 +91,12 @@ export class RboxDaemon {
 
   private watcher?: Watcher;
   private ws?: WebSocket;
-  private safetyTimer?: ReturnType<typeof setInterval>;
+  private safetyTimer?: ReturnType<typeof setTimeout>;
   private deepTimer?: ReturnType<typeof setInterval>;
+  /** Current safety-scan delay (60s floor, backs off to 5m while idle — design 49). */
+  private safetyDelay = SAFETY_SYNC_MS;
+  /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
+  private churnSinceSafety = false;
   private reconnectAttempt = 0;
   private stopped = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
@@ -130,7 +136,8 @@ export class RboxDaemon {
     } catch {
       /* setpriority may be denied; not fatal */
     }
-    // (ionice for IO priority on Linux is a follow-up; CPU nice is the main lever.)
+    // ...and the DISK race too (design 49): macOS throttle tier / linux BE-7.
+    log(`io priority: ${lowerIoPriority()}`);
 
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
@@ -164,10 +171,11 @@ export class RboxDaemon {
    * is load-bearing and covered by a dedicated test.
    */
   private async startLiveWatch(): Promise<void> {
-    this.safetyTimer = setInterval(() => this.request("fullScan"), jitter(SAFETY_SYNC_MS));
+    this.scheduleSafetyScan();
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
     try {
       this.watcher = await this.startWatcherFn(this.root, this.matcher, (events) => {
+        this.churnSinceSafety = true; // churn observed → next safety scan snaps back to the 60s floor
         this.pendingEvents.push(...events);
         this.request("push");
       });
@@ -176,9 +184,31 @@ export class RboxDaemon {
     }
   }
 
+  /**
+   * Self-rescheduling safety tick (design 49). The safety scan heals DROPPED
+   * watcher events, and drops happen under churn — so quiet intervals (zero
+   * watcher events since the previous tick) double the next delay up to 5m,
+   * instead of stat-sweeping every tracked file each minute on an idle
+   * machine, forever. Any event snaps the delay back to the 60s floor, and a
+   * missing live watcher never backs off (there, the scan IS the sync
+   * mechanism). The 30m deep scan stays the unconditional floor beneath both.
+   */
+  private scheduleSafetyScan(): void {
+    this.safetyTimer = setTimeout(() => {
+      if (this.stopped) return;
+      this.safetyDelay = nextSafetyDelay(this.safetyDelay, {
+        watcherLive: this.watcher !== undefined,
+        churned: this.churnSinceSafety,
+      });
+      this.churnSinceSafety = false;
+      this.request("fullScan");
+      this.scheduleSafetyScan();
+    }, jitter(this.safetyDelay));
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
-    if (this.safetyTimer) clearInterval(this.safetyTimer);
+    if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     try {
       this.ws?.close();
@@ -570,3 +600,14 @@ export async function runDaemon(root: string): Promise<void> {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** ± up to 50% jitter so a fleet of daemons never aligns its ticks/reconnects. */
 const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
+
+/**
+ * Next safety-scan delay (design 49), decided when a tick fires. Quiet interval
+ * with a live watcher → double, capped at 5m. Churn, or no live watcher (the
+ * scan is the sync mechanism there), → back to the 60s floor. Pure — the
+ * doubling/cap/reset table is unit-tested without timers.
+ */
+export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean }): number {
+  if (!opts.watcherLive || opts.churned) return SAFETY_SYNC_MS;
+  return Math.min(current * 2, SAFETY_SYNC_MAX_MS);
+}
