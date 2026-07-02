@@ -34,11 +34,11 @@ async function twoVersions(): Promise<{ server: FakeServer; remote: E2eeRemote; 
   const cfg = await cfgFor(root, secrets, remote, WS);
 
   await fs.writeFile(path.join(root, FILE), V1);
-  expect(await push(root, cfg, { remote })).toBe(1);
+  expect((await push(root, cfg, { remote })).sequence).toBe(1);
 
   await fs.writeFile(path.join(root, FILE), V2);
   await fs.writeFile(path.join(root, "added.txt"), "only in v2\n"); // a file absent at seq 1
-  expect(await push(root, cfg, { remote })).toBe(2);
+  expect((await push(root, cfg, { remote })).sequence).toBe(2);
 
   return { server, remote, root };
 }

@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
-import { saveConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, resetSyncState, saveConfig, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
@@ -147,6 +147,19 @@ async function executeInitPlan(
   }
 
   // 3. Write the per-device binding (token injected at runtime, never persisted).
+  //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
+  //    its sync baseline describes the OLD stream — reconciling the new one against
+  //    it reads every old file as remotely deleted (the 2026-07-01 mass-delete
+  //    incident). Reset the baseline explicitly (loadState also guards via the
+  //    workspaceId stamp; this keeps the on-disk state truthful) and say so.
+  const prev = await loadConfig(plan.root).catch(() => undefined);
+  if (prev && prev.remoteWorkspaceId !== workspaceId) {
+    await resetSyncState(plan.root);
+    process.stderr.write(
+      `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
+    );
+  }
   const cfg: WorkspaceConfig = {
     schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
     remoteWorkspaceId: workspaceId,
@@ -181,8 +194,14 @@ async function executeInitPlan(
     const sp = spinner("publishing initial snapshot");
     try {
       deps.onProgress = (done, total, phase) => sp.update(`${phase === "upload" ? "uploading" : "encrypting"} ${done}/${total}`);
-      const seq = await push(plan.root, authed, deps);
-      sp.succeed(`published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`);
+      const { sequence: seq, committed } = await push(plan.root, authed, deps);
+      // Never report a publish that didn't happen (design 44): the incident setup
+      // printed "published → sequence 75" for a push that uploaded zero bytes.
+      sp.succeed(
+        committed
+          ? `published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
+          : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+      );
     } catch (e) {
       sp.fail("initial push failed");
       throw e;

@@ -132,7 +132,7 @@ export class RboxDaemon {
     await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId);
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
-    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
+    this.lastLoggedSeq = (await loadState(this.root, this.cfg.remoteWorkspaceId)).lastSyncedSequence;
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
@@ -344,7 +344,7 @@ export class RboxDaemon {
     }
     // The pull advanced the local base sequence; remember it so the follow-up no-op
     // push isn't logged as if THIS daemon published the remotely-produced sequence.
-    this.lastLoggedSeq = (await loadState(this.root)).lastSyncedSequence;
+    this.lastLoggedSeq = (await loadState(this.root, this.cfg.remoteWorkspaceId)).lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
   }
@@ -433,7 +433,7 @@ export class RboxDaemon {
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
 export async function runDaemon(root: string): Promise<void> {
   const { cfg, deps } = await buildAuthedRemote(root); // E2EE transport + injected KEK
-  await loadState(root); // surfaces corrupt-state errors loudly before we go live
+  await loadState(root, cfg.remoteWorkspaceId); // surfaces corrupt-state errors loudly before we go live
   const daemon = new RboxDaemon(root, cfg, deps);
   const shutdown = async () => {
     await daemon.stop();

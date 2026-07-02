@@ -26,6 +26,11 @@ const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
 
 const MAX_ATTEMPTS = 5;
+/** Mass-delete guard (design 44): a pull that wants to delete this many files AND at
+ *  least half the baseline is far more likely a poisoned baseline / wrong workspace /
+ *  server-side accident than a real edit, so it fails closed until a human says
+ *  otherwise. Normal dev churn (deleting a subtree) stays far under half the tree. */
+const MASS_DELETE_MIN_FILES = 100;
 /** The empty per-relPath 422 recapture set: the default force for a first attempt (design
  *  43 §6 [v2, M5]). Its `.size === 0` also marks "not a git-recapture retry" below. */
 const NO_GIT_FORCE: ReadonlySet<string> = new Set();
@@ -64,6 +69,10 @@ export interface SyncDeps {
    *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
    *  injects its timestamped logger so the lines land in the daemon log. */
   onGitLog?: (line: string) => void;
+  /** Explicit human consent to a pull that deletes ≥half the baseline (design 44).
+   *  Set ONLY by `rbox pull/sync --allow-mass-delete`; the daemon never sets it, so a
+   *  runaway mass delete halts background sync instead of destroying the tree. */
+  allowMassDelete?: boolean;
 }
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
@@ -89,7 +98,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = await loadState(root);
+  const state = await loadState(root, cfg.remoteWorkspaceId);
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = buildIgnoreMatcher(root);
@@ -121,6 +130,18 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // would commit its deletion back to the remote (a data-loss echo).
   const pathOf = (a: Action) => (a.kind === "write" ? a.entry.path : a.path);
   const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
+
+  // Mass-delete guard (design 44): refuse to apply a delete wave that wipes ≥half the
+  // baseline. Checked BEFORE any action touches disk — the whole pull fails closed,
+  // nothing partial. Legitimate big cleanups ack once with `--allow-mass-delete`.
+  const plannedDeletes = all.reduce((n, a) => n + (a.kind === "delete" ? 1 : 0), 0);
+  const baseFiles = state.lastSyncedManifest.files.length;
+  if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
+    throw new Error(
+      `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
+        `If this deletion is intentional, run \`rbox pull --allow-mass-delete\` to apply it once.`
+    );
+  }
   const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
   const applyOpts = {
     device: cfg.deviceId,
@@ -160,6 +181,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
   const gitOutcome = await applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, deps.onGitLog ?? ((l) => console.error(l)));
   await saveState(root, {
+    workspaceId: cfg.remoteWorkspaceId,
     lastSyncedSequence: sequence,
     lastSyncedManifest: { ...remote, gitRepos: gitOutcome.gitRepos },
     gitReposRemoved: gitOutcome.gitReposRemoved,
@@ -173,7 +195,12 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
  * Scan and push. Convenience wrapper for CLI one-shots — the daemon uses
  * {@link pushManifest} directly with its incrementally-patched in-memory manifest.
  */
-export async function push(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}, purgeIgnored = false): Promise<number> {
+export async function push(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps = {},
+  purgeIgnored = false
+): Promise<{ sequence: number; committed: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
@@ -182,11 +209,16 @@ export async function push(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
   }
-  return (await pushManifest(root, cfg, local, deps, 0, purgeIgnored)).sequence;
+  const { sequence, committed } = await pushManifest(root, cfg, local, deps, 0, purgeIgnored);
+  return { sequence, committed };
 }
 
-/** What a push commit reports back to callers holding an in-memory manifest. */
-type PushResult = { sequence: number; manifest: Manifest; deferred?: string[] };
+/** What a push commit reports back to callers holding an in-memory manifest.
+ *  `committed` is true only when a commit actually advanced the sequence — false on
+ *  the no-op and everything-deferred short-circuits, so callers can say "already in
+ *  sync" instead of reporting a publish that never happened (design 44: the setup
+ *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
+type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; committed: boolean };
 
 /**
  * The one typed recovery structure behind pushManifest's bounded retry loop. A failed
@@ -284,7 +316,7 @@ async function runPushAttempt(
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
-  const state = await loadState(root);
+  const state = await loadState(root, cfg.remoteWorkspaceId);
   const matcher = buildIgnoreMatcher(root); // shared: forward-only ignore carry + git discovery
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
@@ -334,6 +366,7 @@ async function runPushAttempt(
         !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
     ) {
       await saveState(root, {
+        workspaceId: cfg.remoteWorkspaceId,
         lastSyncedSequence: state.lastSyncedSequence,
         lastSyncedManifest: state.lastSyncedManifest,
         gitReposRemoved: gitPlan.gitReposRemoved,
@@ -341,7 +374,7 @@ async function runPushAttempt(
         gitPendingRemote: gitPlan.gitPendingRemote,
       });
     }
-    return { done: true, result: { sequence: state.lastSyncedSequence, manifest: local } };
+    return { done: true, result: { sequence: state.lastSyncedSequence, manifest: local, committed: false } };
   }
   // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
   const report = deps.report ?? PhaseReport.disabled("push");
@@ -379,7 +412,7 @@ async function runPushAttempt(
     const dd = diffManifests(state.lastSyncedManifest, committed);
     if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
       reportDeferred(deferred);
-      return { done: true, result: { sequence: state.lastSyncedSequence, manifest: committed, deferred: [...deferred] } };
+      return { done: true, result: { sequence: state.lastSyncedSequence, manifest: committed, deferred: [...deferred], committed: false } };
     }
   }
 
@@ -408,6 +441,7 @@ async function runPushAttempt(
   // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
   const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, state.lastSyncedManifest.gitRepos);
   await saveState(root, {
+    workspaceId: cfg.remoteWorkspaceId,
     lastSyncedSequence: res.sequence!,
     lastSyncedManifest: { ...committed, gitRepos: stateGit },
     gitReposRemoved: gitPlan.gitReposRemoved,
@@ -415,7 +449,7 @@ async function runPushAttempt(
     gitPendingRemote: gitPlan.gitPendingRemote,
   });
   if (deferred.size > 0) reportDeferred(deferred);
-  return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred] } };
+  return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
 }
 
 /** One full cycle: take remote changes, then publish local ones. */
@@ -423,8 +457,8 @@ export async function sync(
   root: string,
   cfg: WorkspaceConfig,
   deps: SyncDeps = {}
-): Promise<{ pulled: Action[]; pushedSequence: number }> {
+): Promise<{ pulled: Action[]; pushedSequence: number; pushCommitted: boolean }> {
   const pulled = await pull(root, cfg, deps);
-  const pushedSequence = await push(root, cfg, deps);
-  return { pulled, pushedSequence };
+  const { sequence: pushedSequence, committed: pushCommitted } = await push(root, cfg, deps);
+  return { pulled, pushedSequence, pushCommitted };
 }

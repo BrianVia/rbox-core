@@ -46,6 +46,11 @@ export interface WorkspaceConfig {
  *  The three `git*` maps are LOCAL-ONLY (design 43 §11): they never ride a manifest
  *  or leave this machine — they are this device's memory of per-repo sync posture. */
 export interface SyncState {
+  /** The workspace this baseline belongs to. A baseline is only meaningful against
+   *  the stream it was built from: reconciling workspace B against a baseline from
+   *  workspace A reads every A-only file as "remotely deleted" — a mass local delete
+   *  (the 2026-07-01 rebind incident). loadState treats a mismatch as NO baseline. */
+  workspaceId: string;
   lastSyncedSequence: number;
   lastSyncedManifest: Manifest;
   /** Removal memories (design 43 §9 [v2, B4]): relPath → the LOCAL identity key at the
@@ -113,22 +118,32 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
 }
 
 /**
- * Load the sync state (the reconcile base). A MISSING file is the expected
- * first-run case → empty base. A CORRUPT file is NOT silently treated as empty:
- * resetting the base to empty would make the next reconcile see every remote
- * file as "new" and every local file as conflicting — a destructive surprise.
- * We refuse and surface it instead.
+ * Load the sync state (the reconcile base) for `workspaceId`. A MISSING file is
+ * the expected first-run case → empty base. A CORRUPT file is NOT silently treated
+ * as empty: resetting the base to empty would make the next reconcile see every
+ * remote file as "new" and every local file as conflicting — a destructive
+ * surprise. We refuse and surface it instead.
+ *
+ * A baseline stamped with a DIFFERENT workspace id is treated as no baseline at
+ * all: it describes another manifest stream, and reconciling against it turns
+ * "file not (yet) in the new workspace" into "remotely deleted" — the rebind
+ * mass-delete incident. A fresh base makes a rebound root pull-without-deleting
+ * and push-everything, which is exactly right for a new binding. A legacy state
+ * file with no stamp is adopted as-is (it predates the stamp; every save since
+ * writes one).
  */
-export async function loadState(root: string): Promise<SyncState> {
+export async function loadState(root: string, workspaceId: string): Promise<SyncState> {
+  const fresh: SyncState = { workspaceId, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST };
   let raw: string;
   try {
     raw = await fs.readFile(statePath(root), "utf8");
   } catch (e) {
-    if (isENOENT(e)) return { lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST };
+    if (isENOENT(e)) return fresh;
     throw e;
   }
+  let state: SyncState;
   try {
-    return JSON.parse(raw) as SyncState;
+    state = JSON.parse(raw) as SyncState;
   } catch {
     throw new Error(
       `Corrupt sync state at ${statePath(root)}. Refusing to reset to an empty base ` +
@@ -136,9 +151,30 @@ export async function loadState(root: string): Promise<SyncState> {
         `intentionally re-baseline from scratch.`
     );
   }
+  if (state.workspaceId === undefined) return { ...state, workspaceId }; // pre-stamp legacy: adopt
+  if (state.workspaceId !== workspaceId) {
+    console.error(
+      `sync state at ${statePath(root)} belongs to workspace ${state.workspaceId}, ` +
+        `not ${workspaceId} — starting from a fresh baseline (files on disk untouched).`
+    );
+    return fresh;
+  }
+  return state;
 }
 
 export async function saveState(root: string, state: SyncState): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
   await writeFileAtomic(statePath(root), JSON.stringify(state, null, 2));
+}
+
+/** Discard the local sync baseline (used when a root is REBOUND to a different
+ *  workspace — the old baseline describes the old stream). Files on disk are
+ *  untouched; the next pull writes without deleting and the next push publishes
+ *  the full tree. Missing file = already reset. */
+export async function resetSyncState(root: string): Promise<void> {
+  try {
+    await fs.rm(statePath(root));
+  } catch (e) {
+    if (!isENOENT(e)) throw e;
+  }
 }

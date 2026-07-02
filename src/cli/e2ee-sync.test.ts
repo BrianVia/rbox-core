@@ -45,7 +45,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
 
     const remoteA = await remoteFor(server, secretsA);
     const cfgA = await cfgFor(rootA, secretsA, remoteA);
-    const seq = await push(rootA, cfgA, { remote: remoteA });
+    const { sequence: seq } = await push(rootA, cfgA, { remote: remoteA });
     expect(seq).toBe(1);
 
     // GC-root invariant (design 13 G3): the commit's blobRefs must cover every
@@ -95,7 +95,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     // second commit (edit) advances the chain; pull on a fresh clone replays both
     await fs.writeFile(path.join(root, "a.txt"), "two\n");
     await fs.writeFile(path.join(root, "b.txt"), "new\n");
-    const s2 = await push(root, cfg, { remote });
+    const { sequence: s2 } = await push(root, cfg, { remote });
     expect(s2).toBe(2);
 
     const root2 = await tmp();
@@ -130,7 +130,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const cfgA: WorkspaceConfig = { ...(await cfgFor(rootA, secrets, remoteA)), syncGit: true };
     await push(rootA, cfgA, { remote: remoteA });
 
-    const sections = (await loadState(rootA)).lastSyncedManifest.gitRepos!;
+    const sections = (await loadState(rootA, "ws_sync")).lastSyncedManifest.gitRepos!;
     expect(Object.keys(sections).sort()).toEqual(["repo1", "repo2"]);
     expect(sections["repo1"]!.bundleEncSha).toBe(sections["repo2"]!.bundleEncSha); // convergent bundles
 
