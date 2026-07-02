@@ -62,6 +62,14 @@ Thresholds: normal dev churn (deleting a vendored dir, pruning a subtree) stays
 far under half the tree; the two-condition AND keeps small workspaces (where
 "half" is a handful of files) from tripping on routine cleanups.
 
+Known over-trigger (accepted, fails CLOSED): the guard counts reconcile deletes
+BEFORE the local-ignore filtering, so a remote commit that both adds ignore
+rules and deletes >100 of the newly-ignored paths can trip the guard even
+though those deletes would never touch disk. Counting after the filter would
+require applying the remote rule files first (a partial mutation before the
+fail-close) — refusing loudly and letting the human `--allow-mass-delete` once
+is the safer trade.
+
 ## 4. Mechanism 3 — honest publish reporting
 
 `push` (and `PushResult`) now reports `committed`: true only when a commit

@@ -273,16 +273,18 @@ export class RboxDaemon {
     });
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
-    // resulting tree size and anything it had to defer. A no-op push (sequence unchanged)
-    // stays silent so the steady state doesn't fill the log.
-    if (res.sequence !== this.lastLoggedSeq) {
+    // resulting tree size and anything it had to defer. Gated on `committed` (design 44):
+    // a push whose internal 409-recovery PULLED a remote sequence and then no-opped must
+    // not be logged as if THIS daemon published it — and the steady-state no-op stays
+    // silent so it doesn't fill the log.
+    if (res.committed && res.sequence !== this.lastLoggedSeq) {
       const deferredNote =
         res.deferred && res.deferred.length > 0
           ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
           : "";
       log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
-      this.lastLoggedSeq = res.sequence;
     }
+    this.lastLoggedSeq = res.sequence;
     // Files deferred because they were still changing under the push: re-enqueue them
     // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
     // per-path retry budget as mid-write files — a pathologically-churning file gives up
