@@ -35,8 +35,12 @@ export interface TrashBatch {
   readonly dir: string;
 }
 
-/** Batch dir names are the pull's wall-clock, filesystem-safe. */
-const batchName = (d: Date) => d.toISOString().replace(/[:.]/g, "-");
+/** Batch dir names lead with the pull's wall-clock (filesystem-safe ISO) and end
+ *  with a pid+counter tail: two pulls in the same millisecond (daemon + one-shot,
+ *  or a fast test) must NOT share a batch dir — they'd trample each other's
+ *  `.active` marker. Age parsing reads only the leading timestamp. */
+let batchSeq = 0;
+const batchName = (d: Date) => `${d.toISOString().replace(/[:.]/g, "-")}-p${process.pid}-${++batchSeq}`;
 
 export function openTrashBatch(root: string, now: Date = new Date()): TrashBatch {
   const dir = path.join(root, TRASH_REL, batchName(now));
@@ -98,9 +102,10 @@ async function listBatches(root: string, nowMs: number): Promise<BatchInfo[]> {
     const dir = path.join(base, name);
     const st = await fs.lstat(dir).catch(() => undefined);
     if (!st?.isDirectory()) continue;
-    // Reverse batchName(): "2026-07-02T17-30-00-000Z" → ISO. Unparseable → mtime.
-    const iso = name.replace(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, "$1:$2:$3.$4Z");
-    const born = Date.parse(iso);
+    // Reverse batchName()'s leading timestamp: "2026-07-02T17-30-00-000Z[-pN-M]"
+    // → ISO (the pid+counter tail is uniqueness only). Unparseable → mtime.
+    const m = name.match(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
+    const born = m ? Date.parse(`${m[1]}:${m[2]}:${m[3]}.${m[4]}Z`) : NaN;
     let active = false;
     const marker = await fs.lstat(path.join(dir, ACTIVE_MARKER)).catch(() => undefined);
     if (marker) active = nowMs - marker.mtimeMs < STALE_ACTIVE_MS;
