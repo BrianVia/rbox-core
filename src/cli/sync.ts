@@ -43,7 +43,7 @@ const fileCountOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.typ
  * Injectable dependencies for the sync entry points (design 09 §1). Defaults
  * give production behavior; tests inject an in-memory `SyncRemote` and a no-op
  * `backoff` to exercise the conflict-retry control flow offline & fast. The SAME
- * deps object flows through pull/push/pushManifest/sync and the recursive retry.
+ * deps object flows through pull/push/pushManifest/sync and its bounded retry loop.
  */
 export interface SyncDeps {
   cache?: HashCache;
@@ -239,13 +239,12 @@ export async function pushManifest(
   purgeIgnored = false,
   forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE
 ): Promise<PushResult> {
-  const api = deps.remote ?? apiFor(cfg);
   const backoff = deps.backoff ?? defaultBackoff;
   let currentLocal = local;
   let currentForce = forceGitRecapture;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, api, backoff, purgeIgnored, currentForce);
+    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce);
     if (outcome.done) return outcome.result;
     // Shared budget: throw once we've exhausted MAX_ATTEMPTS (the just-failed attempt is
     // `attempt`), matching the original recursion's throw-before-retry ordering.
@@ -277,11 +276,14 @@ async function runPushAttempt(
   cfg: WorkspaceConfig,
   local: Manifest,
   deps: SyncDeps,
-  api: SyncRemote,
   backoff: (attempt: number) => Promise<void>,
   purgeIgnored: boolean,
   forceGitRecapture: ReadonlySet<string>
 ): Promise<AttemptOutcome> {
+  // Created PER attempt (not once in the loop): when no remote is injected, a stateful
+  // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
+  // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
+  const api = deps.remote ?? apiFor(cfg);
   const state = await loadState(root);
   const matcher = buildIgnoreMatcher(root); // shared: forward-only ignore carry + git discovery
 
