@@ -191,6 +191,43 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("theirs");
 });
 
+// Design 46: the daemon renders the prompt sidecar (`shell.line`) alongside every
+// activity.json write, from the SAME record on the SAME ordered chain. The zsh prompt
+// hook just reads it, so these assertions guard the fields it depends on.
+async function readShellLine(): Promise<string> {
+  return (await fs.readFile(path.join(root, ".rbox", "state", "shell.line"), "utf8")).trimEnd();
+}
+
+test("a committed push writes shell.line: v1, state ok, committed sequence (design 46)", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  const line = await readShellLine();
+  const parts = line.split(" ");
+  expect(line.startsWith("v1 ")).toBe(true);
+  expect(parts[2]).toBe("ok"); // pump settled, nothing queued
+  expect(parts[4]).toBe("1"); // sequence = the committed seq (lastLoggedSeq)
+  expect(line).toContain("ws_act"); // name falls back to the workspace id
+});
+
+test("a pump error writes shell.line state halt (design 46)", async () => {
+  const remote = new MiniRemote();
+  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  const daemon = await makeDaemon(remote);
+
+  daemon.want.pull = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect((await readShellLine()).split(" ")[2]).toBe("halt");
+});
+
 test("a throwing onPullApplied hook never fails a completed pull (codex R3)", async () => {
   const remote = new MiniRemote();
   remote.injectCommit([await remote.seedEntry("x.txt", "hi")]);

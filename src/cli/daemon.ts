@@ -10,7 +10,7 @@ import {
   type WatchEvent,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
-import { saveActivity, type DaemonActivity } from "./activity.js";
+import { renderShellLine, saveActivity, saveShellLine, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -420,7 +420,20 @@ export class RboxDaemon {
     this.activityDirty = false;
     this.lastActivityWrite = Date.now();
     const snapshot = { ...this.activity };
-    this.activityWrite = this.activityWrite.then(() => saveActivity(this.root, snapshot));
+    // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
+    // onto the same promise so BOTH files preserve write ordering and neither is ever
+    // awaited on the sync path. `settled` = nothing queued and no watcher events left.
+    const settled =
+      !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
+    const line = renderShellLine(snapshot, {
+      settled,
+      sequence: this.lastLoggedSeq,
+      name: this.cfg.name ?? this.cfg.remoteWorkspaceId,
+      now: Date.now(),
+    });
+    this.activityWrite = this.activityWrite
+      .then(() => saveActivity(this.root, snapshot))
+      .then(() => saveShellLine(this.root, line));
   }
 
   /** Every pull that mutated the local tree — whichever path ran it (doPull, or the
