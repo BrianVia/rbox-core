@@ -99,6 +99,36 @@ bun run rig run chaos-restart
 6. **B** pull → assert SYNCED-SET convergence (manifest ∩ disk, like
    `conductor-initial-sync`) → teardown 2xx.
 
+### `git-entanglement` (FAST suite — design 56 §9)
+
+The design-43 regression net: **sync must never corrupt or entangle real git state
+across devices.** Builds two real git repos on A and asserts git-LEVEL integrity on B.
+Deterministic (fixed git identity + commit/tag dates → stable shas), no guest kills, ~16s
+of work — so it rides the every-PR `rig run all` gate.
+
+```bash
+bun run rig run git-entanglement
+```
+
+1. Provision (git-sync **ON** — the §28 default). Before `init`, build on A:
+   - `repo-top/` — dir-repo: 3 commits on `main`, a `feature` branch (+1 commit), an
+     annotated tag `v1`, a tracked file **modified-but-uncommitted** (dirty worktree),
+     and an **untracked** file.
+   - `nested/deeper/repo-inner/` — an independent nested dir-repo, 2 commits, one branch.
+2. Push on A → B joins + pulls. Git state travels as **E2EE-encrypted `git bundle`
+   artifacts** in the manifest's `gitRepos` map (`.git/` is hard-excluded from plain-file
+   sync); the working files travel as ordinary plain files.
+3. **Assert on B, per repo:** `git fsck --strict` clean · HEAD symbolic-ref + sha equal
+   A's · `git for-each-ref` (branches + tags) byte-identical to A · `git log --format=%H`
+   on `main` identical · the two repos stay **independent** (repo-inner's refs/HEAD
+   converge too — no cross-repo bleed).
+4. **Dirty/untracked semantics** (pinned from design 43 §12/§5): the modified tracked
+   file + untracked file arrive via plain-file sync; B restores A's index verbatim, so
+   `git status --porcelain` is **identical** on both sides (` M a.txt` + `?? untracked.txt`).
+5. **Churn:** A switches `repo-top` to `feature`, adds a commit, pushes; B pulls;
+   re-assert fsck + ref equality + HEAD now on `feature`.
+6. Manifest convergence (the plain-file half) closes it out.
+
 ### CI — `.github/workflows/e2e.yml`
 
 Manual (`workflow_dispatch`, input `scenario`, default `all`) + nightly
@@ -111,5 +141,5 @@ the `RBOX_DEV_BOOTSTRAP` repo secret (and optionally `CLOUDFLARE_ACCOUNT_ID` /
 ## What's next
 
 The bootstrap `plan` param (unlocks the `development` tier), `binary` provisioning
-mode, `git-entanglement`, and perf budgets flipped from report-only to gating once
-burn-in data exists. See design 56 §13 for the phase breakdown.
+mode, and perf budgets flipped from report-only to gating once burn-in data exists.
+See design 56 §13 for the phase breakdown.
