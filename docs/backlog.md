@@ -65,3 +65,5 @@ production Analytics Engine + dashboard. Server timing is pulled forward as P0 i
   / GC candidates to KV (eventual) or Queues (async). Those are read-after-write critical.
 - **D1 `batch()` for write coalescing**, respecting limits (100 params, 100 KB/stmt,
   single-threaded per DB).
+
+- **Client fetch timeouts (bench finding, 2026-07-03):** a one-shot `rbox init --workspace` hung 110 minutes at 0 CPU inside a rig guest — a blob/commit fetch black-holed and the CLI awaits forever (no timeout/abort on sync-path fetches; retry-on-same-args succeeded instantly). Design 45 gave the status probe an AbortController for exactly this class; push/pull/init network calls need the same treatment (generous timeouts + bounded retry, careful not to abort legitimately slow big-blob transfers — size/progress-aware deadlines rather than flat ones).

@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
-import { healthLine, lastSyncLines, progressLabel, relTime, type StatusSnapshot } from "./status-view.js";
+import {
+  attributeDaemonForStatus,
+  healthLine,
+  lastSyncLines,
+  progressLabel,
+  relTime,
+  type StatusSnapshot,
+} from "./status-view.js";
 
 // Assertions match plain substrings so they hold with or without ANSI styling
 // (style auto-disables off a TTY, which is how bun test runs).
@@ -16,7 +23,7 @@ const base = (over: Partial<StatusSnapshot> = {}): StatusSnapshot => ({
   trackedFiles: 8603,
   daemonRunning: true,
   localSequence: 78,
-  remoteSequence: 78,
+  remote: { sequence: 78, source: "probe" },
   activity: undefined,
   now: NOW,
   ...over,
@@ -58,7 +65,7 @@ test("halt outranks everything when the daemon is running", () => {
     halt: { at: iso(300), reason: "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).", count: 4, op: "pull" },
     active: { at: iso(1), phase: "upload", done: 1, total: 2 },
   };
-  const line = healthLine(base({ activity, added: 5, remoteSequence: 99 }));
+  const line = healthLine(base({ activity, added: 5, remote: { sequence: 99, source: "probe" } }));
   expect(line).toContain("sync halted");
   expect(line).toContain("mass-delete guard");
   expect(line).toContain("5m ago");
@@ -113,22 +120,111 @@ test("git divergence: clean file tree with unpushed git state is NOT in sync", (
 });
 
 test("local divergence + behind remote are reported together", () => {
-  const line = healthLine(base({ changed: 2, remoteSequence: 80 }));
+  const line = healthLine(base({ changed: 2, remote: { sequence: 80, source: "probe" } }));
   expect(line).toContain("2 local changes");
   expect(line).toContain("behind remote (sequence 78 vs 80)");
 });
 
 test("behind remote only", () => {
-  const running = healthLine(base({ remoteSequence: 80 }));
+  const running = healthLine(base({ remote: { sequence: 80, source: "probe" } }));
   expect(running).toContain("behind remote (sequence 78 vs 80)");
   expect(running).toContain("next pull");
 
-  const stopped = healthLine(base({ remoteSequence: 80, daemonRunning: false }));
+  const stopped = healthLine(base({ remote: { sequence: 80, source: "probe" }, daemonRunning: false }));
   expect(stopped).toContain("rbox pull");
 });
 
 test("unknown remote (offline probe) never renders behind-remote", () => {
-  expect(healthLine(base({ remoteSequence: undefined }))).toContain("in sync");
+  expect(healthLine(base({ remote: undefined }))).toContain("in sync");
+});
+
+test("daemon-sourced behind-remote verdict says the daemon has not applied the broadcast yet", () => {
+  const line = healthLine(base({ remote: { sequence: 80, source: "daemon", ageMs: 8000 } }));
+  expect(line).toContain("behind remote (sequence 78 vs 80)");
+  expect(line).toContain("daemon has not applied seq 80 yet");
+});
+
+// ── daemon attribution / probe elision ───────────────────────────────────────
+
+const wsActivity = (over: Partial<NonNullable<DaemonActivity["ws"]>> = {}, activityOver: Partial<DaemonActivity> = {}): DaemonActivity => ({
+  at: iso(120),
+  ...activityOver,
+  ws: {
+    connected: true,
+    at: iso(8),
+    caughtUp: true,
+    lastBroadcastSequence: 80,
+    bootId: "boot-live",
+    pid: 1234,
+    ...over,
+  },
+});
+
+const attrBase = (over: Partial<Parameters<typeof attributeDaemonForStatus>[0]> = {}) =>
+  attributeDaemonForStatus({
+    activity: wsActivity(),
+    daemonRunning: true,
+    boundWorkspaceId: "ws_current",
+    currentWorkspaceId: "ws_current",
+    livePidfileBootId: "boot-live",
+    localSequence: 78,
+    now: NOW,
+    ...over,
+  });
+
+test("attribution elides with current binding, matching live pidfile bootId, connected, caught-up, fresh ws, and no halt", () => {
+  expect(attrBase()).toEqual({
+    activity: wsActivity(),
+    elided: true,
+    remote: { sequence: 80, source: "daemon", ageMs: 8000 },
+    remoteLine: "remote: seq 80 · live via daemon (8s ago)",
+  });
+});
+
+test("elided remote sequence is at least the local synced sequence", () => {
+  expect(attrBase({ activity: wsActivity({ lastBroadcastSequence: 70 }) }).remote?.sequence).toBe(78);
+  expect(attrBase({ activity: wsActivity({ lastBroadcastSequence: undefined }) }).remote?.sequence).toBe(78);
+});
+
+test("daemon remote evidence is used only when every trust condition passes", () => {
+  const cases: Array<[string, Partial<Parameters<typeof attributeDaemonForStatus>[0]>]> = [
+    ["daemon stopped", { daemonRunning: false }],
+    ["binding missing", { boundWorkspaceId: undefined }],
+    ["binding stale", { boundWorkspaceId: "ws_old" }],
+    ["pidfile legacy/missing boot", { livePidfileBootId: undefined }],
+    ["disconnected", { activity: wsActivity({ connected: false }) }],
+    ["not caught up", { activity: wsActivity({ caughtUp: false }) }],
+    ["halted", { activity: wsActivity({}, { halt: { at: iso(1), reason: "boom", count: 1, op: "pull" } }) }],
+  ];
+  for (const [name, over] of cases) {
+    const r = attrBase(over);
+    expect(`${name}:${r.elided}`).toBe(`${name}:false`);
+    expect(r.remote).toBeUndefined();
+  }
+  expect(attrBase({ livePidfileBootId: undefined }).activity).toBeDefined();
+});
+
+test("daemon remote evidence expires after the freshness window", () => {
+  expect(attrBase({ activity: wsActivity({ at: iso(29) }) }).elided).toBe(true);
+  expect(attrBase({ activity: wsActivity({ at: iso(31) }) }).elided).toBe(false);
+});
+
+test("conflicting ws boot suppresses inherited activity", () => {
+  const activity = wsActivity(
+    { bootId: "boot-loser" },
+    {
+      lastPush: { at: iso(5), files: 1, sequence: 80 },
+      halt: { at: iso(5), reason: "old halt", count: 2, op: "pull" },
+    }
+  );
+  expect(attrBase({ activity })).toEqual({ activity: undefined, elided: false });
+});
+
+test("binding bootId does not affect attribution when pidfile and activity match", () => {
+  const activity = wsActivity({ bootId: "boot-live" });
+  const r = attrBase({ activity, boundWorkspaceId: "ws_current", livePidfileBootId: "boot-live" });
+  expect(r.activity).toBe(activity);
+  expect(r.elided).toBe(true);
 });
 
 // ── lastSyncLines ─────────────────────────────────────────────────────────────

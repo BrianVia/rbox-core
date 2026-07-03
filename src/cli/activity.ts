@@ -18,6 +18,16 @@ import { RBOX_DIR } from "./config.js";
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
   at: string;
+  /** Workspace-DO WebSocket currency evidence. `at` is refreshed only by WS-layer
+   *  traffic/lifecycle, not by pump heartbeats. */
+  ws?: {
+    connected: boolean;
+    at: string;
+    caughtUp: boolean;
+    lastBroadcastSequence?: number;
+    bootId: string;
+    pid: number;
+  };
   /** Last push that COMMITTED. Separate slot from `lastPull` (codex R2): a single
    *  most-recent-op slot let the commit that follows a 409-recovery pull mask the
    *  local-tree mutations that pull had just applied. */
@@ -50,7 +60,29 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const raw = JSON.parse(await fs.readFile(activityPath(root), "utf8")) as Partial<DaemonActivity>;
     if (typeof raw?.at !== "string") return undefined;
     const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+    const uint = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
+    const positiveInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) > 0;
     const a: DaemonActivity = { at: raw.at };
+    const ws = raw.ws;
+    if (
+      ws &&
+      typeof ws.connected === "boolean" &&
+      typeof ws.at === "string" &&
+      typeof ws.caughtUp === "boolean" &&
+      typeof ws.bootId === "string" &&
+      ws.bootId.length > 0 &&
+      positiveInt(ws.pid) &&
+      (ws.lastBroadcastSequence === undefined || uint(ws.lastBroadcastSequence))
+    ) {
+      a.ws = {
+        connected: ws.connected,
+        at: ws.at,
+        caughtUp: ws.caughtUp,
+        bootId: ws.bootId,
+        pid: ws.pid,
+        ...(ws.lastBroadcastSequence !== undefined ? { lastBroadcastSequence: ws.lastBroadcastSequence } : {}),
+      };
+    }
     const push = raw.lastPush;
     if (push && typeof push.at === "string" && num(push.files) && num(push.sequence)) {
       a.lastPush = { at: push.at, files: push.files, sequence: push.sequence };

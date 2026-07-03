@@ -305,8 +305,10 @@ export class WorkspaceSync {
     }
     const sequence = outcome!.sequence;
 
-    // Best-effort D1 commit mirror (not authoritative). Workspace ownership is
-    // established at creation (POST /v1/workspaces), NOT here, so no registry write.
+    wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }));
+
+    // Best-effort D1 commit mirror (not authoritative). Fanout runs first so
+    // `/latest` and WS evidence advance in the same order.
     try {
       await dbFor(op.env, accountId)
         .prepare("INSERT OR IGNORE INTO commits (workspace_id, project_id, sequence, commit_hash, body, sig, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
@@ -315,8 +317,6 @@ export class WorkspaceSync {
     } catch (e) {
       logErr("d1_commit_mirror_failed", e); // no raw error (binds carry ws/proj/body/device)
     }
-
-    wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }), deviceId);
     // Success: the headline commit-latency / body-size / blobs-per-commit + the
     // R2/D1/DO split (dbMs+dbCalls from missingBlobs & mirror, doMs from the txn).
     emitCommit("ok"); // ratio defaults to 0

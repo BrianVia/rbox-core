@@ -11,6 +11,7 @@ const PID_FILE = "daemon.pid";
 const LOG_FILE = "daemon.log";
 const BOUND_FILE = "workspace.bound";
 const DAEMON_MARKER = "__daemon-run";
+export const DAEMON_BOOT_ID_ENV = "RBOX_DAEMON_BOOT_ID";
 
 /** Home rbox dir (`~/.rbox`). `RBOX_HOME` overrides it (tests; also lets a user
  *  relocate global state) — same override the keystore/credentials honor. */
@@ -37,13 +38,67 @@ const pidPath = (root: string) => path.join(daemonRuntimeDir(root), PID_FILE);
 const logPath = (root: string) => path.join(daemonRuntimeDir(root), LOG_FILE);
 const boundPath = (root: string) => path.join(daemonRuntimeDir(root), BOUND_FILE);
 
+export interface ParsedDaemonBinding {
+  workspaceId?: string;
+  bootId?: string;
+  version: "legacy" | "v2" | "invalid";
+}
+
+export interface ParsedDaemonPid {
+  pid?: number;
+  bootId?: string;
+  version: "legacy" | "v2" | "invalid";
+}
+
+type ParsedDaemonLine<T> =
+  | { version: "legacy"; value: T }
+  | { version: "v2"; value: T; bootId: string }
+  | { version: "invalid" };
+
+function parseDualFormatLine<T>(raw: string, parseValue: (s: string | undefined) => T | undefined): ParsedDaemonLine<T> {
+  const line = raw.trim();
+  if (!line) return { version: "invalid" };
+  const parts = line.split(/\s+/);
+  if (parts[0] === "v2") {
+    const value = parseValue(parts[1]);
+    const bootId = parts[2];
+    return parts.length === 3 && value !== undefined && bootId ? { version: "v2", value, bootId } : { version: "invalid" };
+  }
+  const value = parts.length === 1 ? parseValue(line) : undefined;
+  return value !== undefined ? { version: "legacy", value } : { version: "invalid" };
+}
+
+export function parseDaemonBinding(raw: string): ParsedDaemonBinding {
+  const parsed = parseDualFormatLine(raw, (s) => (s ? s : undefined));
+  if (parsed.version === "invalid") return { version: "invalid" };
+  return {
+    version: parsed.version,
+    workspaceId: parsed.value,
+    ...(parsed.version === "v2" ? { bootId: parsed.bootId } : {}),
+  };
+}
+
+export function parseDaemonPid(raw: string): ParsedDaemonPid {
+  const parsePid = (s: string | undefined): number | undefined => {
+    const n = Number(s);
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+  };
+  const parsed = parseDualFormatLine(raw, parsePid);
+  if (parsed.version === "invalid") return { version: "invalid" };
+  return {
+    version: parsed.version,
+    pid: parsed.value,
+    ...(parsed.version === "v2" ? { bootId: parsed.bootId } : {}),
+  };
+}
+
 /** Called by the daemon at startup: record which workspace id THIS daemon bound.
  *  `startDaemon` compares it against the root's current binding to detect a daemon
  *  left over from a previous init of the same root (which would 404 on every op
  *  forever — the observed "setup says started, nothing ever syncs" failure). */
-export async function recordDaemonBinding(root: string, workspaceId: string): Promise<void> {
+export async function recordDaemonBinding(root: string, workspaceId: string, bootId?: string): Promise<void> {
   await fsp.mkdir(daemonRuntimeDir(root), { recursive: true });
-  await fsp.writeFile(boundPath(root), workspaceId);
+  await fsp.writeFile(boundPath(root), bootId ? `v2 ${workspaceId} ${bootId}\n` : `${workspaceId}\n`);
 }
 
 /** The workspace id recorded by a daemon at startup (undefined: absent, unreadable,
@@ -56,6 +111,8 @@ export function readDaemonBinding(root: string): string | undefined {
 export interface DaemonBindingRecord {
   present: boolean;
   workspaceId?: string;
+  bootId?: string;
+  version?: "legacy" | "v2" | "invalid";
   unreadable?: boolean;
 }
 
@@ -63,8 +120,10 @@ export interface DaemonBindingRecord {
  *  to avoid leaking stale daemon-owned sidecars left behind by a crashed/stopped daemon. */
 export function readDaemonBindingRecord(root: string): DaemonBindingRecord {
   try {
-    const id = fs.readFileSync(boundPath(root), "utf8").trim();
-    return id ? { present: true, workspaceId: id } : { present: true, unreadable: true };
+    const parsed = parseDaemonBinding(fs.readFileSync(boundPath(root), "utf8"));
+    return parsed.workspaceId
+      ? { present: true, workspaceId: parsed.workspaceId, bootId: parsed.bootId, version: parsed.version }
+      : { present: true, unreadable: true, version: parsed.version };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return { present: false };
     return { present: true, unreadable: true };
@@ -89,7 +148,7 @@ export function currentWorkspaceId(root: string): string | undefined {
  *  remains "can't tell", matching the existing status rule. Diagnostics sidecar
  *  exclusion separately reads `workspace.bound` independent of liveness. */
 export function daemonBindingStatus(root: string, workspaceId: string): {
-  alive: { running: boolean; pid?: number };
+  alive: { running: boolean; pid?: number; bootId?: string };
   bound?: string;
   stale: boolean;
 } {
@@ -148,20 +207,36 @@ function isOurDaemon(pid: number, root: string): boolean {
   }
 }
 
-function readPid(root: string): number | undefined {
+export interface DaemonPidRecord {
+  present: boolean;
+  pid?: number;
+  bootId?: string;
+  version?: "legacy" | "v2" | "invalid";
+  unreadable?: boolean;
+}
+
+export function readDaemonPidRecord(root: string): DaemonPidRecord {
   try {
-    const n = Number(fs.readFileSync(pidPath(root), "utf8").trim());
-    return Number.isInteger(n) && n > 0 ? n : undefined;
-  } catch {
-    return undefined;
+    const parsed = parseDaemonPid(fs.readFileSync(pidPath(root), "utf8"));
+    return parsed.pid
+      ? { present: true, pid: parsed.pid, bootId: parsed.bootId, version: parsed.version }
+      : { present: true, unreadable: true, version: parsed.version };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { present: false };
+    return { present: true, unreadable: true };
   }
+}
+
+function readPid(root: string): number | undefined {
+  return readDaemonPidRecord(root).pid;
 }
 
 /** Is OUR background-sync daemon currently running for `root`? Used by `status`
  *  (the folded-in `daemon status`) and `untrack` (decide whether to stop first). */
-export function isDaemonRunning(root: string): { running: boolean; pid?: number } {
-  const pid = readPid(root);
-  if (pid !== undefined && isOurDaemon(pid, root)) return { running: true, pid };
+export function isDaemonRunning(root: string): { running: boolean; pid?: number; bootId?: string } {
+  const rec = readDaemonPidRecord(root);
+  const pid = rec.pid;
+  if (pid !== undefined && isOurDaemon(pid, root)) return { running: true, pid, bootId: rec.bootId };
   return { running: false };
 }
 
@@ -229,14 +304,16 @@ export async function startDaemon(root: string): Promise<void> {
   await fsp.rm(boundPath(root), { force: true });
   const out = fs.openSync(logPath(root), "a");
   const args = daemonSpawnArgs(process.argv[1]!, root, isStandaloneBinary());
+  const bootId = crypto.randomBytes(16).toString("hex");
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: ["ignore", out, out],
+    env: { ...process.env, [DAEMON_BOOT_ID_ENV]: bootId },
   });
   child.unref();
   fs.closeSync(out);
 
-  if (child.pid) fs.writeFileSync(pidPath(root), String(child.pid));
+  if (child.pid) fs.writeFileSync(pidPath(root), `v2 ${child.pid} ${bootId}\n`);
   console.log(`rbox daemon started (pid ${child.pid}). logs: ${logPath(root)}`);
 }
 

@@ -16,6 +16,14 @@ afterEach(async () => {
 test("round-trips the full record", async () => {
   const a: DaemonActivity = {
     at: "2026-07-02T12:00:00.000Z",
+    ws: {
+      connected: true,
+      at: "2026-07-02T12:00:01.000Z",
+      caughtUp: true,
+      lastBroadcastSequence: 79,
+      bootId: "boot-1",
+      pid: 1234,
+    },
     lastPush: { at: "2026-07-02T11:58:00.000Z", files: 3, sequence: 78 },
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
@@ -47,12 +55,31 @@ test("malformed nested slots are dropped individually, never handed to render (c
     JSON.stringify({
       at,
       lastPush: {}, // the R3 repro: rendered as `undefined.toLocaleString` crash
+      ws: { connected: true, at, caughtUp: true, lastBroadcastSequence: -1, bootId: "boot-1", pid: 1234 },
       lastPull: { at, writes: 1, deletes: 0, conflicts: 0 }, // valid — must survive
       active: { at, phase: "teleport", done: 1, total: 2 }, // bogus phase
       halt: { at, reason: 7, count: 1, op: "pull" }, // non-string reason
     })
   );
   expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
+});
+
+test("invalid ws evidence is omitted without dropping valid activity slots", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(
+    p,
+    JSON.stringify({
+      at,
+      ws: { connected: true, at, caughtUp: true, lastBroadcastSequence: 1.5, bootId: "boot-1", pid: 1234 },
+      lastPush: { at, files: 3, sequence: 9 },
+    })
+  );
+  expect(await loadActivity(root)).toEqual({ at, lastPush: { at, files: 3, sequence: 9 } });
+
+  await fs.writeFile(p, JSON.stringify({ at, ws: { connected: true, at, caughtUp: true, bootId: "boot-1", pid: 0 } }));
+  expect(await loadActivity(root)).toEqual({ at });
 });
 
 test("resetSyncState clears the sidecar too — a rebind must not inherit the old trail (codex R4)", async () => {
