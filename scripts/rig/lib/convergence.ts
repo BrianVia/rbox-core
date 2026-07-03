@@ -28,16 +28,22 @@ export interface Fingerprint {
  * Shell snippet emitting one tab-separated record per entry:
  *   `F\t<relpath>\t<sha256>`   for regular files
  *   `L\t<relpath>\t<target>`   for symlinks
- * `.rbox/` is pruned. (Paths with tabs/newlines aren't handled — the seeded
- * corpus never produces them; a P1+ concern for arbitrary real workloads.)
+ * Prunes (at ANY depth, by name) exactly the three dirs rbox NEVER syncs:
+ * `.rbox` (per-device state), `.git`, and `node_modules` (both hard-excluded by
+ * src/engine/ignore.ts — a raw `.git` synced file-by-file arrives torn). Fingerprinting
+ * the synced set only is what makes convergence assertable on a real git-repo workload
+ * (conductor-initial-sync). The stream is `find | sort | while read` — never an
+ * argv splat — so a 33k-file tree fingerprints without blowing the arg limit. (Paths
+ * with tabs/newlines aren't handled — real workloads virtually never produce them.)
  */
 export function fingerprintScript(dir: string): string {
+  const prune = `\\( -name .rbox -o -name .git -o -name node_modules \\) -prune`;
   return [
     `cd '${dir}' 2>/dev/null || exit 0`,
-    `find . -path ./.rbox -prune -o -type f -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
+    `find . ${prune} -o -type f -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do`,
     `  printf 'F\\t%s\\t%s\\n' "$f" "$(sha256sum "$f" | cut -d' ' -f1)"`,
     `done`,
-    `find . -path ./.rbox -prune -o -type l -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r l; do`,
+    `find . ${prune} -o -type l -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r l; do`,
     `  printf 'L\\t%s\\t%s\\n' "$l" "$(readlink "$l")"`,
     `done`,
   ].join("\n");

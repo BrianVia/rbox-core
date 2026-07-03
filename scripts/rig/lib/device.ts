@@ -69,6 +69,28 @@ export function scrubSelfPrinted(text: string): string {
     .join("\n");
 }
 
+/** Loosely-typed view of the daemon's `.rbox/state/activity.json` sidecar — the
+ *  rig only reads the heartbeat + halt slot (design 45). */
+export interface GuestActivity {
+  at?: string;
+  halt?: { at: string; reason: string; count: number; op: string };
+  lastPush?: { at: string; files: number; sequence: number };
+  lastPull?: { at: string; writes: number; deletes: number; conflicts: number };
+  active?: { at: string; phase: string; done: number; total: number };
+}
+
+/**
+ * Classify a daemon.log body into its watcher mode (design 56 §9: "if the guest
+ * watcher degrades to polling, that's FINE — log the mode"). Native @parcel/watcher
+ * announces plain `rbox daemon ready`; the fallback logs `live watch unavailable …
+ * degrading to periodic scan` / `periodic-scan mode`. PURE.
+ */
+export function daemonWatcherMode(log: string): "native" | "polling" | "unknown" {
+  if (/live watch unavailable|periodic-scan mode|periodic scan every/i.test(log)) return "polling";
+  if (/rbox daemon ready/i.test(log)) return "native";
+  return "unknown";
+}
+
 export class Device {
   constructor(
     readonly name: string,
@@ -155,6 +177,71 @@ export class Device {
 
   async symlink(target: string, linkPath: string): Promise<void> {
     await this.exec(["ln", "-s", target, linkPath]);
+  }
+
+  // ── daemon control (P2 — design 45/49 scenarios) ─────────────────────────────
+
+  /** `rbox start` in `workDir` — spawns the detached background-sync daemon
+   *  (design 45). Throws on nonzero exit (a daemon that won't start is a hard
+   *  scenario failure). */
+  async daemonStart(workDir: string): Promise<RunResult> {
+    return this.rbox(["start"], { cwd: workDir });
+  }
+
+  /** `rbox stop` in `workDir` — SIGTERMs the daemon (graceful; never SIGKILL).
+   *  Tolerant of "not running" (teardown calls it unconditionally). */
+  async daemonStop(workDir: string): Promise<RunResult> {
+    return this.rbox(["stop"], { cwd: workDir, allowFail: true });
+  }
+
+  /** `rbox status` in `workDir` — the folded-in daemon/health view. Best-effort. */
+  async daemonStatus(workDir: string): Promise<RunResult> {
+    return this.rbox(["status"], { cwd: workDir, allowFail: true });
+  }
+
+  /**
+   * The daemon PROCESS's peak RSS in MB — `VmHWM` from `/proc/<pid>/status`
+   * (high-water mark since spawn, kB). This is the number the idle memory budget
+   * asserts on: guest-wide `memoryUsageBytes` includes page cache from any earlier
+   * workload in the same VM and never deflates (Apple container ballooning), so it
+   * can read ~800MB while the daemon sits at ~150MB. Undefined when no daemon runs.
+   */
+  async daemonPeakRssMb(): Promise<number | undefined> {
+    const r = await this.exec(
+      ["sh", "-c", 'pid=$(pgrep -f __daemon-run | head -1); if [ -n "$pid" ]; then awk \'/VmHWM/{print $2}\' "/proc/$pid/status"; fi'],
+      { allowFail: true }
+    );
+    const kb = Number(r.stdout.trim());
+    return Number.isFinite(kb) && kb > 0 ? kb / 1024 : undefined;
+  }
+
+  /**
+   * Read + parse `<workDir>/.rbox/state/activity.json` (design 45 — the daemon's
+   * heartbeat/halt sidecar, mirrored to disk). Absent/corrupt → undefined. The
+   * `halt` slot is the guard/health signal a scenario asserts on. Shape is read
+   * loosely (the rig only inspects `at`/`halt`), never re-validating the CLI's schema.
+   */
+  async readActivity(workDir: string): Promise<GuestActivity | undefined> {
+    const raw = await this.readFileIfExists(`${workDir}/.rbox/state/activity.json`);
+    if (raw === undefined) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as GuestActivity;
+      return typeof parsed?.at === "string" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Concatenate every `<rboxHome>/daemons/*​/daemon.log` in the guest (design 45
+   * runtime dir). The startup line records the watcher mode — native (`rbox daemon
+   * ready`) vs the polling fallback (`… periodic scan every 60s` / `periodic-scan
+   * mode`); {@link daemonWatcherMode} classifies it. Best-effort → "" on any failure.
+   */
+  async readDaemonLogs(rboxHome: string): Promise<string> {
+    const script = `for f in ${rboxHome}/daemons/*/daemon.log; do [ -f "$f" ] && cat "$f"; done`;
+    const r = await this.exec(["sh", "-c", script], { allowFail: true });
+    return r.exitCode === 0 ? r.stdout : "";
   }
 
   /**

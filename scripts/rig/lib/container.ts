@@ -211,14 +211,31 @@ export async function containerExists(name: string): Promise<boolean> {
   return r.stdout.includes(`"${name}"`);
 }
 
+/** A container mount. `type` defaults to a host-dir bind; `type: "volume"` mounts a
+ *  named volume (`source` = the volume name). */
+export interface Mount {
+  source: string;
+  target: string;
+  readonly?: boolean;
+  type?: "bind" | "volume";
+}
+
+function mountArg(m: Mount): string {
+  const parts: string[] = [];
+  if (m.type) parts.push(`type=${m.type}`);
+  parts.push(`source=${m.source}`, `target=${m.target}`);
+  if (m.readonly) parts.push("readonly");
+  return parts.join(",");
+}
+
 export interface CreateSpec {
   name: string;
   image: string;
   network: string;
   cpus: number;
   memory: string;
-  /** Read-only bind mounts (host → guest). */
-  mounts: Array<{ source: string; target: string; readonly?: boolean }>;
+  /** Bind/volume mounts (host → guest). */
+  mounts: Mount[];
   env?: Record<string, string>;
   /** Overrides the image CMD when set; default keeps the image's `sleep infinity`. */
   cmd?: string[];
@@ -228,11 +245,7 @@ export interface CreateSpec {
  *  all real work runs via `exec`. */
 export async function createContainer(spec: CreateSpec): Promise<void> {
   const args = ["create", "--name", spec.name, "--network", spec.network, "--cpus", String(spec.cpus), "--memory", spec.memory];
-  for (const m of spec.mounts) {
-    const parts = [`source=${m.source}`, `target=${m.target}`];
-    if (m.readonly) parts.push("readonly");
-    args.push("--mount", parts.join(","));
-  }
+  for (const m of spec.mounts) args.push("--mount", mountArg(m));
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
   args.push(spec.image);
   if (spec.cmd) args.push(...spec.cmd);
