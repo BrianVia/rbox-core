@@ -64,6 +64,73 @@ export async function spawnHost(argv: string[], opts: RunOpts = {}): Promise<Run
   return spawnCapture(argv, opts);
 }
 
+// ── streaming spawn (P1 observability: wrangler tail, `container logs --follow`) ──
+
+export interface StreamHandle {
+  readonly exited: Promise<number>;
+  kill(signal?: number | string): void;
+}
+
+export interface StreamOpts {
+  cwd?: string;
+  /** Delivered ONE line at a time (newline stripped) as stdout is produced. */
+  onStdout?: (line: string) => void;
+  onStderr?: (line: string) => void;
+}
+
+/**
+ * Spawn a long-lived process and deliver its stdout/stderr line-by-line as they
+ * are produced (never buffered whole in memory) — the streaming counterpart to
+ * {@link spawnCapture}. Argv is passed verbatim: the caller prefixes `container`
+ * for a runtime subcommand (`container logs --follow`) or names a host tool
+ * (`bunx wrangler tail`). The rig's ONLY streaming spawn.
+ */
+export function spawnStream(argv: string[], opts: StreamOpts = {}): StreamHandle {
+  const proc = Bun.spawn(argv, { cwd: opts.cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  if (opts.onStdout) void pumpLines(proc.stdout, opts.onStdout);
+  if (opts.onStderr) void pumpLines(proc.stderr, opts.onStderr);
+  return { exited: proc.exited, kill: (signal) => proc.kill(signal) };
+}
+
+/** Read a byte stream, splitting on newlines and emitting complete lines as they
+ *  arrive (plus any trailing partial when the stream closes). Best-effort: a stream
+ *  torn down by kill() resolves quietly. */
+async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) {
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          onLine(buf.slice(0, nl));
+          buf = buf.slice(nl + 1);
+        }
+      }
+      if (done) {
+        if (buf.length > 0) onLine(buf);
+        break;
+      }
+    }
+  } catch {
+    /* stream torn down (process killed) — nothing more to read */
+  }
+}
+
+/** One `container stats --format json --no-stream <names...>` call → parsed JSON
+ *  (shape handled defensively by the caller). Throws on a nonzero exit so the
+ *  sampler can record + move on. */
+export async function containerStats(names: string[]): Promise<unknown> {
+  const r = await run(["stats", "--format", "json", "--no-stream", ...names], { allowFail: true });
+  if (r.exitCode !== 0) {
+    throw new Error(`container stats exited ${r.exitCode}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+  }
+  return JSON.parse(r.stdout);
+}
+
 // ── system ───────────────────────────────────────────────────────────────────
 
 /** `container system status` — healthy iff it exits 0. */

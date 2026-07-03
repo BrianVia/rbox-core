@@ -17,6 +17,8 @@ import * as C from "./lib/container.js";
 import { DEFAULT_DEV_API, GUEST, imageHash, NAMES, resolveConfig } from "./lib/config.js";
 import { Device } from "./lib/device.js";
 import { resolveBootstrapSecret } from "./lib/account.js";
+import { RunCapture } from "./lib/capture.js";
+import { renderReportMd } from "./lib/report.js";
 import { getScenario, scenarioNames } from "./scenarios/index.js";
 import { finalizeReport, renderReportTable, type RigCtx } from "./scenarios/types.js";
 
@@ -54,6 +56,7 @@ usage:
   rig doctor                          host preflight (read-only)
   rig up [--api-url <url>]            build image + start rig-dev-a/b
   rig run <scenario> [--api-url <url>] [--keep-account]
+  rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
   rig down [--all]                    tear down containers + network (--all: +image +volumes)
 
 scenarios: ${scenarioNames().join(", ")}
@@ -156,17 +159,37 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
     fs.appendFileSync(logPath, stamped + "\n");
     console.log(line);
   };
+  // Transcript firehose → run.log ONLY (console stays compact). Wired into the devices.
+  const transcript = (text: string): void => {
+    fs.appendFileSync(logPath, (text.endsWith("\n") ? text : text + "\n"));
+  };
   log(`rig run ${name} — api ${apiUrl} — runDir ${runDir}`);
 
   const ctx: RigCtx = {
-    a: new Device(NAMES.a, apiUrl),
-    b: new Device(NAMES.b, apiUrl),
+    a: new Device(NAMES.a, apiUrl, { label: "A", transcript, redact: [bootstrapSecret] }),
+    b: new Device(NAMES.b, apiUrl, { label: "B", transcript, redact: [bootstrapSecret] }),
     apiUrl,
     bootstrapSecret,
     runDir,
     keepAccount: flags["keep-account"] === "true",
     log,
+    transcript,
   };
+
+  // Capture is created BEFORE the scenario and finalized in `finally` so artifacts
+  // exist even when the scenario aborts. Every channel is independently best-effort;
+  // capture failures never change the verdict.
+  const capture = new RunCapture({
+    runDir,
+    repoRoot: REPO_ROOT,
+    names: { a: NAMES.a, b: NAMES.b },
+    devices: { a: ctx.a, b: ctx.b },
+    workDir: GUEST.workDir,
+    rboxHome: GUEST.rboxHome,
+    env: process.env,
+    log,
+  });
+  capture.start();
 
   let report;
   try {
@@ -180,10 +203,23 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
   }
 
   fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(report, null, 2));
+
+  let captureSummary;
+  try {
+    captureSummary = await capture.finish();
+  } catch (e) {
+    // finish() is already best-effort internally; this only guards a truly unexpected
+    // escape so report rendering still happens.
+    log(`capture.finish() error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    captureSummary = { statsA: { skipped: "capture aborted" }, statsB: { skipped: "capture aborted" }, tail: { skipped: "capture aborted" }, ae: { skipped: "capture aborted" }, artifacts: [] as string[] };
+  }
+
+  fs.writeFileSync(path.join(runDir, "report.md"), renderReportMd(report, captureSummary));
+
   const table = renderReportTable(report);
   fs.appendFileSync(logPath, table + "\n");
   console.log("\n" + table);
-  console.log(`\nreport: ${path.join(runDir, "report.json")}`);
+  console.log(`\nreport: ${path.join(runDir, "report.md")}`);
   return report.verdict === "PASS" ? 0 : 1;
 }
 
@@ -208,6 +244,43 @@ async function down(all: boolean): Promise<void> {
   console.log(removed.length ? `removed:\n  ${removed.join("\n  ")}` : "nothing to remove (already clean)");
 }
 
+// ── watch ─────────────────────────────────────────────────────────────────────
+
+/** Interleaved live tail of both guests + the dev worker until Ctrl-C. The [srv]
+ *  stream uses `--format pretty` — wrangler v4's `--format json` is multi-line
+ *  pretty-printed (useless to compact line-by-line); pretty is already human-readable. */
+async function watch(apiUrl: string): Promise<number> {
+  console.log(`rig watch — [A]/[B] container logs + [srv] wrangler tail (${apiUrl}). Ctrl-C to stop.`);
+  const handles: C.StreamHandle[] = [];
+  const emit = (prefix: string) => (line: string) => console.log(`${prefix} ${line}`);
+
+  handles.push(C.spawnStream(["container", "logs", "--follow", NAMES.a], { onStdout: emit("[A]"), onStderr: emit("[A]") }));
+  handles.push(C.spawnStream(["container", "logs", "--follow", NAMES.b], { onStdout: emit("[B]"), onStderr: emit("[B]") }));
+  handles.push(
+    C.spawnStream(["bunx", "wrangler", "tail", "rbox-dev-api", "--format", "pretty"], {
+      cwd: path.join(REPO_ROOT, "apps", "api"),
+      onStdout: emit("[srv]"),
+      onStderr: emit("[srv]"),
+    })
+  );
+
+  await new Promise<void>((resolve) => {
+    const stop = () => {
+      for (const h of handles) {
+        try {
+          h.kill("SIGTERM");
+        } catch {
+          /* best-effort */
+        }
+      }
+      resolve();
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+  });
+  return 0;
+}
+
 // ── doctor ──────────────────────────────────────────────────────────────────────
 
 interface Check {
@@ -215,11 +288,14 @@ interface Check {
   ok: boolean;
   detail: string;
   fix?: string;
+  /** Advisory checks are informational only — they never affect the exit code. */
+  advisory?: boolean;
 }
 
 async function doctor(apiUrl: string): Promise<number> {
   const checks: Check[] = [];
   const add = (label: string, ok: boolean, detail: string, fix?: string) => checks.push({ label, ok, detail, fix });
+  const advise = (label: string, ok: boolean, detail: string) => checks.push({ label, ok, detail, advisory: true });
 
   // macOS >= 26
   try {
@@ -264,10 +340,16 @@ async function doctor(apiUrl: string): Promise<number> {
     add("dev API reachable", false, `${apiUrl}/health → ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  // Advisory: the AE query pair (optional — absence only skips the server-metrics
+  // capture channel, never fails the run or doctor).
+  advise("CLOUDFLARE_ACCOUNT_ID (optional, AE query)", Boolean(process.env.CLOUDFLARE_ACCOUNT_ID), process.env.CLOUDFLARE_ACCOUNT_ID ? "present" : "absent");
+  advise("CLOUDFLARE_API_TOKEN (optional, AE query)", Boolean(process.env.CLOUDFLARE_API_TOKEN), process.env.CLOUDFLARE_API_TOKEN ? "present" : "absent");
+
   let anyFail = false;
   for (const c of checks) {
-    console.log(`${c.ok ? "✓" : "✗"} ${c.label}: ${c.detail}`);
-    if (!c.ok) {
+    const mark = c.advisory ? (c.ok ? "○" : "·") : c.ok ? "✓" : "✗";
+    console.log(`${mark} ${c.label}: ${c.detail}`);
+    if (!c.ok && !c.advisory) {
       anyFail = true;
       if (c.fix) console.log(`    fix: ${c.fix}`);
     }
@@ -301,6 +383,8 @@ async function main(): Promise<number> {
       }
       return runScenario(scenario, resolveConfig(process.env, flags, REPO_ROOT).apiUrl, flags);
     }
+    case "watch":
+      return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
     case "down":
       await down(flags.all === "true");
       return 0;
