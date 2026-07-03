@@ -15,6 +15,7 @@ import { spinner } from "./spinner.js";
 import { resolveAlias } from "./deprecations.js";
 import { isKnownTopLevel } from "./command-catalog.js";
 import { helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
+import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
@@ -208,7 +209,7 @@ async function main(): Promise<void> {
       // "true") used to silently fall through to the device-approval flow and
       // block ~10min looking hung — fail fast with a clear message instead.
       if (flags.bootstrap === "true") throw new Error("`--bootstrap` needs a secret value: `rbox login --bootstrap <secret>` (or just `rbox login` for device approval)");
-      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap, flags.plan);
+      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap, flags.plan, recoveryKitOptionsFromFlags(flags));
       break;
     }
     case "logout": {
@@ -483,7 +484,7 @@ async function main(): Promise<void> {
       break;
     }
     case "recover": {
-      await recoverCmd();
+      await recoverCmd(recoveryKitOptionsFromFlags(flags));
       break;
     }
     case "versions": {
@@ -513,9 +514,9 @@ async function main(): Promise<void> {
     }
     case "key": {
       if (positional[0] === "status") await keyStatus();
-      else if (positional[0] === "backup") await keyBackup();
+      else if (positional[0] === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
       else {
-        console.log("usage: rbox key <status | backup>");
+        console.log("usage: rbox key <status | backup> [--kit] [--kit-path <path>]");
         process.exitCode = 1;
       }
       break;

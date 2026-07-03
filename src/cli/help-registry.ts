@@ -57,10 +57,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "login",
     group: "GETTING STARTED",
     summary: "authorize this machine",
-    usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>]",
+    usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--bootstrap <secret>", desc: "create a new account from a bootstrap secret (genesis device)" },
       { flag: "--plan <solo|pro>", desc: "request a bootstrap plan; honored only by dev-gated servers" },
+      { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
+      { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
     ],
   },
   {
@@ -79,11 +81,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "init",
     group: "GETTING STARTED",
     summary: "headless/CI onboarding (the scripting form of setup)",
-    usage: "rbox init [--new | --workspace <id>] [--root <path>] [--no-interactive]",
+    usage: "rbox init [--new | --workspace <id>] [--root <path>] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
     flags: [
       { flag: "--new", desc: "create a new workspace" },
       { flag: "--workspace <id>", desc: "join an existing workspace" },
       { flag: "--root <path>", desc: "directory to track (default: cwd)" },
+      { flag: "--bootstrap <secret>", desc: "create a new account before initializing" },
+      { flag: "--kit", desc: "write the bootstrap recovery phrase to the default recovery kit path" },
+      { flag: "--kit-path <path>", desc: "write the bootstrap recovery phrase to a specific recovery kit file" },
       { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing" },
     ],
     hidden: true, // documented under `rbox help init`, not in the grouped screen
@@ -235,7 +240,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "recover",
     group: "DEVICES & ACCOUNT",
     summary: "re-enroll this machine from your recovery phrase",
-    usage: "rbox recover",
+    usage: "rbox recover [--kit] [--kit-path <path>]",
+    flags: [
+      { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
+      { flag: "--kit-path <path>", desc: "write the entered recovery phrase to a specific recovery kit file" },
+    ],
   },
   {
     name: "device",
@@ -253,7 +262,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key",
     group: "DEVICES & ACCOUNT",
     summary: "encryption status / re-show recovery phrase",
-    usage: "rbox key <status | backup>",
+    usage: "rbox key <status | backup> [--kit] [--kit-path <path>]",
+    flags: [
+      { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
+      { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
+    ],
   },
 
   // ── BILLING & MAINTENANCE ────────────────────────────────────────────────

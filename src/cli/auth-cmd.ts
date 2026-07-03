@@ -6,16 +6,32 @@ import { RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
+import {
+  defaultKitTargetDir,
+  displayPath,
+  readRecoveryKitRecord,
+  recoveryKitAction,
+  recoveryKitFileState,
+  writeRecoveryKit,
+  type RecoveryKitOptions,
+} from "./recovery-kit.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const NO_KIT: RecoveryKitOptions = { kit: false };
 
 /** Show the recovery phrase once with a forced acknowledgement (no escrow). The
  *  confirm re-asks until it's a deliberate yes — pressing enter (default No) won't
  *  slip past it — preserving the "you must acknowledge" beat without the literal
  *  "yes" typing of the old readline loop. */
-async function showRecoveryPhrase(phrase: string): Promise<void> {
+async function showRecoveryPhrase(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
+  if (!isInteractive() && recoveryKitAction(false, kitOpts) === "write-suppress-echo") {
+    await writeKitOrThrow(phrase, creds, kitOpts, true);
+    return;
+  }
+
   process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
   if (isInteractive()) {
+    if (await offerOrWriteKit(phrase, creds, kitOpts)) return;
     while (!(await promptConfirm({ message: "Have you saved this recovery phrase somewhere safe?", default: false }))) {
       process.stderr.write(`    Save it first — it's the ONLY way back in if you lose every device.\n`);
     }
@@ -33,7 +49,7 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
 }
 
 /** `rbox login [--bootstrap <secret>] [--plan <solo|pro>]` — obtain a per-device token. */
-export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string): Promise<void> {
+export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   const label = os.hostname();
   // Headless pairing: redeem a token from the env (never argv — it's a bearer).
   const envPair = process.env.RBOX_PAIR_TOKEN;
@@ -52,7 +68,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     const api = new RboxApi(remoteUrl, token, "", "");
     if (!(await api.getAccountKeys())) {
       const phrase = await bootstrapNewAccount(api, accountId, deviceId, { now: Date.now() });
-      await showRecoveryPhrase(phrase);
+      await showRecoveryPhrase(phrase, { accountId, deviceId }, kitOpts);
       console.log(`encryption enrolled — this workspace will be end-to-end encrypted.`);
     } else {
       console.error(`this account is already set up; to use it on THIS machine, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
@@ -201,7 +217,7 @@ export async function redeemPair(remoteUrl: string, pairToken: string): Promise<
 
 /** `rbox recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
-export async function recoverCmd(): Promise<void> {
+export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   let phrase: string;
   if (isInteractive()) {
     // No-echo — the phrase is key material (mask:false = matches the old no-echo).
@@ -214,8 +230,9 @@ export async function recoverCmd(): Promise<void> {
     phrase = Buffer.concat(chunks).toString("utf8").trim();
   }
   if (!phrase) throw new Error("no phrase entered");
-  const { deviceId } = await enrollViaRecovery(phrase, Date.now());
+  const { accountId, deviceId } = await enrollViaRecovery(phrase, Date.now());
   console.log(`recovered + enrolled this device: ${deviceId}`);
+  await offerRecoveryKitAfterRecover(phrase, { accountId, deviceId }, kitOpts);
 }
 
 /** `rbox key status` — local E2EE enrollment state for the current account. */
@@ -227,12 +244,14 @@ export async function keyStatus(): Promise<void> {
   if (!creds.accountId) return;
   const loaded = await loadDevice(creds.accountId);
   const enrolled = loaded && "secrets" in loaded;
+  const cachedRk = await loadRecoveryKey(creds.accountId);
   console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox recover`"}`);
-  console.log(`recovery phrase cached locally: ${(await loadRecoveryKey(creds.accountId)) ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
+  console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
+  console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));
 }
 
 /** `rbox key backup` — re-show the recovery phrase IF it was cached at setup (C9). */
-export async function keyBackup(): Promise<void> {
+export async function keyBackup(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   const creds = await loadCredentials();
   if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
   const rk = await loadRecoveryKey(creds.accountId);
@@ -242,7 +261,7 @@ export async function keyBackup(): Promise<void> {
     return;
   }
   const { rkToPhrase } = await import("../engine/e2ee/index.js");
-  await showRecoveryPhrase(await rkToPhrase(rk));
+  await showRecoveryPhrase(await rkToPhrase(rk), creds, kitOpts);
 }
 
 export async function revokeDevice(deviceId: string): Promise<void> {
@@ -250,4 +269,71 @@ export async function revokeDevice(deviceId: string): Promise<void> {
   const res = await postJson(`${creds.remoteUrl}/v1/auth/devices/${deviceId}/revoke`, {}, creds.token);
   if (!res.ok) throw new Error(`revoke failed: ${res.status}`);
   console.log(`revoked ${deviceId}`);
+}
+
+async function offerOrWriteKit(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions): Promise<boolean> {
+  const action = recoveryKitAction(true, kitOpts);
+  if (action === "write") return writeKitOrWarn(phrase, creds, kitOpts, false);
+  if (action !== "offer") return false;
+
+  const target = displayPath(await defaultKitTargetDir());
+  const save = await promptConfirm({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`, default: true });
+  return save ? writeKitOrWarn(phrase, creds, kitOpts, false) : false;
+}
+
+async function offerRecoveryKitAfterRecover(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions): Promise<void> {
+  const action = recoveryKitAction(isInteractive(), kitOpts);
+  if (action === "none") return;
+  if (action === "write-suppress-echo") {
+    await writeKitOrThrow(phrase, creds, kitOpts, true);
+    return;
+  }
+  if (action === "write") {
+    await writeKitOrWarn(phrase, creds, kitOpts, false);
+    return;
+  }
+  const target = displayPath(await defaultKitTargetDir());
+  if (await promptConfirm({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`, default: true })) {
+    await writeKitOrWarn(phrase, creds, kitOpts, false);
+  }
+}
+
+async function writeKitOrWarn(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, suppressEcho: boolean): Promise<boolean> {
+  try {
+    await writeKitSuccess(phrase, creds, kitOpts, suppressEcho);
+    return true;
+  } catch (e) {
+    process.stderr.write(`  ! recovery kit write failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    return false;
+  }
+}
+
+async function writeKitOrThrow(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, suppressEcho: boolean): Promise<void> {
+  try {
+    await writeKitSuccess(phrase, creds, kitOpts, suppressEcho);
+  } catch (e) {
+    throw new Error(`recovery kit write failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+async function writeKitSuccess(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, suppressEcho: boolean): Promise<void> {
+  const written = await writeRecoveryKit(phrase, creds, kitOpts.kitPath);
+  const shown = displayPath(written.path);
+  process.stderr.write(suppressEcho ? `recovery phrase written to ${shown} — not echoed (--kit)\n` : `  ✓ recovery kit written: ${shown}\n`);
+  if (written.recordError) process.stderr.write(`  ! recovery kit status record failed: ${written.recordError.message}\n`);
+}
+
+async function recoveryKitStatusLine(accountId: string, hasCachedRk: boolean): Promise<string> {
+  const record = await readRecoveryKitRecord(accountId);
+  if (!record) {
+    return hasCachedRk
+      ? "recovery kit: none recorded — run `rbox key backup --kit`"
+      : "recovery kit: none recorded — no cached phrase on this device; use the copy you saved at setup, or `rbox recover` (which will offer a kit)";
+  }
+  const written = record.writtenAt.slice(0, 10);
+  const shown = displayPath(record.path);
+  const state = await recoveryKitFileState(record);
+  if (state === "present") return `recovery kit: ${shown} (written ${written})`;
+  if (state === "missing") return `recovery kit: ${shown} (file missing — moved or deleted; re-run rbox key backup --kit)`;
+  return `recovery kit: ${shown} (file present but content unrecognized — replaced?)`;
 }

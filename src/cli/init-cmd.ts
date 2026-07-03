@@ -22,6 +22,7 @@ import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
 import { promptSelect, promptInput, promptConfirm } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
+import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -106,18 +107,18 @@ export async function runInit(
     process.exitCode = 2;
     return undefined;
   }
-  return executeInitPlan(plan, gathered.bootstrap, { summary: opts.summary !== false });
+  return executeInitPlan(plan, gathered.bootstrap, { summary: opts.summary !== false, recoveryKit: recoveryKitOptionsFromFlags(gathered) });
 }
 
 async function executeInitPlan(
   plan: InitPlan,
   bootstrapSecret: string | undefined,
-  opts: { summary: boolean }
+  opts: { summary: boolean; recoveryKit: RecoveryKitOptions }
 ): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
   if (plan.auth === "bootstrap-login") {
-    await login(plan.remoteUrl, bootstrapSecret);
+    await login(plan.remoteUrl, bootstrapSecret, undefined, opts.recoveryKit);
   } else if (plan.auth === "need-interactive-login") {
     await login(plan.remoteUrl, undefined);
   }
