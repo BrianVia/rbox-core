@@ -5,7 +5,7 @@ import { healthLine, lastSyncLines, progressLabel, trashLine } from "./status-vi
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
-import { DEFAULT_LOG_LINES, isDaemonRunning, logsDaemon, readDaemonBinding, startDaemon, stopDaemon } from "./daemon-control.js";
+import { DEFAULT_LOG_LINES, daemonBindingStatus, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -66,7 +66,7 @@ async function fetchRemoteSequence(
 }
 
 // `rbox deps <sub>` group dispatch — commented out (design 51): the whole `deps`
-// CLI surface (install/list/check/drift/notify, plus the hydrate/detect/doctor
+// CLI surface (install/list/check/drift/notify, plus the old hydrate/detect
 // aliases in deprecations.ts and their entries in help-registry.ts) is disabled
 // for now. The underlying implementations (hydrate-cmd.ts, deps-drift.ts,
 // deps-notify.ts) are untouched, so re-enabling is: uncomment this function +
@@ -347,9 +347,9 @@ async function main(): Promise<void> {
       // this one (codex R4): its liveness must not read "running", and its activity
       // sidecar (halt, trail, progress) describes the old binding — suppress both.
       // Unknown binding (pre-binding daemon) is treated as current: can't tell ≠ stale.
-      const alive = isDaemonRunning(root);
-      const bound = alive.running ? readDaemonBinding(root) : undefined;
-      const daemonStale = alive.running && bound !== undefined && bound !== cfg.remoteWorkspaceId;
+      const daemonBinding = daemonBindingStatus(root, cfg.remoteWorkspaceId);
+      const alive = daemonBinding.alive;
+      const daemonStale = daemonBinding.stale;
       const bg = { running: alive.running && !daemonStale, pid: alive.pid };
       // The daemon's activity sidecar, the remote-head probe, and the git-divergence
       // walk are independent best-effort reads — concurrent so status stays snappy.
@@ -431,6 +431,15 @@ async function main(): Promise<void> {
       // still shows all of the local workspace/sync state above.
       const { fetchAccountSummary, formatAccountSummary } = await import("./account-cmd.js");
       for (const line of formatAccountSummary(await fetchAccountSummary())) console.log(line);
+      break;
+    }
+    case "doctor": {
+      const report = flags.report === "true";
+      const diagnostics = flags.diagnostics === "true";
+      const { doctorCmd, refuseDisabledDiagnosticsUpload } = await import("./doctor-cmd.js");
+      if (refuseDisabledDiagnosticsUpload({ report, diagnostics })) break;
+      const root = await resolveRoot(undefined);
+      await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics });
       break;
     }
     case "start": {

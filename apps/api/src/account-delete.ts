@@ -4,6 +4,7 @@ import { ctEqual, json, logErr } from "./util.js";
 import { dbFor, dirDb } from "./db.js";
 import { purgeStripeForAccount } from "./stripe.js";
 import { deleteClerkUser } from "./clerk.js";
+import { purgeDiagnosticR2 } from "./diagnostics.js";
 
 /**
  * Self-serve account + data deletion (design 37). `DELETE /v1/account` is OWNER-ONLY and
@@ -30,6 +31,7 @@ const LEASE_MS = 60 * 1000; // a 'purging' claim older than this is a dead lease
 const SHA_BATCH = 1000; // blob_refs processed per drive chunk (pure D1: delete refs + condemn orphans)
 const UP_BATCH = 100; // in-flight uploads (MPU abort + staging delete) per chunk
 const WS_BATCH = 100; // workspaces (DO purge) per chunk
+const DIAG_BATCH = 100; // plaintext support diagnostics (R2 delete + D1 handle) per chunk
 const IN_CHUNK = 80; // SQLite bound-variable safety for `... IN (?,?,…)`
 // No-queue cron drain cap per account per tick (subrequest budget). With ACCOUNT_DELETE_Q a
 // large purge continues promptly across queue messages; WITHOUT it the daily cron resumes the
@@ -56,6 +58,9 @@ export interface PurgeDeps {
    *  false on ANY transient R2 failure → the caller keeps the `uploads` D1 handle and retries.
    *  Injected so the fail-closed behavior is testable; production uses `purgeUploadR2`. */
   purgeUpload: (env: Env, stagingKey: string, uploadId: string) => Promise<boolean>;
+  /** Delete one plaintext diagnostics report object from R2. Returns false on transient R2
+   *  failure so the D1 row stays as the retry handle. */
+  purgeDiagnostic?: (env: Env, r2Key: string) => Promise<boolean>;
 }
 
 /** True ONLY for a CONCRETE "this multipart upload is already gone" signal — R2 `NoSuchUpload`
@@ -104,7 +109,7 @@ export async function purgeWorkspaceDO(env: Env, ws: string, proj: string): Prom
   return res.ok;
 }
 
-export const REAL_PURGE_DEPS: PurgeDeps = { purgeStripe: purgeStripeForAccount, deleteClerk: deleteClerkUser, purgeWorkspace: purgeWorkspaceDO, purgeUpload: purgeUploadR2 };
+export const REAL_PURGE_DEPS: PurgeDeps = { purgeStripe: purgeStripeForAccount, deleteClerk: deleteClerkUser, purgeWorkspace: purgeWorkspaceDO, purgeUpload: purgeUploadR2, purgeDiagnostic: purgeDiagnosticR2 };
 
 const chunked = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];
@@ -275,7 +280,24 @@ export async function driveAccountDeletion(env: Env, accountId: string, nowMs: n
   const moreUps = await data.prepare("SELECT 1 FROM uploads WHERE account_id = ? LIMIT 1").bind(accountId).first();
   if (moreRefs || moreUps) return releaseAndProgress(env, accountId, leaseToken);
 
-  // 4. Durable-Object purge chunk: wipe each workspace's authoritative commit log, then
+  // 4. Plaintext diagnostics reports: delete the R2 object first, then drop its D1 row.
+  //    A transient R2 failure keeps the row as the retry handle and releases the lease for
+  //    the next chunk/backstop, matching the upload purge fail-closed pattern above.
+  const diagRows = await data.prepare("SELECT id, r2_key FROM diagnostics_reports WHERE account_id = ? LIMIT ?").bind(accountId, DIAG_BATCH).all<{ id: string; r2_key: string }>();
+  let diagDeleteFailed = false;
+  for (const d of diagRows.results ?? []) {
+    const purgeDiagnostic = deps.purgeDiagnostic ?? purgeDiagnosticR2;
+    if (!(await purgeDiagnostic(env, d.r2_key))) {
+      diagDeleteFailed = true;
+      continue;
+    }
+    await data.prepare("DELETE FROM diagnostics_reports WHERE id = ? AND account_id = ?").bind(d.id, accountId).run();
+  }
+  if ((diagRows.results?.length ?? 0) === DIAG_BATCH || diagDeleteFailed) return releaseAndProgress(env, accountId, leaseToken);
+  const moreDiag = await data.prepare("SELECT 1 FROM diagnostics_reports WHERE account_id = ? LIMIT 1").bind(accountId).first();
+  if (moreDiag) return releaseAndProgress(env, accountId, leaseToken);
+
+  // 5. Durable-Object purge chunk: wipe each workspace's authoritative commit log, then
   //    drop its D1 mirror rows so a retry doesn't re-purge it. workspaces/commits/manifests
   //    are account-data plane.
   const wsRows = await data.prepare("SELECT workspace_id, project_id FROM workspaces WHERE account_id = ? LIMIT ?").bind(accountId, WS_BATCH).all<{ workspace_id: string; project_id: string }>();
@@ -294,7 +316,7 @@ export async function driveAccountDeletion(env: Env, accountId: string, nowMs: n
   const moreWs = await data.prepare("SELECT 1 FROM workspaces WHERE account_id = ? LIMIT 1").bind(accountId).first();
   if (moreWs) return releaseAndProgress(env, accountId, leaseToken);
 
-  // 5. D1 finish — every remaining account-scoped table in one atomic batch (accounts last).
+  // 6. D1 finish — every remaining account-scoped table in one atomic batch (accounts last).
   await finishD1(env, accountId, clerkIds, nowMs);
   return "done";
 }
@@ -363,6 +385,7 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], nowMs: 
     data.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM uploads WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM workspaces WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM diagnostics_reports WHERE account_id = ?").bind(a),
     // The account row LAST, then close the ledger. (data)
     data.prepare("DELETE FROM accounts WHERE id = ?").bind(a),
     data.prepare("UPDATE account_deletions SET status = 'done', last_attempt_at = ? WHERE account_id = ?").bind(nowMs, a),

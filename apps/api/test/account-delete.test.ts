@@ -186,12 +186,15 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
     const mpu = await env.rbox_dev_blobs.createMultipartUpload(stagingKey);
     const upId = mpu.uploadId;
     await env.rbox_dev_blobs.put(stagingKey, new Uint8Array(8));
+    const diagKey = `diagnostics/${A.accountId}/diag_delete_me.json`;
+    await env.rbox_dev_blobs.put(diagKey, JSON.stringify({ report: true }));
     await db().batch([
       db().prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES (?, 'root', ?, ?)").bind("ws_a", A.accountId, now),
       db().prepare("INSERT INTO commits (workspace_id, project_id, sequence, commit_hash, body, sig) VALUES ('ws_a','root',1,'h','b','s')"),
       db().prepare("INSERT INTO manifests (workspace_id, project_id, sequence, manifest_blob_sha) VALUES ('ws_a','root',1,?)").bind(shaOrphan),
       db().prepare("INSERT INTO uploads (upload_id, sha256, staging_key, part_size, total_parts, size, created_at, account_id) VALUES (?, ?, ?, 8, 1, 8, ?, ?)").bind(upId, shaOrphan, stagingKey, now, A.accountId),
       db().prepare("INSERT INTO upload_parts (upload_id, part_number, etag, size) VALUES (?, 1, 'e', 8)").bind(upId),
+      db().prepare("INSERT INTO diagnostics_reports (id, account_id, device_id, created_at, expires_at, r2_key, status, bytes, sha256) VALUES ('diag_del', ?, ?, ?, ?, ?, 'stored', 15, ?)").bind(A.accountId, A.deviceId, now, now + 30 * 24 * 60 * 60 * 1000, diagKey, sha("diag")),
       db().prepare("INSERT INTO device_notifications (token_hash, device_id, account_id, event, created_at) VALUES (?, ?, ?, 'pair', ?)").bind(`th_${A.accountId}`, A.deviceId, A.accountId, now),
       db().prepare("INSERT INTO notification_deliveries (token_hash, recipient_user_id, recipient_clerk_id, idempotency_key) VALUES (?, ?, ?, 'ik')").bind(`th_${A.accountId}`, A.ownerUserId, clerkA),
     ]);
@@ -211,6 +214,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       "device_auth WHERE account_id", "pairing_tokens WHERE account_id", "uploads WHERE account_id",
       "workspaces WHERE account_id", "clerk_users WHERE account_id", "device_notifications WHERE account_id",
       "account_notify_prefs WHERE account_id", "audit_log WHERE account_id", "blob_ref_candidates WHERE account_id",
+      "diagnostics_reports WHERE account_id",
     ];
     for (const t of tablesByAccount) {
       expect(await count(`SELECT COUNT(*) AS n FROM ${t} = ?`, A.accountId), `${t} should be empty`).toBe(0);
@@ -229,6 +233,8 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
 
     // Per-upload staging object: deleted FAIL-CLOSED (R2 confirmed) before the uploads row.
     expect(await env.rbox_dev_blobs.get(`staging/${shaOrphan}/x`)).toBeNull();
+    // Plaintext diagnostics object: deleted before its D1 row is allowed to disappear.
+    expect(await env.rbox_dev_blobs.get(diagKey)).toBeNull();
 
     // §4f race-safety (the CRITICAL fix): account deletion CONDEMNS now-orphaned canonical shas
     // to the existing reachability-GC pipeline — it does NOT inline-delete them (that would race a
@@ -361,6 +367,30 @@ describe("uploads — fail-closed R2 cleanup (finding A)", () => {
     await env.rbox_dev_blobs.put(key, new Uint8Array(4));
     expect(await purgeUploadR2(env, key, mpu.uploadId)).toBe(true); // abort resolves, staging deleted
     expect(await env.rbox_dev_blobs.get(key)).toBeNull();
+  });
+});
+
+describe("diagnostics purge — fail-closed R2 cleanup", () => {
+  test("a failed diagnostics R2 delete keeps the D1 row for retry", async () => {
+    const a = await bootstrap("diag-failclosed");
+    const now = Date.now();
+    const diagKey = `diagnostics/${a.accountId}/diag_retry.json`;
+    await env.rbox_dev_blobs.put(diagKey, JSON.stringify({ retry: true }));
+    await db()
+      .prepare("INSERT INTO diagnostics_reports (id, account_id, device_id, created_at, expires_at, r2_key, status, bytes, sha256) VALUES ('diag_retry', ?, ?, ?, ?, ?, 'stored', 14, ?)")
+      .bind(a.accountId, a.deviceId, now, now + 30 * 24 * 60 * 60 * 1000, diagKey, sha("diag_retry"))
+      .run();
+    await deleteAccount(env, ownerPrincipal(a.accountId, a.ownerUserId, a.deviceId), delReq(a.accountId), now);
+    await db().prepare("UPDATE account_deletions SET purge_after = ? WHERE account_id = ?").bind(now - 1000, a.accountId).run();
+
+    const fail: PurgeDeps = { ...OK_DEPS, purgeDiagnostic: async () => false };
+    expect(await driveAccountDeletion(env, a.accountId, now, fail)).toBe("progress");
+    expect(await count("SELECT COUNT(*) AS n FROM diagnostics_reports WHERE id = 'diag_retry'")).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM accounts WHERE id = ?", a.accountId)).toBe(1);
+    expect(await env.rbox_dev_blobs.get(diagKey)).not.toBeNull();
+
+    expect(await driveAccountDeletion(env, a.accountId, now, OK_DEPS)).toBe("done");
+    expect(await count("SELECT COUNT(*) AS n FROM diagnostics_reports WHERE id = 'diag_retry'")).toBe(0);
   });
 });
 

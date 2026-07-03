@@ -10,6 +10,8 @@
 
 Both deploy workflows need a repo secret **`CLOUDFLARE_DEPLOY_TOKEN`** scoped to **Workers Scripts:Edit + Cloudflare Pages:Edit** (+ Account:Read) for the account. Keep it DISTINCT from release.yml's R2-only `CLOUDFLARE_API_TOKEN` (least privilege). The account id is hard-coded in the workflows (not a secret).
 
+**Support diagnostics:** `rbox doctor` / opt-in report upload (`POST /v1/diagnostics`), incl. how to retrieve reports from D1+R2 — see `docs/diagnostics.md`.
+
 **Prefer dev, not prod, while developing:**
 
 - Deploy worker changes to **dev first** and verify there before they reach prod: `cd apps/api && npx wrangler deploy` → `rbox-dev-api`. Remember a merge to `main` ships prod automatically.

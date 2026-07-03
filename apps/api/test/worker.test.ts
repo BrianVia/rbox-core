@@ -947,7 +947,9 @@ describe("worker integration (real DO + D1 + R2)", () => {
       if (cols.some((c) => c.name === "account_id")) accountScoped.push(name);
     }
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
-    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications"];
+    // diagnostics_reports blocks fail-closed: only DEVICE principals can create reports, so a
+    // "web shell" holding one is not the empty shell the destructive reclaim assumes.
+    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports"];
     const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates"]; // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient GC marker
     // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
     // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
@@ -1654,6 +1656,7 @@ describe("routeTemplate privacy masking", () => {
     // ...but real static routes that share a word with a slot are NOT clobbered:
     ["/v1/account/usage", "/v1/account/usage"],
     ["/v1/blobs/check", "/v1/blobs/check"],
+    ["/v1/diagnostics", "/v1/diagnostics"],
     // Allowlist guarantee: an entirely unknown / user-supplied segment is masked,
     // never echoed — this is the case a blocklist would have leaked.
     ["/v1/totally-made-up/../etc/passwd", "/v1/:x/:x/:x/:x"],

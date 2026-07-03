@@ -21,6 +21,7 @@ import type { AccountDeleteMessage, DeviceNotifyMessage, Env } from "./env.js";
 import { authenticate } from "./auth.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
+import { sweepDiagnostics } from "./diagnostics.js";
 import { json, logErr } from "./util.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
@@ -34,6 +35,7 @@ import { webRoutes } from "./routes/web.js";
 import { accountLinkPublicRoutes, accountRoutes } from "./routes/account.js";
 import { keysRoutes } from "./routes/keys.js";
 import { blobsRoutes } from "./routes/blobs.js";
+import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
@@ -114,6 +116,13 @@ export default {
       await sweepNotifications(env);
     } catch (e) {
       logErr("scheduled_notify_sweep_failed", e); // no raw message (touches device/account metadata)
+    }
+    try {
+      // Diagnostics reports are explicitly plaintext support bundles. Keep the R2/D1
+      // TTL tight and bounded per tick; failed item deletes leave their D1 handle for retry.
+      await sweepDiagnostics(env);
+    } catch (e) {
+      logErr("scheduled_diagnostics_sweep_failed", e);
     }
     try {
       // Account-deletion backstop (design 37 §7): hard-purge every account whose grace
@@ -212,6 +221,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if ((r = await accountRoutes(ctx, p))) return r;
   if ((r = await keysRoutes(ctx, p))) return r;
   if ((r = await blobsRoutes(ctx, p))) return r;
+  if ((r = await diagnosticsRoutes(ctx, p))) return r;
   if ((r = await syncRoutes(ctx, p))) return r;
 
   return jsonResponse({ error: "not_found" }, 404);
@@ -235,7 +245,7 @@ const ROUTE_VOCAB = new Set([
   "v1", "health", "install.sh", "version", "version.sig", "bin",
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
-  "account", "usage", "admin", "gc", "plan", "overview", "workspaces",
+  "account", "usage", "admin", "gc", "plan", "overview", "workspaces", "diagnostics",
   "keys", "roster", "admit", "keystate", "workspace",
   "blobs", "check", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",

@@ -7,11 +7,11 @@ test("simple renames forward to the canonical command and warn with the replacem
     positional: ["~/code/app"],
     notice: "note: 'rbox link' is now 'rbox track'.",
   });
-  // hydrate/detect/doctor assertions removed along with the `deps` group itself
-  // (design 51) — resolveAlias no longer rewrites them; see the test below.
+  // hydrate/detect assertions removed along with the `deps` group itself (design 51).
+  // `doctor` is a real support command now, so resolveAlias must not rewrite it.
 });
 
-test("hydrate/detect/doctor are no longer rewritten (deps group disabled, design 51)", () => {
+test("hydrate/detect deps aliases stay disabled and doctor is not rewritten", () => {
   expect(resolveAlias("hydrate", ["/p"])).toBeNull();
   expect(resolveAlias("detect", [])).toBeNull();
   expect(resolveAlias("doctor", [])).toBeNull();
