@@ -108,6 +108,23 @@
 	}
 </script>
 
+{#snippet deviceAction(d: Device)}
+	<!-- Revoke is offered only for OTHER devices. The current session signs out
+	     via the account menu, never a self-revoke the SPA would re-mint. -->
+	{#if !d.isCurrent}
+		<Button
+			variant="ghost"
+			size="sm"
+			class="shrink-0 text-muted-foreground hover:text-destructive max-md:min-h-11"
+			onclick={() => (confirmId = d.deviceId)}
+		>
+			Revoke
+		</Button>
+	{:else}
+		<span class="shrink-0 text-xs text-muted-foreground">Sign out from the menu</span>
+	{/if}
+{/snippet}
+
 <PageHeader
 	title="Devices & workspaces"
 	description="The machines connected to your account and the workspaces they sync."
@@ -177,14 +194,16 @@
 							</div>
 						</div>
 					{:else}
-						<div class="flex items-center justify-between gap-4">
-							<div class="flex min-w-0 items-center gap-3">
+						<div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+							<div class="flex min-w-0 items-start gap-3 sm:items-center">
 								<span class="grid size-9 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
 									<MonitorIcon class="size-4" />
 								</span>
-								<div class="min-w-0">
-									<div class="flex items-center gap-2">
-										<span class="truncate text-sm font-medium">{d.label ?? d.deviceId}</span>
+								<div class="min-w-0 max-sm:flex-1">
+									<div class="flex items-center gap-x-2 gap-y-1 max-sm:flex-wrap">
+										<span class="truncate text-sm font-medium max-sm:min-w-0 max-sm:basis-full">
+											{d.label ?? d.deviceId}
+										</span>
 										<Badge variant="outline" class="px-1.5 py-0 text-[10px] uppercase">
 											{d.kind === 'cli' ? 'CLI' : 'Browser'}
 										</Badge>
@@ -195,22 +214,14 @@
 									<div class="mt-0.5 text-xs text-muted-foreground">
 										Last seen {relativeTime(d.lastSeenAt)}
 									</div>
+									<div class="mt-2 flex sm:hidden">
+										{@render deviceAction(d)}
+									</div>
 								</div>
 							</div>
-							<!-- Revoke is offered only for OTHER devices. The current session signs out
-							     via the account menu, never a self-revoke the SPA would re-mint. -->
-							{#if !d.isCurrent}
-								<Button
-									variant="ghost"
-									size="sm"
-									class="shrink-0 text-muted-foreground hover:text-destructive"
-									onclick={() => (confirmId = d.deviceId)}
-								>
-									Revoke
-								</Button>
-							{:else}
-								<span class="shrink-0 text-xs text-muted-foreground">Sign out from the menu</span>
-							{/if}
+							<div class="hidden shrink-0 sm:block">
+								{@render deviceAction(d)}
+							</div>
 						</div>
 					{/if}
 				</div>
