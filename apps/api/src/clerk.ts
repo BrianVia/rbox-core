@@ -129,7 +129,10 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // be raced/bypassed by a "loser" that skips it. FAIL CLOSED: without the Clerk
     // secret we can't verify, so we refuse to provision (no unverified accounts).
     if (!env.CLERK_SECRET_KEY) return json({ error: "web_auth_not_configured" }, 501);
-    if (!(await clerkEmailVerified(env, sub))) return json({ error: "email_unverified" }, 403);
+    // One Clerk fetch serves both the fail-closed email-verified GATE and the rich
+    // signup ping (email + sign-in method) below — no second round-trip.
+    const clerkUser = await fetchClerkUser(env, sub);
+    if (!clerkUser.verified) return json({ error: "email_unverified" }, 403);
     // Claim the mapping (INSERT OR IGNORE = the single gate); only the won
     // candidate ids ever materialize, so a lost race never orphans an account.
     const candAcct = randomId("acct", 8);
@@ -162,7 +165,16 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // first-logins all resolve to the SAME won account_id, so only the one whose
     // INSERT OR IGNORE materialized it (changes > 0) pings — the losers no-op + skip,
     // so a race doesn't emit duplicate "new account" alerts.
-    if ((acctIns.meta.changes ?? 0) > 0) await pingNewAccount(env, { accountId: map.account_id, origin: "web" });
+    // Rich fields are best-effort: a degraded Clerk fetch (email/method null) just omits
+    // those segments. New web accounts are created 'free' (see the accounts INSERT above).
+    if ((acctIns.meta.changes ?? 0) > 0)
+      await pingNewAccount(env, {
+        accountId: map.account_id,
+        origin: "web",
+        email: clerkUser.email,
+        signInMethod: clerkUser.signInMethod,
+        plan: "free",
+      });
   }
 
   // Refresh the cached owner email for new-device-alert recipient resolution (design 16
@@ -206,14 +218,40 @@ export async function deleteClerkUser(env: Env, sub: string): Promise<boolean> {
   }
 }
 
-async function clerkEmailVerified(env: Env, sub: string): Promise<boolean> {
+/** The Clerk-user facts needed at provisioning time. `verified` is authoritative for the
+ *  fail-closed gate; `email`/`signInMethod` are best-effort ping decoration (null when a
+ *  degraded fetch can't determine them — never blocks provisioning). */
+interface ClerkUserFacts {
+  verified: boolean;
+  email: string | null;
+  signInMethod: string | null; // "github" | "google" | "email" (external-account provider, oauth_ stripped)
+}
+
+/** Clerk `external_accounts[].provider` → a short sign-in method label. No external
+ *  account ⇒ "email" (email/password or email-code). Unknown providers pass through
+ *  with the `oauth_` prefix stripped (honest over guessing). */
+function signInMethodOf(u: { external_accounts?: Array<{ provider?: string }> }): string {
+  const provider = u.external_accounts?.[0]?.provider;
+  if (typeof provider === "string" && provider.length) return provider.replace(/^oauth_/, "");
+  return "email";
+}
+
+/** Fetch the Clerk user once for the provisioning gate + signup ping. FAIL CLOSED on the
+ *  gate (any error ⇒ verified:false ⇒ provisioning refused); the ping fields degrade to
+ *  null on the same failures rather than throwing. */
+async function fetchClerkUser(env: Env, sub: string): Promise<ClerkUserFacts> {
   try {
     const res = await fetch(`https://api.clerk.com/v1/users/${sub}`, { headers: { authorization: `Bearer ${env.CLERK_SECRET_KEY}` } });
-    if (!res.ok) return false;
-    const u = (await res.json()) as { email_addresses?: Array<{ id: string; verification?: { status?: string } }>; primary_email_address_id?: string };
+    if (!res.ok) return { verified: false, email: null, signInMethod: null };
+    const u = (await res.json()) as {
+      email_addresses?: Array<{ id: string; email_address?: string; verification?: { status?: string } }>;
+      primary_email_address_id?: string;
+      external_accounts?: Array<{ provider?: string }>;
+    };
     const primary = u.email_addresses?.find((e) => e.id === u.primary_email_address_id) ?? u.email_addresses?.[0];
-    return primary?.verification?.status === "verified";
+    const verified = primary?.verification?.status === "verified";
+    return { verified, email: (verified && primary?.email_address) || null, signInMethod: signInMethodOf(u) };
   } catch {
-    return false; // fail closed on provisioning
+    return { verified: false, email: null, signInMethod: null }; // fail closed on provisioning
   }
 }

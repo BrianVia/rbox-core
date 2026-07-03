@@ -16,6 +16,7 @@ export default defineWorkersConfig(async () => {
           wrangler: { configPath: "./wrangler.jsonc" },
           miniflare: {
             bindings: {
+              RBOX_ENV: "dev",
               RBOX_BOOTSTRAP_SECRET: "test-bootstrap-secret",
               RBOX_PLATFORM_SECRET: "test-platform-secret",
               // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
