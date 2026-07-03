@@ -26,3 +26,6 @@ TEST_CREDENTIALS
 .agents/
 .claude/skills/
 bench-results/
+
+# rig test-bench run artifacts (design 56) — logs, reports, cached image hash
+scripts/rig/runs/
