@@ -167,7 +167,7 @@
 				{#if deleteError}
 					<Callout class="mb-3">{deleteError}</Callout>
 				{/if}
-				<Label for="del-confirm" class="text-sm font-normal">
+				<Label for="del-confirm" class="block text-sm leading-relaxed font-normal">
 					Type your account {ownerEmail ? 'email' : 'id'}
 					<code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{ownerEmail || accountId}</code>
 					to confirm
@@ -180,7 +180,7 @@
 					placeholder={ownerEmail || accountId}
 					disabled={deleteBusy}
 				/>
-				<div class="mt-3 flex gap-2">
+				<div class="mt-3 flex flex-wrap gap-2">
 					<Button variant="destructive" disabled={!deleteArmed || deleteBusy} onclick={doDelete}>
 						{deleteBusy ? 'Deleting…' : 'Permanently delete this account'}
 					</Button>

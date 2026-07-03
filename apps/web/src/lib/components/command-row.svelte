@@ -30,11 +30,19 @@
 	<code class="min-w-0 flex-1 overflow-x-auto rounded-md border border-border bg-muted/50 px-3 py-2 font-mono text-xs whitespace-nowrap">
 		{command}
 	</code>
-	<Button variant="outline" size="sm" class="shrink-0" onclick={copy}>
+	<Button
+		variant="outline"
+		size="sm"
+		class="shrink-0 max-md:min-h-11 max-sm:min-w-11 max-sm:px-0"
+		aria-label={copied ? 'Copied' : 'Copy'}
+		onclick={copy}
+	>
 		{#if copied}
-			<CheckIcon class="size-3.5 text-success" /> Copied
+			<CheckIcon class="size-3.5 text-success" />
+			<span class="max-sm:hidden">Copied</span>
 		{:else}
-			<CopyIcon class="size-3.5" /> Copy
+			<CopyIcon class="size-3.5" />
+			<span class="max-sm:hidden">Copy</span>
 		{/if}
 	</Button>
 </div>

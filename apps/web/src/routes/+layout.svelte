@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { getClerk } from '$lib/clerk';
@@ -20,6 +20,7 @@
 	let { children } = $props();
 	let ready = $state(false);
 	let fatal = $state('');
+	let mobileNavEl: HTMLElement | null = $state(null);
 
 	onMount(async () => {
 		try {
@@ -52,15 +53,36 @@
 	});
 
 	const nav = [
-		{ href: '/dashboard', label: 'Overview', icon: LayoutDashboardIcon },
-		{ href: '/devices', label: 'Devices & workspaces', icon: HardDriveIcon },
-		{ href: '/settings', label: 'Settings', icon: SettingsIcon }
+		{ href: '/dashboard', label: 'Overview', shortLabel: 'Overview', icon: LayoutDashboardIcon },
+		{
+			href: '/devices',
+			label: 'Devices & workspaces',
+			shortLabel: 'Devices',
+			icon: HardDriveIcon
+		},
+		{ href: '/settings', label: 'Settings', shortLabel: 'Settings', icon: SettingsIcon }
 	];
 	// Active = exact path match. Nested/transient routes (billing/success, link)
 	// aren't in the nav, so they simply light nothing — no prefix logic needed.
 	const isActive = (href: string) => page.url.pathname === href;
 
 	const email = $derived(authState.clerk?.user?.primaryEmailAddress?.emailAddress ?? '');
+
+	function scrollActiveMobileNavIntoView() {
+		if (!mobileNavEl || mobileNavEl.scrollWidth <= mobileNavEl.clientWidth) return;
+		const activeLink = mobileNavEl.querySelector<HTMLAnchorElement>('a[aria-current="page"]');
+		activeLink?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+	}
+
+	$effect(() => {
+		const pathname = page.url.pathname;
+		if (!ready || isAuth || !authState.signedIn) return;
+
+		tick().then(() => {
+			if (page.url.pathname !== pathname) return;
+			scrollActiveMobileNavIntoView();
+		});
+	});
 
 	async function signOut() {
 		try {
@@ -84,7 +106,7 @@
 	</div>
 {/snippet}
 
-{#snippet navLinks()}
+{#snippet navLinks(variant: 'sidebar' | 'mobile')}
 	{#each nav as item (item.href)}
 		{@const Icon = item.icon}
 		{@const active = isActive(item.href)}
@@ -92,14 +114,19 @@
 			href={item.href}
 			aria-current={active ? 'page' : undefined}
 			class={cn(
-				'flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+				'flex items-center rounded-md text-sm font-medium transition-colors',
+				variant === 'mobile'
+					? 'min-h-11 shrink-0 gap-1.5 px-2 py-2'
+					: 'gap-2.5 px-3 py-2',
 				active
 					? 'bg-sidebar-accent text-sidebar-accent-foreground'
 					: 'text-sidebar-foreground/80 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'
 			)}
 		>
 			<Icon class="size-4 shrink-0 opacity-80" />
-			<span class="truncate">{item.label}</span>
+			<span class={variant === 'mobile' ? 'whitespace-nowrap' : 'truncate'}>
+				{variant === 'mobile' ? item.shortLabel : item.label}
+			</span>
 		</a>
 	{/each}
 {/snippet}
@@ -112,7 +139,7 @@
 				'focus-visible:ring-2 focus-visible:ring-ring',
 				trigger === 'sidebar'
 					? 'w-full p-2 hover:bg-sidebar-accent/60'
-					: 'p-1.5 hover:bg-accent'
+					: 'min-h-11 min-w-11 justify-center p-1.5 hover:bg-accent'
 			)}
 		>
 			<span
@@ -185,7 +212,7 @@
 		>
 			<div class="px-2 py-2">{@render wordmark('sm')}</div>
 			<nav class="mt-4 flex flex-1 flex-col gap-1">
-				{@render navLinks()}
+				{@render navLinks('sidebar')}
 			</nav>
 			<div class="border-t border-sidebar-border pt-3">
 				{@render accountMenu('sidebar')}
@@ -198,8 +225,8 @@
 				{@render wordmark('sm')}
 				{@render accountMenu('bar')}
 			</header>
-			<nav class="flex gap-1 overflow-x-auto border-b border-border px-3 py-2">
-				{@render navLinks()}
+			<nav bind:this={mobileNavEl} class="flex gap-1 overflow-x-auto border-b border-border px-3 py-2">
+				{@render navLinks('mobile')}
 			</nav>
 		</div>
 
