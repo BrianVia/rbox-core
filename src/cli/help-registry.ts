@@ -57,8 +57,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "login",
     group: "GETTING STARTED",
     summary: "authorize this machine",
-    usage: "rbox login [--bootstrap <secret>]",
-    flags: [{ flag: "--bootstrap <secret>", desc: "create a new account from a bootstrap secret (genesis device)" }],
+    usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>]",
+    flags: [
+      { flag: "--bootstrap <secret>", desc: "create a new account from a bootstrap secret (genesis device)" },
+      { flag: "--plan <solo|pro>", desc: "request a bootstrap plan; honored only by dev-gated servers" },
+    ],
   },
   {
     name: "logout",

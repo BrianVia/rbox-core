@@ -1,10 +1,11 @@
 import { env, SELF, applyD1Migrations, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
-import { mintDevice } from "../src/auth.js";
+import { bootstrap as bootstrapRoute, mintDevice } from "../src/auth.js";
 import { routeTemplate } from "../src/worker.js";
 import { billingCheckout, repointBillingToAccount } from "../src/stripe.js";
 import { confirmLink } from "../src/account-link.js";
+import { capBytesFor } from "../src/plans.js";
 import type { Principal } from "../src/authz.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -16,14 +17,23 @@ beforeAll(async () => {
 });
 
 // Each test bootstraps its own account/device so they're isolated.
-async function bootstrap(accountName: string): Promise<{ token: string; accountId: string; deviceId: string }> {
+async function bootstrap(accountName: string, extra: Record<string, unknown> = {}): Promise<{ token: string; accountId: string; deviceId: string }> {
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ secret: "test-bootstrap-secret", accountName }),
+    body: JSON.stringify({ secret: "test-bootstrap-secret", accountName, ...extra }),
   });
   expect(res.status).toBe(200);
   return (await res.json()) as { token: string; accountId: string; deviceId: string };
+}
+
+async function accountPlanRow(accountId: string): Promise<{ plan: string; capBytes: number }> {
+  const row = await env.rbox_dev_db
+    .prepare("SELECT plan, cap_bytes AS capBytes FROM accounts WHERE id = ?")
+    .bind(accountId)
+    .first<{ plan: string; capBytes: number }>();
+  expect(row).toBeTruthy();
+  return row!;
 }
 
 const authed = (token: string, extra: Record<string, string> = {}) => ({ authorization: `Bearer ${token}`, ...extra });
@@ -38,6 +48,37 @@ describe("worker integration (real DO + D1 + R2)", () => {
   test("unauthenticated request → 401", async () => {
     const res = await SELF.fetch(`${BASE}/v1/account/usage`);
     expect(res.status).toBe(401);
+  });
+
+  test("bootstrap plan=pro is honored only behind the dev gate and materializes cap_bytes", async () => {
+    const a = await bootstrap("acct-bootstrap-pro", { plan: "pro" });
+    expect(await accountPlanRow(a.accountId)).toEqual({ plan: "pro", capBytes: capBytesFor("pro") });
+  });
+
+  test("bootstrap rejects non-dev-bench plans when the dev gate is enabled", async () => {
+    for (const plan of ["team", "garbage"]) {
+      const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: `acct-bootstrap-bad-${plan}`, plan }),
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "bad_plan" });
+    }
+  });
+
+  test("bootstrap ignores any requested plan when the dev gate is disabled", async () => {
+    const res = await bootstrapRoute(
+      new Request(`${BASE}/v1/auth/device/bootstrap`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: "acct-bootstrap-disabled-plan", plan: "team" }),
+      }),
+      { ...env, RBOX_ALLOW_BOOTSTRAP_PLAN: undefined }
+    );
+    expect(res.status).toBe(200);
+    const a = (await res.json()) as { accountId: string };
+    expect(await accountPlanRow(a.accountId)).toEqual({ plan: "free", capBytes: capBytesFor("free") });
   });
 
   test("blob entitlement: PUT grants, GET works; a different account 404s the same sha", async () => {

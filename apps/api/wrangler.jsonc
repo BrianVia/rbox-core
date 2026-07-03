@@ -77,7 +77,8 @@
   "vars": {
     "RBOX_NOTIFY_FROM": "security@mail.rbox.to",
     // Deploy-env discriminator for observability pings (dev vs prod). See env.ts.
-    "RBOX_ENV": "dev"
+    "RBOX_ENV": "dev",
+    "RBOX_ALLOW_BOOTSTRAP_PLAN": "1"
   },
   // Production environment: separate worker (rbox-prod-api) + its own D1/R2/DO,
   // served at api.rbox.to. Binding NAMES are kept identical to dev so the code is
