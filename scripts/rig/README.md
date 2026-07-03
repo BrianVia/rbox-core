@@ -75,10 +75,41 @@ Tests (`bun test ./scripts/rig/`) cover only the pure logic: the prod refusal, t
 image-staleness hash, secret-resolution precedence + redaction, the fingerprint
 parse/compare, the pair-token parse, and report shaping.
 
-## What's next (P1+)
+### `chaos-restart` (explicit-only — design 56 §9)
 
-Observability capture (log/metrics copy-out, `container stats`, `wrangler tail`, AE
-SQL, `report.md`, `rig watch`), then the scenario suite (`two-device-live`,
-`conductor-initial-sync`, `git-entanglement`, `type-flip`, `daemon-idle-cpu`,
-`mass-delete-guard`), `binary` provisioning mode, the bootstrap `plan` param, and
-CI. See design 56 §13 for the phase breakdown.
+A device that CRASHES mid-push must recover cleanly. Kept OUT of the FAST suite not on
+wall time (a live run lands ~30s) but on flake posture — it SIGKILLs + restarts a guest,
+and Apple `container` 1.0.0 can wedge on kill/start, which doesn't belong in the every-PR
+gate. Run it by name (and nightly):
+
+```bash
+bun run rig run chaos-restart
+```
+
+1. Onboard (git-sync OFF), seed ~400 × 256KiB random files, **no** push yet.
+2. **A** start `rbox push` DETACHED (`RBOX_UPLOAD_CONCURRENCY=4`, redirected to
+   `/work/push.log`) → poll the log until the **upload** phase is clearly underway.
+3. **HARD-KILL** the guest mid-push — `container kill --signal KILL rig-dev-a` (a
+   crash, no grace). (Kill variant shipped: **VM-kill**. The in-guest `pkill -9`
+   fallback exists only for a wedged runtime; whichever ran shows in the step names.)
+4. `container start rig-dev-a` → wait for exec-ability → probe `RBOX_API` came back
+   from the container config → assert `.rbox/state.json` isn't corrupted.
+5. **A** resume `rbox push` (foreground) — design-23 receipts + idempotent commit make
+   it clean; assert exit 0 and **no** mass-delete/reconcile guard refusal.
+6. **B** pull → assert SYNCED-SET convergence (manifest ∩ disk, like
+   `conductor-initial-sync`) → teardown 2xx.
+
+### CI — `.github/workflows/e2e.yml`
+
+Manual (`workflow_dispatch`, input `scenario`, default `all`) + nightly
+(`schedule`, ~02:00 San Diego). Targets a **self-hosted** `[macOS, ARM64]` runner —
+**none is registered yet**, so the job queues/skips until the founder registers one
+on the M2 Max (GitHub-hosted runners can't do macOS 26 + vmnet — design 56 §11). Set
+the `RBOX_DEV_BOOTSTRAP` repo secret (and optionally `CLOUDFLARE_ACCOUNT_ID` /
+`CLOUDFLARE_API_TOKEN` for the AE channel) before the runner goes live.
+
+## What's next
+
+The bootstrap `plan` param (unlocks the `development` tier), `binary` provisioning
+mode, `git-entanglement`, and perf budgets flipped from report-only to gating once
+burn-in data exists. See design 56 §13 for the phase breakdown.

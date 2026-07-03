@@ -261,6 +261,19 @@ export async function stopContainer(name: string): Promise<void> {
   await run(["stop", name], { allowFail: true });
 }
 
+/**
+ * SIGKILL a running container — a CRASH, not a polite stop (`container stop` sends
+ * SIGTERM + grace; this is `container kill --signal KILL`, no grace). The chaos-restart
+ * scenario uses it to simulate a device dying mid-push. Best-effort: an
+ * already-stopped/absent container is not an error (returns false). The container
+ * config (mounts, env, writable layer) survives — only `deleteContainer` removes it,
+ * so the same guest can be `startContainer`ed again afterward.
+ */
+export async function killContainer(name: string): Promise<boolean> {
+  const r = await run(["kill", "--signal", "KILL", name], { allowFail: true });
+  return r.exitCode === 0;
+}
+
 export async function deleteContainer(name: string): Promise<boolean> {
   const r = await run(["delete", "--force", name], { allowFail: true });
   return r.exitCode === 0;

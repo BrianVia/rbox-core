@@ -8,7 +8,7 @@
  * the image's linux node_modules and the CLI can never reach prod (config.ts
  * already refused any prod URL before this device existed).
  */
-import { exec, type RunResult } from "./container.js";
+import { exec, killContainer, startContainer, type RunResult } from "./container.js";
 import { GUEST } from "./config.js";
 
 export interface RboxOpts {
@@ -197,6 +197,54 @@ export class Device {
   /** `rbox status` in `workDir` — the folded-in daemon/health view. Best-effort. */
   async daemonStatus(workDir: string): Promise<RunResult> {
     return this.rbox(["status"], { cwd: workDir, allowFail: true });
+  }
+
+  // ── chaos-restart (design 56 §9) ─────────────────────────────────────────────
+
+  /**
+   * Start `rbox push` DETACHED in the guest and return immediately — the push keeps
+   * running after this exec session ends. `nohup … &` orphans the CLI (reparented to
+   * the guest's init) with its stdout+stderr redirected to `logPath`, so nothing rides
+   * the exec pipe and `container exec` returns as soon as the launcher shell exits.
+   * RBOX_API + RBOX_METRICS are injected (as {@link rbox} does); `env` layers on
+   * per-run knobs (e.g. a throttled RBOX_UPLOAD_CONCURRENCY to widen the push window).
+   * The chaos-restart scenario polls `logPath` for upload progress, then hard-kills the
+   * guest mid-push. Throws only if the LAUNCHER fails — the push's own exit is observed
+   * via the log + a foreground resume, never here.
+   */
+  async pushDetached(workDir: string, logPath: string, env: Record<string, string> = {}): Promise<void> {
+    const script = `nohup bun ${GUEST.cliEntry} push >'${logPath}' 2>&1 & echo "detached pid $!"`;
+    await this.exec(["sh", "-c", script], { cwd: workDir, env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", ...env } });
+  }
+
+  /**
+   * SIGKILL this guest's container — a crash, no grace (see container.killContainer).
+   * The container config + writable layer survive; {@link restart} brings the same guest
+   * back. Returns false if it was already stopped/absent.
+   */
+  async hardKill(): Promise<boolean> {
+    return killContainer(this.name);
+  }
+
+  /** `container start` this guest again after a {@link hardKill} (idempotent). */
+  async restart(): Promise<void> {
+    await startContainer(this.name);
+  }
+
+  /**
+   * Poll a trivial `true` exec until the restarted guest accepts commands (or
+   * `timeoutMs` elapses). After a kill+start the guest's procs are fresh and exec may
+   * briefly refuse; this waits for exec-ability before the scenario resumes. Returns
+   * true once an exec exits 0.
+   */
+  async waitExecReady(timeoutMs: number, intervalMs = 500): Promise<boolean> {
+    const start = Date.now();
+    for (;;) {
+      const r = await this.exec(["true"], { allowFail: true });
+      if (r.exitCode === 0) return true;
+      if (Date.now() - start >= timeoutMs) return false;
+      await new Promise((res) => setTimeout(res, intervalMs));
+    }
   }
 
   /**
