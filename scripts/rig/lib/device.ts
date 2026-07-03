@@ -103,7 +103,9 @@ export class Device {
     return exec({ name: this.name, cmd, env: opts.env, cwd: opts.cwd, stdin: opts.stdin, allowFail: opts.allowFail, redact: opts.redact });
   }
 
-  /** `bun /app/src/cli/index.ts <args>` with RBOX_API + RBOX_METRICS injected. */
+  /** `bun /app/src/cli/index.ts <args>` with RBOX_API + RBOX_METRICS + RBOX_DIAGNOSTICS
+   *  injected (diagnostics ships OFF for users; the bench keeps the real upload path
+   *  continuously exercised — design 56 §10 V4). */
   async rbox(args: string[], opts: RboxOpts = {}): Promise<RunResult> {
     return this.runRecorded(`rbox ${args.join(" ")}`, ["bun", GUEST.cliEntry, ...args], opts);
   }
@@ -126,7 +128,7 @@ export class Device {
    * caller passed `allowFail`.
    */
   private async runRecorded(desc: string, cmd: string[], opts: RboxOpts): Promise<RunResult> {
-    const env = { RBOX_API: this.apiUrl, RBOX_METRICS: "1", ...opts.env };
+    const env = { RBOX_API: this.apiUrl, RBOX_METRICS: "1", RBOX_DIAGNOSTICS: "1", ...opts.env };
     if (!this.obs) {
       return exec({ name: this.name, cmd, env, cwd: opts.cwd, allowFail: opts.allowFail, redact: opts.redact });
     }
@@ -214,7 +216,7 @@ export class Device {
    */
   async pushDetached(workDir: string, logPath: string, env: Record<string, string> = {}): Promise<void> {
     const script = `nohup bun ${GUEST.cliEntry} push >'${logPath}' 2>&1 & echo "detached pid $!"`;
-    await this.exec(["sh", "-c", script], { cwd: workDir, env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", ...env } });
+    await this.exec(["sh", "-c", script], { cwd: workDir, env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", RBOX_DIAGNOSTICS: "1", ...env } });
   }
 
   /**
