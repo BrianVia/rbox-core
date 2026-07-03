@@ -8,7 +8,10 @@
     "test": "bun test ./src/",
     "test:api": "cd apps/api && vitest run",
     "test:all": "bun test ./src/ && cd apps/api && vitest run",
-    "typecheck": "tsc --noEmit && tsc -p apps/api --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p apps/api --noEmit",
+    "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
+    "rig": "bun scripts/rig/rig.ts",
+    "test:rig": "bun test ./scripts/rig/"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.5",
