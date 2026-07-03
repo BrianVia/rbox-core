@@ -134,7 +134,10 @@
         ]
       },
       "send_email": [{ "name": "EMAIL" }],
-      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod" },
+      // RBOX_ALLOW_BOOTSTRAP_PLAN is EXPLICITLY "0" in prod (the dev-only bootstrap plan
+      // override, design 56 §7). Present-but-off because wrangler refuses env-targeted
+      // commands (d1 migrations apply --env production) when a top-level var is absent here.
+      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod", "RBOX_ALLOW_BOOTSTRAP_PLAN": "0" },
       "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]
     }
   }
