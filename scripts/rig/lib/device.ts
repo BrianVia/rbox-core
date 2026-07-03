@@ -20,10 +20,60 @@ export interface RboxOpts {
   redact?: string[];
 }
 
+/**
+ * Observability hooks (P1). When present, every rbox invocation's full
+ * stdout+stderr is appended to `run.log` via {@link DeviceObs.transcript}, prefixed
+ * `[A]`/`[B]` and indented — the firehose the compact console never shows.
+ * `redact` masks the always-known secrets (bootstrap secret) in transcripts; a
+ * per-call `redact` (pairing token) stacks on top.
+ */
+export interface DeviceObs {
+  /** Short device label used as the transcript prefix, e.g. "A" / "B". */
+  label: string;
+  /** Append a block to run.log ONLY (never the console). */
+  transcript: (text: string) => void;
+  /** Always-redacted secret substrings (e.g. the bootstrap secret). */
+  redact?: string[];
+}
+
+function redactAll(text: string, secrets: string[]): string {
+  let s = text;
+  for (const sec of secrets) if (sec) s = s.split(sec).join("***");
+  return s;
+}
+
+/**
+ * Mask secrets the CLI PRINTS ITSELF (unknowable to a redact list at call time):
+ * the 24-word E2EE recovery phrase (`login --bootstrap`) and a freshly minted
+ * pairing token (`rbox pair`). Both are line-shaped, so this scrubs whole lines:
+ * ≥20 all-lowercase words = a BIP39 phrase; a single dot-joined pair of long
+ * base64url halves = a `<redeemToken>.<tokenSecret>` pairing token. Corpus
+ * filenames (`file0007.txt`) and pull summaries (`+b.txt`) can't match — their
+ * post-dot half is too short. PURE (unit-tested). Transcript-only: the caller
+ * still receives the real stdout (scenarios parse the token from it).
+ */
+export function scrubSelfPrinted(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const t = line.trim();
+      const words = t.split(/\s+/);
+      if (words.length >= 20 && words.every((w) => /^[a-z]+$/.test(w))) {
+        return line.replace(t, "*** [recovery phrase redacted] ***");
+      }
+      if (/^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{20,}$/.test(t)) {
+        return line.replace(t, "*** [pairing token redacted] ***");
+      }
+      return line;
+    })
+    .join("\n");
+}
+
 export class Device {
   constructor(
     readonly name: string,
-    private readonly apiUrl: string
+    private readonly apiUrl: string,
+    private readonly obs?: DeviceObs
   ) {}
 
   /** Raw command in the guest. */
@@ -31,16 +81,9 @@ export class Device {
     return exec({ name: this.name, cmd, env: opts.env, cwd: opts.cwd, stdin: opts.stdin, allowFail: opts.allowFail, redact: opts.redact });
   }
 
-  /** `bun /app/src/cli/index.ts <args>` with RBOX_API injected. */
+  /** `bun /app/src/cli/index.ts <args>` with RBOX_API + RBOX_METRICS injected. */
   async rbox(args: string[], opts: RboxOpts = {}): Promise<RunResult> {
-    return exec({
-      name: this.name,
-      cmd: ["bun", GUEST.cliEntry, ...args],
-      env: { RBOX_API: this.apiUrl, ...opts.env },
-      cwd: opts.cwd,
-      allowFail: opts.allowFail,
-      redact: opts.redact,
-    });
+    return this.runRecorded(`rbox ${args.join(" ")}`, ["bun", GUEST.cliEntry, ...args], opts);
   }
 
   /**
@@ -50,14 +93,51 @@ export class Device {
    * `redact` masks it in the rig's own error rendering.
    */
   async rboxShell(script: string, opts: RboxOpts = {}): Promise<RunResult> {
-    return exec({
-      name: this.name,
-      cmd: ["sh", "-c", script],
-      env: { RBOX_API: this.apiUrl, ...opts.env },
-      cwd: opts.cwd,
-      allowFail: opts.allowFail,
-      redact: opts.redact,
-    });
+    return this.runRecorded(`sh -c: ${script}`, ["sh", "-c", script], opts);
+  }
+
+  /**
+   * Shared rbox execution: injects RBOX_API + RBOX_METRICS, runs, and — when an
+   * observability sink is wired — appends the full transcript to run.log before
+   * re-raising a rich error on failure (so an aborting step still records what the
+   * CLI printed). Semantics are preserved: a nonzero exit still throws unless the
+   * caller passed `allowFail`.
+   */
+  private async runRecorded(desc: string, cmd: string[], opts: RboxOpts): Promise<RunResult> {
+    const env = { RBOX_API: this.apiUrl, RBOX_METRICS: "1", ...opts.env };
+    if (!this.obs) {
+      return exec({ name: this.name, cmd, env, cwd: opts.cwd, allowFail: opts.allowFail, redact: opts.redact });
+    }
+    const res = await exec({ name: this.name, cmd, env, cwd: opts.cwd, allowFail: true, redact: opts.redact });
+    const secrets = [...(this.obs.redact ?? []), ...(opts.redact ?? [])];
+    this.obs.transcript(this.formatTranscript(desc, res, secrets));
+    if (res.exitCode !== 0 && !opts.allowFail) {
+      const tail = redactAll(res.stderr, secrets).trim().split("\n").slice(-8).join("\n");
+      throw new Error(`[${this.obs.label}] ${redactAll(desc, secrets)} exited ${res.exitCode}\n${tail}`);
+    }
+    return res;
+  }
+
+  /** One indented `[label] …` transcript block: the redacted command, then its
+   *  stdout/stderr bodies indented under it. */
+  private formatTranscript(desc: string, res: RunResult, secrets: string[]): string {
+    const label = this.obs!.label;
+    const indent = (body: string) =>
+      scrubSelfPrinted(redactAll(body, secrets))
+        .split("\n")
+        .map((l) => `      ${l}`)
+        .join("\n")
+        .replace(/\s+$/, "");
+    const lines = [`[${label}] ${redactAll(desc, secrets)}  (exit ${res.exitCode})`];
+    if (res.stdout.trim()) lines.push(`    ── stdout ──`, indent(res.stdout));
+    if (res.stderr.trim()) lines.push(`    ── stderr ──`, indent(res.stderr));
+    return lines.join("\n");
+  }
+
+  /** `cat path`, tolerating absence (nonzero exit → undefined). */
+  async readFileIfExists(path: string): Promise<string | undefined> {
+    const r = await this.exec(["cat", path], { allowFail: true });
+    return r.exitCode === 0 ? r.stdout : undefined;
   }
 
   async mkdirp(dir: string): Promise<void> {

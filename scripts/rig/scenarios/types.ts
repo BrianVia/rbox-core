@@ -16,6 +16,9 @@ export interface RigCtx {
   keepAccount: boolean;
   /** Timestamped line → run.log AND stdout. */
   log: (line: string) => void;
+  /** Full-transcript block → run.log ONLY (console stays compact). Wired into the
+   *  Device handles so every rbox invocation's stdout/stderr is recorded (P1). */
+  transcript: (text: string) => void;
 }
 
 export interface Scenario {

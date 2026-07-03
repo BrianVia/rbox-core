@@ -20,4 +20,18 @@ declare namespace Bun {
     kill(signal?: number | string): void;
   }
   function spawn(cmd: string[], options?: SpawnOptions): Subprocess;
+
+  /** Incremental file writer — the streaming server-tail capture appends line by
+   *  line rather than buffering the whole tail in memory. */
+  interface FileSink {
+    write(chunk: string | Uint8Array): number;
+    flush(): number | Promise<number>;
+    end(): void | Promise<number>;
+  }
+  interface BunFile {
+    writer(): FileSink;
+    text(): Promise<string>;
+    exists(): Promise<boolean>;
+  }
+  function file(path: string): BunFile;
 }
