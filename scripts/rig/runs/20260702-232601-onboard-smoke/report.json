@@ -1,0 +1,80 @@
+{
+  "scenario": "onboard-smoke",
+  "verdict": "PASS",
+  "startedAt": "2026-07-03T03:26:01.616Z",
+  "finishedAt": "2026-07-03T03:26:14.554Z",
+  "durationMs": 12938,
+  "steps": [
+    {
+      "name": "[A] login --bootstrap",
+      "ok": true,
+      "ms": 3075
+    },
+    {
+      "name": "[A] seed corpus",
+      "ok": true,
+      "ms": 286
+    },
+    {
+      "name": "[A] init --new",
+      "ok": true,
+      "ms": 3319
+    },
+    {
+      "name": "[A] push",
+      "ok": true,
+      "ms": 463
+    },
+    {
+      "name": "[A] pair",
+      "ok": true,
+      "ms": 305
+    },
+    {
+      "name": "[B] login (redeem pair)",
+      "ok": true,
+      "ms": 1994
+    },
+    {
+      "name": "[B] init --workspace + pull",
+      "ok": true,
+      "ms": 3004
+    },
+    {
+      "name": "fingerprint A + B",
+      "ok": true,
+      "ms": 212
+    },
+    {
+      "name": "teardown DELETE /v1/account",
+      "ok": true,
+      "ms": 278
+    }
+  ],
+  "assertions": [
+    {
+      "name": "trees byte-identical (excl .rbox)",
+      "ok": true,
+      "detail": "101 files"
+    },
+    {
+      "name": "file count > 90",
+      "ok": true,
+      "detail": "101"
+    },
+    {
+      "name": "empty file survived",
+      "ok": true
+    },
+    {
+      "name": "symlink survived",
+      "ok": true,
+      "detail": "symlink:rig-target.txt"
+    },
+    {
+      "name": "account delete 2xx",
+      "ok": true,
+      "detail": "200"
+    }
+  ]
+}

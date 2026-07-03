@@ -1,11 +1,11 @@
-# §49 — D1 → PlanetScale (break-glass control-plane migration)
+# §57 — D1 → PlanetScale (break-glass control-plane migration)
 
 **Status:** DRAFT v1 — design only, **contingency**. Nothing to build now. This is the
 "if D1 stops being enough" escape hatch, written so that the decision — and the port —
 is a known, scoped operation rather than a scramble under load. It is deliberately
 positioned *against* [§32 (D1 account sharding)](./32-d1-account-sharding.md): both docs
 answer the **same** trigger (the D1 storage cap / single-writer ceiling), and §32 is the
-already-decision-complete, CF-native first answer. **§49 exists because there is exactly
+already-decision-complete, CF-native first answer. **§57 exists because there is exactly
 one failure mode §32 cannot cover** (a single account whose own metadata exceeds one D1),
 and because a managed multi-writer SQL engine is the lower-operational-burden path if
 per-shard fan-out ever costs more to run than it saves. Read §32 first; this doc assumes
@@ -33,12 +33,12 @@ a single managed, horizontally-scalable SQL engine (PlanetScale) so the storage 
 single-writer ceiling both disappear *without* an app-level shard router — at the cost of a
 non-CF dependency, network latency, and a one-time SQL-dialect + transaction-semantics port.
 
-**The one thing only §49 can do.** §32 shards *by account*, so its partition grain is one
+**The one thing only §57 can do.** §32 shards *by account*, so its partition grain is one
 account. A single account whose own control-plane metadata (its `blob_refs`, `blobs`,
 `commits`, key rows) exceeds one D1's storage cap **cannot be relieved by §32** — there is no
 sub-account shard key in the app-level scheme. PlanetScale/Vitess shards *below* the account
 grain transparently (or simply gives that account a far larger single primary), so it is the
-only escape from a single-whale-over-cap. That, not raw throughput, is §49's unique
+only escape from a single-whale-over-cap. That, not raw throughput, is §57's unique
 justification; everything else §32 also solves.
 
 ## What is (and isn't) "PlanetScale on Cloudflare"
@@ -299,20 +299,20 @@ be sized before committing. Hyperdrive adds its own pricing.
 
 ### Vendor / operational surface
 
-Today the control plane is one throat to choke (Cloudflare: Workers + D1 + R2 + DO). §49 adds a
+Today the control plane is one throat to choke (Cloudflare: Workers + D1 + R2 + DO). §57 adds a
 **hard dependency on a non-CF provider** for the control plane — availability becomes CF ∧
 PlanetScale ∧ the network path between them. R2/DO/Workers stay CF. This is the philosophical
 cost of the move and the reason it is break-glass, not default: §32 keeps everything inside one
-provider; §49 trades that for a database that scales past D1's walls without an app-level shard
+provider; §57 trades that for a database that scales past D1's walls without an app-level shard
 router to build and operate.
 
-## §49 vs §32 — the honest comparison
+## §57 vs §32 — the honest comparison
 
-| | §32 (shard D1) | §49 (PlanetScale) |
+| | §32 (shard D1) | §57 (PlanetScale) |
 |---|---|---|
 | Storage cap | Split across N D1s, per-account grain | Gone (Vitess shards below account grain) |
 | Single-writer ceiling | Relieved per shard | Gone (multi-writer) |
-| **Single account > 10 GB** | **Cannot fix** (shards *by* account) | **Fixed** (only §49 does) |
+| **Single account > 10 GB** | **Cannot fix** (shards *by* account) | **Fixed** (only §57 does) |
 | Latency | CF-native, lowest | Cross-network (mitigable) |
 | Vendor | All Cloudflare | + PlanetScale dependency |
 | Cost | D1-metered | Provisioned DB + egress |
@@ -321,12 +321,12 @@ router to build and operate.
 | SQL dialect | Unchanged (SQLite) | One-time port |
 | Status | **Decision-complete, Phase 0 seam shipped** | **This draft** |
 
-**Net:** §32 is the correct first response and is already the plan. §49 is the escape hatch for
+**Net:** §32 is the correct first response and is already the plan. §57 is the escape hatch for
 (a) a single-whale-over-cap, or (b) when per-shard operational burden (GC/retention across many
 shards, whale migrations) outweighs running one managed multi-writer DB. The two are not
-mutually exclusive by accident: **§32's `dbFor`/`dirDb` seam is precisely what makes §49 a
+mutually exclusive by accident: **§32's `dbFor`/`dirDb` seam is precisely what makes §57 a
 centralized adapter swap rather than a 229-site rewrite.** Building §32 Phase 0 was the right
-call *even if* §49 is where we eventually land.
+call *even if* §57 is where we eventually land.
 
 ## Test + rollout plan
 
@@ -355,14 +355,14 @@ call *even if* §49 is where we eventually land.
 1. **Trigger, not "if" — engine choice (§5):** MySQL/Vitess (recommended: `?`-match +
    account-keyed sharding) vs PlanetScale-Postgres (cheaper dialect port, `$1` friction)?
    Effectively irreversible once data lands.
-2. **What pulls the §49 lever vs §32?** Concretely: a single account approaching the D1
-   storage cap (§49-only), OR a sustained per-shard operational burden that outweighs a managed
-   DB? Both §32 and §49 sit behind the same §25 telemetry trigger — this doc argues §32 fires
-   first and §49 only on the whale-over-cap or operational-burden signal.
+2. **What pulls the §57 lever vs §32?** Concretely: a single account approaching the D1
+   storage cap (§57-only), OR a sustained per-shard operational burden that outweighs a managed
+   DB? Both §32 and §57 sit behind the same §25 telemetry trigger — this doc argues §32 fires
+   first and §57 only on the whale-over-cap or operational-burden signal.
 3. **Adapter vs rewrite:** confirm the `D1Database`-shaped adapter (minimal blast radius, keeps
    §32's seam) over a full Drizzle/Kysely query-layer rewrite?
 4. **Access path:** start on the `@planetscale/database` HTTP driver (no `nodejs_compat`), add
    Hyperdrive later as a latency mitigation — or adopt Hyperdrive from the start?
-5. **Do §32 and §49 coexist?** Once on Vitess, its transparent sharding *replaces* §32's
+5. **Do §32 and §57 coexist?** Once on Vitess, its transparent sharding *replaces* §32's
    app-level router — is §32 then retired, or kept as the CF-native option for a
    PlanetScale-outage fallback? (Affects whether we keep the router code alive.)
