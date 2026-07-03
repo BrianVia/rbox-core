@@ -64,6 +64,8 @@ export interface Env {
   rbox_releases: R2Bucket;
   /** Bootstrap trust anchor for the first device (Wrangler secret, never in git). */
   RBOX_BOOTSTRAP_SECRET: string;
+  /** Dev-only gate for honoring the optional bootstrap `plan` body field. Prod leaves unset. */
+  RBOX_ALLOW_BOOTSTRAP_PLAN?: string;
   /** Platform-admin secret for internal ops (GC). Distinct from tenant device tokens. */
   RBOX_PLATFORM_SECRET: string;
   /** WorkspaceSync DO namespace — the per-(workspace,project) commit sequencer + WS fanout. */

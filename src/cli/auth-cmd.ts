@@ -32,8 +32,8 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
   });
 }
 
-/** `rbox login [--bootstrap <secret>]` — obtain a per-device token. */
-export async function login(remoteUrl: string, bootstrapSecret?: string): Promise<void> {
+/** `rbox login [--bootstrap <secret>] [--plan <solo|pro>]` — obtain a per-device token. */
+export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string): Promise<void> {
   const label = os.hostname();
   // Headless pairing: redeem a token from the env (never argv — it's a bearer).
   const envPair = process.env.RBOX_PAIR_TOKEN;
@@ -42,7 +42,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string): Promis
     return;
   }
   if (bootstrapSecret) {
-    const res = await postJson(`${remoteUrl}/v1/auth/device/bootstrap`, { secret: bootstrapSecret, label });
+    const res = await postJson(`${remoteUrl}/v1/auth/device/bootstrap`, { secret: bootstrapSecret, label, ...(bootstrapPlan !== undefined ? { plan: bootstrapPlan } : {}) });
     if (!res.ok) throw new Error(`bootstrap failed: ${res.status} ${await res.text()}`);
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
