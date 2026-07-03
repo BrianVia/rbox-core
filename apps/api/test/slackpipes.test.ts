@@ -1,7 +1,7 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import { createHmac } from "node:crypto";
-import { pingSlackpipes } from "../src/slackpipes.js";
+import { pingSlackpipes, pingNewAccount, formatNewAccount } from "../src/slackpipes.js";
 import { stripeWebhook } from "../src/stripe.js";
 import type { Env } from "../src/env.js";
 
@@ -69,6 +69,64 @@ describe("pingSlackpipes — never throws, self-gates on config", () => {
   test("a failing fetch is swallowed (resolves, never throws)", async () => {
     failFetch();
     await expect(pingSlackpipes(pingEnv(), "business", "hi")).resolves.toBe(true);
+  });
+});
+
+describe("formatNewAccount — env tag + rich web-signup line, graceful per-segment degradation", () => {
+  test("bootstrap carries only the (origin, env) tag — no rich suffix", () => {
+    expect(formatNewAccount({ accountId: "acct_abc", origin: "bootstrap", env: "dev" })).toBe(
+      ":seedling: New rbox account onboarded — `acct_abc` (bootstrap, dev)",
+    );
+  });
+
+  test("web signup renders email + sign-in method + plan", () => {
+    expect(
+      formatNewAccount({ accountId: "acct_xyz", origin: "web", env: "prod", email: "jane@doe.com", signInMethod: "github", plan: "free" }),
+    ).toBe(":seedling: New rbox account onboarded — `acct_xyz` (web, prod) — jane@doe.com via github · plan free");
+  });
+
+  test("missing email drops only the email — method + plan survive", () => {
+    expect(formatNewAccount({ accountId: "acct_1", origin: "web", env: "prod", signInMethod: "google", plan: "free" })).toBe(
+      ":seedling: New rbox account onboarded — `acct_1` (web, prod) — via google · plan free",
+    );
+  });
+
+  test("missing sign-in method drops only 'via …'", () => {
+    expect(formatNewAccount({ accountId: "acct_2", origin: "web", env: "dev", email: "a@b.com", plan: "solo" })).toBe(
+      ":seedling: New rbox account onboarded — `acct_2` (web, dev) — a@b.com · plan solo",
+    );
+  });
+
+  test("all rich fields absent ⇒ bare tag line (never a dangling separator)", () => {
+    expect(formatNewAccount({ accountId: "acct_3", origin: "web", env: "prod" })).toBe(
+      ":seedling: New rbox account onboarded — `acct_3` (web, prod)",
+    );
+  });
+});
+
+describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
+  test("RBOX_ENV=prod tags prod; the rich web fields ride through to the business channel", async () => {
+    const calls: Call[] = [];
+    recordFetch(calls);
+    await pingNewAccount(pingEnv({ RBOX_ENV: "prod" }), {
+      accountId: "acct_prod",
+      origin: "web",
+      email: "jane@doe.com",
+      signInMethod: "github",
+      plan: "free",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(BUSINESS);
+    expect((calls[0]!.body as { text: string }).text).toBe(
+      ":seedling: New rbox account onboarded — `acct_prod` (web, prod) — jane@doe.com via github · plan free",
+    );
+  });
+
+  test("absent RBOX_ENV degrades to the dev tag (dev is never mislabeled prod)", async () => {
+    const calls: Call[] = [];
+    recordFetch(calls);
+    await pingNewAccount(pingEnv({ RBOX_ENV: undefined }), { accountId: "acct_dev", origin: "bootstrap" });
+    expect((calls[0]!.body as { text: string }).text).toBe(":seedling: New rbox account onboarded — `acct_dev` (bootstrap, dev)");
   });
 });
 

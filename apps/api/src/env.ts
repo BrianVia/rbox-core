@@ -47,6 +47,11 @@ export interface Env {
   EMAIL?: SendEmailBinding;
   /** `From:` for the new-device email (e.g. `security@mail.rbox.to`). */
   RBOX_NOTIFY_FROM?: string;
+  /** Deploy environment discriminator (var, not a secret): `"dev"` on rbox-dev-api,
+   *  `"prod"` on rbox-prod-api. Purely for observability — lets business/ops pings
+   *  label which worker they came from so dev test traffic is distinguishable from
+   *  real prod signups. Absent (local/misconfigured) ⇒ treated as `"dev"`. */
+  RBOX_ENV?: "dev" | "prod";
   /** HMAC pepper for the per-recipient delivery idempotency key (internal dedupe tag, §4.4). */
   NOTIFY_IDEMPOTENCY_PEPPER?: string;
   /** Explicit kill-switch (local/dev only). When "1", deliveries terminally `skipped` —

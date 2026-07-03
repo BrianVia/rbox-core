@@ -18,7 +18,9 @@ import { logErr } from "./util.js";
  * outage must not affect authoritative state. Absent secret ⇒ no-op (self-gating).
  *
  * Keep `text` low-PII: account ids / plan names are fine (this is the founder's own
- * Slack), but never user emails, tokens, paths, or blob/commit hashes.
+ * Slack). The one deliberate exception is the new-account ping for WEB signups, which
+ * carries the signup email + sign-in method (founder request — ops needs to know who
+ * actually signed up). Never tokens, paths, or blob/commit hashes.
  */
 
 export type SlackChannel = "business" | "alerts";
@@ -56,23 +58,61 @@ export async function pingSlackpipes(env: Env, channel: SlackChannel, text: stri
 
 // ── business events (#rbox) — all fire INLINE, best-effort ────────────────────
 
+/** The deploy-env tag for observability pings — dev vs prod (see env.RBOX_ENV).
+ *  Absent/misconfigured degrades to "dev" so dev traffic is never mislabeled prod. */
+function envTag(env: Env): "dev" | "prod" {
+  return env.RBOX_ENV === "prod" ? "prod" : "dev";
+}
+
+/** Fields for the new-account ping. `origin`/`env` always present; the rich fields
+ *  (email / signInMethod / plan) are best-effort — any that's missing is omitted from
+ *  the message rather than breaking it (bootstrap accounts carry none of them). */
+export interface NewAccountPing {
+  accountId: string;
+  origin: string; // "bootstrap" | "web"
+  env: "dev" | "prod";
+  email?: string | null;
+  signInMethod?: string | null; // "github" | "google" | "email"
+  plan?: string | null;
+}
+
+/**
+ * PURE formatter for the new-account ping (unit-testable; the fetch/plumbing lives in
+ * `pingNewAccount`). Shapes:
+ *   bootstrap → `:seedling: New rbox account onboarded — \`acct_…\` (bootstrap, dev)`
+ *   web       → `… (web, prod) — jane@doe.com via github · plan free`
+ * Every rich segment degrades independently — a missing field drops just that segment.
+ */
+export function formatNewAccount(o: NewAccountPing): string {
+  const base = `:seedling: New rbox account onboarded — \`${o.accountId}\` (${o.origin}, ${o.env})`;
+  const bits: string[] = [];
+  if (o.email && o.signInMethod) bits.push(`${o.email} via ${o.signInMethod}`);
+  else if (o.email) bits.push(o.email);
+  else if (o.signInMethod) bits.push(`via ${o.signInMethod}`);
+  if (o.plan) bits.push(`plan ${o.plan}`);
+  return bits.length ? `${base} — ${bits.join(" · ")}` : base;
+}
+
 /** A new tenant was created (CLI bootstrap OR web first-login provisioning). */
-export async function pingNewAccount(env: Env, o: { accountId: string; origin: string }): Promise<void> {
-  await pingSlackpipes(env, "business", `:seedling: New rbox account onboarded — \`${o.accountId}\` (${o.origin})`);
+export async function pingNewAccount(
+  env: Env,
+  o: { accountId: string; origin: string; email?: string | null; signInMethod?: string | null; plan?: string | null },
+): Promise<void> {
+  await pingSlackpipes(env, "business", formatNewAccount({ ...o, env: envTag(env) }));
 }
 
 /** An account started a paid subscription (Stripe `subscription.created`, paying). */
 export async function pingNewSubscription(env: Env, o: { accountId: string | null; plan: string }): Promise<void> {
-  await pingSlackpipes(env, "business", `:moneybag: New subscription — *${o.plan}* on account \`${o.accountId ?? "unknown"}\``);
+  await pingSlackpipes(env, "business", `:moneybag: New subscription — *${o.plan}* on account \`${o.accountId ?? "unknown"}\` (${envTag(env)})`);
 }
 
 /** A subscription payment failed (Stripe `invoice.payment_failed`). */
 export async function pingPaymentFailed(env: Env, o: { accountId: string | null; amountCents: number | null }): Promise<void> {
   const amt = typeof o.amountCents === "number" ? ` ($${(o.amountCents / 100).toFixed(2)})` : "";
-  await pingSlackpipes(env, "alerts", `:warning: Payment failed${amt} on account \`${o.accountId ?? "unknown"}\` — Stripe will retry`);
+  await pingSlackpipes(env, "alerts", `:warning: Payment failed${amt} on account \`${o.accountId ?? "unknown"}\` (${envTag(env)}) — Stripe will retry`);
 }
 
 /** A subscription was canceled / churned (Stripe `subscription.deleted`). */
 export async function pingChurn(env: Env, o: { accountId: string | null }): Promise<void> {
-  await pingSlackpipes(env, "business", `:wave: Subscription canceled — account \`${o.accountId ?? "unknown"}\` downgraded to free (grace started)`);
+  await pingSlackpipes(env, "business", `:wave: Subscription canceled — account \`${o.accountId ?? "unknown"}\` downgraded to free (grace started, ${envTag(env)})`);
 }
