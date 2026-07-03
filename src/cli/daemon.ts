@@ -1,4 +1,5 @@
 import os from "node:os";
+import crypto from "node:crypto";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
@@ -13,7 +14,7 @@ import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
-import { recordDaemonBinding } from "./daemon-control.js";
+import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
@@ -26,6 +27,8 @@ const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (
 const DEEP_SCAN_MS = 30 * 60_000; // infrequent cache-bypassing re-hash (heals mtime+size-stable drift)
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
+const WS_PING_MS = 25_000;
+const WS_KEEPALIVE_PERSIST_MS = 20_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
 
@@ -92,6 +95,10 @@ export class RboxDaemon {
 
   private watcher?: Watcher;
   private ws?: WebSocket;
+  private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
+  private wsGeneration = 0;
+  private pendingCatchUpGeneration?: number;
+  private lastWsKeepaliveWrite = 0;
   private safetyTimer?: ReturnType<typeof setTimeout>;
   private deepTimer?: ReturnType<typeof setInterval>;
   /** Current safety-scan delay (60s floor, backs off to 5m while idle — design 49). */
@@ -126,12 +133,15 @@ export class RboxDaemon {
   private activityDirty = false; // a `last`/halt change that must persist un-throttled
   private lastActivityWrite = 0;
   private lastProgressWrite = 0;
+  private ownershipWindDownStarted = false;
+  private readonly bootId: string;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private readonly cfg: WorkspaceConfig, private readonly e2ee: SyncDeps) {
+  constructor(private readonly root: string, private readonly cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root);
+    this.bootId = bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
   }
 
   async start(): Promise<void> {
@@ -149,7 +159,10 @@ export class RboxDaemon {
     log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
-    await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId);
+    if (!(await this.writeStartupBinding())) return;
+    this.markWsStartupDisconnected();
+    await this.activityWrite;
+    if (this.stopped) return;
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
     this.lastLoggedSeq = (await loadState(this.root, syncStreamId(this.cfg))).lastSyncedSequence;
@@ -251,6 +264,7 @@ export class RboxDaemon {
     this.stopped = true;
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
+    this.stopWsKeepalive();
     try {
       this.ws?.close();
     } catch {
@@ -301,7 +315,10 @@ export class RboxDaemon {
             await this.doFullScan();
             this.want.push = true;
           } else if (op === "pull") {
+            const catchUpGeneration = this.pendingCatchUpGeneration;
+            this.pendingCatchUpGeneration = undefined;
             await this.doPull();
+            if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
             this.want.push = true; // publish any local divergence after taking remote
           } else {
             await this.doPush();
@@ -497,16 +514,23 @@ export class RboxDaemon {
    *  never writes — without the settle pass the glyph reads pending forever). */
   private lastShellState?: string;
 
-  /** Persist the in-memory activity record. Non-blocking for the caller, and
-   *  saveActivity swallows all errors by contract — visibility must never break
-   *  (or slow) sync. Snapshot-shallow-copied: `last`/`active`/`halt` are always
-   *  replaced wholesale (never mutated in place), so a later mutation of
-   *  `this.activity` can't bleed into an in-flight write. */
+  /** Persist the activity record and bump the pump heartbeat. */
   private writeActivity(): void {
-    this.activity.at = new Date().toISOString();
-    this.activityDirty = false;
-    this.lastActivityWrite = Date.now();
-    const snapshot = { ...this.activity };
+    this.enqueueActivityWrite(true);
+  }
+
+  /** Persist the activity record after a WS-only update. */
+  private writeWsActivity(): void {
+    this.enqueueActivityWrite(false);
+  }
+
+  private enqueueActivityWrite(bumpHeartbeat: boolean): void {
+    if (bumpHeartbeat) {
+      this.activity.at = new Date().toISOString();
+      this.activityDirty = false;
+      this.lastActivityWrite = Date.now();
+    }
+    const snapshot = { ...this.activity, ws: this.activity.ws ? { ...this.activity.ws } : undefined };
     // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
     // onto the same promise so BOTH files preserve write ordering and neither is ever
     // awaited on the sync path. `settled` = nothing queued and no watcher events left.
@@ -520,8 +544,33 @@ export class RboxDaemon {
       now: Date.now(),
     });
     this.activityWrite = this.activityWrite
-      .then(() => saveActivity(this.root, snapshot))
-      .then(() => saveShellLine(this.root, line));
+      .then(async () => {
+        if (!this.canPersistTrustedSurface()) return;
+        await saveActivity(this.root, snapshot);
+        await saveShellLine(this.root, line);
+      });
+  }
+
+  private async writeStartupBinding(): Promise<boolean> {
+    if (!this.canPersistTrustedSurface()) return false;
+    await recordDaemonBinding(this.root, this.cfg.remoteWorkspaceId, this.bootId);
+    return !this.stopped;
+  }
+
+  private canPersistTrustedSurface(): boolean {
+    const pidfile = readDaemonPidRecord(this.root);
+    if (pidfile.version === "v2" && pidfile.bootId !== undefined && pidfile.bootId !== this.bootId) {
+      this.beginOwnershipWindDown(`pidfile now belongs to boot ${pidfile.bootId}`);
+      return false;
+    }
+    return true;
+  }
+
+  private beginOwnershipWindDown(reason: string): void {
+    if (this.ownershipWindDownStarted || this.stopped) return;
+    this.ownershipWindDownStarted = true;
+    log(`daemon ownership lost: ${reason} — draining and stopping`);
+    setTimeout(() => void this.stop(), 0);
   }
 
   /** Type-flip evictions seen since the last recorded pull (design 50 §3, review M2).
@@ -601,6 +650,135 @@ export class RboxDaemon {
 
   // ---- live notification channel (optional; correctness never depends on it) ----
 
+  private wsBase(): NonNullable<DaemonActivity["ws"]> {
+    return {
+      connected: false,
+      at: new Date().toISOString(),
+      caughtUp: false,
+      bootId: this.bootId,
+      pid: process.pid,
+      ...(this.activity.ws?.lastBroadcastSequence !== undefined
+        ? { lastBroadcastSequence: this.activity.ws.lastBroadcastSequence }
+        : {}),
+    };
+  }
+
+  private markWsStartupDisconnected(): void {
+    this.activity.ws = this.wsBase();
+    this.writeWsActivity();
+  }
+
+  private markWsOpen(ws: WebSocket): number {
+    const generation = ++this.wsGeneration;
+    this.activity.ws = {
+      ...this.wsBase(),
+      connected: true,
+    };
+    this.writeWsActivity();
+    this.startWsKeepalive(ws);
+    return generation;
+  }
+
+  private markWsDisconnected(ws: WebSocket, reason: "close" | "error"): boolean {
+    if (this.ws !== ws) return false;
+    this.ws = undefined;
+    this.stopWsKeepalive();
+    this.wsGeneration++;
+    this.pendingCatchUpGeneration = undefined;
+    this.activity.ws = {
+      ...this.wsBase(),
+      connected: false,
+      caughtUp: false,
+      at: new Date().toISOString(),
+    };
+    this.writeWsActivity();
+    if (reason === "error") log("ws error");
+    return true;
+  }
+
+  private markWsCaughtUp(generation: number): void {
+    if (generation !== this.wsGeneration || !this.activity.ws?.connected) return;
+    this.activity.ws = { ...this.activity.ws, caughtUp: true, bootId: this.bootId, pid: process.pid };
+    this.writeWsActivity();
+  }
+
+  private refreshWsAtThrottled(): void {
+    if (!this.activity.ws?.connected) return;
+    const now = Date.now();
+    this.activity.ws = { ...this.activity.ws, at: new Date(now).toISOString(), bootId: this.bootId, pid: process.pid };
+    if (now - this.lastWsKeepaliveWrite < WS_KEEPALIVE_PERSIST_MS) return;
+    this.lastWsKeepaliveWrite = now;
+    this.writeWsActivity();
+  }
+
+  private recordCommittedFrame(sequence: number): void {
+    if (!Number.isInteger(sequence) || sequence < 0) {
+      this.refreshWsAtThrottled();
+      return;
+    }
+    const current = this.activity.ws ?? this.wsBase();
+    const lastBroadcastSequence = Math.max(current.lastBroadcastSequence ?? 0, sequence);
+    this.activity.ws = {
+      ...current,
+      connected: true,
+      at: new Date().toISOString(),
+      caughtUp: current.caughtUp,
+      lastBroadcastSequence,
+      bootId: this.bootId,
+      pid: process.pid,
+    };
+    this.writeWsActivity();
+  }
+
+  private handleWsMessageData(data: string): void {
+    if (data === "pong") {
+      this.refreshWsAtThrottled();
+      return;
+    }
+    try {
+      const m = JSON.parse(data) as { type?: string; sequence?: unknown };
+      if (m.type === "committed") {
+        this.recordCommittedFrame(typeof m.sequence === "number" ? m.sequence : -1);
+        this.request("pull");
+      } else {
+        this.refreshWsAtThrottled();
+      }
+    } catch {
+      this.refreshWsAtThrottled();
+    }
+  }
+
+  private handleWsClose(ws: WebSocket): void {
+    if (this.markWsDisconnected(ws, "close")) this.scheduleReconnect();
+  }
+
+  private handleWsError(ws: WebSocket): void {
+    if (!this.markWsDisconnected(ws, "error")) return;
+    try {
+      ws.close();
+    } catch {
+      /* will fire close */
+    }
+    this.scheduleReconnect();
+  }
+
+  private startWsKeepalive(ws: WebSocket): void {
+    this.stopWsKeepalive();
+    this.wsKeepaliveTimer = setInterval(() => {
+      if (this.stopped || this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send("ping");
+      } catch {
+        /* close/error will drive reconnect */
+      }
+    }, WS_PING_MS);
+  }
+
+  private stopWsKeepalive(): void {
+    if (this.wsKeepaliveTimer) clearInterval(this.wsKeepaliveTimer);
+    this.wsKeepaliveTimer = undefined;
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const url = `${this.api.wsConnectUrl()}?device=${encodeURIComponent(this.cfg.deviceId)}`;
@@ -622,26 +800,18 @@ export class RboxDaemon {
     ws.addEventListener("open", () => {
       this.reconnectAttempt = 0;
       log("ws connected");
+      const generation = this.markWsOpen(ws);
+      this.pendingCatchUpGeneration = generation;
       this.request("pull"); // catch up on anything missed while disconnected
     });
     ws.addEventListener("message", (ev: MessageEvent) => {
-      try {
-        const m = JSON.parse(String(ev.data)) as { type?: string; deviceId?: string | null };
-        if (m.type === "committed" && m.deviceId !== this.cfg.deviceId) this.request("pull");
-      } catch {
-        /* ignore malformed */
-      }
+      this.handleWsMessageData(String(ev.data));
     });
     ws.addEventListener("close", () => {
-      if (this.ws === ws) this.ws = undefined;
-      this.scheduleReconnect();
+      this.handleWsClose(ws);
     });
     ws.addEventListener("error", () => {
-      try {
-        ws.close();
-      } catch {
-        /* will fire close */
-      }
+      this.handleWsError(ws);
     });
   }
 

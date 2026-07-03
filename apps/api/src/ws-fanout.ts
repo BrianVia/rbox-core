@@ -17,11 +17,9 @@ export function acceptConnection(ctx: DurableObjectState, url: URL): Response {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-export function broadcast(ctx: DurableObjectState, message: string, fromDeviceId: string | null): void {
+export function broadcast(ctx: DurableObjectState, message: string): void {
   for (const ws of ctx.getWebSockets()) {
     if (ws.readyState !== WebSocket.OPEN) continue; // set can include CLOSING sockets
-    const att = ws.deserializeAttachment() as { deviceId: string | null } | null;
-    if (fromDeviceId && att?.deviceId === fromDeviceId) continue; // don't echo to the committer
     try {
       ws.send(message);
     } catch {

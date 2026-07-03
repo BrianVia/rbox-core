@@ -1,7 +1,7 @@
 import path from "node:path";
 import { buildIgnoreMatcher, diffManifests, scanManifest, type Action } from "../engine/index.js";
 import { loadActivity } from "./activity.js";
-import { healthLine, lastSyncLines, progressLabel, trashLine } from "./status-view.js";
+import { attributeDaemonForStatus, healthLine, lastSyncLines, progressLabel, trashLine, type StatusRemoteHead } from "./status-view.js";
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
@@ -352,16 +352,31 @@ async function main(): Promise<void> {
       const alive = daemonBinding.alive;
       const daemonStale = daemonBinding.stale;
       const bg = { running: alive.running && !daemonStale, pid: alive.pid };
-      // The daemon's activity sidecar, the remote-head probe, and the git-divergence
-      // walk are independent best-effort reads — concurrent so status stays snappy.
+      // The daemon's activity sidecar and local walks are independent best-effort
+      // reads. The remote-head probe is deliberately delayed until after daemon
+      // attribution decides whether it can be elided.
       const { gitDivergenceCount } = await import("./sync-git.js");
       const { trashStats } = await import("../engine/trash.js");
-      const [activity, remoteSequence, gitChanged, trash] = await Promise.all([
-        daemonStale ? Promise.resolve(undefined) : loadActivity(root),
-        fetchRemoteSequence(cfg, creds),
-        gitDivergenceCount(root, cfg, state, matcher).catch(() => 0),
-        trashStats(root).catch(() => undefined),
-      ]);
+      const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
+      const gitChangedP = gitDivergenceCount(root, cfg, state, matcher).catch(() => 0);
+      const trashP = trashStats(root).catch(() => undefined);
+      const rawActivity = await activityP;
+      const attributed = attributeDaemonForStatus({
+        activity: rawActivity,
+        daemonRunning: bg.running,
+        boundWorkspaceId: daemonBinding.bound,
+        currentWorkspaceId: cfg.remoteWorkspaceId,
+        livePidfileBootId: alive.bootId,
+        localSequence: state.lastSyncedSequence,
+        now: Date.now(),
+      });
+      let remote: StatusRemoteHead | undefined = attributed.remote;
+      if (!remote) {
+        const probed = await fetchRemoteSequence(cfg, creds);
+        if (probed !== undefined) remote = { sequence: probed, source: "probe" };
+      }
+      const [gitChanged, trash] = await Promise.all([gitChangedP, trashP]);
+      const activity = attributed.activity;
       // Prefer the locally-cached name (set-once-at-create, never stale) over the
       // opaque id; keep the short id alongside for copy/paste. Falls back to the id
       // when no name was set.
@@ -386,11 +401,12 @@ async function main(): Promise<void> {
           trackedFiles: local.files.length,
           daemonRunning: bg.running,
           localSequence: state.lastSyncedSequence,
-          remoteSequence,
+          remote,
           activity,
           now,
         })}`
       );
+      if (attributed.remoteLine) console.log(`  ${attributed.remoteLine}`);
       for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
       // Folds in the old `daemon status` (design 29): background-sync state.
       console.log(

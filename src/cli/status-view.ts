@@ -26,13 +26,74 @@ export interface StatusSnapshot {
   trackedFiles: number;
   daemonRunning: boolean;
   localSequence: number;
-  /** Best-effort remote probe; undefined = offline/unknown (renders nothing). */
-  remoteSequence?: number;
+  /** Best-effort remote head evidence; undefined = offline/unknown. */
+  remote?: StatusRemoteHead;
   activity?: DaemonActivity;
   now: number;
 }
 
+export const WS_TRUST_MS = 60_000;
+export const ELIDE_MAX_AGE_MS = 30_000;
+
+export interface StatusRemoteHead {
+  sequence: number;
+  source: "probe" | "daemon";
+  ageMs?: number;
+}
+
+export interface DaemonStatusAttribution {
+  activity: DaemonActivity | undefined;
+  remote?: StatusRemoteHead;
+  remoteLine?: string;
+  elided: boolean;
+}
+
 const n = (v: number) => v.toLocaleString("en-US");
+
+export function attributeDaemonForStatus(input: {
+  activity: DaemonActivity | undefined;
+  daemonRunning: boolean;
+  boundWorkspaceId?: string;
+  currentWorkspaceId: string;
+  livePidfileBootId?: string;
+  localSequence: number;
+  now: number;
+}): DaemonStatusAttribution {
+  const { activity } = input;
+  const ws = activity?.ws;
+  if (ws && input.livePidfileBootId !== undefined && ws.bootId !== input.livePidfileBootId) {
+    return { activity: undefined, elided: false };
+  }
+  if (!activity || !ws) return { activity, elided: false };
+
+  const bindingCurrent = input.boundWorkspaceId === input.currentWorkspaceId;
+  const ageMs = input.now - Date.parse(ws.at);
+  const finiteAge = Number.isFinite(ageMs) ? ageMs : Number.POSITIVE_INFINITY;
+  const connectionTrusted = finiteAge >= 0 && finiteAge < WS_TRUST_MS;
+  const canElide =
+    input.daemonRunning &&
+    bindingCurrent &&
+    ws.bootId === input.livePidfileBootId &&
+    ws.connected === true &&
+    ws.caughtUp === true &&
+    connectionTrusted &&
+    finiteAge < ELIDE_MAX_AGE_MS &&
+    !activity.halt;
+
+  if (!canElide) return { activity, elided: false };
+  const sequence = Math.max(ws.lastBroadcastSequence ?? 0, input.localSequence);
+  const renderedAgeMs = Math.max(0, finiteAge);
+  return {
+    activity,
+    elided: true,
+    remote: {
+      sequence,
+      source: "daemon",
+      ageMs: renderedAgeMs,
+    },
+    remoteLine: `${style.dim("remote:")} seq ${n(sequence)} · live via daemon (${ageLabel(renderedAgeMs)})`,
+  };
+}
 
 /** "just now" / "42s ago" / "5m ago" / "3h ago" / "2d ago". */
 export function relTime(iso: string, now: number): string {
@@ -44,6 +105,11 @@ export function relTime(iso: string, now: number): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
+
+const ageLabel = (ageMs: number | undefined): string => {
+  if (ageMs === undefined || !Number.isFinite(ageMs)) return "unknown";
+  return `${Math.max(0, Math.round(ageMs / 1000))}s ago`;
+};
 
 /** `uploading 42% (3,612/8,603)` — shared by spinners and the live status line. */
 export function progressLabel(phase: "encrypt" | "upload" | "download", done: number, total: number): string {
@@ -77,8 +143,9 @@ export function healthLine(s: StatusSnapshot): string {
 
   const localChanges = s.added + s.changed + s.deleted;
   const gitChanged = s.gitChanged ?? 0;
-  const behind = s.remoteSequence !== undefined && s.remoteSequence > s.localSequence;
-  const behindNote = `behind remote (sequence ${s.localSequence} vs ${s.remoteSequence})`;
+  const remoteSequence = s.remote?.sequence;
+  const behind = remoteSequence !== undefined && remoteSequence > s.localSequence;
+  const behindNote = `behind remote (sequence ${s.localSequence} vs ${remoteSequence})`;
 
   // 3. Local divergence from the baseline — file and/or git changes waiting to
   //    upload. With the daemon running this is normally transient; stopped, it
@@ -99,7 +166,7 @@ export function healthLine(s: StatusSnapshot): string {
 
   // 4. Clean locally but the remote has moved on.
   if (behind) {
-    const hint = s.daemonRunning ? "will sync on the next pull" : "run `rbox pull` or `rbox start`";
+    const hint = s.remote?.source === "daemon" ? `daemon has not applied seq ${remoteSequence} yet` : s.daemonRunning ? "will sync on the next pull" : "run `rbox pull` or `rbox start`";
     return `${style.yellow(`↓ ${behindNote}`)} ${style.dim(`— ${hint}`)}`;
   }
 

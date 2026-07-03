@@ -2,7 +2,14 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { currentWorkspaceId, readDaemonBinding, recordDaemonBinding } from "./daemon-control.js";
+import {
+  currentWorkspaceId,
+  parseDaemonBinding,
+  parseDaemonPid,
+  readDaemonBinding,
+  readDaemonBindingRecord,
+  recordDaemonBinding,
+} from "./daemon-control.js";
 import { summarizeActions } from "./daemon.js";
 import type { Action } from "../engine/reconcile.js";
 import type { FileEntry } from "../engine/types.js";
@@ -27,10 +34,21 @@ afterAll(async () => {
 
 test("recordDaemonBinding → readDaemonBinding round-trips; a re-record overwrites", async () => {
   expect(readDaemonBinding(root)).toBeUndefined(); // never started → can't tell
-  await recordDaemonBinding(root, "ws_old");
+  await recordDaemonBinding(root, "ws_old", "boot-old");
   expect(readDaemonBinding(root)).toBe("ws_old");
-  await recordDaemonBinding(root, "ws_new"); // daemon restarted after a re-init
+  expect(readDaemonBindingRecord(root)).toMatchObject({ workspaceId: "ws_old", bootId: "boot-old", version: "v2" });
+  await recordDaemonBinding(root, "ws_new", "boot-new"); // daemon restarted after a re-init
   expect(readDaemonBinding(root)).toBe("ws_new");
+});
+
+test("dual-format daemon pidfile and binding parsers", () => {
+  expect(parseDaemonPid("123\n")).toEqual({ version: "legacy", pid: 123 });
+  expect(parseDaemonPid("v2 123 boot-abc\n")).toEqual({ version: "v2", pid: 123, bootId: "boot-abc" });
+  expect(parseDaemonPid("v2 nope boot-abc\n")).toEqual({ version: "invalid" });
+
+  expect(parseDaemonBinding("ws_legacy\n")).toEqual({ version: "legacy", workspaceId: "ws_legacy" });
+  expect(parseDaemonBinding("v2 ws_current boot-abc\n")).toEqual({ version: "v2", workspaceId: "ws_current", bootId: "boot-abc" });
+  expect(parseDaemonBinding("v2 ws_current\n")).toEqual({ version: "invalid" });
 });
 
 test("currentWorkspaceId reads the root's live binding; missing/invalid → undefined (can't tell ≠ stale)", async () => {
@@ -53,7 +71,7 @@ test("the stale-daemon signal: recorded binding differs from the root's current 
     path.join(root, ".rbox", "workspace.json"),
     JSON.stringify({ schema: "e2ee/v1", remoteWorkspaceId: "ws_current", projectId: "root" })
   );
-  await recordDaemonBinding(root, "ws_old");
+  await recordDaemonBinding(root, "ws_old", "boot-old");
   const bound = readDaemonBinding(root);
   const current = currentWorkspaceId(root);
   expect(bound).toBe("ws_old");

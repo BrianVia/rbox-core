@@ -462,3 +462,16 @@ elision + halt/trails intact); stopDaemon mid-pump (pidfile removed, SIGTERM
 pending: daemon finishes drain, no wind-down-from-absence, no crash);
 absent-pidfile first start (writes proceed, attribution begins when the parent
 write lands).
+
+---
+
+# V11 AMENDMENT (legacy sidecar visibility boundary)
+
+A11-1 (active-conflict suppression only): suppress the sidecar only when
+`activity.ws.bootId` exists, the live pidfile parses as v2, and the bootIds
+differ. When either side has no boot claim (no ws slot from a pre-59 daemon, or
+a legacy/absent pidfile), keep rendering the legacy sidecar fields (halt/trail/
+progress) and deny elision because no matching boot pair can vouch for remote
+currency. Rationale: only a stale ws claim that conflicts with the current boot
+authority can inherit trust; suppressing claim-free legacy sidecars would hide
+mass-delete-guard halts during upgrade without adding safety.
