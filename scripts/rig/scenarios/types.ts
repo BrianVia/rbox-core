@@ -5,6 +5,8 @@
  * parser are PURE (unit-tested) so the verdict logic never depends on a container.
  */
 import type { Device } from "../lib/device.js";
+import type { Divergence } from "../lib/convergence.js";
+import type { PollOutcome } from "../lib/waiters.js";
 
 export interface RigCtx {
   a: Device;
@@ -14,11 +16,29 @@ export interface RigCtx {
   runDir: string;
   /** Whether the per-run account teardown is skipped (`--keep-account`). */
   keepAccount: boolean;
+  /** CLI flags for this run (e.g. `--workload-tar`); scenario-specific reads. */
+  flags: Record<string, string>;
   /** Timestamped line → run.log AND stdout. */
   log: (line: string) => void;
   /** Full-transcript block → run.log ONLY (console stays compact). Wired into the
    *  Device handles so every rbox invocation's stdout/stderr is recorded (P1). */
   transcript: (text: string) => void;
+  /**
+   * Poll `device`'s file at `path` until `predicate(contents|undefined)` holds or
+   * `timeoutMs` elapses (design 56 §9 convergence waiter, single-path form). Resolves
+   * with the outcome (`ok` = predicate held before timeout). Never throws.
+   */
+  waitForPath(
+    device: Device,
+    path: string,
+    predicate: (contents: string | undefined) => boolean,
+    timeoutMs: number
+  ): Promise<PollOutcome<string | undefined>>;
+  /**
+   * Poll BOTH devices' fingerprints of `dir` until byte-identical (excl. `.rbox`) or
+   * `timeoutMs` elapses. Resolves with the outcome carrying the final {@link Divergence}.
+   */
+  waitForConvergence(a: Device, b: Device, dir: string, timeoutMs: number): Promise<PollOutcome<Divergence>>;
 }
 
 export interface Scenario {
@@ -41,12 +61,16 @@ export interface AssertionResult {
 
 export interface ScenarioReport {
   scenario: string;
-  verdict: "PASS" | "FAIL";
+  /** SKIP = the scenario declined to run (missing workload/precondition); it does
+   *  NOT fail a suite and exits 0. PASS/FAIL come from steps+assertions. */
+  verdict: "PASS" | "FAIL" | "SKIP";
   startedAt: string;
   finishedAt: string;
   durationMs: number;
   steps: StepResult[];
   assertions: AssertionResult[];
+  /** Present only when `verdict === "SKIP"` — the human reason (e.g. absent tarball). */
+  skipReason?: string;
 }
 
 /**
@@ -73,10 +97,33 @@ export function finalizeReport(input: {
   };
 }
 
-/** Compact PASS/FAIL table for the terminal + run.log. PURE. */
+/**
+ * A SKIP report — the scenario ran but declined (precondition absent). Carries the
+ * reason as a single skipped "step" so the run.log/report.md read cleanly, and
+ * verdict SKIP so neither the exit code nor a suite treats it as a failure. PURE.
+ */
+export function skipReport(scenario: string, reason: string): ScenarioReport {
+  const now = new Date().toISOString();
+  return {
+    scenario,
+    verdict: "SKIP",
+    startedAt: now,
+    finishedAt: now,
+    durationMs: 0,
+    steps: [{ name: "skipped", ok: true, ms: 0, detail: reason }],
+    assertions: [],
+    skipReason: reason,
+  };
+}
+
+/** Compact PASS/FAIL/SKIP table for the terminal + run.log. PURE. */
 export function renderReportTable(report: ScenarioReport): string {
   const mark = (ok: boolean) => (ok ? "PASS" : "FAIL");
   const lines: string[] = [`── ${report.scenario} :: ${report.verdict} (${report.durationMs}ms) ──`];
+  if (report.verdict === "SKIP") {
+    lines.push(`  skipped: ${report.skipReason ?? "(no reason)"}`);
+    return lines.join("\n");
+  }
   lines.push("steps:");
   for (const s of report.steps) lines.push(`  [${mark(s.ok)}] ${s.name} (${s.ms}ms)${s.detail ? ` — ${s.detail}` : ""}`);
   lines.push("assertions:");

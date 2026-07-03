@@ -35,10 +35,11 @@ function aeBlock(ae: ServerMetricsSummary | { skipped: string }): string[] {
 
 /** Render the full run report as Markdown. PURE. */
 export function renderReportMd(report: ScenarioReport, capture: CaptureSummary): string {
-  const verdict = report.verdict === "PASS" ? "✅ PASS" : "❌ FAIL";
+  const verdict = report.verdict === "PASS" ? "✅ PASS" : report.verdict === "SKIP" ? "○ SKIP" : "❌ FAIL";
   const out: string[] = [];
 
   out.push(`# ${report.scenario} — ${verdict}`, "");
+  if (report.skipReason) out.push(`- skipped: ${report.skipReason}`);
   out.push(`- started: ${report.startedAt}`);
   out.push(`- finished: ${report.finishedAt}`);
   out.push(`- duration: ${n1(report.durationMs)} ms`, "");

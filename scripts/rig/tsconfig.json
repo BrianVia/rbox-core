@@ -4,5 +4,5 @@
     "noEmit": true
   },
   "include": ["."],
-  "exclude": ["**/*.test.ts", "runs"]
+  "exclude": ["**/*.test.ts", "runs", "cache"]
 }

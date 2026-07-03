@@ -31,6 +31,9 @@ export const GUEST = {
   corpusEntry: "/app/scripts/bench/corpus.ts",
   /** HOME is the image default (root); credentials land in /root/.rbox. */
   rboxHome: "/root/.rbox",
+  /** Where the conductor workload volume is mounted (RO) into device A — the extracted
+   *  `workspaces/` tree lives at `${workloadMount}/workspaces` (conductor-initial-sync). */
+  workloadMount: "/workload",
 } as const;
 
 /** P0 = dev only. The deployed dev worker. */

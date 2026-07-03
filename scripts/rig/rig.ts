@@ -11,6 +11,7 @@
  * Hand-rolled arg parsing (no deps). Container work goes through lib/container.ts.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as C from "./lib/container.js";
@@ -19,8 +20,10 @@ import { Device } from "./lib/device.js";
 import { resolveBootstrapSecret } from "./lib/account.js";
 import { RunCapture } from "./lib/capture.js";
 import { renderReportMd } from "./lib/report.js";
-import { getScenario, scenarioNames } from "./scenarios/index.js";
-import { finalizeReport, renderReportTable, type RigCtx } from "./scenarios/types.js";
+import { waitForConvergence, waitForPath } from "./lib/waiters.js";
+import { ensureWorkloadDir, resolveWorkloadTar } from "./lib/workload.js";
+import { FAST_SUITE, getScenario, scenarioNames } from "./scenarios/index.js";
+import { finalizeReport, renderReportTable, type RigCtx, type Scenario, type ScenarioReport } from "./scenarios/types.js";
 
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "../../.."); // scripts/rig/rig.ts → repo root
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
@@ -50,16 +53,19 @@ function parseArgs(argv: string[]): Args {
   return { cmd: positional.shift(), positional, flags };
 }
 
-const USAGE = `rig — design-56 test bench (P0)
+const USAGE = `rig — design-56 test bench
 
 usage:
   rig doctor                          host preflight (read-only)
   rig up [--api-url <url>]            build image + start rig-dev-a/b
-  rig run <scenario> [--api-url <url>] [--keep-account]
+  rig run <scenario> [--keep-account] run one scenario
+  rig run all                         run the FAST suite (fresh account each; exit 1 if any FAIL)
+  rig run conductor-initial-sync [--workload-tar <path>]   real-workload scale (explicit-only)
   rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
   rig down [--all]                    tear down containers + network (--all: +image +volumes)
 
 scenarios: ${scenarioNames().join(", ")}
+suite:     ${FAST_SUITE.join(", ")}
 api url:   --api-url > RBOX_API > ${DEFAULT_DEV_API} (prod is always refused)`;
 
 // ── image build / staleness ─────────────────────────────────────────────────────
@@ -140,41 +146,67 @@ function timestamp(d = new Date()): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-async function runScenario(name: string, apiUrl: string, flags: Record<string, string>): Promise<number> {
-  const scenario = getScenario(name);
-  if (!scenario) {
-    console.error(`rig: unknown scenario ${JSON.stringify(name)} (have: ${scenarioNames().join(", ")})`);
-    return 2;
+/**
+ * Reset both guests to a pristine state between scenarios (`run all` reuses the SAME
+ * containers): kill any leftover daemon, then wipe the workspace dir + rbox home so the
+ * next scenario's fresh-account bootstrap starts from zero. Best-effort — a reset
+ * failure is logged but never aborts the run. Never touches the workload mount.
+ */
+async function resetGuests(devices: { a: Device; b: Device }, log: (l: string) => void): Promise<void> {
+  for (const d of [devices.a, devices.b]) {
+    try {
+      // Kill any detached daemon (guest-local pattern kill — cannot reach the host).
+      await d.exec(["sh", "-c", "pkill -f __daemon-run 2>/dev/null || true"], { allowFail: true });
+      await d.exec(["sh", "-c", `rm -rf '${GUEST.workDir}' '${GUEST.rboxHome}' 2>/dev/null || true`], { allowFail: true });
+    } catch (e) {
+      log(`  (reset ${d.name} best-effort error: ${e instanceof Error ? e.message : String(e)})`);
+    }
   }
-  // Resolve the secret up front (never printed) so a misconfig fails before any work.
-  const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
+}
 
-  await ensureUp(apiUrl);
-
-  const runDir = path.join(RUNS_DIR, `${timestamp()}-${name}`);
+/**
+ * Execute ONE scenario end-to-end: fresh run dir, a fresh {@link RigCtx} (device
+ * handles + waiters), a guest reset, the P1 capture lifecycle, and the report
+ * artifacts. Returns the report. Shared by the single-scenario path and the suite.
+ */
+async function executeScenario(scenario: Scenario, apiUrl: string, flags: Record<string, string>, bootstrapSecret: string): Promise<ScenarioReport> {
+  const runDir = path.join(RUNS_DIR, `${timestamp()}-${scenario.name}`);
   fs.mkdirSync(runDir, { recursive: true });
   const logPath = path.join(runDir, "run.log");
   const log = (line: string): void => {
-    const stamped = `${new Date().toISOString()} ${line}`;
-    fs.appendFileSync(logPath, stamped + "\n");
+    fs.appendFileSync(logPath, `${new Date().toISOString()} ${line}\n`);
     console.log(line);
   };
   // Transcript firehose → run.log ONLY (console stays compact). Wired into the devices.
   const transcript = (text: string): void => {
-    fs.appendFileSync(logPath, (text.endsWith("\n") ? text : text + "\n"));
+    fs.appendFileSync(logPath, text.endsWith("\n") ? text : text + "\n");
   };
-  log(`rig run ${name} — api ${apiUrl} — runDir ${runDir}`);
+  log(`rig run ${scenario.name} — api ${apiUrl} — runDir ${runDir}`);
 
+  const a = new Device(NAMES.a, apiUrl, { label: "A", transcript, redact: [bootstrapSecret] });
+  const b = new Device(NAMES.b, apiUrl, { label: "B", transcript, redact: [bootstrapSecret] });
   const ctx: RigCtx = {
-    a: new Device(NAMES.a, apiUrl, { label: "A", transcript, redact: [bootstrapSecret] }),
-    b: new Device(NAMES.b, apiUrl, { label: "B", transcript, redact: [bootstrapSecret] }),
+    a,
+    b,
     apiUrl,
     bootstrapSecret,
     runDir,
     keepAccount: flags["keep-account"] === "true",
+    flags,
     log,
     transcript,
+    waitForPath: (device, p, predicate, timeoutMs) => waitForPath(device, p, predicate, timeoutMs),
+    waitForConvergence: (da, db, dir, timeoutMs) => waitForConvergence(da, db, dir, timeoutMs),
   };
+
+  // Clean slate before every scenario (containers are reused across the suite).
+  await resetGuests({ a, b }, log);
+
+  // conductor-initial-sync needs the workload volume mounted into A (rig-managed,
+  // scenario-specific). Absent tarball → the scenario SKIPs; a stage failure aborts.
+  if (scenario.name === "conductor-initial-sync") {
+    await prepareConductorWorkload(apiUrl, flags, log);
+  }
 
   // Capture is created BEFORE the scenario and finalized in `finally` so artifacts
   // exist even when the scenario aborts. Every channel is independently best-effort;
@@ -183,7 +215,7 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
     runDir,
     repoRoot: REPO_ROOT,
     names: { a: NAMES.a, b: NAMES.b },
-    devices: { a: ctx.a, b: ctx.b },
+    devices: { a, b },
     workDir: GUEST.workDir,
     rboxHome: GUEST.rboxHome,
     env: process.env,
@@ -191,7 +223,7 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
   });
   capture.start();
 
-  let report;
+  let report: ScenarioReport;
   try {
     report = await scenario.run(ctx);
   } catch (e) {
@@ -199,7 +231,7 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
     // harness without a report.
     log(`✗ scenario threw: ${e instanceof Error ? e.message : String(e)}`);
     const now = new Date().toISOString();
-    report = finalizeReport({ scenario: name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
+    report = finalizeReport({ scenario: scenario.name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
   }
 
   fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(report, null, 2));
@@ -220,7 +252,91 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
   fs.appendFileSync(logPath, table + "\n");
   console.log("\n" + table);
   console.log(`\nreport: ${path.join(runDir, "report.md")}`);
-  return report.verdict === "PASS" ? 0 : 1;
+  return report;
+}
+
+/** Exit code for a report: PASS/SKIP → 0, FAIL → 1. */
+function reportExit(report: ScenarioReport): number {
+  return report.verdict === "FAIL" ? 1 : 0;
+}
+
+async function runScenario(name: string, apiUrl: string, flags: Record<string, string>): Promise<number> {
+  const scenario = getScenario(name);
+  if (!scenario) {
+    console.error(`rig: unknown scenario ${JSON.stringify(name)} (have: ${scenarioNames().join(", ")})`);
+    return 2;
+  }
+  // Resolve the secret up front (never printed) so a misconfig fails before any work.
+  const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
+  await ensureUp(apiUrl);
+  const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret);
+  return reportExit(report);
+}
+
+/**
+ * `rig run all` — the FAST suite (design 56 §9): every gate scenario sequentially in
+ * ONE session with a fresh account each, then a single summary table. Exit 1 if any
+ * FAILs; SKIP never fails the suite. conductor-initial-sync stays explicit-only.
+ */
+async function runSuite(apiUrl: string, flags: Record<string, string>): Promise<number> {
+  const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
+  await ensureUp(apiUrl);
+
+  const results: ScenarioReport[] = [];
+  for (const name of FAST_SUITE) {
+    const scenario = getScenario(name)!;
+    console.log(`\n═══ suite: ${name} (${results.length + 1}/${FAST_SUITE.length}) ═══`);
+    results.push(await executeScenario(scenario, apiUrl, flags, bootstrapSecret));
+  }
+
+  const pad = Math.max(...results.map((r) => r.scenario.length));
+  const rows = results.map((r) => {
+    const mark = r.verdict === "PASS" ? "✅ PASS" : r.verdict === "SKIP" ? "○ SKIP" : "❌ FAIL";
+    const nFail = r.assertions.filter((a) => !a.ok).length + r.steps.filter((s) => !s.ok).length;
+    return `  ${r.scenario.padEnd(pad)}  ${mark}  ${(r.durationMs / 1000).toFixed(1)}s${nFail ? `  (${nFail} failed)` : ""}`;
+  });
+  const failed = results.filter((r) => r.verdict === "FAIL").length;
+  const skipped = results.filter((r) => r.verdict === "SKIP").length;
+  console.log(`\n═══ suite summary ═══\n${rows.join("\n")}\n  → ${results.length - failed - skipped} passed · ${failed} failed · ${skipped} skipped`);
+  return failed > 0 ? 1 : 0;
+}
+
+/**
+ * Stage the conductor tarball into a content-addressed HOST cache dir and (re)create
+ * device A with it bind-mounted RO at {@link GUEST.workloadMount}. No tarball → leave
+ * A as-is (the scenario detects the missing mount and SKIPs). Rig-managed because
+ * scenarios have no container access by design. Host-side staging is deliberate —
+ * see the workload.ts header for the container-1.0.0 wedge this replaced.
+ */
+async function prepareConductorWorkload(apiUrl: string, flags: Record<string, string>, log: (l: string) => void): Promise<void> {
+  const tarPath = resolveWorkloadTar(flags);
+  if (!fs.existsSync(tarPath)) {
+    log(`conductor workload tarball absent (${tarPath}) — scenario will SKIP`);
+    return;
+  }
+  // Cache lives OUTSIDE the repo: `bun test`/tsc would otherwise recurse into the
+  // staged workload (a real tree full of its own .test.ts files), and a host-global
+  // cache is shared across worktrees.
+  const staged = await ensureWorkloadDir(tarPath, path.join(os.homedir(), ".cache", "rbox-rig", "workloads"), log);
+  // Recreate A with the workload dir mounted RO (alongside the standard src/scripts
+  // mounts). B is untouched. A's prior state is disposable (fresh account).
+  log(`recreating ${NAMES.a} with workload ${staged.dir} → ${GUEST.workloadMount}`);
+  await C.stopContainer(NAMES.a);
+  await C.deleteContainer(NAMES.a);
+  await C.createContainer({
+    name: NAMES.a,
+    image: NAMES.image,
+    network: NAMES.network,
+    cpus: DEV_CPUS,
+    memory: DEV_MEMORY,
+    mounts: [
+      { source: path.join(REPO_ROOT, "src"), target: GUEST.srcMount, readonly: true },
+      { source: path.join(REPO_ROOT, "scripts"), target: GUEST.scriptsMount, readonly: true },
+      { source: staged.dir, target: GUEST.workloadMount, readonly: true },
+    ],
+    env: { RBOX_API: apiUrl },
+  });
+  await C.startContainer(NAMES.a);
 }
 
 // ── down ──────────────────────────────────────────────────────────────────────
@@ -378,10 +494,11 @@ async function main(): Promise<number> {
     case "run": {
       const scenario = positional[0];
       if (!scenario) {
-        console.error(`rig: \`run\` needs a scenario (have: ${scenarioNames().join(", ")})`);
+        console.error(`rig: \`run\` needs a scenario or \`all\` (have: ${scenarioNames().join(", ")})`);
         return 2;
       }
-      return runScenario(scenario, resolveConfig(process.env, flags, REPO_ROOT).apiUrl, flags);
+      const apiUrl = resolveConfig(process.env, flags, REPO_ROOT).apiUrl;
+      return scenario === "all" ? runSuite(apiUrl, flags) : runScenario(scenario, apiUrl, flags);
     }
     case "watch":
       return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);

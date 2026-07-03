@@ -33,10 +33,14 @@ test("EMPTY_SHA256 is the sha256 of the empty string (empty-file survival check)
   expect(EMPTY_SHA256).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 });
 
-test("fingerprintScript prunes .rbox and emits both file and symlink sweeps", () => {
+test("fingerprintScript prunes .rbox/.git/node_modules and emits both file and symlink sweeps", () => {
   const s = fingerprintScript("/work/ws");
   expect(s).toContain("cd '/work/ws'");
-  expect(s).toContain("-path ./.rbox -prune");
+  // Prunes exactly the three dirs rbox never syncs, by name at any depth.
+  expect(s).toContain("-name .rbox");
+  expect(s).toContain("-name .git");
+  expect(s).toContain("-name node_modules");
+  expect(s).toContain("-prune");
   expect(s).toContain("sha256sum");
   expect(s).toContain("readlink");
 });
