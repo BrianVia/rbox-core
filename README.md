@@ -52,8 +52,7 @@ rbox init --workspace <id> --no-interactive   # join
 rbox start
 rbox status                      # workspace state + sync metrics
 
-# Dependency rebuild (`rbox deps ...` / `doctor` / `hydrate`) is temporarily
-# disabled — see design 51 (docs/design/51-rbox-yml-config.md).
+# Support diagnostics: `rbox doctor`; dependency rebuild (`rbox deps ...` / `hydrate` / `detect`) remains disabled (design 51).
 ```
 
 Everything interactive has a `--no-interactive` flag-driven path (CI/Docker never depends on a TTY). `NO_COLOR` / `FORCE_COLOR` honored.
@@ -76,7 +75,9 @@ versions <path> | restore <p>@<n>  version history & restore
 ```
 
 Full reference (always in sync with the binary): `rbox help`, or
-[`docs/usage.md`](docs/usage.md) for the narrative version.
+[`docs/usage.md`](docs/usage.md) for the narrative version. Support
+diagnostics (`rbox doctor`, the opt-in report upload, and how the operator
+retrieves reports): [`docs/diagnostics.md`](docs/diagnostics.md).
 
 ## Architecture
 

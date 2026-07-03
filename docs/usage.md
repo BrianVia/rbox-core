@@ -98,10 +98,9 @@ applying what could be a corrupted or mistaken remote state.
 > **Note on deprecated names:** `link` and `daemon <start|stop|logs>` still work
 > but are deprecated aliases (they forward to `track` and `start`/`stop`/`logs`
 > respectively) and print a warning — they're slated for removal at v0.3
-> (design 29). Use the names above in new scripts. `hydrate`/`detect`/`doctor`
-> used to alias `deps install`/`list`/`check` the same way, but the whole `deps`
-> group is currently commented out of the CLI (design 51, §7 below) — those
-> three are unknown commands for now, not just deprecated ones.
+> (design 29). Use the names above in new scripts. `doctor` is now the top-level
+> support command; `hydrate`/`detect` remain disabled deps aliases while the
+> whole `deps` group is commented out of the CLI (design 51, §7 below).
 
 ## 5. `.rboxignore` — shared, cross-machine ignore rules
 
@@ -164,8 +163,8 @@ CLI entirely for now, see §7).
 
 **The whole `deps` command group is commented out of the CLI right now**
 (`src/cli/index.ts`, `help-registry.ts`, `deprecations.ts`) — `rbox deps ...`
-and its old aliases `hydrate`/`detect`/`doctor` are all unknown commands until
-this is revisited. The underlying implementation (`hydrate-cmd.ts`,
+and its old aliases `hydrate`/`detect` are unknown commands until this is
+revisited. The underlying implementation (`hydrate-cmd.ts`,
 `deps-drift.ts`, `deps-notify.ts`) is untouched, just disconnected from the
 dispatcher, so re-enabling is a small, mechanical change when it's wanted
 again — not a rewrite.

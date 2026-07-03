@@ -9,6 +9,7 @@ import { isStandaloneBinary } from "./runtime.js";
 const RBOX_DIR = ".rbox";
 const PID_FILE = "daemon.pid";
 const LOG_FILE = "daemon.log";
+const BOUND_FILE = "workspace.bound";
 const DAEMON_MARKER = "__daemon-run";
 
 /** Home rbox dir (`~/.rbox`). `RBOX_HOME` overrides it (tests; also lets a user
@@ -35,7 +36,6 @@ export const daemonRuntimeDir = (root: string) => path.join(rboxHome(), "daemons
 const pidPath = (root: string) => path.join(daemonRuntimeDir(root), PID_FILE);
 const logPath = (root: string) => path.join(daemonRuntimeDir(root), LOG_FILE);
 const boundPath = (root: string) => path.join(daemonRuntimeDir(root), BOUND_FILE);
-const BOUND_FILE = "workspace.bound";
 
 /** Called by the daemon at startup: record which workspace id THIS daemon bound.
  *  `startDaemon` compares it against the root's current binding to detect a daemon
@@ -46,14 +46,28 @@ export async function recordDaemonBinding(root: string, workspaceId: string): Pr
   await fsp.writeFile(boundPath(root), workspaceId);
 }
 
-/** The workspace id the RUNNING daemon bound at startup (undefined: pre-binding
- *  daemon or never started — callers must treat unknown as "can't tell", not stale). */
+/** The workspace id recorded by a daemon at startup (undefined: absent, unreadable,
+ *  empty, pre-binding daemon, or never started — callers must treat unknown as
+ *  "can't tell", not stale). */
 export function readDaemonBinding(root: string): string | undefined {
+  return readDaemonBindingRecord(root).workspaceId;
+}
+
+export interface DaemonBindingRecord {
+  present: boolean;
+  workspaceId?: string;
+  unreadable?: boolean;
+}
+
+/** Read the daemon binding file without consulting daemon liveness. Diagnostics uses this
+ *  to avoid leaking stale daemon-owned sidecars left behind by a crashed/stopped daemon. */
+export function readDaemonBindingRecord(root: string): DaemonBindingRecord {
   try {
     const id = fs.readFileSync(boundPath(root), "utf8").trim();
-    return id || undefined;
-  } catch {
-    return undefined;
+    return id ? { present: true, workspaceId: id } : { present: true, unreadable: true };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { present: false };
+    return { present: true, unreadable: true };
   }
 }
 
@@ -70,10 +84,31 @@ export function currentWorkspaceId(root: string): string | undefined {
   }
 }
 
+/** The daemon-binding verdict for user-facing liveness: only a LIVE daemon with a
+ *  known mismatching startup binding is stale. Unknown binding (pre-binding daemon)
+ *  remains "can't tell", matching the existing status rule. Diagnostics sidecar
+ *  exclusion separately reads `workspace.bound` independent of liveness. */
+export function daemonBindingStatus(root: string, workspaceId: string): {
+  alive: { running: boolean; pid?: number };
+  bound?: string;
+  stale: boolean;
+} {
+  const alive = isDaemonRunning(root);
+  const bound = alive.running ? readDaemonBinding(root) : undefined;
+  return { alive, bound, stale: alive.running && bound !== undefined && bound !== workspaceId };
+}
+
 /** Pre-global location of the pid/log (inside the workspace). Kept only as a
  *  READ fallback so a daemon started before this change stays visible to `rbox
  *  logs`; nothing new is ever written here. Pre-launch back-compat, not migration. */
 const legacyLogPath = (root: string) => path.join(root, RBOX_DIR, LOG_FILE);
+
+/** The daemon log locations in preference order. The primary is the global
+ *  runtime dir; the legacy in-workspace path is read-only back-compat. */
+export const daemonLogPaths = (root: string): { primary: string; legacy: string } => ({
+  primary: logPath(root),
+  legacy: legacyLogPath(root),
+});
 
 /** Remove the global pid/log dir for `root` — called by `untrack` so tearing down
  *  a workspace leaves no orphaned runtime files behind under `~/.rbox`. */

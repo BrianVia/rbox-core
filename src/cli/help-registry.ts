@@ -270,6 +270,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox billing",
   },
   {
+    name: "doctor",
+    group: "BILLING & MAINTENANCE",
+    summary: "check workspace health; optionally upload a support report",
+    usage: "rbox doctor [--report] [--diagnostics] [--yes]",
+    flags: [
+      { flag: "--report", desc: "preview/upload a plaintext unencrypted support report stored 30 days; requires --diagnostics or RBOX_DIAGNOSTICS=1" },
+      { flag: "--diagnostics", desc: "enable report upload for this invocation; rbox.yml diagnostics is reserved for design 51" },
+      { flag: "--yes", desc: "skip the consent prompt; required with --report in non-interactive mode" },
+    ],
+  },
+  {
     name: "upgrade",
     group: "BILLING & MAINTENANCE",
     summary: "update the rbox binary",
@@ -315,11 +326,11 @@ export const COMMAND_HELP: CommandHelp[] = [
   // ── hidden: deprecated aliases (warn on stderr; removed at v0.3) ──────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
   { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
-  // hydrate/detect/doctor aliases commented out along with `deps` itself (design 51)
+  // hydrate/detect aliases commented out along with `deps` itself (design 51)
   // — their forward target no longer exists, so keeping them would dangle.
+  // The old deps-doctor alias is intentionally not restored; `doctor` is support diagnostics.
   // { name: "hydrate", group: "DEPENDENCIES", summary: "deprecated → rbox deps install", usage: "rbox hydrate [path]", hidden: true, alias: "deps install" },
   // { name: "detect", group: "DEPENDENCIES", summary: "deprecated → rbox deps list", usage: "rbox detect [path]", hidden: true, alias: "deps list" },
-  // { name: "doctor", group: "DEPENDENCIES", summary: "deprecated → rbox deps check", usage: "rbox doctor [path]", hidden: true, alias: "deps check" },
 ];
 
 const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));

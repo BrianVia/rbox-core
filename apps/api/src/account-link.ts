@@ -292,6 +292,7 @@ async function loadShellState(env: Env, accountId: string, nowMs: number): Promi
          (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND consumed_at IS NULL AND expires_at > ?2) AS pt,
          (SELECT COUNT(*) FROM device_auth WHERE account_id = ?1 AND status IN ('pending','approved') AND expires_at > ?2) AS da,
          (SELECT COUNT(*) FROM device_notifications WHERE account_id = ?1) AS dn,
+         (SELECT COUNT(*) FROM diagnostics_reports WHERE account_id = ?1) AS dr,
          (SELECT COUNT(*) FROM commits WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE account_id = ?1)) AS cm,
          (SELECT COUNT(*) FROM clerk_users WHERE account_id = ?1) AS cu,
          (SELECT COUNT(*) FROM memberships WHERE account_id = ?1 AND role = 'owner') AS own
@@ -310,7 +311,9 @@ function judgeReclaimable(r: ShellState | null, opts: { ignoreBilling?: boolean 
   if (r.origin !== "web") return false;
   if (Number(r.used) !== 0) return false;
   if (!opts.ignoreBilling && (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
-  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "dn", "cm"]) if (Number(r[k]) !== 0) return false;
+  // `dr` (diagnostics_reports) blocks fail-closed: only DEVICE principals can create reports,
+  // so a "web shell" holding one is not the empty shell this destructive path assumes.
+  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "dn", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
   if (Number(r.cu) > 1 || Number(r.own) > 1) return false; // only this Clerk id + its one owner membership
   return true;
 }

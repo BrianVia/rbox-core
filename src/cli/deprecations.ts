@@ -25,11 +25,10 @@ export interface ResolvedAlias {
  *  a group path ("deps install") — the subcommand is prepended to the positionals. */
 const SIMPLE_ALIASES: Record<string, string> = {
   link: "track",
-  // hydrate/detect/doctor commented out along with `deps` itself (design 51) —
-  // their forward target (the `deps` group) is currently disabled in index.ts.
+  // hydrate/detect are commented out along with `deps` itself (design 51).
+  // The old deps-doctor alias is intentionally not restored: `doctor` is now support diagnostics.
   // hydrate: "deps install",
   // detect: "deps list",
-  // doctor: "deps check",
 };
 
 const DAEMON_RENAME = "note: 'rbox daemon …' is now 'rbox start/stop/logs'.";
