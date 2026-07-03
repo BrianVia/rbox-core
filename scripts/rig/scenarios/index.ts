@@ -7,6 +7,7 @@ import { typeFlip } from "./type-flip.js";
 import { daemonIdleCpu } from "./daemon-idle-cpu.js";
 import { conductorInitialSync } from "./conductor-initial-sync.js";
 import { chaosRestart } from "./chaos-restart.js";
+import { gitEntanglement } from "./git-entanglement.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
@@ -14,6 +15,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "mass-delete-guard": massDeleteGuard,
   "type-flip": typeFlip,
   "daemon-idle-cpu": daemonIdleCpu,
+  "git-entanglement": gitEntanglement,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };
@@ -28,7 +30,7 @@ export const SCENARIOS: Record<string, Scenario> = {
  * split also omits it). Its wall time is additionally network-variable (resume push + B
  * pull), so it's a poor fit for a tight PR loop regardless.
  */
-export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu"] as const;
+export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement"] as const;
 
 export function getScenario(name: string): Scenario | undefined {
   return SCENARIOS[name];
