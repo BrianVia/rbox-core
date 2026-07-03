@@ -4,7 +4,7 @@
 
 **Pushes to `main` auto-deploy** (GitHub Actions):
 
-- `.github/workflows/deploy-api.yml` — when `apps/api/**` changes → `wrangler deploy --env production` (**`rbox-prod-api` / `api.rbox.to`**), gated on `typecheck` + `test:api`.
+- **API worker deploys are handled by Cloudflare's Workers Builds git integration** (connected in the Cloudflare dash; configured by the founder), not by GitHub Actions — the old `deploy-api.yml` was removed 2026-07-03. PR CI (`ci.yml`: typecheck + full test suites) remains the merge gate on every PR. NOTE: Workers Builds runs no tests itself — the PR gate is the only test gate before prod.
 - `.github/workflows/deploy-web.yml` — when `apps/web/**` changes → build + `wrangler pages deploy` (**`rbox-app` / `app.rbox.to`**), gated on `check` + `test`.
 - `.github/workflows/release.yml` — on `v*` tags → build/sign/publish the `rbox` CLI binaries to R2 (unchanged).
 
