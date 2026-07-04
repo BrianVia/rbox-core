@@ -1,7 +1,8 @@
 import type { Env } from "../env.js";
 import { sha256Hex } from "../util.js";
 import { enqueueNotify, prepareOutboxInsert } from "../notify.js";
-import { dirDb } from "../db.js";
+import { dbFor, dirDb } from "../db.js";
+import { planFor } from "../plans.js";
 import { DEVICE_ID_BYTES, isUniqueViolation, randomHex, TOKEN_BYTES } from "./shared.js";
 
 const MINT_MAX_ATTEMPTS = 5; // bounded retries when a unique INSERT collides (P1)
@@ -73,6 +74,55 @@ export class AccountGoneError extends Error {
   }
 }
 
+/** Thrown when a durable mint is blocked by the per-account device cap. Carries
+ *  cap + plan for the public 409 DTO; handler preflights keep grants unburned,
+ *  and this remains the mint-path backstop. */
+export class DeviceLimitError extends Error {
+  constructor(
+    readonly cap: number,
+    readonly plan: string,
+  ) {
+    super(`device limit reached (cap ${cap} on ${plan})`);
+    this.name = "DeviceLimitError";
+  }
+}
+
+/** The device cap for a plan. Only explicit `RBOX_ENV === "dev"` disables it. */
+function deviceCapFor(env: Env, plan: string | null | undefined): number {
+  return env.RBOX_ENV === "dev" ? Infinity : planFor(plan).devices;
+}
+
+/** accounts.plan for the cap (account-data plane). The legacy 'default' account (which may
+ *  have no `accounts` row) and a missing row both resolve to 'free'. */
+async function readPlan(env: Env, accountId: string): Promise<string> {
+  if (accountId === "default") return "free";
+  const row = await dbFor(env, accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
+  return row?.plan ?? "free";
+}
+
+/** Count of an account's durable, non-revoked device credentials. */
+async function durableDeviceCount(env: Env, accountId: string): Promise<number> {
+  const row = await dirDb(env).prepare("SELECT COUNT(*) AS n FROM devices WHERE account_id = ? AND expires_at IS NULL AND revoked = 0").bind(accountId).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+interface DeviceCapStatus {
+  ok: boolean;
+  cap: number;
+  plan: string;
+}
+
+/** Preflight the durable-device cap without minting. Full accounts 409 before a
+ *  one-time grant is consumed; the legacy 'default' account and explicit dev env
+ *  are unbounded. Read errors fail closed, and the mint backstop catches the
+ *  remaining check-then-mint race. */
+export async function checkDeviceCap(env: Env, accountId: string): Promise<DeviceCapStatus> {
+  const plan = await readPlan(env, accountId);
+  const cap = accountId === "default" ? Infinity : deviceCapFor(env, plan);
+  if (!Number.isFinite(cap)) return { ok: true, cap, plan };
+  return { ok: (await durableDeviceCount(env, accountId)) < cap, cap, plan };
+}
+
 /** A device mint, PREPARED (token generated, INSERT not yet run) so a caller can batch
  *  it atomically with another statement — notably the new-device-notification outbox
  *  row (design 30 §3.4). Returns the plaintext token + `token_hash` + `device_id`. The
@@ -86,6 +136,13 @@ export async function prepareMintDevice(
   expiresAt: number | null = null,
   genDeviceId: () => string = () => `${prefix}_${randomHex(DEVICE_ID_BYTES)}`,
 ): Promise<{ token: string; tokenHash: string; deviceId: string; insert: D1PreparedStatement }> {
+  // Mint backstop for durable credentials. Keep this separate from the design-37
+  // guarded INSERT so changes==0 remains tombstone-only; handlers preflight to
+  // avoid burning grants, and this catches concurrent overshoot.
+  if (expiresAt === null) {
+    const status = await checkDeviceCap(env, accountId);
+    if (!status.ok) throw new DeviceLimitError(status.cap, status.plan);
+  }
   const deviceId = genDeviceId();
   const token = randomHex(TOKEN_BYTES);
   const tokenHash = await sha256Hex(token);

@@ -12,13 +12,17 @@ export interface PlanLimits {
    *  plan-driven prune runs it yet (see docs/design/06-versions-gc.md). */
   retentionDays: number;
   manifestBytes: number;
+  /** Max durable (non-expiring) device credentials per account (design 64 §3.2). Ephemeral
+   *  web-session tokens (`expires_at` set) are not counted. Only explicit RBOX_ENV=dev
+   *  disables enforcement for dev/rig; absent or mistyped envs enforce. */
+  devices: number;
 }
 
 export const PLANS: Record<string, PlanLimits> = {
-  free: { storageBytes: 2 * GiB, workspaces: 1, projects: 5, retentionDays: 0, manifestBytes: 16 * MiB },
-  solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB },
-  pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB },
-  team: { storageBytes: 150 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB },
+  free: { storageBytes: 2 * GiB, workspaces: 1, projects: 5, retentionDays: 0, manifestBytes: 16 * MiB, devices: 5 },
+  solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB, devices: 10 },
+  pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 25 },
+  team: { storageBytes: 150 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 100 },
 };
 
 export function planFor(plan: string | null | undefined): PlanLimits {

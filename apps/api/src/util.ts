@@ -13,8 +13,8 @@ export function logErr(event: string, e: unknown): void {
   console.error(JSON.stringify({ event, errorClass: errClass(e) }));
 }
 
-export function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+export function json(data: unknown, status = 200, headers?: Record<string, string>): Response {
+  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
 export function blobKey(sha: string): string {

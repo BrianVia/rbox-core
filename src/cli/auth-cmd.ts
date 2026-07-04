@@ -17,6 +17,8 @@ import {
 } from "./recovery-kit.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const MIN_LOGIN_BACKOFF_MS = 1000;
+const MAX_LOGIN_BACKOFF_MS = 60_000;
 const NO_KIT: RecoveryKitOptions = { kit: false };
 export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
   "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox recover`.";
@@ -53,6 +55,44 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
     headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
   });
+}
+
+function clampLoginSleepMs(ms: number): number {
+  return Math.min(Math.max(Number.isFinite(ms) ? ms : MIN_LOGIN_BACKOFF_MS, MIN_LOGIN_BACKOFF_MS), MAX_LOGIN_BACKOFF_MS);
+}
+
+function pollIntervalMs(intervalSeconds: number): number {
+  return clampLoginSleepMs(intervalSeconds * 1000);
+}
+
+/** Parse `Retry-After` seconds into a clamped login backoff. */
+function retryAfterMs(res: Response, fallbackMs: number): number {
+  const secs = Number(res.headers.get("Retry-After"));
+  return clampLoginSleepMs(Number.isFinite(secs) && secs >= 0 ? secs * 1000 : fallbackMs);
+}
+
+interface DeviceCodeStart {
+  deviceCode: string;
+  userCode: string;
+  interval: number;
+  expiresIn: number;
+}
+
+/** Start device-code login, retrying bounded 429s with `Retry-After` backoff. */
+async function startDeviceCode(remoteUrl: string, label: string): Promise<DeviceCodeStart> {
+  const MAX_RETRIES = 4;
+  for (let attempt = 0; ; attempt++) {
+    const res = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
+    if (res.ok) return (await res.json()) as DeviceCodeStart;
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      const waitMs = retryAfterMs(res, Math.min(2000 * (attempt + 1), 10_000));
+      console.error(`login rate-limited; retrying in ${Math.ceil(waitMs / 1000)}s...`);
+      await sleep(waitMs);
+      continue;
+    }
+    if (res.status === 429) throw new Error("login rate-limited — wait a minute and run `rbox login` again");
+    throw new Error(`login start failed: ${res.status}`);
+  }
 }
 
 type GenesisApi = Pick<RboxApi, "getAccountKeys" | "bootstrapKeys">;
@@ -160,9 +200,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     return;
   }
 
-  const startRes = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
-  if (!startRes.ok) throw new Error(`login start failed: ${startRes.status}`);
-  const start = (await startRes.json()) as { deviceCode: string; userCode: string; interval: number; expiresIn: number };
+  const start = await startDeviceCode(remoteUrl, label);
 
   // Browser-optional approval (design 47): print a dashboard URL a web session can
   // approve from any browser (laptop/phone, need not be this machine — the SSH case),
@@ -180,9 +218,23 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
   const prompt = offerApprovalOpen(approveUrl);
   try {
     const deadline = Date.now() + start.expiresIn * 1000;
+    const basePollWaitMs = pollIntervalMs(start.interval);
     while (Date.now() < deadline) {
-      await sleep(start.interval * 1000);
+      await sleep(basePollWaitMs);
       const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
+      // Device cap does not clear through polling.
+      if (pollRes.status === 409) {
+        const body = (await pollRes.json().catch(() => ({}))) as { error?: string; cap?: number; plan?: string };
+        if (body.error === "device_limit_reached") {
+          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — revoke a device or upgrade`);
+        }
+        throw new Error(`login poll failed: ${pollRes.status}`);
+      }
+      // Non-OK poll responses are transient until the device code expires.
+      if (!pollRes.ok) {
+        await sleep(retryAfterMs(pollRes, basePollWaitMs));
+        continue;
+      }
       const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
       if (p.status === "approved" && p.token) {
         assertValidDeviceCodeApproval(p);
