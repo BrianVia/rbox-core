@@ -6,6 +6,7 @@ import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
+import { isAutostartEnabled } from "./autostart-cmd.js";
 import {
   defaultKitTargetDir,
   displayPath,
@@ -285,8 +286,10 @@ function offerApprovalOpen(url: string): { cancel: () => void } | undefined {
 }
 
 export async function logout(): Promise<void> {
+  const autostartEnabled = await isAutostartEnabled().catch(() => false);
   await clearCredentials();
   console.log("logged out (credential removed)");
+  if (autostartEnabled) console.log("autostart still enabled");
 }
 
 async function requireCreds() {

@@ -108,6 +108,24 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox stop [path]",
   },
   {
+    name: "autostart enable",
+    group: "SYNCING",
+    summary: "resume background sync after login",
+    usage: "rbox autostart enable",
+  },
+  {
+    name: "autostart disable",
+    group: "SYNCING",
+    summary: "disable login resume",
+    usage: "rbox autostart disable",
+  },
+  {
+    name: "autostart status",
+    group: "SYNCING",
+    summary: "show autostart state",
+    usage: "rbox autostart status",
+  },
+  {
     name: "logs",
     group: "SYNCING",
     summary: "tail background-sync logs",

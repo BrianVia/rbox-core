@@ -18,12 +18,12 @@ export const PUBLIC_COMMANDS: string[] = COMMAND_HELP.filter((c) => !c.hidden).m
 /** Deprecated aliases — dispatched, warn on stderr, removed at v0.3. */
 export const ALIAS_COMMANDS: string[] = COMMAND_HELP.filter((c) => c.alias).map((c) => c.name);
 
-/** Real commands kept OUT of the grouped screen (init, versions/restore), plus the
- *  two internal tokens the dispatcher handles without a help entry. */
+/** Hidden real commands plus internal dispatcher tokens. */
 export const HIDDEN_COMMANDS: string[] = [
   ...COMMAND_HELP.filter((c) => c.hidden && !c.alias).map((c) => c.name),
   "help",
   "__daemon-run",
+  "__boot-resume",
 ];
 
 /** Every top-level token the dispatcher's `switch` must handle (incl. aliases). */
@@ -31,6 +31,7 @@ export const KNOWN_TOP_LEVEL: ReadonlySet<string> = new Set<string>([
   ...COMMAND_HELP.map((c) => firstWord(c.name)),
   "help",
   "__daemon-run",
+  "__boot-resume",
   // `--version` / `-v` are handled before the switch, not real subcommands.
 ]);
 

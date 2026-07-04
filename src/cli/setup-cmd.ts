@@ -26,7 +26,7 @@ import { runInit } from "./init-cmd.js";
 import { collapseHome } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaRecovery } from "./e2ee-client.js";
-import { startDaemon } from "./daemon-control.js";
+import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { loadCredentials } from "./credentials.js";
 import { loadConfig } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
@@ -85,8 +85,13 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
   process.stderr.write(`\n── ${e.bold("Step 3 of 3 · Start syncing")} ${HR.slice(0, 38)}\n`);
   const keep = await promptConfirm({ message: "Keep this workspace syncing in the background?", default: true });
   if (keep) {
-    await startDaemon(outcome.root);
+    await startDaemonAndRecordDesired(outcome.root);
     process.stderr.write(`${e.green("✓")} Background sync started. Stop anytime with \`rbox stop\`.\n`);
+    const resume = await promptConfirm({ message: "Resume syncing automatically after you reboot?", default: true });
+    if (resume) {
+      await enableAutostart();
+      process.stderr.write(`${e.green("✓")} autostart enabled\n`);
+    }
   } else {
     process.stderr.write(`${e.dim("Run `rbox start` whenever you're ready.")}\n`);
   }

@@ -5,7 +5,8 @@ import { attributeDaemonForStatus, healthLine, lastSyncLines, progressLabel, tra
 import { findRoot, loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
-import { DEFAULT_LOG_LINES, daemonBindingStatus, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
+import { DEFAULT_LOG_LINES, daemonBindingStatus, logsDaemon } from "./daemon-control.js";
+import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -465,11 +466,15 @@ async function main(): Promise<void> {
       break;
     }
     case "start": {
-      await startDaemon(await resolveRoot(positional[0]));
+      await startDaemonAndRecordDesired(await resolveRoot(positional[0]));
       break;
     }
     case "stop": {
-      await stopDaemon(await resolveRoot(positional[0]));
+      await stopDaemonAndRecordDesired(await resolveRoot(positional[0]));
+      break;
+    }
+    case "autostart": {
+      await autostartCmd(positional[0]);
       break;
     }
     case "logs": {
@@ -574,6 +579,11 @@ async function main(): Promise<void> {
       const { runDaemon } = await import("./daemon.js");
       const root = path.resolve(positional[0] ?? process.cwd());
       await runDaemon(root);
+      break;
+    }
+    case BOOT_RESUME_MARKER: {
+      // Hidden login resumer; launchd/systemd are not crash supervisors.
+      await bootResume();
       break;
     }
     case "__watcher-selftest": {
