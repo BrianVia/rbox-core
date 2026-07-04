@@ -4,7 +4,8 @@ import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
 import { dbFor, dirDb } from "../db.js";
 import { DEVICE_ID_BYTES, randomHex, TOKEN_BYTES } from "./shared.js";
-import { AccountGoneError, mintDeviceWithNotification } from "./mint.js";
+import { AccountGoneError, checkDeviceCap, DeviceLimitError, mintDeviceWithNotification } from "./mint.js";
+import { ipKey, rateLimited } from "../ratelimit.js";
 
 const AUTH_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_S = 5;
@@ -19,6 +20,9 @@ function randomUserCode(): string {
 
 // POST /v1/auth/device/start { label } -> { deviceCode, userCode, interval, expiresIn }
 export async function startDeviceAuth(req: Request, env: Env): Promise<Response> {
+  // design 64 §3.1: per-IP burst cap BEFORE the unconditional D1 INSERT (the write amplifier).
+  const limited = await rateLimited(env.RL_DEVICE_START, `ds:${ipKey(req)}`);
+  if (limited) return limited;
   const body = (await req.json().catch(() => ({}))) as { label?: string };
   const deviceCode = randomHex(TOKEN_BYTES);
   const deviceId = `dev_${randomHex(DEVICE_ID_BYTES)}`; // proposed id; mint is the real uniqueness gate
@@ -44,6 +48,10 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
 export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { deviceCode?: string };
   if (typeof body.deviceCode !== "string") return json({ error: "bad_request" }, 400);
+  // design 64 §3.1: keyed by the high-entropy deviceCode (NOT the IP) so two simultaneous
+  // logins behind one office NAT each get their own budget (~2.5× the 5s poll cadence).
+  const limited = await rateLimited(env.RL_DEVICE_POLL, `dp:${body.deviceCode}`);
+  if (limited) return limited;
   const row = await dirDb(env)
     .prepare("SELECT user_code, status, device_id, label, expires_at, account_id, user_id FROM device_auth WHERE device_code = ?")
     .bind(body.deviceCode)
@@ -62,6 +70,10 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
       const acctLive = await dbFor(env, acctId).prepare("SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(acctId).first();
       if (!acctLive) return json({ status: "expired" }); // account tombstoned/gone → can't mint
     }
+    // design 64 §3.2: cap PREFLIGHT before burning the one-time approval — on limit, 409 with
+    // the device-code STILL 'approved' (the user revokes a device and re-polls the SAME code).
+    const cap = await checkDeviceCap(env, acctId);
+    if (!cap.ok) return json({ error: "device_limit_reached", cap: cap.cap, plan: cap.plan }, 409);
     // One-time claim: only the poll that wins the conditional UPDATE mints+returns.
     const claim = await dirDb(env)
       .prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ? AND status = 'approved'")
@@ -89,6 +101,9 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
       // design 37: account tombstoned between the liveness read and the device insert → the
       // guarded mint wrote NO rows. The device-code is already claimed (dead); report expired.
       if (e instanceof AccountGoneError) return json({ status: "expired" });
+      // design 64 §3.2: race-overshoot past the preflight cap (a concurrent durable mint
+      // landed) → the backstop threw AFTER the claim burned the code. Same 409, never a 500.
+      if (e instanceof DeviceLimitError) return json({ error: "device_limit_reached", cap: e.cap, plan: e.plan }, 409);
       throw e;
     }
     return json({ status: "approved", token: minted.token, deviceId: minted.deviceId, accountId: row.account_id });

@@ -1,4 +1,5 @@
 import type { RouteCtx } from "./shared.js";
+import { ipKey, rateLimited } from "../ratelimit.js";
 
 /**
  * Public release distribution (design 14), served from the SEPARATE rbox_releases
@@ -8,9 +9,15 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   // Never cache a 404 (a cached 404 could mask a just-published object on the
   // edge — design 14 U7).
   const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+  // design 64 §3.1: one shared per-IP burst cap across the public release GETs. Applied only
+  // once a request MATCHES a release route (below), never on the fall-through, so non-release
+  // traffic doesn't burn the RL_RELEASE budget. Returns the 429 when over budget, else null.
+  const releaseLimited = () => rateLimited(env.RL_RELEASE, `rl:${ipKey(req)}`);
 
   // `curl -fsSL https://api.rbox.to/install.sh | sh`
   if (url.pathname === "/install.sh" && req.method === "GET") {
+    const limited = await releaseLimited();
+    if (limited) return limited;
     const obj = await env.rbox_releases.get("releases/install.sh");
     if (!obj) return releaseNotFound();
     return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" } });
@@ -18,6 +25,8 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   // The signed release manifest + its detached signature (no-cache; `rbox upgrade`
   // verifies the signature against an embedded key before trusting it).
   if ((url.pathname === "/version" || url.pathname === "/version.sig") && req.method === "GET") {
+    const limited = await releaseLimited();
+    if (limited) return limited;
     const key = url.pathname === "/version" ? "releases/version.json" : "releases/version.json.sig";
     const obj = await env.rbox_releases.get(key);
     if (!obj) return releaseNotFound();
@@ -28,6 +37,8 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   // install.sh only) OR `/bin/v<ver>/rbox-<os>-<arch>` (immutable versioned — what
   // `rbox upgrade` downloads from the signed manifest). Name/version validated.
   if (seg[0] === "bin" && req.method === "GET" && (seg.length === 2 || seg.length === 3)) {
+    const limited = await releaseLimited();
+    if (limited) return limited;
     const versioned = seg.length === 3;
     const ver = versioned ? seg[1]! : null;
     const name = versioned ? seg[2]! : seg[1]!;

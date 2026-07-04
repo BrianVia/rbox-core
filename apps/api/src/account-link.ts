@@ -5,6 +5,7 @@ import { verifyClerkJWT } from "./clerk.js";
 import { isUniqueViolation, randomHex } from "./auth.js";
 import { repointBillingToAccount } from "./stripe.js";
 import { dbFor, dirDb } from "./db.js";
+import { ipKey, rateLimited } from "./ratelimit.js";
 
 /**
  * Web↔CLI account linking (design 21). A two-phase bind attaches a live Clerk
@@ -38,6 +39,9 @@ function randomB64url(n: number): string {
 /** POST /v1/account/link/start — PUBLIC. Fresh Clerk JWT in body. Mint a code
  *  bound to the re-proven Clerk identity C and C's CURRENT account (origin). */
 export async function startLink(req: Request, env: Env, nowMs: number): Promise<Response> {
+  // design 64 §3.1: shared per-IP burst cap — cheap to script from a stolen Clerk session.
+  const limited = await rateLimited(env.RL_LINK_PAIR, `lp:${ipKey(req)}`);
+  if (limited) return limited;
   if (!env.CLERK_ISSUER) return json({ error: "web_auth_not_configured" }, 501);
   const body = (await req.json().catch(() => ({}))) as { clerkToken?: unknown };
   if (typeof body.clerkToken !== "string") return json({ error: "unauthorized" }, 401);

@@ -73,6 +73,19 @@
   // legacy MIME binding). No API key/DKIM material at runtime: CF signs DKIM with the
   // CF-managed sending-subdomain key. Sender domain `mail.rbox.to` (onboarded + enabled).
   "send_email": [{ "name": "EMAIL" }],
+  // design 64 §3.1 — anonymous-edge rate limiters (Workers Rate Limiting, GA 2025-09-19).
+  // TOP-LEVEL = the DEV worker: GENEROUS budgets so the design-56 rig never trips. The
+  // env.production block below redeclares its OWN tighter numbers (named envs do NOT inherit
+  // top-level bindings once they override siblings) — that IS the env-aware knob, no code
+  // branch. `namespace_id` is a client-chosen positive-integer id (not a resource that must
+  // pre-exist); Cloudflare provisions the counter namespace on first deploy. `period` is
+  // 10 | 60s only. Registry (AGENTS.md ops): 2001 start / 2002 poll / 2003 release / 2004 pair+link.
+  "ratelimits": [
+    { "name": "RL_DEVICE_START", "namespace_id": "2001", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RL_DEVICE_POLL", "namespace_id": "2002", "simple": { "limit": 240, "period": 60 } },
+    { "name": "RL_RELEASE", "namespace_id": "2003", "simple": { "limit": 600, "period": 60 } },
+    { "name": "RL_LINK_PAIR", "namespace_id": "2004", "simple": { "limit": 120, "period": 60 } }
+  ],
   // From: for the new-device email; the idempotency pepper is a `wrangler secret`.
   "vars": {
     "RBOX_NOTIFY_FROM": "security@mail.rbox.to",
@@ -135,6 +148,16 @@
         ]
       },
       "send_email": [{ "name": "EMAIL" }],
+      // design 64 §3.1 — PROD limiters: real numbers (per-60s bursts; poll=30/60s ≈ 2.5× the
+      // legitimate 5s cadence, keyed per-deviceCode so NAT'd logins don't collide — §3.1). Same
+      // namespace_ids as dev so the counters are the prod worker's own (separate script). Prod
+      // deploy rides Workers Builds on merge, so a config typo here breaks the prod deploy.
+      "ratelimits": [
+        { "name": "RL_DEVICE_START", "namespace_id": "2001", "simple": { "limit": 6, "period": 60 } },
+        { "name": "RL_DEVICE_POLL", "namespace_id": "2002", "simple": { "limit": 30, "period": 60 } },
+        { "name": "RL_RELEASE", "namespace_id": "2003", "simple": { "limit": 60, "period": 60 } },
+        { "name": "RL_LINK_PAIR", "namespace_id": "2004", "simple": { "limit": 10, "period": 60 } }
+      ],
       // RBOX_ALLOW_BOOTSTRAP_PLAN is EXPLICITLY "0" in prod (the dev-only bootstrap plan
       // override, design 56 §7). Present-but-off because wrangler refuses env-targeted
       // commands (d1 migrations apply --env production) when a top-level var is absent here.

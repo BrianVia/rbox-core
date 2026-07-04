@@ -31,6 +31,15 @@ export interface SendEmailBinding {
   send(message: EmailSendMessage): Promise<EmailSendResult>;
 }
 
+/** A Cloudflare Workers rate-limiting binding (GA 2025-09-19). `.limit({ key })` returns
+ *  `{ success }` — `false` when the per-edge, per-key budget for its 10/60s window is
+ *  spent. One binding is declared per logical limit in wrangler.jsonc (design 64 §3.1);
+ *  the prod-vs-dev thresholds are the env-aware knob (the `production` block redeclares
+ *  its own tighter numbers). */
+export interface RateLimitBinding {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface Env {
   rbox_dev_db: D1Database;
   /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
@@ -145,4 +154,15 @@ export interface Env {
   /** Browser origin of the admin SPA (e.g. `https://admin.rbox.to`) — CORS-allowed
    *  WITH credentials for the admin route only. Var; absent ⇒ no admin CORS. */
   ADMIN_ALLOWED_ORIGIN?: string;
+
+  // ── design 64 §3.1: anonymous-edge rate limiters ─────────────────────────────
+  /** Per-IP burst budget on `POST /v1/auth/device/start` (the D1-write amplifier). */
+  RL_DEVICE_START: RateLimitBinding;
+  /** Per-`deviceCode` budget on `POST /v1/auth/device/poll` (keyed by the high-entropy
+   *  device code, NOT the IP, so simultaneous logins behind one NAT don't collide — §3.1). */
+  RL_DEVICE_POLL: RateLimitBinding;
+  /** Shared per-IP budget across the public release GETs (install.sh/version/bin). */
+  RL_RELEASE: RateLimitBinding;
+  /** Shared per-IP budget across the credential-minting edges (pair/redeem + link/start). */
+  RL_LINK_PAIR: RateLimitBinding;
 }

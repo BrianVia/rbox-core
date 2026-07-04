@@ -55,6 +55,41 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
   });
 }
 
+/** Parse a `Retry-After` header (the API always sends an integer-seconds form) into ms,
+ *  clamped to a sane ceiling; falls back to `fallbackMs` when absent/garbage. Used to honor
+ *  the anonymous-edge rate limiter's 429 without hammering (design 64 §3.3). */
+function retryAfterMs(res: Response, fallbackMs: number): number {
+  const secs = Number(res.headers.get("Retry-After"));
+  return Number.isFinite(secs) && secs >= 0 ? Math.min(secs * 1000, 60_000) : fallbackMs;
+}
+
+interface DeviceCodeStart {
+  deviceCode: string;
+  userCode: string;
+  interval: number;
+  expiresIn: number;
+}
+
+/** `POST /v1/auth/device/start` with bounded retry-on-429 honoring `Retry-After` (design 64
+ *  §3.3). A human logging in a handful of times a minute never trips the limiter; a transient
+ *  429 (e.g. sharing an office NAT) backs off and retries rather than hard-failing. After the
+ *  bounded attempts it surfaces a friendly, actionable error. */
+async function startDeviceCode(remoteUrl: string, label: string): Promise<DeviceCodeStart> {
+  const MAX_RETRIES = 4;
+  for (let attempt = 0; ; attempt++) {
+    const res = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
+    if (res.ok) return (await res.json()) as DeviceCodeStart;
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      const waitMs = retryAfterMs(res, Math.min(2000 * (attempt + 1), 10_000));
+      console.error(`login is busy (rate-limited); retrying in ${Math.ceil(waitMs / 1000)}s...`);
+      await sleep(waitMs);
+      continue;
+    }
+    if (res.status === 429) throw new Error("login is rate-limited — wait a minute and run `rbox login` again");
+    throw new Error(`login start failed: ${res.status}`);
+  }
+}
+
 type GenesisApi = Pick<RboxApi, "getAccountKeys" | "bootstrapKeys">;
 type GenesisEnrollmentResult = "enrolled" | "already-setup";
 
@@ -160,9 +195,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     return;
   }
 
-  const startRes = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
-  if (!startRes.ok) throw new Error(`login start failed: ${startRes.status}`);
-  const start = (await startRes.json()) as { deviceCode: string; userCode: string; interval: number; expiresIn: number };
+  const start = await startDeviceCode(remoteUrl, label);
 
   // Browser-optional approval (design 47): print a dashboard URL a web session can
   // approve from any browser (laptop/phone, need not be this machine — the SSH case),
@@ -183,6 +216,22 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     while (Date.now() < deadline) {
       await sleep(start.interval * 1000);
       const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
+      // design 64 §3.2: the per-account device cap is TERMINAL — a friendly, actionable
+      // message, never a retry (revoking a device or upgrading is the only way forward).
+      if (pollRes.status === 409) {
+        const body = (await pollRes.json().catch(() => ({}))) as { error?: string; cap?: number; plan?: string };
+        if (body.error === "device_limit_reached") {
+          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — run \`rbox device revoke <id>\` to free a slot, or upgrade`);
+        }
+        throw new Error(`login poll failed: ${pollRes.status}`);
+      }
+      // design 64 §3.3: a 429 (poll limiter) or any other non-ok is TRANSIENT — the deviceCode
+      // stays valid until it expires server-side, so back off (honoring Retry-After) and keep
+      // polling rather than mis-parsing the body as a `pending` status.
+      if (!pollRes.ok) {
+        await sleep(retryAfterMs(pollRes, start.interval * 1000));
+        continue;
+      }
       const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
       if (p.status === "approved" && p.token) {
         assertValidDeviceCodeApproval(p);

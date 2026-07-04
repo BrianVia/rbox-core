@@ -4,7 +4,8 @@ import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
 import { dbFor, dirDb } from "../db.js";
 import { randomHex, TOKEN_BYTES } from "./shared.js";
-import { AccountGoneError, mintDeviceWithNotification } from "./mint.js";
+import { AccountGoneError, checkDeviceCap, DeviceLimitError, mintDeviceWithNotification } from "./mint.js";
+import { ipKey, rateLimited } from "../ratelimit.js";
 
 // A client-supplied opaque pairing tokenId (design 12, C6): url-safe, 16–64 chars.
 // A legacy server-generated 64-hex token also matches, so redeem accepts both.
@@ -84,6 +85,9 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
  * device is consumed and rejected (never mints). Uniform 401 for every failure.
  */
 export async function redeemPairToken(req: Request, env: Env): Promise<Response> {
+  // design 64 §3.1: shared per-IP burst cap on the credential-minting edge (before D1 work).
+  const limited = await rateLimited(env.RL_LINK_PAIR, `lp:${ipKey(req)}`);
+  if (limited) return limited;
   const body = (await req.json().catch(() => ({}))) as { token?: string; label?: string };
   const raw = typeof body.token === "string" ? body.token : "";
   const token = raw.startsWith(PAIR_PREFIX) ? raw.slice(PAIR_PREFIX.length) : raw;
@@ -93,6 +97,19 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   const label = (typeof body.label === "string" ? body.label : "paired").slice(0, 200);
   const hash = await sha256Hex(token);
   const now = Date.now();
+
+  // design 64 §3.2: cap PREFLIGHT before the single-use consume. Resolve the token's account
+  // WITHOUT burning it (a non-consuming peek), so a full account 409s with the token INTACT —
+  // the user revokes a device and re-redeems the SAME token within its TTL. A miss (invalid /
+  // expired / already-used token) skips the check and falls through to the 401 consume below.
+  const peek = await dirDb(env)
+    .prepare("SELECT account_id FROM pairing_tokens WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?")
+    .bind(hash, now)
+    .first<{ account_id: string }>();
+  if (peek) {
+    const cap = await checkDeviceCap(env, peek.account_id);
+    if (!cap.ok) return json({ error: "device_limit_reached", cap: cap.cap, plan: cap.plan }, 409);
+  }
 
   // Atomic single-use consume + snapshot — only the row-winning redeem gets a row.
   // Also returns the opaque E2EE material (NULL for legacy tokens), handed back so
@@ -148,6 +165,9 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     // design 37: account tombstoned between the live-authority read and the device insert →
     // the guarded mint wrote NO rows. Uniform unauthorized (token already burned).
     if (e instanceof AccountGoneError) return json({ error: "unauthorized" }, 401);
+    // design 64 §3.2: race-overshoot past the preflight cap (a concurrent durable mint landed)
+    // → the backstop threw AFTER the consume burned the token. Same 409, never a 500.
+    if (e instanceof DeviceLimitError) return json({ error: "device_limit_reached", cap: e.cap, plan: e.plan }, 409);
     logErr("pair_redeem_mint_failed", e); // token burned; no raw message (touches account/device material)
     return json({ error: "internal" }, 500);
   }
