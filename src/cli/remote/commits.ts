@@ -2,7 +2,7 @@ import type { Manifest } from "../../engine/index.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
 import type { RemoteContext } from "./context.js";
-import { NeedsRebaselineError } from "./errors.js";
+import { NeedsRebaselineError, readQuotaExceeded } from "./errors.js";
 
 export interface CommitResult {
   sequence?: number;
@@ -31,7 +31,11 @@ export async function commit(ctx: RemoteContext, parentSequence: number, deviceI
     const body = (await res.json()) as { missing?: string[] };
     return { unsatisfiedBlobs: body.missing ?? [] };
   }
-  if (!res.ok) throw new Error(`commit failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const { quota, text } = await readQuotaExceeded(res);
+    if (quota) throw quota;
+    throw new Error(`commit failed: ${res.status} ${text}`);
+  }
   return { sequence: ((await res.json()) as { sequence: number }).sequence };
 }
 
@@ -67,7 +71,11 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
     return { conflict: true, head: b.head };
   }
   if (r.status === 422) return { unsatisfiedBlobs: ((await r.json()) as { missing?: string[] }).missing ?? [] };
-  if (!r.ok) throw new Error(`commit failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const { quota, text } = await readQuotaExceeded(r);
+    if (quota) throw quota;
+    throw new Error(`commit failed: ${r.status} ${text}`);
+  }
   const seq = ((await r.json()) as { sequence: number }).sequence;
   ctx.receipts.clear(); // published → receipts consumed
   return { sequence: seq };

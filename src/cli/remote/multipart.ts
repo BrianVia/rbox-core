@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, readShaMismatch } from "./errors.js";
+import { BlobShaMismatchError, QuotaExceededError, isShaMismatch, readQuotaExceeded, readShaMismatch } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
 
 export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
@@ -12,6 +12,7 @@ export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPa
     // would re-read the same changed source and 400 again. Bubble it so the push
     // re-scans the settled tree and retries with the file's fresh encSha.
     if (e instanceof BlobShaMismatchError) throw e;
+    if (e instanceof QuotaExceededError) throw e;
     // A resume against an expired/dead upload (or any mid-flight error) — clear
     // the token and retry once from a fresh init. If the second attempt fails,
     // surface it (the daemon's pump will retry later).
@@ -47,7 +48,11 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
       headers: { ...ctx.auth, "content-type": "application/json" },
       body: JSON.stringify({ size }),
     });
-    if (!res.ok) throw new Error(`multipart init failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) {
+      const { quota, text } = await readQuotaExceeded(res);
+      if (quota) throw quota;
+      throw new Error(`multipart init failed: ${res.status} ${text}`);
+    }
     const body = (await res.json()) as { uploadId: string; partSize: number };
     uploadId = body.uploadId;
     partSize = body.partSize;
@@ -88,8 +93,9 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
       if (tokenPath) await fsp.rm(tokenPath, { force: true });
       return;
     }
-    const { mismatch, text } = await readShaMismatch(done);
-    if (mismatch) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
+    const { quota, text } = await readQuotaExceeded(done);
+    if (quota) throw quota;
+    if (isShaMismatch(done.status, text)) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
     throw new Error(`multipart complete failed: ${done.status} ${text}`);
   }
   if (tokenPath) await fsp.rm(tokenPath, { force: true });

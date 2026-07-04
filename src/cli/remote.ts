@@ -8,6 +8,11 @@
  * in `api.ts`). This file re-exports the exact surface importers depend on so no
  * consumer path changes.
  */
-export { NeedsRebaselineError, BlobShaMismatchError, AccountAlreadyBootstrappedError } from "./remote/errors.js";
+export {
+  NeedsRebaselineError,
+  BlobShaMismatchError,
+  AccountAlreadyBootstrappedError,
+  QuotaExceededError,
+} from "./remote/errors.js";
 export type { CommitResult } from "./remote/commits.js";
 export { RboxApi, RemoteBlobStore, createRemoteWorkspace, type SyncRemote } from "./remote/api.js";

@@ -19,7 +19,7 @@ import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { lowerIoPriority } from "./io-priority.js";
-import { RboxApi } from "./remote.js";
+import { QuotaExceededError, RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
@@ -118,6 +118,8 @@ export class RboxDaemon {
   private lastErrMsg = "";
   private errRepeat = 0;
   private lastLoggedSeq?: number;
+  /** While quota-blocked, only a safety full-scan arms one upload probe. */
+  private outOfStorageProbeArmed = false;
   /** The watcher factory. Real native-backed `startWatcher` by default; an injectable seam
    *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
    *  a process-global module mock (which leaks across test files). */
@@ -307,12 +309,14 @@ export class RboxDaemon {
         // is keyed on it (a halt is only healed by a success of the SAME kind).
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
         try {
+          let pushedToRemote = false;
           this.want[op] = false;
           if (op === "deepScan") {
             await this.doDeepScan();
             this.want.push = true;
           } else if (op === "fullScan") {
             await this.doFullScan();
+            if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
             this.want.push = true;
           } else if (op === "pull") {
             const catchUpGeneration = this.pendingCatchUpGeneration;
@@ -321,7 +325,14 @@ export class RboxDaemon {
             if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
             this.want.push = true; // publish any local divergence after taking remote
           } else {
-            await this.doPush();
+            const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
+            this.outOfStorageProbeArmed = false;
+            if (this.activity.outOfStorage && !quotaProbe) {
+              await this.applyPendingWatchEvents();
+            } else {
+              await this.doPush();
+              pushedToRemote = true;
+            }
           }
           // Op completed: any live progress is over. A standing halt is healed ONLY by
           // a success of the op kind that recorded it — a mass-delete-guard halt from a
@@ -330,13 +341,19 @@ export class RboxDaemon {
           // Persist when something visible changed (or as a throttled heartbeat, so
           // `rbox status` can say "last checked: Ns ago" without idle disk churn).
           const heals = this.activity.halt !== undefined && this.activity.halt.op === op;
-          const cleared = this.activity.active !== undefined || heals;
+          const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
+          const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage;
           this.activity.active = undefined;
           if (heals) {
             this.activity.halt = undefined;
+          }
+          if (clearsOutOfStorage) {
+            this.activity.outOfStorage = undefined;
+          }
+          if (heals || clearsOutOfStorage) {
             // The healed failure's dedup streak ends with it: a LATER failure with the
-            // same message is a new episode that must log and persist a fresh halt —
-            // not silently count as repeat 2..9 and leave activity.json healed (codex R4).
+            // same message is a new episode that must log and persist a fresh visible
+            // state, not silently count as repeat 2..9 and leave activity.json healed.
             this.lastErrMsg = "";
             this.errRepeat = 0;
           }
@@ -348,12 +365,20 @@ export class RboxDaemon {
           const msg = e instanceof Error ? e.message : String(e);
           this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
           this.lastErrMsg = msg;
+          const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
+          if (e instanceof QuotaExceededError) {
+            const visibleChanged = this.recordOutOfStorage(e, op);
+            if (shouldLogRepeat) log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+            if (visibleChanged || shouldLogRepeat) this.writeActivity();
+            await sleep(jitter(1000));
+            continue;
+          }
           // The halt record is the failure's user-visible surface (design 45): without
           // it a mass-delete-guard refusal (design 44) stalls background sync with no
           // indicator anywhere but this log. Persisted on the log-line schedule.
           this.activity.active = undefined;
           this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
-          if (this.errRepeat === 1 || this.errRepeat % 10 === 0) {
+          if (shouldLogRepeat) {
             log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
             this.writeActivity();
           }
@@ -375,23 +400,7 @@ export class RboxDaemon {
 
   private async doPush(): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
-    if (this.pendingEvents.length > 0) {
-      const events = this.pendingEvents;
-      this.pendingEvents = [];
-      // If the ignore rules themselves changed, rebuild the matcher and full-rescan
-      // so newly-ignored paths are dropped (and re-included ones picked up) — the
-      // incremental matcher would otherwise be stale until restart. [M3b]
-      if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
-        this.matcher = buildIgnoreMatcher(this.root);
-        this.manifest = await scanManifest(this.root, this.matcher, this.cache);
-      } else {
-        const deferred = new Set<string>();
-        this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
-        // A path that hashed cleanly this round is settled — clear any retry it accrued.
-        for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
-        if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
-      }
-    }
+    await this.applyPendingWatchEvents();
     const report = beginReport("push");
     const res = await pushManifest(this.root, this.cfg, this.manifest, {
       ...this.e2ee,
@@ -432,6 +441,52 @@ export class RboxDaemon {
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
     report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
+  }
+
+  private recordOutOfStorage(e: QuotaExceededError, op: keyof Wants): boolean {
+    const next: NonNullable<DaemonActivity["outOfStorage"]> = {
+      at: new Date().toISOString(),
+      kind: e.kind,
+      ...(e.used !== undefined ? { used: e.used } : {}),
+      ...(e.cap !== undefined ? { cap: e.cap } : {}),
+    };
+    const prev = this.activity.outOfStorage;
+    const clearsStaleQuotaHalt =
+      this.activity.halt !== undefined &&
+      op === "push" &&
+      this.activity.halt.op === "push" &&
+      this.activity.halt.reason === e.message;
+    const visibleChanged =
+      clearsStaleQuotaHalt ||
+      !prev ||
+      prev.kind !== next.kind ||
+      prev.used !== next.used ||
+      prev.cap !== next.cap;
+    this.activity.active = undefined;
+    if (clearsStaleQuotaHalt) this.activity.halt = undefined;
+    this.activity.outOfStorage = next;
+    this.outOfStorageProbeArmed = false;
+    return visibleChanged;
+  }
+
+  private async applyPendingWatchEvents(): Promise<void> {
+    if (this.pendingEvents.length > 0) {
+      const events = this.pendingEvents;
+      this.pendingEvents = [];
+      // If the ignore rules themselves changed, rebuild the matcher and full-rescan
+      // so newly-ignored paths are dropped (and re-included ones picked up) — the
+      // incremental matcher would otherwise be stale until restart. [M3b]
+      if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
+        this.matcher = buildIgnoreMatcher(this.root);
+        this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+      } else {
+        const deferred = new Set<string>();
+        this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
+        // A path that hashed cleanly this round is settled — clear any retry it accrued.
+        for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
+        if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
+      }
+    }
   }
 
   /**

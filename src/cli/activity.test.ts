@@ -28,6 +28,7 @@ test("round-trips the full record", async () => {
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
     halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull" },
+    outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
   };
   await saveActivity(root, a);
   expect(await loadActivity(root)).toEqual(a);
@@ -59,6 +60,7 @@ test("malformed nested slots are dropped individually, never handed to render (c
       lastPull: { at, writes: 1, deletes: 0, conflicts: 0 }, // valid — must survive
       active: { at, phase: "teleport", done: 1, total: 2 }, // bogus phase
       halt: { at, reason: 7, count: 1, op: "pull" }, // non-string reason
+      outOfStorage: { at, kind: "storage", used: "full", cap: 1 }, // non-number used
     })
   );
   expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
@@ -99,13 +101,16 @@ test("resetSyncState clears the sidecar too — a rebind must not inherit the ol
 const NOW = 1_800_000_000_000; // 2027-01-15T08:00:00Z; floor(NOW/1000) = 1800000000
 const at = (epoch: number) => new Date(epoch * 1000).toISOString();
 
-test("renderShellLine state precedence: halt > active > pending > ok", async () => {
+test("renderShellLine state precedence: halt > outofstorage > active > pending > ok", async () => {
   const active: DaemonActivity["active"] = { at: at(1799999900), phase: "upload", done: 1, total: 4 };
   const halt: DaemonActivity["halt"] = { at: at(1799999000), reason: "boom", count: 1, op: "pull" };
+  const outOfStorage: DaemonActivity["outOfStorage"] = { at: at(1799999500), kind: "storage", used: 1, cap: 2 };
   const base = { settled: true, name: "ws", now: NOW };
 
   // halt wins even when active AND settled would otherwise apply
-  expect(renderShellLine({ at: "", active, halt }, base).split(" ")[2]).toBe("halt");
+  expect(renderShellLine({ at: "", active, halt, outOfStorage }, base).split(" ")[2]).toBe("halt");
+  // quota is soft but outranks live progress
+  expect(renderShellLine({ at: "", active, outOfStorage }, base).split(" ")[2]).toBe("outofstorage");
   // active wins over settled (ok) and unsettled (pending)
   expect(renderShellLine({ at: "", active }, base).split(" ")[2]).toBe("active");
   expect(renderShellLine({ at: "", active }, { ...base, settled: false }).split(" ")[2]).toBe("active");

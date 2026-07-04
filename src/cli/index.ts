@@ -262,6 +262,11 @@ async function main(): Promise<void> {
       await billingPortal();
       break;
     }
+    case "usage": {
+      const { usageCmd } = await import("./usage-cmd.js");
+      await usageCmd({ json: flags.json === "true" });
+      break;
+    }
     case "push": {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pushing");

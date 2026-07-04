@@ -2,15 +2,15 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity } from "./activity.js";
 import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
 import { daemonRuntimeDir, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull } from "./sync.js";
-import type { CommitResult, SyncRemote } from "./remote.js";
-import { attributeDaemonForStatus } from "./status-view.js";
+import { QuotaExceededError, type CommitResult, type SyncRemote } from "./remote.js";
+import { attributeDaemonForStatus, healthLine } from "./status-view.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
 // sync. The load-bearing lifecycle: a pump error records a HALT (the mass-delete
@@ -79,6 +79,7 @@ interface DaemonInternals {
   ownershipWindDownStarted: boolean;
   cache: HashCache;
   manifest: Manifest;
+  pendingEvents: WatchEvent[];
   activity: import("./activity.js").DaemonActivity;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pump(): Promise<void>;
@@ -165,6 +166,19 @@ class HookedCommitRemote extends MiniRemote {
   override async commit(parentSequence: number, device: string, manifest: Manifest): Promise<CommitResult> {
     this.commitEntered.resolve();
     await this.releaseCommit.promise;
+    return super.commit(parentSequence, device, manifest);
+  }
+}
+
+class QuotaCommitRemote extends MiniRemote {
+  commitCalls = 0;
+  quotaBlocked = true;
+  quotaUsed = 2 * 1024 * 1024 * 1024;
+  quotaCap = 2 * 1024 * 1024 * 1024;
+
+  override async commit(parentSequence: number, device: string, manifest: Manifest): Promise<CommitResult> {
+    this.commitCalls++;
+    if (this.quotaBlocked) throw new QuotaExceededError("storage", this.quotaUsed, this.quotaCap);
     return super.commit(parentSequence, device, manifest);
   }
 }
@@ -292,6 +306,100 @@ test("a pump error writes shell.line state halt (design 46)", async () => {
   await daemon.activityWrite;
 
   expect((await readShellLine()).split(" ")[2]).toBe("halt");
+});
+
+test("quota errors record outOfStorage, suppress watcher uploads, probe on safety scan, and clear on success", async () => {
+  const remote = new QuotaCommitRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  let activity = await loadActivity(root);
+  expect(remote.commitCalls).toBe(1);
+  expect(activity?.halt).toBeUndefined();
+  expect(activity?.outOfStorage).toEqual({
+    at: expect.any(String),
+    kind: "storage",
+    used: 2 * 1024 * 1024 * 1024,
+    cap: 2 * 1024 * 1024 * 1024,
+  });
+  expect((await readShellLine()).split(" ")[2]).toBe("outofstorage");
+
+  await fs.writeFile(path.join(root, "a.txt"), "hello again");
+  daemon.pendingEvents.push({ relPath: "a.txt", kind: "change" });
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  expect(remote.commitCalls).toBe(1);
+  expect((await loadActivity(root))?.outOfStorage?.kind).toBe("storage");
+
+  daemon.want.fullScan = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  expect(remote.commitCalls).toBe(2);
+  expect((await loadActivity(root))?.outOfStorage?.kind).toBe("storage");
+
+  remote.quotaBlocked = false;
+  daemon.want.fullScan = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  activity = await loadActivity(root);
+  expect(remote.commitCalls).toBe(3);
+  expect(activity?.outOfStorage).toBeUndefined();
+  expect(activity?.halt).toBeUndefined();
+  expect(activity?.lastPush?.sequence).toBe(1);
+});
+
+test("a quota probe refreshes outOfStorage without clearing a real pull halt", async () => {
+  const remote = new QuotaCommitRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  const firstQuota = await loadActivity(root);
+  expect(firstQuota?.outOfStorage?.used).toBe(2 * 1024 * 1024 * 1024);
+  expect(firstQuota?.halt).toBeUndefined();
+
+  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  daemon.want.pull = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  const halted = await loadActivity(root);
+  expect(halted?.halt?.op).toBe("pull");
+  expect(halted?.halt?.reason).toContain("mass-delete guard");
+  expect(halted?.outOfStorage?.used).toBe(2 * 1024 * 1024 * 1024);
+
+  remote.quotaUsed = 3 * 1024 * 1024 * 1024;
+  daemon.want.fullScan = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+  const probed = await loadActivity(root);
+  expect(remote.commitCalls).toBe(2);
+  expect(probed?.halt?.op).toBe("pull");
+  expect(probed?.halt?.reason).toContain("mass-delete guard");
+  expect(probed?.outOfStorage?.used).toBe(3 * 1024 * 1024 * 1024);
+  expect((await readShellLine()).split(" ")[2]).toBe("halt");
+
+  const line = healthLine({
+    added: 0,
+    changed: 0,
+    deleted: 0,
+    trackedFiles: 1,
+    daemonRunning: true,
+    localSequence: 0,
+    remote: { sequence: 0, source: "probe" },
+    activity: probed,
+    now: Date.now(),
+  });
+  expect(line).toContain("sync halted");
+  expect(line).toContain("mass-delete guard");
+  expect(line).not.toContain("out of storage");
 });
 
 test("a throwing onPullApplied hook never fails a completed pull (codex R3)", async () => {
