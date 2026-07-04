@@ -26,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { pull } from "./sync.js";
 import { buildAuthedRemote, hasDevice } from "./e2ee-client.js";
-import { RBOX_DIR, saveConfig, type WorkspaceConfig } from "./config.js";
+import { findRoot, RBOX_DIR, saveConfig, type WorkspaceConfig } from "./config.js";
 import { requireCredentials, type Credentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { accountHex16, defaultKitTargetDir, displayPath, localYmd } from "./recovery-kit.js";
@@ -61,9 +61,15 @@ export function sanitizeWorkspaceName(name: string): string {
  *  ALWAYS `<sanitized-name>-<workspaceId-first8>`, with the name part omitted when a
  *  workspace is unnamed (or sanitizes to empty). The id suffix is mandatory because
  *  workspace names are NOT unique — two workspaces both named `app` must NOT merge
- *  into one export dir. Collision-proof by construction: the id is always present. */
+ *  into one export dir. The export loop still fail-closes on the unlikely event that
+ *  two selected workspaces map to the same short name. */
+function workspaceIdBody8(workspaceId: string): string {
+  const m = /^[A-Za-z]+_(.+)$/.exec(workspaceId);
+  return (m?.[1] ?? workspaceId).slice(0, 8);
+}
+
 export function exportSubdirName(name: string | null | undefined, workspaceId: string): string {
-  const id8 = workspaceId.slice(0, 8);
+  const id8 = workspaceIdBody8(workspaceId);
   const clean = name ? sanitizeWorkspaceName(name) : "";
   return clean ? `${clean}-${id8}` : id8;
 }
@@ -163,6 +169,17 @@ async function refuseIfExists(p: string): Promise<void> {
   throw new Error(`refusing to overwrite existing path: ${p} — move it aside or pass a different \`--out\`.`);
 }
 
+async function refuseInsideWorkspace(p: string): Promise<void> {
+  const root = await findRoot(p);
+  if (root) {
+    throw new Error(`refusing to write export inside an rbox workspace (${root}) — choose a path outside synced folders.`);
+  }
+}
+
+function overwriteRefusal(p: string): Error {
+  return new Error(`refusing to overwrite existing path: ${p} — move it aside or pass a different \`--out\`.`);
+}
+
 /** Regular-file count + plaintext byte total under `dir` (the stripped export tree). */
 async function countTree(dir: string): Promise<{ files: number; bytes: number }> {
   let files = 0;
@@ -199,6 +216,37 @@ async function writeMarker(file: string, marker: ExportMarker): Promise<void> {
   await writeFileAtomic(file, `${JSON.stringify(marker, null, 2)}\n`);
 }
 
+async function writeMarkerExclusive(file: string, marker: ExportMarker): Promise<void> {
+  const tmp = path.join(path.dirname(file), `.rbox-export-marker-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
+  let fh: fs.FileHandle | undefined;
+  try {
+    fh = await fs.open(tmp, "wx");
+    await fh.writeFile(`${JSON.stringify(marker, null, 2)}\n`);
+    await fh.sync();
+    await fh.close();
+    fh = undefined;
+    await fs.link(tmp, file);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") throw overwriteRefusal(file);
+    throw e;
+  } finally {
+    await fh?.close().catch(() => {});
+    await fs.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+async function publishFileNoOverwrite(tmpFile: string, finalFile: string): Promise<void> {
+  try {
+    await fs.link(tmpFile, finalFile);
+    await fsyncDir(path.dirname(finalFile));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") throw overwriteRefusal(finalFile);
+    throw e;
+  } finally {
+    await fs.rm(tmpFile, { force: true }).catch(() => {});
+  }
+}
+
 /**
  * Export one-or-all workspaces to a directory tree or a gzipped tarball. Fails closed
  * on an existing target, materializes into a temp staging dir, and only renames into
@@ -219,6 +267,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
   // Disk-safety (design 65 §2.6): refuse to overwrite. Checked before any work.
   await refuseIfExists(finalArtifact);
   if (target.mode === "tar") await refuseIfExists(target.markerBeside);
+  await refuseInsideWorkspace(finalArtifact);
 
   let workspaces = await seams.listWorkspaces();
   if (req.workspaceId) {
@@ -226,6 +275,13 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     if (workspaces.length === 0) throw new Error(`no workspace \`${req.workspaceId}\` on this account.`);
   }
   if (workspaces.length === 0) throw new Error("this account has no workspaces to export.");
+  const selected = workspaces.map((ws) => ({ ws, subName: exportSubdirName(ws.name, ws.workspaceId) }));
+  const seenSubdirs = new Map<string, string>();
+  for (const { ws, subName } of selected) {
+    const prev = seenSubdirs.get(subName);
+    if (prev) throw new Error(`export subdir collision: workspaces ${prev} and ${ws.workspaceId} both map to \`${subName}\`.`);
+    seenSubdirs.set(subName, ws.workspaceId);
+  }
 
   const parent = path.dirname(finalArtifact);
   await fs.mkdir(parent, { recursive: true });
@@ -237,8 +293,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     const summaries: WorkspaceExportSummary[] = [];
     let totalFiles = 0;
     let totalBytes = 0;
-    for (const ws of workspaces) {
-      const subName = exportSubdirName(ws.name, ws.workspaceId);
+    for (const { ws, subName } of selected) {
       seams.onProgress?.(`exporting ${subName}`);
       // Pull materializes the plaintext tree PLUS a `.rbox/` (state + hashcache) into
       // this throwaway root (design 65 §3); we strip `.rbox/` in the move below.
@@ -271,6 +326,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     if (target.mode === "dir") {
       await writeMarker(path.join(stageDir, MARKER_NAME), marker);
       await fsyncDir(stageDir);
+      await refuseIfExists(target.finalDir);
       await fs.rename(stageDir, target.finalDir);
       return { outPath: target.finalDir, markerPath: path.join(target.finalDir, MARKER_NAME), marker };
     }
@@ -280,13 +336,18 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     const tmpTar = path.join(parent, `.rbox-export-${process.pid}-${crypto.randomBytes(6).toString("hex")}.tar.gz`);
     try {
       await seams.tarGzip(stageDir, tmpTar);
-      await fsyncDir(parent);
-      await fs.rename(tmpTar, target.tarball);
+      await publishFileNoOverwrite(tmpTar, target.tarball);
     } catch (e) {
       await fs.rm(tmpTar, { force: true }).catch(() => {});
       throw e;
     }
-    await writeMarker(target.markerBeside, marker);
+    try {
+      await writeMarkerExclusive(target.markerBeside, marker);
+    } catch (e) {
+      await fs.rm(target.tarball, { force: true }).catch(() => {});
+      throw e;
+    }
+    await fsyncDir(parent);
     return { outPath: target.tarball, markerPath: target.markerBeside, marker };
   } finally {
     await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
