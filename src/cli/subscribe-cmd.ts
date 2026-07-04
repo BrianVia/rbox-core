@@ -17,6 +17,13 @@ const PLANS = ["solo", "pro"] as const;
 /** `rbox subscribe [plan]` — open a Stripe checkout bound to THIS account. */
 export async function subscribe(plan: string | undefined): Promise<void> {
   if (!plan) throw new Error(`usage: rbox subscribe <plan>  (one of: ${PLANS.join(", ")})`);
+  // Team is a real roadmap item, presented everywhere as "coming soon" (design 63 §C).
+  // Match that framing here instead of the generic unknown-plan error; the server
+  // rejects it too (non-purchasable), so this is purely a friendlier client message.
+  if (plan === "team") {
+    console.log("Team plans are coming soon — solo and pro are available today.");
+    return;
+  }
   if (!(PLANS as readonly string[]).includes(plan)) throw new Error(`unknown plan "${plan}" — choose one of: ${PLANS.join(", ")}`);
   const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?plan=${encodeURIComponent(plan)}`, {

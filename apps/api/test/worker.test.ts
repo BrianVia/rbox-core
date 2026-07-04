@@ -1233,6 +1233,18 @@ describe("worker integration (real DO + D1 + R2)", () => {
     });
   });
 
+  test("subscribe guard: plan=team → 400 non-purchasable, BEFORE any Stripe call, even though a price would resolve (design 63 §C)", async () => {
+    const a = await bootstrap("acct-sub-team");
+    await withStripe(async () => {
+      // The /v1/prices GET mock resolves a price for ANY lookup_key (incl. team's), so a
+      // 400 here proves the PURCHASABLE_PLANS guard — not a missing price — is the rejecter.
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=team`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("bad_request");
+      expect(stripeCalls.length).toBe(0); // guard fires before priceIdForPlan → zero Stripe calls
+    });
+  });
+
   test("subscribe: a free account → checkout bound to ITS OWN account; a canceled/grace account may re-subscribe", async () => {
     const a = await bootstrap("acct-sub-free");
     await withStripe(async () => {

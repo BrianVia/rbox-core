@@ -62,6 +62,13 @@ describe("rbox subscribe", () => {
     expect(calls.length).toBe(0);
   });
 
+  test("`subscribe team` prints the coming-soon message and never calls the API", async () => {
+    stub(() => ({ status: 200 }));
+    await subscribe("team"); // must not throw — team is "coming soon", not an error
+    expect(calls.length).toBe(0);
+    expect(logs.join("\n")).toContain("Team plans are coming soon — solo and pro are available today.");
+  });
+
   test("already_subscribed (409) is NOT an error — it points at the portal and resolves", async () => {
     stub(() => ({ status: 409, body: { error: "already_subscribed", plan: "pro" } }));
     await subscribe("pro"); // must not throw

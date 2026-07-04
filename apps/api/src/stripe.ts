@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { ctEqual, json } from "./util.js";
-import { PLAN_LOOKUP_KEYS, planForLookupKey } from "./plans.js";
+import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey } from "./plans.js";
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
@@ -60,7 +60,10 @@ async function priceIdForPlan(env: Env, plan: string): Promise<string | null> {
 export async function billingCheckout(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!env.STRIPE_SECRET) return json({ error: "billing_not_configured" }, 501);
   const plan = new URL(req.url).searchParams.get("plan") ?? "";
-  if (!PLAN_LOOKUP_KEYS[plan]) return json({ error: "bad_request", message: "unknown or non-purchasable plan" }, 400);
+  // Gate on the PURCHASABLE allowlist, not PLAN_LOOKUP_KEYS membership (design 63 §C):
+  // `team` has a lookup_key but isn't purchasable yet, so this rejects Team checkout
+  // intent deliberately — before any Stripe call — even once its price exists.
+  if (!PURCHASABLE_PLANS.has(plan)) return json({ error: "bad_request", message: "unknown or non-purchasable plan" }, 400);
 
   // Reuse the account's existing customer if it has one (avoids duplicates).
   const acct = await dbFor(env, p.accountId)
