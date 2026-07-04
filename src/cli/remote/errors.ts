@@ -24,6 +24,16 @@ export class BlobShaMismatchError extends Error {
   }
 }
 
+/** The one-shot account genesis claim lost a race to another device. The caller
+ *  must discard locally pre-persisted genesis material before degrading to
+ *  pair/recover. */
+export class AccountAlreadyBootstrappedError extends Error {
+  constructor() {
+    super("account already bootstrapped");
+    this.name = "AccountAlreadyBootstrappedError";
+  }
+}
+
 /** Distinguish R2's convergent-encryption hash guard (`{"error":"sha_mismatch"}`) from any
  *  other 4xx. The server signals this SAME semantic error with two statuses (apps/api/src/blobs.ts):
  *  400 on the single-PUT / direct-write path, 412 on the multipart-complete publish. Accept both,

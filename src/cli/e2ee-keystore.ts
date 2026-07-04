@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -25,6 +26,8 @@ const home = () => process.env.RBOX_HOME || os.homedir();
 const root = (accountId: string) => path.join(home(), ".rbox", "e2ee", accountId);
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
+const GENESIS_LOCK_CONTENTION_MESSAGE =
+  "another rbox process is already setting up encryption for this account — let it finish, then re-run.";
 
 interface DeviceJson {
   deviceId: string;
@@ -92,6 +95,46 @@ export async function saveDevice(secrets: DeviceSecrets): Promise<void> {
 
 export async function saveMasterKey(accountId: string, mk: Uint8Array): Promise<void> {
   await writeSecret(path.join(root(accountId), "mk.key"), toB64url(mk));
+}
+
+/** Cross-process per-account genesis lock: O_EXCL acquire, pid liveness stale detection, remove on release. */
+export function acquireGenesisLock(accountId: string): () => void {
+  fsSync.mkdirSync(root(accountId), { recursive: true, mode: DIR_MODE });
+  const lock = path.join(root(accountId), "genesis.lock");
+  const take = () => {
+    const fd = fsSync.openSync(lock, "wx");
+    fsSync.writeSync(fd, String(process.pid));
+    fsSync.closeSync(fd);
+  };
+  try {
+    take();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const holder = Number(fsSync.readFileSync(lock, "utf8").trim());
+    const alive =
+      Number.isInteger(holder) &&
+      (() => {
+        try {
+          process.kill(holder, 0);
+          return true;
+        } catch (k) {
+          return (k as NodeJS.ErrnoException).code === "EPERM";
+        }
+      })();
+    if (alive) throw new Error(GENESIS_LOCK_CONTENTION_MESSAGE);
+    fsSync.rmSync(lock, { force: true });
+    take();
+  }
+  return () => fsSync.rmSync(lock, { force: true });
+}
+
+export async function forgetLocalDeviceMaterial(accountId: string): Promise<void> {
+  const dir = root(accountId);
+  await Promise.all([
+    fs.rm(path.join(dir, "device.json"), { force: true }),
+    fs.rm(path.join(dir, "mk.key"), { force: true }),
+    fs.rm(path.join(dir, "rk.key"), { force: true }),
+  ]);
 }
 
 // ---- workspace KEK cache --------------------------------------------------

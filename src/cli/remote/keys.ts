@@ -1,11 +1,21 @@
 import type { AccountKeysDTO } from "../e2ee-remote.js";
+import { AccountAlreadyBootstrappedError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
 
 export async function bootstrapKeys(ctx: RemoteContext, body: unknown): Promise<void> {
   const r = await ctx.postJson("/v1/keys/bootstrap", body);
-  if (!r.ok) throw new Error(`keys/bootstrap failed: ${r.status} ${await r.text()}`);
+  if (r.ok) return;
+  const text = await r.text();
+  if (r.status === 409) {
+    try {
+      if ((JSON.parse(text) as { error?: string }).error === "already_bootstrapped") throw new AccountAlreadyBootstrappedError();
+    } catch (err) {
+      if (err instanceof AccountAlreadyBootstrappedError) throw err;
+    }
+  }
+  throw new Error(`keys/bootstrap failed: ${r.status} ${text}`);
 }
 
 export async function getAccountKeys(ctx: RemoteContext): Promise<AccountKeysDTO | null> {

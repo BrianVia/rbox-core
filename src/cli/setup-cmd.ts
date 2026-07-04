@@ -24,12 +24,13 @@
 import os from "node:os";
 import { runInit } from "./init-cmd.js";
 import { collapseHome } from "./init-plan.js";
-import { login, redeemPair } from "./auth-cmd.js";
+import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaRecovery } from "./e2ee-client.js";
 import { startDaemon } from "./daemon-control.js";
 import { loadCredentials } from "./credentials.js";
 import { loadConfig } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
+import { RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prompt.js";
 import { stderrStyle as e } from "./style.js";
@@ -175,26 +176,65 @@ export function authorizePath(method: "pair" | "browser" | "approve"): "pair-tok
  *  authorizes but can't carry the key). Returns true once enrolled (flow continues),
  *  false if the user defers or provides no input. Offered both freshly after a
  *  device-code login inside Step 1 and on a later re-run of `rbox setup`. */
-async function resolveEnrollment(remote: string): Promise<boolean> {
-  if (await alreadyEnrolled()) return true;
+type ExistingEnrollmentMethod = "pair" | "recover" | "later";
+type EnrollmentMethod = "genesis" | ExistingEnrollmentMethod;
+
+const EXISTING_ENROLLMENT_CHOICES = [
+  { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
+  { name: "Recover with my 24-word phrase", value: "recover" },
+  { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
+] as const;
+
+interface ResolveEnrollmentDeps {
+  alreadyEnrolled?: () => Promise<boolean>;
+  loadCredentials?: typeof loadCredentials;
+  makeApi?: (remoteUrl: string, token: string) => Pick<RboxApi, "getAccountKeys" | "bootstrapKeys">;
+  promptSelect?: typeof promptSelect;
+  runGenesisEnrollment?: typeof runGenesisEnrollment;
+  writeStderr?: (text: string) => void;
+}
+
+export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentDeps = {}): Promise<boolean> {
+  const checkEnrolled = deps.alreadyEnrolled ?? alreadyEnrolled;
+  if (await checkEnrolled()) return true;
 
   // There must be credentials here — this is only reached once we know we're authorized.
-  const creds = await loadCredentials();
-  process.stderr.write(
-    `\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) but NOT yet enrolled for encryption. Enroll it now:\n`
-  );
+  const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  const select = deps.promptSelect ?? promptSelect;
+  const api = creds?.token ? (deps.makeApi ?? ((remoteUrl, token) => new RboxApi(remoteUrl, token, "", "")))(creds.remoteUrl ?? remote, creds.token) : undefined;
+  const accountKeys = api ? await api.getAccountKeys() : null;
 
-  const method = await promptSelect<"pair" | "recover" | "later">({
-    message: "How do you want to enroll this machine for encryption?",
-    choices: [
-      { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
-      { name: "Recover with my 24-word phrase", value: "recover" },
-      { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
-    ],
-  });
+  let method: EnrollmentMethod;
+  if (accountKeys === null) {
+    writeStderr(`\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) and this account has not set up encryption yet.\n`);
+    method = await select<EnrollmentMethod>({
+      message: "How do you want to enroll this machine for encryption?",
+      choices: [
+        { name: "This is my first machine — set up encryption now", value: "genesis", description: "create the recovery phrase and make this device the genesis device" },
+        ...EXISTING_ENROLLMENT_CHOICES,
+      ],
+    });
+  } else {
+    writeStderr(
+      `\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) but NOT yet enrolled for encryption. Enroll it now:\n`
+    );
+    method = await select<ExistingEnrollmentMethod>({
+      message: "How do you want to enroll this machine for encryption?",
+      choices: EXISTING_ENROLLMENT_CHOICES,
+    });
+  }
+
+  if (method === "genesis") {
+    if (!api || !creds?.accountId || !creds.deviceId) throw new Error("missing device credentials — run `rbox login` again");
+    const result = await (deps.runGenesisEnrollment ?? runGenesisEnrollment)(api, { accountId: creds.accountId, deviceId: creds.deviceId });
+    if (result === "enrolled") return checkEnrolled();
+    writeStderr(`${e.yellow("!")}  ${EXISTING_ACCOUNT_ENROLLMENT_MESSAGE}\n`);
+    return false;
+  }
 
   if (method === "later") {
-    process.stderr.write(
+    writeStderr(
       `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox recover` with your phrase — then re-run `rbox setup`.")}\n`
     );
     return false;
@@ -203,7 +243,7 @@ async function resolveEnrollment(remote: string): Promise<boolean> {
   if (method === "pair") {
     const token = await promptPassword({ message: "Paste pairing token" });
     if (!token) {
-      process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
+      writeStderr(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
       return false;
     }
     await redeemPair(remote, token);
@@ -211,7 +251,7 @@ async function resolveEnrollment(remote: string): Promise<boolean> {
     // Recover — same no-echo phrase prompt as `rbox recover` (auth-cmd.ts).
     const phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
     if (!phrase) {
-      process.stderr.write(e.yellow("no phrase entered — re-run `rbox setup` when you're ready.\n"));
+      writeStderr(e.yellow("no phrase entered — re-run `rbox setup` when you're ready.\n"));
       return false;
     }
     await enrollViaRecovery(phrase, Date.now());
@@ -219,7 +259,7 @@ async function resolveEnrollment(remote: string): Promise<boolean> {
 
   // A bad token/phrase throws (propagates to the top-level handler); recheck the
   // robust signal init also uses.
-  return alreadyEnrolled();
+  return checkEnrolled();
 }
 
 /** Step 2 · Workspace. Returns the init outcome, or undefined if the user backed out. */

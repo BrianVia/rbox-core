@@ -7,7 +7,7 @@ import { pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, daemonBindingStatus, logsDaemon, startDaemon, stopDaemon } from "./daemon-control.js";
 import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
-import { approveDevice, keyBackup, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
+import { approveDevice, keyBackup, keyGenesis, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { PROD_REMOTE } from "./credentials.js";
 import { style } from "./style.js";
@@ -531,8 +531,9 @@ async function main(): Promise<void> {
     case "key": {
       if (positional[0] === "status") await keyStatus();
       else if (positional[0] === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
+      else if (positional[0] === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
       else {
-        console.log("usage: rbox key <status | backup> [--kit] [--kit-path <path>]");
+        console.log("usage: rbox key <status | backup | genesis --yes> [--kit] [--kit-path <path>]");
         process.exitCode = 1;
       }
       break;

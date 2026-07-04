@@ -50,7 +50,7 @@ function assertSignedAccountId(claimed: string, signed: string): void {
  * after the POST leaves local MK present ⇒ recoverable. Returns the recovery phrase
  * to display once.
  */
-export async function bootstrapNewAccount(api: RboxApi, accountId: string, deviceId: string, opts: { cacheRecovery?: boolean; now: number }): Promise<string> {
+export async function bootstrapNewAccount(api: Pick<RboxApi, "bootstrapKeys">, accountId: string, deviceId: string, opts: { cacheRecovery?: boolean; now: number }): Promise<string> {
   if (!ACCOUNT_ID_RE.test(accountId)) throw new Error(`malformed accountId from server: ${accountId}`);
   const boot = await bootstrapAccount(accountId, deviceId, opts.now);
   // Persist locally BEFORE the server POST (crash-safety).

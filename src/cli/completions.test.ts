@@ -6,6 +6,8 @@ import { COMMAND_HELP } from "./help-registry.js";
 import { zshCompletions } from "./completions.js";
 
 const firstWord = (s: string) => s.split(" ")[0]!;
+const restWords = (s: string) => s.split(" ").slice(1).join(" ");
+const sq = (s: string) => s.replace(/'/g, "'\\''");
 const publicCmds = COMMAND_HELP.filter((c) => !c.hidden && !c.alias);
 const publicHeads = [...new Set(publicCmds.map((c) => firstWord(c.name)))];
 
@@ -17,18 +19,18 @@ test("script contains every public top-level command as a completion entry", () 
   }
 });
 
-// "multi-word names surface as subcommands with descriptions" is commented out:
-// its only live example was "deps install" under the "deps" group, and the whole
-// `deps` group is currently disabled (design 51, index.ts/help-registry.ts).
-// Reinstate once `deps` (or another multi-word command) returns:
-//
-// test("multi-word names surface as subcommands with descriptions", () => {
-//   const script = zshCompletions();
-//   const depsInstall = COMMAND_HELP.find((c) => c.name === "deps install");
-//   expect(depsInstall).toBeDefined();
-//   expect(script).toContain("_rbox_deps_cmds");
-//   expect(script).toContain(`'install:${depsInstall!.summary}`);
-// });
+test("multi-word names surface as subcommands with descriptions", () => {
+  const script = zshCompletions();
+  const nested = publicCmds.filter((c) => c.name.includes(" "));
+  expect(nested.length, "expected at least one public nested command").toBeGreaterThan(0);
+
+  for (const c of nested) {
+    const head = firstWord(c.name);
+    const leaf = restWords(c.name);
+    expect(script, `missing nested completion array for '${head}'`).toContain(`_rbox_${head}_cmds`);
+    expect(script, `missing nested completion for '${c.name}'`).toContain(`'${sq(leaf)}:${sq(c.summary)}'`);
+  }
+});
 
 test("known flags are completed from registry metadata", () => {
   const script = zshCompletions();
