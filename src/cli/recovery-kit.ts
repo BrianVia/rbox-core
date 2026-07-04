@@ -201,13 +201,18 @@ function resolveUserPath(p: string): string {
   return path.resolve(p);
 }
 
-function accountHex16(accountId: string): string {
+/** The 16-hex account suffix used in the recovery-kit / data-export filenames
+ *  (design 58 §path). Exported so `rbox export` reuses the SAME account slug —
+ *  one place that knows how an account id maps to a filesystem-safe token. */
+export function accountHex16(accountId: string): string {
   const match = accountId.match(/^acct_([0-9a-f]{16})$/i);
   if (!match) throw new Error(`account id does not contain a 16-hex suffix: ${accountId}`);
   return match[1]!.toLowerCase();
 }
 
-function localYmd(date: Date): string {
+/** Local-timezone `YYYYMMDD` for the default kit/export basename (design 58).
+ *  Exported so `rbox export` dates its default dir identically. */
+export function localYmd(date: Date): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");

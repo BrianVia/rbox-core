@@ -157,6 +157,18 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [{ flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" }],
   },
   {
+    name: "export",
+    group: "SYNCING",
+    summary: "export your files back out (decrypted, latest state)",
+    usage: "rbox export [--all | --workspace <id>] [--out <dir | file.tar.gz>]",
+    flags: [
+      { flag: "--all", desc: "export every workspace on the account (the default)" },
+      { flag: "--workspace <id>", desc: "export just one workspace" },
+      { flag: "--out <path>", desc: "output directory, or a *.tar.gz path for a single tarball (default: ~/Downloads)" },
+    ],
+    examples: ["rbox export", "rbox export --workspace ws_ab12cd34", "rbox export --out ~/backup.tar.gz"],
+  },
+  {
     name: "track",
     group: "SYNCING",
     summary: "bind a directory to a workspace (create/join; no first sync)",

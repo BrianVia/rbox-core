@@ -337,6 +337,13 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "export": {
+      // Data takeout (design 65): decrypt + materialize the account's workspaces to
+      // a plain directory tree (or a *.tar.gz). Read-only — no binding, no daemon.
+      const { runExport } = await import("./export-cmd.js");
+      await runExport(flags);
+      break;
+    }
     case "status": {
       const root = await resolveRoot(positional[0]);
       // The EFFECTIVE remote is the credential's (buildAuthedRemote's rule, design 44
