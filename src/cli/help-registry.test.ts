@@ -35,6 +35,7 @@ test("the public surface (derived from the registry) and KNOWN_TOP_LEVEL stay co
   // top-level token must be a command the dispatcher knows.
   for (const name of PUBLIC_COMMANDS) expect(KNOWN_TOP_LEVEL.has(firstWord(name))).toBe(true);
   expect(KNOWN_TOP_LEVEL.has("__daemon-run")).toBe(true); // internal, handled by the switch
+  expect(KNOWN_TOP_LEVEL.has("__boot-resume")).toBe(true);
 });
 
 test("every deprecated alias is hidden and forwards to a real command path", () => {

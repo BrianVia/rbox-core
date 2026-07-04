@@ -6,6 +6,7 @@ import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
 import { findRoot, loadConfig } from "./config.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
+import { desiredStatePath } from "./autostart-cmd.js";
 
 let dir: string;
 let home: string;
@@ -58,10 +59,12 @@ test("untrack also removes the global daemon runtime dir (no orphans under ~/.rb
   await fs.mkdir(runtimeDir, { recursive: true });
   await fs.writeFile(path.join(runtimeDir, "daemon.log"), "sync\n");
   await fs.writeFile(path.join(runtimeDir, "daemon.pid"), "12345");
+  await fs.writeFile(desiredStatePath(root), JSON.stringify({ rootPath: root, state: "running", accountId: "acct_x", workspaceId: "ws_x", at: "2026-07-03T18:00:00.000Z" }));
 
   await untrack({ root, force: true });
 
   await expect(fs.access(runtimeDir)).rejects.toThrow(); // global runtime dir is gone
+  await expect(fs.access(desiredStatePath(root))).rejects.toThrow();
   await expect(fs.access(path.join(root, ".rbox"))).rejects.toThrow(); // workspace binding too
 });
 

@@ -260,7 +260,9 @@ export function forceKill(pid: number): void {
   }
 }
 
-export async function startDaemon(root: string): Promise<void> {
+export type StartDaemonResult = "started" | "already-running" | "retry-later";
+
+export async function startDaemon(root: string): Promise<StartDaemonResult> {
   const existing = readPid(root);
   if (existing && isOurDaemon(existing, root)) {
     // A live daemon is only "already running" if it's bound to the CURRENT workspace.
@@ -284,12 +286,12 @@ export async function startDaemon(root: string): Promise<void> {
         // mutation, whose rollback is JS-level and dies with the process. SIGTERM
         // shutdown is graceful (awaits the pump) — just try again shortly.
         console.log(`old daemon (pid ${existing}) hasn't exited yet — re-run \`rbox start\` in a moment`);
-        return;
+        return "retry-later";
       }
       await fsp.rm(pidPath(root), { force: true });
     } else {
       console.log(`rbox daemon already running (pid ${existing})`);
-      return;
+      return "already-running";
     }
   } else if (existing) {
     // Stale pidfile (process died, or pid reused by something else) — clean it.
@@ -315,6 +317,7 @@ export async function startDaemon(root: string): Promise<void> {
 
   if (child.pid) fs.writeFileSync(pidPath(root), `v2 ${child.pid} ${bootId}\n`);
   console.log(`rbox daemon started (pid ${child.pid}). logs: ${logPath(root)}`);
+  return "started";
 }
 
 export async function stopDaemon(root: string): Promise<void> {
