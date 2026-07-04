@@ -1,5 +1,8 @@
 import { test, expect } from "bun:test";
-import { workspaceFlags, authorizePath } from "./setup-cmd.js";
+import { workspaceFlags, authorizePath, resolveEnrollment } from "./setup-cmd.js";
+import type { AccountKeysDTO } from "./e2ee-remote.js";
+
+const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
 // The guided flow's menus are now arrow-key `@inquirer` `select`s (thin widgets we
 // don't unit-test). The one pure step-transition left is `workspaceFlags` — the
@@ -39,4 +42,63 @@ test("authorize routing: browser and approve are both the device-code grant; onl
   expect(authorizePath("pair")).toBe("pair-token");
   expect(authorizePath("approve")).toBe("device-code");
   expect(authorizePath("browser")).toBe("device-code");
+});
+
+test("resolveEnrollment: keyless account renders the first-machine choice and runs genesis", async () => {
+  let choices: Array<{ name: string; value: string; description?: string }> = [];
+  let genesisCalls = 0;
+  let enrolledChecks = 0;
+
+  const ok = await resolveEnrollment("https://api.test", {
+    alreadyEnrolled: async () => {
+      enrolledChecks++;
+      return enrolledChecks > 1;
+    },
+    loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+    makeApi: () => ({
+      getAccountKeys: async () => null,
+      bootstrapKeys: async () => {},
+    }),
+    promptSelect: (async (cfg: { choices: typeof choices }) => {
+      choices = cfg.choices;
+      return "genesis";
+    }) as never,
+    runGenesisEnrollment: async () => {
+      genesisCalls++;
+      return "enrolled";
+    },
+    writeStderr: () => {},
+  });
+
+  expect(ok).toBe(true);
+  expect(choices[0]!.name).toBe("This is my first machine — set up encryption now");
+  expect(choices.map((c) => c.value)).toEqual(["genesis", "pair", "recover", "later"]);
+  expect(genesisCalls).toBe(1);
+});
+
+test("resolveEnrollment: existing key world keeps the current three choices and warning copy", async () => {
+  let choices: Array<{ name: string; value: string; description?: string }> = [];
+  const err: string[] = [];
+
+  const ok = await resolveEnrollment("https://api.test", {
+    alreadyEnrolled: async () => false,
+    loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+    makeApi: () => ({
+      getAccountKeys: async () => ACCOUNT_KEYS,
+      bootstrapKeys: async () => {},
+    }),
+    promptSelect: (async (cfg: { choices: typeof choices }) => {
+      choices = cfg.choices;
+      return "later";
+    }) as never,
+    writeStderr: (s) => void err.push(s),
+  });
+
+  expect(ok).toBe(false);
+  expect(choices).toEqual([
+    { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
+    { name: "Recover with my 24-word phrase", value: "recover" },
+    { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
+  ]);
+  expect(err[0]).toBe("\n⚠  This machine is authorized (acct_setup) but NOT yet enrolled for encryption. Enroll it now:\n");
 });

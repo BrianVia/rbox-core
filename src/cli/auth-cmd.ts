@@ -2,10 +2,10 @@ import os from "node:os";
 import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser } from "./browser-open.js";
-import { RboxApi } from "./remote.js";
+import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
-import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
+import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import {
   defaultKitTargetDir,
   displayPath,
@@ -18,6 +18,13 @@ import {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const NO_KIT: RecoveryKitOptions = { kit: false };
+export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
+  "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox recover`.";
+const DEVICE_CODE_ENROLLMENT_NOTE =
+  "note: device-code login authorized this machine, but encryption is not enrolled. Run `rbox pair` on an enrolled machine or `rbox recover`.";
+const GENESIS_COMMAND = "rbox key genesis --yes";
+const HEADLESS_GENESIS_COMMAND_NOTE = `note: no encryption keys yet — run \`${GENESIS_COMMAND}\` to set up this first machine.`;
+const ENCRYPTION_ENROLLED_MESSAGE = "encryption enrolled — this workspace will be end-to-end encrypted.";
 
 /** Show the recovery phrase once with a forced acknowledgement (no escrow). The
  *  confirm re-asks until it's a deliberate yes — pressing enter (default No) won't
@@ -48,6 +55,86 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
   });
 }
 
+type GenesisApi = Pick<RboxApi, "getAccountKeys" | "bootstrapKeys">;
+type GenesisEnrollmentResult = "enrolled" | "already-setup";
+
+interface GenesisEnrollmentDeps {
+  showRecoveryPhrase?: typeof showRecoveryPhrase;
+  now?: () => number;
+}
+
+export async function runGenesisEnrollment(
+  api: GenesisApi,
+  creds: { accountId: string; deviceId: string },
+  kitOpts: RecoveryKitOptions = NO_KIT,
+  deps: GenesisEnrollmentDeps = {}
+): Promise<GenesisEnrollmentResult> {
+  const releaseGenesisLock = acquireGenesisLock(creds.accountId);
+  try {
+    if (await api.getAccountKeys()) return "already-setup";
+
+    try {
+      const phrase = await bootstrapNewAccount(api, creds.accountId, creds.deviceId, { now: (deps.now ?? Date.now)() });
+      await (deps.showRecoveryPhrase ?? showRecoveryPhrase)(phrase, creds, kitOpts);
+      return "enrolled";
+    } catch (err) {
+      if (err instanceof AccountAlreadyBootstrappedError) {
+        await forgetLocalDeviceMaterial(creds.accountId);
+        if (await api.getAccountKeys()) return "already-setup";
+      }
+      throw err;
+    }
+  } finally {
+    releaseGenesisLock();
+  }
+}
+
+interface DeviceCodePostApprovalDeps {
+  isInteractive?: typeof isInteractive;
+  promptConfirm?: typeof promptConfirm;
+  runGenesisEnrollment?: typeof runGenesisEnrollment;
+  writeStderr?: (text: string) => void;
+}
+
+function assertValidDeviceCodeApproval(p: { accountId?: string; deviceId?: string }): asserts p is { accountId: string; deviceId: string } {
+  if (!p.accountId || !p.deviceId) throw new Error("malformed approval response from server — run `rbox login` again");
+}
+
+export async function handleDeviceCodePostApprovalEncryption(
+  api: GenesisApi,
+  creds: { accountId: string; deviceId: string },
+  kitOpts: RecoveryKitOptions = NO_KIT,
+  deps: DeviceCodePostApprovalDeps = {}
+): Promise<"existing-keys" | "headless-command" | "declined" | "enrolled" | "already-setup"> {
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  const checkInteractive = deps.isInteractive ?? isInteractive;
+  const confirm = deps.promptConfirm ?? promptConfirm;
+  const enroll = deps.runGenesisEnrollment ?? runGenesisEnrollment;
+  if (await api.getAccountKeys()) {
+    writeStderr(`${DEVICE_CODE_ENROLLMENT_NOTE}\n`);
+    return "existing-keys";
+  }
+
+  if (!checkInteractive()) {
+    writeStderr(`${HEADLESS_GENESIS_COMMAND_NOTE}\n`);
+    return "headless-command";
+  }
+
+  const yes = await confirm({ message: "Set up encryption on this first machine now?", default: true });
+  if (!yes) {
+    writeStderr(`${HEADLESS_GENESIS_COMMAND_NOTE}\n`);
+    return "declined";
+  }
+
+  const result = await enroll(api, creds, kitOpts);
+  if (result === "enrolled") {
+    console.log(ENCRYPTION_ENROLLED_MESSAGE);
+    return "enrolled";
+  }
+  writeStderr(`${DEVICE_CODE_ENROLLMENT_NOTE}\n`);
+  return "already-setup";
+}
+
 /** `rbox login [--bootstrap <secret>] [--plan <solo|pro>]` — obtain a per-device token. */
 export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   const label = os.hostname();
@@ -63,15 +150,12 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
     console.log(`logged in (bootstrapped) as device ${deviceId}`);
-    // E2EE: a brand-new account has no key material yet — enroll it now (this
-    // device becomes the genesis device) and show the recovery phrase once.
     const api = new RboxApi(remoteUrl, token, "", "");
-    if (!(await api.getAccountKeys())) {
-      const phrase = await bootstrapNewAccount(api, accountId, deviceId, { now: Date.now() });
-      await showRecoveryPhrase(phrase, { accountId, deviceId }, kitOpts);
-      console.log(`encryption enrolled — this workspace will be end-to-end encrypted.`);
+    const genesis = await runGenesisEnrollment(api, { accountId, deviceId }, kitOpts);
+    if (genesis === "enrolled") {
+      console.log(ENCRYPTION_ENROLLED_MESSAGE);
     } else {
-      console.error(`this account is already set up; to use it on THIS machine, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
+      console.error(EXISTING_ACCOUNT_ENROLLMENT_MESSAGE);
     }
     return;
   }
@@ -101,9 +185,10 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
       const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
       const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
       if (p.status === "approved" && p.token) {
-        await saveCredentials({ token: p.token, deviceId: p.deviceId ?? "unknown", remoteUrl, accountId: p.accountId });
+        assertValidDeviceCodeApproval(p);
+        await saveCredentials({ token: p.token, deviceId: p.deviceId, remoteUrl, accountId: p.accountId });
         console.log(`device authorized: ${p.deviceId}`);
-        console.error(`note: device-code login authorizes this machine but does NOT enroll it for encryption. To read/sync encrypted data, run \`rbox pair\` on a signed-in machine and connect the token, or \`rbox recover\`.`);
+        await handleDeviceCodePostApprovalEncryption(new RboxApi(remoteUrl, p.token, "", ""), { accountId: p.accountId, deviceId: p.deviceId }, kitOpts);
         return;
       }
       if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
@@ -248,6 +333,19 @@ export async function keyStatus(): Promise<void> {
   console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));
+}
+
+/** `rbox key genesis --yes` — explicit non-interactive first-machine genesis. */
+export async function keyGenesis(yes: boolean, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
+  if (!yes) throw new Error(`usage: ${GENESIS_COMMAND}`);
+  const creds = await loadCredentials();
+  if (!creds?.accountId) throw new Error("not logged in — run `rbox login` first");
+  const result = await runGenesisEnrollment(new RboxApi(creds.remoteUrl, creds.token, "", ""), { accountId: creds.accountId, deviceId: creds.deviceId }, kitOpts);
+  if (result === "enrolled") {
+    console.log(ENCRYPTION_ENROLLED_MESSAGE);
+  } else {
+    console.error(EXISTING_ACCOUNT_ENROLLMENT_MESSAGE);
+  }
 }
 
 /** `rbox key backup` — re-show the recovery phrase IF it was cached at setup (C9). */

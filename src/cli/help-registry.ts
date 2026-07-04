@@ -261,11 +261,22 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "key",
     group: "DEVICES & ACCOUNT",
-    summary: "encryption status / re-show recovery phrase",
-    usage: "rbox key <status | backup> [--kit] [--kit-path <path>]",
+    summary: "encryption status / recovery phrase tools",
+    usage: "rbox key <status | backup | genesis>",
     flags: [
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
+    ],
+  },
+  {
+    name: "key genesis",
+    group: "DEVICES & ACCOUNT",
+    summary: "set up encryption on the first machine",
+    usage: "rbox key genesis --yes [--kit] [--kit-path <path>]",
+    flags: [
+      { flag: "--yes", desc: "required to mint the account's first encryption keys" },
+      { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
+      { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
     ],
   },
 
