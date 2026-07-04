@@ -45,9 +45,12 @@ machinery pointed at a throwaway directory instead of a binding.
    `$HOME` (never *create* `~/Downloads`; headless Linux often lacks it). This is
    the recovery-kit convention verbatim — reuse `defaultKitTargetDir` /
    `displayPath` and the `accountHex16` / `localYmd` helpers
-   (`recovery-kit.ts:50,90,104,204,210`). Per workspace a subdirectory named by its
-   opt-in `name` (else short id), holding a **plain directory tree — no `.rbox`
-   metadata**. `--out` overrides: a directory path, or a `*.tar.gz` path to emit a
+   (`recovery-kit.ts:50,90,104,204,210`). Per workspace a subdirectory named
+   `<sanitized-name>-<workspaceId-first8>` (name part omitted when unnamed) — the id
+   suffix is ALWAYS present because workspace names are **not unique** (no uniqueness
+   constraint at `createWorkspace`; codex adversarial finding, review 2026-07-03: two
+   workspaces both named `app` would otherwise silently merge/clobber into one export
+   dir). Each holds a **plain directory tree — no `.rbox` metadata**. `--out` overrides: a directory path, or a `*.tar.gz` path to emit a
    single gzipped tarball instead of a tree.
 
 3. **Latest state only, v1.** Export materializes each workspace's newest manifest.
@@ -100,8 +103,9 @@ For each target `(workspaceId, projectId)`:
 2. `saveConfig(stagingRoot, cfg)` a synthetic `e2ee/v1` config for that workspace
    (`schema:"e2ee/v1"`, `remoteWorkspaceId`, `projectId`, `rootPath:stagingRoot`,
    `syncGit` on so git repos rematerialize as real working repos). Set trash off
-   for this run (`trashConfig.days = 0`) so pull skips `openTrashBatch` — a
-   throwaway needs no trash tier.
+   for this run via the persisted config field `trash: { days: 0 }` (NOT
+   "`trashConfig.days`" — `trashConfig()` is a derived helper over the config, codex
+   review 2026-07-03) so pull skips `openTrashBatch` — a throwaway needs no trash tier.
 3. `buildAuthedRemote(stagingRoot)` → injects token + KEK from the enrolled
    keystore, exactly as sync does.
 4. `pull(stagingRoot, cfg, deps)`. Fresh baseline (`EMPTY_MANIFEST`) → reconcile
@@ -113,7 +117,16 @@ For each target `(workspaceId, projectId)`:
 This reuses the fully-hardened pull/reconcile/decrypt path unchanged, and the only
 export-specific code is: enumerate workspaces, synthesize a config, strip `.rbox`,
 and the tar/marker/summary shell. It creates **no** durable binding (the staging
-config is deleted), starts **no** daemon, and touches **no** real workspace state.
+config is deleted) and starts **no** daemon.
+
+**One durable side effect, intentional (codex review 2026-07-03 flagged it):** pull
+through `buildAuthedRemote` advances the device's **anti-rollback pins** for each
+exported workspace (the pin store is per-device, keyed by workspace, outside the
+staging dir). This is correct, not a leak: a pin records "this device has
+authentically observed sequence N," and the export genuinely observed it — advancing
+the pin strengthens rollback protection for later syncs on this device. We document
+it rather than build a throwaway in-memory pin store, which would discard a true
+observation. No other real workspace state is touched.
 
 > Alternative considered — extract an in-memory `buildAuthedRemote` variant that
 > takes `(workspaceId, projectId)` and never writes `workspace.json`. Rejected for

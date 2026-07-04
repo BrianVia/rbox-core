@@ -69,8 +69,16 @@ convention (and 54 §9 Q3's recommended fallback shape):
 
 ```jsonc
 // ~/.rbox/daemons/<basename>-<hash8>/desired.json  (mode 600)
-{ "rootPath": "/Users/via/code/app", "state": "running", "at": "2026-07-03T18:00:00Z" }
+{ "rootPath": "/Users/via/code/app", "state": "running",
+  "accountId": "acct_…", "workspaceId": "ws_…", "at": "2026-07-03T18:00:00Z" }
 ```
+
+`accountId`/`workspaceId` are **account-scoping guards** (codex adversarial finding,
+review 2026-07-03): `buildAuthedRemote` combines the root's config with whatever
+`~/.rbox/credentials.json` currently holds, so without scoping, a logout → login-to-a-
+DIFFERENT-account sequence would let `__boot-resume` start old workspace daemons under
+the new account's credential. Resume therefore skips (and reports via `autostart
+status`) any entry whose `accountId` ≠ the current credential's account.
 
 - `rbox start [path]` (`index.ts:462`) writes `state: "running"` **after** `startDaemon`.
 - `rbox stop [path]` (`index.ts:466`) writes `state: "stopped"` — the dir survives a stop
@@ -96,7 +104,9 @@ A hidden dispatcher case (alongside `__daemon-run`, `index.ts:564`). It:
 2. **Enumerates** `~/.rbox/daemons/*/desired.json`, keeps `state === "running"`, and for each
    reads `rootPath`. Rows whose `rootPath` or `<rootPath>/.rbox/workspace.json` no longer
    exists are skipped (stale — dir moved/`rm -rf`'d), matching design 54 §6's stat-based
-   validation. No silent deletion; a later `autostart status` can report them.
+   validation. Rows whose `accountId` doesn't match the current credential are skipped
+   (§3.1 — never start a daemon for account A under account B's token). No silent
+   deletion; a later `autostart status` can report them.
 3. **Calls `startDaemon(root)` per surviving row.** `startDaemon` is already idempotent and
    rebind-safe (`daemon-control.ts:263-297`) — a workspace whose daemon somehow survived is a
    no-op ("already running"); a rebound root restarts cleanly. Each daemon spawns detached +

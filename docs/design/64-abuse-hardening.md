@@ -80,7 +80,7 @@ top-level (dev) block declares lax ones. That IS the env-aware knob — no code 
 // env.production: real numbers
 "ratelimits": [
   { "name": "RL_DEVICE_START", "namespace_id": "2001", "simple": { "limit": 6,  "period": 60 } },
-  { "name": "RL_DEVICE_POLL",  "namespace_id": "2002", "simple": { "limit": 20, "period": 60 } },
+  { "name": "RL_DEVICE_POLL",  "namespace_id": "2002", "simple": { "limit": 30, "period": 60 } },
   { "name": "RL_RELEASE",      "namespace_id": "2003", "simple": { "limit": 60, "period": 60 } },
   { "name": "RL_LINK_PAIR",    "namespace_id": "2004", "simple": { "limit": 10, "period": 60 } }
 ]
@@ -89,7 +89,13 @@ top-level (dev) block declares lax ones. That IS the env-aware knob — no code 
 Reframed from the "10/hour" intent in the ticket: the binding maxes at a 60s window, so
 we express budgets as per-60s bursts (a human logs in a handful of times a minute at
 most; 6/60s/IP is generous for people, ruinous for a loop). Enforcement is one guard
-at the top of each public route, keyed by IP + route:
+at the top of each public route, keyed by IP + route — **except `device/poll`, which is
+keyed by `deviceCode`** (codex adversarial finding, review 2026-07-03): the CLI polls
+every 5s, so one login ≈ 12 polls/min and an IP-keyed 20/60s would break two
+simultaneous logins behind one office NAT. The `deviceCode` is high-entropy and
+per-login, so `dp:${deviceCode}` gives each login its own budget (30/60s ≈ 2.5× the
+legitimate cadence) with zero NAT collateral; an attacker spraying random codes is
+bounded per-code, and creating real codes is bounded by `RL_DEVICE_START`.
 
 ```ts
 const ip = clientIp(req) ?? "noip";           // notify.ts already extracts CF-Connecting-IP
@@ -130,13 +136,24 @@ Two constraints shape the enforcement:
 - **Don't overload design-37's `changes == 0`.** Today `changes == 0` on the guarded
   INSERT means "account tombstoned" (→ `AccountGoneError`). Folding a cap predicate
   into that same WHERE would make 0 ambiguous. So enforce the cap as a **pre-count**
-  inside `mintWithRetry` for durable mints only: `SELECT COUNT(*) FROM devices WHERE
-  account_id = ? AND expires_at IS NULL AND revoked = 0`; if `>= planFor(plan).devices`,
-  throw a typed `DeviceLimitError` before the INSERT. This accepts a benign
-  check-then-insert race (two concurrent mints could overshoot by one) — tolerable
-  because this is a soft resource cap, NOT a secret-issuance gate like pairing (where
-  the atomic INSERT…SELECT…WHERE is load-bearing). If exactness is ever needed, the
-  atomic form is available at the cost of a second sentinel for the ambiguous 0.
+  for durable mints only: `SELECT COUNT(*) FROM devices WHERE account_id = ? AND
+  expires_at IS NULL AND revoked = 0`; if `>= planFor(plan).devices`, reject with a
+  typed `DeviceLimitError` before the INSERT. This accepts a benign check-then-insert
+  race (two concurrent mints could overshoot by one) — tolerable because this is a
+  soft resource cap, NOT a secret-issuance gate like pairing (where the atomic
+  INSERT…SELECT…WHERE is load-bearing).
+- **Check BEFORE burning the one-time grant** (codex adversarial finding, review
+  2026-07-03). Both grant flows consume their authorization before minting: device-code
+  poll flips the code to `claimed` before the mint (`device-code.ts:66-79`), and pair
+  redeem burns the token before the mint (`pairing.ts:100-147`). A cap error raised
+  only inside the mint would therefore 409 AFTER destroying the user's code/token —
+  they'd have to restart the whole login/pair flow even after revoking a device. So the
+  cap pre-count runs as a **preflight at the top of the claim/redeem handlers**, before
+  the code/token is consumed: on limit, return the 409 DTO and leave the grant intact
+  (the user revokes a device and retries the SAME code/token within its TTL). The
+  mint-level check stays as a backstop (bounded overshoot from the preflight race is
+  acceptable; the backstop failing after a burn is then vanishingly rare and returns
+  the same 409 rather than a 500 — add it to each handler's catch explicitly).
 
 Plan is read from `accounts.plan` (account-data plane, `dbFor`) alongside the existing
 liveness read — one extra point read on the durable-mint path only.

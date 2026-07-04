@@ -61,10 +61,20 @@ already_bootstrapped` — and stays untouched.
 
 4. **Race / abuse.** Two fresh devices racing genesis: the first wins the server `INSERT OR
    IGNORE`; the second gets `409 already_bootstrapped`, catches it, re-fetches keys, and
-   falls back to the pair/recover message — no error surfaced to the user, no partial
-   state. An authorized-but-unenrolled device on an EXISTING account can never reset keys:
-   the server refuses to overwrite `account_keys`, so even a coerced client genesis attempt
-   409s and degrades to pair/recover.
+   falls back to the pair/recover message — no error surfaced to the user. **The loser MUST
+   clean up its locally pre-persisted key material** (codex adversarial finding, review
+   2026-07-03): `bootstrapNewAccount` saves `device.json`/`mk.key` (and optionally the
+   cached recovery key) BEFORE the server POST for crash-safety (`e2ee-client.ts:57-59`) —
+   correct when the POST succeeds-but-response-is-lost (local material matches the world the
+   server claimed with OUR wraps), but on a 409 the server holds SOMEONE ELSE's world and
+   the local material is garbage. Left in place it poisons `alreadyEnrolled()` (which
+   trusts only local `hasDevice`, `setup-cmd.ts:112`) into reporting the machine enrolled
+   while it's absent from every roster — sync then fails confusingly later. So the genesis
+   helper's 409 path is: **remove the saved device secrets + any cached recovery key for
+   this account (new keystore cleanup helper), THEN re-fetch keys and fall back to
+   pair/recover.** An authorized-but-unenrolled device on an EXISTING account can never
+   reset keys: the server refuses to overwrite `account_keys`, so even a coerced client
+   genesis attempt 409s and degrades the same way.
 
 5. **Headless / no-TTY: never auto-mint.** A non-interactive genesis prints instructions
    (the explicit command) and exits without touching key material — minting a master key is
@@ -136,7 +146,10 @@ getAccountKeys()  →  null                     →  non-null
   command and mints nothing (assert `bootstrapNewAccount` NOT called); non-null prints the
   today verbatim pair/recover note.
 - Race: helper sees null, `bootstrapNewAccount` throws the 409-mapped error → helper catches,
-  re-fetches keys, returns the pair/recover fallback (no throw to caller).
+  **removes the pre-persisted local device material (assert `hasDevice` false afterward)**,
+  re-fetches keys, returns the pair/recover fallback (no throw to caller). Also assert the
+  success path leaves local material in place, and a non-409 failure (network) leaves the
+  crash-safety material intact for retry.
 
 **Rig scenario — `web-first-genesis` (new variant of `onboard-smoke`):**
 The rig today conflates account creation and genesis in one step: `provisionPair` runs

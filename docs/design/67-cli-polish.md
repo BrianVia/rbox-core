@@ -22,9 +22,15 @@ fix, cites the exact line it corrects, and notes where the fix isn't obvious.
 **A1. `ignore`/`trash` take `--path`; everything else takes positional `[path]`.**
 Confirmed: `push`/`pull`/`status` resolve root from `positional[0]`
 (`src/cli/index.ts:266,290,335`), but `ignore` and `trash` resolve root from
-`flags.path` (`index.ts:478,485`). Fix: accept `positional[0]` on both, keep
-`--path` as a back-compat alias (positional wins if both given — matches no
-other command having this ambiguity today, so any order is fine).
+`flags.path` (`index.ts:478,485`). **Original fix (positional path) REVERSED by
+adversarial review 2026-07-03:** these commands' positional slots are already
+taken — `ignore <glob>` reads the glob from `positional[0]`, and `trash
+<list|restore|empty>` reads its subcommand there (`trash-cmd.ts:13`), so a
+positional path would break `rbox ignore node_modules` and every `trash`
+invocation. Revised fix: keep `--path` as the addressing mechanism for these
+two, and make the inconsistency *legible* instead of invisible — document
+`--path` prominently in both commands' help entries and in the usage-error
+strings ("run from the workspace, or pass --path <dir>"). No parsing change.
 
 **A2. Dead short flags on `logs`.** `parseFlags` (`index.ts:117-129`) only
 ever populates keys from `--long` tokens — there is no code path that sets a
@@ -60,6 +66,12 @@ which path a given command's error takes. Fix: single format everywhere —
 the top-level catch in `index.ts:603-606` calls `style.fail` instead of its
 own `console.error` (so NO_COLOR/FORCE_COLOR/TTY detection — already centralized
 in `style.ts` — applies to the top-level catch too, which today bypasses it).
+**Must be output-mode-aware (adversarial review 2026-07-03):** when the invoked
+command ran with `--json` (§B), a thrown error that reaches the top-level catch
+must emit `{"error": "<message>"}` to stderr, not `✗ rbox: …` — otherwise the §B
+error contract is unimplementable for any error that escapes the command body.
+One `emitError(message)` helper owns the branch (reads a module-level json-mode
+flag set at dispatch); `style.fail` and the top-level catch both route through it.
 
 **A6. Unhide `versions`/`restore` in help.** Both are marked `hidden: true`
 (`help-registry.ts:329,336`) with a stale comment calling them "fail-closed
@@ -105,7 +117,7 @@ to stderr and the normal non-zero exit code (unchanged); no ANSI color
 (`--json` implies `NO_COLOR` semantics regardless of TTY). One-line DTO
 sketch per command:
 
-- `status --json`: `{ workspace: {id,name,root}, health: "ok"|"pending"|"conflict", daemon: {running,pid}, remote: {sequence,source}, trash: {bytes,count}|null, account: {plan,usedBytes,capBytes} }`
+- `status --json`: `{ workspace: {id,name,root}, health, daemon: {running,pid}, remote: {sequence,source}, trash: {bytes,count}|null, account: {plan,usedBytes,capBytes} }` — `health` is NOT a new enum: it mirrors `shellStateOf` (`activity.ts:118`) verbatim, i.e. today `"ok"|"pending"|"active"|"halt"` plus design 62's `"outofstorage"` when that ships (adversarial review 2026-07-03: an invented `ok|pending|conflict` triple would drift from the real state machine; one source of truth)
 - `device list --json`: `{ devices: [{id, kind, createdAt, lastSeenAt, revoked}] }`
 - `account status --json`: `{ accountId, plan, graceUntil, readOnly, linked: boolean }`
 - `versions --json`: `{ versions: [{sequence, committedAt, path|null}] }`
@@ -158,7 +170,15 @@ shell installer: fetch `$BASE/version` (the signed manifest), pull this
 platform's `sha256` field for the artifact, download to a temp file while
 hashing (mirrors `downloadToTemp`, `upgrade-cmd.ts:129-159`), compare against
 the manifest's `sha256` (mirrors the check at `upgrade-cmd.ts:217`), and abort
-before `mv` on mismatch. **Be honest about what this buys**: Ed25519
+before `mv` on mismatch. **JSON-in-POSIX-sh (adversarial review 2026-07-03):**
+no jq dependency and no real parser — the manifest is OUR stable, server-
+generated format (release.yml emits it), so a constrained `grep -o`/`sed`
+extraction of `"rbox-<os>-<arch>"…"sha256":"<64 hex>"` is legitimate, with a
+hard abort (refuse to install) if extraction yields anything but exactly one
+64-hex string. Add a comment at the manifest-emitting site (release workflow /
+`routes/release.ts`) declaring the field layout a compatibility contract the
+installer greps — reshaping it is a breaking change. `sha256sum`/`shasum -a
+256` chosen by probe, abort if neither exists. **Be honest about what this buys**: Ed25519
 signature verification (`verifyAndParseManifest`, `upgrade-cmd.ts:48-69`) needs
 the `RELEASE_KEYS`/verify logic that only exists inside the compiled binary —
 a POSIX shell script can't do public-key crypto without shipping a second
@@ -177,8 +197,12 @@ overclaim.
 `src/cli/` today, confirmed). Default (no flags): print the removal steps
 without performing them (a dry-run-first stance matches `doctor`'s consent
 pattern). With `--yes`: perform them.
-1. Stop any running daemons (reuse `stopDaemon`, `daemon-control.ts`, across
-   every workspace this machine tracks — not just the CWD).
+1. Stop any running daemons — via design 61's `desired.json` enumeration (61 must
+   ship first; its `rootPath` field is what makes "every workspace this machine
+   tracks" enumerable at all — adversarial review 2026-07-03). For pre-61 runtime
+   dirs that lack `desired.json`, fall back to reading each
+   `~/.rbox/daemons/*/daemon.pid` and SIGTERMing that pid directly (best-effort;
+   the pidfile is in the runtime dir even when the root path is unknowable).
 2. Disable autostart if enabled (`rbox autostart disable`, design 61
    `daemon-autostart.md:187`).
 3. Remove `~/.rbox` (credentials, e2ee keystore, daemon state, upgrade lock).

@@ -55,13 +55,15 @@ layout) as privacy. Sections, top to bottom:
    claim and promising the page proves it rather than asserting it.
 2. **What the server sees vs. can't see** (two columns / two lists, the core
    artifact). Source of truth: design 12 §0 + R4.
-   - *Can't see:* file contents, names, paths, directory tree, per-file plaintext
-     sizes, modes, mtimes, symlink targets, git refs/branch names/commit messages,
-     the manifest itself.
+   - *Can't see:* file contents, names, paths, directory tree, modes, mtimes,
+     symlink targets, git refs/branch names/commit messages, the manifest itself.
    - *Can see (honest residual):* that an account/workspace exists; per-commit blob
-     **count** and each **ciphertext size** (≈ plaintext + GCM tag); **commit
-     timing/cadence**; which pseudonymous **device id** committed; total stored
-     bytes (billing needs it); account **email** (via Clerk); Stripe customer
+     **count**; **each blob's size** — ciphertext length is plaintext length plus a
+     small constant (GCM tag), so per-file sizes are effectively visible, just not
+     which *file* a size belongs to (codex review 2026-07-03: do NOT list "per-file
+     sizes" under can't-see — the earlier draft did, contradicting its own caveat 3);
+     **commit timing/cadence**; which pseudonymous **device id** committed; total
+     stored bytes (billing needs it); account **email** (via Clerk); Stripe customer
      reference + plan.
 3. **How it works — the key hierarchy in plain words.** No wire formats. Design 12
    §1:
@@ -123,7 +125,7 @@ contract; anything not on it doesn't go on the page.
 | No escrow / no backdoor / no master password | §8, R6; privacy.astro:49-55 |
 | Recovery = 24-word phrase, shown once, we never see it | §8, design 58 |
 | Lost phrase + all devices ⇒ unrecoverable (by design) | §8 |
-| Server *can* see blob counts, ciphertext sizes, timing, device ids | R4 (caveat 3) |
+| Server *can* see blob counts, per-blob sizes (≈ exact plaintext sizes, unlinked from names), timing, device ids | R4 (caveat 3) |
 | Identical files → identical ciphertext within a workspace | R4/V4-5 (caveat 1) |
 | Device revoke stops access but doesn't yet rotate keys | devices.ts:14-18 (caveat 2) |
 | Account email visible via Clerk; card data only at Stripe | privacy.astro:58-92 |

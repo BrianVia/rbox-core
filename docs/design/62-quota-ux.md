@@ -156,13 +156,21 @@ In the pump catch (`daemon.ts:344`), branch on `e instanceof QuotaExceededError`
 BEFORE the generic halt bookkeeping:
 
 - set `activity.outOfStorage` (and clear any stale `halt`); do NOT set `halt`.
-- **back off:** don't let this op re-arm `want.push` on the safety-scan / watcher path
-  while `outOfStorage` is set — a full account gains nothing from re-uploading every
-  scan. A single retry still rides the next *pull* (remote may have freed refs) and any
-  successful push clears the state; that bounds re-attempts without a hot path.
-- **auto-clear:** on the next successful push (same heal shape as `halt`), OR when a
-  `GET /v1/account/usage` on the daemon's existing periodic tick reports `readOnly:false`
-  / headroom. Clearing re-arms normal sync.
+- **back off:** while `outOfStorage` is set, watcher events, full scans, and pulls keep
+  running normally — they just don't *attempt the upload*. Local edits are never queued
+  or dropped, because sync is **state-based, not an oplog** (codex review 2026-07-03
+  asked; stating it explicitly): the watcher/scanner keep the local picture current on
+  disk, and when the state clears, the next push uploads the *latest* state wholesale.
+  Suppression loses nothing; it only skips futile wire attempts.
+- **retry cadence:** exactly ONE push probe per safety-scan tick (the existing
+  `SAFETY_SYNC_MS` timer, idle-backed to 5 min per design 49) while the state is set —
+  not per watcher event. There is NO existing account/usage tick in the daemon (codex
+  review corrected the draft here): rather than adding a new timer, the same safety-scan
+  probe IS the usage re-check — a probe that stops 402ing clears the state. No separate
+  `GET /v1/account/usage` polling from the daemon (also keeps design-64 rate-limit
+  surface small); on auth/network failure during a probe the state simply persists.
+- **auto-clear:** the next successful push (same heal shape as `halt`) clears
+  `outOfStorage` and re-arms normal sync.
 
 `status-view.ts` gains a verdict tier between `halt` (1) and live-progress (2), plus a
 detail line:

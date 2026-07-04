@@ -75,7 +75,18 @@ under design 67 F, not duplicated here).
 ```ts
 const sub = await stripeSubscriptionStatus(env, accountId); // new helper
 if (!sub) return storedPlan ?? "free";          // no Stripe subscription on file — stored plan stands
-if (sub.status !== "active" && sub.status !== "trialing") return "free"; // lapsed
+if (sub.status !== "active" && sub.status !== "trialing") {
+  // Lapsed but webhook never fired. Do NOT return "free" directly — that would
+  // bypass the 30-day downgrade grace and prune the customer's history on the
+  // very next cron tick (grace_until is NULL in the missed-webhook case; codex
+  // adversarial BLOCKER, review 2026-07-03). Instead apply the SAME guarded
+  // downgrade the webhook would have: plan → free + grace_until = now + 30d,
+  // via the shared design-13 downgrade helper. THIS tick still returns
+  // storedPlan; the stamped grace makes every subsequent tick skip pruning
+  // until the window closes — identical end state to an on-time webhook.
+  await applyWebhookStyleDowngrade(env, accountId);
+  return storedPlan ?? "free";
+}
 return sub.plan;                                 // authoritative tier
 ```
 
@@ -85,7 +96,8 @@ downgrade for a paying customer. This makes reconciliation a periodic
 safety-net over the webhook, not a replacement for it: the webhook stays the
 primary, low-latency path (a downgrade shouldn't wait for the next hourly
 retention cron to take effect), and `resolveAccountPlan` only needs to catch
-the case where the webhook never fired at all.
+the case where the webhook never fired at all — and when it does, the recovery
+must be indistinguishable from the webhook having fired late.
 
 Cost: one Stripe API call per account per `retentionPrune` cron tick. At
 today's cross-shard fan-out shape (§32, `retention.ts:36-39`) this is one call
@@ -99,9 +111,11 @@ with many workspaces.
   → returns its plan; canceled/past_due → `"free"`; no subscription on file →
   stored plan; Stripe API throws → stored plan (fail-open), not `"free"`.
 - Regression: a webhook-missed scenario (stored plan says `pro`, mocked Stripe
-  says canceled) → next `retentionPrune` run resolves `"free"` and prunes
-  accordingly, without touching `grace_until` (grace is a webhook-side stamp,
-  untouched by this reconciliation path).
+  says canceled) → the reconciliation tick stamps `plan=free` +
+  `grace_until=now+30d` (the design-13 downgrade shape) and does NOT prune that
+  tick; a tick with `grace_until` in the past prunes at free-tier retention.
+  Assert history is never pruned inside the 30-day window — that's the BLOCKER
+  this section exists to prevent.
 
 ## 5. Out of scope
 
