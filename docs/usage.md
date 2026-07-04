@@ -84,6 +84,10 @@ rbox start [path]     # start background sync (daemon)
 rbox stop [path]
 rbox logs [path] [--follow] [--lines N]
 
+rbox autostart enable   # resume background sync after login/reboot
+rbox autostart disable
+rbox autostart status
+
 rbox sync [path] [--allow-mass-delete]   # pull, then push, once
 rbox push [path]
 rbox pull [path] [--allow-mass-delete]
@@ -95,12 +99,37 @@ rbox status [path]    # workspace state + conflict metrics
 of the tracked files stops and asks for it explicitly, rather than quietly
 applying what could be a corrupted or mistaken remote state.
 
+**Autostart.** `rbox start` only lasts as long as the process — a reboot, a
+power-cycle, or a logout silently kills every daemon. `rbox autostart enable`
+registers a per-user login agent (launchd on macOS, systemd user unit on Linux)
+that brings your background sync back after login, so a reboot doesn't quietly
+leave a workspace out of sync. `rbox autostart status` shows whether it's
+registered; `rbox autostart disable` removes it. It never runs as root and never
+supervises crashes — it only re-establishes sync at login.
+
+**Export ("give me all my files back").**
+
+```bash
+rbox export                                # every workspace → ~/Downloads
+rbox export --workspace ws_ab12cd34        # just one
+rbox export --out ~/backup.tar.gz          # write a single .tar.gz instead of a directory
+```
+
+`rbox export` decrypts your data under your own keys and writes it back out —
+takeout for an E2EE product where the server only ever holds ciphertext. It
+defaults to every workspace into `~/Downloads`; `--out` targets a directory or,
+if the path ends in `.tar.gz`, a single archive. It's a read-only operation: it
+never binds a workspace, never starts a daemon, and leaves your synced state
+untouched. (For a single-file rollback, use `rbox restore <path>@<seq>` instead —
+export is the whole-workspace path.)
+
 > **Note on deprecated names:** `link` and `daemon <start|stop|logs>` still work
 > but are deprecated aliases (they forward to `track` and `start`/`stop`/`logs`
-> respectively) and print a warning — they're slated for removal at v0.3
-> (design 29). Use the names above in new scripts. `doctor` is now the top-level
-> support command; `hydrate`/`detect` remain disabled deps aliases while the
-> whole `deps` group is commented out of the CLI (design 51, §7 below).
+> respectively) and print a warning on every use (design 29). They're
+> **deprecated-but-supported** — there's no scheduled removal — so prefer the
+> names above in new scripts. `doctor` is now the top-level support command;
+> `hydrate`/`detect` remain disabled deps aliases while the whole `deps` group is
+> commented out of the CLI (design 51, §7 below).
 
 ## 5. `.rboxignore` — shared, cross-machine ignore rules
 
@@ -211,13 +240,53 @@ rbox account link <code>       # link this CLI to your web login
 rbox account status
 rbox account unlink
 
-rbox key status                # encryption status
+rbox key status                # encryption status (+ recovery-kit record)
 rbox key backup                # re-show recovery phrase
+rbox key genesis --yes         # mint this account's first encryption keys
 ```
+
+**`rbox key genesis`.** Web signup and plain device-code `rbox login` authorize
+a machine but do **not** create an encryption key world — there's nothing to
+decrypt until one exists. `rbox key genesis --yes` is the explicit "set up
+encryption on the first machine" step: it mints the account's first keys and the
+24-word recovery phrase on a cold account. `rbox setup` runs it for you inline
+when it detects an authorized-but-unenrolled machine, so you rarely call it by
+hand; the `--yes` flag is required because it's the one-time act that defines the
+key world everything else inherits.
+
+### Recovery kit (`--kit` / `--kit-path`)
+
+The commands that surface your 24-word phrase can also write it to disk as a
+**recovery kit** — a plaintext file with the phrase, your account id, this
+device, step-by-step recovery instructions, and the no-escrow warning. It's
+supported on `rbox login --bootstrap ... --kit`, `rbox init ... --kit`, `rbox key
+backup --kit`, `rbox recover --kit`, and `rbox key genesis --kit`.
+
+```bash
+rbox key backup --kit                      # write to the default kit location
+rbox key backup --kit-path ~/vault/rbox.txt  # write to a specific file
+```
+
+- **Where it lands.** `--kit` writes to `~/Downloads` when that directory
+  exists, otherwise `$HOME`, named
+  `rbox-recovery-kit-<8-hex-account-suffix>-<YYYYMMDD>.txt`. `--kit-path <path>`
+  writes exactly where you point it.
+- **How it's written.** Atomically (temp file + rename) at mode `0600`
+  (owner-read/write only); it refuses to write through a symlink and re-reads the
+  file to verify the contents landed intact.
+- **Tracking it.** After a successful write, rbox records the path and timestamp.
+  `rbox key status` reports the last-written kit — its path and date, or that no
+  kit is recorded, or that the recorded file has since gone missing.
+
+The kit is plaintext by design: anyone who holds it can decrypt your rbox data,
+and rbox has no escrow and can never reset the phrase for you. Treat it like the
+phrase itself — store it somewhere you'd store a password backup, not next to
+the machine it unlocks.
 
 ## 9. Billing & maintenance
 
 ```bash
+rbox usage [--json]            # plan limits + current account usage
 rbox subscribe <solo|pro>
 rbox billing                   # open the billing portal
 rbox upgrade [--check]
@@ -225,6 +294,14 @@ rbox version
 rbox shell-init zsh            # prompt integration + completions: eval "$(rbox shell-init zsh)"
 rbox completions zsh
 ```
+
+**`rbox usage`** prints what your plan allows against what you're using —
+storage used vs cap, workspace and device counts, and (when you're in a
+downgrade grace window) how long read-only access lasts. It's the same figure the
+server uses to decide a `402 quota_exceeded`, so it's the command to reach for
+when a push starts refusing writes. `--json` emits the raw account-usage DTO for
+scripts. `rbox subscribe <solo|pro>` opens a checkout to lift the cap (Team is
+not yet purchasable).
 
 ## 10. Full command reference
 

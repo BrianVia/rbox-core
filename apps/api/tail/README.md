@@ -32,7 +32,7 @@ npx wrangler secret put SLACKPIPES_ALERTS_WEBHOOK_URL --env production
 # 3. UNCOMMENT the `tail_consumers` line in apps/api/wrangler.jsonc (dev + prod),
 #    then redeploy the api worker so the trace is wired:
 cd .. && npx wrangler deploy                  # dev
-#    (prod ships via merge → deploy-api.yml, or `npx wrangler deploy --env production`)
+#    (prod ships via merge → Cloudflare Workers Builds, or `npx wrangler deploy --env production`)
 ```
 
 Absent the secret the tail worker is a safe no-op (it just won't ping).
