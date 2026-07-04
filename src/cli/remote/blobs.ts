@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, readShaMismatch } from "./errors.js";
+import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
 
@@ -15,7 +15,11 @@ export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Ar
     headers: ctx.protoAuth,
     body: bytes,
   });
-  if (!res.ok) throw new Error(`blob PUT failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const { quota, text } = await readQuotaExceeded(res);
+    if (quota) throw quota;
+    throw new Error(`blob PUT failed: ${res.status} ${text}`);
+  }
   ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
 }
 
@@ -40,8 +44,9 @@ export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: s
     } as RequestInit);
     if (res.status !== 413) {
       if (!res.ok) {
-        const { mismatch, text } = await readShaMismatch(res);
-        if (mismatch) throw new BlobShaMismatchError(sha256); // live-folder TOCTOU → let push re-scan + retry
+        const { quota, text } = await readQuotaExceeded(res);
+        if (quota) throw quota;
+        if (isShaMismatch(res.status, text)) throw new BlobShaMismatchError(sha256); // live-folder TOCTOU → let push re-scan + retry
         throw new Error(`blob PUT failed: ${res.status} ${text}`);
       }
       ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });

@@ -43,6 +43,8 @@ export interface DaemonActivity {
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
    *  becomes visible. */
   halt?: { at: string; reason: string; count: number; op: "pull" | "push" | "fullScan" | "deepScan" };
+  /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
+  outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number };
 }
 
 /** An `active` entry older than this is ignored by status (stale = daemon died mid-op). */
@@ -99,6 +101,21 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
       a.halt = { at: halt.at, reason: halt.reason, count: halt.count, op: halt.op };
     }
+    const out = raw.outOfStorage;
+    if (
+      out &&
+      typeof out.at === "string" &&
+      (out.kind === "storage" || out.kind === "workspaces") &&
+      (out.used === undefined || num(out.used)) &&
+      (out.cap === undefined || num(out.cap))
+    ) {
+      a.outOfStorage = {
+        at: out.at,
+        kind: out.kind,
+        ...(out.used !== undefined ? { used: out.used } : {}),
+        ...(out.cap !== undefined ? { cap: out.cap } : {}),
+      };
+    }
     return a;
   } catch {
     return undefined;
@@ -115,11 +132,11 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   }
 }
 
-/** The sidecar's state field — halt > active > pending (unsettled) > ok. Exported
- *  so the daemon can compare "what would render now" against what it last wrote
- *  (the codex R4 settle fix) without duplicating the precedence. */
-export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "active" | "pending" | "ok" =>
-  a.halt ? "halt" : a.active ? "active" : settled ? "ok" : "pending";
+/** The sidecar's state field — halt > outofstorage > active > pending (unsettled) > ok.
+ *  Exported so the daemon can compare "what would render now" against what it last
+ *  wrote without duplicating the precedence. */
+export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "outofstorage" | "active" | "pending" | "ok" =>
+  a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
 
 /**
  * Design 46: render the daemon's activity record into the one-line prompt sidecar
@@ -131,7 +148,7 @@ export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "act
  * Format (v1), single-space separated, `name` LAST because it may contain spaces:
  *   `v1 <epochSeconds> <state> <pct> <sequence> <lastOpEpoch> <lastOpKind> <name>`
  *
- * - `state` precedence: `halt` > `active` > `pending` (unsettled) > `ok` (settled).
+ * - `state` precedence: `halt` > `outofstorage` > `active` > `pending` (unsettled) > `ok` (settled).
  * - `pct` — floor(done/total*100) clamped 0–100 for `active` (total<=0 → 100), else `-`.
  * - `sequence` — last synced sequence; `-` when none (0 = never synced ⇒ `-`).
  * - `lastOpEpoch`/`lastOpKind` — the MORE RECENT of lastPush/lastPull (`push`/`pull`);

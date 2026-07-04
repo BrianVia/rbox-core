@@ -11,6 +11,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
+import { formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
@@ -132,7 +133,17 @@ export function healthLine(s: StatusSnapshot): string {
     return `${style.red("⚠ sync halted")} ${style.dim(`(${relTime(halt.at, s.now)}${times})`)} ${halt.reason}`;
   }
 
-  // 2. A transfer is live right now. Gated on BOTH daemon liveness and freshness
+  // 2. Quota exhaustion is soft state: halt wins, live progress waits below it.
+  const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  if (out) {
+    const usage = quotaUsage(out.kind, out.used, out.cap);
+    const detail = out.kind === "workspaces"
+      ? usage ? `workspace limit reached — ${usage} workspaces used` : "workspace limit reached"
+      : usage ? `out of storage — ${usage} used` : "out of storage";
+    return `${style.red(`⛔ ${detail}`)} · run \`rbox usage\`, then \`rbox subscribe solo\``;
+  }
+
+  // 3. A transfer is live right now. Gated on BOTH daemon liveness and freshness
   //    (codex R5): only the daemon writes `active`, so with the daemon stopped —
   //    even freshly killed mid-op — there is no live transfer to report; and a
   //    daemon that died with its pidfile intact must not show "syncing" forever.
@@ -147,7 +158,7 @@ export function healthLine(s: StatusSnapshot): string {
   const behind = remoteSequence !== undefined && remoteSequence > s.localSequence;
   const behindNote = `behind remote (sequence ${s.localSequence} vs ${remoteSequence})`;
 
-  // 3. Local divergence from the baseline — file and/or git changes waiting to
+  // 4. Local divergence from the baseline — file and/or git changes waiting to
   //    upload. With the daemon running this is normally transient; stopped, it
   //    needs a nudge.
   if (localChanges > 0 || gitChanged > 0) {
@@ -164,13 +175,13 @@ export function healthLine(s: StatusSnapshot): string {
     return `${style.yellow(head)} ${style.dim(`(${parts.join(", ")})`)}${extra}${hint}`;
   }
 
-  // 4. Clean locally but the remote has moved on.
+  // 5. Clean locally but the remote has moved on.
   if (behind) {
     const hint = s.remote?.source === "daemon" ? `daemon has not applied seq ${remoteSequence} yet` : s.daemonRunning ? "will sync on the next pull" : "run `rbox pull` or `rbox start`";
     return `${style.yellow(`↓ ${behindNote}`)} ${style.dim(`— ${hint}`)}`;
   }
 
-  // 5. In sync: no local divergence, and the remote (when reachable) agrees.
+  // 6. In sync: no local divergence, and the remote (when reachable) agrees.
   return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
 }
 
@@ -178,14 +189,7 @@ export function healthLine(s: StatusSnapshot): string {
  *  decimal place above bytes). Pure — the status trash line and any future size surface
  *  share one formatting rule. */
 export function humanBytes(bytes: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = Math.max(0, bytes);
-  let i = 0;
-  while (v >= 1000 && i < units.length - 1) {
-    v /= 1000;
-    i++;
-  }
-  return i === 0 ? `${Math.round(v)} B` : `${v.toFixed(1)} ${units[i]}`;
+  return formatDecimalBytes(bytes);
 }
 
 /** The `rbox status` trash line (design 50 §2), or undefined when trash is empty — the

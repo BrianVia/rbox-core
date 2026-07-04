@@ -294,6 +294,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox billing",
   },
   {
+    name: "usage",
+    group: "BILLING & MAINTENANCE",
+    summary: "show plan limits and current account usage",
+    usage: "rbox usage [--json]",
+    flags: [{ flag: "--json", desc: "print the raw account usage DTO" }],
+  },
+  {
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "check workspace health; optionally upload a support report",

@@ -79,6 +79,20 @@ test("a stopped daemon's leftover halt is dropped (stopped already says sync is 
   expect(line).toContain("in sync");
 });
 
+test("out-of-storage outranks live progress but stays below halt", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    outOfStorage: { at: iso(5), kind: "storage", used: 2 * 1024 * 1024 * 1024, cap: 2 * 1024 * 1024 * 1024 },
+    active: { at: iso(1), phase: "upload", done: 1, total: 2 },
+  };
+  const line = healthLine(base({ activity }));
+  expect(line).toBe("⛔ out of storage — 2.0 GiB of 2.0 GiB used · run `rbox usage`, then `rbox subscribe solo`");
+
+  const halted = healthLine(base({ activity: { ...activity, halt: { at: iso(1), reason: "boom", count: 1, op: "push" } } }));
+  expect(halted).toContain("sync halted");
+  expect(halted).not.toContain("out of storage");
+});
+
 test("fresh live progress renders the syncing line", () => {
   const activity: DaemonActivity = { at: iso(1), active: { at: iso(2), phase: "upload", done: 3612, total: 8603 } };
   const line = healthLine(base({ activity }));

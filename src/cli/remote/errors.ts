@@ -1,3 +1,5 @@
+import { quotaUsage } from "../quota-format.js";
+
 /** The server can't serve a contiguous commit span (the `since` is below the
  *  retention prune floor, so old `seq:<n>` pointers were dropped, OR the span
  *  exceeds `MAX_COMMIT_SPAN`). A typed signal so `versions`/`restore` can fail
@@ -34,6 +36,51 @@ export class AccountAlreadyBootstrappedError extends Error {
   }
 }
 
+export type QuotaKind = "storage" | "workspaces";
+
+function quotaMessage(kind: QuotaKind, used?: number, cap?: number): string {
+  if (kind === "workspaces") {
+    const detail = cap !== undefined ? `plan allows ${cap.toLocaleString("en-US")}` : "plan limit reached";
+    return `Workspace limit reached — ${detail}. Upgrade with \`rbox subscribe solo\` for unlimited workspaces.`;
+  }
+  const usage = quotaUsage(kind, used, cap);
+  const detail = usage ? `${usage} used` : "storage cap reached";
+  return `Out of storage — ${detail}. Upgrade with \`rbox subscribe solo\` (50 GiB), or free up space and run \`rbox sync\`.`;
+}
+
+export class QuotaExceededError extends Error {
+  constructor(
+    public readonly kind: QuotaKind,
+    public readonly used?: number,
+    public readonly cap?: number
+  ) {
+    super(quotaMessage(kind, used, cap));
+    this.name = "QuotaExceededError";
+  }
+}
+
+const finite = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+
+function jsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const body = JSON.parse(text) as unknown;
+    return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 402 with `{"error":"quota_exceeded"}` → typed quota error. Anything else falls
+ *  through with the consumed body text preserved for the caller's generic path. */
+export async function readQuotaExceeded(res: Response): Promise<{ quota: QuotaExceededError | null; text: string }> {
+  const text = await res.text();
+  if (res.status !== 402) return { quota: null, text };
+  const body = jsonObject(text);
+  if (body?.error !== "quota_exceeded") return { quota: null, text };
+  const kind: QuotaKind = body.limit === "workspaces" ? "workspaces" : "storage";
+  return { quota: new QuotaExceededError(kind, finite(body.used), finite(body.cap)), text };
+}
+
 /** Distinguish R2's convergent-encryption hash guard (`{"error":"sha_mismatch"}`) from any
  *  other 4xx. The server signals this SAME semantic error with two statuses (apps/api/src/blobs.ts):
  *  400 on the single-PUT / direct-write path, 412 on the multipart-complete publish. Accept both,
@@ -42,10 +89,10 @@ export class AccountAlreadyBootstrappedError extends Error {
  *  callers keep their existing `status body` diagnostics. */
 export async function readShaMismatch(res: Response): Promise<{ mismatch: boolean; text: string }> {
   const text = await res.text();
-  if (res.status !== 400 && res.status !== 412) return { mismatch: false, text };
-  try {
-    return { mismatch: (JSON.parse(text) as { error?: string }).error === "sha_mismatch", text };
-  } catch {
-    return { mismatch: false, text };
-  }
+  return { mismatch: isShaMismatch(res.status, text), text };
+}
+
+export function isShaMismatch(status: number, text: string): boolean {
+  if (status !== 400 && status !== 412) return false;
+  return jsonObject(text)?.error === "sha_mismatch";
 }
