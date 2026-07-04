@@ -133,6 +133,10 @@ for (const t of targets) {
 }
 
 // 3. manifest
+// COMPATIBILITY CONTRACT: scripts/install.sh extracts the platform artifact sha
+// with constrained grep/sed from this compact JSON shape:
+// `"rbox-<os>-<arch>":{"sha256":"<64hex>","path":"v<version>/rbox-<os>-<arch>"}`
+// Reordering or pretty-printing artifact fields is a breaking installer change.
 const manifest = { version, keyId, artifacts, releasedAt: new Date(Number(process.env.SOURCE_DATE_EPOCH ?? Date.now()) * (process.env.SOURCE_DATE_EPOCH ? 1000 : 1)).toISOString() };
 const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
 fs.writeFileSync(path.join(dist, "version.json"), manifestBytes);

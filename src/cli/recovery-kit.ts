@@ -72,7 +72,7 @@ export function renderKit(input: RenderKitInput): string {
     "How to recover:",
     "",
     "1. Install rbox:",
-    "   curl -fsSL https://rbox.to/install | sh",
+    "   curl -fsSL https://rbox.to/install.sh | sh",
     "2. Sign in on the new machine:",
     "   rbox login",
     "3. Re-enroll encryption:",

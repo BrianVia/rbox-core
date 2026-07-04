@@ -5,6 +5,8 @@
  * receipt/grant state lives here too so every domain module (blobs, multipart,
  * commits, keys) reads and mutates ONE instance held by `RboxApi`.
  */
+import { translateRemoteError } from "./errors.js";
+
 export class RemoteContext {
   constructor(
     readonly baseUrl: string,
@@ -57,7 +59,7 @@ export class RemoteContext {
       headers: { ...this.protoAuth, "content-type": "application/json" },
       body: JSON.stringify({ shas }),
     });
-    if (!res.ok) throw new Error(`blobs/check failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
     return ((await res.json()) as { missing: string[] }).missing;
   }
 }

@@ -26,7 +26,7 @@ export interface DesiredDaemonState {
   at: string;
 }
 
-interface DesiredStateRow {
+export interface DesiredStateRow {
   key: string;
   path: string;
   desired: DesiredDaemonState;
@@ -212,6 +212,10 @@ async function readDesiredRows(): Promise<DesiredStateRow[]> {
     if (desired) rows.push({ key, path: p, desired });
   }
   return rows.sort((a, b) => a.desired.rootPath.localeCompare(b.desired.rootPath));
+}
+
+export async function readDesiredDaemonRows(): Promise<DesiredStateRow[]> {
+  return readDesiredRows();
 }
 
 async function staleReason(root: string): Promise<string | undefined> {

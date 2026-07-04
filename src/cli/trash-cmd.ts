@@ -8,24 +8,44 @@
  */
 import { listTrash, pruneTrash, restoreFromTrash } from "../engine/trash.js";
 import { humanBytes } from "./status-view.js";
-import { style } from "./style.js";
+import { emitJson } from "./json.js";
+import { fail, style } from "./style.js";
 
 export async function trashCmd(root: string, positional: string[], flags: Record<string, string>): Promise<void> {
   const sub = positional[0] ?? "list";
   if (sub === "list") {
-    await trashList(root);
+    await trashList(root, flags.json === "true");
   } else if (sub === "restore") {
     await trashRestore(root, positional[1], flags.batch);
   } else if (sub === "empty") {
     await trashEmpty(root);
   } else {
-    console.log("usage: rbox trash <list | restore <path> [--batch <name>] | empty>");
+    console.log("usage: rbox trash <list | restore <path> [--batch <name>] | empty> [--path <dir>]");
     process.exitCode = 1;
   }
 }
 
-async function trashList(root: string): Promise<void> {
+function deletedAtFromBatch(batch: string): string | null {
+  const m = batch.match(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}:${m[2]}:${m[3]}.${m[4]}Z`);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+async function trashList(root: string, json = false): Promise<void> {
   const entries = await listTrash(root);
+  if (json) {
+    emitJson({
+      entries: entries.map((e) => ({
+        path: e.path,
+        deletedAt: deletedAtFromBatch(e.batch),
+        size: e.bytes,
+        batch: e.batch || null,
+      })),
+      totalBytes: entries.reduce((n, e) => n + e.bytes, 0),
+    });
+    return;
+  }
   if (entries.length === 0) {
     console.log(style.dim("trash is empty — nothing to recover"));
     return;
@@ -40,7 +60,7 @@ async function trashList(root: string): Promise<void> {
 }
 
 async function trashRestore(root: string, rel: string | undefined, batch: string | undefined): Promise<void> {
-  if (!rel) throw new Error("usage: rbox trash restore <path> [--batch <name>]");
+  if (!rel) throw new Error("usage: rbox trash restore <path> [--batch <name>] [--path <dir>]");
   try {
     const { restoredTo } = await restoreFromTrash(root, rel, { batch });
     if (restoredTo === rel) {
@@ -51,8 +71,7 @@ async function trashRestore(root: string, rel: string | undefined, batch: string
     }
   } catch (e) {
     // Unknown path / occupied ancestor: report on stderr, non-zero exit — never a stack trace.
-    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
-    process.exitCode = 1;
+    fail(e instanceof Error ? e.message : String(e));
   }
 }
 

@@ -45,8 +45,24 @@ export const style = makeStyle(colorEnabled(process.stdout));
 /** Styling for stderr (spinners, diagnostics). */
 export const stderrStyle = makeStyle(colorEnabled(process.stderr));
 
+let jsonErrorMode = false;
+
+/** Set by the top-level dispatcher when a command was invoked with `--json`. */
+export function setJsonErrorMode(enabled: boolean): void {
+  jsonErrorMode = enabled;
+}
+
+/** Emit one CLI error in the active output mode. Does not set exitCode. */
+export function emitError(message: string): void {
+  if (jsonErrorMode) {
+    process.stderr.write(`${JSON.stringify({ error: message })}\n`);
+    return;
+  }
+  process.stderr.write(`${stderrStyle.sym.err} ${stderrStyle.red(`rbox: ${message}`)}\n`);
+}
+
 /** Print a styled error to stderr and set a non-zero exit code (does not throw). */
 export function fail(message: string): void {
-  process.stderr.write(`${stderrStyle.sym.err} ${stderrStyle.red(message)}\n`);
+  emitError(message);
   process.exitCode = 1;
 }

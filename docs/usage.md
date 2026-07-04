@@ -28,6 +28,9 @@ TTY.
 
 `NO_COLOR=1` / `FORCE_COLOR=1` are honored everywhere.
 
+Exit codes are intentionally small and stable: `0` means ok, `1` means error,
+and `130` means user cancel (Ctrl-C).
+
 ## 2. What `rbox init` actually does
 
 1. **Auth.** Bootstrap-login (`--bootstrap <secret>`, headless-safe) or
@@ -82,13 +85,13 @@ rbox untrack [path] [--force]                  # stop syncing (local unbind; rem
 
 rbox start [path]     # start background sync (daemon)
 rbox stop [path]
-rbox logs [path] [--follow] [--lines N]
+rbox logs [path] [--follow] [--limit N]  # --lines is still accepted as an alias
 
 rbox sync [path] [--allow-mass-delete]   # pull, then push, once
 rbox push [path]
 rbox pull [path] [--allow-mass-delete]
 
-rbox status [path]    # workspace state + conflict metrics
+rbox status [path] [--json]  # workspace state + conflict metrics
 ```
 
 `--allow-mass-delete` is a consent gate: a pull that would delete half or more
@@ -120,6 +123,7 @@ then, ignore behavior is just `BUILTIN_IGNORE` + `.gitignore`.
 ```bash
 rbox ignore "*.local.json"     # append a pattern (creates the file if absent, de-duped)
 rbox ignore --list             # print the effective merged rule set, labeled by source
+rbox ignore --path ~/code/myapp --list
 ```
 
 **The sharp edge — ignoring an already-synced file.** By default, newly
@@ -204,14 +208,14 @@ echo <token> | rbox connect    # redeem it on the new machine
 rbox recover                   # re-enroll this machine from your recovery phrase
 
 rbox device approve <user-code>
-rbox device list
+rbox device list [--json]
 rbox device revoke <device-id>
 
 rbox account link <code>       # link this CLI to your web login
-rbox account status
+rbox account status [--json]
 rbox account unlink
 
-rbox key status                # encryption status
+rbox key status [--json]       # encryption status
 rbox key backup                # re-show recovery phrase
 ```
 
@@ -221,6 +225,7 @@ rbox key backup                # re-show recovery phrase
 rbox subscribe <solo|pro>
 rbox billing                   # open the billing portal
 rbox upgrade [--check]
+rbox uninstall [--yes]         # no --yes prints the removal steps only
 rbox version
 rbox shell-init zsh            # prompt integration + completions: eval "$(rbox shell-init zsh)"
 rbox completions zsh

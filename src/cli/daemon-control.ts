@@ -335,7 +335,7 @@ export async function stopDaemon(root: string): Promise<void> {
   await fsp.rm(pidPath(root), { force: true });
 }
 
-/** How many trailing lines `rbox logs` shows by default (override with --lines). */
+/** How many trailing lines `rbox logs` shows by default (override with --limit; --lines is an alias). */
 export const DEFAULT_LOG_LINES = 50;
 
 /** Read the last `maxLines` lines of `filePath` without slurping the whole file:

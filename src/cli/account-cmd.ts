@@ -1,4 +1,5 @@
 import { loadCredentials, requireCredentials } from "./credentials.js";
+import { emitJson } from "./json.js";
 import { style } from "./style.js";
 
 /**
@@ -31,6 +32,8 @@ export async function accountLink(code: string): Promise<void> {
 export interface AccountStatus {
   accountId: string;
   plan: string;
+  graceUntil?: number | null;
+  readOnly?: boolean;
   /** Whether a web (Clerk) login manages this account. */
   linked: boolean;
 }
@@ -86,11 +89,24 @@ export function formatAccountSummary(s: AccountSummary): string[] {
 }
 
 /** `rbox account status` — is a web login linked to this account? (Also shows plan.) */
-export async function accountStatus(): Promise<void> {
+export async function accountStatus(opts: { json?: boolean } = {}): Promise<void> {
   const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
   if (!res.ok) throw new Error(`status failed: ${res.status}`);
   const { accountId, linked, plan } = (await res.json()) as { accountId: string; linked: boolean; plan?: string };
+  if (opts.json) {
+    const usage = await fetch(`${c.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${c.token}` } });
+    if (!usage.ok) throw new Error(`usage failed: ${usage.status}`);
+    const u = (await usage.json()) as { plan?: string; graceUntil?: number | null; readOnly?: boolean };
+    emitJson({
+      accountId,
+      plan: u.plan ?? plan ?? "free",
+      graceUntil: u.graceUntil ?? null,
+      readOnly: u.readOnly === true,
+      linked: !!linked,
+    });
+    return;
+  }
   console.log(`account:          ${accountId}`);
   console.log(`plan:             ${plan ?? "free"}`);
   console.log(`web login linked: ${linked ? "yes" : "no"}`);

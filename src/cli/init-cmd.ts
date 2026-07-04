@@ -104,7 +104,7 @@ export async function runInit(
   if (isInitError(plan)) {
     fail(plan.message);
     process.stderr.write(`${stderrStyle.dim("try:")} ${plan.headlessHint}\n`);
-    process.exitCode = 2;
+    process.exitCode = 1;
     return undefined;
   }
   return executeInitPlan(plan, gathered.bootstrap, { summary: opts.summary !== false, recoveryKit: recoveryKitOptionsFromFlags(gathered) });
@@ -189,7 +189,7 @@ async function executeInitPlan(
   if (creds.accountId && !(await hasDevice(creds.accountId))) {
     fail("this machine isn't enrolled for encryption yet.");
     process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
-    process.exitCode = 2;
+    process.exitCode = 1;
     return undefined;
   }
   const { cfg: authed, deps } = await buildAuthedRemote(plan.root);

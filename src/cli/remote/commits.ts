@@ -2,7 +2,7 @@ import type { Manifest } from "../../engine/index.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
 import type { RemoteContext } from "./context.js";
-import { NeedsRebaselineError, readQuotaExceeded } from "./errors.js";
+import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 
 export interface CommitResult {
   sequence?: number;
@@ -34,14 +34,14 @@ export async function commit(ctx: RemoteContext, parentSequence: number, deviceI
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
-    throw new Error(`commit failed: ${res.status} ${text}`);
+    throw new Error(translateRemoteError(res.status, "commit failed", text, "workspace not found — check you're in the right directory"));
   }
   return { sequence: ((await res.json()) as { sequence: number }).sequence };
 }
 
 export async function latestCommit(ctx: RemoteContext): Promise<{ sequence: number; commit: SignedCommit | null }> {
   const r = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, { headers: ctx.auth });
-  if (!r.ok) throw new Error(`latest failed: ${r.status}`);
+  if (!r.ok) throw new Error(translateRemoteError(r.status, "latest failed", undefined, "workspace not found — check you're in the right directory"));
   const body = (await r.json()) as { sequence: number; commit: SignedCommit | null; grant?: unknown };
   ctx.captureGrant(body); // §27 — the pull handshake hands back a download grant
   return { sequence: body.sequence, commit: body.commit };
@@ -50,7 +50,7 @@ export async function latestCommit(ctx: RemoteContext): Promise<{ sequence: numb
 export async function commitsSince(ctx: RemoteContext, since: number): Promise<Array<SignedCommit>> {
   const r = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/commits?since=${since}`, { headers: ctx.auth });
   if (r.status === 409) throw new NeedsRebaselineError(((await r.json().catch(() => ({}))) as { head?: number }).head);
-  if (!r.ok) throw new Error(`commits?since failed: ${r.status}`);
+  if (!r.ok) throw new Error(translateRemoteError(r.status, "commits?since failed", undefined, "workspace not found — check you're in the right directory"));
   return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
 }
 
@@ -74,7 +74,7 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   if (!r.ok) {
     const { quota, text } = await readQuotaExceeded(r);
     if (quota) throw quota;
-    throw new Error(`commit failed: ${r.status} ${text}`);
+    throw new Error(translateRemoteError(r.status, "commit failed", text, "workspace not found — check you're in the right directory"));
   }
   const seq = ((await r.json()) as { sequence: number }).sequence;
   ctx.receipts.clear(); // published → receipts consumed
@@ -85,7 +85,7 @@ export async function latest(ctx: RemoteContext): Promise<{ sequence: number; ma
   const res = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, {
     headers: ctx.auth,
   });
-  if (!res.ok) throw new Error(`latest failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(translateRemoteError(res.status, "latest failed", await res.text(), "workspace not found — check you're in the right directory"));
   const body = (await res.json()) as { sequence: number; manifest: Manifest; grant?: unknown };
   ctx.captureGrant(body); // §27 — capture the download grant on the legacy manifest path too
   return { sequence: body.sequence, manifest: body.manifest };
@@ -97,7 +97,7 @@ export async function latest(ctx: RemoteContext): Promise<{ sequence: number; ma
  *  Returns seq → epoch-ms; a missing/lagging row just means no time for that seq. */
 export async function commitTimes(ctx: RemoteContext, limit = 50): Promise<Map<number, number>> {
   const res = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/versions?limit=${limit}`, { headers: ctx.auth });
-  if (!res.ok) throw new Error(`versions failed: ${res.status}`);
+  if (!res.ok) throw new Error(translateRemoteError(res.status, "versions failed", undefined, "workspace not found — check you're in the right directory"));
   const rows = ((await res.json()) as { versions: Array<{ sequence: number; created_at: number }> }).versions;
   return new Map(rows.map((r) => [r.sequence, r.created_at]));
 }

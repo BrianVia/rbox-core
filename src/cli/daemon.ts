@@ -21,6 +21,7 @@ import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metri
 import { lowerIoPriority } from "./io-priority.js";
 import { QuotaExceededError, RboxApi } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
+import { runUpdateCheckIfDue } from "./update-check.js";
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
@@ -29,6 +30,7 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 const WS_PING_MS = 25_000;
 const WS_KEEPALIVE_PERSIST_MS = 20_000;
+const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
 
@@ -101,6 +103,7 @@ export class RboxDaemon {
   private lastWsKeepaliveWrite = 0;
   private safetyTimer?: ReturnType<typeof setTimeout>;
   private deepTimer?: ReturnType<typeof setInterval>;
+  private updateCheckTimer?: ReturnType<typeof setInterval>;
   /** Current safety-scan delay (60s floor, backs off to 5m while idle — design 49). */
   private safetyDelay = SAFETY_SYNC_MS;
   /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
@@ -179,6 +182,7 @@ export class RboxDaemon {
 
     await this.startLiveWatch();
     this.connect();
+    this.startUpdateChecks();
 
     log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
   }
@@ -266,6 +270,7 @@ export class RboxDaemon {
     this.stopped = true;
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
+    if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
     this.stopWsKeepalive();
     try {
       this.ws?.close();
@@ -289,6 +294,11 @@ export class RboxDaemon {
   private request(kind: keyof Wants): void {
     this.want[kind] = true;
     void this.pump();
+  }
+
+  private startUpdateChecks(): void {
+    void runUpdateCheckIfDue(this.cfg.remoteUrl);
+    this.updateCheckTimer = setInterval(() => void runUpdateCheckIfDue(this.cfg.remoteUrl), UPDATE_CHECK_TICK_MS);
   }
 
   /** The in-flight pump loop, if any — awaited by stop() so shutdown drains it. */
