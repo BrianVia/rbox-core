@@ -60,6 +60,17 @@ export const PLAN_LOOKUP_KEYS: Record<string, string> = {
 };
 export const EXTRA_STORAGE_LOOKUP_KEY = "rbox_extra_100gb_monthly";
 
+/**
+ * Plans a checkout may actually be opened for (design 63 §C). Separate from
+ * PLAN_LOOKUP_KEYS on purpose: `team` keeps its lookup_key (so limits, the admin MRR
+ * estimate, and the webhook→plan mapping keep working) but is NOT purchasable yet —
+ * it's presented everywhere as "coming soon." billingCheckout gates on THIS set, so
+ * the server rejects Team checkout intent before any Stripe call, regardless of which
+ * client (or non-client) calls it — even after a `rbox_team_seat_monthly` price
+ * exists. Launching Team is then a one-line add here.
+ */
+export const PURCHASABLE_PLANS = new Set<string>(["solo", "pro"]);
+
 /** Reverse map: a subscription's price lookup_key → our plan name. */
 export function planForLookupKey(lookupKey: string | null | undefined): string | null {
   if (!lookupKey) return null;
