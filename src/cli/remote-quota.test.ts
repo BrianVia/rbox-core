@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { formatBinaryBytes } from "./quota-format.js";
 import { RboxApi } from "./remote.js";
-import { QuotaExceededError, readQuotaExceeded } from "./remote/errors.js";
+import { QuotaExceededError, readQuotaExceeded, translateRemoteError } from "./remote/errors.js";
 
 const GiB = 1024 * 1024 * 1024;
 const BIG = 100 * 1024 * 1024; // > SINGLE_PUT_MAX (90 MiB) → forces multipart
@@ -79,6 +79,16 @@ describe("readQuotaExceeded", () => {
       globalThis.fetch = origFetch;
       await fs.rm(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe("translateRemoteError", () => {
+  test("maps common statuses while 402 preserves the raw fallback", () => {
+    expect(translateRemoteError(401, "latest failed")).toBe("signed out — run rbox login");
+    expect(translateRemoteError(403, "latest failed")).toBe("not permitted");
+    expect(translateRemoteError(404, "latest failed", undefined, "workspace not found — check you're in the right directory")).toBe("workspace not found — check you're in the right directory");
+    expect(translateRemoteError(503, "latest failed", "busy")).toBe("rbox servers are having trouble — try again shortly (HTTP 503)");
+    expect(translateRemoteError(402, "usage failed", "{\"error\":\"payment_required\"}")).toBe('usage failed: 402 {"error":"payment_required"}');
   });
 });
 

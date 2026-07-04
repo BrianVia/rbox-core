@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded } from "./errors.js";
+import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
 
@@ -18,14 +18,14 @@ export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Ar
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
-    throw new Error(`blob PUT failed: ${res.status} ${text}`);
+    throw new Error(translateRemoteError(res.status, "blob PUT failed", text, "workspace not found — check you're in the right directory"));
   }
   ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
 }
 
 export async function getBlob(ctx: RemoteContext, sha256: string): Promise<Buffer> {
   const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload });
-  if (!res.ok) throw new Error(`blob GET failed: ${res.status}`);
+  if (!res.ok) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
   return Buffer.from(await res.arrayBuffer());
 }
 
@@ -47,7 +47,7 @@ export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: s
         const { quota, text } = await readQuotaExceeded(res);
         if (quota) throw quota;
         if (isShaMismatch(res.status, text)) throw new BlobShaMismatchError(sha256); // live-folder TOCTOU → let push re-scan + retry
-        throw new Error(`blob PUT failed: ${res.status} ${text}`);
+        throw new Error(translateRemoteError(res.status, "blob PUT failed", text, "workspace not found — check you're in the right directory"));
       }
       ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
       return;
@@ -62,7 +62,7 @@ export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: s
  *  Any failure (network, write, or hash mismatch) removes the partial file. */
 export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string): Promise<void> {
   const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload });
-  if (!res.ok || !res.body) throw new Error(`blob GET failed: ${res.status}`);
+  if (!res.ok || !res.body) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
   const hash = createHash("sha256");
   const out = fs.createWriteStream(destPath);
   const reader = (res.body as ReadableStream<Uint8Array>).getReader();

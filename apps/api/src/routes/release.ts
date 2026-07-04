@@ -22,7 +22,9 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
     return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" } });
   }
   // The signed release manifest + its detached signature (no-cache; `rbox upgrade`
-  // verifies the signature against an embedded key before trusting it).
+  // verifies the signature against an embedded key before trusting it). Keep the
+  // manifest JSON shape aligned with scripts/release.ts; install.sh greps the
+  // artifact sha256 from that compact field layout before installing.
   if ((url.pathname === "/version" || url.pathname === "/version.sig") && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;

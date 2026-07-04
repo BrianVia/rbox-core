@@ -4,7 +4,7 @@ import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob, putBlobFile } from "./blobs.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitResult } from "./commits.js";
-import { readQuotaExceeded } from "./errors.js";
+import { readQuotaExceeded, translateRemoteError } from "./errors.js";
 import {
   admitDevice,
   appendRoster,
@@ -152,7 +152,7 @@ export async function createRemoteWorkspace(baseUrl: string, token: string, proj
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
-    throw new Error(`workspace create failed: ${res.status} ${text}`);
+    throw new Error(translateRemoteError(res.status, "workspace create failed", text, "workspace not found — check you're in the right directory"));
   }
   return ((await res.json()) as { workspaceId: string }).workspaceId;
 }

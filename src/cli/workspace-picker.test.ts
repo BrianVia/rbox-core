@@ -150,5 +150,5 @@ test("fetchAccountWorkspaces is bounded by maxPages (won't spin on an endless cu
 
 test("fetchAccountWorkspaces throws on a non-2xx (callers degrade to manual entry)", async () => {
   const fetchFn = (async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => "boom" }) as Response) as unknown as typeof fetch;
-  await expect(fetchAccountWorkspaces("https://api", "tok", 10, fetchFn)).rejects.toThrow(/500/);
+  await expect(fetchAccountWorkspaces("https://api", "tok", 10, fetchFn)).rejects.toThrow(/servers are having trouble/);
 });

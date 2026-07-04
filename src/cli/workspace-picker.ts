@@ -12,6 +12,7 @@
  * KEEPING a manual-id fallback for cross-account / edge cases and the scripted
  * `--workspace <id>` path.
  */
+import { translateRemoteError } from "./remote/errors.js";
 
 /** One row of `GET /v1/account/workspaces` (E2EE: the server holds no path — `name`
  *  is the opt-in dashboard label, null unless the creating host set one). */
@@ -202,7 +203,7 @@ export async function fetchAccountWorkspaces(
     const res = await fetchFn(`${baseUrl}/v1/account/workspaces${qs}`, {
       headers: { authorization: `Bearer ${token}` },
     });
-    if (!res.ok) throw new Error(`account/workspaces failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(translateRemoteError(res.status, "account/workspaces failed", await res.text(), "workspace list not found — check you're signed in to the right account"));
     const body = (await res.json()) as { workspaces: AccountWorkspace[]; nextCursor: string | null };
     out.push(...body.workspaces);
     if (!body.nextCursor) break;

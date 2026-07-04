@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { isSafeRelPath, restoreEntryToPath } from "../engine/index.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { NeedsRebaselineError } from "./remote.js";
+import { emitJson } from "./json.js";
 import { style } from "./style.js";
 
 /**
@@ -14,6 +15,7 @@ import { style } from "./style.js";
  */
 
 const DEFAULT_LIMIT = 50;
+type BuildAuthedRemote = typeof buildAuthedRemote;
 
 /** Normalize a user-supplied restore/versions path to the manifest's POSIX-relative
  *  form and reject anything unsafe (absolute, traversal, NUL/backslash). */
@@ -29,12 +31,21 @@ function fmtTime(ms: number | undefined): string {
   return new Date(ms).toISOString().replace("T", " ").slice(0, 19) + "Z";
 }
 
-export async function versionsCmd(root: string, pathArg: string | undefined, limit = DEFAULT_LIMIT): Promise<void> {
-  const { remote } = await buildAuthedRemote(root);
+export async function versionsCmd(
+  root: string,
+  pathArg: string | undefined,
+  limit = DEFAULT_LIMIT,
+  opts: { json?: boolean; buildAuthedRemote?: BuildAuthedRemote } = {}
+): Promise<void> {
+  const { remote } = await (opts.buildAuthedRemote ?? buildAuthedRemote)(root);
 
   if (pathArg) {
     const rel = toRelPath(pathArg);
-    const changes = await remote.pathHistory(rel, limit);
+    const [changes, times] = await Promise.all([remote.pathHistory(rel, limit), remote.advisoryTimes(limit).catch(() => new Map<number, number>())]);
+    if (opts.json) {
+      emitJson({ versions: changes.map((c) => ({ sequence: c.seq, committedAt: times.get(c.seq) ?? null, path: rel })) });
+      return;
+    }
     if (changes.length === 0) {
       console.log(`no changes to ${style.cyan(rel)} in the last ${limit} versions (or the file is unknown here)`);
       return;
@@ -52,6 +63,10 @@ export async function versionsCmd(root: string, pathArg: string | undefined, lim
   // fetch them concurrently. Timestamps are best-effort (authenticity comes from the
   // signed chain, never the D1 mirror); a failure/lag just shows an em-dash.
   const [versions, times] = await Promise.all([remote.history(limit), remote.advisoryTimes(limit).catch(() => new Map<number, number>())]);
+  if (opts.json) {
+    emitJson({ versions: versions.map((v) => ({ sequence: v.seq, committedAt: times.get(v.seq) ?? null, path: null })) });
+    return;
+  }
   if (versions.length === 0) {
     console.log("no versions yet — push something first");
     return;

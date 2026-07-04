@@ -1,10 +1,8 @@
 # rbox — usage guide
 
-This is the deep-dive companion to the README's Quickstart: what each command
-actually does, what files land where, and the config-file semantics you'd
-otherwise have to go read a design doc to find. It documents **current,
-shipped** behavior only — anything proposed but not yet built is called out
-explicitly as such, with a link to its design doc.
+This guide covers command behavior, files written by the CLI, and config-file
+semantics. It documents **current, shipped** behavior; proposed behavior is
+called out with its design doc.
 
 ## 1. Getting started
 
@@ -21,14 +19,17 @@ rbox init --workspace <id> --no-interactive   # join an existing workspace
 ```
 
 `rbox init` is the scripting form of `setup` — same underlying plan resolver
-(`resolveInitPlan`, `src/cli/init-plan.ts`), just flag-driven instead of
+(`resolveInitPlan`, `src/cli/init-plan.ts`), flag-driven instead of
 prompted. Every interactive prompt has a corresponding flag; `--no-interactive`
 fails fast (with a hint) instead of hanging on a missing prompt when there's no
 TTY.
 
 `NO_COLOR=1` / `FORCE_COLOR=1` are honored everywhere.
 
-## 2. What `rbox init` actually does
+Exit codes are intentionally small and stable: `0` means ok, `1` means error,
+and `130` means user cancel (Ctrl-C).
+
+## 2. What `rbox init` does
 
 1. **Auth.** Bootstrap-login (`--bootstrap <secret>`, headless-safe) or
    device-code login (interactive-only; never started in CI).
@@ -82,25 +83,49 @@ rbox untrack [path] [--force]                  # stop syncing (local unbind; rem
 
 rbox start [path]     # start background sync (daemon)
 rbox stop [path]
-rbox logs [path] [--follow] [--lines N]
+rbox logs [path] [--follow] [--limit N]  # --lines is still accepted as an alias
+
+rbox autostart enable   # resume background sync after login/reboot
+rbox autostart disable
+rbox autostart status
 
 rbox sync [path] [--allow-mass-delete]   # pull, then push, once
 rbox push [path]
 rbox pull [path] [--allow-mass-delete]
 
-rbox status [path]    # workspace state + conflict metrics
+rbox status [path] [--json]  # workspace state + conflict metrics
 ```
 
 `--allow-mass-delete` is a consent gate: a pull that would delete half or more
 of the tracked files stops and asks for it explicitly, rather than quietly
 applying what could be a corrupted or mistaken remote state.
 
+**Autostart.** `rbox start` runs for the current login session.
+`rbox autostart enable` registers a per-user login agent (launchd on macOS,
+systemd user unit on Linux) that restarts background sync after login.
+`rbox autostart status` shows whether it is registered; `rbox autostart disable`
+removes it. It never runs as root and never supervises crashes.
+
+**Export.**
+
+```bash
+rbox export                                # every workspace → ~/Downloads
+rbox export --workspace ws_ab12cd34        # one workspace
+rbox export --out ~/backup.tar.gz          # write a single .tar.gz instead of a directory
+```
+
+`rbox export` decrypts locally and writes files to `~/Downloads` by default.
+`--out` targets a directory or, when the path ends in `.tar.gz`, a single
+archive. It is read-only: it never binds a workspace, starts a daemon, or changes
+sync state. For single-file rollback, use `rbox restore <path>@<seq>`.
+
 > **Note on deprecated names:** `link` and `daemon <start|stop|logs>` still work
 > but are deprecated aliases (they forward to `track` and `start`/`stop`/`logs`
-> respectively) and print a warning — they're slated for removal at v0.3
-> (design 29). Use the names above in new scripts. `doctor` is now the top-level
-> support command; `hydrate`/`detect` remain disabled deps aliases while the
-> whole `deps` group is commented out of the CLI (design 51, §7 below).
+> respectively) and print a warning on every use (design 29). They remain
+> supported, but new scripts should use the names above. `doctor` is now the
+> top-level support command;
+> `hydrate`/`detect` remain disabled deps aliases while the whole `deps` group is
+> commented out of the CLI (design 51, §7 below).
 
 ## 5. `.rboxignore` — shared, cross-machine ignore rules
 
@@ -120,6 +145,7 @@ then, ignore behavior is just `BUILTIN_IGNORE` + `.gitignore`.
 ```bash
 rbox ignore "*.local.json"     # append a pattern (creates the file if absent, de-duped)
 rbox ignore --list             # print the effective merged rule set, labeled by source
+rbox ignore --path ~/code/myapp --list
 ```
 
 **The sharp edge — ignoring an already-synced file.** By default, newly
@@ -204,27 +230,71 @@ echo <token> | rbox connect    # redeem it on the new machine
 rbox recover                   # re-enroll this machine from your recovery phrase
 
 rbox device approve <user-code>
-rbox device list
+rbox device list [--json]
 rbox device revoke <device-id>
 
 rbox account link <code>       # link this CLI to your web login
-rbox account status
+rbox account status [--json]
 rbox account unlink
 
-rbox key status                # encryption status
+rbox key status [--json]       # encryption status (+ recovery-kit record)
 rbox key backup                # re-show recovery phrase
+rbox key genesis --yes         # mint this account's first encryption keys
 ```
+
+**`rbox key genesis`.** Web signup and device-code `rbox login` authorize a
+machine but do **not** create encryption keys. `rbox key genesis --yes` mints the
+account's first keys and 24-word recovery phrase on a cold account. `rbox setup`
+runs it inline when it detects an authorized-but-unenrolled machine; `--yes` is
+required because this defines the key world every device inherits.
+
+### Recovery kit (`--kit` / `--kit-path`)
+
+The commands that surface your 24-word phrase can also write it to disk as a
+**recovery kit** — a plaintext file with the phrase, your account id, this
+device, step-by-step recovery instructions, and the no-escrow warning. It's
+supported on `rbox login --bootstrap ... --kit`, `rbox init ... --kit`, `rbox key
+backup --kit`, `rbox recover --kit`, and `rbox key genesis --kit`.
+
+```bash
+rbox key backup --kit                      # write to the default kit location
+rbox key backup --kit-path ~/vault/rbox.txt  # write to a specific file
+```
+
+- **Where it lands.** `--kit` writes to `~/Downloads` when that directory
+  exists, otherwise `$HOME`, named
+  `rbox-recovery-kit-<8-hex-account-suffix>-<YYYYMMDD>.txt`. `--kit-path <path>`
+  writes exactly where you point it.
+- **How it's written.** Atomically (temp file + rename) at mode `0600`
+  (owner-read/write only); it refuses to write through a symlink and re-reads the
+  file to verify the written contents.
+- **Tracking it.** After a successful write, rbox records the path and timestamp.
+  `rbox key status` reports the last-written kit — its path and date, or that no
+  kit is recorded, or that the recorded file has since gone missing.
+
+The kit is plaintext by design: anyone who holds it can decrypt your rbox data,
+and rbox has no escrow and can never reset the phrase for you. Treat it like the
+phrase itself — store it somewhere you'd store a password backup, not next to
+the machine it unlocks.
 
 ## 9. Billing & maintenance
 
 ```bash
+rbox usage [--json]            # plan limits + current account usage
 rbox subscribe <solo|pro>
 rbox billing                   # open the billing portal
 rbox upgrade [--check]
+rbox uninstall [--yes]         # no --yes prints the removal steps only
 rbox version
 rbox shell-init zsh            # prompt integration + completions: eval "$(rbox shell-init zsh)"
 rbox completions zsh
 ```
+
+**`rbox usage`** prints plan limits and current usage: storage used vs cap,
+workspace and device counts, and downgrade-grace read-only time. It matches the
+server-side `402 quota_exceeded` decision. `--json` emits account usage for
+scripts. `rbox subscribe <solo|pro>` opens checkout to lift the cap; Team is
+listed but not purchasable.
 
 ## 10. Full command reference
 

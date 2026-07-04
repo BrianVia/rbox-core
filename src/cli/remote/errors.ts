@@ -96,3 +96,13 @@ export function isShaMismatch(status: number, text: string): boolean {
   if (status !== 400 && status !== 412) return false;
   return jsonObject(text)?.error === "sha_mismatch";
 }
+
+/** Generic HTTP translation after quota and sha-mismatch handlers have run. */
+export function translateRemoteError(status: number, fallback: string, text?: string, notFound = "not found"): string {
+  if (status === 401) return "signed out — run rbox login";
+  if (status === 403) return "not permitted";
+  if (status === 404) return notFound;
+  if (status >= 500 && status <= 599) return `rbox servers are having trouble — try again shortly (HTTP ${status})`;
+  const detail = text !== undefined && text.length > 0 ? ` ${text}` : "";
+  return `${fallback}: ${status}${detail}`;
+}

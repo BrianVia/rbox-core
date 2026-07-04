@@ -3,6 +3,7 @@ import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./
 import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
+import { emitJson } from "./json.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
@@ -306,11 +307,23 @@ export async function approveDevice(userCode: string): Promise<void> {
   console.log(`approved ${userCode}`);
 }
 
-export async function listDevices(): Promise<void> {
+export async function listDevices(opts: { json?: boolean } = {}): Promise<void> {
   const creds = await requireCreds();
   const res = await fetch(`${creds.remoteUrl}/v1/auth/devices`, { headers: { authorization: `Bearer ${creds.token}` } });
   if (!res.ok) throw new Error(`list failed: ${res.status}`);
   const { devices } = (await res.json()) as { devices: Array<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null; isSelf: boolean }> };
+  if (opts.json) {
+    emitJson({
+      devices: devices.map((d) => ({
+        id: d.device_id,
+        kind: "cli",
+        createdAt: d.created_at,
+        lastSeenAt: d.last_seen_at,
+        revoked: false,
+      })),
+    });
+    return;
+  }
   for (const d of devices) {
     const seen = d.last_seen_at ? new Date(d.last_seen_at).toISOString() : "never";
     console.log(`${d.isSelf ? "* " : "  "}${d.device_id}  ${d.label ?? ""}  last-seen ${seen}`);
@@ -376,15 +389,23 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
 }
 
 /** `rbox key status` — local E2EE enrollment state for the current account. */
-export async function keyStatus(): Promise<void> {
+export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   const creds = await loadCredentials();
   if (!creds) throw new Error("not logged in — run `rbox login`");
+  const loaded = creds.accountId ? await loadDevice(creds.accountId) : undefined;
+  const enrolled = Boolean(loaded && "secrets" in loaded);
+  const cachedRk = creds.accountId ? await loadRecoveryKey(creds.accountId) : undefined;
+  const kitRecord = creds.accountId ? await readRecoveryKitRecord(creds.accountId) : undefined;
+  if (opts.json) {
+    emitJson({
+      enrolled,
+      recoveryKit: kitRecord ? { path: kitRecord.path, writtenAt: kitRecord.writtenAt } : null,
+    });
+    return;
+  }
   console.log(`device:   ${creds.deviceId}`);
   console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
   if (!creds.accountId) return;
-  const loaded = await loadDevice(creds.accountId);
-  const enrolled = loaded && "secrets" in loaded;
-  const cachedRk = await loadRecoveryKey(creds.accountId);
   console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));

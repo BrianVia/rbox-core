@@ -1,3 +1,5 @@
+import { emitJsonTo } from "./json.js";
+
 /**
  * Zero-dependency ANSI styling for the rbox CLI.
  *
@@ -45,8 +47,23 @@ export const style = makeStyle(colorEnabled(process.stdout));
 /** Styling for stderr (spinners, diagnostics). */
 export const stderrStyle = makeStyle(colorEnabled(process.stderr));
 
+let jsonErrorMode = false;
+
+/** JSON errors are enabled only by the dispatcher for commands that declare `--json`. */
+export function setJsonErrorMode(enabled: boolean): void {
+  jsonErrorMode = enabled;
+}
+
+function emitError(message: string): void {
+  if (jsonErrorMode) {
+    emitJsonTo(process.stderr, { error: message });
+    return;
+  }
+  process.stderr.write(`${stderrStyle.sym.err} ${stderrStyle.red(`rbox: ${message}`)}\n`);
+}
+
 /** Print a styled error to stderr and set a non-zero exit code (does not throw). */
 export function fail(message: string): void {
-  process.stderr.write(`${stderrStyle.sym.err} ${stderrStyle.red(message)}\n`);
+  emitError(message);
   process.exitCode = 1;
 }

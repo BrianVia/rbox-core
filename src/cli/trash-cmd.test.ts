@@ -126,7 +126,7 @@ test("trash empty removes eligible batches and reports bytes freed", async () =>
 });
 
 test("unknown trash subcommand prints usage and exits non-zero", async () => {
-  const { out, code } = await capture(() => trashCmd(root, ["bogus"], {}));
+  const { err, code } = await capture(() => trashCmd(root, ["bogus"], {}));
   expect(code).toBe(1);
-  expect(out).toContain("usage: rbox trash");
+  expect(err).toContain("usage: rbox trash");
 });

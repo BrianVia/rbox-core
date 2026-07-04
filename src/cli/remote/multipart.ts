@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, QuotaExceededError, isShaMismatch, readQuotaExceeded, readShaMismatch } from "./errors.js";
+import { BlobShaMismatchError, QuotaExceededError, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
 
 export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
@@ -51,7 +51,7 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
     if (!res.ok) {
       const { quota, text } = await readQuotaExceeded(res);
       if (quota) throw quota;
-      throw new Error(`multipart init failed: ${res.status} ${text}`);
+      throw new Error(translateRemoteError(res.status, "multipart init failed", text, "workspace not found — check you're in the right directory"));
     }
     const body = (await res.json()) as { uploadId: string; partSize: number };
     uploadId = body.uploadId;
@@ -77,7 +77,7 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
     if (!res.ok) {
       const { mismatch, text } = await readShaMismatch(res);
       if (mismatch) throw new BlobShaMismatchError(sha256); // source changed mid-upload → push re-scans + retries
-      throw new Error(`multipart part ${n} failed: ${res.status} ${text}`);
+      throw new Error(translateRemoteError(res.status, `multipart part ${n} failed`, text, "workspace not found — check you're in the right directory"));
     }
   }
 
@@ -96,7 +96,7 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
     const { quota, text } = await readQuotaExceeded(done);
     if (quota) throw quota;
     if (isShaMismatch(done.status, text)) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
-    throw new Error(`multipart complete failed: ${done.status} ${text}`);
+    throw new Error(translateRemoteError(done.status, "multipart complete failed", text, "workspace not found — check you're in the right directory"));
   }
   if (tokenPath) await fsp.rm(tokenPath, { force: true });
 }

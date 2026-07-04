@@ -60,7 +60,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--bootstrap <secret>", desc: "create a new account from a bootstrap secret (genesis device)" },
-      { flag: "--plan <solo|pro>", desc: "request a bootstrap plan; honored only by dev-gated servers" },
+      { flag: "--plan <solo|pro>", desc: "request a bootstrap plan when the server supports plan selection" },
       { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
     ],
@@ -75,7 +75,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "status",
     group: "GETTING STARTED",
     summary: "workspace + background-sync state",
-    usage: "rbox status [path]",
+    usage: "rbox status [path] [--json]",
+    flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
     name: "init",
@@ -129,10 +130,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "logs",
     group: "SYNCING",
     summary: "tail background-sync logs",
-    usage: "rbox logs [path] [--follow] [--lines N]",
+    usage: "rbox logs [path] [--follow] [--limit N]",
     flags: [
       { flag: "--follow", desc: "stream new log lines (Ctrl-C to exit)" },
-      { flag: "--lines N", desc: "show the last N lines (default 50)" },
+      { flag: "--limit N", desc: "show the last N lines (default 50)" },
+      { flag: "--lines N", desc: "alias for --limit" },
     ],
   },
   {
@@ -187,27 +189,54 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "ignore",
     group: "SYNCING",
     summary: "manage .rboxignore",
-    usage: "rbox ignore <glob> | --list",
-    flags: [{ flag: "--list", desc: "print the effective ignore rules" }],
+    usage: "rbox ignore <glob> | --list [--path <dir>]",
+    flags: [
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--list", desc: "print the effective ignore rules" },
+    ],
   },
   {
     name: "trash list",
     group: "SYNCING",
     summary: "list files rbox moved to the local trash",
-    usage: "rbox trash list",
+    usage: "rbox trash list [--path <dir>] [--json]",
+    flags: [
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--json", desc: "print JSON" },
+    ],
   },
   {
     name: "trash restore",
     group: "SYNCING",
     summary: "restore a trashed file back into the workspace",
-    usage: "rbox trash restore <path> [--batch <name>]",
-    flags: [{ flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)" }],
+    usage: "rbox trash restore <path> [--batch <name>] [--path <dir>]",
+    flags: [
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)" },
+    ],
   },
   {
     name: "trash empty",
     group: "SYNCING",
     summary: "permanently delete trashed files (frees disk)",
-    usage: "rbox trash empty",
+    usage: "rbox trash empty [--path <dir>]",
+    flags: [{ flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" }],
+  },
+  {
+    name: "versions",
+    group: "SYNCING",
+    summary: "list version history (or a file's change history)",
+    usage: "rbox versions [path] [--limit <n>] [--json]",
+    flags: [
+      { flag: "--limit <n>", desc: "maximum versions to show" },
+      { flag: "--json", desc: "print JSON" },
+    ],
+  },
+  {
+    name: "restore",
+    group: "SYNCING",
+    summary: "restore a file from a past version",
+    usage: "rbox restore <path>@<seq>",
   },
 
   // ── DEPENDENCIES ─────────────────────────────────────────────────────────
@@ -280,20 +309,23 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "device",
     group: "DEVICES & ACCOUNT",
     summary: "manage devices",
-    usage: "rbox device <approve <user-code> | list | revoke <device-id>>",
+    usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id>>",
+    flags: [{ flag: "--json", desc: "with `list`, print JSON" }],
   },
   {
     name: "account",
     group: "DEVICES & ACCOUNT",
     summary: "link this CLI to your web login",
-    usage: "rbox account <link <code> | status | unlink>",
+    usage: "rbox account <link <code> | status [--json] | unlink>",
+    flags: [{ flag: "--json", desc: "with `status`, print JSON" }],
   },
   {
     name: "key",
     group: "DEVICES & ACCOUNT",
     summary: "encryption status / recovery phrase tools",
-    usage: "rbox key <status | backup | genesis>",
+    usage: "rbox key <status [--json] | backup | genesis>",
     flags: [
+      { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
     ],
@@ -328,7 +360,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "show plan limits and current account usage",
     usage: "rbox usage [--json]",
-    flags: [{ flag: "--json", desc: "print the raw account usage DTO" }],
+    flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
     name: "doctor",
@@ -336,8 +368,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "check workspace health; optionally upload a support report",
     usage: "rbox doctor [--report] [--diagnostics] [--yes]",
     flags: [
-      { flag: "--report", desc: "preview/upload a plaintext unencrypted support report stored 30 days; requires --diagnostics or RBOX_DIAGNOSTICS=1" },
-      { flag: "--diagnostics", desc: "enable report upload for this invocation; rbox.yml diagnostics is reserved for design 51" },
+      { flag: "--report", desc: "preview/upload a plaintext support report stored 30 days; upload requires opt-in" },
+      { flag: "--diagnostics", desc: "opt in to uploading the support report for this invocation" },
       { flag: "--yes", desc: "skip the consent prompt; required with --report in non-interactive mode" },
     ],
   },
@@ -347,6 +379,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "update the rbox binary",
     usage: "rbox upgrade [--check]",
     flags: [{ flag: "--check", desc: "report whether an update is available, without installing" }],
+  },
+  {
+    name: "uninstall",
+    group: "BILLING & MAINTENANCE",
+    summary: "remove local rbox state and installed files",
+    usage: "rbox uninstall [--yes]",
+    flags: [{ flag: "--yes", desc: "perform the removal; without it, print the steps only" }],
   },
   {
     name: "version",
@@ -368,23 +407,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox completions zsh",
   },
 
-  // ── hidden: version-history stubs (fail-closed under E2EE, design 12 D11) ──
-  {
-    name: "versions",
-    group: "SYNCING",
-    summary: "list version history (or a file's change history)",
-    usage: "rbox versions [path] [--limit <n>]",
-    hidden: true,
-  },
-  {
-    name: "restore",
-    group: "SYNCING",
-    summary: "restore a file from a past version",
-    usage: "rbox restore <path>@<seq>",
-    hidden: true,
-  },
-
-  // ── hidden: deprecated aliases (warn on stderr; removed at v0.3) ──────────
+  // ── hidden: deprecated aliases ───────────────────────────────────────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
   { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
   // hydrate/detect aliases commented out along with `deps` itself (design 51)
@@ -414,7 +437,7 @@ export function renderCommand(c: CommandHelp): string {
   lines.push(`${style.bold(c.name)} — ${c.summary}`);
   lines.push("");
   lines.push(`${style.dim("usage:")} ${c.usage}`);
-  if (c.alias) lines.push(style.yellow(`(deprecated — use \`rbox ${c.alias}\`; this alias is removed at v0.3)`));
+  if (c.alias) lines.push(style.yellow(`deprecated: use \`rbox ${c.alias}\``));
   if (c.flags?.length) {
     lines.push("");
     lines.push(style.dim("flags:"));
@@ -444,6 +467,7 @@ export function renderGroupedHelp(): string {
   }
   lines.push("");
   lines.push(style.dim("Run `rbox <command> --help` for details on any command."));
+  lines.push(style.dim("Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C)."));
   return lines.join("\n");
 }
 
@@ -459,4 +483,14 @@ export function helpKeyFor(cmd: string, positional: string[]): string {
   const two = `${cmd} ${positional[0] ?? ""}`.trim();
   if (positional[0] && byName.has(two)) return two;
   return cmd;
+}
+
+function commandHasFlag(c: CommandHelp, flagName: string): boolean {
+  const normalized = flagName.startsWith("--") ? flagName : `--${flagName}`;
+  return c.flags?.some((f) => f.flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1] === normalized) ?? false;
+}
+
+export function commandSupportsFlag(cmd: string | undefined, positional: string[], flagName: string): boolean {
+  if (!cmd) return false;
+  return helpFor(helpKeyFor(cmd, positional))?.some((entry) => commandHasFlag(entry, flagName)) ?? false;
 }
