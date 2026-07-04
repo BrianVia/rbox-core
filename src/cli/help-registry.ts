@@ -159,12 +159,12 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "export",
     group: "SYNCING",
-    summary: "export your files back out (decrypted, latest state)",
+    summary: "export decrypted files",
     usage: "rbox export [--all | --workspace <id>] [--out <dir | file.tar.gz>]",
     flags: [
-      { flag: "--all", desc: "export every workspace on the account (the default)" },
-      { flag: "--workspace <id>", desc: "export just one workspace" },
-      { flag: "--out <path>", desc: "output directory, or a *.tar.gz path for a single tarball (default: ~/Downloads)" },
+      { flag: "--all", desc: "export every workspace (default)" },
+      { flag: "--workspace <id>", desc: "export one workspace" },
+      { flag: "--out <path>", desc: "write to a directory or .tar.gz (default: ~/Downloads)" },
     ],
     examples: ["rbox export", "rbox export --workspace ws_ab12cd34", "rbox export --out ~/backup.tar.gz"],
   },

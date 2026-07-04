@@ -1,25 +1,3 @@
-/**
- * `rbox export [--all | --workspace <id>] [--out <dir | *.tar.gz>]` — data takeout
- * for an E2EE product (design 65). "Give me all my files back."
- *
- * Because the server only ever holds ciphertext (design 12), export MUST run
- * client-side under the device keys. The whole tree is already reconstructible from
- * the network alone: `pull()` on a fresh root with an EMPTY_MANIFEST baseline writes
- * the entire decrypted tree. So export is that machinery pointed at a THROWAWAY
- * staging dir instead of a real binding (design 65 §3):
- *
- *   temp staging dir → saveConfig a synthetic e2ee/v1 config → buildAuthedRemote →
- *   pull (fresh baseline → every file is a `write`) → move everything EXCEPT `.rbox/`
- *   into the export subdir → discard staging.
- *
- * It creates NO durable binding (the staging config is deleted) and starts NO daemon.
- * The ONE intentional durable side effect is the per-device anti-rollback pin
- * advancing for each exported workspace (design 65 §3) — a true observation, kept.
- *
- * This file owns only the export-specific shell: enumerate workspaces, synthesize a
- * config, strip `.rbox`, stage-then-rename, the completion marker, and the tar/summary.
- * The hardened pull/reconcile/decrypt path is reused unchanged.
- */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -35,20 +13,11 @@ import { writeFileAtomic } from "../engine/fsutil.js";
 import { spinner } from "./spinner.js";
 import { style } from "./style.js";
 
-/** The completion marker (design 65 §2.6): its presence means a finished export;
- *  a crashed/interrupted export never renames its staging into place, so it never
- *  drops a marker — a half-finished export is detectable by its absence. */
-export const MARKER_NAME = "rbox-export.json";
+const MARKER_NAME = "rbox-export.json";
 
 type PullProgress = (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
 
-// ── pure naming (design 65 §2) ───────────────────────────────────────────────
-
-/** Reduce an arbitrary workspace name to a single filesystem-safe path component.
- *  Anything outside `[A-Za-z0-9._-]` collapses to `-`; leading/trailing `-`/`.`
- *  are trimmed (no hidden dirs, no dangling separators); bounded length. May reduce
- *  to `""` (all-unsafe name) — the caller then falls back to the id-only form. */
-export function sanitizeWorkspaceName(name: string): string {
+function sanitizeWorkspaceName(name: string): string {
   return name
     .normalize("NFKD")
     .replace(/[^A-Za-z0-9._-]+/g, "-")
@@ -57,44 +26,31 @@ export function sanitizeWorkspaceName(name: string): string {
     .replace(/[-.]+$/, "");
 }
 
-/** The per-workspace export subdir name (design 65 §2, codex 2026-07-03 amendment):
- *  ALWAYS `<sanitized-name>-<workspaceId-first8>`, with the name part omitted when a
- *  workspace is unnamed (or sanitizes to empty). The id suffix is mandatory because
- *  workspace names are NOT unique — two workspaces both named `app` must NOT merge
- *  into one export dir. The export loop still fail-closes on the unlikely event that
- *  two selected workspaces map to the same short name. */
 function workspaceIdBody8(workspaceId: string): string {
   const m = /^[A-Za-z]+_(.+)$/.exec(workspaceId);
   return (m?.[1] ?? workspaceId).slice(0, 8);
 }
 
-export function exportSubdirName(name: string | null | undefined, workspaceId: string): string {
+function exportSubdirName(name: string | null | undefined, workspaceId: string): string {
   const id8 = workspaceIdBody8(workspaceId);
   const clean = name ? sanitizeWorkspaceName(name) : "";
   return clean ? `${clean}-${id8}` : id8;
 }
 
-/** The default export dir basename — the recovery-kit slug convention (design 58),
- *  `rbox-export-<acct16>-<YYYYMMDD>`, reusing the SAME account/date helpers. */
-export function defaultExportDirName(accountId: string, now: Date): string {
+function defaultExportDirName(accountId: string, now: Date): string {
   return `rbox-export-${accountHex16(accountId)}-${localYmd(now)}`;
 }
 
-/** The default absolute export dir: `~/Downloads` when it exists, else `$HOME`
- *  (never CREATE Downloads — headless Linux often lacks it), reusing design 58's
- *  `defaultKitTargetDir` verbatim. */
-export async function defaultExportDir(accountId: string, now: Date, homeDir = os.homedir()): Promise<string> {
+async function defaultExportDir(accountId: string, now: Date, homeDir = os.homedir()): Promise<string> {
   return path.join(await defaultKitTargetDir(homeDir), defaultExportDirName(accountId, now));
 }
 
-/** Expand a leading `~` and resolve to an absolute path (for `--out`). */
 function resolveUserPath(p: string): string {
   if (p === "~") return os.homedir();
   if (p.startsWith(`~${path.sep}`) || p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
   return path.resolve(p);
 }
 
-/** Marker path for a tarball export: beside the archive, `<name>.rbox-export.json`. */
 function markerBesideTarball(tarball: string): string {
   return `${tarball.replace(/\.tar\.gz$/i, "")}.${MARKER_NAME}`;
 }
@@ -103,9 +59,7 @@ type ExportTarget =
   | { mode: "dir"; finalDir: string }
   | { mode: "tar"; tarball: string; markerBeside: string };
 
-/** Resolve where the export lands: `--out` overrides (a directory, or a `*.tar.gz`
- *  file → a single tarball), else the default dir under `~/Downloads`/`$HOME`. */
-export function resolveExportTarget(out: string | undefined, defaultDir: string): ExportTarget {
+function resolveExportTarget(out: string | undefined, defaultDir: string): ExportTarget {
   if (out) {
     const abs = resolveUserPath(out);
     if (abs.toLowerCase().endsWith(".tar.gz")) return { mode: "tar", tarball: abs, markerBeside: markerBesideTarball(abs) };
@@ -143,12 +97,7 @@ export interface ExportRequest {
   out?: string;
 }
 
-/**
- * The seams the core turns on — production wires the real network/pull; tests inject
- * offline fakes so the disk-safety / staging / naming / marker logic is exercised
- * without a server. `enrolled` is pre-probed (`hasDevice`) so the not-enrolled
- * refusal can fail closed BEFORE any staging (export must never bind — design 65 §2.5).
- */
+// Injectable boundary for production IO and offline disk-safety tests.
 export interface ExportSeams {
   enrolled: boolean;
   homeDir: string;
@@ -166,21 +115,20 @@ async function refuseIfExists(p: string): Promise<void> {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
     throw e;
   }
-  throw new Error(`refusing to overwrite existing path: ${p} — move it aside or pass a different \`--out\`.`);
+  throw overwriteRefusal(p);
 }
 
 async function refuseInsideWorkspace(p: string): Promise<void> {
   const root = await findRoot(p);
   if (root) {
-    throw new Error(`refusing to write export inside an rbox workspace (${root}) — choose a path outside synced folders.`);
+    throw new Error(`refusing to export inside an rbox workspace: ${root}`);
   }
 }
 
 function overwriteRefusal(p: string): Error {
-  return new Error(`refusing to overwrite existing path: ${p} — move it aside or pass a different \`--out\`.`);
+  return new Error(`refusing to overwrite: ${p}`);
 }
 
-/** Regular-file count + plaintext byte total under `dir` (the stripped export tree). */
 async function countTree(dir: string): Promise<{ files: number; bytes: number }> {
   let files = 0;
   let bytes = 0;
@@ -198,7 +146,6 @@ async function countTree(dir: string): Promise<{ files: number; bytes: number }>
   return { files, bytes };
 }
 
-/** Best-effort directory fsync so a rename publishes a durable tree (design 65 §2.6). */
 async function fsyncDir(dir: string): Promise<void> {
   let fh: fs.FileHandle | undefined;
   try {
@@ -225,6 +172,7 @@ async function writeMarkerExclusive(file: string, marker: ExportMarker): Promise
     await fh.sync();
     await fh.close();
     fh = undefined;
+    // Hard-link publish fails with EEXIST, so the marker never overwrites.
     await fs.link(tmp, file);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "EEXIST") throw overwriteRefusal(file);
@@ -237,6 +185,7 @@ async function writeMarkerExclusive(file: string, marker: ExportMarker): Promise
 
 async function publishFileNoOverwrite(tmpFile: string, finalFile: string): Promise<void> {
   try {
+    // Hard-link publish gives no-overwrite semantics for tarballs; rename would replace.
     await fs.link(tmpFile, finalFile);
     await fsyncDir(path.dirname(finalFile));
   } catch (e) {
@@ -248,23 +197,17 @@ async function publishFileNoOverwrite(tmpFile: string, finalFile: string): Promi
 }
 
 /**
- * Export one-or-all workspaces to a directory tree or a gzipped tarball. Fails closed
- * on an existing target, materializes into a temp staging dir, and only renames into
- * place after the completion marker is written — so a crash leaves an unmarked,
- * discardable staging dir and never a half-finished export at the destination.
+ * Export workspaces to a directory tree or tarball.
+ * Directory exports write the marker before the final rename; no marker means incomplete.
  */
 export async function runExportCore(req: ExportRequest, accountId: string, seams: ExportSeams): Promise<ExportResult> {
-  // Not-enrolled → refuse with the recover hint (design 65 §2.4), BEFORE any staging.
   if (!seams.enrolled) {
-    throw new Error(
-      "this machine isn't enrolled for encryption — run `rbox recover` (paste your 24-word recovery phrase), then re-run `rbox export`."
-    );
+    throw new Error("encryption key missing on this machine; run `rbox recover`, then retry.");
   }
 
   const target = resolveExportTarget(req.out, await defaultExportDir(accountId, seams.now(), seams.homeDir));
   const finalArtifact = target.mode === "dir" ? target.finalDir : target.tarball;
 
-  // Disk-safety (design 65 §2.6): refuse to overwrite. Checked before any work.
   await refuseIfExists(finalArtifact);
   if (target.mode === "tar") await refuseIfExists(target.markerBeside);
   await refuseInsideWorkspace(finalArtifact);
@@ -276,6 +219,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
   }
   if (workspaces.length === 0) throw new Error("this account has no workspaces to export.");
   const selected = workspaces.map((ws) => ({ ws, subName: exportSubdirName(ws.name, ws.workspaceId) }));
+  // Fail closed rather than merge two workspaces into one export directory.
   const seenSubdirs = new Map<string, string>();
   for (const { ws, subName } of selected) {
     const prev = seenSubdirs.get(subName);
@@ -285,8 +229,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
 
   const parent = path.dirname(finalArtifact);
   await fs.mkdir(parent, { recursive: true });
-  // Staging sits BESIDE the final artifact so the publishing rename is same-filesystem
-  // (and therefore atomic). It is removed on every exit path (success or throw).
+  // Same-directory staging keeps final publication atomic.
   const stageDir = path.join(parent, `.rbox-export-staging-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
   await fs.mkdir(stageDir, { recursive: true });
   try {
@@ -295,8 +238,6 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     let totalBytes = 0;
     for (const { ws, subName } of selected) {
       seams.onProgress?.(`exporting ${subName}`);
-      // Pull materializes the plaintext tree PLUS a `.rbox/` (state + hashcache) into
-      // this throwaway root (design 65 §3); we strip `.rbox/` in the move below.
       const wsStaging = path.join(stageDir, `.pull-${crypto.randomBytes(6).toString("hex")}`);
       await fs.mkdir(wsStaging, { recursive: true });
       await seams.pullWorkspace(wsStaging, { workspaceId: ws.workspaceId, projectId: ws.projectId }, (done, total, phase) =>
@@ -304,8 +245,9 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
       );
       const subdir = path.join(stageDir, subName);
       await fs.mkdir(subdir, { recursive: true });
+      // rename moves symlinks as links; it does not follow them out of staging.
       for (const entry of await fs.readdir(wsStaging)) {
-        if (entry === RBOX_DIR) continue; // strip metadata: a clean plain tree only
+        if (entry === RBOX_DIR) continue;
         await fs.rename(path.join(wsStaging, entry), path.join(subdir, entry));
       }
       await fs.rm(wsStaging, { recursive: true, force: true });
@@ -324,6 +266,7 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
     };
 
     if (target.mode === "dir") {
+      // Marker-before-rename: a published directory is complete.
       await writeMarker(path.join(stageDir, MARKER_NAME), marker);
       await fsyncDir(stageDir);
       await refuseIfExists(target.finalDir);
@@ -331,8 +274,6 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
       return { outPath: target.finalDir, markerPath: path.join(target.finalDir, MARKER_NAME), marker };
     }
 
-    // Tarball: gzip the stripped tree to a temp archive, then rename into place; the
-    // marker lands beside it. Stage-then-rename so a failed tar leaves no partial file.
     const tmpTar = path.join(parent, `.rbox-export-${process.pid}-${crypto.randomBytes(6).toString("hex")}.tar.gz`);
     try {
       await seams.tarGzip(stageDir, tmpTar);
@@ -354,12 +295,6 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
   }
 }
 
-// ── production wiring ─────────────────────────────────────────────────────────
-
-/** The real per-workspace mechanism (design 65 §3): a synthetic e2ee/v1 config in a
- *  throwaway staging root, then the SAME authed pull sync uses — fresh EMPTY_MANIFEST
- *  baseline, so reconcile emits a `write` for every file and the mass-delete guard
- *  never fires. Trash off (`trash:{days:0}`) so pull skips the trash tier. */
 async function defaultPullWorkspace(
   stagingRoot: string,
   target: { workspaceId: string; projectId: string },
@@ -374,8 +309,8 @@ async function defaultPullWorkspace(
     rootPath: stagingRoot,
     remoteUrl: creds.remoteUrl,
     token: "",
-    syncGit: true, // git repos rematerialize as real working repos (design 65 §3)
-    trash: { days: 0 }, // throwaway staging needs no trash tier (persisted field, not trashConfig())
+    syncGit: true,
+    trash: { days: 0 },
   };
   await saveConfig(stagingRoot, synthetic);
   const { cfg, deps } = await buildAuthedRemote(stagingRoot);
@@ -383,8 +318,6 @@ async function defaultPullWorkspace(
   await pull(stagingRoot, cfg, deps);
 }
 
-/** Bun runtime accessor (typed off globalThis — the same shape runtime.ts uses, so
- *  the tsc build under `types:["node"]` stays clean without pulling in @types/bun). */
 interface BunSpawn {
   stderr: ReadableStream<Uint8Array>;
   exited: Promise<number>;
@@ -394,14 +327,12 @@ const bunRuntime = (): {
   spawn(argv: string[], opts: { stdout: "ignore"; stderr: "pipe" }): BunSpawn;
 } => (globalThis as unknown as { Bun: { which(c: string): string | null; spawn(a: string[], o: unknown): BunSpawn } }).Bun;
 
-/** Shell out to the system `tar` (Bun has no built-in tar). Abort clearly if absent. */
 async function systemTarGzip(stageDir: string, tarball: string): Promise<void> {
   const Bun = bunRuntime();
   const tar = Bun.which("tar");
   if (!tar) {
-    throw new Error("`tar` is not on PATH — cannot build a `.tar.gz` export. Export to a directory instead (drop the `.tar.gz` from `--out`).");
+    throw new Error("`tar` not found; export to a directory or install tar.");
   }
-  // cwd = the staging tree; `.` archives the workspace subdirs with relative paths.
   const proc = Bun.spawn([tar, "-czf", tarball, "-C", stageDir, "."], { stdout: "ignore", stderr: "pipe" });
   const code = await proc.exited;
   if (code !== 0) {
@@ -422,17 +353,16 @@ function formatBytes(n: number): string {
   return `${v.toFixed(1)} ${units[i]}`;
 }
 
-/** CLI entry point for `rbox export`. */
 export async function runExport(flags: Record<string, string>): Promise<void> {
   const all = flags.all === "true";
   const workspaceId = flags.workspace && flags.workspace !== "true" ? flags.workspace : undefined;
   if (flags.workspace === "true") throw new Error("`--workspace` needs a workspace id.");
-  if (workspaceId && all) throw new Error("pass either `--workspace <id>` or `--all` (the default), not both.");
-  if (flags.out === "true") throw new Error("`--out` needs a path (a directory, or a `*.tar.gz` file).");
+  if (workspaceId && all) throw new Error("use `--workspace <id>` or `--all`, not both.");
+  if (flags.out === "true") throw new Error("`--out` needs a directory or .tar.gz path.");
   const out = flags.out && flags.out !== "true" ? flags.out : undefined;
 
   const creds = await requireCredentials();
-  if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`.");
+  if (!creds.accountId) throw new Error("credential has no account; run `rbox login`.");
   const enrolled = await hasDevice(creds.accountId);
 
   const sp = spinner("exporting");

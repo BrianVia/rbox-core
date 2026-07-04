@@ -3,25 +3,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AccountWorkspace } from "./workspace-picker.js";
-import {
-  MARKER_NAME,
-  defaultExportDir,
-  exportSubdirName,
-  runExportCore,
-  sanitizeWorkspaceName,
-  type ExportSeams,
-} from "./export-cmd.js";
+import { runExportCore, type ExportSeams } from "./export-cmd.js";
 
 const ACCOUNT = "acct_0123456789abcdef";
 const DATE = new Date(2026, 6, 4, 10, 20, 30);
+const MARKER_NAME = "rbox-export.json";
 
 function ws(workspaceId: string, name: string | null, projectId = "root"): AccountWorkspace {
   return { workspaceId, projectId, name, createdAt: 0 };
 }
 
-/** A fake pull that materializes `files` plus a `.rbox/` metadata dir into the
- *  staging root — exactly the shape a real pull leaves (design 65 §3), so the strip
- *  pass and the marker counts are exercised offline. */
 function fakePull(filesByWs: Record<string, Record<string, string>>): ExportSeams["pullWorkspace"] {
   return async (stagingRoot, target) => {
     const files = filesByWs[target.workspaceId] ?? { "README.md": "hello\n" };
@@ -55,35 +46,17 @@ afterEach(async () => {
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
-describe("export subdir naming (design 65 §2)", () => {
-  test("named workspace → sanitized-name + id8; unnamed → id8 only", () => {
-    expect(exportSubdirName("My App", "ws_ab12cd34ef")).toBe("My-App-ab12cd34");
-    expect(exportSubdirName(null, "ws_ab12cd34ef")).toBe("ab12cd34");
-    expect(exportSubdirName("   ", "ws_ab12cd34ef")).toBe("ab12cd34"); // all-unsafe name falls back to id
-  });
-
-  test("id suffix is mandatory so two same-named workspaces never collide", () => {
-    const a = exportSubdirName("app", "ws_aaaa1111");
-    const b = exportSubdirName("app", "ws_bbbb2222");
-    expect(a).not.toBe(b);
-  });
-
-  test("sanitize strips path separators and leading/trailing junk", () => {
-    expect(sanitizeWorkspaceName("../etc/passwd")).toBe("etc-passwd");
-    expect(sanitizeWorkspaceName(".hidden.")).toBe("hidden");
-  });
-});
-
-describe("default path selection (design 58 reuse)", () => {
+describe("default path selection", () => {
   test("prefers ~/Downloads only when it exists, else $HOME", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-home-"));
     try {
-      const inHome = await defaultExportDir(ACCOUNT, DATE, home);
-      expect(inHome).toBe(path.join(home, "rbox-export-0123456789abcdef-20260704"));
+      const seams = seamsFor({ homeDir: home, list: [ws("ws_alpha001", "Alpha")], pull: fakePull({}) });
+      const inHome = await runExportCore({}, ACCOUNT, seams);
+      expect(inHome.outPath).toBe(path.join(home, "rbox-export-0123456789abcdef-20260704"));
 
       await fs.mkdir(path.join(home, "Downloads"));
-      const inDownloads = await defaultExportDir(ACCOUNT, DATE, home);
-      expect(inDownloads).toBe(path.join(home, "Downloads", "rbox-export-0123456789abcdef-20260704"));
+      const inDownloads = await runExportCore({}, ACCOUNT, seams);
+      expect(inDownloads.outPath).toBe(path.join(home, "Downloads", "rbox-export-0123456789abcdef-20260704"));
     } finally {
       await fs.rm(home, { recursive: true, force: true });
     }
@@ -96,8 +69,8 @@ describe("runExportCore", () => {
     const seams = seamsFor({
       list: [ws("ws_alpha001", "Alpha"), ws("ws_beta0002", null)],
       pull: fakePull({
-        ws_alpha001: { "a.txt": "aaaa", ".keep": "dot", "sub/b.txt": "bb" }, // 9 bytes, 3 files
-        ws_beta0002: { "c.txt": "ccc" }, // 3 bytes, 1 file
+        ws_alpha001: { "a.txt": "aaaa", ".keep": "dot", "sub/b.txt": "bb" },
+        ws_beta0002: { "c.txt": "ccc" },
       }),
     });
 
@@ -111,7 +84,6 @@ describe("runExportCore", () => {
     expect(await fs.readFile(path.join(alphaDir, "sub", "b.txt"), "utf8")).toBe("bb");
     expect(await fs.readFile(path.join(betaDir, "c.txt"), "utf8")).toBe("ccc");
 
-    // Strip pass: NO .rbox metadata leaked into any export subdir.
     await expect(fs.stat(path.join(alphaDir, ".rbox"))).rejects.toThrow();
     await expect(fs.stat(path.join(betaDir, ".rbox"))).rejects.toThrow();
 
@@ -121,9 +93,24 @@ describe("runExportCore", () => {
     expect(marker.files).toBe(4);
     expect(marker.bytes).toBe(12);
     expect(typeof marker.finishedAt).toBe("string");
-    // No staging debris left beside the output.
     const siblings = await fs.readdir(tmp);
     expect(siblings.filter((s) => s.startsWith(".rbox-export-staging"))).toHaveLength(0);
+  });
+
+  test("derives safe unique workspace directory names", async () => {
+    const out = path.join(tmp, "names");
+    const seams = seamsFor({
+      list: [
+        ws("ws_ab12cd34ef", "My App"),
+        ws("ws_deadbeef9", "../etc/passwd"),
+        ws("ws_ffff0000", "   "),
+      ],
+      pull: fakePull({}),
+    });
+
+    await runExportCore({ out }, ACCOUNT, seams);
+
+    expect(await fs.readdir(out)).toEqual(expect.arrayContaining(["My-App-ab12cd34", "etc-passwd-deadbeef", "ffff0000"]));
   });
 
   test("--workspace narrows to a single workspace", async () => {
@@ -187,7 +174,6 @@ describe("runExportCore", () => {
       list: [ws("ws_alpha001", "Alpha")],
       pull: fakePull({ ws_alpha001: { "a.txt": "aaaa" } }),
       tarGzip: async (stageDir, tarball) => {
-        // Capture the tree WHILE it exists — the core removes staging on return.
         stagedEntries = await fs.readdir(stageDir);
         await fs.writeFile(tarball, "TARBALL");
       },
@@ -198,7 +184,6 @@ describe("runExportCore", () => {
     expect(res.markerPath).toBe(path.join(tmp, `backup.${MARKER_NAME}`));
     const marker = JSON.parse(await fs.readFile(res.markerPath, "utf8"));
     expect(marker.files).toBe(1);
-    // tar ran against the stripped staging tree.
     expect(stagedEntries).toContain("Alpha-alpha001");
   });
 
@@ -233,9 +218,7 @@ describe("runExportCore", () => {
     });
     await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/boom/);
     expect(calls).toBe(2);
-    // Neither the destination nor its marker was published.
     await expect(fs.stat(out)).rejects.toThrow();
-    // And the staging dir was cleaned up (no half-written debris beside the target).
     const siblings = await fs.readdir(tmp);
     expect(siblings.filter((s) => s.startsWith(".rbox-export-staging"))).toHaveLength(0);
   });

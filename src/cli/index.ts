@@ -338,8 +338,6 @@ async function main(): Promise<void> {
       break;
     }
     case "export": {
-      // Data takeout (design 65): decrypt + materialize the account's workspaces to
-      // a plain directory tree (or a *.tar.gz). Read-only — no binding, no daemon.
       const { runExport } = await import("./export-cmd.js");
       await runExport(flags);
       break;
