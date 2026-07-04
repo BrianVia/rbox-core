@@ -10,11 +10,10 @@ beforeAll(async () => {
   await applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS);
 });
 
-// The device cap only bites when RBOX_ENV=prod (design 64 §3.2 — dev/rig unbounded so the
-// design-56 bench never trips). The harness env is dev, so cap tests invoke the handlers with
-// a prod-flavored env; the anonymous-edge limiter binding rides along unchanged (allows in
-// local miniflare), so these tests exercise the cap, not the limiter.
+// The harness env is dev, where the device cap is intentionally lifted. Cap tests
+// use prod/unset clones while keeping the local limiter binding unchanged.
 const prodEnv: Env = { ...env, RBOX_ENV: "prod" };
+const unsetEnv: Env = { ...env, RBOX_ENV: undefined };
 
 async function bootstrap(accountName: string): Promise<{ token: string; accountId: string; deviceId: string }> {
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
@@ -26,7 +25,7 @@ async function bootstrap(accountName: string): Promise<{ token: string; accountI
   return (await res.json()) as { token: string; accountId: string; deviceId: string };
 }
 
-/** Mint N extra DURABLE devices into an account and return their ids (for later revoke). */
+/** Mint extra durable devices into an account and return their ids. */
 async function fillDurableDevices(accountId: string, n: number): Promise<string[]> {
   const ids: string[] = [];
   for (let i = 0; i < n; i++) ids.push((await mintDevice(env, accountId, "u", "dev", `filler-${i}`)).deviceId);
@@ -49,7 +48,7 @@ function redeemReq(token: string): Request {
   return new Request(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
 }
 
-/** Seed an APPROVED device_auth grant (as if a device already approved this login). */
+/** Seed an approved device_auth grant. */
 async function seedApprovedDeviceCode(accountId: string, deviceCode: string): Promise<void> {
   const now = Date.now();
   await env.rbox_dev_db
@@ -67,14 +66,12 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     const deviceCode = "dc".padEnd(64, "0");
     await seedApprovedDeviceCode(a.accountId, deviceCode);
 
-    // At cap → 409 with the DTO; the grant must NOT be burned.
     const blocked = await pollDeviceAuth(pollReq(deviceCode), prodEnv);
     expect(blocked.status).toBe(409);
     expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 5, plan: "free" });
     const stillApproved = await env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE device_code = ?").bind(deviceCode).first<{ status: string }>();
     expect(stillApproved?.status).toBe("approved"); // grant intact — not flipped to 'claimed'
 
-    // Revoke one device → under cap → the SAME code now mints.
     await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(fillers[0]).run();
     const ok = await pollDeviceAuth(pollReq(deviceCode), prodEnv);
     expect(ok.status).toBe(200);
@@ -83,10 +80,8 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     expect(typeof body.token).toBe("string");
   });
 
-  test("pair-redeem hits the SAME cap (409), keeps the token intact, and revoking frees a slot", async () => {
+  test("pair-redeem hits the same cap (409), keeps the token intact, and revoking frees a slot", async () => {
     const a = await bootstrap("acct-cap-pair"); // 1 durable device
-    // Create a real, redeemable pairing token via the authed route (dev env is fine — creation
-    // doesn't touch the cap).
     const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}` } });
     expect(created.status).toBe(200);
     const { token: pair } = (await created.json()) as { token: string };
@@ -94,12 +89,10 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     const fillers = await fillDurableDevices(a.accountId, 4); // → 5 total = cap
     expect(await durableCount(a.accountId)).toBe(5);
 
-    // At cap → 409; the single-use token must NOT be consumed.
     const blocked = await redeemPairToken(redeemReq(pair), prodEnv);
     expect(blocked.status).toBe(409);
     expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 5, plan: "free" });
 
-    // Revoke a filler (NOT the creator device) → under cap → the SAME token redeems.
     await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(fillers[0]).run();
     const ok = await redeemPairToken(redeemReq(pair), prodEnv);
     expect(ok.status).toBe(200);
@@ -111,18 +104,37 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     await fillDurableDevices(a.accountId, 4); // → 5 durable = cap
     expect(await durableCount(a.accountId)).toBe(5);
 
-    // A web session (expiresAt set) mints even at the durable cap …
     const ws = await createWebSession(prodEnv, a.accountId, "u");
     expect(typeof ws.token).toBe("string");
-    // … and does NOT count toward it.
     expect(await durableCount(a.accountId)).toBe(5);
   });
 
   test("dev env lifts the cap so the rig is unaffected", async () => {
     const a = await bootstrap("acct-cap-dev");
-    // Mint well past the prod free cap using the DEV env — none should throw.
     await expect(fillDurableDevices(a.accountId, 10)).resolves.toHaveLength(10);
     expect(await durableCount(a.accountId)).toBe(11); // 1 bootstrap + 10
+  });
+
+  test("undefined RBOX_ENV enforces the cap (config drift fails closed)", async () => {
+    const a = await bootstrap("acct-cap-undefined-env");
+    await fillDurableDevices(a.accountId, 4); // → 5 total = free cap
+
+    await expect(mintDevice(unsetEnv, a.accountId, "u", "dev", "blocked")).rejects.toThrow("device limit reached");
+  });
+
+  test("pair-redeem tombstone semantics outrank the cap preflight", async () => {
+    const a = await bootstrap("acct-cap-pair-tombstone");
+    const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}` } });
+    expect(created.status).toBe(200);
+    const { token: pair } = (await created.json()) as { token: string };
+    await fillDurableDevices(a.accountId, 4); // would cap at 5 if tombstone did not short-circuit it
+    await env.rbox_dev_db.prepare("UPDATE accounts SET deleted_at = ? WHERE id = ?").bind(Date.now(), a.accountId).run();
+
+    const gone = await redeemPairToken(redeemReq(pair), prodEnv);
+    expect(gone.status).toBe(401);
+    expect(await gone.json()).toEqual({ error: "unauthorized" });
+    const tokenRow = await env.rbox_dev_db.prepare("SELECT consumed_at FROM pairing_tokens WHERE account_id = ?").bind(a.accountId).first<{ consumed_at: number | null }>();
+    expect(tokenRow?.consumed_at).not.toBeNull();
   });
 });
 
@@ -147,5 +159,32 @@ describe("design 64 §3.1 — limiter guard (fail-open)", () => {
 
   test("an absent binding fails OPEN → null", async () => {
     expect(await rateLimited(undefined, "k")).toBeNull();
+  });
+
+  test("device/poll rejects malformed deviceCode before any rate-limit bucket", async () => {
+    let calls = 0;
+    const failIfCalled = stub(async () => {
+      calls++;
+      throw new Error("limiter should not be called");
+    });
+
+    const res = await pollDeviceAuth(pollReq("A".repeat(64)), { ...env, RL_DEVICE_POLL: failIfCalled, RL_DEVICE_POLL_IP: failIfCalled });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "bad_request" });
+    expect(calls).toBe(0);
+  });
+
+  test("device/poll valid-shaped codes hit both the IP and per-code buckets", async () => {
+    const calls: string[] = [];
+    const bucket = (name: string) =>
+      stub(async ({ key }) => {
+        calls.push(`${name}:${key}`);
+        return { success: true };
+      });
+    const code = "a".repeat(64);
+
+    const res = await pollDeviceAuth(pollReq(code), { ...env, RL_DEVICE_POLL_IP: bucket("ip"), RL_DEVICE_POLL: bucket("code") });
+    expect(res.status).toBe(404);
+    expect(calls).toEqual([`ip:dpi:noip`, `code:dp:${code}`]);
   });
 });

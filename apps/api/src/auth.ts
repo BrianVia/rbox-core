@@ -18,7 +18,7 @@ export { randomHex, isUniqueViolation, isOverCapAbort } from "./auth/shared.js";
 export { authenticate } from "./auth/authenticate.js";
 
 // Device credential minting (durable CLI/device tokens + short-lived web sessions).
-export { AccountGoneError, DeviceLimitError, checkDeviceCap, deviceCapFor, mintDevice, prepareMintDevice, mintDeviceWithNotification, createWebSession, type MintNotifyOpts } from "./auth/mint.js";
+export { AccountGoneError, mintDevice, prepareMintDevice, mintDeviceWithNotification, createWebSession, type MintNotifyOpts } from "./auth/mint.js";
 
 // Pairing tokens (M10): low-friction "connect a new machine".
 export { createPairToken, redeemPairToken } from "./auth/pairing.js";

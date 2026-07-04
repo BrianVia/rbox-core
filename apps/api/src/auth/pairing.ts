@@ -85,7 +85,7 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
  * device is consumed and rejected (never mints). Uniform 401 for every failure.
  */
 export async function redeemPairToken(req: Request, env: Env): Promise<Response> {
-  // design 64 §3.1: shared per-IP burst cap on the credential-minting edge (before D1 work).
+  // Shared per-IP burst cap on the credential-minting edge before D1 work.
   const limited = await rateLimited(env.RL_LINK_PAIR, `lp:${ipKey(req)}`);
   if (limited) return limited;
   const body = (await req.json().catch(() => ({}))) as { token?: string; label?: string };
@@ -98,17 +98,22 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   const hash = await sha256Hex(token);
   const now = Date.now();
 
-  // design 64 §3.2: cap PREFLIGHT before the single-use consume. Resolve the token's account
-  // WITHOUT burning it (a non-consuming peek), so a full account 409s with the token INTACT —
-  // the user revokes a device and re-redeems the SAME token within its TTL. A miss (invalid /
-  // expired / already-used token) skips the check and falls through to the 401 consume below.
+  // Cap preflight resolves the token's account without burning it, so a full live
+  // account 409s while the token remains redeemable after a device is revoked. A
+  // miss falls through to the single-use consume and uniform 401 path.
   const peek = await dirDb(env)
     .prepare("SELECT account_id FROM pairing_tokens WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?")
     .bind(hash, now)
     .first<{ account_id: string }>();
   if (peek) {
-    const cap = await checkDeviceCap(env, peek.account_id);
-    if (!cap.ok) return json({ error: "device_limit_reached", cap: cap.cap, plan: cap.plan }, 409);
+    // design 37 ordering: account tombstone semantics outrank the cap. If the account is
+    // already gone, skip the cap preflight and let the normal consume+liveness path below burn
+    // the token and return the exact design-37 401 response.
+    const acctLive = await dbFor(env, peek.account_id).prepare("SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(peek.account_id).first();
+    if (acctLive) {
+      const cap = await checkDeviceCap(env, peek.account_id);
+      if (!cap.ok) return json({ error: "device_limit_reached", cap: cap.cap, plan: cap.plan }, 409);
+    }
   }
 
   // Atomic single-use consume + snapshot — only the row-winning redeem gets a row.
@@ -165,8 +170,8 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
     // design 37: account tombstoned between the live-authority read and the device insert →
     // the guarded mint wrote NO rows. Uniform unauthorized (token already burned).
     if (e instanceof AccountGoneError) return json({ error: "unauthorized" }, 401);
-    // design 64 §3.2: race-overshoot past the preflight cap (a concurrent durable mint landed)
-    // → the backstop threw AFTER the consume burned the token. Same 409, never a 500.
+    // Mint backstop can still catch concurrent overshoot after the consume; report
+    // the cap as a 409 instead of surfacing a 500.
     if (e instanceof DeviceLimitError) return json({ error: "device_limit_reached", cap: e.cap, plan: e.plan }, 409);
     logErr("pair_redeem_mint_failed", e); // token burned; no raw message (touches account/device material)
     return json({ error: "internal" }, 500);

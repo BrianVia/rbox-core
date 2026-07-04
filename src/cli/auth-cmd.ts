@@ -17,6 +17,8 @@ import {
 } from "./recovery-kit.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const MIN_LOGIN_BACKOFF_MS = 1000;
+const MAX_LOGIN_BACKOFF_MS = 60_000;
 const NO_KIT: RecoveryKitOptions = { kit: false };
 export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
   "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox recover`.";
@@ -55,12 +57,18 @@ async function postJson(url: string, body: unknown, token?: string): Promise<Res
   });
 }
 
-/** Parse a `Retry-After` header (the API always sends an integer-seconds form) into ms,
- *  clamped to a sane ceiling; falls back to `fallbackMs` when absent/garbage. Used to honor
- *  the anonymous-edge rate limiter's 429 without hammering (design 64 §3.3). */
+function clampLoginSleepMs(ms: number): number {
+  return Math.min(Math.max(Number.isFinite(ms) ? ms : MIN_LOGIN_BACKOFF_MS, MIN_LOGIN_BACKOFF_MS), MAX_LOGIN_BACKOFF_MS);
+}
+
+function pollIntervalMs(intervalSeconds: number): number {
+  return clampLoginSleepMs(intervalSeconds * 1000);
+}
+
+/** Parse `Retry-After` seconds into a clamped login backoff. */
 function retryAfterMs(res: Response, fallbackMs: number): number {
   const secs = Number(res.headers.get("Retry-After"));
-  return Number.isFinite(secs) && secs >= 0 ? Math.min(secs * 1000, 60_000) : fallbackMs;
+  return clampLoginSleepMs(Number.isFinite(secs) && secs >= 0 ? secs * 1000 : fallbackMs);
 }
 
 interface DeviceCodeStart {
@@ -70,10 +78,7 @@ interface DeviceCodeStart {
   expiresIn: number;
 }
 
-/** `POST /v1/auth/device/start` with bounded retry-on-429 honoring `Retry-After` (design 64
- *  §3.3). A human logging in a handful of times a minute never trips the limiter; a transient
- *  429 (e.g. sharing an office NAT) backs off and retries rather than hard-failing. After the
- *  bounded attempts it surfaces a friendly, actionable error. */
+/** Start device-code login, retrying bounded 429s with `Retry-After` backoff. */
 async function startDeviceCode(remoteUrl: string, label: string): Promise<DeviceCodeStart> {
   const MAX_RETRIES = 4;
   for (let attempt = 0; ; attempt++) {
@@ -81,11 +86,11 @@ async function startDeviceCode(remoteUrl: string, label: string): Promise<Device
     if (res.ok) return (await res.json()) as DeviceCodeStart;
     if (res.status === 429 && attempt < MAX_RETRIES) {
       const waitMs = retryAfterMs(res, Math.min(2000 * (attempt + 1), 10_000));
-      console.error(`login is busy (rate-limited); retrying in ${Math.ceil(waitMs / 1000)}s...`);
+      console.error(`login rate-limited; retrying in ${Math.ceil(waitMs / 1000)}s...`);
       await sleep(waitMs);
       continue;
     }
-    if (res.status === 429) throw new Error("login is rate-limited — wait a minute and run `rbox login` again");
+    if (res.status === 429) throw new Error("login rate-limited — wait a minute and run `rbox login` again");
     throw new Error(`login start failed: ${res.status}`);
   }
 }
@@ -213,23 +218,21 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
   const prompt = offerApprovalOpen(approveUrl);
   try {
     const deadline = Date.now() + start.expiresIn * 1000;
+    const basePollWaitMs = pollIntervalMs(start.interval);
     while (Date.now() < deadline) {
-      await sleep(start.interval * 1000);
+      await sleep(basePollWaitMs);
       const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
-      // design 64 §3.2: the per-account device cap is TERMINAL — a friendly, actionable
-      // message, never a retry (revoking a device or upgrading is the only way forward).
+      // Device cap does not clear through polling.
       if (pollRes.status === 409) {
         const body = (await pollRes.json().catch(() => ({}))) as { error?: string; cap?: number; plan?: string };
         if (body.error === "device_limit_reached") {
-          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — run \`rbox device revoke <id>\` to free a slot, or upgrade`);
+          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — revoke a device or upgrade`);
         }
         throw new Error(`login poll failed: ${pollRes.status}`);
       }
-      // design 64 §3.3: a 429 (poll limiter) or any other non-ok is TRANSIENT — the deviceCode
-      // stays valid until it expires server-side, so back off (honoring Retry-After) and keep
-      // polling rather than mis-parsing the body as a `pending` status.
+      // Non-OK poll responses are transient until the device code expires.
       if (!pollRes.ok) {
-        await sleep(retryAfterMs(pollRes, start.interval * 1000));
+        await sleep(retryAfterMs(pollRes, basePollWaitMs));
         continue;
       }
       const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };

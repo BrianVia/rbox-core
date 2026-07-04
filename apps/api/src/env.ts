@@ -31,11 +31,8 @@ export interface SendEmailBinding {
   send(message: EmailSendMessage): Promise<EmailSendResult>;
 }
 
-/** A Cloudflare Workers rate-limiting binding (GA 2025-09-19). `.limit({ key })` returns
- *  `{ success }` — `false` when the per-edge, per-key budget for its 10/60s window is
- *  spent. One binding is declared per logical limit in wrangler.jsonc (design 64 §3.1);
- *  the prod-vs-dev thresholds are the env-aware knob (the `production` block redeclares
- *  its own tighter numbers). */
+/** A Cloudflare Workers rate-limiting binding. `.limit({ key })` returns
+ *  `{ success }`; `false` means the key has spent its per-edge window. */
 export interface RateLimitBinding {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
@@ -57,9 +54,8 @@ export interface Env {
   /** `From:` for the new-device email (e.g. `security@mail.rbox.to`). */
   RBOX_NOTIFY_FROM?: string;
   /** Deploy environment discriminator (var, not a secret): `"dev"` on rbox-dev-api,
-   *  `"prod"` on rbox-prod-api. Purely for observability — lets business/ops pings
-   *  label which worker they came from so dev test traffic is distinguishable from
-   *  real prod signups. Absent (local/misconfigured) ⇒ treated as `"dev"`. */
+   *  `"prod"` on rbox-prod-api. Observability labels collapse absent/misconfigured values
+   *  to `"dev"`, but security gates must only take the dev path on explicit `"dev"`. */
   RBOX_ENV?: "dev" | "prod";
   /** HMAC pepper for the per-recipient delivery idempotency key (internal dedupe tag, §4.4). */
   NOTIFY_IDEMPOTENCY_PEPPER?: string;
@@ -159,8 +155,11 @@ export interface Env {
   /** Per-IP burst budget on `POST /v1/auth/device/start` (the D1-write amplifier). */
   RL_DEVICE_START: RateLimitBinding;
   /** Per-`deviceCode` budget on `POST /v1/auth/device/poll` (keyed by the high-entropy
-   *  device code, NOT the IP, so simultaneous logins behind one NAT don't collide — §3.1). */
+   *  device code, not the IP, so simultaneous logins behind one NAT don't collide — §3.1). */
   RL_DEVICE_POLL: RateLimitBinding;
+  /** Coarse per-IP budget on `POST /v1/auth/device/poll` after deviceCode grammar validation,
+   *  bounding valid-shaped spray while preserving the per-code fairness bucket above. */
+  RL_DEVICE_POLL_IP: RateLimitBinding;
   /** Shared per-IP budget across the public release GETs (install.sh/version/bin). */
   RL_RELEASE: RateLimitBinding;
   /** Shared per-IP budget across the credential-minting edges (pair/redeem + link/start). */

@@ -9,9 +9,8 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   // Never cache a 404 (a cached 404 could mask a just-published object on the
   // edge — design 14 U7).
   const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-  // design 64 §3.1: one shared per-IP burst cap across the public release GETs. Applied only
-  // once a request MATCHES a release route (below), never on the fall-through, so non-release
-  // traffic doesn't burn the RL_RELEASE budget. Returns the 429 when over budget, else null.
+  // Shared per-IP burst cap applies only after a release route matches, so
+  // unrelated traffic does not burn the release budget.
   const releaseLimited = () => rateLimited(env.RL_RELEASE, `rl:${ipKey(req)}`);
 
   // `curl -fsSL https://api.rbox.to/install.sh | sh`

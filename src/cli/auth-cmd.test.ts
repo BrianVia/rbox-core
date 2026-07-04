@@ -38,6 +38,7 @@ class FakeGenesisApi {
 let home: string;
 const origLog = console.log;
 const origFetch = globalThis.fetch;
+const origSetTimeout = globalThis.setTimeout;
 
 beforeEach(async () => {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-auth-home-"));
@@ -49,10 +50,23 @@ beforeEach(async () => {
 afterEach(async () => {
   console.log = origLog;
   globalThis.fetch = origFetch;
+  globalThis.setTimeout = origSetTimeout;
   _setSpawner();
   delete process.env.RBOX_HOME;
   await fs.rm(home, { recursive: true, force: true });
 });
+
+function installImmediateTimers(): number[] {
+  const sleeps: number[] = [];
+  globalThis.setTimeout = ((handler: any, timeout?: number, ...args: any[]) => {
+    sleeps.push(Number(timeout));
+    queueMicrotask(() => {
+      if (typeof handler === "function") handler(...args);
+    });
+    return 0 as any;
+  }) as typeof setTimeout;
+  return sleeps;
+}
 
 describe("runGenesisEnrollment", () => {
   test("null account keys mints genesis, shows the phrase, and leaves local device material", async () => {
@@ -149,6 +163,7 @@ describe("genesis lock", () => {
 
 describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)", () => {
   test("device/start retries on 429 (honoring Retry-After) then proceeds to poll", async () => {
+    const sleeps = installImmediateTimers();
     let startCalls = 0;
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
@@ -157,33 +172,38 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
         if (startCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "0" } });
         return new Response(JSON.stringify({ deviceCode: "dc_retry", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       }
-      // Reaching poll (with a deliberately malformed approval) proves start recovered.
       if (url.endsWith("/v1/auth/device/poll")) return new Response(JSON.stringify({ status: "approved", token: "tok" }));
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
     await expect(login("https://api.test")).rejects.toThrow("malformed approval response from server");
-    expect(startCalls).toBe(2); // 429 → retry → 200
+    expect(startCalls).toBe(2);
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);
   });
 
   test("poll treats a 429 as transient (backs off, keeps polling) rather than a status", async () => {
+    const sleeps = installImmediateTimers();
     let pollCalls = 0;
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "dc_poll", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       if (url.endsWith("/v1/auth/device/poll")) {
         pollCalls++;
-        if (pollCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "0" } });
-        return new Response(JSON.stringify({ status: "approved", token: "tok" })); // malformed → terminates after we prove the retry
+        if (pollCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "not-a-number" } });
+        return new Response(JSON.stringify({ status: "approved", token: "tok" }));
       }
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
     await expect(login("https://api.test")).rejects.toThrow("malformed approval response from server");
-    expect(pollCalls).toBe(2); // the 429 poll didn't throw/timeout — it backed off and re-polled
+    expect(pollCalls).toBe(2);
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);
   });
 
-  test("poll device-cap 409 is terminal with an actionable message", async () => {
+  test("poll device-cap 409 stops login", async () => {
+    const sleeps = installImmediateTimers();
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "dc_cap", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
@@ -191,12 +211,15 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    await expect(login("https://api.test")).rejects.toThrow("device limit reached (5/5 on free) — run `rbox device revoke <id>` to free a slot, or upgrade");
+    await expect(login("https://api.test")).rejects.toThrow("device limit reached (5/5 on free) — revoke a device or upgrade");
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);
   });
 });
 
 describe("device-code approval validation", () => {
   test("login rejects an approved response missing accountId or deviceId", async () => {
+    const sleeps = installImmediateTimers();
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) {
@@ -209,6 +232,8 @@ describe("device-code approval validation", () => {
     }) as typeof fetch;
 
     await expect(login("https://api.test")).rejects.toThrow("malformed approval response from server");
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);
   });
 });
 

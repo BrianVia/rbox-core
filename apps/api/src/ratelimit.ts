@@ -4,13 +4,12 @@ import { json, logErr } from "./util.js";
 
 /**
  * The anonymous-edge rate-limit guard (design 64 §3.1). Each public route calls this
- * once, BEFORE its D1 work, so a limited request costs one binding lookup — not a write.
+ * once, before its D1 work, so a limited request costs one binding lookup — not a write.
  *
- * FAIL-OPEN (§4): a thrown (or absent) `.limit()` is logged and treated as allowed, so a
+ * Fail-open (§4): a thrown (or absent) `.limit()` is logged and treated as allowed, so a
  * binding hiccup can never take down login. The counters are per-edge-location and age out
- * on their 10/60s window — a deliberate cost/abuse FLOOR, not a precise global quota.
+ * on their 10/60s window — a deliberate cost/abuse floor, not a precise global quota.
  */
-
 /** Returns a 429 Response when `key` is over-budget on `binding`, else `null` (proceed). */
 export async function rateLimited(binding: RateLimitBinding | undefined, key: string): Promise<Response | null> {
   try {

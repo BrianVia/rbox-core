@@ -28,6 +28,18 @@ import type { SyncDeps } from "./sync.js";
 const ACCOUNT_ID_RE = /^acct_[a-z0-9]+$/i; // grammar gate before trusting the value (D7)
 const ADMIT_RETRIES = 4;
 
+async function pairingRedeemError(res: Response): Promise<Error> {
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string; cap?: unknown; plan?: unknown };
+    if (body.error === "device_limit_reached") {
+      const cap = typeof body.cap === "number" && Number.isFinite(body.cap) ? body.cap : "?";
+      const plan = typeof body.plan === "string" && body.plan ? body.plan : "current plan";
+      return new Error(`device limit reached (${cap}/${cap} on ${plan}) — revoke a device or upgrade; pairing token still valid`);
+    }
+  }
+  return new Error("pairing failed — token may be expired, used, or invalid. Generate a fresh one with `rbox pair`.");
+}
+
 /** Parse the verified account chains from the server DTO + verify them (C1/C2/C7). */
 async function verifyDto(dto: AccountKeysDTO) {
   const rosters = dto.rosters.map((s) => JSON.parse(s) as SignedRoster);
@@ -115,7 +127,7 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ token: redeemToken }),
   });
-  if (!res.ok) throw new Error("pairing failed — token may be expired, used, or invalid. Generate a fresh one with `rbox pair`.");
+  if (!res.ok) throw await pairingRedeemError(res);
   const redeem = (await res.json()) as { token: string; deviceId: string; accountId: string; mkWrap: string | null; admissionGrant: string | null };
   if (!redeem.mkWrap || !redeem.admissionGrant) throw new Error("this pairing token carries no key material — it predates E2EE. Generate a fresh one with `rbox pair`.");
 

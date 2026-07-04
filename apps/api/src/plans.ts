@@ -12,9 +12,9 @@ export interface PlanLimits {
    *  plan-driven prune runs it yet (see docs/design/06-versions-gc.md). */
   retentionDays: number;
   manifestBytes: number;
-  /** Max DURABLE (non-expiring) device credentials per account (design 64 §3.2). Ephemeral
-   *  web-session tokens (`expires_at` set) are NOT counted. Enforced only when RBOX_ENV=prod;
-   *  dev/rig treat it as unbounded (see `deviceCapFor`). */
+  /** Max durable (non-expiring) device credentials per account (design 64 §3.2). Ephemeral
+   *  web-session tokens (`expires_at` set) are not counted. Only explicit RBOX_ENV=dev
+   *  disables enforcement for dev/rig; absent or mistyped envs enforce. */
   devices: number;
 }
 
