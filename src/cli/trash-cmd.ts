@@ -20,8 +20,7 @@ export async function trashCmd(root: string, positional: string[], flags: Record
   } else if (sub === "empty") {
     await trashEmpty(root);
   } else {
-    console.log("usage: rbox trash <list | restore <path> [--batch <name>] | empty> [--path <dir>]");
-    process.exitCode = 1;
+    fail("usage: rbox trash <list | restore <path> [--batch <name>] | empty> [--path <dir>]");
   }
 }
 

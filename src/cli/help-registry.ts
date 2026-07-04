@@ -76,7 +76,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "GETTING STARTED",
     summary: "workspace + background-sync state",
     usage: "rbox status [path] [--json]",
-    flags: [{ flag: "--json", desc: "print a machine-readable status DTO" }],
+    flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
     name: "init",
@@ -202,7 +202,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox trash list [--path <dir>] [--json]",
     flags: [
       { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
-      { flag: "--json", desc: "print a machine-readable trash DTO" },
+      { flag: "--json", desc: "print JSON" },
     ],
   },
   {
@@ -229,7 +229,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox versions [path] [--limit <n>] [--json]",
     flags: [
       { flag: "--limit <n>", desc: "maximum versions to show" },
-      { flag: "--json", desc: "print a machine-readable versions DTO" },
+      { flag: "--json", desc: "print JSON" },
     ],
   },
   {
@@ -310,14 +310,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "DEVICES & ACCOUNT",
     summary: "manage devices",
     usage: "rbox device <approve <user-code> | list [--json] | revoke <device-id>>",
-    flags: [{ flag: "--json", desc: "with `list`, print a machine-readable devices DTO" }],
+    flags: [{ flag: "--json", desc: "with `list`, print JSON" }],
   },
   {
     name: "account",
     group: "DEVICES & ACCOUNT",
     summary: "link this CLI to your web login",
     usage: "rbox account <link <code> | status [--json] | unlink>",
-    flags: [{ flag: "--json", desc: "with `status`, print a machine-readable account DTO" }],
+    flags: [{ flag: "--json", desc: "with `status`, print JSON" }],
   },
   {
     name: "key",
@@ -325,7 +325,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "encryption status / recovery phrase tools",
     usage: "rbox key <status [--json] | backup | genesis>",
     flags: [
-      { flag: "--json", desc: "with `status`, print a machine-readable encryption DTO" },
+      { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
     ],
@@ -360,7 +360,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "show plan limits and current account usage",
     usage: "rbox usage [--json]",
-    flags: [{ flag: "--json", desc: "print the raw account usage DTO" }],
+    flags: [{ flag: "--json", desc: "print JSON" }],
   },
   {
     name: "doctor",
@@ -368,7 +368,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "check workspace health; optionally upload a support report",
     usage: "rbox doctor [--report] [--diagnostics] [--yes]",
     flags: [
-      { flag: "--report", desc: "preview/upload a plaintext unencrypted support report stored 30 days; upload requires opting in first" },
+      { flag: "--report", desc: "preview/upload a plaintext support report stored 30 days; upload requires opt-in" },
       { flag: "--diagnostics", desc: "opt in to uploading the support report for this invocation" },
       { flag: "--yes", desc: "skip the consent prompt; required with --report in non-interactive mode" },
     ],
@@ -407,7 +407,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox completions zsh",
   },
 
-  // ── hidden: deprecated aliases (warn on stderr; removed at v0.3) ──────────
+  // ── hidden: deprecated aliases ───────────────────────────────────────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },
   { name: "daemon", group: "SYNCING", summary: "deprecated → rbox start/stop/logs", usage: "rbox daemon <start|stop|status|logs>", hidden: true, alias: "start" },
   // hydrate/detect aliases commented out along with `deps` itself (design 51)
@@ -437,7 +437,7 @@ export function renderCommand(c: CommandHelp): string {
   lines.push(`${style.bold(c.name)} — ${c.summary}`);
   lines.push("");
   lines.push(`${style.dim("usage:")} ${c.usage}`);
-  if (c.alias) lines.push(style.yellow(`(deprecated — use \`rbox ${c.alias}\`; this alias is removed at v0.3)`));
+  if (c.alias) lines.push(style.yellow(`deprecated: use \`rbox ${c.alias}\``));
   if (c.flags?.length) {
     lines.push("");
     lines.push(style.dim("flags:"));
@@ -483,4 +483,14 @@ export function helpKeyFor(cmd: string, positional: string[]): string {
   const two = `${cmd} ${positional[0] ?? ""}`.trim();
   if (positional[0] && byName.has(two)) return two;
   return cmd;
+}
+
+function commandHasFlag(c: CommandHelp, flagName: string): boolean {
+  const normalized = flagName.startsWith("--") ? flagName : `--${flagName}`;
+  return c.flags?.some((f) => f.flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1] === normalized) ?? false;
+}
+
+export function commandSupportsFlag(cmd: string | undefined, positional: string[], flagName: string): boolean {
+  if (!cmd) return false;
+  return helpFor(helpKeyFor(cmd, positional))?.some((entry) => commandHasFlag(entry, flagName)) ?? false;
 }

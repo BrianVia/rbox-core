@@ -25,7 +25,6 @@ interface StatusAccountJson {
   capBytes: number | null;
 }
 
-/** Best-effort remote-head probe for the status verdict (design 45). */
 async function fetchRemoteSequence(
   cfg: WorkspaceConfig,
   creds: { token: string; remoteUrl?: string } | undefined,

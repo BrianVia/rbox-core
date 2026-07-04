@@ -1,8 +1,8 @@
 # rbox
 
-**Dropbox for devs.** Continuous, end-to-end-encrypted, dev-aware sync of your working directories across machines. Source, configs, and uncommitted git state move; `node_modules`, build output, and secrets stay local. Everything is encrypted under keys only you hold — rbox's servers only ever store ciphertext, and there is no escrow.
+**Dropbox for devs.** Continuous, end-to-end-encrypted, dev-aware sync of your working directories across machines. Source, configs, and uncommitted git state move; `node_modules`, build output, and secrets stay local. Files are encrypted under keys only you hold; rbox's servers store ciphertext, with no escrow.
 
-Built on Cloudflare (Workers + D1 + R2 + Durable Objects) with a Bun/TypeScript client. The wedge isn't sync — it's *understanding what not to sync.*
+Built on Cloudflare (Workers + D1 + R2 + Durable Objects) with a Bun/TypeScript client. rbox treats regenerable build output and secrets as local state.
 
 ## Install
 
@@ -42,7 +42,7 @@ Lost every machine? Re-enroll from your 24-word recovery phrase with `rbox recov
 
 ## What it does
 
-- **Continuous sync.** A per-workspace daemon (`rbox start`) watches for changes, debounces, and prunes ignored trees so an `npm ci` or a giant clone never pegs your machine. `rbox status` shows workspace + sync state with zero network on the happy path.
+- **Continuous sync.** A per-workspace daemon (`rbox start`) watches for changes, debounces, and prunes ignored trees so an `npm ci` or a giant clone never pegs your machine. `rbox status` avoids a network round-trip when the local daemon is live and attributable to the current workspace.
 - **End-to-end encryption.** Full E2EE is the only mode — filenames and contents are encrypted client-side. See [`/security`](https://rbox.to/security).
 - **Doesn't sync `node_modules`.** Regenerable trees, build output, and OS-specific binaries stay local; only your source and lockfiles cross the wire.
 - **Syncs uncommitted git state safely.** Index, HEAD, stashes, and rebase state ride along via `git bundle` (never a torn copy of a live `.git`). On by default; `--git false` opts out per machine.
@@ -50,7 +50,7 @@ Lost every machine? Re-enroll from your 24-word recovery phrase with `rbox recov
 - **Version history & restore.** `rbox versions` / `rbox restore <path>@<seq>` on paid plans.
 - **Local trash tier.** Destructive pulls move files to a recoverable local trash (`rbox trash list|restore|empty`) instead of deleting outright.
 - **Autostart.** `rbox autostart enable` resumes background sync after a reboot or re-login.
-- **Export your data.** `rbox export` decrypts and writes every workspace back out to a directory or `.tar.gz` — takeout under your own keys.
+- **Local export.** `rbox export` decrypts workspaces locally and writes a directory or `.tar.gz`.
 
 Run `rbox help` for the full command list, or [`docs/usage.md`](docs/usage.md) for the narrative guide.
 
@@ -63,7 +63,7 @@ Run `rbox help` for the full command list, or [`docs/usage.md`](docs/usage.md) f
 | Pro | 250 GiB | ∞ | 90 days |
 | Team* | 150 GiB/seat | ∞ | 90 days |
 
-\* Team is coming soon — not yet purchasable. Details and per-plan specifics: [`docs/pricing.md`](docs/pricing.md).
+\* Team is listed but not purchasable. Details and per-plan specifics: [`docs/pricing.md`](docs/pricing.md).
 
 ## Architecture
 
@@ -86,5 +86,5 @@ The blob layer is content-addressed: a file's identity is `sha256(bytes)`, so de
 - [`docs/pricing.md`](docs/pricing.md) — plans
 - [`docs/development.md`](docs/development.md) — building, testing, and benchmarking rbox (contributors)
 - [`docs/diagnostics.md`](docs/diagnostics.md) — `rbox doctor` and the opt-in support-report flow
-- [`docs/design/`](docs/design/) — one spec per design (each carries its codex review resolutions)
+- [`docs/design/`](docs/design/) — one spec per design
 - [`CHANGELOG.md`](CHANGELOG.md) — release highlights

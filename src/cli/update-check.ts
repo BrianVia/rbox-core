@@ -29,7 +29,7 @@ interface UpdateNudgeDeps {
 }
 
 const rboxHome = () => path.join(process.env.RBOX_HOME || homeDir(), ".rbox");
-export const updateCheckPath = (): string => path.join(rboxHome(), "update-check.json");
+const updateCheckPath = (): string => path.join(rboxHome(), "update-check.json");
 
 async function defaultFetchBytes(url: string): Promise<Uint8Array> {
   const res = await fetch(url, { redirect: "follow" });
@@ -39,11 +39,11 @@ async function defaultFetchBytes(url: string): Promise<Uint8Array> {
 
 function parseState(raw: string): UpdateCheckState | undefined {
   try {
-    const v = JSON.parse(raw) as Partial<UpdateCheckState>;
-    if (typeof v.lastCheckedAt !== "string") return undefined;
-    if (typeof v.lastKnownVersion !== "string") return undefined;
-    if (v.lastNudgedVersion !== null && typeof v.lastNudgedVersion !== "string") return undefined;
-    return { lastCheckedAt: v.lastCheckedAt, lastKnownVersion: v.lastKnownVersion, lastNudgedVersion: v.lastNudgedVersion };
+    const { lastCheckedAt, lastKnownVersion, lastNudgedVersion } = JSON.parse(raw) as Partial<UpdateCheckState>;
+    if (typeof lastCheckedAt !== "string") return undefined;
+    if (typeof lastKnownVersion !== "string") return undefined;
+    if (lastNudgedVersion !== null && typeof lastNudgedVersion !== "string") return undefined;
+    return { lastCheckedAt, lastKnownVersion, lastNudgedVersion };
   } catch {
     return undefined;
   }
@@ -66,10 +66,13 @@ async function writeUpdateCheckState(state: UpdateCheckState): Promise<void> {
 function due(state: UpdateCheckState | undefined, now: Date): boolean {
   if (!state) return true;
   const last = Date.parse(state.lastCheckedAt);
-  return !Number.isFinite(last) || now.getTime() - last >= CHECK_INTERVAL_MS;
+  if (!Number.isFinite(last)) return true;
+  const nowMs = now.getTime();
+  if (last > nowMs) return true;
+  return nowMs - last >= CHECK_INTERVAL_MS;
 }
 
-export function updateAvailableVersion(state: UpdateCheckState | undefined): string | undefined {
+function updateAvailableVersion(state: UpdateCheckState | undefined): string | undefined {
   if (!state) return undefined;
   try {
     return semverGt(state.lastKnownVersion, RBOX_VERSION) ? state.lastKnownVersion : undefined;
@@ -78,12 +81,15 @@ export function updateAvailableVersion(state: UpdateCheckState | undefined): str
   }
 }
 
-export function formatUpdateAvailableLine(state: UpdateCheckState | undefined): string | undefined {
-  const next = updateAvailableVersion(state);
-  return next ? style.dim(`update available ${RBOX_VERSION} → ${next} — run \`rbox upgrade\``) : undefined;
+function formatUpdateAvailableText(next: string): string {
+  return `update available ${RBOX_VERSION} → ${next} — run \`rbox upgrade\``;
 }
 
-/** Best-effort daemon-side update check. Verifies the signed manifest and never downloads artifacts. */
+export function formatUpdateAvailableLine(state: UpdateCheckState | undefined): string | undefined {
+  const next = updateAvailableVersion(state);
+  return next ? style.dim(formatUpdateAvailableText(next)) : undefined;
+}
+
 export async function runUpdateCheckIfDue(remoteUrl: string, deps: UpdateCheckDeps = {}): Promise<void> {
   const now = deps.now?.() ?? new Date();
   const prev = await readUpdateCheckState();
@@ -110,13 +116,12 @@ export async function runUpdateCheckIfDue(remoteUrl: string, deps: UpdateCheckDe
   }
 }
 
-/** Stderr note for TTY commands, once per detected version. */
 export async function maybeNudgeForUpdate(deps: UpdateNudgeDeps = {}): Promise<void> {
   const isInteractive = deps.isInteractive ?? (() => process.stdin.isTTY === true && process.stderr.isTTY === true);
   if (!isInteractive()) return;
   const state = await readUpdateCheckState();
   const next = updateAvailableVersion(state);
   if (!state || !next || state.lastNudgedVersion === next) return;
-  (deps.writeStderr ?? ((text) => process.stderr.write(text)))(`${style.dim(`update available ${RBOX_VERSION} → ${next} — run \`rbox upgrade\``)}\n`);
+  (deps.writeStderr ?? ((text) => process.stderr.write(text)))(`${style.dim(formatUpdateAvailableText(next))}\n`);
   await writeUpdateCheckState({ ...state, lastNudgedVersion: next }).catch(() => {});
 }

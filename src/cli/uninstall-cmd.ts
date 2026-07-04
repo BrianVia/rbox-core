@@ -24,11 +24,7 @@ interface StopResult {
 const PATH_START = "# >>> rbox PATH >>>";
 const PATH_END = "# <<< rbox PATH <<<";
 
-function defaultHome(): string {
-  return homeDir();
-}
-
-function defaultRboxHome(home = defaultHome()): string {
+function defaultRboxHome(home = homeDir()): string {
   return path.join(process.env.RBOX_HOME || home, ".rbox");
 }
 
@@ -65,13 +61,11 @@ async function fallbackPidfiles(rboxHome: string, desiredKeys: Set<string>, deps
 async function stopTrackedDaemons(rboxHome: string, deps: UninstallDeps): Promise<StopResult> {
   const rows = await (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)();
   const stopper = deps.stopDaemon ?? stopDaemon;
-  const desiredRoots: string[] = [];
   for (const row of rows) {
-    desiredRoots.push(row.desired.rootPath);
     await stopper(row.desired.rootPath).catch(() => {});
   }
   const fallbackPids = await fallbackPidfiles(rboxHome, new Set(rows.map((r) => r.key)), deps);
-  return { desiredRoots, fallbackPids };
+  return { desiredRoots: rows.map((r) => r.desired.rootPath), fallbackPids };
 }
 
 function printDryRun(log: (line: string) => void, rboxHome: string, rc: string): void {
@@ -84,7 +78,7 @@ function printDryRun(log: (line: string) => void, rboxHome: string, rc: string):
 
 export async function uninstallCmd(flags: Record<string, string>, deps: UninstallDeps = {}): Promise<void> {
   const log = deps.log ?? ((line) => console.log(line));
-  const home = deps.home ?? defaultHome();
+  const home = deps.home ?? homeDir();
   const rboxHome = deps.rboxHome ?? defaultRboxHome(home);
   const rc = targetRc(home);
 

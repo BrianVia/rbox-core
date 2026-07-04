@@ -14,9 +14,10 @@ import { fail, setJsonErrorMode, style } from "./style.js";
 import { spinner } from "./spinner.js";
 import { resolveAlias } from "./deprecations.js";
 import { isKnownTopLevel } from "./command-catalog.js";
-import { helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
+import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
+import { parseFlags } from "./flags.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
@@ -78,29 +79,6 @@ async function postSyncNudge(root: string, actions: Action[], cfg: WorkspaceConf
   }
 }
 
-function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
-  const positional: string[] = [];
-  const flags: Record<string, string> = {};
-  const shortFlags: Record<string, { key: string; takesValue: boolean }> = {
-    "-f": { key: "follow", takesValue: false },
-    "-n": { key: "lines", takesValue: true },
-    "-y": { key: "yes", takesValue: false },
-    "-w": { key: "workspace", takesValue: true },
-  };
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]!;
-    if (a.startsWith("--")) {
-      flags[a.slice(2)] = args[i + 1] && !args[i + 1]!.startsWith("--") ? args[++i]! : "true";
-    } else if (shortFlags[a]) {
-      const spec = shortFlags[a]!;
-      flags[spec.key] = spec.takesValue && args[i + 1] && !args[i + 1]!.startsWith("-") ? args[++i]! : "true";
-    } else {
-      positional.push(a);
-    }
-  }
-  return { positional, flags };
-}
-
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
   if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
@@ -119,8 +97,7 @@ async function main(): Promise<void> {
   const parsed = parseFlags(rest);
   let positional = parsed.positional;
   const flags = parsed.flags;
-  const jsonMode = flags.json === "true";
-  setJsonErrorMode(jsonMode);
+  const rawJsonMode = flags.json === "true";
 
   // `rbox --version` / `-v` / `version` → the binary's embedded version.
   if (cmd === "--version" || cmd === "-v" || cmd === "version") {
@@ -152,7 +129,11 @@ async function main(): Promise<void> {
     }
   }
 
-  if (!jsonMode && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
+  const jsonMode = rawJsonMode && commandSupportsFlag(cmd, positional, "--json");
+  setJsonErrorMode(jsonMode);
+  if (rawJsonMode && !jsonMode) flags.json = "false";
+
+  if (!rawJsonMode && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
     await maybeNudgeForUpdate();
   }
 
@@ -217,8 +198,7 @@ async function main(): Promise<void> {
       else if (sub === "list") await listDevices({ json: jsonMode });
       else if (sub === "revoke") await revokeDevice(positional[1] ?? "");
       else {
-        console.log("usage: rbox device <approve <user-code>|list|revoke <device-id>>");
-        process.exitCode = 1;
+        fail("usage: rbox device <approve <user-code>|list|revoke <device-id>>");
       }
       break;
     }
@@ -230,8 +210,7 @@ async function main(): Promise<void> {
       else if (sub === "status") await accountStatus({ json: jsonMode });
       else if (sub === "unlink") await accountUnlink();
       else {
-        console.log("usage: rbox account <link <code>|status|unlink>");
-        process.exitCode = 1;
+        fail("usage: rbox account <link <code>|status|unlink>");
       }
       break;
     }
@@ -254,7 +233,7 @@ async function main(): Promise<void> {
     }
     case "usage": {
       const { usageCmd } = await import("./usage-cmd.js");
-      await usageCmd({ json: flags.json === "true" });
+      await usageCmd({ json: jsonMode });
       break;
     }
     case "push": {
@@ -332,6 +311,10 @@ async function main(): Promise<void> {
       break;
     }
     case "status": {
+      if (positional.length > 1) {
+        fail("usage: rbox status [path] [--json]");
+        break;
+      }
       const root = await resolveRoot(positional[0]);
       const { statusCmd } = await import("./status-cmd.js");
       await statusCmd(root, { json: jsonMode });
@@ -400,8 +383,15 @@ async function main(): Promise<void> {
       // `rbox versions [path]` — root is the current workspace; an optional
       // workspace-relative path scopes the listing to that file's change history.
       const { versionsCmd } = await import("./versions-cmd.js");
+      let lim: number | undefined;
+      if (flags.limit !== undefined) {
+        lim = Number(flags.limit);
+        if (flags.limit === "true" || !Number.isInteger(lim) || lim < 1) {
+          fail("usage: rbox versions [path] [--limit <n>] [--json]");
+          break;
+        }
+      }
       const root = await resolveRoot(undefined);
-      const lim = flags.limit !== undefined && Number.isInteger(Number(flags.limit)) ? Number(flags.limit) : undefined;
       // `.` / the workspace root means "the whole workspace" (full list), matching how
       // the other commands treat a bare directory arg; only a real subpath scopes.
       const pathArg = positional[0] === undefined || positional[0] === "." || path.resolve(positional[0]) === root ? undefined : positional[0];
@@ -424,8 +414,7 @@ async function main(): Promise<void> {
       else if (positional[0] === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
       else if (positional[0] === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
       else {
-        console.log("usage: rbox key <status | backup | genesis --yes> [--kit] [--kit-path <path>]");
-        process.exitCode = 1;
+        fail("usage: rbox key <status | backup | genesis --yes> [--kit] [--kit-path <path>]");
       }
       break;
     }

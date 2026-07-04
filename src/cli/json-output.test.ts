@@ -60,7 +60,7 @@ afterEach(async () => {
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
-test("status --json emits the status DTO and uses shellStateOf health values", async () => {
+test("status --json emits JSON and uses shellStateOf health values", async () => {
   await saveConfig(tmp, {
     schema: "e2ee/v1",
     remoteWorkspaceId: "ws_json",
@@ -89,7 +89,7 @@ test("status --json emits the status DTO and uses shellStateOf health values", a
   });
 });
 
-test("device list --json emits the devices DTO", async () => {
+test("device list --json emits JSON", async () => {
   process.env.RBOX_TOKEN = "tok";
   process.env.RBOX_API = "https://api.test";
   process.env.RBOX_DEVICE_ID = "dev_a";
@@ -102,7 +102,7 @@ test("device list --json emits the devices DTO", async () => {
   expect(dto).toEqual({ devices: [{ id: "dev_a", kind: "cli", createdAt: 1, lastSeenAt: 2, revoked: false }] });
 });
 
-test("account status --json emits the account DTO", async () => {
+test("account status --json emits JSON", async () => {
   process.env.RBOX_TOKEN = "tok";
   process.env.RBOX_API = "https://api.test";
   process.env.RBOX_DEVICE_ID = "dev_a";
@@ -116,7 +116,7 @@ test("account status --json emits the account DTO", async () => {
   expect(dto).toEqual({ accountId: "acct_a", plan: "pro", graceUntil: 123, readOnly: true, linked: true });
 });
 
-test("versions --json emits the versions DTO", async () => {
+test("versions --json emits JSON", async () => {
   const remote = {
     history: async () => [{ seq: 7, deviceId: "dev_a", keyEpoch: 0 }],
     advisoryTimes: async () => new Map([[7, 456]]),
@@ -132,7 +132,7 @@ test("versions --json emits the versions DTO", async () => {
   expect(dto).toEqual({ versions: [{ sequence: 7, committedAt: 456, path: null }] });
 });
 
-test("trash list --json emits the trash DTO", async () => {
+test("trash list --json emits JSON", async () => {
   const batch = "2020-01-01T00-00-00-000Z";
   const file = path.join(tmp, ".rbox", "trash", batch, "src", "a.txt");
   await fs.mkdir(path.dirname(file), { recursive: true });

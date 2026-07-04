@@ -1,4 +1,11 @@
-/** Stable JSON stdout emitter for `--json` CLI surfaces. */
+function jsonLine(value: unknown): string {
+  return `${JSON.stringify(value)}\n`;
+}
+
+export function emitJsonTo(stream: NodeJS.WritableStream, value: unknown): void {
+  stream.write(jsonLine(value));
+}
+
 export function emitJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  emitJsonTo(process.stdout, value);
 }

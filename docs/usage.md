@@ -1,10 +1,8 @@
 # rbox — usage guide
 
-This is the deep-dive companion to the README's Quickstart: what each command
-actually does, what files land where, and the config-file semantics you'd
-otherwise have to go read a design doc to find. It documents **current,
-shipped** behavior only — anything proposed but not yet built is called out
-explicitly as such, with a link to its design doc.
+This guide covers command behavior, files written by the CLI, and config-file
+semantics. It documents **current, shipped** behavior; proposed behavior is
+called out with its design doc.
 
 ## 1. Getting started
 
@@ -21,7 +19,7 @@ rbox init --workspace <id> --no-interactive   # join an existing workspace
 ```
 
 `rbox init` is the scripting form of `setup` — same underlying plan resolver
-(`resolveInitPlan`, `src/cli/init-plan.ts`), just flag-driven instead of
+(`resolveInitPlan`, `src/cli/init-plan.ts`), flag-driven instead of
 prompted. Every interactive prompt has a corresponding flag; `--no-interactive`
 fails fast (with a hint) instead of hanging on a missing prompt when there's no
 TTY.
@@ -31,7 +29,7 @@ TTY.
 Exit codes are intentionally small and stable: `0` means ok, `1` means error,
 and `130` means user cancel (Ctrl-C).
 
-## 2. What `rbox init` actually does
+## 2. What `rbox init` does
 
 1. **Auth.** Bootstrap-login (`--bootstrap <secret>`, headless-safe) or
    device-code login (interactive-only; never started in CI).
@@ -102,35 +100,30 @@ rbox status [path] [--json]  # workspace state + conflict metrics
 of the tracked files stops and asks for it explicitly, rather than quietly
 applying what could be a corrupted or mistaken remote state.
 
-**Autostart.** `rbox start` only lasts as long as the process — a reboot, a
-power-cycle, or a logout silently kills every daemon. `rbox autostart enable`
-registers a per-user login agent (launchd on macOS, systemd user unit on Linux)
-that brings your background sync back after login, so a reboot doesn't quietly
-leave a workspace out of sync. `rbox autostart status` shows whether it's
-registered; `rbox autostart disable` removes it. It never runs as root and never
-supervises crashes — it only re-establishes sync at login.
+**Autostart.** `rbox start` runs for the current login session.
+`rbox autostart enable` registers a per-user login agent (launchd on macOS,
+systemd user unit on Linux) that restarts background sync after login.
+`rbox autostart status` shows whether it is registered; `rbox autostart disable`
+removes it. It never runs as root and never supervises crashes.
 
-**Export ("give me all my files back").**
+**Export.**
 
 ```bash
 rbox export                                # every workspace → ~/Downloads
-rbox export --workspace ws_ab12cd34        # just one
+rbox export --workspace ws_ab12cd34        # one workspace
 rbox export --out ~/backup.tar.gz          # write a single .tar.gz instead of a directory
 ```
 
-`rbox export` decrypts your data under your own keys and writes it back out —
-takeout for an E2EE product where the server only ever holds ciphertext. It
-defaults to every workspace into `~/Downloads`; `--out` targets a directory or,
-if the path ends in `.tar.gz`, a single archive. It's a read-only operation: it
-never binds a workspace, never starts a daemon, and leaves your synced state
-untouched. (For a single-file rollback, use `rbox restore <path>@<seq>` instead —
-export is the whole-workspace path.)
+`rbox export` decrypts locally and writes files to `~/Downloads` by default.
+`--out` targets a directory or, when the path ends in `.tar.gz`, a single
+archive. It is read-only: it never binds a workspace, starts a daemon, or changes
+sync state. For single-file rollback, use `rbox restore <path>@<seq>`.
 
 > **Note on deprecated names:** `link` and `daemon <start|stop|logs>` still work
 > but are deprecated aliases (they forward to `track` and `start`/`stop`/`logs`
-> respectively) and print a warning on every use (design 29). They're
-> **deprecated-but-supported** — there's no scheduled removal — so prefer the
-> names above in new scripts. `doctor` is now the top-level support command;
+> respectively) and print a warning on every use (design 29). They remain
+> supported, but new scripts should use the names above. `doctor` is now the
+> top-level support command;
 > `hydrate`/`detect` remain disabled deps aliases while the whole `deps` group is
 > commented out of the CLI (design 51, §7 below).
 
@@ -249,14 +242,11 @@ rbox key backup                # re-show recovery phrase
 rbox key genesis --yes         # mint this account's first encryption keys
 ```
 
-**`rbox key genesis`.** Web signup and plain device-code `rbox login` authorize
-a machine but do **not** create an encryption key world — there's nothing to
-decrypt until one exists. `rbox key genesis --yes` is the explicit "set up
-encryption on the first machine" step: it mints the account's first keys and the
-24-word recovery phrase on a cold account. `rbox setup` runs it for you inline
-when it detects an authorized-but-unenrolled machine, so you rarely call it by
-hand; the `--yes` flag is required because it's the one-time act that defines the
-key world everything else inherits.
+**`rbox key genesis`.** Web signup and device-code `rbox login` authorize a
+machine but do **not** create encryption keys. `rbox key genesis --yes` mints the
+account's first keys and 24-word recovery phrase on a cold account. `rbox setup`
+runs it inline when it detects an authorized-but-unenrolled machine; `--yes` is
+required because this defines the key world every device inherits.
 
 ### Recovery kit (`--kit` / `--kit-path`)
 
@@ -277,7 +267,7 @@ rbox key backup --kit-path ~/vault/rbox.txt  # write to a specific file
   writes exactly where you point it.
 - **How it's written.** Atomically (temp file + rename) at mode `0600`
   (owner-read/write only); it refuses to write through a symlink and re-reads the
-  file to verify the contents landed intact.
+  file to verify the written contents.
 - **Tracking it.** After a successful write, rbox records the path and timestamp.
   `rbox key status` reports the last-written kit — its path and date, or that no
   kit is recorded, or that the recorded file has since gone missing.
@@ -300,13 +290,11 @@ rbox shell-init zsh            # prompt integration + completions: eval "$(rbox 
 rbox completions zsh
 ```
 
-**`rbox usage`** prints what your plan allows against what you're using —
-storage used vs cap, workspace and device counts, and (when you're in a
-downgrade grace window) how long read-only access lasts. It's the same figure the
-server uses to decide a `402 quota_exceeded`, so it's the command to reach for
-when a push starts refusing writes. `--json` emits the raw account-usage DTO for
-scripts. `rbox subscribe <solo|pro>` opens a checkout to lift the cap (Team is
-not yet purchasable).
+**`rbox usage`** prints plan limits and current usage: storage used vs cap,
+workspace and device counts, and downgrade-grace read-only time. It matches the
+server-side `402 quota_exceeded` decision. `--json` emits account usage for
+scripts. `rbox subscribe <solo|pro>` opens checkout to lift the cap; Team is
+listed but not purchasable.
 
 ## 10. Full command reference
 

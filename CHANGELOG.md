@@ -6,26 +6,23 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
-This week's merged work (designs 60–65) — the launch-readiness batch:
+Merged work from designs 60-65:
 
 ### Added
-- **Self-serve genesis (design 60).** A cold account created via web signup or
-  plain device-code `rbox login` can now mint its own encryption key world on the
-  first machine — `rbox key genesis`, run inline by `rbox setup`. No longer a
-  chicken-and-egg where enrollment required an already-enrolled machine.
+- **Self-serve genesis (design 60).** Cold accounts created via web signup or
+  device-code `rbox login` mint their first encryption keys with
+  `rbox key genesis`; `rbox setup` runs it inline on the first machine.
 - **Daemon autostart (design 61).** `rbox autostart enable|disable|status`
-  registers a per-user login agent so background sync survives a reboot or
-  re-login instead of silently dropping.
+  registers a per-user login agent that restarts background sync after reboot or
+  re-login.
 - **`rbox usage` + quota UX (design 62).** A dedicated command for plan limits vs
-  current usage, and the typed `402 quota_exceeded` is now rendered as an
-  actionable upgrade moment rather than a raw error string.
+  current usage; typed `402 quota_exceeded` errors name the cap and next step.
 - **Data export (design 65).** `rbox export` decrypts every workspace under your
-  own keys and writes it back out to a directory or `.tar.gz` — client-side
-  takeout for an E2EE product.
+  keys and writes a directory or `.tar.gz`.
 
 ### Changed
-- **Team plan gated as "coming soon" (design 63).** Team is presented
-  consistently as not-yet-purchasable across the CLI, web, and pricing surfaces;
+- **Team checkout disabled (design 63).** Team is listed but not purchasable
+  across the CLI, web, and pricing surfaces;
   the server rejects Team checkout intent before any Stripe call.
 
 ### Security
@@ -33,9 +30,10 @@ This week's merged work (designs 60–65) — the launch-readiness batch:
   (device-code start/poll, release, link/pair) plus a per-account durable-device
   cap.
 
-## [0.7.1] — zero-network status
-- Zero-network `rbox status` via daemon attribution (design 59) — status reads
-  local daemon state on the happy path instead of round-tripping the server.
+## [0.7.1] — status probe elision
+- `rbox status` elides the remote-head probe when the local daemon is live and
+  attributable to the current workspace (design 59); JSON status fetches account
+  usage separately.
 
 ## [0.7.0] — doctor, diagnostics, recovery kit
 - `rbox doctor` + opt-in plaintext support-report upload (design 56).

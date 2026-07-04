@@ -83,11 +83,11 @@ describe("readQuotaExceeded", () => {
 });
 
 describe("translateRemoteError", () => {
-  test("friendly mappings cover common statuses while 402 preserves the raw fallback", () => {
+  test("maps common statuses while 402 preserves the raw fallback", () => {
     expect(translateRemoteError(401, "latest failed")).toBe("signed out — run rbox login");
     expect(translateRemoteError(403, "latest failed")).toBe("not permitted");
     expect(translateRemoteError(404, "latest failed", undefined, "workspace not found — check you're in the right directory")).toBe("workspace not found — check you're in the right directory");
-    expect(translateRemoteError(503, "latest failed", "busy")).toBe("rbox servers are having trouble — try again shortly");
+    expect(translateRemoteError(503, "latest failed", "busy")).toBe("rbox servers are having trouble — try again shortly (HTTP 503)");
     expect(translateRemoteError(402, "usage failed", "{\"error\":\"payment_required\"}")).toBe('usage failed: 402 {"error":"payment_required"}');
   });
 });
