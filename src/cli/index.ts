@@ -337,6 +337,11 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "export": {
+      const { runExport } = await import("./export-cmd.js");
+      await runExport(flags);
+      break;
+    }
     case "status": {
       const root = await resolveRoot(positional[0]);
       // The EFFECTIVE remote is the credential's (buildAuthedRemote's rule, design 44

@@ -201,13 +201,13 @@ function resolveUserPath(p: string): string {
   return path.resolve(p);
 }
 
-function accountHex16(accountId: string): string {
+export function accountHex16(accountId: string): string {
   const match = accountId.match(/^acct_([0-9a-f]{16})$/i);
   if (!match) throw new Error(`account id does not contain a 16-hex suffix: ${accountId}`);
   return match[1]!.toLowerCase();
 }
 
-function localYmd(date: Date): string {
+export function localYmd(date: Date): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
