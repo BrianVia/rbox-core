@@ -1,14 +1,17 @@
 import type { RouteCtx } from "./shared.js";
+import type { Env } from "../env.js";
 import { ipKey, rateLimited } from "../ratelimit.js";
+
+// Never cache a 404 (a cached 404 could mask a just-published object on the
+// edge — design 14 U7).
+const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
 /**
  * Public release distribution (design 14), served from the SEPARATE rbox_releases
  * bucket. All routes are unauthenticated and sit ahead of authenticate().
+ * Gateway half for design 70: apply release RL, then forward cacheable objects.
  */
-export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
-  // Never cache a 404 (a cached 404 could mask a just-published object on the
-  // edge — design 14 U7).
-  const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): Promise<Response | null> {
   // Shared per-IP burst cap applies only after a release route matches, so
   // unrelated traffic does not burn the release budget.
   const releaseLimited = () => rateLimited(env.RL_RELEASE, `rl:${ipKey(req)}`);
@@ -17,9 +20,7 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   if (url.pathname === "/install.sh" && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
-    const obj = await env.rbox_releases.get("releases/install.sh");
-    if (!obj) return releaseNotFound();
-    return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" } });
+    return exports.CachedReleases.fetch(req);
   }
   // The signed release manifest + its detached signature (no-cache; `rbox upgrade`
   // verifies the signature against an embedded key before trusting it). Keep the
@@ -36,10 +37,27 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
   }
   // Binaries: `/bin/rbox-<os>-<arch>` (mutable "latest" alias, short cache — for
   // install.sh only) OR `/bin/v<ver>/rbox-<os>-<arch>` (immutable versioned — what
-  // `rbox upgrade` downloads from the signed manifest). Name/version validated.
+  // `rbox upgrade` downloads from the signed manifest). Name/version validated by
+  // CachedReleases so cache hits can bypass R2 without bypassing this limiter.
   if (seg[0] === "bin" && req.method === "GET" && (seg.length === 2 || seg.length === 3)) {
     const limited = await releaseLimited();
     if (limited) return limited;
+    return exports.CachedReleases.fetch(req);
+  }
+
+  return null;
+}
+
+/** CachedReleases half: pure R2 response contract for design 70's cached entrypoint. */
+export async function cachedReleaseResponse(url: URL, env: Env): Promise<Response> {
+  if (url.pathname === "/install.sh") {
+    const obj = await env.rbox_releases.get("releases/install.sh");
+    if (!obj) return releaseNotFound();
+    return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300, stale-while-revalidate=3600" } });
+  }
+
+  const seg = url.pathname.split("/").filter(Boolean);
+  if (seg[0] === "bin" && (seg.length === 2 || seg.length === 3)) {
     const versioned = seg.length === 3;
     const ver = versioned ? seg[1]! : null;
     const name = versioned ? seg[2]! : seg[1]!;
@@ -51,5 +69,5 @@ export async function releaseRoutes({ req, env, url, seg }: RouteCtx): Promise<R
     return new Response(obj.body, { headers: { "content-type": "application/octet-stream", "content-disposition": `attachment; filename="rbox"`, "cache-control": cacheControl } });
   }
 
-  return null;
+  return releaseNotFound();
 }

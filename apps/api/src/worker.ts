@@ -17,7 +17,8 @@
  * the original if-chain (first match wins). The order is load-bearing for the
  * documented overlapping-prefix cases; see ./routes/shared.ts.
  */
-import type { AccountDeleteMessage, DeviceNotifyMessage, Env } from "./env.js";
+import { WorkerEntrypoint } from "cloudflare:workers";
+import type { AccountDeleteMessage, DeviceNotifyMessage, Env, WorkerEntrypointExports } from "./env.js";
 import { authenticate } from "./auth.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
@@ -27,7 +28,7 @@ import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
 import { driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
 import { eq, isDeviceRevoke, type RouteCtx } from "./routes/shared.js";
-import { releaseRoutes } from "./routes/release.js";
+import { cachedReleaseResponse, releaseRoutes } from "./routes/release.js";
 import { adminRoutes } from "./routes/admin.js";
 import { authDeviceRoutes, authPublicRoutes } from "./routes/auth.js";
 import { billingRoutes, billingWebhookRoutes } from "./routes/billing.js";
@@ -39,16 +40,22 @@ import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
+export class CachedReleases extends WorkerEntrypoint<Env> {
+  async fetch(req: Request): Promise<Response> {
+    return cachedReleaseResponse(new URL(req.url), this.env);
+  }
+}
+
 // §33 GRACE_1: the Phase-1 mark→purge grace, sized to exceed the slowest in-flight
 // commit + clock skew (founder: ≈1h; the existing manual GC default, worker.ts).
 const GRACE_1_MS = 60 * 60 * 1000;
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext & { exports: WorkerEntrypointExports }): Promise<Response> {
     const cors = corsHeaders(req, env);
     // CORS preflight: the browser dashboard sends OPTIONS before any cross-origin
     // authed request (Authorization/content-type headers make it non-simple).
-    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...cors, "cache-control": "no-store" } });
     // Wrap env's D1 for the whole request (via op.env) so pre-DO work (authz,
     // account-epoch lookups in route()) is timed + counted into the `request` row.
     // Per-op handlers (blobs.ts) wrap again → their row counts their own D1; the
@@ -56,7 +63,7 @@ export default {
     const op = startOp(env, "request", `${req.method} ${routeTemplate(new URL(req.url).pathname)}`);
     let res: Response;
     try {
-      res = await route(req, op.env);
+      res = await route(req, op.env, ctx.exports);
     } catch (e) {
       if (e instanceof Response) res = e; // thrown 4xx flows out as itself
       else {
@@ -65,11 +72,16 @@ export default {
       }
     }
     op.done(String(res.status));
-    // Echo CORS headers on the real response (incl. errors) so the browser fetch
-    // resolves instead of failing opaque. No-op when Origin isn't allowlisted.
-    if (cors["Access-Control-Allow-Origin"]) {
+    // WebSocket upgrades cannot be re-wrapped; pass the DO fanout path through.
+    if (res.status === 101 || res.webSocket) return res;
+    // Echo CORS headers on the real response (incl. errors) and default-deny
+    // cacheability for non-release responses (design 70).
+    const needsCors = Boolean(cors["Access-Control-Allow-Origin"]);
+    const needsCacheControl = !res.headers.has("cache-control");
+    if (needsCors || needsCacheControl) {
       const h = new Headers(res.headers);
-      for (const [k, v] of Object.entries(cors)) h.set(k, v);
+      if (needsCors) for (const [k, v] of Object.entries(cors)) h.set(k, v);
+      if (needsCacheControl) h.set("cache-control", "no-store");
       res = new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
     }
     return res;
@@ -181,10 +193,10 @@ export default {
  * the documented overlapping-prefix cases (e.g. blobs/check before blobs/:sha);
  * exact-match routes across groups are mutually exclusive.
  */
-async function route(req: Request, env: Env): Promise<Response> {
+async function route(req: Request, env: Env, exports: WorkerEntrypointExports): Promise<Response> {
   const url = new URL(req.url);
   const seg = url.pathname.split("/").filter(Boolean);
-  const ctx: RouteCtx = { req, env, url, seg };
+  const ctx: RouteCtx = { req, env, exports, url, seg };
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-api" });
 

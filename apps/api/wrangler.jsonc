@@ -31,6 +31,12 @@
   // §32 Tier 2 — native Workers Observability (Workers Logs). Captures console logs +
   // invocation metadata, queryable in the dashboard / via the Tail Worker below.
   "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Workers Cache gateway pattern for public release objects only (design 70).
+  "cache": { "enabled": true },
+  "exports": {
+    "default": { "type": "worker", "cache": { "enabled": false } },
+    "CachedReleases": { "type": "worker", "cache": { "enabled": true } }
+  },
   // §32 Tier 2 — Tail Worker for rare-important error alerts (#rbox-alerts). DEPLOY
   // ORDER MATTERS: `wrangler deploy` of THIS worker fails if the tail service doesn't
   // exist yet, so deploy `tail/` FIRST, then UNCOMMENT this block and redeploy.
@@ -116,6 +122,12 @@
       },
       "analytics_engine_datasets": [{ "binding": "rbox_metrics", "dataset": "rbox_prod_metrics" }],
       "observability": { "enabled": true, "head_sampling_rate": 1 },
+      // Workers Cache gateway pattern for public release objects only (design 70).
+      "cache": { "enabled": true },
+      "exports": {
+        "default": { "type": "worker", "cache": { "enabled": false } },
+        "CachedReleases": { "type": "worker", "cache": { "enabled": true } }
+      },
       // Deploy `tail/ --env production` FIRST, then UNCOMMENT (see tail/README.md).
       // "tail_consumers": [{ "service": "rbox-prod-tail" }],
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
