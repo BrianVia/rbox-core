@@ -61,6 +61,16 @@ export function sanitizeWorkspaceName(raw: string | undefined): string | undefin
   return cleaned ? cleaned.slice(0, MAX_WORKSPACE_NAME) : undefined;
 }
 
+/** Interpret the answer from the single optional workspace-name input. The prompt
+ *  pre-fills a suggestion, so a bare ENTER accepts it; "-" is the DISCOVERABLE skip
+ *  sentinel (the old confirm-step's "n" path — names are server-visible plaintext,
+ *  so declining must stay a first-class, documented move). Exactly "-" after trim →
+ *  no name; a dash INSIDE a name ("my-app") passes through untouched. */
+export function interpretWorkspaceNameAnswer(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  return trimmed && trimmed !== "-" ? trimmed : undefined;
+}
+
 /** `from-credentials` = resolve from the credential saved by the login the
  *  executor will run (auth was "need-interactive-login"). */
 export type ResolvedDeviceId = { kind: "fixed"; id: string } | { kind: "from-credentials" };

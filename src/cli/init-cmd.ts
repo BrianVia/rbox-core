@@ -16,11 +16,11 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { push, sync } from "./sync.js";
-import { resolveInitPlan, isInitError, collapseHome, type InitPlan } from "./init-plan.js";
+import { resolveInitPlan, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
-import { promptSelect, promptInput, promptConfirm } from "./prompt.js";
+import { promptSelect, promptInput } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 
@@ -74,10 +74,11 @@ async function promptMissing(
     process.stderr.write(
       `${stderrStyle.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`
     );
-    if (await promptConfirm({ message: "Add a name for this workspace?", default: true })) {
-      const ans = (await promptInput({ message: "Workspace name", default: suggestion })).trim();
-      if (ans) next.name = ans;
-    }
+    // Single optional input: the suggestion is the default, so a bare ENTER names the
+    // workspace by its directory (what the old confirm→input two-step did on default+
+    // ENTER); "-" is the documented skip (the old confirm's "n" path — keeps it private).
+    const ans = interpretWorkspaceNameAnswer(await promptInput({ message: `Workspace name (Enter accepts, "-" for none)`, default: suggestion }));
+    if (ans) next.name = ans;
   }
   return next;
 }
@@ -194,7 +195,7 @@ async function executeInitPlan(
   }
   const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
   if (plan.firstSync === "push") {
-    const sp = spinner("publishing initial snapshot");
+    const sp = spinner("publishing initial snapshot — scanning files");
     try {
       deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
       const { sequence: seq, committed } = await push(plan.root, authed, deps);
@@ -210,7 +211,7 @@ async function executeInitPlan(
       throw e;
     }
   } else if (plan.firstSync === "sync") {
-    const sp = spinner("syncing from remote");
+    const sp = spinner("syncing from remote — scanning files");
     try {
       deps.onProgress = (done, total, phase) => sp.update(progressLabel(phase, done, total));
       const { pulled, pushedSequence } = await sync(plan.root, authed, deps);

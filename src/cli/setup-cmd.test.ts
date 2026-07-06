@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { workspaceFlags, authorizePath, resolveEnrollment } from "./setup-cmd.js";
+import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES } from "./setup-cmd.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
@@ -32,6 +32,20 @@ test("Step 2 → runInit flags: a create carries the prompted name to the server
   // the founder typed a name and the workspace was still created unnamed).
   const f = workspaceFlags({ kind: "new", root: "/code/app", name: "Conductor Workspaces" });
   expect(f).toMatchObject({ new: "true", name: "Conductor Workspaces", "no-interactive": "true" });
+});
+
+// Step 3 collapsed the keep→resume double-confirm into one `select` (the founder once
+// typed a workspace name into a Y/N). The widget itself we don't unit-test, but the
+// LIVE select renders START_SYNC_CHOICES directly, so pinning the ordered labels+values
+// AND running startSyncActions over each value means a re-shuffle or a value swap in
+// the real wiring fails here — not just the mapper in isolation. Recommended ("both")
+// must stay FIRST so a bare ENTER reproduces the old default:true+ENTER outcome.
+test("Step 3 select wiring: ordered choices → side effects (both first, then daemon-only, then neither)", () => {
+  expect(START_SYNC_CHOICES.map((c) => ({ ...c, ...startSyncActions(c.value) }))).toEqual([
+    { name: "Start now and resume after reboot (recommended)", value: "both", startDaemon: true, enableAutostart: true },
+    { name: "Start now only", value: "start", startDaemon: true, enableAutostart: false },
+    { name: "Not now", value: "none", startDaemon: false, enableAutostart: false },
+  ]);
 });
 
 // The new "Sign in via browser" method (design 47) must land on the SAME device-code
