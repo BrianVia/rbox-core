@@ -15,13 +15,21 @@ export interface CommitResult {
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {
-  const res = await fetch(
+  // SAFE TO RETRY (the judgment call): the server sequences commits with a strict
+  // `parentSequence === head` compare-and-swap (apps/api/src/workspace-sync.ts). If a socket
+  // closes AFTER the server applied this commit, a retry re-POSTs the now-stale parent → the CAS
+  // fails → HTTP 409 conflict (an already-applied duplicate can NEVER double-apply). That 409 is a
+  // Response, so it returns below as `{ conflict }` and the push loop absorbs it (pull → reconcile
+  // → no-op). Accounting is idempotent too (charges 0 for already-entitled refs; INSERT OR IGNORE
+  // on the D1 mirror). A blind retry is therefore benign, not a double-submit.
+  const res = await ctx.fetch(
     `${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`,
     {
       method: "POST",
       headers: { ...ctx.auth, "content-type": "application/json" },
       body: JSON.stringify({ parentSequence, deviceId, manifest }),
-    }
+    },
+    { op: "publishing your changes" }
   );
   if (res.status === 409) {
     const body = (await res.json()) as { head: number };
@@ -40,7 +48,7 @@ export async function commit(ctx: RemoteContext, parentSequence: number, deviceI
 }
 
 export async function latestCommit(ctx: RemoteContext): Promise<{ sequence: number; commit: SignedCommit | null }> {
-  const r = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, { headers: ctx.auth });
+  const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, { headers: ctx.auth }, { op: "checking for remote changes" });
   if (!r.ok) throw new Error(translateRemoteError(r.status, "latest failed", undefined, "workspace not found — check you're in the right directory"));
   const body = (await r.json()) as { sequence: number; commit: SignedCommit | null; grant?: unknown };
   ctx.captureGrant(body); // §27 — the pull handshake hands back a download grant
@@ -48,7 +56,7 @@ export async function latestCommit(ctx: RemoteContext): Promise<{ sequence: numb
 }
 
 export async function commitsSince(ctx: RemoteContext, since: number): Promise<Array<SignedCommit>> {
-  const r = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/commits?since=${since}`, { headers: ctx.auth });
+  const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/commits?since=${since}`, { headers: ctx.auth }, { op: "fetching remote changes" });
   if (r.status === 409) throw new NeedsRebaselineError(((await r.json().catch(() => ({}))) as { head?: number }).head);
   if (!r.ok) throw new Error(translateRemoteError(r.status, "commits?since failed", undefined, "workspace not found — check you're in the right directory"));
   return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
@@ -60,11 +68,14 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   // §23.4: hand the accumulated upload receipts to commit (it does the batched
   // catalog+charge+grant+promote). Sending all still-valid receipts each attempt is
   // safe — the server charges 0 for already-entitled refs.
-  const r = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
+  // SAFE TO RETRY — same `parentSequence === head` CAS as commit() above; a duplicate after a
+  // socket close 409s benignly (see the note there). Sending all still-valid receipts each attempt
+  // is already idempotent (the server charges 0 for already-entitled refs).
+  const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
     method: "POST",
     headers: { ...ctx.protoAuth, "content-type": "application/json" },
     body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: Object.fromEntries(ctx.receipts) }),
-  });
+  }, { op: "publishing your changes" });
   if (r.status === 409) {
     const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number };
     if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0 };
@@ -82,9 +93,9 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
 }
 
 export async function latest(ctx: RemoteContext): Promise<{ sequence: number; manifest: Manifest }> {
-  const res = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, {
+  const res = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/latest`, {
     headers: ctx.auth,
-  });
+  }, { op: "checking for remote changes" });
   if (!res.ok) throw new Error(translateRemoteError(res.status, "latest failed", await res.text(), "workspace not found — check you're in the right directory"));
   const body = (await res.json()) as { sequence: number; manifest: Manifest; grant?: unknown };
   ctx.captureGrant(body); // §27 — capture the download grant on the legacy manifest path too
@@ -96,7 +107,7 @@ export async function latest(ctx: RemoteContext): Promise<{ sequence: number; ma
  *  Authenticity comes from the signed commit chain (`commitsSince`), NEVER this.
  *  Returns seq → epoch-ms; a missing/lagging row just means no time for that seq. */
 export async function commitTimes(ctx: RemoteContext, limit = 50): Promise<Map<number, number>> {
-  const res = await fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/versions?limit=${limit}`, { headers: ctx.auth });
+  const res = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/versions?limit=${limit}`, { headers: ctx.auth }, { op: "fetching version history" });
   if (!res.ok) throw new Error(translateRemoteError(res.status, "versions failed", undefined, "workspace not found — check you're in the right directory"));
   const rows = ((await res.json()) as { versions: Array<{ sequence: number; created_at: number }> }).versions;
   return new Map(rows.map((r) => [r.sequence, r.created_at]));
