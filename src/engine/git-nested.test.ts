@@ -9,11 +9,13 @@ import {
   assertGitTargetWithinRoot,
   buildIgnoreMatcher,
   captureGitState,
+  decideDirBundleAllArgs,
   discoverGitRepos,
   encryptFileToTemp,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
+  inTreeWorktreeParentRel,
   projectIdentity,
   quarantineAndWipeGitState,
   validateManifest,
@@ -50,14 +52,15 @@ async function commit(dir: string, file: string, content: string, msg: string) {
   await git(dir, "commit", "-qm", msg);
 }
 
-/** Main clone at tmp/main (outside the "sync root") + a real worktree at tmp/root/wt on branch `feat`. */
-async function makeMainWithWorktree(): Promise<{ M: string; W: string }> {
-  const M = path.join(tmp, "main");
+/** Main clone + a real linked worktree; defaults keep the original out-of-root shape. */
+async function makeMainWithWorktree(opts: { main?: string; worktree?: string; branch?: string } = {}): Promise<{ M: string; W: string }> {
+  const M = opts.main ?? path.join(tmp, "main");
+  const W = opts.worktree ?? path.join(tmp, "root", "wt");
+  const branch = opts.branch ?? "feat";
   await initRepo(M);
   await commit(M, "f.txt", "base", "c1");
-  const W = path.join(tmp, "root", "wt");
-  await fs.mkdir(path.join(tmp, "root"), { recursive: true });
-  await git(M, "worktree", "add", W, "-b", "feat");
+  await fs.mkdir(path.dirname(W), { recursive: true });
+  await git(M, "worktree", "add", W, "-b", branch);
   return { M, W };
 }
 
@@ -97,7 +100,7 @@ test("preflight: ordinary dir repo ok (kind dir); real worktree ok (kind pointer
   expect(await gitPreflight(W)).toEqual({ ok: true, kind: "pointer" });
 });
 
-test("preflight refusals: no .git, dangling pointer, bare, alternates (both kinds), worktrees/modules, toplevel mismatch", async () => {
+test("preflight refusals: no .git, dangling pointer, bare, alternates (both kinds), modules, toplevel mismatch", async () => {
   // no .git
   const plain = path.join(tmp, "plain");
   await fs.mkdir(plain);
@@ -134,10 +137,8 @@ test("preflight refusals: no .git, dangling pointer, bare, alternates (both kind
   expect(wr.reason).toContain("alternates");
   await fs.rm(path.join(M, ".git", "objects", "info", "alternates"));
 
-  // a PRIMARY with linked worktrees stays refused (v1)
-  const mr = await gitPreflight(M);
-  expect(mr.ok).toBe(false);
-  expect(mr.reason).toContain("worktrees");
+  // design 68 §3.1: a PRIMARY with linked worktrees is now ELIGIBLE (was refused in v1)
+  expect(await gitPreflight(M)).toEqual({ ok: true, kind: "dir" });
 
   // .git/modules (submodule superproject) stays refused (v1 [v2, M1])
   const sup = path.join(tmp, "sup");
@@ -340,7 +341,7 @@ test("wrong-KEK apply into a FRESH target leaves NO .git behind (decrypt before 
   // NB: D/ + an empty hard-ignored D/.rbox/ MAY exist (staging happens pre-decrypt by
   // design); the fail-closed contract is about `.git` — no repo may be materialized.
   expect(await fs.lstat(path.join(D, ".git")).catch(() => undefined)).toBeUndefined(); // nothing materialized
-});
+}, 20_000); // many live-git ops — the 5s default flakes under full-suite load
 
 test("apply refuses a SYMLINKED .git target (never inits through it, never deletes the link)", async () => {
   const A = path.join(tmp, "A");
@@ -396,22 +397,139 @@ test("a repo APPEARING at a fresh target during artifact download defers — its
   expect(await fs.readFile(path.join(D, "user.txt"), "utf8")).toBe("user work");
 });
 
-test("apply REFUSES a primary with linked worktrees (would move a sibling's checked-out branch)", async () => {
+test("design 68 §3.2: apply into a primary with linked worktrees DEFERS on a checked-out-branch collision, then applies once the worktree is removed (V10, V3)", async () => {
   const A = path.join(tmp, "A");
   await initRepo(A);
   await commit(A, "f.txt", "x", "c1");
-  const section = await captureGitState(A, store, KEK);
+  const section = await captureGitState(A, store, KEK); // all-scope {refs/heads/main}
 
-  const M = path.join(tmp, "prim");
-  await initRepo(M);
-  await commit(M, "g.txt", "y", "c1");
-  await git(M, "worktree", "add", path.join(tmp, "prim-wt"), "-b", "sibling");
+  const { M } = await makeMainWithWorktree({ main: path.join(tmp, "prim"), worktree: path.join(tmp, "prim-wt"), branch: "sibling" });
   const siblingSha = await git(M, "rev-parse", "sibling");
+  const mMain = await git(M, "rev-parse", "main");
 
+  // The all-scope apply would DELETE `sibling` (absent from the section) — but prim-wt has it
+  // checked out, so `update-ref -d` would strand that worktree. Whole-section defer, no mutation.
   const res = await applyGitState(M, section!, store, KEK);
   expect(res.applied).toBe(false);
-  expect(res.reason).toContain("worktrees");
+  expect(res.reason).toContain("linked worktree");
+  expect(res.reason).toContain("sibling");
   expect(await git(M, "rev-parse", "sibling")).toBe(siblingSha); // untouched
+  expect(await git(M, "rev-parse", "main")).toBe(mMain); // no partial application
+
+  // Remove the worktree → the checked-out set clears → the section applies next cycle (V3).
+  await git(M, "worktree", "remove", "--force", path.join(tmp, "prim-wt"));
+  const res2 = await applyGitState(M, section!, store, KEK);
+  expect(res2.applied).toBe(true);
+  expect(await git(M, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  await expect(git(M, "rev-parse", "--verify", "sibling")).rejects.toThrow(); // now safely deleted
+});
+
+// ---- design 68: main-clone-with-worktrees capture (§3.1) ------------------------
+
+test("design 68 §3.1: dir bundle args fall back on ancient git only when no live linked worktree depends on --single-worktree", () => {
+  expect(decideDirBundleAllArgs(true, false)).toEqual({ ok: true, args: ["--single-worktree", "--all"] });
+  expect(decideDirBundleAllArgs(true, true)).toEqual({ ok: true, args: ["--single-worktree", "--all"] });
+  expect(decideDirBundleAllArgs(false, false)).toEqual({ ok: true, args: ["--all"] });
+  expect(decideDirBundleAllArgs(false, true)).toEqual({ ok: false, reason: "git >= 2.15 required for worktree-aware capture" });
+});
+
+test("design 68 §3.1 V1/V4: main clone with 2 linked worktrees captures --single-worktree --all; worktree branches + commits ride, main index/stash captured", async () => {
+  const { M, W: W1 } = await makeMainWithWorktree({ worktree: path.join(tmp, "wt1"), branch: "feat1" });
+  await commit(W1, "w1.txt", "w1", "feat1 c1"); // a commit IN the worktree, on its branch
+  const W2 = path.join(tmp, "wt2");
+  await git(M, "worktree", "add", W2, "-b", "feat2");
+  await commit(W2, "w2.txt", "w2", "feat2 c1");
+  // main-checkout-local state: a stash + a staged file (its OWN index, not a worktree's)
+  await fs.writeFile(path.join(M, "f.txt"), "dirty");
+  await git(M, "stash", "-q");
+  await fs.writeFile(path.join(M, "s.txt"), "staged");
+  await git(M, "add", "s.txt");
+
+  const section = await captureGitState(M, store, KEK);
+  expect(section).toBeDefined();
+  expect(section!.refScope).toBe("all");
+  // worktree branches travel as ordinary refs/heads/* (V4); refs/stash is main-local
+  expect(Object.keys(section!.refs).sort()).toEqual(["refs/heads/feat1", "refs/heads/feat2", "refs/heads/main", "refs/stash"]);
+  expect(section!.indexSha).toBeDefined();
+
+  // standalone twin: every branch + its commit present, main index restored, fsck-clean
+  const D = path.join(tmp, "D");
+  expect((await applyGitState(D, section!, store, KEK)).applied).toBe(true);
+  expect((await git(D, "branch", "--format=%(refname:short)")).split("\n").sort()).toEqual(["feat1", "feat2", "main"]);
+  expect(await git(D, "rev-parse", "feat1")).toBe(await git(M, "rev-parse", "feat1")); // V4: worktree-branch commit rode
+  expect(await git(D, "rev-parse", "feat2")).toBe(await git(M, "rev-parse", "feat2"));
+  expect(await git(D, "rev-parse", "refs/stash")).toBe(await git(M, "rev-parse", "refs/stash"));
+  expect(await git(D, "diff", "--cached", "--name-only")).toBe("s.txt"); // main-checkout index restored
+  await expect(git(D, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("design 68 §3.1 V9: a DETACHED linked-worktree HEAD does NOT ride the main bundle (--single-worktree excludes tier-2 state)", async () => {
+  const { M, W } = await makeMainWithWorktree({ worktree: path.join(tmp, "wt") });
+  await commit(W, "w.txt", "onbranch", "feat c1"); // a commit on feat — MUST ride (V4)
+  const featSha = await git(W, "rev-parse", "feat");
+  await git(W, "checkout", "-q", "--detach");
+  await commit(W, "d.txt", "detached", "detached c1"); // reachable ONLY from the detached HEAD
+  const detachedSha = await git(W, "rev-parse", "HEAD");
+  expect(detachedSha).not.toBe(featSha);
+
+  const section = await captureGitState(M, store, KEK);
+  const D = path.join(tmp, "D");
+  expect((await applyGitState(D, section!, store, KEK)).applied).toBe(true);
+  expect(await git(D, "rev-parse", "feat")).toBe(featSha); // branch commit rode
+  await expect(git(D, "cat-file", "-e", `${detachedSha}^{commit}`)).rejects.toThrow(); // detached commit excluded
+});
+
+test("design 68 V7: a prunable-only .git/worktrees is treated as absent — preflight ok, capture proceeds", async () => {
+  const { M, W } = await makeMainWithWorktree({ worktree: path.join(tmp, "wt") });
+  await commit(W, "w.txt", "w", "feat c1");
+  await fs.rm(W, { recursive: true, force: true }); // checkout gone → the admin entry is prunable
+
+  expect((await fs.lstat(path.join(M, ".git", "worktrees"))).isDirectory()).toBe(true); // stale entry lingers
+  expect(await gitPreflight(M)).toEqual({ ok: true, kind: "dir" });
+  const section = await captureGitState(M, store, KEK);
+  expect(section).toBeDefined();
+  expect(section!.refScope).toBe("all");
+});
+
+test("design 68 V13: a PRUNABLE worktree entry produces no phantom apply collision (checked-out set ignores stale entries)", async () => {
+  const { M, W } = await makeMainWithWorktree({ worktree: path.join(tmp, "wt"), branch: "sibling" });
+  await commit(W, "w.txt", "w", "sibling c1");
+  await fs.rm(W, { recursive: true, force: true }); // prunable: `sibling` is not really checked out
+
+  const A = path.join(tmp, "A");
+  await initRepo(A);
+  await commit(A, "a.txt", "x", "c1");
+  const section = await captureGitState(A, store, KEK); // all-scope {refs/heads/main} — would delete `sibling`
+
+  const res = await applyGitState(M, section!, store, KEK);
+  expect(res.applied).toBe(true); // no live worktree holds `sibling` → no collision defer
+  expect(await git(M, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  await expect(git(M, "rev-parse", "--verify", "sibling")).rejects.toThrow(); // deleted — no phantom guard
+});
+
+test("design 68 §3.3 / V14: inTreeWorktreeParentRel resolves in-tree worktrees; exempts submodules and out-of-tree clones", async () => {
+  const root = path.join(tmp, "root");
+  await fs.mkdir(root, { recursive: true });
+  // in-tree main clone + in-tree linked worktree → parent relPath
+  const { W } = await makeMainWithWorktree({ main: path.join(root, "main"), worktree: path.join(root, "wt") });
+  expect(await inTreeWorktreeParentRel(root, W)).toBe("main");
+  // out-of-tree main clone (Conductor layout) → undefined (unchanged full capture)
+  const { W: Wo } = await makeMainWithWorktree({ main: path.join(tmp, "mainOut"), worktree: path.join(root, "wtOut"), branch: "featO" });
+  expect(await inTreeWorktreeParentRel(root, Wo)).toBeUndefined();
+  // ordinary dir repo → undefined
+  const D = path.join(root, "plain");
+  await initRepo(D);
+  await commit(D, "f.txt", "x", "c1");
+  expect(await inTreeWorktreeParentRel(root, D)).toBeUndefined();
+  // submodule checkout: commonDir resolves into .git/modules/<n> → EXEMPT (never a bare `.git`)
+  const sub = path.join(tmp, "sub");
+  await initRepo(sub);
+  await commit(sub, "s.txt", "s", "c1");
+  const sup = path.join(root, "super");
+  await initRepo(sup);
+  await commit(sup, "f.txt", "x", "c1");
+  await git(sup, "-c", "protocol.file.allow=always", "submodule", "add", `file://${sub}`, "mod");
+  expect(await inTreeWorktreeParentRel(root, path.join(sup, "mod"))).toBeUndefined();
 });
 
 test("apply removes op-state DIRECTORIES the sender no longer has (empty rebase-merge/ = phantom rebase)", async () => {

@@ -73,6 +73,63 @@ export async function readHead(ctx: RepoCtx): Promise<string> {
   return (await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8")).trim();
 }
 
+/** Design 68 §3.3 — for a repo dir, the POSIX relPath (from `root`) of the in-tree MAIN
+ *  CLONE that owns it as a LINKED worktree, or undefined when it is NOT an in-tree linked
+ *  worktree: an ordinary dir repo, a submodule checkout, or a worktree whose main clone
+ *  lives outside `root`. Submodules are EXEMPT (V14): their `commonDir` resolves into
+ *  `.git/modules/…` (basename is the module name, never a bare `.git`), and the superproject
+ *  stays structurally refused, so no parent bundle would carry the module store — skipping
+ *  them would regress design-43 support. Used to policy-skip the pointer's full-store
+ *  capture (its history rides the in-tree main clone's bundle instead). */
+export async function inTreeWorktreeParentRel(root: string, repoDir: string): Promise<string | undefined> {
+  const ctx = await repoCtx(repoDir);
+  if (!ctx || ctx.kind !== "pointer") return undefined;
+  if (path.basename(ctx.commonDir) !== ".git") return undefined; // submodule checkout → exempt
+  const mainTop = path.dirname(ctx.commonDir);
+  const rootReal = await fs.realpath(root).catch(() => path.resolve(root));
+  const mainReal = await fs.realpath(mainTop).catch(() => path.resolve(mainTop));
+  const rel = path.relative(rootReal, mainReal);
+  if (rel === "") return "."; // the sync root itself is the main clone
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return undefined; // out-of-tree main clone → unchanged full capture
+  return rel.split(path.sep).join("/"); // POSIX relPath, matching discoverGitRepos keys
+}
+
+/** One entry from `git worktree list --porcelain` — enough for branch-collision checks.
+ *  `prunable` marks a stale entry (`git worktree prune` case), which design 68 treats
+ *  as absent for apply collisions and live-worktree bookkeeping. */
+export interface WorktreeEntry {
+  path: string;
+  /** full refname (refs/heads/…) the worktree has checked out; undefined when detached. */
+  branch?: string;
+  prunable: boolean;
+}
+
+/** Parse `git worktree list --porcelain` into structured entries. Never throws (a repo
+ *  with no worktrees dir simply lists its single main entry; an error → []). */
+export async function listWorktrees(repoDir: string): Promise<WorktreeEntry[]> {
+  const out = await git(repoDir, ["worktree", "list", "--porcelain"]).catch(() => "");
+  const entries: WorktreeEntry[] = [];
+  let cur: (Partial<WorktreeEntry> & { path?: string }) | undefined;
+  const flush = () => {
+    if (cur?.path) entries.push({ path: cur.path, branch: cur.branch, prunable: cur.prunable ?? false });
+    cur = undefined;
+  };
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      flush();
+      cur = { path: line.slice("worktree ".length), prunable: false };
+    } else if (!cur) {
+      continue;
+    } else if (line.startsWith("branch ")) {
+      cur.branch = line.slice("branch ".length);
+    } else if (line.startsWith("prunable")) {
+      cur.prunable = true;
+    }
+  }
+  flush();
+  return entries;
+}
+
 /** "ref: refs/heads/x" → "refs/heads/x"; detached (40-hex) → undefined. */
 export function headBranchOf(head: string): string | undefined {
   const m = /^ref: (refs\/heads\/\S+)$/.exec(head.trim());

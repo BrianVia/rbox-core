@@ -36,39 +36,6 @@ export class AccountAlreadyBootstrappedError extends Error {
   }
 }
 
-/** A network call exhausted its transient-retry budget (or hit a non-retryable
- *  transient like a caller cancellation surfacing as a fault). Carries a HUMAN message so the
- *  raw Bun fetch string ("pass `verbose: true` in the second argument to fetch()") never reaches
- *  a user. Sync-path calls keep the default safe-rerun hint; minting calls pass a stricter
- *  check-before-rerun hint. The original fault is kept on `cause` for logs/telemetry — never
- *  printed. Distinct from every HTTP-derived typed error above: those come from a Response;
- *  this one is a THROWN transport fault. */
-export const DEFAULT_NETWORK_RERUN_HINT = "safe to re-run: already-uploaded data is skipped";
-export const WORKSPACE_MINT_RERUN_HINT = "the request may or may not have completed — check `rbox status` or your workspaces list before re-running";
-export const PAIR_TOKEN_MINT_RERUN_HINT = "the request may or may not have completed — check `rbox device list` for pair tokens before re-running";
-
-export class NetworkError extends Error {
-  constructor(
-    public readonly op: string,
-    public readonly cause?: unknown,
-    public readonly rerunHint: string = DEFAULT_NETWORK_RERUN_HINT
-  ) {
-    super(networkMessage(op, cause, rerunHint));
-    this.name = "NetworkError";
-  }
-}
-
-/** True when a fault is our own request-deadline abort (AbortSignal.timeout → TimeoutError),
- *  so the message can say "timed out" vs the generic "connection dropped". */
-function isTimeoutCause(cause: unknown): boolean {
-  return !!cause && typeof cause === "object" && (cause as { name?: unknown }).name === "TimeoutError";
-}
-
-function networkMessage(op: string, cause: unknown, rerunHint: string): string {
-  const how = isTimeoutCause(cause) ? "timed out" : "dropped";
-  return `connection to rbox ${how} while ${op} — ${rerunHint}`;
-}
-
 export type QuotaKind = "storage" | "workspaces";
 
 function quotaMessage(kind: QuotaKind, used?: number, cap?: number): string {
