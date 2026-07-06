@@ -1,20 +1,24 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
 import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
+import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
 
 export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Array): Promise<void> {
-  const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
+  // Content-addressed → idempotent: a retried PUT of the same sha writes identical bytes.
+  const res = await ctx.fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
     method: "PUT",
     headers: ctx.protoAuth,
     body: bytes,
-  });
+  }, { op: "uploading data", timeoutMs: transferTimeoutMs(bytes.byteLength) });
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
@@ -24,9 +28,15 @@ export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Ar
 }
 
 export async function getBlob(ctx: RemoteContext, sha256: string): Promise<Buffer> {
-  const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload });
-  if (!res.ok) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
-  return Buffer.from(await res.arrayBuffer());
+  // Buffered GET (small blobs / manifests): a flat-generous deadline — the size is unknown up
+  // front, so we can't scale it and can't watch progress the way the streaming path does. Safe
+  // to retry (a GET is idempotent). Large blobs take the streaming getBlobToFile path instead.
+  const got = await fetchBufferedGet(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload }, {
+    op: "downloading data",
+    timeoutMs: BUFFERED_GET_TIMEOUT_MS,
+  });
+  if (!got.ok) throw new Error(translateRemoteError(got.response.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
+  return Buffer.from(got.body);
 }
 
 /**
@@ -36,12 +46,20 @@ export async function getBlob(ctx: RemoteContext, sha256: string): Promise<Buffe
  */
 export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
   if (size <= SINGLE_PUT_MAX) {
-    const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
-      method: "PUT",
-      headers: { ...ctx.protoAuth, "content-length": String(size) },
-      body: fileStream(absPath),
-      duplex: "half",
-    } as RequestInit);
+    // Content-addressed → idempotent: a retried streamed PUT re-sends the same file bytes.
+    // A socket close during the upload body surfaces as a thrown fetch fault (not a Response),
+    // so the retry re-drives the whole PUT. NB: the body is a fresh fileStream PER attempt —
+    // retryTransient re-invokes this thunk, so a consumed/again-un-consumable stream can't leak.
+    const res = await retryTransient(
+      () =>
+        fetchWithDeadline(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
+          method: "PUT",
+          headers: { ...ctx.protoAuth, "content-length": String(size) },
+          body: fileStream(absPath),
+          duplex: "half",
+        } as RequestInit, transferTimeoutMs(size)),
+      { op: "uploading data" }
+    );
     if (res.status !== 413) {
       if (!res.ok) {
         const { quota, text } = await readQuotaExceeded(res);
@@ -59,31 +77,62 @@ export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: s
 }
 
 /** Stream a blob to `destPath`, hashing as it lands; verify before returning.
- *  Any failure (network, write, or hash mismatch) removes the partial file. */
+ *  Any failure (network, write, or hash mismatch) removes the partial file.
+ *
+ *  Deadline design (design 45, extended): a flat cap would kill a legitimately slow multi-GB
+ *  download, so instead of one deadline we use a NO-PROGRESS watchdog — an AbortController that
+ *  fires only if no bytes arrive for {@link DOWNLOAD_IDLE_MS}, reset on every chunk. This is the
+ *  fix for the 110-minute black-holed fetch (a stuck socket at 0 CPU): a stalled stream trips the
+ *  watchdog, which the retry loop treats as transient and re-drives (a GET is idempotent). A hash
+ *  mismatch is NOT transient and propagates on the first attempt. */
 export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string): Promise<void> {
-  const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload });
-  if (!res.ok || !res.body) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
-  const hash = createHash("sha256");
-  const out = fs.createWriteStream(destPath);
-  const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+  await retryTransient(() => downloadToFileOnce(ctx, sha256, destPath), { op: "downloading data" });
+}
+
+async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: string): Promise<void> {
+  const ctrl = new AbortController();
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  const armIdle = () => {
+    if (idle) clearTimeout(idle);
+    // A stalled stream is transient — tag the abort as a TimeoutError so the predicate retries it.
+    idle = setTimeout(() => ctrl.abort(new DOMException("download stalled", "TimeoutError")), DOWNLOAD_IDLE_MS);
+  };
+  armIdle();
   try {
+    const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload, signal: ctrl.signal });
+    if (!res.ok || !res.body) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    const hash = createHash("sha256");
+    const out = fs.createWriteStream(destPath, { flags: "w" }); // every retry starts from byte 0
+    const written = finished(out);
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value) {
+        armIdle(); // progress → reset the no-progress watchdog
+        if (value?.byteLength) {
           hash.update(value);
-          if (!out.write(value)) await new Promise<void>((r) => out.once("drain", () => r()));
+          if (!out.write(value)) await once(out, "drain");
         }
       }
-    } finally {
       out.end();
+      await written;
+      const actual = hash.digest("hex");
+      if (actual !== sha256) throw new Error(`download integrity mismatch: wanted ${sha256}, got ${actual}`);
+    } catch (e) {
+      await reader.cancel().catch(() => {});
+      if (!out.destroyed) out.destroy();
+      await written.catch(() => {});
+      await fsp.rm(destPath, { force: true }).catch(() => {});
+      throw e;
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Best-effort cleanup only; preserve the original network/write/hash failure.
+      }
     }
-    await new Promise<void>((resolve, reject) => out.on("finish", () => resolve()).on("error", reject));
-    const actual = hash.digest("hex");
-    if (actual !== sha256) throw new Error(`download integrity mismatch: wanted ${sha256}, got ${actual}`);
-  } catch (e) {
-    await fsp.rm(destPath, { force: true }).catch(() => {});
-    throw e;
+  } finally {
+    if (idle) clearTimeout(idle);
   }
 }

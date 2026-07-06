@@ -6,6 +6,7 @@
  * commits, keys) reads and mutates ONE instance held by `RboxApi`.
  */
 import { translateRemoteError } from "./errors.js";
+import { fetchResilient, type ResilientOpts } from "./resilient.js";
 
 export class RemoteContext {
   constructor(
@@ -48,17 +49,30 @@ export class RemoteContext {
     if (typeof body.receipt === "string") this.receipts.set(sha256, body.receipt);
   }
 
-  async postJson(path: string, body: unknown): Promise<Response> {
-    return fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.auth, "content-type": "application/json" }, body: JSON.stringify(body) });
+  /**
+   * The shared response-returning fetch seam for the control plane. Most domain modules
+   * (blobs, multipart, commits, keys) issue requests through here so the abort deadline +
+   * bounded transient retry live in a single place; buffered blob GET uses a GET-specific
+   * helper because its OK body read must also sit inside the deadline. Defaults to the
+   * small-control-call timeout and the default retry budget; transfers override `timeoutMs`
+   * (size-aware) and non-idempotent minting calls override `retries: 0`. An HTTP Response of
+   * any status is returned as-is — only a THROWN transport fault is retried/translated.
+   */
+  fetch(url: string, init: RequestInit = {}, opts: ResilientOpts = {}): Promise<Response> {
+    return fetchResilient(url, init, opts);
+  }
+
+  async postJson(path: string, body: unknown, opts: ResilientOpts = {}): Promise<Response> {
+    return this.fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.auth, "content-type": "application/json" }, body: JSON.stringify(body) }, opts);
   }
 
   async missingBlobs(shas: string[]): Promise<string[]> {
     if (shas.length === 0) return [];
-    const res = await fetch(`${this.baseUrl}/v1/blobs/check`, {
+    const res = await this.fetch(`${this.baseUrl}/v1/blobs/check`, {
       method: "POST",
       headers: { ...this.protoAuth, "content-type": "application/json" },
       body: JSON.stringify({ shas }),
-    });
+    }, { op: "checking which blobs to upload" });
     if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
     return ((await res.json()) as { missing: string[] }).missing;
   }
