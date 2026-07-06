@@ -1,6 +1,6 @@
 {
   "name": "@rbox/core",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "type": "module",
   "description": "rbox sync engine (Phase 1: locally-testable core)",

@@ -6,6 +6,22 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-07-06 — status honesty + capture fixes
+
+### Changed
+- **`rbox status` never lies about liveness.** A fresh active cycle leads with
+  its live percentage; a standing failure renders in amber beneath it as
+  "last attempt failed … — will be retried"; "sync halted" (red) is gone —
+  a live daemon always retries. "git-sync: 0 repos synced" during a first
+  publish now reports capture progress instead of implying idleness.
+
+### Fixed
+- **Case-drifted symbolic HEAD no longer permanently defers a repo's git
+  capture** (macOS case-insensitive checkouts: HEAD casing vs packed-refs
+  casing). Capture normalizes to the ref store's casing; self-validation
+  failures now report the real reason instead of "capture returned nothing."
+
+
 ## [0.9.0] — 2026-07-06 — worktree git-sync, live progress, network resilience, fast status
 
 Born from a founder stress test: a first push over a 140-repo, 131k-file
