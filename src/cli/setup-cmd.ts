@@ -23,7 +23,7 @@
  */
 import os from "node:os";
 import { runInit } from "./init-cmd.js";
-import { collapseHome } from "./init-plan.js";
+import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaRecovery } from "./e2ee-client.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
@@ -47,6 +47,28 @@ export function workspaceFlags(plan: { kind: "new" | "join"; root: string; works
   // absent and status falls back to the id.
   if (plan.name) flags.name = plan.name;
   return flags;
+}
+
+/** Step 3 · Start syncing. One `select` replaced the old keep→resume double-confirm
+ *  (the founder mistook a Y/N for a text field once); "both" is the recommended first
+ *  option so a bare ENTER reproduces the old default:true+ENTER outcome. */
+export type StartSyncChoice = "both" | "start" | "none";
+
+/** The Step-3 choices, exported so the test pins the ORDERED labels+values against
+ *  `startSyncActions` — a re-shuffle or value swap in the live select can't silently
+ *  invert which option starts the daemon / enables autostart. */
+export const START_SYNC_CHOICES = [
+  { name: "Start now and resume after reboot (recommended)", value: "both" },
+  { name: "Start now only", value: "start" },
+  { name: "Not now", value: "none" },
+] as const satisfies ReadonlyArray<{ name: string; value: StartSyncChoice }>;
+
+/** Map the Step-3 choice to its two side effects. Pure so the three-way branching is
+ *  pinned by a unit test without driving the inquirer widget (mirrors `workspaceFlags`
+ *  and `authorizePath`). "both" starts the daemon AND enables autostart; "start" starts
+ *  the daemon only; "none" does neither. */
+export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
+  return { startDaemon: choice !== "none", enableAutostart: choice === "both" };
 }
 
 const HR = "─".repeat(72);
@@ -83,14 +105,19 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
 
   // Step 3 · Start syncing in the background.
   process.stderr.write(`\n── ${e.bold("Step 3 of 3 · Start syncing")} ${HR.slice(0, 38)}\n`);
-  const keep = await promptConfirm({ message: "Keep this workspace syncing in the background?", default: true });
-  if (keep) {
+  const startChoice = await promptSelect<StartSyncChoice>({
+    message: "Keep this workspace syncing in the background?",
+    choices: START_SYNC_CHOICES,
+  });
+  const actions = startSyncActions(startChoice);
+  if (actions.startDaemon) {
     await startDaemonAndRecordDesired(outcome.root);
     process.stderr.write(`${e.green("✓")} Background sync started. Stop anytime with \`rbox stop\`.\n`);
-    const resume = await promptConfirm({ message: "Resume syncing automatically after you reboot?", default: true });
-    if (resume) {
+    if (actions.enableAutostart) {
       await enableAutostart();
       process.stderr.write(`${e.green("✓")} autostart enabled\n`);
+    } else {
+      process.stderr.write(`${e.dim("Enable resume-after-reboot later with `rbox autostart enable`.")}\n`);
     }
   } else {
     process.stderr.write(`${e.dim("Run `rbox start` whenever you're ready.")}\n`);
@@ -326,10 +353,13 @@ async function stepWorkspace(
   // A join reuses the picker's already-known name.
   if (choice === "new") {
     process.stderr.write(`${e.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
-    if (await promptConfirm({ message: "Add a name for this workspace?", default: true })) {
-      const ans = (await promptInput({ message: "Workspace name", default: collapseHome(dir, os.homedir()) })).trim();
-      if (ans) name = ans;
-    }
+    // Single optional input: the suggestion is the default, so a bare ENTER names the
+    // workspace by its directory (what the old confirm→input two-step did on default+
+    // ENTER); "-" is the documented skip (the old confirm's "n" path — keeps it private).
+    const ans = interpretWorkspaceNameAnswer(
+      await promptInput({ message: `Workspace name (Enter accepts, "-" for none)`, default: collapseHome(dir, os.homedir()) })
+    );
+    if (ans) name = ans;
   }
 
   const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir, name } : { kind: "join", root: dir, workspace, name });

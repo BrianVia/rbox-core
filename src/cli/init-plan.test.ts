@@ -5,6 +5,7 @@ import {
   unifyDeviceId,
   collapseHome,
   sanitizeWorkspaceName,
+  interpretWorkspaceNameAnswer,
   MAX_WORKSPACE_NAME,
   type InitInput,
   type CredsView,
@@ -144,6 +145,20 @@ test("sanitizeWorkspaceName: strips control chars/newlines, trims, bounds length
   expect(sanitizeWorkspaceName("line1\nline2\tend")).toBe("line1line2end");
   const long = "x".repeat(MAX_WORKSPACE_NAME + 50);
   expect(sanitizeWorkspaceName(long)!.length).toBe(MAX_WORKSPACE_NAME);
+});
+
+// The single optional name input's answer interpretation: "-" is the discoverable
+// skip sentinel (the retired confirm's "n" path — names are server-visible plaintext,
+// so declining must stay first-class). ONLY the lone dash skips; dashes inside a name
+// must never be treated as a skip.
+test("interpretWorkspaceNameAnswer: lone dash and blank skip; anything else is the trimmed name", () => {
+  expect(interpretWorkspaceNameAnswer("-")).toBeUndefined();
+  expect(interpretWorkspaceNameAnswer("  -  ")).toBeUndefined(); // whitespace-padded dash still skips
+  expect(interpretWorkspaceNameAnswer("")).toBeUndefined();
+  expect(interpretWorkspaceNameAnswer("   ")).toBeUndefined();
+  expect(interpretWorkspaceNameAnswer("my-app")).toBe("my-app"); // dash INSIDE a name is a name
+  expect(interpretWorkspaceNameAnswer("  ~/code/rbox  ")).toBe("~/code/rbox");
+  expect(interpretWorkspaceNameAnswer("--")).toBe("--"); // only exactly "-" skips
 });
 
 test("collapseHome: collapses the home prefix to ~, leaves outside paths untouched", () => {
