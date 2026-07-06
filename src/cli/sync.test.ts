@@ -321,6 +321,23 @@ test("a file that NEVER settles is deferred; the push SUCCEEDS committing the OT
   for (const f of committed.files) if (f.type === "file") expect(remote.hasBlob(f.encSha!)).toBe(true);
 });
 
+test("a file that VANISHES between scan and encrypt is deferred; the push commits the rest", async () => {
+  const remote = new FakeRemote();
+  await write("stable.txt", "stable content\n");
+  await write("ghost.txt", "about to vanish\n");
+
+  const local = await scanManifest(root, undefined, undefined);
+  await fs.rm(path.join(root, "ghost.txt")); // vanished after scan, before encrypt (agent/build churn)
+  const res = await pushManifest(root, cfg, local, deps(remote));
+
+  expect(res.sequence).toBe(1); // committed — one vanished file must not abort the push
+  expect(res.deferred).toEqual(["ghost.txt"]);
+  const committed = (await remote.latest()).manifest;
+  expect(committed.files.some((f) => f.path === "ghost.txt")).toBe(false); // never-synced → omitted
+  expect(committed.files.some((f) => f.path === "stable.txt")).toBe(true);
+  for (const f of committed.files) if (f.type === "file") expect(remote.hasBlob(f.encSha!)).toBe(true);
+});
+
 test("a mismatch ONCE then settles is INCLUDED (bounded per-file retry heals it, not deferred)", async () => {
   const remote = new FakeRemote();
   const content = "flickers once\n";
