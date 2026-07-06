@@ -13,6 +13,7 @@
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
 import { formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
+import type { TransferPhase } from "./transfer-progress.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
 export interface StatusSnapshot {
@@ -112,11 +113,41 @@ const ageLabel = (ageMs: number | undefined): string => {
   return `${Math.max(0, Math.round(ageMs / 1000))}s ago`;
 };
 
-/** `uploading 42% (3,612/8,603)` — shared by spinners and the live status line. */
-export function progressLabel(phase: "encrypt" | "upload" | "download", done: number, total: number): string {
-  const verb = phase === "encrypt" ? "encrypting" : phase === "upload" ? "uploading" : "downloading";
-  // Clamped: a misbehaving producer must render at worst a wrong-but-sane percent,
-  // never `150%` or `NaN%` (total ≤ 0 degenerates to done).
+/** Longest display `detail` (in CODE POINTS, e.g. a repo name) rendered on the
+ *  progress line; a longer one is head-truncated so the meaningful TAIL (the
+ *  basename) survives. */
+const DETAIL_MAX = 40;
+/** Sanitize + truncate a display `detail`. Detail comes from on-disk names (repo
+ *  dirs), i.e. untrusted bytes headed for a terminal: strip ANSI/CSI escape
+ *  sequences and every remaining control char first, then truncate by CODE POINTS
+ *  (Array.from — a `.slice` on UTF-16 units could cut through a surrogate pair and
+ *  emit a lone-surrogate mojibake) keeping the tail. */
+const truncateDetail = (d: string): string => {
+  const clean = d.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "").replace(/\p{Cc}/gu, "");
+  const cps = Array.from(clean);
+  return cps.length > DETAIL_MAX ? `…${cps.slice(-(DETAIL_MAX - 1)).join("")}` : clean;
+};
+
+/**
+ * `uploading 42% (3,612/8,603)` — shared by spinners and the live status line.
+ * Phase-shaped so the two silent-until-now phases read truthfully:
+ *  - `scan` is INDETERMINATE (no known total during a live walk) → count only,
+ *    no percent: `scanning… 12,304 files`.
+ *  - `gitcap` is a per-repo N/total with an optional repo name:
+ *    `capturing git state 3/140 — zen-browser-desktop`.
+ * The determinate phases keep the clamped-percent guard (a misbehaving producer
+ * renders a wrong-but-sane percent, never `150%`/`NaN%`).
+ */
+export function progressLabel(phase: TransferPhase, done: number, total: number, detail?: string): string {
+  if (phase === "scan") return `scanning… ${n(done)} files`;
+  if (phase === "gitcap") {
+    const suffix = detail ? ` — ${truncateDetail(detail)}` : "";
+    return `capturing git state ${n(done)}/${n(total)}${suffix}`;
+  }
+  // Determinate transfer phases. The final `?? "syncing"` is a defensive fallback so a
+  // phase string an OLDER daemon never wrote (read from the user-editable activity file)
+  // degrades to a sane verb rather than a misleading "downloading".
+  const verb = phase === "encrypt" ? "encrypting" : phase === "upload" ? "uploading" : phase === "download" ? "downloading" : "syncing";
   const pct = total > 0 ? Math.min(100, Math.max(0, Math.floor((done / total) * 100))) : 100;
   return `${verb} ${pct}% (${n(done)}/${n(total)})`;
 }

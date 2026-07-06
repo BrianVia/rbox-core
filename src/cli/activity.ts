@@ -14,6 +14,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
 import { RBOX_DIR } from "./config.js";
+import type { TransferPhase } from "./transfer-progress.js";
+
+/** The transfer phases the activity sidecar accepts. The daemon only ever writes a
+ *  subset (it never emits `scan` — its full/deep scans don't wire progress), but a
+ *  forward-compatible read must not drop a phase a newer writer might land. */
+const TRANSFER_PHASES: readonly TransferPhase[] = ["scan", "gitcap", "encrypt", "upload", "download"];
+const isTransferPhase = (v: unknown): v is TransferPhase => TRANSFER_PHASES.includes(v as TransferPhase);
 
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
@@ -37,7 +44,7 @@ export interface DaemonActivity {
   lastPull?: { at: string; writes: number; deletes: number; conflicts: number };
   /** Live transfer progress; present only mid-op. Status ignores it when older
    *  than {@link ACTIVE_STALE_MS} — a crashed daemon must not show "syncing" forever. */
-  active?: { at: string; phase: "encrypt" | "upload" | "download"; done: number; total: number };
+  active?: { at: string; phase: TransferPhase; done: number; total: number };
   /** Standing warning set by the pump's error path, cleared ONLY by a later success
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
@@ -94,7 +101,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       a.lastPull = { at: pull.at, writes: pull.writes, deletes: pull.deletes, conflicts: pull.conflicts };
     }
     const act = raw.active;
-    if (act && typeof act.at === "string" && (act.phase === "encrypt" || act.phase === "upload" || act.phase === "download") && num(act.done) && num(act.total)) {
+    if (act && typeof act.at === "string" && isTransferPhase(act.phase) && num(act.done) && num(act.total)) {
       a.active = { at: act.at, phase: act.phase, done: act.done, total: act.total };
     }
     const halt = raw.halt;
@@ -149,7 +156,11 @@ export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "out
  *   `v1 <epochSeconds> <state> <pct> <sequence> <lastOpEpoch> <lastOpKind> <name>`
  *
  * - `state` precedence: `halt` > `outofstorage` > `active` > `pending` (unsettled) > `ok` (settled).
- * - `pct` — floor(done/total*100) clamped 0–100 for `active` (total<=0 → 100), else `-`.
+ * - `pct` — floor(done/total*100) clamped 0–100 for a determinate `active`; `-` for an
+ *   INDETERMINATE active phase (total<=0, e.g. a live scan — a fake "100" would render
+ *   `↻ 100%` for minutes) and when not active at all. `-` has been a legal pct token
+ *   since v1 (the installed zsh snippet's regex pins pct to `([0-9]{1,3}|-)` and its
+ *   glyph renders `↻` alone for `-`), so already-installed stale snippets degrade sanely.
  * - `sequence` — last synced sequence; `-` when none (0 = never synced ⇒ `-`).
  * - `lastOpEpoch`/`lastOpKind` — the MORE RECENT of lastPush/lastPull (`push`/`pull`);
  *   `- -` when neither.
@@ -162,9 +173,9 @@ export function renderShellLine(
   const state = shellStateOf(a, opts.settled);
 
   let pct: string | number = "-";
-  if (a.active) {
+  if (a.active && a.active.total > 0) {
     const { done, total } = a.active;
-    pct = total <= 0 ? 100 : Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
+    pct = Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
   }
 
   // Sequence 0 = never synced (the daemon seeds it from a fresh baseline) — that's

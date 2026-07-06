@@ -4,6 +4,7 @@ import path from "node:path";
 import { encryptFileToTemp, poolMap, type FileEntry, type Manifest, type PhaseReport } from "../engine/index.js";
 import { BlobShaMismatchError, type SyncRemote } from "./remote.js";
 import type { WorkspaceConfig } from "./config.js";
+import type { TransferProgress } from "./transfer-progress.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -55,7 +56,7 @@ export async function encryptAndUpload(
   local: Manifest,
   base: Manifest,
   report: PhaseReport,
-  onProgress: ((done: number, total: number, phase: "encrypt" | "upload" | "download") => void) | undefined,
+  onProgress: TransferProgress | undefined,
   backoff: (attempt: number) => Promise<void>
 ): Promise<{ deferred: Set<string> }> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts

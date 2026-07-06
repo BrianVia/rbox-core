@@ -9,13 +9,14 @@ import { requireCredentials, type Credentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { accountHex16, defaultKitTargetDir, displayPath, localYmd } from "./recovery-kit.js";
 import { progressLabel } from "./status-view.js";
+import type { TransferProgress } from "./transfer-progress.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { spinner } from "./spinner.js";
 import { style } from "./style.js";
 
 const MARKER_NAME = "rbox-export.json";
 
-type PullProgress = (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
+type PullProgress = TransferProgress;
 
 function sanitizeWorkspaceName(name: string): string {
   return name

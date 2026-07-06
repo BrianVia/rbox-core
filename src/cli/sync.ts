@@ -19,6 +19,7 @@ import {
   planGitSections,
 } from "./sync-git.js";
 import { deferManifest, encryptAndUpload, reportDeferred } from "./sync-recovery.js";
+import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, saveState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { openTrashBatch } from "../engine/trash.js";
 import { RboxApi, type SyncRemote } from "./remote.js";
@@ -40,6 +41,11 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
 const defaultBackoff = (attempt: number) => sleep(Math.min(2000, 100 * 2 ** attempt) * (0.5 + Math.random()));
 
+/** Adapt `deps.onProgress` into the engine scan's discovery callback: the walk reports a
+ *  running count with no known total, which surfaces as the indeterminate `scan` phase. */
+const scanTick = (deps: SyncDeps): ((discovered: number) => void) | undefined =>
+  deps.onProgress ? (discovered) => deps.onProgress!(discovered, 0, "scan") : undefined;
+
 /** Plaintext byte total / file-entry count of a manifest (the §35 "plaintext bytes" basis
  *  + file count). Computed only on the metrics-enabled path (each is an O(files) pass). */
 const plaintextBytesOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.type === "file" ? f.size : 0), 0);
@@ -58,10 +64,11 @@ export interface SyncDeps {
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
    *  tally retry pressure without sync.ts doing metrics I/O (design 09 §3). */
   onCommitConflict?: () => void;
-  /** Progress for the long phases of sync (encrypt+upload on push; download on
-   *  pull). The CLI renders it on the spinner; the daemon ignores it. `done`/`total`
-   *  are blob/entry counts. */
-  onProgress?: (done: number, total: number, phase: "encrypt" | "upload" | "download") => void;
+  /** Progress for the long phases of sync (scan + git-capture + encrypt + upload on
+   *  push; download on pull). The CLI renders it on the spinner; the daemon records the
+   *  coarse `{phase,done,total}` into its activity sidecar. `done`/`total` are
+   *  entry/blob/repo counts (`total === 0` = indeterminate, e.g. a live scan). */
+  onProgress?: TransferProgress;
   /** Optional per-run phase-timing collector (design §35). Defaulted off; when absent,
    *  the sync path uses a disabled no-op report that allocates nothing — so the daemon's
    *  hot path and no-op tick stay free unless metrics are explicitly enabled. */
@@ -118,7 +125,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = buildIgnoreMatcher(root);
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache));
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
@@ -239,7 +246,7 @@ export async function push(
 ): Promise<{ sequence: number; committed: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await report.phase("scan", () => scanManifest(root, undefined, cache));
+  const local = await report.phase("scan", () => scanManifest(root, undefined, cache, scanTick(deps)));
   await save();
   if (report.enabled) {
     report.files = fileCountOf(local);
@@ -321,7 +328,7 @@ export async function pushManifest(
       await backoff(attempt);
       await pull(root, cfg, deps);
       const { cache, save } = await withCache(root, deps.cache);
-      currentLocal = await scanManifest(root, undefined, cache); // disk changed under us
+      currentLocal = await scanManifest(root, undefined, cache, scanTick(deps)); // disk changed under us
       await save();
       currentForce = NO_GIT_FORCE;
     } else {
@@ -372,7 +379,7 @@ async function runPushAttempt(
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher);
+  const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress);
   local = { ...local, manifestSchema: gitPlan.gitRepos ? 2 : local.manifestSchema, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {

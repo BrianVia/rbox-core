@@ -849,3 +849,40 @@ test("gitDivergenceCount honors needsResolution suppression before preflight (co
   await commitFile(p1, "c.txt", "v3", "c3");
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
 });
+
+// ── gitcap progress (the long silent phase on a repo-heavy first push) ───────────
+
+test("push emits gitcap progress per CAPTURED repo — monotonic settle count, repo names as detail, capture-scoped total", async () => {
+  const alpha = path.join(rootA, "alpha");
+  await initRepo(alpha);
+  await commitFile(alpha, "a.txt", "a", "c1");
+  const beta = path.join(rootA, "sub", "beta");
+  await initRepo(beta);
+  await commitFile(beta, "b.txt", "b", "c1");
+
+  type Ev = { done: number; total: number; detail?: string };
+  const cap = (): { events: Ev[]; deps: SyncDeps } => {
+    const events: Ev[] = [];
+    return {
+      events,
+      deps: { ...depsA, onProgress: (done, total, phase, detail) => phase === "gitcap" && events.push({ done, total, detail }) },
+    };
+  };
+
+  const first = cap();
+  await push(rootA, cfgA, first.deps);
+  // One event per repo that was actually captured (both are new).
+  expect(first.events.length).toBe(2);
+  // Total is the CAPTURE set, not every discovered repo, and stays fixed across the run.
+  expect(first.events.every((e) => e.total === 2)).toBe(true);
+  // `done` is a monotonic completed-count under bounded concurrency → 1 then 2.
+  expect(first.events.map((e) => e.done).sort((x, y) => x - y)).toEqual([1, 2]);
+  // Detail is the repo basename (a nested repo shows its own name, not the path).
+  expect(new Set(first.events.map((e) => e.detail))).toEqual(new Set(["alpha", "beta"]));
+
+  // A second push with nothing changed CARRIES both repos (no capture) → zero gitcap
+  // events. Proves the denominator is capture-scoped, not repo-count-scoped.
+  const second = cap();
+  await push(rootA, cfgA, second.deps);
+  expect(second.events.length).toBe(0);
+});

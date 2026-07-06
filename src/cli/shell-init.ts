@@ -144,7 +144,9 @@ _rbox_banner() {
       msg+=\$_RBOX_C_OFF
       ;;
     pending) msg="\${_RBOX_C_YELLOW}rbox: \$n ↑ syncing…\$_RBOX_C_OFF" ;;
-    active)  msg="\${_RBOX_C_CYAN}rbox: \$n ↻ \${_RBOX_PCT}%\$_RBOX_C_OFF" ;;
+    active)  msg="\${_RBOX_C_CYAN}rbox: \$n ↻ \${_RBOX_PCT}%\$_RBOX_C_OFF"
+             # Indeterminate phase (pct '-', e.g. a live scan): glyph only, no '-%'.
+             [[ \$_RBOX_PCT == - ]] && msg="\${_RBOX_C_CYAN}rbox: \$n ↻\$_RBOX_C_OFF" ;;
     halt)    msg="\${_RBOX_C_RED}rbox: \$n ⚠ sync halted — run \\\`rbox status\\\`\$_RBOX_C_OFF" ;;
     stale)   msg="\${_RBOX_C_DIM}rbox: \$n ○ background sync not running — rbox start\$_RBOX_C_OFF" ;;
     missing) msg="\${_RBOX_C_DIM}rbox: ○ background sync not running — rbox start\$_RBOX_C_OFF" ;;

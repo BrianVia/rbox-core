@@ -22,13 +22,29 @@ export interface WatchEvent {
  * turning a full scan into a stat-only pass for the common case. The cache is a
  * fast-path hint only; identity is still the content sha (see FileEntry).
  */
+/** How often {@link scanManifest}'s optional discovery callback fires — every Nth
+ *  entry, so the caller's spinner moves during a long walk without paying a callback
+ *  per file on a huge tree. */
+const SCAN_PROGRESS_STRIDE = 500;
+
 export async function scanManifest(
   root: string,
   matcher: IgnoreMatcher = buildIgnoreMatcher(root),
-  cache?: HashCache
+  cache?: HashCache,
+  /** Optional discovery progress: called with the running discovered-entry count
+   *  every {@link SCAN_PROGRESS_STRIDE} entries (and never with a total — a live walk
+   *  has no known total). Display-only; the CLI renders it as the indeterminate
+   *  `scanning… N files` phase. */
+  onProgress?: (discovered: number) => void
 ): Promise<Manifest> {
   const files: FileEntry[] = [];
-  await walk(root, "", matcher, files, cache);
+  let discovered = 0;
+  const onDiscover = onProgress
+    ? () => {
+        if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
+      }
+    : undefined;
+  await walk(root, "", matcher, files, cache, undefined, onDiscover);
   files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return { generatedAt: new Date().toISOString(), files };
 }
@@ -191,7 +207,8 @@ async function walk(
   matcher: IgnoreMatcher,
   out: FileEntry[],
   cache?: HashCache,
-  pending?: PendingHash[]
+  pending?: PendingHash[],
+  onDiscover?: () => void
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
@@ -205,9 +222,10 @@ async function walk(
 
     if (entry.isDirectory()) {
       if (matcher.ignores(`${childRel}/`)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash);
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover);
     } else if (entry.isSymbolicLink()) {
       if (matcher.ignores(childRel)) continue;
+      onDiscover?.();
       const target = await fs.readlink(abs);
       out.push({
         path: childRel,
@@ -220,6 +238,7 @@ async function walk(
       });
     } else if (entry.isFile()) {
       if (matcher.ignores(childRel)) continue;
+      onDiscover?.();
       const st = await fs.stat(abs);
       const cached = cache?.lookup(childRel, st.mtimeMs, st.size);
       if (cached) {

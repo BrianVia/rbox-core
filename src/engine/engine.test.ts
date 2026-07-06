@@ -157,3 +157,26 @@ test("no spurious sync: changing only mtime is not a content change", async () =
   expect(d.changed).toEqual([]);
   expect(d.deleted).toEqual([]);
 });
+
+// scanManifest's optional discovery callback drives the CLI's indeterminate `scan`
+// spinner. It must fire on a running count as the recursive walk crosses the stride,
+// across nested directories — proving the counter is threaded through recursion, not
+// reset per directory.
+test("scanManifest reports discovery progress every 500 entries across the recursive walk", async () => {
+  const TOTAL = 1050;
+  // Spread across nested dirs so the recursion (not a single readdir) is exercised.
+  await Promise.all(
+    Array.from({ length: TOTAL }, (_, i) => write(A, `d${i % 7}/sub${i % 3}/f${i}.txt`, `x${i}`))
+  );
+  const ticks: number[] = [];
+  const m = await scanManifest(A, undefined, undefined, (n) => ticks.push(n));
+  expect(m.files.length).toBe(TOTAL);
+  // 1050 entries → callbacks at 500 and 1000 (stride 500), and only those.
+  expect(ticks).toEqual([500, 1000]);
+});
+
+test("scanManifest omits progress entirely when no callback is given (no-op fast path)", async () => {
+  await write(A, "a.txt", "a");
+  const m = await scanManifest(A); // 3-arg call — the callback is optional
+  expect(m.files.length).toBe(1);
+});

@@ -16,6 +16,7 @@ import { loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./co
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
+import type { TransferPhase } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { lowerIoPriority } from "./io-priority.js";
@@ -138,6 +139,7 @@ export class RboxDaemon {
   private activityDirty = false; // a `last`/halt change that must persist un-throttled
   private lastActivityWrite = 0;
   private lastProgressWrite = 0;
+  private lastProgressPhase: TransferPhase | undefined;
   private ownershipWindDownStarted = false;
   private readonly bootId: string;
 
@@ -673,11 +675,18 @@ export class RboxDaemon {
     this.activityDirty = true;
   }
 
-  /** Live transfer progress → activity sidecar, throttled to ~2 writes/s (plus the
-   *  final tick) so a big upload isn't bottlenecked on progress bookkeeping. */
-  private onTransferProgress(done: number, total: number, phase: "encrypt" | "upload" | "download"): void {
+  /** Live transfer progress → activity sidecar, throttled to ~2 writes/s so a big
+   *  transfer isn't bottlenecked on progress bookkeeping. Two ticks bypass the
+   *  throttle: a phase's FINAL tick (determinate phases only — an indeterminate
+   *  tick has total===0 and is never final, so a huge scan can't queue a write per
+   *  stride) and a phase CHANGE (a gitcap→encrypt transition must show immediately,
+   *  not after up to 500ms of the stale phase). */
+  private onTransferProgress(done: number, total: number, phase: TransferPhase): void {
     const now = Date.now();
-    if (done < total && now - this.lastProgressWrite < 500) return;
+    const final = total > 0 && done >= total;
+    const phaseChanged = phase !== this.lastProgressPhase;
+    if (!final && !phaseChanged && now - this.lastProgressWrite < 500) return;
+    this.lastProgressPhase = phase;
     this.lastProgressWrite = now;
     this.activity.active = { at: new Date().toISOString(), phase, done, total };
     this.writeActivity();
