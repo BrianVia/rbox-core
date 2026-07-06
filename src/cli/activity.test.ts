@@ -27,7 +27,7 @@ test("round-trips the full record", async () => {
     lastPush: { at: "2026-07-02T11:58:00.000Z", files: 3, sequence: 78 },
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
-    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull" },
+    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", terminal: { fingerprint: "sidecar-sha" } },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
   };
   await saveActivity(root, a);
@@ -110,6 +110,8 @@ test("renderShellLine state precedence: fresh active can show a retry over halt,
 
   // A fresh retry should show the active glyph even while the older halt is still recorded.
   expect(renderShellLine({ at: "", active, halt }, base).split(" ")[2]).toBe("active");
+  // Terminal halts are not retry progress: they stay blocked even with fresh active state.
+  expect(renderShellLine({ at: "", active, halt: { ...halt, terminal: { fingerprint: "fp" } } }, base).split(" ")[2]).toBe("halt");
   // A stale active record must not mask a halt.
   expect(renderShellLine({ at: "", active: staleActive, halt }, base).split(" ")[2]).toBe("halt");
   // quota is soft but outranks live progress

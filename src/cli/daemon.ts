@@ -21,6 +21,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { lowerIoPriority } from "./io-priority.js";
 import { QuotaExceededError, RboxApi } from "./remote.js";
+import { CommitRejectedError } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 import { runUpdateCheckIfDue } from "./update-check.js";
 
@@ -121,6 +122,8 @@ export class RboxDaemon {
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
   private errRepeat = 0;
+  private pushTerminalBlocked = false;
+  private lastTerminalBlockFingerprint = "";
   private lastLoggedSeq?: number;
   /** While quota-blocked, only a safety full-scan arms one upload probe. */
   private outOfStorageProbeArmed = false;
@@ -322,6 +325,7 @@ export class RboxDaemon {
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
         try {
           let pushedToRemote = false;
+          this.pushTerminalBlocked = false;
           this.want[op] = false;
           if (op === "deepScan") {
             await this.doDeepScan();
@@ -352,9 +356,10 @@ export class RboxDaemon {
           // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
           // Persist when something visible changed (or as a throttled heartbeat, so
           // `rbox status` can say "last checked: Ns ago" without idle disk churn).
-          const heals = this.activity.halt !== undefined && this.activity.halt.op === op;
+          const terminalBlocked = op === "push" && this.pushTerminalBlocked;
+          const heals = !terminalBlocked && this.activity.halt !== undefined && this.activity.halt.op === op;
           const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
-          const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage;
+          const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
           this.activity.active = undefined;
           if (heals) {
             this.activity.halt = undefined;
@@ -382,6 +387,22 @@ export class RboxDaemon {
             const visibleChanged = this.recordOutOfStorage(e, op);
             if (shouldLogRepeat) log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
             if (visibleChanged || shouldLogRepeat) this.writeActivity();
+            await sleep(jitter(1000));
+            continue;
+          }
+          if (e instanceof CommitRejectedError) {
+            this.activity.active = undefined;
+            this.activity.halt = {
+              at: new Date().toISOString(),
+              reason: msg,
+              count: this.errRepeat,
+              op,
+              ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
+            };
+            if (shouldLogRepeat) {
+              log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              this.writeActivity();
+            }
             await sleep(jitter(1000));
             continue;
           }
@@ -413,17 +434,29 @@ export class RboxDaemon {
   private async doPush(): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     await this.applyPendingWatchEvents();
+    const blockedFingerprint = this.terminalPushBlock();
     const report = beginReport("push");
-    const res = await pushManifest(this.root, this.cfg, this.manifest, {
-      ...this.e2ee,
-      cache: this.cache,
-      onCommitConflict: () => this.bumpConflict("commit"),
-      report,
-      onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
-      onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
-      onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
-      onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
-    });
+    let res: Awaited<ReturnType<typeof pushManifest>>;
+    try {
+      res = await pushManifest(this.root, this.cfg, this.manifest, {
+        ...this.e2ee,
+        cache: this.cache,
+        blockedFingerprint,
+        onCommitConflict: () => this.bumpConflict("commit"),
+        report,
+        onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
+        onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
+        onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
+        onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
+      });
+    } catch (e) {
+      if (e instanceof CommitRejectedError && e.stillBlocked) {
+        this.pushTerminalBlocked = true;
+        this.logTerminalPushBlocked(e.fingerprint);
+        return;
+      }
+      throw e;
+    }
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
     // resulting tree size and anything it had to defer. Gated on `committed` (design 44):
@@ -453,6 +486,19 @@ export class RboxDaemon {
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
     report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
+  }
+
+  private terminalPushBlock(): string | undefined {
+    const halt = this.activity.halt;
+    if (!halt || halt.op !== "push") return undefined;
+    return halt.terminal?.fingerprint;
+  }
+
+  private logTerminalPushBlocked(fingerprint: string | undefined): void {
+    if (!fingerprint || this.lastTerminalBlockFingerprint === fingerprint) return;
+    this.lastTerminalBlockFingerprint = fingerprint;
+    const reason = this.activity.halt?.reason ?? "push is blocked";
+    log(`push blocked: ${reason} — change the workspace or raise limits`);
   }
 
   private recordOutOfStorage(e: QuotaExceededError, op: keyof Wants): boolean {

@@ -1,16 +1,25 @@
 import type { Env } from "./env.js";
 import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { startOp, type MetricEvent } from "./metrics.js";
-import { validateCommitRefs, commitAccounting, MAX_REFS_PER_COMMIT } from "./commit-accounting.js";
+import {
+  validateCommitRefs,
+  commitAccounting,
+  CARRIER_REFS,
+  MAX_RECEIPTS_PER_REDEEM,
+  MAX_REFS_PER_COMMIT,
+  type RefWithSize,
+} from "./commit-accounting.js";
 import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
+import { verifyReceipt } from "./receipts.js";
 import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
   MAX_REQUEST_BODY,
   readBodyCapped,
   readRefMode,
+  unsatisfiedBlobsBody,
   type CommitBodyView,
   type SignedCommit,
 } from "./commit-envelope.js";
@@ -72,6 +81,7 @@ export class WorkspaceSync {
     const ws = seg[2] ?? "";
     const proj = seg[4] ?? "";
     const action = seg[5] ?? "";
+    const subaction = seg[6] ?? "";
 
     await this.ensureBootstrap(ws, proj);
 
@@ -83,6 +93,7 @@ export class WorkspaceSync {
     // hash-chain forward from its pinned head to latest before applying.
     if (action === "commits" && req.method === "GET") return this.commits(url);
     if (action === "manifests" && req.method === "POST") return this.commit(req, ws, proj);
+    if (action === "receipts" && subaction === "redeem" && req.method === "POST") return this.redeemReceipts(req);
     // GET /v1/ws/:ws/proj/:proj/manifests/:seq — a specific historical commit.
     if (seg[5] === "manifests" && seg[6] && req.method === "GET") return this.commitAt(Number(seg[6]));
     // GC support (M6): authoritative retained roots + retention prune.
@@ -138,7 +149,7 @@ export class WorkspaceSync {
     const raw = await readBodyCapped(req, MAX_REQUEST_BODY);
     if (raw === null) {
       op.done("body_too_large", { bytes: MAX_REQUEST_BODY });
-      return json({ error: "bad_request", message: "request body too large" }, 413);
+      return json({ error: "body_too_large", message: "request body too large", max: MAX_REQUEST_BODY }, 413);
     }
     let body: {
       parentSequence?: number | null;
@@ -171,7 +182,7 @@ export class WorkspaceSync {
       // Directly relevant to the commit-body-scaling TODO: track how often bodies
       // hit the cap (the signal that blobRefs need to move out of the signed body).
       op.done("body_too_large", { bytes: commit.body.length });
-      return json({ error: "bad_request", message: "commit body too large" }, 400);
+      return json({ error: "body_too_large", message: "commit body too large", count: commit.body.length, max: MAX_COMMIT_BODY }, 400);
     }
 
     // Parse the body ONLY to read the handful of fields the sequencer needs. We do
@@ -216,15 +227,16 @@ export class WorkspaceSync {
         // §30: cap the DATA-ref count directly (the 2 carriers — encManifest + sidecar — ride
         // within the multi-batch accounting, no separate budget). Same bound readRefMode applies
         // to count, so no dead band. Cheap reject BEFORE the R2 fetch.
-        if (mode.count > MAX_REFS_PER_COMMIT) {
-          emit(mode.count)("too_many_refs");
-          return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
+        const accountedCount = mode.count + CARRIER_REFS;
+        if (accountedCount > MAX_REFS_PER_COMMIT) {
+          emit(accountedCount)("too_many_refs");
+          return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
         const sc = await resolveSidecarBytes(this.env, dbFor(op.env, accountId), accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
         if (!sc.ok) {
           if ("needsUpload" in sc) {
             emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
-            return json({ error: "unsatisfied_blobs", missing: sc.needsUpload }, 422);
+            return json(unsatisfiedBlobsBody(sc.needsUpload), 422);
           }
           emit(mode.count)("bad_sidecar");
           return json({ error: "bad_sidecar", message: sc.badSidecar }, 400);
@@ -235,15 +247,16 @@ export class WorkspaceSync {
         // Defensive backstop: inline can't actually reach this — >MAX_REFS_PER_COMMIT 64-hex
         // shas blow the 1MB MAX_COMMIT_BODY first (→ 400). The §24 client uses the sidecar
         // long before then; the real large-ref ceiling is enforced on the sidecar `count` above.
-        if (mode.refShas.length > MAX_REFS_PER_COMMIT) {
-          emit(shas.length)("too_many_refs");
-          return json({ error: "too_many_refs", max: MAX_REFS_PER_COMMIT }, 413);
+        const accountedCount = mode.refShas.length + CARRIER_REFS;
+        if (accountedCount > MAX_REFS_PER_COMMIT) {
+          emit(accountedCount)("too_many_refs");
+          return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
       }
       const v = await validateCommitRefs(this.env, dbFor(op.env, accountId), accountId, shas, receipts, nowMs);
       if (!v.ok) {
         emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
-        return json({ error: "unsatisfied_blobs", missing: v.needsUpload }, 422);
+        return json(unsatisfiedBlobsBody(v.needsUpload), 422);
       }
       const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
       if ("overCap" in acct) {
@@ -259,7 +272,7 @@ export class WorkspaceSync {
       if (missing.length > 0) {
         // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
         emit(shas.length)("unsatisfied_blobs", { ratio: missing.length / shas.length });
-        return json({ error: "unsatisfied_blobs", missing }, 422);
+        return json(unsatisfiedBlobsBody(missing), 422);
       }
     }
     const emitCommit = emit(shas.length);
@@ -323,6 +336,64 @@ export class WorkspaceSync {
     return json({ sequence, commitHash: commit.commitHash });
   }
 
+  private async redeemReceipts(req: Request): Promise<Response> {
+    const ROUTE = "/v1/ws/:ws/proj/:proj/receipts/redeem";
+    const op = startOp(this.env, "receipts.redeem", ROUTE);
+    const raw = await readBodyCapped(req, MAX_REQUEST_BODY);
+    if (raw === null) {
+      op.done("body_too_large", { bytes: MAX_REQUEST_BODY });
+      return json({ error: "body_too_large", message: "request body too large", max: MAX_REQUEST_BODY }, 413);
+    }
+    let body: { receipts?: unknown } | null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = null;
+    }
+    if (!body || typeof body.receipts !== "object" || body.receipts === null || Array.isArray(body.receipts)) {
+      op.done("bad_request");
+      return json({ error: "bad_request", message: "missing receipts" }, 400);
+    }
+
+    const entries = Object.entries(body.receipts as Record<string, unknown>);
+    if (entries.length > MAX_RECEIPTS_PER_REDEEM) {
+      op.done("too_many_receipts", { count: entries.length });
+      return json({ error: "too_many_receipts", max: MAX_RECEIPTS_PER_REDEEM }, 400);
+    }
+
+    const accountId = req.headers.get("x-rbox-account") ?? "";
+    const nowMs = Date.now();
+    const db = dbFor(op.env, accountId);
+    const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
+    const newRefs: RefWithSize[] = [];
+    let alreadyEntitled = 0;
+    let rejected = 0;
+    for (const [sha, receipt] of entries) {
+      if (!SHA_RE.test(sha) || typeof receipt !== "string") {
+        rejected++;
+        continue;
+      }
+      if (have.has(sha)) {
+        alreadyEntitled++;
+        continue;
+      }
+      const v = await verifyReceipt(this.env, receipt, { accountId, encSha: sha, nowMs });
+      if (!v.ok) {
+        rejected++;
+        continue;
+      }
+      newRefs.push({ sha, size: v.size });
+    }
+
+    const acct = await commitAccounting(db, accountId, newRefs, nowMs);
+    if ("overCap" in acct) {
+      op.done("quota_exceeded", { count: entries.length });
+      return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
+    }
+    op.done("ok", { count: entries.length, ratio: entries.length ? rejected / entries.length : 0 });
+    return json({ granted: newRefs.length, alreadyEntitled, rejected });
+  }
+
   /** Authoritative retained roots (GC): for every sequence the DO still holds
    *  (pruneFloor, head], the referenced content addresses parsed FROM the stored
    *  commit body — so the mark phase needs no R2 manifest fetch. */
@@ -348,7 +419,7 @@ export class WorkspaceSync {
         continue;
       }
       // Sidecar: fetch+bound+verify+parse to recover the reachable data refs; sidecarSha is a root.
-      // (count is already ≤ MAX_REFS_PER_COMMIT via readRefMode, so loadSidecarRefs's size gate bounds the bytes.)
+      // (count + carriers was accepted at commit time, so loadSidecarRefs's size gate bounds the bytes.)
       const loaded = await loadSidecarRefs(this.env, mode.sidecarSha, mode.count);
       if (!loaded.ok) {
         logErr("roots_sidecar_unreadable", new Error(`seq ${s}: ${loaded.reason}`));
@@ -461,6 +532,26 @@ export class WorkspaceSync {
       },
     );
     return shas.filter((s) => !entitled.has(s) || condemned.has(s));
+  }
+
+  private async entitledPresent(db: D1Database, shas: string[], accountId: string): Promise<Set<string>> {
+    const have = new Set<string>();
+    await batchedInLookup<{ sha256: string }>(
+      db,
+      [...new Set(shas)],
+      (chunk) =>
+        db
+          .prepare(
+            `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
+             WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${chunk.map(() => "?").join(",")})
+               AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
+          )
+          .bind(accountId, ...chunk),
+      (rows) => {
+        for (const r of rows) have.add(r.sha256);
+      },
+    );
+    return have;
   }
 
   // ---- WebSocket hibernation handlers (see ws-fanout.ts for connect/broadcast) ----

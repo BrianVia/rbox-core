@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { bootstrapAccount, type DeviceSecrets, type SignedCommit } from "../engine/e2ee/index.js";
+import { bootstrapAccount, parseRefset, type DeviceSecrets, type SignedCommit } from "../engine/e2ee/index.js";
 import type { BlobStore } from "../engine/index.js";
 import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
@@ -66,8 +66,20 @@ export class FakeServer implements E2eeApi {
     return this.commits.slice(since);
   };
   commitSigned = async (parentSeq: number, commit: SignedCommit) => {
-    const body = JSON.parse(commit.body) as { encManifestSha: string; blobRefs: { encSha: string }[] };
-    for (const ref of [body.encManifestSha, ...body.blobRefs.map((r) => r.encSha)]) {
+    const body = JSON.parse(commit.body) as {
+      encManifestSha: string;
+      blobRefs?: { encSha: string }[];
+      blobRefset?: { sidecarSha: string; count: number; totalBytes: number };
+    };
+    let refs: string[];
+    if (body.blobRefs) {
+      refs = [body.encManifestSha, ...body.blobRefs.map((r) => r.encSha)];
+    } else {
+      const sidecar = body.blobRefset;
+      if (!sidecar || !this.store.blobs.has(sidecar.sidecarSha)) return { unsatisfiedBlobs: [sidecar?.sidecarSha ?? body.encManifestSha] };
+      refs = [body.encManifestSha, sidecar.sidecarSha, ...parseRefset(await this.store.get(sidecar.sidecarSha)).map((r) => r.encSha)];
+    }
+    for (const ref of refs) {
       if (!this.store.blobs.has(ref)) return { unsatisfiedBlobs: [ref] };
     }
     if (parentSeq !== this.commits.length) return { conflict: true, head: this.commits.length };

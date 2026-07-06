@@ -16,20 +16,23 @@ export async function syncRoutes({ req, env, url, seg }: RouteCtx, p: Principal)
     const ws = seg[2]!;
     const proj = seg[4]!;
     const action = seg[5]!;
-    const write = action === "manifests" && req.method === "POST"; // commit
+    const write =
+      (action === "manifests" && req.method === "POST") ||
+      (action === "receipts" && seg[6] === "redeem" && req.method === "POST");
     const az = await authorizeWorkspace(env, p, ws, proj, write);
     if (!az.ok) return json({ error: az.status === 403 ? "forbidden" : "not_found" }, az.status);
 
     if (seg.length === 6 && action === "versions" && req.method === "GET") {
       return versionsList(env, p.accountId, ws, proj, Number(url.searchParams.get("limit") ?? "50"));
     }
-    if (action === "manifests" || action === "latest" || action === "connect" || action === "commits") {
+    if (action === "manifests" || action === "latest" || action === "connect" || action === "commits" || action === "receipts") {
       const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
       if (write) {
         // Commit: forward with the authenticated account (DO does account-scoped
         // blob-existence). Clean header set by the Worker (overrides any client value).
         const headers = new Headers(req.headers);
         headers.set("x-rbox-account", p.accountId);
+        if (action === "receipts") return stub.fetch(new Request(req, { headers }));
         // C4: also forward the account's CURRENT key epoch (MAX(account_epoch), 0 if
         // none); the DO asserts the commit's accountEpoch == this inside the txn.
         const epochRow = await dbFor(env, p.accountId)

@@ -9,7 +9,7 @@ import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
 import { daemonRuntimeDir, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull } from "./sync.js";
-import { QuotaExceededError, type CommitResult, type SyncRemote } from "./remote.js";
+import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 import { attributeDaemonForStatus, healthLine } from "./status-view.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
@@ -95,6 +95,7 @@ interface DaemonInternals {
   refreshWsAtThrottled(): void;
   stopWsKeepalive(): void;
   scheduleReconnect(): void;
+  terminalPushBlock(): string | undefined;
   /** The chained sidecar-write promise — the pump never awaits it (best-effort
    *  by contract), so tests drain it explicitly before reading the file. */
   activityWrite: Promise<void>;
@@ -181,6 +182,32 @@ class QuotaCommitRemote extends MiniRemote {
   override async commit(parentSequence: number, device: string, manifest: Manifest): Promise<CommitResult> {
     this.commitCalls++;
     if (this.quotaBlocked) throw new QuotaExceededError("storage", this.quotaUsed, this.quotaCap);
+    return super.commit(parentSequence, device, manifest);
+  }
+}
+
+class RejectedCommitRemote extends MiniRemote {
+  commitCalls = 0;
+  constructor(private readonly rejectWith: CommitRejectedError) {
+    super();
+  }
+  override async commit(_parentSequence: number, _device: string, _manifest: Manifest): Promise<CommitResult> {
+    this.commitCalls++;
+    throw this.rejectWith;
+  }
+}
+
+class StillBlockedRemote extends MiniRemote {
+  commitCalls = 0;
+  lastBlockedFingerprint?: string;
+  stillBlocked = true;
+
+  override async commit(parentSequence: number, device: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult> {
+    this.commitCalls++;
+    this.lastBlockedFingerprint = options?.blockedFingerprint;
+    if (this.stillBlocked && options?.blockedFingerprint) {
+      throw new CommitRejectedError("too_many_refs", 250_001, 250_000, options.blockedFingerprint, true);
+    }
     return super.commit(parentSequence, device, manifest);
   }
 }
@@ -353,6 +380,70 @@ test("quota errors record outOfStorage, suppress watcher uploads, probe on safet
   expect(activity?.outOfStorage).toBeUndefined();
   expect(activity?.halt).toBeUndefined();
   expect(activity?.lastPush?.sequence).toBe(1);
+});
+
+test("CommitRejectedError records a terminal push halt with the sidecar fingerprint", async () => {
+  const err = new CommitRejectedError("too_many_refs", 250_001, 250_000, "sidecar-fingerprint");
+  const remote = new RejectedCommitRemote(err);
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  const activity = await loadActivity(root);
+  expect(remote.commitCalls).toBe(1);
+  expect(activity?.halt).toEqual({
+    at: expect.any(String),
+    reason: err.message,
+    count: 1,
+    op: "push",
+    terminal: { fingerprint: "sidecar-fingerprint" },
+  });
+  expect((await readShellLine()).split(" ")[2]).toBe("halt");
+});
+
+test("terminal push halt passes blocked fingerprint into the push and preserves the halt when still blocked", async () => {
+  const remote = new StillBlockedRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+  daemon.activity.halt = {
+    at: "2026-07-02T12:00:00.000Z",
+    reason: "workspace needs 250,001 blob refs per commit; the server cap is 250,000.",
+    count: 1,
+    op: "push",
+    terminal: { fingerprint: "blocked-sidecar-sha" },
+  };
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect(remote.commitCalls).toBe(1); // the push ran; E2eeRemote is the point of truth for the comparison.
+  expect(remote.lastBlockedFingerprint).toBe("blocked-sidecar-sha");
+  expect(await loadActivity(root)).toMatchObject({
+    halt: {
+      at: "2026-07-02T12:00:00.000Z",
+      reason: "workspace needs 250,001 blob refs per commit; the server cap is 250,000.",
+      count: 1,
+      op: "push",
+      terminal: { fingerprint: "blocked-sidecar-sha" },
+    },
+  });
+
+  remote.stillBlocked = false;
+  await fs.writeFile(path.join(root, "a.txt"), "changed");
+  daemon.manifest = await scanManifest(root);
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect(remote.commitCalls).toBe(2);
+  expect(daemon.activity.halt).toBeUndefined();
+  expect((await loadActivity(root))?.lastPush?.sequence).toBe(1);
 });
 
 test("a quota probe refreshes outOfStorage without clearing a real pull halt", async () => {

@@ -1,13 +1,15 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildPairing, redeemPairing, type DeviceSecrets, type SignedRoster } from "../engine/e2ee/index.js";
-import type { GitSection } from "../engine/index.js";
-import type { E2eeRemote } from "./e2ee-remote.js";
+import { buildPairing, redeemPairing, serializeRefset, type DeviceSecrets, type SignedRoster } from "../engine/e2ee/index.js";
+import type { GitSection, Manifest } from "../engine/index.js";
+import { E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
+import { CommitRejectedError } from "./remote.js";
 import { pull, push } from "./sync.js";
 import { loadState, type WorkspaceConfig } from "./config.js";
 
@@ -20,6 +22,51 @@ const WS = "ws_sync";
 
 const remoteFor = (server: FakeServer, secrets: DeviceSecrets): E2eeRemote => harnessRemote(server, secrets, ACCT, WS, NOW + 5000);
 const cfgFor = (root: string, secrets: DeviceSecrets, remote: E2eeRemote): Promise<WorkspaceConfig> => harnessCfg(root, secrets, remote, WS);
+const hex = (n: number) => n.toString(16).padStart(64, "0");
+const shaBytes = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const largeManifest = (): Manifest => ({
+  generatedAt: "",
+  files: Array.from({ length: SIDECAR_THRESHOLD }, (_, i) => ({
+    path: `f-${i}.txt`,
+    type: "file",
+    sha256: hex(i + 1),
+    encSha: hex(100_000 + i),
+    size: 1,
+    mode: 0o644,
+    mtimeMs: 1,
+  })),
+});
+const sidecarShaOf = (manifest: Manifest): string => {
+  const refs = manifest.files.map((f) => {
+    if (f.type !== "file" || !f.encSha) throw new Error("test manifest must contain encrypted file refs");
+    return { encSha: f.encSha, size: f.size };
+  });
+  return shaBytes(serializeRefset(refs));
+};
+const seedManifestRefs = (server: FakeServer, manifest: Manifest): void => {
+  for (const f of manifest.files) {
+    if (f.type === "file" && f.encSha) server.store.blobs.set(f.encSha, new Uint8Array([1]));
+  }
+};
+
+class ObservedServer extends FakeServer {
+  putBlobBytesCalls: string[] = [];
+  commitSignedCalls = 0;
+
+  constructor() {
+    super();
+    const basePutBlobBytes = this.putBlobBytes;
+    const baseCommitSigned = this.commitSigned;
+    this.putBlobBytes = async (sha, bytes) => {
+      this.putBlobBytesCalls.push(sha);
+      return basePutBlobBytes(sha, bytes);
+    };
+    this.commitSigned = async (parentSeq, commit) => {
+      this.commitSignedCalls++;
+      return baseCommitSigned(parentSeq, commit);
+    };
+  }
+}
 
 let dirs: string[] = [];
 async function tmp(): Promise<string> {
@@ -32,6 +79,40 @@ afterAll(async () => {
 });
 
 describe("E2EE sync transport — two machines through real sync.ts", () => {
+  test("blocked terminal sidecar fingerprint bails before sidecar or manifest upload", async () => {
+    const server = new ObservedServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-blocked", NOW);
+    const remote = await remoteFor(server, secrets);
+    const manifest = largeManifest();
+    const fingerprint = sidecarShaOf(manifest);
+
+    try {
+      await remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: fingerprint });
+      throw new Error("expected still-blocked rejection");
+    } catch (e) {
+      expect(e).toBeInstanceOf(CommitRejectedError);
+      const err = e as CommitRejectedError;
+      expect(err.fingerprint).toBe(fingerprint);
+      expect(err.stillBlocked).toBe(true);
+    }
+    expect(server.putBlobBytesCalls).toEqual([]);
+    expect(server.commitSignedCalls).toBe(0);
+  });
+
+  test("different blocked fingerprint performs the full sidecar commit attempt", async () => {
+    const server = new ObservedServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-changed", NOW);
+    const remote = await remoteFor(server, secrets);
+    const manifest = largeManifest();
+    const fingerprint = sidecarShaOf(manifest);
+    const different = fingerprint === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64);
+    seedManifestRefs(server, manifest);
+
+    await expect(remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: different })).resolves.toEqual({ sequence: 1 });
+    expect(server.putBlobBytesCalls).toContain(fingerprint);
+    expect(server.commitSignedCalls).toBe(1);
+  });
+
   test("A pushes an encrypted tree; B pairs in and pulls it byte-identically; server sees no plaintext", async () => {
     const server = new FakeServer();
 

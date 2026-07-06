@@ -20,21 +20,25 @@ export interface RefWithSize {
 // D1: ≤100 bound params / statement. The grant INSERT binds (account_id, sha256)
 // per row = 2 params (granted_at is a server integer literal), so ≤49 rows; we use
 // 33 to stay well under across catalog/charge/grant in one chunk.
-const CHUNK = 33;
+export const ACCOUNTING_INSERT_CHUNK = 33;
 // §30: refs charged/granted per atomic db.batch(). Each batch() is ONE D1 subrequest and
-// one SQLite transaction; this bounds its statement count (~MAX_REFS_PER_TXN/CHUNK·4 ≈ 364)
+// one SQLite transaction; this bounds its statement count (~MAX_REFS_PER_TXN/
+// ACCOUNTING_INSERT_CHUNK·5 = 455)
 // so a single transaction stays within the D1 isolate's CPU/memory budget. A commit with
 // more refs runs SEVERAL such batches in sequence — each independently atomic + cap-guarded,
 // and (because accounting is idempotent + account-then-publish) crash-/retry-safe.
-const MAX_REFS_PER_TXN = 3_000;
+export const MAX_REFS_PER_TXN = 3_000;
 // Validate IN-list SELECTs (≤90 refs each) grouped per db.batch() — one subrequest per group.
-const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / 90); // ~34
-// §30: hard sanity reject on total refs in one commit (was 6002). The REAL ceiling is the D1
-// isolate CPU/memory of the multi-batch pass + validate, not subrequests; validated against a
-// 12k-blob real workload, 50k kept "behind dev measurement" (telemetry: §25 commit count/ms).
-// The +carriers (encManifest, and §24 sidecar) ride within this bound — workspace-sync caps the
-// data-ref count so count + carriers ≤ this. One source of truth for every ref ceiling.
-export const MAX_REFS_PER_COMMIT = 50_000;
+export const VALIDATE_IN_LIST_CHUNK = 90;
+export const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / VALIDATE_IN_LIST_CHUNK); // ~34
+export const ACCOUNTING_STATEMENTS_PER_CHUNK = 5;
+// §71: hard sanity reject on the ACCOUNTED ref set in one commit. For sidecar commits the
+// signed descriptor's data-ref count is not the full accounting set: encManifestSha and
+// sidecarSha are charged/granted too. Keep the carrier count named so a future carrier changes
+// the budget math and tests deliberately.
+export const CARRIER_REFS = 2; // encManifestSha + sidecarSha
+export const MAX_REFS_PER_COMMIT = 250_000;
+export const MAX_RECEIPTS_PER_REDEEM = 5_000;
 
 const chunk = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];
@@ -69,7 +73,7 @@ export async function validateCommitRefs(
   // commitAccounting re-grants it and CLEARS the marker. Without this, a deduped commit (which
   // never bumps `granted_at`) could publish a head referencing a ref Phase-1 purge is about to
   // drop. Folding it into the existing query (vs a second pass) makes the barrier un-forgettable.
-  const selects = chunk(shas, 90).map((c) =>
+  const selects = chunk(shas, VALIDATE_IN_LIST_CHUNK).map((c) =>
     db
       .prepare(
         `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
@@ -123,7 +127,7 @@ export async function commitAccounting(
   // so a later chunk's NOT-EXISTS still sees earlier chunks' grants (no double-charge).
   for (const superBatch of chunk(newRefs, MAX_REFS_PER_TXN)) {
     const stmts: D1PreparedStatement[] = [];
-    for (const c of chunk(superBatch, CHUNK)) {
+    for (const c of chunk(superBatch, ACCOUNTING_INSERT_CHUNK)) {
       const shas = c.map((r) => r.sha);
       const inList = shas.map(() => "?").join(",");
       // Direct-write (§23.2 v2): PUT already wrote the canonical object, so catalog present=1

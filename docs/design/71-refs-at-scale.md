@@ -1,4 +1,4 @@
-# Design 70 — Refs at scale: let a 123k-file workspace publish
+# Design 71 — Refs at scale: let a 123k-file workspace publish
 
 **Status:** v2 (v1 numbers corrected per codex adversarial review; the receipts
 body-cap wall found in that review is now the centerpiece)
