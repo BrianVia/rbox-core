@@ -2,7 +2,8 @@
  * Pure render helpers for `rbox status` (design 45 §2) and transfer spinners (§3).
  *
  * The verdict logic lives here — not inline in the status command — so priority
- * ordering (halt > live progress > local divergence > behind remote > in sync)
+ * ordering (halt > live progress > local divergence > behind remote > in sync,
+ * with fresh retry progress allowed to lead while the older halt moves below it)
  * and time formatting are unit-testable without console capture. Everything is
  * a pure function of a {@link StatusSnapshot}; `now` is injected, never read.
  *
@@ -113,6 +114,20 @@ const ageLabel = (ageMs: number | undefined): string => {
   return `${Math.max(0, Math.round(ageMs / 1000))}s ago`;
 };
 
+const freshActive = (s: StatusSnapshot): DaemonActivity["active"] | undefined => {
+  const active = s.daemonRunning ? s.activity?.active : undefined;
+  return active && s.now - Date.parse(active.at) < ACTIVE_STALE_MS ? active : undefined;
+};
+
+const haltLine = (halt: NonNullable<DaemonActivity["halt"]>, now: number): string => {
+  const times = halt.count > 1 ? `, ×${halt.count}` : "";
+  // Only reachable with a LIVE daemon (a stopped daemon's leftover halt is dropped
+  // above) — and a live daemon retries every tick, so this is amber, not alarm-red,
+  // and says so. The reason text carries any required action (e.g. the mass-delete
+  // guard's consent flag).
+  return `${style.yellow("⚠ sync failing")} ${style.dim(`(${relTime(halt.at, now)}${times})`)} ${halt.reason} ${style.yellow("— will be retried")}`;
+};
+
 /** Longest display `detail` (in CODE POINTS, e.g. a repo name) rendered on the
  *  progress line; a longer one is head-truncated so the meaningful TAIL (the
  *  basename) survives. */
@@ -159,13 +174,13 @@ export function healthLine(s: StatusSnapshot): string {
   //    A stopped daemon's leftover halt is dropped — "stopped" already says sync is
   //    not running, and the next start re-evaluates.
   const halt = s.daemonRunning ? s.activity?.halt : undefined;
-  if (halt) {
-    const times = halt.count > 1 ? `, ×${halt.count}` : "";
-    return `${style.red("⚠ sync halted")} ${style.dim(`(${relTime(halt.at, s.now)}${times})`)} ${halt.reason}`;
-  }
+  const active = freshActive(s);
 
-  // 2. Quota exhaustion is soft state: halt wins, live progress waits below it.
+  // 2. Quota exhaustion is soft state: halt still wins, and live progress waits
+  //    below it. The one surgical exception is a fresh retry transfer: it
+  //    leads over an older halt, with the halt rendered as secondary context.
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  if (halt && (!active || out)) return haltLine(halt, s.now);
   if (out) {
     const usage = quotaUsage(out.kind, out.used, out.cap);
     const detail = out.kind === "workspaces"
@@ -178,8 +193,7 @@ export function healthLine(s: StatusSnapshot): string {
   //    (codex R5): only the daemon writes `active`, so with the daemon stopped —
   //    even freshly killed mid-op — there is no live transfer to report; and a
   //    daemon that died with its pidfile intact must not show "syncing" forever.
-  const active = s.daemonRunning ? s.activity?.active : undefined;
-  if (active && s.now - Date.parse(active.at) < ACTIVE_STALE_MS) {
+  if (active) {
     return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total)}`);
   }
 
@@ -214,6 +228,15 @@ export function healthLine(s: StatusSnapshot): string {
 
   // 6. In sync: no local divergence, and the remote (when reachable) agrees.
   return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
+}
+
+/** Secondary health details that should sit directly under the verdict line. */
+export function healthDetailLines(s: StatusSnapshot): string[] {
+  const halt = s.daemonRunning ? s.activity?.halt : undefined;
+  const active = freshActive(s);
+  const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  if (!halt || !active || out) return [];
+  return [`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`];
 }
 
 /** Human byte size: `847 B` / `12.3 KB` / `312.4 MB` / `1.4 GB` (decimal units, one
