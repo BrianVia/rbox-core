@@ -16,8 +16,8 @@ export type GitIdentity = Pick<GitSection, "head" | "refs" | "indexTree" | "refS
  *  the repo is unusable. SCOPE-AWARE (design 43 §5): a pointer repo's identity is
  *  HEAD + the current-branch ref + indexTree + opState only — the shared store's other
  *  branches/tags/stash belong to the main clone, not this checkout. */
-export async function gitIdentity(repoDir: string): Promise<GitIdentity | undefined> {
-  const ctx = await repoCtx(repoDir);
+export async function gitIdentity(repoDir: string, knownCtx?: RepoCtx): Promise<GitIdentity | undefined> {
+  const ctx = knownCtx ?? (await repoCtx(repoDir));
   if (!ctx) return undefined;
   if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
   const head = await readHead(ctx);

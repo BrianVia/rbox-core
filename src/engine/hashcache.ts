@@ -77,11 +77,11 @@ export class HashCache {
     }
   }
 
-  async save(root: string): Promise<void> {
+  async save(root: string, opts: { beforeRename?: () => boolean | Promise<boolean> } = {}): Promise<void> {
     if (!this.dirty) return;
     const abs = path.join(root, CACHE_REL);
     await fs.mkdir(path.dirname(abs), { recursive: true });
-    await writeFileAtomic(abs, JSON.stringify(this.toJSON()));
+    await writeFileAtomic(abs, JSON.stringify(this.toJSON()), opts);
     this.dirty = false;
   }
 }

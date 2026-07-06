@@ -17,10 +17,14 @@ export {
   isGitBusy,
   quarantineAndWipeGitState,
   inTreeWorktreeParentRel,
+  inTreeWorktreeParentRelFromCtx,
+  repoCtxFromDisk,
+  setGitSpawnObserver,
   type ApplyGitResult,
   type GitIdentity,
   type GitRepoKind,
   type GitPreflightResult,
+  type RepoCtx,
 } from "./git-state.js";
 export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
 export { generateKek, kekToPhrase, kekFromPhrase, encryptFileToTemp, decryptFileToPath, type EncryptedBlob } from "./crypto.js";

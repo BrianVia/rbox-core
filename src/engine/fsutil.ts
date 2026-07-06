@@ -13,7 +13,11 @@ let counter = 0;
  * half-written real file. Same-directory temp guarantees the rename is on one
  * filesystem (rename across filesystems is not atomic).
  */
-export async function writeFileAtomic(absPath: string, data: string | Uint8Array): Promise<void> {
+export async function writeFileAtomic(
+  absPath: string,
+  data: string | Uint8Array,
+  opts: { beforeRename?: () => boolean | Promise<boolean> } = {}
+): Promise<void> {
   const dir = path.dirname(absPath);
   const tmp = path.join(dir, `${RBOX_TMP_PREFIX}${process.pid}-${counter++}-${path.basename(absPath)}`);
   let fh: fs.FileHandle | undefined;
@@ -23,6 +27,17 @@ export async function writeFileAtomic(absPath: string, data: string | Uint8Array
     await fh.sync(); // durability: bytes hit disk before the rename publishes them
   } finally {
     await fh?.close();
+  }
+  let publish = true;
+  try {
+    publish = opts.beforeRename ? await opts.beforeRename() : true;
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
+  if (!publish) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    return;
   }
   await fs.rename(tmp, absPath);
 }

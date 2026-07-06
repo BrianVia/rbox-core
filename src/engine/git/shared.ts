@@ -13,9 +13,18 @@ export type GitRepoKind = "dir" | "pointer";
 
 const exec = promisify(execFile);
 
+let gitSpawnObserver: ((root: string, args: readonly string[]) => void) | undefined;
+
+/** Test seam for status-performance assertions: counts git subprocesses without
+ *  changing production behavior. */
+export function setGitSpawnObserver(observer: ((root: string, args: readonly string[]) => void) | undefined): void {
+  gitSpawnObserver = observer;
+}
+
 export const HEX40 = /^[0-9a-f]{40}$/;
 
 export async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+  gitSpawnObserver?.(root, args);
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
     // Strip every repo-redirecting env var: rbox may be invoked from a git hook or wrapper,
@@ -54,6 +63,38 @@ export async function detectGitKind(repoDir: string): Promise<GitRepoKind | unde
   return undefined; // symlinked `.git` — unsupported shape
 }
 
+function resolveGitPath(base: string, raw: string): string {
+  return path.resolve(path.isAbsolute(raw) ? raw : path.join(base, raw));
+}
+
+async function pointerGitDir(repoDir: string): Promise<string | undefined> {
+  const raw = await fs.readFile(path.join(repoDir, ".git"), "utf8").catch(() => undefined);
+  if (!raw) return undefined;
+  const first = raw.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  const m = /^gitdir:\s*(.+)$/.exec(first);
+  if (!m) return undefined;
+  return resolveGitPath(repoDir, m[1]!.trim());
+}
+
+async function commonDirFromGitDir(gitDir: string): Promise<string> {
+  const raw = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => undefined);
+  if (!raw) return path.resolve(gitDir);
+  return resolveGitPath(gitDir, raw.trim());
+}
+
+/** Resolve gitdir/commondir from on-disk metadata only. This deliberately avoids
+ *  `git rev-parse`, so warm status fingerprints can be checked with zero git
+ *  subprocesses. It is advisory: callers that need Git's validation still use
+ *  {@link repoCtx}. */
+export async function repoCtxFromDisk(repoDir: string): Promise<RepoCtx | undefined> {
+  const kind = await detectGitKind(repoDir);
+  if (!kind) return undefined;
+  const gitDir = kind === "dir" ? path.join(repoDir, ".git") : await pointerGitDir(repoDir);
+  if (!gitDir) return undefined;
+  const commonDir = await commonDirFromGitDir(gitDir);
+  return { repoDir, kind, gitDir: path.resolve(gitDir), commonDir: path.resolve(commonDir) };
+}
+
 /** Resolve the repo's gitdirs, or undefined when the repo is unusable (no `.git`,
  *  dangling pointer — the Conductor incident — or not a repo at all). */
 export async function repoCtx(repoDir: string): Promise<RepoCtx | undefined> {
@@ -83,6 +124,10 @@ export async function readHead(ctx: RepoCtx): Promise<string> {
  *  capture (its history rides the in-tree main clone's bundle instead). */
 export async function inTreeWorktreeParentRel(root: string, repoDir: string): Promise<string | undefined> {
   const ctx = await repoCtx(repoDir);
+  return inTreeWorktreeParentRelFromCtx(root, ctx);
+}
+
+export async function inTreeWorktreeParentRelFromCtx(root: string, ctx: RepoCtx | undefined): Promise<string | undefined> {
   if (!ctx || ctx.kind !== "pointer") return undefined;
   if (path.basename(ctx.commonDir) !== ".git") return undefined; // submodule checkout → exempt
   const mainTop = path.dirname(ctx.commonDir);

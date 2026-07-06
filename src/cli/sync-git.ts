@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -10,19 +11,28 @@ import {
   gitIdentityKey,
   gitPreflight,
   inTreeWorktreeParentRel,
+  inTreeWorktreeParentRelFromCtx,
   isGitBusy,
   preserveGitConflict,
   projectIdentity,
   quarantineAndWipeGitState,
+  repoCtxFromDisk,
   poolMap,
   MAX_GIT_REPOS,
+  writeFileAtomic,
+  type DiscoveredGitRepo,
   type GitIdentity,
+  type GitPreflightResult,
+  type GitRepoKind,
   type GitRefScope,
   type GitSection,
   type IgnoreMatcher,
   type Manifest,
   type BlobStore,
+  type RepoCtx,
 } from "../engine/index.js";
+import { repoCtx } from "../engine/git/shared.js";
+import { OP_STATE_DIRS, OP_STATE_FILES } from "../engine/manifest-validate.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
 import type { TransferProgress } from "./transfer-progress.js";
@@ -428,6 +438,313 @@ export function gitForceForMissingBlobs(committedGit: Record<string, GitSection>
   return gitForce;
 }
 
+const GIT_DIVERGENCE_CONCURRENCY = 8;
+const GIT_DIVERGENCE_CACHE_REL = ".rbox/state/git-divergence.json";
+
+interface CachedDivergenceProbe {
+  busy: boolean;
+  preflightOk: boolean;
+  preflightStructural?: boolean;
+  preflightKind?: GitRepoKind;
+  identityKey: string;
+  parentRel?: string;
+}
+
+interface GitDivergenceCacheEntry {
+  fingerprint: string;
+  identityKey: string;
+  probe?: CachedDivergenceProbe;
+}
+
+interface GitDivergenceCache {
+  repos: Map<string, GitDivergenceCacheEntry>;
+  dirty: boolean;
+}
+
+interface GitFingerprint {
+  fingerprint: string;
+  diskCtx?: RepoCtx;
+}
+
+type StatToken =
+  | { exists: false }
+  | { exists: true; type: "file" | "dir" | "symlink" | "other"; mtimeMs: number; size: number; target?: string };
+type DotGitToken =
+  | { exists: false }
+  | { exists: true; type: "dir"; mtimeMs: number; size: number }
+  | { exists: true; type: "file"; mtimeMs: number; size: number; pointerTarget?: string }
+  | { exists: true; type: "symlink" | "other"; mtimeMs: number; size: number; target?: string };
+type TreeToken =
+  | { exists: false }
+  | { exists: true; type: "dir" }
+  | { exists: true; type: "file"; size: number; mtimeMs: number }
+  | { exists: true; type: "symlink" | "other"; size: number; mtimeMs: number; target?: string };
+type TreeSummaryToken =
+  | { exists: false }
+  | { exists: true; type: "file" | "symlink" | "other"; mtimeMs: number; size: number; target?: string }
+  | { exists: true; type: "dir"; count: number; maxMtimeMs: number; totalSize: number };
+type ExistenceToken = { exists: false } | { exists: true; type: "file" | "dir" | "symlink" | "other" };
+type WorktreesToken =
+  | { exists: false }
+  | { exists: true; type: "file" | "symlink" | "other"; mtimeMs: number; size: number; target?: string }
+  | { exists: true; type: "dir"; entries: Array<{ name: string; type: "dir"; mtimeMs: number } | { name: string; type: "file" | "symlink" | "other" }> };
+
+interface GitFingerprintRun {
+  commonDirFingerprints: Map<string, Promise<unknown>>;
+}
+
+type DiscoveredGitRepoSource = readonly DiscoveredGitRepo[] | AsyncIterable<DiscoveredGitRepo>;
+
+function isCacheEntry(v: unknown): v is GitDivergenceCacheEntry {
+  if (v === null || typeof v !== "object") return false;
+  const e = v as GitDivergenceCacheEntry;
+  if (typeof e.fingerprint !== "string" || typeof e.identityKey !== "string") return false;
+  if (e.probe !== undefined) {
+    const p = e.probe as CachedDivergenceProbe;
+    if (p === null || typeof p !== "object") return false;
+    if (typeof p.busy !== "boolean" || typeof p.preflightOk !== "boolean" || typeof p.identityKey !== "string") return false;
+  }
+  return true;
+}
+
+async function loadGitDivergenceCache(root: string): Promise<GitDivergenceCache> {
+  try {
+    const raw = await fs.readFile(path.join(root, GIT_DIVERGENCE_CACHE_REL), "utf8");
+    const parsed = JSON.parse(raw) as { repos?: Record<string, unknown> };
+    const repos = new Map<string, GitDivergenceCacheEntry>();
+    for (const [rel, entry] of Object.entries(parsed.repos ?? {})) {
+      if (isCacheEntry(entry)) repos.set(rel, entry);
+    }
+    return { repos, dirty: false };
+  } catch {
+    return { repos: new Map(), dirty: true };
+  }
+}
+
+async function saveGitDivergenceCache(root: string, cache: GitDivergenceCache): Promise<void> {
+  if (!cache.dirty) return;
+  const abs = path.join(root, GIT_DIVERGENCE_CACHE_REL);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  const repos = Object.fromEntries([...cache.repos.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+  await writeFileAtomic(abs, JSON.stringify({ version: 2, repos }));
+  cache.dirty = false;
+}
+
+function statKind(st: { isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean }): "file" | "dir" | "symlink" | "other" {
+  return st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : "other";
+}
+
+async function statToken(abs: string): Promise<StatToken> {
+  const st = await fs.lstat(abs).catch(() => undefined);
+  if (!st) return { exists: false };
+  const type = statKind(st);
+  const token: StatToken = { exists: true, type, mtimeMs: st.mtimeMs, size: st.size };
+  if (type === "symlink") token.target = await fs.readlink(abs).catch(() => "");
+  return token;
+}
+
+async function existenceToken(abs: string): Promise<ExistenceToken> {
+  const st = await fs.lstat(abs).catch(() => undefined);
+  if (!st) return { exists: false };
+  return { exists: true, type: statKind(st) };
+}
+
+async function dotGitToken(abs: string, diskCtx: RepoCtx | undefined): Promise<DotGitToken> {
+  const st = await fs.lstat(abs).catch(() => undefined);
+  if (!st) return { exists: false };
+  if (st.isDirectory()) return { exists: true, type: "dir", mtimeMs: st.mtimeMs, size: st.size };
+  if (st.isFile()) {
+    return { exists: true, type: "file", mtimeMs: st.mtimeMs, size: st.size, pointerTarget: diskCtx?.kind === "pointer" ? diskCtx.gitDir : undefined };
+  }
+  if (st.isSymbolicLink()) return { exists: true, type: "symlink", mtimeMs: st.mtimeMs, size: st.size, target: await fs.readlink(abs).catch(() => "") };
+  return { exists: true, type: "other", mtimeMs: st.mtimeMs, size: st.size };
+}
+
+async function treeToken(abs: string): Promise<TreeToken> {
+  const st = await fs.lstat(abs).catch(() => undefined);
+  if (!st) return { exists: false };
+  if (st.isDirectory()) return { exists: true, type: "dir" };
+  if (st.isFile()) return { exists: true, type: "file", size: st.size, mtimeMs: st.mtimeMs };
+  if (st.isSymbolicLink()) return { exists: true, type: "symlink", size: st.size, mtimeMs: st.mtimeMs, target: await fs.readlink(abs).catch(() => "") };
+  return { exists: true, type: "other", size: st.size, mtimeMs: st.mtimeMs };
+}
+
+async function statTree(abs: string, base = ""): Promise<Array<{ rel: string; stat: TreeToken }>> {
+  const rootStat = await treeToken(path.join(abs, base));
+  const out: Array<{ rel: string; stat: TreeToken }> = [{ rel: base || ".", stat: rootStat }];
+  if (!rootStat.exists || rootStat.type !== "dir") return out;
+  const entries = await fs.readdir(path.join(abs, base), { withFileTypes: true }).catch(() => []);
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    const rel = base ? `${base}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...(await statTree(abs, rel)));
+    else out.push({ rel, stat: await treeToken(path.join(abs, rel)) });
+  }
+  return out;
+}
+
+async function statTreeSummary(abs: string): Promise<TreeSummaryToken> {
+  const root = await statToken(abs);
+  if (!root.exists) return { exists: false };
+  if (root.type === "file" || root.type === "symlink" || root.type === "other") {
+    return root as Extract<TreeSummaryToken, { exists: true; type: "file" | "symlink" | "other" }>;
+  }
+  let count = 0;
+  let maxMtimeMs = root.mtimeMs;
+  let totalSize = 0;
+  const walk = async (dir: string): Promise<void> => {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const child = path.join(dir, entry.name);
+      const st = await fs.lstat(child).catch(() => undefined);
+      if (!st) continue;
+      count++;
+      maxMtimeMs = Math.max(maxMtimeMs, st.mtimeMs);
+      totalSize += st.size;
+      if (entry.isDirectory()) await walk(child);
+    }
+  };
+  await walk(abs);
+  return { exists: true, type: "dir", count, maxMtimeMs, totalSize };
+}
+
+async function worktreesToken(abs: string): Promise<WorktreesToken> {
+  const root = await statToken(abs);
+  if (!root.exists) return { exists: false };
+  if (root.type === "file" || root.type === "symlink" || root.type === "other") {
+    return root as Extract<WorktreesToken, { exists: true; type: "file" | "symlink" | "other" }>;
+  }
+  const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => []);
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const shallow = await Promise.all(
+    entries.map(async (entry) => {
+      if (!entry.isDirectory()) return { name: entry.name, type: statKind(entry) as "file" | "symlink" | "other" };
+      const st = await fs.lstat(path.join(abs, entry.name)).catch(() => undefined);
+      return { name: entry.name, type: "dir" as const, mtimeMs: st?.mtimeMs ?? 0 };
+    })
+  );
+  return { exists: true, type: "dir", entries: shallow };
+}
+
+async function opStateFingerprint(gitDir: string): Promise<unknown> {
+  const files = await Promise.all(OP_STATE_FILES.map(async (rel) => [rel, await statToken(path.join(gitDir, rel))] as const));
+  const dirs = await Promise.all(OP_STATE_DIRS.map(async (rel) => [rel, await statTree(path.join(gitDir, rel))] as const));
+  return { files, dirs };
+}
+
+async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
+  return {
+    shallow: await statToken(path.join(ctx.commonDir, "shallow")),
+    alternates: await statToken(path.join(ctx.commonDir, "objects", "info", "alternates")),
+    config: await statToken(path.join(ctx.commonDir, "config")),
+    modules: await existenceToken(path.join(ctx.commonDir, "modules")),
+    worktrees: await worktreesToken(path.join(ctx.commonDir, "worktrees")),
+    gcPid: await statToken(path.join(ctx.commonDir, "gc.pid")),
+    packedRefs: await statToken(path.join(ctx.commonDir, "packed-refs")),
+    refs: await statTreeSummary(path.join(ctx.commonDir, "refs")),
+  };
+}
+
+function memoizedCommonDirFingerprint(run: GitFingerprintRun, ctx: RepoCtx): Promise<unknown> {
+  const key = path.resolve(ctx.commonDir);
+  let p = run.commonDirFingerprints.get(key);
+  if (!p) {
+    p = commonDirFingerprint(ctx);
+    run.commonDirFingerprints.set(key, p);
+  }
+  return p;
+}
+
+async function gitFingerprint(run: GitFingerprintRun, root: string, rel: string): Promise<GitFingerprint> {
+  const repoDir = repoDirOf(root, rel);
+  const dotGit = path.join(repoDir, ".git");
+  const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+  const parts = {
+    version: 3,
+    dotGit: await dotGitToken(dotGit, diskCtx),
+    ctx: diskCtx ? { kind: diskCtx.kind, gitDir: diskCtx.gitDir, commonDir: diskCtx.commonDir } : null,
+    gitDir: diskCtx
+      ? {
+          head: await statToken(path.join(diskCtx.gitDir, "HEAD")),
+          index: await statToken(path.join(diskCtx.gitDir, "index")),
+          indexLock: await statToken(path.join(diskCtx.gitDir, "index.lock")),
+          headLock: await statToken(path.join(diskCtx.gitDir, "HEAD.lock")),
+          configWorktree: await statToken(path.join(diskCtx.gitDir, "config.worktree")),
+          opState: await opStateFingerprint(diskCtx.gitDir),
+        }
+      : null,
+    commonDir: diskCtx
+      ? await memoizedCommonDirFingerprint(run, diskCtx)
+      : null,
+  };
+  return { fingerprint: crypto.createHash("sha256").update(JSON.stringify(parts)).digest("hex"), diskCtx };
+}
+
+async function probeDivergenceRepo(root: string, rel: string, ctx: RepoCtx | null): Promise<CachedDivergenceProbe> {
+  const repoDir = repoDirOf(root, rel);
+  const busy = await isGitBusy(repoDir, ctx).catch(() => false);
+  if (busy) return { busy: true, preflightOk: false, identityKey: "none" };
+  const pf = (await gitPreflight(repoDir, ctx).catch(
+    (e): GitPreflightResult => ({ ok: false, reason: errMsg(e) })
+  )) as GitPreflightResult;
+  const id = ctx ? await gitIdentity(repoDir, ctx).catch(() => undefined) : undefined;
+  const parentRel = ctx?.kind === "pointer" ? await inTreeWorktreeParentRelFromCtx(root, ctx).catch(() => undefined) : undefined;
+  return {
+    busy: false,
+    preflightOk: pf.ok,
+    preflightStructural: pf.structural === true,
+    preflightKind: pf.kind,
+    identityKey: gitIdentityKey(id),
+    parentRel,
+  };
+}
+
+function sameDivergenceProbe(a: CachedDivergenceProbe | undefined, b: CachedDivergenceProbe): boolean {
+  return (
+    a !== undefined &&
+    a.busy === b.busy &&
+    a.preflightOk === b.preflightOk &&
+    a.preflightStructural === b.preflightStructural &&
+    a.preflightKind === b.preflightKind &&
+    a.identityKey === b.identityKey &&
+    a.parentRel === b.parentRel
+  );
+}
+
+async function cachedDivergenceProbe(
+  run: GitFingerprintRun,
+  root: string,
+  rel: string,
+  cache: GitDivergenceCache,
+  out: Map<string, CachedDivergenceProbe>
+): Promise<void> {
+  let before = await gitFingerprint(run, root, rel);
+  const cached = cache.repos.get(rel);
+  if (cached?.fingerprint === before.fingerprint && cached.probe) {
+    out.set(rel, cached.probe);
+    return;
+  }
+
+  const realCtx = (await repoCtx(repoDirOf(root, rel)).catch(() => undefined)) ?? null;
+  let last: CachedDivergenceProbe | undefined;
+  let previous: CachedDivergenceProbe | undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    last = await probeDivergenceRepo(root, rel, realCtx);
+    if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
+    const after = await gitFingerprint(run, root, rel);
+    if (after.fingerprint === before.fingerprint || sameDivergenceProbe(previous, last)) {
+      cache.repos.set(rel, { fingerprint: after.fingerprint, identityKey: last.identityKey, probe: last });
+      cache.dirty = true;
+      out.set(rel, last);
+      return;
+    }
+    previous = last;
+    before = after;
+  }
+  if (last) out.set(rel, last);
+}
+
 /** The pull-side git outcome: the per-repo base to persist plus the updated local-only maps. */
 export interface GitPullOutcome {
   gitRepos?: Record<string, GitSection>;
@@ -687,27 +1004,59 @@ export async function gitDivergenceCount(
   root: string,
   cfg: WorkspaceConfig,
   state: SyncState,
-  matcher: IgnoreMatcher
+  matcher: IgnoreMatcher,
+  discoveredRepos?: DiscoveredGitRepoSource
 ): Promise<number> {
   if (!cfg.syncGit) return 0;
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const pending = state.gitPendingRemote ?? {};
   const needsRes = state.gitNeedsResolution ?? {};
   const removedMem = state.gitReposRemoved ?? {};
-  const discovered = await discoverGitRepos(root, matcher);
-  const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
-  const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base)])].sort();
+  const cache = await loadGitDivergenceCache(root);
+  const probes = new Map<string, CachedDivergenceProbe>();
+  const run: GitFingerprintRun = { commonDirFingerprints: new Map() };
+  const kindByPath = new Map<string, GitRepoKind>();
+  const scheduled = new Set<string>();
+  const inFlight = new Set<Promise<void>>();
+  const source: DiscoveredGitRepoSource =
+    discoveredRepos ??
+    (await discoverGitRepos(root, matcher)).sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
 
-  // Would the main clone at `parentRel` author a section this cycle (design 68 §3.3
-  // eligibility)? Mirrors planGitSections' disposition: a preflight-passing dir repo with a
-  // base or a non-empty identity is captured/carried; a structural refusal drops it (no
-  // section); a transient refusal base-carries only when a base exists. Conservative — when
-  // unsure it returns false, so an uncertain pointer stays COUNTED (never under-claims sync).
-  const parentIsSectioned = async (parentRel: string): Promise<boolean> => {
-    if (kindByPath.get(parentRel) !== "dir") return base[parentRel] !== undefined; // undiscoverable-but-based → carried
-    const ppf = await gitPreflight(repoDirOf(root, parentRel));
-    if (!ppf.ok) return !ppf.structural && base[parentRel] !== undefined; // structural drop = no section
-    return base[parentRel] !== undefined || (await gitIdentity(repoDirOf(root, parentRel))) !== undefined;
+  const scheduleProbe = async (repo: DiscoveredGitRepo): Promise<void> => {
+    kindByPath.set(repo.relPath, repo.kind);
+    if (pending[repo.relPath] || scheduled.has(repo.relPath)) return;
+    scheduled.add(repo.relPath);
+    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes)
+      .catch(() => {})
+      .finally(() => inFlight.delete(p));
+    inFlight.add(p);
+    if (inFlight.size >= GIT_DIVERGENCE_CONCURRENCY) await Promise.race(inFlight);
+  };
+
+  for await (const repo of source) await scheduleProbe(repo);
+  await Promise.all(inFlight);
+
+  const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base)])].sort();
+  const liveKeys = new Set(keys);
+  for (const rel of [...cache.repos.keys()]) {
+    if (!liveKeys.has(rel)) {
+      cache.repos.delete(rel);
+      cache.dirty = true;
+    }
+  }
+  await saveGitDivergenceCache(root, cache).catch(() => {});
+
+  // Would the main clone at `parentRel` author a section this cycle (design 68
+  // §3.3 eligibility)? Mirrors planGitSections' disposition using the already
+  // cached/probed parent outcome, so warm status never spawns git just to skip a
+  // linked worktree pointer.
+  const parentIsSectioned = (parentRel: string): boolean => {
+    if (kindByPath.get(parentRel) !== "dir") return base[parentRel] !== undefined || pending[parentRel] !== undefined; // undiscoverable-but-based → carried
+    const probe = probes.get(parentRel);
+    if (!probe) return base[parentRel] !== undefined || pending[parentRel] !== undefined;
+    if (probe.busy) return base[parentRel] !== undefined; // busy push defers with base carry only
+    if (!probe.preflightOk) return !probe.preflightStructural && base[parentRel] !== undefined; // structural drop = no section
+    return base[parentRel] !== undefined || pending[parentRel] !== undefined || probe.identityKey !== "none";
   };
 
   let n = 0;
@@ -726,43 +1075,40 @@ export async function gitDivergenceCount(
       if (!dirPresent) n++;
       continue;
     }
-    if (await isGitBusy(repoDirOf(root, rel))) continue; // indeterminate this instant
+    const probe = probes.get(rel);
+    if (!probe || probe.busy) continue; // indeterminate this instant
     // Suppressions FIRST, preflight second — planGitSections' exact order (codex R4:
     // a needsResolution-suppressed repo that turns structurally unsyncable is CARRIED
     // by push, so counting it here would drift the verdict from the planner).
     if (!baseSec && removedMem[rel] !== undefined) {
-      const id = await gitIdentity(repoDirOf(root, rel));
-      if (!id || gitIdentityKey(id) === removedMem[rel]) continue; // untouched removal residue
+      if (probe.identityKey === "none" || probe.identityKey === removedMem[rel]) continue; // untouched removal residue
     }
     if (needsRes[rel] !== undefined) {
-      const id = await gitIdentity(repoDirOf(root, rel));
-      if (gitIdentityKey(id) === needsRes[rel]) continue; // conflict-suppressed until touched
+      if (probe.identityKey === needsRes[rel]) continue; // conflict-suppressed until touched
     }
-    const pf = await gitPreflight(repoDirOf(root, rel));
-    if (!pf.ok) {
+    if (!probe.preflightOk) {
       // A STRUCTURAL refusal (shallow/bare/…) over a synced base is not a skip:
       // planGitSections DROPS the section, and that drop is an unpublished change
       // (codex R2). Transient failures defer-with-carry → genuinely nothing pending.
-      if (pf.structural && baseSec) n++;
+      if (probe.preflightStructural && baseSec) n++;
       continue;
     }
-    const id = await gitIdentity(repoDirOf(root, rel));
-    if (!id) continue; // empty repo: nothing to capture, base (if any) carries
+    if (probe.identityKey === "none") continue; // empty repo: nothing to capture, base (if any) carries
     // Design 68 §3.3 policy skip: an in-tree linked-worktree pointer whose owning main clone
     // is itself syncable does not publish its own state (it rides the parent bundle) — the
     // planner base-carries/never-authors it, so it is not pending work. Mirrors planGitSections.
     if (kind === "pointer") {
-      const parentRel = await inTreeWorktreeParentRel(root, repoDirOf(root, rel));
-      if (parentRel && (await parentIsSectioned(parentRel))) continue;
+      if (probe.parentRel && parentIsSectioned(probe.parentRel)) continue;
     }
-    const key = gitIdentityKey(id);
     if (!baseSec) {
       n++; // never-synced local repo → a push would publish it
       continue;
     }
     // The §7 capture-side carry matrix (see planGitSections for the normative copy).
+    const key = probe.identityKey;
+    const pfKind = probe.preflightKind ?? kind;
     const carry =
-      pf.kind === "dir"
+      pfKind === "dir"
         ? baseSec.refScope === "all" && key === gitIdentityKey(baseSec)
         : baseSec.refScope === "scoped"
           ? key === gitIdentityKey(baseSec)

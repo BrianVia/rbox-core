@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { type GitRepoKind, detectGitKind, exists, git, gitBusy, gitOk, repoCtx } from "./shared.js";
+import { type GitRepoKind, type RepoCtx, detectGitKind, exists, git, gitBusy, gitOk, repoCtx } from "./shared.js";
 
 export interface GitPreflightResult {
   ok: boolean;
@@ -26,14 +26,15 @@ export interface GitPreflightResult {
  *  superprojects (`.git/modules/`) stay refused (v1; explicitly unsupported [design 43 v2,
  *  M1]); alternates refused for both kinds (pointer: checked on the RESOLVED object store).
  *  Dangling pointers (main clone deleted) fail cleanly — the repo is skipped this cycle. */
-export async function gitPreflight(repoDir: string): Promise<GitPreflightResult> {
+export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): Promise<GitPreflightResult> {
   const kind = await detectGitKind(repoDir);
   if (!kind) {
     const st = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     if (!st) return { ok: false, reason: "no .git" };
     return { ok: false, reason: ".git is neither a directory nor a gitfile pointer — unsupported", structural: true };
   }
-  const ctx = await repoCtx(repoDir);
+  if (knownCtx && knownCtx.kind !== kind) return { ok: false, reason: ".git kind changed during preflight", kind };
+  const ctx = knownCtx === null ? undefined : knownCtx ?? (await repoCtx(repoDir));
   if (!ctx) {
     return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
   }
@@ -76,8 +77,8 @@ export async function gitPreflight(repoDir: string): Promise<GitPreflightResult>
  * spurious CONFLICT where the design demands "a busy repo defers only itself").
  * A repo with no usable context is not busy (there is nothing to contend with).
  */
-export async function isGitBusy(repoDir: string): Promise<boolean> {
-  const ctx = await repoCtx(repoDir);
+export async function isGitBusy(repoDir: string, knownCtx?: RepoCtx | null): Promise<boolean> {
+  const ctx = knownCtx === null ? undefined : knownCtx ?? (await repoCtx(repoDir));
   if (!ctx) return false;
   return gitBusy(ctx);
 }
