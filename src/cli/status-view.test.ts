@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
 import {
   attributeDaemonForStatus,
+  healthDetailLines,
   healthLine,
   lastSyncLines,
   progressLabel,
@@ -102,14 +103,43 @@ test("in sync — clean local diff, remote agrees", () => {
   expect(line).toContain("8,603 files");
 });
 
-test("halt outranks everything when the daemon is running", () => {
+test("fresh active progress outranks a standing halt and renders the halt as retry context", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    halt: { at: iso(120), reason: "ENOENT: no such file or directory", count: 1, op: "push" },
+    active: { at: iso(1), phase: "encrypt", done: 105551, total: 121885 },
+  };
+  const snapshot = base({ activity, added: 5, remote: { sequence: 99, source: "probe" } });
+  const line = healthLine(snapshot);
+  expect(line).toBe("↻ syncing — encrypting 86% (105,551/121,885)");
+  expect(healthDetailLines(snapshot)).toEqual([
+    "⚠ last attempt failed (2m ago) ENOENT: no such file or directory — will be retried",
+  ]);
+});
+
+test("stale active progress with a halt keeps the halt as the verdict", () => {
   const activity: DaemonActivity = {
     at: iso(10),
     halt: { at: iso(300), reason: "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).", count: 4, op: "pull" },
-    active: { at: iso(1), phase: "upload", done: 1, total: 2 },
+    active: { at: iso(120), phase: "upload", done: 1, total: 2 },
+  };
+  const snapshot = base({ activity, added: 5, remote: { sequence: 99, source: "probe" } });
+  const line = healthLine(snapshot);
+  expect(line).toContain("sync failing");
+  expect(line).toContain("mass-delete guard");
+  expect(line).toContain("will be retried");
+  expect(line).toContain("5m ago");
+  expect(line).toContain("×4");
+  expect(healthDetailLines(snapshot)).toEqual([]);
+});
+
+test("halt alone keeps the existing halt verdict", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    halt: { at: iso(300), reason: "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).", count: 4, op: "pull" },
   };
   const line = healthLine(base({ activity, added: 5, remote: { sequence: 99, source: "probe" } }));
-  expect(line).toContain("sync halted");
+  expect(line).toContain("sync failing");
   expect(line).toContain("mass-delete guard");
   expect(line).toContain("5m ago");
   expect(line).toContain("×4");
@@ -122,7 +152,7 @@ test("a stopped daemon's leftover halt is dropped (stopped already says sync is 
   expect(line).toContain("in sync");
 });
 
-test("out-of-storage outranks live progress but stays below halt", () => {
+test("out-of-storage outranks fresh live progress but stays below halt", () => {
   const activity: DaemonActivity = {
     at: iso(10),
     outOfStorage: { at: iso(5), kind: "storage", used: 2 * 1024 * 1024 * 1024, cap: 2 * 1024 * 1024 * 1024 },
@@ -130,9 +160,10 @@ test("out-of-storage outranks live progress but stays below halt", () => {
   };
   const line = healthLine(base({ activity }));
   expect(line).toBe("⛔ out of storage — 2.0 GiB of 2.0 GiB used · run `rbox usage`, then `rbox subscribe solo`");
+  expect(healthDetailLines(base({ activity }))).toEqual([]);
 
   const halted = healthLine(base({ activity: { ...activity, halt: { at: iso(1), reason: "boom", count: 1, op: "push" } } }));
-  expect(halted).toContain("sync halted");
+  expect(halted).toContain("sync failing");
   expect(halted).not.toContain("out of storage");
 });
 
