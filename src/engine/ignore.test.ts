@@ -117,3 +117,42 @@ describe("nativePruneGlobs — coarse native watcher prune, negation-aware (desi
     }
   });
 });
+
+describe("builtin ignores — regenerable build/cache dirs (multi-ecosystem)", () => {
+  test("distinctive build outputs are excluded at any depth", () => {
+    const m = buildIgnoreMatcher(root);
+    for (const p of [
+      ".build/checkouts/GRDB.swift/Package.swift", // SwiftPM dep clone (live incident)
+      "apps/apple/NotekeeperCore/.build/debug/app",
+      "DerivedData/Notekeeper/Build/x",
+      "api/__pycache__/mod.cpython-312.pyc",
+      "infra/cdk.out/stack.template.json",
+      "infra/.terraform/providers/x",
+      "svc/.gradle/8.5/task",
+      "web/.wrangler/state/v3/d1.sqlite-x",
+      "site/.output/server/index.mjs",
+      "native/cmake-build-debug/CMakeCache.txt",
+      "lib/zig-out/bin/tool",
+      "ml/.ipynb_checkpoints/nb-checkpoint.ipynb",
+    ]) {
+      expect(m.ignores(p)).toBe(true);
+    }
+  });
+
+  test("generic / sometimes-committed names still sync", () => {
+    const m = buildIgnoreMatcher(root);
+    for (const p of [
+      "bin/deploy.sh", // generic bin/ is real content
+      "obj/model.obj",
+      "out/notes.md",
+      "deps/README.md",
+      "Pods/Local/podspec.json", // sometimes committed on purpose
+      "vendor/patched-lib/x.go",
+      ".vscode/settings.json", // editor config: untracked-but-precious
+      "wandb/run-1/summary.json", // experiment data
+      "terraform.tfstate", // state FILES sync (E2EE backup is a feature)
+    ]) {
+      expect(m.ignores(p)).toBe(false);
+    }
+  });
+});
