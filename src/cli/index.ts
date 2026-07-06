@@ -1,8 +1,8 @@
 import path from "node:path";
-import { type Action } from "../engine/index.js";
 import { progressLabel } from "./status-view.js";
-import { findRoot, type WorkspaceConfig } from "./config.js";
-import { pull, push, sync } from "./sync.js";
+import { findRoot } from "./config.js";
+import { pull, push } from "./sync.js";
+import { postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
@@ -64,21 +64,6 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
 //   }
 // }
 
-/** Post-sync drift nudge: if a pull/sync wrote a changed lockfile, print the
- *  one-line drift notice (design 29). Best-effort — never breaks a sync. */
-async function postSyncNudge(root: string, actions: Action[], cfg: WorkspaceConfig): Promise<void> {
-  if (cfg.noDrift || process.env.RBOX_NO_DRIFT === "1") return;
-  const written = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write").map((a) => a.entry.path);
-  if (written.length === 0) return;
-  try {
-    const { nudgeForWrittenPaths, renderNotices } = await import("./deps-drift.js");
-    const notices = await nudgeForWrittenPaths(root, written);
-    if (notices.length) process.stderr.write(`${renderNotices(notices)}\n`);
-  } catch {
-    /* nudge is advisory; a failure here must not fail the sync */
-  }
-}
-
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
   if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
@@ -133,7 +118,10 @@ async function main(): Promise<void> {
   setJsonErrorMode(jsonMode);
   if (rawJsonMode && !jsonMode) flags.json = "false";
 
-  if (!rawJsonMode && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
+  // Bare `rbox` (cmd === undefined) is excluded too: in a tracked dir it renders the
+  // status block (whose own update line covers this — nudging here would print BEFORE
+  // the block, which `rbox status` never does), and mid-setup an upgrade nag is noise.
+  if (!rawJsonMode && cmd && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
     await maybeNudgeForUpdate();
   }
 
@@ -282,27 +270,7 @@ async function main(): Promise<void> {
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      const sp = spinner("syncing");
-      try {
-        const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
-        deps.allowMassDelete = flags["allow-mass-delete"] === "true";
-        const report = beginReport("sync");
-        deps.report = report;
-        const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
-        sp.stop();
-        summarize("pulled", pulled, root);
-        console.log(
-          pushCommitted
-            ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
-            : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
-        );
-        report?.logSummaryTo((l) => console.log(style.dim(l)));
-        await postSyncNudge(root, pulled, cfg);
-      } catch (e) {
-        sp.fail("sync failed");
-        throw e;
-      }
+      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true" });
       break;
     }
     case "export": {
@@ -464,26 +432,24 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      // Bare `rbox` in a terminal → the guided `setup` front door (design 29).
+      // Bare `rbox` in a terminal → status/actions when already inside a workspace,
+      // otherwise the guided `setup` front door (design 29).
       // Non-interactive bare `rbox`, or an unknown command → the grouped help
       // screen (never hangs). An unknown command also exits non-zero.
       if (!cmd && process.stdin.isTTY) {
-        const { runSetup } = await import("./setup-cmd.js");
-        await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+        const { resolveBareRboxTarget, runFrontDoor } = await import("./front-door.js");
+        const target = await resolveBareRboxTarget(process.cwd());
+        if (target.kind === "front-door") {
+          await runFrontDoor(target.root);
+        } else {
+          const { runSetup } = await import("./setup-cmd.js");
+          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+        }
         break;
       }
       console.log(renderGroupedHelp());
       if (cmd && !isKnownTopLevel(cmd)) process.exitCode = 1;
   }
-}
-
-function summarize(label: string, actions: { kind: string; path?: string; keepLocalAs?: string }[], _root: string): void {
-  const writes = actions.filter((a) => a.kind === "write").length;
-  const deletes = actions.filter((a) => a.kind === "delete").length;
-  const conflicts = actions.filter((a) => a.kind === "conflict");
-  const conflictPart = conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)");
-  console.log(`${style.bold(label)}: ${style.green(`${writes} written`)}, ${deletes} deleted, ${conflictPart}`);
-  for (const c of conflicts) console.log(`  ${style.sym.warn} conflict: ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
 }
 
 main().catch((e) => {

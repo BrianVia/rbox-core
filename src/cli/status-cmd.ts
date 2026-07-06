@@ -1,6 +1,7 @@
 import { buildIgnoreMatcher, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
+import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
@@ -196,7 +197,7 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   const wsLabel = cfg.name
     ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
     : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
-  console.log(`${style.bold("workspace")} ${wsLabel}`);
+  console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
   console.log(
     `  ${healthLine({
       added: d.added.length,
