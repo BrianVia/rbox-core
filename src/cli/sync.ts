@@ -96,6 +96,9 @@ export interface SyncDeps {
    *  (design 45, codex R2: the daemon's forensic log and activity trail must record
    *  every local-tree mutation, whichever path performed it). */
   onPullApplied?: (actions: Action[]) => void;
+  /** Daemon-only terminal-halt hint. Foreground `rbox push` / `rbox sync` leaves this
+   *  unset so an explicit user sync always makes a real attempt. */
+  blockedFingerprint?: string;
 }
 
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
@@ -278,7 +281,7 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; c
  */
 type RecoveryAction =
   | { kind: "pull-first" }
-  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest };
+  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number };
 
 /** The result of ONE push attempt: either done (committed / no-op / everything deferred),
  *  or a classified recovery to apply, carrying the error to throw once the shared
@@ -317,13 +320,20 @@ export async function pushManifest(
   const backoff = deps.backoff ?? defaultBackoff;
   let currentLocal = local;
   let currentForce = forceGitRecapture;
+  let previousUnsatisfiedTotal: number | undefined;
 
   for (;;) {
     const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce);
     if (outcome.done) return outcome.result;
+    const consumesAttempt =
+      outcome.action.kind !== "reupload" ||
+      outcome.action.unsatisfiedTotal === undefined ||
+      previousUnsatisfiedTotal === undefined ||
+      outcome.action.unsatisfiedTotal >= previousUnsatisfiedTotal;
+    previousUnsatisfiedTotal = outcome.action.kind === "reupload" ? outcome.action.unsatisfiedTotal : undefined;
     // Shared budget: throw once we've exhausted MAX_ATTEMPTS (the just-failed attempt is
     // `attempt`), matching the original recursion's throw-before-retry ordering.
-    if (attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
+    if (consumesAttempt && attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
     if (outcome.action.kind === "pull-first") {
       await backoff(attempt);
       await pull(root, cfg, deps);
@@ -336,7 +346,7 @@ export async function pushManifest(
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
     }
-    attempt++;
+    if (consumesAttempt) attempt++;
   }
 }
 
@@ -472,7 +482,8 @@ async function runPushAttempt(
     );
   }
 
-  const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed));
+  const commitOptions = deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : undefined;
+  const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed, commitOptions));
 
   if (res.conflict) {
     deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
@@ -487,7 +498,7 @@ async function runPushAttempt(
     const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
     return {
       done: false,
-      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: local },
+      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: local, unsatisfiedTotal: res.unsatisfiedTotal },
       exhaustedError: "push: server keeps reporting missing blobs after re-upload",
     };
   }

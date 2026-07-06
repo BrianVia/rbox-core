@@ -49,7 +49,13 @@ export interface DaemonActivity {
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
    *  becomes visible. */
-  halt?: { at: string; reason: string; count: number; op: "pull" | "push" | "fullScan" | "deepScan" };
+  halt?: {
+    at: string;
+    reason: string;
+    count: number;
+    op: "pull" | "push" | "fullScan" | "deepScan";
+    terminal?: { fingerprint: string };
+  };
   /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
   outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number };
 }
@@ -106,7 +112,16 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     }
     const halt = raw.halt;
     if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
-      a.halt = { at: halt.at, reason: halt.reason, count: halt.count, op: halt.op };
+      const terminal = halt.terminal;
+      a.halt = {
+        at: halt.at,
+        reason: halt.reason,
+        count: halt.count,
+        op: halt.op,
+        ...(terminal && typeof terminal.fingerprint === "string" && terminal.fingerprint.length > 0
+          ? { terminal: { fingerprint: terminal.fingerprint } }
+          : {}),
+      };
     }
     const out = raw.outOfStorage;
     if (
@@ -157,6 +172,7 @@ export const shellLineStateOf = (
   now: number
 ): "halt" | "outofstorage" | "active" | "pending" | "ok" => {
   const active = freshActive(a, now);
+  if (a.halt?.terminal) return "halt";
   if (a.halt && (!active || a.outOfStorage)) return "halt";
   if (a.outOfStorage) return "outofstorage";
   if (active) return "active";

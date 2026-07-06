@@ -117,6 +117,28 @@ test("fresh active progress outranks a standing halt and renders the halt as ret
   ]);
 });
 
+test("terminal halt renders blocked red, outranks fresh active, and omits retry copy", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    halt: {
+      at: iso(120),
+      reason: "workspace needs 250,001 blob refs per commit; the server cap is 250,000.",
+      count: 1,
+      op: "push",
+      terminal: { fingerprint: "sidecar-sha" },
+    },
+    active: { at: iso(1), phase: "upload", done: 1, total: 2 },
+  };
+  const snapshot = base({ activity, added: 5, remote: { sequence: 99, source: "probe" } });
+  const line = healthLine(snapshot);
+  expect(line).toContain("sync blocked");
+  expect(line).toContain("2m ago");
+  expect(line).toContain("250,001 blob refs");
+  expect(line).not.toContain("will be retried");
+  expect(line).not.toContain("syncing");
+  expect(healthDetailLines(snapshot)).toEqual([]);
+});
+
 test("stale active progress with a halt keeps the halt as the verdict", () => {
   const activity: DaemonActivity = {
     at: iso(10),

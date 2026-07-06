@@ -32,6 +32,8 @@ class FakeRemote implements SyncRemote {
   private readonly blobs = new Map<string, Buffer>(); // encSha → ciphertext
   commitCalls = 0;
   forceUnsatisfiedOnce = false;
+  forceUnsatisfiedTotals: number[] = [];
+  forceUnsatisfiedPageSize = 1;
   beforeCommit?: () => Promise<void>;
   // Live-folder TOCTOU simulation: reject a given encSha's PUT with a 400 sha_mismatch
   // (as R2 does when the streamed ciphertext no longer hashes to the declared encSha).
@@ -81,6 +83,11 @@ class FakeRemote implements SyncRemote {
     const addr = (f: FileEntry) => f.encSha ?? f.sha256;
     const missing = manifest.files.filter((f) => f.type === "file").map(addr).filter((s) => !this.blobs.has(s));
     if (missing.length > 0) return { unsatisfiedBlobs: [...new Set(missing)] };
+    if (this.forceUnsatisfiedTotals.length > 0) {
+      const total = this.forceUnsatisfiedTotals.shift()!;
+      const page = [...new Set(manifest.files.filter((f) => f.type === "file").map(addr))].slice(0, this.forceUnsatisfiedPageSize);
+      return { unsatisfiedBlobs: page, unsatisfiedTotal: total };
+    }
     if (this.forceUnsatisfiedOnce) {
       this.forceUnsatisfiedOnce = false;
       return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map(addr) };
@@ -276,6 +283,27 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
   const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.commitCalls).toBe(2); // 422 then success
+});
+
+test("422 decreasing missingTotal pages can progress beyond the fixed retry budget", async () => {
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  remote.forceUnsatisfiedTotals = [60_000, 50_000, 40_000, 30_000, 20_000, 10_000];
+
+  const { sequence: seq } = await push(root, cfg, deps(remote));
+
+  expect(seq).toBe(1);
+  expect(remote.commitCalls).toBe(7); // six capped 422 pages, then success
+});
+
+test("422 non-decreasing missingTotal still exhausts the existing retry budget", async () => {
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  remote.forceUnsatisfiedTotals = Array.from({ length: 10 }, () => 10_000);
+
+  await expect(push(root, cfg, deps(remote))).rejects.toThrow(/server keeps reporting missing blobs/);
+  expect(remote.headSeq()).toBe(0);
+  expect(remote.commitCalls).toBe(6);
 });
 
 // ── live-folder TOCTOU: 400 sha_mismatch → re-scan + retry (self-heal) ──────

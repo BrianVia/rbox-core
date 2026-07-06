@@ -25,6 +25,15 @@ export const MAX_COMMIT_BODY = 1024 * 1024; // 1MB
 export const MAX_REQUEST_BODY = 8 * 1024 * 1024; // 8MB — parse-heap-safe
 
 export const MAX_COMMIT_SPAN = 5000; // commits?since span cap → over this, client re-baselines
+export const MAX_MISSING_SHAS_RESPONSE = 10_000;
+
+export function unsatisfiedBlobsBody(missing: string[]): { error: "unsatisfied_blobs"; missing: string[]; missingTotal: number } {
+  return {
+    error: "unsatisfied_blobs",
+    missing: missing.slice(0, MAX_MISSING_SHAS_RESPONSE),
+    missingTotal: missing.length,
+  };
+}
 
 // Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
 // Content-Length). Returns the decoded text, "" for an empty body, or null if it exceeds the cap.

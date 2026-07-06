@@ -120,6 +120,7 @@ const freshActive = (s: StatusSnapshot): DaemonActivity["active"] | undefined =>
 };
 
 const haltLine = (halt: NonNullable<DaemonActivity["halt"]>, now: number): string => {
+  if (halt.terminal) return `${style.red("⛔ sync blocked")} ${style.dim(`(${relTime(halt.at, now)})`)} ${halt.reason}`;
   const times = halt.count > 1 ? `, ×${halt.count}` : "";
   // Only reachable with a LIVE daemon (a stopped daemon's leftover halt is dropped
   // above) — and a live daemon retries every tick, so this is amber, not alarm-red,
@@ -180,6 +181,7 @@ export function healthLine(s: StatusSnapshot): string {
   //    below it. The one surgical exception is a fresh retry transfer: it
   //    leads over an older halt, with the halt rendered as secondary context.
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  if (halt?.terminal) return haltLine(halt, s.now);
   if (halt && (!active || out)) return haltLine(halt, s.now);
   if (out) {
     const usage = quotaUsage(out.kind, out.used, out.cap);
@@ -235,7 +237,7 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   const halt = s.daemonRunning ? s.activity?.halt : undefined;
   const active = freshActive(s);
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
-  if (!halt || !active || out) return [];
+  if (!halt || halt.terminal || !active || out) return [];
   return [`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`];
 }
 

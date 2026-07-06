@@ -20,7 +20,7 @@ import {
 } from "../engine/e2ee/index.js";
 import { hashBytes } from "../engine/hash.js";
 import { poolMap, type BlobStore, type Manifest } from "../engine/index.js";
-import { NeedsRebaselineError, type CommitResult, type SyncRemote } from "./remote.js";
+import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
@@ -32,7 +32,7 @@ const HISTORY_DECRYPT_CONCURRENCY = 8;
  *  so the body stays O(1). A repo big enough to need this already exceeds what a pre-§24
  *  client could commit (it would hit the 1 MB cap), so sidecar-for-large-only regresses no
  *  currently-working case. Below the threshold, inline keeps full old/new-client interop. */
-const SIDECAR_THRESHOLD = 4000;
+export const SIDECAR_THRESHOLD = 4000;
 
 /**
  * E2EE sync transport (design 12 §13). Implements the SAME `SyncRemote` seam
@@ -47,6 +47,24 @@ const SIDECAR_THRESHOLD = 4000;
  */
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+
+export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
+  const refByEnc = new Map<string, { encSha: string; size: number }>();
+  for (const f of manifest.files) {
+    if (f.type !== "file") continue;
+    if (!f.encSha) return null;
+    if (!refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
+  }
+  const addGit = (encSha: string | undefined, size: number | undefined) => {
+    if (encSha && !refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size: size ?? 0 });
+  };
+  for (const g of Object.values(manifest.gitRepos ?? {})) {
+    addGit(g.bundleEncSha, g.bundleCipherSize);
+    addGit(g.indexEncSha, g.indexCipherSize);
+    for (const ref of Object.values(g.opState ?? {})) addGit(ref.encSha, ref.cipherSize);
+  }
+  return [...refByEnc.values()];
+}
 
 export interface AccountKeysDTO {
   recoveryWrap: string | null;
@@ -333,7 +351,7 @@ export class E2eeRemote implements SyncRemote {
     return best;
   }
 
-  async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
+  async commit(parentSequence: number, _deviceId: string, manifest: Manifest, options: CommitOptions = {}): Promise<CommitResult> {
     const account = await this.refreshAccount(); // C4: refresh immediately before signing
     // D1: if the epoch rotated between blob encryption (currentKek) and now, the
     // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a
@@ -350,10 +368,6 @@ export class E2eeRemote implements SyncRemote {
     // files can share one blob (identical content → same convergent encSha, e.g.
     // empty files or repeated boilerplate). Dedup by encSha; the file→blob mapping
     // lives in the manifest's file entries. (size advisory; server bills actual R2 bytes.)
-    const refByEnc = new Map<string, { encSha: string; size: number }>();
-    for (const f of manifest.files) {
-      if (f.type === "file" && f.encSha && !refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
-    }
     // §28: git artifact blobs (bundle/index/op-state) live in manifest.gitRepos, NOT
     // manifest.files, so they must be added to blobRefs explicitly — else they're uploaded but
     // never granted/charged and GC could reclaim a live bundle. Union across repos (design 43
@@ -361,15 +375,8 @@ export class E2eeRemote implements SyncRemote {
     // CIPHERTEXT size (codex M2): the `size` is advisory (server bills measured R2 bytes) and
     // the ciphertext size is what the server sees anyway, so no plaintext git size (≈ repo
     // size) enters a server-visible ref/sidecar.
-    const addGit = (encSha: string | undefined, size: number | undefined) => {
-      if (encSha && !refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size: size ?? 0 });
-    };
-    for (const g of Object.values(manifest.gitRepos ?? {})) {
-      addGit(g.bundleEncSha, g.bundleCipherSize);
-      addGit(g.indexEncSha, g.indexCipherSize);
-      for (const ref of Object.values(g.opState ?? {})) addGit(ref.encSha, ref.cipherSize);
-    }
-    const blobRefs = [...refByEnc.values()];
+    const blobRefs = blobRefsForManifest(manifest);
+    if (!blobRefs) throw new Error("E2EE commit requires every file entry to have an encrypted blob address");
     // §24: for a large ref set, move refs OUT of the signed body into a content-addressed
     // sidecar blob (canonical rbox-refset-v1 bytes). The body then carries only the descriptor
     // {sidecarSha,count,totalBytes}; the signature still commits to sidecarSha. Upload the
@@ -378,8 +385,11 @@ export class E2eeRemote implements SyncRemote {
     if (blobRefs.length >= SIDECAR_THRESHOLD) {
       const sidecarBytes = serializeRefset(blobRefs);
       const sidecarSha = hashBytes(sidecarBytes);
-      await this.api.putBlobBytes(sidecarSha, sidecarBytes);
       blobRefset = { sidecarSha, count: blobRefs.length, totalBytes: blobRefs.reduce((n, r) => n + r.size, 0) };
+      if (sidecarSha === options.blockedFingerprint) {
+        throw new CommitRejectedError("too_many_refs", undefined, undefined, sidecarSha, true);
+      }
+      await this.api.putBlobBytes(sidecarSha, sidecarBytes);
     }
     const built = await buildCommit({
       secrets: this.ctx.secrets,
@@ -397,9 +407,15 @@ export class E2eeRemote implements SyncRemote {
     });
     await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
 
-    const res = await this.api.commitSigned(parentSequence, built.commit);
+    let res: CommitChainResult;
+    try {
+      res = await this.api.commitSigned(parentSequence, built.commit);
+    } catch (e) {
+      if (e instanceof CommitRejectedError && blobRefset) e.fingerprint = blobRefset.sidecarSha;
+      throw e;
+    }
     if (res.conflict) return { conflict: true, head: res.head };
-    if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs };
+    if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
     if (res.epochStale !== undefined) return { conflict: true, head: parentSequence }; // rotated under us → pull+retry
     // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.

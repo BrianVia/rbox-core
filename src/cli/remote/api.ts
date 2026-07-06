@@ -3,7 +3,7 @@ import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob, putBlobFile } from "./blobs.js";
-import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitResult } from "./commits.js";
+import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult } from "./commits.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
 import {
@@ -27,7 +27,7 @@ export interface SyncRemote {
   latest(): Promise<{ sequence: number; manifest: Manifest }>;
   missingBlobs(shas: string[]): Promise<string[]>;
   putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void>;
-  commit(parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult>;
+  commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
 }
@@ -60,7 +60,7 @@ export class RboxApi implements SyncRemote {
     return getBlobToFile(this.ctx, sha256, destPath);
   }
 
-  commit(parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {
+  commit(parentSequence: number, deviceId: string, manifest: Manifest, _options?: CommitOptions): Promise<CommitResult> {
     return commit(this.ctx, parentSequence, deviceId, manifest);
   }
 

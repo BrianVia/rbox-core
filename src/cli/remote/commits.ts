@@ -4,6 +4,40 @@ import type { CommitChainResult } from "../e2ee-remote.js";
 import type { RemoteContext } from "./context.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 
+export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
+
+export type CommitRejectReason = "too_many_refs" | "body_too_large";
+
+export class CommitRejectedError extends Error {
+  constructor(
+    public readonly reason: CommitRejectReason,
+    public readonly count?: number,
+    public readonly max?: number,
+    public fingerprint?: string,
+    public readonly stillBlocked = false
+  ) {
+    super(commitRejectedMessage(reason, count, max));
+    this.name = "CommitRejectedError";
+  }
+}
+
+export interface CommitOptions {
+  blockedFingerprint?: string;
+}
+
+export interface ReceiptRedeemResult {
+  granted: number;
+  alreadyEntitled: number;
+  rejected: number;
+}
+
+function commitRejectedMessage(reason: CommitRejectReason, count?: number, max?: number): string {
+  if (reason === "too_many_refs" && count !== undefined && max !== undefined) {
+    return `workspace needs ${count.toLocaleString("en-US")} blob refs per commit; the server cap is ${max.toLocaleString("en-US")}. Exclude large directories with \`rbox ignore\` or split the workspace.`;
+  }
+  return "commit request is too large for the server. Exclude large directories with `rbox ignore` or split the workspace.";
+}
+
 export interface CommitResult {
   sequence?: number;
   /** Parent-sequence conflict (HTTP 409): client must pull+reconcile, then retry. */
@@ -12,6 +46,7 @@ export interface CommitResult {
   /** Manifest referenced blobs the server doesn't have (HTTP 422): upload these, then retry.
    *  Distinct from a parent conflict — a different recovery (upload, not pull). */
   unsatisfiedBlobs?: string[];
+  unsatisfiedTotal?: number;
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {
@@ -36,8 +71,8 @@ export async function commit(ctx: RemoteContext, parentSequence: number, deviceI
     return { conflict: true, head: body.head };
   }
   if (res.status === 422) {
-    const body = (await res.json()) as { missing?: string[] };
-    return { unsatisfiedBlobs: body.missing ?? [] };
+    const body = (await res.json()) as { missing?: string[]; missingTotal?: number };
+    return { unsatisfiedBlobs: body.missing ?? [], unsatisfiedTotal: body.missingTotal };
   }
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
@@ -62,6 +97,31 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
   return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
 }
 
+export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
+  const results: ReceiptRedeemResult[] = [];
+  while (ctx.receipts.size > 0) {
+    const batch = [...ctx.receipts.entries()].slice(0, RECEIPT_REDEEM_BATCH_MAX);
+    // SAFE TO RETRY — receipt redemption is idempotent: duplicate calls find refs already
+    // entitled and grant 0, while a socket-close-before-response can be replayed safely.
+    const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/receipts/redeem`, {
+      method: "POST",
+      headers: { ...ctx.protoAuth, "content-type": "application/json" },
+      body: JSON.stringify({ receipts: Object.fromEntries(batch) }),
+    }, { op: "redeeming upload receipts" });
+    if (!r.ok) {
+      const { quota, text } = await readQuotaExceeded(r);
+      if (quota) throw quota;
+      throw new Error(translateRemoteError(r.status, "receipt redeem failed", text, "workspace not found — check you're in the right directory"));
+    }
+    const body = (await r.json()) as ReceiptRedeemResult;
+    results.push(body);
+    for (const [sha, receipt] of batch) {
+      if (ctx.receipts.get(sha) === receipt) ctx.receipts.delete(sha);
+    }
+  }
+  return results;
+}
+
 /** Post a signed commit envelope. Maps the server's 409 variants: a parent
  *  conflict (pull+retry) vs `epoch_stale` (a rotation landed under us). */
 export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit: SignedCommit): Promise<CommitChainResult> {
@@ -71,19 +131,42 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   // SAFE TO RETRY — same `parentSequence === head` CAS as commit() above; a duplicate after a
   // socket close 409s benignly (see the note there). Sending all still-valid receipts each attempt
   // is already idempotent (the server charges 0 for already-entitled refs).
+  await redeemReceipts(ctx);
   const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
     method: "POST",
     headers: { ...ctx.protoAuth, "content-type": "application/json" },
-    body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: Object.fromEntries(ctx.receipts) }),
+    body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: {} }),
   }, { op: "publishing your changes" });
   if (r.status === 409) {
     const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number };
     if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0 };
     return { conflict: true, head: b.head };
   }
-  if (r.status === 422) return { unsatisfiedBlobs: ((await r.json()) as { missing?: string[] }).missing ?? [] };
+  if (r.status === 422) {
+    const b = (await r.json()) as { missing?: string[]; missingTotal?: number };
+    return { unsatisfiedBlobs: b.missing ?? [], unsatisfiedTotal: b.missingTotal };
+  }
+  if (r.status === 413) {
+    const b = (await r.clone().json().catch(() => ({}))) as { error?: string; count?: number; max?: number };
+    if (b.error === "too_many_refs") throw new CommitRejectedError("too_many_refs", b.count, b.max);
+    if (b.error === "body_too_large") throw new CommitRejectedError("body_too_large", b.count, b.max);
+  }
   if (!r.ok) {
-    const { quota, text } = await readQuotaExceeded(r);
+    const text = await r.text();
+    try {
+      const body = JSON.parse(text) as { error?: unknown; count?: unknown; max?: unknown };
+      if (body.error === "body_too_large") {
+        throw new CommitRejectedError(
+          "body_too_large",
+          typeof body.count === "number" ? body.count : undefined,
+          typeof body.max === "number" ? body.max : undefined,
+        );
+      }
+    } catch (e) {
+      if (e instanceof CommitRejectedError) throw e;
+    }
+    const consumed = new Response(text, { status: r.status, headers: r.headers });
+    const { quota } = await readQuotaExceeded(consumed);
     if (quota) throw quota;
     throw new Error(translateRemoteError(r.status, "commit failed", text, "workspace not found — check you're in the right directory"));
   }
