@@ -6,7 +6,46 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
-Merged work from designs 60-65:
+## [0.9.0] — 2026-07-06 — worktree git-sync, live progress, network resilience, fast status
+
+Born from a founder stress test: a first push over a 140-repo, 131k-file
+workspace, run as a real customer would.
+
+### Added
+- **Git-state sync for main clones with linked worktrees (design 68).**
+  Primary repos using `git worktree` (agent workflows, Conductor) now capture
+  index/HEAD/stash via `--single-worktree --all`; applies defer whole-section
+  when a ref collides with a branch checked out in a sibling worktree; in-tree
+  scratch worktrees no longer re-upload the shared history once per worktree.
+- **Live progress for the long sync phases.** First pushes show
+  `scanning… N files` and `capturing git state 3/140 — <repo>`; the daemon
+  feeds the same progress to `rbox status` and the zsh prompt glyph.
+- **Network resilience on the sync path.** Transient socket faults retry with
+  bounded backoff (commit POSTs proven idempotent via the server's sequence
+  CAS); stalled transfers time out (no-progress watchdog on downloads,
+  size-scaled caps on uploads); network errors now say what dropped and that
+  re-running is safe — raw runtime errors never reach the terminal.
+- **Resumable, hardened git-capture uploads.** Capture stages under the
+  workspace's `.rbox/` (immune to tmp reapers), sha-mismatch faults re-encrypt
+  and retry like file blobs, GB-scale bundle uploads resume across attempts,
+  and stale staging sweeps are pid-aware (a live capture is never swept).
+
+### Changed
+- **`rbox status` is ~11× faster on repo-heavy trees (design 69).** 90s → ~8s
+  warm on the stress-test workspace: status finally uses the on-disk hash
+  cache, discovers repos during the one scan walk, pools the git probes, and
+  skips unchanged repos entirely via a stat-only gitdir fingerprint cache
+  (zero git subprocesses for a quiet repo).
+- **Onboarding prompts tightened.** Workspace naming is one prompt (ENTER
+  accepts the suggestion, `-` skips); background-sync + autostart is one
+  three-way select; first-push spinners explain the scan phase.
+
+### Fixed
+- A transient network fault no longer discards an entire initial push.
+- The 6GB-bundle capture failure mode (ciphertext truncated in `os.tmpdir()`
+  during long multipart uploads) is closed.
+
+## [0.8.0] — 2026-07-04 — launch-readiness batch (designs 60-67)
 
 ### Added
 - **Self-serve genesis (design 60).** Cold accounts created via web signup or
