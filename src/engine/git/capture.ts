@@ -3,7 +3,7 @@ import path from "node:path";
 import type { BlobStore } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
-import { exists, git, gitOk, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
+import { exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
 import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOf } from "./identity.js";
@@ -71,6 +71,17 @@ export interface GitCaptureOptions {
 
 export function gitCaptureScratchRoot(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".rbox", "gitcap");
+}
+
+function normalizeSymbolicHeadCasing(head: string, refs: Record<string, string>): string {
+  const branch = headBranchOf(head);
+  if (!branch || Object.prototype.hasOwnProperty.call(refs, branch)) return head;
+  const matches = Object.keys(refs).filter((ref) => ref.toLowerCase() === branch.toLowerCase());
+  // macOS/APFS case-insensitivity can leave HEAD with checkout-time casing while
+  // packed-refs/show-ref preserves another spelling. Use the ref store's casing as
+  // truth only when it identifies exactly one branch; ambiguous cases still fail
+  // validation below.
+  return matches.length === 1 ? `ref: ${matches[0]}` : head;
 }
 
 function pidIsAlive(pid: number): boolean {
@@ -187,8 +198,9 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     }
 
     // 2. refs + HEAD (scope-aware) — read via git / atomic file from the resolved gitdir.
-    const head = await readHead(ctx);
+    let head = await readHead(ctx);
     const refs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, head);
+    head = normalizeSymbolicHeadCasing(head, refs);
 
     // 3. Make dirty+staged state + pseudo-ref commits reachable, then bundle.
     //    `git stash create` works from a worktree context unchanged.
@@ -240,10 +252,10 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     };
     // Engine self-check (scrutiny M4): a capture race (branch deleted between the HEAD and
     // refs reads by a concurrent git/sibling worktree, or an exotic symbolic-ref outside
-    // refs/heads) can assemble a section apply-side validation refuses. Defer this repo —
-    // undefined, identical to the empty-repo path; the next cycle re-captures — rather than
-    // commit a section every receiver will reject.
-    if (!validateGitSection(section).ok) return undefined;
+    // refs/heads) can assemble a section apply-side validation refuses. Defer this repo
+    // with the validator reason rather than commit a section every receiver will reject.
+    const validation = validateGitSection(section);
+    if (!validation.ok) throw new GitCaptureDeferredError(`capture failed self-validation: ${validation.reason ?? "invalid git section"}`);
     return section;
   } finally {
     if (pins) await deleteScratchPins(repoDir, pins);

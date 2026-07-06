@@ -171,6 +171,11 @@ async function commitFile(dir: string, file: string, content: string, msg: strin
   if (date) await gitAt(dir, date, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
   else await git(dir, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
 }
+async function appendPackedRef(dir: string, ref: string, sha: string) {
+  const packed = path.join(dir, ".git", "packed-refs");
+  const existing = await fs.readFile(packed, "utf8").catch(() => "# pack-refs with: peeled fully-peeled sorted\n");
+  await fs.writeFile(packed, `${existing.endsWith("\n") ? existing : `${existing}\n`}${sha} ${ref}\n`);
+}
 async function makeInTreeMainWithWorktree(): Promise<{ M: string; W: string }> {
   const M = path.join(rootA, "main");
   await initRepo(M);
@@ -321,7 +326,10 @@ test("design 68 V6: an in-tree linked-worktree pointer is SKIPPED — its histor
   const m = (await remote.latest()).manifest;
   expect(Object.keys(m.gitRepos ?? {})).toEqual(["main"]); // wt NOT captured — travels with the main clone
   expect(m.gitRepos!["main"]!.refScope).toBe("all");
-  expect(logsA.some((l) => l.includes("skipped 1") && l.includes("wt"))).toBe(true);
+  const skipLine = logsA.find((l) => l.includes("skipped 1") && l.includes("wt"));
+  expect(skipLine).toBeDefined();
+  expect(skipLine!).toContain("linked worktree of in-tree repo main");
+  expect(skipLine!).not.toContain("captured in-tree repo");
   expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined(); // base-carry never stamps removal memory
 
   // the worktree's committed branch rides the main clone's --single-worktree --all bundle (V4)
@@ -415,6 +423,27 @@ test("a repo whose capture fails mid-push is DEFERRED with base carry; the push 
   // next push (nothing failing): r2 self-heals with a fresh capture
   await push(rootA, cfgA, depsA);
   expect((await remote.latest()).manifest.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
+}, 20_000);
+
+test("capture self-validation failures defer with the validator reason", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitFile(r, "f.txt", "x", "c1");
+  await git(r, "branch", "casemix");
+  const sha = await git(r, "rev-parse", "casemix");
+  await appendPackedRef(r, "refs/heads/CASEMIX", sha);
+  await fs.writeFile(path.join(r, ".git", "HEAD"), "ref: refs/heads/CaseMix\n");
+  await fs.writeFile(path.join(rootA, "note.txt"), "stable");
+
+  const seqBefore = remote.headSeq();
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBe(seqBefore + 1); // push still commits the stable file subset
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect((await remote.latest()).manifest.gitRepos?.["r"]).toBeUndefined();
+  const deferLine = logsA.find((l) => l.includes("deferred 1") && l.includes("r:"));
+  expect(deferLine).toBeDefined();
+  expect(deferLine!).toContain("r: capture failed self-validation: HEAD branch refs/heads/CaseMix not in refs");
+  expect(deferLine!).not.toContain("capture returned nothing");
 }, 20_000);
 
 test("git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir", async () => {
