@@ -3,6 +3,7 @@ export {
   gitPreflight,
   gitIdentity,
   captureGitState,
+  normalizeSymbolicHeadCasing,
   decideDirBundleAllArgs,
   gitCaptureScratchRoot,
   sweepStaleGitCaptureDirs,

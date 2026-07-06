@@ -17,6 +17,8 @@ const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]
 const gitAt = (dir: string, date: string, ...args: string[]) =>
   exec("git", ["-C", dir, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
+test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
+  cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
 
 // E2EE is the only sync mode: the fake server stores CIPHERTEXT by encSha; manifests
 // are the post-decryption plaintext view (same layering as sync.test.ts's FakeRemote).
@@ -425,7 +427,22 @@ test("a repo whose capture fails mid-push is DEFERRED with base carry; the push 
   expect((await remote.latest()).manifest.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
 }, 20_000);
 
-test("capture self-validation failures defer with the validator reason", async () => {
+
+/** True when the tmp filesystem is case-INSENSITIVE (macOS/APFS default). The
+ *  case-drift repro (HEAD casing != packed-refs casing while HEAD still
+ *  resolves) can only exist there; on case-sensitive FS the same setup reads
+ *  as an unborn branch and capture exits early. The pure normalization is
+ *  tested unconditionally below; the end-to-end repros run where they can. */
+const fsCaseInsensitive = await (async () => {
+  const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-case-probe-"));
+  try {
+    await fs.writeFile(path.join(d, "CaseProbe"), "");
+    return await fs.access(path.join(d, "caseprobe")).then(() => true, () => false);
+  } finally {
+    await fs.rm(d, { recursive: true, force: true });
+  }
+})();
+test.if(fsCaseInsensitive)("capture self-validation failures defer with the validator reason", async () => {
   const r = path.join(rootA, "r");
   await initRepo(r);
   await commitFile(r, "f.txt", "x", "c1");
