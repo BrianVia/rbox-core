@@ -6,6 +6,40 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-07-06 — refs at scale: big workspaces can publish
+
+### Added
+- **Receipt redemption (design 71).** Upload receipts are redeemed in batches
+  *before* the commit, so the commit request stays tiny regardless of
+  workspace size. Previously a cold first publish of a very large workspace
+  (~123k files) sent a ~45 MiB receipts map into an 8 MiB request cap and
+  could never publish.
+- **Per-commit ref cap raised 50k → 250k**, enforced against the full
+  accounted set (data refs + carriers) and backed by budget tests derived
+  from the platform math. A workspace over the cap now gets an actionable
+  error and an honest red "sync blocked" status (no false "will be retried")
+  instead of a silent retry loop.
+- **Bare `rbox` inside a workspace** shows the status block plus a small
+  action picker (Sync now / View logs / Pause) instead of the setup wizard;
+  the status header now includes the installed version.
+- **Local dev builds**: `bun run dev:install` compiles a `rbox-dev` binary
+  (`<version>-dev+<sha>`) for release-free on-machine testing
+  (docs/dev-loop.md).
+
+### Fixed
+- **0.9.1 shipped without its own headline status-honesty changes** — a
+  stale-base squash silently reverted them post-merge. Restored: amber
+  "will be retried" for transient failures, live first-publish progress in
+  the git-sync line, fresh-active precedence in the prompt glyph.
+- **A file vanishing mid-push no longer aborts the whole push** (constant on
+  live trees with agents/builds churning); it defers like any churning file
+  and the stable subset commits.
+- **Git capture failures name their real reason** (repo-context / HEAD
+  probes) instead of the generic "capture returned nothing".
+- Recovery from very large missing-blob sets pages through honestly
+  (bounded 422 responses carry the total; progress refunds the retry
+  budget).
+
 ## [0.9.1] — 2026-07-06 — status honesty + capture fixes
 
 ### Changed
