@@ -1,14 +1,27 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { applyGitState, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, LocalBlobStore } from "./index.js";
+import {
+  applyGitState,
+  buildIgnoreMatcher,
+  captureGitState,
+  gitCaptureScratchRoot,
+  gitIdentity,
+  gitIdentityKey,
+  gitPreflight,
+  LocalBlobStore,
+  scanManifest,
+  sweepStaleGitCaptureDirs,
+  type BlobStore,
+} from "./index.js";
 
 const exec = promisify(execFile);
 const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
+const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 
 let tmp: string;
 let A: string;
@@ -91,6 +104,110 @@ test("capture→apply reproduces branches, staged state, and stash across repos"
 
   // fsck clean.
   await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpdir scratch", async () => {
+  const workspace = A;
+  const repo = path.join(workspace, "repo");
+  await fs.mkdir(repo, { recursive: true });
+  await initRepo(repo);
+  await fs.writeFile(path.join(repo, "f.txt"), "v1");
+  await git(repo, "add", "f.txt");
+  await git(repo, "commit", "-qm", "c1");
+
+  const blobs = new Map<string, Buffer>();
+  const uploadPaths: string[] = [];
+  const recordingStore: BlobStore = {
+    async has(s) {
+      return blobs.has(s);
+    },
+    async put(s, bytes) {
+      blobs.set(s, Buffer.from(bytes));
+    },
+    async get(s) {
+      const b = blobs.get(s);
+      if (!b) throw new Error(`missing ${s}`);
+      return b;
+    },
+    async putFile(s, src) {
+      uploadPaths.push(src);
+      blobs.set(s, await fs.readFile(src));
+    },
+  };
+
+  const section = await captureGitState(repo, recordingStore, KEK, { workspaceRoot: workspace });
+  expect(section).toBeDefined();
+  expect(uploadPaths.length).toBeGreaterThan(0);
+  const scratch = `${gitCaptureScratchRoot(workspace)}${path.sep}`;
+  for (const p of uploadPaths) {
+    expect(p.startsWith(scratch)).toBe(true);
+    expect(p.startsWith(path.join(os.tmpdir(), "rbox-gitcap-"))).toBe(false);
+  }
+});
+
+test("stale git capture sweep removes orphan rbox-gitcap directories and preserves live owners", async () => {
+  const scratch = gitCaptureScratchRoot(A);
+  await fs.mkdir(scratch, { recursive: true });
+  const orphanDir = path.join(scratch, "rbox-gitcap-orphan");
+  const freshOrphanDir = path.join(scratch, "rbox-gitcap-fresh-orphan");
+  const liveDir = path.join(scratch, "rbox-gitcap-live");
+  const oldOtherDir = path.join(scratch, "not-rbox-gitcap-old");
+  const oldFile = path.join(scratch, "rbox-gitcap-file");
+  await fs.mkdir(orphanDir);
+  await fs.mkdir(freshOrphanDir);
+  await fs.mkdir(liveDir);
+  await fs.writeFile(path.join(liveDir, "owner.pid"), `${process.pid}\n`);
+  await fs.mkdir(oldOtherDir);
+  await fs.writeFile(oldFile, "not a dir");
+  const now = Date.now();
+  const old = new Date(now - 25 * 60 * 60 * 1000);
+  await fs.utimes(orphanDir, old, old);
+  await fs.utimes(liveDir, old, old);
+  await fs.utimes(oldOtherDir, old, old);
+  await fs.utimes(oldFile, old, old);
+
+  await sweepStaleGitCaptureDirs(A, now);
+  await expect(fs.stat(orphanDir)).rejects.toThrow();
+  await expect(fs.stat(freshOrphanDir)).rejects.toThrow();
+  await expect(fs.stat(liveDir)).resolves.toBeDefined();
+  await expect(fs.stat(oldOtherDir)).resolves.toBeDefined();
+  await expect(fs.stat(oldFile)).resolves.toBeDefined();
+});
+
+test("second git capture sweep preserves an aged live staging dir and sweeps a dead owner promptly", async () => {
+  const repo = path.join(A, "repo");
+  await fs.mkdir(repo, { recursive: true });
+  await initRepo(repo);
+  await fs.writeFile(path.join(repo, "f.txt"), "v1");
+  await git(repo, "add", "f.txt");
+  await git(repo, "commit", "-qm", "c1");
+
+  const scratch = gitCaptureScratchRoot(A);
+  await fs.mkdir(scratch, { recursive: true });
+  const liveDir = path.join(scratch, "rbox-gitcap-live-aging");
+  const deadDir = path.join(scratch, "rbox-gitcap-dead-owner");
+  await fs.mkdir(liveDir);
+  await fs.writeFile(path.join(liveDir, "owner.pid"), `${process.pid}\n`);
+  await fs.writeFile(path.join(liveDir, "repo.bundle"), "still being read");
+  await fs.mkdir(deadDir);
+  await fs.writeFile(path.join(deadDir, "owner.pid"), "999999999\n");
+  await fs.writeFile(path.join(deadDir, "repo.bundle"), "abandoned");
+  const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+  await fs.utimes(liveDir, old, old);
+
+  const section = await captureGitState(repo, store, KEK, { workspaceRoot: A });
+  expect(section).toBeDefined();
+  await expect(fs.stat(liveDir)).resolves.toBeDefined();
+  await expect(fs.stat(deadDir)).rejects.toThrow();
+});
+
+test("scanManifest never includes staged git capture bytes under .rbox", async () => {
+  await fs.writeFile(path.join(A, "tracked.txt"), "visible");
+  await fs.mkdir(path.join(A, ".rbox", "gitcap", "rbox-gitcap-leftover"), { recursive: true });
+  await fs.writeFile(path.join(A, ".rbox", "gitcap", "rbox-gitcap-leftover", "repo.bundle"), "secret bundle bytes");
+
+  const manifest = await scanManifest(A, buildIgnoreMatcher(A));
+  expect(manifest.files.map((f) => f.path)).toEqual(["tracked.txt"]);
 });
 
 test("apply with the WRONG key fails closed — no .git mutation (§28 decrypt-before-mutate)", async () => {

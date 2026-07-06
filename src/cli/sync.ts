@@ -379,7 +379,7 @@ async function runPushAttempt(
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress);
+  const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff);
   local = { ...local, manifestSchema: gitPlan.gitRepos ? 2 : local.manifestSchema, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {

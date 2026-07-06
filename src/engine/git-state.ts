@@ -12,7 +12,13 @@ export type { GitRepoKind } from "./git/shared.js";
 export { inTreeWorktreeParentRel } from "./git/shared.js";
 export { gitPreflight, isGitBusy, type GitPreflightResult } from "./git/preflight.js";
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
-export { captureGitState, decideDirBundleAllArgs, GitCaptureDeferredError } from "./git/capture.js";
+export {
+  captureGitState,
+  decideDirBundleAllArgs,
+  gitCaptureScratchRoot,
+  sweepStaleGitCaptureDirs,
+  GitCaptureDeferredError,
+} from "./git/capture.js";
 export { applyGitState, type ApplyGitResult } from "./git/apply.js";
 export { quarantineAndWipeGitState, preserveGitConflict } from "./git/quarantine.js";
 export { assertGitTargetWithinRoot } from "./git/containment.js";

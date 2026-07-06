@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -28,6 +28,7 @@ import {
 const exec = promisify(execFile);
 const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7);
+const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 
 let tmp: string;
 let store: LocalBlobStore;

@@ -177,7 +177,7 @@ export class RemoteBlobStore implements BlobStore {
     await this.api.getBlobToFile(sha256, destPath);
   }
   /** Streaming upload from a file by content address (e.g. a git bundle). */
-  async putFile(sha256: string, srcPath: string, size: number): Promise<void> {
-    await this.api.putBlobFile(sha256, srcPath, size);
+  async putFile(sha256: string, srcPath: string, size: number, uploadsDir?: string): Promise<void> {
+    await this.api.putBlobFile(sha256, srcPath, size, uploadsDir);
   }
 }
