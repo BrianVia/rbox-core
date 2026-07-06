@@ -71,7 +71,7 @@ function uploadRelease(): void {
   const m = verifyReleaseArtifacts(dist, version); // throws on missing/forged/wrong-key/tampered
   console.log(`[release] signature verified (keyId ${m.keyId}); publishing ${Object.keys(m.artifacts).length} artifacts`);
   // Pin wrangler to an exact version so the publish step can't pull a surprise "latest".
-  const WRANGLER = "wrangler@4.27.0";
+  const WRANGLER = "wrangler@4.107.0"; // keep in lockstep with the root devDependency pin
   const put = (key: string, file: string, ct: string) =>
     sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
   for (const [key, a] of Object.entries(m.artifacts)) {
