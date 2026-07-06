@@ -5,6 +5,7 @@
   "type": "module",
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
+    "dev:install": "bun scripts/dev-install.ts",
     "test": "bun test ./src/",
     "test:api": "cd apps/api && vitest run",
     "test:all": "bun test ./src/ && cd apps/api && vitest run",

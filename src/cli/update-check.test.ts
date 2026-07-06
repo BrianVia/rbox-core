@@ -108,3 +108,19 @@ test("interactive update nudge prints once per version", async () => {
   expect(notes[0]).toContain("99.0.0");
   expect((await readUpdateCheckState())?.lastNudgedVersion).toBe("99.0.0");
 });
+
+test("dev build suppresses update nudge without writing state", async () => {
+  await fs.mkdir(path.dirname(updateCheckPath()), { recursive: true });
+  const state = { lastCheckedAt: "2026-07-04T12:00:00.000Z", lastKnownVersion: "99.0.0", lastNudgedVersion: null };
+  await fs.writeFile(updateCheckPath(), JSON.stringify(state));
+
+  const notes: string[] = [];
+  await maybeNudgeForUpdate({
+    currentVersion: "0.9.1-dev+03ff993.dirty",
+    isInteractive: () => true,
+    writeStderr: (line) => notes.push(line),
+  });
+
+  expect(notes).toHaveLength(0);
+  expect(await readUpdateCheckState()).toEqual(state);
+});

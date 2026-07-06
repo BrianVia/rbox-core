@@ -20,19 +20,20 @@ import { RELEASE_KEYS } from "../src/cli/release-key.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
-const ALL = ["darwin-arm64", "linux-arm64", "linux-x64"] as const;
+export const ALL = ["darwin-arm64", "linux-arm64", "linux-x64"] as const;
+export type ReleaseTarget = (typeof ALL)[number];
 
 // The native `@parcel/watcher` binding is platform-specific (design §41). Each
 // target embeds ONLY its own package; the other two are `--external`ed so a
 // single host can cross-`--compile` without their `.node` bytes being resolved.
 // NB: the TARGET's package must be installed on the build host for its watcher to
 // embed — otherwise that binary still runs, but degrades to periodic-scan-only.
-const PARCEL_PKG: Record<(typeof ALL)[number], string> = {
+export const PARCEL_PKG: Record<ReleaseTarget, string> = {
   "darwin-arm64": "@parcel/watcher-darwin-arm64",
   "linux-arm64": "@parcel/watcher-linux-arm64-glibc",
   "linux-x64": "@parcel/watcher-linux-x64-glibc",
 };
-const externalFlagsFor = (t: (typeof ALL)[number]): string[] =>
+export const externalFlagsFor = (t: ReleaseTarget): string[] =>
   ALL.filter((o) => o !== t).flatMap((o) => ["--external", PARCEL_PKG[o]]);
 
 function arg(name: string): string | undefined {
@@ -40,12 +41,13 @@ function arg(name: string): string | undefined {
   return a ? a.slice(name.length + 3) : undefined;
 }
 
+function main(): void {
 const version = process.argv[2];
 if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
   console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]");
   process.exit(2);
 }
-const targets = (arg("targets")?.split(",") ?? [...ALL]).filter((t): t is (typeof ALL)[number] => (ALL as readonly string[]).includes(t));
+const targets = (arg("targets")?.split(",") ?? [...ALL]).filter((t): t is ReleaseTarget => (ALL as readonly string[]).includes(t));
 const noUpload = process.argv.includes("--no-upload");
 // `--upload-only`: publish a dist/ that an EARLIER job already built + signed + smoke-tested,
 // without rebuilding — so the published bytes are exactly the smoked bytes (design §41 §6).
@@ -111,7 +113,7 @@ console.log("[release] ensuring all-platform @parcel/watcher bindings are presen
 sh(["bun", "install", "--frozen-lockfile", "--os=*", "--cpu=*"]);
 
 /** Absolute path to a target's native binding, or undefined if not installed. */
-function nativeBindingPath(t: (typeof ALL)[number]): string | undefined {
+function nativeBindingPath(t: ReleaseTarget): string | undefined {
   const p = path.join(ROOT, "node_modules", PARCEL_PKG[t], "watcher.node");
   return fs.existsSync(p) ? p : undefined;
 }
@@ -167,3 +169,6 @@ if (noUpload) {
 // 5. upload to rbox-releases (default single-shot local path). uploadRelease() re-reads and
 //    re-verifies the just-signed version.json before uploading — same gate as --upload-only.
 uploadRelease();
+}
+
+if (import.meta.main) main();

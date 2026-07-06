@@ -26,6 +26,7 @@ interface UpdateCheckDeps {
 interface UpdateNudgeDeps {
   isInteractive?: () => boolean;
   writeStderr?: (text: string) => void;
+  currentVersion?: string;
 }
 
 const rboxHome = () => path.join(process.env.RBOX_HOME || homeDir(), ".rbox");
@@ -72,17 +73,17 @@ function due(state: UpdateCheckState | undefined, now: Date): boolean {
   return nowMs - last >= CHECK_INTERVAL_MS;
 }
 
-function updateAvailableVersion(state: UpdateCheckState | undefined): string | undefined {
+function updateAvailableVersion(state: UpdateCheckState | undefined, currentVersion = RBOX_VERSION): string | undefined {
   if (!state) return undefined;
   try {
-    return semverGt(state.lastKnownVersion, RBOX_VERSION) ? state.lastKnownVersion : undefined;
+    return semverGt(state.lastKnownVersion, currentVersion) ? state.lastKnownVersion : undefined;
   } catch {
     return undefined;
   }
 }
 
-function formatUpdateAvailableText(next: string): string {
-  return `update available ${RBOX_VERSION} → ${next} — run \`rbox upgrade\``;
+function formatUpdateAvailableText(next: string, currentVersion = RBOX_VERSION): string {
+  return `update available ${currentVersion} → ${next} — run \`rbox upgrade\``;
 }
 
 export function formatUpdateAvailableLine(state: UpdateCheckState | undefined): string | undefined {
@@ -117,11 +118,13 @@ export async function runUpdateCheckIfDue(remoteUrl: string, deps: UpdateCheckDe
 }
 
 export async function maybeNudgeForUpdate(deps: UpdateNudgeDeps = {}): Promise<void> {
+  const currentVersion = deps.currentVersion ?? RBOX_VERSION;
+  if (currentVersion.includes("-dev")) return;
   const isInteractive = deps.isInteractive ?? (() => process.stdin.isTTY === true && process.stderr.isTTY === true);
   if (!isInteractive()) return;
   const state = await readUpdateCheckState();
-  const next = updateAvailableVersion(state);
+  const next = updateAvailableVersion(state, currentVersion);
   if (!state || !next || state.lastNudgedVersion === next) return;
-  (deps.writeStderr ?? ((text) => process.stderr.write(text)))(`${style.dim(formatUpdateAvailableText(next))}\n`);
+  (deps.writeStderr ?? ((text) => process.stderr.write(text)))(`${style.dim(formatUpdateAvailableText(next, currentVersion))}\n`);
   await writeUpdateCheckState({ ...state, lastNudgedVersion: next }).catch(() => {});
 }
