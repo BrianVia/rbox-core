@@ -51,6 +51,49 @@ test("progressLabel renders percent + counts per phase", () => {
   expect(progressLabel("upload", -1, 2)).toBe("uploading 0% (-1/2)"); // clamped, never negative
 });
 
+test("progressLabel scan is indeterminate — formatted count, no percent", () => {
+  expect(progressLabel("scan", 12304, 0)).toBe("scanning… 12,304 files");
+  expect(progressLabel("scan", 500, 0)).toBe("scanning… 500 files");
+});
+
+test("progressLabel gitcap renders N/total with the repo name", () => {
+  expect(progressLabel("gitcap", 3, 140, "zen-browser-desktop")).toBe("capturing git state 3/140 — zen-browser-desktop");
+  // No detail (e.g. the status line, which never persists a name) → count only.
+  expect(progressLabel("gitcap", 3, 140)).toBe("capturing git state 3/140");
+});
+
+test("progressLabel gitcap truncates an over-long detail keeping the tail", () => {
+  const longName = "deeply/nested/monorepo/packages/some-really-long-repo-name";
+  const out = progressLabel("gitcap", 1, 2, longName);
+  expect(out.startsWith("capturing git state 1/2 — ")).toBe(true);
+  const rendered = out.split(" — ")[1]!;
+  expect(rendered.length).toBeLessThanOrEqual(40);
+  expect(rendered.startsWith("…")).toBe(true);
+  expect(rendered.endsWith("some-really-long-repo-name")).toBe(true); // tail (the repo) survives
+});
+
+test("progressLabel gitcap detail truncation is code-point safe with emoji (never a lone surrogate)", () => {
+  // 45 ASCII chars force truncation; the astral-plane emoji live in the kept tail.
+  const name = `${"x".repeat(45)}-🦊🎉-repo`;
+  const rendered = progressLabel("gitcap", 1, 2, name).split(" — ")[1]!;
+  expect(Array.from(rendered).length).toBeLessThanOrEqual(40); // budget counted in code points
+  expect(rendered.endsWith("-🦊🎉-repo")).toBe(true); // tail intact, emoji unsplit
+  expect(rendered.isWellFormed()).toBe(true); // no lone surrogate (a UTF-16 slice could make one)
+});
+
+test("progressLabel gitcap detail strips ANSI escapes and control chars", () => {
+  // A repo dir name is untrusted terminal-bound input: CSI color codes, BEL, tabs —
+  // all must vanish rather than reach the spinner/status line.
+  const evil = "evil\u001b[31mred\u001b[0m\u0007\tname";
+  expect(progressLabel("gitcap", 1, 2, evil)).toBe("capturing git state 1/2 — evilredname");
+});
+
+test("progressLabel unknown phase falls back to a sane verb, not garbage", () => {
+  // Simulates an older/other writer landing a phase this build's union doesn't name:
+  // it must not masquerade as "downloading".
+  expect(progressLabel("bogus" as unknown as Parameters<typeof progressLabel>[0], 1, 4)).toBe("syncing 25% (1/4)");
+});
+
 // ── healthLine priority order ────────────────────────────────────────────────
 
 test("in sync — clean local diff, remote agrees", () => {

@@ -23,6 +23,7 @@ import {
 } from "../engine/index.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
+import type { TransferProgress } from "./transfer-progress.js";
 
 // ---- git-sync orchestration (design 43 §§6-7, 9, 13.5) ------------------------------
 //
@@ -98,7 +99,12 @@ export async function planGitSections(
   state: SyncState,
   api: SyncRemote,
   force: ReadonlySet<string>,
-  matcher: IgnoreMatcher
+  matcher: IgnoreMatcher,
+  /** Per-repo capture progress (the `gitcap` phase): the longest silent phase on a
+   *  repo-heavy first push — one `git bundle` per repo, minutes each. Emits after each
+   *  capture settles so `done` is a truthful completed-count under bounded concurrency;
+   *  `detail` is the repo just captured. Display-only. */
+  onProgress?: TransferProgress
 ): Promise<GitPushPlan> {
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
@@ -308,7 +314,11 @@ export async function planGitSections(
   }
 
   // Changed repos: bounded-concurrency capture. Any per-repo failure defers THAT repo
-  // (base carry) — the push itself always proceeds (PR #38 churn discipline).
+  // (base carry) — the push itself always proceeds (PR #38 churn discipline). Progress
+  // is a monotonic completed-count (captures run concurrently, so a settle counter is
+  // the only truthful "done") with the just-settled repo's name as the display detail.
+  const repoCount = toCapture.length;
+  let captureDone = 0;
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
       const sec = await captureGitState(repoDirOf(root, rel), api.blobStore(), kek);
@@ -320,6 +330,9 @@ export async function planGitSections(
       }
     } catch (e) {
       deferOne(rel, `capture failed: ${errMsg(e)}`);
+    } finally {
+      // Root repo (rel ".") shows the workspace folder name rather than a bare ".".
+      onProgress?.(++captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : path.basename(rel));
     }
   });
 

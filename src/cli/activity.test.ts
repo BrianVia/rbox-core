@@ -119,14 +119,17 @@ test("renderShellLine state precedence: halt > outofstorage > active > pending >
   expect(renderShellLine({ at: "" }, { ...base, settled: false }).split(" ")[2]).toBe("pending");
 });
 
-test("renderShellLine pct: floors, clamps 0–100, total<=0 → 100; `-` when not active", () => {
+test("renderShellLine pct: floors, clamps 0–100, indeterminate (total<=0) → `-`; `-` when not active", () => {
   const render = (done: number, total: number) =>
     renderShellLine({ at: "", active: { at: at(1799999900), phase: "upload", done, total } }, { settled: false, name: "ws", now: NOW }).split(" ")[3];
   expect(render(1, 3)).toBe("33"); // 33.3 → floored
   expect(render(4, 4)).toBe("100");
   expect(render(9, 4)).toBe("100"); // over-100 clamped
   expect(render(-1, 4)).toBe("0"); // under-0 clamped
-  expect(render(1, 0)).toBe("100"); // total<=0 → 100 (avoid /0)
+  // Indeterminate active (total<=0, e.g. a live scan): `-`, never a fake 100 — the
+  // shell glyph would show `↻ 100%` for the whole walk. `-` is regex-legal in every
+  // installed snippet (`([0-9]{1,3}|-)`), whose glyph renders `↻` alone for it.
+  expect(render(500, 0)).toBe("-");
   expect(renderShellLine({ at: "" }, { settled: true, name: "ws", now: NOW }).split(" ")[3]).toBe("-");
 });
 

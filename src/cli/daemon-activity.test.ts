@@ -82,6 +82,8 @@ interface DaemonInternals {
   pendingEvents: WatchEvent[];
   activity: import("./activity.js").DaemonActivity;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
+  onTransferProgress(done: number, total: number, phase: import("./transfer-progress.js").TransferPhase): void;
+  lastProgressWrite: number;
   pump(): Promise<void>;
   writeWsActivity(): void;
   recordCommittedFrame(sequence: number): void;
@@ -718,4 +720,33 @@ test("activity writes persist without a v2 boot claim and stop on a conflicting 
     else process.env.RBOX_HOME = oldHome;
     await fs.rm(home, { recursive: true, force: true });
   }
+});
+
+test("transfer-progress throttle: indeterminate ticks never bypass it; phase changes and final ticks do", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+
+  // First tick is a phase change (nothing→scan) → recorded immediately.
+  daemon.onTransferProgress(500, 0, "scan");
+  expect(daemon.activity.active).toMatchObject({ phase: "scan", done: 500, total: 0 });
+
+  // Rapid follow-up INDETERMINATE ticks (total===0) are never "final" — throttled.
+  // Pre-fix, the guard was `done < total`, which is false for total===0, so every
+  // 500-file stride of a big daemon scan queued an activity+shell.line write.
+  daemon.onTransferProgress(1000, 0, "scan");
+  daemon.onTransferProgress(1500, 0, "scan");
+  expect(daemon.activity.active?.done).toBe(500);
+
+  // A phase CHANGE bypasses the throttle: scan→gitcap must show immediately.
+  daemon.onTransferProgress(1, 140, "gitcap");
+  expect(daemon.activity.active).toMatchObject({ phase: "gitcap", done: 1, total: 140 });
+
+  // Mid-phase determinate tick inside the 500ms window: throttled.
+  daemon.onTransferProgress(2, 140, "gitcap");
+  expect(daemon.activity.active?.done).toBe(1);
+
+  // The FINAL determinate tick (done >= total) bypasses the throttle.
+  daemon.onTransferProgress(140, 140, "gitcap");
+  expect(daemon.activity.active?.done).toBe(140);
+
+  await daemon.activityWrite; // drain the best-effort sidecar chain before teardown
 });
