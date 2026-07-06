@@ -167,9 +167,24 @@ async function makeGitCaptureDir(workspaceRoot: string): Promise<string> {
  *   the WIP commit + index.
  */
 export async function captureGitState(repoDir: string, store: BlobStore, kek: Buffer, opts: GitCaptureOptions = {}): Promise<GitSection | undefined> {
+  // The two early bails are NAMED (savvy-core incident: a repo deferred for days as
+  // "capture returned nothing" with no way to see why). Each re-runs the failing probe
+  // and surfaces git's actual complaint in the defer reason.
   const ctx = await repoCtx(repoDir);
-  if (!ctx) return undefined; // unusable (dangling pointer etc.) → caller defers
-  if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
+  if (!ctx) {
+    const why = await git(repoDir, ["rev-parse", "--absolute-git-dir"]).then(
+      () => "unsupported .git shape (symlink, or unreadable pointer)",
+      (e) => (e instanceof Error ? e.message.split("\n").slice(0, 2).join(" ") : String(e))
+    );
+    throw new GitCaptureDeferredError(`repo context unresolvable: ${why}`);
+  }
+  if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) {
+    const why = await git(repoDir, ["rev-parse", "--verify", "HEAD"]).then(
+      () => "transient: HEAD verified on recheck",
+      (e) => (e instanceof Error ? e.message.split("\n").slice(0, 2).join(" ") : String(e))
+    );
+    throw new GitCaptureDeferredError(`HEAD unverifiable (empty repo, or drifted symbolic ref): ${why}`);
+  }
 
   // Stage on the WORKSPACE filesystem (under .rbox), NOT os.tmpdir(): git bundles,
   // staged index/op-state, plaintext encryption snapshots, and ciphertext temps can

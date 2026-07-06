@@ -135,6 +135,18 @@ test.if(fsCaseInsensitive)("capture refuses ambiguous case-insensitive HEAD ref 
   expect((err as Error).message).toBe("capture failed self-validation: HEAD branch refs/heads/CaseMix not in refs");
 });
 
+test("capture names its early bails: empty repo throws a reasoned defer, not undefined", async () => {
+  await initRepo(A); // no commit → HEAD is an unborn branch
+  let err: unknown;
+  try {
+    await captureGitState(A, store, KEK);
+  } catch (e) {
+    err = e;
+  }
+  expect(err).toBeInstanceOf(GitCaptureDeferredError);
+  expect((err as Error).message).toContain("HEAD unverifiable");
+});
+
 test("capture→apply reproduces branches, staged state, and stash across repos", async () => {
   await initRepo(A);
   await fs.writeFile(path.join(A, "f.txt"), "v1");
