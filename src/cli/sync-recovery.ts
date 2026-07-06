@@ -81,7 +81,22 @@ export async function encryptAndUpload(
     let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
     await report.phase("encrypt", async () => {
       await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
-        const e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+        let e;
+        try {
+          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+        } catch (err) {
+          // Vanished between scan and snapshot (agent/build churn deletes files
+          // constantly on a live tree). This is the churn case design 38 defers,
+          // not a push-fatal error: one vanished file must never kill a 126k-file
+          // push. Defer it — deferManifest carries the base entry (or omits a
+          // never-synced one) and the next scan sees the deletion for real.
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            deferred.add(f.path);
+            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            return;
+          }
+          throw err;
+        }
         f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
         f.encSha = e.encSha;
         ctByEnc.set(e.encSha, e.ciphertextPath);
@@ -120,7 +135,15 @@ export async function encryptAndUpload(
           // re-encrypt a fresh snapshot of THIS file NOW and adopt whatever address it
           // hashes to. Committing the fresh address (not insisting on the stale one) is what
           // lets a file that changed since the manifest was built still upload consistently.
-          const re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+          let re;
+          try {
+            re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+          } catch (err) {
+            // Vanished mid-push (same churn class as the encrypt-stage catch above):
+            // defer this file instead of failing the whole push.
+            if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+            throw err;
+          }
           f.sha256 = re.plaintextSha;
           f.encSha = re.encSha;
           ct = re.ciphertextPath;
