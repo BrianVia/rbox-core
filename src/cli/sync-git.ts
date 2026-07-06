@@ -26,6 +26,7 @@ import {
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
 import type { TransferProgress } from "./transfer-progress.js";
+import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 
 // ---- git-sync orchestration (design 43 §§6-7, 9, 13.5) ------------------------------
 //
@@ -110,7 +111,8 @@ export async function planGitSections(
    *  repo-heavy first push — one `git bundle` per repo, minutes each. Emits after each
    *  capture settles so `done` is a truthful completed-count under bounded concurrency;
    *  `detail` is the repo just captured. Display-only. */
-  onProgress?: TransferProgress
+  onProgress?: TransferProgress,
+  backoff?: (attempt: number) => Promise<void>
 ): Promise<GitPushPlan> {
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
@@ -354,9 +356,15 @@ export async function planGitSections(
   // the only truthful "done") with the just-settled repo's name as the display detail.
   const repoCount = toCapture.length;
   let captureDone = 0;
+  const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
-      const sec = await captureGitState(repoDirOf(root, rel), api.blobStore(), kek);
+      const sec = await captureGitState(repoDirOf(root, rel), api.blobStore(), kek, {
+        workspaceRoot: root,
+        uploadsDir,
+        uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
+        backoff,
+      });
       if (sec) {
         out[rel] = sec;
         captured.push(rel);

@@ -187,21 +187,44 @@ export async function gitBusy(ctx: RepoCtx): Promise<boolean> {
 
 // ---- encrypted artifact IO (§28) ------------------------------------------
 
+export interface PutGitArtifactOptions {
+  attempts?: number;
+  backoff?: (attempt: number) => Promise<void>;
+  uploadsDir?: string;
+}
+
+const isBlobShaMismatchError = (e: unknown): boolean => e instanceof Error && e.name === "BlobShaMismatchError";
+
 /** §28: ENCRYPT a staged plaintext artifact under the workspace KEK, upload the CIPHERTEXT by
  *  its encSha (convergent — same primitive + receipt-capturing store path as file blobs), and
  *  return the (plaintext sha, encSha, cipherSize) ref. Skips the upload if the account already
- *  has the ciphertext blob (entitled+present). The temp ciphertext is always cleaned up. */
-export async function putGitArtifact(store: BlobStore, kek: Buffer, srcPath: string, tmpDir: string): Promise<GitArtifactRef> {
-  const enc = await encryptFileToTemp(srcPath, kek, tmpDir);
-  try {
-    if (!(await store.has(enc.encSha))) {
-      if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize);
-      else await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+ *  has the ciphertext blob (entitled+present). On a typed sha-mismatch, drop the stale
+ *  ciphertext temp, re-encrypt from the staged plaintext artifact, back off, and retry
+ *  within the caller's bound. The temp ciphertext is always cleaned up. */
+export async function putGitArtifact(
+  store: BlobStore,
+  kek: Buffer,
+  srcPath: string,
+  tmpDir: string,
+  opts: PutGitArtifactOptions = {}
+): Promise<GitArtifactRef> {
+  const attempts = Math.max(1, opts.attempts ?? 1);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const enc = await encryptFileToTemp(srcPath, kek, tmpDir);
+    try {
+      if (!(await store.has(enc.encSha))) {
+        if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize, opts.uploadsDir);
+        else await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+      }
+      return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
+    } catch (e) {
+      if (!isBlobShaMismatchError(e) || attempt + 1 >= attempts) throw e;
+      await opts.backoff?.(attempt);
+    } finally {
+      await fs.rm(enc.ciphertextPath, { force: true });
     }
-  } finally {
-    await fs.rm(enc.ciphertextPath, { force: true });
   }
-  return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
+  throw new Error("unreachable git artifact upload retry state");
 }
 
 async function getBlobToFile(store: BlobStore, sha: string, destPath: string): Promise<void> {

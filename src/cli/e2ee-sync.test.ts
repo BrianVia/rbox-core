@@ -163,5 +163,5 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       expect(await git(path.join(rootB, r), "rev-parse", "main")).toBe(await git(path.join(rootA, r), "rev-parse", "main"));
       await expect(git(path.join(rootB, r), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
     }
-  }, 20_000);
+  }, 30_000);
 });

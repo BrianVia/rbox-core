@@ -4,6 +4,8 @@ export {
   gitIdentity,
   captureGitState,
   decideDirBundleAllArgs,
+  gitCaptureScratchRoot,
+  sweepStaleGitCaptureDirs,
   applyGitState,
   GitCaptureDeferredError,
   preserveGitConflict,

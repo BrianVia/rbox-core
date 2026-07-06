@@ -18,7 +18,7 @@ import type { TransferProgress } from "./transfer-progress.js";
  *  deferred out of this commit (design: partial progress — commit the stable subset,
  *  defer the file that won't settle). Bounded so a perpetually-churning file can never
  *  hot-loop the push; the daemon's watcher/safety scans re-queue it once it settles. */
-const PER_FILE_UPLOAD_ATTEMPTS = 3;
+export const PER_FILE_UPLOAD_ATTEMPTS = 3;
 
 // Concurrency knobs (read at call-time so the bench harness + power users can tune
 // via env). Upload is the dominant cost on a first push (latency-bound), so it's

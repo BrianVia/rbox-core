@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
-import type { CommitResult, SyncRemote } from "./remote.js";
+import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitDivergenceCount } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
@@ -15,6 +15,7 @@ const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
 const gitAt = (dir: string, date: string, ...args: string[]) =>
   exec("git", ["-C", dir, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
+const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 
 // E2EE is the only sync mode: the fake server stores CIPHERTEXT by encSha; manifests
 // are the post-decryption plaintext view (same layering as sync.test.ts's FakeRemote).
@@ -38,6 +39,9 @@ class FakeRemote implements SyncRemote {
   /** Fail the NEXT git-artifact upload (blobStore().putFile) — simulates a repo
    *  churning/vanishing mid-capture so that repo defers. Self-clears. */
   failNextGitPut = false;
+  gitShaMismatchFailures = 0;
+  gitPutCalls = 0;
+  gitPutUploads: Array<{ sha: string; src: string; size: number; uploadsDir?: string }> = [];
 
   async seedEntry(rel: string, content: string): Promise<FileEntry> {
     const p = await enc(content);
@@ -56,7 +60,7 @@ class FakeRemote implements SyncRemote {
   async missingBlobs(shas: string[]): Promise<string[]> {
     return shas.filter((s) => !this.blobs.has(s));
   }
-  async putBlobFile(sha256: string, absPath: string): Promise<void> {
+  async putBlobFile(sha256: string, absPath: string, _size?: number, _uploadsDir?: string): Promise<void> {
     this.blobs.set(sha256, await fs.readFile(absPath));
   }
   async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
@@ -94,7 +98,13 @@ class FakeRemote implements SyncRemote {
         await fs.mkdir(path.dirname(dest), { recursive: true });
         await fs.writeFile(dest, b);
       },
-      async putFile(s, src) {
+      async putFile(s, src, size, uploadsDir) {
+        self.gitPutCalls += 1;
+        self.gitPutUploads.push({ sha: s, src, size, uploadsDir });
+        if (self.gitShaMismatchFailures > 0) {
+          self.gitShaMismatchFailures -= 1;
+          throw new BlobShaMismatchError(s);
+        }
         if (self.failNextGitPut) {
           self.failNextGitPut = false;
           throw new Error("simulated mid-capture churn (upload failed)");
@@ -392,6 +402,51 @@ test("a repo whose capture fails mid-push is DEFERRED with base carry; the push 
   // next push (nothing failing): r2 self-heals with a fresh capture
   await push(rootA, cfgA, depsA);
   expect((await remote.latest()).manifest.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
+}, 20_000);
+
+test("git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitFile(r, "f.txt", "v1", "c1");
+  const backoffAttempts: number[] = [];
+  remote.gitShaMismatchFailures = 1;
+
+  await push(rootA, cfgA, { ...depsA, backoff: async (attempt) => backoffAttempts.push(attempt) });
+
+  const m = (await remote.latest()).manifest;
+  expect(m.gitRepos?.["r"]).toBeDefined();
+  expect(backoffAttempts).toEqual([0]);
+  expect(remote.gitPutCalls).toBeGreaterThanOrEqual(2);
+  expect(remote.gitPutUploads[0]!.sha).toBe(remote.gitPutUploads[1]!.sha); // same plaintext bundle re-encrypted to the same encSha
+  expect(remote.gitPutUploads[0]!.src).not.toBe(remote.gitPutUploads[1]!.src); // stale ciphertext temp was dropped and recreated
+  const scratch = `${path.join(rootA, ".rbox", "gitcap")}${path.sep}`;
+  expect(remote.gitPutUploads[0]!.src.startsWith(scratch)).toBe(true);
+  expect(remote.gitPutUploads[1]!.src.startsWith(scratch)).toBe(true);
+  expect(new Set(remote.gitPutUploads.map((u) => u.uploadsDir))).toEqual(new Set([path.join(rootA, ".rbox", "state", "uploads")]));
+}, 20_000);
+
+test("git artifact sha_mismatch retries are bounded; final failure defers with base carry", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitFile(r, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  const base = (await st(rootA)).lastSyncedManifest.gitRepos!["r"]!;
+  remote.gitPutCalls = 0;
+  remote.gitPutUploads = [];
+
+  await commitFile(r, "f.txt", "v2", "c2");
+  await fs.writeFile(path.join(rootA, "note.txt"), "stable");
+  const backoffAttempts: number[] = [];
+  remote.gitShaMismatchFailures = 99;
+
+  await push(rootA, cfgA, { ...depsA, backoff: async (attempt) => backoffAttempts.push(attempt) });
+
+  expect(remote.gitPutCalls).toBe(3); // PER_FILE_UPLOAD_ATTEMPTS parity
+  expect(backoffAttempts).toEqual([0, 1]);
+  const m = (await remote.latest()).manifest;
+  expect(m.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect(m.gitRepos!["r"]!.bundleEncSha).toBe(base.bundleEncSha);
+  expect(logsA.some((l) => l.includes("deferred 1") && l.includes("r: capture failed: blob PUT rejected"))).toBe(true);
 }, 20_000);
 
 test("push: a locked (busy) repo defers with base carry — no raw-identity capture while mid-operation", async () => {

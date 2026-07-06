@@ -15,8 +15,9 @@ export interface BlobStore {
   /** Optional streaming download into a file — used by apply for large blobs so
    *  they never materialize in memory. Falls back to get()+write when absent. */
   getToFile?(sha256: string, destPath: string): Promise<void>;
-  /** Optional streaming upload from a file (e.g. a git bundle) by content address. */
-  putFile?(sha256: string, srcPath: string, size: number): Promise<void>;
+  /** Optional streaming upload from a file (e.g. a git bundle) by content address.
+   *  `uploadsDir` lets remote multipart implementations persist resumable tokens. */
+  putFile?(sha256: string, srcPath: string, size: number, uploadsDir?: string): Promise<void>;
 }
 
 export class LocalBlobStore implements BlobStore {
@@ -59,7 +60,7 @@ export class LocalBlobStore implements BlobStore {
     await fs.copyFile(this.keyPath(sha256), destPath);
   }
 
-  async putFile(sha256: string, srcPath: string): Promise<void> {
+  async putFile(sha256: string, srcPath: string, _size = 0, _uploadsDir?: string): Promise<void> {
     const dest = this.keyPath(sha256);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     await fs.copyFile(srcPath, dest);

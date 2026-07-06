@@ -9,10 +9,14 @@ export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPa
   try {
     await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true);
   } catch (e) {
-    // A live-folder TOCTOU sha_mismatch is NOT a dead-upload — re-initing multipart
-    // would re-read the same changed source and 400 again. Bubble it so the push
-    // re-scans the settled tree and retries with the file's fresh encSha.
-    if (e instanceof BlobShaMismatchError) throw e;
+    // A sha_mismatch means the assembled/uploaded bytes do not match this content
+    // address. Clear any resume token for that address before bubbling so caller-level
+    // re-encrypt retry starts from fresh multipart state when the encSha is stable
+    // (git artifacts), while live files still re-scan/retry with a fresh address.
+    if (e instanceof BlobShaMismatchError) {
+      if (uploadsDir) await fsp.rm(path.join(uploadsDir, `${sha256}.json`), { force: true }).catch(() => {});
+      throw e;
+    }
     if (e instanceof QuotaExceededError) throw e;
     // A resume against an expired/dead upload (or any mid-flight error) — clear
     // the token and retry once from a fresh init. If the second attempt fails,

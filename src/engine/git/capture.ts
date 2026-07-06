@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import type { BlobStore } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
@@ -29,6 +28,8 @@ export class GitCaptureDeferredError extends Error {
 }
 
 const WORKTREE_AWARE_CAPTURE_REASON = "git >= 2.15 required for worktree-aware capture";
+const GITCAP_STALE_MS = 24 * 60 * 60 * 1000;
+const GITCAP_OWNER_PID = "owner.pid";
 let supportsSingleWorktreeCache: boolean | undefined;
 
 async function gitSupportsSingleWorktree(repoDir: string): Promise<boolean> {
@@ -56,6 +57,79 @@ export function decideDirBundleAllArgs(
   return { ok: true, args: ["--all"] };
 }
 
+export interface GitCaptureOptions {
+  /** Workspace root whose `.rbox/gitcap/` owns capture scratch. Defaults to `repoDir`
+   *  for direct engine callers; sync-git passes the actual workspace root. */
+  workspaceRoot?: string;
+  /** Resumable multipart token directory, normally `<workspace>/.rbox/state/uploads`. */
+  uploadsDir?: string;
+  /** Bounded sha-mismatch retry count supplied by the file-upload path. */
+  uploadAttempts?: number;
+  /** Backoff between sha-mismatch retries; attempt is zero-based. */
+  backoff?: (attempt: number) => Promise<void>;
+}
+
+export function gitCaptureScratchRoot(workspaceRoot: string): string {
+  return path.join(workspaceRoot, ".rbox", "gitcap");
+}
+
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function readGitCaptureOwnerPid(dir: string): Promise<number | "absent" | "unreadable"> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(dir, GITCAP_OWNER_PID), "utf8");
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
+  }
+  const pid = Number(raw.trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : "unreadable";
+}
+
+export async function sweepStaleGitCaptureDirs(workspaceRoot: string, now = Date.now(), olderThanMs = GITCAP_STALE_MS): Promise<void> {
+  const root = gitCaptureScratchRoot(workspaceRoot);
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  await Promise.all(
+    entries.map(async (entry) => {
+      if (!entry.isDirectory() || !entry.name.startsWith("rbox-gitcap-")) return;
+      const abs = path.join(root, entry.name);
+      const owner = await readGitCaptureOwnerPid(abs);
+      if (typeof owner === "number") {
+        if (pidIsAlive(owner)) return;
+        await fs.rm(abs, { recursive: true, force: true }).catch(() => {});
+        return;
+      }
+      if (owner === "absent") {
+        await fs.rm(abs, { recursive: true, force: true }).catch(() => {});
+        return;
+      }
+      const st = await fs.stat(abs).catch(() => undefined);
+      if (!st || now - st.mtimeMs < olderThanMs) return;
+      await fs.rm(abs, { recursive: true, force: true }).catch(() => {});
+    })
+  );
+}
+
+async function makeGitCaptureDir(workspaceRoot: string): Promise<string> {
+  const scratch = gitCaptureScratchRoot(workspaceRoot);
+  await fs.mkdir(scratch, { recursive: true, mode: 0o700 });
+  await fs.chmod(scratch, 0o700).catch(() => {});
+  await sweepStaleGitCaptureDirs(workspaceRoot);
+  const pending = await fs.mkdtemp(path.join(scratch, ".rbox-gitcap-"));
+  await fs.chmod(pending, 0o700).catch(() => {});
+  await fs.writeFile(path.join(pending, GITCAP_OWNER_PID), `${process.pid}\n`, { mode: 0o600 });
+  const dir = path.join(scratch, `rbox-gitcap-${path.basename(pending).slice(".rbox-gitcap-".length)}`);
+  await fs.rename(pending, dir);
+  return dir;
+}
+
 /** Full capture: build the bundle + upload all artifacts; return the manifest section.
  *
  * Small files (index, op-state) are STAGED (copied) into a temp dir FIRST and then
@@ -81,12 +155,16 @@ export function decideDirBundleAllArgs(
  *   stack out into N standalone repos [v2, B2]). Uncommitted dirty state still transfers via
  *   the WIP commit + index.
  */
-export async function captureGitState(repoDir: string, store: BlobStore, kek: Buffer): Promise<GitSection | undefined> {
+export async function captureGitState(repoDir: string, store: BlobStore, kek: Buffer, opts: GitCaptureOptions = {}): Promise<GitSection | undefined> {
   const ctx = await repoCtx(repoDir);
   if (!ctx) return undefined; // unusable (dangling pointer etc.) → caller defers
   if (!(await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]))) return undefined; // empty repo
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcap-"));
+  // Stage on the WORKSPACE filesystem (under .rbox), NOT os.tmpdir(): git bundles,
+  // staged index/op-state, plaintext encryption snapshots, and ciphertext temps can
+  // be large and live across hash→multipart upload. Keeping them under the repo root
+  // avoids tmp cleaners/truncation and stays on the same mount for cheap local moves.
+  const tmpDir = await makeGitCaptureDir(opts.workspaceRoot ?? repoDir);
   let pins: ScratchPins | undefined;
   try {
     // Age-guarded prune of scratch refs left by prior crashed captures (shared-store safe).
@@ -135,14 +213,15 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     //    encSha (convergent — same primitive as file blobs), and record (plaintext sha, encSha,
     //    cipherSize). The server only ever sees ciphertext + encShas; the manifest carrying this
     //    section is itself E2EE-encrypted, so refs/HEAD/object-shas stay private too.
-    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir);
+    const uploadOpts = { attempts: opts.uploadAttempts, backoff: opts.backoff, uploadsDir: opts.uploadsDir };
+    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir, uploadOpts);
 
     let index: GitArtifactRef | undefined;
-    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir);
+    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir, uploadOpts);
     const indexTree = await indexTreeOf(ctx);
     const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
-      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir);
+      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir, uploadOpts);
     }
 
     const section: GitSection = {
