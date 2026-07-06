@@ -1,4 +1,4 @@
-import type { Env } from "../env.js";
+import type { Env, WorkerEntrypointExports } from "../env.js";
 import { json } from "../util.js";
 
 /**
@@ -13,6 +13,7 @@ import { json } from "../util.js";
 export interface RouteCtx {
   req: Request;
   env: Env;
+  exports: WorkerEntrypointExports;
   url: URL;
   seg: string[];
 }

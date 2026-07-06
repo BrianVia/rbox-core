@@ -2,10 +2,12 @@ import { env, SELF, applyD1Migrations, createExecutionContext, waitOnExecutionCo
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { bootstrap as bootstrapRoute, mintDevice } from "../src/auth.js";
-import { routeTemplate } from "../src/worker.js";
+import { CachedReleases, routeTemplate } from "../src/worker.js";
+import { releaseRoutes } from "../src/routes/release.js";
 import { billingCheckout, repointBillingToAccount } from "../src/stripe.js";
 import { confirmLink } from "../src/account-link.js";
 import { capBytesFor } from "../src/plans.js";
+import type { Env, WorkerEntrypointExports } from "../src/env.js";
 import type { Principal } from "../src/authz.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -48,6 +50,17 @@ describe("worker integration (real DO + D1 + R2)", () => {
   test("unauthenticated request → 401", async () => {
     const res = await SELF.fetch(`${BASE}/v1/account/usage`);
     expect(res.status).toBe(401);
+  });
+
+  test("default-deny cache-control guard covers authed responses and final 404", async () => {
+    const a = await bootstrap("acct-cache-guard");
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(usage.status).toBe(200);
+    expect(usage.headers.get("cache-control")).toBe("no-store");
+
+    const missing = await SELF.fetch(`${BASE}/v1/does/not/exist`, { headers: authed(a.token) });
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get("cache-control")).toBe("no-store");
   });
 
   test("bootstrap plan=pro is honored only behind the dev gate and materializes cap_bytes", async () => {
@@ -1609,8 +1622,37 @@ describe("release distribution (design 14)", () => {
     await env.rbox_releases.put("releases/version.json.sig", "sig-bytes");
     await env.rbox_releases.put("releases/install.sh", "#!/bin/sh\n");
     await env.rbox_releases.put("releases/rbox-linux-x64", "LATEST-BIN");
+    await env.rbox_releases.put("releases/rbox-darwin-arm64", "LATEST-DARWIN");
     await env.rbox_releases.put("releases/v0.0.2/rbox-linux-x64", "VERSIONED-BIN");
+    await env.rbox_releases.put("releases/v1.2.3/rbox-darwin-arm64", "VERSIONED-DARWIN");
   });
+
+  // The SELF test above covers the real ctx.exports loopback; these gateway-unit tests
+  // stub it so individual forwards can be observed/intercepted (e.g. the limiter test).
+  const cachedExports: WorkerEntrypointExports = {
+    CachedReleases: {
+      fetch: async (req: Request) => {
+        const ctx = createExecutionContext();
+        const res = await new CachedReleases(ctx, env).fetch(req);
+        await waitOnExecutionContext(ctx);
+        return res;
+      },
+    },
+  };
+
+  async function releaseGateway(path: string, options: { env?: Env; exports?: WorkerEntrypointExports } = {}): Promise<Response> {
+    const req = new Request(`${BASE}${path}`);
+    const url = new URL(req.url);
+    const res = await releaseRoutes({
+      req,
+      env: options.env ?? env,
+      exports: options.exports ?? cachedExports,
+      url,
+      seg: url.pathname.split("/").filter(Boolean),
+    });
+    expect(res).not.toBeNull();
+    return res!;
+  }
 
   test("/version + /version.sig serve from the release bucket, no-cache", async () => {
     const v = await SELF.fetch(`${BASE}/version`);
@@ -1620,25 +1662,69 @@ describe("release distribution (design 14)", () => {
     expect((await SELF.fetch(`${BASE}/version.sig`)).status).toBe(200);
   });
 
-  test("versioned binary is immutable-cached; latest alias is short-cached", async () => {
-    const versioned = await SELF.fetch(`${BASE}/bin/v0.0.2/rbox-linux-x64`);
+  // End-to-end through the REAL worker fetch → gateway → ctx.exports.CachedReleases
+  // loopback (no stub) — proves the design 70 wiring the release routes ride on.
+  test("install.sh + versioned binary via SELF exercise the real ctx.exports loopback", async () => {
+    const install = await SELF.fetch(`${BASE}/install.sh`);
+    expect(install.status).toBe(200);
+    expect(install.headers.get("cache-control")).toBe("public, max-age=300, stale-while-revalidate=3600");
+    expect(await install.text()).toBe("#!/bin/sh\n");
+
+    const versioned = await SELF.fetch(`${BASE}/bin/v1.2.3/rbox-darwin-arm64`);
     expect(versioned.status).toBe(200);
-    expect(versioned.headers.get("cache-control")).toContain("immutable");
-    expect(await versioned.text()).toBe("VERSIONED-BIN");
-    const latest = await SELF.fetch(`${BASE}/bin/rbox-linux-x64`);
+    expect(versioned.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(await versioned.text()).toBe("VERSIONED-DARWIN");
+  });
+
+  test("/install.sh is short-cached with stale-while-revalidate", async () => {
+    const res = await releaseGateway("/install.sh");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=300, stale-while-revalidate=3600");
+    expect(await res.text()).toBe("#!/bin/sh\n");
+  });
+
+  test("versioned binary is immutable-cached; latest alias is short-cached without SWR", async () => {
+    const versioned = await releaseGateway("/bin/v1.2.3/rbox-darwin-arm64");
+    expect(versioned.status).toBe(200);
+    expect(versioned.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(await versioned.text()).toBe("VERSIONED-DARWIN");
+
+    const latest = await releaseGateway("/bin/rbox-darwin-arm64");
     expect(latest.status).toBe(200);
     expect(latest.headers.get("cache-control")).toBe("public, max-age=300");
+    expect(latest.headers.get("cache-control")).not.toContain("stale-while-revalidate");
+    expect(await latest.text()).toBe("LATEST-DARWIN");
   });
 
   test("rejects bad name / bad version / path traversal; 404s are no-store", async () => {
     for (const bad of ["/bin/evil", "/bin/v0.0.2/evil", "/bin/notaversion/rbox-linux-x64", "/bin/rbox-windows-x64"]) {
-      const r = await SELF.fetch(`${BASE}${bad}`);
+      const r = await releaseGateway(bad);
       expect(r.status).toBe(404);
       expect(r.headers.get("cache-control")).toBe("no-store");
     }
-    const missing = await SELF.fetch(`${BASE}/bin/v9.9.9/rbox-linux-x64`);
+    const missing = await releaseGateway("/bin/v9.9.9/rbox-linux-x64");
     expect(missing.status).toBe(404);
     expect(missing.headers.get("cache-control")).toBe("no-store");
+  });
+
+  test("RL_RELEASE is enforced before forwarding to CachedReleases", async () => {
+    let forwarded = false;
+    const limitedEnv: Env = { ...env, RL_RELEASE: { limit: async () => ({ success: false }) } };
+    const res = await releaseGateway("/bin/rbox-darwin-arm64", {
+      env: limitedEnv,
+      exports: {
+        CachedReleases: {
+          fetch: async () => {
+            forwarded = true;
+            return new Response("unexpected");
+          },
+        },
+      },
+    });
+    expect(forwarded).toBe(false);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(await res.json()).toEqual({ error: "rate_limited", retryAfterSeconds: 60 });
   });
 });
 

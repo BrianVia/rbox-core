@@ -7,10 +7,10 @@ import { grantEntitlementWithQuota } from "../src/billing.js";
 import { mintReceipt } from "../src/receipts.js";
 
 // §33 Phase 1 — per-account entitlement GC, against real workerd D1 (mirrors
-// spike-d1-charge.test.ts). The DO commit-sequencer (storage.kv/transactionSync) is
-// unavailable in the pinned runtime — every DO-driven path is test.skip elsewhere — so
-// reachability is injected as a Set (exactly what perAccountReachable returns from DO
-// roots) and the per-account fail-closed property is exercised via the broken DO itself.
+// spike-d1-charge.test.ts). Reachability is injected as a Set (exactly what
+// perAccountReachable returns from DO roots); the per-account fail-closed property is
+// exercised via an explicitly broken DO namespace stub (runtime-independent — the old
+// fixture leaned on the pre-2026 pool runtime lacking storage.kv).
 
 const db = () => env.rbox_dev_db;
 const NOW = 1_700_000_000_000;
@@ -310,16 +310,22 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
     await mkAccount("bad");
     // GOOD: no workspace → perAccountReachable returns empty → its stale orphan is markable.
     await addRef("good", "g", 10, NOW - 2 * HOUR);
-    // BAD: has a workspace → perAccountReachable must read its DO roots, which FAILS in this
-    // runtime (storage.kv unavailable) — a faithful "broken DO" → fail-closed for this account.
+    // BAD: has a workspace → perAccountReachable must read its DO roots. Break the DO
+    // explicitly (a namespace whose stubs 500 on /roots) — GOOD never touches the DO (no
+    // workspace), so the same env exercises fail-closed isolation between the two.
     await db().prepare("INSERT INTO workspaces(workspace_id, project_id, account_id, created_at) VALUES ('ws_bad', 'root', 'bad', ?)").bind(NOW).run();
     await addRef("bad", "b", 20, NOW - 2 * HOUR);
+    const brokenDO = {
+      idFromName: (name: string) => env.WORKSPACE_SYNC.idFromName(name),
+      get: () => ({ fetch: async () => new Response("boom", { status: 500 }) }),
+    } as unknown as DurableObjectNamespace; // test double: only the two members reachableFromWorkspaces uses
+    const envBroken = { ...env, WORKSPACE_SYNC: brokenDO };
 
     // sanity: reachability for BAD throws (fail-closed), GOOD resolves empty.
-    await expect(perAccountReachable(env, "bad")).rejects.toThrow();
-    expect([...(await perAccountReachable(env, "good"))]).toEqual([]);
+    await expect(perAccountReachable(envBroken, "bad")).rejects.toThrow();
+    expect([...(await perAccountReachable(envBroken, "good"))]).toEqual([]);
 
-    const res = (await runPhase1(env, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
+    const res = (await runPhase1(envBroken, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
     expect(res.failed).toBeGreaterThanOrEqual(1); // bad failed closed
     expect(res.processed).toBeGreaterThanOrEqual(1); // good still ran
 

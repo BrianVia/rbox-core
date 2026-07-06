@@ -37,6 +37,13 @@ export interface RateLimitBinding {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
+/** Loopback entrypoints exposed through ctx.exports. Keep in sync with worker.ts exports. */
+export interface WorkerEntrypointExports {
+  CachedReleases: {
+    fetch(req: Request): Promise<Response>;
+  };
+}
+
 export interface Env {
   rbox_dev_db: D1Database;
   /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
