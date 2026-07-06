@@ -31,6 +31,45 @@ export const BUILTIN_IGNORE: string[] = [
   // `.yarn/` is intentionally committed by some projects, so it's NOT ignored here.
   ".pnpm-store/",
   "vendor/bundle/",
+  // Regenerable build/dependency/cache dirs across ecosystems (curated from the
+  // github/gitignore templates). Bar for inclusion: the name is DISTINCTIVE (no
+  // plausible user content — which is why generic `bin/`, `obj/`, `out/`, `lib/`,
+  // `deps/`, `pkg/` are deliberately absent) AND the contents are regenerable.
+  // Sometimes-committed-on-purpose dirs (`Pods/`, plain `vendor/`, `.yarn/`) are
+  // also deliberately absent. Editor config (`.vscode/`, `.idea/`) and experiment
+  // data (`wandb/`, `mlruns/`) stay synced — untracked-but-precious is the point.
+  ".build/", // SwiftPM (its checkouts/ contain dependency .git clones — git-sync noise)
+  "DerivedData/", // Xcode
+  "__pycache__/",
+  ".pytest_cache/",
+  ".mypy_cache/",
+  ".ruff_cache/",
+  ".tox/",
+  ".nox/",
+  ".eggs/",
+  ".ipynb_checkpoints/",
+  "cdk.out/", // AWS CDK synth output
+  ".terraform/", // provider binaries/modules (state FILES still sync — that's a feature)
+  ".serverless/",
+  ".gradle/",
+  "_build/", // Elixir mix / Sphinx
+  ".dart_tool/",
+  ".expo/",
+  ".vercel/",
+  ".netlify/",
+  ".firebase/",
+  ".wrangler/", // Wrangler local dev state/cache
+  ".output/", // Nuxt 3 / Nitro
+  ".parcel-cache/",
+  ".angular/",
+  ".astro/",
+  ".docusaurus/",
+  "zig-cache/",
+  "zig-out/",
+  "cmake-build-*/", // CLion per-profile CMake output
+  ".nyc_output/",
+  ".sass-cache/",
+  "storybook-static/",
   ".DS_Store",
   // Secrets: excluded by default; opt-in sync is E2EE-only (not in Phase 1).
   ".env",
@@ -81,6 +120,25 @@ export const HARD_PRUNE_DIRS: string[] = [
   "coverage",
   "target",
   ".pnpm-store",
+  // The big regenerable dirs from the curated set above (literal names only —
+  // `cmake-build-*` is a glob and stays matcher-side).
+  ".build",
+  "DerivedData",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".tox",
+  ".nox",
+  "cdk.out",
+  ".terraform",
+  ".gradle",
+  "_build",
+  ".dart_tool",
+  ".parcel-cache",
+  ".angular",
+  "zig-cache",
+  "zig-out",
 ];
 
 /** Hard-prune dirs that are effectively never user-re-includable, so they stay safe to
