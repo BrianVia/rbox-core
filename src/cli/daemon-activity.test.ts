@@ -399,7 +399,7 @@ test("a quota probe refreshes outOfStorage without clearing a real pull halt", a
     activity: probed,
     now: Date.now(),
   });
-  expect(line).toContain("sync halted");
+  expect(line).toContain("sync failing");
   expect(line).toContain("mass-delete guard");
   expect(line).not.toContain("out of storage");
 });

@@ -139,11 +139,29 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   }
 }
 
-/** The sidecar's state field — halt > outofstorage > active > pending (unsettled) > ok.
- *  Exported so the daemon can compare "what would render now" against what it last
- *  wrote without duplicating the precedence. */
+/** The machine-facing activity state — halt > outofstorage > active > pending
+ *  (unsettled) > ok. `status --json` mirrors this verbatim. */
 export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "outofstorage" | "active" | "pending" | "ok" =>
   a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
+
+const freshActive = (a: DaemonActivity, now: number): DaemonActivity["active"] | undefined => {
+  const active = a.active;
+  return active && now - Date.parse(active.at) < ACTIVE_STALE_MS ? active : undefined;
+};
+
+/** Writer-side prompt state. `status --json` intentionally keeps using
+ *  {@link shellStateOf}; this variant only controls the pre-rendered shell line. */
+export const shellLineStateOf = (
+  a: DaemonActivity,
+  settled: boolean,
+  now: number
+): "halt" | "outofstorage" | "active" | "pending" | "ok" => {
+  const active = freshActive(a, now);
+  if (a.halt && (!active || a.outOfStorage)) return "halt";
+  if (a.outOfStorage) return "outofstorage";
+  if (active) return "active";
+  return settled ? "ok" : "pending";
+};
 
 /**
  * Design 46: render the daemon's activity record into the one-line prompt sidecar
@@ -155,7 +173,9 @@ export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "out
  * Format (v1), single-space separated, `name` LAST because it may contain spaces:
  *   `v1 <epochSeconds> <state> <pct> <sequence> <lastOpEpoch> <lastOpKind> <name>`
  *
- * - `state` precedence: `halt` > `outofstorage` > `active` > `pending` (unsettled) > `ok` (settled).
+ * - `state` precedence: `halt` > `outofstorage` > `active` > `pending` (unsettled) > `ok` (settled),
+ *   except a FRESH `active` transfer renders as `active` while carrying an older halt
+ *   record, so installed snippets show the live retry glyph instead of a stale warning.
  * - `pct` — floor(done/total*100) clamped 0–100 for a determinate `active`; `-` for an
  *   INDETERMINATE active phase (total<=0, e.g. a live scan — a fake "100" would render
  *   `↻ 100%` for minutes) and when not active at all. `-` has been a legal pct token
@@ -170,7 +190,7 @@ export function renderShellLine(
   opts: { settled: boolean; sequence?: number; name: string; now: number }
 ): string {
   const epochSeconds = Math.floor(opts.now / 1000);
-  const state = shellStateOf(a, opts.settled);
+  const state = shellLineStateOf(a, opts.settled, opts.now);
 
   let pct: string | number = "-";
   if (a.active && a.active.total > 0) {
