@@ -11,7 +11,7 @@ import {
   type WatchEvent,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
-import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
+import { renderShellLine, saveActivity, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
@@ -404,7 +404,7 @@ export class RboxDaemon {
       // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
       const settledNow =
         !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
-      if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
+      if (shellStateOf(this.activity, settledNow) !== this.lastShellState) this.writeActivity();
     } finally {
       this.pumping = false;
     }
@@ -603,13 +603,12 @@ export class RboxDaemon {
     // awaited on the sync path. `settled` = nothing queued and no watcher events left.
     const settled =
       !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
-    const now = Date.now();
-    this.lastShellState = shellLineStateOf(snapshot, settled, now);
+    this.lastShellState = shellStateOf(snapshot, settled);
     const line = renderShellLine(snapshot, {
       settled,
       sequence: this.lastLoggedSeq,
       name: this.cfg.name ?? this.cfg.remoteWorkspaceId,
-      now,
+      now: Date.now(),
     });
     this.activityWrite = this.activityWrite
       .then(async () => {

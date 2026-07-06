@@ -9,7 +9,6 @@ import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
 import {
   attributeDaemonForStatus,
-  healthDetailLines,
   healthLine,
   lastSyncLines,
   trashLine,
@@ -198,20 +197,20 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
     ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
     : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
   console.log(`${style.bold("workspace")} ${wsLabel}`);
-  const statusSnapshot = {
-    added: d.added.length,
-    changed: d.changed.length,
-    deleted,
-    gitChanged,
-    trackedFiles: local.files.length,
-    daemonRunning: bg.running,
-    localSequence: state.lastSyncedSequence,
-    remote,
-    activity,
-    now,
-  };
-  console.log(`  ${healthLine(statusSnapshot)}`);
-  for (const detail of healthDetailLines(statusSnapshot)) console.log(`  ${detail}`);
+  console.log(
+    `  ${healthLine({
+      added: d.added.length,
+      changed: d.changed.length,
+      deleted,
+      gitChanged,
+      trackedFiles: local.files.length,
+      daemonRunning: bg.running,
+      localSequence: state.lastSyncedSequence,
+      remote,
+      activity,
+      now,
+    })}`
+  );
   if (attributed.remoteLine) console.log(`  ${attributed.remoteLine}`);
   for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
   console.log(
@@ -227,22 +226,7 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
     const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
     const pending = Object.keys(state.gitPendingRemote ?? {}).length;
     const conflicts = Object.keys(state.gitNeedsResolution ?? {}).length;
-    // "0 repos synced" while the first publish is mid-flight reads as "doing
-    // nothing" (founder repro). When a fresh cycle is running, say what's
-    // actually happening; the gitcap phase even knows its counts. Richer
-    // persisted per-phase counters are design 69 §3.4.
-    const act = activity?.active;
-    const live = act && Date.now() - Date.parse(act.at) < 60_000 ? act : undefined;
-    const parts: string[] = [];
-    if (synced === 0 && live) {
-      parts.push(
-        live.phase === "gitcap"
-          ? style.cyan(`capturing ${live.done}/${live.total} repos — first publish in progress`)
-          : style.cyan("first publish in progress")
-      );
-    } else {
-      parts.push(style.green(`${synced} repo${synced === 1 ? "" : "s"} synced`));
-    }
+    const parts = [style.green(`${synced} repo${synced === 1 ? "" : "s"} synced`)];
     if (pending) parts.push(style.yellow(`${pending} pending`));
     if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);

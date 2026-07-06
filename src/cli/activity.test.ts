@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ACTIVE_STALE_MS, loadActivity, renderShellLine, saveActivity, saveShellLine, type DaemonActivity } from "./activity.js";
+import { loadActivity, renderShellLine, saveActivity, saveShellLine, type DaemonActivity } from "./activity.js";
 import { resetSyncState } from "./config.js";
 
 let root: string;
@@ -101,17 +101,14 @@ test("resetSyncState clears the sidecar too — a rebind must not inherit the ol
 const NOW = 1_800_000_000_000; // 2027-01-15T08:00:00Z; floor(NOW/1000) = 1800000000
 const at = (epoch: number) => new Date(epoch * 1000).toISOString();
 
-test("renderShellLine state precedence: fresh active can show a retry over halt, quota still outranks active", async () => {
-  const active: DaemonActivity["active"] = { at: at(1799999990), phase: "upload", done: 1, total: 4 };
-  const staleActive: DaemonActivity["active"] = { at: new Date(NOW - ACTIVE_STALE_MS - 1000).toISOString(), phase: "upload", done: 1, total: 4 };
+test("renderShellLine state precedence: halt > outofstorage > active > pending > ok", async () => {
+  const active: DaemonActivity["active"] = { at: at(1799999900), phase: "upload", done: 1, total: 4 };
   const halt: DaemonActivity["halt"] = { at: at(1799999000), reason: "boom", count: 1, op: "pull" };
   const outOfStorage: DaemonActivity["outOfStorage"] = { at: at(1799999500), kind: "storage", used: 1, cap: 2 };
   const base = { settled: true, name: "ws", now: NOW };
 
-  // A fresh retry should show the active glyph even while the older halt is still recorded.
-  expect(renderShellLine({ at: "", active, halt }, base).split(" ")[2]).toBe("active");
-  // A stale active record must not mask a halt.
-  expect(renderShellLine({ at: "", active: staleActive, halt }, base).split(" ")[2]).toBe("halt");
+  // halt wins even when active AND settled would otherwise apply
+  expect(renderShellLine({ at: "", active, halt, outOfStorage }, base).split(" ")[2]).toBe("halt");
   // quota is soft but outranks live progress
   expect(renderShellLine({ at: "", active, outOfStorage }, base).split(" ")[2]).toBe("outofstorage");
   // active wins over settled (ok) and unsettled (pending)
@@ -124,7 +121,7 @@ test("renderShellLine state precedence: fresh active can show a retry over halt,
 
 test("renderShellLine pct: floors, clamps 0–100, indeterminate (total<=0) → `-`; `-` when not active", () => {
   const render = (done: number, total: number) =>
-    renderShellLine({ at: "", active: { at: at(1799999990), phase: "upload", done, total } }, { settled: false, name: "ws", now: NOW }).split(" ")[3];
+    renderShellLine({ at: "", active: { at: at(1799999900), phase: "upload", done, total } }, { settled: false, name: "ws", now: NOW }).split(" ")[3];
   expect(render(1, 3)).toBe("33"); // 33.3 → floored
   expect(render(4, 4)).toBe("100");
   expect(render(9, 4)).toBe("100"); // over-100 clamped

@@ -38,7 +38,7 @@ function driveHooks(scriptFile: string, wsDir: string): { glyph: string; banner:
     "_rbox_precmd",
     'print -r -- "GLYPH:${RBOX_PROMPT}"',
   ].join("; ");
-  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd], { cwd: tmpdir() });
   const stdout = new TextDecoder().decode(res.stdout);
   const stderr = new TextDecoder().decode(res.stderr);
   const glyph = (stdout.match(/GLYPH:(.*)/)?.[1] ?? "").trimEnd();
@@ -63,6 +63,7 @@ test("auto-append enables PROMPT_SUBST (stock zsh has it off — the embedded $R
   const file = writeScript();
   const probe = (env: Record<string, string>) => {
     const res = Bun.spawnSync([ZSH, "-f", "-c", `source ${file}; [[ -o prompt_subst ]] && print ON || print OFF; print -r -- "R:$RPROMPT"`], {
+      cwd: tmpdir(),
       env: { ...process.env, ...env },
     });
     return new TextDecoder().decode(res.stdout);
@@ -174,7 +175,7 @@ test("RBOX_NO_RPROMPT=1 is retroactive: a re-eval removes the auto-appended segm
     "-f",
     "-c",
     `source ${file}; print -r -- "FIRST:[$RPROMPT]"; RBOX_NO_RPROMPT=1; source ${file}; print -r -- "SECOND:[$RPROMPT]"`,
-  ]);
+  ], { cwd: tmpdir() });
   const out = new TextDecoder().decode(res.stdout);
   expect(out).toContain("FIRST:[ $RBOX_PROMPT]");
   expect(out.match(/SECOND:\[(.*)\]/)?.[1]).not.toContain("$RBOX_PROMPT");
@@ -188,7 +189,7 @@ test("hostile shell options (SH_WORD_SPLIT, GLOB_SUBST) cannot glob-expand a '*'
   const ws = makeWorkspace(`v1 ${now} ok - 80 - - *\n`); // a name of literally '*'
   const file = writeScript();
   const cmd = [`setopt sh_word_split glob_subst`, `source ${file}`, `cd ${ws}`, "_rbox_chpwd", "_rbox_precmd", 'print -r -- "GLYPH:${RBOX_PROMPT}"'].join("; ");
-  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd], { cwd: tmpdir() });
   const banner = new TextDecoder().decode(res.stderr);
   expect(banner).toContain("rbox: * ✓"); // literal star, not a filename listing
   expect(banner).not.toContain("workspace.json"); // globbing would have matched files
@@ -200,7 +201,7 @@ test("_rbox_read never clobbers the user's regex match globals (codex R2)", () =
   const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`);
   const file = writeScript();
   const cmd = [`source ${file}`, `MATCH=keepme`, `cd ${ws}`, "_rbox_chpwd", "_rbox_precmd", 'print -r -- "MATCH:${MATCH}"'].join("; ");
-  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd], { cwd: tmpdir() });
   expect(new TextDecoder().decode(res.stdout)).toContain("MATCH:keepme");
 });
 
@@ -223,7 +224,7 @@ test("opt-out removal never deletes a USER-owned ' $RBOX_PROMPT' placement (code
     `source ${file}`, // retroactive path must be a no-op (flag unset)
     'print -r -- "R:[$RPROMPT]"',
   ].join("; ");
-  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd]);
+  const res = Bun.spawnSync([ZSH!, "-f", "-c", cmd], { cwd: tmpdir() });
   expect(new TextDecoder().decode(res.stdout)).toContain("R:[pre $RBOX_PROMPT post]");
 });
 
@@ -236,7 +237,7 @@ test("completions register even when eval'd BEFORE compinit (codex R3)", () => {
     "-f",
     "-c",
     `source ${file}; autoload -Uz compinit; compinit -D; _rbox_compdef_retry; print -r -- "COMP:\${_comps[rbox]-MISSING}"`,
-  ]);
+  ], { cwd: tmpdir() });
   expect(new TextDecoder().decode(before.stdout)).toContain("COMP:_rbox");
   // eval AFTER compinit: the inline guarded compdef registers immediately.
   const after = Bun.spawnSync([
@@ -244,10 +245,10 @@ test("completions register even when eval'd BEFORE compinit (codex R3)", () => {
     "-f",
     "-c",
     `autoload -Uz compinit; compinit -D; source ${file}; print -r -- "COMP:\${_comps[rbox]-MISSING}"`,
-  ]);
+  ], { cwd: tmpdir() });
   expect(new TextDecoder().decode(after.stdout)).toContain("COMP:_rbox");
   // no compinit at all: the retry is a silent no-op at each prompt.
-  const never = Bun.spawnSync([ZSH, "-f", "-c", `source ${file}; _rbox_compdef_retry; print -r -- "OK"`]);
+  const never = Bun.spawnSync([ZSH, "-f", "-c", `source ${file}; _rbox_compdef_retry; print -r -- "OK"`], { cwd: tmpdir() });
   expect(new TextDecoder().decode(never.stdout)).toContain("OK");
   expect(new TextDecoder().decode(never.stderr)).toBe("");
 });

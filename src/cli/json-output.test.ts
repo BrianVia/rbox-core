@@ -90,33 +90,6 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
   });
 });
 
-test("status --json keeps machine health at halt when a fresh retry is active", async () => {
-  await saveConfig(tmp, {
-    schema: "e2ee/v1",
-    remoteWorkspaceId: "ws_json_retry",
-    name: "JSON Retry Workspace",
-    projectId: "root",
-    deviceId: "dev_json_retry",
-    rootPath: tmp,
-    remoteUrl: "https://api.test",
-    token: "",
-    syncGit: false,
-  });
-  await fs.mkdir(path.join(tmp, ".rbox", "state"), { recursive: true });
-  const now = new Date().toISOString();
-  await fs.writeFile(
-    path.join(tmp, ".rbox", "state", "activity.json"),
-    JSON.stringify({
-      at: now,
-      halt: { at: now, reason: "ENOENT: no such file or directory", count: 1, op: "push" },
-      active: { at: now, phase: "encrypt", done: 1, total: 2 },
-    })
-  );
-
-  const dto = JSON.parse(await captureStdout(() => statusCmd(tmp, { json: true })));
-  expect(dto.health).toBe("halt");
-});
-
 test("status hashcache write-back is guarded by daemon pidfile presence", async () => {
   process.env.RBOX_HOME = path.join(tmp, "home");
   await fs.writeFile(path.join(tmp, "file.txt"), "hash me");

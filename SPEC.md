@@ -1,39 +1,60 @@
-# SPEC — implement design 69 parts 3.1–3.3 (status perf, daemon-down half)
+# SPEC — CI sharding, caching, latest-runtime action pins
 
-The NORMATIVE spec is docs/design/69-status-perf.md (on main, codex-reviewed
-v2 — the resolutions section explains every rule; do not weaken them).
-Implement §3.1 (HashCache in status, pid-guarded write-back), §3.2
-(divergence overhaul: poolMap concurrency 8, repoCtx threaded once,
-fingerprint cache with the COMPLETE v2 input set + stable-pair rule,
-`.rbox/state/git-divergence.json` atomic writes), §3.3 (scan-walk collector
-firing PRE-prune for `.git` entries — dir AND gitfile pointer — feeding
-gitDivergenceCount's new optional repo-list param; default behavior for all
-other callers unchanged, preserving design-68 pointer-parent skip semantics).
+## Objective
+Rework .github/workflows/ci.yml so each shard's TEST step is ≤30s, setup is
+cache-minimized, and all pinned actions run on current (non-deprecated) Node.
 
-§3.4 (daemon snapshot) is OUT of scope — separate PR.
+## Measured baseline (2026-07-06)
+- CI job total 122-196s: setup ~20s (checkout 1s, setup-bun 3s, cache 6s,
+  install 1s), typecheck 8s, `bun test ./src/` 115s, apps/api vitest 24s.
+- Local split: `bun test ./src/engine/` ≈ 33s wall, `./src/cli/` ≈ 79s wall.
 
-Constraints:
-- gitIdentity/capture-path semantics untouched for sync; only status's
-  divergence path rides the fingerprint cache.
-- The fingerprint MUST cover the full v2 input list (op-state set, preflight
-  sentinels incl. config mtime + worktrees state, commonDir refs/packed-refs,
-  .git shape/pointer target, resolved gitDir+commonDir paths).
-- Start the human-mode fetchAccountSummary concurrent with local work
-  (design 69 §4 v2 note) — do not change its output or error-swallowing.
-- No new flags; no output changes except speed (and the --json local fields
-  are §3.4's, NOT yours).
+## Requirements
+1. **Shard the bun test mass** into a matrix so every shard's test step is
+   ≤30s (founder target; ~3-4 shards expected — 3 preferred, 4 acceptable if
+   30s is otherwise unreachable). CRITICAL — no file left behind: do NOT
+   hardcode per-shard file lists. Use deterministic hash/index partitioning
+   computed at runtime (e.g. a small script that globs src/**/*.test.ts,
+   sorts, assigns index % SHARD_COUNT, and passes that shard's files to
+   `bun test`). Add a guard (in one shard) asserting the union of all
+   partitions equals the full glob, so a partition bug fails loudly.
+   Balance matters more than directory purity: measure per-file durations
+   once (bun test prints timings; or time per directory) and if naive
+   modulo packing leaves a shard >30s, use a static weight hint list for
+   the handful of heavy files (git-sync, git-nested, e2ee-sync, daemon
+   tests) with modulo for the rest — document the mechanism in a comment.
+2. **Fold the small steps**: typecheck + @inquirer guard + apps/api vitest
+   distributed across shards so no shard is idle-light (vitest 24s can be
+   its own matrix entry paired with typecheck+guard ≈ 32s total — fine).
+3. **Cache aggressively in front of every step**:
+   - keep the bun install store cache (works — install is 1s warm);
+   - add tsc incremental: emit .tsbuildinfo (tsc --incremental) for both
+     tsconfigs, cached via actions/cache keyed on a source hash with
+     restore-keys fallback — typecheck 8s → ~2-3s warm;
+   - cache apps/api vitest/miniflare artifacts if a cacheable dir exists
+     (check what vitest-pool-workers puts where; skip if nothing stable);
+   - do NOT cache node_modules dirs themselves (bun install from warm store
+     is already 1s; a node_modules cache is staleness risk for no gain).
+4. **Latest-Node action pins** (the deprecation warning: "actions target
+   Node.js 20 forced to Node 24"): bump EVERY pinned action in ALL FOUR
+   workflows (ci.yml, release.yml, deploy-web.yml, e2e.yml) to the latest
+   released major (actions/checkout v5.x, actions/cache v4.x latest,
+   oven-sh/setup-bun latest, actions/setup-node v5.x, cloudflare/
+   wrangler-action latest v3.x) — keep the repo's pin-by-full-SHA-with-
+   version-comment convention (fetch SHAs via gh api releases/tags). Do not
+   change any workflow LOGIC outside ci.yml; the others get pin bumps only.
+5. Keep `concurrency` cancel-in-progress semantics; matrix shards must all
+   be required for merge (they will be, as jobs of the same workflow).
 
-Acceptance criteria (all must go green from worktree root):
-- `bun run typecheck`
-- `bun run test` (known baseline failures NOT yours: 4 shell-init/completions,
-  status --json environmental, occasional watcher-timeout flake)
-- New tests covering: fingerprint invalidation per mutation class (commit,
-  stage, stash, branch/checkout, rebase-step/op-state, packed-refs repack,
-  shallow/alternates sentinel flips, pointer-worktree ref change via
-  commonDir), zero-git-spawn on unchanged repo (spawn-count seam),
-  stable-pair rule under mid-probe mutation, collector sees dir+pointer
-  repos and misses nothing discoverGitRepos finds (equivalence test on a
-  mixed fixture), pid-guarded hashcache write-back (daemon pidfile present
-  → no write), corrupt caches → correct slow path + heal.
-- A micro-benchmark test proving the divergence path issues 0 git spawns on
-  a warm unchanged multi-repo fixture.
+## Acceptance criteria
+- `act` isn't available; validate by (a) YAML parses (yq/python -c yaml),
+  (b) the partition script runs locally producing N non-empty disjoint
+  shards whose union == full glob (run it, show output), (c) local dry-run
+  of each shard's exact `bun test <files>` command passes (run them).
+- Local full `bun run typecheck` + `bun run test` still green (partition
+  script and any package.json script additions must not break them).
+  Known baseline failures: 4 shell-init/completions, status --json
+  environmental, watcher flake.
+- Return: the final shard packing with measured/estimated per-shard times,
+  the partition mechanism, cache keys added, the action pin bump table
+  (old→new SHA per workflow), and anything you could not validate locally.
