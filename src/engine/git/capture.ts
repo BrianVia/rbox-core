@@ -4,7 +4,7 @@ import path from "node:path";
 import type { BlobStore } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
-import { exists, git, gitOk, putGitArtifact, readHead, repoCtx } from "./shared.js";
+import { exists, git, gitOk, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
 import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOf } from "./identity.js";
@@ -24,6 +24,38 @@ import { indexTreeOf } from "./identity.js";
 
 // ---- capture (design 43 §5) ----------------------------------------------------
 
+export class GitCaptureDeferredError extends Error {
+  override name = "GitCaptureDeferredError";
+}
+
+const WORKTREE_AWARE_CAPTURE_REASON = "git >= 2.15 required for worktree-aware capture";
+let supportsSingleWorktreeCache: boolean | undefined;
+
+async function gitSupportsSingleWorktree(repoDir: string): Promise<boolean> {
+  if (supportsSingleWorktreeCache !== undefined) return supportsSingleWorktreeCache;
+  supportsSingleWorktreeCache = await gitOk(repoDir, ["rev-list", "--single-worktree", "--max-count=0", "HEAD"]);
+  return supportsSingleWorktreeCache;
+}
+
+async function hasLiveLinkedWorktrees(ctx: RepoCtx): Promise<boolean> {
+  const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
+  for (const e of await listWorktrees(ctx.repoDir)) {
+    if (e.prunable) continue;
+    const real = await fs.realpath(e.path).catch(() => path.resolve(e.path));
+    if (real !== selfReal) return true;
+  }
+  return false;
+}
+
+export function decideDirBundleAllArgs(
+  supportsSingleWorktree: boolean,
+  liveLinkedWorktrees: boolean
+): { ok: true; args: string[] } | { ok: false; reason: string } {
+  if (supportsSingleWorktree) return { ok: true, args: ["--single-worktree", "--all"] };
+  if (liveLinkedWorktrees) return { ok: false, reason: WORKTREE_AWARE_CAPTURE_REASON };
+  return { ok: true, args: ["--all"] };
+}
+
 /** Full capture: build the bundle + upload all artifacts; return the manifest section.
  *
  * Small files (index, op-state) are STAGED (copied) into a temp dir FIRST and then
@@ -34,11 +66,20 @@ import { indexTreeOf } from "./identity.js";
  * snapshot.) History rides the bundle, which git produces consistently regardless.
  *
  * Scope split (design 43 §5):
- * - dir repo → refScope "all": bundle `--all` + refs/stash + enumerated pins.
+ * - dir repo → refScope "all": bundle `--single-worktree --all` + refs/stash + enumerated
+ *   pins. The `--single-worktree` restriction (design 68 §3.1) matters ONLY for a main clone
+ *   with linked worktrees: plain `--all` runs rev-list over EVERY worktree's HEAD, so a
+ *   detached linked-worktree HEAD would smuggle tier-2 state into the main bundle (codex M1;
+ *   live-repro'd git 2.50.1). `--single-worktree` restricts rev-list to the main checkout's
+ *   view; branches checked out in worktrees are ordinary `refs/heads/*` and still ride. It is
+ *   a harmless no-op on a worktree-free repo. Ancient git without `--single-worktree`
+ *   falls back to plain `--all` only when no live linked worktrees exist; with live
+ *   worktrees we defer instead of smuggling detached tier-2 state.
  * - pointer repo → refScope "scoped": bundle `refs/heads/<current-branch>` + enumerated
- *   pins ONLY — no `--all`, and `refs/stash` is NEVER captured (it lives in the SHARED
- *   gitdir; per-worktree capture would fan one global stash stack out into N standalone
- *   repos [v2, B2]). Uncommitted dirty state still transfers via the WIP commit + index.
+ *   pins ONLY — no `--all` (so `--single-worktree` does not apply), and `refs/stash` is NEVER
+ *   captured (it lives in the SHARED gitdir; per-worktree capture would fan one global stash
+ *   stack out into N standalone repos [v2, B2]). Uncommitted dirty state still transfers via
+ *   the WIP commit + index.
  */
 export async function captureGitState(repoDir: string, store: BlobStore, kek: Buffer): Promise<GitSection | undefined> {
   const ctx = await repoCtx(repoDir);
@@ -78,9 +119,15 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     if (wip) pinShas.add(wip);
     pins = await createScratchPins(repoDir, [...pinShas]);
     const bundlePath = path.join(tmpDir, "repo.bundle");
+    let dirAllArgs: string[] | undefined;
+    if (ctx.kind === "dir") {
+      const decision = decideDirBundleAllArgs(await gitSupportsSingleWorktree(repoDir), await hasLiveLinkedWorktrees(ctx));
+      if (!decision.ok) throw new GitCaptureDeferredError(decision.reason);
+      dirAllArgs = decision.args;
+    }
     const bundleArgs =
       ctx.kind === "dir"
-        ? ["--all", ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
+        ? [...dirAllArgs!, ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
         : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
     await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs]);
 

@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, gitIdentity, gitIdentityKey, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitDivergenceCount } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
@@ -160,6 +160,15 @@ async function commitFile(dir: string, file: string, content: string, msg: strin
   if (date) await gitAt(dir, date, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
   else await git(dir, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
 }
+async function makeInTreeMainWithWorktree(): Promise<{ M: string; W: string }> {
+  const M = path.join(rootA, "main");
+  await initRepo(M);
+  await commitFile(M, "m.txt", "mm", "c1");
+  const W = path.join(rootA, "wt");
+  await git(M, "worktree", "add", W, "-b", "feat");
+  await commitFile(W, "w.txt", "ww", "wt c1");
+  return { M, W };
+}
 const st = (root: string) => loadState(root, "http://x::ws_g43::root");
 const syncCycle = async () => {
   await sync(rootA, cfgA, depsA);
@@ -279,6 +288,79 @@ test("root repo '.' still syncs end-to-end (pre-§43 behavior preserved)", async
   await syncCycle();
   expect(remote.headSeq()).toBe(head);
 });
+
+// ── design 68 §3.3: in-tree linked-worktree pointer skip (base-carry) ──────────────
+
+test("design 68 V6: an in-tree linked-worktree pointer is SKIPPED — its history rides the main clone's bundle; no removal memory, no echo", async () => {
+  const { M } = await makeInTreeMainWithWorktree();
+
+  await push(rootA, cfgA, depsA);
+  const m = (await remote.latest()).manifest;
+  expect(Object.keys(m.gitRepos ?? {})).toEqual(["main"]); // wt NOT captured — travels with the main clone
+  expect(m.gitRepos!["main"]!.refScope).toBe("all");
+  expect(logsA.some((l) => l.includes("skipped 1") && l.includes("wt"))).toBe(true);
+  expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined(); // base-carry never stamps removal memory
+
+  // the worktree's committed branch rides the main clone's --single-worktree --all bundle (V4)
+  await pull(rootB, cfgB, depsB);
+  expect(await git(path.join(rootB, "main"), "rev-parse", "feat")).toBe(await git(M, "rev-parse", "feat"));
+  expect((await st(rootB)).gitReposRemoved?.["wt"]).toBeUndefined();
+
+  // steady state: skip is a carry → zero echo commits
+  const head = remote.headSeq();
+  await syncCycle();
+  await syncCycle();
+  expect(remote.headSeq()).toBe(head);
+  expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined();
+  expect((await st(rootB)).gitReposRemoved?.["wt"]).toBeUndefined();
+}, 20_000);
+
+test("design 68 V11: a skip-eligible pointer with an EXISTING captured base is CARRIED unchanged, not dropped — no removal memory (mixed-version safe)", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+
+  // Seed a pre-existing captured base for wt, as an OLDER client (which captured pointer
+  // worktrees and refused main clones, §6a) would have authored. Its artifacts live
+  // server-side, so the carry's blobRef check passes.
+  const wtSection = await captureGitState(W, remote.blobStore(), KEK);
+  expect(wtSection!.refScope).toBe("scoped");
+  const s0 = await st(rootA);
+  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
+
+  await push(rootA, cfgA, depsA);
+  const m = (await remote.latest()).manifest;
+  expect(Object.keys(m.gitRepos ?? {}).sort()).toEqual(["main", "wt"]); // wt CARRIED alongside the captured main clone
+  expect(m.gitRepos!["wt"]!.bundleEncSha).toBe(wtSection!.bundleEncSha); // carried UNCHANGED — never re-captured
+  expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined(); // M4: base-carry, never a removal-memory stamp
+  expect(logsA.some((l) => l.includes("skipped") && l.includes("wt"))).toBe(true);
+
+  // steady state: the carry echoes nothing (the section bytes are stable across cycles)
+  const head = remote.headSeq();
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBe(head);
+  await pull(rootB, cfgB, depsB);
+  expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined();
+  expect((await st(rootB)).gitReposRemoved?.["wt"]).toBeUndefined();
+}, 20_000);
+
+test("design 68 §3.3 + 422: a forced skip-eligible pointer recaptures instead of carrying a missing base blob", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+
+  const wtSection = await captureGitState(W, remote.blobStore(), KEK);
+  expect(wtSection!.refScope).toBe("scoped");
+  const s0 = await st(rootA);
+  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
+
+  remote.deleteBlob(wtSection!.bundleEncSha); // first attempt 422s on the carried pointer base
+  await fs.writeFile(path.join(rootA, "note.txt"), "forces a commit\n");
+  const events: Array<{ phase: string; detail?: string }> = [];
+  await push(rootA, cfgA, { ...depsA, onProgress: (_done, _total, phase, detail) => events.push({ phase, detail }) });
+
+  const m = (await remote.latest()).manifest;
+  expect(m.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect(m.gitRepos?.["wt"]).toBeDefined();
+  expect(events.some((e) => e.phase === "gitcap" && e.detail === "wt")).toBe(true); // forced rel was captured, not skip-carried
+  await expect(remote.blobStore().get(m.gitRepos!["wt"]!.bundleEncSha)).resolves.toBeDefined();
+}, 20_000);
 
 // ── (b) churn: per-repo capture failure defers with base carry, push proceeds ────
 
@@ -613,6 +695,73 @@ test("fresh re-create at a removed path: dir leftover is QUARANTINED then wiped,
   const sB = await st(rootB);
   expect(sB.gitReposRemoved?.["r"]).toBeUndefined(); // memory cleared
   expect(sB.lastSyncedManifest.gitRepos?.["r"]).toBeDefined(); // based again
+}, 20_000);
+
+test("clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch", async () => {
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "f.txt", "old", "old c1");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, "r");
+  await git(b, "branch", "sibling");
+  const siblingWt = path.join(tmp, "b-r-sibling");
+  await git(b, "worktree", "add", siblingWt, "sibling");
+  const siblingSha = await git(b, "rev-parse", "sibling");
+
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB); // B: removal memory recorded over the dir leftover
+  expect((await st(rootB)).gitReposRemoved?.["r"]).toBeDefined();
+
+  const mainA = path.join(tmp, "a-main-for-r");
+  await initRepo(mainA);
+  await commitFile(mainA, "base.txt", "base", "main c1");
+  await git(mainA, "worktree", "add", a, "-b", "feat");
+  await commitFile(a, "feat.txt", "new", "feat c1");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.refScope).toBe("scoped");
+
+  await pull(rootB, cfgB, depsB);
+  const sB = await st(rootB);
+  expect(sB.gitPendingRemote?.["r"]).toBeDefined(); // whole section deferred
+  expect(sB.gitReposRemoved?.["r"]).toBeDefined(); // memory kept; hook did not run
+  expect(logsB.some((l) => l.includes("r") && l.includes("would be wiped"))).toBe(true);
+  expect(await git(b, "rev-parse", "sibling")).toBe(siblingSha);
+  expect(await git(siblingWt, "rev-parse", "HEAD")).toBe(siblingSha);
+  expect(await fs.readdir(path.join(b, ".rbox", "git-quarantine")).catch(() => [])).toEqual([]);
+}, 20_000);
+
+test("clean materialization with a ref-wiping hook still applies when no sibling worktree owns the wiped refs", async () => {
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "f.txt", "old", "old c1");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, "r");
+  await git(b, "branch", "sibling"); // local syncable ref, but not checked out in a linked worktree
+
+  await fs.rm(a, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  expect((await st(rootB)).gitReposRemoved?.["r"]).toBeDefined();
+
+  const mainA = path.join(tmp, "a-main-for-r");
+  await initRepo(mainA);
+  await commitFile(mainA, "base.txt", "base", "main c1");
+  await git(mainA, "worktree", "add", a, "-b", "feat");
+  await commitFile(a, "feat.txt", "new", "feat c1");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.refScope).toBe("scoped");
+
+  await pull(rootB, cfgB, depsB);
+  const sB = await st(rootB);
+  expect(sB.gitPendingRemote?.["r"]).toBeUndefined();
+  expect(sB.gitReposRemoved?.["r"]).toBeUndefined();
+  expect(await git(b, "symbolic-ref", "HEAD")).toBe("refs/heads/feat");
+  await expect(git(b, "rev-parse", "--verify", "sibling")).rejects.toThrow(); // wiped by clean materialization
+  const qFiles = await fs.readdir(path.join(b, ".rbox", "git-quarantine"));
+  expect(qFiles.some((f) => f.endsWith(".bundle"))).toBe(true);
 }, 20_000);
 
 test("clean materialization wipes ONLY after artifacts verify — a missing bundle leaves the leftover intact", async () => {

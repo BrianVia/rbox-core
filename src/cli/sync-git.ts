@@ -4,10 +4,12 @@ import {
   applyGitState,
   assertGitTargetWithinRoot,
   captureGitState,
+  GitCaptureDeferredError,
   discoverGitRepos,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
+  inTreeWorktreeParentRel,
   isGitBusy,
   preserveGitConflict,
   projectIdentity,
@@ -81,6 +83,10 @@ export interface GitPushPlan {
   captured: string[];
   carried: string[];
   deferred: Array<{ relPath: string; reason: string }>;
+  /** Design 68 §3.3 — in-tree linked-worktree pointers whose full-store capture was
+   *  policy-skipped because the owning main clone is captured in this same cycle (history
+   *  travels with the parent bundle). Base-carry, never a drop — so no removal memory. */
+  skipped: Array<{ relPath: string; reason: string }>;
   removed: string[];
 }
 
@@ -111,9 +117,10 @@ export async function planGitSections(
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
   const captured: string[] = [];
-  const carried: string[] = [];
+  let carried: string[] = [];
   const removed: string[] = [];
   const deferred: Array<{ relPath: string; reason: string }> = [];
+  const skipped: Array<{ relPath: string; reason: string }> = [];
   const out: Record<string, GitSection> = {};
   const plan = (): GitPushPlan => {
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
@@ -137,6 +144,7 @@ export async function planGitSections(
       captured,
       carried,
       deferred,
+      skipped,
       removed,
     };
   };
@@ -170,7 +178,7 @@ export async function planGitSections(
   const cap = gitRepoCap();
   let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
 
-  const toCapture: string[] = [];
+  let toCapture: string[] = [];
   /** Per-repo failure → defer. Forced (422) repos take the M5 non-looping DROP instead:
    *  their base section references exactly the blobs the server lost, so carrying it
    *  would 422 forever — drop from THIS commit; the daemon re-captures when possible. */
@@ -313,6 +321,33 @@ export async function planGitSections(
     toCapture.push(rel);
   }
 
+  // Design 68 §3.3 — base-carry POLICY SKIP for in-tree linked-worktree pointers. A pointer
+  // whose owning main clone is (a) an in-tree linked-worktree parent AND (b) itself authored
+  // a section THIS cycle skips its own full-store capture: the shared history already rides
+  // the main clone's `--single-worktree --all` bundle, so capturing the pointer would upload
+  // the same object store again. Skip is BASE-CARRY, never a drop (codex M4): an existing
+  // section is carried forward unchanged (the remote never observes an absence → no removal
+  // memory is stamped, sync-git.ts:443/:231 untouched), and a repo with no base is simply
+  // never authored. `sectioned` is snapshotted BEFORE mutating toCapture — parents are dir
+  // repos, never pointers, so removing a pointer can't change any parent's membership.
+  const sectioned = new Set([...Object.keys(out), ...toCapture]);
+  const skippedRelPaths = new Set<string>();
+  for (const rel of [...toCapture, ...carried]) {
+    if (force.has(rel)) continue; // 422 recapture must capture, not base-carry via policy skip
+    if (kindByPath.get(rel) !== "pointer" || pending[rel] || needsRes[rel] !== undefined) continue;
+    const parentRel = await inTreeWorktreeParentRel(root, repoDirOf(root, rel));
+    if (!parentRel || !sectioned.has(parentRel)) continue; // out-of-tree/submodule/uncaptured parent → unchanged
+    skippedRelPaths.add(rel);
+    const b = base[rel];
+    if (b) out[rel] = b; // base-carry: never a remote absence, never a removal memory
+    else delete out[rel]; // fresh pointer: never authored
+    skipped.push({ relPath: rel, reason: `linked worktree of captured in-tree repo ${parentRel} — history travels with the main clone` });
+  }
+  if (skippedRelPaths.size > 0) {
+    toCapture = toCapture.filter((rel) => !skippedRelPaths.has(rel));
+    carried = carried.filter((rel) => !skippedRelPaths.has(rel));
+  }
+
   // Changed repos: bounded-concurrency capture. Any per-repo failure defers THAT repo
   // (base carry) — the push itself always proceeds (PR #38 churn discipline). Progress
   // is a monotonic completed-count (captures run concurrently, so a settle counter is
@@ -329,7 +364,7 @@ export async function planGitSections(
         deferOne(rel, "capture returned nothing (repo vanished mid-capture or failed self-validation)");
       }
     } catch (e) {
-      deferOne(rel, `capture failed: ${errMsg(e)}`);
+      deferOne(rel, e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`);
     } finally {
       // Root repo (rel ".") shows the workspace folder name rather than a bare ".".
       onProgress?.(++captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : path.basename(rel));
@@ -340,11 +375,17 @@ export async function planGitSections(
 }
 
 /** Format the §10 forensic push line:
- *  `git-sync: captured N (a, b) · carried N · deferred N (p: reason) · removed N (x)` */
+ *  `git-sync: captured N (a, b) · carried N · skipped N (p: reason) · deferred N (p: reason) · removed N (x)`
+ *  Skipped (design 68 §3.3 in-tree worktree pointers) is its own category — distinct from a
+ *  failure defer — so the summary reads honestly instead of hiding N× redundant captures. */
 export function formatGitPushLine(plan: GitPushPlan): string {
   const names = (xs: string[]) => (xs.length ? ` (${xs.join(", ")})` : "");
-  const defer = plan.deferred.length ? ` (${plan.deferred.map((d) => `${d.relPath}: ${d.reason}`).join("; ")})` : "";
-  return `git-sync: captured ${plan.captured.length}${names(plan.captured)} · carried ${plan.carried.length} · deferred ${plan.deferred.length}${defer} · removed ${plan.removed.length}${names(plan.removed)}`;
+  const reasons = (xs: Array<{ relPath: string; reason: string }>) => (xs.length ? ` (${xs.map((d) => `${d.relPath}: ${d.reason}`).join("; ")})` : "");
+  return (
+    `git-sync: captured ${plan.captured.length}${names(plan.captured)} · carried ${plan.carried.length}` +
+    ` · skipped ${plan.skipped.length}${reasons(plan.skipped)}` +
+    ` · deferred ${plan.deferred.length}${reasons(plan.deferred)} · removed ${plan.removed.length}${names(plan.removed)}`
+  );
 }
 
 /** Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
@@ -582,6 +623,7 @@ export async function applyGitSections(
       kek,
       wipeLeftover
         ? {
+            beforeMutateWipesRefs: true,
             beforeMutate: async () => {
               await quarantineAndWipeGitState(repoDir);
               delete removedMem[rel]; // leftover quarantined + wiped — the memory served its purpose
@@ -648,6 +690,18 @@ export async function gitDivergenceCount(
   const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base)])].sort();
 
+  // Would the main clone at `parentRel` author a section this cycle (design 68 §3.3
+  // eligibility)? Mirrors planGitSections' disposition: a preflight-passing dir repo with a
+  // base or a non-empty identity is captured/carried; a structural refusal drops it (no
+  // section); a transient refusal base-carries only when a base exists. Conservative — when
+  // unsure it returns false, so an uncertain pointer stays COUNTED (never under-claims sync).
+  const parentIsSectioned = async (parentRel: string): Promise<boolean> => {
+    if (kindByPath.get(parentRel) !== "dir") return base[parentRel] !== undefined; // undiscoverable-but-based → carried
+    const ppf = await gitPreflight(repoDirOf(root, parentRel));
+    if (!ppf.ok) return !ppf.structural && base[parentRel] !== undefined; // structural drop = no section
+    return base[parentRel] !== undefined || (await gitIdentity(repoDirOf(root, parentRel))) !== undefined;
+  };
+
   let n = 0;
   for (const rel of keys) {
     if (pending[rel]) continue; // unapplied remote truth is carried, never local divergence
@@ -686,6 +740,13 @@ export async function gitDivergenceCount(
     }
     const id = await gitIdentity(repoDirOf(root, rel));
     if (!id) continue; // empty repo: nothing to capture, base (if any) carries
+    // Design 68 §3.3 policy skip: an in-tree linked-worktree pointer whose owning main clone
+    // is itself syncable does not publish its own state (it rides the parent bundle) — the
+    // planner base-carries/never-authors it, so it is not pending work. Mirrors planGitSections.
+    if (kind === "pointer") {
+      const parentRel = await inTreeWorktreeParentRel(root, repoDirOf(root, rel));
+      if (parentRel && (await parentIsSectioned(parentRel))) continue;
+    }
     const key = gitIdentityKey(id);
     if (!baseSec) {
       n++; // never-synced local repo → a push would publish it

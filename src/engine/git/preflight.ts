@@ -21,10 +21,11 @@ export interface GitPreflightResult {
 
 /** Preflight: ordinary non-bare repos whose toplevel IS `repoDir` — as a real `.git`
  *  dir ("dir") or a gitfile worktree/submodule checkout ("pointer"). Dir-repos with
- *  linked worktrees (`.git/worktrees/`) or submodules (`.git/modules/`) stay refused
- *  (v1; superprojects explicitly unsupported [v2, M1]); alternates refused for both
- *  kinds (pointer: checked on the RESOLVED object store). Dangling pointers (main
- *  clone deleted) fail cleanly — the repo is skipped this cycle. */
+ *  linked worktrees (`.git/worktrees/`) are now ELIGIBLE (design 68 §3.1 — captured with
+ *  `bundle --single-worktree --all`, apply guarded by the §3.2 collision defer); submodule
+ *  superprojects (`.git/modules/`) stay refused (v1; explicitly unsupported [design 43 v2,
+ *  M1]); alternates refused for both kinds (pointer: checked on the RESOLVED object store).
+ *  Dangling pointers (main clone deleted) fail cleanly — the repo is skipped this cycle. */
 export async function gitPreflight(repoDir: string): Promise<GitPreflightResult> {
   const kind = await detectGitKind(repoDir);
   if (!kind) {
@@ -53,7 +54,9 @@ export async function gitPreflight(repoDir: string): Promise<GitPreflightResult>
   const topReal = top ? await fs.realpath(top).catch(() => path.resolve(top)) : "";
   if (topReal !== dirReal) return { ok: false, reason: "repo toplevel != repo dir", kind, structural: true };
   if (kind === "dir") {
-    for (const bad of ["objects/info/alternates", "worktrees", "modules"]) {
+    // `worktrees` is deliberately ABSENT here (design 68 §3.1): a main clone with linked
+    // worktrees now captures. `modules` (submodule superproject) + `alternates` stay refused.
+    for (const bad of ["objects/info/alternates", "modules"]) {
       if (await exists(path.join(repoDir, ".git", bad))) return { ok: false, reason: `.git/${bad} present — unsupported`, kind, structural: true };
     }
   } else {

@@ -14,6 +14,7 @@ import {
   gitBusy,
   gitOk,
   headBranchOf,
+  listWorktrees,
   moveFileAtomic,
   repoCtx,
 } from "./shared.js";
@@ -33,23 +34,56 @@ export interface ApplyGitResult {
   filteredRefs?: string[];
 }
 
-/** Branches (full refnames) checked out by a DIFFERENT worktree of the same store —
- *  `git update-ref refs/heads/x` from one worktree silently moves a branch a sibling
- *  has checked out, leaving that sibling dirty (`git branch -f` refuses; `update-ref`
- *  does not — codex repro, design 43 §7 [v4]). From `git worktree list --porcelain`. */
-async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Set<string>> {
-  const out = await git(ctx.repoDir, ["worktree", "list", "--porcelain"]).catch(() => "");
+/** Branches (full refname → linked-worktree display name) checked out by a DIFFERENT,
+ *  NON-PRUNABLE worktree of the same store — `git update-ref refs/heads/x` from one
+ *  worktree silently moves a branch a sibling has checked out, leaving that sibling dirty
+ *  (`git branch -f` refuses; `update-ref` does not — codex repro, design 43 §7 [v4]).
+ *  Prunable (stale) entries are ignored so they can't produce phantom collisions
+ *  (design 68 V13). From `git worktree list --porcelain`. */
+async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Map<string, string>> {
   const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
-  const owned = new Set<string>();
-  let wtPath: string | undefined;
-  for (const line of out.split("\n")) {
-    if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length);
-    else if (line.startsWith("branch ") && wtPath) {
-      const real = await fs.realpath(wtPath).catch(() => path.resolve(wtPath!));
-      if (real !== selfReal) owned.add(line.slice("branch ".length));
-    }
+  const owned = new Map<string, string>();
+  for (const e of await listWorktrees(ctx.repoDir)) {
+    if (e.prunable || !e.branch) continue;
+    const real = await fs.realpath(e.path).catch(() => path.resolve(e.path));
+    if (real !== selfReal) owned.set(e.branch, path.basename(e.path));
   }
   return owned;
+}
+
+/** Design 68 §3.2 — mandatory apply-side collision defer for a dir target (a main clone)
+ *  with LIVE linked worktrees. rbox publishes via `git update-ref`, which SILENTLY moves a
+ *  branch a sibling worktree has checked out (apply.ts hazard above) — git's porcelain
+ *  refusal never fires on this path. So before ANY publish we intersect the destination's
+ *  checked-out set (branches of OTHER, non-prunable worktrees) with the section's ref
+ *  UPDATES, ref DELETIONS (only when this apply deletes absent refs), a ref-wiping
+ *  pre-mutation hook (clean materialization), and HEAD move. ANY intersection defers the
+ *  WHOLE section (no partial application). Returns the collision reason, or undefined
+ *  when clear. Read-only. */
+async function worktreeCollision(ctx: RepoCtx, section: GitSection, deletesAbsent: boolean, beforeMutateWipesRefs: boolean): Promise<string | undefined> {
+  const owned = await branchesCheckedOutElsewhere(ctx);
+  if (owned.size === 0) return undefined;
+  const shortName = (ref: string) => ref.replace(/^refs\/heads\//, "");
+  const collision = (ref: string, suffix = "") => `branch ${shortName(ref)} checked out in linked worktree ${owned.get(ref)}${suffix}`;
+  // ref updates — every branch the section would publish
+  for (const ref of Object.keys(section.refs)) if (owned.has(ref)) return collision(ref);
+  // pre-mutation ref wipe — clean materialization deletes every local syncable ref before
+  // publishing even scoped sections, so every live sibling branch is at risk.
+  if (beforeMutateWipesRefs) {
+    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) {
+      if (owned.has(ref)) return collision(ref, " (would be wiped)");
+    }
+  }
+  // ref deletions — a checked-out branch absent from the section would be deleted
+  if (deletesAbsent) {
+    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) {
+      if (owned.has(ref) && !(ref in section.refs)) return collision(ref, " (would be deleted)");
+    }
+  }
+  // HEAD move — pointing the main checkout at a branch a sibling already holds
+  const headBranch = headBranchOf(section.head);
+  if (headBranch && owned.has(headBranch)) return collision(headBranch);
+  return undefined;
 }
 
 /**
@@ -76,7 +110,9 @@ async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Set<string>> {
  * `opts.beforeMutate` (design 43 §9 [v5] clean materialization): invoked AFTER every
  * artifact has been fetched+decrypted+verified but BEFORE any gitdir mutation — the
  * caller's quarantine+ref-wipe of a removal-memory leftover runs here, so a missing or
- * corrupt remote artifact can never strand a wiped repo (codex step-3 MAJOR). A hook
+ * corrupt remote artifact can never strand a wiped repo (codex step-3 MAJOR). When the
+ * hook wipes syncable refs, callers must set `beforeMutateWipesRefs` so the worktree
+ * collision pre-check can defer before the hook strands a sibling checkout. A hook
  * throw returns {applied:false} with the target untouched.
  */
 export async function applyGitState(
@@ -84,7 +120,7 @@ export async function applyGitState(
   section: GitSection,
   store: BlobStore,
   kek: Buffer,
-  opts: { beforeMutate?: () => Promise<void> } = {}
+  opts: { beforeMutate?: () => Promise<void>; beforeMutateWipesRefs?: boolean } = {}
 ): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
@@ -108,17 +144,25 @@ export async function applyGitState(
   const filteredRefs: string[] = [];
   let deleteAbsent = false;
   if (!ctx || ctx.kind === "dir") {
-    // Apply refuses the same dir shapes preflight refuses: publishing into a PRIMARY with
-    // linked worktrees would move branches its siblings have checked out (codex repro), and
-    // superproject/alternates stores have undefined apply semantics (design 43 §4, v1).
+    // superproject/alternates stores have undefined apply semantics (design 43 §4, v1) —
+    // still structurally refused. A PRIMARY with linked worktrees is now ELIGIBLE
+    // (design 68 §3.1); its one hazard — silently moving a sibling's checked-out branch —
+    // is caught by the §3.2 collision defer below, not a blanket refusal.
     if (ctx) {
-      for (const bad of ["worktrees", "modules", "objects/info/alternates"]) {
+      for (const bad of ["modules", "objects/info/alternates"]) {
         if (await exists(path.join(ctx.commonDir, bad))) {
           return { applied: false, reason: `.git/${bad} present — unsupported apply target` };
         }
       }
     }
     deleteAbsent = section.refScope === "all";
+    // Design 68 §3.2: zero-cost path when `.git/worktrees` is absent (the common case) —
+    // only pay `git worktree list` when linked worktrees actually exist. Any collision
+    // defers the whole section this cycle with no mutation.
+    if (ctx && (await exists(path.join(ctx.commonDir, "worktrees")))) {
+      const reason = await worktreeCollision(ctx, section, deleteAbsent, opts.beforeMutateWipesRefs === true);
+      if (reason) return { applied: false, reason };
+    }
   } else {
     for (const ref of Object.keys(publishRefs)) {
       if (!ref.startsWith("refs/heads/")) {

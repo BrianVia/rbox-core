@@ -4,8 +4,7 @@ import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob, putBlobFile } from "./blobs.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitResult } from "./commits.js";
-import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
-import { fetchResilient } from "./resilient.js";
+import { readQuotaExceeded, translateRemoteError } from "./errors.js";
 import {
   admitDevice,
   appendRoster,
@@ -146,12 +145,10 @@ export class RboxApi implements SyncRemote {
  *  sent as plaintext (the deliberate, consensual metadata trade) and stored once. */
 export async function createRemoteWorkspace(baseUrl: string, token: string, project: string, name?: string): Promise<string> {
   const nameQs = name ? `&name=${encodeURIComponent(name)}` : "";
-  // NOT auto-retried (retries: 0): mints a fresh server-owned workspace id; a retry after a
-  // socket-close-post-success would orphan a second workspace. Gets the timeout deadline only.
-  const res = await fetchResilient(`${baseUrl}/v1/workspaces?project=${encodeURIComponent(project)}${nameQs}`, {
+  const res = await fetch(`${baseUrl}/v1/workspaces?project=${encodeURIComponent(project)}${nameQs}`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
-  }, { retries: 0, op: "creating the workspace", rerunHint: WORKSPACE_MINT_RERUN_HINT });
+  });
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
