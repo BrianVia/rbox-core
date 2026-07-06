@@ -63,7 +63,7 @@ Fields worth knowing about as a user (not an exhaustive schema dump):
 | `remoteWorkspaceId` | which workspace this root syncs against |
 | `name` | optional, human-readable label, cached locally so `rbox status` doesn't need a server round-trip |
 | `projectId` | which project within the workspace (`"root"` today — single-project) |
-| `syncGit` | git-state sync (index/HEAD/stash), **on by default** (design 28 — the git-native sync this product is built around), `--git false` at `init`/`track` opts a device out |
+| `syncGit` | git-state sync (index/HEAD/stash), **on by default** (design 28 — the git-native sync this product is built around), `--git false` at `init`/`track` opts a device out. **Shape caveat:** a *primary* clone whose `.git` contains linked worktrees (`git worktree`), a submodule superproject, alternates, or a shallow/bare repo is currently *ineligible* for git-state capture — its section is not published, and the reason is reported per-repo in `rbox logs`. (Worktree *checkouts* themselves — gitfile-pointer repos — are captured today.) Regular file sync is unaffected. Primary-clone worktree support is design 68. |
 | `noDrift` | opt-out of dependency-drift nudges, **per device**, unset (nudges on) unless something writes it |
 | `encrypted` | always on — full E2EE (design 12) is the only supported mode |
 
