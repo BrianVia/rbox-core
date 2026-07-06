@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type { Clerk } from '@clerk/clerk-js';
 	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { fetchUsage, fetchAccountStatus, startCheckout, openBillingPortal, type Usage } from '$lib/api';
+	import { consumePlanIntent } from '$lib/plan-intent';
 	import { formatBytes, errMsg } from '$lib/format';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
@@ -30,6 +31,11 @@
 
 	requireAuth(); // not signed in → /
 
+	// load() can resolve after the user has navigated away — a checkout redirect must
+	// never fire from a destroyed page (plain flag, not $state: nothing renders it).
+	let destroyed = false;
+	onDestroy(() => (destroyed = true));
+
 	onMount(load);
 
 	async function load() {
@@ -46,6 +52,17 @@
 			error = m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
 		}
 		linked = s.status === 'fulfilled' ? s.value.linked : null;
+
+		// Pricing-CTA handoff: a buyer who clicked "Go Pro" on the marketing site arrives
+		// here post-sign-in with a stashed plan intent. Consume it one-shot FIRST (a
+		// cancelled checkout returns via /billing → here and must NOT re-fire), then
+		// auto-start checkout only if they're still on the free plan — paid users manage
+		// plans via the portal, never a second checkout. Errors surface via redirectVia.
+		// If the page was destroyed mid-fetch, don't consume — the intent stays stashed
+		// (within its TTL) for the buyer's next dashboard visit.
+		if (destroyed) return;
+		const intent = consumePlanIntent();
+		if (intent && usage?.plan === 'free') checkout(intent);
 	}
 
 	// One busy-lock + error-capture + redirect path for every billing action.
