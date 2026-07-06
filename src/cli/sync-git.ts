@@ -353,7 +353,7 @@ export async function planGitSections(
     const b = base[rel];
     if (b) out[rel] = b; // base-carry: never a remote absence, never a removal memory
     else delete out[rel]; // fresh pointer: never authored
-    skipped.push({ relPath: rel, reason: `linked worktree of captured in-tree repo ${parentRel} — history travels with the main clone` });
+    skipped.push({ relPath: rel, reason: `linked worktree of in-tree repo ${parentRel} — history travels with the main clone` });
   }
   if (skippedRelPaths.size > 0) {
     toCapture = toCapture.filter((rel) => !skippedRelPaths.has(rel));

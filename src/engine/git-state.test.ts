@@ -8,6 +8,7 @@ import {
   applyGitState,
   buildIgnoreMatcher,
   captureGitState,
+  GitCaptureDeferredError,
   gitCaptureScratchRoot,
   gitIdentity,
   gitIdentityKey,
@@ -15,6 +16,7 @@ import {
   LocalBlobStore,
   scanManifest,
   sweepStaleGitCaptureDirs,
+  validateGitSection,
   type BlobStore,
 } from "./index.js";
 
@@ -45,6 +47,16 @@ async function initRepo(dir: string) {
   await git(dir, "config", "user.email", "t@t.t");
   await git(dir, "config", "user.name", "t");
 }
+async function commitFile(dir: string, file: string, content: string, msg: string) {
+  await fs.writeFile(path.join(dir, file), content);
+  await git(dir, "add", file);
+  await git(dir, "commit", "-qm", msg);
+}
+async function appendPackedRef(dir: string, ref: string, sha: string) {
+  const packed = path.join(dir, ".git", "packed-refs");
+  const existing = await fs.readFile(packed, "utf8").catch(() => "# pack-refs with: peeled fully-peeled sorted\n");
+  await fs.writeFile(packed, `${existing.endsWith("\n") ? existing : `${existing}\n`}${sha} ${ref}\n`);
+}
 
 test("preflight accepts an ordinary repo, rejects non-repo and bare", async () => {
   await initRepo(A);
@@ -56,6 +68,37 @@ test("preflight accepts an ordinary repo, rejects non-repo and bare", async () =
   const plain = path.join(tmp, "plain");
   await fs.mkdir(plain);
   expect((await gitPreflight(plain)).ok).toBe(false);
+});
+
+test("capture normalizes symbolic HEAD casing to the ref store casing", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "x", "c1");
+  await git(A, "branch", "casemix");
+  await fs.writeFile(path.join(A, ".git", "HEAD"), "ref: refs/heads/CaseMix\n");
+
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  expect(section!.head).toBe("ref: refs/heads/casemix");
+  expect(section!.refs["refs/heads/casemix"]).toBe(await git(A, "rev-parse", "casemix"));
+  expect(validateGitSection(section!).ok).toBe(true);
+});
+
+test("capture refuses ambiguous case-insensitive HEAD ref matches with validation reason", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "x", "c1");
+  await git(A, "branch", "casemix");
+  const sha = await git(A, "rev-parse", "casemix");
+  await appendPackedRef(A, "refs/heads/CASEMIX", sha);
+  await fs.writeFile(path.join(A, ".git", "HEAD"), "ref: refs/heads/CaseMix\n");
+
+  let err: unknown;
+  try {
+    await captureGitState(A, store, KEK);
+  } catch (e) {
+    err = e;
+  }
+  expect(err).toBeInstanceOf(GitCaptureDeferredError);
+  expect((err as Error).message).toBe("capture failed self-validation: HEAD branch refs/heads/CaseMix not in refs");
 });
 
 test("capture→apply reproduces branches, staged state, and stash across repos", async () => {
