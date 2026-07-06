@@ -8,6 +8,7 @@ import {
   applyGitState,
   buildIgnoreMatcher,
   captureGitState,
+  normalizeSymbolicHeadCasing,
   GitCaptureDeferredError,
   gitCaptureScratchRoot,
   gitIdentity,
@@ -24,6 +25,8 @@ const exec = promisify(execFile);
 const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
+test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
+  cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
 
 let tmp: string;
 let A: string;
@@ -70,7 +73,38 @@ test("preflight accepts an ordinary repo, rejects non-repo and bare", async () =
   expect((await gitPreflight(plain)).ok).toBe(false);
 });
 
-test("capture normalizes symbolic HEAD casing to the ref store casing", async () => {
+
+/** True when the tmp filesystem is case-INSENSITIVE (macOS/APFS default). The
+ *  case-drift repro (HEAD casing != packed-refs casing while HEAD still
+ *  resolves) can only exist there; on case-sensitive FS the same setup reads
+ *  as an unborn branch and capture exits early. The pure normalization is
+ *  tested unconditionally below; the end-to-end repros run where they can. */
+const fsCaseInsensitive = await (async () => {
+  const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-case-probe-"));
+  try {
+    await fs.writeFile(path.join(d, "CaseProbe"), "");
+    return await fs.access(path.join(d, "caseprobe")).then(() => true, () => false);
+  } finally {
+    await fs.rm(d, { recursive: true, force: true });
+  }
+})();
+
+test("normalizeSymbolicHeadCasing: pure semantics (FS-independent)", () => {
+  const refs = { "refs/heads/casemix": "a".repeat(40), "refs/heads/main": "b".repeat(40) };
+  // drift → normalized to the ref store's casing
+  expect(normalizeSymbolicHeadCasing("ref: refs/heads/CaseMix", refs)).toBe("ref: refs/heads/casemix");
+  // exact match → untouched
+  expect(normalizeSymbolicHeadCasing("ref: refs/heads/main", refs)).toBe("ref: refs/heads/main");
+  // ambiguous (two case-variants) → untouched, validation refuses downstream
+  const amb = { ...refs, "refs/heads/CASEMIX": "c".repeat(40) };
+  expect(normalizeSymbolicHeadCasing("ref: refs/heads/CaseMix", amb)).toBe("ref: refs/heads/CaseMix");
+  // detached HEAD → untouched
+  expect(normalizeSymbolicHeadCasing("d".repeat(40), refs)).toBe("d".repeat(40));
+  // no candidate at all → untouched
+  expect(normalizeSymbolicHeadCasing("ref: refs/heads/ghost", refs)).toBe("ref: refs/heads/ghost");
+});
+
+test.if(fsCaseInsensitive)("capture normalizes symbolic HEAD casing to the ref store casing", async () => {
   await initRepo(A);
   await commitFile(A, "f.txt", "x", "c1");
   await git(A, "branch", "casemix");
@@ -83,7 +117,7 @@ test("capture normalizes symbolic HEAD casing to the ref store casing", async ()
   expect(validateGitSection(section!).ok).toBe(true);
 });
 
-test("capture refuses ambiguous case-insensitive HEAD ref matches with validation reason", async () => {
+test.if(fsCaseInsensitive)("capture refuses ambiguous case-insensitive HEAD ref matches with validation reason", async () => {
   await initRepo(A);
   await commitFile(A, "f.txt", "x", "c1");
   await git(A, "branch", "casemix");

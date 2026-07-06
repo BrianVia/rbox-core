@@ -14,6 +14,7 @@ export { gitPreflight, isGitBusy, type GitPreflightResult } from "./git/prefligh
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
 export {
   captureGitState,
+  normalizeSymbolicHeadCasing,
   decideDirBundleAllArgs,
   gitCaptureScratchRoot,
   sweepStaleGitCaptureDirs,

@@ -73,7 +73,7 @@ export function gitCaptureScratchRoot(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".rbox", "gitcap");
 }
 
-function normalizeSymbolicHeadCasing(head: string, refs: Record<string, string>): string {
+export function normalizeSymbolicHeadCasing(head: string, refs: Record<string, string>): string {
   const branch = headBranchOf(head);
   if (!branch || Object.prototype.hasOwnProperty.call(refs, branch)) return head;
   const matches = Object.keys(refs).filter((ref) => ref.toLowerCase() === branch.toLowerCase());
