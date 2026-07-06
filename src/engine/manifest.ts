@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { indexByPath } from "./diff.js";
+import type { DiscoveredGitRepo } from "./git-discover.js";
 import { hashBytes, hashFile } from "./hash.js";
 import type { HashCache } from "./hashcache.js";
 import { buildIgnoreMatcher, type IgnoreMatcher } from "./ignore.js";
@@ -35,7 +36,11 @@ export async function scanManifest(
    *  every {@link SCAN_PROGRESS_STRIDE} entries (and never with a total — a live walk
    *  has no known total). Display-only; the CLI renders it as the indeterminate
    *  `scanning… N files` phase. */
-  onProgress?: (discovered: number) => void
+  onProgress?: (discovered: number) => void,
+  /** Optional git repo discovery hook. Fires for `.git` directories and gitfile
+   *  pointers before the hard `.git` ignore prune, so callers can avoid a second
+   *  full workspace walk. */
+  onGitRepo?: (repo: DiscoveredGitRepo) => void
 ): Promise<Manifest> {
   const files: FileEntry[] = [];
   let discovered = 0;
@@ -44,7 +49,7 @@ export async function scanManifest(
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover);
+  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo);
   files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return { generatedAt: new Date().toISOString(), files };
 }
@@ -208,7 +213,8 @@ async function walk(
   out: FileEntry[],
   cache?: HashCache,
   pending?: PendingHash[],
-  onDiscover?: () => void
+  onDiscover?: () => void,
+  onGitRepo?: (repo: DiscoveredGitRepo) => void
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
@@ -219,10 +225,15 @@ async function walk(
   for (const entry of entries) {
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     const abs = path.join(root, childRel);
+    if (entry.name === ".git") {
+      const relPath = rel === "" ? "." : rel;
+      if (entry.isDirectory()) onGitRepo?.({ relPath, kind: "dir" });
+      else if (entry.isFile()) onGitRepo?.({ relPath, kind: "pointer" });
+    }
 
     if (entry.isDirectory()) {
       if (matcher.ignores(`${childRel}/`)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover);
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo);
     } else if (entry.isSymbolicLink()) {
       if (matcher.ignores(childRel)) continue;
       onDiscover?.();

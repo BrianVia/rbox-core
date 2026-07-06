@@ -1,82 +1,39 @@
-# SPEC — gitcap upload hardening (backlog item, 2026-07-06 stress-test finding)
+# SPEC — implement design 69 parts 3.1–3.3 (status perf, daemon-down half)
 
-## Objective
+The NORMATIVE spec is docs/design/69-status-perf.md (on main, codex-reviewed
+v2 — the resolutions section explains every rule; do not weaken them).
+Implement §3.1 (HashCache in status, pid-guarded write-back), §3.2
+(divergence overhaul: poolMap concurrency 8, repoCtx threaded once,
+fingerprint cache with the COMPLETE v2 input set + stable-pair rule,
+`.rbox/state/git-divergence.json` atomic writes), §3.3 (scan-walk collector
+firing PRE-prune for `.git` entries — dir AND gitfile pointer — feeding
+gitDivergenceCount's new optional repo-list param; default behavior for all
+other callers unchanged, preserving design-68 pointer-parent skip semantics).
 
-Make git-state capture uploads survive the failure that killed the 6GB
-zen-browser-desktop capture: the ciphertext temp lived in `os.tmpdir()` across
-the entire hash→multipart-upload window, got truncated externally, the server
-correctly rejected the sha mismatch, and the git path — unlike file blobs —
-had no retry, so one transient fault permanently deferred the repo's cycle.
+§3.4 (daemon snapshot) is OUT of scope — separate PR.
 
-Three changes, in one PR:
+Constraints:
+- gitIdentity/capture-path semantics untouched for sync; only status's
+  divergence path rides the fingerprint cache.
+- The fingerprint MUST cover the full v2 input list (op-state set, preflight
+  sentinels incl. config mtime + worktrees state, commonDir refs/packed-refs,
+  .git shape/pointer target, resolved gitDir+commonDir paths).
+- Start the human-mode fetchAccountSummary concurrent with local work
+  (design 69 §4 v2 note) — do not change its output or error-swallowing.
+- No new flags; no output changes except speed (and the --json local fields
+  are §3.4's, NOT yours).
 
-## 1. Stage git captures under the repo's `.rbox`, not `os.tmpdir()`
-
-- `src/engine/git/capture.ts:48` (approx): `fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcap-"))`
-  → stage under the workspace root's `.rbox/` (a `gitcap/` scratch subdir),
-  mirroring the apply side, which already refuses `os.tmpdir()` for exactly
-  this hazard class — see the comment at `src/engine/git/apply.ts:146-148`
-  and copy its rationale style.
-- `captureGitState(repoDir, store, kek)` doesn't currently know the workspace
-  root — thread a staging-dir (or root) parameter from the caller
-  (`src/cli/sync-git.ts` capture pool) the same way other deps thread.
-  Same-mount matters: keep any rename/move semantics cheap (the apply side's
-  comment explains why).
-- The encrypt temp (`.ct`) must also land in that staging dir — check
-  `src/engine/crypto.ts` `encryptFileToTemp` (or equivalent) for where the
-  ciphertext temp goes and route it via the same dir parameter if it
-  currently defaults to tmpdir.
-- Cleanup semantics unchanged: same strictly-awaited `finally` removal
-  (`capture.ts:122-125`). Add: on CLI startup or capture start, sweep stale
-  `.rbox/gitcap/` leftovers from crashed prior runs (bounded: only rm dirs
-  older than, say, 24h — do not race a concurrent daemon's live staging).
-- `.rbox/` is already excluded from sync (verify — the manifest scan must
-  never pick up staging bytes; if exclusion is pattern-based confirm
-  `gitcap/` is covered, else add it).
-
-## 2. Sha-mismatch retry parity with file blobs
-
-- File blobs already do this: on `BlobShaMismatchError`, drop the stale temp,
-  re-encrypt a fresh snapshot, back off, retry — `src/cli/sync-recovery.ts:134-141`
-  (`PER_FILE_UPLOAD_ATTEMPTS`).
-- The git path has NO catch between `putGitArtifact` (`src/engine/git/shared.ts:141`)
-  and the per-repo deferral (`src/cli/sync-git.ts:321-323`). Add a bounded
-  re-encrypt-and-retry (reuse the file path's attempt count/backoff constants,
-  don't mint new ones) around the git artifact upload. The retry must
-  re-encrypt from the plaintext bundle — which means the plaintext `.bundle`
-  must survive until upload succeeds (today the `.snap` copy is deleted
-  pre-upload at `crypto.ts:110` — the retry source is the `.bundle` in the
-  staging dir, still present until the `finally`; verify and use it).
-- On final failure: exactly today's behavior (deferOne with the error).
-
-## 3. Resumable git multipart
-
-- `src/cli/remote/api.ts:178` (approx): the git `putFile` path calls
-  `putBlobFile(sha256, srcPath, size)` with no `uploadsDir` — file blobs pass
-  one so `putBlobMultipart` can resume (`src/cli/remote/multipart.ts:19-21`).
-  Pass the staging dir (or the same uploads-state dir file blobs use — read
-  how file blobs choose it and be consistent).
-
-## Constraints
-
-- Do NOT touch: preflight.ts refusal logic, apply-side semantics, sync-git
-  capture-set planning (a worktree-support change just landed there —
-  rebase your base onto current origin/main first and build on it).
-- No new config/flags. No behavior change for the success path beyond file
-  locations.
-- NOTE: if `src/engine/git/capture.ts` or `sync-git.ts` conflict with the
-  freshly-merged worktree-gitsync changes, integrate on top of them — they
-  are the newer truth.
-
-## Acceptance criteria (must go green, run from worktree root)
-
+Acceptance criteria (all must go green from worktree root):
 - `bun run typecheck`
-- `bun run test`  (known pre-existing failures NOT yours: 4 in
-  shell-init/completions tests, one status --json environmental, an
-  occasional watcher timeout flake — everything else green)
-- New tests:
-  - staging dir is under `<root>/.rbox/` and never `os.tmpdir()` (assert path)
-  - a first-attempt `BlobShaMismatchError` on a git artifact → re-encrypt +
-    retry succeeds; attempts bounded; final failure still defers with reason
-  - stale-staging sweep removes only old dirs
-  - staged bytes never appear in the scan manifest
+- `bun run test` (known baseline failures NOT yours: 4 shell-init/completions,
+  status --json environmental, occasional watcher-timeout flake)
+- New tests covering: fingerprint invalidation per mutation class (commit,
+  stage, stash, branch/checkout, rebase-step/op-state, packed-refs repack,
+  shallow/alternates sentinel flips, pointer-worktree ref change via
+  commonDir), zero-git-spawn on unchanged repo (spawn-count seam),
+  stable-pair rule under mid-probe mutation, collector sees dir+pointer
+  repos and misses nothing discoverGitRepos finds (equivalence test on a
+  mixed fixture), pid-guarded hashcache write-back (daemon pidfile present
+  → no write), corrupt caches → correct slow path + heal.
+- A micro-benchmark test proving the divergence path issues 0 git spawns on
+  a warm unchanged multi-repo fixture.

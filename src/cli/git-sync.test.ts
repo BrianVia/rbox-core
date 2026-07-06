@@ -1,5 +1,6 @@
 import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +8,7 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitDivergenceCount } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
@@ -184,6 +185,18 @@ const syncCycle = async () => {
   await sync(rootA, cfgA, depsA);
   await sync(rootB, cfgB, depsB);
 };
+async function observeGitSpawns<T>(fn: () => Promise<T>): Promise<{ value: T; spawns: number }> {
+  let spawns = 0;
+  setGitSpawnObserver(() => {
+    spawns++;
+  });
+  try {
+    const value = await fn();
+    return { value, spawns };
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+}
 
 // ── (a) two-machine e2e: fidelity across nested repos + a real worktree ──────────
 
@@ -1053,6 +1066,178 @@ test("gitDivergenceCount honors needsResolution suppression before preflight (co
   await commitFile(p1, "c.txt", "v3", "c3");
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
 });
+
+test("gitDivergenceCount treats dangling gitfile pointers as transient like capture preflight", async () => {
+  const repo = path.join(rootA, "dangling");
+  await initRepo(repo);
+  await commitFile(repo, "a.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  await fs.rm(path.join(repo, ".git"), { recursive: true, force: true });
+  await fs.writeFile(path.join(repo, ".git"), "gitdir: /nonexistent/rbox-main/.git/worktrees/dangling\n");
+
+  const pf = await gitPreflight(repo);
+  expect(pf.ok).toBe(false);
+  expect(pf.kind).toBe("pointer");
+  expect(pf.structural).not.toBe(true);
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
+});
+
+test("gitDivergenceCount warm unchanged multi-repo fixture issues zero git spawns", async () => {
+  for (const rel of ["alpha", "nested/beta", "gamma"]) {
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", rel, "c1");
+  }
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0); // populate cache
+  const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(warm.value).toBe(0);
+  expect(warm.spawns).toBe(0);
+}, 30_000);
+
+test("gitDivergenceCount fingerprint cache invalidates on commits, staging, stash, branch checkout, packed refs, and sentinels", async () => {
+  const repo = path.join(rootA, "mut");
+  await initRepo(repo);
+  await commitFile(repo, "base.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  const warmZero = async () => {
+    expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+    const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+    expect(warm.value).toBe(0);
+    expect(warm.spawns).toBe(0);
+  };
+  const expectInvalidates = async (mutate: () => Promise<void>, expected: number) => {
+    await warmZero();
+    await mutate();
+    const after = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+    expect(after.value).toBe(expected);
+    expect(after.spawns).toBeGreaterThan(0);
+  };
+
+  await expectInvalidates(() => commitFile(repo, "commit.txt", "commit", "commit mutation"), 1);
+  await push(rootA, cfgA, depsA);
+
+  await expectInvalidates(async () => {
+    await fs.writeFile(path.join(repo, "staged.txt"), "staged");
+    await git(repo, "add", "staged.txt");
+  }, 1);
+  await push(rootA, cfgA, depsA);
+
+  await expectInvalidates(async () => {
+    await fs.writeFile(path.join(repo, "stash.txt"), "stash");
+    await git(repo, "stash", "-q");
+  }, 1);
+  await push(rootA, cfgA, depsA);
+
+  await expectInvalidates(async () => {
+    await git(repo, "checkout", "-qb", "topic");
+  }, 1);
+  await push(rootA, cfgA, depsA);
+
+  await expectInvalidates(async () => {
+    await git(repo, "pack-refs", "--all", "--prune");
+  }, 0);
+
+  const head = await git(repo, "rev-parse", "HEAD");
+  await expectInvalidates(async () => {
+    await fs.writeFile(path.join(repo, ".git", "shallow"), `${head}\n`);
+  }, 1);
+  await fs.rm(path.join(repo, ".git", "shallow"), { force: true });
+
+  await expectInvalidates(async () => {
+    await fs.writeFile(path.join(repo, ".git", "objects", "info", "alternates"), "/tmp/rbox-missing-objects\n");
+  }, 1);
+}, 40_000);
+
+test("gitDivergenceCount fingerprint cache invalidates on rebase op-state", async () => {
+  const repo = path.join(rootA, "rebasey");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+  expect((await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher))).spawns).toBe(0);
+
+  await git(repo, "checkout", "-qb", "side");
+  await commitFile(repo, "f.txt", "side", "side c1");
+  await git(repo, "checkout", "-q", "main");
+  await commitFile(repo, "f.txt", "main", "main c2");
+  await git(repo, "checkout", "-q", "side");
+  await expect(git(repo, "rebase", "main")).rejects.toThrow();
+
+  const after = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(after.value).toBe(1);
+  expect(after.spawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("gitDivergenceCount fingerprint cache invalidates pointer worktree refs via commonDir", async () => {
+  const main = path.join(tmp, "main-outside");
+  await initRepo(main);
+  await commitFile(main, "m.txt", "main", "c1");
+  const wt = path.join(rootA, "wt-pointer");
+  await git(main, "worktree", "add", wt, "-b", "feat");
+  await commitFile(wt, "w.txt", "worktree", "wt c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+  expect((await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher))).spawns).toBe(0);
+
+  await commitFile(wt, "w2.txt", "common-dir-ref-change", "wt c2");
+  const after = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(after.value).toBe(1);
+  expect(after.spawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mutation", async () => {
+  const repo = path.join(rootA, "stable");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+  await fs.rm(path.join(rootA, ".rbox", "state", "git-divergence.json"), { force: true });
+
+  let mutated = false;
+  setGitSpawnObserver((spawnRoot, args) => {
+    if (mutated || spawnRoot !== repo || args[0] !== "write-tree") return;
+    mutated = true;
+    fsSync.writeFileSync(path.join(repo, "late.txt"), "late");
+    execFileSync("git", ["-C", repo, "add", "late.txt"]);
+  });
+  try {
+    expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(mutated).toBe(true);
+
+  const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(warm.value).toBe(1);
+  expect(warm.spawns).toBe(0);
+}, 30_000);
+
+test("gitDivergenceCount heals corrupt divergence cache after correct slow path", async () => {
+  const repo = path.join(rootA, "corrupt-cache");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+  await fs.mkdir(path.join(rootA, ".rbox", "state"), { recursive: true });
+  const cachePath = path.join(rootA, ".rbox", "state", "git-divergence.json");
+  await fs.writeFile(cachePath, "{not json");
+
+  const slow = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(slow.value).toBe(0);
+  expect(slow.spawns).toBeGreaterThan(0);
+  expect(JSON.parse(await fs.readFile(cachePath, "utf8")).version).toBe(2);
+
+  const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
+  expect(warm.value).toBe(0);
+  expect(warm.spawns).toBe(0);
+}, 30_000);
 
 // ── gitcap progress (the long silent phase on a repo-heavy first push) ───────────
 

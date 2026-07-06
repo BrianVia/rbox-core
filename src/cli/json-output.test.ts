@@ -5,6 +5,7 @@ import path from "node:path";
 import { saveConfig } from "./config.js";
 import { accountStatus } from "./account-cmd.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
+import { daemonRuntimeDir } from "./daemon-control.js";
 import { statusCmd } from "./status-cmd.js";
 import { trashCmd } from "./trash-cmd.js";
 import { versionsCmd } from "./versions-cmd.js";
@@ -87,6 +88,35 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
   });
+});
+
+test("status hashcache write-back is guarded by daemon pidfile presence", async () => {
+  process.env.RBOX_HOME = path.join(tmp, "home");
+  await fs.writeFile(path.join(tmp, "file.txt"), "hash me");
+  await saveConfig(tmp, {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: "ws_hashcache",
+    name: "HashCache Workspace",
+    projectId: "root",
+    deviceId: "dev_hashcache",
+    rootPath: tmp,
+    remoteUrl: "https://api.test",
+    token: "",
+    syncGit: false,
+  });
+  const cachePath = path.join(tmp, ".rbox", "state", "hashcache.json");
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
+  await fs.writeFile(cachePath, "{}");
+  const runtime = daemonRuntimeDir(tmp);
+  await fs.mkdir(runtime, { recursive: true });
+  await fs.writeFile(path.join(runtime, "daemon.pid"), "v2 999999 rbox-test-boot\n");
+
+  await captureStdout(() => statusCmd(tmp, { json: true }));
+  expect(await fs.readFile(cachePath, "utf8")).toBe("{}");
+
+  await fs.rm(path.join(runtime, "daemon.pid"), { force: true });
+  await captureStdout(() => statusCmd(tmp, { json: true }));
+  expect(JSON.parse(await fs.readFile(cachePath, "utf8"))["file.txt"]).toBeDefined();
 });
 
 test("device list --json emits JSON", async () => {

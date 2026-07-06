@@ -1,10 +1,10 @@
-import { buildIgnoreMatcher, diffManifests, scanManifest } from "../engine/index.js";
+import { buildIgnoreMatcher, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
-import { daemonBindingStatus } from "./daemon-control.js";
+import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
 import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
 import {
@@ -87,13 +87,62 @@ function statusHealthJson(input: {
   return shellStateOf(input.activity ?? { at: new Date(input.now).toISOString() }, settled);
 }
 
+function createGitRepoFeed(): {
+  push: (repo: DiscoveredGitRepo) => void;
+  close: () => void;
+  iterable: AsyncIterable<DiscoveredGitRepo>;
+} {
+  const queue: DiscoveredGitRepo[] = [];
+  const waiters: Array<(result: IteratorResult<DiscoveredGitRepo>) => void> = [];
+  let closed = false;
+
+  return {
+    push(repo) {
+      if (closed) return;
+      const waiter = waiters.shift();
+      if (waiter) waiter({ value: repo, done: false });
+      else queue.push(repo);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const waiter of waiters.splice(0)) waiter({ value: undefined, done: true });
+    },
+    iterable: {
+      [Symbol.asyncIterator]() {
+        return {
+          next(): Promise<IteratorResult<DiscoveredGitRepo>> {
+            const repo = queue.shift();
+            if (repo) return Promise.resolve({ value: repo, done: false });
+            if (closed) return Promise.resolve({ value: undefined, done: true });
+            return new Promise((resolve) => waiters.push(resolve));
+          },
+        };
+      },
+    },
+  };
+}
+
 export async function statusCmd(root: string, opts: { json?: boolean } = {}): Promise<void> {
   const creds = await loadCredentials().catch(() => undefined);
+  const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root);
-  const local = await scanManifest(root, matcher);
+  const hashCache = await HashCache.load(root);
+  const gitRepoFeed = createGitRepoFeed();
+  const gitChangedP = gitDivergenceCount(root, cfg, state, matcher, gitRepoFeed.iterable).catch(() => 0);
+  let local;
+  try {
+    local = await scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
+  } finally {
+    gitRepoFeed.close();
+  }
+  if (!readDaemonPidRecord(root).present) {
+    hashCache.prune(new Set(local.files.map((f) => f.path)));
+    await hashCache.save(root, { beforeRename: () => !readDaemonPidRecord(root).present }).catch(() => {});
+  }
 
   const daemonBinding = daemonBindingStatus(root, cfg.remoteWorkspaceId);
   const alive = daemonBinding.alive;
@@ -101,7 +150,6 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   const bg = { running: alive.running && !daemonStale, pid: alive.pid };
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
-  const gitChangedP = gitDivergenceCount(root, cfg, state, matcher).catch(() => 0);
   const trashP = trashStats(root).catch(() => undefined);
   const accountJsonP = opts.json ? fetchStatusAccountJson(creds) : Promise.resolve(null);
   const rawActivity = await activityP;
@@ -193,7 +241,7 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   const trashStatus = trashLine(trash);
   if (trashStatus) console.log(`  ${trashStatus}`);
   console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${local.files.length.toLocaleString("en-US")} files on disk`)}`);
-  for (const line of formatAccountSummary(await fetchAccountSummary())) console.log(line);
+  for (const line of formatAccountSummary((await accountSummaryP)!)) console.log(line);
   const updateLine = formatUpdateAvailableLine(await readUpdateCheckState());
   if (updateLine) console.log(`  ${updateLine}`);
 }

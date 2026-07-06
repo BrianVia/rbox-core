@@ -18,6 +18,7 @@ import {
   inTreeWorktreeParentRel,
   projectIdentity,
   quarantineAndWipeGitState,
+  scanManifest,
   validateManifest,
   LocalBlobStore,
   MAX_GIT_REPOS,
@@ -87,6 +88,25 @@ test("discoverGitRepos finds nested repos + pointers, prunes ignored subtrees, s
     { relPath: "b/c", kind: "dir" },
     { relPath: "wt", kind: "pointer" },
   ]);
+});
+
+test("scanManifest git collector matches discoverGitRepos for mixed dir and pointer repos", async () => {
+  const root = path.join(tmp, "root-scan");
+  await initRepo(root);
+  await initRepo(path.join(root, "a"));
+  await initRepo(path.join(root, "nested", "b"));
+  await initRepo(path.join(root, "ignored", "nope"));
+  await fs.writeFile(path.join(root, ".rboxignore"), "ignored/\n");
+  await fs.mkdir(path.join(root, "wt"), { recursive: true });
+  await fs.writeFile(path.join(root, "wt", ".git"), "gitdir: ../main/.git/worktrees/wt\n");
+  await fs.writeFile(path.join(root, "file.txt"), "manifest file");
+
+  const matcher = buildIgnoreMatcher(root);
+  const collected: Array<{ relPath: string; kind: "dir" | "pointer" }> = [];
+  await scanManifest(root, matcher, undefined, undefined, (repo) => collected.push(repo));
+  collected.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+
+  expect(collected).toEqual(await discoverGitRepos(root, matcher));
 });
 
 // ---- preflight matrix (design 43 §4) -----------------------------------------
