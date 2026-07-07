@@ -47,6 +47,17 @@ const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY,
 // win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
 const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
 
+/** RBOX_LANE_TIMING=1 — push-side encrypt vs upload attribution. Mirrors the pull
+ *  lane timing instrument in apply.ts: module-level accumulator, no plumbing, and
+ *  performance.now() only behind the env flag. */
+const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
+export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, blobs: 0, bytes: 0 };
+export function uploadLaneTimingSummary(): string | undefined {
+  if (!LANE_TIMING || uploadLaneTiming.blobs === 0) return undefined;
+  const e = uploadLaneTiming.encryptMs, u = uploadLaneTiming.uploadMs, n = uploadLaneTiming.blobs;
+  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${((e / (e + u)) * 100).toFixed(0)}%) · upload ${(u / 1000).toFixed(1)}s (${((u / (e + u)) * 100).toFixed(0)}%) · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms`;
+}
+
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string) => Promise<EncryptedBlob>;
 
 export interface EncryptAndUploadOptions {
@@ -143,6 +154,7 @@ export async function encryptAndUpload(
     let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
     await report.phase("encrypt", async () => {
       await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
+        const t0 = LANE_TIMING ? performance.now() : 0;
         const cached = encryptCache.lookup(f.sha256);
         if (cached) {
           const status = await classifyCacheHit(root, f);
@@ -156,6 +168,7 @@ export async function encryptAndUpload(
             ctSizeByEnc.set(cached.encSha, cached.cipherSize);
             encryptCache.record(f.sha256, { ...cached, path: f.path });
             cacheWriter.schedule();
+            if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
             onProgress?.(++enc, toEncrypt.length, "encrypt");
             return;
           }
@@ -183,13 +196,16 @@ export async function encryptAndUpload(
         encryptCache.record(e.plaintextSha, { encSha: e.encSha, cipherSize: e.cipherSize, path: f.path });
         cacheWriter.schedule();
         encCtBytes += e.cipherSize;
+        if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
         onProgress?.(++enc, toEncrypt.length, "encrypt");
       });
     });
     report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
 
     const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
+    const missingT0 = LANE_TIMING ? performance.now() : 0;
     const missing = new Set(await api.missingBlobs(encShas));
+    if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
     report.blobs = encShas.length;
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
 
@@ -222,7 +238,9 @@ export async function encryptAndUpload(
           // lets a file that changed since the manifest was built still upload consistently.
           let re;
           try {
+            const t0 = LANE_TIMING ? performance.now() : 0;
             re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+            if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
             // Vanished mid-push (same churn class as the encrypt-stage catch above):
             // defer this file instead of failing the whole push.
@@ -246,7 +264,10 @@ export async function encryptAndUpload(
             return 0; // fresh address already landed by a peer
           }
           if (!missing.has(f.encSha)) {
-            if ((await api.missingBlobs([f.encSha])).length === 0) {
+            const checkT0 = LANE_TIMING ? performance.now() : 0;
+            const present = (await api.missingBlobs([f.encSha])).length === 0;
+            if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - checkT0;
+            if (present) {
               uploaded.add(f.encSha);
               byteTracker.migrate(f.path, undefined);
               emitUploadProgress();
@@ -262,10 +283,16 @@ export async function encryptAndUpload(
           const uploadEncSha = f.encSha!;
           byteTracker.reviseTotal(uploadEncSha, size);
           emitUploadProgress();
+          const t0 = LANE_TIMING ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
             emitUploadProgress();
           });
+          if (LANE_TIMING) {
+            uploadLaneTiming.uploadMs += performance.now() - t0;
+            uploadLaneTiming.blobs++;
+            uploadLaneTiming.bytes += size;
+          }
           byteTracker.setProgress(uploadEncSha, size);
           uploaded.add(uploadEncSha);
           return size; // settled — the committed manifest can safely reference f.encSha

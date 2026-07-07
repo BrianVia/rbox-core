@@ -27,6 +27,7 @@ import {
   encryptAndUpload,
   pruneEncryptAddressCache,
   reportDeferred,
+  uploadLaneTimingSummary,
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
@@ -391,7 +392,11 @@ export async function pushManifest(
 
   for (;;) {
     const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce);
-    if (outcome.done) return outcome.result;
+    if (outcome.done) {
+      const lane = uploadLaneTimingSummary();
+      if (lane) process.stderr.write(`${lane}\n`);
+      return outcome.result;
+    }
     const consumesAttempt =
       outcome.action.kind !== "reupload" ||
       outcome.action.unsatisfiedTotal === undefined ||
