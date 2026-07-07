@@ -26,6 +26,8 @@ export interface WatchOptions {
    *  (design 49 / codex R1). Events may well keep flowing after a transient error;
    *  the callback is a health signal, not a teardown. */
   onError?: (err: Error) => void;
+  /** Fires after matcher filtering and before debounce coalescing. */
+  onRawEvent?: (event: WatchEvent) => void;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -116,6 +118,12 @@ export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounce
       timer = undefined;
     },
   };
+}
+
+function pushWatchEvent(batcher: Batcher, opts: WatchOptions, relPath: string, kind: WatchEventKind): void {
+  const event = { relPath, kind };
+  opts.onRawEvent?.(event);
+  batcher.push(event.relPath, event.kind);
 }
 
 const toRelFor = (root: string) => (abs: string) => path.relative(root, abs).split(path.sep).join("/");
@@ -230,7 +238,7 @@ async function startParcel(
           // Parcel doesn't say file-vs-dir on delete (the path is gone). `unlinkDir`
           // removes the exact path AND any `path/**` children (see applyWatchEvents),
           // so it correctly covers both a deleted file and a deleted directory.
-          batcher.push(rel, "unlinkDir");
+          pushWatchEvent(batcher, opts, rel, "unlinkDir");
           continue;
         }
 
@@ -243,8 +251,8 @@ async function startParcel(
           /* raced away; treat as file, applyWatchEvents handles the vanish */
         }
         if (isDir ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel)) continue;
-        if (ev.type === "create") batcher.push(rel, isDir ? "addDir" : "add");
-        else batcher.push(rel, "change");
+        if (ev.type === "create") pushWatchEvent(batcher, opts, rel, isDir ? "addDir" : "add");
+        else pushWatchEvent(batcher, opts, rel, "change");
       }
     },
     // Coarse native prune (volume optimization): hard-prune dirs + their subtrees,
@@ -290,7 +298,7 @@ function startChokidar(
     if (!kind) return;
     const rel = toRel(abs);
     if (rel === "" || escapesRoot(rel)) return; // parity with the parcel path
-    batcher.push(rel, kind);
+    pushWatchEvent(batcher, opts, rel, kind);
   });
 
   return {

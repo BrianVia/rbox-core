@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { saveConfig } from "./config.js";
+import { HashCache, type Manifest } from "../engine/index.js";
+import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { accountStatus } from "./account-cmd.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
-import { statusCmd } from "./status-cmd.js";
+import type { DaemonActivity } from "./activity.js";
+import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { trashCmd } from "./trash-cmd.js";
 import { versionsCmd } from "./versions-cmd.js";
 import { fail, setJsonErrorMode } from "./style.js";
@@ -16,6 +19,7 @@ const origStdout = process.stdout.write.bind(process.stdout);
 const origStderr = process.stderr.write.bind(process.stderr);
 
 let tmp: string;
+const STATUS_NOW = Date.parse("2026-07-04T12:00:00Z");
 
 async function captureStdout(fn: () => Promise<void> | void): Promise<string> {
   const out: string[] = [];
@@ -43,8 +47,70 @@ function stubFetch(responder: (url: string) => { status: number; body: unknown }
   }) as unknown as typeof fetch;
 }
 
+function statusDeps(overrides: Partial<StatusCmdDeps> = {}): StatusCmdDeps {
+  return {
+    now: () => STATUS_NOW,
+    loadHashCache: async () => new HashCache(),
+    scanManifest: async (): Promise<Manifest> => ({ generatedAt: new Date(STATUS_NOW).toISOString(), files: [] }),
+    gitDivergenceCount: async () => 0,
+    gitDivergenceFastRepoSource: async () => [],
+    daemonBindingStatus: () => ({ alive: { running: false }, stale: false }),
+    readDaemonPidRecord: () => ({ present: false }),
+    ...overrides,
+  };
+}
+
+async function saveStatusWorkspace(overrides: Partial<WorkspaceConfig> = {}): Promise<WorkspaceConfig> {
+  const cfg: WorkspaceConfig = {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: "ws_status_fast",
+    name: "Status Fast Workspace",
+    projectId: "root",
+    deviceId: "dev_status_fast",
+    rootPath: tmp,
+    remoteUrl: "https://api.rbox.to",
+    token: "",
+    syncGit: false,
+    ...overrides,
+  };
+  await saveConfig(tmp, cfg);
+  await saveState(tmp, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 10,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+  return cfg;
+}
+
+async function writeActivity(body: Record<string, unknown>): Promise<void> {
+  const p = path.join(tmp, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  await fs.writeFile(p, JSON.stringify(body));
+}
+
+function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<DaemonActivity["local"]>> = {}): Record<string, unknown> {
+  const at = new Date(STATUS_NOW - ageMs).toISOString();
+  return {
+    at,
+    ws: { connected: true, at, caughtUp: true, lastBroadcastSequence: 10, bootId: "boot-live", pid: 1234 },
+    local: {
+      at,
+      stream: "https://api.rbox.to::ws_status_fast::root",
+      baseSequence: 10,
+      trackedFiles: 123,
+      added: 4,
+      changed: 5,
+      deleted: 6,
+      settled: true,
+      sourceVersion: 1,
+      ...localOverrides,
+    },
+  };
+}
+
 beforeEach(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-json-output-"));
+  process.env.RBOX_HOME = path.join(tmp, "home");
 });
 
 afterEach(async () => {
@@ -144,6 +210,107 @@ test("status hashcache write-back is guarded by daemon pidfile presence", async 
   await fs.rm(path.join(runtime, "daemon.pid"), { force: true });
   await captureStdout(() => statusCmd(tmp, { json: true }));
   expect(JSON.parse(await fs.readFile(cachePath, "utf8"))["file.txt"]).toBeDefined();
+});
+
+test("status --json trusts attributed fresh local and skips hashcache and manifest scan", async () => {
+  await saveStatusWorkspace({ syncGit: true });
+  await writeActivity(trustedActivity(31_000));
+  const statusJson = JSON.parse(
+    await captureStdout(() =>
+      statusCmdWithDeps(
+        tmp,
+        { json: true },
+        statusDeps({
+          daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+          loadHashCache: async () => {
+            throw new Error("HashCache.load must not run on trusted local path");
+          },
+          scanManifest: async () => {
+            throw new Error("scanManifest must not run on trusted local path");
+          },
+          gitDivergenceFastRepoSource: async () => [{ relPath: "repo", kind: "dir" }],
+          gitDivergenceCount: async (_root, _cfg, _state, matcher, source) => {
+            expect(matcher).toBeUndefined();
+            expect(source).toEqual([{ relPath: "repo", kind: "dir" }]);
+            return 2;
+          },
+        })
+      )
+    )
+  );
+  expect(statusJson.local).toEqual({ added: 4, changed: 5, deleted: 6, gitChangedRepos: 2, source: "daemon", ageMs: 31_000 });
+});
+
+test("status local trust predicate falls back on stale boot, base mismatch, stale age, and malformed local", async () => {
+  const exerciseFallback = async (activity: Record<string, unknown>, depsOverrides: Partial<StatusCmdDeps> = {}) => {
+    await fs.rm(tmp, { recursive: true, force: true });
+    await fs.mkdir(tmp, { recursive: true });
+    await saveStatusWorkspace();
+    await writeActivity(activity);
+    let scanned = false;
+    const statusJson = JSON.parse(
+      await captureStdout(() =>
+        statusCmdWithDeps(
+          tmp,
+          { json: true },
+          statusDeps({
+            daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+            scanManifest: async () => {
+              scanned = true;
+              return { generatedAt: new Date(STATUS_NOW).toISOString(), files: [] };
+            },
+            ...depsOverrides,
+          })
+        )
+      )
+    );
+    expect(scanned).toBe(true);
+    expect(statusJson.local).toBeUndefined();
+  };
+
+  await exerciseFallback(trustedActivity(1_000, { baseSequence: 9 }));
+  await exerciseFallback(trustedActivity(61_000));
+  await exerciseFallback(trustedActivity(1_000, { changed: -1 }));
+  await exerciseFallback(trustedActivity(1_000, {}), {
+    daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-new" }, bound: "ws_status_fast", stale: false }),
+  });
+});
+
+test("status fallback re-reads state before scanning after local base mismatch", async () => {
+  const cfg = await saveStatusWorkspace();
+  const file = { path: "fresh.txt", type: "file" as const, sha256: "abc", size: 3, mode: 0o644, mtimeMs: 1 };
+  await writeActivity(trustedActivity(1_000, { baseSequence: 11, added: 99, changed: 0, deleted: 0 }));
+
+  let rewroteState = false;
+  const statusJson = JSON.parse(
+    await captureStdout(() =>
+      statusCmdWithDeps(
+        tmp,
+        { json: true },
+        statusDeps({
+          daemonBindingStatus: () => {
+            if (!rewroteState) {
+              rewroteState = true;
+              fsSync.writeFileSync(
+                path.join(tmp, ".rbox", "state.json"),
+                JSON.stringify({
+                  stream: syncStreamId(cfg),
+                  lastSyncedSequence: 11,
+                  lastSyncedManifest: { generatedAt: "", files: [file] },
+                })
+              );
+            }
+            return { alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false };
+          },
+          scanManifest: async () => ({ generatedAt: new Date(STATUS_NOW).toISOString(), files: [file] }),
+        })
+      )
+    )
+  );
+
+  expect(rewroteState).toBe(true);
+  expect(statusJson.health).toBe("ok");
+  expect(statusJson.local).toBeUndefined();
 });
 
 test("device list --json emits JSON", async () => {

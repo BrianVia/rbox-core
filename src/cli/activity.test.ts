@@ -29,6 +29,17 @@ test("round-trips the full record", async () => {
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
     halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", terminal: { fingerprint: "sidecar-sha" } },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
+    local: {
+      at: "2026-07-02T12:00:02.000Z",
+      stream: "https://api.test::ws::root",
+      baseSequence: 78,
+      trackedFiles: 8603,
+      added: 1,
+      changed: 2,
+      deleted: 3,
+      settled: true,
+      sourceVersion: 1,
+    },
   };
   await saveActivity(root, a);
   expect(await loadActivity(root)).toEqual(a);
@@ -61,9 +72,28 @@ test("malformed nested slots are dropped individually, never handed to render (c
       active: { at, phase: "teleport", done: 1, total: 2 }, // bogus phase
       halt: { at, reason: 7, count: 1, op: "pull" }, // non-string reason
       outOfStorage: { at, kind: "storage", used: "full", cap: 1 }, // non-number used
+      local: { at, stream: "s", baseSequence: 0, trackedFiles: 1, added: 0, changed: 0, deleted: 0, settled: true }, // missing sourceVersion
     })
   );
   expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
+});
+
+test("malformed local slot is dropped alone", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(
+    p,
+    JSON.stringify({
+      at,
+      ws: { connected: true, at, caughtUp: true, bootId: "boot-1", pid: 1234 },
+      local: { at, stream: "s", baseSequence: 0, trackedFiles: 1, added: 0, changed: -1, deleted: 0, settled: true, sourceVersion: 1 },
+    })
+  );
+  expect(await loadActivity(root)).toEqual({
+    at,
+    ws: { connected: true, at, caughtUp: true, bootId: "boot-1", pid: 1234 },
+  });
 });
 
 test("invalid ws evidence is omitted without dropping valid activity slots", async () => {
