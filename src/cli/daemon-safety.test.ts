@@ -151,3 +151,29 @@ test("design 72: safety tick reloads workspace.json and rebuilds the matcher", a
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("v0.9.2 regression: reload preserves runtime-attached encrypted/kek/remoteUrl", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  const persisted = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://persisted.invalid", token: "" };
+  try {
+    fs.mkdirSync(path.join(root, ".rbox"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify(persisted));
+    // Simulate what buildAuthedRemote layers on at boot — none of it is persisted.
+    daemon.cfg.encrypted = true;
+    daemon.cfg.kek = Buffer.alloc(32, 7);
+    daemon.cfg.remoteUrl = "https://credential-override.invalid";
+    daemon.cfg.token = "runtime-token";
+
+    await daemon.reloadWorkspaceConfigIfChanged();
+
+    // The v0.9.2 bug: cfg rebuilt from workspace.json dropped `encrypted` (and the
+    // credential remoteUrl), so every subsequent daemon push failed "E2EE required".
+    expect(daemon.cfg.encrypted).toBe(true);
+    expect(Buffer.isBuffer(daemon.cfg.kek)).toBe(true);
+    expect(daemon.cfg.remoteUrl).toBe("https://credential-override.invalid");
+    expect(daemon.cfg.token).toBe("runtime-token");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
