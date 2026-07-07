@@ -70,6 +70,7 @@ function statusText(f: DecodedFrame): string {
 function r2Object(bytes: Uint8Array): R2ObjectBody {
   return {
     size: bytes.byteLength,
+    arrayBuffer: () => Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)),
     body: new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(bytes);

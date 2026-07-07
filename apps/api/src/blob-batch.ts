@@ -19,7 +19,7 @@ const MAX_BATCH_REQUEST_BYTES = 4 * 1024;
 
 type BatchStatus = "missing" | "too_large" | "error";
 type BatchResult =
-  | { sha: string; kind: "object"; object: R2ObjectBody }
+  | { sha: string; kind: "object"; size: number; bytes: ArrayBuffer }
   | { sha: string; kind: "status"; status: BatchStatus; code?: string; size?: number };
 
 const textEncoder = new TextEncoder();
@@ -89,13 +89,14 @@ function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPre
           const { index, result } = await Promise.race(indexed);
           pending.splice(index, 1);
           if (result.kind === "object") {
-            if (result.object.size > MAX_BATCH_RECORD_BYTES || dataBytes + result.object.size > MAX_BATCH_BODY_BYTES) {
-              payloadBytes += enqueueStatus(controller, result.sha, "too_large", { size: result.object.size });
+            if (dataBytes + result.size > MAX_BATCH_BODY_BYTES) {
+              payloadBytes += enqueueStatus(controller, result.sha, "too_large", { size: result.size });
               continue;
             }
-            controller.enqueue(encodeBatchFrameHeader(result.sha, result.object.size, false));
-            dataBytes += result.object.size;
-            payloadBytes += await enqueueObjectBody(controller, result.object);
+            controller.enqueue(encodeBatchFrameHeader(result.sha, result.size, false));
+            controller.enqueue(new Uint8Array(result.bytes));
+            dataBytes += result.size;
+            payloadBytes += result.size;
           } else {
             payloadBytes += enqueueStatus(controller, result.sha, result.status, { code: result.code, size: result.size });
           }
@@ -118,8 +119,19 @@ async function authenticatedResults(op: Op, shas: string[], accountId: string): 
 async function fetchObject(op: Op, sha: string): Promise<BatchResult> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const obj = await op.span.r2(() => op.env.rbox_dev_blobs.get(blobKey(sha)));
-      return obj ? { sha, kind: "object", object: obj } : { sha, kind: "status", status: "missing" };
+      // Body bytes are pre-read INSIDE the parallel fan-out (bounded: ≤256 KiB
+      // each, ≤8 MiB per batch). Piping R2 bodies one at a time through the
+      // response stream serializes ~30ms per object — the rejected-d76 failure
+      // mode reappearing at the body layer. Over-cap objects skip the body read.
+      const got = await op.span.r2(async () => {
+        const obj = await op.env.rbox_dev_blobs.get(blobKey(sha));
+        if (!obj) return null;
+        if (obj.size > MAX_BATCH_RECORD_BYTES) return { size: obj.size };
+        return { size: obj.size, bytes: await obj.arrayBuffer() };
+      });
+      if (!got) return { sha, kind: "status", status: "missing" };
+      if (got.bytes === undefined) return { sha, kind: "status", status: "too_large", size: got.size };
+      return { sha, kind: "object", size: got.size, bytes: got.bytes };
     } catch {
       if (attempt === 1) return { sha, kind: "status", status: "error", code: "r2" };
     }
@@ -131,28 +143,6 @@ function enqueueStatus(controller: ReadableStreamDefaultController<Uint8Array>, 
   controller.enqueue(header);
   controller.enqueue(payload);
   return payload.byteLength;
-}
-
-async function enqueueObjectBody(controller: ReadableStreamDefaultController<Uint8Array>, obj: R2ObjectBody): Promise<number> {
-  const reader = obj.body.getReader();
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value?.byteLength) {
-        total += value.byteLength;
-        controller.enqueue(value);
-      }
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // Best effort only; preserve the original stream outcome.
-    }
-  }
-  return total;
 }
 
 function hexToBytes(hex: string): Uint8Array {

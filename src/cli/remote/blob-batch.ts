@@ -18,7 +18,7 @@ export const DEFAULT_BATCH_RECORD_BYTES = 256 * 1024;
 const BATCH_STATUS_MAX_BYTES = 4 * 1024;
 const DEFAULT_BATCH_RECORDS = 32;
 const DEFAULT_BATCH_BODY_BYTES = 8 * 1024 * 1024;
-const DEFAULT_BATCH_SLOTS = 8;
+const DEFAULT_BATCH_SLOTS = 16;
 const FLUSH_DELAY_MS = 10;
 const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
 
@@ -130,7 +130,6 @@ export class BlobBatchDownloader {
   private queueShas = new Set<string>();
   private queuedBytes = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private ready: BatchRequest[][] = [];
   private active = 0;
 
   constructor(private readonly ctx: RemoteContext) {
@@ -146,42 +145,79 @@ export class BlobBatchDownloader {
     });
   }
 
+  // Pull-based dispatch (measured 2026-07-07: the previous push-based flush —
+  // batches formed the moment a 10ms timer fired — settled into ~5.4 shas/batch
+  // under steady load, 17k requests instead of ~3k, and the join REGRESSED to
+  // 342s vs the 176s single-GET baseline). Full batches dispatch the instant a
+  // slot is free; partial batches leave the queue only on the flush timer or
+  // when every slot is idle, so steady-state batches stay full.
   private enqueue(req: BatchRequest): void {
-    if (!this.queueShas.has(req.sha) && this.queue.length > 0 && this.queuedBytes + req.expectedSize > this.config.bodyBytes) this.flush();
     this.queue.push(req);
     if (!this.queueShas.has(req.sha)) {
       this.queueShas.add(req.sha);
       this.queuedBytes += req.expectedSize;
     }
-    if (this.queueShas.size >= this.config.records || this.queuedBytes >= this.config.bodyBytes) this.flush();
-    else this.armTimer();
+    this.dispatchFull();
+    if (this.queue.length > 0 && !this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = undefined;
+        this.dispatchPartial();
+      }, FLUSH_DELAY_MS);
+    }
   }
 
-  private armTimer(): void {
-    if (this.timer) return;
-    this.timer = setTimeout(() => this.flush(), FLUSH_DELAY_MS);
+  /** Dispatch only FULL batches (record or byte cap reached) into free slots. */
+  private dispatchFull(): void {
+    while (this.active < this.config.slots && (this.queueShas.size >= this.config.records || this.queuedBytes >= this.config.bodyBytes)) {
+      this.launch(this.carve());
+    }
   }
 
-  private flush(): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = undefined;
-    if (this.queue.length === 0) return;
-    this.ready.push(this.queue);
-    this.queue = [];
+  /** Timer/idle path: keep slots busy even when only a partial batch is queued. */
+  private dispatchPartial(): void {
+    this.dispatchFull();
+    while (this.active < this.config.slots && this.queue.length > 0) this.launch(this.carve());
+  }
+
+  private launch(batch: BatchRequest[]): void {
+    if (batch.length === 0) return;
+    this.active++;
+    void this.dispatchBatch(batch).finally(() => {
+      this.active--;
+      this.dispatchFull();
+      // Tail: nothing left in flight but stragglers queued — ship them now
+      // rather than waiting on an already-fired timer.
+      if (this.active === 0 && this.queue.length > 0) this.dispatchPartial();
+    });
+  }
+
+  /** Take up to `records` unique shas (within the byte cap) off the queue front. */
+  private carve(): BatchRequest[] {
+    const taken: BatchRequest[] = [];
+    const shas = new Set<string>();
+    let bytes = 0;
+    let i = 0;
+    for (; i < this.queue.length; i++) {
+      const req = this.queue[i]!;
+      if (shas.has(req.sha)) {
+        taken.push(req);
+        continue;
+      }
+      if (shas.size >= this.config.records || bytes + req.expectedSize > this.config.bodyBytes) break;
+      shas.add(req.sha);
+      bytes += req.expectedSize;
+      taken.push(req);
+    }
+    this.queue.splice(0, i);
     this.queueShas = new Set();
     this.queuedBytes = 0;
-    this.pump();
-  }
-
-  private pump(): void {
-    while (this.active < this.config.slots && this.ready.length > 0) {
-      const batch = this.ready.shift()!;
-      this.active++;
-      void this.dispatchBatch(batch).finally(() => {
-        this.active--;
-        this.pump();
-      });
+    for (const r of this.queue) {
+      if (!this.queueShas.has(r.sha)) {
+        this.queueShas.add(r.sha);
+        this.queuedBytes += r.expectedSize;
+      }
     }
+    return taken;
   }
 
   private async dispatchBatch(batch: BatchRequest[]): Promise<void> {
@@ -269,12 +305,10 @@ export class BlobBatchDownloader {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const queued = this.queue;
-    const ready = this.ready.flat();
     this.queue = [];
-    this.ready = [];
     this.queueShas = new Set();
     this.queuedBytes = 0;
-    for (const req of [...queued, ...ready]) void this.dispatchSingle(req);
+    for (const req of queued) void this.dispatchSingle(req);
   }
 
   private async fallbackAll(pending: Map<string, BatchRequest[]>): Promise<void> {
