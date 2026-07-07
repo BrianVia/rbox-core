@@ -48,7 +48,7 @@
   // the `used_bytes` leak promptly. retentionPrune + the notify sweep ride the same tick
   // (both idempotent). Phase 2 (R2 delete) stays the manual `/v1/admin/gc?phase=purge` sweep.
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["23 * * * *"]
   },
   // New-device security email (design 16 / 30). The Worker has no ExecutionContext, so
   // the durable path is: outbox (D1) → Queue → consumer send → cron backstop.
@@ -131,7 +131,7 @@
       // Deploy `tail/ --env production` FIRST, then UNCOMMENT (see tail/README.md).
       // "tail_consumers": [{ "service": "rbox-prod-tail" }],
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
-      "triggers": { "crons": ["0 * * * *"] }, // §33: hourly Phase-1 entitlement prune (see dev block)
+      "triggers": { "crons": ["23 * * * *"] }, // §33: hourly Phase-1 entitlement prune (see dev block)
       // New-device email infra in prod (reaches prod ONLY via merge→CI, never from a dev
       // deploy). Separate prod queue + DLQ; same EMAIL binding + sender domain.
       "queues": {
