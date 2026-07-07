@@ -21,6 +21,7 @@ const DEFAULT_BATCH_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BATCH_SLOTS = 16;
 const FLUSH_DELAY_MS = 10;
 const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
+const SINGLE_FALLBACK_CONCURRENCY = 128;
 
 interface BatchFrame {
   sha: string;
@@ -138,7 +139,7 @@ export class BlobBatchDownloader {
 
   getToFile(sha: string, expectedSize: number | undefined, destPath: string): Promise<void> {
     if (disabledForProcess || !this.config.enabled || expectedSize === undefined || expectedSize > this.config.recordBytes) {
-      return getBlobToFile(this.ctx, sha, destPath);
+      return this.gatedGetToFile(sha, destPath);
     }
     return new Promise<void>((resolve, reject) => {
       this.enqueue({ sha, expectedSize, destPath, resolve, reject });
@@ -317,9 +318,29 @@ export class BlobBatchDownloader {
     await Promise.all(groups.flat().map((req) => this.dispatchSingle(req)));
   }
 
+  // With batching on, the apply pool supplies up to 512 tasks (apply.ts §77
+  // comment) — large-blob bypasses, old-server drains, and mass fallbacks must
+  // not turn that into 512 concurrent single GETs. Gate every single GET this
+  // downloader issues at the pre-batching width.
+  private singleActive = 0;
+  private singleWaiters: Array<() => void> = [];
+
+  private async gatedGetToFile(sha: string, destPath: string): Promise<void> {
+    if (this.singleActive >= SINGLE_FALLBACK_CONCURRENCY) {
+      await new Promise<void>((resolve) => this.singleWaiters.push(resolve));
+    }
+    this.singleActive++;
+    try {
+      await getBlobToFile(this.ctx, sha, destPath);
+    } finally {
+      this.singleActive--;
+      this.singleWaiters.shift()?.();
+    }
+  }
+
   private async dispatchSingle(req: BatchRequest): Promise<void> {
     try {
-      await getBlobToFile(this.ctx, req.sha, req.destPath);
+      await this.gatedGetToFile(req.sha, req.destPath);
       req.resolve();
     } catch (e) {
       req.reject(e);
