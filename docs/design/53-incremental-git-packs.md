@@ -1,305 +1,341 @@
 # 53 — Incremental git packs (bundle chains: push cost O(history) → O(delta))
 
-**Status:** draft — spec only, NOT scheduled (founder: stability first; build on measured trigger).
-**Builds on:** design 02 (bundle-based capture/apply), §28 (git artifacts under E2EE — the
-prior-art note that *named* this optimization), design 43 (nested-repo `gitRepos` sections,
-`refScope`, the §7 carry matrix, per-repo defer/422/removal machinery), §06/§33 (retention →
-mark → purge reachability GC).
-**Non-goals:** any server/API/D1/Worker change; cross-repo or cross-worktree object dedup beyond
-the recommendation in §4; any change to file sync; any change to the design-43 §7 failure/recovery
-*semantics* (increments ride *inside* a section and must be invisible to that machinery).
+**Status:** v2 — spec-only rewrite folding the two-review FINAL decisions: design-68 layout split, real bundle-arg threading, schema-3 chain validation, forced/presence-skipped chain apply, MAX_PACK_CHAIN=8, and design-71 refs/422 accounting.
+**Builds on:** design 02 (bundle-based git-state sync), design 28 (E2EE git artifacts and the
+gcrypt prior-art note), design 43 (`gitRepos`, `refScope`, per-repo defer/422/removal/conflict
+semantics), design 68 (main-clone linked-worktree capture and pointer policy-skip), design 71
+(large refsets and bounded 422 missing lists), design 72 (gitignore-pruned known repos base-carry),
+and §06/§33 (retention → mark → purge reachability GC).
+**Non-goals:** server/API/D1/Worker changes; cross-repo or cross-worktree object dedup; receiver to
+sender repair signaling; any file-sync change; any change to design-43 per-repo recovery semantics.
 
 ---
 
-## 1. Problem — bundles never dedup, so every git change re-ships all history
+## 1. Problem — after design 68, the hot cost moved to one dir/all bundle
 
-§28 and design 43 ship a repo's history as a **full `git bundle`** (`--all` for dir repos,
-`refs/heads/<branch>` for pointer repos), convergent-encrypted and uploaded by `encSha`. Because
-`git stash create` mints a fresh WIP commit and the bundle carries the whole object closure, the
-**bundle bytes differ on every capture** — so bundles **never dedup** (stated in
-`src/engine/git/capture.ts` header, `docs/design/28` "Bundle determinism / dedup", and
-`docs/learnings.md:586`). Change detection (`gitIdentityKey`, `src/engine/git/identity.ts`)
-correctly *skips* an unchanged repo, but the moment identity moves by **one commit** — or the index
-churns, or dirty state shifts the WIP commit — `captureGitState` re-bundles and re-uploads the
-**entire history**.
+The current git capture path still emits one full `git bundle` for each captured section. The code
+does this in `captureGitState` (`src/engine/git/capture.ts:169`) after reading refs/HEAD, creating
+scratch pins, and calling `git bundle create` with a full argument set (`src/engine/git/capture.ts:215-237`).
+Change detection (`gitIdentityKey`) correctly skips unchanged sections, but any changed commit,
+index tree, op-state, or WIP pin makes capture upload the whole history again. §28 already named
+the gcrypt-style future fix: keep an encrypted pack list and bundle only objects not reachable from
+already-pushed tips (`docs/learnings.md:583-586`).
 
-At the founder's scale this is the standing cost. `savvy-core` is ~762 commits / 246 tags / ~17 MB
-`.git` (`docs/learnings.md`), and his `~/conductor/workspaces` layout carries **30+ Conductor
-worktrees of that one repo** (design 43 §1). Design 43 §13 booked the honest cost — "each worktree
-ships its branch's full history once … ~17 MB × N … Incremental packs stay the future fix" — and
-§28's prior-art analysis of `git-remote-gcrypt` named the exact remedy:
+The v1 cost model treated every Conductor worktree as an independent full-history upload. That is
+now only the secondary layout. Design 68 changed the primary in-tree layout:
 
-> track the pushed object set, bundle only `--not` the already-uploaded refs, and keep an
-> (encrypted) pack list in the GitSection — turning push cost from **O(history) into O(delta)**.
-> Deferred until a measurement shows full-bundle re-upload is a real cost at our scale.
+- **In-tree main clone + linked worktrees** (for example a main `savvy-core` clone with
+  `.claude/worktrees/*` inside the workspace): pointer worktree sections are policy-skipped and
+  base-carried when their owning main clone is captured (`src/cli/sync-git.ts:342-367`; design
+  68 §3.3, `docs/design/68-worktree-git-sync.md:96-123`). Agent commits made inside those linked
+  worktrees still move ordinary `refs/heads/*` in the main clone, so the main clone's single
+  `refScope: "all"` section re-bundles the full history. The measured churn shape that triggered
+  v2 was 286 recaptures/night, all against one 68 MB dir/all section. Incremental chains target
+  this dir/all section first.
+- **Out-of-tree worktree clones** (Conductor's original standalone workspace-dir shape, where the
+  main clone is outside the synced root): each workspace directory remains its own scoped/pointer
+  section because no in-tree main section carries its object store (`docs/design/68-worktree-git-sync.md:121-123`).
+  Those sections still chain independently. This is the v1 model, retained as the secondary case.
 
-This document makes that fix decision-complete. It does **not** schedule it (§6).
+So the target is not "dedup all worktrees together." The target is: once a section has a base
+bundle, subsequent captures for that same section upload O(delta) increments until bounded
+recompaction emits a fresh full bundle.
 
-## 2. Delta mechanism — a bundle chain carried inside the GitSection
+## 2. Manifest shape and schema
 
-### 2.1 The increment
-
-`git bundle create` accepts negative revisions, so a delta bundle is:
-
-```
-git -C <repoDir> bundle create <inc.bundle>  ^<basis-tip-1> ^<basis-tip-2> …  <new-refs…> <pins…>
-```
-
-A bundle built with `^basis` records those basis commits as **prerequisites** in its header and
-ships only the objects reachable from the new tips but *not* from the basis. This composes cleanly
-with the design-43 §5 pinning discipline: the enumerated `refs/rbox-wip/<captureId>/*` scratch pins
-(`src/engine/git/pins.ts` `createScratchPins`/`collectPinShas`) and the dir-repo `refs/stash`
-entry are still passed as **positive** revs, so a new detached-HEAD sha, a new WIP/stash commit, or
-a new pseudo-ref commit (`MERGE_HEAD`, rebase state) all ride the increment — negated only against
-the *previously captured* tips, never against the pins.
-
-### 2.2 The basis is the base section — no new persistent basis state
-
-The sender already has, in `state.lastSyncedManifest.gitRepos[rel]` (read today by
-`planGitSections` as `const base = …`, `src/cli/sync-git.ts`), the section it last synced. That
-section's `refs` **are** the basis tips, and its bundle chain **is** the existing chain. So:
-
-- **basis tips** = `Object.values(base[rel].refs)` — for a pointer/scoped section this is exactly
-  the one current-branch sha; for a dir/all section, every branch+tag sha.
-- **existing chain** = `[...(base[rel].packChain ?? []), base[rel].bundle]` (base first, newest
-  last).
-
-The next increment is `^basis-tips <current tips + pins>`, and the section published this cycle is
-`{ …base fields…, packChain: existingChain, bundle: <new increment> }`. **No new local state.** The
-basis for a *cross-machine* extension is derivable the same way: machine B, having *applied* A's
-chained section, holds that section as its base — so B can extend the chain (append an increment
-negated against `base.refs`) without ever having captured the repo. This reuses design 43's
-"the base section is the single source of truth" invariant and touches none of the §7 state maps.
-
-> Convergent-encryption subtlety, resolved: an increment's plaintext bytes still vary per capture
-> (fresh WIP commit), so **increments don't dedup either** — but each increment is O(delta) bytes,
-> not O(history), which is the entire win. Convergent encryption is unchanged; we are shrinking the
-> plaintext, not deduping it.
-
-### 2.3 Schema — additive field, conditional bump to `manifestSchema: 3`
-
-Design 43 chose a **clean break** to schema 2 (`src/engine/types.ts`, `KNOWN_MANIFEST_SCHEMA = 2`)
-because it was *deleting* the legacy `git` field. This change is **purely additive** — a full-bundle
-section (no `packChain`) stays byte-for-byte a valid design-43 section, so **existing data needs no
-migration**. `GitSection` gains one optional field:
+`GitSection` currently has one bundle artifact plus optional index/op-state artifacts
+(`src/engine/types.ts:55-81`). v2 adds an ordered chain of ancestor bundle links:
 
 ```ts
+interface GitPackLink extends GitArtifactRef {
+  /** One or more commit tips made reachable by this link, used for cat-file presence skips. */
+  tips: string[];
+}
+
 interface GitSection {
-  …                                   // unchanged: bundleSha/EncSha/CipherSize = the NEWEST link
-  /** design 53: ordered ANCESTOR bundle blobs (base first, previous-increment last) that must be
-   *  fetched into the staging store BEFORE this section's own bundle. Absent = self-contained full
-   *  bundle (today's design-02/§28/§43 shape). Present = this section's `bundle*` fields are an
-   *  INCREMENT whose prerequisites are satisfied by the last link's tips. */
-  packChain?: GitArtifactRef[];
+  // unchanged: bundleSha/bundleEncSha/bundleCipherSize describe the NEWEST link
+  packChain?: GitPackLink[];
 }
 ```
 
-`validateGitSection` (`src/engine/manifest-validate.ts:147`) gains: each `packChain` entry passes
-`validArtifactRef`; the chain length is bounded (`MAX_PACK_CHAIN`, see §3); and — the load-bearing
-rule — **a section with a non-empty `packChain` requires `manifestSchema >= 3`**.
+Ordering is base → older increments → previous increment. The section's own `bundle*` fields are
+the newest link. The newest link's tips are derived from the section itself: `Object.values(refs)`
+plus detached `head` when `head` is a 40-hex commit. A chain link stores `tips` because a receiver
+cannot reconstruct old link tips from the final section refs.
 
-We do **not** flag-day the whole fleet to schema 3. Following §2's own precedent
-(`manifestSchema: 2` is set *only when* `gitRepos` is present), the pusher sets `manifestSchema = 3`
-**only when some section actually carries a `packChain`**; a workspace whose repos all recompact to
-full bundles stays schema 2. This preserves design 43's hard-won invariant — *every future schema
-break fails loudly* — because a pre-increment client, gated by `schema > KNOWN_MANIFEST_SCHEMA`
-("upgrade rbox"), **refuses** a chain-bearing manifest instead of silently mishandling it. There is
-no repeat of the §2 "silent-strip" window: that window existed only for the pre-schema-gate legacy
-`git` field; the gate closes it for all future breaks, this one included.
+Schema is a clean break for chained sections:
 
-> Why the field and not just a per-machine convention: the **receiver** cannot reconstruct the
-> chain locally (it has no record of what basis the sender negated against). The chain *must* travel
-> in the manifest, and the manifest is E2EE — so the server still sees only opaque blobs and their
-> count/sizes (§28 leakage model, unchanged; §8).
+- `KNOWN_MANIFEST_SCHEMA` bumps from 2 to 3 (`src/engine/manifest-validate.ts:17-19` today).
+- `manifestSchema >= 3` is required when any git section has a non-empty `packChain`.
+- The cross-field rule lives in `validateManifest` (`src/engine/manifest-validate.ts:47-124`),
+  not in `validateGitSection`. `validateGitSection` (`src/engine/manifest-validate.ts:147-175`)
+  validates one untrusted section body: normal artifact refs, `packChain` artifact shape, link
+  `tips`, and the `MAX_PACK_CHAIN` bound. It does not know the manifest schema.
+- Capture self-validation remains a section-body check only. `captureGitState` currently calls
+  `validateGitSection(section)` before returning (`src/engine/git/capture.ts:268-274`); that stays
+  true for the newly captured body before `planGitSections` attaches chain metadata.
 
-### 2.4 Apply — fetch the chain in order into the staging store, verify each link
+Full-bundle sections without `packChain` remain valid schema-2 git sections. A manifest only needs
+schema 3 when it actually carries a chain, but old clients still fail loudly on that manifest
+instead of silently stripping or mishandling chain links.
 
-The design-43 apply (`src/engine/git/apply.ts` `applyGitState`) already fetches the bundle into an
-apply-unique `refs/rbox-incoming/<id>/*` namespace under quarantine + `git bundle verify` + fsck +
-rollback, with **decrypt-before-mutate** (all artifacts fetched, decrypted, and verified *before*
-any gitdir mutation, §28 codex M4). The chain extends this without weakening it:
+## 3. Capture construction
 
-1. In the decrypt-before-mutate phase, fetch **every** `packChain[i]` blob + this section's own
-   bundle via `getGitArtifact` (`src/engine/git/shared.ts`) into temp files. Any missing/corrupt
-   link throws here → `{applied:false}`, target untouched (existing behavior; §5).
-2. Import the links **in order** (base → … → tip) with the existing
-   `git fetch --no-tags <link> 'refs/*:<incomingNs>/*'` into the *same* incoming namespace, so each
-   link's objects land in the target's object store before the next link (which needs them as
-   prerequisites) is fetched.
-3. **`git bundle verify` semantics for increments — the reasoning that governs step 2 ordering.** A
-   bundle with prerequisites reports them and **errors if the objects it requires are absent from
-   the repo you verify against**. So the design-43 gate — `git bundle verify <bundle>` against the
-   *pre-existing* target before mutating (`apply.ts:188`) — is only valid for a **self-contained**
-   bundle. For a chain we verify **per link, after its ancestors are fetched**: the base link (no
-   prerequisites) verifies standalone; `packChain[1]`'s prerequisites are the base tips, now present
-   in `<incomingNs>`, so it verifies; and so on. Verifying the tip increment against the bare
-   pre-existing repo — as design 43 does today — would **fail** (its prerequisites live only in the
-   earlier links), which is exactly the failure mode §5 must never let escape as data loss.
-   Practical shape: for chained sections the whole chain is fetched+verified into the incoming
-   namespace *first*, and only then does the existing publish/HEAD/index/fsck/rollback sequence run
-   unchanged. A verify or fetch failure at any link → `{applied:false}`, defer (§5), nothing
-   published.
+### 3.1 Basis lives at the capture/plan boundary
 
-The publish/HEAD/index/op-state/fsck/rollback tail is **entirely unchanged**: once the chain's
-objects are all in the store, publishing `section.refs` and restoring index/op-state is identical to
-the full-bundle path. Increments change *how objects arrive*, never *what state is published*.
+`captureGitState(repoDir, store, kek, opts)` gains:
 
-## 3. Compaction — chains can't grow forever
+```ts
+opts.basis?: { tips: string[] };
+```
 
-A chain that only ever appends becomes slower to apply and pins more blobs into retention. The
-sender **recompacts** — emits a fresh full bundle with `packChain` cleared — on a **capture-side,
-receiver-agnostic** trigger (the receiver applies whatever it's handed; recompaction needs no
-coordination):
+No basis means "emit a full bundle" and clear any chain. Force-recapture paths, recompaction paths,
+and all error fallbacks omit `basis`.
 
-- **Length bound:** `packChain.length + 1 >= MAX_PACK_CHAIN` (proposed default **20**; also the
-  validation ceiling in §2.3).
-- **Byte bound (gcrypt's heuristic, made concrete):** `sum(cipherSize of all links) >=
-  base-link cipherSize`. The base link's `cipherSize` is a cheap proxy for full-bundle size, and it
-  is already carried in `packChain[0]`. Once the increments in aggregate cost as much as the base,
-  the chain has lost its advantage → collapse to one full bundle. (`git-remote-gcrypt`'s README warns
-  the unbounded-append model "can easily get to the point that continued usage is impractical";
-  this bound is what prevents that.)
+`planGitSections` is the only layer that can derive a basis because it has the last synced base
+map (`const base = state.lastSyncedManifest.gitRepos ?? {}` at `src/cli/sync-git.ts:127`) and owns
+the carry/capture decision (`src/cli/sync-git.ts:319-339`). For a changed, non-forced repo with a
+usable base section:
 
-Recompaction is *just a full capture*: `captureGitState` with `packChain` omitted — i.e. today's
-exact behavior. So recompaction is also the **universal fallback** (§5): any doubt → full bundle.
+1. Derive `basis.tips` from `Object.values(baseSec.refs)` plus `baseSec.head` when it is a detached
+   40-hex commit. This detached-head rule is mandatory: scoped pointer sections can have
+   `refs: {}` while the pinned detached HEAD commit still rode the prior bundle.
+2. If `basis.tips` is empty, do not build an increment; capture a full bundle.
+3. Build the candidate ancestor chain as:
+   `candidateChain = [...(baseSec.packChain ?? []), linkFrom(baseSec.bundle*, tipsFrom(baseSec))]`.
+4. Pass `opts.basis` into `captureGitState`.
+5. Attach `packChain: candidateChain` to the returned section **after** capture and section
+   self-validation.
 
-**GC of superseded links — nothing new; retention does it.** Every link is manifest-referenced, so
-the §28 correctness rule extends verbatim: `e2ee-remote.ts` `commit()` (the `addGit` loop at
-`e2ee-remote.ts:367`) must add **every `packChain[i].encSha`** to `blobRefs`, not just
-`bundleEncSha` — otherwise GC condemns a live chain link and every apply of that section breaks
-(the load-bearing point from §28 step 3). `sync-git.ts`'s `sectionEncShas` helper must likewise
-include the chain (§5). Given that, superseded links age out **for free**: when a section
-recompacts, the new head commit no longer references the old links, but older *retained* commits
-still do — so the links survive exactly until those commits fall outside the owning account's
-retention window (Free 7 / Solo 30 / Pro 90 days, §06 M7b), at which point the existing
-retention → mark → purge sweep (§06/§33) reclaims them. **No new GC path, no server change.** The
-one interaction to keep in view: a long chain across many retained commits keeps more blobs
-reachable within the window than a full-bundle workspace would — bounded by `MAX_PACK_CHAIN` and the
-byte trigger, and quantified against retention in testing (§6).
+This keeps "the base section is the basis" as the only persistent state. A second machine that
+applied a chained section can extend the chain from its saved base without any hidden local pack
+database.
 
-## 4. The multi-worktree question — increments only; do NOT build shared basis (recommendation)
+### 3.2 Increments use the real design-68 bundle arguments
 
-The founder's actual layout: 30 worktrees of one repo, each captured **standalone** (design 43 §5 —
-because the main clone lives outside the tree and Conductor may delete it), each carrying an
-independent full history today.
+The increment is not a new bundle path. It is the existing argument set plus basis negations.
+Today the dir/all argument set is decided at `src/engine/git/capture.ts:227-237`:
 
-**What increments alone fix, quantified.** Steady state drops from
-`30 worktrees × 17 MB × (every capture cycle a worktree's identity moves)` to
-`30 × 17 MB once` **+** `30 × O(delta) per cycle`. The recurring term — worktrees re-shipping full
-history every time an agent makes a commit or churns the index — is the term that was actually
-loading the machine, and increments **kill it**. Each worktree's **first** capture, and any
-**recompaction** (§3), still ships that worktree's full branch history once (~17 MB); that cost is
-**non-recurring** and already skipped-when-unchanged by the identity carry (`gitIdentityKey`), so
-increments leave a bounded one-time `30 × 17 MB ≈ 480 MB` and remove the unbounded recurring bleed.
+```ts
+const decision = decideDirBundleAllArgs(...);
+const bundleArgs =
+  ctx.kind === "dir"
+    ? [...dirAllArgs!, ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
+    : [...Object.keys(refs), ...pins.refs];
+```
 
-**What increments do NOT fix.** A *fresh* worktree's first capture is still O(history). The only
-thing that fixes *that* is a **per-origin shared basis**: one shared base pack of the origin's common
-history, with each worktree shipping only its delta from it.
+v2 threads `^<basisTip>` through that path:
 
-**Recommendation: keep per-repo independence + increments; do not build shared basis (v1, and
-likely ever).** Shared basis reintroduces precisely the coupling design 43 spent six review rounds
-removing. It makes worktree section B's applicability *depend* on a shared-base blob S being present
-and applied first — a cross-section reachability + ordering dependency that every part of the §7
-matrix (per-repo defer, per-repo 422 recapture via `gitForceForMissingBlobs`, per-repo removal
-memory, per-repo base advance) assumes does **not** exist; §8's "union blobRefs, GC roots each
-encSha exactly once" and §2's clean per-section independence would all have to be reopened. Worse,
-there is **no sound origin key to group worktrees by**: design 43 captures them standalone *by
-contract* precisely because the main clone may be gone, so "these N sections share an origin" is not
-reliably knowable. And the "free" convergent version doesn't exist — convergent sharing needs
-byte-identical base bundles across worktrees, which capture (fresh WIP commits, per-capture pins)
-never produces; you'd need a deterministic canonical base-pack builder, a whole subsystem. Against
-the founder's explicit "stability first," importing that coupling to shave a **non-recurring**
-480 MB is a bad trade. **Increments deliver the recurring win at zero cross-section coupling.**
-Shared basis is recorded here as a deferred §53.x, to be revisited *only* if measurement (§6) ever
-shows first-capture / recompaction volume — not steady-state re-upload — dominating git cost.
+- **Dir/all sections:** `--single-worktree --all ^<basisTip1> ^<basisTip2> ...` plus the existing
+  positive `refs/stash` and scratch-pin refs. `--single-worktree --all` is the design-68 invariant
+  that keeps detached linked-worktree HEADs out of the main bundle while still carrying branches
+  checked out in worktrees (`docs/design/68-worktree-git-sync.md:54-59`).
+- **Pointer/scoped sections:** the scoped positive refs plus `^basis...`, with scratch pins
+  unchanged. If the pointer is detached and has no scoped refs, the detached `HEAD` sha in
+  `basis.tips` is what makes the next increment valid; no basis means full bundle.
+- **Ancient git:** no new branch. `decideDirBundleAllArgs` already returns
+  `["--single-worktree", "--all"]`, falls back to `["--all"]` only when no live linked worktrees
+  exist, or defers when linked worktrees require `--single-worktree`
+  (`src/engine/git/capture.ts:51-58`, `src/engine/git/capture.ts:227-232`). Chains compose with
+  whichever argument set that decision returns.
 
-## 5. Failure / recovery matrix — every path degrades to a full bundle
+Scratch pins, WIP commits from `git stash create`, pseudo-ref commits, index/op-state artifact
+capture, and convergent encryption are unchanged. We shrink the bundle plaintext; we do not make
+increment ciphertext dedup.
 
-The increment layer is an **optimization shell around a correct core**. The core is design 43's
-full-bundle capture/apply, which is already proven; increments are an opt-in fast path that **any**
-error escapes back into the full path. Concretely:
+## 4. Cost model and compaction
 
-| Failure | Detection | Degradation |
+`MAX_PACK_CHAIN = 8`. Validation rejects any section requiring more than eight bundle links total
+(`packChain.length + 1 > MAX_PACK_CHAIN`), and capture recompacts before publishing a candidate
+that would exceed the bound.
+
+The byte trigger is over increment links only:
+
+```ts
+incrementBytes =
+  sum(candidate.packChain.slice(1).map((l) => l.cipherSize)) +
+  candidate.bundleCipherSize;
+
+if (incrementBytes >= candidate.packChain[0].cipherSize) recompactFull();
+```
+
+`packChain[0]` is the base full bundle and is excluded from the numerator. Its cipher size is a
+drifting conservative proxy for "what a new full bundle would cost"; history grows, so the old base
+can be smaller than a fresh full bundle, which makes the trigger recompact earlier rather than
+letting chains grow too long.
+
+### 4.1 In-tree layout: one hot dir/all section
+
+Before chains, the measured shape was:
+
+```text
+286 recaptures/night × 68 MB full dir/all bundle ≈ 19.0 GiB/night
+```
+
+With chains, the initial full bundle or any recompaction is still about 68 MB, but ordinary agent
+commits publish one increment whose size is proportional to new objects and pins. The hard fresh-join
+apply cost for the hot repo is at most eight bundle links, not 286 historical full bundles. The
+length-only worst case forces a full bundle roughly every eighth link; the byte trigger usually
+fires sooner if deltas are large. This is why v2 targets the main clone's dir/all section first:
+design 68 already removed the redundant in-tree pointer captures by base-carrying them.
+
+### 4.2 Out-of-tree layout: independent scoped chains
+
+For standalone workspace-dir clones, each captured repo keeps its own chain:
+
+```text
+N repos × one first full branch-history bundle
+  + N independent streams of O(delta) increments
+  + per-repo recompaction when length or byte caps fire
+```
+
+There is no shared basis across those repos. The old v1 improvement remains valid for this layout,
+but it is no longer the primary cost story. Cross-repo or per-origin shared bases would reopen the
+per-repo defer, 422, removal, conflict, and GC independence that design 43 established, and remain
+out of scope.
+
+### 4.3 Fresh join and stall bounds
+
+Design 71's stress shape is roughly 140 repos; the review's fresh-join bound used 121 chained repos.
+At `MAX_PACK_CHAIN = 8`, a fresh receiver imports at most:
+
+```text
+121 repos × 8 links = 968 bundle fetch/verify/import steps
+```
+
+That is intentional: small enough to test and reason about, and far below an unbounded gcrypt-style
+append list. The same cap bounds the receiver missing-link stall in sender capture cycles: if a
+receiver cannot fetch a link, it records `gitPendingRemote` and retries later; it heals when the
+sender's own length cap, byte cap, or 422 force emits a full bundle. There is no receiver→sender
+"please recompact" channel. If the sender never captures that repo again, the receiver remains
+honestly pending; preserving per-repo independence is worth that bounded, visible stall behavior.
+
+## 5. Apply, presence skips, and conflict preserve
+
+The existing apply path downloads one bundle and verifies it before mutation
+(`src/engine/git/apply.ts:203-236`), then imports it into an apply-unique namespace with a non-forced
+refspec (`src/engine/git/apply.ts:292-300`) and publishes filtered refs/HEAD/index/op-state under
+the existing rollback rules (`src/engine/git/apply.ts:307-347`). Chained sections replace only the
+"get and import bundle" helper.
+
+The helper operates over `packChain` plus the section's own bundle:
+
+1. For each link, compute the recorded tips. Chain links use `link.tips`; the newest link uses the
+   current section tips.
+2. Before fetching link `i`, run `git cat-file -e <tip>^{commit}` for each recorded tip. If every
+   tip is already present, skip fetch and import for that link. This turns steady-state ping-pong
+   from O(chain) into O(new links). Fresh joins still pay the full bounded chain.
+3. If a link is not present, fetch/decrypt the artifact with `getGitArtifact`
+   (`src/engine/git/shared.ts` exports it; callers already use it from apply and conflict preserve),
+   run `git bundle verify` after all ancestor links have been imported, then fetch the bundle with:
+
+   ```text
+   git fetch --no-tags <bundle> '+refs/*:<incomingNs>/*'
+   ```
+
+   The `+` is mandatory. The incoming namespace is scratch; a later increment that rewrites a ref
+   the base created must win. Non-fast-forward refusal in scratch refs is not an integrity boundary.
+   Integrity comes from decrypt/plaintext-sha verification, per-link `git bundle verify` after
+   ancestors are present, and the final design-68 publish/filter/collision rules.
+
+For existing targets, this chain helper runs before `beforeMutate`, preserving the current
+decrypt-before-mutate guarantee. For fresh targets, apply may create a removable `git init` target
+after artifact decrypt so there is an object store to verify/fetch into; any chain failure removes
+the `.git` it created, matching the current fresh-target fail-closed behavior.
+
+Conflict preservation must use the same helper. Today `preserveGitConflict` fetches/verifies only
+`section.bundle*` and copies that one bundle to `.rbox/git-conflicts`
+(`src/engine/git/quarantine.ts:82-99`). Under v2, a conflict copy of a chained section must
+materialize identically to a normal apply: fetch/verify/import the whole chain with the same
+presence skip, then preserve a recovery bundle or namespace that contains the remote tips. A
+conflict path that preserves only the newest increment is invalid because that increment's
+prerequisites may exist only in earlier links.
+
+## 6. Failure, 422, refs, and GC
+
+Every failure degrades to a full bundle or a design-43 defer. No increment path is a new correctness
+dependency.
+
+| Failure | Detection | Behavior |
 |---|---|---|
-| **Basis unavailable at capture** (no base section, base unreadable, `bundle create ^basis` errors) | capture-side, before upload | emit a **full `--all`/scoped bundle**, `packChain` omitted — today's `captureGitState` default branch. Never a failed push. |
-| **Missing chain-link blob, server-side (sender 422)** | `commit()` returns `unsatisfiedBlobs`; `sectionEncShas` (extended to include `packChain`) intersects the missing set → `gitForceForMissingBlobs` adds the repo to `force` | forced repos skip the carry fast-path (`planGitSections`) **and force-recapture emits FULL** (chain reset) — never another increment negated against the same missing basis. Reuses design 43 §6/M5 verbatim. |
-| **Missing / corrupt link on receiver apply** (GC'd, never uploaded, bit-rot) | `getGitArtifact` throws in decrypt-before-mutate, or a per-link `git bundle verify` fails (§2.4) | `applyGitState` → `{applied:false}` with the target **untouched**; `applyGitSections` records `gitPendingRemote[rel]` and defers (design 43 §7 [v5]). The stall resolves when the sender recompacts to full (below). |
-| **Sender re-carries a chain the receiver can't apply** | receiver stays pending; identity unchanged, so `planGitSections` would re-carry the same broken section | the receiver's persistent defer is the signal; the operator-visible standoff (`rbox status`, design 45) is the same non-destructive stall design 43 §7 already ships. Deterministic heal: a recompaction at the sender (§3, or forced by any 422) replaces the chain with a self-contained full bundle the receiver **can** apply. |
-| **Divergent history (force-push / rebase in a worktree)** | identity moves → normal recapture; `bundle create ^oldbasis <rewritten-tips>` ships the rewritten objects (prerequisites = old basis, still present in the chain) | apply verifies (old basis objects present) and publishes the rewritten tip via the existing ref-publish rules; orphaned old objects are harmless. If the rewrite shares little with basis the increment grows toward full → the §3 byte trigger recompacts. No special case. |
-| **Busy / defer / needsResolution / removal** (design 43 §7 carry matrix) | unchanged | a carried section is **reused verbatim** — its `packChain` rides along and **does not grow** (carry ≠ capture). Removal drops the whole section (chain included); retention ages the links out (§3). The chain is invisible to every one of these paths. |
+| No usable base or empty basis tips | capture planning | Omit `opts.basis`; emit full bundle; no `packChain`. |
+| `git bundle create` with basis fails | capture | Retry/degrade as full bundle; if full capture also fails, existing per-repo defer/base-carry applies. |
+| Recompaction length or byte trigger fires | capture planning | Omit basis; emit full bundle; chain reset. |
+| 422 reports a missing git chain blob | push commit returns `unsatisfiedBlobs` | `sectionEncShas` must include every chain link encSha; `gitForceForMissingBlobs` then forces exactly those repos (`src/cli/sync-git.ts:439-444`). Forced capture omits basis and emits full bundle. |
+| Receiver missing/corrupt chain link | `getGitArtifact`, plaintext sha, bundle verify, or forced fetch fails | `applyGitState` returns `{applied:false}` with target untouched; `applyGitSections` records `gitPendingRemote` and retries (`src/cli/sync-git.ts:925-978`). Heal waits for sender recompaction; no receiver signal channel exists. |
+| Sender rewrites history between links | next capture changes identity | Increment is still valid: old basis objects are prerequisites from earlier links, fetch uses forced scratch refs, and final publish moves refs under existing rules. Large rewrites grow toward the byte trigger. |
+| Busy/defer/needsResolution/removal/policy skip | design-43/design-68/design-72 state machine | Carry the section verbatim; `packChain` does not grow unless capture runs. Removal drops the whole section; retention ages old links out. |
 
-**Invariant (normative):** *no section is ever un-applyable in principle.* A full bundle always
-applies; every increment path that cannot complete falls back to (or is healed by) a full bundle.
-The increment layer must never become a new correctness dependency — it may only make a correct
-transfer cheaper.
+Design 71 changes the accounting math. `blobRefsForManifest` currently adds git bundle, index, and
+op-state encShas through the `addGit` helper (`src/cli/e2ee-remote.ts:51-66`; invoked during commit
+at `src/cli/e2ee-remote.ts:367-378`). v2 must add every `packChain[i].encSha` through the same
+helper. That is both a quota/entitlement requirement and the GC root: if a live chain link is not in
+blobRefs, retention/GC can reclaim it.
 
-## 6. Trigger to build, staged rollout, test plan
+The ref-count impact is small against design 71. At the stress scale:
 
-**Build trigger — measured steady-state re-upload volume, not clone-time spikes.** Design 35
-(client phase metrics) already instruments the daemon; extend it to attribute **git bytes uploaded
-per cycle to *captured* (not *carried*) sections**, and compute the **re-upload amplification** =
-`bytes shipped ÷ bytes of genuinely-new objects` (new-object bytes are cheaply estimable as the
-`bundle create ^lastTips` size — measurable *without* shipping it). Build when, over a representative
-week of the founder's real `~/conductor/workspaces` daemon:
+```text
+≤8 extra chain refs × ~140 repos ≈ 1.1k refs
+```
 
-- sustained median amplification **> ~10×** (i.e. we ship an order of magnitude more than the delta), **or**
-- absolute git re-upload from unchanged/near-unchanged histories **> a few GB / week**.
+That is negligible against the 250k ref cap in design 71 §3.2
+(`docs/design/71-refs-at-scale.md:91-103`). It does grow the signed refset and the GC roots walk by
+the same count; design 71 already names GC/roots-at-scale as a deferred item
+(`docs/design/71-refs-at-scale.md:136-143`), and this is within that budget.
 
-The 30-worktree × 17 MB anecdote almost certainly clears this — but the **discipline is to measure
-first**. Do not build on the anecdote; build on the §35 numbers. Explicitly *not* a trigger:
-first-clone / hydration spikes (one-time, and the §4 shared-basis question, not this one).
+422 recovery must use design-71 paging language. Missing lists are capped at 10,000 shas plus
+`missingTotal` (`docs/design/71-refs-at-scale.md:105-111`; current clients surface
+`missingTotal` at `src/cli/remote/commits.ts:73-75` and `src/cli/remote/commits.ts:145-147`).
+`gitForceForMissingBlobs` only sees the returned page, so any returned encSha matching any chain
+link is enough to force a full recapture of that repo. The retry will re-run missing checks; it must
+never build another increment against a basis the server just proved incomplete.
 
-**Staged rollout.** (1) Behind config — `git.incremental` default **off**, gated exactly like
-`syncGit` is today; full-bundle behavior is the shipped default until proven. (2) **One repo first**
-— opt in a single low-stakes repo (or per-workspace flag), watch a two-machine round-trip for a week,
-confirm the fallback paths (§5) fire and heal. (3) Widen once green. The conditional
-`manifestSchema: 3` (§2.3) means a workspace only advertises schema 3 once it actually emits a
-chain, so a half-rolled-out fleet degrades safely (pre-increment clients loudly refuse chained
-manifests; they never silently corrupt).
+## 7. Rollout and build trigger
 
-**Test plan sketch.**
-- **Unit:** chain build (`^basis` negation for dir/all and pointer/scoped); per-link
-  `bundle verify` ordering (base verifies standalone; increment fails against a bare repo, passes
-  after ancestors fetched); recompaction triggers (length + byte); `sectionEncShas`/`blobRefs`
-  include `packChain`; **fallback on every injected failure** (missing link, corrupt link, absent
-  basis, 422 on a link) → full bundle / clean defer, never a mutated target.
-- **Two-machine e2e** (design 43's FakeRemote / e2ee harness): base capture → 3 successive
-  small commits → assert each pushes an **O(delta)** blob (not O(history)); B applies the chain,
-  `git fsck` clean, `git log`/`status`/`stash`/rebase-continue all match; recompact at threshold and
-  confirm B still round-trips. **Adversarial:** delete a middle chain-link blob → B defers
-  (untouched) → sender recompacts full → B heals. Zero-plaintext grep over stored bytes (§28
-  acceptance test) still passes.
-- **Real-repo round-trip** (extend design 43's live `caracas` / `savvy-core` validation, 762
-  commits): capture base, three real commits, assert three increments each ≪ 17 MB; drive a
-  recompaction; a fresh clone reconstructing the full chain fscks clean and matches `git log`
-  byte-identically; R2 spot-check confirms ciphertext-only. Measure retention-window blob-count
-  interaction (§3) at Solo (30d) and Pro (90d).
+This remains spec-only and not scheduled. Build it behind an off-by-default `git.incremental` gate,
+then enable one low-stakes repo before widening. A chained manifest advertises schema 3, so mixed
+fleets fail loudly on chained sections rather than silently corrupting them.
 
-## 7. Non-goals (restated)
+The build trigger is measured steady-state re-upload, not first-clone volume:
 
-- **No server / API / D1 / Worker change.** Blobs stay opaque; GC is the existing retention →
-  mark → purge with `packChain` encShas added to `blobRefs` at commit (client-side only). The §28
-  leakage model is unchanged (the server may now see *more* small blobs per repo instead of one
-  large one — a slightly different size/count signal, still no refs/paths/contents; §8 of design 43).
-- **No cross-repo or cross-worktree object dedup** beyond the §4 recommendation (which is *not* to
-  build it). Each section's chain is independent.
-- **No change to file sync**, and **no change to the design-43 §7 recovery *semantics*** — increments
-  live strictly inside a section and are invisible to defer/422/removal/conflict handling.
+- in-tree layout: repeated full uploads of the same dir/all section, like the 286 × 68 MB/night
+  churn shape;
+- out-of-tree layout: repeated scoped full-history uploads across standalone worktree dirs;
+- not a trigger: one-time hydration or first capture, which this design intentionally does not
+  solve with shared bases.
 
----
+## 8. Verification additions
 
-## Open questions for the founder
+Add the existing v1 tests plus these v2 gates:
 
-1. **Recompaction defaults.** `MAX_PACK_CHAIN = 20` links and "increments ≥ base bytes" — good
-   starting points, or tune straight off the §35 numbers before first ship?
-2. **Rollout granularity.** Per-repo opt-in first, or a per-workspace `git.incremental` flag? Per-repo
-   is safer for the "one repo first" stage but adds a config surface.
-3. **First-capture volume.** Is the non-recurring `~480 MB` (30 worktrees × 17 MB, §4) ever actually
-   a problem in practice, or purely a steady-state concern? Only a measurement reopens the
-   shared-basis question — do we even want it on the radar?
-4. **Retention interaction.** Chains keep more (smaller) blobs reachable within the retention window
-   than a single full bundle. At Pro's 90-day window with long-lived worktrees, is the extra
-   reachable-blob count worth an explicit tighter recompaction bound, or is `MAX_PACK_CHAIN` enough?
-5. **Trigger authority.** Are the §6 thresholds (>~10× sustained amplification, or >few GB/week)
-   the right shape, or would you rather gate purely on a single "git re-upload GB/week" number that's
-   easier to eyeball on a dashboard?
+- **Argument construction:** dir/all increments are the design-68 `decideDirBundleAllArgs` output
+  plus basis negations; stash and scratch pins remain positive. Pointer/scoped increments use
+  scoped positives plus basis negations. Ancient-git fallback/defer behavior is unchanged.
+- **Detached scoped basis:** a pointer section with `refs: {}` and detached `HEAD` extends from the
+  pinned head sha; empty basis emits a full bundle.
+- **Schema validation:** `KNOWN_MANIFEST_SCHEMA = 3`; `validateManifest` rejects `packChain` under
+  schema <3; `validateGitSection` validates link shape/tips/length but does not inspect schema.
+- **Multi-repo fresh join:** N chained repos apply on a fresh receiver with subprocess work bounded
+  by `N × MAX_PACK_CHAIN`; a second apply with no new links uses cat-file presence skips and stays
+  O(new links).
+- **Rewritten-ref chain:** force-push or rebase between links reproduces the non-fast-forward
+  scratch-ref blocker; forced refspecs import the later link and final publish lands the rewritten
+  tip.
+- **Conflict preserve:** local divergence on a chained remote section preserves a complete recovery
+  artifact/namespace, not only the newest increment.
+- **422 chain link:** missing `packChain[i].encSha` appears in a bounded missing page, forces that
+  repo, and the forced recapture emits a full bundle.
+- **Compaction:** length cap at eight total links; byte cap sums only increments
+  (`packChain[1..]` plus newest bundle) against `packChain[0].cipherSize`.
+- **Rig scenario:** extend the two-device live rig with one chained repo and the savvy-core-like
+  churn shape; assert before/after cycle time and upload bytes improve from the 286 × 68 MB full
+  reupload pattern to full-on-base/recompaction plus O(delta) increments.
+
+## 9. Invariants kept from v1
+
+- Per-repo independence stays. No shared basis across repos or worktrees.
+- Every capture/apply uncertainty degrades to a full bundle or a design-43 per-repo defer.
+- Per-link verify-after-ancestors ordering is mandatory; v1 got this right.
+- The correct orchestration file is `src/cli/sync-git.ts`, not the old
+  `src/engine/git/sync-git.ts` path. Current push planning, force recapture, conflict preserve
+  calls, and apply loop citations in this document use the current tree.
