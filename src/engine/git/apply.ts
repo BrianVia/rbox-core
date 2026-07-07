@@ -7,6 +7,7 @@ import { validateGitSection } from "../manifest-validate.js";
 import type { GitSection } from "../types.js";
 import {
   type RepoCtx,
+  clearIndexResolveUndo,
   detectGitKind,
   exists,
   getGitArtifact,
@@ -313,7 +314,11 @@ export async function applyGitState(
 
       // Restore index + op-state from the pre-decrypted temp files via atomic rename —
       // into the RESOLVED gitdir.
-      if (indexTmp) await moveFileAtomic(indexTmp, path.join(ctx.gitDir, "index"));
+      if (indexTmp) {
+        const indexPath = path.join(ctx.gitDir, "index");
+        await moveFileAtomic(indexTmp, indexPath);
+        await clearIndexResolveUndo(repoDir, indexPath);
+      }
       await restoreOpState(ctx.gitDir, opTmp);
 
       if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {

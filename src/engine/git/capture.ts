@@ -3,7 +3,7 @@ import path from "node:path";
 import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
-import { exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
+import { clearIndexResolveUndo, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
 import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOf } from "./identity.js";
@@ -209,6 +209,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     if (await exists(path.join(ctx.gitDir, "index"))) {
       stagedIndex = path.join(tmpDir, "index");
       await fs.copyFile(path.join(ctx.gitDir, "index"), stagedIndex);
+      await clearIndexResolveUndo(repoDir, stagedIndex);
     }
     const stagedOp: Array<{ rel: string; staged: string }> = [];
     const liveOp = await readOpState(ctx.gitDir, async () => ""); // just enumerate present op-state

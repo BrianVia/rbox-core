@@ -1,5 +1,5 @@
 import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,8 @@ import {
   applyGitState,
   buildIgnoreMatcher,
   captureGitState,
+  decryptFileToPath,
+  encryptFileToTemp,
   normalizeSymbolicHeadCasing,
   GitCaptureDeferredError,
   gitCaptureScratchRoot,
@@ -27,7 +29,9 @@ import {
 } from "./index.js";
 
 const exec = promisify(execFile);
-const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
+const cleanGitEnv = (extra: NodeJS.ProcessEnv = {}) =>
+  ({ ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined, ...extra }) as NodeJS.ProcessEnv;
+const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: cleanGitEnv() }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
@@ -69,6 +73,71 @@ async function appendPackedRef(dir: string, ref: string, sha: string) {
   const packed = path.join(dir, ".git", "packed-refs");
   const existing = await fs.readFile(packed, "utf8").catch(() => "# pack-refs with: peeled fully-peeled sorted\n");
   await fs.writeFile(packed, `${existing.endsWith("\n") ? existing : `${existing}\n`}${sha} ${ref}\n`);
+}
+async function gitWithStdin(dir: string, args: string[], stdin: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("git", ["-C", dir, ...args], { env: cleanGitEnv() });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`git ${args.join(" ")} failed (${code}): ${stderr}`))));
+    child.stdin.end(stdin);
+  });
+}
+async function gitWithIndex(dir: string, indexFile: string, ...args: string[]): Promise<string> {
+  return exec("git", ["-C", dir, ...args], { env: cleanGitEnv({ GIT_INDEX_FILE: indexFile }) }).then((r) => r.stdout.toString().trim());
+}
+async function writeLooseBlob(repo: string, label: string, content: string): Promise<string> {
+  const blobDir = path.join(tmp, "loose-blob-inputs");
+  await fs.mkdir(blobDir, { recursive: true });
+  const file = path.join(blobDir, label);
+  await fs.writeFile(file, content);
+  return git(repo, "hash-object", "-w", file);
+}
+async function createSyntheticResolveUndoRepo(repo: string): Promise<{ base: string; ours: string; theirs: string }> {
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "tracked\n", "base");
+  const base = await writeLooseBlob(repo, "base", "base-unreachable\n");
+  const ours = await writeLooseBlob(repo, "ours", "ours-unreachable\n");
+  const theirs = await writeLooseBlob(repo, "theirs", "theirs-unreachable\n");
+
+  await gitWithStdin(
+    repo,
+    ["update-index", "--index-info"],
+    [
+      "0 0000000000000000000000000000000000000000\tf.txt",
+      `100644 ${base} 1\tf.txt`,
+      `100644 ${ours} 2\tf.txt`,
+      `100644 ${theirs} 3\tf.txt`,
+      "",
+    ].join("\n")
+  );
+  await fs.writeFile(path.join(repo, "f.txt"), "resolved\n");
+  await git(repo, "add", "f.txt");
+  return { base, ours, theirs };
+}
+async function putEncryptedArtifact(srcPath: string): Promise<{ sha: string; encSha: string; cipherSize: number }> {
+  const artifactTmp = await fs.mkdtemp(path.join(tmp, "git-artifact-"));
+  try {
+    const enc = await encryptFileToTemp(srcPath, KEK, artifactTmp);
+    try {
+      await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+      return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
+    } finally {
+      await fs.rm(enc.ciphertextPath, { force: true });
+    }
+  } finally {
+    await fs.rm(artifactTmp, { recursive: true, force: true });
+  }
+}
+async function decryptIndexArtifact(section: GitSection, destPath: string): Promise<void> {
+  const ctPath = path.join(tmp, `ct-${section.indexEncSha}`);
+  await fs.writeFile(ctPath, await store.get(section.indexEncSha!));
+  try {
+    await decryptFileToPath(ctPath, KEK, section.indexSha!, destPath);
+  } finally {
+    await fs.rm(ctPath, { force: true });
+  }
 }
 
 test("preflight accepts an ordinary repo, rejects non-repo and bare", async () => {
@@ -204,6 +273,52 @@ test("capture→apply reproduces branches, staged state, and stash across repos"
   // fsck clean.
   await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
 });
+
+test("resolve-undo entries with unreachable blobs are stripped on capture and healed before apply fsck", async () => {
+  const { base, ours, theirs } = await createSyntheticResolveUndoRepo(A);
+  const liveResolveUndo = await git(A, "ls-files", "--resolve-undo");
+  expect(liveResolveUndo.split("\n")).toHaveLength(3);
+  expect(liveResolveUndo).toContain(base);
+  expect(liveResolveUndo).toContain(ours);
+  expect(liveResolveUndo).toContain(theirs);
+  await expect(git(A, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+  expect(await git(A, "rev-list", "--objects", "--all")).not.toContain(base);
+  expect(await git(A, "rev-list", "--objects", "--all")).not.toContain(ours);
+  expect(await git(A, "rev-list", "--objects", "--all")).not.toContain(theirs);
+
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  expect(await git(A, "ls-files", "--resolve-undo")).toBe(liveResolveUndo);
+
+  const capturedIndex = path.join(tmp, "captured.index");
+  await decryptIndexArtifact(section!, capturedIndex);
+  expect(await gitWithIndex(A, capturedIndex, "ls-files", "--resolve-undo")).toBe("");
+
+  await fs.mkdir(B, { recursive: true });
+  await fs.writeFile(path.join(B, "f.txt"), "resolved\n");
+  let res = await applyGitState(B, section!, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(B, "ls-files", "--resolve-undo")).toBe("");
+  await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+  expect(await git(B, "status", "--porcelain=v1")).toBe(await git(A, "status", "--porcelain=v1"));
+
+  const unstripped = await putEncryptedArtifact(path.join(A, ".git", "index"));
+  const oldClientSection: GitSection = {
+    ...section!,
+    indexSha: unstripped.sha,
+    indexEncSha: unstripped.encSha,
+    indexCipherSize: unstripped.cipherSize,
+  };
+  const C = path.join(tmp, "C");
+  await fs.mkdir(C, { recursive: true });
+  await fs.writeFile(path.join(C, "f.txt"), "resolved\n");
+
+  res = await applyGitState(C, oldClientSection, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(C, "ls-files", "--resolve-undo")).toBe("");
+  await expect(git(C, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+  expect(await git(C, "status", "--porcelain=v1")).toBe(await git(A, "status", "--porcelain=v1"));
+}, 30_000);
 
 test("incremental dir/all capture uses basis negations and a chained section round-trips", async () => {
   await initRepo(A);
