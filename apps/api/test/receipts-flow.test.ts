@@ -219,7 +219,11 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const a = await bootstrap("rcpt-redeem-bad-hmac");
     const good = await putStaged(a.token, "good");
     const bad = await putStaged(a.token, "bad");
-    const res = await redeem(a.accountId, { [good.sha]: good.receipt, [bad.sha]: `${bad.receipt.slice(0, -1)}x` });
+    // Deterministic tamper: flip the last char to a DIFFERENT char — a fixed "x"
+    // suffix is a no-op ~1/64 runs when the HMAC text already ends in "x" (flaked
+    // in CI 2026-07-07: the untampered receipt verified and granted:2).
+    const tampered = `${bad.receipt.slice(0, -1)}${bad.receipt.endsWith("x") ? "y" : "x"}`;
+    const res = await redeem(a.accountId, { [good.sha]: good.receipt, [bad.sha]: tampered });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ granted: 1, alreadyEntitled: 0, rejected: 1 });
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, bad.sha).first()).toBeNull();
