@@ -25,10 +25,33 @@
  *                      (the denominator that decides §40 chunk sync)
  */
 
-export type PhaseName = "scan" | "encrypt" | "upload" | "download" | "decrypt" | "apply" | "commit";
+export type PhaseName =
+  | "latest"
+  | "scan"
+  | "encrypt"
+  | "upload"
+  | "download"
+  | "decrypt"
+  | "apply"
+  | "git-apply"
+  | "cache-save"
+  | "state-save"
+  | "commit";
 
 /** Stable display order for the summary line (and any tabular diff). */
-const PHASE_ORDER: readonly PhaseName[] = ["scan", "encrypt", "upload", "commit", "download", "decrypt", "apply"];
+const PHASE_ORDER: readonly PhaseName[] = [
+  "latest",
+  "scan",
+  "encrypt",
+  "upload",
+  "commit",
+  "download",
+  "decrypt",
+  "apply",
+  "git-apply",
+  "cache-save",
+  "state-save",
+];
 
 export interface PhaseTotals {
   ms: number;
@@ -37,6 +60,7 @@ export interface PhaseTotals {
   ciphertextBytes: number;
   wireBytes: number;
   changedBytes: number;
+  details?: Record<string, unknown>;
 }
 
 /** Bytes/counts to attribute to a phase. All optional; a phase sets only what it moves. */
@@ -68,6 +92,7 @@ export class PhaseReport {
   private readonly op: "push" | "pull" | "sync";
   private readonly startedAt: number;
   private readonly phases = new Map<PhaseName, PhaseTotals>();
+  private readonly phaseSummaries = new Map<PhaseName, string>();
   private peakRss = 0;
 
   private constructor(op: "push" | "pull" | "sync", enabled: boolean) {
@@ -119,18 +144,32 @@ export class PhaseReport {
     this.bump(name, 0, bytes);
   }
 
+  /** Attach path-free, hash-free details to a phase. `summary` is appended to the
+   * greppable one-line report; callers own keeping it privacy-preserving. */
+  recordDetails(name: PhaseName, details: Record<string, unknown>, summary?: string): void {
+    if (!this.enabled) return;
+    const t = this.ensure(name);
+    t.details = { ...(t.details ?? {}), ...details };
+    if (summary) this.phaseSummaries.set(name, summary);
+  }
+
   private bump(name: PhaseName, ms: number, bytes?: PhaseBytes): void {
-    let t = this.phases.get(name);
-    if (!t) {
-      t = zeroTotals();
-      this.phases.set(name, t);
-    }
+    const t = this.ensure(name);
     t.ms += ms;
     t.count += bytes?.count ?? 0;
     t.plaintextBytes += bytes?.plaintextBytes ?? 0;
     t.ciphertextBytes += bytes?.ciphertextBytes ?? 0;
     t.wireBytes += bytes?.wireBytes ?? 0;
     t.changedBytes += bytes?.changedBytes ?? 0;
+  }
+
+  private ensure(name: PhaseName): PhaseTotals {
+    let t = this.phases.get(name);
+    if (!t) {
+      t = zeroTotals();
+      this.phases.set(name, t);
+    }
+    return t;
   }
 
   private sampleRss(): void {
@@ -169,7 +208,8 @@ export class PhaseReport {
       ct += t.ciphertextBytes;
       wire += t.wireBytes;
       changed += t.changedBytes;
-      parts.push(`${name} ${fmtMs(t.ms)}`);
+      const detail = this.phaseSummaries.get(name);
+      parts.push(`${name} ${fmtMs(t.ms)}${detail ? ` ${detail}` : ""}`);
     }
     const wallMs = Date.now() - this.startedAt;
     const head = `rbox ${this.op} files=${this.files} blobs=${this.blobs} ct=${fmtBytes(ct)} wire=${fmtBytes(wire)} changed=${fmtBytes(changed)} ${fmtMs(wallMs)}`;

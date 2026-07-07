@@ -21,7 +21,7 @@ const fakeGitSection = (): GitSection => ({
   bundleEncSha: sha("bundle-enc"),
   bundleCipherSize: 1,
   head: "ref: refs/heads/main",
-  refs: {},
+  refs: { "refs/heads/main": "1".repeat(40) },
   refScope: "all",
   generatedAt: "",
 });
@@ -61,9 +61,14 @@ class FakeRemote implements SyncRemote {
     this.blobs.set(p.encSha, Buffer.from(p.ciphertext));
     return { path: rel, type: "file", sha256: p.plaintextSha, encSha: p.encSha, size: content.length, mode: 0o644, mtimeMs: 1 };
   }
-  injectCommit(files: FileEntry[]): void {
+  injectCommit(files: FileEntry[], gitRepos?: Record<string, GitSection>): void {
     this.head += 1;
-    this.log.set(this.head, { generatedAt: "", files });
+    const manifest: Manifest = { generatedAt: "", files };
+    if (gitRepos) {
+      manifest.manifestSchema = 2;
+      manifest.gitRepos = gitRepos;
+    }
+    this.log.set(this.head, manifest);
   }
   headSeq(): number {
     return this.head;
@@ -609,9 +614,52 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   await pull(root, cfg, { remote, backoff: noBackoff, report });
 
   const j = report.toJSON();
-  expect(Object.keys(j.phases).sort()).toEqual(["apply", "scan"]);
+  expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "scan", "state-save"]);
   expect(j.blobs).toBe(1); // one write action applied
   expect(j.phases.apply!.plaintextBytes).toBe(Buffer.byteLength(content));
+  expect(j.phases["git-apply"]!.count).toBe(0);
+});
+
+test("design 74 phase 0: pull reports git-apply repo timings and commonDir group count", async () => {
+  const remote = new FakeRemote();
+  const gitRepos = { repoA: fakeGitSection(), repoB: fakeGitSection() };
+  remote.injectCommit([], gitRepos);
+  cfg = { ...cfg, syncGit: true };
+  await saveState(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: remote.headSeq(),
+    lastSyncedManifest: { generatedAt: "", files: [], manifestSchema: 2, gitRepos },
+  });
+
+  const report = PhaseReport.pull();
+  await pull(root, cfg, { remote, backoff: noBackoff, report });
+
+  const phase = report.toJSON().phases["git-apply"]!;
+  expect(phase.count).toBe(2);
+  const details = phase.details?.gitApply as {
+    runKind: string;
+    repos: number;
+    commonDirGroups: number;
+    results: Record<string, number>;
+    repoTimings: Array<{ index: number; queueMs: number; wallMs: number; result: string }>;
+  };
+  expect(details.runKind).toBe("steady");
+  expect(details.repos).toBe(2);
+  expect(details.commonDirGroups).toBe(0);
+  expect(details.results.unchanged).toBe(2);
+  expect(details.repoTimings).toHaveLength(2);
+  expect(details.repoTimings.map((t) => t.index)).toEqual([0, 1]);
+  for (const t of details.repoTimings) {
+    expect(t.queueMs).toBeGreaterThanOrEqual(0);
+    expect(t.wallMs).toBeGreaterThanOrEqual(0);
+    expect(t.result).toBe("unchanged");
+  }
+  const lines: string[] = [];
+  report.logSummaryTo((l) => lines.push(l));
+  expect(lines[0]).toContain("git-apply");
+  expect(lines[0]).toContain("repos=2 commonDirs=0");
+  expect(lines[0]).toContain("results=unchanged=2");
+  expect(lines[0]).toContain("repoMs=i0");
 });
 
 test("§35: with no report, the sync path is unaffected (disabled fallback records nothing)", async () => {
