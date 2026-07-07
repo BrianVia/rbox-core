@@ -115,8 +115,8 @@ const FIVE_SECONDS_MS = 5000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const MAX_RETRIES = 10;
 
-/** Flat deadline for small control round-trips (JSON POST/GET, multipart init/complete). */
-export const CONTROL_TIMEOUT_MS = envInt("RBOX_NET_CONTROL_TIMEOUT_MS", 30_000, ONE_SECOND_MS, ONE_HOUR_MS);
+/** Flat deadline for small control round-trips (JSON POST/GET, byte blobs, multipart init/complete). */
+export const SMALL_CONTROL_TIMEOUT_MS = envInt("RBOX_NET_CONTROL_TIMEOUT_MS", 60_000, ONE_SECOND_MS, ONE_HOUR_MS);
 /** Idle (no-progress) watchdog for streaming blob downloads — resets on every chunk. */
 export const DOWNLOAD_IDLE_MS = envInt("RBOX_NET_DOWNLOAD_IDLE_MS", 60_000, FIVE_SECONDS_MS, ONE_HOUR_MS);
 /** Generous flat cap for buffered (in-memory) blob GETs, which can't observe progress. */
@@ -243,7 +243,7 @@ export function fetchBufferedGet(url: string, init: RequestInit = {}, opts: Resi
  * level up, re-creating a fresh body per attempt: `retryTransient(() => fetchWithDeadline(...))`.
  */
 export function fetchWithDeadline(url: string, init: RequestInit = {}, timeoutMs?: number, signal?: AbortSignal): Promise<Response> {
-  return fetch(url, withDeadline(init, timeoutMs ?? CONTROL_TIMEOUT_MS, signal));
+  return fetch(url, withDeadline(init, timeoutMs ?? SMALL_CONTROL_TIMEOUT_MS, signal));
 }
 
 /**
@@ -253,6 +253,6 @@ export function fetchWithDeadline(url: string, init: RequestInit = {}, timeoutMs
  * on the strength of a Response the caller hasn't seen.
  */
 export function fetchResilient(url: string, init: RequestInit = {}, opts: ResilientOpts = {}): Promise<Response> {
-  const timeoutMs = opts.timeoutMs ?? CONTROL_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? SMALL_CONTROL_TIMEOUT_MS;
   return retryTransient(() => fetch(url, withDeadline(init, timeoutMs, opts.signal)), opts);
 }

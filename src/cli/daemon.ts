@@ -35,6 +35,7 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 const WS_PING_MS = 25_000;
 const WS_KEEPALIVE_PERSIST_MS = 20_000;
+export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
@@ -104,6 +105,7 @@ export class RboxDaemon {
   private watcher?: Watcher;
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
+  private activityHeartbeatTimer?: ReturnType<typeof setInterval>;
   private wsGeneration = 0;
   private pendingCatchUpGeneration?: number;
   private lastWsKeepaliveWrite = 0;
@@ -184,6 +186,7 @@ export class RboxDaemon {
     this.markWsStartupDisconnected();
     await this.activityWrite;
     if (this.stopped) return;
+    this.startActivityHeartbeat();
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
     const initialState = await this.loadSyncBase();
@@ -293,6 +296,7 @@ export class RboxDaemon {
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
+    this.stopActivityHeartbeat();
     for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
     this.writeFinishRetryTimers.clear();
     this.deferredRetryPaths.clear();
@@ -677,6 +681,20 @@ export class RboxDaemon {
   /** Persist the activity record after a WS-only update. */
   private writeWsActivity(): void {
     this.enqueueActivityWrite(false);
+  }
+
+  /** Timer-driven daemon heartbeat: proves the process is alive even if a pump op is hung. */
+  private startActivityHeartbeat(intervalMs = ACTIVITY_HEARTBEAT_MS): void {
+    if (this.activityHeartbeatTimer || this.stopped) return;
+    this.activityHeartbeatTimer = setInterval(() => {
+      if (!this.stopped) this.enqueueActivityWrite(true);
+    }, intervalMs);
+  }
+
+  private stopActivityHeartbeat(): void {
+    if (!this.activityHeartbeatTimer) return;
+    clearInterval(this.activityHeartbeatTimer);
+    this.activityHeartbeatTimer = undefined;
   }
 
   private markLocalUnsettledFromWatchEvent(): void {

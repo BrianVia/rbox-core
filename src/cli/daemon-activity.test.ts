@@ -97,6 +97,8 @@ interface DaemonInternals {
   loadSyncBase(): Promise<SyncState>;
   scheduleWriteFinishRetry(paths: Set<string>): void;
   writeWsActivity(): void;
+  startActivityHeartbeat(intervalMs?: number): void;
+  stopActivityHeartbeat(): void;
   recordCommittedFrame(sequence: number): void;
   handleWsMessageData(data: string): void;
   markWsOpen(ws: WebSocket): number;
@@ -157,6 +159,7 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 }
 
 const fakeWs = () => ({ readyState: WebSocket.OPEN, send: () => {}, close: () => {} }) as unknown as WebSocket;
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 async function withIsolatedDaemonHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const oldHome = process.env.RBOX_HOME;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
@@ -567,6 +570,32 @@ test("local snapshot stays unsettled while a pump op is in flight", async () => 
 
     expect((await loadActivity(root))?.local?.settled).toBe(false);
   } finally {
+    remote.releaseCommit.resolve();
+    await pump;
+    await daemon.activityWrite;
+  }
+});
+
+test("timer heartbeat advances while a pump op is in flight", async () => {
+  const remote = new HookedCommitRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "during.txt"), "local work");
+  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.want.push = true;
+
+  const pump = daemon.pump();
+  await remote.commitEntered.promise;
+  const before = daemon.activity.at;
+  try {
+    daemon.startActivityHeartbeat(5);
+    for (let i = 0; i < 20 && daemon.activity.at === before; i++) await sleep(10);
+    await daemon.activityWrite;
+
+    const activity = await loadActivity(root);
+    expect(activity?.at).not.toBe(before);
+    expect(activity?.local?.settled).toBe(false);
+  } finally {
+    daemon.stopActivityHeartbeat();
     remote.releaseCommit.resolve();
     await pump;
     await daemon.activityWrite;
