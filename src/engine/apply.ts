@@ -106,7 +106,13 @@ export async function applyActions(
   // plateau, so foreground pulls default to 128. Constrained clients can pin
   // RBOX_DOWNLOAD_CONCURRENCY=64; daemon pulls still rely on design 49's
   // background IO priority/throttling instead of a lower command default.
-  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 128);
+  // §77: the batch coalescer fills batches FROM this pool — 128 tasks can never
+  // fill 16 slots × 32 records of batch capacity (measured 2026-07-07: 12.8
+  // shas/batch, join 231s vs 202s single-GET). A task awaiting the coalescer is
+  // just a promise, so when batching is on the supply scales to slots×records
+  // and the coalescer, not this pool, bounds real network parallelism.
+  const batchDefault = process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 128;
+  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 512 ? envDl : batchDefault);
   await poolMap(rest, dlConc, async (a) => {
     if (a.kind === "write") {
       await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
