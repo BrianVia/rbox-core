@@ -46,9 +46,15 @@ export class CachedReleases extends WorkerEntrypoint<Env> {
   }
 }
 
-// §33 GRACE_1: the Phase-1 mark→purge grace, sized to exceed the slowest in-flight
-// commit + clock skew (founder: ≈1h; the existing manual GC default, worker.ts).
-const GRACE_1_MS = 60 * 60 * 1000;
+// §33 GRACE_1: the Phase-1 mark→purge grace. Sized to exceed the slowest in-flight
+// FIRST PUBLISH, not the slowest commit: a 123k-file/17GB workspace uploads for
+// hours with ZERO commit roots, so every grant looks unreachable until the first
+// commit anchors it. At 1h the hourly cron marked 71,742 in-flight grants and
+// forced a full re-upload (live incident, 2026-07-07 — the founder's ~/Development
+// first publish Sisyphus'd against this all night). 24h keeps GC's leak-closing
+// purpose (over-cap partials, abandoned uploads) while never racing a real push;
+// the durable fix, if ever needed, is a granted_at keepalive on active sessions.
+const GRACE_1_MS = 24 * 60 * 60 * 1000;
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext & { exports: WorkerEntrypointExports }): Promise<Response> {
