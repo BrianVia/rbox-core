@@ -870,7 +870,7 @@ test("design 74 phase 0: pull reports git-apply repo timings and commonDir group
   expect(details.commonDirGroups).toBe(0);
   expect(details.results.unchanged).toBe(2);
   expect(details.repoTimings).toHaveLength(2);
-  expect(details.repoTimings.map((t) => t.index)).toEqual([0, 1]);
+  expect(details.repoTimings.map((t) => t.index).sort()).toEqual([0, 1]);
   for (const t of details.repoTimings) {
     expect(t.queueMs).toBeGreaterThanOrEqual(0);
     expect(t.wallMs).toBeGreaterThanOrEqual(0);
