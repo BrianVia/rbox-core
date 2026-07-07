@@ -17,6 +17,7 @@ import {
   formatGitPushLine,
   gitBaseAfterCommit,
   gitForceForMissingBlobs,
+  gitReposManifestSchema,
   planGitSections,
 } from "./sync-git.js";
 import { deferManifest, encryptAndUpload, reportDeferred } from "./sync-recovery.js";
@@ -406,7 +407,7 @@ async function runPushAttempt(
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
   const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff);
-  local = { ...local, manifestSchema: gitPlan.gitRepos ? 2 : local.manifestSchema, gitRepos: gitPlan.gitRepos };
+  local = { ...local, manifestSchema: gitReposManifestSchema(gitPlan.gitRepos) ?? local.manifestSchema, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {
     const d = diffManifests(state.lastSyncedManifest, local);

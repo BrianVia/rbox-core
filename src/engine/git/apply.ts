@@ -14,6 +14,7 @@ import {
   gitBusy,
   gitOk,
   headBranchOf,
+  importGitPackChain,
   listWorktrees,
   moveFileAtomic,
   repoCtx,
@@ -108,12 +109,13 @@ async function worktreeCollision(ctx: RepoCtx, section: GitSection, deletesAbsen
  * (design 43 §7 [v2, B5; v3]) — this function trusts `repoDir`.
  *
  * `opts.beforeMutate` (design 43 §9 [v5] clean materialization): invoked AFTER every
- * artifact has been fetched+decrypted+verified but BEFORE any gitdir mutation — the
- * caller's quarantine+ref-wipe of a removal-memory leftover runs here, so a missing or
- * corrupt remote artifact can never strand a wiped repo (codex step-3 MAJOR). When the
- * hook wipes syncable refs, callers must set `beforeMutateWipesRefs` so the worktree
- * collision pre-check can defer before the hook strands a sibling checkout. A hook
- * throw returns {applied:false} with the target untouched.
+ * artifact has been fetched+decrypted+verified/imported into scratch refs but BEFORE
+ * publish/ref-wipe/index mutation. The caller's quarantine+ref-wipe of a removal-memory
+ * leftover runs here, so a missing or corrupt remote artifact can never strand a wiped
+ * repo (codex step-3 MAJOR). When the hook wipes syncable refs, callers must set
+ * `beforeMutateWipesRefs` so the worktree collision pre-check can defer before the hook
+ * strands a sibling checkout. A hook throw returns {applied:false} after scratch refs
+ * are cleaned.
  */
 export async function applyGitState(
   repoDir: string,
@@ -199,17 +201,34 @@ export async function applyGitState(
   const removeFreshGit = async () => {
     if (createdGit) await fs.rm(path.join(repoDir, ".git"), { recursive: true, force: true }).catch(() => {});
   };
+  let incomingNs: string | undefined;
+  const cleanupIncoming = async () => {
+    if (!incomingNs) return;
+    for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    incomingNs = undefined;
+  };
+  const importIncoming = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+    await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
+    incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    try {
+      await importGitPackChain(repoDir, section, store, kek, tmpDir, incomingNs);
+      return { ok: true };
+    } catch (e) {
+      await cleanupIncoming();
+      await removeFreshGit();
+      return {
+        ok: false,
+        reason: `git artifact fetch/decrypt/import failed (no publish): ${(e as Error)?.message ?? e}`,
+      };
+    }
+  };
   try {
-    // §28 (codex M4): fetch + DECRYPT + verify ALL artifacts into temp files BEFORE touching
-    // the gitdir (and before `git init` on a fresh target). A decrypt/fetch/verify failure
-    // (wrong key, swapped blob, corruption) returns {applied:false} with the target untouched
-    // — never aborts mid-mutation. GCM + the plaintext-sha check in decryptFileToPath
-    // authenticate each artifact here.
-    const bundlePath = path.join(tmpDir, "in.bundle");
+    // §28 (codex M4): decrypt side artifacts before publish/index mutation. Bundle
+    // links are decrypted, git-verified, and imported into scratch refs below; failures
+    // clean those refs and return {applied:false} before user-visible git state changes.
     const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;
     const opTmp: Array<{ rel: string; tmp: string }> = [];
     try {
-      await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
       if (indexTmp) await getGitArtifact(store, kek, { sha: section.indexSha!, encSha: section.indexEncSha!, cipherSize: section.indexCipherSize! }, indexTmp, tmpDir);
       for (const [rel, ref] of Object.entries(section.opState ?? {})) {
         const tmp = path.join(tmpDir, "op", rel);
@@ -220,24 +239,14 @@ export async function applyGitState(
       return { applied: false, reason: `git artifact fetch/decrypt failed (no mutation): ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
 
-    // GIT-LEVEL bundle verification BEFORE any mutation when a repo already exists at
-    // the target: decrypt + plaintext-sha authenticate the BYTES, not their bundle-ness
-    // — a sha-valid non-bundle would otherwise pass to `beforeMutate`, wipe a clean-
-    // materialization leftover, and only then fail `bundle verify` (codex step-3
-    // round-2 repro). Our bundles are self-contained (no prerequisites), so verifying
-    // against the pre-existing repo is equivalent to the post-init verify below, which
-    // stays as the fresh-target gate (nothing exists to verify against before init).
-    let bundleVerified = false;
     if (ctx) {
-      if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
-        return { applied: false, reason: "bundle verify failed (no mutation)", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
-      }
-      bundleVerified = true;
+      const imported = await importIncoming();
+      if (!imported.ok) return { applied: false, reason: imported.reason, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
 
-    // Artifacts are decrypt-verified on disk and the bundle is git-verified — the
-    // caller's pre-mutation step (quarantine + ref-wipe for a clean materialization)
-    // may now run. Failure → no mutation yet, defer cleanly.
+    // Artifacts are decrypt-verified on disk and bundle links are git-verified/imported
+    // into scratch refs. The caller's pre-mutation step (quarantine + ref-wipe for a
+    // clean materialization) may now run; failure cleans scratch refs and defers cleanly.
     if (opts.beforeMutate) {
       try {
         await opts.beforeMutate();
@@ -263,17 +272,12 @@ export async function applyGitState(
         await removeFreshGit();
         return { applied: false, reason: "git init failed for fresh apply target" };
       }
+      const imported = await importIncoming();
+      if (!imported.ok) return { applied: false, reason: imported.reason, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
 
     const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
     const snap = await snapshotLocal(ctx);
-
-    // Fresh targets verify here (a repo now exists); existing targets verified above —
-    // don't pay the full bundle read twice.
-    if (!bundleVerified && !(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
-      await removeFreshGit();
-      return { applied: false, reason: "bundle verify failed", filteredRefs: filteredRefs.length ? filteredRefs : undefined };
-    }
 
     // Quarantine local committed+staged state first — fail closed if we can't (§9 [v5]:
     // bundle with capture-grade pinning PLUS index/op-state copies).
@@ -284,24 +288,6 @@ export async function applyGitState(
       } catch (e) {
         return { applied: false, reason: `quarantine bundle failed; aborting: ${(e as Error)?.message ?? e}`, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
-    }
-
-    // Import objects from the (decrypted, verified) remote bundle into a non-checked-out,
-    // APPLY-UNIQUE namespace (pointer targets share the ref store with sibling worktrees —
-    // a fixed namespace would race concurrent sibling applies, same hazard as rbox-wip).
-    await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
-    const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-    try {
-      // --no-tags: fetch's tag-following would otherwise write the bundle's refs/tags/* DIRECTLY
-      // into refs/tags (outside the namespace refspec) — on a pointer target that is the shared
-      // tag store the §7 filter exists to protect. Tags still publish on dir targets via the
-      // explicit update-ref loop below (they're in section.refs).
-      await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
-    } catch (e) {
-      // Nothing published yet — refs/HEAD/index are untouched; only namespaced scratch may exist.
-      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
-      await removeFreshGit();
-      return { applied: false, reason: `bundle fetch failed (no publish): ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     }
 
     try {
@@ -342,10 +328,11 @@ export async function applyGitState(
       else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {});
       return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     } finally {
-      for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+      await cleanupIncoming();
     }
     return { applied: true, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
   } finally {
+    await cleanupIncoming();
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 }

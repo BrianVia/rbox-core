@@ -45,6 +45,11 @@ export interface GitArtifactRef {
   cipherSize: number;
 }
 
+export interface GitPackLink extends GitArtifactRef {
+  /** Commit tips made reachable by this historical bundle link. */
+  tips: string[];
+}
+
 /** Which ref semantics a {@link GitSection} carries (design 43 §2 [v2, B1]).
  *  "all"    — the section's refs are the repo's COMPLETE syncable ref set (dir-repo
  *             capture; design-02 semantics: apply may delete absent refs).
@@ -59,6 +64,8 @@ export interface GitSection {
   bundleEncSha: string;
   /** ciphertext byte length of the bundle (upload size + advisory blobRef size). */
   bundleCipherSize: number;
+  /** Ancestor bundle links, ordered base → older increments → previous increment. */
+  packChain?: GitPackLink[];
   /** HEAD file contents — "ref: refs/heads/x" or a detached 40-hex sha. */
   head: string;
   /** refname → commit sha for every published ref (identity + receiver publish set). */

@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { buildPairing, redeemPairing, serializeRefset, type DeviceSecrets, type SignedRoster } from "../engine/e2ee/index.js";
-import type { GitSection, Manifest } from "../engine/index.js";
-import { E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
+import { gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
 import { pull, push } from "./sync.js";
@@ -43,6 +43,26 @@ const sidecarShaOf = (manifest: Manifest): string => {
   });
   return shaBytes(serializeRefset(refs));
 };
+test("blobRefsForManifest includes every git packChain link", () => {
+  const section: GitSection = {
+    bundleSha: "a".repeat(64),
+    bundleEncSha: "b".repeat(64),
+    bundleCipherSize: 10,
+    packChain: [
+      { sha: "c".repeat(64), encSha: "d".repeat(64), cipherSize: 20, tips: ["e".repeat(40)] },
+      { sha: "f".repeat(64), encSha: "0".repeat(64), cipherSize: 30, tips: ["1".repeat(40)] },
+    ],
+    head: "ref: refs/heads/main",
+    refs: { "refs/heads/main": "2".repeat(40) },
+    indexSha: "3".repeat(64),
+    indexEncSha: "4".repeat(64),
+    indexCipherSize: 5,
+    refScope: "all",
+    generatedAt: "",
+  };
+  const refs = blobRefsForManifest({ generatedAt: "", files: [], manifestSchema: 3, gitRepos: { repo: section } })!;
+  expect(refs.map((r) => r.encSha).sort()).toEqual(["0".repeat(64), "4".repeat(64), "b".repeat(64), "d".repeat(64)].sort());
+});
 const seedManifestRefs = (server: FakeServer, manifest: Manifest): void => {
   for (const f of manifest.files) {
     if (f.type === "file" && f.encSha) server.store.blobs.set(f.encSha, new Uint8Array([1]));
@@ -220,11 +240,10 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const body = JSON.parse(server.commits.at(-1)!.body) as { blobRefs: { encSha: string }[] };
     const refShas = body.blobRefs.map((r) => r.encSha);
     expect(new Set(refShas).size).toBe(refShas.length); // no duplicate refs
-    const gitShas = (s: GitSection) => [s.bundleEncSha, ...(s.indexEncSha ? [s.indexEncSha] : []), ...Object.values(s.opState ?? {}).map((r) => r.encSha)];
     for (const s of Object.values(sections)) {
-      for (const e of gitShas(s)) {
-        expect(refShas).toContain(e);
-        expect(server.store.blobs.has(e)).toBe(true);
+      for (const ref of gitSectionBlobRefs(s)) {
+        expect(refShas).toContain(ref.encSha);
+        expect(server.store.blobs.has(ref.encSha)).toBe(true);
       }
     }
 

@@ -19,7 +19,7 @@ import {
   type Wrap,
 } from "../engine/e2ee/index.js";
 import { hashBytes } from "../engine/hash.js";
-import { poolMap, type BlobStore, type Manifest } from "../engine/index.js";
+import { gitSectionBlobRefs, poolMap, type BlobStore, type Manifest } from "../engine/index.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
@@ -55,13 +55,11 @@ export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string;
     if (!f.encSha) return null;
     if (!refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
   }
-  const addGit = (encSha: string | undefined, size: number | undefined) => {
-    if (encSha && !refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size: size ?? 0 });
+  const addGit = (encSha: string, size: number) => {
+    if (!refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size });
   };
   for (const g of Object.values(manifest.gitRepos ?? {})) {
-    addGit(g.bundleEncSha, g.bundleCipherSize);
-    addGit(g.indexEncSha, g.indexCipherSize);
-    for (const ref of Object.values(g.opState ?? {})) addGit(ref.encSha, ref.cipherSize);
+    for (const ref of gitSectionBlobRefs(g)) addGit(ref.encSha, ref.size);
   }
   return [...refByEnc.values()];
 }

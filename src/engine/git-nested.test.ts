@@ -21,6 +21,7 @@ import {
   scanManifest,
   validateManifest,
   LocalBlobStore,
+  MAX_PACK_CHAIN,
   MAX_GIT_REPOS,
   type FileEntry,
   type GitSection,
@@ -759,10 +760,28 @@ test("validateManifest: schema gate — legacy `git` refused, newer schema refus
   const legacy = validateManifest({ generatedAt: "", files: [], git: section() });
   expect(legacy.ok).toBe(false);
   expect(!legacy.ok && legacy.error).toContain("older rbox");
-  const future = validateManifest({ generatedAt: "", files: [], manifestSchema: 3 });
+  const future = validateManifest({ generatedAt: "", files: [], manifestSchema: 4 });
   expect(future.ok).toBe(false);
   expect(!future.ok && future.error).toContain("upgrade rbox");
   expect(validateManifest({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: {} }).ok).toBe(true);
+});
+
+test("validateManifest: schema-3 packChain gate and section-local chain rules", () => {
+  const link = { sha: "d".repeat(64), encSha: "e".repeat(64), cipherSize: 5, tips: ["f".repeat(40)] };
+  const hex64 = (n: number) => n.toString(16).repeat(64).slice(0, 64);
+  const chained = section({ packChain: [link] });
+  const underSchema = validateManifest(m43({ ".": chained }));
+  expect(underSchema.ok).toBe(false);
+  expect(!underSchema.ok && underSchema.error).toContain("packChain requires manifestSchema >= 3");
+  expect(validateManifest(m43({ ".": chained }, { manifestSchema: 3 })).ok).toBe(true);
+  expect(validateManifest(m43({ ".": section({ packChain: [{ ...link, tips: [] }] }) }, { manifestSchema: 3 })).ok).toBe(false);
+  expect(validateManifest(m43({ ".": section({ packChain: [{ ...link, encSha: "bad" }] }) }, { manifestSchema: 3 })).ok).toBe(false);
+  const tooLong = Array.from({ length: MAX_PACK_CHAIN }, (_, i) => ({
+    ...link,
+    sha: hex64(i),
+    encSha: hex64(i + 1),
+  }));
+  expect(validateManifest(m43({ ".": section({ packChain: tooLong }) }, { manifestSchema: 3 })).ok).toBe(false);
 });
 
 test("validateManifest: gitRepos keys — '.', safe rel paths ok; traversal/dup/file-collision/bad-section refused", () => {

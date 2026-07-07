@@ -67,6 +67,10 @@ export interface GitCaptureOptions {
   uploadAttempts?: number;
   /** Backoff between sha-mismatch retries; attempt is zero-based. */
   backoff?: (attempt: number) => Promise<void>;
+  /** Previous section tips that may be excluded from this bundle to produce an increment. */
+  basis?: { tips: string[] };
+  /** Internal planning hook: called when basis bundle creation degrades to a full bundle. */
+  onBasisFallback?: (reason: string) => void;
 }
 
 export function gitCaptureScratchRoot(workspaceRoot: string): string {
@@ -234,7 +238,15 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       ctx.kind === "dir"
         ? [...dirAllArgs!, ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
         : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
-    await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs]);
+    const basisTips = [...new Set(opts.basis?.tips ?? [])].filter((tip) => /^[0-9a-f]{40}$/.test(tip)).sort();
+    try {
+      await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs, ...basisTips.map((tip) => `^${tip}`)]);
+    } catch (e) {
+      if (basisTips.length === 0) throw e;
+      opts.onBasisFallback?.((e as Error)?.message ?? String(e));
+      await fs.rm(bundlePath, { force: true }).catch(() => {});
+      await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs]);
+    }
 
     // 4. §28: ENCRYPT each staged artifact under the workspace KEK, upload the CIPHERTEXT by
     //    encSha (convergent — same primitive as file blobs), and record (plaintext sha, encSha,
