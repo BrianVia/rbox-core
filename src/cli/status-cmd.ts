@@ -131,7 +131,10 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const state = await loadState(root, syncStreamId(cfg));
-  const matcher = buildIgnoreMatcher(root);
+  const matcher = buildIgnoreMatcher(root, {
+    respectGitignore: cfg.respectGitignore === true,
+    knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+  });
   const hashCache = await HashCache.load(root);
   const gitRepoFeed = createGitRepoFeed();
   const gitChangedP = gitDivergenceCount(root, cfg, state, matcher, gitRepoFeed.iterable).catch(() => 0);

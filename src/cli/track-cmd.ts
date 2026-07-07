@@ -100,6 +100,7 @@ export async function track(
     // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
     // non-git root; pass --git false to opt out.
     syncGit: flags.git !== "false",
+    respectGitignore: flags["respect-gitignore"] === "true",
     // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
     // no round-trip (manual-id / --workspace entry has none → status falls back to id).
     ...(pickedName ? { name: pickedName } : {}),

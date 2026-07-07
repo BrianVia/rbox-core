@@ -6,7 +6,7 @@ import { postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
-import { addIgnorePattern, listIgnoreRules } from "./ignore-cmd.js";
+import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { PROD_REMOTE } from "./credentials.js";
@@ -318,7 +318,9 @@ async function main(): Promise<void> {
     }
     case "ignore": {
       const root = await resolvePathFlagRoot(flags.path);
-      if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
+      if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
+      else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
+      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
       else await addIgnorePattern(root, positional[0]!);
       break;
     }

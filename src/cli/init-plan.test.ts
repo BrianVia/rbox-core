@@ -56,6 +56,7 @@ test("default (no flags) → new workspace, firstSync push", () => {
   if (isInitError(r)) throw new Error("unexpected error");
   expect(r.workspace).toEqual({ kind: "new", project: "root" });
   expect(r.firstSync).toBe("push");
+  expect(r.respectGitignore).toBe(false);
 });
 
 test("--workspace <id> → join, firstSync sync (pull-first, not blind push)", () => {
@@ -63,6 +64,12 @@ test("--workspace <id> → join, firstSync sync (pull-first, not blind push)", (
   if (isInitError(r)) throw new Error("unexpected error");
   expect(r.workspace).toEqual({ kind: "join", id: "ws_abc", project: "api" });
   expect(r.firstSync).toBe("sync");
+});
+
+test("--respect-gitignore opts a new workspace into design-72 file filtering", () => {
+  const r = resolveInitPlan(input({ flags: { "respect-gitignore": "true" } }));
+  if (isInitError(r)) throw new Error("unexpected error");
+  expect(r.respectGitignore).toBe(true);
 });
 
 test("--no-sync overrides firstSync to none for both new and join", () => {

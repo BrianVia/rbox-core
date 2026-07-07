@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
-import { loadConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, daemonLogPaths, readDaemonBindingRecord } from "./daemon-control.js";
 import { loadDevice } from "./e2ee-keystore.js";
@@ -202,8 +202,12 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
   }
 }
 
-async function workspaceShape(root: string): Promise<WorkspaceShape> {
-  const matcher = buildIgnoreMatcher(root);
+async function workspaceShape(root: string, cfg: WorkspaceConfig): Promise<WorkspaceShape> {
+  const state = await loadState(root, syncStreamId(cfg));
+  const matcher = buildIgnoreMatcher(root, {
+    respectGitignore: cfg.respectGitignore === true,
+    knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+  });
   const shape: WorkspaceShape = { fileCount: 0, totalBytes: 0 };
   await addWorkspaceShape(root, "", matcher, shape);
   return shape;
@@ -219,7 +223,7 @@ async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMa
   }
   for (const ent of entries) {
     const rel = relDir ? `${relDir}/${ent.name}` : ent.name;
-    if (matcher.ignores(ent.isDirectory() ? `${rel}/` : rel)) continue;
+    if (ent.isDirectory() ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel)) continue;
     const abs = path.join(root, rel);
     if (ent.isDirectory()) {
       await addWorkspaceShape(root, rel, matcher, shape);
@@ -247,7 +251,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     checkRemote(creds, cfg),
     checkVersion(creds, cfg),
     checkState(root, cfg),
-    workspaceShape(root),
+    workspaceShape(root, cfg),
   ]);
   return {
     root,

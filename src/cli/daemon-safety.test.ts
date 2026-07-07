@@ -45,6 +45,9 @@ interface SafetyInternals {
   watcher?: { close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
+  matcher: { ignores(path: string): boolean };
+  cfg: { respectGitignore?: boolean };
+  reloadWorkspaceConfigIfChanged(): Promise<void>;
 }
 
 function makeDaemon(root: string): SafetyInternals {
@@ -114,6 +117,37 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("design 72: safety tick reloads workspace.json and rebuilds the matcher", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  const cfg = {
+    remoteWorkspaceId: "w",
+    projectId: "root",
+    deviceId: "d",
+    rootPath: root,
+    remoteUrl: "https://example.invalid",
+    token: "",
+    respectGitignore: false,
+  };
+  try {
+    fs.mkdirSync(path.join(root, ".rbox"), { recursive: true });
+    fs.mkdirSync(path.join(root, "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(root, "pkg", ".gitignore"), "ignored.txt\n");
+    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify(cfg));
+
+    await daemon.reloadWorkspaceConfigIfChanged();
+    expect(daemon.cfg.respectGitignore).toBe(false);
+    expect(daemon.matcher.ignores("pkg/ignored.txt")).toBe(false);
+
+    fs.writeFileSync(path.join(root, ".rbox", "workspace.json"), JSON.stringify({ ...cfg, respectGitignore: true }, null, 2));
+    await daemon.reloadWorkspaceConfigIfChanged();
+    expect(daemon.cfg.respectGitignore).toBe(true);
+    expect(daemon.matcher.ignores("pkg/ignored.txt")).toBe(true);
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

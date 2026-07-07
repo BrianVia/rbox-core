@@ -242,7 +242,7 @@ async function startParcel(
         } catch {
           /* raced away; treat as file, applyWatchEvents handles the vanish */
         }
-        if (matcher.ignores(isDir ? `${rel}/` : rel)) continue;
+        if (isDir ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel)) continue;
         if (ev.type === "create") batcher.push(rel, isDir ? "addDir" : "add");
         else batcher.push(rel, "change");
       }
@@ -280,7 +280,7 @@ function startChokidar(
     ignored: (p: string, stats?: { isDirectory(): boolean }) => {
       const rel = toRel(p);
       if (rel === "" || escapesRoot(rel)) return false; // the root itself
-      return stats?.isDirectory() ? matcher.ignores(`${rel}/`) : matcher.ignores(rel);
+      return stats?.isDirectory() ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel);
     },
   });
 

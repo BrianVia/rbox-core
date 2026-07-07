@@ -3,15 +3,28 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
-import { loadState, syncStreamId } from "./config.js";
+import { loadState, saveState, syncStreamId } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { PhaseReport, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, PhaseReport, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
+import { listTrash } from "../engine/trash.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+const exec = promisify(execFile);
+const fakeGitSection = (): GitSection => ({
+  bundleSha: sha("bundle"),
+  bundleEncSha: sha("bundle-enc"),
+  bundleCipherSize: 1,
+  head: "ref: refs/heads/main",
+  refs: {},
+  refScope: "all",
+  generatedAt: "",
+});
 
 // Fixed test workspace KEK — E2EE is the only sync mode now (design 12 D6), so the
 // FakeRemote operates at the blob layer in CIPHERTEXT (by encSha) exactly as the
@@ -459,6 +472,93 @@ test("a now-ignored, previously-synced file is carried forward (not seen as a de
   expect(latest.manifest.files.some((f) => f.path === "keep.env")).toBe(true); // carried forward
 });
 
+test("design 72: enabling respectGitignore deletes nothing and stops updating newly ignored untracked files", async () => {
+  const remote = new FakeRemote();
+  await fs.mkdir(path.join(root, "junk"), { recursive: true });
+  await write("junk/cache.txt", "v1\n");
+  await push(root, cfg, deps(remote));
+  const before = (await remote.latest()).manifest.files.find((f) => f.path === "junk/cache.txt")!;
+  expect(before).toBeDefined();
+
+  cfg = { ...cfg, respectGitignore: true };
+  await write(".gitignore", "junk/\n");
+  await write("junk/cache.txt", "v2\n");
+  await push(root, cfg, deps(remote));
+  const latest = await remote.latest();
+  const carried = latest.manifest.files.find((f) => f.path === "junk/cache.txt");
+  expect(carried?.sha256).toBe(before.sha256); // stale carry, not an update and not a delete
+  expect(latest.manifest.files.some((f) => f.path === ".gitignore")).toBe(true);
+});
+
+test("design 72: explicit purgeIgnored push removes now-ignored carried entries", async () => {
+  const remote = new FakeRemote();
+  await fs.mkdir(path.join(root, "junk"), { recursive: true });
+  await write("junk/cache.txt", "v1\n");
+  await push(root, cfg, deps(remote));
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "junk/cache.txt")).toBe(true);
+
+  cfg = { ...cfg, respectGitignore: true };
+  await write(".gitignore", "junk/\n");
+  await push(root, cfg, deps(remote), true);
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "junk/cache.txt")).toBe(false);
+});
+
+test("design 72: purge push refuses if a known repo becomes unevaluable after the dry-run manifest", async () => {
+  const remote = new FakeRemote();
+  cfg = { ...cfg, respectGitignore: true };
+  const repo = path.join(root, "hidden");
+  await fs.mkdir(repo, { recursive: true });
+  await exec("git", ["-C", repo, "init", "-qb", "main"]);
+  await write(".gitignore", "hidden/\n");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "tracked");
+  await exec("git", ["-C", repo, "add", "-f", "tracked.txt"]);
+
+  const stale = await remote.seedEntry("hidden/drop.txt", "stale\n");
+  await saveState(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [stale], manifestSchema: 2, gitRepos: { hidden: fakeGitSection() } },
+  });
+
+  const dryRunMatcher = buildIgnoreMatcher(root, {
+    respectGitignore: true,
+    forceTrackedEvaluation: true,
+    protectTrackedPaths: true,
+    knownGitRepos: ["hidden"],
+  });
+  const dryRunLocal = await scanManifest(root, dryRunMatcher);
+  await fs.rm(path.join(repo, ".git", "index"), { force: true });
+
+  const before = remote.commitCalls;
+  await expect(pushManifest(root, cfg, dryRunLocal, deps(remote), 0, true)).rejects.toThrow(/refusing purge: cannot evaluate tracked files/);
+  expect(remote.commitCalls).toBe(before);
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(0);
+});
+
+test("design 72: purge with respectGitignore off still preserves tracked files under a .rboxignore repo dir", async () => {
+  const remote = new FakeRemote();
+  const repo = path.join(root, "repo");
+  await fs.mkdir(repo, { recursive: true });
+  await exec("git", ["-C", repo, "init", "-qb", "main"]);
+  await fs.writeFile(path.join(repo, "keep.txt"), "tracked");
+  await fs.writeFile(path.join(repo, "drop.txt"), "untracked");
+  await exec("git", ["-C", repo, "add", "-f", "keep.txt"]);
+  await push(root, cfg, deps(remote));
+
+  const st = await loadState(root, syncStreamId(cfg));
+  await saveState(root, {
+    ...st,
+    lastSyncedManifest: { ...st.lastSyncedManifest, manifestSchema: 2, gitRepos: { repo: fakeGitSection() } },
+  });
+  await write(".rboxignore", "repo/\n");
+
+  await push(root, cfg, deps(remote), true);
+  const paths = (await remote.latest()).manifest.files.map((f) => f.path).sort();
+  expect(paths).toContain(".rboxignore");
+  expect(paths).toContain("repo/keep.txt");
+  expect(paths).not.toContain("repo/drop.txt");
+});
+
 // ── full sync cycle ────────────────────────────────────────────────────────
 
 test("sync = pull then push in one call", async () => {
@@ -596,6 +696,7 @@ test("mass-delete guard: normal-scale deletions (under half the baseline) apply 
   const actions = await pull(root, cfg, deps(remote));
   expect(actions.filter((a) => a.kind === "delete")).toHaveLength(30);
   await expect(fs.access(path.join(root, "f90.txt"))).rejects.toThrow();
+  expect((await listTrash(root)).some((e) => e.path === "f90.txt")).toBe(true);
   expect(await read("f89.txt")).toBe("89\n");
 });
 

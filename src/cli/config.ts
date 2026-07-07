@@ -33,6 +33,9 @@ export interface WorkspaceConfig {
   /** Opt-in git-state sync (M2). Default off — syncing git config could move
    *  machine-local settings; hooks are never synced regardless. */
   syncGit?: boolean;
+  /** Design 72 opt-in: when true, nested `.gitignore` rules exclude gitignored
+   *  untracked files from the FILE layer. Existing workspaces default false. */
+  respectGitignore?: boolean;
   /** Per-repo opt-out for dependency-drift nudges (design 29). When true, a sync
    *  that writes a changed lockfile into this tree prints no drift notice. */
   noDrift?: boolean;
