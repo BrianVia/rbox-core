@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { BlobStore } from "../blobstore.js";
 import { encryptFileToTemp, decryptFileToPath } from "../crypto.js";
-import type { GitArtifactRef } from "../types.js";
+import type { GitArtifactRef, GitPackLink, GitSection } from "../types.js";
 
 /** Repo shape: "dir" = ordinary repo (`.git` directory); "pointer" = worktree/submodule
  *  checkout (`.git` gitfile whose state lives in the main clone's gitdir). */
@@ -179,6 +179,86 @@ export async function listWorktrees(repoDir: string): Promise<WorktreeEntry[]> {
 export function headBranchOf(head: string): string | undefined {
   const m = /^ref: (refs\/heads\/\S+)$/.exec(head.trim());
   return m?.[1];
+}
+
+export function gitSectionTips(section: Pick<GitSection, "head" | "refs">): string[] {
+  const tips = new Set<string>();
+  for (const sha of Object.values(section.refs)) {
+    if (HEX40.test(sha)) tips.add(sha);
+  }
+  const head = section.head.trim();
+  if (HEX40.test(head)) tips.add(head);
+  return [...tips].sort();
+}
+
+export function gitSectionNewestLink(section: GitSection): GitPackLink {
+  return {
+    sha: section.bundleSha,
+    encSha: section.bundleEncSha,
+    cipherSize: section.bundleCipherSize,
+    tips: gitSectionTips(section),
+  };
+}
+
+export function gitSectionPackLinks(section: GitSection): GitPackLink[] {
+  return [...(section.packChain ?? []), gitSectionNewestLink(section)];
+}
+
+export function gitSectionBlobRefs(section: GitSection): Array<{ encSha: string; size: number }> {
+  return [
+    { encSha: section.bundleEncSha, size: section.bundleCipherSize },
+    ...(section.packChain ?? []).map((link) => ({ encSha: link.encSha, size: link.cipherSize })),
+    ...(section.indexEncSha ? [{ encSha: section.indexEncSha, size: section.indexCipherSize ?? 0 }] : []),
+    ...Object.values(section.opState ?? {}).map((ref) => ({ encSha: ref.encSha, size: ref.cipherSize })),
+  ];
+}
+
+async function gitTipsPresent(repoDir: string, tips: readonly string[]): Promise<boolean> {
+  if (tips.length === 0) return false;
+  for (const tip of tips) {
+    if (!(await gitOk(repoDir, ["cat-file", "-e", `${tip}^{commit}`]))) return false;
+  }
+  return true;
+}
+
+/** Import every missing link in a git bundle chain into an apply-unique namespace.
+ *  The caller owns namespace cleanup after publish or defer. */
+export async function importGitPackChain(
+  repoDir: string,
+  section: GitSection,
+  store: BlobStore,
+  kek: Buffer,
+  tmpDir: string,
+  incomingNs: string
+): Promise<{ imported: number; skipped: number }> {
+  let imported = 0;
+  let skipped = 0;
+
+  const importLink = async (link: GitPackLink, i: number): Promise<void> => {
+    const bundlePath = path.join(tmpDir, `chain-${i}.bundle`);
+    await getGitArtifact(store, kek, link, bundlePath, tmpDir);
+    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+      throw new Error(`bundle verify failed for git pack link ${i}`);
+    }
+    await git(repoDir, ["fetch", "--no-tags", bundlePath, `+refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    imported++;
+  };
+
+  const links = gitSectionPackLinks(section);
+  const hasHistoricalLinks = (section.packChain?.length ?? 0) > 0;
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i]!;
+    // Presence-skip is only safe for historical chain links. The current section's
+    // index/op-state reference only CURRENT-link objects; superseded links' WIP
+    // objects are never referenced by restored state, and repo fsck remains the
+    // backstop after import/publish.
+    if (hasHistoricalLinks && i < links.length - 1 && (await gitTipsPresent(repoDir, link.tips))) {
+      skipped++;
+      continue;
+    }
+    await importLink(link, i);
+  }
+  return { imported, skipped };
 }
 
 // ---- filesystem helpers ---------------------------------------------------

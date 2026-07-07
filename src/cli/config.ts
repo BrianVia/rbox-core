@@ -33,6 +33,11 @@ export interface WorkspaceConfig {
   /** Opt-in git-state sync (M2). Default off — syncing git config could move
    *  machine-local settings; hooks are never synced regardless. */
   syncGit?: boolean;
+  /** Git-sync feature gates. Schema-3 pack chains are default-on; `incremental: false`
+   *  is the escape hatch for full-bundle recaptures. */
+  git?: {
+    incremental?: boolean;
+  };
   /** Design 72 opt-in: when true, nested `.gitignore` rules exclude gitignored
    *  untracked files from the FILE layer. Existing workspaces default false. */
   respectGitignore?: boolean;

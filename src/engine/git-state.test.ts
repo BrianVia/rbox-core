@@ -11,14 +11,19 @@ import {
   normalizeSymbolicHeadCasing,
   GitCaptureDeferredError,
   gitCaptureScratchRoot,
+  gitSectionNewestLink,
+  gitSectionTips,
   gitIdentity,
   gitIdentityKey,
   gitPreflight,
   LocalBlobStore,
+  preserveGitConflict,
   scanManifest,
+  setGitSpawnObserver,
   sweepStaleGitCaptureDirs,
   validateGitSection,
   type BlobStore,
+  type GitSection,
 } from "./index.js";
 
 const exec = promisify(execFile);
@@ -54,6 +59,11 @@ async function commitFile(dir: string, file: string, content: string, msg: strin
   await fs.writeFile(path.join(dir, file), content);
   await git(dir, "add", file);
   await git(dir, "commit", "-qm", msg);
+}
+async function captureIncrement(repo: string, base: GitSection): Promise<GitSection> {
+  const inc = await captureGitState(repo, store, KEK, { basis: { tips: gitSectionTips(base) } });
+  expect(inc).toBeDefined();
+  return { ...inc!, packChain: [...(base.packChain ?? []), gitSectionNewestLink(base)] };
 }
 async function appendPackedRef(dir: string, ref: string, sha: string) {
   const packed = path.join(dir, ".git", "packed-refs");
@@ -193,6 +203,169 @@ test("capture→apply reproduces branches, staged state, and stash across repos"
 
   // fsck clean.
   await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("incremental dir/all capture uses basis negations and a chained section round-trips", async () => {
+  await initRepo(A);
+  await commitFile(A, "history.txt", "base\n", "c1");
+  const base = await captureGitState(A, store, KEK);
+  expect(base).toBeDefined();
+  const baseTip = await git(A, "rev-parse", "main");
+
+  await fs.writeFile(path.join(A, "history.txt"), "stashed\n");
+  await git(A, "stash", "-q");
+  await commitFile(A, "next.txt", "next\n", "c2");
+
+  const bundleCreates: string[][] = [];
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "bundle" && args[1] === "create") bundleCreates.push([...args]);
+  });
+  let chained: NonNullable<Awaited<ReturnType<typeof captureGitState>>>;
+  try {
+    chained = await captureIncrement(A, base!);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  const incArgs = bundleCreates.at(-1)!;
+  expect(incArgs).toContain("--all");
+  expect(incArgs).toContain("refs/stash");
+  expect(incArgs).toContain(`^${baseTip}`);
+  expect(chained.packChain).toHaveLength(1);
+
+  const res = await applyGitState(B, chained, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(B, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  expect(await git(B, "rev-parse", "refs/stash")).toBe(await git(A, "rev-parse", "refs/stash"));
+});
+
+test("rewritten refs between increment links import with forced scratch refs, and second apply skips only historical links", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "base\n", "c1");
+  const base = (await captureGitState(A, store, KEK))!;
+  const c1 = await git(A, "rev-parse", "main");
+
+  await commitFile(A, "f.txt", "base\nold-tip\n", "c2");
+  const link1 = await captureIncrement(A, base);
+  const c2 = await git(A, "rev-parse", "main");
+
+  await git(A, "reset", "--hard", c1);
+  await commitFile(A, "f.txt", "base\nrewritten-tip\n", "c3");
+  const rewritten = await captureIncrement(A, link1);
+  const c3 = await git(A, "rev-parse", "main");
+  expect(c3).not.toBe(c2);
+  expect(rewritten.packChain).toHaveLength(2);
+
+  let res = await applyGitState(B, rewritten, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(B, "rev-parse", "main")).toBe(c3);
+
+  const fetches: string[][] = [];
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "fetch") fetches.push([...args]);
+  });
+  try {
+    res = await applyGitState(B, rewritten, store, KEK);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(res.applied).toBe(true);
+  expect(fetches).toHaveLength(1);
+});
+
+test("current incremental link is imported even when recorded commit tips are already present", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "base\n", "c1");
+  const base = (await captureGitState(A, store, KEK))!;
+  let res = await applyGitState(B, base, store, KEK);
+  expect(res.applied).toBe(true);
+
+  await fs.writeFile(path.join(A, "staged.txt"), "staged\n");
+  await git(A, "add", "staged.txt");
+  const chained = await captureIncrement(A, base);
+  expect(chained.packChain).toHaveLength(1);
+  expect(gitSectionTips(chained)).toEqual(gitSectionTips(base));
+
+  res = await applyGitState(B, chained, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(B, "diff", "--cached", "--name-only")).toBe("staged.txt");
+  await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+});
+
+test("unchained full-bundle sections do not use presence probes", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "base\n", "c1");
+  const section = (await captureGitState(A, store, KEK))!;
+  expect(section.packChain).toBeUndefined();
+
+  let res = await applyGitState(B, section, store, KEK);
+  expect(res.applied).toBe(true);
+
+  let catFileProbes = 0;
+  let fetches = 0;
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "cat-file" && args[1] === "-e") catFileProbes++;
+    if (args[0] === "fetch") fetches++;
+  });
+  try {
+    res = await applyGitState(B, section, store, KEK);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(res.applied).toBe(true);
+  expect(catFileProbes).toBe(0);
+  expect(fetches).toBe(1);
+});
+
+test("preserveGitConflict imports the current WIP link even when commit tips are present", async () => {
+  await initRepo(A);
+  await commitFile(A, "f.txt", "base\n", "c1");
+  const base = (await captureGitState(A, store, KEK))!;
+  const applied = await applyGitState(B, base, store, KEK);
+  expect(applied.applied).toBe(true);
+
+  await fs.writeFile(path.join(A, "staged.txt"), "staged\n");
+  await git(A, "add", "staged.txt");
+  const chained = await captureIncrement(A, base);
+  expect(gitSectionTips(chained)).toEqual(gitSectionTips(base));
+
+  const preserved = await preserveGitConflict(B, chained, store, KEK);
+  expect(preserved.recoveryBundle).toBeDefined();
+  await expect(git(B, "bundle", "verify", preserved.recoveryBundle!)).resolves.toBeDefined();
+  expect(await git(B, "bundle", "list-heads", preserved.recoveryBundle!)).toContain("rbox-wip");
+});
+
+test("detached pointer captures use detached HEAD as basis for scoped chains", async () => {
+  const M = path.join(tmp, "main");
+  const W = path.join(tmp, "worktree");
+  await fs.mkdir(M, { recursive: true });
+  await initRepo(M);
+  await commitFile(M, "f.txt", "base\n", "c1");
+  await git(M, "worktree", "add", "--detach", W, "HEAD");
+
+  const base = (await captureGitState(W, store, KEK))!;
+  expect(base.refScope).toBe("scoped");
+  expect(base.refs).toEqual({});
+  await commitFile(W, "detached.txt", "next\n", "detached c2");
+
+  const bundleCreates: string[][] = [];
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "bundle" && args[1] === "create") bundleCreates.push([...args]);
+  });
+  let chained: NonNullable<Awaited<ReturnType<typeof captureGitState>>>;
+  try {
+    chained = await captureIncrement(W, base);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  const incArgs = bundleCreates.at(-1)!;
+  expect(incArgs).not.toContain("--all");
+  expect(incArgs).toContain(`^${base.head}`);
+  expect(chained.refs).toEqual({});
+  expect(chained.head).toBe(await git(W, "rev-parse", "HEAD"));
+
+  const res = await applyGitState(B, chained, store, KEK);
+  expect(res.applied).toBe(true);
+  expect(await git(B, "rev-parse", "HEAD")).toBe(chained.head);
 });
 
 test("capture stages ciphertext under workspace .rbox/gitcap, not direct os.tmpdir scratch", async () => {

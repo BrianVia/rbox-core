@@ -1,5 +1,6 @@
 import { test as bunTest, expect, beforeEach, afterEach } from "bun:test";
 import { execFile, execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -8,7 +9,7 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
 import { gitDivergenceCount, gitDivergenceFastRepoSource } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
@@ -24,9 +25,6 @@ test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>
 // are the post-decryption plaintext view (same layering as sync.test.ts's FakeRemote).
 const KEK = Buffer.alloc(32, 7);
 const enc = (content: string | Buffer) => encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
-
-/** Ciphertext addresses a git section references — mirrors the server's §28 blobRef view. */
-const gitShasOf = (s: GitSection): string[] => [s.bundleEncSha, ...(s.indexEncSha ? [s.indexEncSha] : []), ...Object.values(s.opState ?? {}).map((r) => r.encSha)];
 
 /**
  * Stateful in-memory server (the sync.test.ts FakeRemote, extended for design 43):
@@ -74,7 +72,7 @@ class FakeRemote implements SyncRemote {
       if (f.type === "file" && !this.blobs.has(f.encSha ?? f.sha256)) missing.add(f.encSha ?? f.sha256);
     }
     for (const g of Object.values(manifest.gitRepos ?? {})) {
-      for (const s of gitShasOf(g)) if (!this.blobs.has(s)) missing.add(s);
+      for (const ref of gitSectionBlobRefs(g)) if (!this.blobs.has(ref.encSha)) missing.add(ref.encSha);
     }
     if (missing.size > 0) return { unsatisfiedBlobs: [...missing] };
     this.head += 1;
@@ -172,6 +170,11 @@ async function commitFile(dir: string, file: string, content: string, msg: strin
   // identity via -c so commits work in repos rbox materialized (no local user config)
   if (date) await gitAt(dir, date, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
   else await git(dir, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", msg);
+}
+async function commitBinaryHistory(dir: string, prefix: string, count = 4) {
+  for (let i = 0; i < count; i++) {
+    await commitFile(dir, `${prefix}-${i}.bin`, crypto.randomBytes(2048).toString("hex"), `${prefix} ${i}`);
+  }
 }
 async function appendPackedRef(dir: string, ref: string, sha: string) {
   const packed = path.join(dir, ".git", "packed-refs");
@@ -318,6 +321,218 @@ test("root repo '.' still syncs end-to-end (pre-§43 behavior preserved)", async
   await syncCycle();
   expect(remote.headSeq()).toBe(head);
 });
+
+test("design 53: schema-3 incremental chain round-trips and is smaller than the base full bundle", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  for (let i = 0; i < 12; i++) {
+    await commitFile(r, `history-${i}.txt`, `${i}\n${"x".repeat(4096)}\n`, `history ${i}`);
+  }
+  await push(rootA, cfgA, depsA);
+  const base = (await remote.latest()).manifest.gitRepos!["r"]!;
+  expect((await remote.latest()).manifest.manifestSchema).toBe(2);
+
+  await commitFile(r, "delta.txt", "small delta\n", "delta");
+  await push(rootA, cfgA, depsA);
+  const chained = (await remote.latest()).manifest;
+  const sec = chained.gitRepos!["r"]!;
+  expect(chained.manifestSchema).toBe(3);
+  expect(sec.packChain).toHaveLength(1);
+  expect(sec.packChain![0]!.encSha).toBe(base.bundleEncSha);
+  expect(sec.bundleCipherSize).toBeLessThan(base.bundleCipherSize);
+
+  await pull(rootB, cfgB, depsB);
+  await expect(git(path.join(rootB, "r"), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+  expect(await git(path.join(rootB, "r"), "rev-parse", "main")).toBe(await git(r, "rev-parse", "main"));
+}, 30_000);
+
+test("design 53: default-on staged-only increment materializes on the receiver", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitBinaryHistory(r, "base", 8);
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+
+  await fs.writeFile(path.join(r, "staged.txt"), "staged\n");
+  await git(r, "add", "staged.txt");
+  await push(rootA, cfgA, depsA);
+
+  const chained = (await remote.latest()).manifest;
+  expect(chained.manifestSchema).toBe(3);
+  expect(chained.gitRepos!["r"]!.packChain).toHaveLength(1);
+
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, "r");
+  expect(await git(b, "status", "--porcelain", "--untracked-files=no")).toBe(await git(r, "status", "--porcelain", "--untracked-files=no"));
+  expect(await git(b, "status", "--porcelain", "--", "staged.txt")).toBe("A  staged.txt");
+  await expect(git(b, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
+}, 30_000);
+
+test("design 53: explicit git.incremental false keeps full-bundle schema-2 recaptures", async () => {
+  cfgA = { ...cfgA, git: { incremental: false } };
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitBinaryHistory(r, "base");
+  await push(rootA, cfgA, depsA);
+  const base = (await remote.latest()).manifest.gitRepos!["r"]!;
+
+  await commitFile(r, "delta.txt", "v2\n", "c2");
+  await push(rootA, cfgA, depsA);
+
+  const full = (await remote.latest()).manifest;
+  expect(full.manifestSchema).toBe(2);
+  expect(full.gitRepos!["r"]!.packChain).toBeUndefined();
+  expect(full.gitRepos!["r"]!.bundleEncSha).not.toBe(base.bundleEncSha);
+}, 30_000);
+
+test("design 53: missing chain blob in 422 page forces a full-bundle recapture", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitBinaryHistory(r, "base");
+  await push(rootA, cfgA, depsA);
+  await commitFile(r, "delta.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+  const chained = (await remote.latest()).manifest.gitRepos!["r"]!;
+  expect(chained.packChain).toHaveLength(1);
+
+  remote.deleteBlob(chained.packChain![0]!.encSha);
+  await fs.writeFile(path.join(rootA, "note.txt"), "forces commit\n");
+  await push(rootA, cfgA, depsA);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect(healed.manifestSchema).toBe(2);
+  expect(healed.gitRepos!["r"]!.packChain).toBeUndefined();
+  await expect(remote.blobStore().get(healed.gitRepos!["r"]!.bundleEncSha)).resolves.toBeDefined();
+}, 30_000);
+
+test("design 53: length and byte compaction triggers publish full bundles", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const rLen = path.join(rootA, "rLen");
+  await initRepo(rLen);
+  await commitFile(rLen, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  let sA = await st(rootA);
+  const lenBase = sA.lastSyncedManifest.gitRepos!["rLen"]!;
+  const maxLinks = Array.from({ length: MAX_PACK_CHAIN - 1 }, () => gitSectionNewestLink(lenBase));
+  await saveState(rootA, {
+    ...sA,
+    lastSyncedManifest: { ...sA.lastSyncedManifest, manifestSchema: 3, gitRepos: { rLen: { ...lenBase, packChain: maxLinks } } },
+  });
+  await commitFile(rLen, "f.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["rLen"]!.packChain).toBeUndefined();
+
+  const rByte = path.join(rootA, "rByte");
+  await initRepo(rByte);
+  await commitFile(rByte, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  sA = await st(rootA);
+  const byteBase = sA.lastSyncedManifest.gitRepos!["rByte"]!;
+  await saveState(rootA, {
+    ...sA,
+    lastSyncedManifest: { ...sA.lastSyncedManifest, gitRepos: { ...sA.lastSyncedManifest.gitRepos, rByte: { ...byteBase, bundleCipherSize: 1 } } },
+  });
+  await commitFile(rByte, "f.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["rByte"]!.packChain).toBeUndefined();
+}, 30_000);
+
+test("design 53: missing receiver link defers, then heals when sender recompacts full", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitBinaryHistory(r, "base");
+  await push(rootA, cfgA, depsA);
+  await commitFile(r, "delta.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+  const chained = (await remote.latest()).manifest.gitRepos!["r"]!;
+  const blocked = chained.packChain![0]!.encSha;
+  const failingRemote: SyncRemote = {
+    latest: () => remote.latest(),
+    missingBlobs: (shas) => remote.missingBlobs(shas),
+    putBlobFile: (sha256, absPath, size, uploadsDir) => remote.putBlobFile(sha256, absPath, size, uploadsDir),
+    commit: (parentSequence, deviceId, manifest) => remote.commit(parentSequence, deviceId, manifest),
+    blobStore() {
+      const bs = remote.blobStore();
+      return {
+        ...bs,
+        async get(s) {
+          if (s === blocked) throw new Error("simulated receiver-only missing chain link");
+          return bs.get(s);
+        },
+        async getToFile(s, dest) {
+          if (s === blocked) throw new Error("simulated receiver-only missing chain link");
+          if (bs.getToFile) return bs.getToFile(s, dest);
+          await fs.writeFile(dest, await bs.get(s));
+        },
+      };
+    },
+  };
+  await pull(rootB, cfgB, { ...depsB, remote: failingRemote });
+  expect((await st(rootB)).gitPendingRemote?.["r"]).toBeDefined();
+
+  const sA = await st(rootA);
+  const maxLinks = Array.from({ length: MAX_PACK_CHAIN - 1 }, () => gitSectionNewestLink(chained));
+  await saveState(rootA, {
+    ...sA,
+    lastSyncedManifest: { ...sA.lastSyncedManifest, manifestSchema: 3, gitRepos: { r: { ...chained, packChain: maxLinks } } },
+  });
+  await commitFile(r, "f.txt", "v3", "c3");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.packChain).toBeUndefined();
+
+  await pull(rootB, cfgB, depsB);
+  expect((await st(rootB)).gitPendingRemote?.["r"]).toBeUndefined();
+  expect(await git(path.join(rootB, "r"), "rev-parse", "main")).toBe(await git(r, "rev-parse", "main"));
+}, 30_000);
+
+test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  for (const rel of ["ra", "rb", "rc"]) {
+    const r = path.join(rootA, rel);
+    await initRepo(r);
+    await commitBinaryHistory(r, "base");
+  }
+  await push(rootA, cfgA, depsA);
+  for (const rel of ["ra", "rb", "rc"]) await commitFile(path.join(rootA, rel), "delta.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+
+  let fetches = 0;
+  setGitSpawnObserver((_root, args) => {
+    if (args[0] === "fetch") fetches++;
+  });
+  try {
+    await pull(rootB, cfgB, depsB);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(fetches).toBeLessThanOrEqual(3 * MAX_PACK_CHAIN);
+  expect(fetches).toBe(6);
+}, 30_000);
+
+test("design 53: conflict preserve materializes a complete recovery bundle for chained sections", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitBinaryHistory(r, "base");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+
+  await commitFile(r, "delta.txt", "v2", "c2");
+  await push(rootA, cfgA, depsA);
+  expect((await remote.latest()).manifest.gitRepos!["r"]!.packChain).toHaveLength(1);
+
+  const b = path.join(rootB, "r");
+  await commitFile(b, "local.txt", "local\n", "local");
+  await pull(rootB, cfgB, depsB);
+  expect((await st(rootB)).gitNeedsResolution?.["r"]).toBeDefined();
+  const recDir = path.join(b, ".rbox", "git-conflicts");
+  const bundles = (await fs.readdir(recDir)).filter((f) => f.endsWith(".bundle"));
+  expect(bundles.length).toBeGreaterThan(0);
+  await expect(git(b, "bundle", "verify", path.join(recDir, bundles[0]!))).resolves.toBeDefined();
+}, 30_000);
 
 // ── design 68 §3.3: in-tree linked-worktree pointer skip (base-carry) ──────────────
 

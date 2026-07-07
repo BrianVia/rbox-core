@@ -1,4 +1,4 @@
-export type { FileEntry, FileType, Manifest, GitSection, GitRefScope, GitArtifactRef } from "./types.js";
+export type { FileEntry, FileType, Manifest, GitSection, GitRefScope, GitArtifactRef, GitPackLink } from "./types.js";
 export {
   gitPreflight,
   gitIdentity,
@@ -10,6 +10,10 @@ export {
   applyGitState,
   GitCaptureDeferredError,
   preserveGitConflict,
+  gitSectionBlobRefs,
+  gitSectionNewestLink,
+  gitSectionPackLinks,
+  gitSectionTips,
   validateGitSection,
   isSyncableRef,
   gitIdentityKey,
@@ -59,6 +63,7 @@ export {
   MAX_MANIFEST_BYTES,
   MAX_SYMLINK_TARGET_BYTES,
   KNOWN_MANIFEST_SCHEMA,
+  MAX_PACK_CHAIN,
   MAX_GIT_REPOS,
 } from "./manifest-validate.js";
 export {

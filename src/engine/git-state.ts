@@ -9,7 +9,7 @@
 export { isSyncableRef, validateGitSection } from "./manifest-validate.js";
 
 export type { GitRepoKind, RepoCtx } from "./git/shared.js";
-export { inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver } from "./git/shared.js";
+export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver } from "./git/shared.js";
 export { gitPreflight, isGitBusy, type GitPreflightResult } from "./git/preflight.js";
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
 export {

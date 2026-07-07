@@ -13,15 +13,20 @@ import {
   inTreeWorktreeParentRel,
   inTreeWorktreeParentRelFromCtx,
   isGitBusy,
+  gitSectionBlobRefs,
+  gitSectionNewestLink,
+  gitSectionTips,
   preserveGitConflict,
   projectIdentity,
   quarantineAndWipeGitState,
   repoCtxFromDisk,
   poolMap,
+  MAX_PACK_CHAIN,
   MAX_GIT_REPOS,
   writeFileAtomic,
   type DiscoveredGitRepo,
   type GitIdentity,
+  type GitPackLink,
   type GitPreflightResult,
   type GitRepoKind,
   type GitRefScope,
@@ -64,10 +69,67 @@ const repoDirOf = (root: string, relPath: string) => (relPath === "." ? root : p
  *  cross-scope identity comparison (design 43 §7). */
 const narrowerScope = (a: GitRefScope, b: GitRefScope | undefined): GitRefScope => (a === "scoped" || b === "scoped" ? "scoped" : "all");
 const projectedKey = (g: GitSection | GitIdentity | undefined, scope: GitRefScope): string => gitIdentityKey(g ? projectIdentity(g, scope) : undefined);
-/** Every ciphertext address a git section references (bundle + index + op-state). */
-const sectionEncShas = (s: GitSection): string[] => [s.bundleEncSha, ...(s.indexEncSha ? [s.indexEncSha] : []), ...Object.values(s.opState ?? {}).map((r) => r.encSha)];
+export const gitReposManifestSchema = (gitRepos: Record<string, GitSection> | undefined): 2 | 3 | undefined =>
+  gitRepos ? (Object.values(gitRepos).some((s) => (s.packChain?.length ?? 0) > 0) ? 3 : 2) : undefined;
 const emptyToUndef = <T,>(o: Record<string, T>): Record<string, T> | undefined => (Object.keys(o).length ? o : undefined);
 const errMsg = (e: unknown): string => (e as Error)?.message ?? String(e);
+
+function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
+  if (cfg.git?.incremental === false || !baseSec || forced) return undefined;
+  const basisTips = gitSectionTips(baseSec);
+  if (basisTips.length === 0) return undefined;
+  const chain = [...(baseSec.packChain ?? []), gitSectionNewestLink(baseSec)];
+  if (chain.length + 1 > MAX_PACK_CHAIN) return undefined;
+  return { basisTips, chain };
+}
+
+function exceedsPackChainByteBound(chain: GitPackLink[], newestCipherSize: number): boolean {
+  if (chain.length === 0) return false;
+  const incrementBytes = chain.slice(1).reduce((n, l) => n + l.cipherSize, 0) + newestCipherSize;
+  return incrementBytes >= chain[0]!.cipherSize;
+}
+
+async function capturePlannedGitSection(
+  root: string,
+  rel: string,
+  cfg: WorkspaceConfig,
+  baseSec: GitSection | undefined,
+  api: SyncRemote,
+  kek: Buffer,
+  uploadsDir: string,
+  forced: boolean,
+  backoff?: (attempt: number) => Promise<void>
+): Promise<{ section?: GitSection; reason?: string }> {
+  const repoDir = repoDirOf(root, rel);
+  const capture = (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) =>
+    captureGitState(repoDir, api.blobStore(), kek, {
+      workspaceRoot: root,
+      uploadsDir,
+      uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
+      backoff,
+      ...opts,
+    });
+
+  const incremental = incrementalCapturePlan(cfg, baseSec, forced);
+  let basisFellBack = false;
+  const section = await capture(
+    incremental
+      ? {
+          basis: { tips: incremental.basisTips },
+          onBasisFallback: () => {
+            basisFellBack = true;
+          },
+        }
+      : {}
+  );
+  if (!section || !incremental || basisFellBack) return { section };
+  if (!exceedsPackChainByteBound(incremental.chain, section.bundleCipherSize)) {
+    return { section: { ...section, packChain: incremental.chain } };
+  }
+
+  const full = await capture();
+  return full ? { section: full } : { reason: "capture returned nothing during git pack recompaction" };
+}
 
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
@@ -375,17 +437,12 @@ export async function planGitSections(
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
-      const sec = await captureGitState(repoDirOf(root, rel), api.blobStore(), kek, {
-        workspaceRoot: root,
-        uploadsDir,
-        uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
-        backoff,
-      });
+      const { section: sec, reason } = await capturePlannedGitSection(root, rel, cfg, base[rel], api, kek, uploadsDir, force.has(rel), backoff);
       if (sec) {
         out[rel] = sec;
         captured.push(rel);
       } else {
-        deferOne(rel, "capture returned nothing (repo vanished mid-capture or failed self-validation)");
+        deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
       }
     } catch (e) {
       deferOne(rel, e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`);
@@ -439,7 +496,7 @@ export function gitBaseAfterCommit(
 export function gitForceForMissingBlobs(committedGit: Record<string, GitSection> | undefined, missing: Set<string>): Set<string> {
   const gitForce = new Set<string>();
   for (const [rel, sec] of Object.entries(committedGit ?? {})) {
-    if (sectionEncShas(sec).some((s) => missing.has(s))) gitForce.add(rel);
+    if (gitSectionBlobRefs(sec).some((ref) => missing.has(ref.encSha))) gitForce.add(rel);
   }
   return gitForce;
 }

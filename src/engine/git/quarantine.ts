@@ -3,16 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import type { BlobStore } from "../blobstore.js";
 import type { GitSection } from "../types.js";
-import { type RepoCtx, exists, getGitArtifact, git, gitOk, readHead, repoCtx } from "./shared.js";
-import { pruneEmptyOpStateDirs, readAllRefs, readOpState, readScopedRefs } from "./refs.js";
+import { type RepoCtx, HEX40, exists, git, gitOk, importGitPackChain, readHead, repoCtx } from "./shared.js";
+import { listRefs, pruneEmptyOpStateDirs, readAllRefs, readOpState, readScopedRefs } from "./refs.js";
 import { WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 
 /** Quarantine the local repo's committed + staged state before a mutating apply —
  *  a bundle with the SAME HEAD/pseudo-ref pinning discipline as capture, PLUS copies
  *  of index/op-state (full recovery, not refs-only — design 43 §9 [v5]). Dir repos
- *  bundle `--all`; pointer repos bundle their scoped line of work (an `--all` bundle
- *  of a big SHARED clone would be huge and isn't ours to quarantine). Throws on
- *  bundle failure — callers fail closed. */
+ *  bundle syncable refs explicitly so apply-time rbox scratch namespaces are never
+ *  captured into the user's recovery bundle. Pointer repos bundle only their scoped
+ *  line of work (an `--all` bundle of a big SHARED clone would be huge and isn't
+ *  ours to quarantine). Throws on bundle failure — callers fail closed. */
 export async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): Promise<string> {
   await fs.mkdir(qDir, { recursive: true });
   const bundlePath = path.join(qDir, `${ts}.bundle`);
@@ -27,7 +28,7 @@ export async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): P
   try {
     const args =
       ctx.kind === "dir"
-        ? ["--all", ...pins.refs]
+        ? [...Object.keys(await readAllRefs(ctx.repoDir)), ...pins.refs]
         : [...Object.keys(await readScopedRefs(ctx.repoDir, head)), ...pins.refs];
     await git(ctx.repoDir, ["bundle", "create", bundlePath, ...args]);
   } finally {
@@ -82,17 +83,20 @@ export async function quarantineAndWipeGitState(repoDir: string): Promise<{ quar
 export async function preserveGitConflict(repoDir: string, section: GitSection, store: BlobStore, kek: Buffer): Promise<{ recoveryBundle?: string }> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitcf-"));
   try {
-    const bundlePath = path.join(tmpDir, "remote.bundle");
-    await getGitArtifact(store, kek, { sha: section.bundleSha, encSha: section.bundleEncSha, cipherSize: section.bundleCipherSize }, bundlePath, tmpDir);
-    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) return {};
     const ts = `${Date.now()}`;
-    // --no-tags: tag-following would write remote tags DIRECTLY into refs/tags, outside the
-    // recovery namespace — a silent local mutation the conflict flow must never make.
-    await git(repoDir, ["fetch", "--no-tags", bundlePath, `refs/*:refs/rbox-conflict/${ts}/*`], { maxBuffer: 64 * 1024 * 1024 }).catch(() => {});
+    const incomingNs = `refs/rbox-conflict/${ts}`;
+    await importGitPackChain(repoDir, section, store, kek, tmpDir, incomingNs);
+    for (const [ref, sha] of Object.entries(section.refs)) {
+      await git(repoDir, ["update-ref", `${incomingNs}/${ref.replace(/^refs\//, "")}`, sha]).catch(() => {});
+    }
+    if (Object.keys(section.refs).length === 0 && HEX40.test(section.head.trim())) {
+      await git(repoDir, ["update-ref", `${incomingNs}/detached-head`, section.head.trim()]).catch(() => {});
+    }
     const recDir = path.join(repoDir, ".rbox", "git-conflicts");
     await fs.mkdir(recDir, { recursive: true });
     const recoveryBundle = path.join(recDir, `remote-${ts}.bundle`);
-    await fs.copyFile(bundlePath, recoveryBundle).catch(() => {});
+    const refs = await listRefs(repoDir, incomingNs);
+    if (refs.length > 0) await git(repoDir, ["bundle", "create", recoveryBundle, ...refs]).catch(() => {});
     return { recoveryBundle };
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });

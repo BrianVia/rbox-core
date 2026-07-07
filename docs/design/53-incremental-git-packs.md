@@ -220,12 +220,15 @@ the existing rollback rules (`src/engine/git/apply.ts:307-347`). Chained section
 
 The helper operates over `packChain` plus the section's own bundle:
 
-1. For each link, compute the recorded tips. Chain links use `link.tips`; the newest link uses the
-   current section tips.
-2. Before fetching link `i`, run `git cat-file -e <tip>^{commit}` for each recorded tip. If every
-   tip is already present, skip fetch and import for that link. This turns steady-state ping-pong
-   from O(chain) into O(new links). Fresh joins still pay the full bounded chain.
-3. If a link is not present, fetch/decrypt the artifact with `getGitArtifact`
+1. Unchained full-bundle sections, including schema-2 sections and schema-3 full recaptures, do a
+   straight fetch/decrypt/verify/import of the section bundle with no presence probes.
+2. Chained sections run presence-skip only for historical `packChain` links. For each historical
+   link, run `git cat-file -e <tip>^{commit}` for each recorded `link.tips` value. If every tip is
+   already present, skip fetch and import for that historical link.
+3. The newest link, the section's own bundle, is never skipped. It carries the current section's
+   WIP/index/op-state object closure, whose scratch-pin objects are not visible in recorded commit
+   tips.
+4. If a link is not skipped, fetch/decrypt the artifact with `getGitArtifact`
    (`src/engine/git/shared.ts` exports it; callers already use it from apply and conflict preserve),
    run `git bundle verify` after all ancestor links have been imported, then fetch the bundle with:
 
@@ -292,9 +295,10 @@ never build another increment against a basis the server just proved incomplete.
 
 ## 7. Rollout and build trigger
 
-This remains spec-only and not scheduled. Build it behind an off-by-default `git.incremental` gate,
-then enable one low-stakes repo before widening. A chained manifest advertises schema 3, so mixed
-fleets fail loudly on chained sections rather than silently corrupting them.
+This ships default-on whenever a repo qualifies for incremental capture; `git.incremental: false`
+is the local escape hatch for full-bundle recaptures. The first chained capture flips the manifest
+to schema 3, so older clients reject the workspace until upgraded by deliberate clean-break rule
+rather than silently corrupting chained sections.
 
 The build trigger is measured steady-state re-upload, not first-clone volume:
 
@@ -316,8 +320,8 @@ Add the existing v1 tests plus these v2 gates:
 - **Schema validation:** `KNOWN_MANIFEST_SCHEMA = 3`; `validateManifest` rejects `packChain` under
   schema <3; `validateGitSection` validates link shape/tips/length but does not inspect schema.
 - **Multi-repo fresh join:** N chained repos apply on a fresh receiver with subprocess work bounded
-  by `N × MAX_PACK_CHAIN`; a second apply with no new links uses cat-file presence skips and stays
-  O(new links).
+  by `N × MAX_PACK_CHAIN`; a second apply presence-skips historical links but still imports each
+  section's newest bundle to preserve current WIP/index/op-state closure.
 - **Rewritten-ref chain:** force-push or rebase between links reproduces the non-fast-forward
   scratch-ref blocker; forced refspecs import the later link and final publish lands the rewritten
   tip.
