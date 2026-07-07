@@ -219,10 +219,13 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const a = await bootstrap("rcpt-redeem-bad-hmac");
     const good = await putStaged(a.token, "good");
     const bad = await putStaged(a.token, "bad");
-    // Deterministic tamper: flip the last char to a DIFFERENT char — a fixed "x"
-    // suffix is a no-op ~1/64 runs when the HMAC text already ends in "x" (flaked
-    // in CI 2026-07-07: the untampered receipt verified and granted:2).
-    const tampered = `${bad.receipt.slice(0, -1)}${bad.receipt.endsWith("x") ? "y" : "x"}`;
+    // Deterministic tamper: flip a MID-MAC character. Flipping the FINAL base64
+    // char is not enough — decoders discard the unused low bits of the last
+    // symbol, so adjacent chars can decode to the identical MAC byte (flaked in
+    // CI twice, 2026-07-07: the "tampered" receipt verified and granted:2).
+    // A middle character always carries 6 meaningful bits.
+    const i = bad.receipt.length - 10;
+    const tampered = `${bad.receipt.slice(0, i)}${bad.receipt[i] === "A" ? "B" : "A"}${bad.receipt.slice(i + 1)}`;
     const res = await redeem(a.accountId, { [good.sha]: good.receipt, [bad.sha]: tampered });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ granted: 1, alreadyEntitled: 0, rejected: 1 });
