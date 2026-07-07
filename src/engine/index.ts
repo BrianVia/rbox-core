@@ -30,7 +30,17 @@ export {
 export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
 export { generateKek, kekToPhrase, kekFromPhrase, encryptFileToTemp, decryptFileToPath, type EncryptedBlob } from "./crypto.js";
 export { hashFile, hashBytes } from "./hash.js";
-export { BUILTIN_IGNORE, HARD_PRUNE_DIRS, nativePruneGlobs, buildIgnoreMatcher, effectiveIgnoreRules, isIgnoreRuleFile, type IgnoreMatcher, type IgnoreRule } from "./ignore.js";
+export {
+  BUILTIN_IGNORE,
+  HARD_PRUNE_DIRS,
+  nativePruneGlobs,
+  buildIgnoreMatcher,
+  effectiveIgnoreRules,
+  isIgnoreRuleFile,
+  type BuildIgnoreMatcherOptions,
+  type IgnoreMatcher,
+  type IgnoreRule,
+} from "./ignore.js";
 export { scanManifest, applyWatchEvents, type WatchEvent, type WatchEventKind } from "./manifest.js";
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";

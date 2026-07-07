@@ -37,7 +37,7 @@ import { stderrStyle as e } from "./style.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
-export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string }): Record<string, string> {
+export function workspaceFlags(plan: { kind: "new" | "join"; root: string; workspace?: string; name?: string; respectGitignore?: boolean }): Record<string, string> {
   const flags: Record<string, string> = { root: plan.root, project: "root", "no-interactive": "true" };
   if (plan.kind === "new") flags.new = "true";
   else flags.workspace = plan.workspace ?? "";
@@ -46,6 +46,7 @@ export function workspaceFlags(plan: { kind: "new" | "join"; root: string; works
   // exists, first-writer-wins). Manual-id entry has no name, so the flag is simply
   // absent and status falls back to the id.
   if (plan.name) flags.name = plan.name;
+  if (plan.kind === "new" && plan.respectGitignore === true) flags["respect-gitignore"] = "true";
   return flags;
 }
 
@@ -362,7 +363,23 @@ async function stepWorkspace(
     if (ans) name = ans;
   }
 
-  const flags = workspaceFlags(choice === "new" ? { kind: "new", root: dir, name } : { kind: "join", root: dir, workspace, name });
+  const respectGitignore =
+    choice === "new" &&
+    (await promptSelect<"false" | "true">({
+      message: "How should rbox handle gitignored files?",
+      choices: [
+        { name: "Sync everything (current behavior)", value: "false" },
+        {
+          name: "Skip gitignored untracked files",
+          value: "true",
+          description: "build output and caches stay local; re-include notes/state in .rboxignore",
+        },
+      ],
+    })) === "true";
+
+  const flags = workspaceFlags(
+    choice === "new" ? { kind: "new", root: dir, name, respectGitignore } : { kind: "join", root: dir, workspace, name }
+  );
   return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
 }
 

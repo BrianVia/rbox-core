@@ -19,3 +19,10 @@ test("boolean long flags do not consume following positionals", () => {
 test("known value long flags still consume values", () => {
   expect(parseFlags(["--limit", "25", "--path", "."])).toEqual({ positional: [], flags: { limit: "25", path: "." } });
 });
+
+test("ignore respect-gitignore consumes on/off value", () => {
+  expect(parseFlags(["--respect-gitignore", "on", "--path", "."])).toEqual({
+    positional: [],
+    flags: { "respect-gitignore": "on", path: "." },
+  });
+});

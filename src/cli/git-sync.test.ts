@@ -933,6 +933,26 @@ test("an ignored-but-present leftover keeps its removal memory (guard survives b
   expect((await remote.latest()).manifest.gitRepos).toBeUndefined(); // and nothing resurrected
 }, 20_000);
 
+test("design 72: a based repo hidden by gitignore discovery pruning is silently base-carried, not deferred or removed", async () => {
+  const depA = path.join(rootA, "dep");
+  await initRepo(depA);
+  await commitFile(depA, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const before = (await remote.latest()).manifest.gitRepos?.["dep"]?.bundleEncSha;
+  expect(before).toBeDefined();
+
+  logsB = [];
+  await fs.writeFile(path.join(rootB, ".gitignore"), "dep/\n");
+  await fs.writeFile(path.join(rootB, "note.txt"), "forces a file commit");
+  await push(rootB, cfgB, depsB);
+
+  const latest = await remote.latest();
+  expect(latest.manifest.gitRepos?.["dep"]?.bundleEncSha).toBe(before);
+  expect(logsB.some((l) => l.includes("dep") && l.includes("deferred"))).toBe(false);
+  expect(logsB.some((l) => l.includes("dep") && l.includes("removed"))).toBe(false);
+}, 20_000);
+
 // ── (e) cap semantics [v2, M4] ─────────────────────────────────────────────────────
 
 test("cap: new repos beyond the cap are deferred LOUDLY; base-carrying repos always carry AND still capture", async () => {

@@ -47,7 +47,7 @@ async function walkDir(root: string, rel: string, matcher: IgnoreMatcher, out: D
   for (const e of entries) {
     if (!e.isDirectory()) continue; // dirents don't report symlinked dirs as directories — never followed
     const childRel = rel ? `${rel}/${e.name}` : e.name;
-    if (matcher.ignores(`${childRel}/`)) continue; // pruned before descent (`.git/` is hard-excluded)
+    if ((matcher.prunesForGitDiscovery?.(`${childRel}/`) ?? matcher.ignores(`${childRel}/`))) continue; // pruned before descent (`.git/` is hard-excluded)
     await walkDir(root, childRel, matcher, out);
   }
 }

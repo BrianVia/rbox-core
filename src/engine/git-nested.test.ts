@@ -90,6 +90,31 @@ test("discoverGitRepos finds nested repos + pointers, prunes ignored subtrees, s
   ]);
 });
 
+test("design 72: discovery prunes repos hidden by nested gitignore even when file-sync respect is off", async () => {
+  const root = path.join(tmp, "root-gitignore-discovery");
+  await initRepo(root);
+  await fs.mkdir(path.join(root, "pkg"), { recursive: true });
+  await fs.writeFile(path.join(root, "pkg", ".gitignore"), "checkouts/\n");
+  await initRepo(path.join(root, "pkg", "checkouts", "dep"));
+  await initRepo(path.join(root, "pkg", "src", "kept"));
+
+  const found = await discoverGitRepos(root, buildIgnoreMatcher(root));
+  expect(found.map((r) => r.relPath)).toEqual([".", "pkg/src/kept"]);
+});
+
+test("design 72: .rboxignore re-includes discovery only when ignored ancestors are also re-included", async () => {
+  const root = path.join(tmp, "root-gitignore-redisc");
+  await initRepo(root);
+  await fs.writeFile(path.join(root, ".gitignore"), "deps/\n");
+  await initRepo(path.join(root, "deps", "dep"));
+
+  await fs.writeFile(path.join(root, ".rboxignore"), "!deps/dep/\n");
+  expect((await discoverGitRepos(root, buildIgnoreMatcher(root))).map((r) => r.relPath)).toEqual(["."]);
+
+  await fs.writeFile(path.join(root, ".rboxignore"), "!deps/\n!deps/dep/\n");
+  expect((await discoverGitRepos(root, buildIgnoreMatcher(root))).map((r) => r.relPath)).toEqual([".", "deps/dep"]);
+});
+
 test("scanManifest git collector matches discoverGitRepos for mixed dir and pointer repos", async () => {
   const root = path.join(tmp, "root-scan");
   await initRepo(root);

@@ -87,6 +87,8 @@ export interface InitPlan {
   firstSync: "push" | "sync" | "none";
   /** §28: git-sync defaults ON (git artifacts are E2EE-encrypted); --git false opts out. */
   syncGit: boolean;
+  /** Design 72 opt-in. Defaults false so new scripted workspaces keep current behavior. */
+  respectGitignore: boolean;
 }
 
 export interface InitError {
@@ -164,5 +166,14 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   const firstSync: InitPlan["firstSync"] =
     flags["no-sync"] === TRUE ? "none" : workspace.kind === "new" ? "push" : "sync";
 
-  return { auth, workspace, root, remoteUrl, deviceId: unifyDeviceId(creds), firstSync, syncGit: flags.git !== "false" };
+  return {
+    auth,
+    workspace,
+    root,
+    remoteUrl,
+    deviceId: unifyDeviceId(creds),
+    firstSync,
+    syncGit: flags.git !== "false",
+    respectGitignore: flags["respect-gitignore"] === "true",
+  };
 }

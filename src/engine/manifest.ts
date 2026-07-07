@@ -49,7 +49,7 @@ export async function scanManifest(
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo);
+  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false);
   files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return { generatedAt: new Date().toISOString(), files };
 }
@@ -107,9 +107,9 @@ export async function applyWatchEvents(
       const prefix = `${rel}/`;
       const st = await fs.lstat(path.join(root, rel)).catch(() => undefined);
       if (st?.isDirectory()) {
-        if (matcher.ignores(`${rel}/`)) continue;
+        if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
         const sub: FileEntry[] = [];
-        await walk(root, rel, matcher, sub, cache);
+        await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false);
         const fresh = new Set(sub.map((e) => e.path));
         for (const k of [...map.keys()]) {
           if ((k === rel || k.startsWith(prefix)) && !fresh.has(k)) {
@@ -139,9 +139,9 @@ export async function applyWatchEvents(
         }
       }
     } else if (ev.kind === "addDir") {
-      if (matcher.ignores(`${rel}/`)) continue;
+      if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
       const sub: FileEntry[] = [];
-      await walk(root, rel, matcher, sub, cache);
+      await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false);
       for (const e of sub) map.set(e.path, e);
     } else {
       // add | change
@@ -214,7 +214,8 @@ async function walk(
   cache?: HashCache,
   pending?: PendingHash[],
   onDiscover?: () => void,
-  onGitRepo?: (repo: DiscoveredGitRepo) => void
+  onGitRepo?: (repo: DiscoveredGitRepo) => void,
+  discoveryPruned = false
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
@@ -227,13 +228,15 @@ async function walk(
     const abs = path.join(root, childRel);
     if (entry.name === ".git") {
       const relPath = rel === "" ? "." : rel;
-      if (entry.isDirectory()) onGitRepo?.({ relPath, kind: "dir" });
-      else if (entry.isFile()) onGitRepo?.({ relPath, kind: "pointer" });
+      if (!discoveryPruned && entry.isDirectory()) onGitRepo?.({ relPath, kind: "dir" });
+      else if (!discoveryPruned && entry.isFile()) onGitRepo?.({ relPath, kind: "pointer" });
     }
 
     if (entry.isDirectory()) {
-      if (matcher.ignores(`${childRel}/`)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo);
+      const childDir = `${childRel}/`;
+      const childDiscoveryPruned = discoveryPruned || (matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
+      if ((matcher.prunes?.(childDir) ?? matcher.ignores(childDir))) continue;
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned);
     } else if (entry.isSymbolicLink()) {
       if (matcher.ignores(childRel)) continue;
       onDiscover?.();

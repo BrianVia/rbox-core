@@ -34,6 +34,12 @@ test("Step 2 → runInit flags: a create carries the prompted name to the server
   expect(f).toMatchObject({ new: "true", name: "Conductor Workspaces", "no-interactive": "true" });
 });
 
+test("Step 2 → runInit flags: respectGitignore is opt-in and only forwarded for creates", () => {
+  expect(workspaceFlags({ kind: "new", root: "/code/app" })["respect-gitignore"]).toBeUndefined();
+  expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: true })).toMatchObject({ "respect-gitignore": "true" });
+  expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
+});
+
 // Step 3 collapsed the keep→resume double-confirm into one `select` (the founder once
 // typed a workspace name into a Y/N). The widget itself we don't unit-test, but the
 // LIVE select renders START_SYNC_CHOICES directly, so pinning the ordered labels+values

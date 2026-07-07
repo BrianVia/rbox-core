@@ -1,5 +1,7 @@
 import os from "node:os";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
@@ -12,7 +14,7 @@ import {
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
-import { loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -131,6 +133,7 @@ export class RboxDaemon {
    *  so the "watcher init rejects → reconcile loops stay armed" invariant is testable without
    *  a process-global module mock (which leaks across test files). */
   private startWatcherFn: typeof startWatcher = startWatcher;
+  private workspaceConfigStat?: { mtimeMs: number; size: number };
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
@@ -148,9 +151,9 @@ export class RboxDaemon {
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private readonly cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string) {
+  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
-    this.matcher = buildIgnoreMatcher(root);
+    this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
   }
 
@@ -175,7 +178,9 @@ export class RboxDaemon {
     if (this.stopped) return;
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
-    this.lastLoggedSeq = (await loadState(this.root, syncStreamId(this.cfg))).lastSyncedSequence;
+    const initialState = await loadState(this.root, syncStreamId(this.cfg));
+    this.lastLoggedSeq = initialState.lastSyncedSequence;
+    this.rebuildMatcher(initialState);
 
     // Initial convergence: full scan, then a real pull+push cycle.
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
@@ -535,7 +540,7 @@ export class RboxDaemon {
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
       if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
-        this.matcher = buildIgnoreMatcher(this.root);
+        this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
         this.manifest = await scanManifest(this.root, this.matcher, this.cache);
       } else {
         const deferred = new Set<string>();
@@ -602,7 +607,7 @@ export class RboxDaemon {
     // below and the pump's follow-up push — otherwise that push publishes files the
     // freshly pulled rules exclude (same hazard doPush guards on watcher events).
     if (actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path))) {
-      this.matcher = buildIgnoreMatcher(this.root);
+      this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
     }
     // The pull advanced the local base sequence; remember it so the follow-up no-op
     // push isn't logged as if THIS daemon published the remotely-produced sequence.
@@ -740,12 +745,14 @@ export class RboxDaemon {
   }
 
   private async doFullScan(): Promise<void> {
+    await this.reloadWorkspaceConfigIfChanged();
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
     this.pruneCache();
   }
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
   private async doDeepScan(): Promise<void> {
+    await this.reloadWorkspaceConfigIfChanged();
     const fresh = new HashCache();
     this.manifest = await scanManifest(this.root, this.matcher, fresh);
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
@@ -767,6 +774,29 @@ export class RboxDaemon {
    */
   private pruneCache(): void {
     this.cache.prune(new Set(this.manifest.files.map((f) => f.path)));
+  }
+
+  private rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void {
+    this.matcher = buildIgnoreMatcher(this.root, {
+      respectGitignore: this.cfg.respectGitignore === true,
+      knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
+    });
+  }
+
+  private async reloadWorkspaceConfigIfChanged(): Promise<void> {
+    const file = path.join(this.root, ".rbox", "workspace.json");
+    const st = await fs.stat(file).catch(() => undefined);
+    if (!st) return;
+    const token = { mtimeMs: st.mtimeMs, size: st.size };
+    if (this.workspaceConfigStat && this.workspaceConfigStat.mtimeMs === token.mtimeMs && this.workspaceConfigStat.size === token.size) return;
+    this.workspaceConfigStat = token;
+    const loaded = await loadConfig(this.root);
+    const wasRespecting = this.cfg.respectGitignore === true;
+    this.cfg = { ...loaded, token: this.cfg.token, kek: this.cfg.kek };
+    this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
+    if (wasRespecting !== (this.cfg.respectGitignore === true)) {
+      log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
+    }
   }
 
   // ---- live notification channel (optional; correctness never depends on it) ----

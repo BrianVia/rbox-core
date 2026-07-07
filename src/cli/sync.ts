@@ -9,6 +9,7 @@ import {
   scanManifest,
   validateManifest,
   type Action,
+  type IgnoreMatcher,
   type Manifest,
 } from "../engine/index.js";
 import {
@@ -50,6 +51,13 @@ const scanTick = (deps: SyncDeps): ((discovered: number) => void) | undefined =>
  *  + file count). Computed only on the metrics-enabled path (each is an O(files) pass). */
 const plaintextBytesOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.type === "file" ? f.size : 0), 0);
 const fileCountOf = (m: Manifest): number => m.files.reduce((n, f) => n + (f.type === "file" ? 1 : 0), 0);
+const matcherForState = (root: string, cfg: WorkspaceConfig, state?: { lastSyncedManifest: Manifest }, opts: { purgeSafety?: boolean } = {}) =>
+  buildIgnoreMatcher(root, {
+    respectGitignore: cfg.respectGitignore === true,
+    forceTrackedEvaluation: opts.purgeSafety === true,
+    protectTrackedPaths: opts.purgeSafety === true,
+    knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
+  });
 
 /**
  * Injectable dependencies for the sync entry points (design 09 §1). Defaults
@@ -127,7 +135,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const state = await loadState(root, syncStreamId(cfg));
   const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
-  const matcher = buildIgnoreMatcher(root);
+  const matcher = matcherForState(root, cfg, state);
   const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
   if (report.enabled) {
     report.files = fileCountOf(local);
@@ -187,7 +195,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   try {
     await report.phase("apply", async () => {
       if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
-      const fresh = ruleActions.length > 0 ? buildIgnoreMatcher(root) : matcher;
+      const fresh = ruleActions.length > 0 ? matcherForState(root, cfg, state) : matcher;
       finalMatcher = fresh;
       const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
       await applyActions(root, rest, api.blobStore(), applyOpts);
@@ -249,7 +257,9 @@ export async function push(
 ): Promise<{ sequence: number; committed: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
-  const local = await report.phase("scan", () => scanManifest(root, undefined, cache, scanTick(deps)));
+  const state = await loadState(root, syncStreamId(cfg));
+  const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
   await save();
   if (report.enabled) {
     report.files = fileCountOf(local);
@@ -338,7 +348,8 @@ export async function pushManifest(
       await backoff(attempt);
       await pull(root, cfg, deps);
       const { cache, save } = await withCache(root, deps.cache);
-      currentLocal = await scanManifest(root, undefined, cache, scanTick(deps)); // disk changed under us
+      const state = await loadState(root, syncStreamId(cfg));
+      currentLocal = await scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps)); // disk changed under us
       await save();
       currentForce = NO_GIT_FORCE;
     } else {
@@ -370,7 +381,7 @@ async function runPushAttempt(
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
   const state = await loadState(root, syncStreamId(cfg));
-  const matcher = buildIgnoreMatcher(root); // shared: forward-only ignore carry + git discovery
+  const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
   // NOT read as a deletion on other machines. Carry forward its last-synced entry
@@ -382,6 +393,11 @@ async function runPushAttempt(
     if (carried.length) {
       local = { ...local, files: [...local.files, ...carried].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
     }
+  }
+
+  if (purgeIgnored) {
+    const deleted = diffManifests(state.lastSyncedManifest, local).deleted;
+    assertNoUnevaluatedPurgeDeletes(matcher, deleted);
   }
 
   // Attach the git sections (design 43 §6): per-repo carry/capture/defer/remove map
@@ -517,6 +533,18 @@ async function runPushAttempt(
   });
   if (deferred.size > 0) reportDeferred(deferred);
   return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
+}
+
+function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: string[]): void {
+  for (const path of deleted) {
+    const repo = matcher.unevaluatedGitRepoForPath?.(path);
+    if (repo !== undefined) {
+      throw new Error(
+        `refusing purge: cannot evaluate tracked files for git repo ${repo} (first affected path ${path}). ` +
+          `Fix that repo's .git/index and retry.`
+      );
+    }
+  }
 }
 
 /** One full cycle: take remote changes, then publish local ones. */

@@ -235,6 +235,12 @@ export async function planGitSections(
         delete needsRes[rel];
         continue;
       }
+      const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
+      if (dotGit && rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? false)) {
+        out[rel] = baseSec;
+        skipped.push({ relPath: rel, reason: "gitignored by discovery pruning — carrying base" });
+        continue;
+      }
       deferOne(rel, "no usable .git (deleted or unsupported shape) — carrying base");
       continue;
     }
