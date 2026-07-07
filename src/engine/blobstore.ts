@@ -16,7 +16,7 @@ export interface BlobStore {
   get(sha256: string): Promise<Buffer>;
   /** Optional streaming download into a file — used by apply for large blobs so
    *  they never materialize in memory. Falls back to get()+write when absent. */
-  getToFile?(sha256: string, destPath: string): Promise<void>;
+  getToFile?(sha256: string, destPath: string, expectedSize?: number): Promise<void>;
   /** Optional streaming upload from a file (e.g. a git bundle) by content address.
    *  `uploadsDir` lets remote multipart implementations persist resumable tokens. */
   putFile?(

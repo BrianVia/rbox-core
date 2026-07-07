@@ -96,7 +96,7 @@ export function isTransientNetworkError(e: unknown): boolean {
   return false;
 }
 
-function envInt(name: string, fallback: number, min: number, max: number): number {
+export function envInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
   if (!/^-?\d+$/.test(raw)) return fallback;

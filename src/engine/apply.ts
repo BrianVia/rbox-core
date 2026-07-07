@@ -3,7 +3,7 @@ import path from "node:path";
 import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
-import { decryptFileToPath } from "./crypto.js";
+import { BLOB_CIPHERTEXT_TAG_BYTES, decryptFileToPath } from "./crypto.js";
 import { assertWithinRoot, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
@@ -195,7 +195,7 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
     const ctTmp = `${tmp}.ct`;
     try {
       const t0 = LANE_TIMING ? performance.now() : 0;
-      if (store.getToFile) await store.getToFile(entry.encSha, ctTmp);
+      if (store.getToFile) await store.getToFile(entry.encSha, ctTmp, entry.size + BLOB_CIPHERTEXT_TAG_BYTES);
       else await fs.writeFile(ctTmp, await store.get(entry.encSha));
       const t1 = LANE_TIMING ? performance.now() : 0;
       await decryptFileToPath(ctTmp, kek, entry.sha256, tmp);

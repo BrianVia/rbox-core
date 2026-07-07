@@ -4,6 +4,7 @@ import { bootstrapAccount, parseCommit, parseRefset, type DeviceSecrets, type Si
 import type { BlobStore } from "../engine/index.js";
 import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
+import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT } from "./remote/blob-batch.js";
 import type { WorkspaceConfig } from "./config.js";
 
 /**
@@ -40,6 +41,7 @@ export class MemBlobStore implements BlobStore {
 export class FakeServer implements E2eeApi {
   store = new MemBlobStore();
   commits: SignedCommit[] = [];
+  batchGetCalls = 0;
   account: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
   wsKeys = new Map<string, WsKeyDTO>(); // `${wsId}:${epoch}` → winner
   /** Simulated retention prune floor: commit pointers ≤ this are "dropped", so a
@@ -51,6 +53,22 @@ export class FakeServer implements E2eeApi {
   putBlobFile = async (sha: string, abs: string) => this.store.putFile(sha, abs);
   putBlobBytes = async (sha: string, bytes: Uint8Array) => this.store.put(sha, bytes);
   blobStore = () => this.store;
+
+  async blobBatchGet(shas: string[]): Promise<Response> {
+    this.batchGetCalls++;
+    const frames = shas.map((sha) => {
+      const bytes = this.store.blobs.get(sha);
+      return bytes ? batchFrame(sha, bytes, false) : batchFrame(sha, new TextEncoder().encode('{"status":"missing"}'), true);
+    });
+    const total = frames.reduce((n, f) => n + f.byteLength, 0);
+    const body = new Uint8Array(total);
+    let off = 0;
+    for (const frame of frames) {
+      body.set(frame, off);
+      off += frame.byteLength;
+    }
+    return new Response(body, { headers: { "content-type": BATCH_BLOB_CONTENT_TYPE } });
+  }
 
   getAccountKeys = async () => (this.account.rosters.length ? this.account : null);
   getWorkspaceKeys = async (wsId: string) => [...this.wsKeys.entries()].filter(([k]) => k.startsWith(`${wsId}:`)).map(([, v]) => v);
@@ -92,6 +110,14 @@ export class FakeServer implements E2eeApi {
     const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
     return [...this.store.blobs.values(), enc(this.commits), enc(this.account), enc([...this.wsKeys])];
   }
+}
+
+function batchFrame(sha: string, payload: Uint8Array, status: boolean): Uint8Array {
+  const out = new Uint8Array(BATCH_FRAME_HEADER_BYTES + payload.byteLength);
+  for (let i = 0; i < 32; i++) out[i] = Number.parseInt(sha.slice(i * 2, i * 2 + 2), 16);
+  new DataView(out.buffer).setUint32(32, status ? (BATCH_STATUS_BIT | payload.byteLength) >>> 0 : payload.byteLength, false);
+  out.set(payload, BATCH_FRAME_HEADER_BYTES);
+  return out;
 }
 
 /** An in-memory `PinStore` (stands in for the keystore-backed pin). */
