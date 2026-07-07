@@ -9,7 +9,7 @@ import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
-import { gitDivergenceCount } from "./sync-git.js";
+import { gitDivergenceCount, gitDivergenceFastRepoSource } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
@@ -1158,10 +1158,62 @@ test("gitDivergenceCount warm unchanged multi-repo fixture issues zero git spawn
   const matcher = buildIgnoreMatcher(rootA);
 
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0); // populate cache
+  const cache = JSON.parse(await fs.readFile(path.join(rootA, ".rbox", "state", "git-divergence.json"), "utf8")) as {
+    repos: { alpha: { kind?: string } };
+  };
+  expect(cache.repos.alpha.kind).toBe("dir");
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
   expect(warm.spawns).toBe(0);
 }, 30_000);
+
+test("gitDivergenceFastRepoSource ignores legacy cache entries without kind", async () => {
+  const cachePath = path.join(rootA, ".rbox", "state", "git-divergence.json");
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
+  await fs.mkdir(path.join(rootA, "cached-pointer"), { recursive: true });
+  await fs.writeFile(
+    cachePath,
+    JSON.stringify({
+      version: 2,
+      repos: {
+        legacy: { fingerprint: "fp", identityKey: "id", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "cached-pointer": { fingerprint: "fp", identityKey: "id", kind: "pointer", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+      },
+    })
+  );
+  expect(await gitDivergenceFastRepoSource(rootA, undefined, buildIgnoreMatcher(rootA))).toEqual([{ relPath: "cached-pointer", kind: "pointer" }]);
+});
+
+test("gitDivergenceFastRepoSource filters cached and base repos through current admission", async () => {
+  const cachePath = path.join(rootA, ".rbox", "state", "git-divergence.json");
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
+  await fs.mkdir(path.join(rootA, "cache-present"), { recursive: true });
+  await fs.mkdir(path.join(rootA, "base-present"), { recursive: true });
+  await fs.mkdir(path.join(rootA, "ignored", "cache"), { recursive: true });
+  await fs.mkdir(path.join(rootA, "ignored", "base"), { recursive: true });
+  await fs.writeFile(path.join(rootA, ".rboxignore"), "ignored/\n");
+  await fs.writeFile(
+    cachePath,
+    JSON.stringify({
+      version: 2,
+      repos: {
+        "cache-present": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "cache-missing": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "ignored/cache": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+      },
+    })
+  );
+  const base = {
+    "base-present": {} as GitSection,
+    "base-missing": {} as GitSection,
+    "ignored/base": {} as GitSection,
+  };
+
+  expect(await gitDivergenceFastRepoSource(rootA, base, buildIgnoreMatcher(rootA))).toEqual([
+    { relPath: "base-present" },
+    { relPath: "cache-present", kind: "dir" },
+  ]);
+});
 
 test("gitDivergenceCount fingerprint cache invalidates on commits, staging, stash, branch checkout, packed refs, and sentinels", async () => {
   const repo = path.join(rootA, "mut");

@@ -25,6 +25,18 @@ const isTransferPhase = (v: unknown): v is TransferPhase => TRANSFER_PHASES.incl
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
   at: string;
+  /** Daemon-computed local file divergence against the recorded sync-state base. */
+  local?: {
+    at: string;
+    stream: string;
+    baseSequence: number;
+    trackedFiles: number;
+    added: number;
+    changed: number;
+    deleted: number;
+    settled: boolean;
+    sourceVersion: 1;
+  };
   /** Workspace-DO WebSocket currency evidence. `at` is refreshed only by WS-layer
    *  traffic/lifecycle, not by pump heartbeats. */
   ws?: {
@@ -78,6 +90,31 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const uint = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
     const positiveInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) > 0;
     const a: DaemonActivity = { at: raw.at };
+    const local = raw.local;
+    if (
+      local &&
+      typeof local.at === "string" &&
+      typeof local.stream === "string" &&
+      uint(local.baseSequence) &&
+      uint(local.trackedFiles) &&
+      uint(local.added) &&
+      uint(local.changed) &&
+      uint(local.deleted) &&
+      typeof local.settled === "boolean" &&
+      local.sourceVersion === 1
+    ) {
+      a.local = {
+        at: local.at,
+        stream: local.stream,
+        baseSequence: local.baseSequence,
+        trackedFiles: local.trackedFiles,
+        added: local.added,
+        changed: local.changed,
+        deleted: local.deleted,
+        settled: local.settled,
+        sourceVersion: 1,
+      };
+    }
     const ws = raw.ws;
     if (
       ws &&

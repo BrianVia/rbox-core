@@ -1,9 +1,9 @@
-import { buildIgnoreMatcher, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo } from "../engine/index.js";
+import { buildIgnoreMatcher, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
-import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
 import { emitJson } from "./json.js";
@@ -16,7 +16,7 @@ import {
   trashLine,
   type StatusRemoteHead,
 } from "./status-view.js";
-import { gitDivergenceCount } from "./sync-git.js";
+import { gitDivergenceCount, gitDivergenceFastRepoSource, type GitDivergenceRepoHint } from "./sync-git.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
@@ -25,6 +25,76 @@ interface StatusAccountJson {
   plan: string | null;
   usedBytes: number | null;
   capBytes: number | null;
+}
+
+interface StatusLocalCountsBase {
+  added: number;
+  changed: number;
+  deleted: number;
+  trackedFiles: number;
+  gitChanged: number;
+}
+
+type StatusLocalCounts =
+  | (StatusLocalCountsBase & { source: "computed" })
+  | (StatusLocalCountsBase & { source: "daemon"; ageMs: number });
+
+export interface StatusCmdDeps {
+  now: () => number;
+  loadHashCache: (root: string) => Promise<HashCache>;
+  scanManifest: typeof scanManifest;
+  gitDivergenceCount: typeof gitDivergenceCount;
+  gitDivergenceFastRepoSource: (
+    root: string,
+    baseGitRepos: SyncState["lastSyncedManifest"]["gitRepos"],
+    matcher: IgnoreMatcher
+  ) => Promise<GitDivergenceRepoHint[]>;
+  daemonBindingStatus: typeof daemonBindingStatus;
+  readDaemonPidRecord: typeof readDaemonPidRecord;
+}
+
+const defaultStatusDeps: StatusCmdDeps = {
+  now: () => Date.now(),
+  loadHashCache: (root) => HashCache.load(root),
+  scanManifest,
+  gitDivergenceCount,
+  gitDivergenceFastRepoSource,
+  daemonBindingStatus,
+  readDaemonPidRecord,
+};
+
+const LOCAL_TRUST_MS = 60_000;
+
+function trustedLocalSnapshot(
+  input: {
+    activity: DaemonActivity | undefined;
+    state: SyncState;
+    now: number;
+    daemonRunning: boolean;
+    boundWorkspaceId?: string;
+    currentWorkspaceId: string;
+    livePidfileBootId?: string;
+  }
+): { local: NonNullable<DaemonActivity["local"]>; ageMs: number } | undefined {
+  if (!input.daemonRunning) return undefined;
+  if (input.boundWorkspaceId !== input.currentWorkspaceId) return undefined;
+  if (input.livePidfileBootId === undefined) return undefined;
+  const { activity, state, now } = input;
+  if (!activity) return undefined;
+  const local = activity.local;
+  if (!local) return undefined;
+  if (!activity.ws) return undefined;
+  const ageMs = now - Date.parse(local.at);
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs >= LOCAL_TRUST_MS) return undefined;
+  if (local.stream !== state.stream) return undefined;
+  if (local.baseSequence !== state.lastSyncedSequence) return undefined;
+  if (!local.settled) return undefined;
+  return { local, ageMs };
+}
+
+function localBaseSequenceMismatched(activity: DaemonActivity | undefined, state: SyncState): boolean {
+  const local = activity?.local;
+  return local !== undefined && local.stream === state.stream && local.baseSequence !== state.lastSyncedSequence;
 }
 
 async function fetchRemoteSequence(
@@ -126,30 +196,21 @@ function createGitRepoFeed(): {
 }
 
 export async function statusCmd(root: string, opts: { json?: boolean } = {}): Promise<void> {
+  return statusCmdWithDeps(root, opts, defaultStatusDeps);
+}
+
+export async function statusCmdWithDeps(
+  root: string,
+  opts: { json?: boolean } = {},
+  deps: StatusCmdDeps = defaultStatusDeps
+): Promise<void> {
   const creds = await loadCredentials().catch(() => undefined);
   const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const state = await loadState(root, syncStreamId(cfg));
-  const matcher = buildIgnoreMatcher(root, {
-    respectGitignore: cfg.respectGitignore === true,
-    knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-  });
-  const hashCache = await HashCache.load(root);
-  const gitRepoFeed = createGitRepoFeed();
-  const gitChangedP = gitDivergenceCount(root, cfg, state, matcher, gitRepoFeed.iterable).catch(() => 0);
-  let local;
-  try {
-    local = await scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
-  } finally {
-    gitRepoFeed.close();
-  }
-  if (!readDaemonPidRecord(root).present) {
-    hashCache.prune(new Set(local.files.map((f) => f.path)));
-    await hashCache.save(root, { beforeRename: () => !readDaemonPidRecord(root).present }).catch(() => {});
-  }
+  let state = await loadState(root, syncStreamId(cfg));
 
-  const daemonBinding = daemonBindingStatus(root, cfg.remoteWorkspaceId);
+  const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
   const alive = daemonBinding.alive;
   const daemonStale = daemonBinding.stale;
   const bg = { running: alive.running && !daemonStale, pid: alive.pid };
@@ -158,43 +219,121 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   const trashP = trashStats(root).catch(() => undefined);
   const accountJsonP = opts.json ? fetchStatusAccountJson(creds) : Promise.resolve(null);
   const rawActivity = await activityP;
-  const attributed = attributeDaemonForStatus({
-    activity: rawActivity,
-    daemonRunning: bg.running,
-    boundWorkspaceId: daemonBinding.bound,
-    currentWorkspaceId: cfg.remoteWorkspaceId,
-    livePidfileBootId: alive.bootId,
-    localSequence: state.lastSyncedSequence,
-    now: Date.now(),
-  });
-  let remote: StatusRemoteHead | undefined = attributed.remote;
-  if (!remote) {
-    const probed = await fetchRemoteSequence(cfg, creds);
-    if (probed !== undefined) remote = { sequence: probed, source: "probe" };
+  const attributionNow = deps.now();
+  const attributeActivity = (base: SyncState) =>
+    attributeDaemonForStatus({
+      activity: rawActivity,
+      daemonRunning: bg.running,
+      boundWorkspaceId: daemonBinding.bound,
+      currentWorkspaceId: cfg.remoteWorkspaceId,
+      livePidfileBootId: alive.bootId,
+      localSequence: base.lastSyncedSequence,
+      now: attributionNow,
+    });
+  let attributed = attributeActivity(state);
+  let activity = attributed.activity;
+  let mustComputeLocal = false;
+  if (localBaseSequenceMismatched(activity, state)) {
+    state = await loadState(root, syncStreamId(cfg));
+    attributed = attributeActivity(state);
+    activity = attributed.activity;
+    mustComputeLocal = true;
   }
-  const [gitChanged, trash, accountJson] = await Promise.all([gitChangedP, trashP, accountJsonP]);
-  const activity = attributed.activity;
-  const d = diffManifests(state.lastSyncedManifest, local);
-  const deleted = d.deleted.filter((p) => !matcher.ignores(p)).length;
-  const localChanges = d.added.length + d.changed.length + deleted;
-  const now = Date.now();
+  const remoteHeadP: Promise<StatusRemoteHead | undefined> = attributed.remote
+    ? Promise.resolve(attributed.remote)
+    : fetchRemoteSequence(cfg, creds).then((probed) => (probed !== undefined ? { sequence: probed, source: "probe" as const } : undefined));
+  const trusted = mustComputeLocal
+    ? undefined
+    : trustedLocalSnapshot({
+      activity,
+      state,
+      now: attributionNow,
+      daemonRunning: bg.running,
+      boundWorkspaceId: daemonBinding.bound,
+      currentWorkspaceId: cfg.remoteWorkspaceId,
+      livePidfileBootId: alive.bootId,
+    });
+
+  let counts: StatusLocalCounts;
+  if (trusted) {
+    const matcher = buildIgnoreMatcher(root, {
+      respectGitignore: false,
+      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    });
+    const repoHints = cfg.syncGit ? await deps.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
+    const gitChanged = await deps.gitDivergenceCount(root, cfg, state, undefined, repoHints, false).catch(() => 0);
+    counts = {
+      added: trusted.local.added,
+      changed: trusted.local.changed,
+      deleted: trusted.local.deleted,
+      trackedFiles: trusted.local.trackedFiles,
+      gitChanged,
+      source: "daemon",
+      ageMs: trusted.ageMs,
+    };
+  } else {
+    const matcher = buildIgnoreMatcher(root, {
+      respectGitignore: cfg.respectGitignore === true,
+      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    });
+    const hashCache = await deps.loadHashCache(root);
+    const gitRepoFeed = createGitRepoFeed();
+    const gitChangedP = deps.gitDivergenceCount(root, cfg, state, matcher, gitRepoFeed.iterable).catch(() => 0);
+    let localManifest;
+    try {
+      localManifest = await deps.scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
+    } finally {
+      gitRepoFeed.close();
+    }
+    if (!deps.readDaemonPidRecord(root).present) {
+      hashCache.prune(new Set(localManifest.files.map((f) => f.path)));
+      await hashCache.save(root, { beforeRename: () => !deps.readDaemonPidRecord(root).present }).catch(() => {});
+    }
+    const manifestDiff = diffManifests(state.lastSyncedManifest, localManifest);
+    const deleted = manifestDiff.deleted.filter((p) => !matcher.ignores(p)).length;
+    counts = {
+      added: manifestDiff.added.length,
+      changed: manifestDiff.changed.length,
+      deleted,
+      trackedFiles: localManifest.files.length,
+      gitChanged: await gitChangedP,
+      source: "computed",
+    };
+  }
+
+  const [remote, trash, accountJson] = await Promise.all([remoteHeadP, trashP, accountJsonP]);
+  const localChanges = counts.added + counts.changed + counts.deleted;
+  const now = deps.now();
 
   if (opts.json) {
-    emitJson({
+    const statusJson = {
       workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
       health: statusHealthJson({
         activity,
         localChanges,
-        gitChanged,
+        gitChanged: counts.gitChanged,
         localSequence: state.lastSyncedSequence,
         remote,
         now,
       }),
       daemon: { running: bg.running, pid: bg.pid ?? null },
       remote: remote ? { sequence: remote.sequence, source: remote.source } : null,
+      ...(counts.source === "daemon"
+        ? {
+          local: {
+            added: counts.added,
+            changed: counts.changed,
+            deleted: counts.deleted,
+            gitChangedRepos: counts.gitChanged,
+            source: counts.source,
+            ageMs: counts.ageMs,
+          },
+        }
+        : {}),
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
-    });
+    };
+    emitJson(statusJson);
     return;
   }
 
@@ -203,11 +342,11 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
     : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
   console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
   const statusSnapshot = {
-    added: d.added.length,
-    changed: d.changed.length,
-    deleted,
-    gitChanged,
-    trackedFiles: local.files.length,
+    added: counts.added,
+    changed: counts.changed,
+    deleted: counts.deleted,
+    gitChanged: counts.gitChanged,
+    trackedFiles: counts.trackedFiles,
     daemonRunning: bg.running,
     localSequence: state.lastSyncedSequence,
     remote,
@@ -260,7 +399,7 @@ export async function statusCmd(root: string, opts: { json?: boolean } = {}): Pr
   }
   const trashStatus = trashLine(trash);
   if (trashStatus) console.log(`  ${trashStatus}`);
-  console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${local.files.length.toLocaleString("en-US")} files on disk`)}`);
+  console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${counts.trackedFiles.toLocaleString("en-US")} files on disk`)}`);
   for (const line of formatAccountSummary((await accountSummaryP)!)) console.log(line);
   const updateLine = formatUpdateAvailableLine(await readUpdateCheckState());
   if (updateLine) console.log(`  ${updateLine}`);

@@ -2,15 +2,17 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
+import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
-import { loadActivity } from "./activity.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadActivity, type DaemonActivity } from "./activity.js";
+import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
 import { daemonRuntimeDir, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull } from "./sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 import { attributeDaemonForStatus, healthLine } from "./status-view.js";
+import type { TransferPhase } from "./transfer-progress.js";
+import type { WatchOptions, Watcher } from "./watcher.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
 // sync. The load-bearing lifecycle: a pump error records a HALT (the mass-delete
@@ -71,6 +73,8 @@ class MiniRemote implements SyncRemote {
 }
 
 /** The daemon privates this test drives directly (no watcher, no websocket). */
+type TestStartWatcher = (root: string, matcher: IgnoreMatcher, onSettle: (events: WatchEvent[]) => void, opts?: WatchOptions) => Promise<Watcher>;
+
 interface DaemonInternals {
   ws?: WebSocket;
   wsKeepaliveTimer?: ReturnType<typeof setInterval>;
@@ -80,11 +84,18 @@ interface DaemonInternals {
   cache: HashCache;
   manifest: Manifest;
   pendingEvents: WatchEvent[];
-  activity: import("./activity.js").DaemonActivity;
+  activity: DaemonActivity;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
-  onTransferProgress(done: number, total: number, phase: import("./transfer-progress.js").TransferPhase): void;
+  startWatcherFn: TestStartWatcher;
+  startLiveWatch(): Promise<void>;
+  safetyTimer?: ReturnType<typeof setTimeout>;
+  deepTimer?: ReturnType<typeof setInterval>;
+  onTransferProgress(done: number, total: number, phase: TransferPhase): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
+  stop(): Promise<void>;
+  loadSyncBase(): Promise<SyncState>;
+  scheduleWriteFinishRetry(paths: Set<string>): void;
   writeWsActivity(): void;
   recordCommittedFrame(sequence: number): void;
   handleWsMessageData(data: string): void;
@@ -128,6 +139,7 @@ async function makeDaemon(remote: MiniRemote, bootId = "boot-test"): Promise<Dae
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, bootId) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
   daemon.manifest = await scanManifest(root);
+  await daemon.loadSyncBase();
   return daemon;
 }
 
@@ -142,7 +154,6 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 }
 
 const fakeWs = () => ({ readyState: WebSocket.OPEN, send: () => {}, close: () => {} }) as unknown as WebSocket;
-
 async function withIsolatedDaemonHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const oldHome = process.env.RBOX_HOME;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
@@ -533,6 +544,64 @@ test("an idle pull + no-op push settles shell.line back to ok (codex R4)", async
 
   const line = await fs.readFile(path.join(root, ".rbox", "state", "shell.line"), "utf8");
   expect(line.split(" ")[2]).toBe("ok");
+});
+
+test("local snapshot stays unsettled while a pump op is in flight", async () => {
+  const remote = new HookedCommitRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "during.txt"), "local work");
+  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.want.push = true;
+
+  const pump = daemon.pump();
+  await remote.commitEntered.promise;
+  try {
+    daemon.writeWsActivity();
+    await daemon.activityWrite;
+
+    expect((await loadActivity(root))?.local?.settled).toBe(false);
+  } finally {
+    remote.releaseCommit.resolve();
+    await pump;
+    await daemon.activityWrite;
+  }
+});
+
+test("raw watcher event persists local unsettled before the debounced pump runs", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
+    opts.onRawEvent?.({ relPath: "a.txt", kind: "add" });
+    return { close: async () => {} };
+  };
+
+  try {
+    await daemon.startLiveWatch();
+    await daemon.activityWrite;
+    daemon.writeWsActivity();
+    await daemon.activityWrite;
+    const activity = await loadActivity(root);
+    expect(activity?.local).toMatchObject({
+      baseSequence: 0,
+      settled: false,
+      sourceVersion: 1,
+    });
+    expect(daemon.pendingEvents).toEqual([]);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+  }
+});
+
+test("deferred write-finish retry keeps local unsettled while retry is pending", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  try {
+    daemon.scheduleWriteFinishRetry(new Set(["still-writing.txt"]));
+    daemon.writeWsActivity();
+    await daemon.activityWrite;
+    expect((await loadActivity(root))?.local?.settled).toBe(false);
+  } finally {
+    await daemon.stop();
+  }
 });
 
 test("ws-only activity writes preserve top-level heartbeat and committed sequence evidence", async () => {

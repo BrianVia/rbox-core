@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
+  diffManifests,
   isIgnoreRuleFile,
   HashCache,
   scanManifest,
@@ -14,7 +15,7 @@ import {
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -97,6 +98,7 @@ export class RboxDaemon {
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
   private manifest: Manifest = { generatedAt: "", files: [] };
+  private syncBase?: SyncState;
   private pendingEvents: WatchEvent[] = [];
 
   private watcher?: Watcher;
@@ -121,6 +123,12 @@ export class RboxDaemon {
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
    *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
   private readonly writeFinishRetries = new Map<string, number>();
+  private readonly writeFinishRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly deferredRetryPaths = new Set<string>();
+  private watcherUnsettled = false;
+  private watcherUnsettledGeneration = 0;
+  private activePumpOp?: keyof Wants;
+  private appliedPendingEventsInOp = false;
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
   private errRepeat = 0;
@@ -178,7 +186,7 @@ export class RboxDaemon {
     if (this.stopped) return;
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
-    const initialState = await loadState(this.root, syncStreamId(this.cfg));
+    const initialState = await this.loadSyncBase();
     this.lastLoggedSeq = initialState.lastSyncedSequence;
     this.rebuildMatcher(initialState);
 
@@ -217,6 +225,10 @@ export class RboxDaemon {
           this.request("push");
         },
         {
+          onRawEvent: () => {
+            this.noteChurn();
+            this.markLocalUnsettledFromWatchEvent();
+          },
           onError: (err) => {
             // One backend error and the watcher is no longer TRUSTED (codex R1): a
             // dead FSEvents/inotify stream must not let the safety scan — now the
@@ -281,6 +293,9 @@ export class RboxDaemon {
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
+    for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
+    this.writeFinishRetryTimers.clear();
+    this.deferredRetryPaths.clear();
     this.stopWsKeepalive();
     try {
       this.ws?.close();
@@ -306,6 +321,12 @@ export class RboxDaemon {
     void this.pump();
   }
 
+  private async loadSyncBase(): Promise<SyncState> {
+    const state = await loadState(this.root, syncStreamId(this.cfg));
+    this.syncBase = state;
+    return state;
+  }
+
   private startUpdateChecks(): void {
     void runUpdateCheckIfDue(this.cfg.remoteUrl);
     this.updateCheckTimer = setInterval(() => void runUpdateCheckIfDue(this.cfg.remoteUrl), UPDATE_CHECK_TICK_MS);
@@ -328,32 +349,40 @@ export class RboxDaemon {
         // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
         // is keyed on it (a halt is only healed by a success of the SAME kind).
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
+        const opWatcherGeneration = this.watcherUnsettledGeneration;
         try {
           let pushedToRemote = false;
           this.pushTerminalBlocked = false;
           this.want[op] = false;
-          if (op === "deepScan") {
-            await this.doDeepScan();
-            this.want.push = true;
-          } else if (op === "fullScan") {
-            await this.doFullScan();
-            if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
-            this.want.push = true;
-          } else if (op === "pull") {
-            const catchUpGeneration = this.pendingCatchUpGeneration;
-            this.pendingCatchUpGeneration = undefined;
-            await this.doPull();
-            if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-            this.want.push = true; // publish any local divergence after taking remote
-          } else {
-            const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
-            this.outOfStorageProbeArmed = false;
-            if (this.activity.outOfStorage && !quotaProbe) {
-              await this.applyPendingWatchEvents();
+          this.activePumpOp = op;
+          this.appliedPendingEventsInOp = false;
+          try {
+            if (op === "deepScan") {
+              await this.doDeepScan();
+              this.want.push = true;
+            } else if (op === "fullScan") {
+              await this.doFullScan();
+              if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
+              this.want.push = true;
+            } else if (op === "pull") {
+              const catchUpGeneration = this.pendingCatchUpGeneration;
+              this.pendingCatchUpGeneration = undefined;
+              await this.doPull();
+              if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
+              this.want.push = true; // publish any local divergence after taking remote
             } else {
-              await this.doPush();
-              pushedToRemote = true;
+              const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
+              this.outOfStorageProbeArmed = false;
+              if (this.activity.outOfStorage && !quotaProbe) {
+                await this.applyPendingWatchEvents();
+              } else {
+                await this.doPush();
+                pushedToRemote = true;
+              }
             }
+            this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+          } finally {
+            this.activePumpOp = undefined;
           }
           // Op completed: any live progress is over. A standing halt is healed ONLY by
           // a success of the op kind that recorded it — a mass-delete-guard halt from a
@@ -428,8 +457,7 @@ export class RboxDaemon {
       // the state CHANGED from the last write — the mid-pump write said `pending`
       // (push still queued) and the no-op push wrote nothing; an idle workspace must
       // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
-      const settledNow =
-        !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
+      const settledNow = this.localSettled();
       if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
     } finally {
       this.pumping = false;
@@ -488,6 +516,7 @@ export class RboxDaemon {
     // to the safety/deep scan instead of hot-looping. res.manifest already carries their
     // base (or omits them), so a genuine settle is re-detected by the change event's re-hash.
     if (res.deferred && res.deferred.length > 0) this.scheduleWriteFinishRetry(new Set(res.deferred));
+    await this.loadSyncBase();
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
     report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
@@ -536,11 +565,12 @@ export class RboxDaemon {
     if (this.pendingEvents.length > 0) {
       const events = this.pendingEvents;
       this.pendingEvents = [];
+      this.appliedPendingEventsInOp = true;
       // If the ignore rules themselves changed, rebuild the matcher and full-rescan
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
       if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
-        this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
+        this.rebuildMatcher(await this.loadSyncBase());
         this.manifest = await scanManifest(this.root, this.matcher, this.cache);
       } else {
         const deferred = new Set<string>();
@@ -567,17 +597,24 @@ export class RboxDaemon {
       const n = (this.writeFinishRetries.get(p) ?? 0) + 1;
       if (n <= MAX_RETRIES) {
         this.writeFinishRetries.set(p, n);
+        this.deferredRetryPaths.add(p);
         retryable.push(p);
       } else {
         this.writeFinishRetries.delete(p); // give up; the safety scan will heal it
+        this.deferredRetryPaths.delete(p);
       }
     }
     if (retryable.length === 0 || this.stopped) return;
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      this.writeFinishRetryTimers.delete(timer);
       if (this.stopped) return;
-      for (const p of retryable) this.pendingEvents.push({ relPath: p, kind: "change" });
+      for (const p of retryable) {
+        this.deferredRetryPaths.delete(p);
+        this.pendingEvents.push({ relPath: p, kind: "change" });
+      }
       this.request("push");
     }, RETRY_DELAY_MS);
+    this.writeFinishRetryTimers.add(timer);
   }
 
   private async doPull(): Promise<void> {
@@ -607,11 +644,11 @@ export class RboxDaemon {
     // below and the pump's follow-up push — otherwise that push publishes files the
     // freshly pulled rules exclude (same hazard doPush guards on watcher events).
     if (actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path))) {
-      this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
+      this.rebuildMatcher(await this.loadSyncBase());
     }
     // The pull advanced the local base sequence; remember it so the follow-up no-op
     // push isn't logged as if THIS daemon published the remotely-produced sequence.
-    this.lastLoggedSeq = (await loadState(this.root, syncStreamId(this.cfg))).lastSyncedSequence;
+    this.lastLoggedSeq = (await this.loadSyncBase()).lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     this.manifest = await scanManifest(this.root, this.matcher, this.cache);
   }
@@ -642,19 +679,69 @@ export class RboxDaemon {
     this.enqueueActivityWrite(false);
   }
 
+  private markLocalUnsettledFromWatchEvent(): void {
+    const wasUnsettled = this.watcherUnsettled;
+    this.watcherUnsettled = true;
+    this.watcherUnsettledGeneration++;
+    if (!this.syncBase || (wasUnsettled && this.activity.local?.settled === false)) return;
+    this.enqueueActivityWrite(false);
+  }
+
+  private localSettled(): boolean {
+    return (
+      this.activePumpOp === undefined &&
+      !this.watcherUnsettled &&
+      !this.want.pull &&
+      !this.want.push &&
+      !this.want.fullScan &&
+      !this.want.deepScan &&
+      this.pendingEvents.length === 0 &&
+      this.deferredRetryPaths.size === 0
+    );
+  }
+
+  private maybeClearWatcherUnsettledAfterOp(op: keyof Wants, opWatcherGeneration: number): void {
+    if (!this.watcherUnsettled || this.watcherUnsettledGeneration > opWatcherGeneration || this.pendingEvents.length > 0) return;
+    const refreshedLocalTruth = this.appliedPendingEventsInOp || op === "pull" || op === "fullScan" || op === "deepScan";
+    if (refreshedLocalTruth) this.watcherUnsettled = false;
+  }
+
+  private localSnapshot(settled: boolean, now: number): DaemonActivity["local"] | undefined {
+    const base = this.syncBase;
+    if (!base) return undefined;
+    const manifestDiff = diffManifests(base.lastSyncedManifest, this.manifest);
+    return {
+      at: new Date(now).toISOString(),
+      stream: base.stream,
+      baseSequence: base.lastSyncedSequence,
+      trackedFiles: this.manifest.files.length,
+      added: manifestDiff.added.length,
+      changed: manifestDiff.changed.length,
+      deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,
+      settled,
+      sourceVersion: 1,
+    };
+  }
+
   private enqueueActivityWrite(bumpHeartbeat: boolean): void {
     if (bumpHeartbeat) {
       this.activity.at = new Date().toISOString();
       this.activityDirty = false;
       this.lastActivityWrite = Date.now();
     }
-    const snapshot = { ...this.activity, ws: this.activity.ws ? { ...this.activity.ws } : undefined };
     // Design 46: the same record ALSO renders the one-line prompt sidecar, chained
     // onto the same promise so BOTH files preserve write ordering and neither is ever
-    // awaited on the sync path. `settled` = nothing queued and no watcher events left.
-    const settled =
-      !this.want.pull && !this.want.push && !this.want.fullScan && !this.want.deepScan && this.pendingEvents.length === 0;
+    // awaited on the sync path.
+    const settled = this.localSettled();
     const now = Date.now();
+    const localSnapshot = this.localSnapshot(settled, now);
+    if (localSnapshot) this.activity.local = localSnapshot;
+    else this.activity.local = undefined;
+    const snapshot = {
+      ...this.activity,
+      local: this.activity.local ? { ...this.activity.local } : undefined,
+      ws: this.activity.ws ? { ...this.activity.ws } : undefined,
+    };
     this.lastShellState = shellLineStateOf(snapshot, settled, now);
     const line = renderShellLine(snapshot, {
       settled,
@@ -800,7 +887,7 @@ export class RboxDaemon {
     // live on 2026-07-07. cfg stays the boot object; only the hot-reloadable
     // setting moves.
     this.cfg = { ...this.cfg, respectGitignore: loaded.respectGitignore };
-    this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
+    this.rebuildMatcher(await this.loadSyncBase());
     if (wasRespecting !== (this.cfg.respectGitignore === true)) {
       log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
     }

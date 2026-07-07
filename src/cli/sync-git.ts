@@ -459,6 +459,7 @@ interface CachedDivergenceProbe {
 interface GitDivergenceCacheEntry {
   fingerprint: string;
   identityKey: string;
+  kind?: GitRepoKind;
   probe?: CachedDivergenceProbe;
 }
 
@@ -499,18 +500,49 @@ interface GitFingerprintRun {
   commonDirFingerprints: Map<string, Promise<unknown>>;
 }
 
-type DiscoveredGitRepoSource = readonly DiscoveredGitRepo[] | AsyncIterable<DiscoveredGitRepo>;
+export type GitDivergenceRepoHint = { relPath: string; kind?: GitRepoKind };
+type GitDivergenceRepoSource = readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>;
+
+const isGitRepoKind = (v: unknown): v is GitRepoKind => v === "dir" || v === "pointer";
 
 function isCacheEntry(v: unknown): v is GitDivergenceCacheEntry {
   if (v === null || typeof v !== "object") return false;
   const e = v as GitDivergenceCacheEntry;
   if (typeof e.fingerprint !== "string" || typeof e.identityKey !== "string") return false;
+  if (e.kind !== undefined && !isGitRepoKind(e.kind)) return false;
   if (e.probe !== undefined) {
     const p = e.probe as CachedDivergenceProbe;
     if (p === null || typeof p !== "object") return false;
     if (typeof p.busy !== "boolean" || typeof p.preflightOk !== "boolean" || typeof p.identityKey !== "string") return false;
   }
   return true;
+}
+
+export async function gitDivergenceFastRepoSource(
+  root: string,
+  baseGitRepos: Record<string, GitSection> | undefined,
+  matcher: IgnoreMatcher
+): Promise<GitDivergenceRepoHint[]> {
+  const cache = await loadGitDivergenceCache(root);
+  const byPath = new Map<string, GitDivergenceRepoHint>();
+  for (const [rel, entry] of cache.repos) {
+    if (entry.kind && (await fastRepoAdmitted(root, matcher, rel))) {
+      byPath.set(rel, { relPath: rel, kind: entry.kind });
+    }
+  }
+  for (const rel of Object.keys(baseGitRepos ?? {})) {
+    if (!(await fastRepoAdmitted(root, matcher, rel))) continue;
+    byPath.set(rel, byPath.get(rel) ?? { relPath: rel });
+  }
+  return [...byPath.values()].sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+}
+
+async function fastRepoAdmitted(root: string, matcher: IgnoreMatcher, rel: string): Promise<boolean> {
+  if (rel !== "." && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) return false;
+  return fs
+    .lstat(repoDirOf(root, rel))
+    .then((s) => s.isDirectory())
+    .catch(() => false);
 }
 
 async function loadGitDivergenceCache(root: string): Promise<GitDivergenceCache> {
@@ -723,16 +755,18 @@ async function cachedDivergenceProbe(
   root: string,
   rel: string,
   cache: GitDivergenceCache,
-  out: Map<string, CachedDivergenceProbe>
-): Promise<void> {
+  out: Map<string, CachedDivergenceProbe>,
+  hintKind?: GitRepoKind
+): Promise<GitRepoKind | undefined> {
   let before = await gitFingerprint(run, root, rel);
   const cached = cache.repos.get(rel);
   if (cached?.fingerprint === before.fingerprint && cached.probe) {
     out.set(rel, cached.probe);
-    return;
+    return cached.kind ?? before.diskCtx?.kind ?? hintKind;
   }
 
   const realCtx = (await repoCtx(repoDirOf(root, rel)).catch(() => undefined)) ?? null;
+  const repoKind = before.diskCtx?.kind ?? realCtx?.kind ?? hintKind;
   let last: CachedDivergenceProbe | undefined;
   let previous: CachedDivergenceProbe | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -740,15 +774,22 @@ async function cachedDivergenceProbe(
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
     const after = await gitFingerprint(run, root, rel);
     if (after.fingerprint === before.fingerprint || sameDivergenceProbe(previous, last)) {
-      cache.repos.set(rel, { fingerprint: after.fingerprint, identityKey: last.identityKey, probe: last });
+      const afterKind = after.diskCtx?.kind ?? repoKind;
+      cache.repos.set(rel, {
+        fingerprint: after.fingerprint,
+        identityKey: last.identityKey,
+        ...(afterKind ? { kind: afterKind } : {}),
+        probe: last,
+      });
       cache.dirty = true;
       out.set(rel, last);
-      return;
+      return afterKind;
     }
     previous = last;
     before = after;
   }
   if (last) out.set(rel, last);
+  return repoKind;
 }
 
 /** The pull-side git outcome: the per-repo base to persist plus the updated local-only maps. */
@@ -1010,8 +1051,9 @@ export async function gitDivergenceCount(
   root: string,
   cfg: WorkspaceConfig,
   state: SyncState,
-  matcher: IgnoreMatcher,
-  discoveredRepos?: DiscoveredGitRepoSource
+  matcher?: IgnoreMatcher,
+  discoveredRepos?: GitDivergenceRepoSource,
+  includeBaseRepos = true
 ): Promise<number> {
   if (!cfg.syncGit) return 0;
   const base = state.lastSyncedManifest.gitRepos ?? {};
@@ -1022,27 +1064,36 @@ export async function gitDivergenceCount(
   const probes = new Map<string, CachedDivergenceProbe>();
   const run: GitFingerprintRun = { commonDirFingerprints: new Map() };
   const kindByPath = new Map<string, GitRepoKind>();
+  const sourcePaths = new Set<string>();
   const scheduled = new Set<string>();
   const inFlight = new Set<Promise<void>>();
-  const source: DiscoveredGitRepoSource =
-    discoveredRepos ??
-    (await discoverGitRepos(root, matcher)).sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+  let repoSource: GitDivergenceRepoSource;
+  if (discoveredRepos) {
+    repoSource = discoveredRepos;
+  } else {
+    if (!matcher) throw new Error("gitDivergenceCount requires an ignore matcher unless a repo source is supplied");
+    repoSource = (await discoverGitRepos(root, matcher)).sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+  }
 
-  const scheduleProbe = async (repo: DiscoveredGitRepo): Promise<void> => {
-    kindByPath.set(repo.relPath, repo.kind);
+  const scheduleProbe = async (repo: GitDivergenceRepoHint): Promise<void> => {
+    sourcePaths.add(repo.relPath);
+    if (repo.kind) kindByPath.set(repo.relPath, repo.kind);
     if (pending[repo.relPath] || scheduled.has(repo.relPath)) return;
     scheduled.add(repo.relPath);
-    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes)
+    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes, repo.kind)
+      .then((kind) => {
+        if (kind) kindByPath.set(repo.relPath, kind);
+      })
       .catch(() => {})
       .finally(() => inFlight.delete(p));
     inFlight.add(p);
     if (inFlight.size >= GIT_DIVERGENCE_CONCURRENCY) await Promise.race(inFlight);
   };
 
-  for await (const repo of source) await scheduleProbe(repo);
+  for await (const repo of repoSource) await scheduleProbe(repo);
   await Promise.all(inFlight);
 
-  const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base)])].sort();
+  const keys = [...new Set([...kindByPath.keys(), ...sourcePaths, ...(includeBaseRepos ? Object.keys(base) : [])])].sort();
   const liveKeys = new Set(keys);
   for (const rel of [...cache.repos.keys()]) {
     if (!liveKeys.has(rel)) {
