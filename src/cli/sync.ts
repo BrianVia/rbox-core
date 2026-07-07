@@ -20,7 +20,13 @@ import {
   gitReposManifestSchema,
   planGitSections,
 } from "./sync-git.js";
-import { deferManifest, encryptAndUpload, reportDeferred } from "./sync-recovery.js";
+import {
+  deferManifest,
+  encryptAndUpload,
+  pruneEncryptAddressCache,
+  reportDeferred,
+  type EncryptAndUploadOptions,
+} from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, saveState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { openTrashBatch } from "../engine/trash.js";
@@ -38,6 +44,14 @@ const MASS_DELETE_MIN_FILES = 100;
 /** The empty per-relPath 422 recapture set: the default force for a first attempt (design
  *  43 §6 [v2, M5]). Its `.size === 0` also marks "not a git-recapture retry" below. */
 const NO_GIT_FORCE: ReadonlySet<string> = new Set();
+
+type CurrentWriteContext = {
+  kek: Uint8Array;
+  accountId: string;
+  accountEpoch: number;
+  keyEpoch: number;
+};
+type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWriteContext> };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
@@ -82,6 +96,10 @@ export interface SyncDeps {
    *  the sync path uses a disabled no-op report that allocates nothing — so the daemon's
    *  hot path and no-op tick stay free unless metrics are explicitly enabled. */
   report?: PhaseReport;
+  /** Test seam for the expensive encrypt primitive; production uses encryptFileToTemp. */
+  encryptFileToTemp?: EncryptAndUploadOptions["encryptFileToTemp"];
+  /** Test seam for debounce timing; production leaves the design-75 ~10s default. */
+  encryptCacheFlushMs?: number;
   /** Forensic git-sync log sink (design 43 §10): capture/carry/defer/remove summaries on
    *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
    *  injects its timestamped logger so the lines land in the daemon log. */
@@ -118,6 +136,28 @@ async function withCache(
   if (provided) return { cache: provided, save: async () => {} };
   const cache = await HashCache.load(root);
   return { cache, save: () => cache.save(root) };
+}
+
+async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promise<void> {
+  const remote = deps.remote as WriteContextProvider | undefined;
+  if (typeof remote?.currentKek !== "function") {
+    throw new Error("push: account epoch changed, but this remote cannot refresh the E2EE write context");
+  }
+  const writeContext = await remote.currentKek();
+  Object.assign(cfg, {
+    kek: Buffer.from(writeContext.kek),
+    accountId: writeContext.accountId,
+    accountEpoch: writeContext.accountEpoch,
+    keyEpoch: writeContext.keyEpoch,
+  });
+}
+
+async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored: boolean): Promise<Manifest> {
+  const { cache, save } = await withCache(root, deps.cache);
+  const state = await loadState(root, syncStreamId(cfg));
+  const local = await scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps));
+  await save();
+  return local;
 }
 
 /**
@@ -284,6 +324,8 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; c
  * churn defer, and blob-sha mismatch) into a single sequencing point:
  *  - `pull-first` — a 409 parent-sequence conflict: PULL (absorb the remote change) then
  *    RE-SCAN (disk moved under us) and retry with a fresh manifest and no git force.
+ *  - `epoch-stale` — the account rotated under this push: refresh the write context,
+ *    RE-SCAN under the new KEK/cache binding, and retry with no git force.
  *  - `reupload` — a 422 unsatisfied-blobs bounce: retry the SAME manifest (no pull, no
  *    re-scan), forcing a git recapture for exactly the referenced repos (§6 [v2, M5]).
  * (The per-file churn defer + blob-sha-mismatch recovery live one layer down, inside
@@ -292,6 +334,7 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; c
  */
 type RecoveryAction =
   | { kind: "pull-first" }
+  | { kind: "epoch-stale" }
   | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number };
 
 /** The result of ONE push attempt: either done (committed / no-op / everything deferred),
@@ -348,10 +391,11 @@ export async function pushManifest(
     if (outcome.action.kind === "pull-first") {
       await backoff(attempt);
       await pull(root, cfg, deps);
-      const { cache, save } = await withCache(root, deps.cache);
-      const state = await loadState(root, syncStreamId(cfg));
-      currentLocal = await scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps)); // disk changed under us
-      await save();
+      currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored); // disk changed under us
+      currentForce = NO_GIT_FORCE;
+    } else if (outcome.action.kind === "epoch-stale") {
+      await refreshWriteContext(cfg, deps);
+      currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored);
       currentForce = NO_GIT_FORCE;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
@@ -383,6 +427,7 @@ async function runPushAttempt(
   const api = deps.remote ?? apiFor(cfg);
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
+  const scannedFilePaths = new Set(local.files.filter((f) => f.type === "file").map((f) => f.path));
 
   // Forward-only ignore (M3b): a file that was synced but is now ignored should
   // NOT read as a deletion on other machines. Carry forward its last-synced entry
@@ -444,6 +489,7 @@ async function runPushAttempt(
         gitPendingRemote: gitPlan.gitPendingRemote,
       });
     }
+    if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: state.lastSyncedSequence, manifest: local, committed: false } };
   }
   // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
@@ -463,7 +509,11 @@ async function runPushAttempt(
   // encryptAndUpload retries it a bounded number of times and then DEFERS it (returns its
   // path) rather than aborting the entire push. We commit the stable subset; the daemon's
   // watcher + safety/deep scans naturally re-queue the deferred files once they settle.
-  const { deferred } = await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, report, deps.onProgress, backoff);
+  const { deferred } = await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, report, deps.onProgress, backoff, {
+    encryptFileToTemp: deps.encryptFileToTemp,
+    encryptCacheFlushMs: deps.encryptCacheFlushMs,
+    pruneLivePaths: scannedFilePaths,
+  });
 
   // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
   // if it was previously synced we carry its base entry forward (mirrors the forward-only
@@ -502,6 +552,9 @@ async function runPushAttempt(
   const commitOptions = deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : undefined;
   const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed, commitOptions));
 
+  if (res.epochStale !== undefined) {
+    return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
+  }
   if (res.conflict) {
     deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
     return { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };

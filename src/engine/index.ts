@@ -53,6 +53,13 @@ export { applyActions, restoreEntryToPath, uploadManifestBlobs } from "./apply.j
 export { poolMap } from "./pool.js";
 export { PhaseReport, type PhaseName, type PhaseTotals, type PhaseBytes, type PhaseReportJson } from "./phase-report.js";
 export { HashCache, type HashCacheEntry } from "./hashcache.js";
+export {
+  EncryptAddressCache,
+  EncryptAddressCacheWriter,
+  ENCRYPT_ADDRESS_CACHE_REL,
+  type EncryptAddressCacheContext,
+  type EncryptAddressCacheEntry,
+} from "./encrypt-address-cache.js";
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
 export {
   validateManifest,

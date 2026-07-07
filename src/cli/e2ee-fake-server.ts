@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { bootstrapAccount, parseRefset, type DeviceSecrets, type SignedCommit } from "../engine/e2ee/index.js";
+import { bootstrapAccount, parseCommit, parseRefset, type DeviceSecrets, type SignedCommit } from "../engine/e2ee/index.js";
 import type { BlobStore } from "../engine/index.js";
 import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
@@ -45,6 +45,7 @@ export class FakeServer implements E2eeApi {
   /** Simulated retention prune floor: commit pointers ≤ this are "dropped", so a
    *  `commitsSince(since < floor)` fails closed exactly like the real DO (409). */
   pruneFloor = 0;
+  beforeCommitSigned?: () => Promise<void> | void;
 
   missingBlobs = async (shas: string[]) => shas.filter((s) => !this.store.blobs.has(s));
   putBlobFile = async (sha: string, abs: string) => this.store.putFile(sha, abs);
@@ -66,13 +67,12 @@ export class FakeServer implements E2eeApi {
     return this.commits.slice(since);
   };
   commitSigned = async (parentSeq: number, commit: SignedCommit) => {
-    const body = JSON.parse(commit.body) as {
-      encManifestSha: string;
-      blobRefs?: { encSha: string }[];
-      blobRefset?: { sidecarSha: string; count: number; totalBytes: number };
-    };
+    const body = parseCommit(commit);
+    await this.beforeCommitSigned?.();
+    const currentEpoch = this.account.keyStates.length - 1;
+    if (body.accountEpoch !== currentEpoch) return { epochStale: currentEpoch };
     let refs: string[];
-    if (body.blobRefs) {
+    if ("blobRefs" in body) {
       refs = [body.encManifestSha, ...body.blobRefs.map((r) => r.encSha)];
     } else {
       const sidecar = body.blobRefset;
@@ -120,6 +120,19 @@ export function remoteFor(server: FakeServer, secrets: DeviceSecrets, accountId:
 /** A `WorkspaceConfig` with the blob-encryption KEK loaded from the remote (frozen
  *  write epoch), matching what `buildAuthedRemote` produces in production. */
 export async function cfgFor(root: string, secrets: DeviceSecrets, remote: E2eeRemote, workspaceId: string): Promise<WorkspaceConfig> {
-  const kek = await remote.currentKek();
-  return { schema: "e2ee/v1", remoteWorkspaceId: workspaceId, projectId: "root", deviceId: secrets.deviceId, rootPath: root, remoteUrl: "mem://", token: "t", encrypted: true, kek: Buffer.from(kek) };
+  const writeContext = await remote.currentKek();
+  return {
+    schema: "e2ee/v1",
+    remoteWorkspaceId: workspaceId,
+    projectId: "root",
+    deviceId: secrets.deviceId,
+    rootPath: root,
+    remoteUrl: "mem://",
+    token: "t",
+    encrypted: true,
+    kek: Buffer.from(writeContext.kek),
+    accountId: writeContext.accountId,
+    accountEpoch: writeContext.accountEpoch,
+    keyEpoch: writeContext.keyEpoch,
+  };
 }

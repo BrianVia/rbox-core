@@ -47,6 +47,8 @@ export interface CommitResult {
    *  Distinct from a parent conflict — a different recovery (upload, not pull). */
   unsatisfiedBlobs?: string[];
   unsatisfiedTotal?: number;
+  /** The signed commit used a stale account epoch; refresh E2EE write context and retry. */
+  epochStale?: number;
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {

@@ -131,6 +131,9 @@ function testConfig(): WorkspaceConfig {
     token: "",
     encrypted: true,
     kek: KEK,
+    accountId: "acct_act",
+    accountEpoch: 0,
+    keyEpoch: 0,
   };
 }
 
@@ -519,6 +522,9 @@ test("a throwing onPullApplied hook never fails a completed pull (codex R3)", as
     token: "",
     encrypted: true,
     kek: KEK,
+    accountId: "acct_act",
+    accountEpoch: 0,
+    keyEpoch: 0,
   };
   const actions = await pull(root, cfg, {
     remote,

@@ -5,8 +5,19 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildPairing, redeemPairing, serializeRefset, type DeviceSecrets, type SignedRoster } from "../engine/e2ee/index.js";
-import { gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import {
+  buildKeyState,
+  buildPairing,
+  parseCommit,
+  redeemPairing,
+  serializeRefset,
+  signPrivateFromPkcs8,
+  type DeviceSecrets,
+  type SignedKeyState,
+  type SignedRoster,
+} from "../engine/e2ee/index.js";
+import { ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
@@ -43,6 +54,26 @@ const sidecarShaOf = (manifest: Manifest): string => {
   });
   return shaBytes(serializeRefset(refs));
 };
+
+async function appendKeyState(server: FakeServer, secrets: DeviceSecrets, keyEpoch: number): Promise<void> {
+  const prev = JSON.parse(server.account.keyStates.at(-1)!) as SignedKeyState;
+  const roster = JSON.parse(server.account.rosters[0]!) as SignedRoster;
+  const accountEpoch = server.account.keyStates.length;
+  const next = await buildKeyState({
+    accountId: ACCT,
+    accountEpoch,
+    prevStateHash: prev.stateHash,
+    rosterVersion: 0,
+    rosterHash: roster.rosterHash,
+    keyEpoch,
+    mkWrapHashes: [],
+    recoveryWrapId: `rec_${accountEpoch}`,
+    signerDeviceId: secrets.deviceId,
+    signKey: { publicKey: secrets.sigPubKey, privateKey: signPrivateFromPkcs8(secrets.sigPrivPkcs8) },
+  });
+  server.account.keyStates.push(JSON.stringify(next));
+}
+
 test("blobRefsForManifest includes every git packChain link", () => {
   const section: GitSection = {
     bundleSha: "a".repeat(64),
@@ -63,6 +94,83 @@ test("blobRefsForManifest includes every git packChain link", () => {
   const refs = blobRefsForManifest({ generatedAt: "", files: [], manifestSchema: 3, gitRepos: { repo: section } })!;
   expect(refs.map((r) => r.encSha).sort()).toEqual(["0".repeat(64), "4".repeat(64), "b".repeat(64), "d".repeat(64)].sort());
 });
+
+test("currentKek returns the verified nonzero write context without defaulting epochs", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-epoch", NOW);
+  const s0 = JSON.parse(server.account.keyStates[0]!) as SignedKeyState;
+  const roster0 = JSON.parse(server.account.rosters[0]!) as SignedRoster;
+  const s1 = await buildKeyState({
+    accountId: ACCT,
+    accountEpoch: 1,
+    prevStateHash: s0.stateHash,
+    rosterVersion: 0,
+    rosterHash: roster0.rosterHash,
+    keyEpoch: 7,
+    mkWrapHashes: [],
+    recoveryWrapId: "rec_1",
+    signerDeviceId: secrets.deviceId,
+    signKey: { publicKey: secrets.sigPubKey, privateKey: signPrivateFromPkcs8(secrets.sigPrivPkcs8) },
+  });
+  server.account.keyStates.push(JSON.stringify(s1));
+
+  const remote = await remoteFor(server, secrets);
+  const writeContext = await remote.currentKek();
+
+  expect(writeContext.accountId).toBe(ACCT);
+  expect(writeContext.accountEpoch).toBe(1);
+  expect(writeContext.keyEpoch).toBe(7);
+  expect(server.wsKeys.has(`${WS}:7`)).toBe(true);
+  expect(server.wsKeys.has(`${WS}:0`)).toBe(false);
+});
+
+test("push refreshes write context and encrypt cache after an epoch_stale commit retry", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-epoch-stale", NOW);
+  const root = await tmp();
+  const remote = await remoteFor(server, secrets);
+  const cfg = await cfgFor(root, secrets, remote);
+  const bytes = new TextEncoder().encode("rotating write\n");
+  await fs.writeFile(path.join(root, "rotate.txt"), bytes);
+
+  const stale = await encryptFileNameProbe(new Uint8Array(cfg.kek!), bytes);
+  const cacheFile = path.join(root, ENCRYPT_ADDRESS_CACHE_REL);
+  await fs.mkdir(path.dirname(cacheFile), { recursive: true });
+  await fs.writeFile(
+    cacheFile,
+    JSON.stringify({
+      version: 1,
+      accountId: cfg.accountId,
+      workspaceId: cfg.remoteWorkspaceId,
+      accountEpoch: cfg.accountEpoch,
+      keyEpoch: cfg.keyEpoch,
+      entries: {
+        [stale.plaintextSha]: { encSha: stale.encSha, cipherSize: stale.ciphertext.length, paths: ["rotate.txt"] },
+      },
+    })
+  );
+
+  let rotated = false;
+  server.beforeCommitSigned = async () => {
+    if (rotated) return;
+    rotated = true;
+    await appendKeyState(server, secrets, 7);
+  };
+
+  const res = await push(root, cfg, { remote });
+
+  expect(res.sequence).toBe(1);
+  expect(cfg.accountEpoch).toBe(1);
+  expect(cfg.keyEpoch).toBe(7);
+  const body = parseCommit(server.commits[0]!);
+  expect(body.accountEpoch).toBe(1);
+  expect(body.keyEpoch).toBe(7);
+  const raw = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+  expect(raw.accountEpoch).toBe(1);
+  expect(raw.keyEpoch).toBe(7);
+  expect(raw.entries[stale.plaintextSha].encSha).not.toBe(stale.encSha);
+});
+
 const seedManifestRefs = (server: FakeServer, manifest: Manifest): void => {
   for (const f of manifest.files) {
     if (f.type === "file" && f.encSha) server.store.blobs.set(f.encSha, new Uint8Array([1]));

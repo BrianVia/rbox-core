@@ -1,7 +1,17 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { encryptFileToTemp, poolMap, type FileEntry, type Manifest, type PhaseReport } from "../engine/index.js";
+import {
+  EncryptAddressCache,
+  EncryptAddressCacheWriter,
+  encryptFileToTemp as defaultEncryptFileToTemp,
+  poolMap,
+  type EncryptedBlob,
+  type EncryptAddressCacheContext,
+  type FileEntry,
+  type Manifest,
+  type PhaseReport,
+} from "../engine/index.js";
 import { BlobShaMismatchError, type SyncRemote } from "./remote.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
@@ -37,6 +47,48 @@ const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY,
 // win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
 const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
 
+type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string) => Promise<EncryptedBlob>;
+
+export interface EncryptAndUploadOptions {
+  encryptFileToTemp?: EncryptFileToTempForSync;
+  encryptCacheFlushMs?: number;
+  pruneLivePaths?: ReadonlySet<string>;
+}
+
+const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
+const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheContext {
+  if (!cfg.accountId) throw new Error("E2EE write context missing accountId; refusing to use encrypt address cache");
+  if (!isRuntimeEpoch(cfg.accountEpoch)) throw new Error("E2EE write context missing accountEpoch; refusing to use encrypt address cache");
+  if (!isRuntimeEpoch(cfg.keyEpoch)) throw new Error("E2EE write context missing keyEpoch; refusing to use encrypt address cache");
+  return {
+    accountId: cfg.accountId,
+    workspaceId: cfg.remoteWorkspaceId,
+    accountEpoch: cfg.accountEpoch,
+    keyEpoch: cfg.keyEpoch,
+  };
+}
+
+type CacheHitStatus = "accept" | "encrypt" | "defer";
+
+async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitStatus> {
+  try {
+    const st = await fs.lstat(path.join(root, f.path));
+    if (!st.isFile()) return "encrypt";
+    return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "encrypt";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return "defer";
+    throw err;
+  }
+}
+
+export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
+  const cache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
+  cache.prune(livePaths);
+  await cache.save(root);
+}
+
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
  *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha).
@@ -58,12 +110,16 @@ export async function encryptAndUpload(
   base: Manifest,
   report: PhaseReport,
   onProgress: TransferProgress | undefined,
-  backoff: (attempt: number) => Promise<void>
+  backoff: (attempt: number) => Promise<void>,
+  options: EncryptAndUploadOptions = {}
 ): Promise<{ deferred: Set<string> }> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
+  const encryptFileToTemp = options.encryptFileToTemp ?? defaultEncryptFileToTemp;
+  const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
+  const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
   const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
   const ctByEnc = new Map<string, string>();
@@ -71,18 +127,39 @@ export async function encryptAndUpload(
   const deferred = new Set<string>();
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
-    const toEncrypt: typeof local.files = [];
+    const toEncrypt: FileEntry[] = [];
     for (const f of local.files) {
       if (f.type !== "file") continue;
       const reuse = baseEnc.get(f.sha256);
-      if (reuse) f.encSha = reuse; // unchanged → reuse ciphertext address (no re-encrypt)
-      else toEncrypt.push(f);
+      if (reuse) {
+        f.encSha = reuse; // unchanged → reuse ciphertext address (no re-encrypt)
+        if (encryptCache.migratePath(f.sha256, f.path)) cacheWriter.schedule();
+      } else {
+        toEncrypt.push(f);
+      }
     }
     // Encrypt changed files concurrently (was sequential — slow on a big first push).
     let enc = 0;
     let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
     await report.phase("encrypt", async () => {
       await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
+        const cached = encryptCache.lookup(f.sha256);
+        if (cached) {
+          const status = await classifyCacheHit(root, f);
+          if (status === "defer") {
+            deferred.add(f.path);
+            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            return;
+          }
+          if (status === "accept") {
+            f.encSha = cached.encSha;
+            ctSizeByEnc.set(cached.encSha, cached.cipherSize);
+            encryptCache.record(f.sha256, { ...cached, path: f.path });
+            cacheWriter.schedule();
+            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            return;
+          }
+        }
         let e;
         try {
           e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
@@ -103,6 +180,8 @@ export async function encryptAndUpload(
         f.encSha = e.encSha;
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
+        encryptCache.record(e.plaintextSha, { encSha: e.encSha, cipherSize: e.cipherSize, path: f.path });
+        cacheWriter.schedule();
         encCtBytes += e.cipherSize;
         onProgress?.(++enc, toEncrypt.length, "encrypt");
       });
@@ -159,6 +238,8 @@ export async function encryptAndUpload(
           ct = re.ciphertextPath;
           ctByEnc.set(f.encSha, ct);
           ctSizeByEnc.set(f.encSha, re.cipherSize);
+          encryptCache.record(re.plaintextSha, { encSha: re.encSha, cipherSize: re.cipherSize, path: f.path });
+          cacheWriter.schedule();
           if (uploaded.has(f.encSha)) {
             byteTracker.migrate(f.path, f.encSha, re.cipherSize);
             emitUploadProgress();
@@ -221,7 +302,15 @@ export async function encryptAndUpload(
     });
     report.record("upload", { count: up, wireBytes: upWireBytes });
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    try {
+      const livePaths = new Set(options.pruneLivePaths ?? local.files.filter((f) => f.type === "file").map((f) => f.path));
+      for (const p of deferred) livePaths.delete(p);
+      encryptCache.prune(livePaths);
+      cacheWriter.schedule();
+      await cacheWriter.flush();
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   }
   return { deferred };
 }

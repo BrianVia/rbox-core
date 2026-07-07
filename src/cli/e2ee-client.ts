@@ -230,11 +230,24 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   const api = new RboxApi(remoteUrl, creds.token, cfg.remoteWorkspaceId, cfg.projectId);
   const secrets = await ensureSecrets(api, creds.accountId);
   const remote = new E2eeRemote(api, { accountId: creds.accountId, workspaceId: cfg.remoteWorkspaceId, secrets, now }, keystorePinStore(creds.accountId, cfg.remoteWorkspaceId));
-  const kek = await remote.currentKek(); // frozen write epoch (D1)
+  const writeContext = await remote.currentKek(); // frozen write epoch (D1)
   // `remote` is returned alongside `deps` so version-history commands can reach the
   // E2eeRemote history/restore/advisoryTimes methods directly (the raw transport stays
   // encapsulated); push/pull/sync ignore it and use `deps` as before.
-  return { cfg: { ...cfg, remoteUrl, token: creds.token, encrypted: true, kek: Buffer.from(kek) }, deps: { remote }, remote };
+  return {
+    cfg: {
+      ...cfg,
+      remoteUrl,
+      token: creds.token,
+      encrypted: true,
+      kek: Buffer.from(writeContext.kek),
+      accountId: writeContext.accountId,
+      accountEpoch: writeContext.accountEpoch,
+      keyEpoch: writeContext.keyEpoch,
+    },
+    deps: { remote },
+    remote,
+  };
 }
 
 export { hasDevice };

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection, Manifest } from "../engine/index.js";
+import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 
 function isENOENT(e: unknown): boolean {
@@ -48,6 +49,12 @@ export interface WorkspaceConfig {
   encrypted?: boolean;
   /** Workspace KEK — runtime only, loaded from the keystore; NEVER persisted. */
   kek?: Buffer;
+  /** E2EE write-context binding for blob-address caches — runtime only, NEVER persisted. */
+  accountId?: string;
+  /** Current verified account epoch for the runtime KEK wrap context — runtime only. */
+  accountEpoch?: number;
+  /** Current workspace key epoch for the runtime KEK wrap context — runtime only. */
+  keyEpoch?: number;
   /** Local trash-tier retention (design 50 §2). Both fields optional; normalized
    *  by {@link trashConfig} on read (never trusted raw). `days: 0` = classic
    *  immediate delete (no trash, for the space-constrained). */
@@ -117,6 +124,17 @@ const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 const configPath = (root: string) => path.join(root, RBOX_DIR, CONFIG_FILE);
 const statePath = (root: string) => path.join(root, RBOX_DIR, STATE_FILE);
 
+function configForDisk(cfg: WorkspaceConfig): WorkspaceConfig {
+  return {
+    ...cfg,
+    token: "",
+    kek: undefined,
+    accountId: undefined,
+    accountEpoch: undefined,
+    keyEpoch: undefined,
+  };
+}
+
 /** The identity of the manifest stream a binding syncs against — what a sync
  *  baseline is stamped with and validated against (design 44 §2). Composed of
  *  every coordinate that selects a distinct sequence history server-side. */
@@ -158,7 +176,7 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
   // Never persist secrets to the workspace config: the token lives in the
   // per-machine credential (M4) and the KEK in the keystore (M5). Both injected
   // at runtime by loadAuthedConfig.
-  await writeFileAtomic(configPath(root), JSON.stringify({ ...cfg, token: "", kek: undefined }, null, 2));
+  await writeFileAtomic(configPath(root), JSON.stringify(configForDisk(cfg), null, 2));
 }
 
 /**
@@ -221,6 +239,7 @@ export async function saveState(root: string, state: SyncState): Promise<void> {
 export async function resetSyncState(root: string): Promise<void> {
   for (const p of [
     statePath(root),
+    path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
     path.join(root, RBOX_DIR, "state", "activity.json"),
     path.join(root, RBOX_DIR, "state", "shell.line"),
   ]) {
