@@ -420,3 +420,41 @@ at **185 ms/81% of `blob.get` p50** — a serialized single-threaded-D1 cost the
 could not see. Both levers are real and independent: higher concurrency shrinks wall time; the
 grant removes the 81%-of-p50 D1 serialization point. §27 is now justified on measured server-side
 data.
+
+## Amendment A (2026-07-07) — the grant IS the credential on blob GETs
+
+Measured on a 93,624-blob rematerialization: fetch = 99% of every pull
+lane (818ms/blob loaded vs ~150ms uncontended vs ~40ms R2-only). The
+inflation is D1 queueing: the grant skipped the ENTITLEMENT read but
+every GET still ran bearer AUTHENTICATION through D1, serializing 93k
+requests at the database (~7.8ms × 93k ≈ the entire 731s wall). Client
+concurrency cannot help; the queue is server-side.
+
+Change: `GET /v1/blobs/:sha` presenting a VALID grant skips
+`authenticate()` entirely — the grant is an account-bound, 5-minute,
+HMAC-signed capability minted immediately after a fully-authenticated
+pull handshake; verifying it (CPU-only) IS authentication for this
+narrow read scope. Invalid/absent/expired grant ⇒ the existing
+authenticate + entitlement path, unchanged.
+
+Residuals — stated honestly (review-corrected):
+- **Revocation lag**: a revoked device or an account mid-deletion can use
+  an already-minted grant for up to the TTL (5 min). authenticate() was
+  the only liveness check; the grant deliberately trades it away for this
+  one narrow read scope. Device revocation and account deletion therefore
+  gain a ≤5-minute blob-READ lag (writes/commits unaffected — they still
+  authenticate). Accepted: the capability's blast radius is strictly
+  smaller than the bearer token it derives from, and the lag is bounded.
+- **Stolen-grant probing**: blob keys are global and content-addressed; a
+  grant alone (no bearer) now suffices for the known-encSha probe that
+  previously required bearer+grant. Same information class as before
+  (present-but-unentitled serving is already locked by tests); the delta
+  is credential-theft surface, bounded by the TTL.
+- Implementation ordering is load-bearing: the pre-auth branch matches
+  ONLY `GET /v1/blobs/:64hex` with a grant header, verifies MAC/TTL
+  FIRST, and derives accountId FROM the verified grant — a failed
+  verification falls through to the full authenticate path and must
+  never reach the D1-fallback entitlement check with an unauthenticated
+  accountId. Expected effect: blob GETs become D1-zero and embarrassingly
+parallel (~40-60ms each at any concurrency); the 93k-blob join drops
+from ~12min toward the R2/bandwidth floor (~1-2min).

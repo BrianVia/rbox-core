@@ -176,12 +176,11 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 // GET /v1/blobs/:sha — streamed body. Entitlement checked BEFORE R2 (no timing/
 // existence oracle); an unentitled account gets 404 even if the blob exists (M7).
 //
-// §27 — a valid download grant (HMAC, account-bound, unexpired) authorizes the read
-// WITHOUT the per-blob D1 `isEntitled` read (the 81%-of-p50 hot-path cost), so the grant
-// path emits dbCalls=0. The grant's account must equal the authenticated principal's
-// account (verifyGrant binds `a == accountId`). Any absent/invalid/expired grant falls
-// through to the existing D1 path — old clients and a misconfigured grant key are
-// unaffected, and an entitled account is still served. `blobGet` never 500s on a bad
+// §27 v1 — on the authenticated fallback path, a valid download grant (HMAC,
+// account-bound, unexpired) still authorizes the read WITHOUT the per-blob D1
+// `isEntitled` read. Amendment A's worker-level pre-auth path handles the common
+// valid-grant case before authenticate(); this function remains the legacy fallback for
+// absent/invalid/expired grants and for direct callers. `blobGet` never 500s on a bad
 // grant: an invalid grant is treated exactly like no grant.
 export async function blobGet(env: Env, sha: string, accountId: string, grant?: string): Promise<Response> {
   const op = startOp(env, "blob.get");
@@ -195,6 +194,22 @@ export async function blobGet(env: Env, sha: string, accountId: string, grant?: 
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
   op.done("ok", { bytes: got.size });
+  return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
+}
+
+// §27 Amendment A — grant-only pre-auth blob GET. The worker calls this only after
+// `verifyGrantCredential()` has authenticated the HMAC, TTL, and signed account id.
+// The account id is intentionally not used for a D1 lookup here: the verified grant is
+// the narrow read credential, and this path must stay D1-zero.
+export async function blobGetWithVerifiedGrant(env: Env, sha: string, _accountId: string): Promise<Response> {
+  const op = startOp(env, "blob.get");
+  const notFound = () => {
+    op.done("not_found_grant_preauth");
+    return json({ error: "not_found" }, 404);
+  };
+  const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
+  if (!got) return notFound();
+  op.done("ok_grant_preauth", { bytes: got.size });
   return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
