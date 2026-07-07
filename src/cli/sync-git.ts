@@ -878,6 +878,77 @@ export interface GitPullOutcome {
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
+  gitApplyMetrics?: GitApplyMetrics;
+}
+
+export type GitApplyRunKind = "fresh" | "steady";
+export type GitApplyRepoResult =
+  | "unchanged"
+  | "applied"
+  | "deferred"
+  | "conflict"
+  | "removed"
+  | "skipped";
+
+export interface GitApplyRepoTiming {
+  index: number;
+  queueMs: number;
+  wallMs: number;
+  result: GitApplyRepoResult;
+  commonDirGroup?: number;
+}
+
+export interface GitApplyMetrics {
+  runKind: GitApplyRunKind;
+  repos: number;
+  commonDirGroups: number;
+  results: Record<GitApplyRepoResult, number>;
+  repoTimings: GitApplyRepoTiming[];
+}
+
+const emptyGitApplyResults = (): Record<GitApplyRepoResult, number> => ({
+  unchanged: 0,
+  applied: 0,
+  deferred: 0,
+  conflict: 0,
+  removed: 0,
+  skipped: 0,
+});
+
+const GIT_APPLY_RESULT_ABBR: Record<GitApplyRepoResult, string> = {
+  unchanged: "u",
+  applied: "a",
+  deferred: "d",
+  conflict: "c",
+  removed: "rm",
+  skipped: "s",
+};
+
+function finishGitApplyMetrics(
+  metrics: GitApplyMetrics | undefined,
+  commonDirGroups: Map<string, number> | undefined
+): GitApplyMetrics | undefined {
+  if (!metrics) return undefined;
+  return {
+    ...metrics,
+    commonDirGroups: commonDirGroups?.size ?? 0,
+    results: { ...metrics.results },
+    repoTimings: metrics.repoTimings.map((timing) => ({ ...timing })),
+  };
+}
+
+export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
+  const resultBits = (Object.entries(metrics.results) as Array<[GitApplyRepoResult, number]>)
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${k}=${n}`)
+    .join(",");
+  const repoBits = metrics.repoTimings
+    .map((t) => {
+      const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
+      return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}`;
+    })
+    .join(",");
+  return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} results=${resultBits || "none"} repoMs=${repoBits || "none"}`;
 }
 
 /**
@@ -902,21 +973,39 @@ export async function applyGitSections(
   remote: Manifest,
   store: BlobStore,
   matcher: IgnoreMatcher,
-  glog: (line: string) => void
+  glog: (line: string) => void,
+  opts: { collectMetrics?: boolean } = {}
 ): Promise<GitPullOutcome> {
   const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
   const applied: Record<string, GitSection> = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
+  let commonDirGroups: Map<string, number> | undefined;
+  let metrics: GitApplyMetrics | undefined;
   const pack = (): GitPullOutcome => ({
     gitRepos: emptyToUndef(applied),
     gitReposRemoved: emptyToUndef(removedMem),
     gitNeedsResolution: emptyToUndef(needsRes),
     gitPendingRemote: emptyToUndef(pending),
+    gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
   });
   if (!cfg.syncGit) return pack();
   const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  if (opts.collectMetrics) {
+    commonDirGroups = new Map();
+    metrics = {
+      // "fresh" = no useful local/base git state (design 74 §3) — NOT sequence 0:
+      // a file-synced workspace receiving its first remote.gitRepos is fresh for
+      // git purposes even at a nonzero baseline (review finding: sequence-keyed
+      // classification would poison the Phase-1 gate data).
+      runKind: Object.keys(baseRepos).length === 0 && Object.keys(pending).length === 0 ? "fresh" : "steady",
+      repos: keys.length,
+      commonDirGroups: 0,
+      results: emptyGitApplyResults(),
+      repoTimings: [],
+    };
+  }
   if (keys.length === 0) return pack();
   // Fail closed ONCE, before any per-repo work: git sections (incl. pending ones) are
   // E2EE artifacts — without the key nothing below can decrypt-verify.
@@ -924,12 +1013,26 @@ export async function applyGitSections(
     throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
   }
 
-  const processRepo = async (rel: string): Promise<void> => {
+  const commonDirGroupFor = async (repoDir: string, hasDotGit: boolean): Promise<number | undefined> => {
+    if (!commonDirGroups || !hasDotGit) return undefined;
+    const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!ctx) return undefined;
+    const key = path.resolve(ctx.commonDir);
+    let group = commonDirGroups.get(key);
+    if (group === undefined) {
+      group = commonDirGroups.size + 1;
+      commonDirGroups.set(key, group);
+    }
+    return group;
+  };
+
+  const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const remoteSec = remote.gitRepos?.[rel];
     const baseSec = baseRepos[rel];
     const pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
     const dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+    const commonDirGroup = await commonDirGroupFor(repoDir, dotGit !== undefined);
 
     // Receiver quiescence (design 43 §7): a busy repo defers only itself, and the busy
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
@@ -939,7 +1042,7 @@ export async function applyGitSections(
     if (busy && remoteSec) {
       pending[rel] = remoteSec; // apply needs quiescence — retry next pull; outbound carries newest truth
       glog(`git-sync deferred ${rel}: receiver git busy`);
-      return;
+      return { result: "deferred", commonDirGroup };
     }
     // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
     // and skipping it would leave gitPendingRemote/base carrying a section the remote
@@ -984,7 +1087,7 @@ export async function applyGitSections(
           glog(`git-sync WARNING ${rel}: could not preserve the pending remote section after the remote deletion (local work untouched): ${errMsg(e)}`);
         }
       }
-      return;
+      return { result: "removed", commonDirGroup };
     }
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
@@ -1001,7 +1104,7 @@ export async function applyGitSections(
       } else if (!localId && dotGit.isFile()) {
         pending[rel] = remoteSec;
         glog(`git-sync deferred ${rel}: leftover pointer repo unreadable — keeping removal memory`);
-        return;
+        return { result: "deferred", commonDirGroup };
       } else {
         delete removedMem[rel]; // identity genuinely changed (incl. a re-init'd empty dir repo)
       }
@@ -1013,7 +1116,7 @@ export async function applyGitSections(
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
     if (!remoteChanged && !pend) {
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
-      return;
+      return { result: "unchanged", commonDirGroup };
     }
 
     // Already converged? (e.g. a pending retry finding the user manually resolved, or a
@@ -1026,7 +1129,7 @@ export async function applyGitSections(
         applied[rel] = remoteSec;
         delete pending[rel];
         delete removedMem[rel];
-        return;
+        return { result: "unchanged", commonDirGroup };
       }
     }
 
@@ -1040,7 +1143,7 @@ export async function applyGitSections(
       needsRes[rel] = gitIdentityKey(localId);
       delete pending[rel];
       glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
-      return;
+      return { result: "conflict", commonDirGroup };
     }
 
     // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
@@ -1050,13 +1153,13 @@ export async function applyGitSections(
     };
     if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
       defer("target is inside an ignored subtree — refusing to materialize");
-      return;
+      return { result: "deferred", commonDirGroup };
     }
     try {
       await assertGitTargetWithinRoot(root, rel);
     } catch (e) {
       defer(errMsg(e));
-      return;
+      return { result: "deferred", commonDirGroup };
     }
 
     // Dir leftover clean materialization [v5]: quarantine (capture-grade pinning +
@@ -1094,14 +1197,23 @@ export async function applyGitSections(
       delete pending[rel];
       delete removedMem[rel];
       glog(`git-sync applied ${rel}${res.filteredRefs?.length ? ` (filtered refs: ${res.filteredRefs.join(" ")})` : ""}`);
+      return { result: "applied", commonDirGroup };
     } else {
       defer(res.reason ?? "apply deferred");
+      return { result: "deferred", commonDirGroup };
     }
   };
 
-  for (const rel of keys) {
+  const queuedAt = Date.now();
+  for (let i = 0; i < keys.length; i++) {
+    const rel = keys[i]!;
+    const startedAt = Date.now();
+    let result: GitApplyRepoResult = "deferred";
+    let commonDirGroup: number | undefined;
     try {
-      await processRepo(rel);
+      const processed = await processRepo(rel);
+      result = processed.result;
+      commonDirGroup = processed.commonDirGroup;
     } catch (e) {
       // Per-repo failures defer only THAT repo — one bad repo (a blob missing mid
       // conflict-preserve, an ENOTDIR/hostile target, an fs error) must never abort
@@ -1109,6 +1221,18 @@ export async function applyGitSections(
       const remoteSec = remote.gitRepos?.[rel];
       if (remoteSec) pending[rel] = remoteSec;
       glog(`git-sync deferred ${rel}: ${errMsg(e)}`);
+      result = "deferred";
+    } finally {
+      if (metrics) {
+        metrics.results[result] += 1;
+        metrics.repoTimings.push({
+          index: i,
+          queueMs: startedAt - queuedAt,
+          wallMs: Date.now() - startedAt,
+          result,
+          commonDirGroup,
+        });
+      }
     }
   }
   return pack();

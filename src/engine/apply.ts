@@ -102,14 +102,11 @@ export async function applyActions(
   // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
   let done = 0;
   const envDl = Number(process.env.RBOX_DOWNLOAD_CONCURRENCY);
-  // 64 — now DIRECTLY swept (was 32 by analogy with the old upload knee). A savvy-core clone
-  // (4287 blobs, dev) drops ~14% going 32→64 and keeps improving to ~25% at 128 with NO D1
-  // plateau — i.e. the per-blob entitlement read is NOT the clone bottleneck (this is why the
-  // §27 download-capability scheme was deferred: it removes a read that isn't contended;
-  // download THROUGHPUT is the lever). 64 matches the upload knee and is the safe default
-  // (downloads are streamed to disk, but 128 concurrent large-file writes can spike a
-  // constrained client); power users on fast links bump RBOX_DOWNLOAD_CONCURRENCY toward 128.
-  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 64);
+  // The recorded savvy-core sweep kept improving from 64 to 128 without a D1
+  // plateau, so foreground pulls default to 128. Constrained clients can pin
+  // RBOX_DOWNLOAD_CONCURRENCY=64; daemon pulls still rely on design 49's
+  // background IO priority/throttling instead of a lower command default.
+  const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 256 ? envDl : 128);
   await poolMap(rest, dlConc, async (a) => {
     if (a.kind === "write") {
       await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);

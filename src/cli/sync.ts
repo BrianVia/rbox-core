@@ -14,6 +14,7 @@ import {
 } from "../engine/index.js";
 import {
   applyGitSections,
+  formatGitApplyMetrics,
   formatGitPushLine,
   gitBaseAfterCommit,
   gitForceForMissingBlobs,
@@ -128,13 +129,13 @@ async function withCache(
  */
 export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
   const api = deps.remote ?? apiFor(cfg);
-  const { sequence, manifest: remote } = await api.latest();
+  const report = deps.report ?? PhaseReport.disabled("pull");
+  const { sequence, manifest: remote } = await report.phase("latest", () => api.latest());
 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
   const state = await loadState(root, syncStreamId(cfg));
-  const report = deps.report ?? PhaseReport.disabled("pull");
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = matcherForState(root, cfg, state);
   const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
@@ -221,20 +222,27 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
       cache.invalidate(a.keepLocalAs);
     }
   }
-  await save();
+  await report.phase("cache-save", save);
 
   // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
   // scope-projected identity, per-repo base advance (one busy repo never blocks the
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
-  const gitOutcome = await applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, deps.onGitLog ?? ((l) => console.error(l)));
-  await saveState(root, {
+  const glog = deps.onGitLog ?? ((line: string) => console.error(line));
+  const gitOutcome = await report.phase("git-apply", () =>
+    applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, { collectMetrics: report.enabled })
+  );
+  report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
+  if (gitOutcome.gitApplyMetrics) {
+    report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
+  }
+  await report.phase("state-save", () => saveState(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: sequence,
     lastSyncedManifest: { ...remote, gitRepos: gitOutcome.gitRepos },
     gitReposRemoved: gitOutcome.gitReposRemoved,
     gitNeedsResolution: gitOutcome.gitNeedsResolution,
     gitPendingRemote: gitOutcome.gitPendingRemote,
-  });
+  }));
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);

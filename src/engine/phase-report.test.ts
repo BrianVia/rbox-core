@@ -88,11 +88,25 @@ describe("PhaseReport", () => {
     expect(line).not.toContain("acct_");
   });
 
+  test("phase details are emitted in JSON and appended to the summary line", () => {
+    const r = PhaseReport.pull();
+    r.record("git-apply", { count: 2 });
+    r.recordDetails("git-apply", { gitApply: { repos: 2, commonDirGroups: 1 } }, "repos=2 commonDirs=1 repoMs=i0q0w1u,i1q1w1a");
+
+    const j = r.toJSON();
+    expect(j.phases["git-apply"]).toMatchObject({ count: 2, details: { gitApply: { repos: 2, commonDirGroups: 1 } } });
+    const line = r.summaryLine();
+    expect(line).toContain("git-apply");
+    expect(line).toContain("repos=2 commonDirs=1");
+    expect(line).toContain("repoMs=i0q0w1u,i1q1w1a");
+  });
+
   test("toJSON emits phases in stable order regardless of record order", () => {
     const r = PhaseReport.pull();
+    r.record("git-apply", { count: 1 });
     r.record("apply", { count: 1 });
     r.record("download", { count: 1 });
     r.record("decrypt", { count: 1 });
-    expect(Object.keys(r.toJSON().phases)).toEqual(["download", "decrypt", "apply"]);
+    expect(Object.keys(r.toJSON().phases)).toEqual(["download", "decrypt", "apply", "git-apply"]);
   });
 });
