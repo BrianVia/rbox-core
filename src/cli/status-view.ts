@@ -12,9 +12,9 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
-import { formatDecimalBytes, quotaUsage } from "./quota-format.js";
+import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
-import type { TransferPhase } from "./transfer-progress.js";
+import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
 export interface StatusSnapshot {
@@ -52,6 +52,7 @@ export interface DaemonStatusAttribution {
 }
 
 const n = (v: number) => v.toLocaleString("en-US");
+const BINARY_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"] as const;
 
 export function attributeDaemonForStatus(input: {
   activity: DaemonActivity | undefined;
@@ -145,27 +146,51 @@ const truncateDetail = (d: string): string => {
 };
 
 /**
- * `uploading 42% (3,612/8,603)` — shared by spinners and the live status line.
+ * Shared by spinners and the live status line.
  * Phase-shaped so the two silent-until-now phases read truthfully:
  *  - `scan` is INDETERMINATE (no known total during a live walk) → count only,
  *    no percent: `scanning… 12,304 files`.
  *  - `gitcap` is a per-repo N/total with an optional repo name:
  *    `capturing git state 3/140 — zen-browser-desktop`.
- * The determinate phases keep the clamped-percent guard (a misbehaving producer
- * renders a wrong-but-sane percent, never `150%`/`NaN%`).
+ *  - byte-aware transfer phases render count and byte fractions side by side,
+ *    without manufacturing a unified percent.
  */
-export function progressLabel(phase: TransferPhase, done: number, total: number, detail?: string): string {
+export function progressLabel(phase: TransferPhase, done: number, total: number, detail?: string, bytes?: TransferProgressBytes): string {
   if (phase === "scan") return `scanning… ${n(done)} files`;
+  const byteSuffix = bytes ? ` · ${formatProgressBytes(bytes)}` : "";
   if (phase === "gitcap") {
     const suffix = detail ? ` — ${truncateDetail(detail)}` : "";
-    return `capturing git state ${n(done)}/${n(total)}${suffix}`;
+    return `capturing git state ${n(done)}/${n(total)}${byteSuffix}${suffix}`;
   }
   // Determinate transfer phases. The final `?? "syncing"` is a defensive fallback so a
   // phase string an OLDER daemon never wrote (read from the user-editable activity file)
   // degrades to a sane verb rather than a misleading "downloading".
   const verb = phase === "encrypt" ? "encrypting" : phase === "upload" ? "uploading" : phase === "download" ? "downloading" : "syncing";
+  if (bytes) return `${verb} ${n(done)}/${n(total)}${byteSuffix}`;
   const pct = total > 0 ? Math.min(100, Math.max(0, Math.floor((done / total) * 100))) : 100;
   return `${verb} ${pct}% (${n(done)}/${n(total)})`;
+}
+
+function formatProgressBytes(bytes: TransferProgressBytes): string {
+  if (bytes.bytesTotal !== undefined && bytes.bytesTotal > 0) return formatBinaryBytePair(bytes.bytesDone, bytes.bytesTotal);
+  return `${formatBinaryBytes(bytes.bytesDone)} sent`;
+}
+
+const activeBytes = (active: NonNullable<DaemonActivity["active"]>): TransferProgressBytes | undefined =>
+  active.bytesDone !== undefined ? { bytesDone: active.bytesDone, bytesTotal: active.bytesTotal } : undefined;
+
+function formatBinaryBytePair(done: number, total: number): string {
+  const clampedTotal = Math.max(0, total);
+  const clampedDone = Math.max(0, done);
+  if (clampedTotal < 1024) return `${Math.round(clampedDone)}/${Math.round(clampedTotal)} B`;
+  let unit = 0;
+  let scaledTotal = clampedTotal;
+  while (scaledTotal >= 1024 && unit < BINARY_UNITS.length - 1) {
+    scaledTotal /= 1024;
+    unit++;
+  }
+  const divisor = 1024 ** unit;
+  return `${(clampedDone / divisor).toFixed(1)}/${scaledTotal.toFixed(1)} ${BINARY_UNITS[unit]}`;
 }
 
 /** The top-line health verdict, highest-priority state wins. */
@@ -196,7 +221,7 @@ export function healthLine(s: StatusSnapshot): string {
   //    even freshly killed mid-op — there is no live transfer to report; and a
   //    daemon that died with its pidfile intact must not show "syncing" forever.
   if (active) {
-    return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total)}`);
+    return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total, undefined, activeBytes(active))}`);
   }
 
   const localChanges = s.added + s.changed + s.deleted;

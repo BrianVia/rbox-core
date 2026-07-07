@@ -98,7 +98,8 @@ async function capturePlannedGitSection(
   kek: Buffer,
   uploadsDir: string,
   forced: boolean,
-  backoff?: (attempt: number) => Promise<void>
+  backoff?: (attempt: number) => Promise<void>,
+  onBytes?: (absoluteBytes: number) => void
 ): Promise<{ section?: GitSection; reason?: string }> {
   const repoDir = repoDirOf(root, rel);
   const capture = (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) =>
@@ -107,6 +108,7 @@ async function capturePlannedGitSection(
       uploadsDir,
       uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
       backoff,
+      onBytes,
       ...opts,
     });
 
@@ -434,10 +436,25 @@ export async function planGitSections(
   // the only truthful "done") with the just-settled repo's name as the display detail.
   const repoCount = toCapture.length;
   let captureDone = 0;
+  let gitBytesDone = 0;
+  const repoByteAbs = new Map<string, number>();
+  const noteRepoBytes = (rel: string, abs: number) => {
+    const prev = repoByteAbs.get(rel) ?? 0;
+    if (abs < prev) {
+      repoByteAbs.set(rel, abs);
+      return;
+    }
+    gitBytesDone += abs - prev;
+    repoByteAbs.set(rel, abs);
+    onProgress?.(captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : path.basename(rel), { bytesDone: gitBytesDone });
+  };
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
-      const { section: sec, reason } = await capturePlannedGitSection(root, rel, cfg, base[rel], api, kek, uploadsDir, force.has(rel), backoff);
+      const { section: sec, reason } = await capturePlannedGitSection(
+        root, rel, cfg, base[rel], api, kek, uploadsDir, force.has(rel), backoff,
+        (abs) => noteRepoBytes(rel, abs)
+      );
       if (sec) {
         out[rel] = sec;
         captured.push(rel);
@@ -448,7 +465,13 @@ export async function planGitSections(
       deferOne(rel, e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`);
     } finally {
       // Root repo (rel ".") shows the workspace folder name rather than a bare ".".
-      onProgress?.(++captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : path.basename(rel));
+      onProgress?.(
+        ++captureDone,
+        repoCount,
+        "gitcap",
+        rel === "." ? path.basename(root) : path.basename(rel),
+        gitBytesDone > 0 ? { bytesDone: gitBytesDone } : undefined
+      );
     }
   });
 

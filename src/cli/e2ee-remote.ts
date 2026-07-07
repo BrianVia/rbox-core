@@ -18,6 +18,7 @@ import {
   type VerifiedAccount,
   type Wrap,
 } from "../engine/e2ee/index.js";
+import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
 import { gitSectionBlobRefs, poolMap, type BlobStore, type Manifest } from "../engine/index.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
@@ -85,8 +86,14 @@ export interface CommitChainResult extends CommitResult {
 export interface E2eeApi {
   // blobs (reused as-is for ciphertext)
   missingBlobs(shas: string[]): Promise<string[]>;
-  putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void>;
-  putBlobBytes(sha256: string, bytes: Uint8Array): Promise<void>;
+  putBlobFile(
+    sha256: string,
+    absPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void>;
+  putBlobBytes(sha256: string, bytes: Uint8Array, onBytes?: ByteProgressCallback): Promise<void>;
   blobStore(): BlobStore;
   // key material
   getAccountKeys(): Promise<AccountKeysDTO | null>;
@@ -425,8 +432,14 @@ export class E2eeRemote implements SyncRemote {
   missingBlobs(shas: string[]): Promise<string[]> {
     return this.api.missingBlobs(shas);
   }
-  putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
-    return this.api.putBlobFile(sha256, absPath, size, uploadsDir);
+  putBlobFile(
+    sha256: string,
+    absPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void> {
+    return this.api.putBlobFile(sha256, absPath, size, uploadsDir, onBytes);
   }
   blobStore(): BlobStore {
     return this.api.blobStore();

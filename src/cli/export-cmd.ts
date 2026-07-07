@@ -241,8 +241,8 @@ export async function runExportCore(req: ExportRequest, accountId: string, seams
       seams.onProgress?.(`exporting ${subName}`);
       const wsStaging = path.join(stageDir, `.pull-${crypto.randomBytes(6).toString("hex")}`);
       await fs.mkdir(wsStaging, { recursive: true });
-      await seams.pullWorkspace(wsStaging, { workspaceId: ws.workspaceId, projectId: ws.projectId }, (done, total, phase) =>
-        seams.onProgress?.(`${subName}: ${progressLabel(phase, done, total)}`)
+      await seams.pullWorkspace(wsStaging, { workspaceId: ws.workspaceId, projectId: ws.projectId }, (done, total, phase, detail, bytes) =>
+        seams.onProgress?.(`${subName}: ${progressLabel(phase, done, total, detail, bytes)}`)
       );
       const subdir = path.join(stageDir, subName);
       await fs.mkdir(subdir, { recursive: true });

@@ -100,9 +100,9 @@ Gitcap is byte-indeterminate-total. Do not grow a denominator as artifacts becom
 
 `renderShellLine` also stays pure. Its v1 grammar has one scalar pct token, so it uses byte percent when `bytesTotal > 0`, count percent when only counts are determinate, and `-` otherwise (`src/cli/activity.ts:195`, `src/cli/activity.ts:199`, `src/cli/activity.ts:211`, `src/cli/activity.ts:215`).
 
-Any high-water-mark clamp belongs only in stateful callers that maintain live display state: the foreground spinner loop and the daemon writer. Key it by a fresh phase-instance token, never by phase name; `upload -> idle -> upload` must not inherit the first upload's 100%. `progressLabel`, `renderShellLine`, and one-shot `rbox status` do not keep clamp state.
+There is no high-water display clamp. Foreground spinners, the daemon writer, `progressLabel`, `renderShellLine`, and one-shot `rbox status` render the raw tracker values they receive. Retry restarts, file-migration retractions, defers, and other regressions are honest progress information; jitter-free monotonicity is not a goal. The upload byte tracker's `bytesDone <= bytesTotal` invariant is the only byte-safety guarantee.
 
-Bytes must not amplify daemon writes. Emit bytes through the existing `onProgress` path and keep the current daemon throttle: phase change, final tick, or at most one write per ~500 ms (`src/cli/daemon.ts:730`, `src/cli/daemon.ts:744`).
+Bytes must not amplify daemon writes. Emit bytes through the existing `onProgress` path and keep the daemon throttle raw: phase change, determinate final tick, same-phase raw regression/restart, or at most one write per ~500 ms (`src/cli/daemon.ts:823`, `src/cli/daemon.ts:844`).
 
 Downloads are out of scope. They already have a stalled-stream watchdog (`src/cli/remote/blobs.ts:82`, `src/cli/remote/blobs.ts:89`, `src/cli/remote/resilient.ts:120`, `src/cli/remote/resilient.ts:121`); byte-level download progress can mirror this later.
 

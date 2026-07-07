@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { finished } from "node:stream/promises";
+import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
@@ -12,7 +13,12 @@ import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, fetchBufferedGet, fetchWithD
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
 
-export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Array): Promise<void> {
+export async function putBlob(
+  ctx: RemoteContext,
+  sha256: string,
+  bytes: Uint8Array,
+  onBytes?: ByteProgressCallback
+): Promise<void> {
   // Content-addressed → idempotent: a retried PUT of the same sha writes identical bytes.
   const res = await ctx.fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
     method: "PUT",
@@ -25,6 +31,7 @@ export async function putBlob(ctx: RemoteContext, sha256: string, bytes: Uint8Ar
     throw new Error(translateRemoteError(res.status, "blob PUT failed", text, "workspace not found — check you're in the right directory"));
   }
   ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
+  onBytes?.(bytes.byteLength);
 }
 
 export async function getBlob(ctx: RemoteContext, sha256: string): Promise<Buffer> {
@@ -44,7 +51,14 @@ export async function getBlob(ctx: RemoteContext, sha256: string): Promise<Buffe
  * ≤ SINGLE_PUT_MAX → one streamed PUT (R2 verifies the hash server-side); larger
  * → resumable multipart. `uploadsDir` (`.rbox/state/uploads/`) enables resume.
  */
-export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
+export async function putBlobFile(
+  ctx: RemoteContext,
+  sha256: string,
+  absPath: string,
+  size: number,
+  uploadsDir?: string,
+  onBytes?: ByteProgressCallback
+): Promise<void> {
   if (size <= SINGLE_PUT_MAX) {
     // Content-addressed → idempotent: a retried streamed PUT re-sends the same file bytes.
     // A socket close during the upload body surfaces as a thrown fetch fault (not a Response),
@@ -68,12 +82,13 @@ export async function putBlobFile(ctx: RemoteContext, sha256: string, absPath: s
         throw new Error(translateRemoteError(res.status, "blob PUT failed", text, "workspace not found — check you're in the right directory"));
       }
       ctx.captureReceipt(sha256, (await res.json().catch(() => ({}))) as { receipt?: unknown });
+      onBytes?.(size);
       return;
     }
     // 413: server says too big for single PUT → fall through to multipart (legacy
     // canonical+grant+present=1 path; large files aren't on the receipts hot path).
   }
-  await putBlobMultipart(ctx, sha256, absPath, size, uploadsDir);
+  await putBlobMultipart(ctx, sha256, absPath, size, uploadsDir, onBytes);
 }
 
 /** Stream a blob to `destPath`, hashing as it lands; verify before returning.

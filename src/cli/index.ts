@@ -229,7 +229,7 @@ async function main(): Promise<void> {
       const sp = spinner("pushing");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
+        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
         // Push-side consent (design 50 §4, review B2): op-scoped — NEVER the pull-side
         // `allowMassDelete`, which the 409-recovery pull inside pushManifest would inherit.
         deps.allowMassDeletePush = flags["allow-mass-delete"] === "true";
@@ -253,7 +253,7 @@ async function main(): Promise<void> {
       const sp = spinner("pulling");
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
+        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
         deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("pull");
         deps.report = report;

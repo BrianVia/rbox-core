@@ -1,4 +1,5 @@
 import type { BlobStore, Manifest } from "../../engine/index.js";
+import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
@@ -26,7 +27,13 @@ import {
 export interface SyncRemote {
   latest(): Promise<{ sequence: number; manifest: Manifest }>;
   missingBlobs(shas: string[]): Promise<string[]>;
-  putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void>;
+  putBlobFile(
+    sha256: string,
+    absPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void>;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
@@ -52,8 +59,14 @@ export class RboxApi implements SyncRemote {
     return getBlob(this.ctx, sha256);
   }
 
-  putBlobFile(sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
-    return putBlobFile(this.ctx, sha256, absPath, size, uploadsDir);
+  putBlobFile(
+    sha256: string,
+    absPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void> {
+    return putBlobFile(this.ctx, sha256, absPath, size, uploadsDir, onBytes);
   }
 
   getBlobToFile(sha256: string, destPath: string): Promise<void> {
@@ -65,8 +78,8 @@ export class RboxApi implements SyncRemote {
   }
 
   /** Upload opaque bytes by content address (the encrypted-manifest blob). */
-  putBlobBytes(sha256: string, bytes: Uint8Array): Promise<void> {
-    return putBlob(this.ctx, sha256, bytes);
+  putBlobBytes(sha256: string, bytes: Uint8Array, onBytes?: ByteProgressCallback): Promise<void> {
+    return putBlob(this.ctx, sha256, bytes, onBytes);
   }
 
   bootstrapKeys(body: unknown): Promise<void> {
@@ -177,7 +190,13 @@ export class RemoteBlobStore implements BlobStore {
     await this.api.getBlobToFile(sha256, destPath);
   }
   /** Streaming upload from a file by content address (e.g. a git bundle). */
-  async putFile(sha256: string, srcPath: string, size: number, uploadsDir?: string): Promise<void> {
-    await this.api.putBlobFile(sha256, srcPath, size, uploadsDir);
+  async putFile(
+    sha256: string,
+    srcPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void> {
+    await this.api.putBlobFile(sha256, srcPath, size, uploadsDir, onBytes);
   }
 }

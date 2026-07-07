@@ -26,7 +26,7 @@ test("round-trips the full record", async () => {
     },
     lastPush: { at: "2026-07-02T11:58:00.000Z", files: 3, sequence: 78 },
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
-    active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3 },
+    active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3, bytesDone: 512, bytesTotal: 1024 },
     halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", terminal: { fingerprint: "sidecar-sha" } },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
     local: {
@@ -94,6 +94,25 @@ test("malformed local slot is dropped alone", async () => {
     at,
     ws: { connected: true, at, caughtUp: true, bootId: "boot-1", pid: 1234 },
   });
+});
+
+test("loadActivity keeps active when optional byte fields are malformed", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  const base = { at, active: { at, phase: "upload", done: 1, total: 2 } };
+
+  await fs.writeFile(p, JSON.stringify({ ...base, active: { ...base.active, bytesDone: 10, bytesTotal: 20 } }));
+  expect(await loadActivity(root)).toEqual({ ...base, active: { ...base.active, bytesDone: 10, bytesTotal: 20 } });
+
+  await fs.writeFile(p, JSON.stringify({ ...base, active: { ...base.active, bytesDone: -1, bytesTotal: 20 } }));
+  expect(await loadActivity(root)).toEqual(base);
+
+  await fs.writeFile(p, JSON.stringify({ ...base, active: { ...base.active, bytesDone: 30, bytesTotal: 20 } }));
+  expect(await loadActivity(root)).toEqual(base);
+
+  await fs.writeFile(p, JSON.stringify({ ...base, active: { ...base.active, bytesTotal: 20 } }));
+  expect(await loadActivity(root)).toEqual(base);
 });
 
 test("invalid ws evidence is omitted without dropping valid activity slots", async () => {
@@ -166,6 +185,16 @@ test("renderShellLine pct: floors, clamps 0–100, indeterminate (total<=0) → 
   // installed snippet (`([0-9]{1,3}|-)`), whose glyph renders `↻` alone for it.
   expect(render(500, 0)).toBe("-");
   expect(renderShellLine({ at: "" }, { settled: true, name: "ws", now: NOW }).split(" ")[3]).toBe("-");
+});
+
+test("renderShellLine pct prefers determinate bytes, otherwise falls back to count or `-`", () => {
+  const activeAt = at(1799999990);
+  const pct = (active: DaemonActivity["active"]) =>
+    renderShellLine({ at: "", active }, { settled: false, name: "ws", now: NOW }).split(" ")[3];
+
+  expect(pct({ at: activeAt, phase: "upload", done: 1, total: 10, bytesDone: 512, bytesTotal: 1024 })).toBe("50");
+  expect(pct({ at: activeAt, phase: "gitcap", done: 2, total: 140, bytesDone: 1024 })).toBe("1");
+  expect(pct({ at: activeAt, phase: "scan", done: 500, total: 0, bytesDone: 1024 })).toBe("-");
 });
 
 test("renderShellLine placeholders: no sequence and no ops render `-` and `- -`", () => {

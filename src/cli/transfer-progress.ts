@@ -21,7 +21,20 @@
  */
 export type TransferPhase = "scan" | "gitcap" | "encrypt" | "upload" | "download";
 
+export interface TransferProgressBytes {
+  /** Absolute bytes completed in this phase instance. */
+  bytesDone: number;
+  /** Present only when the byte denominator is determinate. */
+  bytesTotal?: number;
+}
+
 /** Progress for the long phases of sync. The CLI renders it on the spinner and
- *  `rbox status` line; the daemon records the coarse `{phase,done,total}` into its
- *  activity sidecar (never `detail`). */
-export type TransferProgress = (done: number, total: number, phase: TransferPhase, detail?: string) => void;
+ *  `rbox status` line; the daemon records `{phase,done,total}` plus optional byte
+ *  counters into its activity sidecar (never `detail`). */
+export type TransferProgress = (
+  done: number,
+  total: number,
+  phase: TransferPhase,
+  detail?: string,
+  bytes?: TransferProgressBytes
+) => void;

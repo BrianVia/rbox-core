@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { BlobStore } from "../blobstore.js";
+import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { encryptFileToTemp, decryptFileToPath } from "../crypto.js";
 import type { GitArtifactRef, GitPackLink, GitSection } from "../types.js";
 
@@ -316,6 +316,7 @@ export interface PutGitArtifactOptions {
   attempts?: number;
   backoff?: (attempt: number) => Promise<void>;
   uploadsDir?: string;
+  onBytes?: ByteProgressCallback;
 }
 
 const isBlobShaMismatchError = (e: unknown): boolean => e instanceof Error && e.name === "BlobShaMismatchError";
@@ -338,8 +339,11 @@ export async function putGitArtifact(
     const enc = await encryptFileToTemp(srcPath, kek, tmpDir);
     try {
       if (!(await store.has(enc.encSha))) {
-        if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize, opts.uploadsDir);
-        else await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+        if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize, opts.uploadsDir, opts.onBytes);
+        else {
+          await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
+          opts.onBytes?.(enc.cipherSize);
+        }
       }
       return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
     } catch (e) {

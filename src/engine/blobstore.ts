@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { hashBytes } from "./hash.js";
 
+export type ByteProgressCallback = (absoluteBytesCompleted: number) => void;
+
 /**
  * Content-addressed blob store on the local filesystem. In Phase 1 this stands
  * in for R2 — the engine talks to this interface, so swapping in a real remote
@@ -17,7 +19,13 @@ export interface BlobStore {
   getToFile?(sha256: string, destPath: string): Promise<void>;
   /** Optional streaming upload from a file (e.g. a git bundle) by content address.
    *  `uploadsDir` lets remote multipart implementations persist resumable tokens. */
-  putFile?(sha256: string, srcPath: string, size: number, uploadsDir?: string): Promise<void>;
+  putFile?(
+    sha256: string,
+    srcPath: string,
+    size: number,
+    uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void>;
 }
 
 export class LocalBlobStore implements BlobStore {
@@ -60,9 +68,16 @@ export class LocalBlobStore implements BlobStore {
     await fs.copyFile(this.keyPath(sha256), destPath);
   }
 
-  async putFile(sha256: string, srcPath: string, _size = 0, _uploadsDir?: string): Promise<void> {
+  async putFile(
+    sha256: string,
+    srcPath: string,
+    size = 0,
+    _uploadsDir?: string,
+    onBytes?: ByteProgressCallback
+  ): Promise<void> {
     const dest = this.keyPath(sha256);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     await fs.copyFile(srcPath, dest);
+    onBytes?.(size);
   }
 }
