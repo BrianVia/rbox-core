@@ -28,6 +28,8 @@ export class RemoteContext {
   // entitlement read. Refreshed every handshake; harmless when stale (an expired grant
   // makes the server fall back to the D1 path, still serving an entitled account).
   private downloadGrant?: string;
+  private downloadGrantCapturedAtMs = 0;
+  private downloadGrantRefresh?: Promise<void>;
 
   get auth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}` };
@@ -38,7 +40,10 @@ export class RemoteContext {
   }
   /** Capture a §27 grant from a `/latest` response body (no-op when absent — old server). */
   captureGrant(body: { grant?: unknown }): void {
-    if (typeof body.grant === "string") this.downloadGrant = body.grant;
+    if (typeof body.grant === "string") {
+      this.downloadGrant = body.grant;
+      this.downloadGrantCapturedAtMs = Date.now();
+    }
   }
   get protoAuth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}`, "x-rbox-protocol": RemoteContext.PROTO };
@@ -75,5 +80,27 @@ export class RemoteContext {
     }, { op: "checking which blobs to upload" });
     if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
     return ((await res.json()) as { missing: string[] }).missing;
+  }
+
+  async ensureFreshDownloadGrant(maxAgeMs: number): Promise<void> {
+    if (!this.downloadGrant) return;
+    if (Date.now() - this.downloadGrantCapturedAtMs <= maxAgeMs) return;
+    if (!this.downloadGrantRefresh) {
+      this.downloadGrantRefresh = this.refreshDownloadGrant().finally(() => {
+        this.downloadGrantRefresh = undefined;
+      });
+    }
+    await this.downloadGrantRefresh;
+  }
+
+  private async refreshDownloadGrant(): Promise<void> {
+    const res = await this.fetch(`${this.baseUrl}/v1/ws/${this.workspaceId}/proj/${this.projectId}/latest`, { headers: this.auth }, { op: "checking for remote changes" });
+    if (!res.ok) throw new Error(translateRemoteError(res.status, "latest failed", await res.text(), "workspace not found — check you're in the right directory"));
+    const body = (await res.json().catch(() => ({}))) as { grant?: unknown };
+    if (typeof body.grant === "string") this.captureGrant(body);
+    else {
+      this.downloadGrant = undefined;
+      this.downloadGrantCapturedAtMs = 0;
+    }
   }
 }

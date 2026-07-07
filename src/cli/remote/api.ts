@@ -4,6 +4,7 @@ import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob, putBlobFile } from "./blobs.js";
+import { BlobBatchDownloader } from "./blob-batch.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult } from "./commits.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
@@ -42,9 +43,11 @@ export interface SyncRemote {
 /** Thin client for the rbox control plane. */
 export class RboxApi implements SyncRemote {
   private readonly ctx: RemoteContext;
+  private readonly batchDownloader: BlobBatchDownloader;
 
   constructor(baseUrl: string, token: string, workspaceId: string, projectId: string) {
     this.ctx = new RemoteContext(baseUrl, token, workspaceId, projectId);
+    this.batchDownloader = new BlobBatchDownloader(this.ctx);
   }
 
   missingBlobs(shas: string[]): Promise<string[]> {
@@ -69,8 +72,8 @@ export class RboxApi implements SyncRemote {
     return putBlobFile(this.ctx, sha256, absPath, size, uploadsDir, onBytes);
   }
 
-  getBlobToFile(sha256: string, destPath: string): Promise<void> {
-    return getBlobToFile(this.ctx, sha256, destPath);
+  getBlobToFile(sha256: string, destPath: string, expectedSize?: number): Promise<void> {
+    return this.batchDownloader.getToFile(sha256, expectedSize, destPath);
   }
 
   commit(parentSequence: number, deviceId: string, manifest: Manifest, _options?: CommitOptions): Promise<CommitResult> {
@@ -186,8 +189,8 @@ export class RemoteBlobStore implements BlobStore {
     return this.api.getBlob(sha256);
   }
   /** Streaming download into a destination file (used by apply for large blobs). */
-  async getToFile(sha256: string, destPath: string): Promise<void> {
-    await this.api.getBlobToFile(sha256, destPath);
+  async getToFile(sha256: string, destPath: string, expectedSize?: number): Promise<void> {
+    await this.api.getBlobToFile(sha256, destPath, expectedSize);
   }
   /** Streaming upload from a file by content address (e.g. a git bundle). */
   async putFile(

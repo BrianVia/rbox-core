@@ -23,7 +23,7 @@ import { hashFile } from "./hash.js";
  */
 
 const AAD = Buffer.from("rbox/blob/v1");
-const TAG_BYTES = 16;
+export const BLOB_CIPHERTEXT_TAG_BYTES = 16;
 
 export function generateKek(): Buffer {
   return randomBytes(32);
@@ -135,11 +135,11 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
 export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSha: string, destPath: string): Promise<void> {
   const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
   const total = (await fs.stat(ctPath)).size;
-  if (total < TAG_BYTES) throw new Error("ciphertext too short");
-  const tag = Buffer.alloc(TAG_BYTES);
+  if (total < BLOB_CIPHERTEXT_TAG_BYTES) throw new Error("ciphertext too short");
+  const tag = Buffer.alloc(BLOB_CIPHERTEXT_TAG_BYTES);
   const fh = await fs.open(ctPath, "r");
   try {
-    await fh.read(tag, 0, TAG_BYTES, total - TAG_BYTES);
+    await fh.read(tag, 0, BLOB_CIPHERTEXT_TAG_BYTES, total - BLOB_CIPHERTEXT_TAG_BYTES);
   } finally {
     await fh.close();
   }
@@ -147,7 +147,7 @@ export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSh
   decipher.setAAD(AAD);
   decipher.setAuthTag(tag);
   try {
-    const contentLen = total - TAG_BYTES;
+    const contentLen = total - BLOB_CIPHERTEXT_TAG_BYTES;
     if (contentLen === 0) {
       // Empty plaintext (e.g. .gitkeep, __init__.py): the ciphertext is tag-only,
       // so there's no body to stream — the range [0, -1] is invalid. Verify the

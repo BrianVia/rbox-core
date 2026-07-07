@@ -20,6 +20,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { AccountDeleteMessage, DeviceNotifyMessage, Env, WorkerEntrypointExports } from "./env.js";
 import { authenticate } from "./auth.js";
+import { blobBatchGetWithVerifiedGrant } from "./blob-batch.js";
 import { blobGetWithVerifiedGrant } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
@@ -38,6 +39,7 @@ import { webRoutes } from "./routes/web.js";
 import { accountLinkPublicRoutes, accountRoutes } from "./routes/account.js";
 import { keysRoutes } from "./routes/keys.js";
 import { blobsRoutes } from "./routes/blobs.js";
+import { blobBatchRoutes } from "./routes/blob-batch.js";
 import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 export { WorkspaceSync } from "./workspace-sync.js";
@@ -217,16 +219,22 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   if ((r = await webRoutes(ctx))) return r;
   if ((r = await accountLinkPublicRoutes(ctx))) return r;
 
-  // §27 Amendment A: a valid download grant is the narrow credential for exactly
-  // `GET /v1/blobs/:sha`. Ordering is load-bearing: verify MAC/TTL first, derive the
-  // account id only from the verified grant, and on ANY failure fall through to the
-  // normal authenticate() path. Do not move the rest of blobsRoutes pre-auth: check,
-  // PUT, and multipart still require a live bearer token.
-  if (req.method === "GET" && seg.length === 3 && seg[0] === "v1" && seg[1] === "blobs" && SHA256_HEX_RE.test(seg[2]!)) {
+  // §27 Amendment A + §77 P1: a valid download grant is the narrow credential for
+  // exactly `GET /v1/blobs/:sha` and `POST /v1/blob-batch/get`. Ordering is
+  // load-bearing: verify MAC/TTL first, derive the account id only from the
+  // verified grant, and on ANY failure fall through to the normal authenticate()
+  // path. Do not move the rest of blobsRoutes pre-auth: check, PUT, and multipart
+  // still require a live bearer token.
+  const isGrantBlobGet = req.method === "GET" && seg.length === 3 && seg[0] === "v1" && seg[1] === "blobs" && SHA256_HEX_RE.test(seg[2]!);
+  const isGrantBlobBatchGet = req.method === "POST" && eq(seg, ["v1", "blob-batch", "get"]);
+  if (isGrantBlobGet || isGrantBlobBatchGet) {
     const grant = req.headers.get("x-rbox-download-grant");
     if (grant) {
       const verified = await verifyGrantCredential(env, grant, { nowMs: Date.now() });
-      if (verified.ok) return blobGetWithVerifiedGrant(env, seg[2]!, verified.accountId);
+      if (verified.ok) {
+        if (isGrantBlobGet) return blobGetWithVerifiedGrant(env, seg[2]!, verified.accountId);
+        return blobBatchGetWithVerifiedGrant(req, env, verified.accountId);
+      }
     }
   }
 
@@ -253,6 +261,7 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   if ((r = await billingRoutes(ctx, p))) return r;
   if ((r = await accountRoutes(ctx, p))) return r;
   if ((r = await keysRoutes(ctx, p))) return r;
+  if ((r = await blobBatchRoutes(ctx, p))) return r;
   if ((r = await blobsRoutes(ctx, p))) return r;
   if ((r = await diagnosticsRoutes(ctx, p))) return r;
   if ((r = await syncRoutes(ctx, p))) return r;
@@ -280,7 +289,7 @@ const ROUTE_VOCAB = new Set([
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "workspaces", "diagnostics",
   "keys", "roster", "admit", "keystate", "workspace",
-  "blobs", "check", "multipart", "part", "complete",
+  "blobs", "blob-batch", "check", "get", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
 ]);
 export function routeTemplate(pathname: string): string {
