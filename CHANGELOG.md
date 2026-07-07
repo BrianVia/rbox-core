@@ -6,6 +6,31 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-07-07 — batched downloads + parallel git materialization
+
+### Added
+- **Batched blob downloads (design 77 P1).** Small encrypted blobs now ride
+  `POST /v1/blob-batch/get` — up to 32 per request under the §27 download
+  grant (one verification, zero D1 on the happy path), streamed back as
+  binary frames in completion order. The client coalescer fills batches
+  pull-based from a supply-scaled download pool; large blobs keep the
+  streaming single GET. A fresh join now issues ~3k requests where it issued
+  ~93k. Kill switch: `RBOX_BATCH_BLOBS=0`.
+- **Parallel git materialization.** Pull-side git apply runs repos through a
+  bounded pool (`RBOX_GIT_APPLY_CONCURRENCY`, default 6) over nesting-safe
+  chains, with per-store locking for worktrees sharing a common git dir.
+  Measured: the ~98-repo git phase of a fresh join dropped from ~85s serial
+  to ~34s.
+- **Push-side lane timing.** `RBOX_LANE_TIMING=1` now attributes push wall
+  time to encrypt vs upload, mirroring the pull instrument.
+
+### Performance
+- Fresh join of a 96k-file / 4.9 GiB workspace, measured end to end on the
+  same hardware: **118s**, vs ~200s before this release and ~30 minutes two
+  days ago. Server-side (already live for all clients): grant-authenticated
+  blob reads skip the per-request D1 queue entirely (§27 Amendment A).
+
+
 ## [0.9.5] — 2026-07-07 — index resolve-undo fix
 
 ### Fixed
