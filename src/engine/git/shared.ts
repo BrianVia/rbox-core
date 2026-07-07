@@ -34,6 +34,20 @@ export async function git(root: string, args: string[], opts: { maxBuffer?: numb
   });
   return stdout.toString().trim();
 }
+
+async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+  gitSpawnObserver?.(root, args);
+  const { stdout } = await exec("git", ["-C", root, ...args], {
+    maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
+    env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: indexFile } as NodeJS.ProcessEnv,
+  });
+  return stdout.toString().trim();
+}
+
+export async function clearIndexResolveUndo(repoDir: string, indexFile: string): Promise<void> {
+  await gitWithIndexFile(repoDir, indexFile, ["update-index", "--clear-resolve-undo"]);
+}
+
 export async function gitOk(root: string, args: string[]): Promise<boolean> {
   try {
     await git(root, args);
