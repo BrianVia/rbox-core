@@ -124,6 +124,20 @@ describe("nativePruneGlobs — coarse native watcher prune, negation-aware (desi
   });
 });
 
+describe("legacy ignore semantics with respectGitignore off", () => {
+  test("a `.rboxignore` `!dist/` re-includes children and keeps dist unpruned", async () => {
+    const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-legacy-ign-"));
+    try {
+      await fs.writeFile(path.join(d, ".rboxignore"), "!dist/\n");
+      const m = buildIgnoreMatcher(d);
+      expect(m.ignores("dist/keep.txt")).toBe(false);
+      expect(m.prunes?.("dist/")).toBe(false);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("builtin ignores — regenerable build/cache dirs (multi-ecosystem)", () => {
   test("distinctive build outputs are excluded at any depth", () => {
     const m = buildIgnoreMatcher(root);

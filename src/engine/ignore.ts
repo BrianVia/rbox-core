@@ -246,7 +246,7 @@ function isHardExcluded(relPath: string): boolean {
 }
 
 type IgnoreInstance = ReturnType<typeof ignore>;
-type RuleSource = "builtin" | ".gitignore" | ".rboxignore";
+type RuleSource = "legacy" | ".gitignore" | ".rboxignore";
 
 interface GitRuleLayer {
   base: string;
@@ -278,8 +278,13 @@ function matcherOptions(extraOrOptions: string[] | BuildIgnoreMatcherOptions): R
 
 export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | BuildIgnoreMatcherOptions = []): IgnoreMatcher {
   const opts = matcherOptions(extraOrOptions);
-  const builtinIg = ignore().add(BUILTIN_IGNORE);
+  const rootGitignoreText = readIfExists(path.join(root, ".gitignore"));
+  const legacyIg = ignore().add(BUILTIN_IGNORE);
+  if (rootGitignoreText) legacyIg.add(rootGitignoreText);
+  const rootGitIg = ignore();
+  if (rootGitignoreText) rootGitIg.add(rootGitignoreText);
   const rboxLines = [...ruleLines(readIfExists(path.join(root, ".rboxignore"))), ...opts.extra];
+  legacyIg.add(rboxLines);
   const rboxIg = ignore().add(rboxLines);
   const rboxNegations = negationInfos(rboxLines);
   const slashlessRboxNegation = rboxNegations.some((n) => n.slashless);
@@ -293,7 +298,7 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
     const key = normalizeRepoRel(base);
     if (gitLayers.has(key)) return gitLayers.get(key);
     const rel = key === "." ? "" : key;
-    const text = readIfExists(path.join(root, rel, ".gitignore"));
+    const text = key === "." ? rootGitignoreText : readIfExists(path.join(root, rel, ".gitignore"));
     const layer = text ? { base: rel, ig: ignore().add(text) } : undefined;
     gitLayers.set(key, layer);
     return layer;
@@ -307,10 +312,16 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
     return undefined;
   };
 
-  const gitDecision = (relPath: string, nested: boolean): boolean | undefined => {
+  const rootGitDecision = (relPath: string): boolean | undefined => {
     const { clean, isDir } = normalizeRel(relPath);
     if (!clean) return undefined;
-    const bases = nested ? gitCandidateBases(clean, isDir) : [""];
+    return testLayer(rootGitIg, clean + (isDir ? "/" : ""));
+  };
+
+  const nestedGitDecision = (relPath: string): boolean | undefined => {
+    const { clean, isDir } = normalizeRel(relPath);
+    if (!clean) return undefined;
+    const bases = gitCandidateBases(clean, isDir).filter(Boolean);
     const loaded: GitRuleLayer[] = [];
     let decision: boolean | undefined;
     for (const base of bases) {
@@ -326,6 +337,37 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
       if (d !== undefined) decision = d;
     }
     return decision;
+  };
+
+  const legacyDecision = (relPath: string): RuleDecision | undefined => {
+    const { clean, isDir } = normalizeRel(relPath);
+    if (!clean) return undefined;
+    const normalized = clean + (isDir ? "/" : "");
+    const ignored = testLayer(legacyIg, normalized);
+    if (ignored === undefined) return undefined;
+    const rbox = testLayer(rboxIg, normalized);
+    const rootGit = rootGitDecision(normalized);
+    const source: RuleSource = ignored && rbox === true ? ".rboxignore" : rootGit === true ? ".gitignore" : "legacy";
+    return { ignored, source };
+  };
+
+  const rboxNegationRescues = (relPath: string): boolean => {
+    if (rboxNegations.length === 0) return false;
+    const { clean, isDir } = normalizeRel(relPath);
+    if (!clean) return false;
+    const normalized = clean + (isDir ? "/" : "");
+    const direct = testLayer(rboxIg, normalized);
+    if (direct === true) return false;
+    if (direct === false) return true;
+
+    const parts = clean.split("/");
+    for (let i = parts.length; i >= 1; i--) {
+      const ancestor = `${parts.slice(0, i).join("/")}/`;
+      const ancestorDecision = testLayer(rboxIg, ancestor);
+      if (ancestorDecision === true) return false;
+      if (ancestorDecision === false) return true;
+    }
+    return false;
   };
 
   const evaluateGitLayers = (layers: GitRuleLayer[], relPath: string): boolean | undefined => {
@@ -368,23 +410,16 @@ export function buildIgnoreMatcher(root: string, extraOrOptions: string[] | Buil
     return false;
   };
 
-  const baseDecision = (relPath: string, nestedGitignore: boolean): RuleDecision | undefined => {
-    const { clean, isDir } = normalizeRel(relPath);
-    if (!clean) return undefined;
-    let decision: RuleDecision | undefined;
-    const builtin = testLayer(builtinIg, clean + (isDir ? "/" : ""));
-    if (builtin !== undefined) decision = { ignored: builtin, source: "builtin" };
-    const git = gitDecision(clean + (isDir ? "/" : ""), nestedGitignore);
-    if (git !== undefined) decision = { ignored: git, source: ".gitignore" };
-    return decision;
-  };
-
   const fullDecision = (relPath: string, nestedGitignore: boolean): RuleDecision | undefined => {
     const { clean, isDir } = normalizeRel(relPath);
     if (!clean) return undefined;
-    let decision = baseDecision(clean + (isDir ? "/" : ""), nestedGitignore);
-    const rbox = testLayer(rboxIg, clean + (isDir ? "/" : ""));
-    if (rbox !== undefined) decision = { ignored: rbox, source: ".rboxignore" };
+    const normalized = clean + (isDir ? "/" : "");
+    let decision = legacyDecision(normalized);
+    if (nestedGitignore) {
+      const nested = nestedGitDecision(normalized);
+      if (nested === true) decision = rboxNegationRescues(normalized) ? { ignored: false, source: ".rboxignore" } : { ignored: true, source: ".gitignore" };
+      if (decision?.ignored === true && rboxNegationRescues(normalized)) decision = { ignored: false, source: ".rboxignore" };
+    }
     return decision;
   };
 
