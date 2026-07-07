@@ -174,6 +174,17 @@ async function writeEntry(
  *  into `tmp`; plain file → stream by sha (download verifies it) + chmod. Shared by
  *  the pull writer (precondition-checked publish) and the version-restore writer
  *  (explicit overwrite). */
+/** RBOX_LANE_TIMING=1 — per-lane fetch vs decrypt+write attribution (design 74/76
+ *  reviews: the pull's per-blob cost must be decomposable before transport work is
+ *  justified). Zero cost when unset. Totals print once per apply via laneTimingSummary. */
+const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
+export const laneTiming = { fetchMs: 0, decryptWriteMs: 0, blobs: 0 };
+export function laneTimingSummary(): string | undefined {
+  if (!LANE_TIMING || laneTiming.blobs === 0) return undefined;
+  const f = laneTiming.fetchMs, d = laneTiming.decryptWriteMs, n = laneTiming.blobs;
+  return `lane timing: ${n} blobs · fetch ${(f / 1000).toFixed(1)}s (${((f / (f + d)) * 100).toFixed(0)}%) · decrypt+write ${(d / 1000).toFixed(1)}s (${((d / (f + d)) * 100).toFixed(0)}%) · per-blob fetch ${(f / n).toFixed(1)}ms / local ${(d / n).toFixed(1)}ms`;
+}
+
 async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore, kek?: Buffer): Promise<void> {
   if (entry.type === "symlink") {
     await fs.symlink(entry.symlinkTarget ?? "", tmp);
@@ -183,9 +194,16 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
     // Encrypted (M5/E2EE): fetch ciphertext by encSha, decrypt+verify into tmp.
     const ctTmp = `${tmp}.ct`;
     try {
+      const t0 = LANE_TIMING ? performance.now() : 0;
       if (store.getToFile) await store.getToFile(entry.encSha, ctTmp);
       else await fs.writeFile(ctTmp, await store.get(entry.encSha));
+      const t1 = LANE_TIMING ? performance.now() : 0;
       await decryptFileToPath(ctTmp, kek, entry.sha256, tmp);
+      if (LANE_TIMING) {
+        laneTiming.fetchMs += t1 - t0;
+        laneTiming.decryptWriteMs += performance.now() - t1;
+        laneTiming.blobs++;
+      }
     } finally {
       await fs.rm(ctTmp, { force: true }).catch(() => {});
     }

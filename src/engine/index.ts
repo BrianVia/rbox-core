@@ -49,7 +49,8 @@ export { scanManifest, applyWatchEvents, type WatchEvent, type WatchEventKind } 
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
-export { applyActions, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
+export { applyActions,
+  laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
 export { poolMap } from "./pool.js";
 export { PhaseReport, type PhaseName, type PhaseTotals, type PhaseBytes, type PhaseReportJson } from "./phase-report.js";
 export { HashCache, type HashCacheEntry } from "./hashcache.js";
