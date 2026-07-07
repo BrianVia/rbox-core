@@ -11,6 +11,7 @@ import {
   type Action,
   type IgnoreMatcher,
   type Manifest,
+  laneTimingSummary,
 } from "../engine/index.js";
 import {
   applyGitSections,
@@ -245,6 +246,10 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     });
   } finally {
     if (batch) await batch.finish();
+  }
+  {
+    const lane = laneTimingSummary();
+    if (lane) process.stderr.write(`${lane}\n`);
   }
   if (report.enabled) {
     const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
