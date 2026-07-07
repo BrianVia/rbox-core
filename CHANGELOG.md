@@ -6,6 +6,15 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-07-07 — index resolve-undo fix
+
+### Fixed
+- **Repos with old merge-conflict residue no longer defer forever on
+  receivers.** An index resolve-undo extension pointing at unreachable
+  conflict blobs failed every receiver's post-apply fsck. Snapshots now
+  strip it at capture, and apply clears it before fsck (existing stuck
+  sections heal without a re-capture).
+
 ## [0.9.4] — 2026-07-07 — the performance sprint
 
 ### Added
