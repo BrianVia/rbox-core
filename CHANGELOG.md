@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-07-07 — daemon hotfix
+
+### Fixed
+- **v0.9.2 daemons stopped pushing minutes after start** ("E2EE required:
+  refusing to sync without an encryption key"): the new workspace-config
+  reload rebuilt the daemon's config from workspace.json, dropping the
+  runtime-attached encryption key material and credential remote override.
+  The reload now moves only the hot-reloadable setting. If you installed
+  0.9.2, upgrade and restart the daemon (`rbox upgrade && rbox stop && rbox
+  start`).
+
 ## [0.9.2] — 2026-07-06 — refs at scale: big workspaces can publish
 
 ### Added
