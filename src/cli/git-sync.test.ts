@@ -7,10 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
-import { loadState, saveState, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, type SyncState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
-import { gitDivergenceCount, gitDivergenceFastRepoSource } from "./sync-git.js";
+import { applyGitSections, gitDivergenceCount, gitDivergenceFastRepoSource } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
@@ -159,6 +159,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   delete process.env.RBOX_GIT_REPO_CAP;
+  delete process.env.RBOX_GIT_APPLY_CONCURRENCY;
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -211,6 +212,234 @@ async function observeGitSpawns<T>(fn: () => Promise<T>): Promise<{ value: T; sp
     setGitSpawnObserver(undefined);
   }
 }
+
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void; reject: (reason?: unknown) => void } {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const resolvesWithin = async (promise: Promise<unknown>, ms: number): Promise<boolean> =>
+  Promise.race([promise.then(() => true), delay(ms).then(() => false)]);
+
+function observingBlobStore(inner: BlobStore, onGetToFile: (sha: string) => Promise<void> | void): BlobStore {
+  const wrapped: BlobStore = {
+    has: (sha) => inner.has(sha),
+    put: (sha, bytes) => inner.put(sha, bytes),
+    get: (sha) => inner.get(sha),
+    async getToFile(sha, dest, expectedSize) {
+      await onGetToFile(sha);
+      if (inner.getToFile) return inner.getToFile(sha, dest, expectedSize);
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.writeFile(dest, await inner.get(sha));
+    },
+  };
+  if (inner.putFile) wrapped.putFile = (sha, src, size, uploadsDir, onBytes) => inner.putFile!(sha, src, size, uploadsDir, onBytes);
+  return wrapped;
+}
+
+const gitManifest = (gitRepos: Record<string, GitSection>): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos });
+const gitState = (gitRepos?: Record<string, GitSection>): SyncState => ({
+  stream: "test",
+  lastSyncedSequence: 0,
+  lastSyncedManifest: gitRepos ? gitManifest(gitRepos) : { generatedAt: "", files: [] },
+});
+
+async function captureSections(rels: readonly string[]): Promise<Record<string, GitSection>> {
+  const store = remote.blobStore();
+  const out: Record<string, GitSection> = {};
+  for (const rel of rels) out[rel] = (await captureGitState(path.join(rootA, rel), store, KEK))!;
+  return out;
+}
+
+const artifactSet = (section: GitSection): Set<string> => new Set(gitSectionBlobRefs(section).map((r) => r.encSha));
+
+async function initRepoOnBranch(dir: string, branch: string, fileContent: string): Promise<void> {
+  await initRepo(dir);
+  await git(dir, "checkout", "-qb", branch);
+  await commitFile(dir, "f.txt", fileContent, "c1");
+}
+
+// ── pooled pull-side git apply scheduling ─────────────────────────────────────
+
+test("git apply pools independent repos under RBOX_GIT_APPLY_CONCURRENCY>=2", async () => {
+  process.env.RBOX_GIT_APPLY_CONCURRENCY = "2";
+  for (const rel of ["alpha", "beta"]) {
+    await initRepo(path.join(rootA, rel));
+    await commitFile(path.join(rootA, rel), "f.txt", rel, "c1");
+  }
+  const sections = await captureSections(["alpha", "beta"]);
+  const alphaArtifacts = artifactSet(sections.alpha!);
+  const betaArtifacts = artifactSet(sections.beta!);
+  const alphaBlocked = deferred();
+  const releaseAlpha = deferred();
+  const betaStarted = deferred();
+  let blockedAlpha = false;
+
+  const store = observingBlobStore(remote.blobStore(), async (sha) => {
+    if (!blockedAlpha && alphaArtifacts.has(sha)) {
+      blockedAlpha = true;
+      alphaBlocked.resolve();
+      await releaseAlpha.promise;
+    } else if (betaArtifacts.has(sha)) {
+      await alphaBlocked.promise;
+      betaStarted.resolve();
+    }
+  });
+
+  const outcome = applyGitSections(rootB, cfgB, gitState(), gitManifest(sections), store, buildIgnoreMatcher(rootB), (l) => logsB.push(l));
+  await alphaBlocked.promise;
+  const betaStartedBeforeAlphaFinished = await resolvesWithin(betaStarted.promise, 1_000);
+  releaseAlpha.resolve();
+  await outcome;
+
+  expect(betaStartedBeforeAlphaFinished).toBe(true);
+  expect(logsB.filter((l) => l.startsWith("git-sync applied ")).sort()).toEqual(["git-sync applied alpha", "git-sync applied beta"]);
+}, 30_000);
+
+test("git apply serializes pointer repos that share one common git dir", async () => {
+  process.env.RBOX_GIT_APPLY_CONCURRENCY = "2";
+  const main = path.join(tmp, "shared-main");
+  await initRepo(main);
+  await commitFile(main, "base.txt", "base", "base");
+  const wtA = path.join(rootB, "wt-a");
+  const wtB = path.join(rootB, "wt-b");
+  await git(main, "worktree", "add", wtA, "-b", "wt-a");
+  await commitFile(wtA, "local-a.txt", "local-a", "local a");
+  await git(main, "worktree", "add", wtB, "-b", "wt-b");
+  await commitFile(wtB, "local-b.txt", "local-b", "local b");
+
+  const storeForCapture = remote.blobStore();
+  const baseA = (await captureGitState(wtA, storeForCapture, KEK))!;
+  const baseB = (await captureGitState(wtB, storeForCapture, KEK))!;
+  await initRepoOnBranch(path.join(rootA, "wt-a"), "wt-a", "remote-a");
+  await initRepoOnBranch(path.join(rootA, "wt-b"), "wt-b", "remote-b");
+  const remoteSecs = await captureSections(["wt-a", "wt-b"]);
+  const labels = new Map<string, string>();
+  for (const [rel, sec] of Object.entries(remoteSecs)) for (const sha of artifactSet(sec)) labels.set(sha, rel);
+  const firstBlocked = deferred<string>();
+  const releaseFirst = deferred();
+  const secondStarted = deferred();
+  let firstRel: string | undefined;
+
+  const store = observingBlobStore(remote.blobStore(), async (sha) => {
+    const rel = labels.get(sha);
+    if (!rel) return;
+    if (!firstRel) {
+      firstRel = rel;
+      firstBlocked.resolve(rel);
+      await releaseFirst.promise;
+    } else if (rel !== firstRel) {
+      secondStarted.resolve();
+    }
+  });
+
+  const outcome = applyGitSections(
+    rootB,
+    cfgB,
+    gitState({ "wt-a": baseA, "wt-b": baseB }),
+    gitManifest(remoteSecs),
+    store,
+    buildIgnoreMatcher(rootB),
+    (l) => logsB.push(l)
+  );
+  await firstBlocked.promise;
+  const overlapped = await resolvesWithin(secondStarted.promise, 1_000);
+  releaseFirst.resolve();
+  await outcome;
+
+  expect(overlapped).toBe(false);
+  expect(logsB.filter((l) => l.startsWith("git-sync applied ")).sort()).toEqual(["git-sync applied wt-a", "git-sync applied wt-b"]);
+}, 30_000);
+
+test("git apply keeps nested repo chains parent-before-child under pooling", async () => {
+  process.env.RBOX_GIT_APPLY_CONCURRENCY = "2";
+  await initRepo(path.join(rootA, "parent"));
+  await commitFile(path.join(rootA, "parent"), "parent.txt", "parent", "parent c1");
+  await initRepo(path.join(rootA, "parent", "child"));
+  await commitFile(path.join(rootA, "parent", "child"), "child.txt", "child", "child c1");
+  const sections = await captureSections(["parent", "parent/child"]);
+  const parentArtifacts = artifactSet(sections.parent!);
+  const childArtifacts = artifactSet(sections["parent/child"]!);
+  const parentBlocked = deferred();
+  const releaseParent = deferred();
+  const childStarted = deferred();
+  let blockedParent = false;
+
+  const store = observingBlobStore(remote.blobStore(), async (sha) => {
+    if (!blockedParent && parentArtifacts.has(sha)) {
+      blockedParent = true;
+      parentBlocked.resolve();
+      await releaseParent.promise;
+    } else if (childArtifacts.has(sha)) {
+      await parentBlocked.promise;
+      childStarted.resolve();
+    }
+  });
+
+  const outcome = applyGitSections(rootB, cfgB, gitState(), gitManifest(sections), store, buildIgnoreMatcher(rootB), (l) => logsB.push(l));
+  await parentBlocked.promise;
+  const childStartedBeforeParentFinished = await resolvesWithin(childStarted.promise, 1_000);
+  releaseParent.resolve();
+  await outcome;
+
+  expect(childStartedBeforeParentFinished).toBe(false);
+  expect(logsB.filter((l) => l.startsWith("git-sync applied "))).toEqual(["git-sync applied parent", "git-sync applied parent/child"]);
+}, 30_000);
+
+test("RBOX_GIT_APPLY_CONCURRENCY=1 preserves serial apply order", async () => {
+  process.env.RBOX_GIT_APPLY_CONCURRENCY = "1";
+  for (const rel of ["one", "two"]) {
+    await initRepo(path.join(rootA, rel));
+    await commitFile(path.join(rootA, rel), "f.txt", rel, "c1");
+  }
+  const sections = await captureSections(["one", "two"]);
+  const oneArtifacts = artifactSet(sections.one!);
+  const seen = new Set<string>();
+  const events: string[] = [];
+  const oneBlocked = deferred();
+  const releaseOne = deferred();
+  const twoStarted = deferred();
+  let blockedOne = false;
+
+  const labelFor = (sha: string): string | undefined => {
+    for (const [rel, sec] of Object.entries(sections)) if (artifactSet(sec).has(sha)) return rel;
+    return undefined;
+  };
+  const store = observingBlobStore(remote.blobStore(), async (sha) => {
+    const rel = labelFor(sha);
+    if (rel && !seen.has(rel)) {
+      seen.add(rel);
+      events.push(`start:${rel}`);
+    }
+    if (!blockedOne && oneArtifacts.has(sha)) {
+      blockedOne = true;
+      oneBlocked.resolve();
+      await releaseOne.promise;
+    } else if (rel === "two") {
+      await oneBlocked.promise;
+      twoStarted.resolve();
+    }
+  });
+
+  const outcome = applyGitSections(rootB, cfgB, gitState(), gitManifest(sections), store, buildIgnoreMatcher(rootB), (l) => {
+    logsB.push(l);
+    const m = /^git-sync applied (.+)$/.exec(l);
+    if (m) events.push(`done:${m[1]}`);
+  });
+  await oneBlocked.promise;
+  const twoStartedBeforeOneFinished = await resolvesWithin(twoStarted.promise, 1_000);
+  releaseOne.resolve();
+  await outcome;
+
+  expect(twoStartedBeforeOneFinished).toBe(false);
+  expect(events).toEqual(["start:one", "done:one", "start:two", "done:two"]);
+}, 30_000);
 
 // ── (a) two-machine e2e: fidelity across nested repos + a real worktree ──────────
 

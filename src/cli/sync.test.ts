@@ -870,7 +870,7 @@ test("design 74 phase 0: pull reports git-apply repo timings and commonDir group
   expect(details.commonDirGroups).toBe(0);
   expect(details.results.unchanged).toBe(2);
   expect(details.repoTimings).toHaveLength(2);
-  expect(details.repoTimings.map((t) => t.index)).toEqual([0, 1]);
+  expect(details.repoTimings.map((t) => t.index).sort()).toEqual([0, 1]);
   for (const t of details.repoTimings) {
     expect(t.queueMs).toBeGreaterThanOrEqual(0);
     expect(t.wallMs).toBeGreaterThanOrEqual(0);
@@ -881,7 +881,10 @@ test("design 74 phase 0: pull reports git-apply repo timings and commonDir group
   expect(lines[0]).toContain("git-apply");
   expect(lines[0]).toContain("repos=2 commonDirs=0");
   expect(lines[0]).toContain("results=unchanged=2");
-  expect(lines[0]).toContain("repoMs=i0");
+  // Pooled apply (d78): repo timings emit in completion order, so assert both
+  // repos appear rather than which one prints first.
+  expect(lines[0]).toMatch(/repoMs=.*i0q/);
+  expect(lines[0]).toMatch(/repoMs=.*i1q/);
 });
 
 test("§35: with no report, the sync path is unaffected (disabled fallback records nothing)", async () => {

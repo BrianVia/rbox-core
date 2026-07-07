@@ -54,6 +54,22 @@ import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 
 /** Bundling is CPU/IO heavy — bound concurrent captures (design 43 §6.3). */
 const GIT_CAPTURE_CONCURRENCY = 4;
+const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
+
+const envInt = (name: string, fallback: number, min: number, max: number): number => {
+  const raw = process.env[name]?.trim();
+  if (!raw || !/^-?\d+$/.test(raw)) return fallback;
+  try {
+    const n = BigInt(raw);
+    if (n < BigInt(min)) return min;
+    if (n > BigInt(max)) return max;
+    return Number(n);
+  } catch {
+    return fallback;
+  }
+};
+
+const gitApplyConcurrency = (): number => envInt("RBOX_GIT_APPLY_CONCURRENCY", GIT_APPLY_CONCURRENCY_DEFAULT, 1, 16);
 
 /** The push-side new-repo admission cap (design 43 §3 [v2, M4]). Env-overridable for
  *  tests/tuning; the manifest-validation bound stays the hard MAX_GIT_REPOS. The cap
@@ -87,6 +103,59 @@ function exceedsPackChainByteBound(chain: GitPackLink[], newestCipherSize: numbe
   if (chain.length === 0) return false;
   const incrementBytes = chain.slice(1).reduce((n, l) => n + l.cipherSize, 0) + newestCipherSize;
   return incrementBytes >= chain[0]!.cipherSize;
+}
+
+function isStrictPathAncestor(ancestor: string, rel: string): boolean {
+  if (ancestor === rel) return false;
+  if (ancestor === ".") return rel !== ".";
+  return rel.startsWith(`${ancestor}/`);
+}
+
+function nestedRepoChains(keys: readonly string[]): string[][] {
+  const chains: string[][] = [];
+  const chainByRel = new Map<string, string[]>();
+  const seen: string[] = [];
+  for (const rel of keys) {
+    let nearestAncestor: string | undefined;
+    for (let i = seen.length - 1; i >= 0; i--) {
+      const candidate = seen[i]!;
+      if (isStrictPathAncestor(candidate, rel)) {
+        nearestAncestor = candidate;
+        break;
+      }
+    }
+    const chain = nearestAncestor ? chainByRel.get(nearestAncestor)! : [];
+    if (!nearestAncestor) chains.push(chain);
+    chain.push(rel);
+    chainByRel.set(rel, chain);
+    seen.push(rel);
+  }
+  return chains;
+}
+
+async function chainLock<T>(locks: Map<string, Promise<void>>, key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current, () => current);
+  locks.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (locks.get(key) === tail) locks.delete(key);
+  }
+}
+
+async function gitApplyMutationKey(root: string, rel: string): Promise<string> {
+  const repoDir = repoDirOf(root, rel);
+  const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+  if (ctx) return path.resolve(ctx.commonDir);
+  const dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+  return dotGit ? path.resolve(repoDir, ".git") : path.resolve(repoDir);
 }
 
 async function capturePlannedGitSection(
@@ -1205,15 +1274,21 @@ export async function applyGitSections(
   };
 
   const queuedAt = Date.now();
-  for (let i = 0; i < keys.length; i++) {
-    const rel = keys[i]!;
-    const startedAt = Date.now();
+  const commonDirLocks = new Map<string, Promise<void>>();
+  const indexes = new Map(keys.map((rel, i) => [rel, i]));
+  const runRepo = async (rel: string): Promise<void> => {
+    const i = indexes.get(rel)!;
+    let startedAt = Date.now();
     let result: GitApplyRepoResult = "deferred";
     let commonDirGroup: number | undefined;
     try {
-      const processed = await processRepo(rel);
-      result = processed.result;
-      commonDirGroup = processed.commonDirGroup;
+      const lockKey = await gitApplyMutationKey(root, rel);
+      await chainLock(commonDirLocks, lockKey, async () => {
+        startedAt = Date.now();
+        const processed = await processRepo(rel);
+        result = processed.result;
+        commonDirGroup = processed.commonDirGroup;
+      });
     } catch (e) {
       // Per-repo failures defer only THAT repo — one bad repo (a blob missing mid
       // conflict-preserve, an ENOTDIR/hostile target, an fs error) must never abort
@@ -1234,7 +1309,10 @@ export async function applyGitSections(
         });
       }
     }
-  }
+  };
+  await poolMap(nestedRepoChains(keys), gitApplyConcurrency(), async (chain) => {
+    for (const rel of chain) await runRepo(rel);
+  });
   return pack();
 }
 
