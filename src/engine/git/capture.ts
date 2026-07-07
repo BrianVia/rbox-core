@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { BlobStore } from "../blobstore.js";
+import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
 import { exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
@@ -71,6 +71,9 @@ export interface GitCaptureOptions {
   basis?: { tips: string[] };
   /** Internal planning hook: called when basis bundle creation degrades to a full bundle. */
   onBasisFallback?: (reason: string) => void;
+  /** Cumulative ciphertext bytes uploaded during this capture. Engine-local:
+   *  callers decide how to surface it. */
+  onBytes?: ByteProgressCallback;
 }
 
 export function gitCaptureScratchRoot(workspaceRoot: string): string {
@@ -252,15 +255,28 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     //    encSha (convergent — same primitive as file blobs), and record (plaintext sha, encSha,
     //    cipherSize). The server only ever sees ciphertext + encShas; the manifest carrying this
     //    section is itself E2EE-encrypted, so refs/HEAD/object-shas stay private too.
-    const uploadOpts = { attempts: opts.uploadAttempts, backoff: opts.backoff, uploadsDir: opts.uploadsDir };
-    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir, uploadOpts);
+    let captureBytes = 0;
+    const uploadOpts = () => {
+      let artifactAbs = 0;
+      return {
+        attempts: opts.uploadAttempts,
+        backoff: opts.backoff,
+        uploadsDir: opts.uploadsDir,
+        onBytes: (abs: number) => {
+          captureBytes += Math.max(0, abs - artifactAbs);
+          artifactAbs = abs;
+          opts.onBytes?.(captureBytes);
+        },
+      };
+    };
+    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir, uploadOpts());
 
     let index: GitArtifactRef | undefined;
-    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir, uploadOpts);
+    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir, uploadOpts());
     const indexTree = await indexTreeOf(ctx);
     const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
-      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir, uploadOpts);
+      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir, uploadOpts());
     }
 
     const section: GitSection = {

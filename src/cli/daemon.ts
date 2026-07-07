@@ -19,7 +19,7 @@ import { loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type 
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
-import type { TransferPhase } from "./transfer-progress.js";
+import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { lowerIoPriority } from "./io-priority.js";
@@ -478,7 +478,7 @@ export class RboxDaemon {
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
         onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
-        onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45: live % in `rbox status`
+        onProgress: (done, total, phase, _detail, bytes) => this.onTransferProgress(done, total, phase, bytes), // design 45: live progress in `rbox status`
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
       });
@@ -629,7 +629,7 @@ export class RboxDaemon {
       cache: this.cache,
       report,
       onGitLog: log,
-      onProgress: (done, total, phase) => this.onTransferProgress(done, total, phase), // design 45
+      onProgress: (done, total, phase, _detail, bytes) => this.onTransferProgress(done, total, phase, bytes), // design 45
       onPullApplied: (a) => this.recordPullApplied(a),
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
     });
@@ -815,19 +815,30 @@ export class RboxDaemon {
   }
 
   /** Live transfer progress → activity sidecar, throttled to ~2 writes/s so a big
-   *  transfer isn't bottlenecked on progress bookkeeping. Two ticks bypass the
-   *  throttle: a phase's FINAL tick (determinate phases only — an indeterminate
-   *  tick has total===0 and is never final, so a huge scan can't queue a write per
-   *  stride) and a phase CHANGE (a gitcap→encrypt transition must show immediately,
-   *  not after up to 500ms of the stale phase). */
-  private onTransferProgress(done: number, total: number, phase: TransferPhase): void {
+   *  transfer isn't bottlenecked on progress bookkeeping. Phase changes, determinate
+   *  final ticks, and raw same-phase regressions bypass the throttle so transitions,
+   *  completions, and retry/retraction restarts are visible immediately. */
+  private onTransferProgress(done: number, total: number, phase: TransferPhase, bytes?: TransferProgressBytes): void {
     const now = Date.now();
     const final = total > 0 && done >= total;
     const phaseChanged = phase !== this.lastProgressPhase;
-    if (!final && !phaseChanged && now - this.lastProgressWrite < 500) return;
+    const active = this.activity.active;
+    const regressed =
+      active?.phase === phase &&
+      (done < active.done ||
+        total < active.total ||
+        (bytes?.bytesDone !== undefined && active.bytesDone !== undefined && bytes.bytesDone < active.bytesDone) ||
+        (bytes?.bytesTotal !== undefined && active.bytesTotal !== undefined && bytes.bytesTotal < active.bytesTotal));
+    if (!final && !phaseChanged && !regressed && now - this.lastProgressWrite < 500) return;
     this.lastProgressPhase = phase;
     this.lastProgressWrite = now;
-    this.activity.active = { at: new Date().toISOString(), phase, done, total };
+    this.activity.active = {
+      at: new Date().toISOString(),
+      phase,
+      done,
+      total,
+      ...(bytes ? { bytesDone: bytes.bytesDone, ...(bytes.bytesTotal !== undefined ? { bytesTotal: bytes.bytesTotal } : {}) } : {}),
+    };
     this.writeActivity();
   }
 

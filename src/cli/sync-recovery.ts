@@ -5,6 +5,7 @@ import { encryptFileToTemp, poolMap, type FileEntry, type Manifest, type PhaseRe
 import { BlobShaMismatchError, type SyncRemote } from "./remote.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
+import { UploadByteTracker } from "./upload-byte-tracker.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -66,6 +67,7 @@ export async function encryptAndUpload(
   const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
   const ctByEnc = new Map<string, string>();
+  const ctSizeByEnc = new Map<string, number>();
   const deferred = new Set<string>();
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
@@ -100,6 +102,7 @@ export async function encryptAndUpload(
         f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
         f.encSha = e.encSha;
         ctByEnc.set(e.encSha, e.ciphertextPath);
+        ctSizeByEnc.set(e.encSha, e.cipherSize);
         encCtBytes += e.cipherSize;
         onProgress?.(++enc, toEncrypt.length, "encrypt");
       });
@@ -118,6 +121,9 @@ export async function encryptAndUpload(
     // same address are deduped by `uploaded` — the second is satisfied without a re-PUT.
     const toUpload = local.files.filter((f): f is FileEntry => f.type === "file" && !!f.encSha && missing.has(f.encSha));
     const uploaded = new Set<string>(); // addresses already landed this run (convergent dedup)
+    let up = 0;
+    const byteTracker = UploadByteTracker.fromFiles(toUpload, missing, ctSizeByEnc);
+    const emitUploadProgress = () => onProgress?.(up, toUpload.length, "upload", undefined, byteTracker.progress());
 
     /**
      * Upload ONE file's blob with bounded per-file retry. Each retry re-encrypts a fresh
@@ -141,26 +147,57 @@ export async function encryptAndUpload(
           } catch (err) {
             // Vanished mid-push (same churn class as the encrypt-stage catch above):
             // defer this file instead of failing the whole push.
-            if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+            if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+              byteTracker.defer(f.path);
+              emitUploadProgress();
+              return null;
+            }
             throw err;
           }
           f.sha256 = re.plaintextSha;
           f.encSha = re.encSha;
           ct = re.ciphertextPath;
           ctByEnc.set(f.encSha, ct);
-          if (uploaded.has(f.encSha)) return 0; // fresh address already landed by a peer
+          ctSizeByEnc.set(f.encSha, re.cipherSize);
+          if (uploaded.has(f.encSha)) {
+            byteTracker.migrate(f.path, f.encSha, re.cipherSize);
+            emitUploadProgress();
+            return 0; // fresh address already landed by a peer
+          }
+          if (!missing.has(f.encSha)) {
+            if ((await api.missingBlobs([f.encSha])).length === 0) {
+              uploaded.add(f.encSha);
+              byteTracker.migrate(f.path, undefined);
+              emitUploadProgress();
+              return 0; // fresh address is already present remotely; no phase bytes to add
+            }
+            missing.add(f.encSha);
+          }
+          byteTracker.migrate(f.path, f.encSha, re.cipherSize);
+          emitUploadProgress();
         }
         try {
           const size = (await fs.stat(ct)).size;
-          await api.putBlobFile(f.encSha!, ct, size, uploadsDir);
-          uploaded.add(f.encSha!);
+          const uploadEncSha = f.encSha!;
+          byteTracker.reviseTotal(uploadEncSha, size);
+          emitUploadProgress();
+          await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
+            byteTracker.setProgress(uploadEncSha, abs);
+            emitUploadProgress();
+          });
+          byteTracker.setProgress(uploadEncSha, size);
+          uploaded.add(uploadEncSha);
           return size; // settled — the committed manifest can safely reference f.encSha
         } catch (e) {
           if (!(e instanceof BlobShaMismatchError)) throw e;
           // The streamed ciphertext no longer hash-matched (the file moved again). Drop
           // the stale temp so the next attempt re-encrypts, back off, and retry — bounded.
           ctByEnc.delete(f.encSha!);
-          if (attempt + 1 >= PER_FILE_UPLOAD_ATTEMPTS) return null; // never settled → defer
+          if (attempt + 1 >= PER_FILE_UPLOAD_ATTEMPTS) {
+            byteTracker.defer(f.path);
+            emitUploadProgress();
+            return null; // never settled → defer
+          }
           await backoff(attempt);
         }
       }
@@ -169,7 +206,6 @@ export async function encryptAndUpload(
 
     // Upload missing blobs concurrently — THE dominant cost on a first push (each
     // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
-    let up = 0;
     let upWireBytes = 0; // ciphertext bytes actually sent over the wire this run
     await report.phase("upload", async () => {
       await poolMap(toUpload, uploadConcurrency(), async (f) => {
@@ -179,7 +215,8 @@ export async function encryptAndUpload(
           return;
         }
         upWireBytes += size;
-        onProgress?.(++up, toUpload.length, "upload");
+        up++;
+        emitUploadProgress();
       });
     });
     report.record("upload", { count: up, wireBytes: upWireBytes });

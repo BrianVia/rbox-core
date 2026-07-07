@@ -99,7 +99,7 @@ class FakeRemote implements SyncRemote {
         await fs.mkdir(path.dirname(dest), { recursive: true });
         await fs.writeFile(dest, b);
       },
-      async putFile(s, src, size, uploadsDir) {
+      async putFile(s, src, size, uploadsDir, onBytes) {
         self.gitPutCalls += 1;
         self.gitPutUploads.push({ sha: s, src, size, uploadsDir });
         if (self.gitShaMismatchFailures > 0) {
@@ -111,6 +111,7 @@ class FakeRemote implements SyncRemote {
           throw new Error("simulated mid-capture churn (upload failed)");
         }
         self.blobs.set(s, await fs.readFile(src));
+        onBytes?.(size ?? 0);
       },
     };
   }
@@ -1582,23 +1583,28 @@ test("push emits gitcap progress per CAPTURED repo — monotonic settle count, r
   await initRepo(beta);
   await commitFile(beta, "b.txt", "b", "c1");
 
-  type Ev = { done: number; total: number; detail?: string };
+  type Ev = { done: number; total: number; detail?: string; bytesDone?: number; bytesTotal?: number };
   const cap = (): { events: Ev[]; deps: SyncDeps } => {
     const events: Ev[] = [];
     return {
       events,
-      deps: { ...depsA, onProgress: (done, total, phase, detail) => phase === "gitcap" && events.push({ done, total, detail }) },
+      deps: {
+        ...depsA,
+        onProgress: (done, total, phase, detail, bytes) =>
+          phase === "gitcap" && events.push({ done, total, detail, bytesDone: bytes?.bytesDone, bytesTotal: bytes?.bytesTotal }),
+      },
     };
   };
 
   const first = cap();
   await push(rootA, cfgA, first.deps);
-  // One event per repo that was actually captured (both are new).
-  expect(first.events.length).toBe(2);
+  expect(first.events.length).toBeGreaterThanOrEqual(2);
   // Total is the CAPTURE set, not every discovered repo, and stays fixed across the run.
   expect(first.events.every((e) => e.total === 2)).toBe(true);
-  // `done` is a monotonic completed-count under bounded concurrency → 1 then 2.
-  expect(first.events.map((e) => e.done).sort((x, y) => x - y)).toEqual([1, 2]);
+  // `done` is a monotonic completed-count under bounded concurrency, and byte ticks
+  // can arrive before the repo count advances.
+  expect(Math.max(...first.events.map((e) => e.done))).toBe(2);
+  expect(first.events.some((e) => e.bytesDone !== undefined && e.bytesDone > 0 && e.bytesTotal === undefined)).toBe(true);
   // Detail is the repo basename (a nested repo shows its own name, not the path).
   expect(new Set(first.events.map((e) => e.detail))).toEqual(new Set(["alpha", "beta"]));
 

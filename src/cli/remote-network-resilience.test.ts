@@ -121,6 +121,13 @@ describe("blob PUT — transient retry (idempotent, content-addressed)", () => {
     expect(puts).toBe(2);
     expect(payloads).toEqual(["ciphertext", "ciphertext"]);
   }, 15_000);
+
+  test("a successful single-PUT reconciles byte progress to the full size", async () => {
+    const bytes: number[] = [];
+    globalThis.fetch = (async () => resp(200, { receipt: "r1" })) as unknown as typeof fetch;
+    await api().putBlobFile(SHA, file, 10, undefined, (abs) => bytes.push(abs));
+    expect(bytes).toEqual([10]);
+  });
 });
 
 describe("buffered blob GET — stalled OK body is inside the retry deadline", () => {
@@ -190,6 +197,7 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
   test("a socket close on complete does NOT fire a second complete — recovery is the present-check", async () => {
     let completes = 0;
     let checks = 0;
+    const bytes: number[] = [];
     globalThis.fetch = (async (url: string, init?: RequestInit) => {
       const u = String(url);
       const method = init?.method ?? "GET";
@@ -206,10 +214,53 @@ describe("multipart complete — NOT network-retried; present-check absorbs a lo
       return resp(200, {});
     }) as unknown as typeof fetch;
 
-    await api().putBlobFile(SHA, file, BIG); // resolves via the present-check, no throw
+    await api().putBlobFile(SHA, file, BIG, undefined, (abs) => bytes.push(abs)); // resolves via the present-check, no throw
     expect(completes).toBe(1); // exactly ONE complete attempt — NOT auto-retried at the network layer
     expect(checks).toBeGreaterThanOrEqual(1); // the present-check is what absorbed the lost response
+    expect(bytes.at(-1)).toBe(BIG); // present-shortcut reconciles the object to full size
   }, 15_000);
+
+  test("a complete error with a now-present blob reconciles byte progress to full size", async () => {
+    const bytes: number[] = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.endsWith("/multipart") && method === "POST") return resp(200, { uploadId: "up1", partSize: BIG });
+      if (u.includes("/part/") && method === "PUT") return resp(200, {});
+      if (u.endsWith("/complete") && method === "POST") return resp(500, { error: "publish_lost" });
+      if (u.endsWith("/blobs/check") && method === "POST") return resp(200, { missing: [] });
+      return resp(200, {});
+    }) as unknown as typeof fetch;
+
+    await api().putBlobFile(SHA, file, BIG, undefined, (abs) => bytes.push(abs));
+    expect(bytes.at(-1)).toBe(BIG);
+  }, 15_000);
+
+  test("multipart resume credits completed parts with short-final-part geometry and not failed retries", async () => {
+    const size = 100 * 1024 * 1024;
+    const partSize = 40 * 1024 * 1024;
+    const uploadsDir = path.join(tmp, "uploads");
+    await fs.mkdir(uploadsDir, { recursive: true });
+    await fs.writeFile(path.join(uploadsDir, `${SHA}.json`), JSON.stringify({ uploadId: "up-resume" }));
+    const bytes: number[] = [];
+    let part2Attempts = 0;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.endsWith(`/multipart/up-resume`) && method === "GET") return resp(200, { partSize, completedParts: [1, 3] });
+      if (u.endsWith("/part/2") && method === "PUT") {
+        part2Attempts++;
+        if (part2Attempts === 1) throw socketClosed();
+        return resp(200, {});
+      }
+      if (u.endsWith("/complete") && method === "POST") return resp(200, {});
+      return resp(200, {});
+    }) as unknown as typeof fetch;
+
+    await api().putBlobFile(SHA, file, size, uploadsDir, (abs) => bytes.push(abs));
+    expect(part2Attempts).toBe(2);
+    expect(bytes).toEqual([60 * 1024 * 1024, 100 * 1024 * 1024, 100 * 1024 * 1024]);
+  }, 20_000);
 
   test("if the blob is genuinely absent after a complete drop, the friendly NetworkError surfaces", async () => {
     let completes = 0;

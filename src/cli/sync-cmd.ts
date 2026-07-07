@@ -35,7 +35,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
   const sp = spinner("syncing");
   try {
     const { cfg, deps } = await buildAuthedRemote(root);
-    deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
+    deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
     deps.allowMassDelete = opts.allowMassDelete === true;
     const report = beginReport("sync");
     deps.report = report;

@@ -211,7 +211,7 @@ async function executeInitPlan(
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot — scanning files");
     try {
-      deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
+      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
       const { sequence: seq, committed } = await push(plan.root, authed, deps);
       // Never report a publish that didn't happen (design 44): the incident setup
       // printed "published → sequence 75" for a push that uploaded zero bytes.
@@ -227,7 +227,7 @@ async function executeInitPlan(
   } else if (plan.firstSync === "sync") {
     const sp = spinner("syncing from remote — scanning files");
     try {
-      deps.onProgress = (done, total, phase, detail) => sp.update(progressLabel(phase, done, total, detail));
+      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
       const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
       sp.stop();
       const conflicts = pulled.filter((a) => a.kind === "conflict");

@@ -56,7 +56,14 @@ export interface DaemonActivity {
   lastPull?: { at: string; writes: number; deletes: number; conflicts: number };
   /** Live transfer progress; present only mid-op. Status ignores it when older
    *  than {@link ACTIVE_STALE_MS} — a crashed daemon must not show "syncing" forever. */
-  active?: { at: string; phase: TransferPhase; done: number; total: number };
+  active?: {
+    at: string;
+    phase: TransferPhase;
+    done: number;
+    total: number;
+    bytesDone?: number;
+    bytesTotal?: number;
+  };
   /** Standing warning set by the pump's error path, cleared ONLY by a later success
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
@@ -146,6 +153,13 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const act = raw.active;
     if (act && typeof act.at === "string" && isTransferPhase(act.phase) && num(act.done) && num(act.total)) {
       a.active = { at: act.at, phase: act.phase, done: act.done, total: act.total };
+      if (
+        uint(act.bytesDone) &&
+        (act.bytesTotal === undefined || (positiveInt(act.bytesTotal) && act.bytesDone <= act.bytesTotal))
+      ) {
+        a.active.bytesDone = act.bytesDone;
+        if (act.bytesTotal !== undefined) a.active.bytesTotal = act.bytesTotal;
+      }
     }
     const halt = raw.halt;
     if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
@@ -246,7 +260,10 @@ export function renderShellLine(
   const state = shellLineStateOf(a, opts.settled, opts.now);
 
   let pct: string | number = "-";
-  if (a.active && a.active.total > 0) {
+  if (a.active?.bytesTotal !== undefined && a.active.bytesTotal > 0) {
+    const { bytesDone, bytesTotal } = a.active;
+    pct = Math.min(100, Math.max(0, Math.floor(((bytesDone ?? 0) / bytesTotal) * 100)));
+  } else if (a.active && a.active.total > 0) {
     const { done, total } = a.active;
     pct = Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
   }

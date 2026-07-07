@@ -52,6 +52,17 @@ test("progressLabel renders percent + counts per phase", () => {
   expect(progressLabel("upload", -1, 2)).toBe("uploading 0% (-1/2)"); // clamped, never negative
 });
 
+test("progressLabel renders byte channel as a second fraction without a unified percent", () => {
+  const GiB = 1024 ** 3;
+  expect(progressLabel("upload", 126352, 126369, undefined, { bytesDone: Math.round(4.1 * GiB), bytesTotal: Math.round(6.3 * GiB) })).toBe(
+    "uploading 126,352/126,369 · 4.1/6.3 GiB"
+  );
+  expect(progressLabel("gitcap", 2, 140, undefined, { bytesDone: Math.round(4.1 * GiB) })).toBe(
+    "capturing git state 2/140 · 4.1 GiB sent"
+  );
+  expect(progressLabel("gitcap", 2, 140, "repo", { bytesDone: 512 })).toBe("capturing git state 2/140 · 512 B sent — repo");
+});
+
 test("progressLabel scan is indeterminate — formatted count, no percent", () => {
   expect(progressLabel("scan", 12304, 0)).toBe("scanning… 12,304 files");
   expect(progressLabel("scan", 500, 0)).toBe("scanning… 500 files");
@@ -194,6 +205,12 @@ test("fresh live progress renders the syncing line", () => {
   const line = healthLine(base({ activity }));
   expect(line).toContain("syncing");
   expect(line).toContain("uploading 41% (3,612/8,603)");
+});
+
+test("fresh live progress renders byte suffix from activity", () => {
+  const activity: DaemonActivity = { at: iso(1), active: { at: iso(2), phase: "upload", done: 12, total: 100, bytesDone: 512, bytesTotal: 1024 } };
+  const line = healthLine(base({ activity }));
+  expect(line).toBe("↻ syncing — uploading 12/100 · 0.5/1.0 KiB");
 });
 
 test("stale live progress is ignored (a crashed daemon must not show syncing forever)", () => {

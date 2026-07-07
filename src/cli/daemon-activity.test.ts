@@ -4,14 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
-import { loadActivity, type DaemonActivity } from "./activity.js";
+import { loadActivity, renderShellLine, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
 import { daemonRuntimeDir, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull } from "./sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
-import { attributeDaemonForStatus, healthLine } from "./status-view.js";
-import type { TransferPhase } from "./transfer-progress.js";
+import { attributeDaemonForStatus, healthLine, progressLabel } from "./status-view.js";
+import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
@@ -90,7 +90,7 @@ interface DaemonInternals {
   startLiveWatch(): Promise<void>;
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
-  onTransferProgress(done: number, total: number, phase: TransferPhase): void;
+  onTransferProgress(done: number, total: number, phase: TransferPhase, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
   stop(): Promise<void>;
@@ -909,4 +909,39 @@ test("transfer-progress throttle: indeterminate ticks never bypass it; phase cha
   expect(daemon.activity.active?.done).toBe(140);
 
   await daemon.activityWrite; // drain the best-effort sidecar chain before teardown
+});
+
+test("transfer-progress throttle: byte-only ticks use the existing write cadence", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+
+  daemon.onTransferProgress(0, 1, "upload", { bytesDone: 0, bytesTotal: 100 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 0, total: 1, bytesDone: 0, bytesTotal: 100 });
+
+  daemon.onTransferProgress(0, 1, "upload", { bytesDone: 50, bytesTotal: 100 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 0, total: 1, bytesDone: 0, bytesTotal: 100 });
+
+  daemon.onTransferProgress(1, 1, "upload", { bytesDone: 100, bytesTotal: 100 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 1, total: 1, bytesDone: 100, bytesTotal: 100 });
+
+  // A same-phase retry restart is a real regression, not jitter: it bypasses the
+  // throttle and writes the raw fresh 0/N instead of leaving the final tick visible.
+  daemon.onTransferProgress(0, 1, "upload", { bytesDone: 0, bytesTotal: 100 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 0, total: 1, bytesDone: 0, bytesTotal: 100 });
+
+  daemon.lastProgressWrite = 0; // age out the throttle for the next normal progress tick
+  daemon.onTransferProgress(1, 2, "upload", { bytesDone: 90, bytesTotal: 100 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 90, bytesTotal: 100 });
+
+  // Retraction-corrected tracker values also pass through raw and stay valid at
+  // the activity boundary and renderer boundary.
+  daemon.onTransferProgress(1, 2, "upload", { bytesDone: 10, bytesTotal: 40 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40 });
+  expect(daemon.activity.active!.bytesDone!).toBeLessThanOrEqual(daemon.activity.active!.bytesTotal!);
+  expect(progressLabel("upload", 1, 2, undefined, { bytesDone: 10, bytesTotal: 40 })).toBe("uploading 1/2 · 10/40 B");
+
+  await daemon.activityWrite;
+  const persisted = (await loadActivity(root))?.active;
+  expect(persisted).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40 });
+  expect(persisted!.bytesDone!).toBeLessThanOrEqual(persisted!.bytesTotal!);
+  expect(renderShellLine({ at: "", active: persisted }, { settled: false, name: "ws", now: Date.now() }).split(" ")[3]).toBe("25");
 });

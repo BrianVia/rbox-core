@@ -1,13 +1,32 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
+import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, QuotaExceededError, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
 import { fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
 
-export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir?: string): Promise<void> {
+export function multipartCompletedBytes(completedParts: Iterable<number>, partSize: number, size: number): number {
+  if (partSize <= 0 || size <= 0) return 0;
+  const totalParts = Math.ceil(size / partSize);
+  let done = 0;
+  for (const n of completedParts) {
+    if (!Number.isInteger(n) || n < 1 || n > totalParts) continue;
+    done += n < totalParts ? partSize : size - (totalParts - 1) * partSize;
+  }
+  return done;
+}
+
+export async function putBlobMultipart(
+  ctx: RemoteContext,
+  sha256: string,
+  absPath: string,
+  size: number,
+  uploadsDir?: string,
+  onBytes?: ByteProgressCallback
+): Promise<void> {
   try {
-    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true);
+    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true, onBytes);
   } catch (e) {
     // A sha_mismatch means the assembled/uploaded bytes do not match this content
     // address. Clear any resume token for that address before bubbling so caller-level
@@ -22,12 +41,24 @@ export async function putBlobMultipart(ctx: RemoteContext, sha256: string, absPa
     // the token and retry once from a fresh init. If the second attempt fails,
     // surface it (the daemon's pump will retry later).
     if (uploadsDir) await fsp.rm(path.join(uploadsDir, `${sha256}.json`), { force: true }).catch(() => {});
-    if ((await ctx.missingBlobs([sha256])).length === 0) return; // someone else finished it
-    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, false);
+    if ((await ctx.missingBlobs([sha256])).length === 0) {
+      onBytes?.(size);
+      return; // someone else finished it
+    }
+    onBytes?.(0);
+    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, false, onBytes);
   }
 }
 
-async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: string, size: number, uploadsDir: string | undefined, allowResume: boolean): Promise<void> {
+async function multipartAttempt(
+  ctx: RemoteContext,
+  sha256: string,
+  absPath: string,
+  size: number,
+  uploadsDir: string | undefined,
+  allowResume: boolean,
+  onBytes: ByteProgressCallback | undefined
+): Promise<void> {
   const tokenPath = uploadsDir ? path.join(uploadsDir, `${sha256}.json`) : undefined;
 
   // Try to resume from a persisted token (server is the source of truth).
@@ -70,6 +101,8 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
   }
 
   const totalParts = Math.ceil(size / partSize);
+  let completedBytes = multipartCompletedBytes(completed, partSize, size);
+  if (completedBytes > 0) onBytes?.(completedBytes);
   for (let n = 1; n <= totalParts; n++) {
     if (completed.has(n)) continue; // resume: skip already-uploaded parts
     const start = (n - 1) * partSize;
@@ -92,6 +125,8 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
       if (mismatch) throw new BlobShaMismatchError(sha256); // source changed mid-upload → push re-scans + retries
       throw new Error(translateRemoteError(res.status, `multipart part ${n} failed`, text, "workspace not found — check you're in the right directory"));
     }
+    completedBytes += len;
+    onBytes?.(completedBytes);
   }
 
   // COMPLETE IS NOT AUTO-RETRIED (retries: 0) — the deliberate idempotency-safety call. The
@@ -112,6 +147,7 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
     // now present, the content is correct regardless of who completed it.
     if ((await ctx.missingBlobs([sha256])).length === 0) {
       if (tokenPath) await fsp.rm(tokenPath, { force: true });
+      onBytes?.(size);
       return;
     }
     const { quota, text } = await readQuotaExceeded(done);
@@ -120,4 +156,5 @@ async function multipartAttempt(ctx: RemoteContext, sha256: string, absPath: str
     throw new Error(translateRemoteError(done.status, "multipart complete failed", text, "workspace not found — check you're in the right directory"));
   }
   if (tokenPath) await fsp.rm(tokenPath, { force: true });
+  onBytes?.(size);
 }
