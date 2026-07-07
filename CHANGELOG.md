@@ -6,6 +6,36 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-07-07 — the performance sprint
+
+### Added
+- **Incremental git sync (design 53).** Repos with a synced base ship
+  history increments instead of full bundles — measured 0.024% of the
+  full-bundle bytes per change. Default on; `git.incremental: false`
+  opts a workspace out. The first chained capture moves the workspace to
+  manifest schema 3 (older clients must upgrade — clean break).
+- **Instant status (design 69 §3.4).** With a live, settled daemon,
+  `rbox status` answers from the daemon's published counts in ~50ms
+  (was ~8s on a 130k-file tree) — and falls back to the full scan on any
+  trust-predicate miss, never to wrong output.
+- **Live byte progress (design 73).** Transfers render dual fractions
+  (`uploading 126,352/126,369 · 4.1/6.3 GiB`); git capture shows
+  cumulative bytes sent. Multi-GB uploads no longer look like hangs.
+- **Pull instrumentation + faster fresh joins (design 74 Phase 0).**
+  The pull's git-apply tail is now measured per repo, and download
+  concurrency defaults to 128 (recorded sweep: ~25% faster on big
+  materializations).
+- **First-publish encrypt cache (design 75).** Retrying a large first
+  publish re-encrypts only what the server is actually missing, instead
+  of the entire workspace.
+- **No more silent network wedges.** Small control requests carry a 60s
+  deadline with the established retry rules, and the daemon heartbeat
+  advances on a timer, so a hung operation reads as visible staleness.
+
+### Changed
+- Hourly server maintenance moved off the top of the hour (was
+  correlating with transient commit 500s).
+
 ## [0.9.3] — 2026-07-07 — daemon hotfix
 
 ### Fixed
