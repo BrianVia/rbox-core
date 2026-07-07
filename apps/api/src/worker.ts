@@ -20,13 +20,15 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { AccountDeleteMessage, DeviceNotifyMessage, Env, WorkerEntrypointExports } from "./env.js";
 import { authenticate } from "./auth.js";
+import { blobGetWithVerifiedGrant } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
 import { sweepDiagnostics } from "./diagnostics.js";
-import { json, logErr } from "./util.js";
+import { json, logErr, SHA256_HEX_RE } from "./util.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
 import { driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
+import { verifyGrantCredential } from "./grants.js";
 import { eq, isDeviceRevoke, type RouteCtx } from "./routes/shared.js";
 import { cachedReleaseResponse, releaseRoutes } from "./routes/release.js";
 import { adminRoutes } from "./routes/admin.js";
@@ -214,6 +216,19 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   if ((r = await billingWebhookRoutes(ctx))) return r;
   if ((r = await webRoutes(ctx))) return r;
   if ((r = await accountLinkPublicRoutes(ctx))) return r;
+
+  // §27 Amendment A: a valid download grant is the narrow credential for exactly
+  // `GET /v1/blobs/:sha`. Ordering is load-bearing: verify MAC/TTL first, derive the
+  // account id only from the verified grant, and on ANY failure fall through to the
+  // normal authenticate() path. Do not move the rest of blobsRoutes pre-auth: check,
+  // PUT, and multipart still require a live bearer token.
+  if (req.method === "GET" && seg.length === 3 && seg[0] === "v1" && seg[1] === "blobs" && SHA256_HEX_RE.test(seg[2]!)) {
+    const grant = req.headers.get("x-rbox-download-grant");
+    if (grant) {
+      const verified = await verifyGrantCredential(env, grant, { nowMs: Date.now() });
+      if (verified.ok) return blobGetWithVerifiedGrant(env, seg[2]!, verified.accountId);
+    }
+  }
 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);

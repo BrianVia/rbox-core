@@ -3,6 +3,7 @@ import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { bootstrap as bootstrapRoute, mintDevice } from "../src/auth.js";
 import { CachedReleases, routeTemplate } from "../src/worker.js";
+import { mintGrant, GRANT_TTL_MS } from "../src/grants.js";
 import { releaseRoutes } from "../src/routes/release.js";
 import { billingCheckout, repointBillingToAccount } from "../src/stripe.js";
 import { confirmLink } from "../src/account-link.js";
@@ -106,6 +107,64 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const b = await bootstrap("acct-blob-b");
     const cross = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: authed(b.token) });
     expect(cross.status).toBe(404);
+  });
+
+  test("download grant pre-auth: valid grant with no bearer serves the same bytes as authenticated GET", async () => {
+    const a = await bootstrap("acct-grant-preauth-ok");
+    const content = "grant-preauth-bytes";
+    const s = sha(content);
+    const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
+    expect(put.status).toBe(200);
+    const grant = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws_grant_preauth", nowMs: Date.now() });
+    expect(grant).toBeTruthy();
+
+    const authedGet = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: authed(a.token) });
+    const grantGet = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: { "x-rbox-download-grant": grant! } });
+    expect(authedGet.status).toBe(200);
+    expect(grantGet.status).toBe(200);
+    expect(await grantGet.text()).toBe(await authedGet.text());
+    expect(grantGet.headers.get("content-type")).toBe(authedGet.headers.get("content-type"));
+  });
+
+  test("download grant pre-auth: expired or tampered grant with no bearer falls through to 401", async () => {
+    const a = await bootstrap("acct-grant-preauth-invalid");
+    const s = sha("grant-preauth-invalid");
+    const expired = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws_grant_preauth", nowMs: Date.now() - GRANT_TTL_MS - 10_000 });
+    const valid = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws_grant_preauth", nowMs: Date.now() });
+    const [kid, payload, mac] = valid!.split(".");
+    const tampered = `${kid}.${payload}.${mac}x`;
+
+    for (const grant of [expired!, tampered]) {
+      const res = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: { "x-rbox-download-grant": grant } });
+      expect(res.status).toBe(401);
+    }
+  });
+
+  test("download grant pre-auth: revoked bearer with a still-valid grant serves during the documented TTL lag", async () => {
+    const a = await bootstrap("acct-grant-preauth-revoked");
+    const content = "grant-preauth-revoked";
+    const s = sha(content);
+    const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
+    expect(put.status).toBe(200);
+    const grant = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws_grant_preauth", nowMs: Date.now() });
+    await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(a.deviceId).run();
+
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: authed(a.token) })).status).toBe(401);
+    const res = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: authed(a.token, { "x-rbox-download-grant": grant! }) });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(content);
+  });
+
+  test("download grant pre-auth is narrow: PUT, check, and multipart still require auth", async () => {
+    const a = await bootstrap("acct-grant-preauth-narrow");
+    const s = sha("grant-preauth-narrow");
+    const grant = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws_grant_preauth", nowMs: Date.now() });
+    const headers = { "x-rbox-download-grant": grant! };
+
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: { ...headers, "content-length": "1" }, body: "x" })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/blobs/check`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ shas: [s] }) })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}/multipart`, { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ size: 1 }) })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}/multipart/upload-1`, { headers })).status).toBe(401);
   });
 
   // The DO commit sequencer uses `ctx.storage.kv` + `transactionSync` — DO storage
