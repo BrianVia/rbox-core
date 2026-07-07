@@ -29,10 +29,13 @@ describe("bip39 recovery phrase", () => {
   });
 
   test("rejects a one-word typo via checksum", async () => {
-    const rk = generateRecoveryKey();
-    const words = (await rkToPhrase(rk)).split(" ");
-    // swap the first word for a different valid word → checksum should fail
-    words[0] = words[0] === "zoo" ? "zone" : "zoo";
+    // FIXED vector, not a random key: a one-word swap passes the 8-bit BIP39
+    // checksum ~1/256 of the time, so the randomized form flaked in CI
+    // (2026-07-07). This phrase+swap is verified to fail checksum, always.
+    const phrase =
+      "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title";
+    const words = phrase.split(" ");
+    words[0] = "zoo";
     await expect(phraseToRk(words.join(" "))).rejects.toThrow(/checksum|word/);
   });
 
