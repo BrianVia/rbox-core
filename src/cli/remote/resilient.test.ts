@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { NetworkError } from "./errors.js";
-import { fetchResilient, isTransientNetworkError, retryTransient, transferTimeoutMs } from "./resilient.js";
+import { fetchResilient, isTransientNetworkError, retryTransient, SMALL_CONTROL_TIMEOUT_MS, transferTimeoutMs } from "./resilient.js";
 
 // A deterministic, instant sleep so backoff never adds real wall-clock to the suite.
 const noSleep = () => Promise.resolve();
@@ -151,7 +151,7 @@ describe("RBOX_NET_* env overrides — strict parse and bounded timers", () => {
       RBOX_NET_BUFFERED_GET_TIMEOUT_MS: "999999999999999999999",
       RBOX_NET_RETRIES: "999",
     });
-    expect(mod.CONTROL_TIMEOUT_MS).toBe(30_000); // partial integer garbage falls back
+    expect(mod.SMALL_CONTROL_TIMEOUT_MS).toBe(60_000); // partial integer garbage falls back
     expect(mod.DOWNLOAD_IDLE_MS).toBe(5_000); // idle watchdog floor
     expect(mod.BUFFERED_GET_TIMEOUT_MS).toBe(60 * 60 * 1000); // deadline ceiling
     expect(mod.DEFAULT_RETRIES).toBe(10); // retry ceiling
@@ -165,11 +165,11 @@ describe("RBOX_NET_* env overrides — strict parse and bounded timers", () => {
       RBOX_NET_BUFFERED_GET_TIMEOUT_MS: "-5",
       RBOX_NET_RETRIES: "-5",
     });
-    expect(mod.CONTROL_TIMEOUT_MS).toBe(1_000);
+    expect(mod.SMALL_CONTROL_TIMEOUT_MS).toBe(1_000);
     expect(mod.DOWNLOAD_IDLE_MS).toBe(5_000);
     expect(mod.BUFFERED_GET_TIMEOUT_MS).toBe(1_000);
     expect(mod.DEFAULT_RETRIES).toBe(0);
-    expect(() => AbortSignal.timeout(mod.CONTROL_TIMEOUT_MS)).not.toThrow();
+    expect(() => AbortSignal.timeout(mod.SMALL_CONTROL_TIMEOUT_MS)).not.toThrow();
   });
 });
 
@@ -202,6 +202,42 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
     const res = await fetchResilient("https://api.test/blobs/x", { method: "PUT" }, { retries: 2, sleep: noSleep });
     expect(res.status).toBe(200);
     expect(calls).toBe(2);
+  });
+
+  test("a black-holed fetch is aborted by the control deadline and retried per policy", async () => {
+    const origFetch = globalThis.fetch;
+    const origTimeout = AbortSignal.timeout;
+    let calls = 0;
+    const timeoutBudgets: number[] = [];
+    try {
+      (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = ((ms: number) => {
+        timeoutBudgets.push(ms);
+        const ctrl = new AbortController();
+        queueMicrotask(() => ctrl.abort(new DOMException("control request black-holed", "TimeoutError")));
+        return ctrl.signal;
+      }) as typeof AbortSignal.timeout;
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        calls++;
+        if (calls <= 2) {
+          return await new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal as AbortSignal | undefined;
+            if (!signal) return;
+            if (signal.aborted) reject(signal.reason);
+            else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+        return new Response("ok", { status: 200 });
+      }) as unknown as typeof fetch;
+
+      const res = await fetchResilient("https://api.test/manifests", { method: "POST" }, { retries: 2, sleep: noSleep, op: "publishing your changes" });
+
+      expect(res.status).toBe(200);
+      expect(calls).toBe(3);
+      expect(timeoutBudgets).toEqual([SMALL_CONTROL_TIMEOUT_MS, SMALL_CONTROL_TIMEOUT_MS, SMALL_CONTROL_TIMEOUT_MS]);
+    } finally {
+      globalThis.fetch = origFetch;
+      (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origTimeout;
+    }
   });
 
   test("retries: 0 makes exactly one attempt then translates (the complete/pairCreate contract)", async () => {

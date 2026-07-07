@@ -8,7 +8,7 @@ import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
-import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
+import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
@@ -19,12 +19,13 @@ export async function putBlob(
   bytes: Uint8Array,
   onBytes?: ByteProgressCallback
 ): Promise<void> {
-  // Content-addressed → idempotent: a retried PUT of the same sha writes identical bytes.
+  // Content-addressed and small-bodied on the E2EE push path (encManifest/refset sidecar):
+  // idempotent retries plus a flat control deadline, not the large-transfer budget.
   const res = await ctx.fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, {
     method: "PUT",
     headers: ctx.protoAuth,
     body: bytes,
-  }, { op: "uploading data", timeoutMs: transferTimeoutMs(bytes.byteLength) });
+  }, { op: "uploading data", timeoutMs: SMALL_CONTROL_TIMEOUT_MS });
   if (!res.ok) {
     const { quota, text } = await readQuotaExceeded(res);
     if (quota) throw quota;
