@@ -9,7 +9,18 @@ import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, PhaseReport, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import {
+  buildIgnoreMatcher,
+  ENCRYPT_ADDRESS_CACHE_REL,
+  encryptFileToTemp,
+  PhaseReport,
+  scanManifest,
+  type BlobStore,
+  type EncryptedBlob,
+  type FileEntry,
+  type GitSection,
+  type Manifest,
+} from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { listTrash } from "../engine/trash.js";
 
@@ -149,7 +160,19 @@ beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   // E2EE is the only mode (D6): a workspace always has an encryption key.
-  cfg = { remoteWorkspaceId: "ws_t", projectId: "root", deviceId: "devA", rootPath: root, remoteUrl: "http://x", token: "", encrypted: true, kek: KEK };
+  cfg = {
+    remoteWorkspaceId: "ws_t",
+    projectId: "root",
+    deviceId: "devA",
+    rootPath: root,
+    remoteUrl: "http://x",
+    token: "",
+    encrypted: true,
+    kek: KEK,
+    accountId: "acct_t",
+    accountEpoch: 0,
+    keyEpoch: 0,
+  };
 });
 afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
@@ -157,6 +180,35 @@ afterEach(async () => {
 
 const write = (rel: string, content: string) => fs.writeFile(path.join(root, rel), content);
 const read = (rel: string) => fs.readFile(path.join(root, rel), "utf8");
+
+async function writeEncryptCache(entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }>): Promise<void> {
+  const file = path.join(root, ENCRYPT_ADDRESS_CACHE_REL);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(
+    file,
+    JSON.stringify({
+      version: 1,
+      accountId: cfg.accountId,
+      workspaceId: cfg.remoteWorkspaceId,
+      accountEpoch: cfg.accountEpoch,
+      keyEpoch: cfg.keyEpoch,
+      entries,
+    })
+  );
+}
+
+async function readEncryptCache(): Promise<{ entries: Record<string, { encSha: string; cipherSize: number; paths: string[] }> }> {
+  return JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
+}
+
+function countingEncrypt() {
+  let calls = 0;
+  const fn: NonNullable<SyncDeps["encryptFileToTemp"]> = async (srcPath: string, kek: Buffer, tmpDir?: string): Promise<EncryptedBlob> => {
+    calls++;
+    return encryptFileToTemp(srcPath, kek, tmpDir);
+  };
+  return { fn, calls: () => calls };
+}
 
 // ── echo-storm no-op (the guard that makes continuous sync viable) ──────────
 
@@ -239,6 +291,176 @@ test("binary (non-UTF8) content is encrypted + byte-verified by ciphertext addre
   const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.hasBlob((await enc(binary)).encSha)).toBe(true); // ciphertext addressed correctly
+});
+
+test("encrypt cache hit skips encrypt when the cached blob already exists", async () => {
+  const remote = new FakeRemote();
+  const content = "cached content\n";
+  await write("cached.txt", content);
+  const cached = await enc(content);
+  await remote.blobStore().put(cached.encSha, cached.ciphertext);
+  await writeEncryptCache({
+    [cached.plaintextSha]: { encSha: cached.encSha, cipherSize: cached.ciphertext.length, paths: ["cached.txt"] },
+  });
+
+  const counter = countingEncrypt();
+  const progress: Array<{ phase: string; bytesTotal?: number }> = [];
+  const res = await push(root, cfg, {
+    ...deps(remote),
+    encryptFileToTemp: counter.fn,
+    onProgress: (_done, _total, phase, _label, bytes) => progress.push({ phase, bytesTotal: bytes?.bytesTotal }),
+  });
+
+  expect(res.sequence).toBe(1);
+  expect(counter.calls()).toBe(0);
+  expect((await remote.latest()).manifest.files[0]!.encSha).toBe(cached.encSha);
+  expect(progress.filter((p) => p.phase === "upload" && (p.bytesTotal ?? 0) > 0)).toEqual([]);
+});
+
+test("wrong cached encSha to a missing blob re-encrypts through the upload-time !ct path and heals the cache", async () => {
+  const remote = new FakeRemote();
+  const content = "actual content\n";
+  await write("wrong.txt", content);
+  const actual = await enc(content);
+  const wrongEncSha = sha("wrong cached ciphertext address");
+  await writeEncryptCache({
+    [actual.plaintextSha]: { encSha: wrongEncSha, cipherSize: 999, paths: ["wrong.txt"] },
+  });
+
+  const counter = countingEncrypt();
+  const uploadProgress: number[] = [];
+  const res = await push(root, cfg, {
+    ...deps(remote),
+    encryptFileToTemp: counter.fn,
+    onProgress: (_done, _total, phase, _label, bytes) => {
+      if (phase === "upload" && bytes) uploadProgress.push(bytes.bytesTotal);
+    },
+  });
+
+  expect(res.sequence).toBe(1);
+  expect(counter.calls()).toBe(1);
+  expect(remote.hasBlob(actual.encSha)).toBe(true);
+  const committed = (await remote.latest()).manifest.files[0]!;
+  expect(committed.encSha).toBe(actual.encSha);
+  expect(committed.encSha).not.toBe(wrongEncSha);
+  expect(uploadProgress).toContain(actual.ciphertext.length);
+
+  const raw = JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
+  expect(raw.entries[actual.plaintextSha].encSha).toBe(actual.encSha);
+  expect(raw.entries[actual.plaintextSha].cipherSize).toBe(actual.ciphertext.length);
+});
+
+test("failed first-publish commit retry reuses flushed encrypt cache entries", async () => {
+  const remote = new FakeRemote();
+  await write("a.txt", "A\n");
+  await write("b.txt", "B\n");
+  await write("c.txt", "C\n");
+  remote.beforeCommit = async () => {
+    throw new Error("commit response lost");
+  };
+
+  const first = countingEncrypt();
+  await expect(push(root, cfg, { ...deps(remote), encryptFileToTemp: first.fn, encryptCacheFlushMs: 1 })).rejects.toThrow(/commit response lost/);
+  expect(first.calls()).toBe(3);
+
+  remote.beforeCommit = undefined;
+  const second = countingEncrypt();
+  const res = await push(root, cfg, { ...deps(remote), encryptFileToTemp: second.fn, encryptCacheFlushMs: 1 });
+
+  expect(res.sequence).toBe(1);
+  expect(second.calls()).toBe(0);
+});
+
+test("cache hit whose path vanished after scan is deferred without encrypting", async () => {
+  const remote = new FakeRemote();
+  const content = "about to vanish\n";
+  await write("ghost.txt", content);
+  const cached = await enc(content);
+  await writeEncryptCache({
+    [cached.plaintextSha]: { encSha: cached.encSha, cipherSize: cached.ciphertext.length, paths: ["ghost.txt"] },
+  });
+  const local = await scanManifest(root, undefined, undefined);
+  await fs.rm(path.join(root, "ghost.txt"));
+
+  const counter = countingEncrypt();
+  const res = await pushManifest(root, cfg, local, { ...deps(remote), encryptFileToTemp: counter.fn });
+
+  expect(counter.calls()).toBe(0);
+  expect(res.committed).toBe(false);
+  expect(res.deferred).toEqual(["ghost.txt"]);
+  expect(remote.headSeq()).toBe(0);
+  expect((await readEncryptCache()).entries[cached.plaintextSha]).toBeUndefined();
+});
+
+test("no-op push prunes departed encrypt-cache paths absent from the scan", async () => {
+  const remote = new FakeRemote();
+  const stale = await enc("departed\n");
+  await writeEncryptCache({
+    [stale.plaintextSha]: { encSha: stale.encSha, cipherSize: stale.ciphertext.length, paths: ["departed.txt"] },
+  });
+
+  const res = await push(root, cfg, deps(remote));
+
+  expect(res).toEqual({ sequence: 0, committed: false });
+  expect(remote.commitCalls).toBe(0);
+  expect((await readEncryptCache()).entries[stale.plaintextSha]).toBeUndefined();
+});
+
+test("base-enc reuse migrates a changed path out of its old encrypt-cache entry", async () => {
+  const remote = new FakeRemote();
+  const old = await enc("old\n");
+  const shared = await enc("shared\n");
+  await write("a.txt", "old\n");
+  await write("known.txt", "shared\n");
+  await push(root, cfg, deps(remote));
+
+  await write("a.txt", "shared\n");
+  const counter = countingEncrypt();
+  await push(root, cfg, { ...deps(remote), encryptFileToTemp: counter.fn });
+
+  expect(counter.calls()).toBe(0);
+  const raw = await readEncryptCache();
+  expect(raw.entries[old.plaintextSha]).toBeUndefined();
+  expect(raw.entries[shared.plaintextSha]?.paths).toContain("known.txt");
+  const latest = await remote.latest();
+  const a = latest.manifest.files.find((f) => f.path === "a.txt")!;
+  expect(a.sha256).toBe(shared.plaintextSha);
+  expect(a.encSha).toBe(shared.encSha);
+});
+
+test("cache mapping to an existing wrong blob is detected by pull integrity, not silently accepted", async () => {
+  const remote = new FakeRemote();
+  const actualContent = "actual bytes\n";
+  const wrongContent = "different bytes\n";
+  await write("poisoned.txt", actualContent);
+  const actual = await enc(actualContent);
+  const wrong = await enc(wrongContent);
+  await remote.blobStore().put(wrong.encSha, wrong.ciphertext);
+  await writeEncryptCache({
+    [actual.plaintextSha]: { encSha: wrong.encSha, cipherSize: wrong.ciphertext.length, paths: ["poisoned.txt"] },
+  });
+
+  const counter = countingEncrypt();
+  await push(root, cfg, { ...deps(remote), encryptFileToTemp: counter.fn });
+  expect(counter.calls()).toBe(0);
+  expect((await remote.latest()).manifest.files[0]!.encSha).toBe(wrong.encSha);
+
+  const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-pull-wrong-cache-"));
+  try {
+    await fs.mkdir(path.join(otherRoot, ".rbox", "state"), { recursive: true });
+    await expect(pull(otherRoot, { ...cfg, rootPath: otherRoot, deviceId: "devB" }, deps(remote))).rejects.toThrow(/authenticate|integrity|decrypt/i);
+  } finally {
+    await fs.rm(otherRoot, { recursive: true, force: true });
+  }
+});
+
+test("encryptAndUpload refuses to use the cache without an explicit keyEpoch", async () => {
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const badCfg: WorkspaceConfig = { ...cfg, keyEpoch: undefined };
+
+  await expect(push(root, badCfg, deps(remote))).rejects.toThrow(/missing keyEpoch/);
+  await expect(fs.stat(path.join(root, ENCRYPT_ADDRESS_CACHE_REL))).rejects.toThrow();
 });
 
 // ── 409 conflict-retry: the rescan is load-bearing ─────────────────────────

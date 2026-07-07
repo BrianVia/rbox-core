@@ -1,0 +1,208 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { writeFileAtomic } from "./fsutil.js";
+import { isSafeRelPath } from "./manifest-validate.js";
+
+export interface EncryptAddressCacheContext {
+  accountId: string;
+  workspaceId: string;
+  accountEpoch: number;
+  keyEpoch: number;
+}
+
+export interface EncryptAddressCacheEntry {
+  encSha: string;
+  cipherSize: number;
+}
+
+interface StoredEncryptAddressCacheEntry extends EncryptAddressCacheEntry {
+  paths: string[];
+}
+
+interface StoredEncryptAddressCache {
+  version: 1;
+  accountId: string;
+  workspaceId: string;
+  accountEpoch: number;
+  keyEpoch: number;
+  entries: Record<string, StoredEncryptAddressCacheEntry>;
+}
+
+export const ENCRYPT_ADDRESS_CACHE_REL = ".rbox/state/encrypt-cache.json";
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+function matchesContext(raw: StoredEncryptAddressCache, context: EncryptAddressCacheContext): boolean {
+  return (
+    raw.accountId === context.accountId &&
+    raw.workspaceId === context.workspaceId &&
+    raw.accountEpoch === context.accountEpoch &&
+    raw.keyEpoch === context.keyEpoch
+  );
+}
+
+function parseStored(raw: unknown, context: EncryptAddressCacheContext): Map<string, StoredEncryptAddressCacheEntry> | undefined {
+  if (raw == null || typeof raw !== "object") return undefined;
+  const cache = raw as Partial<StoredEncryptAddressCache>;
+  if (cache.version !== 1) return undefined;
+  if (typeof cache.accountId !== "string" || typeof cache.workspaceId !== "string") return undefined;
+  if (!isNonNegativeInteger(cache.accountEpoch) || !isNonNegativeInteger(cache.keyEpoch)) return undefined;
+  if (!cache.entries || typeof cache.entries !== "object" || Array.isArray(cache.entries)) return undefined;
+  if (!matchesContext(cache as StoredEncryptAddressCache, context)) return undefined;
+
+  const entries = new Map<string, StoredEncryptAddressCacheEntry>();
+  for (const [plaintextSha, entry] of Object.entries(cache.entries)) {
+    if (!SHA256_HEX_RE.test(plaintextSha)) return undefined;
+    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const e = entry as Partial<StoredEncryptAddressCacheEntry>;
+    if (typeof e.encSha !== "string" || !SHA256_HEX_RE.test(e.encSha)) return undefined;
+    if (!isNonNegativeInteger(e.cipherSize)) return undefined;
+    if (!Array.isArray(e.paths) || e.paths.length === 0) return undefined;
+    const paths = new Set<string>();
+    for (const p of e.paths) {
+      if (!isSafeRelPath(p) || paths.has(p)) return undefined;
+      paths.add(p);
+    }
+    entries.set(plaintextSha, { encSha: e.encSha, cipherSize: e.cipherSize, paths: [...paths].sort() });
+  }
+  return entries;
+}
+
+export class EncryptAddressCache {
+  private readonly entries: Map<string, StoredEncryptAddressCacheEntry>;
+  private dirtyRevision = 0;
+  private savedRevision = 0;
+
+  constructor(private readonly context: EncryptAddressCacheContext, storedEntries?: Map<string, StoredEncryptAddressCacheEntry>) {
+    this.entries = storedEntries ? new Map(storedEntries) : new Map();
+  }
+
+  lookup(plaintextSha: string): EncryptAddressCacheEntry | undefined {
+    if (!SHA256_HEX_RE.test(plaintextSha)) return undefined;
+    const entry = this.entries.get(plaintextSha);
+    return entry ? { encSha: entry.encSha, cipherSize: entry.cipherSize } : undefined;
+  }
+
+  record(plaintextSha: string, entry: EncryptAddressCacheEntry & { path: string }): void {
+    if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
+    if (!SHA256_HEX_RE.test(entry.encSha)) throw new Error(`invalid ciphertext sha for encrypt cache: ${entry.encSha}`);
+    if (!isNonNegativeInteger(entry.cipherSize)) throw new Error(`invalid ciphertext size for encrypt cache: ${entry.cipherSize}`);
+    if (!isSafeRelPath(entry.path)) throw new Error(`invalid path for encrypt cache: ${entry.path}`);
+
+    this.migratePath(plaintextSha, entry.path);
+    const prev = this.entries.get(plaintextSha);
+    if (prev) {
+      const paths = new Set(prev.paths);
+      const beforePaths = paths.size;
+      paths.add(entry.path);
+      if (prev.encSha === entry.encSha && prev.cipherSize === entry.cipherSize && paths.size === beforePaths) return;
+      this.entries.set(plaintextSha, { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [...paths].sort() });
+    } else {
+      this.entries.set(plaintextSha, { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [entry.path] });
+    }
+    this.markDirty();
+  }
+
+  migratePath(plaintextSha: string, relPath: string): boolean {
+    if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
+    if (!isSafeRelPath(relPath)) throw new Error(`invalid path for encrypt cache: ${relPath}`);
+    return this.removePathFromOtherEntries(relPath, plaintextSha);
+  }
+
+  prune(livePaths: ReadonlySet<string>): void {
+    for (const [plaintextSha, entry] of this.entries) {
+      const next = entry.paths.filter((p) => livePaths.has(p));
+      if (next.length === entry.paths.length) continue;
+      if (next.length === 0) this.entries.delete(plaintextSha);
+      else this.entries.set(plaintextSha, { ...entry, paths: next });
+      this.markDirty();
+    }
+  }
+
+  get needsSave(): boolean {
+    return this.dirtyRevision !== this.savedRevision;
+  }
+
+  private removePathFromOtherEntries(relPath: string, keepPlaintextSha: string): boolean {
+    let changed = false;
+    for (const [plaintextSha, entry] of this.entries) {
+      if (plaintextSha === keepPlaintextSha || !entry.paths.includes(relPath)) continue;
+      const next = entry.paths.filter((p) => p !== relPath);
+      if (next.length === 0) this.entries.delete(plaintextSha);
+      else this.entries.set(plaintextSha, { ...entry, paths: next });
+      this.markDirty();
+      changed = true;
+    }
+    return changed;
+  }
+
+  private markDirty(): void {
+    this.dirtyRevision++;
+  }
+
+  private toJSON(): StoredEncryptAddressCache {
+    const entries: Record<string, StoredEncryptAddressCacheEntry> = {};
+    for (const [plaintextSha, entry] of [...this.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      entries[plaintextSha] = { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [...entry.paths].sort() };
+    }
+    return { version: 1, ...this.context, entries };
+  }
+
+  static async load(root: string, context: EncryptAddressCacheContext): Promise<EncryptAddressCache> {
+    try {
+      const raw = await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8");
+      const entries = parseStored(JSON.parse(raw), context);
+      return new EncryptAddressCache(context, entries);
+    } catch {
+      return new EncryptAddressCache(context);
+    }
+  }
+
+  async save(root: string): Promise<void> {
+    if (!this.needsSave) return;
+    const revision = this.dirtyRevision;
+    const abs = path.join(root, ENCRYPT_ADDRESS_CACHE_REL);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await writeFileAtomic(abs, JSON.stringify(this.toJSON()));
+    this.savedRevision = Math.max(this.savedRevision, revision);
+  }
+}
+
+export class EncryptAddressCacheWriter {
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private inFlight: Promise<void> | undefined;
+
+  constructor(
+    private readonly root: string,
+    private readonly cache: EncryptAddressCache,
+    private readonly flushMs = 10_000
+  ) {}
+
+  schedule(): void {
+    if (!this.cache.needsSave || this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.flush();
+    }, this.flushMs);
+    (this.timer as { unref?: () => void }).unref?.();
+  }
+
+  async flush(): Promise<void> {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    if (this.inFlight) {
+      await this.inFlight;
+      if (!this.cache.needsSave) return;
+    }
+    if (!this.cache.needsSave) return;
+    this.inFlight = this.cache.save(this.root).finally(() => {
+      this.inFlight = undefined;
+    });
+    await this.inFlight;
+    if (this.cache.needsSave) await this.flush();
+  }
+}

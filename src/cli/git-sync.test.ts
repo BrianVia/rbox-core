@@ -146,6 +146,9 @@ beforeEach(async () => {
     syncGit: true,
     encrypted: true,
     kek: KEK,
+    accountId: "acct_g43",
+    accountEpoch: 0,
+    keyEpoch: 0,
   });
   cfgA = mk(rootA, "devA");
   cfgB = mk(rootB, "devB");

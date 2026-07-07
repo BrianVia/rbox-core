@@ -164,6 +164,9 @@ test("v0.9.2 regression: reload preserves runtime-attached encrypted/kek/remoteU
     daemon.cfg.kek = Buffer.alloc(32, 7);
     daemon.cfg.remoteUrl = "https://credential-override.invalid";
     daemon.cfg.token = "runtime-token";
+    daemon.cfg.accountId = "acct_runtime";
+    daemon.cfg.accountEpoch = 2;
+    daemon.cfg.keyEpoch = 9;
 
     await daemon.reloadWorkspaceConfigIfChanged();
 
@@ -173,6 +176,9 @@ test("v0.9.2 regression: reload preserves runtime-attached encrypted/kek/remoteU
     expect(Buffer.isBuffer(daemon.cfg.kek)).toBe(true);
     expect(daemon.cfg.remoteUrl).toBe("https://credential-override.invalid");
     expect(daemon.cfg.token).toBe("runtime-token");
+    expect(daemon.cfg.accountId).toBe("acct_runtime");
+    expect(daemon.cfg.accountEpoch).toBe(2);
+    expect(daemon.cfg.keyEpoch).toBe(9);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

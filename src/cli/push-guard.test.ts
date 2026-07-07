@@ -84,7 +84,19 @@ const N = 200; // baseline size; the guard needs ≥100 deletes AND ≥half the 
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-push-guard-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
-  cfg = { remoteWorkspaceId: "ws_t", projectId: "root", deviceId: "devA", rootPath: root, remoteUrl: "http://x", token: "", encrypted: true, kek: KEK };
+  cfg = {
+    remoteWorkspaceId: "ws_t",
+    projectId: "root",
+    deviceId: "devA",
+    rootPath: root,
+    remoteUrl: "http://x",
+    token: "",
+    encrypted: true,
+    kek: KEK,
+    accountId: "acct_t",
+    accountEpoch: 0,
+    keyEpoch: 0,
+  };
 });
 afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });

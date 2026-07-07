@@ -143,6 +143,13 @@ export interface E2eeContext {
   now: () => number;
 }
 
+export interface CurrentWriteKek {
+  kek: Uint8Array;
+  accountId: string;
+  accountEpoch: number;
+  keyEpoch: number;
+}
+
 export class E2eeRemote implements SyncRemote {
   private readonly kekByEpoch = new Map<number, Uint8Array>();
   /** The keyEpoch the KEK handed to `currentKek()` belongs to — blobs are
@@ -153,10 +160,16 @@ export class E2eeRemote implements SyncRemote {
 
   /** The current-epoch workspace KEK — also used by sync.ts to encrypt blobs.
    *  Snapshots the write epoch so `commit()` can reject a stale-KEK sign (D1). */
-  async currentKek(): Promise<Uint8Array> {
+  async currentKek(): Promise<CurrentWriteKek> {
     const account = await this.refreshAccount();
     this.writeEpoch = account.currentKeyEpoch;
-    return this.kekFor(account.currentKeyEpoch, account, true);
+    const kek = await this.kekFor(account.currentKeyEpoch, account, true);
+    return {
+      kek,
+      accountId: this.ctx.accountId,
+      accountEpoch: account.currentEpoch,
+      keyEpoch: account.currentKeyEpoch,
+    };
   }
 
   // ---- SyncRemote ----------------------------------------------------------
@@ -362,7 +375,7 @@ export class E2eeRemote implements SyncRemote {
     // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a
     // commit whose keyEpoch ≠ the blobs' epoch. (v1 has no rotation; never fires.)
     if (this.writeEpoch !== undefined && this.writeEpoch !== account.currentKeyEpoch) {
-      return { conflict: true, head: parentSequence };
+      return { epochStale: account.currentEpoch };
     }
     const epoch = account.currentKeyEpoch;
     const kek = await this.kekFor(epoch, account, true);
@@ -421,7 +434,7 @@ export class E2eeRemote implements SyncRemote {
     }
     if (res.conflict) return { conflict: true, head: res.head };
     if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
-    if (res.epochStale !== undefined) return { conflict: true, head: parentSequence }; // rotated under us → pull+retry
+    if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry
     // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
     if (res.sequence !== parentSequence + 1) throw new Error("server returned a sequence that does not match the signed commit seq — refusing to pin");
