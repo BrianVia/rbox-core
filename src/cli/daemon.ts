@@ -792,7 +792,14 @@ export class RboxDaemon {
     this.workspaceConfigStat = token;
     const loaded = await loadConfig(this.root);
     const wasRespecting = this.cfg.respectGitignore === true;
-    this.cfg = { ...loaded, token: this.cfg.token, kek: this.cfg.kek };
+    // Take ONLY the field this reload exists for. Rebuilding cfg from `loaded`
+    // clobbers the RUNTIME-ATTACHED fields buildAuthedRemote layered on at boot
+    // (`encrypted: true`, `kek`, the credential `remoteUrl` override) — none of
+    // which live in workspace.json. That shipped in v0.9.2 and killed every
+    // daemon push with "E2EE required" minutes after start (first reload tick),
+    // live on 2026-07-07. cfg stays the boot object; only the hot-reloadable
+    // setting moves.
+    this.cfg = { ...this.cfg, respectGitignore: loaded.respectGitignore };
     this.rebuildMatcher(await loadState(this.root, syncStreamId(this.cfg)));
     if (wasRespecting !== (this.cfg.respectGitignore === true)) {
       log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
