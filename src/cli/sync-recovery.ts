@@ -46,6 +46,7 @@ const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY,
 // (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
 // win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
 const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
+const compressionEnabled = () => process.env.RBOX_COMPRESS === "1";
 
 /** RBOX_LANE_TIMING=1 — push-side encrypt vs upload attribution. Mirrors the pull
  *  lane timing instrument in apply.ts: module-level accumulator, no plumbing, and
@@ -58,7 +59,36 @@ export function uploadLaneTimingSummary(): string | undefined {
   return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${((e / (e + u)) * 100).toFixed(0)}%) · upload ${(u / 1000).toFixed(1)}s (${((u / (e + u)) * 100).toFixed(0)}%) · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms`;
 }
 
-type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string) => Promise<EncryptedBlob>;
+type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: { compress?: boolean }) => Promise<EncryptedBlob>;
+
+type CipherDescriptor = {
+  encSha: string;
+  cipherSize?: number;
+  comp?: "zstd";
+  payloadSha?: string;
+};
+
+function descriptorFromEntry(f: FileEntry): CipherDescriptor | undefined {
+  if (!f.encSha) return undefined;
+  return f.comp ? { encSha: f.encSha, comp: f.comp, payloadSha: f.payloadSha, cipherSize: f.cipherSize } : { encSha: f.encSha };
+}
+
+function descriptorFromEncryptedBlob(e: EncryptedBlob): CipherDescriptor {
+  return e.comp ? { encSha: e.encSha, comp: e.comp, payloadSha: e.payloadSha, cipherSize: e.cipherSize } : { encSha: e.encSha };
+}
+
+function applyCipherDescriptor(f: FileEntry, descriptor: CipherDescriptor): void {
+  f.encSha = descriptor.encSha;
+  if (descriptor.comp) {
+    f.comp = descriptor.comp;
+    f.payloadSha = descriptor.payloadSha;
+    f.cipherSize = descriptor.cipherSize;
+  } else {
+    delete f.comp;
+    delete f.payloadSha;
+    delete f.cipherSize;
+  }
+}
 
 export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
@@ -129,9 +159,10 @@ export async function encryptAndUpload(
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
   const encryptFileToTemp = options.encryptFileToTemp ?? defaultEncryptFileToTemp;
+  const encryptOpts = { compress: compressionEnabled() };
   const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
-  const baseEnc = new Map(base.files.filter((f) => f.encSha).map((f) => [f.sha256, f.encSha!]));
+  const baseEnc = new Map(base.files.map((f) => [f.sha256, descriptorFromEntry(f)]).filter((x): x is [string, CipherDescriptor] => x[1] !== undefined));
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
   const ctByEnc = new Map<string, string>();
   const ctSizeByEnc = new Map<string, number>();
@@ -143,7 +174,7 @@ export async function encryptAndUpload(
       if (f.type !== "file") continue;
       const reuse = baseEnc.get(f.sha256);
       if (reuse) {
-        f.encSha = reuse; // unchanged → reuse ciphertext address (no re-encrypt)
+        applyCipherDescriptor(f, reuse); // unchanged → reuse ciphertext descriptor (no re-encrypt)
         if (encryptCache.migratePath(f.sha256, f.path)) cacheWriter.schedule();
       } else {
         toEncrypt.push(f);
@@ -164,7 +195,7 @@ export async function encryptAndUpload(
             return;
           }
           if (status === "accept") {
-            f.encSha = cached.encSha;
+            applyCipherDescriptor(f, cached);
             ctSizeByEnc.set(cached.encSha, cached.cipherSize);
             encryptCache.record(f.sha256, { ...cached, path: f.path });
             cacheWriter.schedule();
@@ -175,7 +206,7 @@ export async function encryptAndUpload(
         }
         let e;
         try {
-          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, encryptOpts);
         } catch (err) {
           // Vanished between scan and snapshot (agent/build churn deletes files
           // constantly on a live tree). This is the churn case design 38 defers,
@@ -190,10 +221,10 @@ export async function encryptAndUpload(
           throw err;
         }
         f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
-        f.encSha = e.encSha;
+        applyCipherDescriptor(f, descriptorFromEncryptedBlob(e));
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
-        encryptCache.record(e.plaintextSha, { encSha: e.encSha, cipherSize: e.cipherSize, path: f.path });
+        encryptCache.record(e.plaintextSha, { ...descriptorFromEncryptedBlob(e), cipherSize: e.cipherSize, path: f.path });
         cacheWriter.schedule();
         encCtBytes += e.cipherSize;
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
@@ -239,7 +270,7 @@ export async function encryptAndUpload(
           let re;
           try {
             const t0 = LANE_TIMING ? performance.now() : 0;
-            re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir);
+            re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, encryptOpts);
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
             // Vanished mid-push (same churn class as the encrypt-stage catch above):
@@ -252,30 +283,31 @@ export async function encryptAndUpload(
             throw err;
           }
           f.sha256 = re.plaintextSha;
-          f.encSha = re.encSha;
+          applyCipherDescriptor(f, descriptorFromEncryptedBlob(re));
+          const freshEncSha = re.encSha;
           ct = re.ciphertextPath;
-          ctByEnc.set(f.encSha, ct);
-          ctSizeByEnc.set(f.encSha, re.cipherSize);
-          encryptCache.record(re.plaintextSha, { encSha: re.encSha, cipherSize: re.cipherSize, path: f.path });
+          ctByEnc.set(freshEncSha, ct);
+          ctSizeByEnc.set(freshEncSha, re.cipherSize);
+          encryptCache.record(re.plaintextSha, { ...descriptorFromEncryptedBlob(re), cipherSize: re.cipherSize, path: f.path });
           cacheWriter.schedule();
-          if (uploaded.has(f.encSha)) {
-            byteTracker.migrate(f.path, f.encSha, re.cipherSize);
+          if (uploaded.has(freshEncSha)) {
+            byteTracker.migrate(f.path, freshEncSha, re.cipherSize);
             emitUploadProgress();
             return 0; // fresh address already landed by a peer
           }
-          if (!missing.has(f.encSha)) {
+          if (!missing.has(freshEncSha)) {
             const checkT0 = LANE_TIMING ? performance.now() : 0;
-            const present = (await api.missingBlobs([f.encSha])).length === 0;
+            const present = (await api.missingBlobs([freshEncSha])).length === 0;
             if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - checkT0;
             if (present) {
-              uploaded.add(f.encSha);
+              uploaded.add(freshEncSha);
               byteTracker.migrate(f.path, undefined);
               emitUploadProgress();
               return 0; // fresh address is already present remotely; no phase bytes to add
             }
-            missing.add(f.encSha);
+            missing.add(freshEncSha);
           }
-          byteTracker.migrate(f.path, f.encSha, re.cipherSize);
+          byteTracker.migrate(f.path, freshEncSha, re.cipherSize);
           emitUploadProgress();
         }
         try {

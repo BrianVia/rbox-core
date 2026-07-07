@@ -25,6 +25,14 @@ export interface FileEntry {
    *  body is stored. `sha256` stays the PLAINTEXT identity (dedup/reconcile key);
    *  this is the address of the AES-GCM ciphertext in R2. Absent = plaintext blob. */
   encSha?: string;
+  /** Payload compression applied before encryption (design 79). Absent = raw. */
+  comp?: "zstd";
+  /** sha256 of the compressed payload (the exact encrypted bytes) — the key/nonce
+   *  derivation input for compressed blobs. Present iff `comp` is. */
+  payloadSha?: string;
+  /** Ciphertext byte length (payload + GCM tag). Present iff `comp` is — used as
+   *  the download size hint since `size` no longer predicts it. */
+  cipherSize?: number;
 }
 
 /**
@@ -43,6 +51,8 @@ export interface GitArtifactRef {
   sha: string;
   encSha: string;
   cipherSize: number;
+  comp?: "zstd";
+  payloadSha?: string;
 }
 
 export interface GitPackLink extends GitArtifactRef {
@@ -64,6 +74,8 @@ export interface GitSection {
   bundleEncSha: string;
   /** ciphertext byte length of the bundle (upload size + advisory blobRef size). */
   bundleCipherSize: number;
+  bundleComp?: "zstd";
+  bundlePayloadSha?: string;
   /** Ancestor bundle links, ordered base → older increments → previous increment. */
   packChain?: GitPackLink[];
   /** HEAD file contents — "ref: refs/heads/x" or a detached 40-hex sha. */
@@ -75,6 +87,8 @@ export interface GitSection {
   /** ciphertext address + size of the encrypted index blob (present iff indexSha is). */
   indexEncSha?: string;
   indexCipherSize?: number;
+  indexComp?: "zstd";
+  indexPayloadSha?: string;
   /** `git write-tree` sha of the staging — a STABLE content identity (the raw index
    *  file hash is not: git refreshes its stat info). Used for change-detection. */
   indexTree?: string;

@@ -54,7 +54,7 @@ export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string;
   for (const f of manifest.files) {
     if (f.type !== "file") continue;
     if (!f.encSha) return null;
-    if (!refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.size });
+    if (!refByEnc.has(f.encSha)) refByEnc.set(f.encSha, { encSha: f.encSha, size: f.comp && f.cipherSize !== undefined ? f.cipherSize : f.size });
   }
   const addGit = (encSha: string, size: number) => {
     if (!refByEnc.has(encSha)) refByEnc.set(encSha, { encSha, size });

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -23,6 +24,131 @@ describe("encryptFileToTemp / decryptFileToPath edge cases", () => {
       expect((await fs.stat(out)).size).toBe(0);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("compress-before-encrypt prototype", () => {
+  test("compressible payload encrypts compressed bytes and round-trips", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-rt-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-ct-"));
+    try {
+      const src = path.join(root, "story.txt");
+      const content = Buffer.from("compress me please\n".repeat(10_000));
+      await fs.writeFile(src, content);
+
+      const blob = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+
+      expect(blob.comp).toBe("zstd");
+      expect(blob.payloadSha).toMatch(/^[0-9a-f]{64}$/);
+      expect(blob.payloadSha).not.toBe(blob.plaintextSha);
+      expect(blob.cipherSize).toBeLessThan(content.length);
+
+      const out = path.join(root, "out.txt");
+      await decryptFileToPath(blob.ciphertextPath, kek, blob.plaintextSha, out, { comp: blob.comp, payloadSha: blob.payloadSha });
+      expect(fsSync.readFileSync(out).equals(content)).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("incompressible payload falls back to byte-identical raw encryption", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-rand-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-rand-ct-"));
+    try {
+      const src = path.join(root, "random.bin");
+      await fs.writeFile(src, randomBytes(8192));
+
+      const compressedAttempt = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      const raw = await encryptFileToTemp(src, kek, tmpDir, { compress: false });
+
+      expect(compressedAttempt.comp).toBeUndefined();
+      expect(compressedAttempt.payloadSha).toBeUndefined();
+      expect(compressedAttempt.encSha).toBe(raw.encSha);
+      expect(fsSync.readFileSync(compressedAttempt.ciphertextPath).equals(fsSync.readFileSync(raw.ciphertextPath))).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("same plaintext raw and compressed use different derivation inputs", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-nonce-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-nonce-ct-"));
+    try {
+      const src = path.join(root, "text.txt");
+      const content = Buffer.from("same plaintext, different encrypted payload\n".repeat(8000));
+      await fs.writeFile(src, content);
+
+      const raw = await encryptFileToTemp(src, kek, tmpDir, { compress: false });
+      const compressed = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+
+      expect(compressed.comp).toBe("zstd");
+      expect(compressed.payloadSha).not.toBe(raw.plaintextSha);
+      expect(compressed.encSha).not.toBe(raw.encSha);
+      expect(fsSync.readFileSync(compressed.ciphertextPath).equals(fsSync.readFileSync(raw.ciphertextPath))).toBe(false);
+
+      const rawOut = path.join(root, "raw.out");
+      const compressedOut = path.join(root, "compressed.out");
+      await decryptFileToPath(raw.ciphertextPath, kek, raw.plaintextSha, rawOut);
+      await decryptFileToPath(compressed.ciphertextPath, kek, compressed.plaintextSha, compressedOut, { comp: compressed.comp, payloadSha: compressed.payloadSha });
+      expect(fsSync.readFileSync(rawOut).equals(content)).toBe(true);
+      expect(fsSync.readFileSync(compressedOut).equals(content)).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("compressed decrypt requires the right payloadSha and removes partial output", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-bad-sha-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-bad-sha-ct-"));
+    try {
+      const src = path.join(root, "text.txt");
+      await fs.writeFile(src, Buffer.from("payloadSha guard\n".repeat(10_000)));
+      const blob = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      expect(blob.comp).toBe("zstd");
+
+      const missingOut = path.join(root, "missing.out");
+      await expect(decryptFileToPath(blob.ciphertextPath, kek, blob.plaintextSha, missingOut, { comp: "zstd" })).rejects.toThrow(/payloadSha/);
+      expect(fsSync.existsSync(missingOut)).toBe(false);
+
+      const wrongOut = path.join(root, "wrong.out");
+      const wrongPayloadSha = blob.payloadSha === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64);
+      await expect(decryptFileToPath(blob.ciphertextPath, kek, blob.plaintextSha, wrongOut, { comp: "zstd", payloadSha: wrongPayloadSha })).rejects.toThrow();
+      expect(fsSync.existsSync(wrongOut)).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("tampered compressed ciphertext fails authentication", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-tamper-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-tamper-ct-"));
+    try {
+      const src = path.join(root, "text.txt");
+      await fs.writeFile(src, Buffer.from("tamper me\n".repeat(10_000)));
+      const blob = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      expect(blob.comp).toBe("zstd");
+
+      const tampered = path.join(root, "tampered.ct");
+      const bytes = await fs.readFile(blob.ciphertextPath);
+      bytes[0] = bytes[0]! ^ 0xff;
+      await fs.writeFile(tampered, bytes);
+
+      const out = path.join(root, "out.txt");
+      await expect(decryptFileToPath(tampered, kek, blob.plaintextSha, out, { comp: blob.comp, payloadSha: blob.payloadSha })).rejects.toThrow();
+      expect(fsSync.existsSync(out)).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -170,7 +296,6 @@ describe("encryptFileToTemp under concurrency", () => {
       // writes) AND decrypts back to the original bytes.
       for (const b of blobs) {
         const onDisk = await fs.readFile(b.ciphertextPath);
-        const { createHash } = await import("node:crypto");
         expect(createHash("sha256").update(onDisk).digest("hex")).toBe(b.encSha);
         const out = path.join(root, `out-${path.basename(b.ciphertextPath)}`);
         await decryptFileToPath(b.ciphertextPath, kek, b.plaintextSha, out);

@@ -56,6 +56,22 @@ test("validateManifest rejects malformed entries", () => {
   expect(validateManifest({ files: "notarray" }).ok).toBe(false);
 });
 
+test("validateManifest accepts only complete compressed file descriptors", () => {
+  const compressed = goodEntry({
+    encSha: "b".repeat(64),
+    comp: "zstd",
+    payloadSha: "c".repeat(64),
+    cipherSize: 42,
+  });
+  expect(validateManifest({ files: [compressed] }).ok).toBe(true);
+  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "br" as "zstd", payloadSha: "c".repeat(64), cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: undefined, cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "bad", cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "c".repeat(64), cipherSize: -1 })] }).ok).toBe(false);
+  expect(validateManifest({ files: [goodEntry({ payloadSha: "c".repeat(64) })] }).ok).toBe(false);
+  expect(validateManifest({ files: [goodEntry({ cipherSize: 42 })] }).ok).toBe(false);
+});
+
 // ---- hash cache (the performance fast-path) -------------------------------
 
 test("HashCache.lookup hits only on matching mtime+size", () => {

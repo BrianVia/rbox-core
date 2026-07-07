@@ -24,6 +24,7 @@ export const MAX_GIT_REPOS = 256;
 const SHA_RE = /^[0-9a-f]{64}$/;
 const HEX40 = /^[0-9a-f]{40}$/;
 const utf8 = new TextEncoder();
+const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 /** A relative POSIX path that cannot escape the root or smuggle control bytes. */
 export function isSafeRelPath(p: unknown): p is string {
@@ -71,6 +72,15 @@ export function validateManifest(m: unknown): ValidationResult {
     if (e.encSha !== undefined && (typeof e.encSha !== "string" || !SHA_RE.test(e.encSha))) return { ok: false, error: `bad encSha for ${p}` };
     if (typeof e.size !== "number" || !Number.isInteger(e.size) || e.size < 0) return { ok: false, error: `bad size for ${p}` };
     if (typeof e.mode !== "number" || !Number.isInteger(e.mode) || e.mode < 0 || e.mode > 0o7777) return { ok: false, error: `bad mode for ${p}` };
+    if (e.comp !== undefined) {
+      if (e.comp !== "zstd") return { ok: false, error: `bad comp for ${p}` };
+      if (typeof e.payloadSha !== "string" || !SHA_RE.test(e.payloadSha)) return { ok: false, error: `bad payloadSha for ${p}` };
+      if (!isNonNegativeInteger(e.cipherSize)) return { ok: false, error: `bad cipherSize for ${p}` };
+      if (e.encSha === undefined) return { ok: false, error: `compressed entry missing encSha for ${p}` };
+    } else {
+      if (e.payloadSha !== undefined) return { ok: false, error: `payloadSha without comp for ${p}` };
+      if (e.cipherSize !== undefined) return { ok: false, error: `cipherSize without comp for ${p}` };
+    }
 
     if (e.type === "symlink") {
       const t = e.symlinkTarget;
@@ -153,10 +163,14 @@ function validArtifactRef(r: unknown): r is GitArtifactRef {
     SHA_RE.test(ref.sha) &&
     typeof ref.encSha === "string" &&
     SHA_RE.test(ref.encSha) &&
-    typeof ref.cipherSize === "number" &&
-    Number.isInteger(ref.cipherSize) &&
-    ref.cipherSize >= 0
+    isNonNegativeInteger(ref.cipherSize) &&
+    validCompressionFields(ref.comp, ref.payloadSha)
   );
+}
+
+function validCompressionFields(comp: unknown, payloadSha: unknown): boolean {
+  if (comp === undefined) return payloadSha === undefined;
+  return comp === "zstd" && typeof payloadSha === "string" && SHA_RE.test(payloadSha);
 }
 
 function packChainRequiresSchema3(s: unknown): boolean {
@@ -187,12 +201,13 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   // §28: the bundle is mandatory and addressed by both its plaintext sha (decrypt-verify) and
   // its encSha (the ciphertext blob actually fetched). Both must be well-formed.
   if (typeof s.bundleSha !== "string" || !SHA_RE.test(s.bundleSha) || typeof s.bundleEncSha !== "string" || !SHA_RE.test(s.bundleEncSha)) return { ok: false, reason: "bad bundle sha/encSha" };
-  if (typeof s.bundleCipherSize !== "number" || !Number.isInteger(s.bundleCipherSize) || s.bundleCipherSize < 0) return { ok: false, reason: "bad bundleCipherSize" };
+  if (!isNonNegativeInteger(s.bundleCipherSize)) return { ok: false, reason: "bad bundleCipherSize" };
+  if (!validCompressionFields(s.bundleComp, s.bundlePayloadSha)) return { ok: false, reason: "bad bundle compression" };
   const packChainReason = invalidPackChainReason(s.packChain);
   if (packChainReason) return { ok: false, reason: packChainReason };
   // index is optional but, if present, both shas + size travel together.
-  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined) {
-    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize! })) return { ok: false, reason: "bad index ref" };
+  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined || s.indexComp !== undefined || s.indexPayloadSha !== undefined) {
+    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize!, comp: s.indexComp, payloadSha: s.indexPayloadSha })) return { ok: false, reason: "bad index ref" };
   }
   // HEAD is either detached (40-hex) or symbolic onto a BRANCH the section itself carries —
   // capture can produce nothing else (an unborn HEAD never captures), so a symbolic HEAD

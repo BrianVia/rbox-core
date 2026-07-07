@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -22,7 +22,7 @@ import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remot
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
 import { pull, push } from "./sync.js";
-import { loadState, type WorkspaceConfig } from "./config.js";
+import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -206,6 +206,28 @@ afterAll(async () => {
   for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
 });
 
+async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.RBOX_COMPRESS;
+  if (value === undefined) delete process.env.RBOX_COMPRESS;
+  else process.env.RBOX_COMPRESS = value;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.RBOX_COMPRESS;
+    else process.env.RBOX_COMPRESS = prev;
+  }
+}
+
+function hasKeyDeep(value: unknown, keys: ReadonlySet<string>): boolean {
+  if (Array.isArray(value)) return value.some((v) => hasKeyDeep(v, keys));
+  if (value === null || typeof value !== "object") return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (keys.has(key)) return true;
+    if (hasKeyDeep(child, keys)) return true;
+  }
+  return false;
+}
+
 describe("E2EE sync transport — two machines through real sync.ts", () => {
   test("blocked terminal sidecar fingerprint bails before sidecar or manifest upload", async () => {
     const server = new ObservedServer();
@@ -290,6 +312,70 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       }
     }
   });
+
+  test("RBOX_COMPRESS=1 round-trips mixed blobs and carries compressed descriptors forward", async () =>
+    withCompressEnv("1", async () => {
+      const server = new FakeServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-compress", NOW);
+      const rootA = await tmp();
+      await fs.mkdir(path.join(rootA, "data"), { recursive: true });
+      const text = Buffer.from("design 79 compressible corpus line\n".repeat(12_000));
+      const binary = randomBytes(16 * 1024);
+      await fs.writeFile(path.join(rootA, "data", "notes.txt"), text);
+      await fs.writeFile(path.join(rootA, "data", "photo.bin"), binary);
+
+      const remoteA = await remoteFor(server, secrets);
+      const cfgA = await cfgFor(rootA, secrets, remoteA);
+      await push(rootA, cfgA, { remote: remoteA });
+
+      const firstManifest = (await loadState(rootA, syncStreamId(cfgA))).lastSyncedManifest;
+      const firstText = firstManifest.files.find((f) => f.path === "data/notes.txt")!;
+      const firstBinary = firstManifest.files.find((f) => f.path === "data/photo.bin")!;
+      expect(firstText.comp).toBe("zstd");
+      expect(firstText.payloadSha).toMatch(/^[0-9a-f]{64}$/);
+      expect(firstText.cipherSize).toBeLessThan(firstText.size);
+      expect(firstBinary.comp).toBeUndefined();
+      expect(firstBinary.payloadSha).toBeUndefined();
+      expect(firstBinary.cipherSize).toBeUndefined();
+
+      const rootB = await tmp();
+      const remoteB = await remoteFor(server, secrets);
+      const cfgB = await cfgFor(rootB, secrets, remoteB);
+      await pull(rootB, cfgB, { remote: remoteB });
+      expect(Buffer.from(await fs.readFile(path.join(rootB, "data", "notes.txt"))).equals(text)).toBe(true);
+      expect(Buffer.from(await fs.readFile(path.join(rootB, "data", "photo.bin"))).equals(binary)).toBe(true);
+
+      await fs.writeFile(path.join(rootA, "other.txt"), "new small file\n");
+      await push(rootA, cfgA, { remote: remoteA });
+      const secondManifest = (await loadState(rootA, syncStreamId(cfgA))).lastSyncedManifest;
+      const secondText = secondManifest.files.find((f) => f.path === "data/notes.txt")!;
+      expect({
+        encSha: secondText.encSha,
+        comp: secondText.comp,
+        payloadSha: secondText.payloadSha,
+        cipherSize: secondText.cipherSize,
+      }).toEqual({
+        encSha: firstText.encSha,
+        comp: firstText.comp,
+        payloadSha: firstText.payloadSha,
+        cipherSize: firstText.cipherSize,
+      });
+    }));
+
+  test("RBOX_COMPRESS unset writes no compression fields into file manifests", async () =>
+    withCompressEnv(undefined, async () => {
+      const server = new FakeServer();
+      const secrets = await bootstrapOnto(server, ACCT, "devA-raw-default", NOW);
+      const root = await tmp();
+      await fs.writeFile(path.join(root, "notes.txt"), "default raw path stays raw\n".repeat(10_000));
+
+      const remote = await remoteFor(server, secrets);
+      const cfg = await cfgFor(root, secrets, remote);
+      await push(root, cfg, { remote });
+
+      const manifest = (await loadState(root, syncStreamId(cfg))).lastSyncedManifest;
+      expect(hasKeyDeep(manifest.files, new Set(["comp", "payloadSha", "cipherSize"]))).toBe(false);
+    }));
 
   test("round-trips edits both directions and converges", async () => {
     const server = new FakeServer();

@@ -48,10 +48,23 @@ test("EncryptAddressCache load discards malformed entries", async () => {
     { encSha: hex("b"), cipherSize: -1, paths: ["a.txt"] },
     { encSha: hex("b"), cipherSize: 11, paths: ["../a.txt"] },
     { encSha: hex("b"), cipherSize: 11, paths: [] },
+    { encSha: hex("b"), cipherSize: 11, comp: "br", payloadSha: hex("c"), paths: ["a.txt"] },
+    { encSha: hex("b"), cipherSize: 11, comp: "zstd", paths: ["a.txt"] },
+    { encSha: hex("b"), cipherSize: 11, payloadSha: hex("c"), paths: ["a.txt"] },
   ]) {
     await writeCache(stored({}, { [hex("a")]: badEntry }));
     expect((await EncryptAddressCache.load(root, ctx)).lookup(hex("a"))).toBeUndefined();
   }
+});
+
+test("EncryptAddressCache preserves compressed descriptors", async () => {
+  const cache = new EncryptAddressCache(ctx);
+  cache.record(hex("a"), { encSha: hex("b"), cipherSize: 10, comp: "zstd", payloadSha: hex("c"), path: "a.txt" });
+  await cache.save(root);
+
+  const raw = JSON.parse(await fs.readFile(path.join(root, ENCRYPT_ADDRESS_CACHE_REL), "utf8"));
+  expect(raw.entries[hex("a")]).toEqual({ encSha: hex("b"), cipherSize: 10, comp: "zstd", payloadSha: hex("c"), paths: ["a.txt"] });
+  expect((await EncryptAddressCache.load(root, ctx)).lookup(hex("a"))).toEqual({ encSha: hex("b"), cipherSize: 10, comp: "zstd", payloadSha: hex("c") });
 });
 
 test("EncryptAddressCache prune removes departed path refs and empty entries", async () => {
