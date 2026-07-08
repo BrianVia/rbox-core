@@ -5,7 +5,7 @@ import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob } from "./blobs.js";
 import { BlobBatchDownloader, BlobBatchUploader } from "./blob-batch.js";
-import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult } from "./commits.js";
+import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult, type LatestOptions } from "./commits.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
 import {
@@ -26,7 +26,7 @@ import {
  * simulator. Keep it minimal: only what pull/push actually call.
  */
 export interface SyncRemote {
-  latest(): Promise<{ sequence: number; manifest: Manifest }>;
+  latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }>;
   missingBlobs(shas: string[]): Promise<string[]>;
   putBlobFile(
     sha256: string,
@@ -149,7 +149,7 @@ export class RboxApi implements SyncRemote {
     return this.ctx.token;
   }
 
-  latest(): Promise<{ sequence: number; manifest: Manifest }> {
+  latest(_options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
     return latest(this.ctx);
   }
 

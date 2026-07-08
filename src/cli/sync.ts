@@ -5,6 +5,7 @@ import {
   isIgnoreRuleFile,
   HashCache,
   PhaseReport,
+  createScanStats,
   reconcile,
   scanManifest,
   validateManifest,
@@ -12,6 +13,7 @@ import {
   type Action,
   type IgnoreMatcher,
   type Manifest,
+  type ScanStats,
   laneTimingSummary,
 } from "../engine/index.js";
 import {
@@ -34,7 +36,7 @@ import {
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, saveState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { openTrashBatch } from "../engine/trash.js";
-import { RboxApi, type SyncRemote } from "./remote.js";
+import { RboxApi, type CommitOptions, type CommitTimings, type LatestTimings, type SyncRemote } from "./remote.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
@@ -78,6 +80,19 @@ const matcherForState = (root: string, cfg: WorkspaceConfig, state?: { lastSynce
     knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
   });
 
+const fmtDetailSeconds = (ms: number): string => (ms / 1000).toFixed(1);
+const fmtDetailBytes = (n: number): string => {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}KB`;
+  return `${n}B`;
+};
+const formatCommitTimings = (t: CommitTimings): string =>
+  `r${fmtDetailSeconds(t.refreshMs)} sc${fmtDetailSeconds(t.sidecarMs)} e${fmtDetailSeconds(t.encodeMs)} c${fmtDetailSeconds(t.encryptMs)} u${fmtDetailSeconds(t.uploadMs)} p${fmtDetailSeconds(t.postMs)} ${fmtDetailBytes(t.encBytes)}`;
+const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}`;
+const formatScanStats = (s: ScanStats): string =>
+  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit}`;
+
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
   const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
   if (schema === 0) {
@@ -109,6 +124,9 @@ export interface SyncDeps {
    *  the sync path uses a disabled no-op report that allocates nothing — so the daemon's
    *  hot path and no-op tick stay free unless metrics are explicitly enabled. */
   report?: PhaseReport;
+  /** internal: cumulative scan-stats accumulator for RBOX_METRICS; created at the entry point,
+   *  shared by retry/recovery rescans. */
+  scanStats?: ScanStats;
   /** Test seam for the expensive encrypt primitive; production uses encryptFileToTemp. */
   encryptFileToTemp?: EncryptAndUploadOptions["encryptFileToTemp"];
   /** Test seam for debounce timing; production leaves the design-75 ~10s default. */
@@ -141,6 +159,11 @@ export interface SyncDeps {
   blockedFingerprint?: string;
 }
 
+function withReportScanStats(deps: SyncDeps, report: PhaseReport): SyncDeps {
+  if (!report.enabled || deps.scanStats) return deps;
+  return { ...deps, scanStats: createScanStats() };
+}
+
 /** Either use the caller's cache (caller owns persistence) or load+save one locally. */
 async function withCache(
   root: string,
@@ -169,7 +192,9 @@ async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
-  const local = await scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps));
+  const scanStats = report.enabled ? deps.scanStats : undefined;
+  const local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats));
+  if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
   await save();
   return local;
 }
@@ -181,9 +206,14 @@ async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps
  * the filesystem (never trust the network). Returns the actions taken.
  */
 export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
-  const api = deps.remote ?? apiFor(cfg);
   const report = deps.report ?? PhaseReport.disabled("pull");
-  const { sequence, manifest: remote } = await report.phase("latest", () => api.latest());
+  deps = withReportScanStats(deps, report);
+  const api = deps.remote ?? apiFor(cfg);
+  let latestTimings: LatestTimings | undefined;
+  const { sequence, manifest: remote } = await report.phase("latest", () =>
+    api.latest(report.enabled ? { onLatestTimings: (t) => (latestTimings = t) } : undefined)
+  );
+  if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
@@ -191,10 +221,12 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = matcherForState(root, cfg, state);
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
+  const scanStats = report.enabled ? deps.scanStats : undefined;
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats));
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
+    if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
   }
 
   // E2EE is the only mode (D6): the KEK is injected by buildAuthedRemote. A remote
@@ -323,14 +355,17 @@ export async function push(
   purgeIgnored = false
 ): Promise<{ sequence: number; committed: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
+  deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
+  const scanStats = report.enabled ? deps.scanStats : undefined;
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats));
   await save();
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
+    if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
   }
   const { sequence, committed } = await pushManifest(root, cfg, local, deps, 0, purgeIgnored);
   return { sequence, committed };
@@ -397,6 +432,8 @@ export async function pushManifest(
   purgeIgnored = false,
   forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE
 ): Promise<PushResult> {
+  const report = deps.report ?? PhaseReport.disabled("push");
+  deps = withReportScanStats(deps, report);
   const backoff = deps.backoff ?? defaultBackoff;
   let currentLocal = local;
   let currentForce = forceGitRecapture;
@@ -584,8 +621,16 @@ async function runPushAttempt(
     );
   }
 
-  const commitOptions = deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : undefined;
+  let commitTimings: CommitTimings | undefined;
+  let commitOptions: CommitOptions | undefined;
+  if (deps.blockedFingerprint !== undefined || report.enabled) {
+    commitOptions = {
+      ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
+      ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
+    };
+  }
   const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed, commitOptions));
+  if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
 
   if (res.epochStale !== undefined) {
     return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
@@ -642,6 +687,8 @@ export async function sync(
   cfg: WorkspaceConfig,
   deps: SyncDeps = {}
 ): Promise<{ pulled: Action[]; pushedSequence: number; pushCommitted: boolean }> {
+  const report = deps.report ?? PhaseReport.disabled("sync");
+  deps = withReportScanStats(deps, report);
   const pulled = await pull(root, cfg, deps);
   const { sequence: pushedSequence, committed: pushCommitted } = await push(root, cfg, deps);
   return { pulled, pushedSequence, pushCommitted };

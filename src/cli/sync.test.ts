@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
-import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
+import { BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 import {
   buildIgnoreMatcher,
   ENCRYPT_ADDRESS_CACHE_REL,
@@ -121,7 +121,8 @@ class FakeRemote implements SyncRemote {
     return this.blobs.has(encSha);
   }
 
-  async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
+    options?.onLatestTimings?.({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4 });
     return { sequence: this.head, manifest: this.log.get(this.head) ?? { generatedAt: "", files: [] } };
   }
   async missingBlobs(shas: string[]): Promise<string[]> {
@@ -137,7 +138,7 @@ class FakeRemote implements SyncRemote {
     if (shaBytes(bytes) !== sha256) throw new Error(`putBlobFile: content/sha mismatch for ${sha256}`);
     this.blobs.set(sha256, bytes);
   }
-  async commit(parentSequence: number, _deviceId: string, manifest: Manifest): Promise<CommitResult> {
+  async commit(parentSequence: number, _deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult> {
     this.commitCalls += 1;
     if (this.beforeCommit) await this.beforeCommit();
     if (parentSequence !== this.head) return { conflict: true, head: this.head };
@@ -154,6 +155,7 @@ class FakeRemote implements SyncRemote {
       this.forceUnsatisfiedOnce = false;
       return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map(addr) };
     }
+    options?.onCommitTimings?.({ refreshMs: 1, sidecarMs: 2, encodeMs: 3, encryptMs: 4, uploadMs: 5, postMs: 6, encBytes: 7 });
     this.head += 1;
     this.log.set(this.head, manifest);
     return { sequence: this.head };
@@ -509,11 +511,14 @@ test("409 conflict: client pulls + RE-SCANS + retries, and does NOT lose the rem
       remote.injectCommit([await remote.seedEntry("theirs.txt", theirs)]);
     }
   };
-  const { sequence: seq } = await push(root, cfg, deps(remote));
+  const report = PhaseReport.push();
+  const { sequence: seq } = await push(root, cfg, { ...deps(remote), report });
   expect(await read("theirs.txt")).toBe(theirs); // remote change not clobbered
   expect(await read("mine.txt")).toBe("mine\n"); // our change preserved
   expect(seq).toBe(remote.headSeq());
   expect(remote.commitCalls).toBeGreaterThanOrEqual(2);
+  const scanDetails = report.toJSON().phases.scan!.details as Record<string, number>;
+  expect(scanDetails.filesStatted).toBeGreaterThanOrEqual(4); // initial push scan + 409 pull scan + retry rescan
 });
 
 // ── 409 give-up leaves state untouched ─────────────────────────────────────
@@ -849,15 +854,30 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   // Bases attributed to the right phase: plaintext on scan, ciphertext/changed on
   // encrypt, wire on upload — each strictly positive for a real one-file push.
   expect(j.phases.scan!.plaintextBytes).toBe(Buffer.byteLength(content));
+  expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "dirsWalked",
+    "filesHashed",
+    "filesSkippedCacheHit",
+    "filesStatted",
+    "hashMs",
+    "matcherMs",
+    "readdirMs",
+    "sortMs",
+    "statMs",
+  ]);
   expect(j.phases.encrypt!.count).toBe(1);
   expect(j.phases.encrypt!.ciphertextBytes).toBeGreaterThan(0);
   expect(j.phases.encrypt!.changedBytes).toBe(j.phases.encrypt!.ciphertextBytes);
   expect(j.phases.upload!.wireBytes).toBeGreaterThan(0);
+  expect(Object.keys(j.phases.commit!.details ?? {}).sort()).toEqual(["encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "sidecarMs", "uploadMs"]);
   // The summary line is emitted (a phase was recorded) and stays PII-free.
   const lines: string[] = [];
   report.logSummaryTo((l) => lines.push(l));
   expect(lines.length).toBe(1);
   expect(lines[0]).not.toContain("x.txt");
+  expect(lines[0]).toContain("scan");
+  expect(lines[0]).toContain("commit");
+  expect(lines[0]).toContain("r0.0 sc0.0 e0.0 c0.0 u0.0 p0.0 7B");
 });
 
 test("§35: an enabled report times pull phases (scan + apply) with plaintext bytes", async () => {
@@ -871,8 +891,24 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   const j = report.toJSON();
   expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "scan", "state-load", "state-save"]);
   expect(j.blobs).toBe(1); // one write action applied
+  expect(Object.keys(j.phases.latest!.details ?? {}).sort()).toEqual(["decryptMs", "downloadMs", "encBytes", "parseMs"]);
+  expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "dirsWalked",
+    "filesHashed",
+    "filesSkippedCacheHit",
+    "filesStatted",
+    "hashMs",
+    "matcherMs",
+    "readdirMs",
+    "sortMs",
+    "statMs",
+  ]);
   expect(j.phases.apply!.plaintextBytes).toBe(Buffer.byteLength(content));
   expect(j.phases["git-apply"]!.count).toBe(0);
+  const lines: string[] = [];
+  report.logSummaryTo((l) => lines.push(l));
+  expect(lines[0]).toContain("latest");
+  expect(lines[0]).toContain("d0.0 x0.0 p0.0 4B");
 });
 
 test("design 74 phase 0: pull reports git-apply repo timings and commonDir group count", async () => {
@@ -926,6 +962,14 @@ test("§35: with no report, the sync path is unaffected (disabled fallback recor
   // No `report` in deps → sync uses PhaseReport.disabled internally; push still works.
   const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
+
+  const disabled = PhaseReport.disabled("push");
+  await write("z.txt", "again\n");
+  await push(root, cfg, { ...deps(remote), report: disabled });
+  expect(disabled.toJSON().phases).toEqual({});
+  const lines: string[] = [];
+  disabled.logSummaryTo((l) => lines.push(l));
+  expect(lines).toEqual([]);
 });
 
 // ── design 44: rebind state-poisoning + the mass-delete guard ────────────────

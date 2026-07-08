@@ -258,9 +258,15 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const different = fingerprint === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64);
     seedManifestRefs(server, manifest);
 
-    await expect(remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: different })).resolves.toEqual({ sequence: 1 });
+    let timings: Record<string, number> | undefined;
+    await expect(remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: different, onCommitTimings: (t) => (timings = t) })).resolves.toEqual({ sequence: 1 });
     expect(server.putBlobBytesCalls).toContain(fingerprint);
     expect(server.commitSignedCalls).toBe(1);
+    if (!timings) throw new Error("missing commit timings");
+    expect(Object.keys(timings).sort()).toEqual(["encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "sidecarMs", "uploadMs"]);
+    expect(timings.sidecarMs).toBeGreaterThanOrEqual(0);
+    expect(timings.postMs).toBeGreaterThanOrEqual(0);
+    expect(timings.encBytes).toBeGreaterThan(0);
   });
 
   test("A pushes an encrypted tree; B pairs in and pulls it byte-identically; server sees no plaintext", async () => {

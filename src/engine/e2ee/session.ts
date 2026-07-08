@@ -178,8 +178,11 @@ export async function buildCommit(args: {
   manifestJson: Uint8Array;
   blobRefs: BlobRef[];
   blobRefset?: BlobRefset;
+  onEncryptMs?: (ms: number) => void;
 }): Promise<BuiltCommit> {
+  const t0 = args.onEncryptMs ? Date.now() : 0;
   const enc = await encryptManifest(args.kek, args.secrets.accountId, args.workspaceId, args.keyEpoch, args.manifestJson);
+  if (args.onEncryptMs) args.onEncryptMs(Date.now() - t0);
   const base = {
     accountId: args.secrets.accountId,
     accountEpoch: args.accountEpoch,
