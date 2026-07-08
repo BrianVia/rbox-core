@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     }
     case "setup": {
       const { runSetup } = await import("./setup-cmd.js");
-      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags });
       break;
     }
     case "track": {
@@ -270,7 +270,7 @@ async function main(): Promise<void> {
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true" });
+      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true", pullOnly: flags["pull-only"] === "true" });
       break;
     }
     case "export": {
@@ -298,7 +298,7 @@ async function main(): Promise<void> {
       break;
     }
     case "start": {
-      await startDaemonAndRecordDesired(await resolveRoot(positional[0]));
+      await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { pullOnly: flags["pull-only"] === "true" });
       break;
     }
     case "stop": {
@@ -380,11 +380,25 @@ async function main(): Promise<void> {
       break;
     }
     case "key": {
-      if (positional[0] === "status") await keyStatus({ json: jsonMode });
-      else if (positional[0] === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
-      else if (positional[0] === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
+      const sub = positional[0];
+      if (sub === "status") await keyStatus({ json: jsonMode });
+      else if (sub === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
+      else if (sub === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
+      else if (sub === "create-ci") {
+        const { createCiKey } = await import("./key-cmd.js");
+        await createCiKey(flags);
+      } else if (sub === "materialize") {
+        const { materializeCmd } = await import("./key-cmd.js");
+        await materializeCmd(flags);
+      } else if (sub === "list") {
+        const { listKeys } = await import("./key-cmd.js");
+        await listKeys({ json: jsonMode });
+      } else if (sub === "revoke") {
+        const { revokeKey } = await import("./key-cmd.js");
+        await revokeKey(positional[1] ?? "");
+      }
       else {
-        fail("usage: rbox key <status | backup | genesis --yes> [--kit] [--kit-path <path>]");
+        fail("usage: rbox key <status | backup | genesis --yes | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
     }
@@ -453,7 +467,7 @@ async function main(): Promise<void> {
           await runFrontDoor(target.root);
         } else {
           const { runSetup } = await import("./setup-cmd.js");
-          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {} });
         }
         break;
       }

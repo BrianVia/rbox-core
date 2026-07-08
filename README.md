@@ -40,6 +40,25 @@ That enrolls the new machine for encryption in two steps — no re-typing your r
 
 Lost every machine? Re-enroll from your 24-word recovery phrase with `rbox recover`.
 
+## Agent / CI sync (beta)
+
+Create an expiring agent key on a trusted, already-enrolled machine:
+
+```bash
+rbox key create-ci --expires 7d
+```
+
+Put the printed `RBOX_KEY` in your CI or agent secret store, then bootstrap an
+ephemeral machine without a browser:
+
+```bash
+export RBOX_KEY='...'
+curl -fsSL https://rbox.to/agent.sh | sh -s -- --workspace <workspace> --pull-only
+```
+
+`RBOX_KEY` carries account decryption authority in this beta, so keep expiries
+short and store it only where you would store a root-equivalent CI secret.
+
 ## What it does
 
 - **Continuous sync.** A per-workspace daemon (`rbox start`) watches for changes, debounces, and prunes ignored trees so an `npm ci` or a giant clone never pegs your machine. `rbox status` avoids a network round-trip when the local daemon is live and attributable to the current workspace.

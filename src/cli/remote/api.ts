@@ -12,11 +12,16 @@ import {
   admitDevice,
   appendRoster,
   bootstrapKeys,
+  createApiKey,
   getAccountKeys,
   getWorkspaceKeys,
+  listApiKeys,
   pairCreate,
   putDeviceKeys,
   putWorkspaceKey,
+  revokeApiKey,
+  type ApiKeyRow,
+  type CreateApiKeyBody,
 } from "./keys.js";
 
 /**
@@ -135,6 +140,18 @@ export class RboxApi implements SyncRemote {
 
   pairCreate(body: { tokenId: string; mkWrap: string; admissionGrant: string }): Promise<{ token: string }> {
     return pairCreate(this.ctx, body);
+  }
+
+  createApiKey(body: CreateApiKeyBody): Promise<{ id: string; deviceId: string; expiresAt: number }> {
+    return createApiKey(this.ctx, body);
+  }
+
+  listApiKeys(): Promise<ApiKeyRow[]> {
+    return listApiKeys(this.ctx);
+  }
+
+  revokeApiKey(deviceId: string): Promise<void> {
+    return revokeApiKey(this.ctx, deviceId);
   }
 
   /** wss:// URL for the live notification channel. The daemon opens this with an

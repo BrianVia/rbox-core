@@ -161,7 +161,7 @@ export class RboxDaemon {
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string) {
+  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string, private readonly pullOnly = false) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
@@ -179,7 +179,7 @@ export class RboxDaemon {
 
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
-    log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})`);
+    log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
     if (!(await this.writeStartupBinding())) return;
@@ -198,10 +198,10 @@ export class RboxDaemon {
     this.pruneCache();
     await this.cache.save(this.root);
     this.want.pull = true;
-    this.want.push = true;
+    this.want.push = !this.pullOnly;
     await this.pump();
 
-    await this.startLiveWatch();
+    if (!this.pullOnly) await this.startLiveWatch();
     this.connect();
     this.startUpdateChecks();
 
@@ -321,6 +321,7 @@ export class RboxDaemon {
   // ---- single-flight pump --------------------------------------------------
 
   private request(kind: keyof Wants): void {
+    if (this.pullOnly && kind !== "pull") return;
     this.want[kind] = true;
     void this.pump();
   }
@@ -373,7 +374,7 @@ export class RboxDaemon {
               this.pendingCatchUpGeneration = undefined;
               await this.doPull();
               if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-              this.want.push = true; // publish any local divergence after taking remote
+              if (!this.pullOnly) this.want.push = true; // publish any local divergence after taking remote
             } else {
               const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
               this.outOfStorageProbeArmed = false;
@@ -1105,7 +1106,7 @@ export class RboxDaemon {
 export async function runDaemon(root: string): Promise<void> {
   const { cfg, deps } = await buildAuthedRemote(root); // E2EE transport + injected KEK
   await loadState(root, syncStreamId(cfg)); // surfaces corrupt-state errors loudly before we go live
-  const daemon = new RboxDaemon(root, cfg, deps);
+  const daemon = new RboxDaemon(root, cfg, deps, undefined, process.env.RBOX_DAEMON_PULL_ONLY === "1");
   const shutdown = async () => {
     await daemon.stop();
     process.exit(0);

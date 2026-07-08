@@ -80,7 +80,7 @@ export async function redeemLink(env: Env, p: Principal, rawCode: string): Promi
   // Fail-closed: a web session is also an owner `devices` row, so kind must be
   // durable AND role owner (design 21 §4.2, finding 4). The redeemer is identified
   // by the unique token_hash via authenticate(), so this proof is sound.
-  if (p.kind !== "durable") return json({ error: "forbidden", message: "link redeem requires a durable CLI device token" }, 403);
+  if (p.kind !== "device") return json({ error: "forbidden", message: "link redeem requires a durable CLI device token" }, 403);
   if (p.role !== "owner" || !p.userId) return json({ error: "forbidden", message: "link redeem requires an owner device" }, 403);
   const code = rawCode.startsWith(LINK_PREFIX) ? rawCode.slice(LINK_PREFIX.length) : rawCode;
   if (!CODE_RE.test(code)) return json({ error: "unauthorized" }, 401);
@@ -290,6 +290,7 @@ async function loadShellState(env: Env, accountId: string, nowMs: number): Promi
          (SELECT COUNT(*) FROM account_key_states WHERE account_id = ?1) AS aks,
          (SELECT COUNT(*) FROM workspace_keys WHERE account_id = ?1) AS wk,
          (SELECT COUNT(*) FROM devices WHERE account_id = ?1 AND expires_at IS NULL) AS durdev,
+         (SELECT COUNT(*) FROM api_keys WHERE account_id = ?1) AS apik,
          (SELECT COUNT(*) FROM workspaces WHERE account_id = ?1) AS ws,
          (SELECT COUNT(*) FROM blob_refs WHERE account_id = ?1) AS br,
          (SELECT COUNT(*) FROM uploads WHERE account_id = ?1) AS up,
@@ -317,7 +318,9 @@ function judgeReclaimable(r: ShellState | null, opts: { ignoreBilling?: boolean 
   if (!opts.ignoreBilling && (r.plan !== "none" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
   // `dr` (diagnostics_reports) blocks fail-closed: only DEVICE principals can create reports,
   // so a "web shell" holding one is not the empty shell this destructive path assumes.
-  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "dn", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
+  // `apik` (api_keys) likewise: keys are minted by device principals AND their devices rows
+  // carry expires_at, so `durdev` alone would never see them.
+  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "apik", "ws", "br", "up", "pt", "da", "dn", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
   if (Number(r.cu) > 1 || Number(r.own) > 1) return false; // only this Clerk id + its one owner membership
   return true;
 }

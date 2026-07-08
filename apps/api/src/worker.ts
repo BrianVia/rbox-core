@@ -255,6 +255,9 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   if (p.kind === "web" && !webTokenAllowed(req.method, seg)) {
     return jsonResponse({ error: "forbidden", message: "web session not permitted on this route" }, 403);
   }
+  if (p.kind === "api_key" && !apiKeyAllowed(req.method, seg)) {
+    return jsonResponse({ error: "forbidden_for_api_key" }, 403);
+  }
 
   // ---- AUTHED groups (Principal-scoped, under the §1.1 gate) ----
   if ((r = await authDeviceRoutes(ctx, p))) return r;
@@ -284,11 +287,11 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
  * Exported for tests — this privacy contract is load-bearing for the whole layer.
  */
 const ROUTE_VOCAB = new Set([
-  "v1", "health", "install.sh", "version", "version.sig", "bin",
+  "v1", "health", "install.sh", "agent.sh", "version", "version.sig", "bin",
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "workspaces", "diagnostics",
-  "keys", "roster", "admit", "keystate", "workspace",
+  "keys", "api", "roster", "admit", "keystate", "workspace",
   "blobs", "blob-batch", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
 ]);
@@ -337,7 +340,7 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   // design 22 §2.4: the new web-facing reads — exact pairs, NOT a GET /v1/account/* wildcard.
   if (method === "GET" && (eq(seg, ["v1", "account", "devices"]) || eq(seg, ["v1", "account", "workspaces"]))) return true;
   if (isDeviceRevoke(method, seg)) return true;
-  if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='durable' check
+  if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='device' check
   if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)
   // design 37: a web OWNER session may delete the account; deleteAccount() re-checks the
   // owner role + confirmation. A non-owner web session is rejected there, not here.
@@ -350,6 +353,28 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   // lets `rbox login`'s device-code flow be approved from a browser instead of a
   // second terminal.
   if (method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return true;
+  return false;
+}
+
+/**
+ * The exact route family an agent API key may reach (design 20 R2 + design 87 R2).
+ * It is intentionally narrower than "all authed routes": the key is a full E2EE
+ * device cryptographically, but the server still blocks account management,
+ * billing, pairing/device minting, and workspace creation.
+ */
+function apiKeyAllowed(method: string, seg: string[]): boolean {
+  if (method === "GET" && (eq(seg, ["v1", "account", "usage"]) || eq(seg, ["v1", "account", "workspaces"]))) return true;
+  if (seg[0] === "v1" && seg[1] === "ws") return true;
+  if (seg[0] === "v1" && (seg[1] === "blobs" || seg[1] === "blob-batch")) return true;
+  if (seg[0] === "v1" && seg[1] === "keys") {
+    // POST admit is the key's one-time SELF-admission during `rbox key create-ci`
+    // (admitAgentDevice runs under the new PAT bearer). The other mutating keys
+    // routes — bootstrap (genesis), device, roster, keystate (epoch), workspace
+    // (KEK publication) — are admin surface a leaked key must not reach. The
+    // crypto layer rejects unsigned mutations anyway; this is defense in depth.
+    if (method === "POST" && eq(seg, ["v1", "keys", "admit"])) return true;
+    if (method === "GET" && (eq(seg, ["v1", "keys", "account"]) || (seg.length === 4 && seg[2] === "workspace"))) return true;
+  }
   return false;
 }
 

@@ -1,6 +1,7 @@
 import {
   assertMkWrapAuthorized,
   bootstrapAccount,
+  buildPairing,
   buildRecoveryAdmission,
   fromB64url,
   generateSignKeyPair,
@@ -93,10 +94,14 @@ async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedR
 const headRoster = (dto: AccountKeysDTO): SignedRoster => JSON.parse(dto.rosters[dto.rosters.length - 1]!) as SignedRoster;
 
 async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>): Promise<void> {
-  let result = initial;
   // Persist the device + MK locally BEFORE admit (D3): the keypair is durable, so a
   // lost admit-response can be finalized on the next run rather than wedging.
-  await saveDevice(result.secrets);
+  await admitWithRetryInner(api, deviceId, initial, rebuild, true);
+}
+
+async function admitWithRetryInner(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>, persist: boolean): Promise<void> {
+  let result = initial;
+  if (persist) await saveDevice(result.secrets);
   for (let attempt = 0; attempt <= ADMIT_RETRIES; attempt++) {
     const res = await api.admitDevice({
       device: { deviceId, sigPubKey: result.device.sigPubKey, encPubKey: result.device.encPubKey, mkWrap: JSON.stringify(result.device.mkWrap) },
@@ -110,7 +115,7 @@ async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemRes
     if (dto.devices.some((d) => d.deviceId === deviceId)) return; // our earlier attempt actually succeeded
     if (attempt === ADMIT_RETRIES) throw new Error("admit kept conflicting — try again");
     result = await rebuild(dto);
-    await saveDevice(result.secrets); // keypair unchanged; roster parent updated
+    if (persist) await saveDevice(result.secrets); // keypair unchanged; roster parent updated
   }
 }
 
@@ -178,6 +183,49 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
   const initial = await build(dto);
   await admitWithRetry(api, deviceId, initial, build);
   return { accountId: creds.accountId, deviceId };
+}
+
+/** Admit a locally generated agent/API-key device without replacing the issuing
+ *  machine's own keystore. The PAT bearer must already authenticate as `deviceId`;
+ *  the issuer signs the admission grant, and the new device self-admits through
+ *  the same verified roster path as pairing. */
+export async function admitAgentDevice(args: {
+  remoteUrl: string;
+  bearer: string;
+  accountId: string;
+  deviceId: string;
+  issuer: DeviceSecrets;
+  expiresAt: number;
+  now: number;
+}): Promise<{ secrets: DeviceSecrets; mkWrap: Wrap }> {
+  const api = new RboxApi(args.remoteUrl, args.bearer, "", "");
+  const dto = await api.getAccountKeys();
+  if (!dto) throw new Error("account has no key material (fatal)");
+  const { account } = await verifyDto(dto);
+  assertSignedAccountId(args.accountId, account.currentRoster.accountId);
+
+  const tokenSecret = randomBytes(32);
+  const tokenId = `agent_${toB64url(randomBytes(16))}`;
+  const material = await buildPairing(args.issuer, { accountEpoch: account.currentEpoch, tokenId, tokenSecret, notAfter: args.expiresAt });
+  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() };
+  const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
+    const r = await redeemPairing({
+      accountId: args.accountId,
+      deviceId: args.deviceId,
+      tokenSecret,
+      accountEpoch: account.currentEpoch,
+      material,
+      prevRoster: headRoster(curDto),
+      now: args.now,
+      deviceKeys: keys,
+    });
+    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap);
+    return r;
+  };
+
+  const initial = await build(dto);
+  await admitWithRetryInner(api, args.deviceId, initial, build, false);
+  return { secrets: initial.secrets, mkWrap: initial.device.mkWrap };
 }
 
 // ---- the sync seam ---------------------------------------------------------

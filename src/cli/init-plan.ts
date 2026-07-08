@@ -83,8 +83,8 @@ export interface InitPlan {
   root: string;
   remoteUrl: string;
   deviceId: ResolvedDeviceId;
-  /** new→push (publish), join→sync (pull-first, surface conflicts), --no-sync→none. */
-  firstSync: "push" | "sync" | "none";
+  /** new→push, join→sync, keyed agent join→pull, --no-sync→none. */
+  firstSync: "push" | "sync" | "pull" | "none";
   /** §28: git-sync defaults ON (git artifacts are E2EE-encrypted); --git false opts out. */
   syncGit: boolean;
   /** Design 72 opt-in. Defaults false so new scripted workspaces keep current behavior. */
@@ -164,7 +164,7 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   // push; joining an existing one must pull/reconcile first (never blind-upload
   // an arbitrary local tree over someone else's workspace).
   const firstSync: InitPlan["firstSync"] =
-    flags["no-sync"] === TRUE ? "none" : workspace.kind === "new" ? "push" : "sync";
+    flags["no-sync"] === TRUE ? "none" : workspace.kind === "new" ? "push" : flags["pull-only"] === TRUE ? "pull" : "sync";
 
   return {
     auth,

@@ -3,7 +3,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport } from "./metrics.js";
 import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
-import { sync } from "./sync.js";
+import { pull, sync } from "./sync.js";
 import { style } from "./style.js";
 import { type WorkspaceConfig } from "./config.js";
 
@@ -31,14 +31,22 @@ export function summarize(label: string, actions: { kind: string; path?: string;
   for (const c of conflicts) console.log(`  ${style.sym.warn} conflict: ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
 }
 
-export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean } = {}): Promise<void> {
+export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean; pullOnly?: boolean } = {}): Promise<void> {
   const sp = spinner("syncing");
   try {
     const { cfg, deps } = await buildAuthedRemote(root);
     deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
     deps.allowMassDelete = opts.allowMassDelete === true;
-    const report = beginReport("sync");
+    const report = beginReport(opts.pullOnly ? "pull" : "sync");
     deps.report = report;
+    if (opts.pullOnly) {
+      const pulled = await pull(root, cfg, deps);
+      sp.stop();
+      summarize("pulled", pulled, root);
+      report?.logSummaryTo((l) => console.log(style.dim(l)));
+      await postSyncNudge(root, pulled, cfg);
+      return;
+    }
     const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
     sp.stop();
     summarize("pulled", pulled, root);

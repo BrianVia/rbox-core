@@ -1,13 +1,13 @@
 # Design 87 — Agent sync keys ("sync your latest code to your agents, fast")
 
-> **Implementation: 🔴 NOT STARTED** — design drafted + codex-adversarially
-> reviewed (2026-07-08): pass 1 FAIL (2 BLOCKER + 4 HIGH + 2 MEDIUM), all
-> eight resolved in §9 (normative, amends the body). Builds directly on
-> [design 20](./20-cli-api-keys.md) (CLI/CI API keys), which is design-complete
-> and codex-reviewed but unimplemented. Status index: [`README.md`](./README.md).
+> **Implementation: 🟢 BUILT (v1 beta)** — server + CLI shipped 2026-07-08:
+> `RBOX_KEY`, keyed `rbox setup --workspace`, PAT route gating, and `/agent.sh`.
+> Dashboard management remains future work. GA remains gated on E2EE epoch
+> rotation. Builds directly on [design 20](./20-cli-api-keys.md) (CLI/CI API
+> keys). Status index: [`README.md`](./README.md).
 
-**Status:** DRAFT — review pass 1 resolved; ready for a confirming pass 2
-alongside implementation.
+**Status:** v1 beta implemented; review pass 1 resolved; GA still waits for P3
+epoch rotation.
 **Depends on:** design 20 (adopted wholesale as the mechanism), design 12 (full
 E2EE), design 86 (paid-only plans — device caps per plan).
 **Blocks:** the "sync your latest code to your agents" marketing line on
