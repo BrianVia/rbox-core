@@ -40,6 +40,15 @@ Methodology + the broader (micro-bench, e2e, observability) plan live in
 [`benchmarking-and-observability.md`](benchmarking-and-observability.md);
 measured wins are logged in [`perf-improvements.md`](perf-improvements.md).
 
+### Runtime knobs
+
+| Variable | Default | Notes |
+| --- | ---: | --- |
+| `RBOX_PULL_JOIN_WATCHDOG_MS` | `90000` | Pull batch-join liveness window before retrying outstanding blob downloads. |
+| `RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS` | `3` | Consecutive zero-progress watchdog firings before a pull join fails loudly. |
+| `RBOX_NET_BLOB_MIN_TIMEOUT_MS` | `120000` | Minimum total deadline for size-aware blob downloads. |
+| `RBOX_NET_BLOB_MAX_TIMEOUT_MS` | `3600000` | Maximum total deadline for size-aware blob downloads. |
+
 ### Benchmarking a server-side change (dev, not prod)
 
 The control plane is benchmarked against the **dev** worker `rbox-dev-api` — real

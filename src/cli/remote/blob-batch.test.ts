@@ -16,7 +16,20 @@ import {
 
 const origFetch = globalThis.fetch;
 const origDateNow = Date.now;
-const ENV_KEYS = ["RBOX_BATCH_BLOBS", "RBOX_BATCH_RECORDS", "RBOX_BATCH_RECORD_BYTES", "RBOX_BATCH_BODY_BYTES", "RBOX_BATCH_SLOTS", "RBOX_BATCH_PUT_SLOTS", "RBOX_UPLOAD_CONCURRENCY", "RBOX_LANE_TIMING"] as const;
+const ENV_KEYS = [
+  "RBOX_BATCH_BLOBS",
+  "RBOX_BATCH_RECORDS",
+  "RBOX_BATCH_RECORD_BYTES",
+  "RBOX_BATCH_BODY_BYTES",
+  "RBOX_BATCH_SLOTS",
+  "RBOX_BATCH_PUT_SLOTS",
+  "RBOX_UPLOAD_CONCURRENCY",
+  "RBOX_LANE_TIMING",
+  "RBOX_PULL_JOIN_WATCHDOG_MS",
+  "RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS",
+  "RBOX_NET_BLOB_MIN_TIMEOUT_MS",
+  "RBOX_NET_BLOB_MAX_TIMEOUT_MS",
+] as const;
 const savedEnv = new Map<(typeof ENV_KEYS)[number], string | undefined>();
 
 const shaBytes = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
@@ -189,6 +202,72 @@ describe("BlobBatchDownloader fallback behavior", () => {
     await Promise.all(shas.map((s, i) => a.getBlobToFile(s, dest(`reconcile-${i}`), singles.get(s)!.byteLength)));
     expect(batchCalls()).toHaveLength(1);
     expect(singleCalls()).toHaveLength(12);
+  });
+
+  test("pull liveness watchdog retries a dropped batch completion", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "10";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS = "3";
+    process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
+    const payload = bytes("eventually single");
+    const s = seed(payload);
+    batchHandler = () => stallingBodyResponse(50);
+
+    const out = dest("watchdog-retry");
+    await api().getBlobToFile(s, out, payload.byteLength);
+
+    expect(await fs.readFile(out, "utf8")).toBe("eventually single");
+    expect(batchCalls()).toHaveLength(1);
+    expect(singleCalls()).toHaveLength(1);
+  });
+
+  test("watchdog duplicate failure does not settle while the primary batch later completes", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "10";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS = "5";
+    process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
+    const payload = bytes("primary eventually wins");
+    const s = shaBytes(payload);
+    batchHandler = () => delayedFramesResponse([frameData(s, payload)], 25);
+
+    const out = dest("watchdog-duplicate-fail-silent");
+    await api().getBlobToFile(s, out, payload.byteLength);
+
+    expect(await fs.readFile(out, "utf8")).toBe("primary eventually wins");
+    expect(batchCalls()).toHaveLength(1);
+    expect(singleCalls().length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("stream progress keeps the pull liveness watchdog from retrying moving batches", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "10";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS = "2";
+    process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
+    const payload = bytes("slow moving batch");
+    const s = seed(payload);
+    batchHandler = () => chunkedFramesResponse([frameData(s, payload)], 6);
+
+    const out = dest("watchdog-stream-progress");
+    await api().getBlobToFile(s, out, payload.byteLength);
+
+    expect(await fs.readFile(out, "utf8")).toBe("slow moving batch");
+    expect(batchCalls()).toHaveLength(1);
+    expect(singleCalls()).toHaveLength(0);
+  });
+
+  test("pull liveness watchdog fails loudly after repeated zero-progress checks", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MS = "10";
+    process.env.RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS = "1";
+    process.env.RBOX_NET_BLOB_MIN_TIMEOUT_MS = "1000";
+    const s = seed(bytes("never completed"));
+    batchHandler = () => stallingBodyResponse(50);
+
+    await expect(api().getBlobToFile(s, dest("watchdog-fail"), singles.get(s)!.byteLength)).rejects.toThrow(
+      new RegExp(`pull download stalled:.*${s}`)
+    );
+    expect(batchCalls()).toHaveLength(1);
+    expect(singleCalls()).toHaveLength(0);
   });
 
   test("corrupted payload falls back to single GET without leaving bad ciphertext", async () => {
@@ -520,6 +599,53 @@ function framesResponse(frames: Uint8Array[], status = 200): Response {
     off += frame.byteLength;
   }
   return new Response(body, { status, headers: { "content-type": "application/x-rbox-blobs" } });
+}
+
+function stallingBodyResponse(errorAfterMs: number): Response {
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      const t = setTimeout(() => controller.error(new DOMException("test batch stalled", "TimeoutError")), errorAfterMs);
+      t.unref?.();
+    },
+  }), { status: 200, headers: { "content-type": "application/x-rbox-blobs" } });
+}
+
+function delayedFramesResponse(frames: Uint8Array[], delayMs: number): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const t = setTimeout(() => {
+        for (const frame of frames) controller.enqueue(frame);
+        controller.close();
+      }, delayMs);
+      t.unref?.();
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/x-rbox-blobs" } });
+}
+
+function chunkedFramesResponse(frames: Uint8Array[], delayMs: number): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const chunks = frames.flatMap((frame) => {
+        const size = Math.max(1, Math.ceil(frame.byteLength / 4));
+        const parts: Uint8Array[] = [];
+        for (let off = 0; off < frame.byteLength; off += size) parts.push(frame.subarray(off, Math.min(frame.byteLength, off + size)));
+        return parts;
+      });
+      const write = (i: number) => {
+        const chunk = chunks[i];
+        if (!chunk) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk);
+        const t = setTimeout(() => write(i + 1), delayMs);
+        t.unref?.();
+      };
+      write(0);
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "application/x-rbox-blobs" } });
 }
 
 function frameData(sha: string, payload: Uint8Array): Uint8Array {

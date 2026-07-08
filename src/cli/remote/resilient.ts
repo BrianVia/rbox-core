@@ -126,6 +126,8 @@ export const DEFAULT_RETRIES = envInt("RBOX_NET_RETRIES", 2, 0, MAX_RETRIES);
 
 const XFER_BASE_MS = 30_000;
 const XFER_FLOOR_BPS = 512 * 1024; // deliberately pessimistic: a healthy link is 20–200× faster
+const BLOB_DOWNLOAD_MIN_TIMEOUT_MS = 120_000;
+const BLOB_DOWNLOAD_FLOOR_BPS = 256 * 1024;
 
 /**
  * Size-aware deadline for a blob upload/download (send + response). A flat cap would kill a
@@ -134,6 +136,20 @@ const XFER_FLOOR_BPS = 512 * 1024; // deliberately pessimistic: a healthy link i
  */
 export function transferTimeoutMs(sizeBytes: number): number {
   return XFER_BASE_MS + Math.ceil((Math.max(0, sizeBytes) / XFER_FLOOR_BPS) * 1000);
+}
+
+/**
+ * Total deadline for blob downloads, including the response body. It is deliberately
+ * looser than the upload/send deadline: a dogfood populate can include large blobs
+ * on ordinary residential links, but anything slower than 256 KiB/s for a single
+ * ciphertext blob is no longer useful foreground progress. The idle watchdog still
+ * catches black holes faster; this cap bounds slow-drip forever hangs.
+ */
+export function blobDownloadTimeoutMs(sizeBytes: number | undefined): number {
+  const minMs = envInt("RBOX_NET_BLOB_MIN_TIMEOUT_MS", BLOB_DOWNLOAD_MIN_TIMEOUT_MS, ONE_SECOND_MS, ONE_HOUR_MS);
+  const maxMs = envInt("RBOX_NET_BLOB_MAX_TIMEOUT_MS", ONE_HOUR_MS, minMs, ONE_HOUR_MS);
+  const size = typeof sizeBytes === "number" && Number.isFinite(sizeBytes) ? Math.max(0, sizeBytes) : 0;
+  return Math.min(maxMs, Math.max(minMs, Math.ceil((size / BLOB_DOWNLOAD_FLOOR_BPS) * 1000)));
 }
 
 export interface ResilientOpts {

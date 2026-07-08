@@ -32,6 +32,13 @@ export interface StatusSnapshot {
   /** Best-effort remote head evidence; undefined = offline/unknown. */
   remote?: StatusRemoteHead;
   activity?: DaemonActivity;
+  populate?: {
+    phase: TransferPhase;
+    filesDone: number;
+    filesTotal: number;
+    bytesDone?: number;
+    bytesTotal?: number;
+  };
   now: number;
 }
 
@@ -179,6 +186,19 @@ function formatProgressBytes(bytes: TransferProgressBytes): string {
 const activeBytes = (active: NonNullable<DaemonActivity["active"]>): TransferProgressBytes | undefined =>
   active.bytesDone !== undefined ? { bytesDone: active.bytesDone, bytesTotal: active.bytesTotal } : undefined;
 
+const populateLine = (p: NonNullable<StatusSnapshot["populate"]>): string => {
+  const files =
+    p.filesTotal > 0
+      ? `${n(p.filesDone)}/${n(p.filesTotal)} files`
+      : p.filesDone > 0
+        ? `${n(p.filesDone)} files`
+        : "starting";
+  const bytes = p.bytesDone !== undefined && p.bytesTotal !== undefined && p.bytesTotal > 0
+    ? ` · ${formatBinaryBytePair(p.bytesDone, p.bytesTotal)}`
+    : "";
+  return `${style.cyan(`↻ initial sync in progress — ${files}${bytes}`)}`;
+};
+
 function formatBinaryBytePair(done: number, total: number): string {
   const clampedTotal = Math.max(0, total);
   const clampedDone = Math.max(0, done);
@@ -224,6 +244,7 @@ export function healthLine(s: StatusSnapshot): string {
   if (active) {
     return style.cyan(`↻ syncing — ${progressLabel(active.phase, active.done, active.total, undefined, activeBytes(active))}`);
   }
+  if (s.populate) return populateLine(s.populate);
 
   const localChanges = s.added + s.changed + s.deleted;
   const gitChanged = s.gitChanged ?? 0;

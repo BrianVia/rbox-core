@@ -19,6 +19,8 @@ function bundle(raw: object): string {
 describe("rbox key materialize", () => {
   test("RBOX_KEY bundle decodes and materializes keystore files with private modes", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-"));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-home-"));
+    process.env.HOME = home;
     const boot = await bootstrapAccount("acct_agentmat", "agent_devmat", 1_900_000_000_000);
     const mkB64 = toB64url(boot.secrets.mk);
     const raw = bundle({
@@ -40,6 +42,7 @@ describe("rbox key materialize", () => {
     expect(decodeAgentKeyBundle(raw).deviceId).toBe("agent_devmat");
     const out = await materializeAgentKey(raw, { dir: tmp });
     expect(out).toMatchObject({ home: tmp, token: "rbox_pat_testBearer", accountId: "acct_agentmat", deviceId: "agent_devmat" });
+    await expect(fs.stat(path.join(home, ".rbox", "credentials.json"))).rejects.toThrow();
 
     const acctDir = path.join(tmp, ".rbox", "e2ee", "acct_agentmat");
     expect((await fs.stat(acctDir)).mode & 0o777).toBe(0o700);
@@ -62,6 +65,8 @@ describe("rbox key materialize", () => {
     expect(printed).toContain("export RBOX_ACCOUNT_ID=");
     expect(printed).toContain("export RBOX_DEVICE_ID=");
     expect(printed).not.toContain(mkB64);
+    await expect(fs.stat(path.join(home, ".rbox", "credentials.json"))).rejects.toThrow();
     await fs.rm(tmp, { recursive: true, force: true });
+    await fs.rm(home, { recursive: true, force: true });
   });
 });

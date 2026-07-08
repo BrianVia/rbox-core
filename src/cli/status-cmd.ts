@@ -20,6 +20,7 @@ import { gitDivergenceCount, gitDivergenceFastRepoSource, type GitDivergenceRepo
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
+import { readFreshPopulateStatus } from "./populate-status.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -148,12 +149,14 @@ async function fetchStatusAccountJson(creds: Credentials | undefined, timeoutMs 
 
 function statusHealthJson(input: {
   activity: DaemonActivity | undefined;
+  populate?: { filesDone: number; filesTotal: number };
   localChanges: number;
   gitChanged: number;
   localSequence: number;
   remote: StatusRemoteHead | undefined;
   now: number;
 }): "halt" | "outofstorage" | "active" | "pending" | "ok" {
+  if (input.populate) return "active";
   const behind = input.remote?.sequence !== undefined && input.remote.sequence > input.localSequence;
   const settled = input.localChanges === 0 && input.gitChanged === 0 && !behind;
   return shellStateOf(input.activity ?? { at: new Date(input.now).toISOString() }, settled);
@@ -242,6 +245,7 @@ export async function statusCmdWithDeps(
   const remoteHeadP: Promise<StatusRemoteHead | undefined> = attributed.remote
     ? Promise.resolve(attributed.remote)
     : fetchRemoteSequence(cfg, creds).then((probed) => (probed !== undefined ? { sequence: probed, source: "probe" as const } : undefined));
+  const populate = state.lastSyncedSequence === 0 ? await readFreshPopulateStatus(root, cfg, attributionNow).catch(() => undefined) : undefined;
   const trusted = mustComputeLocal
     ? undefined
     : trustedLocalSnapshot({
@@ -270,6 +274,15 @@ export async function statusCmdWithDeps(
       gitChanged,
       source: "daemon",
       ageMs: trusted.ageMs,
+    };
+  } else if (populate) {
+    counts = {
+      added: 0,
+      changed: 0,
+      deleted: 0,
+      trackedFiles: populate.operation.filesDone,
+      gitChanged: 0,
+      source: "computed",
     };
   } else {
     const matcher = buildIgnoreMatcher(root, {
@@ -311,6 +324,7 @@ export async function statusCmdWithDeps(
       workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
       health: statusHealthJson({
         activity,
+        populate: populate?.operation,
         localChanges,
         gitChanged: counts.gitChanged,
         localSequence: state.lastSyncedSequence,
@@ -353,6 +367,15 @@ export async function statusCmdWithDeps(
     localSequence: state.lastSyncedSequence,
     remote,
     activity,
+    populate: populate
+      ? {
+          phase: populate.operation.phase,
+          filesDone: populate.operation.filesDone,
+          filesTotal: populate.operation.filesTotal,
+          ...(populate.operation.bytesDone !== undefined ? { bytesDone: populate.operation.bytesDone } : {}),
+          ...(populate.operation.bytesTotal !== undefined ? { bytesTotal: populate.operation.bytesTotal } : {}),
+        }
+      : undefined,
     now,
   };
   console.log(`  ${healthLine(statusSnapshot)}`);
@@ -362,7 +385,9 @@ export async function statusCmdWithDeps(
   for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
   console.log(
     `  ${style.dim("background sync:")} ${
-      daemonStale
+      populate
+        ? style.cyan(`initial sync in progress (pid ${populate.pid})`)
+        : daemonStale
         ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
         : bg.running
           ? style.green(`running (pid ${bg.pid})`)

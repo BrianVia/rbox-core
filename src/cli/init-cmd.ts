@@ -23,6 +23,7 @@ import { progressLabel } from "./status-view.js";
 import { promptSelect, promptInput } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
+import { createPopulateStatusWriter } from "./populate-status.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -226,8 +227,13 @@ async function executeInitPlan(
     }
   } else if (plan.firstSync === "sync") {
     const sp = spinner("syncing from remote — scanning files");
+    const populate = createPopulateStatusWriter(plan.root, authed);
     try {
-      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+      await populate.start();
+      deps.onProgress = (done, total, phase, detail, bytes) => {
+        sp.update(progressLabel(phase, done, total, detail, bytes));
+        populate.update(done, total, phase, bytes);
+      };
       const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
       sp.stop();
       const conflicts = pulled.filter((a) => a.kind === "conflict");
@@ -239,11 +245,18 @@ async function executeInitPlan(
     } catch (e) {
       sp.fail("initial sync failed");
       throw e;
+    } finally {
+      await populate.stop();
     }
   } else if (plan.firstSync === "pull") {
     const sp = spinner("pulling from remote");
+    const populate = createPopulateStatusWriter(plan.root, authed);
     try {
-      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+      await populate.start();
+      deps.onProgress = (done, total, phase, detail, bytes) => {
+        sp.update(progressLabel(phase, done, total, detail, bytes));
+        populate.update(done, total, phase, bytes);
+      };
       const actions = await pull(plan.root, authed, deps);
       sp.stop();
       const conflicts = actions.filter((a) => a.kind === "conflict");
@@ -252,6 +265,8 @@ async function executeInitPlan(
     } catch (e) {
       sp.fail("initial pull failed");
       throw e;
+    } finally {
+      await populate.stop();
     }
   }
 

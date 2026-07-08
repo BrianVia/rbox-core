@@ -3,9 +3,16 @@ import path from "node:path";
 import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
 import type { DaemonActivity } from "./activity.js";
 import type { TransferPhase } from "./transfer-progress.js";
+import { syncStreamId, type WorkspaceConfig } from "./config.js";
+import {
+  AMBIENT_STATUS_STALE_MS,
+  hasFreshPopulateHeartbeat,
+  isProcessAlive,
+  parsePopulateStatus,
+  populateStatusPath,
+} from "./populate-marker.js";
 
-export const AMBIENT_STATUS_HEARTBEAT_MS = 5_000;
-export const AMBIENT_STATUS_STALE_MS = AMBIENT_STATUS_HEARTBEAT_MS * 3;
+export { AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
 
 export type AmbientDaemonState = "synced" | "syncing" | "attention" | "paused";
 export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degraded" | "ownership-lost" | "unknown-error";
@@ -54,6 +61,7 @@ export type PromptStatusVerdict =
     };
 
 type PumpOp = "pull" | "push" | "fullScan" | "deepScan";
+type PromptWorkspaceIdentity = Pick<WorkspaceConfig, "remoteUrl" | "remoteWorkspaceId" | "projectId">;
 
 export interface AmbientStatusProjectionInput {
   activity: DaemonActivity;
@@ -232,6 +240,57 @@ function readStatusFile(root: string): { kind: "absent" } | { kind: "corrupt" } 
   }
 }
 
+function readWorkspaceIdentity(root: string): PromptWorkspaceIdentity | undefined {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(root, ".rbox", "workspace.json"), "utf8")) as Partial<PromptWorkspaceIdentity>;
+    if (typeof cfg.remoteUrl !== "string" || typeof cfg.remoteWorkspaceId !== "string" || typeof cfg.projectId !== "string") {
+      return undefined;
+    }
+    return {
+      remoteUrl: cfg.remoteUrl,
+      remoteWorkspaceId: cfg.remoteWorkspaceId,
+      projectId: cfg.projectId,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function readFreshPopulateVerdict(root: string, now: number): PromptStatusVerdict | undefined {
+  let status = undefined as ReturnType<typeof parsePopulateStatus>;
+  try {
+    status = parsePopulateStatus(fs.readFileSync(populateStatusPath(root), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!status) return undefined;
+  const identity = readWorkspaceIdentity(root);
+  if (!identity) return undefined;
+  if (status.workspaceId !== identity.remoteWorkspaceId || status.projectId !== identity.projectId || status.stream !== syncStreamId(identity)) return undefined;
+  if (!hasFreshPopulateHeartbeat(status, now)) return undefined;
+  if (!isProcessAlive(status.pid)) return undefined;
+  const op = status.operation;
+  const pidfilePresent = filePresent(daemonPidPath(root));
+  return {
+    kind: "workspace",
+    state: "syncing",
+    operation: stripUndefined({
+      kind: "pull" as const,
+      phase: op.phase,
+      filesDone: op.filesDone,
+      filesTotal: op.filesTotal,
+      bytesDone: op.bytesDone,
+      bytesTotal: op.bytesTotal,
+    }),
+    sequence: null,
+    lastSyncedAt: null,
+    heartbeatAt: status.heartbeatAt,
+    stale: false,
+    pidfilePresent,
+    inferred: true,
+  };
+}
+
 function reasonOf(status: AmbientDaemonStatusV1): PromptAttentionReason | undefined {
   if (status.state !== "attention") return undefined;
   switch (status.attentionReason) {
@@ -302,6 +361,9 @@ function pausedVerdict(pidfilePresent: boolean): PromptStatusVerdict {
 export function readPromptStatus(start = process.cwd(), now = Date.now()): PromptStatusVerdict {
   const root = findWorkspaceRootSync(start);
   if (!root) return { kind: "outside-workspace" };
+
+  const populate = readFreshPopulateVerdict(root, now);
+  if (populate) return populate;
 
   const pidfilePresent = filePresent(daemonPidPath(root));
   const read = readStatusFile(root);

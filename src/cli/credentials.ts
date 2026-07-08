@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { homeDir } from "./rbox-paths.js";
 
 /**
  * Per-machine rbox credential — the device token obtained via `rbox login`,
@@ -32,7 +32,7 @@ export const PROD_REMOTE = "https://api.rbox.to";
  *  still win. This literal is only the fallback. */
 export const PROD_WEB = "https://app.rbox.to";
 
-const dir = () => path.join(os.homedir(), ".rbox");
+const dir = () => path.join(homeDir(), ".rbox");
 const file = () => path.join(dir(), "credentials.json");
 
 export async function loadCredentials(): Promise<Credentials | undefined> {
