@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
-import { resolveKeyedWorkspace, ensureKeyedTargetDir } from "./setup-keyed.js";
+import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
@@ -153,6 +153,30 @@ test("keyed setup target guard refuses non-empty dirs unless forced", async () =
   await expect(ensureKeyedTargetDir(tmp, false)).rejects.toThrow(/not empty/);
   await expect(ensureKeyedTargetDir(tmp, true)).resolves.toBeUndefined();
   await fs.rm(tmp, { recursive: true, force: true });
+});
+
+test("keyed setup persists credentials with private file mode", async () => {
+  const oldHome = process.env.HOME;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-home-"));
+  process.env.HOME = home;
+  try {
+    await persistKeyedCredentials(
+      { token: "rbox_pat_keyed", deviceId: "agent_dev", accountId: "acct_keyed" },
+      "https://api.test"
+    );
+    const file = path.join(home, ".rbox", "credentials.json");
+    expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({
+      token: "rbox_pat_keyed",
+      deviceId: "agent_dev",
+      remoteUrl: "https://api.test",
+      accountId: "acct_keyed",
+    });
+    expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    await fs.rm(home, { recursive: true, force: true });
+  }
 });
 
 test("keyed setup rejects literal --key values before any interactive work", async () => {

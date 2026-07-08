@@ -3,6 +3,7 @@ import path from "node:path";
 import { runInit } from "./init-cmd.js";
 import { startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { materializeAgentKey } from "./agent-key-bundle.js";
+import { saveCredentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { stderrStyle as e } from "./style.js";
 import { readStdinTrimmed } from "./read-stdin.js";
@@ -57,11 +58,24 @@ export async function ensureKeyedTargetDir(target: string, force: boolean): Prom
   await fs.mkdir(target, { recursive: true });
 }
 
+export async function persistKeyedCredentials(
+  materialized: { token: string; deviceId: string; accountId: string },
+  remoteUrl: string
+): Promise<void> {
+  await saveCredentials({
+    token: materialized.token,
+    deviceId: materialized.deviceId,
+    remoteUrl,
+    accountId: materialized.accountId,
+  });
+}
+
 export async function runKeyedSetup(cwd: string, defaultRemote: string, flags: Record<string, string>): Promise<void> {
   const workspaceArg = flags.workspace;
   if (!workspaceArg || workspaceArg === "true") throw new Error("--workspace requires a name or id");
   const materialized = await materializeAgentKey(await readKeyBundle(flags), { remoteUrlFallback: defaultRemote });
   const remoteUrl = materialized.remoteUrl ?? defaultRemote;
+  await persistKeyedCredentials(materialized, remoteUrl);
   const workspaces = await fetchAccountWorkspaces(remoteUrl, materialized.token);
   const picked = resolveKeyedWorkspace(workspaceArg, workspaces);
   const target = path.resolve(cwd, flags.dir && flags.dir !== "true" ? flags.dir : defaultTargetSlug(picked));

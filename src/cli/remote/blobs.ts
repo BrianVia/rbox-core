@@ -8,7 +8,7 @@ import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
-import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
+import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
@@ -101,12 +101,16 @@ export async function putBlobFile(
  *  fix for the 110-minute black-holed fetch (a stuck socket at 0 CPU): a stalled stream trips the
  *  watchdog, which the retry loop treats as transient and re-drives (a GET is idempotent). A hash
  *  mismatch is NOT transient and propagates on the first attempt. */
-export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string): Promise<void> {
-  await retryTransient(() => downloadToFileOnce(ctx, sha256, destPath), { op: "downloading data" });
+export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
+  await retryTransient(() => downloadToFileOnce(ctx, sha256, destPath, expectedSize), {
+    op: `downloading blob ${sha256}`,
+    rerunHint: "safe to re-run `rbox pull`: already-downloaded blobs are skipped",
+  });
 }
 
-async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: string): Promise<void> {
+async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
   const ctrl = new AbortController();
+  const signal = AbortSignal.any([ctrl.signal, AbortSignal.timeout(blobDownloadTimeoutMs(expectedSize))]);
   let idle: ReturnType<typeof setTimeout> | undefined;
   const armIdle = () => {
     if (idle) clearTimeout(idle);
@@ -115,7 +119,7 @@ async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: 
   };
   armIdle();
   try {
-    const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload, signal: ctrl.signal });
+    const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload, signal });
     if (!res.ok || !res.body) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
     const reader = (res.body as ReadableStream<Uint8Array>).getReader();
     const hash = createHash("sha256");

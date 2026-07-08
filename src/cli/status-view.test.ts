@@ -128,6 +128,17 @@ test("fresh active progress outranks a standing halt and renders the halt as ret
   ]);
 });
 
+test("fresh populate marker suppresses local-change verdict", () => {
+  const line = healthLine(base({
+    daemonRunning: false,
+    added: 120_058,
+    populate: { phase: "download", filesDone: 119_812, filesTotal: 119_813 },
+  }));
+  expect(line).toContain("initial sync in progress");
+  expect(line).toContain("119,812/119,813 files");
+  expect(line).not.toContain("local changes");
+});
+
 test("terminal halt renders blocked red, outranks fresh active, and omits retry copy", () => {
   const activity: DaemonActivity = {
     at: iso(10),
