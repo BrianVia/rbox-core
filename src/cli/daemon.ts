@@ -27,6 +27,13 @@ import { QuotaExceededError, RboxApi } from "./remote.js";
 import { CommitRejectedError } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 import { runUpdateCheckIfDue } from "./update-check.js";
+import {
+  AMBIENT_STATUS_HEARTBEAT_MS,
+  pausedAmbientDaemonStatus,
+  projectAmbientDaemonStatus,
+  type AmbientDaemonStatusV1,
+} from "./ambient-status.js";
+import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
@@ -106,6 +113,7 @@ export class RboxDaemon {
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
   private activityHeartbeatTimer?: ReturnType<typeof setInterval>;
+  private ambientStatusHeartbeatTimer?: ReturnType<typeof setInterval>;
   private wsGeneration = 0;
   private pendingCatchUpGeneration?: number;
   private lastWsKeepaliveWrite = 0;
@@ -120,6 +128,7 @@ export class RboxDaemon {
    *  errored once is no longer trusted to have delivered everything, so the safety
    *  scan never backs off again (fail-safe toward pre-design-49 behavior). */
   private watcherHealthy = true;
+  private watcherDegraded = false;
   private reconnectAttempt = 0;
   private stopped = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
@@ -157,6 +166,8 @@ export class RboxDaemon {
   private lastProgressWrite = 0;
   private lastProgressPhase: TransferPhase | undefined;
   private ownershipWindDownStarted = false;
+  private ambientStatusSawPidfile = false;
+  private activeProgressPath?: string;
   private readonly bootId: string;
   private readonly pullOnly: boolean;
 
@@ -189,6 +200,7 @@ export class RboxDaemon {
     await this.activityWrite;
     if (this.stopped) return;
     this.startActivityHeartbeat();
+    this.startAmbientStatusHeartbeat();
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
     const initialState = await this.loadSyncBase();
@@ -242,12 +254,16 @@ export class RboxDaemon {
             // the flag alone would wait out the remaining timeout.
             if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
             this.watcherHealthy = false;
+            this.watcherDegraded = true;
+            this.writeAmbientStatus();
             this.pinSafetyFloor();
           },
         }
       );
     } catch (e) {
       log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
+      this.watcherDegraded = true;
+      this.writeAmbientStatus();
     }
   }
 
@@ -294,11 +310,14 @@ export class RboxDaemon {
   }
 
   async stop(): Promise<void> {
+    const firstStop = !this.stopped;
     this.stopped = true;
+    if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
     this.stopActivityHeartbeat();
+    this.stopAmbientStatusHeartbeat();
     for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
     this.writeFinishRetryTimers.clear();
     this.deferredRetryPaths.clear();
@@ -317,6 +336,7 @@ export class RboxDaemon {
     await this.pumpRun.catch(() => {});
     await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
     await this.cache?.save(this.root).catch(() => {});
+    await this.writePausedAmbientStatus().catch(() => {});
     log("rbox daemon stopped");
   }
 
@@ -332,6 +352,7 @@ export class RboxDaemon {
       if (this.pullOnly && kind !== "pull") return;
       this.want[kind] = true;
     }
+    this.writeAmbientStatus();
     void this.pump();
   }
 
@@ -369,6 +390,7 @@ export class RboxDaemon {
           this.pushTerminalBlocked = false;
           this.want[op] = false;
           this.activePumpOp = op;
+          this.writeAmbientStatus();
           this.appliedPendingEventsInOp = false;
           try {
             if (op === "deepScan") {
@@ -397,6 +419,8 @@ export class RboxDaemon {
             this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
           } finally {
             this.activePumpOp = undefined;
+            this.activeProgressPath = undefined;
+            this.writeAmbientStatus();
           }
           // Op completed: any live progress is over. A standing halt is healed ONLY by
           // a success of the op kind that recorded it — a mass-delete-guard halt from a
@@ -409,6 +433,7 @@ export class RboxDaemon {
           const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
           const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
           this.activity.active = undefined;
+          this.activeProgressPath = undefined;
           if (heals) {
             this.activity.halt = undefined;
           }
@@ -440,6 +465,7 @@ export class RboxDaemon {
           }
           if (e instanceof CommitRejectedError) {
             this.activity.active = undefined;
+            this.activeProgressPath = undefined;
             this.activity.halt = {
               at: new Date().toISOString(),
               reason: msg,
@@ -458,6 +484,7 @@ export class RboxDaemon {
           // it a mass-delete-guard refusal (design 44) stalls background sync with no
           // indicator anywhere but this log. Persisted on the log-line schedule.
           this.activity.active = undefined;
+          this.activeProgressPath = undefined;
           this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
           if (shouldLogRepeat) {
             log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
@@ -467,6 +494,7 @@ export class RboxDaemon {
         }
       }
       await this.cache.save(this.root);
+      this.writeAmbientStatus();
       // Settle the sidecar (codex R4 P1): all wants are drained here, so re-render if
       // the state CHANGED from the last write — the mid-pump write said `pending`
       // (push still queued) and the no-op push wrote nothing; an idle workspace must
@@ -492,7 +520,7 @@ export class RboxDaemon {
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
         onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
-        onProgress: (done, total, phase, _detail, bytes) => this.onTransferProgress(done, total, phase, bytes), // design 45: live progress in `rbox status`
+        onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
       });
@@ -573,6 +601,7 @@ export class RboxDaemon {
       prev.cap !== next.cap ||
       prev.reason !== next.reason;
     this.activity.active = undefined;
+    this.activeProgressPath = undefined;
     if (clearsStaleQuotaHalt) this.activity.halt = undefined;
     this.activity.outOfStorage = next;
     this.outOfStorageProbeArmed = false;
@@ -647,7 +676,7 @@ export class RboxDaemon {
       cache: this.cache,
       report,
       onGitLog: log,
-      onProgress: (done, total, phase, _detail, bytes) => this.onTransferProgress(done, total, phase, bytes), // design 45
+      onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
       onPullApplied: (a) => this.recordPullApplied(a),
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
     });
@@ -711,6 +740,20 @@ export class RboxDaemon {
     this.activityHeartbeatTimer = undefined;
   }
 
+  private startAmbientStatusHeartbeat(intervalMs = AMBIENT_STATUS_HEARTBEAT_MS): void {
+    if (this.ambientStatusHeartbeatTimer || this.stopped) return;
+    this.ambientStatusHeartbeatTimer = setInterval(() => {
+      if (!this.stopped) this.writeHeartbeatSurfaces();
+    }, intervalMs);
+    this.ambientStatusHeartbeatTimer.unref?.();
+  }
+
+  private stopAmbientStatusHeartbeat(): void {
+    if (!this.ambientStatusHeartbeatTimer) return;
+    clearInterval(this.ambientStatusHeartbeatTimer);
+    this.ambientStatusHeartbeatTimer = undefined;
+  }
+
   private markLocalUnsettledFromWatchEvent(): void {
     const wasUnsettled = this.watcherUnsettled;
     this.watcherUnsettled = true;
@@ -755,6 +798,87 @@ export class RboxDaemon {
     };
   }
 
+  private ambientStatusFrom(snapshot: DaemonActivity, settled: boolean, now: number): AmbientDaemonStatusV1 {
+    return projectAmbientDaemonStatus({
+      activity: snapshot,
+      settled,
+      now,
+      sequence: this.lastLoggedSeq,
+      activePumpOp: this.activePumpOp,
+      want: this.want,
+      watcherDegraded: this.watcherDegraded,
+      ownershipLost: this.ownershipWindDownStarted,
+      currentPath: this.activeProgressPath,
+    });
+  }
+
+  private activitySnapshot(): DaemonActivity {
+    return {
+      ...this.activity,
+      local: this.activity.local ? { ...this.activity.local } : undefined,
+      ws: this.activity.ws ? { ...this.activity.ws } : undefined,
+      active: this.activity.active ? { ...this.activity.active } : undefined,
+    };
+  }
+
+  private async saveAmbientStatusIfOwned(status: AmbientDaemonStatusV1): Promise<void> {
+    if (!this.canPersistAmbientStatus(status)) return;
+    await saveAmbientDaemonStatus(this.root, status, { beforeRename: () => this.canPersistAmbientStatus(status) });
+  }
+
+  private enqueueAmbientStatusWrite(status?: AmbientDaemonStatusV1): void {
+    const next =
+      status ??
+      this.ambientStatusFrom(
+        this.activitySnapshot(),
+        this.localSettled(),
+        Date.now()
+      );
+    this.activityWrite = this.activityWrite.then(async () => {
+      await this.saveAmbientStatusIfOwned(next);
+    });
+  }
+
+  private writeAmbientStatus(): void {
+    this.enqueueAmbientStatusWrite();
+  }
+
+  private pausedAmbientStatus(now = Date.now()): AmbientDaemonStatusV1 {
+    const previous = this.ambientStatusFrom(this.activity, this.localSettled(), now);
+    return pausedAmbientDaemonStatus(now, previous);
+  }
+
+  private async writePausedAmbientStatusImmediate(): Promise<void> {
+    await this.saveAmbientStatusIfOwned(this.pausedAmbientStatus());
+  }
+
+  private async writePausedAmbientStatus(): Promise<void> {
+    const paused = this.pausedAmbientStatus();
+    this.activityWrite = this.activityWrite.then(async () => {
+      await this.saveAmbientStatusIfOwned(paused);
+    });
+    await this.activityWrite;
+  }
+
+  private writeHeartbeatSurfaces(): void {
+    const settled = this.localSettled();
+    const now = Date.now();
+    const snapshot = this.activitySnapshot();
+    const shellState = shellLineStateOf(snapshot, settled, now);
+    const line = renderShellLine(snapshot, {
+      settled,
+      sequence: this.lastLoggedSeq,
+      name: this.cfg.name ?? this.cfg.remoteWorkspaceId,
+      now,
+    });
+    const ambient = this.ambientStatusFrom(snapshot, settled, now);
+    this.lastShellState = shellState;
+    this.activityWrite = this.activityWrite.then(async () => {
+      if (this.canPersistTrustedSurface()) await saveShellLine(this.root, line);
+      await this.saveAmbientStatusIfOwned(ambient);
+    });
+  }
+
   private enqueueActivityWrite(bumpHeartbeat: boolean): void {
     if (bumpHeartbeat) {
       this.activity.at = new Date().toISOString();
@@ -769,11 +893,7 @@ export class RboxDaemon {
     const localSnapshot = this.localSnapshot(settled, now);
     if (localSnapshot) this.activity.local = localSnapshot;
     else this.activity.local = undefined;
-    const snapshot = {
-      ...this.activity,
-      local: this.activity.local ? { ...this.activity.local } : undefined,
-      ws: this.activity.ws ? { ...this.activity.ws } : undefined,
-    };
+    const snapshot = this.activitySnapshot();
     this.lastShellState = shellLineStateOf(snapshot, settled, now);
     const line = renderShellLine(snapshot, {
       settled,
@@ -781,11 +901,13 @@ export class RboxDaemon {
       name: this.cfg.name ?? this.cfg.remoteWorkspaceId,
       now,
     });
+    const ambient = this.ambientStatusFrom(snapshot, settled, now);
     this.activityWrite = this.activityWrite
       .then(async () => {
         if (!this.canPersistTrustedSurface()) return;
         await saveActivity(this.root, snapshot);
         await saveShellLine(this.root, line);
+        await this.saveAmbientStatusIfOwned(ambient);
       });
   }
 
@@ -799,6 +921,21 @@ export class RboxDaemon {
     const pidfile = readDaemonPidRecord(this.root);
     if (pidfile.version === "v2" && pidfile.bootId !== undefined && pidfile.bootId !== this.bootId) {
       this.beginOwnershipWindDown(`pidfile now belongs to boot ${pidfile.bootId}`);
+      return false;
+    }
+    return true;
+  }
+
+  private canPersistAmbientStatus(status: AmbientDaemonStatusV1): boolean {
+    if (this.stopped && status.state !== "paused") return false;
+    const pidfile = readDaemonPidRecord(this.root);
+    if (pidfile.present) this.ambientStatusSawPidfile = true;
+    if (pidfile.version === "v2" && pidfile.bootId !== undefined && pidfile.bootId !== this.bootId) {
+      this.beginOwnershipWindDown(`pidfile now belongs to boot ${pidfile.bootId}`);
+      return false;
+    }
+    const gracefulPaused = this.stopped && !this.ownershipWindDownStarted && status.state === "paused" && this.ambientStatusSawPidfile;
+    if (!pidfile.present && !gracefulPaused) {
       return false;
     }
     return true;
@@ -850,7 +987,15 @@ export class RboxDaemon {
    *  transfer isn't bottlenecked on progress bookkeeping. Phase changes, determinate
    *  final ticks, and raw same-phase regressions bypass the throttle so transitions,
    *  completions, and retry/retraction restarts are visible immediately. */
-  private onTransferProgress(done: number, total: number, phase: TransferPhase, bytes?: TransferProgressBytes): void {
+  private onTransferProgress(
+    done: number,
+    total: number,
+    phase: TransferPhase,
+    detailOrBytes?: string | TransferProgressBytes,
+    maybeBytes?: TransferProgressBytes
+  ): void {
+    const detail = typeof detailOrBytes === "string" ? detailOrBytes : undefined;
+    const bytes = typeof detailOrBytes === "string" ? maybeBytes : detailOrBytes;
     const now = Date.now();
     const final = total > 0 && done >= total;
     const phaseChanged = phase !== this.lastProgressPhase;
@@ -864,6 +1009,7 @@ export class RboxDaemon {
     if (!final && !phaseChanged && !regressed && now - this.lastProgressWrite < 500) return;
     this.lastProgressPhase = phase;
     this.lastProgressWrite = now;
+    this.activeProgressPath = detail;
     this.activity.active = {
       at: new Date().toISOString(),
       phase,

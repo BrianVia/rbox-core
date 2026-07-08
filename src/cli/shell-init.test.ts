@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { shellInitZsh } from "./shell-init.js";
@@ -50,12 +50,39 @@ test("the script embeds both hooks, root discovery, the version guard, and compl
   expect(s).toContain("add-zsh-hook chpwd _rbox_chpwd");
   expect(s).toContain("add-zsh-hook precmd _rbox_precmd");
   expect(s).toContain("_rbox_find_root");
+  expect(s).toContain("prompt-status");
+  expect(s).toContain("_RBOX_PROMPT_STATUS_DEFAULT=0");
   expect(s).toContain("RBOX_PROMPT");
   // The v1 whole-line shape gate — refuses any other version tag AND malformed fields.
   expect(s).toContain("^v1 [0-9]{1,12} (ok|pending|active|halt)");
   // The completions are appended verbatim (ends with the #compdef header + footer).
   expect(s).toContain("#compdef rbox");
   expect(s).toContain("compdef _rbox rbox");
+});
+
+test("RBOX_USE_PROMPT_STATUS=1 prefers prompt-status and falls back to shell.line by default", () => {
+  if (!ZSH) return;
+  const dir = mkdtempSync(join(tmpdir(), "rbox-shellinit-bin-"));
+  const fake = join(dir, "rbox");
+  writeFileSync(fake, "#!/bin/sh\nif [ \"$1\" = prompt-status ]; then echo '↑7'; exit 0; fi\nexit 1\n");
+  chmodSync(fake, 0o755);
+  const file = writeScript();
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - My Workspace\n`);
+  const cmd = [
+    `RBOX_USE_PROMPT_STATUS=1`,
+    `RBOX_BIN=${fake}`,
+    `source ${file}`,
+    `cd ${ws}`,
+    "_rbox_chpwd",
+    "_rbox_precmd",
+    'print -r -- "GLYPH:${RBOX_PROMPT}"',
+  ].join("; ");
+  const res = Bun.spawnSync([ZSH, "-f", "-c", cmd], { cwd: tmpdir() });
+  const stdout = new TextDecoder().decode(res.stdout);
+  const stderr = new TextDecoder().decode(res.stderr);
+  expect(stderr).toContain("↑7");
+  expect(stdout).toContain("GLYPH:%F{cyan}↑7%f");
 });
 
 test("auto-append enables PROMPT_SUBST (stock zsh has it off — the embedded $RBOX_PROMPT would render literally); opting out leaves options untouched", () => {
@@ -111,10 +138,10 @@ test("a halted workspace shows the ⚠ glyph and a halt banner", () => {
   expect(banner).toContain("halted");
 });
 
-test("a stale sidecar (heartbeat > 180s old) shows the ○ 'not running' state", () => {
+test("a stale sidecar (heartbeat > 15s old) shows the ○ 'not running' state", () => {
   if (!ZSH) return;
   const now = Math.floor(Date.now() / 1000);
-  const ws = makeWorkspace(`v1 ${now - 200} ok - 80 - - My Workspace\n`);
+  const ws = makeWorkspace(`v1 ${now - 20} ok - 80 - - My Workspace\n`);
   const { glyph, banner } = driveHooks(writeScript(), ws);
   expect(glyph).toContain("○");
   expect(banner).toContain("○");

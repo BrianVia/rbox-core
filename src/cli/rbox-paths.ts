@@ -8,6 +8,7 @@
  */
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 
 /** The user's home directory. Prefers `process.env.HOME` (live) over `os.homedir()`:
  *  under Bun `os.homedir()` is resolved once at startup and IGNORES a later `HOME`
@@ -23,3 +24,22 @@ export function configDir(): string {
 }
 
 export const depsStatePath = (): string => path.join(configDir(), "deps-state.json");
+
+const RBOX_DIR = ".rbox";
+
+/** A stable, human-scannable, collision-safe key for a workspace, derived purely
+ *  from its absolute resolved root: `<basename>-<hash8>`. */
+export function workspaceKey(root: string): string {
+  const abs = path.resolve(root);
+  const hash = crypto.createHash("sha256").update(abs).digest("hex").slice(0, 8);
+  const base = path.basename(abs).replace(/[^A-Za-z0-9._-]/g, "_") || "root";
+  return `${base}-${hash}`;
+}
+
+const daemonHome = () => path.join(process.env.RBOX_HOME || os.homedir(), RBOX_DIR);
+
+export const daemonRuntimeDir = (root: string): string => path.join(daemonHome(), "daemons", workspaceKey(root));
+export const daemonStatusPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.status.json");
+export const daemonPidPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.pid");
+export const daemonLogPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.log");
+export const daemonBoundPath = (root: string): string => path.join(daemonRuntimeDir(root), "workspace.bound");
