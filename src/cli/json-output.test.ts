@@ -153,6 +153,7 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     remote: null,
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
+    crypto: { state: "idle", workers: 0, jobsRun: 0, workerExecutions: 0 },
   });
 });
 

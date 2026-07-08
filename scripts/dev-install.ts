@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ALL, externalFlagsFor, PARCEL_PKG, type ReleaseTarget } from "./release.js";
+import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 import { style } from "../src/cli/style.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -106,6 +107,7 @@ export function main(argv = process.argv.slice(2)): void {
 
   fs.mkdirSync(outDir, { recursive: true });
   console.log(`[dev-install] build ${target} (embedding ${PARCEL_PKG[target]})`);
+  buildCryptoWorkerBundle();
   runBuild(assembleDevBuildArgv({ target, version, outfile }));
   fs.chmodSync(outfile, 0o755);
 

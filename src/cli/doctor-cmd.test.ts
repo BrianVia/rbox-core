@@ -29,6 +29,7 @@ const checks: DoctorChecks = {
   remote: { ok: true, label: "remote", message: "reachable", latencyMs: 10 },
   version: { ok: true, label: "version", message: "up to date", current: "0.6.8", latest: "0.6.8" },
   state: { ok: true, label: "state", message: "ok" },
+  crypto: { ok: true, label: "crypto workers", message: "idle", status: "idle" },
 };
 
 beforeEach(async () => {

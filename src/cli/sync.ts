@@ -240,6 +240,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const applyOpts = {
     device: cfg.deviceId,
     kek,
+    keyEpoch: cfg.keyEpoch,
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
     onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
