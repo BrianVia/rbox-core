@@ -17,6 +17,7 @@ import path from "node:path";
 import { releaseSigningInput } from "../src/cli/upgrade-cmd.js";
 import { verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
+import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
@@ -120,6 +121,7 @@ function nativeBindingPath(t: ReleaseTarget): string | undefined {
 
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
+buildCryptoWorkerBundle();
 const artifacts: Record<string, { sha256: string; path: string }> = {};
 for (const t of targets) {
   const out = path.join(dist, `rbox-${t}`);

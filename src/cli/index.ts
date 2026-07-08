@@ -433,6 +433,14 @@ async function main(): Promise<void> {
       process.exit(await watcherSelfTest(positional[0]));
       break;
     }
+    case "__crypto-smoke": {
+      // Hidden: compiled-binary smoke for design 81. Proves worker-pool crypto actually
+      // executes in this binary; inline fallback alone exits non-zero.
+      const { cryptoSmoke } = await import("./crypto-smoke.js");
+      const jobs = flags.jobs !== undefined ? Number(flags.jobs) : undefined;
+      process.exit(await cryptoSmoke({ jobs }));
+      break;
+    }
     default:
       // Bare `rbox` in a terminal → status/actions when already inside a workspace,
       // otherwise the guided `setup` front door (design 29).

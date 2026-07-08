@@ -6,6 +6,7 @@ import {
   EncryptAddressCacheWriter,
   encryptFileToTemp as defaultEncryptFileToTemp,
   poolMap,
+  withCryptoPool,
   type EncryptedBlob,
   type EncryptAddressCacheContext,
   type FileEntry,
@@ -39,7 +40,7 @@ const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
   const n = Number(v);
   return Number.isInteger(n) && n >= 1 && n <= max ? n : dflt;
 };
-const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, 8); // CPU/disk bound
+const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, poolWorkers ? poolWorkers * 2 : 8); // CPU/disk bound
 // 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
 // ~7 D1 round-trips and concurrency past 32 just multiplied D1 contention. §23 moved D1 off
 // the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
@@ -173,11 +174,12 @@ export async function encryptAndUpload(
         toEncrypt.push(f);
       }
     }
-    // Encrypt changed files concurrently (was sequential — slow on a big first push).
-    let enc = 0;
-    let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
-    await report.phase("encrypt", async () => {
-      await poolMap(toEncrypt, encryptConcurrency(), async (f) => {
+    const runCryptoAndUpload = async (poolWorkers: number | undefined): Promise<void> => {
+      // Encrypt changed files concurrently (was sequential — slow on a big first push).
+      let enc = 0;
+      let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
+      await report.phase("encrypt", async () => {
+        await poolMap(toEncrypt, encryptConcurrency(poolWorkers), async (f) => {
         const t0 = LANE_TIMING ? performance.now() : 0;
         const cached = encryptCache.lookup(f.sha256);
         if (cached) {
@@ -222,9 +224,9 @@ export async function encryptAndUpload(
         encCtBytes += e.cipherSize;
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
         onProgress?.(++enc, toEncrypt.length, "encrypt");
+        });
       });
-    });
-    report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
+      report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
 
     const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
     const missingT0 = LANE_TIMING ? performance.now() : 0;
@@ -353,7 +355,14 @@ export async function encryptAndUpload(
         emitUploadProgress();
       });
     });
-    report.record("upload", { count: up, wireBytes: upWireBytes });
+      report.record("upload", { count: up, wireBytes: upWireBytes });
+    };
+
+    if (options.encryptFileToTemp === undefined) {
+      await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool?.workers.length));
+    } else {
+      await runCryptoAndUpload(undefined);
+    }
   } finally {
     try {
       const livePaths = new Set(options.pruneLivePaths ?? local.files.filter((f) => f.type === "file").map((f) => f.path));

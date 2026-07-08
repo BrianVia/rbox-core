@@ -4,6 +4,7 @@ node_modules/
 # build output
 dist/
 .cache/
+src/engine/generated/
 
 # local workspace/runtime state (per-device, never synced or committed)
 .rbox/

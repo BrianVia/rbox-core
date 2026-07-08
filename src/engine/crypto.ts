@@ -121,6 +121,20 @@ export interface EncryptedBlob {
   payloadSha?: string;
 }
 
+export type EncryptFileOptions = { compress?: boolean; bufferedCompressionMaxBytes?: number };
+export type DecryptFileOptions = { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number };
+
+type CryptoPoolSelection = {
+  encrypt(srcPath: string, tmpDir?: string, opts?: EncryptFileOptions): Promise<EncryptedBlob>;
+  decrypt(ctPath: string, plaintextSha: string, destPath: string, opts?: DecryptFileOptions): Promise<void>;
+};
+
+let cryptoPoolSelector: ((kek: Buffer) => CryptoPoolSelection | undefined) | undefined;
+
+export function setCryptoPoolSelectorForProcess(selector: (kek: Buffer) => CryptoPoolSelection | undefined): void {
+  cryptoPoolSelector = selector;
+}
+
 /**
  * Encrypt `srcPath` to a temp ciphertext file. Re-hashes the actual bytes for key
  * derivation (review finding #1) and returns the ciphertext content-address
@@ -148,7 +162,7 @@ export interface EncryptedBlob {
  * already exposes on this disk. The snapshot is deleted the moment encryption
  * finishes (below), bounding that transient copy.
  */
-export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string, opts: { compress?: boolean; bufferedCompressionMaxBytes?: number } = {}): Promise<EncryptedBlob> {
+export async function encryptFileToTempInline(srcPath: string, kek: Buffer, tmpDir?: string, opts: EncryptFileOptions = {}): Promise<EncryptedBlob> {
   // Track whether WE created the dir: on the default path an early error must not
   // leak an empty `rbox-enc-*` temp dir (the caller can't clean a dir it never saw).
   const ownDir = tmpDir === undefined;
@@ -236,17 +250,22 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
   }
 }
 
+export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string, opts: { compress?: boolean; bufferedCompressionMaxBytes?: number } = {}): Promise<EncryptedBlob> {
+  const pool = cryptoPoolSelector?.(kek);
+  return pool ? pool.encrypt(srcPath, tmpDir, opts) : encryptFileToTempInline(srcPath, kek, tmpDir, opts);
+}
+
 /**
  * Decrypt a ciphertext file to `destPath`, verifying the GCM tag and then that the
  * recovered plaintext hashes to `plaintextSha`. Throws (and removes any partial
  * output) on tamper / wrong key / mismatch.
  */
-export async function decryptFileToPath(
+export async function decryptFileToPathInline(
   ctPath: string,
   kek: Buffer,
   plaintextSha: string,
   destPath: string,
-  opts: { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number } = {}
+  opts: DecryptFileOptions = {}
 ): Promise<void> {
   if (opts.comp && !opts.payloadSha) throw new Error("compressed blob missing payloadSha");
   const derivationSha = opts.comp ? opts.payloadSha! : plaintextSha;
@@ -293,4 +312,16 @@ export async function decryptFileToPath(
     await fs.rm(destPath, { force: true }).catch(() => {});
     throw e;
   }
+}
+
+export async function decryptFileToPath(
+  ctPath: string,
+  kek: Buffer,
+  plaintextSha: string,
+  destPath: string,
+  opts: { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number } = {}
+): Promise<void> {
+  const pool = cryptoPoolSelector?.(kek);
+  if (pool) return pool.decrypt(ctPath, plaintextSha, destPath, opts);
+  return decryptFileToPathInline(ctPath, kek, plaintextSha, destPath, opts);
 }

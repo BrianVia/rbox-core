@@ -1,4 +1,4 @@
-import { buildIgnoreMatcher, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
@@ -304,6 +304,7 @@ export async function statusCmdWithDeps(
   const [remote, trash, accountJson] = await Promise.all([remoteHeadP, trashP, accountJsonP]);
   const localChanges = counts.added + counts.changed + counts.deleted;
   const now = deps.now();
+  const crypto = cryptoPoolStatus();
 
   if (opts.json) {
     const statusJson = {
@@ -332,6 +333,7 @@ export async function statusCmdWithDeps(
         : {}),
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
+      crypto,
     };
     emitJson(statusJson);
     return;
@@ -356,6 +358,7 @@ export async function statusCmdWithDeps(
   console.log(`  ${healthLine(statusSnapshot)}`);
   for (const detail of healthDetailLines(statusSnapshot)) console.log(`  ${detail}`);
   if (attributed.remoteLine) console.log(`  ${attributed.remoteLine}`);
+  if (crypto.state === "disabled") console.log(`  ${style.dim("crypto workers:")} ${style.yellow(`disabled — ${crypto.reason}`)}`);
   for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
   console.log(
     `  ${style.dim("background sync:")} ${
