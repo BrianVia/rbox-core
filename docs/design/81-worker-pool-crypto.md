@@ -353,6 +353,21 @@ Bench gate, on the 32-core Linux host, using a compiled dev build, not
    measurement, which the full-corpus run structurally cannot provide
    (review blocker).
 
+**Gate results (measured 2026-07-08, compiled dev build 483eb27 on the
+32-core Linux host, same corpus as the founding measurements):** full publish
+1,653s → 599s; encrypt phase 363s = 293 files/s (5.5x the 53 baseline) /
+132 unique-encrypts/s (3.7x the true 36 baseline — the corpus proved to be
+55% duplicate files, absorbed by the design-75 cache; the baseline "blobs"
+figures were files-basis and, on v0.9.7, double-counted); CPU peaked 575%;
+join decrypt+write lane 9-10% → 1% (19.6ms → 1.5ms/blob); small push pool
+359s vs inline 391s (no regression; the ~6-min absolute is a cold-throwaway
+git-recapture artifact present in both arms); full-corpus join diff: zero
+differing files; compiled-binary worker execution proven on darwin-arm64 and
+linux-x64. The 400 files/s aspiration was missed at 293: a tmpfs A/B was
+null (encrypt ~416s on /dev/shm), so the residual bound is per-job overhead,
+not disk I/O — in-worker profiling / multi-blob job batching is the named
+follow-up. Shipped on the strength of 5.5x + zero regressions.
+
 Only after that gate passes does this ship as v0.9.9. The rollout is a normal
 fleet upgrade plus daemon restarts so long-running daemons move onto the worker
 pool build.

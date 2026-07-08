@@ -4,6 +4,7 @@ import type { BlobStore } from "./blobstore.js";
 import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
 import { BLOB_CIPHERTEXT_TAG_BYTES, decryptFileToPath } from "./crypto.js";
+import { withCryptoPool } from "./crypto-pool.js";
 import { assertWithinRoot, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
@@ -38,6 +39,8 @@ export interface ApplyOptions {
   /** Workspace KEK (M5). When set and an entry has `encSha`, the blob is fetched
    *  by `encSha` (ciphertext) and decrypted+verified before write. */
   kek?: Buffer;
+  /** Key epoch for the KEK. Required for worker-pool decrypt selection. */
+  keyEpoch?: number;
   /** Max concurrent writes (each fetches+decrypts a blob). Defaults to 16 — the
    *  dominant cost of a pull is per-blob download latency, so this is the lever. */
   concurrency?: number;
@@ -113,15 +116,23 @@ export async function applyActions(
   // and the coalescer, not this pool, bounds real network parallelism.
   const batchDefault = process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 128;
   const dlConc = opts.concurrency ?? (Number.isInteger(envDl) && envDl >= 1 && envDl <= 512 ? envDl : batchDefault);
-  await poolMap(rest, dlConc, async (a) => {
-    if (a.kind === "write") {
-      await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
-    } else if (a.kind === "conflict") {
-      // Reconcile already decided both sides diverged: keep local aside, take remote.
-      await moveAside(destRoot, a.path, a.keepLocalAs);
-      await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
-    }
-    opts.onProgress?.(++done, rest.length);
+  const encryptedEntryCount = opts.kek
+    ? rest.filter((a) => {
+        const entry = a.kind === "write" || a.kind === "conflict" ? a.entry : undefined;
+        return entry?.type === "file" && !!entry.encSha;
+      }).length
+    : 0;
+  await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
+    await poolMap(rest, dlConc, async (a) => {
+      if (a.kind === "write") {
+        await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
+      } else if (a.kind === "conflict") {
+        // Reconcile already decided both sides diverged: keep local aside, take remote.
+        await moveAside(destRoot, a.path, a.keepLocalAs);
+        await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
+      }
+      opts.onProgress?.(++done, rest.length);
+    });
   });
   for (const a of deletes) {
     await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);

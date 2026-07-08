@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, cryptoPoolStatus, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
@@ -25,7 +25,7 @@ const NOTICE =
   "this includes your daemon log tail, which contains file and folder names/paths from this workspace, your device id, and raw error messages; it is stored UNENCRYPTED for support for 30 days.";
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
 
-type CheckName = "credentials" | "enrollment" | "daemon" | "remote" | "version" | "state";
+type CheckName = "credentials" | "enrollment" | "daemon" | "remote" | "version" | "state" | "crypto";
 
 export interface DoctorCheck {
   ok: boolean;
@@ -202,6 +202,23 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
   }
 }
 
+function checkCryptoWorkers(): DoctorCheck {
+  const status = cryptoPoolStatus();
+  if (status.state === "disabled") {
+    return {
+      ok: false,
+      label: "crypto workers",
+      message: `disabled: ${status.reason}`,
+      hint: "worker pool unavailable; inline crypto fallback is active",
+      status: "disabled",
+    };
+  }
+  if (status.state === "off") {
+    return { ok: true, label: "crypto workers", message: status.reason ?? "off", status: "off" };
+  }
+  return { ok: true, label: "crypto workers", message: `${status.state} (${status.workers} worker${status.workers === 1 ? "" : "s"})`, status: status.state };
+}
+
 async function workspaceShape(root: string, cfg: WorkspaceConfig): Promise<WorkspaceShape> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
@@ -259,7 +276,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     creds,
     daemonStale: daemon.stale,
     workspaceShape: shape,
-    checks: { credentials, enrollment, daemon: daemon.check, remote, version, state },
+    checks: { credentials, enrollment, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers() },
   };
 }
 
@@ -364,7 +381,7 @@ function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
 
 export function renderDoctor(checks: DoctorChecks): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "daemon", "remote", "version", "state"] as const) {
+  for (const key of ["credentials", "enrollment", "daemon", "remote", "version", "state", "crypto"] as const) {
     const c = checks[key];
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);
     if (!c.ok && c.hint) lines.push(`      ${style.dim("fix:")} ${c.hint}`);
