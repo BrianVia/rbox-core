@@ -760,7 +760,7 @@ test("validateManifest: schema gate — legacy `git` refused, newer schema refus
   const legacy = validateManifest({ generatedAt: "", files: [], git: section() });
   expect(legacy.ok).toBe(false);
   expect(!legacy.ok && legacy.error).toContain("older rbox");
-  const future = validateManifest({ generatedAt: "", files: [], manifestSchema: 4 });
+  const future = validateManifest({ generatedAt: "", files: [], manifestSchema: 5 });
   expect(future.ok).toBe(false);
   expect(!future.ok && future.error).toContain("upgrade rbox");
   expect(validateManifest({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: {} }).ok).toBe(true);
@@ -782,6 +782,32 @@ test("validateManifest: schema-3 packChain gate and section-local chain rules", 
     encSha: hex64(i + 1),
   }));
   expect(validateManifest(m43({ ".": section({ packChain: tooLong }) }, { manifestSchema: 3 })).ok).toBe(false);
+});
+
+test("validateManifest: git compression descriptors require schema 4", () => {
+  const compressedBundle = section({ bundleComp: "zstd", bundlePayloadSha: "d".repeat(64) });
+  const bundleUnderSchema = validateManifest(m43({ ".": compressedBundle }, { manifestSchema: 3 }));
+  expect(bundleUnderSchema.ok).toBe(false);
+  expect(!bundleUnderSchema.ok && bundleUnderSchema.error).toBe("compressed entries require manifestSchema >= 4");
+  expect(validateManifest(m43({ ".": compressedBundle }, { manifestSchema: 4 })).ok).toBe(true);
+
+  const compressedIndex = section({
+    indexSha: "e".repeat(64),
+    indexEncSha: "f".repeat(64),
+    indexCipherSize: 12,
+    indexComp: "zstd",
+    indexPayloadSha: "0".repeat(64),
+  });
+  expect(validateManifest(m43({ ".": compressedIndex }, { manifestSchema: 3 })).ok).toBe(false);
+  expect(validateManifest(m43({ ".": compressedIndex }, { manifestSchema: 4 })).ok).toBe(true);
+
+  const compressedOpState = section({
+    opState: {
+      MERGE_HEAD: { sha: "1".repeat(64), encSha: "2".repeat(64), cipherSize: 12, comp: "zstd", payloadSha: "3".repeat(64) },
+    },
+  });
+  expect(validateManifest(m43({ ".": compressedOpState }, { manifestSchema: 3 })).ok).toBe(false);
+  expect(validateManifest(m43({ ".": compressedOpState }, { manifestSchema: 4 })).ok).toBe(true);
 });
 
 test("validateManifest: gitRepos keys — '.', safe rel paths ok; traversal/dup/file-collision/bad-section refused", () => {

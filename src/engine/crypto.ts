@@ -3,8 +3,10 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { hashFile } from "./hash.js";
+import * as zlib from "node:zlib";
+import { hashBytes, hashFile } from "./hash.js";
 
 /**
  * Convergent blob-content encryption (design 12, V4-5). AES-256-GCM with a
@@ -24,6 +26,68 @@ import { hashFile } from "./hash.js";
 
 const AAD = Buffer.from("rbox/blob/v1");
 export const BLOB_CIPHERTEXT_TAG_BYTES = 16;
+const ZSTD_LEVEL = 3;
+const COMPRESS_MIN_BYTES = 128;
+const COMPRESS_RATIO = 0.95;
+const BUFFERED_COMPRESS_MAX_BYTES = 4 * 1024 * 1024;
+
+type ZstdZlib = typeof zlib & {
+  createZstdCompress?: (options?: { level?: number }) => Transform;
+  createZstdDecompress?: () => Transform;
+};
+const zstd = zlib as ZstdZlib;
+
+function createZstdCompressLevel3(): Transform {
+  if (!zstd.createZstdCompress) throw new Error("zstd compression is not available in this runtime");
+  return zstd.createZstdCompress({ level: ZSTD_LEVEL });
+}
+
+function createZstdDecompress(): Transform {
+  if (!zstd.createZstdDecompress) throw new Error("zstd decompression is not available in this runtime");
+  return zstd.createZstdDecompress();
+}
+
+async function zstdCompressFileToBuffer(srcPath: string): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  await pipeline(
+    fsSync.createReadStream(srcPath),
+    createZstdCompressLevel3(),
+    new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk); // zstd emits fresh, unshared buffers — no defensive copy
+        callback();
+      },
+    })
+  );
+  return Buffer.concat(chunks);
+}
+
+async function encryptBufferToFile(payload: Buffer, ctPath: string, dek: Buffer, nonce: Buffer): Promise<void> {
+  const cipher = createCipheriv("aes-256-gcm", dek, nonce);
+  cipher.setAAD(AAD);
+  const body = cipher.update(payload);
+  cipher.final(); // GCM emits no final bytes; required before getAuthTag()
+  const fh = await fs.open(ctPath, "w");
+  try {
+    await fh.writev([body, cipher.getAuthTag()]); // single write, no full-payload concat copy
+  } finally {
+    await fh.close();
+  }
+}
+
+function maxPlaintextBytesTransform(maxPlaintextBytes: number): Transform {
+  let seen = 0;
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      seen += Buffer.byteLength(chunk);
+      if (seen > maxPlaintextBytes) {
+        callback(new Error(`decompressed plaintext exceeds declared size (${seen} > ${maxPlaintextBytes})`));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+}
 
 export function generateKek(): Buffer {
   return randomBytes(32);
@@ -40,9 +104,11 @@ export function kekFromPhrase(phrase: string): Buffer {
 
 /** Single HKDF → 44 bytes split into the 32-byte key and 12-byte nonce (V4-5).
  *  `AAD` doubles as the HKDF salt: the blob-domain string `rbox/blob/v1` is the
- *  one shared label for this scheme (constant AAD + domain-separated derivation). */
-function deriveKeyNonce(kek: Buffer, plaintextSha: string): { dek: Buffer; nonce: Buffer } {
-  const out = Buffer.from(hkdfSync("sha256", kek, AAD, Buffer.from(plaintextSha, "hex"), 44));
+ *  one shared label for this scheme (constant AAD + domain-separated derivation).
+ *  The info is the sha256 of the exact payload bytes fed to AES-GCM: plaintext for
+ *  raw blobs, compressed payload for zstd blobs. */
+function deriveKeyNonce(kek: Buffer, payloadSha: string): { dek: Buffer; nonce: Buffer } {
+  const out = Buffer.from(hkdfSync("sha256", kek, AAD, Buffer.from(payloadSha, "hex"), 44));
   return { dek: out.subarray(0, 32), nonce: out.subarray(32, 44) };
 }
 
@@ -51,6 +117,8 @@ export interface EncryptedBlob {
   encSha: string;
   ciphertextPath: string; // temp file; caller uploads then removes
   cipherSize: number;
+  comp?: "zstd";
+  payloadSha?: string;
 }
 
 /**
@@ -80,7 +148,7 @@ export interface EncryptedBlob {
  * already exposes on this disk. The snapshot is deleted the moment encryption
  * finishes (below), bounding that transient copy.
  */
-export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string): Promise<EncryptedBlob> {
+export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string, opts: { compress?: boolean; bufferedCompressionMaxBytes?: number } = {}): Promise<EncryptedBlob> {
   // Track whether WE created the dir: on the default path an early error must not
   // leak an empty `rbox-enc-*` temp dir (the caller can't clean a dir it never saw).
   const ownDir = tmpDir === undefined;
@@ -91,28 +159,68 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
   // so concurrent calls never share a path.
   const snapPath = path.join(dir, `${randomBytes(8).toString("hex")}.snap`);
   let snapDone = false;
+  let compressedPath: string | undefined;
   let ctPath: string | undefined;
   try {
     await fs.copyFile(srcPath, snapPath); // single read of the live file → immutable copy
     const plaintextSha = await hashFile(snapPath); // fresh hash of the snapshot bytes
-    const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
+    const plaintextSize = (await fs.stat(snapPath)).size;
+    let payloadPath = snapPath;
+    let payloadBuffer: Buffer | undefined;
+    let payloadSha = plaintextSha;
+    let comp: "zstd" | undefined;
+
+    if (opts.compress && plaintextSize >= COMPRESS_MIN_BYTES) {
+      const bufferedCompressionMaxBytes = opts.bufferedCompressionMaxBytes ?? BUFFERED_COMPRESS_MAX_BYTES;
+      if (plaintextSize <= bufferedCompressionMaxBytes) {
+        const compressed = await zstdCompressFileToBuffer(snapPath);
+        const compressedSize = compressed.byteLength;
+        if (compressedSize < plaintextSize * COMPRESS_RATIO) {
+          payloadBuffer = compressed;
+          payloadSha = hashBytes(compressed);
+          comp = "zstd";
+        }
+      } else {
+        compressedPath = path.join(dir, `${plaintextSha}.${randomBytes(8).toString("hex")}.zst`);
+        await pipeline(fsSync.createReadStream(snapPath), createZstdCompressLevel3(), fsSync.createWriteStream(compressedPath));
+        const compressedSize = (await fs.stat(compressedPath)).size;
+        if (compressedSize < plaintextSize * COMPRESS_RATIO) {
+          payloadPath = compressedPath;
+          payloadSha = await hashFile(compressedPath, compressedSize);
+          comp = "zstd";
+        } else {
+          await fs.rm(compressedPath, { force: true }).catch(() => {});
+          compressedPath = undefined;
+        }
+      }
+    }
+
+    const { dek, nonce } = deriveKeyNonce(kek, payloadSha);
     // Unique per CALL, not per content: concurrent encryption of two identical-
     // content files (same plaintextSha — common: empty files, boilerplate) must not
     // write the same temp path, or the interleaved writes corrupt it (sha mismatch).
     ctPath = path.join(dir, `${plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
 
-    const cipher = createCipheriv("aes-256-gcm", dek, nonce);
-    cipher.setAAD(AAD);
-    await pipeline(fsSync.createReadStream(snapPath), cipher, fsSync.createWriteStream(ctPath));
-    await fs.appendFile(ctPath, cipher.getAuthTag()); // tag at EOF
-    // Snapshot is consumed — delete it NOW (before hashing/stat'ing the ciphertext)
-    // to bound peak disk to a single extra copy rather than snapshot + ciphertext.
+    if (payloadBuffer) {
+      await encryptBufferToFile(payloadBuffer, ctPath, dek, nonce);
+    } else {
+      const cipher = createCipheriv("aes-256-gcm", dek, nonce);
+      cipher.setAAD(AAD);
+      await pipeline(fsSync.createReadStream(payloadPath), cipher, fsSync.createWriteStream(ctPath));
+      await fs.appendFile(ctPath, cipher.getAuthTag()); // tag at EOF
+    }
+    // Snapshot/compressed temps are consumed — delete them NOW (before hashing/stat'ing
+    // the ciphertext) to bound peak disk to the final ciphertext after encryption.
     await fs.rm(snapPath, { force: true }).catch(() => {});
+    if (compressedPath) {
+      await fs.rm(compressedPath, { force: true }).catch(() => {});
+      compressedPath = undefined;
+    }
     snapDone = true;
 
     const encSha = await hashFile(ctPath);
     const cipherSize = (await fs.stat(ctPath)).size;
-    return { plaintextSha, encSha, ciphertextPath: ctPath, cipherSize };
+    return comp ? { plaintextSha, encSha, ciphertextPath: ctPath, cipherSize, comp, payloadSha } : { plaintextSha, encSha, ciphertextPath: ctPath, cipherSize };
   } catch (e) {
     // On any failure, don't leak the ciphertext temp either (the snapshot is cleaned
     // in `finally`); the caller only removes the ciphertext on success. If we created
@@ -124,6 +232,7 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
     // Safety net: no-op if already deleted after the pipeline; guarantees the
     // plaintext snapshot never outlives this call even on the error path.
     if (!snapDone) await fs.rm(snapPath, { force: true }).catch(() => {});
+    if (compressedPath) await fs.rm(compressedPath, { force: true }).catch(() => {});
   }
 }
 
@@ -132,8 +241,16 @@ export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: s
  * recovered plaintext hashes to `plaintextSha`. Throws (and removes any partial
  * output) on tamper / wrong key / mismatch.
  */
-export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSha: string, destPath: string): Promise<void> {
-  const { dek, nonce } = deriveKeyNonce(kek, plaintextSha);
+export async function decryptFileToPath(
+  ctPath: string,
+  kek: Buffer,
+  plaintextSha: string,
+  destPath: string,
+  opts: { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number } = {}
+): Promise<void> {
+  if (opts.comp && !opts.payloadSha) throw new Error("compressed blob missing payloadSha");
+  const derivationSha = opts.comp ? opts.payloadSha! : plaintextSha;
+  const { dek, nonce } = deriveKeyNonce(kek, derivationSha);
   const total = (await fs.stat(ctPath)).size;
   if (total < BLOB_CIPHERTEXT_TAG_BYTES) throw new Error("ciphertext too short");
   const tag = Buffer.alloc(BLOB_CIPHERTEXT_TAG_BYTES);
@@ -149,11 +266,24 @@ export async function decryptFileToPath(ctPath: string, kek: Buffer, plaintextSh
   try {
     const contentLen = total - BLOB_CIPHERTEXT_TAG_BYTES;
     if (contentLen === 0) {
+      if (opts.comp) throw new Error("compressed ciphertext body is empty");
       // Empty plaintext (e.g. .gitkeep, __init__.py): the ciphertext is tag-only,
       // so there's no body to stream — the range [0, -1] is invalid. Verify the
       // GCM tag over zero bytes and write the empty file.
       const out = Buffer.concat([decipher.update(Buffer.alloc(0)), decipher.final()]); // final() throws on a bad tag
       await fs.writeFile(destPath, out);
+    } else if (opts.comp) {
+      if (opts.maxPlaintextBytes !== undefined) {
+        await pipeline(
+          fsSync.createReadStream(ctPath, { start: 0, end: contentLen - 1 }),
+          decipher,
+          createZstdDecompress(),
+          maxPlaintextBytesTransform(opts.maxPlaintextBytes),
+          fsSync.createWriteStream(destPath)
+        );
+      } else {
+        await pipeline(fsSync.createReadStream(ctPath, { start: 0, end: contentLen - 1 }), decipher, createZstdDecompress(), fsSync.createWriteStream(destPath));
+      }
     } else {
       await pipeline(fsSync.createReadStream(ctPath, { start: 0, end: contentLen - 1 }), decipher, fsSync.createWriteStream(destPath));
     }

@@ -8,6 +8,7 @@ import {
   reconcile,
   scanManifest,
   validateManifest,
+  manifestRequiresSchema4,
   type Action,
   type IgnoreMatcher,
   type Manifest,
@@ -76,6 +77,15 @@ const matcherForState = (root: string, cfg: WorkspaceConfig, state?: { lastSynce
     protectTrackedPaths: opts.purgeSafety === true,
     knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
   });
+
+export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
+  const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
+  if (schema === 0) {
+    const { manifestSchema: _manifestSchema, ...withoutSchema } = manifest;
+    return withoutSchema;
+  }
+  return { ...manifest, manifestSchema: schema };
+}
 
 /**
  * Injectable dependencies for the sync entry points (design 09 §1). Defaults
@@ -470,7 +480,9 @@ async function runPushAttempt(
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
   const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff);
-  local = { ...local, manifestSchema: gitReposManifestSchema(gitPlan.gitRepos) ?? local.manifestSchema, gitRepos: gitPlan.gitRepos };
+  // Schema is stamped once, at commit (stampManifestSchemaForCommit) — deriving it
+  // here too would be a second copy of the rule.
+  local = { ...local, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {
     const d = diffManifests(state.lastSyncedManifest, local);
@@ -539,7 +551,7 @@ async function runPushAttempt(
   // deferred file is simply omitted. Invariant: every blob the committed manifest references
   // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
   // ref, no phantom deletion.
-  const committed = deferred.size === 0 ? local : deferManifest(local, state.lastSyncedManifest, deferred);
+  const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, state.lastSyncedManifest, deferred));
 
   // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
   // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
@@ -586,7 +598,7 @@ async function runPushAttempt(
     const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
     return {
       done: false,
-      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: local, unsatisfiedTotal: res.unsatisfiedTotal },
+      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: committed, unsatisfiedTotal: res.unsatisfiedTotal },
       exhaustedError: "push: server keeps reporting missing blobs after re-upload",
     };
   }

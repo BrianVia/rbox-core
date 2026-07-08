@@ -206,12 +206,17 @@ export function gitSectionTips(section: Pick<GitSection, "head" | "refs">): stri
 }
 
 export function gitSectionNewestLink(section: GitSection): GitPackLink {
-  return {
+  const link: GitPackLink = {
     sha: section.bundleSha,
     encSha: section.bundleEncSha,
     cipherSize: section.bundleCipherSize,
     tips: gitSectionTips(section),
   };
+  if (section.bundleComp) {
+    link.comp = section.bundleComp;
+    link.payloadSha = section.bundlePayloadSha;
+  }
+  return link;
 }
 
 export function gitSectionPackLinks(section: GitSection): GitPackLink[] {
@@ -359,7 +364,7 @@ export async function putGitArtifact(
           opts.onBytes?.(enc.cipherSize);
         }
       }
-      return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
+      return enc.comp ? { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize, comp: enc.comp, payloadSha: enc.payloadSha } : { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
     } catch (e) {
       if (!isBlobShaMismatchError(e) || attempt + 1 >= attempts) throw e;
       await opts.backoff?.(attempt);
@@ -383,6 +388,10 @@ export async function getGitArtifact(store: BlobStore, kek: Buffer, ref: GitArti
   const ct = path.join(tmpDir, `ct-${ref.encSha}`);
   await getBlobToFile(store, ref.encSha, ct);
   await fs.mkdir(path.dirname(destPath), { recursive: true });
-  await decryptFileToPath(ct, kek, ref.sha, destPath);
+  // No maxPlaintextBytes cap here: GitArtifactRef has no plaintext-size field, and capture
+  // never compresses git artifacts (design 79 keeps the git lane raw), so `comp` is
+  // structurally absent today. A future git-lane-compression design MUST add a declared
+  // plaintext size to GitArtifactRef and cap here, as apply.ts does with entry.size.
+  await decryptFileToPath(ct, kek, ref.sha, destPath, { comp: ref.comp, payloadSha: ref.payloadSha });
   await fs.rm(ct, { force: true });
 }

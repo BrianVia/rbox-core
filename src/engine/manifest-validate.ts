@@ -14,8 +14,8 @@ export const MAX_ENTRIES = 200_000; // monorepo headroom; plan-tied caps come in
 export const MAX_MANIFEST_BYTES = 64 * 1024 * 1024; // hard ceiling on serialized manifest
 export const MAX_SYMLINK_TARGET_BYTES = 4096;
 
-/** The newest manifest schema this client understands. Schema 3 adds git pack chains. */
-export const KNOWN_MANIFEST_SCHEMA = 3;
+/** The newest manifest schema this client understands. Schema 4 adds compression descriptors. */
+export const KNOWN_MANIFEST_SCHEMA = 4;
 export const MAX_PACK_CHAIN = 8;
 /** Bound on `gitRepos` entries — raise-on-measurement; a LOUD error at the boundary, never a
  *  silent drop (§30's lesson; design 43 §2). */
@@ -24,6 +24,7 @@ export const MAX_GIT_REPOS = 256;
 const SHA_RE = /^[0-9a-f]{64}$/;
 const HEX40 = /^[0-9a-f]{40}$/;
 const utf8 = new TextEncoder();
+const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 /** A relative POSIX path that cannot escape the root or smuggle control bytes. */
 export function isSafeRelPath(p: unknown): p is string {
@@ -49,6 +50,8 @@ export function validateManifest(m: unknown): ValidationResult {
   const files: unknown = (m as { files?: unknown }).files;
   if (!Array.isArray(files)) return { ok: false, error: "manifest.files is not an array" };
   if (files.length > MAX_ENTRIES) return { ok: false, error: `too many entries (${files.length} > ${MAX_ENTRIES})` };
+  const mm = m as Record<string, unknown>;
+  const schema = mm.manifestSchema;
 
   const seen = new Set<string>();
   const seenLower = new Set<string>();
@@ -71,6 +74,16 @@ export function validateManifest(m: unknown): ValidationResult {
     if (e.encSha !== undefined && (typeof e.encSha !== "string" || !SHA_RE.test(e.encSha))) return { ok: false, error: `bad encSha for ${p}` };
     if (typeof e.size !== "number" || !Number.isInteger(e.size) || e.size < 0) return { ok: false, error: `bad size for ${p}` };
     if (typeof e.mode !== "number" || !Number.isInteger(e.mode) || e.mode < 0 || e.mode > 0o7777) return { ok: false, error: `bad mode for ${p}` };
+    if (e.comp !== undefined) {
+      if (typeof schema !== "number" || schema < 4) return { ok: false, error: "compressed entries require manifestSchema >= 4" };
+      if (e.comp !== "zstd") return { ok: false, error: `bad comp for ${p}` };
+      if (typeof e.payloadSha !== "string" || !SHA_RE.test(e.payloadSha)) return { ok: false, error: `bad payloadSha for ${p}` };
+      if (!isNonNegativeInteger(e.cipherSize)) return { ok: false, error: `bad cipherSize for ${p}` };
+      if (e.encSha === undefined) return { ok: false, error: `compressed entry missing encSha for ${p}` };
+    } else {
+      if (e.payloadSha !== undefined) return { ok: false, error: `payloadSha without comp for ${p}` };
+      if (e.cipherSize !== undefined) return { ok: false, error: `cipherSize without comp for ${p}` };
+    }
 
     if (e.type === "symlink") {
       const t = e.symlinkTarget;
@@ -84,12 +97,10 @@ export function validateManifest(m: unknown): ValidationResult {
   }
 
   // ---- schema gate + gitRepos (design 43 §2) --------------------------------
-  const mm = m as Record<string, unknown>;
   // Clean break: pre-§43 single-repo `git` sections are refused loudly, never migrated.
   if (mm.git !== undefined) {
     return { ok: false, error: "workspace synced by an older rbox — re-init (legacy `git` section is no longer supported)" };
   }
-  const schema = mm.manifestSchema;
   if (schema !== undefined && (typeof schema !== "number" || !Number.isInteger(schema) || schema < 1)) {
     return { ok: false, error: `bad manifestSchema: ${JSON.stringify(schema)}` };
   }
@@ -117,6 +128,9 @@ export function validateManifest(m: unknown): ValidationResult {
       if (seen.has(key)) return { ok: false, error: `gitRepos key collides with a file entry: ${key}` };
       const section = (gitRepos as Record<string, unknown>)[key];
       if (section === null || typeof section !== "object") return { ok: false, error: `gitRepos[${key}] is not an object` };
+      if (gitSectionRequiresSchema4(section) && (typeof schema !== "number" || schema < 4)) {
+        return { ok: false, error: "compressed entries require manifestSchema >= 4" };
+      }
       const gv = validateGitSection(section);
       if (!gv.ok) return { ok: false, error: `gitRepos[${key}]: ${gv.reason}` };
       if (packChainRequiresSchema3(section) && (typeof schema !== "number" || schema < 3)) {
@@ -153,15 +167,42 @@ function validArtifactRef(r: unknown): r is GitArtifactRef {
     SHA_RE.test(ref.sha) &&
     typeof ref.encSha === "string" &&
     SHA_RE.test(ref.encSha) &&
-    typeof ref.cipherSize === "number" &&
-    Number.isInteger(ref.cipherSize) &&
-    ref.cipherSize >= 0
+    isNonNegativeInteger(ref.cipherSize) &&
+    validCompressionFields(ref.comp, ref.payloadSha)
   );
+}
+
+function validCompressionFields(comp: unknown, payloadSha: unknown): boolean {
+  if (comp === undefined) return payloadSha === undefined;
+  return comp === "zstd" && typeof payloadSha === "string" && SHA_RE.test(payloadSha);
 }
 
 function packChainRequiresSchema3(s: unknown): boolean {
   const section = asRecord(s);
   return Array.isArray(section?.packChain) && section.packChain.length > 0;
+}
+
+function refHasCompressionFields(ref: unknown): boolean {
+  const r = asRecord(ref);
+  return r?.comp !== undefined || r?.payloadSha !== undefined;
+}
+
+/** Does this manifest carry ANY compression descriptor (file entry or git
+ *  section)? The single source of truth shared by the commit-side schema
+ *  stamper (sync.ts) and the schema-4 gates in this file — stamping and
+ *  validation MUST agree on the field set or a client could stamp a manifest
+ *  its own validator then rejects. */
+export function manifestRequiresSchema4(m: { files: Array<{ comp?: string }>; gitRepos?: Record<string, unknown> }): boolean {
+  return m.files.some((f) => f.comp !== undefined) || Object.values(m.gitRepos ?? {}).some(gitSectionRequiresSchema4);
+}
+
+function gitSectionRequiresSchema4(s: unknown): boolean {
+  const section = asRecord(s);
+  if (!section) return false;
+  if (section.bundleComp !== undefined || section.bundlePayloadSha !== undefined || section.indexComp !== undefined || section.indexPayloadSha !== undefined) return true;
+  if (Array.isArray(section.packChain) && section.packChain.some(refHasCompressionFields)) return true;
+  const opState = asRecord(section.opState);
+  return !!opState && Object.values(opState).some(refHasCompressionFields);
 }
 
 function invalidPackChainReason(packChain: unknown): string | undefined {
@@ -187,12 +228,13 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   // §28: the bundle is mandatory and addressed by both its plaintext sha (decrypt-verify) and
   // its encSha (the ciphertext blob actually fetched). Both must be well-formed.
   if (typeof s.bundleSha !== "string" || !SHA_RE.test(s.bundleSha) || typeof s.bundleEncSha !== "string" || !SHA_RE.test(s.bundleEncSha)) return { ok: false, reason: "bad bundle sha/encSha" };
-  if (typeof s.bundleCipherSize !== "number" || !Number.isInteger(s.bundleCipherSize) || s.bundleCipherSize < 0) return { ok: false, reason: "bad bundleCipherSize" };
+  if (!isNonNegativeInteger(s.bundleCipherSize)) return { ok: false, reason: "bad bundleCipherSize" };
+  if (!validCompressionFields(s.bundleComp, s.bundlePayloadSha)) return { ok: false, reason: "bad bundle compression" };
   const packChainReason = invalidPackChainReason(s.packChain);
   if (packChainReason) return { ok: false, reason: packChainReason };
   // index is optional but, if present, both shas + size travel together.
-  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined) {
-    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize! })) return { ok: false, reason: "bad index ref" };
+  if (s.indexSha || s.indexEncSha || s.indexCipherSize !== undefined || s.indexComp !== undefined || s.indexPayloadSha !== undefined) {
+    if (!validArtifactRef({ sha: s.indexSha!, encSha: s.indexEncSha!, cipherSize: s.indexCipherSize!, comp: s.indexComp, payloadSha: s.indexPayloadSha })) return { ok: false, reason: "bad index ref" };
   }
   // HEAD is either detached (40-hex) or symbolic onto a BRANCH the section itself carries —
   // capture can produce nothing else (an unborn HEAD never captures), so a symbolic HEAD

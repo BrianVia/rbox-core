@@ -13,6 +13,8 @@ export interface EncryptAddressCacheContext {
 export interface EncryptAddressCacheEntry {
   encSha: string;
   cipherSize: number;
+  comp?: "zstd";
+  payloadSha?: string;
 }
 
 interface StoredEncryptAddressCacheEntry extends EncryptAddressCacheEntry {
@@ -33,6 +35,14 @@ export const ENCRYPT_ADDRESS_CACHE_REL = ".rbox/state/encrypt-cache.json";
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
 const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const validCompressionFields = (entry: Partial<EncryptAddressCacheEntry>): boolean => {
+  if (entry.comp === undefined) return entry.payloadSha === undefined;
+  return entry.comp === "zstd" && typeof entry.payloadSha === "string" && SHA256_HEX_RE.test(entry.payloadSha);
+};
+
+function cacheEntryBody(entry: EncryptAddressCacheEntry): EncryptAddressCacheEntry {
+  return entry.comp ? { encSha: entry.encSha, cipherSize: entry.cipherSize, comp: entry.comp, payloadSha: entry.payloadSha } : { encSha: entry.encSha, cipherSize: entry.cipherSize };
+}
 
 function matchesContext(raw: StoredEncryptAddressCache, context: EncryptAddressCacheContext): boolean {
   return (
@@ -59,13 +69,14 @@ function parseStored(raw: unknown, context: EncryptAddressCacheContext): Map<str
     const e = entry as Partial<StoredEncryptAddressCacheEntry>;
     if (typeof e.encSha !== "string" || !SHA256_HEX_RE.test(e.encSha)) return undefined;
     if (!isNonNegativeInteger(e.cipherSize)) return undefined;
+    if (!validCompressionFields(e)) return undefined;
     if (!Array.isArray(e.paths) || e.paths.length === 0) return undefined;
     const paths = new Set<string>();
     for (const p of e.paths) {
       if (!isSafeRelPath(p) || paths.has(p)) return undefined;
       paths.add(p);
     }
-    entries.set(plaintextSha, { encSha: e.encSha, cipherSize: e.cipherSize, paths: [...paths].sort() });
+    entries.set(plaintextSha, { ...cacheEntryBody(e as EncryptAddressCacheEntry), paths: [...paths].sort() });
   }
   return entries;
 }
@@ -82,25 +93,27 @@ export class EncryptAddressCache {
   lookup(plaintextSha: string): EncryptAddressCacheEntry | undefined {
     if (!SHA256_HEX_RE.test(plaintextSha)) return undefined;
     const entry = this.entries.get(plaintextSha);
-    return entry ? { encSha: entry.encSha, cipherSize: entry.cipherSize } : undefined;
+    return entry ? cacheEntryBody(entry) : undefined;
   }
 
   record(plaintextSha: string, entry: EncryptAddressCacheEntry & { path: string }): void {
     if (!SHA256_HEX_RE.test(plaintextSha)) throw new Error(`invalid plaintext sha for encrypt cache: ${plaintextSha}`);
     if (!SHA256_HEX_RE.test(entry.encSha)) throw new Error(`invalid ciphertext sha for encrypt cache: ${entry.encSha}`);
     if (!isNonNegativeInteger(entry.cipherSize)) throw new Error(`invalid ciphertext size for encrypt cache: ${entry.cipherSize}`);
+    if (!validCompressionFields(entry)) throw new Error("invalid compression descriptor for encrypt cache");
     if (!isSafeRelPath(entry.path)) throw new Error(`invalid path for encrypt cache: ${entry.path}`);
 
     this.migratePath(plaintextSha, entry.path);
     const prev = this.entries.get(plaintextSha);
+    const nextBody = cacheEntryBody(entry);
     if (prev) {
       const paths = new Set(prev.paths);
       const beforePaths = paths.size;
       paths.add(entry.path);
-      if (prev.encSha === entry.encSha && prev.cipherSize === entry.cipherSize && paths.size === beforePaths) return;
-      this.entries.set(plaintextSha, { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [...paths].sort() });
+      if (prev.encSha === nextBody.encSha && prev.cipherSize === nextBody.cipherSize && prev.comp === nextBody.comp && prev.payloadSha === nextBody.payloadSha && paths.size === beforePaths) return;
+      this.entries.set(plaintextSha, { ...nextBody, paths: [...paths].sort() });
     } else {
-      this.entries.set(plaintextSha, { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [entry.path] });
+      this.entries.set(plaintextSha, { ...nextBody, paths: [entry.path] });
     }
     this.markDirty();
   }
@@ -145,7 +158,7 @@ export class EncryptAddressCache {
   private toJSON(): StoredEncryptAddressCache {
     const entries: Record<string, StoredEncryptAddressCacheEntry> = {};
     for (const [plaintextSha, entry] of [...this.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-      entries[plaintextSha] = { encSha: entry.encSha, cipherSize: entry.cipherSize, paths: [...entry.paths].sort() };
+      entries[plaintextSha] = { ...cacheEntryBody(entry), paths: [...entry.paths].sort() };
     }
     return { version: 1, ...this.context, entries };
   }
