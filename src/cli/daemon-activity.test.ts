@@ -7,7 +7,7 @@ import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, type DaemonActivity } from "./activity.js";
 import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { RboxDaemon } from "./daemon.js";
-import { daemonRuntimeDir, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
+import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull } from "./sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 import { attributeDaemonForStatus, healthLine, progressLabel } from "./status-view.js";
@@ -90,7 +90,7 @@ interface DaemonInternals {
   startLiveWatch(): Promise<void>;
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
-  onTransferProgress(done: number, total: number, phase: TransferPhase, bytes?: TransferProgressBytes): void;
+  onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
   stop(): Promise<void>;
@@ -99,6 +99,8 @@ interface DaemonInternals {
   writeWsActivity(): void;
   startActivityHeartbeat(intervalMs?: number): void;
   stopActivityHeartbeat(): void;
+  startAmbientStatusHeartbeat(intervalMs?: number): void;
+  stopAmbientStatusHeartbeat(): void;
   recordCommittedFrame(sequence: number): void;
   handleWsMessageData(data: string): void;
   markWsOpen(ws: WebSocket): number;
@@ -324,6 +326,26 @@ async function readShellLine(): Promise<string> {
   return (await fs.readFile(path.join(root, ".rbox", "state", "shell.line"), "utf8")).trimEnd();
 }
 
+async function readAmbientStatus(): Promise<Record<string, unknown>> {
+  return JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8")) as Record<string, unknown>;
+}
+
+async function waitForAmbientState(state: string, timeoutMs = 1000): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const status = await readAmbientStatus();
+      if (status.state === state) return status;
+      last = status;
+    } catch (e) {
+      last = e;
+    }
+    await sleep(25);
+  }
+  throw new Error(`ambient status did not become ${state}: ${JSON.stringify(last)}`);
+}
+
 test("a committed push writes shell.line: v1, state ok, committed sequence (design 46)", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
@@ -352,6 +374,26 @@ test("a pump error writes shell.line state halt (design 46)", async () => {
   await daemon.activityWrite;
 
   expect((await readShellLine()).split(" ")[2]).toBe("halt");
+});
+
+test("ambient status writes beside the pidfile and carries local-only currentPath", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-test\n`);
+
+    daemon.onTransferProgress(1, 3, "encrypt", "src/private-file.ts");
+    await daemon.activityWrite;
+
+    const status = await readAmbientStatus();
+    expect(status).toMatchObject({
+      schemaVersion: 1,
+      state: "syncing",
+      sequence: null,
+      operation: { kind: "push", phase: "encrypt", filesDone: 1, filesTotal: 3, currentPath: "src/private-file.ts" },
+    });
+  });
 });
 
 test("quota errors record outOfStorage, suppress watcher uploads, probe on safety scan, and clear on success", async () => {
@@ -599,6 +641,28 @@ test("timer heartbeat advances while a pump op is in flight", async () => {
     remote.releaseCommit.resolve();
     await pump;
     await daemon.activityWrite;
+  }
+});
+
+test("ambient heartbeat refreshes shell.line while the daemon is otherwise idle", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  daemon.writeWsActivity();
+  await daemon.activityWrite;
+  const before = Number((await readShellLine()).split(" ")[1]);
+
+  const realNow = Date.now;
+  Date.now = () => (before + 20) * 1000;
+  try {
+    daemon.startAmbientStatusHeartbeat(5);
+    for (let i = 0; i < 20; i++) {
+      await sleep(10);
+      await daemon.activityWrite;
+      if (Number((await readShellLine()).split(" ")[1]) > before) break;
+    }
+    expect(Number((await readShellLine()).split(" ")[1])).toBeGreaterThan(before);
+  } finally {
+    daemon.stopAmbientStatusHeartbeat();
+    Date.now = realNow;
   }
 });
 
@@ -915,6 +979,86 @@ test("activity writes persist without a v2 boot claim and stop on a conflicting 
     else process.env.RBOX_HOME = oldHome;
     await fs.rm(home, { recursive: true, force: true });
   }
+});
+
+test("ambient status writer stops when an observed pidfile disappears", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const runtime = daemonRuntimeDir(root);
+    const pidfile = path.join(runtime, "daemon.pid");
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(pidfile, `v2 ${process.pid} boot-test\n`);
+
+    daemon.onTransferProgress(1, 3, "encrypt", "before-loss.txt");
+    await daemon.activityWrite;
+    expect((await readAmbientStatus()).operation).toMatchObject({ currentPath: "before-loss.txt" });
+
+    let windDown = false;
+    (daemon as unknown as { beginOwnershipWindDown(reason: string): void }).beginOwnershipWindDown = () => {
+      windDown = true;
+    };
+    await fs.rm(pidfile);
+    daemon.onTransferProgress(2, 3, "encrypt", "after-loss.txt");
+    await daemon.activityWrite;
+
+    expect(windDown).toBe(false);
+    expect((await readAmbientStatus()).operation).toMatchObject({ currentPath: "before-loss.txt" });
+  });
+});
+
+test("graceful daemon stop writes paused ambient status even after stopDaemon removes the pidfile", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const runtime = daemonRuntimeDir(root);
+    const pidfile = path.join(runtime, "daemon.pid");
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(pidfile, `v2 ${process.pid} boot-test\n`);
+
+    daemon.onTransferProgress(1, 3, "encrypt", "stopping.txt");
+    await daemon.activityWrite;
+    await fs.rm(pidfile);
+    await daemon.stop();
+
+    expect(await readAmbientStatus()).toMatchObject({ schemaVersion: 1, state: "paused" });
+  });
+});
+
+test("graceful stop writes paused ambient status before a slow pump drains", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const remote = new HookedCommitRemote();
+    const daemon = await makeDaemon(remote);
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-test\n`);
+
+    await fs.writeFile(path.join(root, "slow.txt"), "hello");
+    daemon.manifest = await scanManifest(root);
+    daemon.want.push = true;
+    const pump = daemon.pump();
+    await remote.commitEntered.promise;
+
+    let stopped = false;
+    const stop = daemon.stop().then(() => {
+      stopped = true;
+    });
+    const early = await waitForAmbientState("paused", 1000);
+    expect(early).toMatchObject({ schemaVersion: 1, state: "paused" });
+    await sleep(50);
+    expect(stopped).toBe(false);
+
+    remote.releaseCommit.resolve();
+    await pump;
+    await stop;
+    expect(await readAmbientStatus()).toMatchObject({ schemaVersion: 1, state: "paused" });
+  });
+});
+
+test("daemon that never saw a pidfile does not write paused ambient status on stop", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    await daemon.stop();
+    await expect(fs.readFile(daemonStatusPath(root), "utf8")).rejects.toThrow();
+  });
 });
 
 test("transfer-progress throttle: indeterminate ticks never bypass it; phase changes and final ticks do", async () => {

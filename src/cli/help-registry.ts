@@ -461,6 +461,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "print shell completions",
     usage: "rbox completions zsh",
   },
+  {
+    name: "prompt-status",
+    group: "BILLING & MAINTENANCE",
+    summary: "print programmatic ambient prompt status",
+    usage: "rbox prompt-status [path] [--json]",
+    flags: [{ flag: "--json", desc: "print JSON" }],
+    hidden: true,
+  },
 
   // ── hidden: deprecated aliases ───────────────────────────────────────────
   { name: "link", group: "SYNCING", summary: "deprecated → rbox track", usage: "rbox link <path>", hidden: true, alias: "track" },

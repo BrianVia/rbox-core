@@ -2,9 +2,10 @@ import { spawn, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { isStandaloneBinary } from "./runtime.js";
+import { daemonBoundPath, daemonLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
+export { daemonBoundPath, daemonLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
 
 const RBOX_DIR = ".rbox";
 const PID_FILE = "daemon.pid";
@@ -13,30 +14,9 @@ const BOUND_FILE = "workspace.bound";
 const DAEMON_MARKER = "__daemon-run";
 export const DAEMON_BOOT_ID_ENV = "RBOX_DAEMON_BOOT_ID";
 
-/** Home rbox dir (`~/.rbox`). `RBOX_HOME` overrides it (tests; also lets a user
- *  relocate global state) — same override the keystore/credentials honor. */
-const rboxHome = () => path.join(process.env.RBOX_HOME || os.homedir(), RBOX_DIR);
-
-/** A stable, human-scannable, collision-safe key for a workspace, derived purely
- *  from its ABSOLUTE resolved root: `<basename>-<hash8>`. The basename keeps the
- *  dir scannable by eye; the sha256 prefix disambiguates same-named workspaces in
- *  different locations. Deterministic — the same root always maps to the same key. */
-export function workspaceKey(root: string): string {
-  const abs = path.resolve(root);
-  const hash = crypto.createHash("sha256").update(abs).digest("hex").slice(0, 8);
-  const base = path.basename(abs).replace(/[^A-Za-z0-9._-]/g, "_") || "root";
-  return `${base}-${hash}`;
-}
-
-/** GLOBAL per-workspace runtime dir for the daemon's pid/log — `~/.rbox/daemons/
- *  <basename>-<hash8>`. Kept OUT of the tracked workspace so `rbox start` never
- *  litters the project with `daemon.log`/`daemon.pid` (state.json/workspace.json
- *  still live in `<root>/.rbox`, like `.git`). */
-export const daemonRuntimeDir = (root: string) => path.join(rboxHome(), "daemons", workspaceKey(root));
-
-const pidPath = (root: string) => path.join(daemonRuntimeDir(root), PID_FILE);
-const logPath = (root: string) => path.join(daemonRuntimeDir(root), LOG_FILE);
-const boundPath = (root: string) => path.join(daemonRuntimeDir(root), BOUND_FILE);
+const pidPath = daemonPidPath;
+const logPath = daemonLogPath;
+const boundPath = daemonBoundPath;
 
 export interface ParsedDaemonBinding {
   workspaceId?: string;
@@ -307,6 +287,7 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
   // running), not the old id — which would misclassify the fresh daemon as stale
   // and SIGTERM it mid-startup.
   await fsp.rm(boundPath(root), { force: true });
+  await fsp.rm(daemonStatusPath(root), { force: true });
   const out = fs.openSync(logPath(root), "a");
   const args = daemonSpawnArgs(process.argv[1]!, root, isStandaloneBinary());
   const bootId = crypto.randomBytes(16).toString("hex");

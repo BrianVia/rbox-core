@@ -134,8 +134,8 @@ const haltLine = (halt: NonNullable<DaemonActivity["halt"]>, now: number): strin
  *  progress line; a longer one is head-truncated so the meaningful TAIL (the
  *  basename) survives. */
 const DETAIL_MAX = 40;
-/** Sanitize + truncate a display `detail`. Detail comes from on-disk names (repo
- *  dirs), i.e. untrusted bytes headed for a terminal: strip ANSI/CSI escape
+/** Sanitize + truncate a display `detail`. Detail comes from on-disk names,
+ *  i.e. untrusted bytes headed for a terminal: strip ANSI/CSI escape
  *  sequences and every remaining control char first, then truncate by CODE POINTS
  *  (Array.from — a `.slice` on UTF-16 units could cut through a surrogate pair and
  *  emit a lone-surrogate mojibake) keeping the tail. */

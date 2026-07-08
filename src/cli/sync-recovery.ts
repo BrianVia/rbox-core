@@ -193,7 +193,7 @@ export async function encryptAndUpload(
           const status = await classifyCacheHit(root, f);
           if (status === "defer") {
             deferred.add(f.path);
-            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
           }
           if (status === "accept") {
@@ -203,7 +203,7 @@ export async function encryptAndUpload(
             encryptCache.record(f.sha256, { ...cached, path: f.path });
             cacheWriter.schedule();
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
           }
         }
@@ -219,7 +219,7 @@ export async function encryptAndUpload(
           // never-synced one) and the next scan sees the deletion for real.
           if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
             deferred.add(f.path);
-            onProgress?.(++enc, toEncrypt.length, "encrypt");
+            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
           }
           throw err;
@@ -232,7 +232,7 @@ export async function encryptAndUpload(
         cacheWriter.schedule();
         encCtBytes += e.cipherSize;
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-        onProgress?.(++enc, toEncrypt.length, "encrypt");
+        onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
         });
       });
       report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
@@ -257,7 +257,7 @@ export async function encryptAndUpload(
     const uploaded = new Set<string>(); // addresses already landed this run (convergent dedup)
     let up = 0;
     const byteTracker = UploadByteTracker.fromFiles(toUpload, missing, ctSizeByEnc);
-    const emitUploadProgress = () => onProgress?.(up, toUpload.length, "upload", undefined, byteTracker.progress());
+    const emitUploadProgress = (currentPath?: string) => onProgress?.(up, toUpload.length, "upload", currentPath, byteTracker.progress());
 
     /**
      * Upload ONE file's blob with bounded per-file retry. Each retry re-encrypts a fresh
@@ -285,7 +285,7 @@ export async function encryptAndUpload(
             // defer this file instead of failing the whole push.
             if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
               byteTracker.defer(f.path);
-              emitUploadProgress();
+              emitUploadProgress(f.path);
               return null;
             }
             throw err;
@@ -300,7 +300,7 @@ export async function encryptAndUpload(
           cacheWriter.schedule();
           if (uploaded.has(freshEncSha)) {
             byteTracker.migrate(f.path, freshEncSha, re.cipherSize);
-            emitUploadProgress();
+            emitUploadProgress(f.path);
             return 0; // fresh address already landed by a peer
           }
           if (!missing.has(freshEncSha)) {
@@ -310,24 +310,24 @@ export async function encryptAndUpload(
             if (present) {
               uploaded.add(freshEncSha);
               byteTracker.migrate(f.path, undefined);
-              emitUploadProgress();
+              emitUploadProgress(f.path);
               return 0; // fresh address is already present remotely; no phase bytes to add
             }
             missing.add(freshEncSha);
           }
           byteTracker.migrate(f.path, freshEncSha, re.cipherSize);
-          emitUploadProgress();
+          emitUploadProgress(f.path);
         }
         try {
           const size = (await fs.stat(ct)).size;
           const uploadEncSha = f.encSha!;
           byteTracker.reviseTotal(uploadEncSha, size);
-          emitUploadProgress();
+          emitUploadProgress(f.path);
           const callerOwnsLaneTiming = LANE_TIMING && api.ownsUploadLaneTiming?.(size) !== true;
           const t0 = callerOwnsLaneTiming ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
-            emitUploadProgress();
+            emitUploadProgress(f.path);
           });
           if (callerOwnsLaneTiming) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
@@ -344,7 +344,7 @@ export async function encryptAndUpload(
           ctByEnc.delete(f.encSha!);
           if (attempt + 1 >= PER_FILE_UPLOAD_ATTEMPTS) {
             byteTracker.defer(f.path);
-            emitUploadProgress();
+            emitUploadProgress(f.path);
             return null; // never settled → defer
           }
           await backoff(attempt);
@@ -365,10 +365,10 @@ export async function encryptAndUpload(
         }
         upWireBytes += size;
         up++;
-        emitUploadProgress();
+        emitUploadProgress(f.path);
       });
     });
-      report.record("upload", { count: up, wireBytes: upWireBytes });
+    report.record("upload", { count: up, wireBytes: upWireBytes });
     };
 
     if (options.encryptFileToTemp === undefined) {

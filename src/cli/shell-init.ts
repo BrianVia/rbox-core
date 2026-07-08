@@ -18,6 +18,8 @@
  */
 import { zshCompletions } from "./completions.js";
 
+const USE_PROMPT_STATUS_BY_DEFAULT = false; // Flip only after the design-88 ≤5ms p99 hyperfine gate passes.
+
 // The plugin body. Authored as a TS template literal, so every zsh `$`/`${` is
 // escaped `\$`/`\${` and zsh backticks are escaped `\`` — the emitted script is
 // plain zsh (validated by `zsh -n` in shell-init.test.ts).
@@ -27,6 +29,8 @@ const PLUGIN = `# rbox shell integration (design 46) — ambient sync status in 
 
 # Millisecond-free clock (\$EPOCHSECONDS) without ever spawning \`date\`.
 zmodload zsh/datetime 2>/dev/null
+
+typeset -g _RBOX_PROMPT_STATUS_DEFAULT=${USE_PROMPT_STATUS_BY_DEFAULT ? "1" : "0"}
 
 # Banner colors as LITERAL ANSI escapes for \`print -r\` (raw, expansion-free output).
 # NEVER use \`print -P\` on strings containing sidecar data: under PROMPT_SUBST,
@@ -110,8 +114,8 @@ _rbox_read() {
   # Defense-in-depth: the renderer already strips control chars from the name, but a
   # hand-tampered file must not be able to smuggle terminal escapes to the banner.
   name=\${line//[^[:print:]]/?}
-  # Older than 180s: the daemon heartbeats <=60s while alive, so 3x that is dead.
-  if (( EPOCHSECONDS - ep > 180 )); then
+  # Older than 15s: the daemon rewrites shell.line on its 5s ambient heartbeat.
+  if (( EPOCHSECONDS - ep > 15 )); then
     _RBOX_KIND=stale
     _RBOX_NAME=\$name
     return
@@ -124,12 +128,52 @@ _rbox_read() {
   _RBOX_OPKIND=\$opkind
 }
 
+_rbox_prompt_status_enabled() {
+  emulate -L zsh
+  [[ \${RBOX_USE_PROMPT_STATUS:-\$_RBOX_PROMPT_STATUS_DEFAULT} == 1 ]]
+}
+
+_rbox_prompt_status() {
+  emulate -L zsh
+  local bin="\${RBOX_BIN:-rbox}" out
+  out="\$("\$bin" prompt-status "\$1" 2>/dev/null)" || return 1
+  [[ -n \$out ]] || return 1
+  case \$out in
+    ✓|○|↑|↑<->|↓|↓<->|\\!*) REPLY=\$out; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_rbox_prompt_status_glyph() {
+  emulate -L zsh
+  case \$1 in
+    ✓) RBOX_PROMPT="%F{green}✓%f" ;;
+    ○) RBOX_PROMPT="%F{8}○%f" ;;
+    ↑*) RBOX_PROMPT="%F{cyan}\$1%f" ;;
+    ↓*) RBOX_PROMPT="%F{cyan}\$1%f" ;;
+    \\!*) RBOX_PROMPT="%F{red}\$1%f" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Print the one-line entry banner to stderr. RAW output (\`print -r\`) with literal
 # ANSI color variables — never \`print -P\`: prompt expansion would command-substitute
 # backticks/\$() in the (tainted) workspace name under PROMPT_SUBST (codex R1 BLOCKER),
 # and even our own halt message's backticks would execute.
 _rbox_banner() {
   emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  if _rbox_prompt_status_enabled && _rbox_prompt_status "\$1"; then
+    local ps="\$REPLY" msg
+    case \$ps in
+      ✓) msg="\${_RBOX_C_GREEN}rbox: ✓ in sync\$_RBOX_C_OFF" ;;
+      ○) msg="\${_RBOX_C_DIM}rbox: ○ background sync paused\$_RBOX_C_OFF" ;;
+      ↑*|↓*) msg="\${_RBOX_C_CYAN}rbox: \$ps syncing\$_RBOX_C_OFF" ;;
+      \\!*) msg="\${_RBOX_C_RED}rbox: \$ps — run \\\`rbox status\\\`\$_RBOX_C_OFF" ;;
+      *) msg="" ;;
+    esac
+    [[ -n \$msg ]] && print -r -u2 -- "\$msg"
+    return
+  fi
   _rbox_read "\$1"
   local n="\$_RBOX_NAME"
   local msg
@@ -162,6 +206,9 @@ _rbox_banner() {
 # value contains no \$-references of its own.
 _rbox_glyph() {
   emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  if _rbox_prompt_status_enabled && _rbox_prompt_status "\$1"; then
+    _rbox_prompt_status_glyph "\$REPLY" && return
+  fi
   _rbox_read "\$1"
   case \$_RBOX_KIND in
     ok)            RBOX_PROMPT="%F{green}✓%f" ;;
