@@ -63,11 +63,14 @@ test("validateManifest accepts only complete compressed file descriptors", () =>
     payloadSha: "c".repeat(64),
     cipherSize: 42,
   });
-  expect(validateManifest({ files: [compressed] }).ok).toBe(true);
-  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "br" as "zstd", payloadSha: "c".repeat(64), cipherSize: 42 })] }).ok).toBe(false);
-  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: undefined, cipherSize: 42 })] }).ok).toBe(false);
-  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "bad", cipherSize: 42 })] }).ok).toBe(false);
-  expect(validateManifest({ files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "c".repeat(64), cipherSize: -1 })] }).ok).toBe(false);
+  expect(validateManifest({ manifestSchema: 4, files: [compressed] }).ok).toBe(true);
+  const underSchema = validateManifest({ manifestSchema: 3, files: [compressed] });
+  expect(underSchema.ok).toBe(false);
+  expect(!underSchema.ok && underSchema.error).toBe("compressed entries require manifestSchema >= 4");
+  expect(validateManifest({ manifestSchema: 4, files: [goodEntry({ encSha: "b".repeat(64), comp: "br" as "zstd", payloadSha: "c".repeat(64), cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ manifestSchema: 4, files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: undefined, cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ manifestSchema: 4, files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "bad", cipherSize: 42 })] }).ok).toBe(false);
+  expect(validateManifest({ manifestSchema: 4, files: [goodEntry({ encSha: "b".repeat(64), comp: "zstd", payloadSha: "c".repeat(64), cipherSize: -1 })] }).ok).toBe(false);
   expect(validateManifest({ files: [goodEntry({ payloadSha: "c".repeat(64) })] }).ok).toBe(false);
   expect(validateManifest({ files: [goodEntry({ cipherSize: 42 })] }).ok).toBe(false);
 });

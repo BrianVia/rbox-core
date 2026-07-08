@@ -74,6 +74,52 @@ describe("E2EE version history + restore (design 12 §15)", () => {
     expect(changes[0]!.sha256).not.toBe(changes[1]!.sha256); // distinct content per version
   });
 
+  test("decode-boundary validation rejects invalid historical manifests before restore decrypts blobs", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-invalid-schema", NOW);
+    const root = await tmp();
+    const remote = remoteFor(server, secrets, ACCT, WS, NOW + 5000);
+    const fileEncSha = "f".repeat(64);
+    server.store.blobs.set(fileEncSha, new Uint8Array([1, 2, 3]));
+
+    const invalidManifest = {
+      generatedAt: "",
+      manifestSchema: 3,
+      files: [
+        {
+          path: FILE,
+          type: "file",
+          sha256: "1".repeat(64),
+          encSha: fileEncSha,
+          size: 10,
+          mode: 0o644,
+          mtimeMs: 0,
+          comp: "zstd",
+          payloadSha: "2".repeat(64),
+          cipherSize: 3,
+        },
+      ],
+    } as const;
+    expect(await remote.commit(0, secrets.deviceId, invalidManifest)).toEqual({ sequence: 1 });
+
+    let fileBlobReads = 0;
+    const originalGet = server.store.get.bind(server.store);
+    server.store.get = async (sha: string) => {
+      if (sha === fileEncSha) fileBlobReads++;
+      return originalGet(sha);
+    };
+
+    await expect(
+      (async () => {
+        const { manifest, kek } = await remote.manifestAtSeq(1);
+        const entry = manifest.files.find((f) => f.path === FILE)!;
+        await restoreEntryToPath(root, entry, remote.blobStore(), Buffer.from(kek));
+      })()
+    ).rejects.toThrow("compressed entries require manifestSchema >= 4");
+    await expect(remote.pathHistory(FILE, 50)).rejects.toThrow("compressed entries require manifestSchema >= 4");
+    expect(fileBlobReads).toBe(0);
+  });
+
   test("manifest@1 does not contain a file that was only added at seq 2", async () => {
     const { remote } = await twoVersions();
     const { manifest } = await remote.manifestAtSeq(1);

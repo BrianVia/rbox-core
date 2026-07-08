@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
+import { pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
@@ -43,6 +43,39 @@ const fakeGitSection = (): GitSection => ({
 // hands sync.ts. `enc()` mirrors the V4-5 convergent blob derivation.
 const KEK = Buffer.alloc(32, 7);
 const enc = (content: string | Buffer) => encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+
+test("stampManifestSchemaForCommit stamps schema 4 only when file or git compression descriptors are present", () => {
+  const raw: Manifest = { generatedAt: "", files: [] };
+  expect(stampManifestSchemaForCommit(raw).manifestSchema).toBeUndefined();
+  expect(stampManifestSchemaForCommit({ ...raw, gitRepos: { repo: fakeGitSection() } }).manifestSchema).toBe(2);
+
+  const compressedFile: FileEntry = {
+    path: "a.txt",
+    type: "file",
+    sha256: sha("plain"),
+    encSha: sha("enc"),
+    size: 5,
+    mode: 0o644,
+    mtimeMs: 0,
+    comp: "zstd",
+    payloadSha: sha("payload"),
+    cipherSize: 10,
+  };
+  expect(stampManifestSchemaForCommit({ generatedAt: "", files: [compressedFile] }).manifestSchema).toBe(4);
+  expect(
+    stampManifestSchemaForCommit({
+      generatedAt: "",
+      files: [],
+      gitRepos: {
+        repo: {
+          ...fakeGitSection(),
+          bundleComp: "zstd",
+          bundlePayloadSha: sha("git-payload"),
+        },
+      },
+    }).manifestSchema
+  ).toBe(4);
+});
 
 /**
  * Stateful in-memory server simulator (design 09 §1) — monotonic head, 409 parent

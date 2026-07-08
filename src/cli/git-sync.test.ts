@@ -21,6 +21,18 @@ const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_0
 test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
   cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
 
+async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.RBOX_COMPRESS;
+  if (value === undefined) delete process.env.RBOX_COMPRESS;
+  else process.env.RBOX_COMPRESS = value;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.RBOX_COMPRESS;
+    else process.env.RBOX_COMPRESS = prev;
+  }
+}
+
 // E2EE is the only sync mode: the fake server stores CIPHERTEXT by encSha; manifests
 // are the post-decryption plaintext view (same layering as sync.test.ts's FakeRemote).
 const KEK = Buffer.alloc(32, 7);
@@ -555,7 +567,7 @@ test("root repo '.' still syncs end-to-end (pre-§43 behavior preserved)", async
   expect(remote.headSeq()).toBe(head);
 });
 
-test("design 53: schema-3 incremental chain round-trips and is smaller than the base full bundle", async () => {
+test("design 53: schema-3 incremental chain round-trips and is smaller than the base full bundle", () => withCompressEnv("0", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
   const r = path.join(rootA, "r");
   await initRepo(r);
@@ -578,9 +590,9 @@ test("design 53: schema-3 incremental chain round-trips and is smaller than the 
   await pull(rootB, cfgB, depsB);
   await expect(git(path.join(rootB, "r"), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
   expect(await git(path.join(rootB, "r"), "rev-parse", "main")).toBe(await git(r, "rev-parse", "main"));
-}, 30_000);
+}), 30_000);
 
-test("design 53: default-on staged-only increment materializes on the receiver", async () => {
+test("design 53: default-on staged-only increment materializes on the receiver", () => withCompressEnv("0", async () => {
   const r = path.join(rootA, "r");
   await initRepo(r);
   await commitBinaryHistory(r, "base", 8);
@@ -600,9 +612,9 @@ test("design 53: default-on staged-only increment materializes on the receiver",
   expect(await git(b, "status", "--porcelain", "--untracked-files=no")).toBe(await git(r, "status", "--porcelain", "--untracked-files=no"));
   expect(await git(b, "status", "--porcelain", "--", "staged.txt")).toBe("A  staged.txt");
   await expect(git(b, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
-}, 30_000);
+}), 30_000);
 
-test("design 53: explicit git.incremental false keeps full-bundle schema-2 recaptures", async () => {
+test("design 53: explicit git.incremental false keeps full-bundle schema-2 recaptures", () => withCompressEnv("0", async () => {
   cfgA = { ...cfgA, git: { incremental: false } };
   const r = path.join(rootA, "r");
   await initRepo(r);
@@ -617,9 +629,9 @@ test("design 53: explicit git.incremental false keeps full-bundle schema-2 recap
   expect(full.manifestSchema).toBe(2);
   expect(full.gitRepos!["r"]!.packChain).toBeUndefined();
   expect(full.gitRepos!["r"]!.bundleEncSha).not.toBe(base.bundleEncSha);
-}, 30_000);
+}), 30_000);
 
-test("design 53: missing chain blob in 422 page forces a full-bundle recapture", async () => {
+test("design 53: missing chain blob in 422 page forces a full-bundle recapture", () => withCompressEnv("0", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
   const r = path.join(rootA, "r");
   await initRepo(r);
@@ -638,7 +650,7 @@ test("design 53: missing chain blob in 422 page forces a full-bundle recapture",
   expect(healed.manifestSchema).toBe(2);
   expect(healed.gitRepos!["r"]!.packChain).toBeUndefined();
   await expect(remote.blobStore().get(healed.gitRepos!["r"]!.bundleEncSha)).resolves.toBeDefined();
-}, 30_000);
+}), 30_000);
 
 test("design 53: length and byte compaction triggers publish full bundles", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };

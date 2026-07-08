@@ -151,6 +151,82 @@ describe("compress-before-encrypt prototype", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("compressed decrypt enforces the declared plaintext cap and removes partial output", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-cap-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-cap-ct-"));
+    try {
+      const src = path.join(root, "text.txt");
+      const content = Buffer.from("cap me\n".repeat(50_000));
+      await fs.writeFile(src, content);
+      const blob = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      expect(blob.comp).toBe("zstd");
+
+      const out = path.join(root, "out.txt");
+      await expect(
+        decryptFileToPath(blob.ciphertextPath, kek, blob.plaintextSha, out, {
+          comp: blob.comp,
+          payloadSha: blob.payloadSha,
+          maxPlaintextBytes: content.length - 1,
+        })
+      ).rejects.toThrow(/decompressed plaintext exceeds declared size/);
+      expect(fsSync.existsSync(out)).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("small compressed files avoid a compressed temp and remain deterministic against the stream path", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-buffer-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-buffer-ct-"));
+    try {
+      const src = path.join(root, "small.txt");
+      await fs.writeFile(src, Buffer.from("buffered frame\n".repeat(20_000)));
+
+      const buffered = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      const forcedStream = await encryptFileToTemp(src, kek, tmpDir, { compress: true, bufferedCompressionMaxBytes: 0 });
+
+      expect(buffered.comp).toBe("zstd");
+      expect(forcedStream.comp).toBe("zstd");
+      expect(buffered.payloadSha).toBe(forcedStream.payloadSha);
+      expect(buffered.encSha).toBe(forcedStream.encSha);
+      expect(fsSync.readFileSync(buffered.ciphertextPath).equals(fsSync.readFileSync(forcedStream.ciphertextPath))).toBe(true);
+      expect((await fs.readdir(tmpDir)).some((entry) => entry.endsWith(".zst"))).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test(">4MiB compressed files use the streaming path and match the same-frame buffered path", async () => {
+    const kek = generateKek();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-large-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-zstd-large-ct-"));
+    try {
+      const src = path.join(root, "large.txt");
+      const content = Buffer.alloc(4 * 1024 * 1024 + 1024, 0x61);
+      await fs.writeFile(src, content);
+
+      const streamed = await encryptFileToTemp(src, kek, tmpDir, { compress: true });
+      const forcedBuffered = await encryptFileToTemp(src, kek, tmpDir, { compress: true, bufferedCompressionMaxBytes: Number.MAX_SAFE_INTEGER });
+
+      expect(streamed.comp).toBe("zstd");
+      expect(forcedBuffered.comp).toBe("zstd");
+      expect(streamed.payloadSha).toBe(forcedBuffered.payloadSha);
+      expect(streamed.encSha).toBe(forcedBuffered.encSha);
+      expect(fsSync.readFileSync(streamed.ciphertextPath).equals(fsSync.readFileSync(forcedBuffered.ciphertextPath))).toBe(true);
+
+      const out = path.join(root, "large.out");
+      await decryptFileToPath(streamed.ciphertextPath, kek, streamed.plaintextSha, out, { comp: streamed.comp, payloadSha: streamed.payloadSha, maxPlaintextBytes: content.length });
+      expect(fsSync.readFileSync(out).equals(content)).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Snapshot-first integrity: `encryptFileToTemp` copies the source to an immutable

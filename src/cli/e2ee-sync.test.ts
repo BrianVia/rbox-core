@@ -313,8 +313,8 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     }
   });
 
-  test("RBOX_COMPRESS=1 round-trips mixed blobs and carries compressed descriptors forward", async () =>
-    withCompressEnv("1", async () => {
+  test("RBOX_COMPRESS unset/default-on round-trips mixed blobs and carries compressed descriptors forward when opt-out later", async () =>
+    withCompressEnv(undefined, async () => {
       const server = new FakeServer();
       const secrets = await bootstrapOnto(server, ACCT, "devA-compress", NOW);
       const rootA = await tmp();
@@ -329,6 +329,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       await push(rootA, cfgA, { remote: remoteA });
 
       const firstManifest = (await loadState(rootA, syncStreamId(cfgA))).lastSyncedManifest;
+      expect(firstManifest.manifestSchema).toBe(4);
       const firstText = firstManifest.files.find((f) => f.path === "data/notes.txt")!;
       const firstBinary = firstManifest.files.find((f) => f.path === "data/photo.bin")!;
       expect(firstText.comp).toBe("zstd");
@@ -345,10 +346,14 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       expect(Buffer.from(await fs.readFile(path.join(rootB, "data", "notes.txt"))).equals(text)).toBe(true);
       expect(Buffer.from(await fs.readFile(path.join(rootB, "data", "photo.bin"))).equals(binary)).toBe(true);
 
-      await fs.writeFile(path.join(rootA, "other.txt"), "new small file\n");
-      await push(rootA, cfgA, { remote: remoteA });
+      await withCompressEnv("0", async () => {
+        await fs.writeFile(path.join(rootA, "other.txt"), "new opt-out file\n".repeat(10_000));
+        await push(rootA, cfgA, { remote: remoteA });
+      });
       const secondManifest = (await loadState(rootA, syncStreamId(cfgA))).lastSyncedManifest;
+      expect(secondManifest.manifestSchema).toBe(4);
       const secondText = secondManifest.files.find((f) => f.path === "data/notes.txt")!;
+      const secondOther = secondManifest.files.find((f) => f.path === "other.txt")!;
       expect({
         encSha: secondText.encSha,
         comp: secondText.comp,
@@ -360,10 +365,13 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
         payloadSha: firstText.payloadSha,
         cipherSize: firstText.cipherSize,
       });
+      expect(secondOther.comp).toBeUndefined();
+      expect(secondOther.payloadSha).toBeUndefined();
+      expect(secondOther.cipherSize).toBeUndefined();
     }));
 
-  test("RBOX_COMPRESS unset writes no compression fields into file manifests", async () =>
-    withCompressEnv(undefined, async () => {
+  test("RBOX_COMPRESS=0 writes no compression fields into fresh file manifests", async () =>
+    withCompressEnv("0", async () => {
       const server = new FakeServer();
       const secrets = await bootstrapOnto(server, ACCT, "devA-raw-default", NOW);
       const root = await tmp();
@@ -374,6 +382,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       await push(root, cfg, { remote });
 
       const manifest = (await loadState(root, syncStreamId(cfg))).lastSyncedManifest;
+      expect(manifest.manifestSchema).toBeUndefined();
       expect(hasKeyDeep(manifest.files, new Set(["comp", "payloadSha", "cipherSize"]))).toBe(false);
     }));
 

@@ -25,6 +25,7 @@ import {
   sweepStaleGitCaptureDirs,
   validateGitSection,
   type BlobStore,
+  type GitArtifactRef,
   type GitSection,
 } from "./index.js";
 
@@ -116,13 +117,15 @@ async function createSyntheticResolveUndoRepo(repo: string): Promise<{ base: str
   await git(repo, "add", "f.txt");
   return { base, ours, theirs };
 }
-async function putEncryptedArtifact(srcPath: string): Promise<{ sha: string; encSha: string; cipherSize: number }> {
+async function putEncryptedArtifact(srcPath: string, opts: { compress?: boolean } = {}): Promise<GitArtifactRef> {
   const artifactTmp = await fs.mkdtemp(path.join(tmp, "git-artifact-"));
   try {
-    const enc = await encryptFileToTemp(srcPath, KEK, artifactTmp);
+    const enc = await encryptFileToTemp(srcPath, KEK, artifactTmp, opts);
     try {
       await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
-      return { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
+      return enc.comp
+        ? { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize, comp: enc.comp, payloadSha: enc.payloadSha }
+        : { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
     } finally {
       await fs.rm(enc.ciphertextPath, { force: true });
     }
@@ -134,7 +137,7 @@ async function decryptIndexArtifact(section: GitSection, destPath: string): Prom
   const ctPath = path.join(tmp, `ct-${section.indexEncSha}`);
   await fs.writeFile(ctPath, await store.get(section.indexEncSha!));
   try {
-    await decryptFileToPath(ctPath, KEK, section.indexSha!, destPath);
+    await decryptFileToPath(ctPath, KEK, section.indexSha!, destPath, { comp: section.indexComp, payloadSha: section.indexPayloadSha });
   } finally {
     await fs.rm(ctPath, { force: true });
   }
@@ -318,6 +321,34 @@ test("resolve-undo entries with unreachable blobs are stripped on capture and he
   expect(await git(C, "ls-files", "--resolve-undo")).toBe("");
   await expect(git(C, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
   expect(await git(C, "status", "--porcelain=v1")).toBe(await git(A, "status", "--porcelain=v1"));
+}, 30_000);
+
+test("applyGitState threads compressed index descriptors into artifact decrypt", async () => {
+  await initRepo(A);
+  await commitFile(A, "base.txt", "base\n", "base");
+  for (let i = 0; i < 160; i++) {
+    await fs.writeFile(path.join(A, `staged-${i}.txt`), `staged ${i}\n`);
+    await git(A, "add", `staged-${i}.txt`);
+  }
+
+  const section = await captureGitState(A, store, KEK);
+  expect(section).toBeDefined();
+  const compressedIndex = await putEncryptedArtifact(path.join(A, ".git", "index"), { compress: true });
+  expect(compressedIndex.comp).toBe("zstd");
+  const compressedSection: GitSection = {
+    ...section!,
+    indexSha: compressedIndex.sha,
+    indexEncSha: compressedIndex.encSha,
+    indexCipherSize: compressedIndex.cipherSize,
+    indexComp: compressedIndex.comp,
+    indexPayloadSha: compressedIndex.payloadSha,
+  };
+
+  const res = await applyGitState(B, compressedSection, store, KEK);
+  expect(res.applied).toBe(true);
+  const staged = (await git(B, "diff", "--cached", "--name-only")).split("\n");
+  expect(staged).toContain("staged-0.txt");
+  expect(staged).toContain("staged-159.txt");
 }, 30_000);
 
 test("incremental dir/all capture uses basis negations and a chained section round-trips", async () => {

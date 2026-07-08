@@ -20,7 +20,7 @@ import {
 } from "../engine/e2ee/index.js";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
-import { gitSectionBlobRefs, poolMap, type BlobStore, type Manifest } from "../engine/index.js";
+import { gitSectionBlobRefs, poolMap, validateManifest, type BlobStore, type Manifest } from "../engine/index.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
@@ -192,7 +192,10 @@ export class E2eeRemote implements SyncRemote {
     const encManifest = await this.api.blobStore().get(body.encManifestSha);
     const open = historical ? openCommitHistorical : openCommit;
     const json = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
-    return { manifest: JSON.parse(new TextDecoder().decode(json)) as Manifest, kek };
+    const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
+    const validation = validateManifest(manifest);
+    if (!validation.ok) throw new Error(validation.error);
+    return { manifest, kek };
   }
 
   /**

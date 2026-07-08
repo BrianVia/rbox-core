@@ -205,7 +205,7 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
       if (store.getToFile) await store.getToFile(entry.encSha, ctTmp, ciphertextSizeHint);
       else await fs.writeFile(ctTmp, await store.get(entry.encSha));
       const t1 = LANE_TIMING ? performance.now() : 0;
-      await decryptFileToPath(ctTmp, kek, entry.sha256, tmp, { comp: entry.comp, payloadSha: entry.payloadSha });
+      await decryptFileToPath(ctTmp, kek, entry.sha256, tmp, { comp: entry.comp, payloadSha: entry.payloadSha, maxPlaintextBytes: entry.size });
       if (LANE_TIMING) {
         laneTiming.fetchMs += t1 - t0;
         laneTiming.decryptWriteMs += performance.now() - t1;

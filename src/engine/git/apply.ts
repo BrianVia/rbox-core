@@ -230,7 +230,20 @@ export async function applyGitState(
     const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;
     const opTmp: Array<{ rel: string; tmp: string }> = [];
     try {
-      if (indexTmp) await getGitArtifact(store, kek, { sha: section.indexSha!, encSha: section.indexEncSha!, cipherSize: section.indexCipherSize! }, indexTmp, tmpDir);
+      if (indexTmp) {
+        await getGitArtifact(
+          store,
+          kek,
+          {
+            sha: section.indexSha!,
+            encSha: section.indexEncSha!,
+            cipherSize: section.indexCipherSize!,
+            ...(section.indexComp ? { comp: section.indexComp, payloadSha: section.indexPayloadSha } : {}),
+          },
+          indexTmp,
+          tmpDir
+        );
+      }
       for (const [rel, ref] of Object.entries(section.opState ?? {})) {
         const tmp = path.join(tmpDir, "op", rel);
         await getGitArtifact(store, kek, ref, tmp, tmpDir);

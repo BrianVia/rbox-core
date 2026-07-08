@@ -46,7 +46,7 @@ const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY,
 // (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
 // win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
 const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
-const compressionEnabled = () => process.env.RBOX_COMPRESS === "1";
+const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 
 /** RBOX_LANE_TIMING=1 — push-side encrypt vs upload attribution. Mirrors the pull
  *  lane timing instrument in apply.ts: module-level accumulator, no plumbing, and
