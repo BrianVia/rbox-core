@@ -27,7 +27,12 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
   const releaseLimited = () => rateLimited(env.RL_RELEASE, `rl:${ipKey(req)}`);
 
   // `curl -fsSL https://api.rbox.to/install.sh | sh`
-  if ((url.pathname === "/install.sh" || url.pathname === "/agent.sh") && req.method === "GET") {
+  if (url.pathname === "/agent.sh" && req.method === "GET") {
+    const limited = await releaseLimited();
+    if (limited) return limited;
+    return new Response(AGENT_SH, { headers: SHELL_HEADERS });
+  }
+  if (url.pathname === "/install.sh" && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
     return exports.CachedReleases.fetch(req);
@@ -64,10 +69,6 @@ export async function cachedReleaseResponse(url: URL, env: Env): Promise<Respons
     const obj = await env.rbox_releases.get("releases/install.sh");
     if (!obj) return releaseNotFound();
     return new Response(obj.body, { headers: SHELL_HEADERS });
-  }
-
-  if (url.pathname === "/agent.sh") {
-    return new Response(AGENT_SH, { headers: SHELL_HEADERS });
   }
 
   const seg = url.pathname.split("/").filter(Boolean);

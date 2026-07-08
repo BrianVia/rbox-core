@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
 import { createPatToken } from "../../../src/engine/pat-token.js";
 import { createWebSession } from "../src/auth.js";
-import { cachedReleaseResponse, releaseRoutes } from "../src/routes/release.js";
+import { releaseRoutes } from "../src/routes/release.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";
 
 const BASE = "https://example.com";
@@ -141,7 +141,7 @@ describe("agent/API sync keys", () => {
 
     const listed = await SELF.fetch(`${BASE}/v1/keys/api`, { headers: authed(a.token) });
     expect(listed.status).toBe(200);
-    expect(((await listed.json()) as { keys: Array<{ id: string; label: string }> }).keys.map((k) => k.id)).toEqual(expect.arrayContaining([k1.deviceId, k2.deviceId]));
+    expect(((await listed.json()) as { keys: Array<{ deviceId: string; label: string }> }).keys.map((k) => k.deviceId)).toEqual(expect.arrayContaining([k1.deviceId, k2.deviceId]));
 
     const rev = await SELF.fetch(`${BASE}/v1/keys/api/${k1.deviceId}/revoke`, { method: "POST", headers: authed(a.token) });
     expect(rev.status).toBe(200);
@@ -151,14 +151,23 @@ describe("agent/API sync keys", () => {
 
   test("agent.sh route serves the passthrough setup wrapper with install.sh cache headers", async () => {
     const req = new Request(`${BASE}/agent.sh`);
+    let forwarded = false;
     const res = await releaseRoutes({
       req,
       env,
-      exports: { CachedReleases: { fetch: (r: Request) => cachedReleaseResponse(new URL(r.url), env) } } as WorkerEntrypointExports,
+      exports: {
+        CachedReleases: {
+          fetch: async () => {
+            forwarded = true;
+            return new Response("unexpected");
+          },
+        },
+      } as WorkerEntrypointExports,
       url: new URL(req.url),
       seg: ["agent.sh"],
     });
     expect(res).not.toBeNull();
+    expect(forwarded).toBe(false);
     expect(res!.status).toBe(200);
     expect(res!.headers.get("content-type")).toContain("text/x-shellscript");
     expect(res!.headers.get("cache-control")).toBe("public, max-age=300, stale-while-revalidate=3600");

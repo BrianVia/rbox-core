@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { bootstrapAccount, toB64url, utf8 } from "../engine/e2ee/index.js";
-import { materializeAgentKey, materializeCmd, decodeAgentKeyBundle } from "./key-cmd.js";
+import { materializeCmd } from "./key-cmd.js";
+import { materializeAgentKey, decodeAgentKeyBundle } from "./agent-key-bundle.js";
 
 const OLD_ENV = { ...process.env };
 

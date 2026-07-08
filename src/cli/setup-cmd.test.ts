@@ -2,7 +2,8 @@ import { test, expect } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, resolveKeyedWorkspace, ensureKeyedTargetDir, runSetup } from "./setup-cmd.js";
+import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
+import { resolveKeyedWorkspace, ensureKeyedTargetDir } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
@@ -156,4 +157,15 @@ test("keyed setup target guard refuses non-empty dirs unless forced", async () =
 
 test("keyed setup rejects literal --key values before any interactive work", async () => {
   await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app", key: "secret" } })).rejects.toThrow(/argv leaks secrets/);
+});
+
+test("keyed setup requires key input when --workspace is present", async () => {
+  const oldKey = process.env.RBOX_KEY;
+  delete process.env.RBOX_KEY;
+  try {
+    await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app" } })).rejects.toThrow("--workspace requires a key: set RBOX_KEY or pass --key-file/--key -");
+  } finally {
+    if (oldKey === undefined) delete process.env.RBOX_KEY;
+    else process.env.RBOX_KEY = oldKey;
+  }
 });

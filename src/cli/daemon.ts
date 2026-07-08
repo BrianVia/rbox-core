@@ -158,13 +158,15 @@ export class RboxDaemon {
   private lastProgressPhase: TransferPhase | undefined;
   private ownershipWindDownStarted = false;
   private readonly bootId: string;
+  private readonly pullOnly: boolean;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, bootId?: string, private readonly pullOnly = false) {
+  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, opts: { bootId?: string; pullOnly?: boolean } = {}) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
-    this.bootId = bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
+    this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
+    this.pullOnly = opts.pullOnly === true;
   }
 
   async start(): Promise<void> {
@@ -198,7 +200,7 @@ export class RboxDaemon {
     this.pruneCache();
     await this.cache.save(this.root);
     this.want.pull = true;
-    this.want.push = !this.pullOnly;
+    this.requestPush();
     await this.pump();
 
     if (!this.pullOnly) await this.startLiveWatch();
@@ -320,9 +322,16 @@ export class RboxDaemon {
 
   // ---- single-flight pump --------------------------------------------------
 
+  private requestPush(): void {
+    if (!this.pullOnly) this.want.push = true;
+  }
+
   private request(kind: keyof Wants): void {
-    if (this.pullOnly && kind !== "pull") return;
-    this.want[kind] = true;
+    if (kind === "push") this.requestPush();
+    else {
+      if (this.pullOnly && kind !== "pull") return;
+      this.want[kind] = true;
+    }
     void this.pump();
   }
 
@@ -364,17 +373,17 @@ export class RboxDaemon {
           try {
             if (op === "deepScan") {
               await this.doDeepScan();
-              this.want.push = true;
+              this.requestPush();
             } else if (op === "fullScan") {
               await this.doFullScan();
               if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
-              this.want.push = true;
+              this.requestPush();
             } else if (op === "pull") {
               const catchUpGeneration = this.pendingCatchUpGeneration;
               this.pendingCatchUpGeneration = undefined;
               await this.doPull();
               if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-              if (!this.pullOnly) this.want.push = true; // publish any local divergence after taking remote
+              this.requestPush(); // publish any local divergence after taking remote
             } else {
               const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
               this.outOfStorageProbeArmed = false;
@@ -1106,7 +1115,7 @@ export class RboxDaemon {
 export async function runDaemon(root: string): Promise<void> {
   const { cfg, deps } = await buildAuthedRemote(root); // E2EE transport + injected KEK
   await loadState(root, syncStreamId(cfg)); // surfaces corrupt-state errors loudly before we go live
-  const daemon = new RboxDaemon(root, cfg, deps, undefined, process.env.RBOX_DAEMON_PULL_ONLY === "1");
+  const daemon = new RboxDaemon(root, cfg, deps, { pullOnly: process.env.RBOX_DAEMON_PULL_ONLY === "1" });
   const shutdown = async () => {
     await daemon.stop();
     process.exit(0);

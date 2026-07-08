@@ -8,6 +8,7 @@ import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
+import { readStdinTrimmed } from "./read-stdin.js";
 import {
   defaultKitTargetDir,
   displayPath,
@@ -378,9 +379,7 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
   } else {
     // Piped (`echo "<phrase>" | rbox recover`) — drain stdin like `connect` does so
     // recovery still works in CI / non-TTY, where inquirer can't run.
-    const chunks: Buffer[] = [];
-    for await (const c of process.stdin) chunks.push(c as Buffer);
-    phrase = Buffer.concat(chunks).toString("utf8").trim();
+    phrase = await readStdinTrimmed();
   }
   if (!phrase) throw new Error("no phrase entered");
   const { accountId, deviceId } = await enrollViaRecovery(phrase, Date.now());

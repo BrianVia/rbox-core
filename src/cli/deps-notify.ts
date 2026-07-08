@@ -23,6 +23,7 @@ import { writeFileAtomic } from "../engine/index.js";
 import { configDir, homeDir } from "./rbox-paths.js";
 import { loadDepsState, saveDepsState } from "./deps-drift.js";
 import { style } from "./style.js";
+import { shQuote } from "./shell-quote.js";
 
 export type Shell = "zsh" | "bash" | "fish";
 
@@ -90,7 +91,7 @@ export function hookScript(shell: Shell, binPath: string): string {
       "# rbox dep-drift hook (fish) — generated; edits are overwritten by `rbox deps notify install`.",
       "function __rbox_dep_drift --on-variable PWD",
       `    ${tests}; or return`,
-      `    ${q(binPath)} deps drift --quiet &`,
+      `    ${shQuote(binPath)} deps drift --quiet &`,
       "    disown",
       "end",
       "",
@@ -104,7 +105,7 @@ export function hookScript(shell: Shell, binPath: string): string {
       "# rbox dep-drift hook (zsh) — generated; edits are overwritten by `rbox deps notify install`.",
       "__rbox_dep_drift() {",
       `  [[ ${prefilter} ]] || return`,
-      `  ( ${q(binPath)} deps drift --quiet & ) >/dev/null 2>&1`,
+      `  ( ${shQuote(binPath)} deps drift --quiet & ) >/dev/null 2>&1`,
       "}",
       "autoload -Uz add-zsh-hook",
       "add-zsh-hook chpwd __rbox_dep_drift",
@@ -118,7 +119,7 @@ export function hookScript(shell: Shell, binPath: string): string {
     `  [ "$PWD" = "$__rbox_last_pwd" ] && return`,
     `  __rbox_last_pwd="$PWD"`,
     `  [[ ${prefilter} ]] || return`,
-    `  ( ${q(binPath)} deps drift --quiet & ) >/dev/null 2>&1`,
+    `  ( ${shQuote(binPath)} deps drift --quiet & ) >/dev/null 2>&1`,
     "}",
     'case ";$PROMPT_COMMAND;" in',
     "  *\";__rbox_dep_drift;\"*) ;;",
@@ -137,7 +138,7 @@ export function rcBlock(shell: Shell, hookPath: string): string {
     // fish (documented). A swapped/symlinked hook is still rejected.
     return [
       BEGIN,
-      `set -l __rbox_hook ${q(hookPath)}`,
+      `set -l __rbox_hook ${shQuote(hookPath)}`,
       'if test -f "$__rbox_hook"; and test ! -L "$__rbox_hook"; and test -O "$__rbox_hook"',
       '    source "$__rbox_hook"',
       "end",
@@ -147,7 +148,7 @@ export function rcBlock(shell: Shell, hookPath: string): string {
   }
   return [
     BEGIN,
-    `__rbox_hook=${q(hookPath)}`,
+    `__rbox_hook=${shQuote(hookPath)}`,
     'if [ -f "$__rbox_hook" ] && [ ! -L "$__rbox_hook" ] && [ -O "$__rbox_hook" ]; then',
     "  # reject group/world-writable: mask 022 must be clear",
     `  __rbox_perm=$(stat -f '%Lp' "$__rbox_hook" 2>/dev/null || stat -c '%a' "$__rbox_hook" 2>/dev/null)`,
@@ -157,11 +158,6 @@ export function rcBlock(shell: Shell, hookPath: string): string {
     END,
     "",
   ].join("\n");
-}
-
-/** Single-quote a path for shell safety (the install dir is user-controlled). */
-function q(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 // ── pure block upsert/remove (idempotent) ─────────────────────────────────────

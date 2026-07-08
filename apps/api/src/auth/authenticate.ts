@@ -13,8 +13,9 @@ function tokenShapeOk(token: string): boolean {
   return DEVICE_TOKEN_RE.test(token) || isValidPatToken(token);
 }
 
-function classifyKind(kind: string | null, expiresAt: number | null): DeviceKind {
+export function classifyKind(kind: string | null, expiresAt: number | null): DeviceKind {
   if (kind === "device" || kind === "web" || kind === "api_key") return kind;
+  // TODO(migration 0023): kind NOT NULL, drop fallback.
   return expiresAt === null ? "device" : "web";
 }
 

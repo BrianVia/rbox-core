@@ -29,6 +29,10 @@ import type { SyncDeps } from "./sync.js";
 const ACCOUNT_ID_RE = /^acct_[a-z0-9]+$/i; // grammar gate before trusting the value (D7)
 const ADMIT_RETRIES = 4;
 
+export function newAgentId(): string {
+  return `agent_${toB64url(randomBytes(16))}`;
+}
+
 async function pairingRedeemError(res: Response): Promise<Error> {
   if (res.status === 409) {
     const body = (await res.json().catch(() => ({}))) as { error?: string; cap?: unknown; plan?: unknown };
@@ -93,13 +97,9 @@ async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedR
  *  produces a RedeemResult for a given head roster + the reused keypair. */
 const headRoster = (dto: AccountKeysDTO): SignedRoster => JSON.parse(dto.rosters[dto.rosters.length - 1]!) as SignedRoster;
 
-async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>): Promise<void> {
+async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>, persist = true): Promise<void> {
   // Persist the device + MK locally BEFORE admit (D3): the keypair is durable, so a
   // lost admit-response can be finalized on the next run rather than wedging.
-  await admitWithRetryInner(api, deviceId, initial, rebuild, true);
-}
-
-async function admitWithRetryInner(api: RboxApi, deviceId: string, initial: RedeemResult, rebuild: (dto: AccountKeysDTO) => Promise<RedeemResult>, persist: boolean): Promise<void> {
   let result = initial;
   if (persist) await saveDevice(result.secrets);
   for (let attempt = 0; attempt <= ADMIT_RETRIES; attempt++) {
@@ -197,7 +197,7 @@ export async function admitAgentDevice(args: {
   issuer: DeviceSecrets;
   expiresAt: number;
   now: number;
-}): Promise<{ secrets: DeviceSecrets; mkWrap: Wrap }> {
+}): Promise<DeviceSecrets> {
   const api = new RboxApi(args.remoteUrl, args.bearer, "", "");
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
@@ -205,7 +205,7 @@ export async function admitAgentDevice(args: {
   assertSignedAccountId(args.accountId, account.currentRoster.accountId);
 
   const tokenSecret = randomBytes(32);
-  const tokenId = `agent_${toB64url(randomBytes(16))}`;
+  const tokenId = newAgentId();
   const material = await buildPairing(args.issuer, { accountEpoch: account.currentEpoch, tokenId, tokenSecret, notAfter: args.expiresAt });
   const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() };
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
@@ -224,8 +224,8 @@ export async function admitAgentDevice(args: {
   };
 
   const initial = await build(dto);
-  await admitWithRetryInner(api, args.deviceId, initial, build, false);
-  return { secrets: initial.secrets, mkWrap: initial.device.mkWrap };
+  await admitWithRetry(api, args.deviceId, initial, build, false);
+  return initial.secrets;
 }
 
 // ---- the sync seam ---------------------------------------------------------

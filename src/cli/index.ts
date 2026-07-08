@@ -18,6 +18,7 @@ import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedH
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags } from "./flags.js";
+import { readStdinTrimmed } from "./read-stdin.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
@@ -336,9 +337,7 @@ async function main(): Promise<void> {
       //   rbox pair        # on a signed-in machine → prints the token
       //   echo <token> | rbox connect
       const { redeemPair } = await import("./auth-cmd.js");
-      const chunks: Buffer[] = [];
-      for await (const c of process.stdin) chunks.push(c as Buffer);
-      const token = Buffer.concat(chunks).toString("utf8").trim();
+      const token = await readStdinTrimmed();
       if (!token) throw new Error("no pairing token on stdin (pipe the token from `rbox pair`)");
       await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
       break;
@@ -384,21 +383,13 @@ async function main(): Promise<void> {
       if (sub === "status") await keyStatus({ json: jsonMode });
       else if (sub === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
       else if (sub === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
-      else if (sub === "create-ci") {
-        const { createCiKey } = await import("./key-cmd.js");
-        await createCiKey(flags);
-      } else if (sub === "materialize") {
-        const { materializeCmd } = await import("./key-cmd.js");
-        await materializeCmd(flags);
-      } else if (sub === "list") {
-        const { listKeys } = await import("./key-cmd.js");
-        await listKeys({ json: jsonMode });
-      } else if (sub === "revoke") {
-        const { revokeKey } = await import("./key-cmd.js");
-        await revokeKey(positional[1] ?? "");
-      }
       else {
-        fail("usage: rbox key <status | backup | genesis --yes | create-ci --expires <dur> | materialize | list | revoke <id>>");
+        const { createCiKey, materializeCmd, listKeys, revokeKey } = await import("./key-cmd.js");
+        if (sub === "create-ci") await createCiKey(flags);
+        else if (sub === "materialize") await materializeCmd(flags);
+        else if (sub === "list") await listKeys({ json: jsonMode });
+        else if (sub === "revoke") await revokeKey(positional[1] ?? "");
+        else fail("usage: rbox key <status | backup | genesis --yes | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
     }

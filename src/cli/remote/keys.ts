@@ -80,7 +80,6 @@ export interface CreateApiKeyBody {
 }
 
 export interface ApiKeyRow {
-  id: string;
   deviceId: string;
   label: string | null;
   displayPrefix: string;
@@ -90,10 +89,10 @@ export interface ApiKeyRow {
   revoked: boolean;
 }
 
-export async function createApiKey(ctx: RemoteContext, body: CreateApiKeyBody): Promise<{ id: string; deviceId: string; expiresAt: number }> {
+export async function createApiKey(ctx: RemoteContext, body: CreateApiKeyBody): Promise<{ deviceId: string; expiresAt: number }> {
   const r = await ctx.postJson("/v1/keys/api", body, { retries: 0, op: "creating an agent key" });
   if (!r.ok) throw new Error(translateRemoteError(r.status, "key create failed", await r.text(), "agent key route not found"));
-  return (await r.json()) as { id: string; deviceId: string; expiresAt: number };
+  return (await r.json()) as { deviceId: string; expiresAt: number };
 }
 
 export async function listApiKeys(ctx: RemoteContext): Promise<ApiKeyRow[]> {

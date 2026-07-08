@@ -23,15 +23,11 @@
  *     internal tokens like `__daemon-run`).
  */
 import { COMMAND_HELP, type CommandHelp } from "./help-registry.js";
-
-/** Escape a string for embedding inside a zsh single-quoted string literal. */
-function sq(s: string): string {
-  return s.replace(/'/g, "'\\''");
-}
+import { shQuote } from "./shell-quote.js";
 
 /** Wrap content as a single-quoted zsh word (after single-quote escaping). */
 function q(content: string): string {
-  return `'${sq(content)}'`;
+  return shQuote(content);
 }
 
 /**

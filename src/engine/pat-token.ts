@@ -1,8 +1,11 @@
+import { toB64url } from "./encoding.js";
+
 const PAT_PREFIX = "rbox_pat_";
 const PAT_BODY_CHARS = 43; // base64url(32 random bytes), no padding
 const PAT_CHECKSUM_CHARS = 4; // base64url(24 bits of CRC32)
 const PAT_BODY_RE = /^[A-Za-z0-9_-]{43}$/;
 const PAT_CHECKSUM_RE = /^[A-Za-z0-9_-]{4}$/;
+export const PAT_MAX_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 
 let CRC_TABLE: Uint32Array | undefined;
 
@@ -25,21 +28,14 @@ function crc32(s: string): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function bytesToBase64url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  const b64 = btoa(binary);
-  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
 function checksum(body: string): string {
   const n = crc32(`${PAT_PREFIX}${body}`);
-  return bytesToBase64url(new Uint8Array([(n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]));
+  return toB64url(new Uint8Array([(n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]));
 }
 
 export function createPatToken(random = crypto.getRandomValues(new Uint8Array(32))): string {
   if (random.length !== 32) throw new Error("PAT entropy must be 32 bytes");
-  const body = bytesToBase64url(random);
+  const body = toB64url(random);
   return `${PAT_PREFIX}${body}${checksum(body)}`;
 }
 
@@ -55,5 +51,3 @@ export function isValidPatToken(token: string): boolean {
 export function patDisplayPrefix(token: string): string {
   return `${token.slice(0, PAT_PREFIX.length + 8)}...`;
 }
-
-export { PAT_PREFIX };

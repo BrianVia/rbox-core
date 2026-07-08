@@ -1,25 +1,17 @@
 import type { Env } from "../env.js";
-import { audit, type Principal } from "../authz.js";
-import { dbFor, dirDb } from "../db.js";
+import { audit, sanitizeWorkspaceName, type Principal } from "../authz.js";
+import { dirDb } from "../db.js";
 import { isUniqueViolation } from "./shared.js";
 import { json, SHA256_HEX_RE } from "../util.js";
 import { revokeDevice } from "./devices.js";
+import { readPlan } from "./mint.js";
+import { isPaidPlan } from "../plans.js";
+import { PAT_MAX_TTL_MS } from "../../../../src/engine/pat-token.js";
 
 const API_KEY_CAP = 5;
-const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,96}$/;
 const DISPLAY_PREFIX_MAX = 80;
 const LABEL_MAX = 200;
-const PAID_PLANS = new Set(["solo", "pro", "team"]);
-
-function cleanString(v: unknown, max: number): string | null {
-  return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null;
-}
-
-async function accountPlan(env: Env, accountId: string): Promise<string> {
-  const row = await dbFor(env, accountId).prepare("SELECT plan FROM accounts WHERE id = ? AND deleted_at IS NULL").bind(accountId).first<{ plan: string | null }>();
-  return row?.plan ?? "none";
-}
 
 function subscribeRequired(): Response {
   return json({ error: "subscription_required", message: "agent keys require an active plan — run `rbox subscribe`" }, 403);
@@ -33,17 +25,18 @@ export async function createApiKey(env: Env, p: Principal, body: unknown, now = 
   if (p.kind !== "device") return json({ error: "forbidden" }, 403);
   if (!p.userId) return json({ error: "forbidden", message: "key creation requires a user membership" }, 403);
 
-  const plan = await accountPlan(env, p.accountId);
-  if (!PAID_PLANS.has(plan)) return subscribeRequired();
+  // authenticate() already rejects tombstoned accounts before this route reads plan state.
+  const plan = await readPlan(env, p.accountId);
+  if (!isPaidPlan(plan)) return subscribeRequired();
 
   const b = (body ?? {}) as Record<string, unknown>;
   const tokenHash = typeof b.tokenHash === "string" && SHA256_HEX_RE.test(b.tokenHash) ? b.tokenHash : null;
   const deviceId = typeof b.deviceId === "string" && DEVICE_ID_RE.test(b.deviceId) ? b.deviceId : null;
   const expiresAt = typeof b.expiresAt === "number" && Number.isInteger(b.expiresAt) ? b.expiresAt : null;
-  const displayPrefix = cleanString(b.displayPrefix, DISPLAY_PREFIX_MAX);
-  const label = cleanString(b.label, LABEL_MAX);
+  const displayPrefix = sanitizeWorkspaceName(typeof b.displayPrefix === "string" ? b.displayPrefix : null, DISPLAY_PREFIX_MAX);
+  const label = sanitizeWorkspaceName(typeof b.label === "string" ? b.label : null, LABEL_MAX);
   if (!tokenHash || !deviceId || !displayPrefix || expiresAt === null) return json({ error: "bad_request", message: "tokenHash, deviceId, displayPrefix, and expiresAt are required" }, 400);
-  if (expiresAt <= now || expiresAt > now + ONE_YEAR_MS) return json({ error: "bad_request", message: "expiresAt must be in the future and no more than 1 year out" }, 400);
+  if (expiresAt <= now || expiresAt > now + PAT_MAX_TTL_MS) return json({ error: "bad_request", message: "expiresAt must be in the future and no more than 1 year out" }, 400);
 
   try {
     const results = await dirDb(env).batch([
@@ -65,7 +58,7 @@ export async function createApiKey(env: Env, p: Principal, body: unknown, now = 
     ]);
     if ((results[0]?.meta.changes ?? 0) === 0) return json({ error: "too_many_api_keys", cap: API_KEY_CAP }, 429);
     await audit(env, p, "api_key.create", deviceId);
-    return json({ ok: true, id: deviceId, deviceId, expiresAt });
+    return json({ ok: true, deviceId, expiresAt });
   } catch (e) {
     if (isUniqueViolation(e)) return json({ error: "conflict", message: "tokenHash or deviceId already exists" }, 409);
     throw e;
@@ -85,7 +78,6 @@ export async function listApiKeys(env: Env, p: Principal): Promise<Response> {
     .all<{ device_id: string; label: string | null; display_prefix: string; created_at: number; last_seen_at: number | null; expires_at: number; revoked: number }>();
   return json({
     keys: (rows.results ?? []).map((r) => ({
-      id: r.device_id,
       deviceId: r.device_id,
       label: r.label,
       displayPrefix: r.display_prefix,

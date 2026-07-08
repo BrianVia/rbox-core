@@ -18,12 +18,19 @@ export interface PlanLimits {
   devices: number;
 }
 
+const PAID_PLAN_NAMES = ["solo", "pro", "team"] as const;
+const PAID_PLAN_SET = new Set<string>(PAID_PLAN_NAMES);
+
 export const PLANS: Record<string, PlanLimits> = {
   none: { storageBytes: 1, workspaces: 1, projects: 1, retentionDays: 0, manifestBytes: 16 * MiB, devices: 2 },
   solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB, devices: 10 },
   pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 25 },
   team: { storageBytes: 150 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 100 },
 };
+
+export function isPaidPlan(plan: string | null | undefined): boolean {
+  return PAID_PLAN_SET.has(plan ?? "");
+}
 
 export function planFor(plan: string | null | undefined): PlanLimits {
   return PLANS[plan ?? "none"] ?? PLANS.none!;

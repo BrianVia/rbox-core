@@ -142,7 +142,7 @@ export class RboxApi implements SyncRemote {
     return pairCreate(this.ctx, body);
   }
 
-  createApiKey(body: CreateApiKeyBody): Promise<{ id: string; deviceId: string; expiresAt: number }> {
+  createApiKey(body: CreateApiKeyBody): Promise<{ deviceId: string; expiresAt: number }> {
     return createApiKey(this.ctx, body);
   }
 

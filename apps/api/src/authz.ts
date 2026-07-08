@@ -78,11 +78,11 @@ export const MAX_WORKSPACE_NAME = 128;
  *  also sanitizes). `name` is OPAQUE user text — strip control chars/newlines so it
  *  stays a single label line, trim, and bound length. Empty/absent → null (no name,
  *  the private default). It is NOT a path with server meaning — just a label. */
-export function sanitizeWorkspaceName(raw: string | null | undefined): string | null {
+export function sanitizeWorkspaceName(raw: string | null | undefined, max = MAX_WORKSPACE_NAME): string | null {
   if (raw == null) return null;
   // eslint-disable-next-line no-control-regex -- strip C0/C1 control chars (incl. \n\r\t)
   const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
-  return cleaned ? cleaned.slice(0, MAX_WORKSPACE_NAME) : null;
+  return cleaned ? cleaned.slice(0, max) : null;
 }
 
 /** POST /v1/workspaces — create a workspace OWNED by the caller's account, with a

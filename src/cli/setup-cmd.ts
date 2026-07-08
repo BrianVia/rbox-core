@@ -21,9 +21,7 @@
  * new/existing account picker for a machine that's already signed in, and never
  * promises Steps 2–3 it can't deliver.
  */
-import fs from "node:fs/promises";
 import os from "node:os";
-import path from "node:path";
 import { runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
@@ -33,19 +31,12 @@ import { loadCredentials } from "./credentials.js";
 import { loadConfig } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { RboxApi } from "./remote.js";
-import { materializeAgentKey } from "./key-cmd.js";
-import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prompt.js";
 import { stderrStyle as e } from "./style.js";
 import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
 import { openAndShow } from "./browser-open.js";
-
-interface ResolvedWorkspace {
-  workspaceId: string;
-  projectId: string;
-  name: string | null;
-}
+import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -93,7 +84,8 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
   if (flags.key && flags.key !== "true" && flags.key !== "-") {
     throw new Error("refusing --key=<value>: argv leaks secrets via shell history and process listings. Use RBOX_KEY, --key-file <path>, or --key -.");
   }
-  if (flags.workspace && hasKeyInput(flags)) {
+  if (flags.workspace) {
+    if (!hasKeyInput(flags)) throw new Error("--workspace requires a key: set RBOX_KEY or pass --key-file/--key -");
     await runKeyedSetup(opts.cwd, opts.defaultRemote, flags);
     return;
   }
@@ -171,88 +163,6 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
   // }
 
   printSummary(outcome.workspaceId, outcome.deviceId);
-}
-
-function hasKeyInput(flags: Record<string, string>): boolean {
-  return Boolean(process.env.RBOX_KEY || flags["key-file"] || flags.key);
-}
-
-async function readStdinTrimmed(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const c of process.stdin) chunks.push(c as Buffer);
-  return Buffer.concat(chunks).toString("utf8").trim();
-}
-
-async function readKeyBundle(flags: Record<string, string>): Promise<string> {
-  if (flags.key === "-") return readStdinTrimmed();
-  if (flags["key-file"]) {
-    if (flags["key-file"] === "true") throw new Error("--key-file requires a path");
-    return (await fs.readFile(flags["key-file"], "utf8")).trim();
-  }
-  if (!process.env.RBOX_KEY) throw new Error("RBOX_KEY is not set");
-  return process.env.RBOX_KEY.trim();
-}
-
-export function slugifyWorkspaceName(s: string): string {
-  return s.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-
-function defaultTargetSlug(ws: ResolvedWorkspace): string {
-  return slugifyWorkspaceName(ws.name ?? "") || ws.workspaceId;
-}
-
-export function resolveKeyedWorkspace(input: string, workspaces: AccountWorkspace[]): ResolvedWorkspace {
-  const byId = workspaces.find((w) => w.workspaceId === input);
-  if (byId) return byId;
-  if (/^ws_[A-Za-z0-9]+$/.test(input)) return { workspaceId: input, projectId: "root", name: null };
-  const matches = workspaces.filter((w) => w.name === input || (w.name ? slugifyWorkspaceName(w.name) === input : false));
-  if (matches.length === 1) return matches[0]!;
-  const available = workspaces.map((w) => w.name ?? w.workspaceId).join(", ") || "(none)";
-  if (matches.length === 0) throw new Error(`workspace not found: ${input}. Available: ${available}`);
-  throw new Error(`workspace name is ambiguous: ${input}. Use the workspace id (${matches.map((w) => w.workspaceId).join(", ")}).`);
-}
-
-export async function ensureKeyedTargetDir(target: string, force: boolean): Promise<void> {
-  const st = await fs.stat(target).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT") return undefined;
-    throw err;
-  });
-  if (st && !st.isDirectory()) throw new Error(`target exists and is not a directory: ${target}`);
-  const entries = st ? await fs.readdir(target) : [];
-  if (entries.length > 0 && !force) throw new Error(`target directory is not empty: ${target}. Re-run with --force to use it anyway.`);
-  await fs.mkdir(target, { recursive: true });
-}
-
-async function runKeyedSetup(cwd: string, defaultRemote: string, flags: Record<string, string>): Promise<void> {
-  const workspaceArg = flags.workspace;
-  if (!workspaceArg || workspaceArg === "true") throw new Error("--workspace requires a name or id");
-  const materialized = await materializeAgentKey(await readKeyBundle(flags), { remoteUrlFallback: defaultRemote });
-  const remoteUrl = materialized.remoteUrl ?? defaultRemote;
-  const workspaces = await fetchAccountWorkspaces(remoteUrl, materialized.token);
-  const picked = resolveKeyedWorkspace(workspaceArg, workspaces);
-  const target = path.resolve(cwd, flags.dir && flags.dir !== "true" ? flags.dir : defaultTargetSlug(picked));
-  await ensureKeyedTargetDir(target, flags.force === "true");
-
-  const outcome = await runInit(
-    {
-      workspace: picked.workspaceId,
-      project: picked.projectId,
-      root: target,
-      "no-interactive": "true",
-      "pull-only": "true",
-      ...(picked.name ? { name: picked.name } : {}),
-    },
-    { cwd, defaultRemote: remoteUrl, summary: false }
-  );
-  if (!outcome) return;
-  if (flags.daemon === "true") {
-    if (flags["pull-only"] === "true") {
-      process.stderr.write(`${e.dim("starting pull-only background sync; local changes will not be pushed.")}\n`);
-    } else {
-      process.stderr.write(`${e.yellow("!")} Shared agent keys are pull-only fleet credentials. A writing agent needs its own key.\n`);
-    }
-    await startDaemonAndRecordDesired(outcome.root, { pullOnly: flags["pull-only"] === "true" });
-  }
 }
 
 /** True when this machine already holds the account's key material (skip Step 1). */

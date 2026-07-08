@@ -54,7 +54,6 @@ interface DesiredDeps extends CommonDeps {
 interface StartStopDeps extends DesiredDeps {
   startDaemon?: typeof startDaemon;
   stopDaemon?: typeof stopDaemon;
-  pullOnly?: boolean;
 }
 
 interface BootResumeDeps extends CommonDeps {
@@ -148,10 +147,10 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
       rootPath: v.rootPath,
       state: v.state,
       accountId: v.accountId,
-    workspaceId: v.workspaceId,
-    at: v.at,
-    ...(v.pullOnly === true ? { pullOnly: true } : {}),
-  };
+      workspaceId: v.workspaceId,
+      at: v.at,
+      ...(v.pullOnly === true ? { pullOnly: true } : {}),
+    };
   } catch {
     return undefined;
   }
