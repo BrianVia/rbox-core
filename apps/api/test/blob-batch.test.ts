@@ -6,6 +6,7 @@ import {
   BATCH_FRAME_HEADER_BYTES,
   BATCH_STATUS_BIT,
   MAX_BATCH_RECORD_BYTES,
+  blobBatchPut,
   blobBatchGetWithVerifiedGrant,
   encodeBatchFrameHeader,
   encodeBatchStatusFrame,
@@ -13,6 +14,7 @@ import {
 import { mintGrant, GRANT_TTL_MS } from "../src/grants.js";
 import { blobKey } from "../src/util.js";
 import type { Env } from "../src/env.js";
+import { verifyReceipt } from "../src/receipts.js";
 
 const BASE = "https://example.com";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -78,6 +80,46 @@ function r2Object(bytes: Uint8Array): R2ObjectBody {
       },
     }),
   } as R2ObjectBody;
+}
+
+function fakePutEnv(opts: { throwSha?: string; metrics?: Array<{ blobs: string[]; doubles: number[] }> } = {}): Env & { putKeys: string[] } {
+  const putKeys: string[] = [];
+  return {
+    RBOX_RECEIPT_KEY: "r".repeat(40),
+    rbox_dev_db: {},
+    rbox_metrics: opts.metrics
+      ? { writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => opts.metrics!.push(point) }
+      : undefined,
+    rbox_dev_blobs: {
+      put: (key: string, body: Uint8Array) => {
+        const s = key.slice(-64);
+        putKeys.push(s);
+        if (s === opts.throwSha) throw new Error("r2 down");
+        return Promise.resolve({ size: body.byteLength });
+      },
+    },
+    putKeys,
+  } as unknown as Env & { putKeys: string[] };
+}
+
+function batchPutBody(records: Array<{ sha: string; payload: Uint8Array }>): Uint8Array {
+  const frames = records.map(({ sha, payload }) => {
+    const frame = new Uint8Array(BATCH_FRAME_HEADER_BYTES + payload.byteLength);
+    frame.set(encodeBatchFrameHeader(sha, payload.byteLength, false), 0);
+    frame.set(payload, BATCH_FRAME_HEADER_BYTES);
+    return frame;
+  });
+  const out = new Uint8Array(frames.reduce((n, f) => n + f.byteLength, 0));
+  let off = 0;
+  for (const frame of frames) {
+    out.set(frame, off);
+    off += frame.byteLength;
+  }
+  return out;
+}
+
+async function batchPutDirect(body: Uint8Array, envOverride = fakePutEnv(), headers: Record<string, string> = { "x-rbox-protocol": "upload-receipts-v1" }): Promise<Response> {
+  return blobBatchPut(new Request(`${BASE}/v1/blob-batch/put`, { method: "POST", headers, body }), envOverride, "acct_batch_put");
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
@@ -246,5 +288,107 @@ describe("POST /v1/blob-batch/get", () => {
     const res = await blobBatchGetWithVerifiedGrant(new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify([s]) }), fakeEnv, "acct_big");
     const [frame] = await decodeFrames(res);
     expect(statusText(frame!)).toBe(`{"status":"too_large","size":${MAX_BATCH_RECORD_BYTES + 1}}`);
+  });
+});
+
+describe("POST /v1/blob-batch/put", () => {
+  test("is routed on the authenticated path and requires upload receipts", async () => {
+    const a = await bootstrap("batch-put-route");
+    const payload = new TextEncoder().encode("route bytes");
+    const s = sha("route bytes");
+    const noReceipts = await SELF.fetch(`${BASE}/v1/blob-batch/put`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": BATCH_BLOB_CONTENT_TYPE }),
+      body: batchPutBody([{ sha: s, payload }]),
+    });
+    expect(noReceipts.status).toBe(400);
+    expect(await noReceipts.json()).toEqual({ error: "receipts_required" });
+
+    const ok = await SELF.fetch(`${BASE}/v1/blob-batch/put`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": BATCH_BLOB_CONTENT_TYPE, "x-rbox-protocol": "upload-receipts-v1" }),
+      body: batchPutBody([{ sha: s, payload }]),
+    });
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as { results: Array<{ ok: boolean; sha256: string; receipt?: string; sizeBytes?: number }> };
+    expect(body.results[0]?.ok).toBe(true);
+    expect(await env.rbox_dev_blobs.get(blobKey(s))).not.toBeNull();
+    expect((await verifyReceipt(env, body.results[0]!.receipt!, { accountId: a.accountId, encSha: s, size: payload.byteLength, nowMs: Date.now() })).ok).toBe(true);
+  });
+
+  test("rejects malformed frames, empty batches, and lying content-length over the actual byte cap", async () => {
+    const good = new TextEncoder().encode("x");
+    const s = sha("x");
+    const truncatedHeader = new Uint8Array(BATCH_FRAME_HEADER_BYTES - 1);
+    const truncatedPayload = batchPutBody([{ sha: s, payload: good }]).subarray(0, BATCH_FRAME_HEADER_BYTES);
+    const empty = new Uint8Array(0);
+    for (const body of [truncatedHeader, truncatedPayload, empty]) {
+      const res = await batchPutDirect(body);
+      expect(res.status).toBe(400);
+    }
+
+    const tooBig = new Uint8Array(8 * 1024 * 1024 + 1);
+    const res = await blobBatchPut(new Request(`${BASE}/v1/blob-batch/put`, {
+      method: "POST",
+      headers: { "x-rbox-protocol": "upload-receipts-v1", "content-length": "1" },
+      body: tooBig,
+    }), fakePutEnv(), "acct_batch_put");
+    expect(res.status).toBe(400);
+  });
+
+  test("deduplicates duplicate shas and returns too_large per record while siblings succeed", async () => {
+    const env2 = fakePutEnv();
+    const okPayload = new TextEncoder().encode("dedupe payload");
+    const okSha = sha("dedupe payload");
+    const largePayload = new Uint8Array(MAX_BATCH_RECORD_BYTES + 1);
+    const largeSha = createHash("sha256").update(largePayload).digest("hex");
+    const res = await batchPutDirect(batchPutBody([
+      { sha: okSha, payload: okPayload },
+      { sha: largeSha, payload: largePayload },
+      { sha: okSha, payload: okPayload },
+    ]), env2);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { results: unknown[] };
+    expect(body.results).toHaveLength(3);
+    expect(body.results[0]).toEqual(body.results[2]);
+    expect(body.results[1]).toEqual({ sha256: largeSha, ok: false, error: "too_large" });
+    expect(env2.putKeys).toEqual([okSha]);
+  });
+
+  test("settles sha_mismatch and r2_error per record without discarding fulfilled receipts", async () => {
+    const okPayload = new TextEncoder().encode("allsettled ok");
+    const okSha = sha("allsettled ok");
+    const mismatchPayload = new TextEncoder().encode("actual");
+    const mismatchSha = sha("claimed");
+    const throwPayload = new TextEncoder().encode("r2 boom");
+    const throwSha = sha("r2 boom");
+    const env2 = fakePutEnv({ throwSha });
+    const res = await batchPutDirect(batchPutBody([
+      { sha: okSha, payload: okPayload },
+      { sha: mismatchSha, payload: mismatchPayload },
+      { sha: throwSha, payload: throwPayload },
+    ]), env2);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { results: Array<{ sha256: string; ok: boolean; error?: string; receipt?: string; sizeBytes?: number }> };
+    expect(body.results[0]?.ok).toBe(true);
+    expect(typeof body.results[0]?.receipt).toBe("string");
+    expect(body.results[1]).toEqual({ sha256: mismatchSha, ok: false, error: "sha_mismatch" });
+    expect(body.results[2]).toEqual({ sha256: throwSha, ok: false, error: "r2_error" });
+    expect((await verifyReceipt(env2, body.results[0]!.receipt!, { accountId: "acct_batch_put", encSha: okSha, size: okPayload.byteLength, nowMs: Date.now() })).ok).toBe(true);
+  });
+
+  test("emits blob.batchPut metrics with ok, partial, and bad_request outcomes", async () => {
+    const metrics: Array<{ blobs: string[]; doubles: number[] }> = [];
+    const okPayload = new TextEncoder().encode("metric ok");
+    const okSha = sha("metric ok");
+    await batchPutDirect(batchPutBody([{ sha: okSha, payload: okPayload }]), fakePutEnv({ metrics }));
+
+    const badSha = sha("not metric payload");
+    await batchPutDirect(batchPutBody([{ sha: badSha, payload: okPayload }]), fakePutEnv({ metrics }));
+    await batchPutDirect(new Uint8Array(0), fakePutEnv({ metrics }));
+
+    expect(metrics.map((m) => m.blobs[2])).toEqual(["ok", "partial", "bad_request"]);
+    expect(metrics[0]?.doubles[4]).toBe(okPayload.byteLength);
+    expect(metrics[0]?.doubles[5]).toBe(1);
   });
 });

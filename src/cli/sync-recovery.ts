@@ -16,6 +16,7 @@ import { BlobShaMismatchError, type SyncRemote } from "./remote.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
+import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -34,9 +35,9 @@ export const PER_FILE_UPLOAD_ATTEMPTS = 3;
 // Concurrency knobs (read at call-time so the bench harness + power users can tune
 // via env). Upload is the dominant cost on a first push (latency-bound), so it's
 // the highest. Bench sweeps RBOX_UPLOAD_CONCURRENCY to find the real optimum.
-const clampConc = (v: string | undefined, dflt: number): number => {
+const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
   const n = Number(v);
-  return Number.isInteger(n) && n >= 1 && n <= 256 ? n : dflt;
+  return Number.isInteger(n) && n >= 1 && n <= max ? n : dflt;
 };
 const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, 8); // CPU/disk bound
 // 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
@@ -44,20 +45,12 @@ const encryptConcurrency = () => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY,
 // the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
 // savvy-core push (4287 blobs, dev) drops ~25% going 32→64 (31s→23s), then regresses by 96
 // (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
-// win actually lives (codex §26 review: DONT-BUILD; the simpler lever captures more). Env-tunable.
-const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, 64); // network/latency bound
+// win lived before design 80. With upload batching enabled, this pool becomes supply for the
+// coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
+const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 64); // network/latency bound
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
-
-/** RBOX_LANE_TIMING=1 — push-side encrypt vs upload attribution. Mirrors the pull
- *  lane timing instrument in apply.ts: module-level accumulator, no plumbing, and
- *  performance.now() only behind the env flag. */
-const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
-export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, blobs: 0, bytes: 0 };
-export function uploadLaneTimingSummary(): string | undefined {
-  if (!LANE_TIMING || uploadLaneTiming.blobs === 0) return undefined;
-  const e = uploadLaneTiming.encryptMs, u = uploadLaneTiming.uploadMs, n = uploadLaneTiming.blobs;
-  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${((e / (e + u)) * 100).toFixed(0)}%) · upload ${(u / 1000).toFixed(1)}s (${((u / (e + u)) * 100).toFixed(0)}%) · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms`;
-}
+export { uploadLaneTiming, uploadLaneTimingSummary };
+export const uploadConcurrencyForTests = uploadConcurrency;
 
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: { compress?: boolean }) => Promise<EncryptedBlob>;
 
@@ -315,12 +308,13 @@ export async function encryptAndUpload(
           const uploadEncSha = f.encSha!;
           byteTracker.reviseTotal(uploadEncSha, size);
           emitUploadProgress();
-          const t0 = LANE_TIMING ? performance.now() : 0;
+          const timingOwnedByRemote = LANE_TIMING && api.ownsUploadLaneTiming?.(size) === true;
+          const t0 = LANE_TIMING && !timingOwnedByRemote ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
             emitUploadProgress();
           });
-          if (LANE_TIMING) {
+          if (LANE_TIMING && !timingOwnedByRemote) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
             uploadLaneTiming.blobs++;
             uploadLaneTiming.bytes += size;

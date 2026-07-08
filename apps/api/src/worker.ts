@@ -289,7 +289,7 @@ const ROUTE_VOCAB = new Set([
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "workspaces", "diagnostics",
   "keys", "roster", "admit", "keystate", "workspace",
-  "blobs", "blob-batch", "check", "get", "multipart", "part", "complete",
+  "blobs", "blob-batch", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
 ]);
 export function routeTemplate(pathname: string): string {

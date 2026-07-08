@@ -1,8 +1,9 @@
 import type { Env } from "./env.js";
 import { isEntitled } from "./authz.js";
-import { readBodyCapped } from "./commit-envelope.js";
+import { readBodyCapped, readBytesCapped } from "./commit-envelope.js";
 import { startOp, type Op } from "./metrics.js";
-import { blobKey, json, SHA256_HEX_RE } from "./util.js";
+import { directWriteWithReceipt, usesReceipts } from "./blobs.js";
+import { blobKey, json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
 // Wire twin: src/cli/remote/blob-batch.ts — the framing constants and codec are
 // duplicated per build target (house pattern, like UPLOAD_RECEIPTS_V1). Change
@@ -21,6 +22,14 @@ type BatchStatus = "missing" | "too_large" | "error";
 type BatchResult =
   | { sha: string; kind: "object"; size: number; bytes: ArrayBuffer }
   | { sha: string; kind: "status"; status: BatchStatus; code?: string; size?: number };
+type BatchPutError = "sha_mismatch" | "too_large" | "r2_error";
+type BatchPutResult =
+  | { sha256: string; ok: true; sizeBytes: number; receipt: string }
+  | { sha256: string; ok: false; error: BatchPutError };
+interface BatchPutRecord {
+  sha: string;
+  payload: Uint8Array;
+}
 
 const textEncoder = new TextEncoder();
 
@@ -51,6 +60,25 @@ export async function blobBatchGet(req: Request, env: Env, opts: { accountId: st
   return new Response(streamBatch(op, parsed.shas, opts), { headers: { "content-type": BATCH_BLOB_CONTENT_TYPE } });
 }
 
+export async function blobBatchPut(req: Request, env: Env, accountId: string): Promise<Response> {
+  const op = startOp(env, "blob.batchPut");
+  if (!usesReceipts(req)) {
+    op.done("bad_request", { count: 0, bytes: 0 });
+    return json({ error: "receipts_required" }, 400);
+  }
+
+  const parsed = await readBatchPutRequest(req);
+  if (!parsed.ok) {
+    op.done("bad_request", { count: 0, bytes: 0 });
+    return parsed.response;
+  }
+
+  const results = await writeBatchPutRecords(op, parsed.records, accountId);
+  const outcome = results.every((r) => r.ok) ? "ok" : "partial";
+  op.done(outcome, { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
+  return json({ results });
+}
+
 async function readBatchRequest(req: Request): Promise<{ ok: true; shas: string[] } | { ok: false; response: Response }> {
   const raw = await readBodyCapped(req, MAX_BATCH_REQUEST_BYTES);
   if (raw === null) return { ok: false, response: json({ error: "bad_request", message: "request body too large" }, 400) };
@@ -73,6 +101,61 @@ async function readBatchRequest(req: Request): Promise<{ ok: true; shas: string[
   if (shas.length === 0) return { ok: false, response: json({ error: "bad_request", message: "empty batch" }, 400) };
   if (shas.length > MAX_BATCH_RECORDS) return { ok: false, response: json({ error: "bad_request", message: "too many shas", max: MAX_BATCH_RECORDS }, 400) };
   return { ok: true, shas };
+}
+
+async function readBatchPutRequest(req: Request): Promise<{ ok: true; records: BatchPutRecord[]; acceptedPayloadBytes: number } | { ok: false; response: Response }> {
+  const raw = await readBytesCapped(req, MAX_BATCH_BODY_BYTES);
+  if (raw === null) return { ok: false, response: json({ error: "bad_request", message: "request body too large" }, 400) };
+  const parsed = parseBatchPutFrames(raw);
+  if (!parsed.ok) return { ok: false, response: json({ error: "bad_request", message: parsed.message }, 400) };
+  let acceptedPayloadBytes = 0;
+  for (const r of parsed.records) if (r.payload.byteLength <= MAX_BATCH_RECORD_BYTES) acceptedPayloadBytes += r.payload.byteLength;
+  return { ok: true, records: parsed.records, acceptedPayloadBytes };
+}
+
+function parseBatchPutFrames(raw: Uint8Array): { ok: true; records: BatchPutRecord[] } | { ok: false; message: string } {
+  const records: BatchPutRecord[] = [];
+  for (let off = 0; off < raw.byteLength;) {
+    if (raw.byteLength - off < BATCH_FRAME_HEADER_BYTES) return { ok: false, message: "truncated frame header" };
+    const head = raw.subarray(off, off + BATCH_FRAME_HEADER_BYTES);
+    off += BATCH_FRAME_HEADER_BYTES;
+    const sha = toHex(head.subarray(0, 32));
+    const word = new DataView(head.buffer, head.byteOffset + 32, 4).getUint32(0, false);
+    if ((word & BATCH_STATUS_BIT) !== 0) return { ok: false, message: "invalid frame length" };
+    const len = word;
+    if (raw.byteLength - off < len) return { ok: false, message: "truncated frame payload" };
+    records.push({ sha, payload: raw.subarray(off, off + len) });
+    off += len;
+    if (records.length > MAX_BATCH_RECORDS) return { ok: false, message: "too many records" };
+  }
+  if (records.length === 0) return { ok: false, message: "empty batch" };
+  return { ok: true, records };
+}
+
+async function writeBatchPutRecords(op: Op, records: BatchPutRecord[], accountId: string): Promise<BatchPutResult[]> {
+  const unique: BatchPutRecord[] = [];
+  const seen = new Set<string>();
+  for (const record of records) {
+    if (seen.has(record.sha)) continue;
+    seen.add(record.sha);
+    unique.push(record);
+  }
+
+  const settled = await Promise.allSettled(unique.map((record) => putOneRecord(op, record, accountId)));
+  const bySha = new Map<string, BatchPutResult>();
+  for (let i = 0; i < settled.length; i++) {
+    const record = unique[i]!;
+    const result = settled[i]!;
+    bySha.set(record.sha, result.status === "fulfilled" ? result.value : { sha256: record.sha, ok: false, error: "r2_error" });
+  }
+  return records.map((record) => bySha.get(record.sha)!);
+}
+
+async function putOneRecord(op: Op, record: BatchPutRecord, accountId: string): Promise<BatchPutResult> {
+  if (record.payload.byteLength > MAX_BATCH_RECORD_BYTES) return { sha256: record.sha, ok: false, error: "too_large" };
+  if (await sha256Hex(record.payload) !== record.sha) return { sha256: record.sha, ok: false, error: "sha_mismatch" };
+  const written = await directWriteWithReceipt(op.env, accountId, record.sha, record.payload, op.span.r2.bind(op.span));
+  return { sha256: record.sha, ok: true, ...written };
 }
 
 function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPreauth?: boolean }): ReadableStream<Uint8Array> {

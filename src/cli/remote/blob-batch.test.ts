@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RboxApi } from "../remote.js";
+import { BlobShaMismatchError, RboxApi } from "../remote.js";
 import { FakeServer } from "../e2ee-fake-server.js";
 import { encryptFileToTemp, generateKek } from "../../engine/crypto.js";
 import type { FileEntry } from "../../engine/types.js";
@@ -16,7 +16,7 @@ import {
 
 const origFetch = globalThis.fetch;
 const origDateNow = Date.now;
-const ENV_KEYS = ["RBOX_BATCH_BLOBS", "RBOX_BATCH_RECORDS", "RBOX_BATCH_RECORD_BYTES", "RBOX_BATCH_BODY_BYTES", "RBOX_BATCH_SLOTS", "RBOX_LANE_TIMING"] as const;
+const ENV_KEYS = ["RBOX_BATCH_BLOBS", "RBOX_BATCH_RECORDS", "RBOX_BATCH_RECORD_BYTES", "RBOX_BATCH_BODY_BYTES", "RBOX_BATCH_SLOTS", "RBOX_BATCH_PUT_SLOTS", "RBOX_UPLOAD_CONCURRENCY", "RBOX_LANE_TIMING"] as const;
 const savedEnv = new Map<(typeof ENV_KEYS)[number], string | undefined>();
 
 const shaBytes = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
@@ -27,6 +27,7 @@ let tmpDir = "";
 let calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }> = [];
 let singles = new Map<string, Uint8Array>();
 let batchHandler: (shas: string[], headers: Record<string, string>) => Response | Promise<Response>;
+let batchPutHandler: (body: Uint8Array, headers: Record<string, string>) => Response | Promise<Response>;
 
 beforeEach(async () => {
   resetBatchBlobStateForTests();
@@ -38,17 +39,33 @@ beforeEach(async () => {
     delete process.env[k];
   }
   batchHandler = (shas) => framesResponse(shas.map((s) => frameData(s, singles.get(s)!)));
+  batchPutHandler = (body) => {
+    const records = decodeBatchPutFrames(body);
+    if (!records) return new Response(JSON.stringify({ error: "bad_request" }), { status: 400 });
+    return jsonResponse(200, { results: records.map(({ sha, payload }) => {
+      if (shaBytes(payload) !== sha) return { sha256: sha, ok: false, error: "sha_mismatch" };
+      singles.set(sha, new Uint8Array(payload));
+      return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
+    }) });
+  };
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
     const u = String(url);
     const method = init?.method ?? "GET";
     const headers = (init?.headers ?? {}) as Record<string, string>;
-    let body: unknown;
-    if (init?.body && typeof init.body === "string") body = JSON.parse(init.body);
+    const rawBody = await readFetchBody(init?.body);
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : rawBody;
     calls.push({ url: u, method, headers, body });
     if (u.endsWith("/latest")) return new Response(JSON.stringify({ sequence: 0, commit: null, grant: "fresh-grant" }), { status: 200 });
     if (u.endsWith("/v1/blob-batch/get")) return batchHandler((body ?? []) as string[], headers);
+    if (u.endsWith("/v1/blob-batch/put")) return batchPutHandler(rawBody, headers);
     const m = u.match(/\/v1\/blobs\/([0-9a-f]{64})$/);
     if (m) {
+      if (method === "PUT") {
+        const s = m[1]!;
+        if (shaBytes(rawBody) !== s) return jsonResponse(400, { error: "sha_mismatch" });
+        singles.set(s, new Uint8Array(rawBody));
+        return jsonResponse(200, { ok: true, sha256: s, sizeBytes: rawBody.byteLength, receipt: `single:${s}` });
+      }
       const b = singles.get(m[1]!);
       return b ? new Response(b, { status: 200 }) : new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
     }
@@ -192,6 +209,143 @@ describe("BlobBatchDownloader fallback behavior", () => {
   });
 });
 
+describe("BlobBatchUploader queueing", () => {
+  test("coalesces concurrent same-sha uploads into one batch record and settles all waiters", async () => {
+    const f = await uploadFile("same-sha", "shared ciphertext");
+    const a = api();
+    await Promise.all([
+      a.putBlobFile(f.sha, f.file, f.size),
+      a.putBlobFile(f.sha, f.file, f.size),
+    ]);
+    expect(batchPutCalls()).toHaveLength(1);
+    expect(batchPutCalls()[0]!.headers["x-rbox-protocol"]).toBe("upload-receipts-v1");
+    expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(1);
+    expect(singlePutCalls()).toHaveLength(0);
+    expect(singles.get(f.sha)).toEqual(f.payload);
+  });
+
+  test("fake batch PUT requires the receipts protocol header", async () => {
+    const server = new FakeServer();
+    const payload = bytes("fake strict");
+    const body = frameData(shaBytes(payload), payload);
+
+    const missing = await server.blobBatchPut(body);
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toEqual({ error: "receipts_required" });
+
+    const ok = await server.blobBatchPut(body, { "x-rbox-protocol": "upload-receipts-v1" });
+    expect(ok.status).toBe(200);
+  });
+
+  test("pull-first dispatch keeps queued supply for full batches and the tail guard flushes the remainder", async () => {
+    process.env.RBOX_BATCH_RECORDS = "2";
+    process.env.RBOX_BATCH_PUT_SLOTS = "1";
+    const files = await Promise.all([uploadFile("q0", "zero"), uploadFile("q1", "one"), uploadFile("q2", "two")]);
+    const a = api();
+    let releaseFirst!: () => void;
+    batchPutHandler = async (body) => {
+      const records = decodeBatchPutFrames(body)!;
+      if (batchPutCalls().length === 1) await new Promise<void>((resolve) => (releaseFirst = resolve));
+      return jsonResponse(200, { results: records.map(({ sha, payload }) => {
+        singles.set(sha, new Uint8Array(payload));
+        return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
+      }) });
+    };
+    const pending = Promise.all(files.map((f) => a.putBlobFile(f.sha, f.file, f.size)));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(batchPutCalls()).toHaveLength(1);
+    expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(2);
+    releaseFirst();
+    await pending;
+    expect(batchPutCalls()).toHaveLength(2);
+    expect(decodeBatchPutFrames(batchPutCalls()[1]!.body as Uint8Array)).toHaveLength(1);
+  });
+
+  test("RBOX_BATCH_BLOBS=0 bypasses batch PUT", async () => {
+    process.env.RBOX_BATCH_BLOBS = "0";
+    const f = await uploadFile("disabled-put", "disabled");
+    await api().putBlobFile(f.sha, f.file, f.size);
+    expect(batchPutCalls()).toHaveLength(0);
+    expect(singlePutCalls()).toHaveLength(1);
+  });
+
+  test("upload supply default is 512 with batching, 64 when disabled, and explicit env wins", async () => {
+    const { uploadConcurrencyForTests } = await import("../sync-recovery.js");
+    delete process.env.RBOX_UPLOAD_CONCURRENCY;
+    delete process.env.RBOX_BATCH_BLOBS;
+    expect(uploadConcurrencyForTests()).toBe(512);
+    process.env.RBOX_BATCH_BLOBS = "0";
+    expect(uploadConcurrencyForTests()).toBe(64);
+    process.env.RBOX_UPLOAD_CONCURRENCY = "7";
+    expect(uploadConcurrencyForTests()).toBe(7);
+  });
+});
+
+describe("BlobBatchUploader fallback behavior", () => {
+  test("per-record sha_mismatch rejects that file while r2_error and too_large fall back singly", async () => {
+    process.env.RBOX_BATCH_RECORDS = "4";
+    const ok = await uploadFile("u-ok", "ok");
+    const mismatch = await uploadFile("u-mismatch", "mismatch");
+    const r2 = await uploadFile("u-r2", "r2");
+    const tooLarge = await uploadFile("u-large-status", "large-status");
+    const a = api();
+    batchPutHandler = (body) => {
+      const records = decodeBatchPutFrames(body)!;
+      return jsonResponse(200, { results: records.map(({ sha, payload }) => {
+        if (sha === mismatch.sha) return { sha256: sha, ok: false, error: "sha_mismatch" };
+        if (sha === r2.sha) return { sha256: sha, ok: false, error: "r2_error" };
+        if (sha === tooLarge.sha) return { sha256: sha, ok: false, error: "too_large" };
+        singles.set(sha, new Uint8Array(payload));
+        return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
+      }) });
+    };
+
+    const settled = await Promise.allSettled([ok, mismatch, r2, tooLarge].map((f) => a.putBlobFile(f.sha, f.file, f.size)));
+    expect(settled[0]?.status).toBe("fulfilled");
+    expect(settled[1]?.status).toBe("rejected");
+    expect((settled[1] as PromiseRejectedResult).reason).toBeInstanceOf(BlobShaMismatchError);
+    expect(settled[2]?.status).toBe("fulfilled");
+    expect(settled[3]?.status).toBe("fulfilled");
+    expect(singlePutCalls().map((c) => c.url)).toEqual(expect.arrayContaining([
+      expect.stringContaining(r2.sha),
+      expect.stringContaining(tooLarge.sha),
+    ]));
+  });
+
+  test("whole-batch 500 falls back all records without disabling future batches", async () => {
+    const first = await Promise.all([uploadFile("batch-500-a", "a"), uploadFile("batch-500-b", "b")]);
+    const a = api();
+    batchPutHandler = () => new Response("no", { status: 500 });
+    await Promise.all(first.map((f) => a.putBlobFile(f.sha, f.file, f.size)));
+    expect(singlePutCalls()).toHaveLength(2);
+
+    const second = await uploadFile("batch-after-500", "after");
+    batchPutHandler = (body) => {
+      const records = decodeBatchPutFrames(body)!;
+      return jsonResponse(200, { results: records.map(({ sha, payload }) => {
+        singles.set(sha, new Uint8Array(payload));
+        return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
+      }) });
+    };
+    await a.putBlobFile(second.sha, second.file, second.size);
+    expect(batchPutCalls()).toHaveLength(2);
+  });
+
+  test("a first 405 permanently disables upload batching for future records", async () => {
+    const first = await uploadFile("old-put", "old");
+    const a = api();
+    batchPutHandler = () => new Response("old server", { status: 405 });
+    await a.putBlobFile(first.sha, first.file, first.size);
+    expect(batchPutCalls()).toHaveLength(1);
+    expect(singlePutCalls()).toHaveLength(1);
+
+    const second = await uploadFile("old-put-future", "future");
+    await a.putBlobFile(second.sha, second.file, second.size);
+    expect(batchPutCalls()).toHaveLength(1);
+    expect(singlePutCalls()).toHaveLength(2);
+  });
+});
+
 describe("BlobBatchDownloader grant freshness", () => {
   test("stale grants refresh once before concurrent batch dispatch", async () => {
     process.env.RBOX_BATCH_RECORDS = "1";
@@ -292,6 +446,69 @@ function batchCalls() {
 
 function singleCalls() {
   return calls.filter((c) => /\/v1\/blobs\/[0-9a-f]{64}$/.test(c.url));
+}
+
+function batchPutCalls() {
+  return calls.filter((c) => c.url.endsWith("/v1/blob-batch/put"));
+}
+
+function singlePutCalls() {
+  return singleCalls().filter((c) => c.method === "PUT");
+}
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+async function readFetchBody(body: BodyInit | null | undefined): Promise<Uint8Array> {
+  if (!body) return new Uint8Array(0);
+  if (typeof body === "string") return bytes(body);
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+  if (typeof (body as ReadableStream<Uint8Array>).getReader === "function") {
+    const reader = (body as ReadableStream<Uint8Array>).getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, off);
+      off += chunk.byteLength;
+    }
+    return out;
+  }
+  return new Uint8Array(0);
+}
+
+function decodeBatchPutFrames(body: Uint8Array): Array<{ sha: string; payload: Uint8Array }> | null {
+  const out: Array<{ sha: string; payload: Uint8Array }> = [];
+  for (let off = 0; off < body.byteLength;) {
+    if (body.byteLength - off < BATCH_FRAME_HEADER_BYTES) return null;
+    const head = body.subarray(off, off + BATCH_FRAME_HEADER_BYTES);
+    off += BATCH_FRAME_HEADER_BYTES;
+    const s = [...head.subarray(0, 32)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const word = new DataView(head.buffer, head.byteOffset + 32, 4).getUint32(0, false);
+    if ((word & BATCH_STATUS_BIT) !== 0 || body.byteLength - off < word) return null;
+    out.push({ sha: s, payload: body.subarray(off, off + word) });
+    off += word;
+  }
+  return out.length ? out : null;
+}
+
+async function uploadFile(name: string, content: string): Promise<{ sha: string; file: string; size: number; payload: Uint8Array }> {
+  const payload = bytes(content);
+  const file = dest(name);
+  await fs.writeFile(file, payload);
+  return { sha: shaBytes(payload), file, size: payload.byteLength, payload };
 }
 
 function framesResponse(frames: Uint8Array[], status = 200): Response {
