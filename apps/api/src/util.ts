@@ -21,6 +21,12 @@ export function blobKey(sha: string): string {
   return `blobs/sha256/${sha.slice(0, 2)}/${sha}`;
 }
 
+export function toHex(bytes: Uint8Array): string {
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
 export function manifestKey(sha: string): string {
   return `manifests/sha256/${sha.slice(0, 2)}/${sha}`;
 }
@@ -39,7 +45,7 @@ export function ctEqual(a: string, b: string): boolean {
 export async function sha256Hex(data: string | ArrayBuffer | Uint8Array): Promise<string> {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return toHex(new Uint8Array(digest));
 }
 
 /** Lowercase-hex HMAC-SHA256(key, message). */

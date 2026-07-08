@@ -36,12 +36,12 @@ export function unsatisfiedBlobsBody(missing: string[]): { error: "unsatisfied_b
 }
 
 // Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
-// Content-Length). Returns the decoded text, "" for an empty body, or null if it exceeds the cap.
-export async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
-  if (!req.body) return "";
+// Content-Length). Returns raw bytes, an empty Uint8Array for an empty body, or null if it exceeds
+// the cap.
+export async function readBytesCapped(req: Request, maxBytes: number): Promise<Uint8Array | null> {
+  if (!req.body) return new Uint8Array(0);
   const reader = req.body.getReader();
-  const decoder = new TextDecoder();
-  let out = "";
+  const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
@@ -52,11 +52,25 @@ export async function readBodyCapped(req: Request, maxBytes: number): Promise<st
         await reader.cancel().catch(() => {});
         return null;
       }
-      out += decoder.decode(value, { stream: true });
+      chunks.push(value);
     }
   }
-  out += decoder.decode();
+  if (chunks.length === 0) return new Uint8Array(0);
+  if (chunks.length === 1) return chunks[0]!;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
   return out;
+}
+
+// Text wrapper over the byte-preserving capped reader above.
+export async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  const bytes = await readBytesCapped(req, maxBytes);
+  if (bytes === null) return null;
+  return new TextDecoder().decode(bytes);
 }
 
 /** The opaque signed commit envelope the server stores verbatim (design 12, v4).

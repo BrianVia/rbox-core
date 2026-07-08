@@ -3,8 +3,8 @@ import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
 import { RemoteContext } from "./context.js";
-import { getBlob, getBlobToFile, putBlob, putBlobFile } from "./blobs.js";
-import { BlobBatchDownloader } from "./blob-batch.js";
+import { getBlob, getBlobToFile, putBlob } from "./blobs.js";
+import { BlobBatchDownloader, BlobBatchUploader } from "./blob-batch.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult } from "./commits.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
@@ -35,6 +35,7 @@ export interface SyncRemote {
     uploadsDir?: string,
     onBytes?: ByteProgressCallback
   ): Promise<void>;
+  ownsUploadLaneTiming?(size: number): boolean;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
@@ -44,10 +45,12 @@ export interface SyncRemote {
 export class RboxApi implements SyncRemote {
   private readonly ctx: RemoteContext;
   private readonly batchDownloader: BlobBatchDownloader;
+  private readonly batchUploader: BlobBatchUploader;
 
   constructor(baseUrl: string, token: string, workspaceId: string, projectId: string) {
     this.ctx = new RemoteContext(baseUrl, token, workspaceId, projectId);
     this.batchDownloader = new BlobBatchDownloader(this.ctx);
+    this.batchUploader = new BlobBatchUploader(this.ctx);
   }
 
   missingBlobs(shas: string[]): Promise<string[]> {
@@ -69,7 +72,11 @@ export class RboxApi implements SyncRemote {
     uploadsDir?: string,
     onBytes?: ByteProgressCallback
   ): Promise<void> {
-    return putBlobFile(this.ctx, sha256, absPath, size, uploadsDir, onBytes);
+    return this.batchUploader.putFile(sha256, absPath, size, uploadsDir, onBytes);
+  }
+
+  ownsUploadLaneTiming(size: number): boolean {
+    return this.batchUploader.ownsLaneTiming(size);
   }
 
   getBlobToFile(sha256: string, destPath: string, expectedSize?: number): Promise<void> {

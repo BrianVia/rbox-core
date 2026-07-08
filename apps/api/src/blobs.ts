@@ -14,6 +14,33 @@ import { batchedInLookup } from "./d1-batch.js";
 export const UPLOAD_RECEIPTS_V1 = "upload-receipts-v1";
 export const usesReceipts = (req: Request): boolean => req.headers.get("x-rbox-protocol") === UPLOAD_RECEIPTS_V1;
 
+type DirectWriteBody = Parameters<Env["rbox_dev_blobs"]["put"]>[1];
+type R2Span = <T>(fn: () => Promise<T>) => Promise<T>;
+
+class DirectWriteR2Error extends Error {
+  constructor() {
+    super("direct blob write failed");
+    this.name = "DirectWriteR2Error";
+  }
+}
+
+export async function directWriteWithReceipt(
+  env: Env,
+  accountId: string,
+  sha: string,
+  body: DirectWriteBody,
+  r2Span: R2Span,
+): Promise<{ sizeBytes: number; receipt: string }> {
+  let obj: R2Object;
+  try {
+    obj = await r2Span(() => env.rbox_dev_blobs.put(blobKey(sha), body, { sha256: sha }));
+  } catch {
+    throw new DirectWriteR2Error();
+  }
+  const receipt = await mintReceipt(env, { accountId, encSha: sha, size: obj.size, nowMs: Date.now() });
+  return { sizeBytes: obj.size, receipt };
+}
+
 /**
  * Blob endpoints (M3): streaming single-PUT with R2-native integrity, and
  * resumable R2 multipart for files past Cloudflare's request-body cap.
@@ -132,16 +159,16 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   // orphan concern moot; online canonical GC is disabled (cron) so a stale purge can't race a
   // direct PUT (codex scaling review). This removes the §25-measured 7-D1-call PUT plateau.
   if (usesReceipts(req)) {
-    let obj: R2Object;
+    let written: { sizeBytes: number; receipt: string };
     try {
-      obj = await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), req.body!, { sha256: sha }));
-    } catch {
+      written = await directWriteWithReceipt(op.env, accountId, sha, req.body!, op.span.r2.bind(op.span));
+    } catch (e) {
+      if (!(e instanceof DirectWriteR2Error)) throw e;
       op.done("sha_mismatch", { bytes: len });
       return json({ error: "sha_mismatch" }, 400);
     }
-    const receipt = await mintReceipt(env, { accountId, encSha: sha, size: obj.size, nowMs: Date.now() });
-    op.done("ok", { bytes: obj.size });
-    return json({ ok: true, sha256: sha, sizeBytes: obj.size, receipt });
+    op.done("ok", { bytes: written.sizeBytes });
+    return json({ ok: true, sha256: sha, ...written });
   }
 
   // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
