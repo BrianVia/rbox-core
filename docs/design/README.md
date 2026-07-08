@@ -36,7 +36,7 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 
 | # | Doc | Status | Depends on | One-liner |
 |---|-----|--------|-----------|-----------|
-| 16 | [New-device security emails](./16-new-device-emails.md) | 🔴 NOT STARTED | P1, P2 | "new device added" email; **Cloudflare Email Service** send on `security.rbox.to` |
+| 16 | [New-device security emails](./16-new-device-emails.md) | 🟢 BUILT | — | "new device added" email; **Cloudflare Email Service** send on `security.rbox.to` |
 | 17 | [Account devices/workspaces list](./17-account-devices-workspaces.md) | 🔴 NOT STARTED | P1, P2 | read-only dashboard list; new `GET /v1/account/devices\|workspaces` |
 | 18 | [Support email routing](./18-support-email-routing.md) | ✅ SHIPPED (2026-06-30) | — | `support@`/`postmaster@`/`security@` → Gmail via CF Email Routing; migrated off Namecheap; catch-all Drop |
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
