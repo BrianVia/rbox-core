@@ -10,7 +10,7 @@ import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
 import { loadState, saveState, type SyncState, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
-import { applyGitSections, gitDivergenceCount, gitDivergenceFastRepoSource } from "./sync-git.js";
+import { applyGitSections, GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitDivergenceCount, gitDivergenceFastRepoSource, planGitSections, type GitPushPlan } from "./sync-git.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
@@ -223,6 +223,46 @@ async function observeGitSpawns<T>(fn: () => Promise<T>): Promise<{ value: T; sp
   } finally {
     setGitSpawnObserver(undefined);
   }
+}
+
+async function observeGitSpawnsForRoot<T>(targetRoot: string, fn: () => Promise<T>): Promise<{ value: T; spawns: number; targetSpawns: number }> {
+  let spawns = 0;
+  let targetSpawns = 0;
+  setGitSpawnObserver((spawnRoot) => {
+    spawns++;
+    if (spawnRoot === targetRoot) targetSpawns++;
+  });
+  try {
+    const value = await fn();
+    return { value, spawns, targetSpawns };
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+}
+
+const divergenceCachePath = (root: string) => path.join(root, ".rbox", "state", "git-divergence.json");
+
+async function readDivergenceCache(root: string): Promise<{ version?: number; repos?: Record<string, any> }> {
+  return JSON.parse(await fs.readFile(divergenceCachePath(root), "utf8")) as { version?: number; repos?: Record<string, any> };
+}
+
+async function writeDivergenceCache(root: string, cache: { version?: number; repos?: Record<string, any> }): Promise<void> {
+  await fs.mkdir(path.dirname(divergenceCachePath(root)), { recursive: true });
+  await fs.writeFile(divergenceCachePath(root), JSON.stringify(cache));
+}
+
+async function markDivergenceCacheTrusted(root: string): Promise<void> {
+  const cache = await readDivergenceCache(root);
+  const trustedWrittenAt = Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 5_000;
+  for (const entry of Object.values(cache.repos ?? {})) {
+    if (entry && typeof entry === "object") entry.writtenAtMs = trustedWrittenAt;
+  }
+  await writeDivergenceCache(root, cache);
+}
+
+function gitPlanSurface(plan: GitPushPlan): Omit<GitPushPlan, "gitPlanStats"> {
+  const { gitPlanStats: _gitPlanStats, ...surface } = plan;
+  return surface;
 }
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void; reject: (reason?: unknown) => void } {
@@ -1618,16 +1658,18 @@ test("gitDivergenceCount warm unchanged multi-repo fixture issues zero git spawn
   const matcher = buildIgnoreMatcher(rootA);
 
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0); // populate cache
+  await markDivergenceCacheTrusted(rootA);
   const cache = JSON.parse(await fs.readFile(path.join(rootA, ".rbox", "state", "git-divergence.json"), "utf8")) as {
     repos: { alpha: { kind?: string } };
   };
+  expect(cache.version).toBe(3);
   expect(cache.repos.alpha.kind).toBe("dir");
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
   expect(warm.spawns).toBe(0);
 }, 30_000);
 
-test("gitDivergenceFastRepoSource ignores legacy cache entries without kind", async () => {
+test("gitDivergenceFastRepoSource treats v2 divergence cache as empty", async () => {
   const cachePath = path.join(rootA, ".rbox", "state", "git-divergence.json");
   await fs.mkdir(path.dirname(cachePath), { recursive: true });
   await fs.mkdir(path.join(rootA, "cached-pointer"), { recursive: true });
@@ -1636,12 +1678,12 @@ test("gitDivergenceFastRepoSource ignores legacy cache entries without kind", as
     JSON.stringify({
       version: 2,
       repos: {
-        legacy: { fingerprint: "fp", identityKey: "id", probe: { busy: false, preflightOk: true, identityKey: "id" } },
-        "cached-pointer": { fingerprint: "fp", identityKey: "id", kind: "pointer", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        legacy: { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "cached-pointer": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "pointer", probe: { busy: false, preflightOk: true, identityKey: "id" } },
       },
     })
   );
-  expect(await gitDivergenceFastRepoSource(rootA, undefined, buildIgnoreMatcher(rootA))).toEqual([{ relPath: "cached-pointer", kind: "pointer" }]);
+  expect(await gitDivergenceFastRepoSource(rootA, undefined, buildIgnoreMatcher(rootA))).toEqual([]);
 });
 
 test("gitDivergenceFastRepoSource filters cached and base repos through current admission", async () => {
@@ -1655,11 +1697,11 @@ test("gitDivergenceFastRepoSource filters cached and base repos through current 
   await fs.writeFile(
     cachePath,
     JSON.stringify({
-      version: 2,
+      version: 3,
       repos: {
-        "cache-present": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
-        "cache-missing": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
-        "ignored/cache": { fingerprint: "fp", identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "cache-present": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "cache-missing": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
+        "ignored/cache": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
       },
     })
   );
@@ -1684,6 +1726,7 @@ test("gitDivergenceCount fingerprint cache invalidates on commits, staging, stas
 
   const warmZero = async () => {
     expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+    await markDivergenceCacheTrusted(rootA);
     const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
     expect(warm.value).toBe(0);
     expect(warm.spawns).toBe(0);
@@ -1738,6 +1781,7 @@ test("gitDivergenceCount fingerprint cache invalidates on rebase op-state", asyn
   await push(rootA, cfgA, depsA);
   const matcher = buildIgnoreMatcher(rootA);
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+  await markDivergenceCacheTrusted(rootA);
   expect((await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher))).spawns).toBe(0);
 
   await git(repo, "checkout", "-qb", "side");
@@ -1762,6 +1806,7 @@ test("gitDivergenceCount fingerprint cache invalidates pointer worktree refs via
   await push(rootA, cfgA, depsA);
   const matcher = buildIgnoreMatcher(rootA);
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
+  await markDivergenceCacheTrusted(rootA);
   expect((await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher))).spawns).toBe(0);
 
   await commitFile(wt, "w2.txt", "common-dir-ref-change", "wt c2");
@@ -1792,6 +1837,7 @@ test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mu
   }
   expect(mutated).toBe(true);
 
+  await markDivergenceCacheTrusted(rootA);
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(1);
   expect(warm.spawns).toBe(0);
@@ -1810,11 +1856,402 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
   const slow = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(slow.value).toBe(0);
   expect(slow.spawns).toBeGreaterThan(0);
-  expect(JSON.parse(await fs.readFile(cachePath, "utf8")).version).toBe(2);
+  expect(JSON.parse(await fs.readFile(cachePath, "utf8")).version).toBe(3);
 
+  await markDivergenceCacheTrusted(rootA);
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
   expect(warm.spawns).toBe(0);
+}, 30_000);
+
+// ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
+
+test("design 83: plan cache treats v2 as cold, writes v3, then serves trusted warm carries with zero git spawns", async () => {
+  const repo = path.join(rootA, "d83-v2");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+
+  await writeDivergenceCache(rootA, {
+    version: 2,
+    repos: {
+      "d83-v2": { fingerprint: "legacy", identityKey: "legacy", kind: "dir", probe: { busy: false, preflightOk: true, preflightKind: "dir", identityKey: "legacy" } },
+    },
+  });
+
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const cold = await observeGitSpawns(async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(cold.value.gitPlanStats?.fpMisses).toBe(1);
+  expect(cold.value.gitPlanStats?.spawnedRepos).toBe(1);
+  expect(cold.spawns).toBeGreaterThan(0);
+  expect((await readDivergenceCache(rootA)).version).toBe(3);
+
+  await markDivergenceCacheTrusted(rootA);
+  const warm = await observeGitSpawns(async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(warm.value.gitPlanStats?.fpHits).toBe(1);
+  expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
+  expect(warm.spawns).toBe(0);
+  expect(gitPlanSurface(warm.value)).toEqual(gitPlanSurface(cold.value));
+}, 30_000);
+
+test("design 83: racy-clean margin refuses a hash-matching entry and takes the spawn path", async () => {
+  const repo = path.join(rootA, "d83-margin");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+
+  let cache = await readDivergenceCache(rootA);
+  for (const entry of Object.values(cache.repos ?? {})) {
+    if (entry && typeof entry === "object") entry.writtenAtMs = 0;
+  }
+  await writeDivergenceCache(rootA, cache);
+
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  cache = await readDivergenceCache(rootA);
+  for (const entry of Object.values(cache.repos ?? {})) {
+    if (entry && typeof entry === "object") entry.writtenAtMs = 0;
+  }
+  await writeDivergenceCache(rootA, cache);
+
+  const plan = await observeGitSpawns(async () => planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA)));
+  expect(plan.value.gitPlanStats?.fpUntrusted).toBe(1);
+  expect(plan.value.gitPlanStats?.spawnedRepos).toBe(1);
+  expect(plan.spawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("design 83: plan cache does not trust a stale carried probe after another repo changes during capture", async () => {
+  const cleanRel = "d83-race-clean";
+  const slowRel = "d83-race-slow";
+  const clean = path.join(rootA, cleanRel);
+  const slow = path.join(rootA, slowRel);
+  for (const repo of [clean, slow]) {
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", "base", "c1");
+  }
+  await push(rootA, cfgA, depsA);
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+
+  await commitFile(slow, "slow.txt", "slow", "slow c2");
+  let mutatedClean = false;
+  setGitSpawnObserver((spawnRoot, args) => {
+    if (mutatedClean || spawnRoot !== slow || args[0] !== "bundle" || args[1] !== "create") return;
+    mutatedClean = true;
+    fsSync.writeFileSync(path.join(clean, "late.txt"), "late");
+    execFileSync("git", ["-C", clean, "add", "late.txt"]);
+    execFileSync("git", ["-C", clean, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "late clean"]);
+  });
+  try {
+    await push(rootA, cfgA, depsA);
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(mutatedClean).toBe(true);
+
+  await markDivergenceCacheTrusted(rootA);
+  const next = await observeGitSpawns(async () => planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA)));
+  expect(next.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(next.value.captured).toContain(cleanRel);
+  expect(next.value.carried).not.toContain(cleanRel);
+  expect(next.spawns).toBeGreaterThan(0);
+}, 40_000);
+
+test("design 83: trusted warm plan is zero-spawn and uses cached parentRel for pointer skips", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+  const wtSection = (await captureGitState(W, remote.blobStore(), KEK))!;
+  const s0 = await st(rootA);
+  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection } } });
+  await push(rootA, cfgA, depsA);
+
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const slow = await observeGitSpawns(async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(slow.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(slow.spawns).toBeGreaterThan(0);
+
+  await markDivergenceCacheTrusted(rootA);
+  const warm = await observeGitSpawns(async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(gitPlanSurface(warm.value)).toEqual(gitPlanSurface(slow.value));
+  expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
+  expect(warm.value.gitPlanStats?.parentRelCached).toBe(1);
+  expect(warm.spawns).toBe(0);
+}, 30_000);
+
+test("design 83: baseless in-tree pointer pre-skip uses warm cached parentRel with zero spawns", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+  await push(rootA, cfgA, depsA);
+
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const cold = await observeGitSpawnsForRoot(W, async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(cold.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(cold.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(cold.targetSpawns).toBeGreaterThan(0);
+  expect(cold.value.skipped.map((s) => s.relPath)).toContain("wt");
+  expect(cold.value.gitRepos?.["wt"]).toBeUndefined();
+  const coldCache = await readDivergenceCache(rootA);
+  expect(coldCache.repos?.wt?.kind).toBe("pointer");
+  expect(coldCache.repos?.wt?.probe?.preflightOk).toBe(true);
+  expect(coldCache.repos?.wt?.probe?.parentRel).toBe("main");
+
+  await markDivergenceCacheTrusted(rootA);
+  const warm = await observeGitSpawnsForRoot(W, async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(gitPlanSurface(warm.value)).toEqual(gitPlanSurface(cold.value));
+  expect(warm.value.gitPlanStats?.pointerPreSkips).toBe(1);
+  expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
+  expect(warm.targetSpawns).toBe(0);
+  expect(warm.spawns).toBe(0);
+}, 30_000);
+
+test("design 83: baseless pointer pre-skip falls back when cached parent is not sectioned", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+  await fs.writeFile(path.join(rootA, ".rboxignore"), "main/\n");
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  const cold = await observeGitSpawnsForRoot(W, async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(cold.value.skipped.map((s) => s.relPath)).not.toContain("wt");
+  expect(cold.value.captured).toEqual(["wt"]);
+  expect(cold.targetSpawns).toBeGreaterThan(0);
+
+  await markDivergenceCacheTrusted(rootA);
+  const warm = await observeGitSpawnsForRoot(W, async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
+  expect(warm.value.skipped.map((s) => s.relPath)).not.toContain("wt");
+  expect(warm.value.captured).toEqual(["wt"]);
+  expect(Object.keys(warm.value.gitRepos ?? {})).toEqual(Object.keys(cold.value.gitRepos ?? {}));
+  expect(warm.value.gitRepos?.["wt"]?.refScope).toBe(cold.value.gitRepos?.["wt"]?.refScope);
+  expect(warm.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(warm.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(warm.targetSpawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("design 83: baseless pointer fingerprint miss spawns and never pre-skips", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+  await push(rootA, cfgA, depsA);
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+
+  const planned = await observeGitSpawnsForRoot(W, async () =>
+    planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA))
+  );
+  expect(planned.value.gitPlanStats?.fpMisses).toBeGreaterThan(0);
+  expect(planned.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(planned.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(planned.targetSpawns).toBeGreaterThan(0);
+  expect(planned.value.skipped.map((s) => s.relPath)).toContain("wt");
+}, 30_000);
+
+test("design 83: pending, needs-resolution, and force baseless pointers never pre-skip", async () => {
+  const { W } = await makeInTreeMainWithWorktree();
+  const wtSection = (await captureGitState(W, remote.blobStore(), KEK))!;
+  await push(rootA, cfgA, depsA);
+  await markDivergenceCacheTrusted(rootA);
+
+  const baseState = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const liveIdentityKey = gitIdentityKey(await gitIdentity(W));
+
+  const pending = await observeGitSpawnsForRoot(W, async () =>
+    planGitSections(rootA, cfgA, { ...baseState, gitPendingRemote: { wt: wtSection } }, remote, new Set(), matcher)
+  );
+  expect(pending.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(pending.value.skipped.map((s) => s.relPath)).not.toContain("wt");
+  expect(pending.value.gitRepos?.["wt"]).toEqual(wtSection);
+  expect(pending.targetSpawns).toBe(0);
+
+  await markDivergenceCacheTrusted(rootA);
+  const needsResolution = await observeGitSpawnsForRoot(W, async () =>
+    planGitSections(rootA, cfgA, { ...baseState, gitNeedsResolution: { wt: liveIdentityKey } }, remote, new Set(), matcher)
+  );
+  expect(needsResolution.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(needsResolution.value.skipped.map((s) => s.relPath)).not.toContain("wt");
+  expect(needsResolution.value.gitRepos?.["wt"]).toBeUndefined();
+  expect(needsResolution.targetSpawns).toBeGreaterThan(0);
+
+  await markDivergenceCacheTrusted(rootA);
+  const forced = await observeGitSpawnsForRoot(W, async () =>
+    planGitSections(rootA, cfgA, baseState, remote, new Set(["wt"]), matcher)
+  );
+  expect(forced.value.gitPlanStats?.pointerPreSkips).toBe(0);
+  expect(forced.value.skipped.map((s) => s.relPath)).not.toContain("wt");
+  expect(forced.value.captured).toContain("wt");
+  expect(forced.targetSpawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("design 83: fast-path guard failures stay on the existing live planner path", async () => {
+  const rel = "d83-guards";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const baseState = await st(rootA);
+  const baseSec = baseState.lastSyncedManifest.gitRepos![rel]!;
+  const liveIdentityKey = gitIdentityKey(await gitIdentity(repo));
+  const matcher = () => buildIgnoreMatcher(rootA);
+  const plan = (state: SyncState, force: ReadonlySet<string> = new Set(), m = matcher()) =>
+    planGitSections(rootA, cfgA, state, remote, force, m);
+  const refreshTrusted = async () => {
+    await plan(baseState);
+    await markDivergenceCacheTrusted(rootA);
+  };
+  const expectSpawn = async (state: SyncState = baseState, force: ReadonlySet<string> = new Set(), m = matcher()) => {
+    await refreshTrusted();
+    const out = await plan(state, force, m);
+    expect(out.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+    expect(out.gitPlanStats?.fpHits).toBe(0);
+    return out;
+  };
+
+  expect((await expectSpawn(baseState, new Set([rel]))).captured).toContain(rel);
+  expect((await expectSpawn({ ...baseState, gitNeedsResolution: { [rel]: liveIdentityKey } })).carried).toContain(rel);
+  expect((await expectSpawn({ ...baseState, lastSyncedManifest: { ...baseState.lastSyncedManifest, gitRepos: undefined }, gitReposRemoved: { [rel]: liveIdentityKey } })).gitRepos).toBeUndefined();
+  expect((await expectSpawn({ ...baseState, lastSyncedManifest: { ...baseState.lastSyncedManifest, gitRepos: undefined } })).captured).toContain(rel);
+
+  await refreshTrusted();
+  const pending = await plan({ ...baseState, gitPendingRemote: { [rel]: baseSec } });
+  expect(pending.gitPlanStats?.fpHits).toBe(0);
+  expect(pending.gitPlanStats?.spawnedRepos).toBe(0);
+  expect(pending.gitRepos?.[rel]).toEqual(baseSec);
+
+  await fs.writeFile(path.join(rootA, ".rboxignore"), `${rel}/\n`);
+  try {
+    await refreshTrusted();
+    const ignored = await plan(baseState, new Set(), buildIgnoreMatcher(rootA));
+    expect(ignored.gitPlanStats?.fpHits).toBe(0);
+    expect(ignored.gitPlanStats?.spawnedRepos).toBe(0);
+    expect(ignored.gitRepos?.[rel]).toEqual(baseSec);
+  } finally {
+    await fs.rm(path.join(rootA, ".rboxignore"), { force: true });
+  }
+
+  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+  try {
+    const busy = await expectSpawn();
+    expect(busy.deferred.some((d) => d.relPath === rel && d.reason.includes("git busy"))).toBe(true);
+  } finally {
+    await fs.rm(path.join(repo, ".git", "index.lock"), { force: true });
+  }
+
+  const head = await git(repo, "rev-parse", "HEAD");
+  await fs.writeFile(path.join(repo, ".git", "shallow"), `${head}\n`);
+  try {
+    const structural = await expectSpawn();
+    expect(structural.removed).toContain(rel);
+  } finally {
+    await fs.rm(path.join(repo, ".git", "shallow"), { force: true });
+  }
+
+  await refreshTrusted();
+  let cache = await readDivergenceCache(rootA);
+  cache.repos![rel]!.probe.preflightKind = "bogus";
+  await writeDivergenceCache(rootA, cache);
+  let invalidKind = await plan(baseState);
+  expect(invalidKind.gitPlanStats?.fpMisses).toBe(1);
+  expect(invalidKind.gitPlanStats?.spawnedRepos).toBe(1);
+
+  await refreshTrusted();
+  cache = await readDivergenceCache(rootA);
+  cache.repos![rel]!.probe.identityKey = "different";
+  cache.repos![rel]!.identityKey = "different";
+  await writeDivergenceCache(rootA, cache);
+  const nonCarry = await plan(baseState);
+  expect(nonCarry.gitPlanStats?.fpMisses).toBe(1);
+  expect(nonCarry.gitPlanStats?.spawnedRepos).toBe(1);
+}, 40_000);
+
+test("design 83: plan cache misses changed git state and keeps other repos on the fast path", async () => {
+  for (const rel of ["d83-a", "d83-b"]) {
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", rel, "c1");
+  }
+  await push(rootA, cfgA, depsA);
+
+  const expectOneRepoMiss = async (mutate: () => Promise<void>, expectCapture: boolean) => {
+    await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+    await markDivergenceCacheTrusted(rootA);
+    await mutate();
+    const planned = await observeGitSpawns(async () => planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA)));
+    expect(planned.value.gitPlanStats?.fpHits).toBe(1);
+    expect(planned.value.gitPlanStats?.spawnedRepos).toBe(1);
+    if (expectCapture) expect(planned.value.captured).toEqual(["d83-a"]);
+    else expect(planned.value.carried).toContain("d83-a");
+    expect(planned.spawns).toBeGreaterThan(0);
+  };
+
+  await expectOneRepoMiss(() => commitFile(path.join(rootA, "d83-a"), "commit.txt", "changed", "changed"), true);
+  await push(rootA, cfgA, depsA);
+
+  await expectOneRepoMiss(async () => {
+    await fs.writeFile(path.join(rootA, "d83-a", "staged.txt"), "staged");
+    await git(path.join(rootA, "d83-a"), "add", "staged.txt");
+  }, true);
+  await push(rootA, cfgA, depsA);
+
+  await expectOneRepoMiss(async () => {
+    await git(path.join(rootA, "d83-a"), "tag", "d83-tag");
+  }, true);
+  await push(rootA, cfgA, depsA);
+
+  await expectOneRepoMiss(async () => {
+    await git(path.join(rootA, "d83-a"), "checkout", "-qb", "d83-topic");
+  }, true);
+  await push(rootA, cfgA, depsA);
+
+  await expectOneRepoMiss(async () => {
+    await git(path.join(rootA, "d83-a"), "pack-refs", "--all", "--prune");
+  }, false);
+}, 30_000);
+
+test("design 83: plan cache invalidates paused rebase op-state instead of fast-carrying", async () => {
+  const rel = "d83-rebase-plan";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), matcher);
+  await markDivergenceCacheTrusted(rootA);
+  expect((await observeGitSpawns(async () => planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), matcher))).spawns).toBe(0);
+
+  await git(repo, "checkout", "-qb", "side");
+  await commitFile(repo, "f.txt", "side", "side c1");
+  await git(repo, "checkout", "-q", "main");
+  await commitFile(repo, "f.txt", "main", "main c2");
+  await git(repo, "checkout", "-q", "side");
+  await expect(git(repo, "rebase", "main")).rejects.toThrow();
+
+  const planned = await observeGitSpawns(async () => planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), matcher));
+  expect(planned.value.gitPlanStats?.fpHits).toBe(0);
+  expect(planned.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
+  expect(planned.value.carried).not.toContain(rel);
+  expect(planned.value.captured.includes(rel) || planned.value.deferred.some((d) => d.relPath === rel)).toBe(true);
+  expect(planned.spawns).toBeGreaterThan(0);
+}, 30_000);
+
+test("design 83: status and plan writers leave one loadable v3 cache", async () => {
+  const repo = path.join(rootA, "d83-cross-writer");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  let cache = await readDivergenceCache(rootA);
+  expect(cache.version).toBe(3);
+  expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
+  expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
+
+  await fs.rm(divergenceCachePath(rootA), { force: true });
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
+  cache = await readDivergenceCache(rootA);
+  expect(cache.version).toBe(3);
+  expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
+  expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
 }, 30_000);
 
 // ── gitcap progress (the long silent phase on a repo-heavy first push) ───────────

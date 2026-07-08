@@ -1,7 +1,9 @@
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { hashFile } from "../hash.js";
 import type { GitRefScope, GitSection } from "../types.js";
-import { type RepoCtx, exists, git, gitOk, headBranchOf, readHead, repoCtx } from "./shared.js";
+import { type RepoCtx, exists, git, gitOk, gitWithIndexFile, headBranchOf, readHead, repoCtx } from "./shared.js";
 import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
 
 /** The stable, plaintext-only identity of a repo's git state (no ciphertext addresses) —
@@ -34,16 +36,34 @@ export async function gitIdentity(repoDir: string, knownCtx?: RepoCtx): Promise<
 }
 
 /** Stable staging identity via write-tree (NOT the raw index file hash, which git
- *  refreshes). write-tree may refresh stat info — harmless, like `git status`.
+ *  refreshes). write-tree may rewrite the index, so probe a byte-copy instead of
+ *  the resolved live index; otherwise the identity probe invalidates fingerprint
+ *  brackets that include index ino/mtime.
  *  Fallback (design 43 §6.6 [v2, M3]): write-tree FAILS on an index with unmerged
  *  entries, which would freeze the identity mid-conflict and never re-capture staged
  *  conflict-resolution progress — so identity falls back to `raw:<sha256 of the
  *  resolved-gitdir index bytes>`. Volatile (stat refreshes can over-capture) but
  *  conservative: in the transient unmerged window, re-capturing beats carrying stale state. */
 export async function indexTreeOf(ctx: RepoCtx): Promise<string | undefined> {
-  const wt = (await git(ctx.repoDir, ["write-tree"]).catch(() => "")) || undefined;
-  if (wt) return wt;
   const idx = path.join(ctx.gitDir, "index");
+  if (await exists(idx)) {
+    let tmpDir: string | undefined;
+    let wt: string | undefined;
+    try {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitid-"));
+      const tmpIndex = path.join(tmpDir, "index");
+      await fs.copyFile(idx, tmpIndex);
+      wt = (await gitWithIndexFile(ctx.repoDir, tmpIndex, ["write-tree"]).catch(() => "")) || undefined;
+    } catch {
+      wt = undefined;
+    } finally {
+      if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (wt) return wt;
+  } else {
+    const wt = (await git(ctx.repoDir, ["write-tree"]).catch(() => "")) || undefined;
+    if (wt) return wt;
+  }
   if (!(await exists(idx))) return undefined;
   return `raw:${await hashFile(idx)}`;
 }
