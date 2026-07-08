@@ -28,6 +28,7 @@
 	let linked = $state<boolean | null>(null);
 	let error = $state('');
 	let busy = $state(false);
+	let cadence = $state<'monthly' | 'annual'>('annual');
 
 	requireAuth(); // not signed in → /
 
@@ -56,13 +57,13 @@
 		// Pricing-CTA handoff: a buyer who clicked "Go Pro" on the marketing site arrives
 		// here post-sign-in with a stashed plan intent. Consume it one-shot FIRST (a
 		// cancelled checkout returns via /billing → here and must NOT re-fire), then
-		// auto-start checkout only if they're still on the free plan — paid users manage
+		// auto-start checkout only if they still have no active plan — paid users manage
 		// plans via the portal, never a second checkout. Errors surface via redirectVia.
 		// If the page was destroyed mid-fetch, don't consume — the intent stays stashed
 		// (within its TTL) for the buyer's next dashboard visit.
 		if (destroyed) return;
 		const intent = consumePlanIntent();
-		if (intent && usage?.plan === 'free') checkout(intent);
+		if (intent && (usage?.plan ?? 'none') === 'none') checkout(intent.plan, intent.cadence);
 	}
 
 	// One busy-lock + error-capture + redirect path for every billing action.
@@ -77,13 +78,14 @@
 		}
 	}
 
-	const checkout = (plan: 'solo' | 'pro') => redirectVia((c) => startCheckout(c, plan));
+	const checkout = (plan: 'solo' | 'pro', selectedCadence: 'monthly' | 'annual' = cadence) =>
+		redirectVia((c) => startCheckout(c, plan, selectedCadence));
 	const portal = () => redirectVia(openBillingPortal);
 
 	// Display metadata per plan (matches apps/api/src/plans.ts).
-	type Tier = 'free' | 'solo' | 'pro' | 'team';
+	type Tier = 'none' | 'solo' | 'pro' | 'team';
 	const PLAN: Record<Tier, { label: string; price: string }> = {
-		free: { label: 'Free', price: '$0' },
+		none: { label: 'No plan', price: '—' },
 		solo: { label: 'Solo', price: '$8/mo' },
 		pro: { label: 'Pro', price: '$20/mo' },
 		team: { label: 'Team', price: '$12/seat' }
@@ -92,20 +94,23 @@
 	const UPGRADES: {
 		id: 'solo' | 'pro';
 		label: string;
-		price: string;
+		monthlyPrice: string;
+		annualPrice: string;
 		features: string[];
 		featured?: boolean;
 	}[] = [
 		{
 			id: 'solo',
 			label: 'Solo',
-			price: '$8',
+			monthlyPrice: '$8',
+			annualPrice: '$6.67',
 			features: ['50 GB storage', '30-day version history', 'Unlimited workspaces']
 		},
 		{
 			id: 'pro',
 			label: 'Pro',
-			price: '$20',
+			monthlyPrice: '$20',
+			annualPrice: '$16.67',
 			features: ['250 GB storage', '90-day version history', 'Advanced hydration'],
 			featured: true
 		}
@@ -117,9 +122,9 @@
 	const INSTALL_CMD = 'curl -fsSL https://rbox.to/install.sh | sh';
 	const SETUP_CMD = 'rbox setup';
 
-	const plan = $derived((usage?.plan as Tier) ?? 'free');
-	const isFree = $derived(plan === 'free');
-	const info = $derived(PLAN[plan] ?? PLAN.free);
+	const plan = $derived((usage?.plan as Tier) ?? 'none');
+	const noPlan = $derived(plan === 'none');
+	const info = $derived(PLAN[plan] ?? PLAN.none);
 	const pct = $derived(
 		usage && usage.storageCap ? Math.min(100, (usage.usedBytes / usage.storageCap) * 100) : 0
 	);
@@ -137,16 +142,16 @@
 		<CardContent class="p-6">
 			<div class="flex flex-wrap items-center justify-between gap-4">
 				<div class="flex items-center gap-3">
-					<Badge variant={isFree ? 'secondary' : 'default'} class="px-2.5 py-0.5 text-sm">
+					<Badge variant={noPlan ? 'secondary' : 'default'} class="px-2.5 py-0.5 text-sm">
 						{info.label}
 					</Badge>
 					<span class="text-sm text-muted-foreground">
-						{isFree ? 'Free plan' : 'Active subscription'}
+						{noPlan ? 'No active plan' : 'Active subscription'}
 					</span>
 				</div>
 				<div class="flex items-center gap-4">
 					<span class="text-lg font-semibold tabular">{info.price}</span>
-					{#if !isFree}
+					{#if !noPlan}
 						<Button variant="outline" size="sm" disabled={busy} onclick={portal}>
 							Manage billing
 						</Button>
@@ -249,12 +254,34 @@
 		</div>
 	</details>
 
-	{#if isFree}
-		<!-- Free → upgrade. Cards make the choice + value obvious. Paid users change
+	{#if noPlan}
+		<!-- Locked → trial. Cards make the choice + value obvious. Paid users change
 		     plans via the portal (in the summary above), never a second checkout. -->
-		<h2 class="mt-9 mb-3 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-			Upgrade your plan
-		</h2>
+		<div class="mt-9 mb-4 flex flex-wrap items-center justify-between gap-3">
+			<h2 class="text-lg font-semibold tracking-tight">Start your 14-day free trial</h2>
+			<div class="inline-flex rounded-lg border border-border bg-muted/50 p-1">
+				<button
+					type="button"
+					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'annual'
+						? 'bg-background text-foreground shadow-sm'
+						: 'text-muted-foreground hover:text-foreground'}"
+					onclick={() => (cadence = 'annual')}
+					aria-pressed={cadence === 'annual'}
+				>
+					Annual
+				</button>
+				<button
+					type="button"
+					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'monthly'
+						? 'bg-background text-foreground shadow-sm'
+						: 'text-muted-foreground hover:text-foreground'}"
+					onclick={() => (cadence = 'monthly')}
+					aria-pressed={cadence === 'monthly'}
+				>
+					Monthly
+				</button>
+			</div>
+		</div>
 		<div class="grid gap-4 sm:grid-cols-2">
 			{#each UPGRADES as p (p.id)}
 				<div
@@ -269,8 +296,10 @@
 					{/if}
 					<div class="text-sm font-medium text-muted-foreground">{p.label}</div>
 					<div class="mt-1 mb-4 flex items-baseline gap-1">
-						<span class="text-3xl font-semibold tracking-tight tabular">{p.price}</span>
-						<span class="text-sm text-muted-foreground">/mo</span>
+						<span class="text-3xl font-semibold tracking-tight tabular">{cadence === 'annual' ? p.annualPrice : p.monthlyPrice}</span>
+						<span class="text-sm text-muted-foreground">
+							{cadence === 'annual' ? '/mo · billed annually' : '/mo'}
+						</span>
 					</div>
 					<ul class="mb-5 flex flex-1 flex-col gap-2.5">
 						{#each p.features as f (f)}
@@ -285,7 +314,7 @@
 						disabled={busy}
 						onclick={() => checkout(p.id)}
 					>
-						Choose {p.label}
+						Start {p.label} trial
 					</Button>
 				</div>
 			{/each}

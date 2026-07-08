@@ -14,20 +14,20 @@ import { dbFor } from "./db.js";
  * for. Intended shape:
  *
  *   const sub = await stripeSubscriptionStatus(env, accountId);
- *   if (!sub || sub.status !== "active") return "free";   // canceled/past_due → downgrade
+ *   if (!sub || sub.status !== "active") return "none";   // canceled/past_due → lock
  *   return sub.plan;                                       // authoritative tier
  *
  * Kept async now so adding the Stripe call later is non-breaking.
  */
 export async function resolveAccountPlan(_env: Env, _accountId: string, storedPlan: string | null): Promise<string> {
   // TODO(stripe): verify against live subscription status once billing is linked.
-  return storedPlan ?? "free";
+  return storedPlan ?? "none";
 }
 
 /**
  * Plan-driven retention prune (M6 prune + M7b plans). For each workspace, set its
  * DO prune floor so versions OLDER than the owning account's `retentionDays` are
- * dropped — free (retentionDays 0) keeps only the current state. This sets floors
+ * dropped — locked accounts (retentionDays 0) keep only the current state. This sets floors
  * only; the existing GC mark/purge reclaims the now-unreachable blobs, so the
  * operational order is: retention → mark → purge. The DO never prunes the head,
  * so the current version always survives regardless of the window.
@@ -49,7 +49,7 @@ export async function retentionPrune(env: Env, nowMs: number = Date.now()): Prom
   const perWorkspace: Array<{ ws: string; proj: string; floor: number; pruned: number }> = [];
   for (const r of rows.results ?? []) {
     // Downgrade grace (design 13): while grace_until is in the future, retain ALL
-    // history — skip pruning entirely. Only consulted when free; paid plans keep
+    // history — skip pruning entirely. Only consulted when locked; paid plans keep
     // their own retentionDays regardless.
     if (r.grace_until != null && nowMs < r.grace_until) {
       inGrace++;

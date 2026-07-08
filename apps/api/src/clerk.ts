@@ -154,8 +154,8 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // owner on X (privilege resurrection). A returning login only resolves + mints.
     // cap_bytes = the materialized §23 hard-cap (kept in sync with the plan by the trigger).
     const acctIns = await dbFor(env, map.account_id)
-      .prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)")
-      .bind(map.account_id, nowMs, capBytesFor("free"))
+      .prepare("INSERT OR IGNORE INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'none', 'web', ?, ?)")
+      .bind(map.account_id, nowMs, capBytesFor("none"))
       .run();
     // users/memberships are directory-plane (authenticate JOINs memberships, §32 §2).
     await dirDb(env).prepare("INSERT OR IGNORE INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(map.user_id, map.account_id, nowMs).run();
@@ -166,14 +166,14 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // INSERT OR IGNORE materialized it (changes > 0) pings — the losers no-op + skip,
     // so a race doesn't emit duplicate "new account" alerts.
     // Rich fields are best-effort: a degraded Clerk fetch (email/method null) just omits
-    // those segments. New web accounts are created 'free' (see the accounts INSERT above).
+    // those segments. New web accounts are created locked (see the accounts INSERT above).
     if ((acctIns.meta.changes ?? 0) > 0)
       await pingNewAccount(env, {
         accountId: map.account_id,
         origin: "web",
         email: clerkUser.email,
         signInMethod: clerkUser.signInMethod,
-        plan: "free",
+        plan: "none",
       });
   }
 

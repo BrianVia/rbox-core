@@ -104,7 +104,7 @@ export async function validateCommitRefs(
   return { ok: true, newRefs };
 }
 
-export type AccountingResult = { ok: true } | { overCap: { used: number; cap: number } };
+export type AccountingResult = { ok: true } | { overCap: { used: number; cap: number; reason?: "no_plan" } };
 
 /** Catalog (present=1) + charge + grant + un-condemn for `newRefs` in ONE chunked,
  *  atomic D1 batch (the accounts_cap_guard trigger rolls the whole batch back on over-cap).
@@ -118,6 +118,15 @@ export async function commitAccounting(
   nowMs: number,
 ): Promise<AccountingResult> {
   if (newRefs.length === 0) return { ok: true };
+
+  const acc = await db.prepare("SELECT plan, used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
+    plan: string;
+    used_bytes: number;
+    cap_bytes: number;
+  }>();
+  if (acc?.plan === "none") {
+    return { overCap: { used: Number(acc.used_bytes ?? 0), cap: Number(acc.cap_bytes ?? 0), reason: "no_plan" } };
+  }
 
   // §30: charge+grant in SEQUENTIAL atomic super-batches of ≤MAX_REFS_PER_TXN refs. Each
   // db.batch() is one transaction (cap-guarded); a commit larger than one transaction runs

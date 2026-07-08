@@ -38,7 +38,7 @@ export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Res
   // POST /v1/admin/account/:id/plan?plan=pro&extraGB=N (platform secret; interim until Stripe).
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
-    return adminSetPlan(env, seg[3]!, url.searchParams.get("plan") ?? "free", Number(url.searchParams.get("extraGB") ?? "0"));
+    return adminSetPlan(env, seg[3]!, url.searchParams.get("plan") ?? "none", Number(url.searchParams.get("extraGB") ?? "0"));
   }
 
   return null;

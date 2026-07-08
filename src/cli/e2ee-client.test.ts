@@ -14,12 +14,12 @@ describe("enrollViaPairing redeem errors", () => {
     globalThis.fetch = (async (input: string | URL | Request) => {
       calls++;
       expect(String(input)).toBe("https://api.test/v1/auth/pair/redeem");
-      return new Response(JSON.stringify({ error: "device_limit_reached", cap: 5, plan: "free" }), { status: 409 });
+      return new Response(JSON.stringify({ error: "device_limit_reached", cap: 2, plan: "none" }), { status: 409 });
     }) as typeof fetch;
 
     const secret = Buffer.alloc(32).toString("base64url");
     await expect(enrollViaPairing("https://api.test", `rbox-pair_${"a".repeat(16)}.${secret}`, 1)).rejects.toThrow(
-      "device limit reached (5/5 on free) — revoke a device or upgrade; pairing token still valid"
+      "device limit reached (2/2 on none) — revoke a device or upgrade; pairing token still valid"
     );
     expect(calls).toBe(1);
   });

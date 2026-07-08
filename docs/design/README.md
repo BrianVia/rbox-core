@@ -5,7 +5,7 @@ design-review status — each doc's own header records its codex-review history.
 
 **Legend:** ✅ DONE (in `main`) · 🟡 IN PROGRESS · 🔴 NOT STARTED (design only)
 
-_Last updated: 2026-06-29._
+_Last updated: 2026-07-08._
 
 ## Shipped (1–15)
 
@@ -42,6 +42,7 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
 | 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🔴 NOT STARTED | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
 | 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | ✅ SHIPPED (PR #2, prod) | — | web↔CLI link (`rbox account link`) + `rbox subscribe` + re-point saga; closes P2 & P4; unblocks 16/17/19 |
+| 86 | [Paid-only plans, trial, annual billing](./86-paid-only-trial.md) | 🟡 IN PROGRESS | 07b, 13 | remove free tier; locked `none` state; 14-day Stripe trial; annual prices |
 
 ## Cross-cutting prerequisites (gate the 16–21 batch)
 

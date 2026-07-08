@@ -207,11 +207,11 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "dc_cap", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
-      if (url.endsWith("/v1/auth/device/poll")) return new Response(JSON.stringify({ error: "device_limit_reached", cap: 5, plan: "free" }), { status: 409 });
+      if (url.endsWith("/v1/auth/device/poll")) return new Response(JSON.stringify({ error: "device_limit_reached", cap: 2, plan: "none" }), { status: 409 });
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    await expect(login("https://api.test")).rejects.toThrow("device limit reached (5/5 on free) — revoke a device or upgrade");
+    await expect(login("https://api.test")).rejects.toThrow("device limit reached (2/2 on none) — revoke a device or upgrade");
     expect(sleeps.length).toBeGreaterThan(0);
     expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);
   });

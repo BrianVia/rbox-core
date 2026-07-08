@@ -60,15 +60,15 @@ async function seedApprovedDeviceCode(accountId: string, deviceCode: string): Pr
 describe("design 64 §3.2 — per-account durable-device cap", () => {
   test("device-code claim hits the cap (409), keeps the grant intact, and revoking frees a slot", async () => {
     const a = await bootstrap("acct-cap-devicecode"); // bootstrap mints 1 durable device
-    const fillers = await fillDurableDevices(a.accountId, 4); // → 5 total = free cap
-    expect(await durableCount(a.accountId)).toBe(5);
+    const fillers = await fillDurableDevices(a.accountId, 1); // → 2 total = none cap
+    expect(await durableCount(a.accountId)).toBe(2);
 
     const deviceCode = "dc".padEnd(64, "0");
     await seedApprovedDeviceCode(a.accountId, deviceCode);
 
     const blocked = await pollDeviceAuth(pollReq(deviceCode), prodEnv);
     expect(blocked.status).toBe(409);
-    expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 5, plan: "free" });
+    expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 2, plan: "none" });
     const stillApproved = await env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE device_code = ?").bind(deviceCode).first<{ status: string }>();
     expect(stillApproved?.status).toBe("approved"); // grant intact — not flipped to 'claimed'
 
@@ -86,12 +86,12 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     expect(created.status).toBe(200);
     const { token: pair } = (await created.json()) as { token: string };
 
-    const fillers = await fillDurableDevices(a.accountId, 4); // → 5 total = cap
-    expect(await durableCount(a.accountId)).toBe(5);
+    const fillers = await fillDurableDevices(a.accountId, 1); // → 2 total = cap
+    expect(await durableCount(a.accountId)).toBe(2);
 
     const blocked = await redeemPairToken(redeemReq(pair), prodEnv);
     expect(blocked.status).toBe(409);
-    expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 5, plan: "free" });
+    expect(await blocked.json()).toEqual({ error: "device_limit_reached", cap: 2, plan: "none" });
 
     await env.rbox_dev_db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ?").bind(fillers[0]).run();
     const ok = await redeemPairToken(redeemReq(pair), prodEnv);
@@ -101,12 +101,12 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
 
   test("an ephemeral web-session mint is exempt — not counted, never blocked", async () => {
     const a = await bootstrap("acct-cap-web");
-    await fillDurableDevices(a.accountId, 4); // → 5 durable = cap
-    expect(await durableCount(a.accountId)).toBe(5);
+    await fillDurableDevices(a.accountId, 1); // → 2 durable = cap
+    expect(await durableCount(a.accountId)).toBe(2);
 
     const ws = await createWebSession(prodEnv, a.accountId, "u");
     expect(typeof ws.token).toBe("string");
-    expect(await durableCount(a.accountId)).toBe(5);
+    expect(await durableCount(a.accountId)).toBe(2);
   });
 
   test("dev env lifts the cap so the rig is unaffected", async () => {
@@ -117,7 +117,7 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
 
   test("undefined RBOX_ENV enforces the cap (config drift fails closed)", async () => {
     const a = await bootstrap("acct-cap-undefined-env");
-    await fillDurableDevices(a.accountId, 4); // → 5 total = free cap
+    await fillDurableDevices(a.accountId, 1); // → 2 total = none cap
 
     await expect(mintDevice(unsetEnv, a.accountId, "u", "dev", "blocked")).rejects.toThrow("device limit reached");
   });
@@ -127,7 +127,7 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
     const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}` } });
     expect(created.status).toBe(200);
     const { token: pair } = (await created.json()) as { token: string };
-    await fillDurableDevices(a.accountId, 4); // would cap at 5 if tombstone did not short-circuit it
+    await fillDurableDevices(a.accountId, 1); // would cap at 2 if tombstone did not short-circuit it
     await env.rbox_dev_db.prepare("UPDATE accounts SET deleted_at = ? WHERE id = ?").bind(Date.now(), a.accountId).run();
 
     const gone = await redeemPairToken(redeemReq(pair), prodEnv);

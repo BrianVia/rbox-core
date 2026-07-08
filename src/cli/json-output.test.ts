@@ -337,7 +337,7 @@ test("account status --json emits JSON", async () => {
   process.env.RBOX_DEVICE_ID = "dev_a";
   stubFetch((url) =>
     url.endsWith("/v1/account/status")
-      ? { status: 200, body: { accountId: "acct_a", linked: true, plan: "free" } }
+      ? { status: 200, body: { accountId: "acct_a", linked: true, plan: "none" } }
       : { status: 200, body: { plan: "pro", graceUntil: 123, readOnly: true } }
   );
 

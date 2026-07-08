@@ -92,11 +92,11 @@ describe("worker integration (real DO + D1 + R2)", () => {
     );
     expect(res.status).toBe(200);
     const a = (await res.json()) as { accountId: string };
-    expect(await accountPlanRow(a.accountId)).toEqual({ plan: "free", capBytes: capBytesFor("free") });
+    expect(await accountPlanRow(a.accountId)).toEqual({ plan: "none", capBytes: capBytesFor("none") });
   });
 
   test("blob entitlement: PUT grants, GET works; a different account 404s the same sha", async () => {
-    const a = await bootstrap("acct-blob-a");
+    const a = await bootstrap("acct-blob-a", { plan: "pro" });
     const content = "blob-entitlement-content";
     const s = sha(content);
     const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
@@ -109,8 +109,28 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(cross.status).toBe(404);
   });
 
+  test("none account: existing reads still work, new uploads 402 with no_plan", async () => {
+    const a = await bootstrap("acct-none-read-write", { plan: "pro" });
+    const content = "already-owned-before-lock";
+    const s = sha(content);
+    const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
+    expect(put.status).toBe(200);
+
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=none`, { method: "POST", headers: PLAT });
+
+    const get = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { headers: authed(a.token) });
+    expect(get.status).toBe(200);
+    expect(await get.text()).toBe(content);
+
+    const next = "x";
+    const blockedSha = sha(next);
+    const blocked = await SELF.fetch(`${BASE}/v1/blobs/${blockedSha}`, { method: "PUT", headers: authed(a.token, { "content-length": String(next.length) }), body: next });
+    expect(blocked.status).toBe(402);
+    expect((await blocked.json()) as { error: string; reason?: string }).toMatchObject({ error: "quota_exceeded", reason: "no_plan" });
+  });
+
   test("download grant pre-auth: valid grant with no bearer serves the same bytes as authenticated GET", async () => {
-    const a = await bootstrap("acct-grant-preauth-ok");
+    const a = await bootstrap("acct-grant-preauth-ok", { plan: "pro" });
     const content = "grant-preauth-bytes";
     const s = sha(content);
     const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
@@ -141,7 +161,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
   });
 
   test("download grant pre-auth: revoked bearer with a still-valid grant serves during the documented TTL lag", async () => {
-    const a = await bootstrap("acct-grant-preauth-revoked");
+    const a = await bootstrap("acct-grant-preauth-revoked", { plan: "pro" });
     const content = "grant-preauth-revoked";
     const s = sha(content);
     const put = await SELF.fetch(`${BASE}/v1/blobs/${s}`, { method: "PUT", headers: authed(a.token, { "content-length": String(content.length) }), body: content });
@@ -276,7 +296,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await res.json()) as { error: string }).error).toBe("epoch_stale");
   });
 
-  test("free plan workspace cap: 2nd workspace → 402 quota_exceeded", async () => {
+  test("none plan workspace cap: 2nd workspace → 402 quota_exceeded", async () => {
     const a = await bootstrap("acct-quota");
     const first = await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
     expect(first.status).toBe(200);
@@ -309,7 +329,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // The minted token authenticates and lands in the creator's account.
     const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(deviceToken) });
     expect(usage.status).toBe(200);
-    expect(((await usage.json()) as { plan: string }).plan).toBe("free");
+    expect(((await usage.json()) as { plan: string }).plan).toBe("none");
   });
 
   test("pairing token is SINGLE-USE (second redeem → 401)", async () => {
@@ -461,7 +481,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await (await webhook(body, sig)).json() as { duplicate?: boolean }).duplicate).toBe(true); // 2nd = no-op
   });
 
-  test("webhook downgrades to free when subscription is canceled/past_due", async () => {
+  test("webhook locks when subscription is canceled/past_due", async () => {
     const a = await bootstrap("acct-cancel");
     const t = Math.floor(Date.now() / 1000);
     const mk = (id: string, status: string, lk: string) =>
@@ -471,7 +491,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const down = mk("evt_down", "past_due", "rbox_pro_monthly");
     await webhook(down, await stripeSig(down, "whsec_test_secret", t));
     const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
-    expect(((await usage.json()) as { plan: string }).plan).toBe("free"); // fail-closed
+    expect(((await usage.json()) as { plan: string }).plan).toBe("none"); // fail-closed
   });
 
   // ── downgrade grace period (design 13) ──────────────────────────────────────
@@ -485,10 +505,11 @@ describe("worker integration (real DO + D1 + R2)", () => {
       JSON.stringify({ id, type: "customer.subscription.updated", data: { object: { id: "sub_g", status, customer: "cus_g", metadata: { account_id: a.accountId }, items: { data: [{ price: { lookup_key: "rbox_pro_monthly" } }] } } } });
     const up = upd("evt_g_up", "active");
     await webhook(up, await stripeSig(up, "whsec_test_secret", t));
-    const down1 = upd("evt_g_d1", "past_due"); // first downgrade → free + grace
+    const down1 = upd("evt_g_d1", "past_due"); // first downgrade → none + grace
     await webhook(down1, await stripeSig(down1, "whsec_test_secret", t));
     const u1 = await usageOf(a.token);
-    expect(u1.plan).toBe("free");
+    expect(u1.plan).toBe("none");
+    expect(u1.storageCap).toBe(1);
     expect(u1.graceUntil).toBeGreaterThan(Date.now());
     // A later subscription.deleted for the same sub must NOT push the window out.
     const down2 = JSON.stringify({ id: "evt_g_d2", type: "customer.subscription.deleted", data: { object: { id: "sub_g", status: "canceled", customer: "cus_g", metadata: { account_id: a.accountId } } } });
@@ -497,26 +518,26 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(u2.graceUntil).toBe(u1.graceUntil); // unchanged — once per window
   });
 
-  test("adminSetPlan paid→free clears extra storage AND stamps grace", async () => {
+  test("adminSetPlan paid→locked clears extra storage AND stamps grace", async () => {
     const GiB = 1024 * 1024 * 1024;
     const a = await bootstrap("acct-admin-grace");
     await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=pro&extraGB=100`, { method: "POST", headers: PLAT });
     const u1 = await usageOf(a.token);
     expect(u1.plan).toBe("pro");
     expect(u1.storageCap).toBe(250 * GiB + 100 * GiB); // base + extra
-    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=free`, { method: "POST", headers: PLAT });
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=none`, { method: "POST", headers: PLAT });
     const u2 = await usageOf(a.token);
-    expect(u2.plan).toBe("free");
-    expect(u2.storageCap).toBe(2 * GiB); // extras cleared on downgrade
+    expect(u2.plan).toBe("none");
+    expect(u2.storageCap).toBe(1); // extras cleared on downgrade
     expect(u2.graceUntil).toBeGreaterThan(Date.now());
   });
 
   test("retention SKIPS an in-grace account (history preserved, 0 pruned)", async () => {
     const a = await bootstrap("acct-grace-retain");
-    // pro → free puts it in grace; give it a workspace so retention iterates it.
+    // pro → none puts it in grace; give it a workspace so retention iterates it.
     await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=pro`, { method: "POST", headers: PLAT });
     await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) });
-    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=free`, { method: "POST", headers: PLAT });
+    await SELF.fetch(`${BASE}/v1/admin/account/${a.accountId}/plan?plan=none`, { method: "POST", headers: PLAT });
     const res = await SELF.fetch(`${BASE}/v1/admin/gc?phase=retention`, { method: "POST", headers: PLAT });
     const body = (await res.json()) as { inGrace: number; pruned: number };
     expect(body.inGrace).toBeGreaterThanOrEqual(1); // the in-grace workspace was skipped
@@ -963,7 +984,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // Seed three pre-0014 (origin NULL) accounts, then run the migration's two
     // classification UPDATEs verbatim and assert the three-way split.
     const seed = (id: string) =>
-      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'legacy', 'free', ?)").bind(id, Date.now()).run();
+      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'legacy', 'none', ?)").bind(id, Date.now()).run();
     await seed("acct_bf_data");
     await seed("acct_bf_shell");
     await seed("acct_bf_ambig");
@@ -992,7 +1013,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
            OR id IN (SELECT account_id FROM pairing_tokens WHERE consumed_at IS NULL AND expires_at > CAST(strftime('%s','now') AS INTEGER)*1000)
            OR id IN (SELECT account_id FROM device_auth WHERE account_id IS NOT NULL AND status IN ('pending','approved') AND expires_at > CAST(strftime('%s','now') AS INTEGER)*1000)
            OR id IN (SELECT DISTINCT account_id FROM devices WHERE expires_at IS NULL)
-           OR plan != 'free' OR stripe_customer_id IS NOT NULL OR stripe_subscription_id IS NOT NULL
+           OR plan != 'none' OR stripe_customer_id IS NOT NULL OR stripe_subscription_id IS NOT NULL
            OR grace_until IS NOT NULL OR extra_storage_bytes != 0 OR used_bytes != 0 )`
       )
       .run();
@@ -1259,12 +1280,16 @@ describe("worker integration (real DO + D1 + R2)", () => {
   // test env (where the mutation IS visible) and mock Stripe via fetchMock. D1, the
   // Clerk JWKS mock, and the webhook (via SELF) are all real.
   const stripeCalls: { path: string; method: string; body: string }[] = [];
+  const priceCalls: { path: string; method: string }[] = [];
   beforeAll(async () => {
     const { fetchMock } = await import("cloudflare:test");
     const pool = fetchMock.get("https://api.stripe.com");
     pool
       .intercept({ path: /^\/v1\/prices/, method: "GET" })
-      .reply(200, JSON.stringify({ data: [{ id: "price_test" }] }))
+      .reply((o: { path: string; method: string }) => {
+        priceCalls.push({ path: o.path, method: o.method });
+        return { statusCode: 200, data: JSON.stringify({ data: [{ id: "price_test" }] }) };
+      })
       .persist();
     pool
       .intercept({ path: /^\/v1\//, method: "POST" })
@@ -1279,6 +1304,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
   async function withStripe<T>(fn: () => Promise<T>): Promise<T> {
     (env as { STRIPE_SECRET?: string }).STRIPE_SECRET = "sk_test_dummy";
     stripeCalls.length = 0;
+    priceCalls.length = 0;
     try {
       return await fn();
     } finally {
@@ -1317,8 +1343,50 @@ describe("worker integration (real DO + D1 + R2)", () => {
     });
   });
 
-  test("subscribe: a free account → checkout bound to ITS OWN account; a canceled/grace account may re-subscribe", async () => {
-    const a = await bootstrap("acct-sub-free");
+  test("subscribe: cadence=annual resolves the annual lookup key", async () => {
+    const a = await bootstrap("acct-sub-annual");
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=solo&cadence=annual`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200);
+      expect(priceCalls).toHaveLength(1);
+      expect(priceCalls[0]!.path).toContain("rbox_solo_annual");
+    });
+  });
+
+  test("subscribe: junk cadence → 400 before any Stripe call", async () => {
+    const a = await bootstrap("acct-sub-bad-cadence");
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=solo&cadence=weekly`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("bad_request");
+      expect(priceCalls).toHaveLength(0);
+      expect(stripeCalls).toHaveLength(0);
+    });
+  });
+
+  test("subscribe: 14-day trial is attached only when the account has no Stripe customer", async () => {
+    const first = await bootstrap("acct-sub-first-trial");
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(first));
+      expect(res.status).toBe(200);
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      expect(checkout.body).toContain("trial_period_days");
+      expect(checkout.body).toContain("14");
+    });
+
+    const returning = await bootstrap("acct-sub-returning-no-trial");
+    await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = ? WHERE id = ?").bind("cus_returning", returning.accountId).run();
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(returning));
+      expect(res.status).toBe(200);
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      expect(checkout.body).not.toContain("trial_period_days");
+      expect(checkout.body).toContain("customer=cus_returning");
+    });
+  });
+
+  test("subscribe: a none account → checkout bound to ITS OWN account; a canceled/grace account may re-subscribe", async () => {
+    const a = await bootstrap("acct-sub-none");
     await withStripe(async () => {
       const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
       expect(res.status).toBe(200);
@@ -1351,7 +1419,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const bx = await billingOf(x.accountId);
     expect(bx).toMatchObject({ cust: "cus_rp", sub: "sub_rp", plan: "pro" });
     const bs = await billingOf(shell);
-    expect(bs).toMatchObject({ cust: null, sub: null, plan: "free" });
+    expect(bs).toMatchObject({ cust: null, sub: null, plan: "none" });
     const reclaimed = await env.rbox_dev_db.prepare("SELECT reclaimed_at FROM accounts WHERE id = ?").bind(shell).first<{ reclaimed_at: number | null }>();
     expect(reclaimed?.reclaimed_at).toBeGreaterThan(0);
     // THE DUAL-ROUTING-KEY FIX: the subscription's Stripe metadata was repointed to X.

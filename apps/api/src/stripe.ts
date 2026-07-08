@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { ctEqual, json } from "./util.js";
-import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey } from "./plans.js";
+import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey, type BillingCadence } from "./plans.js";
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
@@ -47,8 +47,8 @@ async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: stri
 }
 
 /** Resolve a plan's active price id from its lookup_key (test/live agnostic). */
-async function priceIdForPlan(env: Env, plan: string): Promise<string | null> {
-  const lookupKey = PLAN_LOOKUP_KEYS[plan];
+async function priceIdForPlan(env: Env, plan: string, cadence: BillingCadence): Promise<string | null> {
+  const lookupKey = PLAN_LOOKUP_KEYS[plan]?.[cadence];
   if (!lookupKey) return null;
   const list = await stripeApi(env, "GET", "/prices", { "lookup_keys[0]": lookupKey, active: "true", limit: 1 });
   return list.data?.[0]?.id ?? null;
@@ -56,10 +56,14 @@ async function priceIdForPlan(env: Env, plan: string): Promise<string | null> {
 
 // ---- routes (all gated on STRIPE_SECRET) ----
 
-/** POST /v1/billing/checkout?plan=solo — authed. Returns a Stripe Checkout URL. */
+/** POST /v1/billing/checkout?plan=solo&cadence=monthly|annual — authed. Returns a Stripe Checkout URL. */
 export async function billingCheckout(req: Request, env: Env, p: Principal): Promise<Response> {
   if (!env.STRIPE_SECRET) return json({ error: "billing_not_configured" }, 501);
-  const plan = new URL(req.url).searchParams.get("plan") ?? "";
+  const url = new URL(req.url);
+  const plan = url.searchParams.get("plan") ?? "";
+  const rawCadence = url.searchParams.get("cadence") ?? "monthly";
+  if (rawCadence !== "monthly" && rawCadence !== "annual") return json({ error: "bad_request", message: "cadence must be monthly or annual" }, 400);
+  const cadence = rawCadence as BillingCadence;
   // Gate on the PURCHASABLE allowlist, not PLAN_LOOKUP_KEYS membership (design 63 §C):
   // `team` has a lookup_key but isn't purchasable yet, so this rejects Team checkout
   // intent deliberately — before any Stripe call — even once its price exists.
@@ -81,8 +85,8 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
     return json({ error: "already_subscribed", plan: acct.plan, message: "this account already has an active subscription — manage it from the billing portal" }, 409);
   }
 
-  const priceId = await priceIdForPlan(env, plan);
-  if (!priceId) return json({ error: "price_unavailable", message: `no active price for ${plan}` }, 500);
+  const priceId = await priceIdForPlan(env, plan, cadence);
+  if (!priceId) return json({ error: "price_unavailable", message: `no active ${cadence} price for ${plan}` }, 500);
 
   const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
   const session = await stripeApi(env, "POST", "/checkout/sessions", {
@@ -96,6 +100,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
     "metadata[account_id]": p.accountId,
     // Bind the subscription to the account so webhooks can map it back.
     "subscription_data[metadata][account_id]": p.accountId,
+    ...(acct?.stripe_customer_id ? {} : { "subscription_data[trial_period_days]": 14 }),
     // Reuse the account's customer if it has one; in subscription mode Stripe
     // auto-creates a customer otherwise (customer_creation is payment-mode only).
     ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : {}),
@@ -167,13 +172,13 @@ export async function stripeWebhook(req: Request, env: Env, nowMs: number): Prom
   return json({ received: true });
 }
 
-// Grace stamp on a paid→free transition (design 13 G1/G6): only when the
+// Grace stamp on a paid→locked transition (design 13 G1/G6): only when the
 // PRE-update plan was paid AND no unexpired grace already exists (so an
 // at-least-once `deleted` / a subscribe-cancel loop inside the window can't extend
 // it). Reads pre-update `plan`/`grace_until` in the CASE, so a replay after
-// "UPDATE ok, event-insert failed" no-ops (plan is already 'free').
+// "UPDATE ok, event-insert failed" no-ops (plan is already 'none').
 function graceCase(): string {
-  return "CASE WHEN plan <> 'free' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END";
+  return "CASE WHEN plan <> 'none' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END";
 }
 
 async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }, nowMs: number): Promise<void> {
@@ -206,8 +211,8 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
       // as-yet UNBOUND account named by trusted-at-checkout metadata) can change.
       if (paying) {
         // active/trialing → the purchased plan. Leave grace_until untouched (it's
-        // only read when free; clearing it would let a cancel re-grant in-window — G6).
-        const plan = planForLookupKey(lookupKey) ?? "free";
+        // only read when locked; clearing it would let a cancel re-grant in-window — G6).
+        const plan = planForLookupKey(lookupKey) ?? "none";
         const upd = await dbFor(env, accountId)
           .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
           .bind(plan, obj.customer, obj.id, accountId, obj.customer)
@@ -218,9 +223,9 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // shell no-ops the UPDATE (changes == 0) → no FALSE "new subscription" alert.
         if (event.type === "customer.subscription.created" && (upd.meta.changes ?? 0) > 0) await pingNewSubscription(env, { accountId, plan });
       } else {
-        // non-paying (past_due/unpaid/canceled-but-not-deleted) → free + grace + clear extras.
+        // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
         await dbFor(env, accountId)
-          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
+          .prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
           .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer)
           .run();
       }
@@ -233,7 +238,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // placement-constraint model) with NO account id in scope. Account-less at N=1 (one
         // shard); a sharded world needs a (stripe_customer_id → shard) directory index.
         const del = await dbFor(env, "")
-          .prepare(`UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
+          .prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
           .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
         // §32 Tier 1 churn ping (best-effort) — only when this delete actually
@@ -334,7 +339,7 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
 
   // D1 move (one atomic batch; later statements see earlier ones' writes). Both
   // writes are guarded against concurrent webhooks racing the saga:
-  //  1. claim onto X only if X is free-or-already-ours AND the shell STILL holds
+  //  1. claim onto X only if X is empty-or-already-ours AND the shell STILL holds
   //     this exact subscription — so a concurrent `subscription.deleted` that
   //     cleared the shell aborts the move instead of resurrecting a canceled sub.
   //  2. clear + TOMBSTONE the shell only if X now actually holds this sub — so a
@@ -355,7 +360,7 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
       .bind(shell.cust, shell.sub, shell.plan, shell.grace, shell.extra, destId, shell.cust, shellId, shell.sub),
     dbFor(env, destId)
       .prepare(
-        `UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'free', grace_until = NULL, extra_storage_bytes = 0, reclaimed_at = ?
+        `UPDATE accounts SET stripe_customer_id = NULL, stripe_subscription_id = NULL, plan = 'none', grace_until = NULL, extra_storage_bytes = 0, reclaimed_at = ?
          WHERE id = ? AND stripe_subscription_id = ?
            AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND stripe_subscription_id = ?)`
       )

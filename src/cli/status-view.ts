@@ -209,6 +209,7 @@ export function healthLine(s: StatusSnapshot): string {
   if (halt?.terminal) return haltLine(halt, s.now);
   if (halt && (!active || out)) return haltLine(halt, s.now);
   if (out) {
+    if (out.reason === "no_plan") return `${style.red("⛔ no active plan")} · run \`rbox subscribe\``;
     const usage = quotaUsage(out.kind, out.used, out.cap);
     const detail = out.kind === "workspaces"
       ? usage ? `workspace limit reached — ${usage} workspaces used` : "workspace limit reached"

@@ -56,12 +56,13 @@ Run `rbox help` for the full command list, or [`docs/usage.md`](docs/usage.md) f
 
 ## Plans
 
-| Plan | Storage | Workspaces | Version history |
-|---|---|---|---|
-| Free | 2 GiB | 1 | current state only |
-| Solo | 50 GiB | ∞ | 30 days |
-| Pro | 250 GiB | ∞ | 90 days |
-| Team* | 150 GiB/seat | ∞ | 90 days |
+| Plan | Price | Storage | Workspaces | Version history |
+|---|---|---|---|---|
+| Solo | $8/mo or $80/yr | 50 GiB | ∞ | 30 days |
+| Pro | $20/mo or $200/yr | 250 GiB | ∞ | 90 days |
+| Team* | not yet purchasable | 150 GiB/seat | ∞ | 90 days |
+
+Solo and Pro include a 14-day card-upfront trial; annual billing is two months free.
 
 \* Team is listed but not purchasable. Details and per-plan specifics: [`docs/pricing.md`](docs/pricing.md).
 

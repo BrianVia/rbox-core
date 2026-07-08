@@ -28,7 +28,7 @@ export async function accountLink(code: string): Promise<void> {
 }
 
 /** The shape of `GET /v1/account/status`. `plan` is best-effort — an older API that
- *  predates the plan field is treated as `free` rather than a hard failure. */
+ *  predates the plan field is treated as no active plan rather than a hard failure. */
 export interface AccountStatus {
   accountId: string;
   plan: string;
@@ -60,7 +60,7 @@ export async function fetchAccountSummary(timeoutMs = 3500): Promise<AccountSumm
     });
     if (!res.ok) return { state: "unavailable" };
     const { accountId, linked, plan } = (await res.json()) as { accountId: string; linked: boolean; plan?: string };
-    return { state: "ok", status: { accountId, linked: !!linked, plan: plan ?? "free" } };
+    return { state: "ok", status: { accountId, linked: !!linked, plan: plan ?? "none" } };
   } catch {
     // Offline, DNS failure, timeout/abort, malformed body — all degrade to the same
     // "we couldn't reach the account plane" outcome. Local status still renders.
@@ -83,9 +83,13 @@ export function formatAccountSummary(s: AccountSummary): string[] {
   const { accountId, plan, linked } = s.status;
   return [
     `${style.bold("account")} ${style.cyan(accountId)}`,
-    `  ${style.dim("plan:")} ${plan}`,
+    `  ${style.dim("plan:")} ${renderPlan(plan)}`,
     `  ${style.dim("web login linked:")} ${linked ? style.green("yes") : style.yellow("no")}`,
   ];
+}
+
+function renderPlan(plan: string | null | undefined): string {
+  return (plan ?? "none") === "none" ? "no active plan" : plan!;
 }
 
 /** `rbox account status` — is a web login linked to this account? (Also shows plan.) */
@@ -100,7 +104,7 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
     const u = (await usage.json()) as { plan?: string; graceUntil?: number | null; readOnly?: boolean };
     emitJson({
       accountId,
-      plan: u.plan ?? plan ?? "free",
+      plan: u.plan ?? plan ?? "none",
       graceUntil: u.graceUntil ?? null,
       readOnly: u.readOnly === true,
       linked: !!linked,
@@ -108,7 +112,7 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
     return;
   }
   console.log(`account:          ${accountId}`);
-  console.log(`plan:             ${plan ?? "free"}`);
+  console.log(`plan:             ${renderPlan(plan)}`);
   console.log(`web login linked: ${linked ? "yes" : "no"}`);
 }
 

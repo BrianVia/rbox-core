@@ -547,6 +547,7 @@ export class RboxDaemon {
       kind: e.kind,
       ...(e.used !== undefined ? { used: e.used } : {}),
       ...(e.cap !== undefined ? { cap: e.cap } : {}),
+      ...(e.reason === "no_plan" ? { reason: e.reason } : {}),
     };
     const prev = this.activity.outOfStorage;
     const clearsStaleQuotaHalt =
@@ -559,7 +560,8 @@ export class RboxDaemon {
       !prev ||
       prev.kind !== next.kind ||
       prev.used !== next.used ||
-      prev.cap !== next.cap;
+      prev.cap !== next.cap ||
+      prev.reason !== next.reason;
     this.activity.active = undefined;
     if (clearsStaleQuotaHalt) this.activity.halt = undefined;
     this.activity.outOfStorage = next;

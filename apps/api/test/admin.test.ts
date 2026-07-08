@@ -304,12 +304,12 @@ describe("computeAggregates — correctness against seeded D1 (delta-based)", ()
     const now = Date.now();
     const before = await computeAggregates(env, now);
 
-    // Seed two fresh accounts: one free (100 bytes, no sub), one on 'solo' with a sub
+    // Seed two fresh accounts: one no-plan (100 bytes, no sub), one on 'solo' with a sub
     // (200 bytes). One non-reclaimed each.
     const a1 = `acct_seed_${crypto.randomUUID().replace(/-/g, "")}`;
     const a2 = `acct_seed_${crypto.randomUUID().replace(/-/g, "")}`;
     await env.rbox_dev_db.batch([
-      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at, used_bytes) VALUES (?, 'a1', 'free', ?, 100)").bind(a1, now),
+      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at, used_bytes) VALUES (?, 'a1', 'none', ?, 100)").bind(a1, now),
       env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at, used_bytes, stripe_customer_id, stripe_subscription_id) VALUES (?, 'a2', 'solo', ?, 200, 'cus_seed', 'sub_seed')").bind(a2, now),
     ]);
     // Two devices on a1: one active (durable), one revoked.
@@ -335,8 +335,8 @@ describe("computeAggregates — correctness against seeded D1 (delta-based)", ()
     const live = `acct_dlive_${crypto.randomUUID().replace(/-/g, "")}`;
     const dead = `acct_ddead_${crypto.randomUUID().replace(/-/g, "")}`;
     await env.rbox_dev_db.batch([
-      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'live', 'free', ?)").bind(live, now),
-      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at, reclaimed_at) VALUES (?, 'dead', 'free', ?, ?)").bind(dead, now, now),
+      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'live', 'none', ?)").bind(live, now),
+      env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at, reclaimed_at) VALUES (?, 'dead', 'none', ?, ?)").bind(dead, now, now),
     ]);
     await env.rbox_dev_db.batch([
       // live account: one durable CLI device, one LIVE web session, one EXPIRED web session
@@ -359,7 +359,7 @@ describe("computeAggregates — correctness against seeded D1 (delta-based)", ()
     const before = await computeAggregates(env, now);
     const dead = `acct_dead_${crypto.randomUUID().replace(/-/g, "")}`;
     await env.rbox_dev_db
-      .prepare("INSERT INTO accounts (id, name, plan, created_at, used_bytes, reclaimed_at) VALUES (?, 'dead', 'free', ?, 999, ?)")
+      .prepare("INSERT INTO accounts (id, name, plan, created_at, used_bytes, reclaimed_at) VALUES (?, 'dead', 'none', ?, 999, ?)")
       .bind(dead, now, now)
       .run();
     const after = await computeAggregates(env, now);

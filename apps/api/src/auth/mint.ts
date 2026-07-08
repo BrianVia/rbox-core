@@ -92,12 +92,11 @@ function deviceCapFor(env: Env, plan: string | null | undefined): number {
   return env.RBOX_ENV === "dev" ? Infinity : planFor(plan).devices;
 }
 
-/** accounts.plan for the cap (account-data plane). The legacy 'default' account (which may
- *  have no `accounts` row) and a missing row both resolve to 'free'. */
+/** accounts.plan for the cap (account-data plane). Missing rows fail closed. */
 async function readPlan(env: Env, accountId: string): Promise<string> {
-  if (accountId === "default") return "free";
+  if (accountId === "default") return "none";
   const row = await dbFor(env, accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
-  return row?.plan ?? "free";
+  return row?.plan ?? "none";
 }
 
 /** Count of an account's durable, non-revoked device credentials. */

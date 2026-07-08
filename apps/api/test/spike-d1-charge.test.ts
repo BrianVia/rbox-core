@@ -51,7 +51,7 @@ async function mkAccount(id: string, capBytes: number) {
   await db()
     .prepare(
       `INSERT INTO accounts(id, plan, created_at, used_bytes, extra_storage_bytes, cap_bytes)
-       VALUES (?, 'free', ?, 0, 0, ?)`,
+       VALUES (?, 'pro', ?, 0, 0, ?)`,
     )
     .bind(id, NOW, capBytes)
     .run();
@@ -213,12 +213,12 @@ describe("§30 cap_bytes is materialized on insert (0016 trigger)", () => {
   const capOf = async (id: string) =>
     Number((await db().prepare("SELECT cap_bytes FROM accounts WHERE id=?").bind(id).first())!.cap_bytes);
 
-  it("a tenant insert omitting cap_bytes gets its plan cap (free=2GiB), guard active", async () => {
-    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('t1','free',?)").bind(NOW).run();
-    expect(await capOf("t1")).toBe(2 * 1024 * 1024 * 1024);
-    // and the guard is now live: a charge over 2GiB aborts
+  it("a tenant insert omitting cap_bytes gets its plan cap (none=1B), guard active", async () => {
+    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('t1','none',?)").bind(NOW).run();
+    expect(await capOf("t1")).toBe(1);
+    // and the guard is now live: a charge over 1 byte aborts
     await expect(
-      db().batch(commitBatch("t1", [{ sha: "big", size: 3 * 1024 * 1024 * 1024 }])),
+      db().batch(commitBatch("t1", [{ sha: "big", size: 2 }])),
     ).rejects.toThrow(/over_cap|ABORT|constraint/i);
   });
 
@@ -228,7 +228,7 @@ describe("§30 cap_bytes is materialized on insert (0016 trigger)", () => {
   });
 
   it("the platform 'default' account stays cap_bytes=0 (deliberate unlimited)", async () => {
-    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('default','free',?)").bind(NOW).run();
+    await db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('default','none',?)").bind(NOW).run();
     expect(await capOf("default")).toBe(0);
   });
 });

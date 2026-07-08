@@ -44,10 +44,16 @@ describe("rbox subscribe", () => {
   test("opens a checkout bound to this account with the durable bearer", async () => {
     stub(() => ({ status: 200, body: { url: "https://checkout.stripe/cs_1" } }));
     await subscribe("pro");
-    expect(calls[0]!.url).toBe("https://api.test/v1/billing/checkout?plan=pro");
+    expect(calls[0]!.url).toBe("https://api.test/v1/billing/checkout?plan=pro&cadence=monthly");
     expect((calls[0]!.init!.headers as Record<string, string>).authorization).toBe("Bearer durable-token");
     expect(calls[0]!.init!.method).toBe("POST");
     expect(logs.join("\n")).toContain("https://checkout.stripe/cs_1");
+  });
+
+  test("--annual opens annual checkout", async () => {
+    stub(() => ({ status: 200, body: { url: "https://checkout.stripe/cs_annual" } }));
+    await subscribe("solo", { annual: true });
+    expect(calls[0]!.url).toBe("https://api.test/v1/billing/checkout?plan=solo&cadence=annual");
   });
 
   test("a missing plan is a usage error and never calls the API", async () => {

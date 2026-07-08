@@ -150,9 +150,22 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   if (len > SINGLE_PUT_MAX) return json({ error: "too_large", message: "use multipart", maxSingle: SINGLE_PUT_MAX }, 413);
   if (!req.body) return json({ error: "bad_request", message: "missing body" }, 400);
 
-  // §23.2 (v2, direct-write) — receipts protocol: ~R2-only. Write the CANONICAL blob key
-  // directly (R2 verifies the sha) + return a receipt minted only after R2 accepts. ZERO D1:
-  // no blobs/blob_refs/used_bytes/gc_candidates writes, no quota read. Accounting (charge +
+  // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
+  // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
+  // §33: wouldExceedCap is entitlement-aware — a re-upload forced by the candidate-aware
+  // "missing" (a prune-marked but still-owned ref) charges 0 at grant, so it returns over:false
+  // for an already-entitled sha, letting an at/over-cap account re-establish + un-mark a ref it
+  // already paid for. The grant's cap-guard trigger is the authoritative gate.
+  const pre = await wouldExceedCap(op.env, accountId, sha, len);
+  if (pre.over) {
+    op.done("quota_exceeded", { bytes: len });
+    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap, ...(pre.reason ? { reason: pre.reason } : {}) }, 402);
+  }
+
+  // §23.2 (v2, direct-write) — receipts protocol: R2-dominant. Write the CANONICAL blob key
+  // directly (R2 verifies the sha) + return a receipt minted only after R2 accepts. After
+  // the quota precheck above, this does no blobs/blob_refs/used_bytes/gc_candidates writes.
+  // Accounting (charge +
   // grant + present=1) moves to commit (§23.4) as a pure D1 batch — NO staging→canonical
   // promote. Dropping the promote removes the serial O(N) commit phase that made §23 regress
   // at scale (measured: 2000-file promote = 19s). Single-user reality makes the canonical-
@@ -171,17 +184,6 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
     return json({ ok: true, sha256: sha, ...written });
   }
 
-  // Fail-fast over-cap (design 13 G4): refuse BEFORE writing R2 so a downgraded /
-  // over-cap account can't stage orphan bytes. The finalize grant stays authoritative.
-  // §33: wouldExceedCap is entitlement-aware — a re-upload forced by the candidate-aware
-  // "missing" (a prune-marked but still-owned ref) charges 0 at grant, so it returns over:false
-  // for an already-entitled sha, letting an at/over-cap account re-establish + un-mark a ref it
-  // already paid for. The grant's cap-guard trigger is the authoritative gate.
-  const pre = await wouldExceedCap(op.env, accountId, sha, len);
-  if (pre.over) {
-    op.done("quota_exceeded", { bytes: len });
-    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
-  }
   let obj: R2Object;
   try {
     obj = await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), req.body!, { sha256: sha }));
@@ -194,7 +196,7 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
   const grant = await grantEntitlementWithQuota(op.env, accountId, sha, obj.size); // verified upload → quota-checked read access
   if (!grant.granted) {
     op.done("quota_exceeded", { bytes: obj.size });
-    return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap }, 402);
+    return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap, ...(grant.reason ? { reason: grant.reason } : {}) }, 402);
   }
   op.done("ok", { bytes: obj.size });
   return json({ ok: true, sha256: sha, sizeBytes: obj.size });
@@ -254,7 +256,7 @@ export async function multipartInit(req: Request, env: Env, sha: string, account
   const pre = await wouldExceedCap(op.env, accountId, sha, size);
   if (pre.over) {
     op.done("quota_exceeded", { bytes: size });
-    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap }, 402);
+    return json({ error: "quota_exceeded", used: pre.used, cap: pre.cap, ...(pre.reason ? { reason: pre.reason } : {}) }, 402);
   }
 
   // Best-effort GC of our own expired upload state.
@@ -385,7 +387,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     const grant = await grantEntitlementWithQuota(op.env, accountId, sha, bytes);
     if (!grant.granted) {
       outcome = "quota_exceeded";
-      return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap }, 402);
+      return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap, ...(grant.reason ? { reason: grant.reason } : {}) }, 402);
     }
     outcome = "ok";
     return json({ ok: true, sha256: sha, sizeBytes: bytes });

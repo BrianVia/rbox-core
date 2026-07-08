@@ -109,11 +109,11 @@ describe("rbox status — account section", () => {
     expect(out).toMatch(/linked:\s*yes/i);
   });
 
-  test("ok: an API without the plan field degrades to `free`, not a failure", async () => {
+  test("ok: an API without the plan field degrades to no active plan, not a failure", async () => {
     stub(() => ({ status: 200, body: { accountId: "acct_old", linked: false } }));
     const summary = await fetchAccountSummary();
-    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "free", linked: false } });
-    expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*free/i);
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "none", linked: false } });
+    expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*no active plan/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/linked:\s*no/i);
   });
 

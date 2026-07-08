@@ -24,7 +24,7 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   if (env.RBOX_ALLOW_BOOTSTRAP_PLAN === "1" && body.plan !== undefined && !requestedPlan) {
     return json({ error: "bad_plan" }, 400);
   }
-  const plan = env.RBOX_ALLOW_BOOTSTRAP_PLAN === "1" && requestedPlan ? requestedPlan : "free";
+  const plan = env.RBOX_ALLOW_BOOTSTRAP_PLAN === "1" && requestedPlan ? requestedPlan : "none";
   const now = Date.now();
   const accountId = `acct_${randomHex(8)}`;
   const userId = `user_${randomHex(8)}`;
@@ -40,6 +40,6 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");
   // §32 Tier 1 business ping (best-effort, never throws/blocks) — a new tenant via the
   // CLI bootstrap path. Fires after the account is durably created.
-  await pingNewAccount(env, { accountId, origin: "bootstrap", ...(plan !== "free" ? { plan } : {}) });
+  await pingNewAccount(env, { accountId, origin: "bootstrap", ...(plan !== "none" ? { plan } : {}) });
   return json({ token, deviceId, accountId });
 }

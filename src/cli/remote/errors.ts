@@ -70,8 +70,10 @@ function networkMessage(op: string, cause: unknown, rerunHint: string): string {
 }
 
 export type QuotaKind = "storage" | "workspaces";
+export type QuotaReason = "no_plan";
 
-function quotaMessage(kind: QuotaKind, used?: number, cap?: number): string {
+function quotaMessage(kind: QuotaKind, used?: number, cap?: number, reason?: QuotaReason): string {
+  if (reason === "no_plan") return "No active plan — run `rbox subscribe`.";
   if (kind === "workspaces") {
     const detail = cap !== undefined ? `plan allows ${cap.toLocaleString("en-US")}` : "plan limit reached";
     return `Workspace limit reached — ${detail}. Upgrade with \`rbox subscribe solo\` for unlimited workspaces.`;
@@ -85,9 +87,10 @@ export class QuotaExceededError extends Error {
   constructor(
     public readonly kind: QuotaKind,
     public readonly used?: number,
-    public readonly cap?: number
+    public readonly cap?: number,
+    public readonly reason?: QuotaReason
   ) {
-    super(quotaMessage(kind, used, cap));
+    super(quotaMessage(kind, used, cap, reason));
     this.name = "QuotaExceededError";
   }
 }
@@ -111,7 +114,8 @@ export async function readQuotaExceeded(res: Response): Promise<{ quota: QuotaEx
   const body = jsonObject(text);
   if (body?.error !== "quota_exceeded") return { quota: null, text };
   const kind: QuotaKind = body.limit === "workspaces" ? "workspaces" : "storage";
-  return { quota: new QuotaExceededError(kind, finite(body.used), finite(body.cap)), text };
+  const reason = body.reason === "no_plan" ? "no_plan" : undefined;
+  return { quota: new QuotaExceededError(kind, finite(body.used), finite(body.cap), reason), text };
 }
 
 /** Distinguish R2's convergent-encryption hash guard (`{"error":"sha_mismatch"}`) from any

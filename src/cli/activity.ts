@@ -76,7 +76,7 @@ export interface DaemonActivity {
     terminal?: { fingerprint: string };
   };
   /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
-  outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number };
+  outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number; reason?: "no_plan" };
 }
 
 /** An `active` entry older than this is ignored by status (stale = daemon died mid-op). */
@@ -180,13 +180,15 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       typeof out.at === "string" &&
       (out.kind === "storage" || out.kind === "workspaces") &&
       (out.used === undefined || num(out.used)) &&
-      (out.cap === undefined || num(out.cap))
+      (out.cap === undefined || num(out.cap)) &&
+      (out.reason === undefined || out.reason === "no_plan")
     ) {
       a.outOfStorage = {
         at: out.at,
         kind: out.kind,
         ...(out.used !== undefined ? { used: out.used } : {}),
         ...(out.cap !== undefined ? { cap: out.cap } : {}),
+        ...(out.reason === "no_plan" ? { reason: out.reason } : {}),
       };
     }
     return a;

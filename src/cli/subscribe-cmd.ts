@@ -13,10 +13,32 @@ import { openAndShow } from "./browser-open.js";
  */
 
 const PLANS = ["solo", "pro"] as const;
+export type SubscribePlan = (typeof PLANS)[number];
+export type BillingCadence = "monthly" | "annual";
+
+function normalizePlan(plan: string | undefined): SubscribePlan {
+  if (!plan) throw new Error(`usage: rbox subscribe <plan>  (one of: ${PLANS.join(", ")})`);
+  if (!(PLANS as readonly string[]).includes(plan)) throw new Error(`unknown plan "${plan}" — choose one of: ${PLANS.join(", ")}`);
+  return plan as SubscribePlan;
+}
+
+export async function checkoutUrl(plan: SubscribePlan, cadence: BillingCadence = "monthly"): Promise<string | "already_subscribed"> {
+  const c = await requireCredentials();
+  const q = new URLSearchParams({ plan, cadence });
+  const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?${q}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${c.token}` },
+  });
+  if (res.status === 409) return "already_subscribed";
+  if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
+  if (!res.ok) throw new Error(`subscribe failed: ${res.status} ${await res.text()}`);
+  const { url } = (await res.json()) as { url: string };
+  if (!url) throw new Error("subscribe failed: checkout returned no URL");
+  return url;
+}
 
 /** `rbox subscribe [plan]` — open a Stripe checkout bound to THIS account. */
-export async function subscribe(plan: string | undefined): Promise<void> {
-  if (!plan) throw new Error(`usage: rbox subscribe <plan>  (one of: ${PLANS.join(", ")})`);
+export async function subscribe(plan: string | undefined, opts: { annual?: boolean } = {}): Promise<void> {
   // Team is a real roadmap item, presented everywhere as "coming soon" (design 63 §C).
   // Match that framing here instead of the generic unknown-plan error; the server
   // rejects it too (non-purchasable), so this is purely a friendlier client message.
@@ -24,21 +46,12 @@ export async function subscribe(plan: string | undefined): Promise<void> {
     console.log("Team plans are coming soon — solo and pro are available today.");
     return;
   }
-  if (!(PLANS as readonly string[]).includes(plan)) throw new Error(`unknown plan "${plan}" — choose one of: ${PLANS.join(", ")}`);
-  const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?plan=${encodeURIComponent(plan)}`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${c.token}` },
-  });
-  if (res.status === 409) {
+  const url = await checkoutUrl(normalizePlan(plan), opts.annual ? "annual" : "monthly");
+  if (url === "already_subscribed") {
     // already_subscribed — not an error; the account already pays. Point at the portal.
-    const body = (await res.json().catch(() => ({}))) as { plan?: string };
-    console.log(`You're already subscribed${body.plan ? ` (plan: ${body.plan})` : ""}. Manage or change it with \`rbox billing\`.`);
+    console.log("You're already subscribed. Manage or change it with `rbox billing`.");
     return;
   }
-  if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
-  if (!res.ok) throw new Error(`subscribe failed: ${res.status} ${await res.text()}`);
-  const { url } = (await res.json()) as { url: string };
   openAndShow(url, "Opening your browser to complete checkout...", "Open this URL in your browser to complete checkout:");
 }
 
