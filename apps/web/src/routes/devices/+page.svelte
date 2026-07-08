@@ -10,7 +10,7 @@
 		type Device,
 		type Workspace
 	} from '$lib/api';
-	import { relativeTime, errMsg } from '$lib/format';
+	import { relativeTime, errMsg, friendlyErr } from '$lib/format';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { Switch } from '$lib/components/ui/switch';
@@ -44,10 +44,6 @@
 		loading = false;
 	});
 
-	function friendly(m: string): string {
-		return m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
-	}
-
 	async function loadDevices(cursor: string | null = null) {
 		if (!authState.clerk) return;
 		try {
@@ -59,7 +55,7 @@
 			devicesCursor = pageRes.nextCursor;
 			devicesError = '';
 		} catch (e) {
-			devicesError = friendly(errMsg(e));
+			devicesError = friendlyErr(e);
 		}
 	}
 
@@ -71,7 +67,7 @@
 			workspacesCursor = pageRes.nextCursor;
 			workspacesError = '';
 		} catch (e) {
-			workspacesError = friendly(errMsg(e));
+			workspacesError = friendlyErr(e);
 		}
 	}
 

@@ -114,6 +114,16 @@ export interface Page<T> {
 	nextCursor: string | null;
 }
 
+export interface ApiKey {
+	deviceId: string;
+	label: string | null;
+	displayPrefix: string;
+	createdAt: number;
+	lastSeenAt: number | null;
+	expiresAt: number;
+	revoked: boolean;
+}
+
 export async function fetchDevices(
 	clerk: Clerk,
 	opts: { include?: 'cli' | 'all'; cursor?: string | null } = {}
@@ -126,6 +136,14 @@ export async function fetchDevices(
 	if (!res.ok) throw new Error(`devices failed (${res.status})`);
 	const data = (await res.json()) as { devices: Device[]; nextCursor: string | null };
 	return { items: data.devices, nextCursor: data.nextCursor };
+}
+
+export async function fetchApiKeys(clerk: Clerk): Promise<ApiKey[]> {
+	const res = await authed(clerk, '/v1/keys/api');
+	if (res.status === 404 || res.status === 501) throw new Error('WEB_AUTH_NOT_ENABLED');
+	if (!res.ok) throw new Error(`api keys failed (${res.status})`);
+	const data = (await res.json()) as { keys: ApiKey[] };
+	return data.keys;
 }
 
 export async function fetchWorkspaces(
@@ -157,6 +175,15 @@ export async function revokeDevice(clerk: Clerk, deviceId: string): Promise<void
 	});
 	if (res.status === 403) throw new Error('You don’t have permission to revoke this device.');
 	if (res.status === 404) throw new Error('That device no longer exists.');
+	if (!res.ok) throw new Error(`revoke failed (${res.status})`);
+}
+
+export async function revokeApiKey(clerk: Clerk, deviceId: string): Promise<void> {
+	const res = await authed(clerk, `/v1/keys/api/${encodeURIComponent(deviceId)}/revoke`, {
+		method: 'POST'
+	});
+	if (res.status === 403) throw new Error('You don’t have permission to revoke this key.');
+	if (res.status === 404) throw new Error('That key no longer exists.');
 	if (!res.ok) throw new Error(`revoke failed (${res.status})`);
 }
 
