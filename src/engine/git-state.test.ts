@@ -28,6 +28,8 @@ import {
   type GitArtifactRef,
   type GitSection,
 } from "./index.js";
+import { indexTreeOf } from "./git/identity.js";
+import { repoCtx } from "./git/shared.js";
 
 const exec = promisify(execFile);
 const cleanGitEnv = (extra: NodeJS.ProcessEnv = {}) =>
@@ -87,6 +89,35 @@ async function gitWithStdin(dir: string, args: string[], stdin: string): Promise
 }
 async function gitWithIndex(dir: string, indexFile: string, ...args: string[]): Promise<string> {
   return exec("git", ["-C", dir, ...args], { env: cleanGitEnv({ GIT_INDEX_FILE: indexFile }) }).then((r) => r.stdout.toString().trim());
+}
+async function resolvedIndexPath(dir: string): Promise<string> {
+  const ctx = await repoCtx(dir);
+  expect(ctx).toBeDefined();
+  return path.join(ctx!.gitDir, "index");
+}
+async function indexSnapshot(dir: string): Promise<{ path: string; ino: number; mtimeMs: number; ctimeMs: number; size: number; bytes: Buffer }> {
+  const indexPath = await resolvedIndexPath(dir);
+  const [st, bytes] = await Promise.all([fs.stat(indexPath), fs.readFile(indexPath)]);
+  return { path: indexPath, ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, bytes };
+}
+function expectSameIndexSnapshot(actual: Awaited<ReturnType<typeof indexSnapshot>>, expected: Awaited<ReturnType<typeof indexSnapshot>>): void {
+  expect(actual.path).toBe(expected.path);
+  expect(actual.ino).toBe(expected.ino);
+  expect(actual.mtimeMs).toBe(expected.mtimeMs);
+  expect(actual.ctimeMs).toBe(expected.ctimeMs);
+  expect(actual.size).toBe(expected.size);
+  expect(Buffer.compare(actual.bytes, expected.bytes)).toBe(0);
+}
+async function makeMainWithWorktree(main: string, worktree: string): Promise<void> {
+  await fs.mkdir(main, { recursive: true });
+  await initRepo(main);
+  await commitFile(main, "base.txt", "base", "c1");
+  await fs.mkdir(path.dirname(worktree), { recursive: true });
+  await git(main, "worktree", "add", worktree, "-b", "feat");
+}
+async function stageIdentityChange(dir: string, file: string): Promise<void> {
+  await fs.writeFile(path.join(dir, file), `staged ${file}`);
+  await git(dir, "add", file);
 }
 async function writeLooseBlob(repo: string, label: string, content: string): Promise<string> {
   const blobDir = path.join(tmp, "loose-blob-inputs");
@@ -656,3 +687,50 @@ test("gitIdentity is stable across captures when nothing changed (no echo)", asy
   const id3 = await gitIdentity(A);
   expect(gitIdentityKey(id3 as never)).not.toBe(gitIdentityKey(id1 as never));
 });
+
+test("gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers", async () => {
+  const dirRepo = path.join(tmp, "dir-index");
+  await fs.mkdir(dirRepo, { recursive: true });
+  await initRepo(dirRepo);
+  await commitFile(dirRepo, "base.txt", "base", "c1");
+  await stageIdentityChange(dirRepo, "staged.txt");
+
+  const main = path.join(tmp, "main-index");
+  const worktree = path.join(tmp, "root", "wt-index");
+  await makeMainWithWorktree(main, worktree);
+  await stageIdentityChange(worktree, "wt-staged.txt");
+
+  for (const repo of [dirRepo, worktree]) {
+    const before = await indexSnapshot(repo);
+    const id1 = await gitIdentity(repo);
+    const afterFirst = await indexSnapshot(repo);
+    const id2 = await gitIdentity(repo);
+    const afterSecond = await indexSnapshot(repo);
+
+    expect(/^[0-9a-f]{40}$/.test(id1!.indexTree ?? "")).toBe(true);
+    expect(gitIdentityKey(id2)).toBe(gitIdentityKey(id1));
+    expectSameIndexSnapshot(afterFirst, before);
+    expectSameIndexSnapshot(afterSecond, before);
+  }
+}, 30_000);
+
+test("indexTreeOf temp-index write-tree matches direct write-tree for staged dir and pointer repos", async () => {
+  const dirRepo = path.join(tmp, "dir-tree");
+  await fs.mkdir(dirRepo, { recursive: true });
+  await initRepo(dirRepo);
+  await commitFile(dirRepo, "base.txt", "base", "c1");
+  await stageIdentityChange(dirRepo, "staged.txt");
+
+  const main = path.join(tmp, "main-tree");
+  const worktree = path.join(tmp, "root", "wt-tree");
+  await makeMainWithWorktree(main, worktree);
+  await stageIdentityChange(worktree, "wt-staged.txt");
+
+  for (const repo of [dirRepo, worktree]) {
+    const ctx = await repoCtx(repo);
+    expect(ctx).toBeDefined();
+    const viaTempIndex = await indexTreeOf(ctx!);
+    const direct = await git(repo, "write-tree");
+    expect(viaTempIndex).toBe(direct);
+  }
+}, 30_000);

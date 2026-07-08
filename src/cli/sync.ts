@@ -19,6 +19,7 @@ import {
 import {
   applyGitSections,
   formatGitApplyMetrics,
+  formatGitPlanStats,
   formatGitPushLine,
   gitBaseAfterCommit,
   gitForceForMissingBlobs,
@@ -523,7 +524,10 @@ async function runPushAttempt(
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
   const gitPlan = await report.phase("git-plan", () => planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff));
-  if (report.enabled) report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
+  if (report.enabled) {
+    report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
+    if (gitPlan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: gitPlan.gitPlanStats }, formatGitPlanStats(gitPlan.gitPlanStats));
+  }
   // Schema is stamped once, at commit (stampManifestSchemaForCommit) — deriving it
   // here too would be a second copy of the rule.
   local = { ...local, gitRepos: gitPlan.gitRepos };

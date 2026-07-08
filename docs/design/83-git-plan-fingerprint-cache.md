@@ -275,15 +275,61 @@ repeats). This means a daemon-only host that never runs `rbox status` still
 self-warms after its first plan, and the status and push paths keep one shared,
 mutually-warmed cache.
 
+Field lesson (2026-07-08): identity probes are side-effect-free — `write-tree` runs against a temp index copy; otherwise the probe invalidates its own fingerprint bracket.
+
 ### 3.7 Why this is generalization, not duplication
 
 `gitFingerprint`, `CachedDivergenceProbe`, `GitDivergenceCache`, and the
 2-attempt stabilization loop are reused with one shared schema upgrade (v4,
 §3.2). The new code is (a) the shared `fingerprintHitProbe` helper with its
 memo-policy parameter, (b) the ~20-line guard at the top of the
-`planGitSections` loop, and (c) the cached-`parentRel` branch in the skip pass.
-No second cache, no forked fingerprint. One cache, two readers, two writers,
-converged by the shared prune-and-save.
+`planGitSections` loop, (c) the cached-`parentRel` branch in the skip pass, and
+(d) the post-gate baseless-pointer pre-skip in §3.8. No second cache, no forked
+fingerprint. One cache, two readers, two writers, converged by the shared
+prune-and-save.
+
+### 3.8 Baseless-pointer pre-skip (post-gate extension)
+
+Phase-0 on the real workspace found a second pointer floor after the base-carry
+fast path landed: discovery sees **153 repos**, but the manifest has only **98
+base sections**. Of the 55 baseless repos, **48 are linked-worktree pointers**.
+The cold planner still runs the full per-repo identity path for those pointers,
+about 13 subprocesses each, even though the design-68 skip pass later discards
+them because their in-tree parent already authored a section. That is roughly
+48 x 13 subprocesses and about **11s** of the measured **15.0s** `git-plan`
+phase.
+
+The skip outcome for these repos is parent-determined, not identity-determined:
+once the repo is a discovered pointer with no base/pending/conflict/removal
+suppression, design-68 §3.3 only asks whether `parentRel` is non-empty and
+whether that parent is in `sectioned`. If yes, the baseless pointer is never
+authored (`delete out[rel]`), gets a `skipped` reason, and is removed from
+capture. Its identity is unused.
+
+Mechanism: in the main loop, a repo that fails only the `baseSec` guard
+(`!force`, no pending, no needs-resolution, no removal memory, discovered
+`kind === "pointer"`, and no base section) attempts `fingerprintHitProbe`. On a
+trusted hit whose cached probe is plannable-clean (`!busy`, `preflightOk`,
+`!preflightStructural`, valid `preflightKind`) and has a non-empty
+`probe.parentRel`, the planner defers the repo into a `pendingPointerPreSkips`
+list instead of spawning. After the loop, when `sectioned` is known, the planner
+checks the cached parent:
+
+- parent in `sectioned`: apply the exact design-68 skip mutation
+  (`skippedRelPaths.add`, no emitted section for a baseless pointer, same
+  skipped reason, no removal-memory or needs-resolution edits) and increment
+  `pointerPreSkips`;
+- parent not in `sectioned`: fall back to the original per-repo slow path at
+  that point, including preflight, identity, admission, capture/defer behavior,
+  and cache write-back.
+
+The provenance argument is the same as §3.5 / §9.4: the trusted fingerprint that
+justifies using cached `identityKey` also justifies cached `parentRel`, because
+both are derived from the same fingerprinted repo ctx, `.git` pointer, and
+common-dir worktree state. The fail-safe shape is unchanged: a miss,
+untrusted/racy hit, busy or structural probe, invalid kind, absent parentRel,
+forced repo, pending repo, needs-resolution repo, removal-memory repo, or
+non-sectioned parent routes to the unchanged spawn path.
 
 ## 4. Correctness - what the fingerprint must cover for a skip to be safe
 
@@ -383,12 +429,18 @@ touched.** Add, under `RBOX_METRICS=1`, to the existing `git-plan` phase record
 - `fpHits` / `fpMisses` — repos served from the fingerprint cache vs spawned,
   with `fpUntrusted` counted separately (hash matched but the margin rule
   refused — the racy-window signal).
+- `pointerPreSkips` — baseless linked-worktree pointers skipped from a trusted
+  cached `parentRel` before identity/preflight spawning. In the measured
+  workspace, `fpHits` (base-section carries) plus `pointerPreSkips` (baseless
+  pointer skips) covers the optimized repo set.
 - `spawnedRepos` — repos that ran the full preflight/identity sequence (the
   residual floor), and `parentRelCached` — pointer repos whose design-68 skip
   used the cached parentRel.
 - `carried` / `captured` counts are already in the plan; surface them here so
-  the phase line reads `git-plan repos=98 fpHits=98 spawned=0 carried=98
-  captured=0` in the steady state and `spawned=N` whenever a real change lands.
+  the phase line reads `git-plan repos=153 fpHits=98 pointerPreSkips=48
+  spawned=7 carried=98 captured=0` on the measured warm workspace: the
+  base+pointer set has zero spawns, while discovered-but-ignored dir repos can
+  legitimately remain on the spawn path (measured: 7).
 
 This makes the section 7 gate self-evidencing and turns any future regression
 (hit-rate collapse) into a visible metric rather than a silent slowdown.
@@ -402,11 +454,15 @@ are being gated in sequence, so schedule this design's window accordingly.
 
 1. **Mac warm no-change git-plan (gate 1): PASS if** a no-op `RBOX_METRICS=1
    rbox push` (no touch, second run after the v4 warming run) reports
-   `git-plan` **≤ 4s** (from 24-25s), with `fpHits=98`, `spawned=0` — including
-   pointer repos, which §3.5 makes reachable. Target rationale: the remaining
-   floor is the `discoverGitRepos` tree walk (~2.3s Mac, §8.7) plus 98
-   fingerprints at fs-stat + tiny-read cost; > 8s means investigate before
-   merge.
+   `git-plan` **≤ 4s** (from 24-25s), with base sections covered by `fpHits`
+   and baseless worktree pointers covered by `pointerPreSkips` (measured:
+   roughly `fpHits=98`, `pointerPreSkips=48`). `spawned=0` is expected for that
+   base+pointer set; total `spawnedRepos` may still include
+   discovered-but-ignored dir repos that legitimately need the slow path
+   (measured: 7 on the real workspace). Target rationale: the remaining floor
+   is the `discoverGitRepos` tree walk (~2.3s Mac, §8.7) plus fingerprints at
+   fs-stat + tiny-read cost and the ignored-dir tail; > 8s means investigate
+   before merge.
 2. **Linux warm no-change git-plan (gate 2): PASS if** the same run on the wired
    replica reports `git-plan` **≤ 1.5s** (from ~2.3s). The Linux floor is
    already small; the win is proportionally smaller but must not regress.

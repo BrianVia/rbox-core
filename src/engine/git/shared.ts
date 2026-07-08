@@ -35,7 +35,7 @@ export async function git(root: string, args: string[], opts: { maxBuffer?: numb
   return stdout.toString().trim();
 }
 
-async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+export async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   gitSpawnObserver?.(root, args);
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
