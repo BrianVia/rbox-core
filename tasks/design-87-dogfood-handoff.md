@@ -88,7 +88,7 @@ this over ssh.
   apply is serial per repo — possible parallelism win, one for the perf
   backlog).
 - On-disk: 7.1GB vs 44.9GiB account `used_bytes` (history + git lanes +
-  GC-eligible) — see design 88 (usage decomposition) and the GC review task
+  GC-eligible) — see design 89 (usage decomposition, doc pending) and the GC review task
   (~2026-07-15): 111.8GiB total in R2, ~67GiB unreferenced, purge never run
   (`POST /v1/admin/gc?phase=purge` is manual-only; hourly cron is Phase 1
   only).
