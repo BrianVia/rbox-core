@@ -1,4 +1,4 @@
--- Design 83: paid-only accounts.
+-- Design 86: paid-only accounts.
 -- Replace the old free tier with the locked `none` state and materialize its
 -- one-byte storage cap in the cap sync triggers.
 

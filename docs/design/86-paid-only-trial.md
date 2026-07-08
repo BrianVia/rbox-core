@@ -1,4 +1,4 @@
-# Design 83: Paid-only plans, 14-day card-upfront trial, annual billing
+# Design 86: Paid-only plans, 14-day card-upfront trial, annual billing
 
 **Status:** 🟡 In progress
 **Depends on:** design 07b (billing), design 13 (billing grace)
