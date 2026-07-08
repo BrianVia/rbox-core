@@ -6,6 +6,26 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.13] — 2026-07-08 — join/populate reliability (design-87 dogfood fixes)
+
+### Fixed
+- **Populate pulls can no longer hang silently on a lost blob completion.**
+  Request-level settlement tracking in the batch downloader, size-aware total
+  deadlines on every blob fetch, and a stream-progress-aware stall watchdog:
+  90s of no progress logs the outstanding blobs and retries them (fail-silent
+  duplicates — a failing retry never kills a request the primary may still
+  deliver); persistent stalls fail loudly with a resume hint. Resume already
+  re-fetched exactly the missing blobs.
+- **Keyed setup persists credentials** (mode 600), so `--daemon` joins survive
+  the invoking shell and reboots; `rbox key materialize` remains env-only.
+- **`rbox status` and the prompt are honest during an initial populate**:
+  a versioned populate marker renders "initial sync in progress — N/M files"
+  instead of claiming 120k phantom local changes with sync not running.
+
+New env knobs (documented in docs/development.md):
+`RBOX_PULL_JOIN_WATCHDOG_MS`, `RBOX_PULL_JOIN_WATCHDOG_MAX_FIRINGS`,
+`RBOX_NET_BLOB_MIN_TIMEOUT_MS`, `RBOX_NET_BLOB_MAX_TIMEOUT_MS`.
+
 ## [0.9.12] — 2026-07-08 — ambient sync status (design 88)
 
 ### Added
