@@ -11,6 +11,11 @@ import path from "node:path";
 // targets are validated on native CI runners (design §41 §6).
 
 const ROOT = path.resolve(import.meta.dir, "..", "..");
+// Any `bun build --compile` whose graph reaches engine/index needs the crypto-worker
+// bundle present (design 81 §3: build scripts own the pre-bundle step — this test IS
+// a build script). Fresh checkouts don't have the generated artifact; create it.
+const { buildCryptoWorkerBundle } = await import(path.join(ROOT, "scripts", "build-crypto-worker.ts"));
+buildCryptoWorkerBundle();
 const PARCEL_PKG: Record<string, string> = {
   "darwin-arm64": "@parcel/watcher-darwin-arm64",
   "linux-arm64": "@parcel/watcher-linux-arm64-glibc",

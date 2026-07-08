@@ -111,6 +111,10 @@ function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<Daem
 beforeEach(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-json-output-"));
   process.env.RBOX_HOME = path.join(tmp, "home");
+  // The crypto DTO asserts jobsRun/workerExecutions, which are process-global —
+  // crypto-pool tests running earlier in the same process leave them non-zero.
+  const { __cryptoPoolTestHooks } = await import("../engine/crypto-pool.js");
+  await __cryptoPoolTestHooks.reset();
 });
 
 afterEach(async () => {
