@@ -21,7 +21,10 @@ const BATCH_STATUS_MAX_BYTES = 4 * 1024;
 const DEFAULT_BATCH_RECORDS = 32;
 const DEFAULT_BATCH_BODY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BATCH_SLOTS = 16;
-const DEFAULT_BATCH_PUT_SLOTS = 8;
+// measured 2026-07-08 — Workers cap parallel subrequests per invocation (~6),
+// so one batch PUT settles in ~910ms regardless of records; slots scale linearly
+// (8 slots = 83s publish, 24 slots = 39s on the A/B corpus; AE avg_ms constant at both).
+const DEFAULT_BATCH_PUT_SLOTS = 24;
 const FLUSH_DELAY_MS = 10;
 const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
 const SINGLE_FALLBACK_CONCURRENCY = 128;

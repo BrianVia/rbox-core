@@ -308,13 +308,13 @@ export async function encryptAndUpload(
           const uploadEncSha = f.encSha!;
           byteTracker.reviseTotal(uploadEncSha, size);
           emitUploadProgress();
-          const timingOwnedByRemote = LANE_TIMING && api.ownsUploadLaneTiming?.(size) === true;
-          const t0 = LANE_TIMING && !timingOwnedByRemote ? performance.now() : 0;
+          const callerOwnsLaneTiming = LANE_TIMING && api.ownsUploadLaneTiming?.(size) !== true;
+          const t0 = callerOwnsLaneTiming ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
             emitUploadProgress();
           });
-          if (LANE_TIMING && !timingOwnedByRemote) {
+          if (callerOwnsLaneTiming) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
             uploadLaneTiming.blobs++;
             uploadLaneTiming.bytes += size;
