@@ -134,7 +134,7 @@ describe("POST /v1/diagnostics", () => {
 
   test("failed R2 put best-effort deletes its pending row so quota is not consumed", async () => {
     const a = await bootstrap("diag-r2-fail");
-    const principal: Principal = { accountId: a.accountId, deviceId: a.deviceId, userId: a.ownerUserId, role: "owner", kind: "durable" };
+    const principal: Principal = { accountId: a.accountId, deviceId: a.deviceId, userId: a.ownerUserId, role: "owner", kind: "device" };
     const res = await createDiagnosticsReport(env, principal, req(bundle()), Date.now(), {
       putReport: async () => {
         throw new Error("r2 down");

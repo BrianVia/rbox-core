@@ -5,6 +5,20 @@ import { ipKey, rateLimited } from "../ratelimit.js";
 // Never cache a 404 (a cached 404 could mask a just-published object on the
 // edge — design 14 U7).
 const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+const SHELL_HEADERS = { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300, stale-while-revalidate=3600" };
+const AGENT_SH = `#!/bin/sh
+set -eu
+
+if ! command -v rbox >/dev/null 2>&1; then
+  curl -fsSL --proto '=https' https://rbox.to/install.sh | sh
+  # install.sh drops the binary in ~/.rbox/bin and persists PATH only for NEW
+  # shells; a child sh can't mutate ours, so extend PATH here or the exec
+  # would 127 on the exact machine this script exists for (fresh agent VM).
+  PATH="\${RBOX_INSTALL_DIR:-\${HOME}/.rbox/bin}:\${PATH}"
+fi
+
+exec rbox setup "$@"
+`;
 
 /**
  * Public release distribution (design 14), served from the SEPARATE rbox_releases
@@ -17,6 +31,11 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
   const releaseLimited = () => rateLimited(env.RL_RELEASE, `rl:${ipKey(req)}`);
 
   // `curl -fsSL https://api.rbox.to/install.sh | sh`
+  if (url.pathname === "/agent.sh" && req.method === "GET") {
+    const limited = await releaseLimited();
+    if (limited) return limited;
+    return new Response(AGENT_SH, { headers: SHELL_HEADERS });
+  }
   if (url.pathname === "/install.sh" && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
@@ -53,7 +72,7 @@ export async function cachedReleaseResponse(url: URL, env: Env): Promise<Respons
   if (url.pathname === "/install.sh") {
     const obj = await env.rbox_releases.get("releases/install.sh");
     if (!obj) return releaseNotFound();
-    return new Response(obj.body, { headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300, stale-while-revalidate=3600" } });
+    return new Response(obj.body, { headers: SHELL_HEADERS });
   }
 
   const seg = url.pathname.split("/").filter(Boolean);

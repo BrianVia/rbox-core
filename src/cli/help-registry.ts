@@ -50,7 +50,16 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "setup",
     group: "GETTING STARTED",
     summary: "guided onboarding: account → workspace → start syncing",
-    usage: "rbox setup",
+    usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
+    flags: [
+      { flag: "--workspace <name|id>", desc: "with RBOX_KEY, sync an existing workspace non-interactively" },
+      { flag: "--dir <path>", desc: "target directory for keyed setup" },
+      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
+      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
+      { flag: "--daemon", desc: "after the first pull, start background sync" },
+      { flag: "--pull-only", desc: "with --daemon, never push local changes" },
+      { flag: "--force", desc: "allow a non-empty target directory" },
+    ],
     examples: ["rbox setup"],
   },
   {
@@ -101,7 +110,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "start",
     group: "SYNCING",
     summary: "start background sync for this workspace",
-    usage: "rbox start [path]",
+    usage: "rbox start [path] [--pull-only]",
+    flags: [{ flag: "--pull-only", desc: "watch remote changes without pushing local changes" }],
   },
   {
     name: "stop",
@@ -142,8 +152,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "sync",
     group: "SYNCING",
     summary: "sync once (pull, then push)",
-    usage: "rbox sync [path] [--allow-mass-delete]",
-    flags: [{ flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" }],
+    usage: "rbox sync [path] [--allow-mass-delete] [--pull-only]",
+    flags: [
+      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
+      { flag: "--pull-only", desc: "pull remote changes and skip the push phase" },
+    ],
   },
   {
     name: "push",
@@ -330,8 +343,8 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "key",
     group: "DEVICES & ACCOUNT",
-    summary: "encryption status / recovery phrase tools",
-    usage: "rbox key <status [--json] | backup | genesis>",
+    summary: "encryption and agent sync keys",
+    usage: "rbox key <status | backup | genesis | create-ci | materialize | list | revoke>",
     flags: [
       { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
@@ -348,6 +361,37 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
     ],
+  },
+  {
+    name: "key create-ci",
+    group: "DEVICES & ACCOUNT",
+    summary: "create an agent/CI sync key bundle",
+    usage: "rbox key create-ci --expires <dur> [--label <text>] [--accept-root-key]",
+    flags: [
+      { flag: "--expires <dur>", desc: "required; suggested 90d, maximum 1y" },
+      { flag: "--label <text>", desc: "dashboard label" },
+      { flag: "--accept-root-key", desc: "skip the interactive account-root warning confirmation" },
+    ],
+  },
+  {
+    name: "key materialize",
+    group: "DEVICES & ACCOUNT",
+    summary: "unpack RBOX_KEY into the local keystore",
+    usage: "rbox key materialize [--dir <path>]",
+    flags: [{ flag: "--dir <path>", desc: "RBOX_HOME directory to write (default: standard location)" }],
+  },
+  {
+    name: "key list",
+    group: "DEVICES & ACCOUNT",
+    summary: "list agent/CI sync keys",
+    usage: "rbox key list [--json]",
+    flags: [{ flag: "--json", desc: "print JSON" }],
+  },
+  {
+    name: "key revoke",
+    group: "DEVICES & ACCOUNT",
+    summary: "revoke an agent/CI sync key",
+    usage: "rbox key revoke <id>",
   },
 
   // ── BILLING & MAINTENANCE ────────────────────────────────────────────────

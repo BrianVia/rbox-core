@@ -1,5 +1,9 @@
 import { test, expect } from "bun:test";
-import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES } from "./setup-cmd.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
+import { resolveKeyedWorkspace, ensureKeyedTargetDir } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
@@ -121,4 +125,47 @@ test("resolveEnrollment: existing key world keeps the current three choices and 
     { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
   ]);
   expect(err[0]).toBe("\n⚠  This machine is authorized (acct_setup) but NOT yet enrolled for encryption. Enroll it now:\n");
+});
+
+test("keyed setup workspace resolver accepts id, exact name, and slug; unknown lists available names", () => {
+  const rows = [
+    { workspaceId: "ws_alpha", projectId: "root", name: "Alpha App", createdAt: 1 },
+    { workspaceId: "ws_beta", projectId: "root", name: "Beta App", createdAt: 2 },
+  ];
+  expect(resolveKeyedWorkspace("ws_alpha", rows).workspaceId).toBe("ws_alpha");
+  expect(resolveKeyedWorkspace("Beta App", rows).workspaceId).toBe("ws_beta");
+  expect(resolveKeyedWorkspace("alpha-app", rows).workspaceId).toBe("ws_alpha");
+  expect(resolveKeyedWorkspace("ws_rawidnotlisted", rows)).toEqual({ workspaceId: "ws_rawidnotlisted", projectId: "root", name: null });
+  expect(() => resolveKeyedWorkspace("missing", rows)).toThrow(/Available: Alpha App, Beta App/);
+});
+
+test("keyed setup workspace resolver rejects ambiguous names by demanding an id", () => {
+  const rows = [
+    { workspaceId: "ws_one", projectId: "root", name: "Same", createdAt: 1 },
+    { workspaceId: "ws_two", projectId: "root", name: "Same", createdAt: 2 },
+  ];
+  expect(() => resolveKeyedWorkspace("Same", rows)).toThrow(/ambiguous/);
+});
+
+test("keyed setup target guard refuses non-empty dirs unless forced", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-keyed-"));
+  await fs.writeFile(path.join(tmp, "file.txt"), "x");
+  await expect(ensureKeyedTargetDir(tmp, false)).rejects.toThrow(/not empty/);
+  await expect(ensureKeyedTargetDir(tmp, true)).resolves.toBeUndefined();
+  await fs.rm(tmp, { recursive: true, force: true });
+});
+
+test("keyed setup rejects literal --key values before any interactive work", async () => {
+  await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app", key: "secret" } })).rejects.toThrow(/argv leaks secrets/);
+});
+
+test("keyed setup requires key input when --workspace is present", async () => {
+  const oldKey = process.env.RBOX_KEY;
+  delete process.env.RBOX_KEY;
+  try {
+    await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app" } })).rejects.toThrow(/--workspace requires a key/);
+  } finally {
+    if (oldKey === undefined) delete process.env.RBOX_KEY;
+    else process.env.RBOX_KEY = oldKey;
+  }
 });

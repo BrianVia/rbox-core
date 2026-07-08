@@ -44,7 +44,7 @@ async function bootstrap(name: string): Promise<{ token: string; accountId: stri
 }
 
 function ownerPrincipal(accountId: string, userId: string, deviceId: string): Principal {
-  return { deviceId, accountId, userId, role: "owner", kind: "durable" };
+  return { deviceId, accountId, userId, role: "owner", kind: "device" };
 }
 const delReq = (confirm: unknown) => new Request(`${BASE}/v1/account`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm }) });
 const count = async (sql: string, ...binds: unknown[]) => Number((await db().prepare(sql).bind(...binds).first<{ n: number }>())!.n);

@@ -18,6 +18,7 @@ import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedH
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags } from "./flags.js";
+import { readStdinTrimmed } from "./read-stdin.js";
 
 const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
@@ -133,7 +134,7 @@ async function main(): Promise<void> {
     }
     case "setup": {
       const { runSetup } = await import("./setup-cmd.js");
-      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags });
       break;
     }
     case "track": {
@@ -270,7 +271,7 @@ async function main(): Promise<void> {
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true" });
+      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true", pullOnly: flags["pull-only"] === "true" });
       break;
     }
     case "export": {
@@ -298,7 +299,7 @@ async function main(): Promise<void> {
       break;
     }
     case "start": {
-      await startDaemonAndRecordDesired(await resolveRoot(positional[0]));
+      await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { pullOnly: flags["pull-only"] === "true" });
       break;
     }
     case "stop": {
@@ -336,9 +337,7 @@ async function main(): Promise<void> {
       //   rbox pair        # on a signed-in machine → prints the token
       //   echo <token> | rbox connect
       const { redeemPair } = await import("./auth-cmd.js");
-      const chunks: Buffer[] = [];
-      for await (const c of process.stdin) chunks.push(c as Buffer);
-      const token = Buffer.concat(chunks).toString("utf8").trim();
+      const token = await readStdinTrimmed();
       if (!token) throw new Error("no pairing token on stdin (pipe the token from `rbox pair`)");
       await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
       break;
@@ -380,11 +379,17 @@ async function main(): Promise<void> {
       break;
     }
     case "key": {
-      if (positional[0] === "status") await keyStatus({ json: jsonMode });
-      else if (positional[0] === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
-      else if (positional[0] === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
+      const sub = positional[0];
+      if (sub === "status") await keyStatus({ json: jsonMode });
+      else if (sub === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
+      else if (sub === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
       else {
-        fail("usage: rbox key <status | backup | genesis --yes> [--kit] [--kit-path <path>]");
+        const { createCiKey, materializeCmd, listKeys, revokeKey } = await import("./key-cmd.js");
+        if (sub === "create-ci") await createCiKey(flags);
+        else if (sub === "materialize") await materializeCmd(flags);
+        else if (sub === "list") await listKeys({ json: jsonMode });
+        else if (sub === "revoke") await revokeKey(positional[1] ?? "");
+        else fail("usage: rbox key <status | backup | genesis --yes | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
     }
@@ -453,7 +458,7 @@ async function main(): Promise<void> {
           await runFrontDoor(target.root);
         } else {
           const { runSetup } = await import("./setup-cmd.js");
-          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE });
+          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {} });
         }
         break;
       }

@@ -24,6 +24,7 @@ export interface DesiredDaemonState {
   accountId: string;
   workspaceId: string;
   at: string;
+  pullOnly?: boolean;
 }
 
 export interface DesiredStateRow {
@@ -47,6 +48,7 @@ interface CommonDeps {
 
 interface DesiredDeps extends CommonDeps {
   now?: () => Date;
+  pullOnly?: boolean;
 }
 
 interface StartStopDeps extends DesiredDeps {
@@ -147,6 +149,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
       accountId: v.accountId,
       workspaceId: v.workspaceId,
       at: v.at,
+      ...(v.pullOnly === true ? { pullOnly: true } : {}),
     };
   } catch {
     return undefined;
@@ -166,6 +169,7 @@ async function desiredContext(root: string, state: DesiredDaemonStateValue, deps
     accountId,
     workspaceId,
     at: (deps.now ?? (() => new Date()))().toISOString(),
+    ...(deps.pullOnly === true ? { pullOnly: true } : {}),
   };
 }
 
@@ -186,7 +190,7 @@ async function readDesiredRecord(filePath: string): Promise<DesiredDaemonState |
 
 export async function startDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
   const record = await desiredContext(root, "running", deps);
-  const result = await (deps.startDaemon ?? startDaemon)(record.rootPath);
+  const result = await (deps.startDaemon ?? startDaemon)(record.rootPath, { pullOnly: deps.pullOnly === true });
   if (result === "started" || result === "already-running") await writeDesiredRecord(record);
 }
 
@@ -224,8 +228,8 @@ async function staleReason(root: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function desiredRunningRoots(accountId: string): Promise<string[]> {
-  return (await autostartWorkspaceStatuses(accountId)).filter((row) => row.status === "running").map((row) => row.rootPath);
+async function desiredRunningRows(accountId: string): Promise<AutostartWorkspaceStatus[]> {
+  return (await autostartWorkspaceStatuses(accountId)).filter((row) => row.status === "running");
 }
 
 async function statusForDesiredRow(row: DesiredStateRow, currentAccountId?: string): Promise<AutostartWorkspaceStatus> {
@@ -270,8 +274,8 @@ export async function bootResume(deps: BootResumeDeps = {}): Promise<void> {
     return;
   }
   const starter = deps.startDaemon ?? startDaemon;
-  for (const root of await desiredRunningRoots(creds.accountId)) {
-    await starter(root);
+  for (const row of await desiredRunningRows(creds.accountId)) {
+    await starter(row.rootPath, { pullOnly: row.pullOnly === true });
   }
 }
 

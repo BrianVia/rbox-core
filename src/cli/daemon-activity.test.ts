@@ -141,7 +141,7 @@ function testConfig(): WorkspaceConfig {
 
 async function makeDaemon(remote: MiniRemote, bootId = "boot-test"): Promise<DaemonInternals> {
   const cfg = testConfig();
-  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, bootId) as unknown as DaemonInternals;
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId }) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
   daemon.manifest = await scanManifest(root);
   await daemon.loadSyncBase();

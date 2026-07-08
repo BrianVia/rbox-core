@@ -261,8 +261,11 @@ export function forceKill(pid: number): void {
 }
 
 export type StartDaemonResult = "started" | "already-running" | "retry-later";
+export interface StartDaemonOptions {
+  pullOnly?: boolean;
+}
 
-export async function startDaemon(root: string): Promise<StartDaemonResult> {
+export async function startDaemon(root: string, opts: StartDaemonOptions = {}): Promise<StartDaemonResult> {
   const existing = readPid(root);
   if (existing && isOurDaemon(existing, root)) {
     // A live daemon is only "already running" if it's bound to the CURRENT workspace.
@@ -310,7 +313,7 @@ export async function startDaemon(root: string): Promise<StartDaemonResult> {
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: ["ignore", out, out],
-    env: { ...process.env, [DAEMON_BOOT_ID_ENV]: bootId },
+    env: { ...process.env, [DAEMON_BOOT_ID_ENV]: bootId, RBOX_DAEMON_PULL_ONLY: opts.pullOnly ? "1" : "0" },
   });
   child.unref();
   fs.closeSync(out);

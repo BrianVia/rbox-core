@@ -40,10 +40,10 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 | 17 | [Account devices/workspaces list](./17-account-devices-workspaces.md) | 🔴 NOT STARTED | P1, P2 | read-only dashboard list; new `GET /v1/account/devices\|workspaces` |
 | 18 | [Support email routing](./18-support-email-routing.md) | ✅ SHIPPED (2026-06-30) | — | `support@`/`postmaster@`/`security@` → Gmail via CF Email Routing; migrated off Namecheap; catch-all Drop |
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
-| 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🔴 NOT STARTED | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
+| 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🟢 BUILT (v1 beta) | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
 | 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | ✅ SHIPPED (PR #2, prod) | — | web↔CLI link (`rbox account link`) + `rbox subscribe` + re-point saga; closes P2 & P4; unblocks 16/17/19 |
 | 86 | [Paid-only plans, trial, annual billing](./86-paid-only-trial.md) | ✅ SHIPPED (2026-07-08, PR #159) | 07b, 13 | remove free tier; locked `none` state; 14-day Stripe trial; annual prices |
-| 87 | [Agent sync keys](./87-agent-sync-keys.md) | 🔴 NOT STARTED | 20, P3 | `RBOX_KEY` + keyed `rbox setup --workspace` for ephemeral agent VMs; beta pre-P3, **GA gated on P3** |
+| 87 | [Agent sync keys](./87-agent-sync-keys.md) | 🟢 BUILT (v1 beta) | 20, P3 | `RBOX_KEY` + keyed `rbox setup --workspace` for ephemeral agent VMs; beta pre-P3, **GA gated on P3** |
 
 ## Cross-cutting prerequisites (gate the 16–21 batch)
 
@@ -52,7 +52,7 @@ Surfaced independently across multiple specs — these are the real foundation w
 - **P1 — `device_id` uniqueness. ✅ DONE** (migration `0013`, commit `5ef4ba2`). Resolved as a **global** `UNIQUE(device_id)` — reconciles with the E2EE `device_keys` global PK (stricter than the per-account form first proposed here); ids widened to 128-bit; `mintDevice` retries on collision. _Note: 16/17's "non-unique" body language is now stale._
 - **P2 — web↔CLI account link. ✅ DONE** (doc **21**, shipped PR #2). `rbox account link` binds a Clerk identity onto the real CLI-born account; `rbox subscribe` lets the CLI pay directly onto it. CLI-born accounts are now linkable/manageable from the dashboard.
 - **P3 — E2EE epoch *rotation operation* isn't built.** Full E2EE is merged and epoch *enforcement* works, but no operation bumps the epoch + re-wraps MK for survivors + signs a new roster (genesis writes epoch 0; `e2ee-remote.ts:146` "v1 has no rotation"). So `revoked=1` blocks *new* access but a leaked credential still decrypts *existing* data.
-- **P4 — credential-kind route gating. ✅ DONE** (shipped with doc 21, PR #2). `Principal.kind` is derived from `expires_at`, and a default-deny route policy 403s `kind=='web'` tokens on every durable-credential-mint / crypto / sync route — closing the "an ephemeral web session can mint permanent access" gap.
+- **P4 — credential-kind route gating. ✅ DONE** (shipped with doc 21, PR #2; hardened by doc 87). `Principal.kind` is stored explicitly on `devices.kind` with an `expires_at` fallback only for legacy rows, and a default-deny route policy 403s non-durable tokens on durable-credential-mint / crypto / sync routes — closing the "an ephemeral web session can mint permanent access" gap.
 
 ## What remains undone
 

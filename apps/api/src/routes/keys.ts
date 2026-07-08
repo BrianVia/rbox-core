@@ -1,4 +1,5 @@
 import { eq, type RouteCtx } from "./shared.js";
+import { createApiKey, listApiKeys, revokeApiKey } from "../auth.js";
 import { admitDevice, appendKeyState, appendRoster, bootstrapAccountKeys, getAccountKeys, getWorkspaceKeys, putDeviceKeys, putWorkspaceKey } from "../keys.js";
 import type { Principal } from "../authz.js";
 
@@ -10,6 +11,9 @@ import type { Principal } from "../authz.js";
  */
 export async function keysRoutes({ req, env, seg }: RouteCtx, p: Principal): Promise<Response | null> {
   if (seg[0] === "v1" && seg[1] === "keys") {
+    if (req.method === "POST" && eq(seg, ["v1", "keys", "api"])) return createApiKey(env, p, await req.json().catch(() => ({})));
+    if (req.method === "GET" && eq(seg, ["v1", "keys", "api"])) return listApiKeys(env, p);
+    if (req.method === "POST" && seg.length === 5 && seg[2] === "api" && seg[4] === "revoke") return revokeApiKey(env, p, seg[3]!);
     if (req.method === "POST" && eq(seg, ["v1", "keys", "bootstrap"])) return bootstrapAccountKeys(env, p, await req.json().catch(() => ({})));
     if (req.method === "GET" && eq(seg, ["v1", "keys", "account"])) return getAccountKeys(env, p);
     if (req.method === "POST" && eq(seg, ["v1", "keys", "device"])) return putDeviceKeys(env, p, await req.json().catch(() => ({})));

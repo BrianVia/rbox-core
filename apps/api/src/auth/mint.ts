@@ -93,7 +93,7 @@ function deviceCapFor(env: Env, plan: string | null | undefined): number {
 }
 
 /** accounts.plan for the cap (account-data plane). Missing rows fail closed. */
-async function readPlan(env: Env, accountId: string): Promise<string> {
+export async function readPlan(env: Env, accountId: string): Promise<string> {
   if (accountId === "default") return "none";
   const row = await dbFor(env, accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
   return row?.plan ?? "none";
@@ -154,11 +154,11 @@ export async function prepareMintDevice(
   // while `devices` is directory-plane — one binding at N=1, a cross-plane coupling under sharding.
   const insert = dirDb(env)
     .prepare(
-      `INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO devices (token_hash, device_id, label, account_id, user_id, created_at, expires_at, kind)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL) OR ? = 'default'`,
     )
-    .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt, accountId, accountId);
+    .bind(tokenHash, deviceId, label, accountId, userId, Date.now(), expiresAt, expiresAt === null ? "device" : "web", accountId, accountId);
   return { token, tokenHash, deviceId, insert };
 }
 

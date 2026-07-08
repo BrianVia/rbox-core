@@ -50,9 +50,9 @@ interface SafetyInternals {
   reloadWorkspaceConfigIfChanged(): Promise<void>;
 }
 
-function makeDaemon(root: string): SafetyInternals {
+function makeDaemon(root: string, opts: { pullOnly?: boolean } = {}): SafetyInternals {
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  return new RboxDaemon(root, cfg as never, {} as never) as unknown as SafetyInternals;
+  return new RboxDaemon(root, cfg as never, {} as never, opts) as unknown as SafetyInternals;
 }
 
 test("watcher events mark churn AND pull a backed-off timer forward (codex R1)", async () => {
@@ -80,6 +80,28 @@ test("watcher events mark churn AND pull a backed-off timer forward (codex R1)",
     // the armed 5m timer. The timer must be re-armed at the floor immediately.
     expect(daemon.safetyDelay).toBe(FLOOR);
     expect(daemon.safetyTimer).not.toBe(armedBefore);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pull-only daemon watcher path never queues push", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root, { pullOnly: true });
+  let deliver: ((events: unknown[]) => void) | undefined;
+  daemon.startWatcherFn = (_root, _matcher, cb) => {
+    deliver = cb;
+    return Promise.resolve({ close: async () => {} });
+  };
+  daemon.pumping = true;
+
+  try {
+    await daemon.startLiveWatch();
+    deliver!([{ type: "update", path: path.join(root, "a.txt") }]);
+    expect(daemon.want.push).toBe(false);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);

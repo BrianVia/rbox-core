@@ -360,6 +360,7 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], nowMs: 
     // directory plane:
     dir.prepare("DELETE FROM pairing_tokens WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM device_auth WHERE account_id = ?").bind(a),
+    dir.prepare("DELETE FROM api_keys WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM devices WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM memberships WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM users WHERE account_id = ?").bind(a),

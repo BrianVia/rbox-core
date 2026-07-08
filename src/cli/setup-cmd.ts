@@ -36,6 +36,7 @@ import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prom
 import { stderrStyle as e } from "./style.js";
 import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
 import { openAndShow } from "./browser-open.js";
+import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -78,7 +79,16 @@ const HR = "─".repeat(72);
 
 // ── the guided flow ───────────────────────────────────────────────────────────
 
-export async function runSetup(opts: { cwd: string; defaultRemote: string }): Promise<void> {
+export async function runSetup(opts: { cwd: string; defaultRemote: string; flags?: Record<string, string> }): Promise<void> {
+  const flags = opts.flags ?? {};
+  if (flags.key && flags.key !== "true" && flags.key !== "-") {
+    throw new Error("refusing --key=<value>: argv leaks secrets via shell history and process listings. Use RBOX_KEY, --key-file <path>, or --key -.");
+  }
+  if (flags.workspace) {
+    if (!hasKeyInput(flags)) throw new Error("--workspace requires a key: set RBOX_KEY or pass --key-file/--key -");
+    await runKeyedSetup(opts.cwd, opts.defaultRemote, flags);
+    return;
+  }
   if (process.stdin.isTTY !== true) {
     process.stderr.write(
       "rbox setup is interactive. For scripts/CI use `rbox init` " +

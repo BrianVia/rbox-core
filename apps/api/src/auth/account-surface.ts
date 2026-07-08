@@ -2,6 +2,7 @@ import type { Env } from "../env.js";
 import { json } from "../util.js";
 import type { Principal } from "../authz.js";
 import { dbFor, dirDb } from "../db.js";
+import { classifyKind } from "./authenticate.js";
 
 // ── /devices dashboard surface (design 22 §2) ────────────────────────────────
 // Account-scoped, web-facing, camelCase, secret-free projections of the devices &
@@ -58,6 +59,7 @@ interface DeviceRow {
   created_at: number;
   last_seen_at: number | null;
   expires_at: number | null;
+  kind: string | null;
 }
 
 /** GET /v1/account/devices?include=cli|all&limit&cursor — the caller's devices. */
@@ -85,20 +87,23 @@ export async function accountDevices(env: Env, p: Principal, url: URL): Promise<
   binds.push(limit + 1); // +1 sentinel → is there a next page?
 
   const rows = await dirDb(env)
-    .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, expires_at FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, expires_at, kind FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
     .bind(...binds)
     .all<DeviceRow>();
   const { page, nextCursor } = keysetPage(rows.results, limit);
 
   return json({
-    devices: page.map((r) => ({
-      deviceId: r.device_id,
-      label: r.label === null ? null : r.label.slice(0, DEVICE_LABEL_MAX),
-      kind: r.expires_at === null ? "cli" : "web", // the ONLY projection of expires_at
-      createdAt: r.created_at,
-      lastSeenAt: r.last_seen_at,
-      isCurrent: r.device_id === p.deviceId,
-    })),
+    devices: page.map((r) => {
+      const kind = classifyKind(r.kind, r.expires_at);
+      return {
+        deviceId: r.device_id,
+        label: r.label === null ? null : r.label.slice(0, DEVICE_LABEL_MAX),
+        kind: kind === "device" ? "cli" : kind,
+        createdAt: r.created_at,
+        lastSeenAt: r.last_seen_at,
+        isCurrent: r.device_id === p.deviceId,
+      };
+    }),
     nextCursor,
   });
 }

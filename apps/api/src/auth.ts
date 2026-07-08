@@ -32,5 +32,8 @@ export { startDeviceAuth, pollDeviceAuth, approveDeviceAuth, lookupDeviceAuth } 
 // CLI device management (list / revoke).
 export { listDevices, revokeDevice } from "./auth/devices.js";
 
+// API/agent sync key management.
+export { createApiKey, listApiKeys, revokeApiKey } from "./auth/api-keys.js";
+
 // Web dashboard surface (design 22 §2): account-scoped device & workspace projections.
 export { accountDevices, accountWorkspaces } from "./auth/account-surface.js";

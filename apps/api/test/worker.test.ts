@@ -1042,7 +1042,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
     // diagnostics_reports blocks fail-closed: only DEVICE principals can create reports, so a
     // "web shell" holding one is not the empty shell the destructive reclaim assumes.
-    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports"];
+    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports", "api_keys"];
     const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates"]; // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient GC marker
     // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
     // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
@@ -1311,7 +1311,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
       delete (env as { STRIPE_SECRET?: string }).STRIPE_SECRET;
     }
   }
-  const durablePrincipal = (a: { accountId: string; deviceId: string }, userId = "user_x"): Principal => ({ deviceId: a.deviceId, accountId: a.accountId, userId, role: "owner", kind: "durable" });
+  const durablePrincipal = (a: { accountId: string; deviceId: string }, userId = "user_x"): Principal => ({ deviceId: a.deviceId, accountId: a.accountId, userId, role: "owner", kind: "device" });
   const setBilling = (id: string, cust: string, sub: string, plan = "pro") =>
     env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ? WHERE id = ?").bind(cust, sub, plan, id).run();
   const billingOf = (id: string) =>

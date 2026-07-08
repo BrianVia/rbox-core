@@ -15,7 +15,7 @@ import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceCon
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
-import { push, sync } from "./sync.js";
+import { pull, push, sync } from "./sync.js";
 import { resolveInitPlan, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
@@ -238,6 +238,19 @@ async function executeInitPlan(
       for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
     } catch (e) {
       sp.fail("initial sync failed");
+      throw e;
+    }
+  } else if (plan.firstSync === "pull") {
+    const sp = spinner("pulling from remote");
+    try {
+      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+      const actions = await pull(plan.root, authed, deps);
+      sp.stop();
+      const conflicts = actions.filter((a) => a.kind === "conflict");
+      const writes = actions.filter((a) => a.kind === "write").length;
+      console.log(`${style.bold("pulled")}: ${style.green(`${writes} written`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")}`);
+    } catch (e) {
+      sp.fail("initial pull failed");
       throw e;
     }
   }

@@ -67,3 +67,41 @@ export async function pairCreate(ctx: RemoteContext, body: { tokenId: string; mk
   if (!r.ok) throw new Error(translateRemoteError(r.status, "pair/create failed", await r.text(), "pairing token not found"));
   return (await r.json()) as { token: string };
 }
+
+// ---- agent/API key management --------------------------------------------
+
+export interface CreateApiKeyBody {
+  tokenHash: string;
+  deviceId: string;
+  expiresAt: number;
+  label?: string;
+  displayPrefix: string;
+  enrolled: true;
+}
+
+export interface ApiKeyRow {
+  deviceId: string;
+  label: string | null;
+  displayPrefix: string;
+  createdAt: number;
+  lastSeenAt: number | null;
+  expiresAt: number;
+  revoked: boolean;
+}
+
+export async function createApiKey(ctx: RemoteContext, body: CreateApiKeyBody): Promise<{ deviceId: string; expiresAt: number }> {
+  const r = await ctx.postJson("/v1/keys/api", body, { retries: 0, op: "creating an agent key" });
+  if (!r.ok) throw new Error(translateRemoteError(r.status, "key create failed", await r.text(), "agent key route not found"));
+  return (await r.json()) as { deviceId: string; expiresAt: number };
+}
+
+export async function listApiKeys(ctx: RemoteContext): Promise<ApiKeyRow[]> {
+  const r = await ctx.fetch(`${ctx.baseUrl}/v1/keys/api`, { headers: ctx.auth }, { op: "listing agent keys" });
+  if (!r.ok) throw new Error(translateRemoteError(r.status, "key list failed", await r.text(), "agent key route not found"));
+  return ((await r.json()) as { keys: ApiKeyRow[] }).keys;
+}
+
+export async function revokeApiKey(ctx: RemoteContext, deviceId: string): Promise<void> {
+  const r = await ctx.postJson(`/v1/keys/api/${encodeURIComponent(deviceId)}/revoke`, {}, { retries: 0, op: "revoking an agent key" });
+  if (!r.ok) throw new Error(translateRemoteError(r.status, "key revoke failed", await r.text(), "agent key not found"));
+}
