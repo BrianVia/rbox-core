@@ -843,7 +843,7 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
 
   const j = report.toJSON();
   // Every coarse push phase was timed (scan from push(), the rest from pushManifest).
-  expect(Object.keys(j.phases).sort()).toEqual(["commit", "encrypt", "scan", "upload"]);
+  expect(Object.keys(j.phases).sort()).toEqual(["address", "commit", "encrypt", "git-plan", "missing", "scan", "state-load", "state-save", "upload"]);
   expect(j.files).toBe(1);
   expect(j.blobs).toBe(1);
   // Bases attributed to the right phase: plaintext on scan, ciphertext/changed on
@@ -869,7 +869,7 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   await pull(root, cfg, { remote, backoff: noBackoff, report });
 
   const j = report.toJSON();
-  expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "scan", "state-save"]);
+  expect(Object.keys(j.phases).sort()).toEqual(["apply", "cache-save", "git-apply", "latest", "scan", "state-load", "state-save"]);
   expect(j.blobs).toBe(1); // one write action applied
   expect(j.phases.apply!.plaintextBytes).toBe(Buffer.byteLength(content));
   expect(j.phases["git-apply"]!.count).toBe(0);

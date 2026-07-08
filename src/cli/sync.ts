@@ -166,8 +166,9 @@ async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promis
 }
 
 async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored: boolean): Promise<Manifest> {
+  const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
-  const state = await loadState(root, syncStreamId(cfg));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const local = await scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps));
   await save();
   return local;
@@ -187,7 +188,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = await loadState(root, syncStreamId(cfg));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = matcherForState(root, cfg, state);
   const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
@@ -323,7 +324,7 @@ export async function push(
 ): Promise<{ sequence: number; committed: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
-  const state = await loadState(root, syncStreamId(cfg));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps)));
   await save();
@@ -454,7 +455,11 @@ async function runPushAttempt(
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).
   const api = deps.remote ?? apiFor(cfg);
-  const state = await loadState(root, syncStreamId(cfg));
+  // Needed before the no-op short-circuit (state-load/git-plan are phased, design 82
+  // §4); §35's "a no-op tick allocates nothing" still holds — disabled() is a shared
+  // free singleton, not a per-attempt allocation.
+  const report = deps.report ?? PhaseReport.disabled("push");
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
   const scannedFilePaths = new Set(local.files.filter((f) => f.type === "file").map((f) => f.path));
 
@@ -480,7 +485,8 @@ async function runPushAttempt(
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff);
+  const gitPlan = await report.phase("git-plan", () => planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff));
+  if (report.enabled) report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
   // Schema is stamped once, at commit (stampManifestSchemaForCommit) — deriving it
   // here too would be a second copy of the rule.
   local = { ...local, gitRepos: gitPlan.gitRepos };
@@ -511,20 +517,18 @@ async function runPushAttempt(
         !same(gitPlan.gitNeedsResolution, state.gitNeedsResolution) ||
         !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
     ) {
-      await saveState(root, {
+      await report.phase("state-save", () => saveState(root, {
         stream: syncStreamId(cfg),
         lastSyncedSequence: state.lastSyncedSequence,
         lastSyncedManifest: state.lastSyncedManifest,
         gitReposRemoved: gitPlan.gitReposRemoved,
         gitNeedsResolution: gitPlan.gitNeedsResolution,
         gitPendingRemote: gitPlan.gitPendingRemote,
-      });
+      }));
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: state.lastSyncedSequence, manifest: local, committed: false } };
   }
-  // Constructed AFTER the no-op short-circuit so a no-op tick allocates nothing (§35).
-  const report = deps.report ?? PhaseReport.disabled("push");
   // §10 forensic line — only when git-sync did something beyond a steady carry.
   if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
     (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan));
@@ -608,14 +612,14 @@ async function runPushAttempt(
   // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
   // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
   const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, state.lastSyncedManifest.gitRepos);
-  await saveState(root, {
+  await report.phase("state-save", () => saveState(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: res.sequence!,
     lastSyncedManifest: { ...committed, gitRepos: stateGit },
     gitReposRemoved: gitPlan.gitReposRemoved,
     gitNeedsResolution: gitPlan.gitNeedsResolution,
     gitPendingRemote: gitPlan.gitPendingRemote,
-  });
+  }));
   if (deferred.size > 0) reportDeferred(deferred);
   return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
 }

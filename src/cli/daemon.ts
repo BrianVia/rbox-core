@@ -523,7 +523,9 @@ export class RboxDaemon {
     await this.loadSyncBase();
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
-    report?.logSummaryTo(log); // §35: silent on a no-op tick (nothing recorded)
+    report?.logSummaryTo(log); // metrics off (default): silent. With RBOX_METRICS=1 even a
+    // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
+    // invisible steady-state cost is exactly what that design instruments).
   }
 
   private terminalPushBlock(): string | undefined {

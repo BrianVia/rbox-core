@@ -164,20 +164,27 @@ export async function encryptAndUpload(
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
     const toEncrypt: FileEntry[] = [];
-    for (const f of local.files) {
-      if (f.type !== "file") continue;
-      const reuse = baseEnc.get(f.sha256);
-      if (reuse) {
-        applyCipherDescriptor(f, reuse); // unchanged → reuse ciphertext descriptor (no re-encrypt)
-        if (encryptCache.migratePath(f.sha256, f.path)) cacheWriter.schedule();
-      } else {
-        toEncrypt.push(f);
+    let carried = 0;
+    await report.phase("address", async () => {
+      for (const f of local.files) {
+        if (f.type !== "file") continue;
+        const reuse = baseEnc.get(f.sha256);
+        if (reuse) {
+          applyCipherDescriptor(f, reuse); // unchanged → reuse ciphertext descriptor (no re-encrypt)
+          if (encryptCache.migratePath(f.sha256, f.path)) cacheWriter.schedule();
+          carried++;
+        } else {
+          toEncrypt.push(f);
+        }
       }
-    }
+    });
+    report.record("address", { count: carried });
     const runCryptoAndUpload = async (poolWorkers: number | undefined): Promise<void> => {
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
       let enc = 0;
       let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
+      let cacheHits = 0;
+      let cacheMisses = 0;
       await report.phase("encrypt", async () => {
         await poolMap(toEncrypt, encryptConcurrency(poolWorkers), async (f) => {
         const t0 = LANE_TIMING ? performance.now() : 0;
@@ -190,6 +197,7 @@ export async function encryptAndUpload(
             return;
           }
           if (status === "accept") {
+            cacheHits++;
             applyCipherDescriptor(f, cached);
             ctSizeByEnc.set(cached.encSha, cached.cipherSize);
             encryptCache.record(f.sha256, { ...cached, path: f.path });
@@ -199,6 +207,7 @@ export async function encryptAndUpload(
             return;
           }
         }
+        cacheMisses++;
         let e;
         try {
           e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, encryptOpts);
@@ -227,12 +236,16 @@ export async function encryptAndUpload(
         });
       });
       report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
+      // Design 82 §4: address-cache effectiveness travels with the address phase
+      // (hits/misses are only known here, after classifyCacheHit ran per file).
+      report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
 
     const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
     const missingT0 = LANE_TIMING ? performance.now() : 0;
-    const missing = new Set(await api.missingBlobs(encShas));
+    const missing = new Set(await report.phase("missing", () => api.missingBlobs(encShas)));
     if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
-    report.blobs = encShas.length;
+    report.record("missing", { count: encShas.length });
+    if (report.enabled) report.blobs = encShas.length; // guarded: disabled reports are shared singletons
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
 
     // The files whose blob still needs uploading (their post-encrypt address is missing
