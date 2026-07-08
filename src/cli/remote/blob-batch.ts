@@ -20,7 +20,11 @@ export const DEFAULT_BATCH_RECORD_BYTES = 256 * 1024;
 const BATCH_STATUS_MAX_BYTES = 4 * 1024;
 const DEFAULT_BATCH_RECORDS = 32;
 const DEFAULT_BATCH_BODY_BYTES = 8 * 1024 * 1024;
-const DEFAULT_BATCH_SLOTS = 16;
+// measured 2026-07-08 (same subrequest-cap mechanism as PUT below): a batch GET's
+// 32 parallel R2 reads serialize ~6-wide inside one invocation (~1s/batch), so GET
+// slots scale linearly too — full-corpus wired join: 16 slots = 128s, 48 = 84s,
+// 64 = 82s (flat past the knee; the floor moves to git apply + local decrypt).
+const DEFAULT_BATCH_SLOTS = 48;
 // measured 2026-07-08 — Workers cap parallel subrequests per invocation (~6),
 // so one batch PUT settles in ~910ms regardless of records; slots scale linearly
 // (8 slots = 83s publish, 24 slots = 39s on the A/B corpus; AE avg_ms constant at both).
