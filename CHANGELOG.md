@@ -6,6 +6,37 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-07-08 — compress-before-encrypt + batched uploads
+
+### Added
+- **Compress-before-encrypt (design 79), default ON.** Blob payloads are
+  zstd-level-3 compressed before AES-GCM when it pays (≥128 bytes and >5%
+  smaller; media/archives stay raw automatically) — measured 2.17x
+  byte-weighted across a real 6 GiB workspace, 4.9x on source-heavy corpora.
+  Key/nonce derive from the sha of the exact encrypted bytes (`payloadSha`),
+  so raw blobs stay bit-identical to 0.9.6 and nonce reuse is impossible by
+  construction. Compressed manifests stamp `manifestSchema: 4`; older clients
+  refuse them with one loud "upgrade rbox" error (validation now runs at the
+  manifest decode boundary, covering pull, versions, and restore alike).
+  Decompression is capped at each entry's declared size. Opt-out:
+  `RBOX_COMPRESS=0` (new encryptions only). **Upgrade all machines in a
+  workspace (and restart daemons) before the first push from this version.**
+- **Batched blob uploads (design 80).** Small ciphertexts ride
+  `POST /v1/blob-batch/put` — up to 32 per request, receipts-only, parallel
+  R2 server-side with per-record results, receipts preserved via
+  `Promise.allSettled`. The client coalescer mirrors the download side
+  (same-sha waiter coalescing, pull-first dispatch with a 10ms tail flush,
+  single-PUT fallback on old servers / per-record failures); the upload pool
+  scales to 512 when batching. Kills the measured ~125 blobs/s per-request
+  upload floor. Kill switch: `RBOX_BATCH_BLOBS=0`.
+
+### Performance
+- The design-79 A/B that motivated both features (17.5k files / 570 MB,
+  WiFi): compression cut wire bytes 79% while walls stayed flat — proving
+  small-blob transfer is request-bound, not byte-bound. Batching removes the
+  request floor; compression then cuts the remaining bytes. Combined
+  measurements land in the design docs after the release capstone.
+
 ## [0.9.6] — 2026-07-07 — batched downloads + parallel git materialization
 
 ### Added
