@@ -176,7 +176,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       db().prepare("INSERT INTO account_notify_prefs (account_id, notify_new_device) VALUES (?, 0)").bind(A.accountId),
       db().prepare("INSERT INTO audit_log (account_id, action, at) VALUES (?, 'x', ?)").bind(A.accountId, now),
       // §5b: platform audit rows store the account id in `target` with account_id NULL.
-      db().prepare("INSERT INTO audit_log (account_id, action, target, at) VALUES (NULL, 'account.set_plan', ?, ?)").bind(`${A.accountId}:free`, now),
+      db().prepare("INSERT INTO audit_log (account_id, action, target, at) VALUES (NULL, 'account.set_plan', ?, ?)").bind(`${A.accountId}:none`, now),
       db().prepare("INSERT INTO account_link_events (clerk_user_id, to_account, method, at) VALUES (?, ?, 'cli_link', ?)").bind(clerkA, A.accountId, now),
       db().prepare("INSERT INTO account_link_codes (code_hash, poll_key, clerk_user_id, origin_account, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)").bind(`ch_${A.accountId}`, `pk_${A.accountId}`, clerkA, A.accountId, now, now + 1e6),
     ]);

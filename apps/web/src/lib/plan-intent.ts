@@ -10,22 +10,31 @@ const KEY = 'rbox_plan_intent';
 // unrelated (e.g. cli-login) doesn't get a surprise Stripe redirect.
 export const PLAN_INTENT_TTL_MS = 30 * 60 * 1000;
 
-export type PlanIntent = 'solo' | 'pro';
+export type PlanIntentPlan = 'solo' | 'pro';
+export type BillingCadence = 'monthly' | 'annual';
+export interface PlanIntent {
+	plan: PlanIntentPlan;
+	cadence: BillingCadence;
+}
 
-// Only the two paid tiers a self-serve checkout exists for. 'free'/'team'/junk/empty
-// are not stashable — team has no checkout, free has nothing to buy.
-function isPlanIntent(v: unknown): v is PlanIntent {
+// Only the two paid tiers a self-serve checkout exists for. 'none'/'team'/junk/empty
+// are not stashable — team has no checkout.
+function isPlanIntentPlan(v: unknown): v is PlanIntentPlan {
 	return v === 'solo' || v === 'pro';
+}
+
+function cadenceFor(v: unknown): BillingCadence {
+	return v === 'annual' ? 'annual' : 'monthly';
 }
 
 /** Stash a plan intent from a raw `?plan=` query value; a no-op for anything that
  *  isn't exactly 'solo' or 'pro'. A throwing sessionStorage (Safari private mode)
  *  degrades to a no-op — a funnel nicety must never break the landing page.
  *  Returns whether an intent was actually stashed. `now` is injectable for tests. */
-export function stashPlanIntent(raw: string | null, now = Date.now()): boolean {
-	if (!isPlanIntent(raw)) return false;
+export function stashPlanIntent(raw: string | null, rawCadence: string | null = null, now = Date.now()): boolean {
+	if (!isPlanIntentPlan(raw)) return false;
 	try {
-		sessionStorage.setItem(KEY, JSON.stringify({ plan: raw, at: now }));
+		sessionStorage.setItem(KEY, JSON.stringify({ plan: raw, cadence: cadenceFor(rawCadence), at: now }));
 		return true;
 	} catch {
 		return false; // storage unavailable → skip the handoff, land on the dashboard
@@ -46,9 +55,9 @@ export function consumePlanIntent(now = Date.now()): PlanIntent | null {
 	}
 	if (!v) return null;
 	try {
-		const { plan, at } = JSON.parse(v) as { plan?: unknown; at?: unknown };
+		const { plan, cadence, at } = JSON.parse(v) as { plan?: unknown; cadence?: unknown; at?: unknown };
 		if (typeof at !== 'number' || now - at > PLAN_INTENT_TTL_MS) return null;
-		return isPlanIntent(plan) ? plan : null;
+		return isPlanIntentPlan(plan) ? { plan, cadence: cadenceFor(cadence) } : null;
 	} catch {
 		return null; // legacy/garbage value — already cleared above
 	}

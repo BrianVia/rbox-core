@@ -192,8 +192,9 @@ export async function deleteAccount(
 	return res.json() as Promise<{ status: string; purgeAfter: number }>;
 }
 
-export async function startCheckout(clerk: Clerk, plan: 'solo' | 'pro'): Promise<string> {
-	const res = await authed(clerk, `/v1/billing/checkout?plan=${plan}`, { method: 'POST' });
+export async function startCheckout(clerk: Clerk, plan: 'solo' | 'pro', cadence: 'monthly' | 'annual' = 'monthly'): Promise<string> {
+	const q = new URLSearchParams({ plan, cadence });
+	const res = await authed(clerk, `/v1/billing/checkout?${q}`, { method: 'POST' });
 	if (!res.ok) throw new Error(`checkout failed (${res.status})`);
 	const { url } = (await res.json()) as { url?: string };
 	if (!url) throw new Error('checkout returned no URL');

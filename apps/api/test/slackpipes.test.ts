@@ -81,13 +81,13 @@ describe("formatNewAccount — env tag + rich web-signup line, graceful per-segm
 
   test("web signup renders email + sign-in method + plan", () => {
     expect(
-      formatNewAccount({ accountId: "acct_xyz", origin: "web", env: "prod", email: "jane@doe.com", signInMethod: "github", plan: "free" }),
-    ).toBe(":seedling: New rbox account onboarded — `acct_xyz` (web, prod) — jane@doe.com via github · plan free");
+      formatNewAccount({ accountId: "acct_xyz", origin: "web", env: "prod", email: "jane@doe.com", signInMethod: "github", plan: "none" }),
+    ).toBe(":seedling: New rbox account onboarded — `acct_xyz` (web, prod) — jane@doe.com via github · plan none");
   });
 
   test("missing email drops only the email — method + plan survive", () => {
-    expect(formatNewAccount({ accountId: "acct_1", origin: "web", env: "prod", signInMethod: "google", plan: "free" })).toBe(
-      ":seedling: New rbox account onboarded — `acct_1` (web, prod) — via google · plan free",
+    expect(formatNewAccount({ accountId: "acct_1", origin: "web", env: "prod", signInMethod: "google", plan: "none" })).toBe(
+      ":seedling: New rbox account onboarded — `acct_1` (web, prod) — via google · plan none",
     );
   });
 
@@ -113,12 +113,12 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
       origin: "web",
       email: "jane@doe.com",
       signInMethod: "github",
-      plan: "free",
+      plan: "none",
     });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe(BUSINESS);
     expect((calls[0]!.body as { text: string }).text).toBe(
-      ":seedling: New rbox account onboarded — `acct_prod` (web, prod) — jane@doe.com via github · plan free",
+      ":seedling: New rbox account onboarded — `acct_prod` (web, prod) — jane@doe.com via github · plan none",
     );
   });
 
@@ -133,7 +133,7 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
 describe("Stripe webhook business pings — fire on the right events, never bubble a failure", () => {
   test("subscription.created (paying) on an existing account → business channel, with the plan", async () => {
     const acct = `acct_sub_${crypto.randomUUID().replace(/-/g, "")}`;
-    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'x', 'free', ?)").bind(acct, Date.now()).run();
+    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'x', 'none', ?)").bind(acct, Date.now()).run();
     const calls: Call[] = [];
     recordFetch(calls);
     const res = await stripeWebhook(
@@ -167,7 +167,7 @@ describe("Stripe webhook business pings — fire on the right events, never bubb
     expect(calls.filter((c) => c.url === BUSINESS)).toHaveLength(0);
   });
 
-  test("subscription.deleted that downgrades a real account → churn ping; a no-op delete does not", async () => {
+  test("subscription.deleted that locks a real account → churn ping; a no-op delete does not", async () => {
     const acct = `acct_churn_${crypto.randomUUID().replace(/-/g, "")}`;
     await env.rbox_dev_db
       .prepare("INSERT INTO accounts (id, name, plan, created_at, stripe_customer_id, stripe_subscription_id) VALUES (?, 'c', 'solo', ?, 'cus_churn', 'sub_churn')")
@@ -175,13 +175,14 @@ describe("Stripe webhook business pings — fire on the right events, never bubb
       .run();
     const calls: Call[] = [];
     recordFetch(calls);
-    // real downgrade (matches the row) → ping
+    // real lock (matches the row) → ping
     await stripeWebhook(
       signedWebhook({ id: `evt_del_${crypto.randomUUID()}`, type: "customer.subscription.deleted", data: { object: { id: "sub_churn", customer: "cus_churn", metadata: { account_id: acct } } } }),
       pingEnv(),
       Date.now(),
     );
     expect(calls.filter((c) => c.url === BUSINESS)).toHaveLength(1);
+    expect((calls.find((c) => c.url === BUSINESS)!.body as { text: string }).text).toContain("locked (grace started");
     // stale/duplicate delete (matches nothing now — sub already cleared) → no second ping
     calls.length = 0;
     await stripeWebhook(

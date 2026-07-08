@@ -14,6 +14,10 @@ export interface AccountUsageDTO {
 
 const BAR_WIDTH = 20;
 
+function renderPlan(plan: string): string {
+  return plan === "none" ? "no active plan" : plan;
+}
+
 export async function usageCmd(opts: { json?: boolean } = {}): Promise<void> {
   const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/usage`, {
@@ -45,7 +49,7 @@ function renderUsage(u: AccountUsageDTO): string {
   const retention = u.retentionDays === 0 ? "0 days (current state only)" : `${u.retentionDays.toLocaleString("en-US")} day${u.retentionDays === 1 ? "" : "s"}`;
   const grace = u.graceUntil === null ? "none" : new Date(u.graceUntil).toISOString();
   return [
-    `plan:       ${u.plan}`,
+    `plan:       ${renderPlan(u.plan)}`,
     `storage:    ${bar}  ${storage}   (${storageNote})`,
     `workspaces: ${u.workspaces.toLocaleString("en-US")} / ${workspaceCap}`,
     `retention:  ${retention}`,

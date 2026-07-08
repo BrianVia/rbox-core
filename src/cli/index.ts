@@ -206,7 +206,7 @@ async function main(): Promise<void> {
       // PRIMARY billing path (design 21 §3.4.1): open a Stripe checkout bound to
       // THIS account's durable token — no web shell, no Clerk identity bind.
       const { subscribe } = await import("./subscribe-cmd.js");
-      await subscribe(positional[0]);
+      await subscribe(positional[0], { annual: flags.annual === "true" });
       break;
     }
     case "billing": {

@@ -25,6 +25,12 @@ import {
 } from "./commit-envelope.js";
 import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
 
+async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
+  if (overCap.reason === "no_plan") return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, reason: "no_plan" as const };
+  const row = await db.prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
+  return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, ...(row?.plan === "none" ? { reason: "no_plan" as const } : {}) };
+}
+
 /**
  * WorkspaceSync — the per-(workspace, project) Durable Object (D2).
  *
@@ -261,7 +267,7 @@ export class WorkspaceSync {
       const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
       if ("overCap" in acct) {
         emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
-        return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
+        return json(await quotaExceededBody(dbFor(op.env, accountId), accountId, acct.overCap), 402);
       }
     } else {
       // Legacy (M7): inline only — a sidecar commit was rejected above (requires receipts),
@@ -388,7 +394,7 @@ export class WorkspaceSync {
     const acct = await commitAccounting(db, accountId, newRefs, nowMs);
     if ("overCap" in acct) {
       op.done("quota_exceeded", { count: entries.length });
-      return json({ error: "quota_exceeded", used: acct.overCap.used, cap: acct.overCap.cap }, 402);
+      return json(await quotaExceededBody(db, accountId, acct.overCap), 402);
     }
     op.done("ok", { count: entries.length, ratio: entries.length ? rejected / entries.length : 0 });
     return json({ granted: newRefs.length, alreadyEntitled, rejected });

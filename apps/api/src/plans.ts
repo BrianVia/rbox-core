@@ -7,8 +7,8 @@ export interface PlanLimits {
   storageBytes: number; // base cap (extra_storage_bytes add-on is added on top)
   workspaces: number;
   projects: number;
-  /** Days of version history retained. 0 = current state only (no history) — free
-   *  tier. NOTE: not yet ENFORCED — surfaced via /v1/account/usage but no
+  /** Days of version history retained. 0 = current state only (no history) — locked
+   *  accounts. NOTE: not yet ENFORCED — surfaced via /v1/account/usage but no
    *  plan-driven prune runs it yet (see docs/design/06-versions-gc.md). */
   retentionDays: number;
   manifestBytes: number;
@@ -19,14 +19,14 @@ export interface PlanLimits {
 }
 
 export const PLANS: Record<string, PlanLimits> = {
-  free: { storageBytes: 2 * GiB, workspaces: 1, projects: 5, retentionDays: 0, manifestBytes: 16 * MiB, devices: 5 },
+  none: { storageBytes: 1, workspaces: 1, projects: 1, retentionDays: 0, manifestBytes: 16 * MiB, devices: 2 },
   solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB, devices: 10 },
   pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 25 },
   team: { storageBytes: 150 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 100 },
 };
 
 export function planFor(plan: string | null | undefined): PlanLimits {
-  return PLANS[plan ?? "free"] ?? PLANS.free!;
+  return PLANS[plan ?? "none"] ?? PLANS.none!;
 }
 
 /** §23: the materialized hard-cap (accounts.cap_bytes), = plan base + purchasable
@@ -55,14 +55,19 @@ export const PLAN_MONTHLY_CENTS: Record<string, number> = {
 /**
  * Stripe price lookup_keys per paid plan (M10/billing). We map by lookup_key —
  * stable across test/live — never by raw price id, so the same code works once
- * live prices are created with the same keys. `free` has no Stripe price.
+ * live prices are created with the same keys. `none` has no Stripe price.
  */
-export const PLAN_LOOKUP_KEYS: Record<string, string> = {
-  solo: "rbox_solo_monthly",
-  pro: "rbox_pro_monthly",
-  team: "rbox_team_seat_monthly",
+export type BillingCadence = "monthly" | "annual";
+
+export const PLAN_LOOKUP_KEYS: Record<string, Partial<Record<BillingCadence, string>>> = {
+  solo: { monthly: "rbox_solo_monthly", annual: "rbox_solo_annual" },
+  pro: { monthly: "rbox_pro_monthly", annual: "rbox_pro_annual" },
+  team: { monthly: "rbox_team_seat_monthly" },
 };
-export const EXTRA_STORAGE_LOOKUP_KEY = "rbox_extra_100gb_monthly";
+export const EXTRA_STORAGE_LOOKUP_KEYS: Record<BillingCadence, string> = {
+  monthly: "rbox_extra_100gb_monthly",
+  annual: "rbox_extra_100gb_annual",
+};
 
 /**
  * Plans a checkout may actually be opened for (design 63 §C). Separate from
@@ -78,6 +83,8 @@ export const PURCHASABLE_PLANS = new Set<string>(["solo", "pro"]);
 /** Reverse map: a subscription's price lookup_key → our plan name. */
 export function planForLookupKey(lookupKey: string | null | undefined): string | null {
   if (!lookupKey) return null;
-  for (const [plan, key] of Object.entries(PLAN_LOOKUP_KEYS)) if (key === lookupKey) return plan;
+  for (const [plan, keys] of Object.entries(PLAN_LOOKUP_KEYS)) {
+    if (Object.values(keys).includes(lookupKey)) return plan;
+  }
   return null;
 }

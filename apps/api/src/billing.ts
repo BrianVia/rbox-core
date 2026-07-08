@@ -5,13 +5,13 @@ import { audit, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
 
-/** Downgrade grace window (design 13): paid→free preserves all version history
- *  for this long before free-tier retention resumes. */
+/** Downgrade grace window (design 13): paid→locked preserves all version history
+ *  for this long before locked-state retention resumes. */
 export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
 async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null }> {
   const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null }>();
-  return { plan: r?.plan ?? "free", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
+  return { plan: r?.plan ?? "none", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
 }
 
 /** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
@@ -24,11 +24,13 @@ async function account(env: Env, accountId: string): Promise<{ plan: string; ext
  *  (NOT-EXISTS), so it can never push the account over cap — including the candidate-aware
  *  "missing" re-upload of a prune-marked but still-owned ref by an at/over-cap account. We
  *  return `over:false` for it directly, so callers need no fake-sentinel bypass. */
-export async function wouldExceedCap(env: Env, accountId: string, sha: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number }> {
+export async function wouldExceedCap(env: Env, accountId: string, sha: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number; reason?: "no_plan" }> {
   const a = await account(env, accountId);
   const cap = planFor(a.plan).storageBytes + a.extra;
+  if (a.plan === "none") return { over: true, used: a.used, cap, reason: "no_plan" };
   if (await isEntitled(env, accountId, sha)) return { over: false, used: a.used, cap };
-  return { over: cap !== Infinity && a.used + incomingSize > cap, used: a.used, cap };
+  const over = cap !== Infinity && a.used + incomingSize > cap;
+  return { over, used: a.used, cap, ...(over && a.plan === "none" ? { reason: "no_plan" as const } : {}) };
 }
 
 /**
@@ -39,8 +41,11 @@ export async function wouldExceedCap(env: Env, accountId: string, sha: string, i
  * Over quota → roll back the entitlement, return granted:false (caller 402s; the
  * canonical R2 blob is left as a GC-reclaimable orphan, never deleted).
  */
-export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number, nowMs: number = Date.now()): Promise<{ granted: boolean; used: number; cap: number }> {
+export async function grantEntitlementWithQuota(env: Env, accountId: string, sha: string, size: number, nowMs: number = Date.now()): Promise<{ granted: boolean; used: number; cap: number; reason?: "no_plan" }> {
   const db = dbFor(env, accountId);
+  const a = await account(env, accountId);
+  const cap = planFor(a.plan).storageBytes + a.extra;
+  if (a.plan === "none") return { granted: false, used: a.used, cap, reason: "no_plan" };
   // §33: the grant is ONE atomic db.batch (one D1 transaction), mirroring commitAccounting —
   // NOT a split insert-then-charge. Statement order is charge → grant → un-mark/un-condemn:
   //   1. CHARGE iff newly entitled (NOT-EXISTS, evaluated BEFORE the grant insert so it sees
@@ -72,15 +77,15 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
   } catch (e) {
     // accounts_cap_guard RAISE(ABORT,'over_cap') rolled the whole batch back → nothing granted.
     if (isOverCapAbort(e)) {
-      const a = await account(env, accountId);
-      return { granted: false, used: a.used, cap: planFor(a.plan).storageBytes + a.extra };
+      const latest = await account(env, accountId);
+      return { granted: false, used: latest.used, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
     }
     throw e;
   }
   // ONE post-batch accounts read is the authoritative used/cap (the cap-guard trigger, not an
   // upfront cap fetch, is the gate) — `cap` is derived locally from the same row, no second read.
-  const a = await account(env, accountId);
-  return { granted: true, used: a.used, cap: planFor(a.plan).storageBytes + a.extra };
+  const after = await account(env, accountId);
+  return { granted: true, used: after.used, cap: planFor(after.plan).storageBytes + after.extra };
 }
 
 /** Decrement an account's usage counter (called by GC purge per dropped entitlement). */
@@ -109,7 +114,7 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     workspaces: await countWorkspaces(env, p.accountId),
     workspaceCap: limits.workspaces === Infinity ? null : limits.workspaces,
     retentionDays: limits.retentionDays,
-    // Downgrade grace (design 13): graceUntil set on a paid→free transition; while
+    // Downgrade grace (design 13): graceUntil set on a paid→locked transition; while
     // it's in the future, history is preserved. readOnly = already at/over cap, so
     // any new upload is blocked (used+size<=cap is the grant predicate).
     graceUntil: a.graceUntil,
@@ -121,16 +126,16 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
 export async function adminSetPlan(env: Env, accountId: string, plan: string, extraGB: number, nowMs: number = Date.now()): Promise<Response> {
   if (!PLANS[plan]) return json({ error: "bad_plan", valid: Object.keys(PLANS) }, 400);
   const extra = Number.isFinite(extraGB) && extraGB >= 0 ? Math.floor(extraGB) * 1024 * 1024 * 1024 : 0;
-  if (plan === "free") {
-    // Paid→free downgrade gets the same grace stamp as the webhook path (design 13
-    // G7): same CASE predicate (only on a real paid→free transition, never re-extend
+  if (plan === "none") {
+    // Paid→locked downgrade gets the same grace stamp as the webhook path (design 13
+    // G7): same CASE predicate (only on a real paid→locked transition, never re-extend
     // an unexpired window) + clear extras. extraGB is ignored when downgrading.
     const r = await dbFor(env, accountId)
-      .prepare("UPDATE accounts SET plan = 'free', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'free' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
+      .prepare("UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'none' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
       .bind(nowMs, nowMs + GRACE_PERIOD_MS, accountId)
       .run();
-    await audit(env, null, "account.set_plan", `${accountId}:free`, accountId);
-    return json({ ok: true, accountId, plan: "free", changed: r.meta.changes });
+    await audit(env, null, "account.set_plan", `${accountId}:none`, accountId);
+    return json({ ok: true, accountId, plan: "none", changed: r.meta.changes });
   }
   const r = await dbFor(env, accountId).prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId).run();
   await audit(env, null, "account.set_plan", `${accountId}:${plan}`, accountId);

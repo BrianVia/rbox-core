@@ -6,7 +6,7 @@
 	import Loading from '$lib/components/loading.svelte';
 
 	// The plan flips on the Stripe subscription webhook, not on this browser return
-	// (SF4). Poll usage until it leaves `free`, then hand off to the dashboard — which
+	// (SF4). Poll usage until it leaves `none`, then hand off to the dashboard — which
 	// owns error display, so any failure here just breaks the poll and lets it show.
 	let done = $state(false);
 
@@ -19,7 +19,7 @@
 			while (Date.now() < deadline) {
 				try {
 					const u = await fetchUsage(clerk);
-					if (u.plan && u.plan !== 'free') break;
+					if (u.plan && u.plan !== 'none') break;
 				} catch {
 					break; // terminal — the dashboard will surface the real error
 				}

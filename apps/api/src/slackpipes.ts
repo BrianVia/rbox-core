@@ -80,7 +80,7 @@ export interface NewAccountPing {
  * PURE formatter for the new-account ping (unit-testable; the fetch/plumbing lives in
  * `pingNewAccount`). Shapes:
  *   bootstrap → `:seedling: New rbox account onboarded — \`acct_…\` (bootstrap, dev)`
- *   web       → `… (web, prod) — jane@doe.com via github · plan free`
+ *   web       → `… (web, prod) — jane@doe.com via github · plan none`
  * Every rich segment degrades independently — a missing field drops just that segment.
  */
 export function formatNewAccount(o: NewAccountPing): string {
@@ -114,5 +114,5 @@ export async function pingPaymentFailed(env: Env, o: { accountId: string | null;
 
 /** A subscription was canceled / churned (Stripe `subscription.deleted`). */
 export async function pingChurn(env: Env, o: { accountId: string | null }): Promise<void> {
-  await pingSlackpipes(env, "business", `:wave: Subscription canceled — account \`${o.accountId ?? "unknown"}\` downgraded to free (grace started, ${envTag(env)})`);
+  await pingSlackpipes(env, "business", `:wave: Subscription canceled — account \`${o.accountId ?? "unknown"}\` locked (grace started, ${envTag(env)})`);
 }

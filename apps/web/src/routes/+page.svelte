@@ -11,13 +11,14 @@
 	// signed-out buyers (before the Clerk redirect dance) and already-signed-in ones
 	// (before redirectIfSignedIn below). Stash the intent here, ahead of either
 	// redirect, so the dashboard can pick it up and auto-start checkout.
-	if (stashPlanIntent(page.url.searchParams.get('plan'))) {
+	if (stashPlanIntent(page.url.searchParams.get('plan'), page.url.searchParams.get('cadence'))) {
 		// Strip the consumed param (keeping others, e.g. Clerk's redirect_url) so a
 		// Back-navigation to this history entry can't re-stash and re-fire checkout.
 		// Raw history.replaceState, not $app/navigation's — the router isn't
 		// initialized yet at script-eval time, and no navigation has happened.
 		const url = new URL(location.href);
 		url.searchParams.delete('plan');
+		url.searchParams.delete('cadence');
 		history.replaceState(history.state, '', url);
 	}
 

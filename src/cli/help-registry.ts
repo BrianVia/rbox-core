@@ -355,7 +355,10 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "subscribe",
     group: "BILLING & MAINTENANCE",
     summary: "open a checkout to subscribe this account",
-    usage: "rbox subscribe <solo | pro>",
+    usage: "rbox subscribe <solo | pro> [--annual]",
+    flags: [
+      { flag: "--annual", desc: "use annual billing (two months free)" },
+    ],
   },
   {
     name: "billing",

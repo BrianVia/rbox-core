@@ -14,6 +14,7 @@ test("--json is a boolean long flag before or after a device subcommand", () => 
 test("boolean long flags do not consume following positionals", () => {
   expect(parseFlags(["--follow", "."])).toEqual({ positional: ["."], flags: { follow: "true" } });
   expect(parseFlags(["--yes", "genesis"])).toEqual({ positional: ["genesis"], flags: { yes: "true" } });
+  expect(parseFlags(["--annual", "solo"])).toEqual({ positional: ["solo"], flags: { annual: "true" } });
 });
 
 test("known value long flags still consume values", () => {

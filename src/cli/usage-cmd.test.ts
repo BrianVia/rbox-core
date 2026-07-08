@@ -7,9 +7,9 @@ let calls: { url: string; init?: RequestInit }[] = [];
 let logs: string[] = [];
 
 const dto: AccountUsageDTO = {
-  plan: "free",
-  usedBytes: 2 * 1024 * 1024 * 1024,
-  storageCap: 2 * 1024 * 1024 * 1024,
+  plan: "none",
+  usedBytes: 1,
+  storageCap: 1,
   workspaces: 1,
   workspaceCap: 1,
   retentionDays: 0,
@@ -59,8 +59,8 @@ describe("rbox usage", () => {
     stub(JSON.stringify(dto));
     await usageCmd();
     const out = logs[0]!;
-    expect(out).toContain("plan:       free");
-    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  2.0 GiB / 2.0 GiB   (100%, read-only)");
+    expect(out).toContain("plan:       no active plan");
+    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, read-only)");
     expect(out).toContain("workspaces: 1 / 1");
     expect(out).toContain("retention:  0 days (current state only)");
     expect(out).toContain("grace:      none");

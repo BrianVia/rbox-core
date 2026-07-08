@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('$lib/config', () => ({ config: { apiBase: 'https://api.test' } }));
 vi.mock('$lib/clerk', () => ({ sessionId: (c: { session?: { id?: string } }) => c?.session?.id ?? null }));
 
-import { fetchUsage, clearStaleTokens, lookupDeviceAuth, approveDeviceAuth } from './api';
+import { fetchUsage, clearStaleTokens, lookupDeviceAuth, approveDeviceAuth, startCheckout } from './api';
 
 function makeStorage() {
 	const m = new Map<string, string>();
@@ -118,6 +118,36 @@ describe('rbox token cache (B3 / SF1)', () => {
 		expect(store.getItem('rbox_token:B')).toBe('tokenB');
 		const usageCall = f.mock.calls.find((c) => String(c[0]).includes('/v1/account/usage'));
 		expect((usageCall![1] as RequestInit).headers).toMatchObject({ authorization: 'Bearer tokenB' });
+	});
+});
+
+describe('billing checkout', () => {
+	it('POSTs plan and cadence, then returns the checkout URL', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ url: 'https://checkout.test/session' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await expect(startCheckout(clerk('A') as never, 'solo', 'annual')).resolves.toBe('https://checkout.test/session');
+
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/billing/checkout'));
+		expect(call).toBeTruthy();
+		expect(String(call![0])).toBe('https://api.test/v1/billing/checkout?plan=solo&cadence=annual');
+		expect((call![1] as RequestInit).method).toBe('POST');
+	});
+
+	it('defaults checkout cadence to monthly', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ url: 'https://checkout.test/session' }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await startCheckout(clerk('A') as never, 'pro');
+
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/billing/checkout'));
+		expect(String(call![0])).toBe('https://api.test/v1/billing/checkout?plan=pro&cadence=monthly');
 	});
 });
 

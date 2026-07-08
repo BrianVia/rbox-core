@@ -42,6 +42,13 @@ describe("readQuotaExceeded", () => {
     expect(quota?.cap).toBe(1);
   });
 
+  test("no_plan reason maps to subscribe guidance", async () => {
+    const { quota } = await readQuotaExceeded(resp(402, { error: "quota_exceeded", reason: "no_plan", used: 1, cap: 1 }));
+    expect(quota).toBeInstanceOf(QuotaExceededError);
+    expect(quota?.reason).toBe("no_plan");
+    expect(quota?.message).toBe("No active plan — run `rbox subscribe`.");
+  });
+
   test("non-quota 402 and non-402 bodies pass through with preserved text", async () => {
     const nonQuota = await readQuotaExceeded(resp(402, { error: "payment_required", detail: "other" }));
     expect(nonQuota.quota).toBeNull();
@@ -100,6 +107,7 @@ describe("quota formatting", () => {
     expect(new QuotaExceededError("workspaces", undefined, 1).message).toBe(
       "Workspace limit reached — plan allows 1. Upgrade with `rbox subscribe solo` for unlimited workspaces."
     );
+    expect(new QuotaExceededError("storage", 1, 1, "no_plan").message).toBe("No active plan — run `rbox subscribe`.");
   });
 
   test("binary byte formatter uses 1024-based units and one decimal above bytes", () => {

@@ -28,7 +28,7 @@ async function bootstrap(name: string): Promise<{ token: string; accountId: stri
   const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: name }),
+    body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: name, plan: "pro" }),
   });
   expect(res.status).toBe(200);
   return (await res.json()) as { token: string; accountId: string };

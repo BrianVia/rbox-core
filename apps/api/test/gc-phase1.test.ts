@@ -19,7 +19,7 @@ const EMPTY = new Set<string>();
 
 async function mkAccount(id: string, capBytes = 1_000_000_000) {
   await db()
-    .prepare(`INSERT INTO accounts(id, plan, created_at, used_bytes, extra_storage_bytes, cap_bytes) VALUES (?, 'free', ?, 0, 0, ?)`)
+    .prepare(`INSERT INTO accounts(id, plan, created_at, used_bytes, extra_storage_bytes, cap_bytes) VALUES (?, 'pro', ?, 0, 0, ?)`)
     .bind(id, NOW, capBytes)
     .run();
 }
@@ -264,7 +264,7 @@ describe("§33 at-cap re-upload clears the marker (legacy blobPut pre-check skip
     const r = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: name }),
+      body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: name, plan: "pro" }),
     });
     expect(r.status).toBe(200);
     return (await r.json()) as { token: string; accountId: string };

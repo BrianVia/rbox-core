@@ -314,7 +314,7 @@ function judgeReclaimable(r: ShellState | null, opts: { ignoreBilling?: boolean 
   if (!r) return false; // no such account row → not reclaimable (same as origin != 'web')
   if (r.origin !== "web") return false;
   if (Number(r.used) !== 0) return false;
-  if (!opts.ignoreBilling && (r.plan !== "free" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
+  if (!opts.ignoreBilling && (r.plan !== "none" || r.scid != null || r.ssid != null || r.grace != null || Number(r.extra) !== 0)) return false;
   // `dr` (diagnostics_reports) blocks fail-closed: only DEVICE principals can create reports,
   // so a "web shell" holding one is not the empty shell this destructive path assumes.
   for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "ws", "br", "up", "pt", "da", "dn", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
@@ -344,10 +344,10 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
   // devices/account_link_events. One atomic batch at N=1; a future cross-plane saga under
   // sharding. Run on dirDb (the rebind is the headline); the accounts INSERT routes by newAcct.
   await dirDb(env).batch([
-    // cap_bytes set explicitly (free plan) so the new shell is quota-guarded immediately —
+    // cap_bytes set explicitly so the new shell is quota-guarded immediately —
     // a 0 here would disable accounts_cap_guard (§30 codex BLOCKER 5). The 0016 AFTER INSERT
     // trigger is the catch-all backstop; this keeps the intent visible at the insert site.
-    dbFor(env, newAcct).prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'free', 'web', ?, ?)").bind(newAcct, nowMs, 2 * 1024 * 1024 * 1024),
+    dbFor(env, newAcct).prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'none', 'web', ?, ?)").bind(newAcct, nowMs, 1),
     dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
     dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
     dirDb(env).prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),
@@ -371,5 +371,5 @@ export async function accountStatus(env: Env, p: Principal): Promise<Response> {
     dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>(),
     dbFor(env, p.accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(p.accountId).first<{ plan: string }>(),
   ]);
-  return json({ accountId: p.accountId, linked: !!row, plan: acct?.plan ?? "free" });
+  return json({ accountId: p.accountId, linked: !!row, plan: acct?.plan ?? "none" });
 }

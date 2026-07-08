@@ -34,6 +34,8 @@ import { RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prompt.js";
 import { stderrStyle as e } from "./style.js";
+import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
+import { openAndShow } from "./browser-open.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -92,17 +94,27 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string }): Pr
   // already exist but enrollment doesn't (authorized-but-unenrolled from a prior
   // device-code login), resolve enrollment inline instead of restarting the full
   // new/existing picker as if the user had never signed in.
+  let syncDisabledUntilSubscribe = false;
   if (await alreadyEnrolled()) {
     process.stderr.write(`${e.dim("This machine is already signed in and enrolled. Continuing to your workspace.")}\n`);
   } else {
     const hasCreds = Boolean((await loadCredentials())?.accountId);
-    const ok = hasCreds ? await resolveEnrollment(opts.defaultRemote) : await stepAccount(opts.defaultRemote);
-    if (!ok) return;
+    const result = hasCreds ? { ok: await resolveEnrollment(opts.defaultRemote), created: false } : await stepAccount(opts.defaultRemote);
+    if (!result.ok) return;
+    if (result.created) {
+      syncDisabledUntilSubscribe = !(await startTrialAfterAccountCreation());
+    }
   }
 
   // Step 2 · Workspace — bind a directory + run the initial populate-sync.
-  const outcome = await stepWorkspace(opts);
+  const outcome = await stepWorkspace(opts, { noSync: syncDisabledUntilSubscribe });
   if (!outcome) return;
+
+  if (syncDisabledUntilSubscribe) {
+    process.stderr.write(`${e.yellow("!")}  Sync is disabled until you run \`rbox subscribe\` and choose a plan.\n`);
+    printSummary(outcome.workspaceId, outcome.deviceId);
+    return;
+  }
 
   // Step 3 · Start syncing in the background.
   process.stderr.write(`\n── ${e.bold("Step 3 of 3 · Start syncing")} ${HR.slice(0, 38)}\n`);
@@ -151,7 +163,12 @@ async function alreadyEnrolled(): Promise<boolean> {
 
 /** Step 1 · Account. Returns true if this machine is now enrolled (flow continues),
  *  false if it hard-stopped on the device-code (authorize-only) path. */
-async function stepAccount(remote: string): Promise<boolean> {
+interface StepAccountResult {
+  ok: boolean;
+  created: boolean;
+}
+
+async function stepAccount(remote: string): Promise<StepAccountResult> {
   process.stderr.write(`\n── ${e.bold("Step 1 of 3 · Account")} ${HR.slice(0, 46)}\n`);
   const choice = await promptSelect<"create" | "existing">({
     message: "Are you new here, or do you already have an rbox account?",
@@ -166,7 +183,7 @@ async function stepAccount(remote: string): Promise<boolean> {
     // A secret bootstraps the genesis device (shows the recovery phrase); blank falls
     // back to device-code, which authorizes but can't enroll → resolve inline.
     await login(remote, secret || undefined);
-    return resolveEnrollment(remote);
+    return { ok: await resolveEnrollment(remote), created: Boolean(secret) };
   }
 
   // Existing account.
@@ -183,17 +200,56 @@ async function stepAccount(remote: string): Promise<boolean> {
     const token = await promptPassword({ message: "Paste pairing token" });
     if (!token) {
       process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
-      return false;
+      return { ok: false, created: false };
     }
     await redeemPair(remote, token); // enrolls inline → resolveEnrollment short-circuits true
-    return resolveEnrollment(remote);
+    return { ok: await resolveEnrollment(remote), created: false };
   }
 
   // "browser" and "approve" are the SAME device-code grant (authorize-only) — the
   // browser option is just a friendlier front door onto login()'s own printed UX
   // (design 47). Both authorize but do NOT enroll for encryption → resolve inline.
   await login(remote, undefined);
-  return resolveEnrollment(remote);
+  return { ok: await resolveEnrollment(remote), created: false };
+}
+
+async function startTrialAfterAccountCreation(): Promise<boolean> {
+  process.stderr.write(`\n── ${e.bold("Start your 14-day free trial")} ${HR.slice(0, 36)}\n`);
+  const choice = await promptSelect<`${SubscribePlan}:${BillingCadence}`>({
+    message: "Choose a plan for this new account:",
+    choices: [
+      { name: "Solo annual — $80/year (recommended)", value: "solo:annual" },
+      { name: "Pro annual — $200/year", value: "pro:annual" },
+      { name: "Solo monthly — $8/month", value: "solo:monthly" },
+      { name: "Pro monthly — $20/month", value: "pro:monthly" },
+    ],
+  });
+  const [plan, cadence] = choice.split(":") as [SubscribePlan, BillingCadence];
+  process.stderr.write(`${e.dim("Card required; cancel anytime before the trial ends.")}\n`);
+  const url = await checkoutUrl(plan, cadence);
+  if (url === "already_subscribed") return true;
+  openAndShow(url, "Opening your browser to complete checkout...", "Open this URL in your browser to complete checkout:");
+  process.stderr.write(`${e.dim("Waiting for checkout to complete...")}\n`);
+  return pollUntilPlanActive();
+}
+
+async function pollUntilPlanActive(): Promise<boolean> {
+  const creds = await loadCredentials();
+  if (!creds?.token || !creds.remoteUrl) return false;
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${creds.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${creds.token}` } });
+      if (res.ok) {
+        const body = (await res.json()) as { plan?: string };
+        if (body.plan && body.plan !== "none") return true;
+      }
+    } catch {
+      // Keep polling until the deadline; browser checkout and webhook delivery race.
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
 }
 
 /** Which authorize path an existing-account method takes. "pair" redeems a pairing
@@ -297,7 +353,8 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
 
 /** Step 2 · Workspace. Returns the init outcome, or undefined if the user backed out. */
 async function stepWorkspace(
-  opts: { cwd: string; defaultRemote: string }
+  opts: { cwd: string; defaultRemote: string },
+  setupOpts: { noSync?: boolean } = {}
 ): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
   process.stderr.write(`\n── ${e.bold("Step 2 of 3 · Workspace")} ${HR.slice(0, 44)}\n`);
   const choice = await promptSelect<"new" | "existing">({
@@ -380,6 +437,7 @@ async function stepWorkspace(
   const flags = workspaceFlags(
     choice === "new" ? { kind: "new", root: dir, name, respectGitignore } : { kind: "join", root: dir, workspace, name }
   );
+  if (setupOpts.noSync) flags["no-sync"] = "true";
   return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
 }
 
