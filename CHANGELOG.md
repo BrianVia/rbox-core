@@ -6,6 +6,26 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.10] — 2026-07-08 — steady-state sync at O(change) (encrypt-cache reverse path index)
+
+### Fixed
+- **Steady-state pushes no longer pay an O(files × cache-entries) scan
+  (design 82).** The encrypt-address cache migrated every unchanged file's
+  path with a full-cache scan — ~5.5 billion entry visits per push on a
+  116k-file workspace with a 47k-entry cache, 481s of a 700s push, invisible
+  to phase timers. Path migration is now O(1) via a reverse path index (same
+  on-disk format; legacy duplicate paths self-heal on load). Measured on the
+  real workspace: Mac push with a 1-file change 204s → 54s, Linux 60s → 29s,
+  no-op sync 43s, daemon publish cycle ~3.5 min → 25–63s.
+
+### Added
+- **Phase coverage for the formerly-invisible sync zone (design 82 §4).**
+  New `state-load`, `git-plan`, `address` (with cache hit/miss detail), and
+  `missing` phases in `RBOX_METRICS=1` reports — phase walls now account for
+  96–98.7% of push wall (was ~10–14%), so a regression like this can't hide
+  again. Disabled reports are now a shared allocation-free singleton, so the
+  no-op daemon tick stays free.
+
 ## [0.9.9] — 2026-07-08 — worker-pool crypto (real cores for blob encrypt/decrypt)
 
 ### Added
