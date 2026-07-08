@@ -58,8 +58,7 @@ jobs:
 
       # Cache Bun's global package store (setup-bun caches only the bun binary),
       # keyed on the lockfile hash + --frozen-lockfile so versions come solely from
-      # bun.lock (sha512-integrity-verified). Shares the non-superset namespace with
-      # deploy-api.yml, so a warm cache is reused across workflows.
+      # bun.lock (sha512-integrity-verified).
       - name: Cache bun install store
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
