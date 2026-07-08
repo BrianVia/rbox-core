@@ -1,6 +1,6 @@
 # Design 86: Paid-only plans, 14-day card-upfront trial, annual billing
 
-**Status:** 🟡 In progress
+**Status:** ✅ Shipped 2026-07-08 (PR #159; prod worker + migration 0021 applied)
 **Depends on:** design 07b (billing), design 13 (billing grace)
 **Supersedes:** the free tier everywhere (design 07b's `free` row, design 13's downgrade-to-free target)
 

@@ -36,13 +36,14 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 
 | # | Doc | Status | Depends on | One-liner |
 |---|-----|--------|-----------|-----------|
-| 16 | [New-device security emails](./16-new-device-emails.md) | 🔴 NOT STARTED | P1, P2 | "new device added" email; **Cloudflare Email Service** send on `security.rbox.to` |
+| 16 | [New-device security emails](./16-new-device-emails.md) | 🟢 BUILT | — | "new device added" email; **Cloudflare Email Service** send on `security.rbox.to` |
 | 17 | [Account devices/workspaces list](./17-account-devices-workspaces.md) | 🔴 NOT STARTED | P1, P2 | read-only dashboard list; new `GET /v1/account/devices\|workspaces` |
 | 18 | [Support email routing](./18-support-email-routing.md) | ✅ SHIPPED (2026-06-30) | — | `support@`/`postmaster@`/`security@` → Gmail via CF Email Routing; migrated off Namecheap; catch-all Drop |
 | 19 | [Device revocation](./19-device-revocation.md) | 🔴 NOT STARTED | P1, P3 | revoke web+CLI; access-revoke works, crypto-revoke needs rotation |
 | 20 | [CLI/CI API keys](./20-cli-api-keys.md) | 🔴 NOT STARTED | P1, P3 | headless `RBOX_KEY`; **don't GA before P3** |
 | 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | ✅ SHIPPED (PR #2, prod) | — | web↔CLI link (`rbox account link`) + `rbox subscribe` + re-point saga; closes P2 & P4; unblocks 16/17/19 |
-| 86 | [Paid-only plans, trial, annual billing](./86-paid-only-trial.md) | 🟡 IN PROGRESS | 07b, 13 | remove free tier; locked `none` state; 14-day Stripe trial; annual prices |
+| 86 | [Paid-only plans, trial, annual billing](./86-paid-only-trial.md) | ✅ SHIPPED (2026-07-08, PR #159) | 07b, 13 | remove free tier; locked `none` state; 14-day Stripe trial; annual prices |
+| 87 | [Agent sync keys](./87-agent-sync-keys.md) | 🔴 NOT STARTED | 20, P3 | `RBOX_KEY` + keyed `rbox setup --workspace` for ephemeral agent VMs; beta pre-P3, **GA gated on P3** |
 
 ## Cross-cutting prerequisites (gate the 16–21 batch)
 
