@@ -103,11 +103,15 @@ supersede) → unbounded free R2. Three bounds close it:
    Worst-case paid-for-free storage ≈ churn-rate × retention-window — finite,
    plan-priced, and exactly the margin the founder chose to eat.
 2. **Stuffing bound (the repointed guard):** `used_bytes` (total referenced +
-   staged) may not exceed `K × cap_bytes` (propose **K = 4**, per-plan
-   override possible). Hitting it → 402 `quota_exceeded` with
-   `reason: "churn_bound"` and a message that names history/churn, not
-   storage. Honest users inside retention windows will not hit K=4;
-   blob-stuffers will.
+   staged) may not exceed `K × cap_bytes` (**K = 4**, per-plan override
+   possible — margin-validated in §11). When the bound binds, behavior splits
+   by cause (§11 rider 2): **honest churn thins** — the retention prune runs
+   early against that account, oldest/densest history first (the
+   Syncthing/Nextcloud staggered norm; Microsoft now ships the same idea as
+   "automatic" versioning), so the user experience is "up to 1 year of
+   history, full fidelity for 30 days," never a blocked push. The hard 402
+   (`reason: "churn_bound"`) is reserved for the §4.3 receipt-stuffing case,
+   where there is no history to thin.
 3. **Unreferenced uploads — the hole codex closed (§10 R1):** receipt PUTs
    (single AND batch) write canonical R2 and mint receipts **before any
    `blob_refs`/`used_bytes` exist**, and the batch path currently has no
@@ -180,7 +184,8 @@ Until then, Pro history is pruned 9 months earlier than the site sells.
 
 ## 9. Open questions
 
-1. K for the stuffing bound (default 4× cap?) — per-plan?
+1. ~~K for the stuffing bound?~~ Resolved (§11): K = 4, with thin-don't-block
+   for honest churn and the IA-tiering rider.
 2. ~~Do git-lane bundle bytes count as live?~~ Resolved (§10 R9): they're
    already inside the head refset — counted, not double-counted.
 3. Team pooled-storage interaction (150 GB/user) — live-bytes pooling is the
@@ -227,3 +232,38 @@ body above has been amended. This section is normative.
   self-contradiction: repo code AND repo copy say 90 days; rbox.to sells
   1 year. §7 now states it precisely with the founder's chosen direction
   (90 → 365 in plans.ts + README + docs/pricing.md + dashboard card).
+
+## 11. Competitive landscape & margin model (researched 2026-07-08)
+
+Full sourced report in the research archive; the load-bearing facts:
+
+- **History-exempt quota is Dropbox's model** (all tiers, explicitly "doesn't
+  take up any of your available storage space"); Microsoft charges quota for
+  versions and it is the most-resented storage behavior in that ecosystem;
+  Google is in between. So §1's promise is table stakes done right, not a
+  radical bet — **the differentiator is the window**: Dropbox gives 180 days
+  at the $20-ish Professional tier and reserves 365 for $26+/user Business
+  plans. rbox Pro at $20 with 365 days out-windows the direct comparable.
+- **Margin math (R2 Standard $0.015/GB-mo; deletes free), at the observed
+  agent-whale churn of 3.8 GB/day on a 7 GB working set:**
+  | Scenario | History COGS/mo | % of $20 Pro |
+  |---|---|---|
+  | 365d uncapped | $20.81 | 104% — margin trap |
+  | 365d, K=4 (≤1 TB referenced) | ~$14.95 | 75% |
+  | 365d, K=4 + IA tiering (>30d history in R2 Infrequent Access, $0.01) | ~$11.25 | 56% |
+  | Normal dev (0.38 GB/day), 365d | ~$2.83 all-in | 14% (≈86% gross margin) |
+  Blended (≈2% whales): ~$3.25/user storage COGS ≈ 84% gross margin.
+- **Adopted riders:**
+  1. **IA tiering:** age history blobs >30 days old into R2 Infrequent Access
+     (verify IA retrieval fees before implementation — restores of old
+     versions are rare and can eat a retrieval fee).
+  2. **Thin, don't block:** when K×cap binds on honest churn, prune
+     oldest/densest history early rather than 402ing (§4.2). Backblaze-honest
+     framing: "full fidelity 30 days, up to 1 year."
+  3. Skip 180d (saves ~$4/mo on the rarest users, forfeits the headline);
+     skip a history add-on at launch (Backblaze's $0.006/GB-mo "forever"
+     shape remains available later if whales ask).
+- **Free marketing note:** Dropbox heavily markets "Rewind" (point-in-time
+  folder/account rollback within the window). rbox's commit-sequence model
+  gets this nearly free — a named "rewind" feature is low-cost, high-signal
+  once this design ships.
