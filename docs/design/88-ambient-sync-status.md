@@ -116,6 +116,10 @@ interface AmbientDaemonStatusV1 {
     filesTotal?: number;
     bytesDone?: number;
     bytesTotal?: number;
+    /** Current file being processed, workspace-relative. LOCAL-ONLY display
+     *  (founder call 2026-07-08): shown in the menu dropdown's
+     *  Status / File / Progress block; never exported off-machine. */
+    currentPath?: string;
   };
   attentionReason?:
     | "halt"
@@ -126,12 +130,14 @@ interface AmbientDaemonStatusV1 {
 }
 ```
 
-PII rule: no file paths, repo paths/names, workspace root, blob hashes,
-plaintext hashes, git hashes, or progress `detail`. Counts, byte totals, phase
-names, timestamps, and sequence numbers are allowed. This matches design 73:
-`detail` is not persisted
-(`src/cli/transfer-progress.ts:12-20`) and the design-82 phase-report privacy
-posture: phase reports carry aggregate counts, not per-path activity.
+Privacy scoping (founder call 2026-07-08): the status file is a LOCAL-ONLY
+surface in the daemon runtime dir — same trust domain as `daemon.log`, which
+already records paths by design. So `operation.currentPath` and its display in
+local surfaces (menu dropdown) are allowed; Dropbox shows the syncing filename
+for the same reason. What stays banned from paths/hashes is everything that
+LEAVES the machine: phase reports (design 82 §35), metrics summaries, gate
+logs, and anything pasted into PRs. The prompt segment also stays path-free —
+not for privacy but for width and the ≤5ms budget.
 
 State derivation:
 
@@ -259,21 +265,21 @@ Menu bar title: `✓` synced, `↑` / `↓` syncing push/pull, `!` attention, an
    short workspace id, not root path (`rbox status` already uses name/id for its
    human header at `src/cli/status-cmd.ts:342-345`);
 2. last synced time from `lastSyncedAt`;
-3. current operation and progress from `operation`;
+3. the current operation as three aligned lines — `Status:` (phase),
+   `File:` (`currentPath`, middle-truncated, monospace), `Progress:`
+   (`filesDone / filesTotal — N%`) — with a thin progress bar. Rendered
+   mockup: [assets/88-menubar-mockup.png](assets/88-menubar-mockup.png)
+   (source: [assets/88-menubar-mockup.html](assets/88-menubar-mockup.html));
 4. Pause / Resume actions wired to `rbox stop "$RBOX_ROOT"` and
    `rbox start "$RBOX_ROOT"` (`src/cli/daemon-control.ts:265-335`);
 5. Open dashboard URL, derived from local config/app defaults
    (`src/cli/config.ts:12-30`, `src/cli/credentials.ts:27-33`);
 6. redacted daemon-log tail plus "Open raw daemon log".
 
-The log-tail line needs the redaction qualifier. `daemon.log` is an intentional
-local forensic record and can contain paths; `summarizeActions` renders changed
-paths by design (`src/cli/daemon.ts:31-58`) and `transfer-progress.ts` calls out
-repo relpaths in daemon logs as a separate local observability channel
-(`src/cli/transfer-progress.ts:16-20`). The menu surface must not display raw
-paths if the PII gate in §9 is to pass. Raw logs stay one click away for local
-debugging; ambient surfaces stay aggregate. The MVP is demand validation: if
-users ask for this beyond the terminal-native cohort, unpark §8.
+Log tail: with §4's local-only privacy scoping, the raw `daemon.log` tail may
+render directly in the dropdown (it is the same local trust domain). The MVP is
+demand validation: if users ask for this beyond the terminal-native cohort,
+unpark §8.
 
 ## 8. Phase 3 - native macOS menu bar app, parked
 
@@ -303,10 +309,11 @@ simple consumers can still read one file and infer liveness by staleness.
    `dead` within one 15s staleness window.
 4. **Paused distinction:** `rbox stop` renders paused, not daemon-dead, after the
    daemon's final write and pidfile removal.
-5. **PII:** `daemon.status.json`, `rbox prompt-status`, and the SwiftBar menu
-   contain no paths, repo names, blob/plaintext/git hashes, or progress detail
-   strings. A grep gate runs against fixtures and a real status file. The log
-   tail is redacted or replaced with an open-log action until this passes.
+5. **Privacy scope:** `rbox prompt-status` output contains no paths; nothing
+   from `daemon.status.json` (including `currentPath`) flows into phase
+   reports, metrics summaries, or any off-machine artifact. A grep gate runs
+   against RBOX_METRICS outputs and phase-report JSON with a synced+syncing
+   fixture whose `currentPath` is a sentinel string.
 6. **Overhead:** status writes are unmeasurable in the phase report, with
    explicit acceptance of **<10ms/tick** overhead on both hosts. If the write
    path shows up, reduce heartbeat frequency or coalesce writes before shipping.
@@ -349,8 +356,9 @@ simple consumers can still read one file and infer liveness by staleness.
    - Quiet: `✓`, `up 12`, `down 8`, `! halt`
 2. **SwiftBar notification on attention.** Should the MVP fire a macOS
    notification on a fresh `attention` reason, or stay glance-only?
-3. **Progress scalar.** Should v1 carry/display percent in addition to counts,
-   or stay counts-only and let each surface compute its own percent?
+3. ~~Progress scalar.~~ **Resolved** (founder format, 2026-07-08): the file
+   carries counts; every surface renders `filesDone / filesTotal — N%` with
+   the percent computed at display time.
 4. **The no-daemon prompt.** A workspace with background sync intentionally off
    renders `paused` — should the prompt show a quiet glyph (`○`), the louder
    `! paused`, or nothing at all? A permanent nag is wrong for a user who
