@@ -44,6 +44,8 @@ Codex adversarially-reviewed specs. **Implementation: 🔴 NOT STARTED.**
 | 21 | [Account linking / identity](./21-account-linking.md) · [build plan](./21-account-linking-plan.md) | ✅ SHIPPED (PR #2, prod) | — | web↔CLI link (`rbox account link`) + `rbox subscribe` + re-point saga; closes P2 & P4; unblocks 16/17/19 |
 | 86 | [Paid-only plans, trial, annual billing](./86-paid-only-trial.md) | ✅ SHIPPED (2026-07-08, PR #159) | 07b, 13 | remove free tier; locked `none` state; 14-day Stripe trial; annual prices |
 | 87 | [Agent sync keys](./87-agent-sync-keys.md) | 🟢 BUILT (v1 beta) | 20, P3 | `RBOX_KEY` + keyed `rbox setup --workspace` for ephemeral agent VMs; beta pre-P3, **GA gated on P3** |
+| 89 | [History-free quota](./89-history-free-quota.md) | 🔴 NOT STARTED (design only) | 86, 33, GC-purge cron | quota = live bytes; history rides free; stuffing bound K×cap; **pro retentionDays 90→365 bug flagged** |
+| 90 | [Dashboard agent-keys view](./90-dashboard-keys-view.md) | 🔴 NOT STARTED (design only) | 87 | list/label/revoke in apps/web; create stays CLI-only (design 20 R8) |
 
 ## Cross-cutting prerequisites (gate the 16–21 batch)
 
