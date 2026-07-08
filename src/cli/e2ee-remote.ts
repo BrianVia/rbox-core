@@ -93,6 +93,7 @@ export interface E2eeApi {
     uploadsDir?: string,
     onBytes?: ByteProgressCallback
   ): Promise<void>;
+  ownsUploadLaneTiming?(size: number): boolean;
   putBlobBytes(sha256: string, bytes: Uint8Array, onBytes?: ByteProgressCallback): Promise<void>;
   blobStore(): BlobStore;
   // key material
@@ -456,6 +457,9 @@ export class E2eeRemote implements SyncRemote {
     onBytes?: ByteProgressCallback
   ): Promise<void> {
     return this.api.putBlobFile(sha256, absPath, size, uploadsDir, onBytes);
+  }
+  ownsUploadLaneTiming(size: number): boolean {
+    return this.api.ownsUploadLaneTiming?.(size) === true;
   }
   blobStore(): BlobStore {
     return this.api.blobStore();
