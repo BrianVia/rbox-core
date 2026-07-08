@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { Dirent, Stats } from "node:fs";
 import path from "node:path";
 import { indexByPath } from "./diff.js";
 import type { DiscoveredGitRepo } from "./git-discover.js";
@@ -28,6 +29,32 @@ export interface WatchEvent {
  *  per file on a huge tree. */
 const SCAN_PROGRESS_STRIDE = 500;
 
+export interface ScanStats {
+  dirsWalked: number;
+  filesStatted: number;
+  filesSkippedCacheHit: number;
+  filesHashed: number;
+  readdirMs: number;
+  statMs: number;
+  matcherMs: number;
+  hashMs: number;
+  sortMs: number;
+}
+
+export function createScanStats(): ScanStats {
+  return {
+    dirsWalked: 0,
+    filesStatted: 0,
+    filesSkippedCacheHit: 0,
+    filesHashed: 0,
+    readdirMs: 0,
+    statMs: 0,
+    matcherMs: 0,
+    hashMs: 0,
+    sortMs: 0,
+  };
+}
+
 export async function scanManifest(
   root: string,
   matcher: IgnoreMatcher = buildIgnoreMatcher(root),
@@ -40,7 +67,11 @@ export async function scanManifest(
   /** Optional git repo discovery hook. Fires for `.git` directories and gitfile
    *  pointers before the hard `.git` ignore prune, so callers can avoid a second
    *  full workspace walk. */
-  onGitRepo?: (repo: DiscoveredGitRepo) => void
+  onGitRepo?: (repo: DiscoveredGitRepo) => void,
+  /** Optional metrics sink. Readdir/sort/hash timing is batched at the operation
+   *  level; stat and matcher timing stays at the checked-entry level because the
+   *  current walk interleaves them with pruning and recursion. */
+  scanStats?: ScanStats
 ): Promise<Manifest> {
   const files: FileEntry[] = [];
   let discovered = 0;
@@ -49,8 +80,14 @@ export async function scanManifest(
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false);
-  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats);
+  if (scanStats) {
+    const t0 = Date.now();
+    files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    scanStats.sortMs += Date.now() - t0;
+  } else {
+    files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
   return { generatedAt: new Date().toISOString(), files };
 }
 
@@ -215,14 +252,23 @@ async function walk(
   pending?: PendingHash[],
   onDiscover?: () => void,
   onGitRepo?: (repo: DiscoveredGitRepo) => void,
-  discoveryPruned = false
+  discoveryPruned = false,
+  scanStats?: ScanStats
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
   const isRoot = pending === undefined;
   const toHash = pending ?? [];
 
-  const entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  let entries: Dirent[];
+  if (scanStats) {
+    const t0 = Date.now();
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+    scanStats.readdirMs += Date.now() - t0;
+    scanStats.dirsWalked += 1;
+  } else {
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  }
   for (const entry of entries) {
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     const abs = path.join(root, childRel);
@@ -234,11 +280,15 @@ async function walk(
 
     if (entry.isDirectory()) {
       const childDir = `${childRel}/`;
-      const childDiscoveryPruned = discoveryPruned || (matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
-      if ((matcher.prunes?.(childDir) ?? matcher.ignores(childDir))) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned);
+      const childDiscoveryPruned =
+        discoveryPruned ||
+        (scanStats
+          ? timedMatcher(scanStats, () => matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir))
+          : matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
+      if (scanStats ? timedMatcher(scanStats, () => matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) : matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) continue;
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats);
     } else if (entry.isSymbolicLink()) {
-      if (matcher.ignores(childRel)) continue;
+      if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
       onDiscover?.();
       const target = await fs.readlink(abs);
       out.push({
@@ -251,11 +301,23 @@ async function walk(
         mtimeMs: 0,
       });
     } else if (entry.isFile()) {
-      if (matcher.ignores(childRel)) continue;
+      if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
       onDiscover?.();
-      const st = await fs.stat(abs);
+      let st: Stats;
+      if (scanStats) {
+        const t0 = Date.now();
+        try {
+          st = await fs.stat(abs);
+        } finally {
+          scanStats.statMs += Date.now() - t0;
+        }
+        scanStats.filesStatted += 1;
+      } else {
+        st = await fs.stat(abs);
+      }
       const cached = cache?.lookup(childRel, st.mtimeMs, st.size);
       if (cached) {
+        if (scanStats) scanStats.filesSkippedCacheHit += 1;
         out.push({ path: childRel, type: "file", sha256: cached, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
       } else {
         // Defer the hash — sequential per-file hashing dominates a cold scan.
@@ -264,7 +326,25 @@ async function walk(
     }
   }
 
-  if (isRoot && toHash.length > 0) await drainHashes(toHash, out, cache);
+  if (isRoot && toHash.length > 0) {
+    if (scanStats) {
+      scanStats.filesHashed += toHash.length;
+      const t0 = Date.now();
+      await drainHashes(toHash, out, cache);
+      scanStats.hashMs += Date.now() - t0;
+    } else {
+      await drainHashes(toHash, out, cache);
+    }
+  }
+}
+
+function timedMatcher(scanStats: ScanStats, fn: () => boolean): boolean {
+  const t0 = Date.now();
+  try {
+    return fn();
+  } finally {
+    scanStats.matcherMs += Date.now() - t0;
+  }
 }
 
 /** Hash the deferred cache-miss files with bounded concurrency. */

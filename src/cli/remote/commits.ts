@@ -23,6 +23,28 @@ export class CommitRejectedError extends Error {
 
 export interface CommitOptions {
   blockedFingerprint?: string;
+  onCommitTimings?: (timings: CommitTimings) => void;
+}
+
+export interface CommitTimings {
+  refreshMs: number;
+  sidecarMs: number;
+  encodeMs: number;
+  encryptMs: number;
+  uploadMs: number;
+  postMs: number;
+  encBytes: number;
+}
+
+export interface LatestTimings {
+  downloadMs: number;
+  decryptMs: number;
+  parseMs: number;
+  encBytes: number;
+}
+
+export interface LatestOptions {
+  onLatestTimings?: (timings: LatestTimings) => void;
 }
 
 export interface ReceiptRedeemResult {

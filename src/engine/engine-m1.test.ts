@@ -6,6 +6,7 @@ import {
   applyWatchEvents,
   buildIgnoreMatcher,
   HashCache,
+  createScanStats,
   scanManifest,
   validateManifest,
   isSafeRelPath,
@@ -109,6 +110,42 @@ test("scanManifest consults the cache (seeded wrong sha is returned, proving no 
     const entry2 = m2.files.find((f) => f.path === "a.txt")!;
     expect(entry2.sha256).not.toBe("bogus".padEnd(64, "0"));
     expect(entry2.sha256).toMatch(/^[0-9a-f]{64}$/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scanManifest optional ScanStats counts the current full-scan work and does not change entries", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-scan-stats-"));
+  try {
+    await fs.mkdir(path.join(dir, "sub"));
+    await fs.writeFile(path.join(dir, "a.txt"), "a");
+    await fs.writeFile(path.join(dir, "sub", "b.txt"), "bb");
+
+    const matcher = buildIgnoreMatcher(dir);
+    const cache = new HashCache();
+    const stats = createScanStats();
+    const withStats = await scanManifest(dir, matcher, cache, undefined, undefined, stats);
+
+    expect(stats.dirsWalked).toBe(2);
+    expect(stats.filesStatted).toBe(2);
+    expect(stats.filesSkippedCacheHit).toBe(0);
+    expect(stats.filesHashed).toBe(2);
+    expect(stats.readdirMs).toBeGreaterThanOrEqual(0);
+    expect(stats.statMs).toBeGreaterThanOrEqual(0);
+    expect(stats.matcherMs).toBeGreaterThanOrEqual(0);
+    expect(stats.hashMs).toBeGreaterThanOrEqual(0);
+    expect(stats.sortMs).toBeGreaterThanOrEqual(0);
+
+    const withoutStats = await scanManifest(dir, matcher, cache);
+    expect(withoutStats.files).toEqual(withStats.files);
+
+    const hitStats = createScanStats();
+    await scanManifest(dir, matcher, cache, undefined, undefined, hitStats);
+    expect(hitStats.dirsWalked).toBe(2);
+    expect(hitStats.filesStatted).toBe(2);
+    expect(hitStats.filesSkippedCacheHit).toBe(2);
+    expect(hitStats.filesHashed).toBe(0);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

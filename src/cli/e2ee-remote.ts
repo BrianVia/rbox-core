@@ -21,7 +21,7 @@ import {
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
 import { gitSectionBlobRefs, poolMap, validateManifest, type BlobStore, type Manifest } from "../engine/index.js";
-import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
+import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
@@ -175,10 +175,11 @@ export class E2eeRemote implements SyncRemote {
 
   // ---- SyncRemote ----------------------------------------------------------
 
-  async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
     const vh = await this.verifiedHead();
+    // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const { manifest } = await this.decodeManifestAt(vh.commit, vh.account, false);
+    const { manifest } = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings);
     return { sequence: vh.sequence, manifest };
   }
 
@@ -187,15 +188,30 @@ export class E2eeRemote implements SyncRemote {
    *  the C4 head gate (`openCommit`); `true` opens an ancestor already authenticated by
    *  `verifyHistorySegment` (`openCommitHistorical`, no current-epoch gate). Both openers
    *  share one args shape, so the only difference is which gate runs. */
-  private async decodeManifestAt(commit: SignedCommit, account: VerifiedAccount, historical: boolean): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+  private async decodeManifestAt(
+    commit: SignedCommit,
+    account: VerifiedAccount,
+    historical: boolean,
+    onLatestTimings?: LatestOptions["onLatestTimings"]
+  ): Promise<{ manifest: Manifest; kek: Uint8Array }> {
     const body = parseCommit(commit);
     const kek = await this.kekFor(body.keyEpoch, account, false);
-    const encManifest = await this.api.blobStore().get(body.encManifestSha);
+    const timed = async <T>(fn: () => Promise<T>): Promise<[T, number]> => {
+      if (!onLatestTimings) return [await fn(), 0];
+      const t0 = Date.now();
+      const result = await fn();
+      return [result, Date.now() - t0];
+    };
+    const [encManifest, downloadMs] = await timed(() => this.api.blobStore().get(body.encManifestSha));
     const open = historical ? openCommitHistorical : openCommit;
-    const json = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
-    const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
-    const validation = validateManifest(manifest);
-    if (!validation.ok) throw new Error(validation.error);
+    const [json, decryptMs] = await timed(() => open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId }));
+    const [manifest, parseMs] = await timed(async () => {
+      const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
+      const validation = validateManifest(manifest);
+      if (!validation.ok) throw new Error(validation.error);
+      return manifest;
+    });
+    onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
     return { manifest, kek };
   }
 
@@ -373,8 +389,17 @@ export class E2eeRemote implements SyncRemote {
     return best;
   }
 
-  async commit(parentSequence: number, _deviceId: string, manifest: Manifest, options: CommitOptions = {}): Promise<CommitResult> {
-    const account = await this.refreshAccount(); // C4: refresh immediately before signing
+  async commit(parentSequence: number, _deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult> {
+    const onCommitTimings = options?.onCommitTimings;
+    let refreshMs = 0;
+    let account: VerifiedAccount;
+    if (onCommitTimings) {
+      const t0 = Date.now();
+      account = await this.refreshAccount(); // C4: refresh immediately before signing
+      refreshMs = Date.now() - t0;
+    } else {
+      account = await this.refreshAccount(); // C4: refresh immediately before signing
+    }
     // D1: if the epoch rotated between blob encryption (currentKek) and now, the
     // blobs are under the old KEK — force a re-scan/re-encrypt rather than sign a
     // commit whose keyEpoch ≠ the blobs' epoch. (v1 has no rotation; never fires.)
@@ -404,16 +429,30 @@ export class E2eeRemote implements SyncRemote {
     // {sidecarSha,count,totalBytes}; the signature still commits to sidecarSha. Upload the
     // sidecar like any blob FIRST (so it's resolvable at commit), then sign the descriptor.
     let blobRefset: BlobRefset | undefined;
+    let sidecarMs = 0;
     if (blobRefs.length >= SIDECAR_THRESHOLD) {
+      const t0 = onCommitTimings ? Date.now() : 0;
       const sidecarBytes = serializeRefset(blobRefs);
       const sidecarSha = hashBytes(sidecarBytes);
       blobRefset = { sidecarSha, count: blobRefs.length, totalBytes: blobRefs.reduce((n, r) => n + r.size, 0) };
-      if (sidecarSha === options.blockedFingerprint) {
+      if (sidecarSha === options?.blockedFingerprint) {
         throw new CommitRejectedError("too_many_refs", undefined, undefined, sidecarSha, true);
       }
       await this.api.putBlobBytes(sidecarSha, sidecarBytes);
+      if (onCommitTimings) sidecarMs = Date.now() - t0;
     }
-    const built = await buildCommit({
+    let encodeMs = 0;
+    let encryptMs = 0;
+    let uploadMs = 0;
+    let manifestJson: Uint8Array;
+    if (onCommitTimings) {
+      const t0 = Date.now();
+      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
+      encodeMs = Date.now() - t0;
+    } else {
+      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
+    }
+    const buildArgs: Parameters<typeof buildCommit>[0] = {
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
       kek,
@@ -423,19 +462,35 @@ export class E2eeRemote implements SyncRemote {
       seq: parentSequence + 1,
       parentSeq: parentSequence,
       parentCommitHash,
-      manifestJson: new TextEncoder().encode(JSON.stringify(manifest)),
+      manifestJson,
       blobRefs,
       blobRefset,
-    });
-    await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
+    };
+    if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs = ms);
+    const built = await buildCommit(buildArgs);
+    if (onCommitTimings) {
+      const t0 = Date.now();
+      await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
+      uploadMs = Date.now() - t0;
+    } else {
+      await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
+    }
 
     let res: CommitChainResult;
+    let postMs = 0;
     try {
-      res = await this.api.commitSigned(parentSequence, built.commit);
+      if (onCommitTimings) {
+        const t0 = Date.now();
+        res = await this.api.commitSigned(parentSequence, built.commit);
+        postMs = Date.now() - t0;
+      } else {
+        res = await this.api.commitSigned(parentSequence, built.commit);
+      }
     } catch (e) {
       if (e instanceof CommitRejectedError && blobRefset) e.fingerprint = blobRefset.sidecarSha;
       throw e;
     }
+    onCommitTimings?.({ refreshMs, sidecarMs, encodeMs, encryptMs, uploadMs, postMs, encBytes: built.encManifest.byteLength });
     if (res.conflict) return { conflict: true, head: res.head };
     if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
     if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry
