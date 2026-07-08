@@ -24,7 +24,7 @@ const PAID_PLAN_SET = new Set<string>(PAID_PLAN_NAMES);
 export const PLANS: Record<string, PlanLimits> = {
   none: { storageBytes: 1, workspaces: 1, projects: 1, retentionDays: 0, manifestBytes: 16 * MiB, devices: 2 },
   solo: { storageBytes: 50 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 30, manifestBytes: 32 * MiB, devices: 10 },
-  pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 25 },
+  pro: { storageBytes: 250 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 365, manifestBytes: 64 * MiB, devices: 25 },
   team: { storageBytes: 150 * GiB, workspaces: Infinity, projects: Infinity, retentionDays: 90, manifestBytes: 64 * MiB, devices: 100 },
 };
 

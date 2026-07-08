@@ -9,4 +9,9 @@ describe("plan lookup", () => {
     expect(capBytesFor(null)).toBe(1);
     expect(capBytesFor("garbage")).toBe(1);
   });
+
+  test("Pro retains one year of version history while Team stays at 90 days", () => {
+    expect(planFor("pro").retentionDays).toBe(365);
+    expect(planFor("team").retentionDays).toBe(90);
+  });
 });

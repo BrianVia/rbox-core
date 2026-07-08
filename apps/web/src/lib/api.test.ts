@@ -4,7 +4,15 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('$lib/config', () => ({ config: { apiBase: 'https://api.test' } }));
 vi.mock('$lib/clerk', () => ({ sessionId: (c: { session?: { id?: string } }) => c?.session?.id ?? null }));
 
-import { fetchUsage, clearStaleTokens, lookupDeviceAuth, approveDeviceAuth, startCheckout } from './api';
+import {
+	fetchUsage,
+	clearStaleTokens,
+	lookupDeviceAuth,
+	approveDeviceAuth,
+	startCheckout,
+	fetchApiKeys,
+	revokeApiKey
+} from './api';
 
 function makeStorage() {
 	const m = new Map<string, string>();
@@ -21,7 +29,7 @@ function makeStorage() {
 
 let store: ReturnType<typeof makeStorage>;
 const clerk = (sid: string) => ({ session: { id: sid, getToken: vi.fn(async () => `jwt_${sid}`) }, user: {} });
-const usageBody = { plan: 'pro', usedBytes: 0, storageCap: 1, workspaces: 0, workspaceCap: null, retentionDays: 90 };
+const usageBody = { plan: 'pro', usedBytes: 0, storageCap: 1, workspaces: 0, workspaceCap: null, retentionDays: 365 };
 const sessionCalls = (m: ReturnType<typeof vi.fn>) =>
 	m.mock.calls.filter((c) => String(c[0]).includes('/v1/web/session')).length;
 
@@ -148,6 +156,49 @@ describe('billing checkout', () => {
 
 		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/billing/checkout'));
 		expect(String(call![0])).toBe('https://api.test/v1/billing/checkout?plan=pro&cadence=monthly');
+	});
+});
+
+describe('agent API keys', () => {
+	it('GETs /v1/keys/api with the rbox web bearer and returns camelCase rows', async () => {
+		const key = {
+			deviceId: 'key_dev_1',
+			label: 'deploy',
+			displayPrefix: 'rbox_pat_pNFofOvu...',
+			createdAt: 10,
+			lastSeenAt: 20,
+			expiresAt: 30,
+			revoked: false
+		};
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ keys: [key] }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await expect(fetchApiKeys(clerk('A') as never)).resolves.toEqual([key]);
+
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/keys/api'));
+		expect(call).toBeTruthy();
+		expect(String(call![0])).toBe('https://api.test/v1/keys/api');
+		expect((call![1] as RequestInit).headers).toMatchObject({ authorization: 'Bearer rbox_A' });
+	});
+
+	it('POSTs key revocation to /v1/keys/api/:deviceId/revoke', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true }) });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await revokeApiKey(clerk('A') as never, 'key/dev 1');
+
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/keys/api/'));
+		expect(call).toBeTruthy();
+		expect(String(call![0])).toBe('https://api.test/v1/keys/api/key%2Fdev%201/revoke');
+		const init = call![1] as RequestInit;
+		expect(init.method).toBe('POST');
+		expect(init.headers).toMatchObject({ authorization: 'Bearer rbox_A' });
 	});
 });
 
