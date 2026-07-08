@@ -6,6 +6,20 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-07-08 — worker-pool crypto (real cores for blob encrypt/decrypt)
+
+### Added
+- **Worker-pool crypto (design 81).** Blob encrypt and decrypt now run on a
+  pool of Bun workers (default `min(cores−2, 16)`, memory- and fd-aware;
+  `RBOX_CRYPTO_WORKERS` overrides, `0` disables). The pool is lazy — small
+  syncs below 8 crypto jobs stay inline — keyed to the workspace key epoch,
+  and idles out after 60s. Ciphertext output is byte-identical to the inline
+  path. If workers can't start (e.g. a broken binary), rbox falls back to
+  inline crypto and `rbox doctor`/`rbox status` surface the degradation.
+  Measured on a 32-core Linux host (105k-file first publish): wall
+  27.5 min → 10 min, encrypt phase 5.5x, join decrypt lane 10% → 1%,
+  zero small-push regression, full-corpus byte diff clean.
+
 ## [0.9.8] — 2026-07-08 — batch slot defaults from the capstone curves
 
 ### Changed
