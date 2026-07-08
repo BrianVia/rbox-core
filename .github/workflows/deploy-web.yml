@@ -35,6 +35,20 @@ jobs:
       # via ws) make a macOS-generated lock fail strict `npm ci` on Linux. install
       # still respects the lock for the rest.
       - run: npm install --no-audit --no-fund
+
+      # SvelteKit's generated .svelte-kit dir + Vite's dep pre-bundle cache. Just a
+      # build-speed optimization (svelte-check/vite still re-validate content), so a
+      # stale restore-key fallback is safe here — unlike release.yml's signing path.
+      - name: Cache SvelteKit + Vite build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            apps/web/.svelte-kit
+            apps/web/node_modules/.vite
+          key: sveltekit-vite-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-${{ hashFiles('apps/web/src/**') }}
+          restore-keys: |
+            sveltekit-vite-${{ runner.os }}-${{ hashFiles('apps/web/package-lock.json') }}-
+            sveltekit-vite-${{ runner.os }}-
       - name: Gate — types + unit tests, then build
         run: |
           npm run check
