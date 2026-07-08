@@ -6,6 +6,31 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.11] — 2026-07-08 — git-plan at O(change) (fingerprint cache) + phase-0 instrumentation
+
+### Fixed
+- **git-plan no longer spawns ~13 git subprocesses per unchanged repo
+  (design 83).** `planGitSections` consumes the `git-divergence.json`
+  stat-fingerprint cache via a shared publish-grade v4 fingerprint
+  (content-hashed HEAD/refs/small-index, ctime, 2s racy-clean margin,
+  per-decision memoization) with a base-carry-only fast path and a
+  baseless-worktree-pointer pre-skip. Measured on the real workspace:
+  git-plan 24–43s → 4.0s (Mac) / 0.9s (wired Linux); daemon no-op tick
+  25–63s → 4.5–4.8s (Mac) / 1.5s (Linux); no-op CLI push 41s → 10.2s.
+  Cache file v2 → v3 (old caches self-heal with one cold plan).
+- **Git identity probes are side-effect-free.** `git write-tree` rewrites
+  the index file on every invocation; probes now run it against a temp
+  index copy (`GIT_INDEX_FILE`), so rbox's plan/status probes no longer
+  churn index files in tracked repos.
+
+### Added
+- **Commit/latest/scan sub-step instrumentation (designs 84/85 phase-0).**
+  `RBOX_METRICS=1` phase lines now decompose commit
+  (refresh/sidecar/encode/encrypt/upload/post + encBytes), latest
+  (download/decrypt/parse), scan (readdir/stat/matcher/hash/sort + walked/
+  statted/hashed/cache-hit counts, cumulative across 409-retry rescans),
+  and git-plan (fpHits/fpMisses/fpUntrusted/pointerPreSkips/spawnedRepos).
+
 ## [0.9.10] — 2026-07-08 — steady-state sync at O(change) (encrypt-cache reverse path index)
 
 ### Fixed
