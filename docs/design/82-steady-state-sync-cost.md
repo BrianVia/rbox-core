@@ -271,6 +271,46 @@ never running the benchmark at once on the shared WAN.
 5. Daemon soak: restart both daemons on the dev build and observe one natural
    churn cycle each. Pass: capture-to-publish gap from `daemon.log` <= 90s.
 
+### 6.1 Gate results (run 2026-07-08, dev build 0.9.9-dev+30e7359)
+
+All runs on the real workspace, daemons stopped, hosts serialized on the shared
+WAN. The clean compiled Mac baseline came in well under the phase-0 numbers
+(204.1s vs the 700s bun-source/profiler run and the 559s contended sync — the
+quadratic burn is machine-state and cache-size dependent), so the deltas below
+are against same-day, same-conditions baselines.
+
+1. **Mac push (gate 1): PASS.** Baseline v0.9.9: 204.1s wall for a 42B change
+   (~185s unphased). Dev: **54.3s** (<= 150s), `address` **0.1s** (<= 5s),
+   phase coverage **98.7%** (>= 85%). Phases now visible: git-plan 24.2s,
+   commit 17.5s, scan 7.3s, missing 4.1s.
+2. **Linux push (gate 2): PASS.** Baseline v0.9.9: 60.4s — the quadratic is
+   small on this host because the encrypt cache only grows on the ENCRYPTING
+   device: the Mac (original full publisher) holds 47,748 entries / 17MB, the
+   Linux replica 5.4KB. Dev: **29.2s** (<= 180s), `address` 0.1s, coverage 96%.
+   The fix matters most exactly where a workspace was born.
+3. **Mac no-op sync (gate 3): PASS.** Dev: **42.9s** (<= 120s), 98.6% phased.
+   Correction to the phase-0 read: the 559s "no-op" sync was actually carrying
+   worktree churn (a true no-op short-circuits before `encryptAndUpload`, so
+   the quadratic never ran on no-ops — it ran on every *changed* push, which
+   the daemon does constantly).
+4. **Correctness (gate 4): PASS.** `bun test ./src/` 867/868 (the 1 fail is the
+   known-local json-output account-fields environmental); typecheck green. A
+   clean cross-host rename applied as exactly 1 written + 2 deleted, and the
+   cache entry migrated to own only the new path. Full-cache disjointness audit
+   on the real 47,757-entry Mac cache after the dev runs: **0 duplicate paths**.
+5. **Daemon soak (gate 5): PASS.** Both daemons restarted on the dev build.
+   Mac: cold start to first catch-up publish 63s (worst case — includes the
+   initial full scan), then steady cycles publishing ~60s apart under active
+   churn (v0.9.9 cycle was ~3.5 min). Linux: post-pull to publish ~25s.
+   Cross-host propagation (Mac publish to Linux pull applied) ~15s. All
+   <= 90s.
+
+One anomaly logged for the record: two consecutive HTTP 500s from the prod API
+during the first dev-arm push attempts (failing at blob upload), not
+reproduced on any subsequent run (all-200 wrangler tail on the passing run,
+v0.9.9 pushed fine in between). Treated as a transient server blip; watch for
+recurrence during the soak/release window.
+
 ## 7. Non-goals
 
 1. **Scan cost.** A scan is 51.4s, and CLI sync can run about 2 scans. Future

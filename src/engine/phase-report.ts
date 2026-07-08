@@ -27,22 +27,30 @@
 
 export type PhaseName =
   | "latest"
+  | "state-load"
   | "scan"
+  | "git-plan"
+  | "address"
   | "encrypt"
+  | "missing"
   | "upload"
+  | "commit"
   | "download"
   | "decrypt"
   | "apply"
   | "git-apply"
   | "cache-save"
-  | "state-save"
-  | "commit";
+  | "state-save";
 
 /** Stable display order for the summary line (and any tabular diff). */
 const PHASE_ORDER: readonly PhaseName[] = [
   "latest",
+  "state-load",
   "scan",
+  "git-plan",
+  "address",
   "encrypt",
+  "missing",
   "upload",
   "commit",
   "download",
@@ -112,10 +120,20 @@ export class PhaseReport {
   static sync(): PhaseReport {
     return new PhaseReport("sync", true);
   }
-  /** The no-op report used on the daemon hot path: runs wrapped work, records nothing. */
+  /** The no-op report used on the daemon hot path: runs wrapped work, records nothing.
+   *  A shared per-op singleton, so `deps.report ?? PhaseReport.disabled(...)` costs no
+   *  allocation on a no-op tick (§35) — safe to share because a disabled report
+   *  accumulates nothing: phase()/record()/recordDetails() early-return, and the
+   *  files/blobs field scribbles callers make are only ever read from enabled reports. */
   static disabled(op: "push" | "pull" | "sync" = "push"): PhaseReport {
-    return new PhaseReport(op, false);
+    return PhaseReport.DISABLED[op];
   }
+
+  private static readonly DISABLED = {
+    push: new PhaseReport("push", false),
+    pull: new PhaseReport("pull", false),
+    sync: new PhaseReport("sync", false),
+  } as const;
 
   /** Emit the one-line summary to `sink`, but ONLY if at least one phase was recorded —
    *  so a run that did no work (e.g. a no-op push tick) logs nothing. */

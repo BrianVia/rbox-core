@@ -17,7 +17,7 @@ export interface EncryptAddressCacheEntry {
   payloadSha?: string;
 }
 
-interface StoredEncryptAddressCacheEntry extends EncryptAddressCacheEntry {
+export interface StoredEncryptAddressCacheEntry extends EncryptAddressCacheEntry {
   paths: string[];
 }
 
@@ -83,11 +83,33 @@ function parseStored(raw: unknown, context: EncryptAddressCacheContext): Map<str
 
 export class EncryptAddressCache {
   private readonly entries: Map<string, StoredEncryptAddressCacheEntry>;
+  private readonly pathOwner = new Map<string, string>();
   private dirtyRevision = 0;
   private savedRevision = 0;
 
   constructor(private readonly context: EncryptAddressCacheContext, storedEntries?: Map<string, StoredEncryptAddressCacheEntry>) {
-    this.entries = storedEntries ? new Map(storedEntries) : new Map();
+    this.entries = new Map();
+    if (!storedEntries) return;
+
+    // THE authoritative ordering for duplicate-path resolution (design 82 §3:
+    // first owner in sorted-sha order wins) — parseStored is deliberately
+    // order-agnostic so this sort is the single load-bearing one.
+    let scrubbed = false;
+    for (const plaintextSha of [...storedEntries.keys()].sort()) {
+      const entry = storedEntries.get(plaintextSha)!;
+      const paths = entry.paths.filter((relPath) => {
+        if (this.pathOwner.has(relPath)) return false; // cross-entry duplicate — earlier owner keeps it
+        this.pathOwner.set(relPath, plaintextSha);
+        return true;
+      });
+      if (paths.length === entry.paths.length) {
+        this.entries.set(plaintextSha, entry); // untouched — reuse parseStored's fresh object
+        continue;
+      }
+      scrubbed = true;
+      if (paths.length > 0) this.entries.set(plaintextSha, { ...entry, paths });
+    }
+    if (scrubbed) this.markDirty();
   }
 
   lookup(plaintextSha: string): EncryptAddressCacheEntry | undefined {
@@ -110,11 +132,14 @@ export class EncryptAddressCache {
       const paths = new Set(prev.paths);
       const beforePaths = paths.size;
       paths.add(entry.path);
+      // paths.size === beforePaths means entry.path was already in prev.paths, so by
+      // the disjointness invariant pathOwner already maps it here — nothing to update.
       if (prev.encSha === nextBody.encSha && prev.cipherSize === nextBody.cipherSize && prev.comp === nextBody.comp && prev.payloadSha === nextBody.payloadSha && paths.size === beforePaths) return;
       this.entries.set(plaintextSha, { ...nextBody, paths: [...paths].sort() });
     } else {
       this.entries.set(plaintextSha, { ...nextBody, paths: [entry.path] });
     }
+    this.pathOwner.set(entry.path, plaintextSha);
     this.markDirty();
   }
 
@@ -125,12 +150,10 @@ export class EncryptAddressCache {
   }
 
   prune(livePaths: ReadonlySet<string>): void {
-    for (const [plaintextSha, entry] of this.entries) {
-      const next = entry.paths.filter((p) => livePaths.has(p));
-      if (next.length === entry.paths.length) continue;
-      if (next.length === 0) this.entries.delete(plaintextSha);
-      else this.entries.set(plaintextSha, { ...entry, paths: next });
-      this.markDirty();
+    for (const [plaintextSha, entry] of [...this.entries]) {
+      for (const relPath of entry.paths) {
+        if (!livePaths.has(relPath)) this.releasePath(plaintextSha, relPath);
+      }
     }
   }
 
@@ -139,16 +162,24 @@ export class EncryptAddressCache {
   }
 
   private removePathFromOtherEntries(relPath: string, keepPlaintextSha: string): boolean {
-    let changed = false;
-    for (const [plaintextSha, entry] of this.entries) {
-      if (plaintextSha === keepPlaintextSha || !entry.paths.includes(relPath)) continue;
-      const next = entry.paths.filter((p) => p !== relPath);
-      if (next.length === 0) this.entries.delete(plaintextSha);
-      else this.entries.set(plaintextSha, { ...entry, paths: next });
-      this.markDirty();
-      changed = true;
-    }
-    return changed;
+    const owner = this.pathOwner.get(relPath);
+    if (owner === undefined || owner === keepPlaintextSha) return false;
+    this.releasePath(owner, relPath);
+    return true;
+  }
+
+  /** Remove `relPath` from `owner`'s entry AND its reverse mapping — the one place
+   *  entry paths shrink, so the entries↔pathOwner lockstep invariant is enforced
+   *  here rather than replicated at every removal site. Deletes the entry when its
+   *  last path goes. Must stay synchronous (design 82 §3: no await between the
+   *  paired mutations). */
+  private releasePath(owner: string, relPath: string): void {
+    const entry = this.entries.get(owner)!; // invariant: pathOwner never points at a missing entry
+    const next = entry.paths.filter((p) => p !== relPath);
+    if (next.length === 0) this.entries.delete(owner);
+    else this.entries.set(owner, { ...entry, paths: next });
+    this.pathOwner.delete(relPath);
+    this.markDirty();
   }
 
   private markDirty(): void {
