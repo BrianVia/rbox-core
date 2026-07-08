@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.12] — 2026-07-08 — ambient sync status (design 88)
+
+### Added
+- **Ambient sync status (design 88).** The daemon maintains an atomic
+  `daemon.status.json` beside its pidfile (5s heartbeat, ownership-gated,
+  early-paused on graceful stop); `rbox prompt-status [--json]` reads it with
+  staleness-as-death semantics (a killed daemon shows `! dead` within 15s);
+  the zsh prompt's staleness window tightens 180s → 15s on the new heartbeat;
+  `contrib/swiftbar/rbox.5s.sh` ships the macOS menu bar MVP with a
+  Status / File / Progress dropdown, pause/resume, and log tail.
+
 ## [0.9.11] — 2026-07-08 — git-plan at O(change) (fingerprint cache) + phase-0 instrumentation
 
 ### Fixed
