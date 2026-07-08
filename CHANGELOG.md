@@ -6,6 +6,22 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.8] — 2026-07-08 — batch slot defaults from the capstone curves
+
+### Changed
+- **Batch transport slot defaults raised: downloads 16→48, uploads 8→24.**
+  Cloudflare Workers cap parallel subrequests per invocation (~6), so a
+  32-record batch settles in ~1s regardless of size — concurrent batch
+  requests are the linear throughput lever. Measured on the v0.9.7 capstone:
+  publish 83s→39s (8→24 put slots, A/B corpus, WiFi); full-corpus wired join
+  128s→84s (16→48 get slots; 64 is flat — the knee is 48). `RBOX_BATCH_SLOTS`
+  / `RBOX_BATCH_PUT_SLOTS` still override.
+
+### Fixed
+- Push lane timing no longer double-counts batched blobs
+  (`ownsUploadLaneTiming` is now forwarded through the E2EE remote wrapper,
+  and ownership is exclusive).
+
 ## [0.9.7] — 2026-07-08 — compress-before-encrypt + batched uploads
 
 ### Added
