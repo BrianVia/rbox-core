@@ -174,5 +174,6 @@ describe("agent/API sync keys", () => {
     const body = await res!.text();
     expect(body).toContain("install.sh");
     expect(body).toContain('exec rbox setup "$@"');
+    expect(body).toContain('.rbox/bin'); // PATH extension — a child sh can't mutate ours (antislop #1)
   });
 });

@@ -50,11 +50,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "setup",
     group: "GETTING STARTED",
     summary: "guided onboarding: account → workspace → start syncing",
-    usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key <env|->] [--key-file <path>] [--daemon] [--pull-only] [--force]",
+    usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
     flags: [
       { flag: "--workspace <name|id>", desc: "with RBOX_KEY, sync an existing workspace non-interactively" },
       { flag: "--dir <path>", desc: "target directory for keyed setup" },
-      { flag: "--key <env|->", desc: "read RBOX_KEY from env, or '-' from stdin; literal values are rejected" },
+      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
       { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
       { flag: "--daemon", desc: "after the first pull, start background sync" },
       { flag: "--pull-only", desc: "with --daemon, never push local changes" },

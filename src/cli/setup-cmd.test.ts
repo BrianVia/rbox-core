@@ -163,7 +163,7 @@ test("keyed setup requires key input when --workspace is present", async () => {
   const oldKey = process.env.RBOX_KEY;
   delete process.env.RBOX_KEY;
   try {
-    await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app" } })).rejects.toThrow("--workspace requires a key: set RBOX_KEY or pass --key-file/--key -");
+    await expect(runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { workspace: "app" } })).rejects.toThrow(/--workspace requires a key/);
   } finally {
     if (oldKey === undefined) delete process.env.RBOX_KEY;
     else process.env.RBOX_KEY = oldKey;

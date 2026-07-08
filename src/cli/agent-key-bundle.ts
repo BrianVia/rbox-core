@@ -24,10 +24,26 @@ export function encodeAgentKeyBundle(bundle: AgentKeyBundle): string {
   return toB64url(utf8(JSON.stringify(bundle)));
 }
 
+const BUNDLE_ERROR = "RBOX_KEY is not a valid agent key bundle — expected the one-time output of `rbox key create-ci` (check for truncation when pasting into your secret store)";
+
 export function decodeAgentKeyBundle(raw: string): AgentKeyBundle {
-  const b = JSON.parse(new TextDecoder().decode(fromB64url(raw.trim()))) as Partial<AgentKeyBundle>;
-  if (b.v !== 1 || b.kind !== "agent" || typeof b.bearer !== "string" || typeof b.accountId !== "string" || typeof b.deviceId !== "string" || typeof b.mk !== "string" || typeof b.device !== "object" || b.device === null) {
-    throw new Error("invalid RBOX_KEY bundle");
+  let b: Partial<AgentKeyBundle>;
+  try {
+    b = JSON.parse(new TextDecoder().decode(fromB64url(raw.trim()))) as Partial<AgentKeyBundle>;
+  } catch {
+    throw new Error(BUNDLE_ERROR);
+  }
+  const d = b.device as Partial<AgentKeyBundle["device"]> | null | undefined;
+  if (
+    b.v !== 1 || b.kind !== "agent" || typeof b.bearer !== "string" || typeof b.accountId !== "string" || typeof b.deviceId !== "string" || typeof b.mk !== "string" ||
+    typeof d !== "object" || d === null ||
+    typeof d.sigPubKey !== "string" || typeof d.sigPrivPkcs8 !== "string" || typeof d.encPubSpki !== "string" || typeof d.encPrivPkcs8 !== "string"
+  ) {
+    throw new Error(BUNDLE_ERROR);
+  }
+  const keks = Array.isArray(b.keks) ? b.keks : [];
+  for (const k of keks) {
+    if (typeof k.workspaceId !== "string" || !Number.isInteger(k.keyEpoch) || typeof k.kek !== "string") throw new Error(BUNDLE_ERROR);
   }
   return {
     v: 1,
@@ -36,9 +52,9 @@ export function decodeAgentKeyBundle(raw: string): AgentKeyBundle {
     accountId: b.accountId,
     deviceId: b.deviceId,
     ...(typeof b.remoteUrl === "string" ? { remoteUrl: b.remoteUrl } : {}),
-    device: b.device as AgentKeyBundle["device"],
+    device: { sigPubKey: d.sigPubKey, sigPrivPkcs8: d.sigPrivPkcs8, encPubSpki: d.encPubSpki, encPrivPkcs8: d.encPrivPkcs8 },
     mk: b.mk,
-    keks: Array.isArray(b.keks) ? b.keks : [],
+    keks,
   };
 }
 
@@ -67,10 +83,9 @@ export async function materializeAgentKey(rawBundle: string, opts: { dir?: strin
   if (remoteUrl) process.env.RBOX_API = remoteUrl;
 
   await saveDevice(bundleSecrets(bundle));
+  // Entries were validated strictly at decode; a malformed kek throws there.
   for (const k of bundle.keks) {
-    if (typeof k.workspaceId === "string" && Number.isInteger(k.keyEpoch) && typeof k.kek === "string") {
-      await saveWsKek(bundle.accountId, k.workspaceId, k.keyEpoch, fromB64url(k.kek));
-    }
+    await saveWsKek(bundle.accountId, k.workspaceId, k.keyEpoch, fromB64url(k.kek));
   }
   return { home, token: bundle.bearer, accountId: bundle.accountId, deviceId: bundle.deviceId, remoteUrl };
 }

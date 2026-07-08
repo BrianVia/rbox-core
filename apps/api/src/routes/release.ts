@@ -11,6 +11,10 @@ set -eu
 
 if ! command -v rbox >/dev/null 2>&1; then
   curl -fsSL --proto '=https' https://rbox.to/install.sh | sh
+  # install.sh drops the binary in ~/.rbox/bin and persists PATH only for NEW
+  # shells; a child sh can't mutate ours, so extend PATH here or the exec
+  # would 127 on the exact machine this script exists for (fresh agent VM).
+  PATH="\${RBOX_INSTALL_DIR:-\${HOME}/.rbox/bin}:\${PATH}"
 fi
 
 exec rbox setup "$@"

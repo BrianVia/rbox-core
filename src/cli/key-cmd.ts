@@ -70,7 +70,9 @@ export async function createCiKey(flags: Record<string, string>): Promise<void> 
     expiresAt,
     now: Date.now(),
   }).catch(async (e) => {
-    await api.revokeApiKey(deviceId).catch(() => {});
+    await api.revokeApiKey(deviceId).catch(() => {
+      process.stderr.write(`cleanup failed — the half-created key still counts against the cap; run \`rbox key revoke ${deviceId}\`\n`);
+    });
     throw e;
   });
   const bundle: AgentKeyBundle = {
