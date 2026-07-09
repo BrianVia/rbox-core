@@ -13,6 +13,7 @@ import { CommitRejectedError, QuotaExceededError, type CommitOptions, type Commi
 import { attributeDaemonForStatus, healthLine, progressLabel } from "./status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import type { WatchOptions, Watcher } from "./watcher.js";
+import { RBOX_VERSION } from "./version.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
 // sync. The load-bearing lifecycle: a pump error records a HALT (the mass-delete
@@ -420,6 +421,9 @@ test("ambient status writes beside the pidfile and carries local-only currentPat
       schemaVersion: 1,
       state: "syncing",
       sequence: null,
+      fileCount: 0,
+      daemonVersion: RBOX_VERSION,
+      workspaceRoot: root,
       operation: { kind: "push", phase: "encrypt", filesDone: 1, filesTotal: 3, currentPath: "src/private-file.ts" },
     });
   });
@@ -1137,7 +1141,13 @@ test("graceful daemon stop writes paused ambient status even after stopDaemon re
     await fs.rm(pidfile);
     await daemon.stop();
 
-    expect(await readAmbientStatus()).toMatchObject({ schemaVersion: 1, state: "paused" });
+    expect(await readAmbientStatus()).toMatchObject({
+      schemaVersion: 1,
+      state: "paused",
+      fileCount: 0,
+      daemonVersion: RBOX_VERSION,
+      workspaceRoot: root,
+    });
   });
 });
 

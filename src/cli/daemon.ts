@@ -34,6 +34,13 @@ import {
   type AmbientDaemonStatusV1,
 } from "./ambient-status.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
+import { RBOX_VERSION } from "./version.js";
+
+type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
+  fileCount: number;
+  daemonVersion: string;
+  workspaceRoot: string;
+};
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
@@ -814,18 +821,23 @@ export class RboxDaemon {
     };
   }
 
-  private ambientStatusFrom(snapshot: DaemonActivity, settled: boolean, now: number): AmbientDaemonStatusV1 {
-    return projectAmbientDaemonStatus({
-      activity: snapshot,
-      settled,
-      now,
-      sequence: this.lastLoggedSeq,
-      activePumpOp: this.activePumpOp,
-      want: this.want,
-      watcherDegraded: this.watcherDegraded,
-      ownershipLost: this.ownershipWindDownStarted,
-      currentPath: this.activeProgressPath,
-    });
+  private ambientStatusFrom(snapshot: DaemonActivity, settled: boolean, now: number): RboxBarAmbientStatus {
+    return {
+      ...projectAmbientDaemonStatus({
+        activity: snapshot,
+        settled,
+        now,
+        sequence: this.lastLoggedSeq,
+        activePumpOp: this.activePumpOp,
+        want: this.want,
+        watcherDegraded: this.watcherDegraded,
+        ownershipLost: this.ownershipWindDownStarted,
+        currentPath: this.activeProgressPath,
+      }),
+      fileCount: this.manifest.files.length,
+      daemonVersion: RBOX_VERSION,
+      workspaceRoot: this.root,
+    };
   }
 
   private activitySnapshot(): DaemonActivity {
@@ -859,9 +871,14 @@ export class RboxDaemon {
     this.enqueueAmbientStatusWrite();
   }
 
-  private pausedAmbientStatus(now = Date.now()): AmbientDaemonStatusV1 {
+  private pausedAmbientStatus(now = Date.now()): RboxBarAmbientStatus {
     const previous = this.ambientStatusFrom(this.activity, this.localSettled(), now);
-    return pausedAmbientDaemonStatus(now, previous);
+    return {
+      ...pausedAmbientDaemonStatus(now, previous),
+      fileCount: previous.fileCount,
+      daemonVersion: previous.daemonVersion,
+      workspaceRoot: previous.workspaceRoot,
+    };
   }
 
   private async writePausedAmbientStatusImmediate(): Promise<void> {

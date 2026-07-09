@@ -40,7 +40,7 @@ struct MenuContentView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             Divider()
-            footer
+            footer(nil)
             quitButton
         }
         .padding(14)
@@ -66,24 +66,25 @@ struct MenuContentView: View {
                 operationBlock(workspace.operation)
             }
 
-            if workspace.state == .attention {
+            if workspace.severityTier == .degraded {
+                degradedStatusLine
+            } else if workspace.severityTier == .critical {
                 attentionBanner(workspace)
             }
 
-            if workspace.state == .synced || workspace.state == .attention {
-                metaLine(workspace)
-            }
+            statusSummary(workspace)
 
             Divider()
-            actionButton(for: workspace)
-            itemButton(title: "Open Dashboard", symbol: "arrow.up.right") {
-                model.openDashboard()
-            }
-            itemButton(title: "View Daemon Log...", symbol: "line.3.horizontal") {
+            pauseResumeButton(for: workspace)
+            restartButton(for: workspace)
+            itemButton(title: "Open logs", symbol: "line.3.horizontal") {
                 model.openLog(for: workspace)
             }
             Divider()
-            footer
+            if let availableVersion = model.availableUpdate(for: workspace) {
+                updateButton(availableVersion)
+            }
+            footer(workspace)
             Divider()
             quitButton
         }
@@ -91,13 +92,22 @@ struct MenuContentView: View {
     }
 
     private func header(_ workspace: WorkspaceStatus) -> some View {
-        HStack(spacing: 8) {
-            Text(workspace.name)
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            statePill(workspace)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(workspace.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                statePill(workspace)
+            }
+            if let rootPath = workspace.rootPath {
+                Text(Self.displayPath(rootPath))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         }
     }
 
@@ -204,23 +214,54 @@ struct MenuContentView: View {
     }
 
     private func attentionBanner(_ workspace: WorkspaceStatus) -> some View {
-        let color: Color = workspace.severityTier == .degraded ? .orange : .red
-
         return VStack(alignment: .leading, spacing: 4) {
             Text(Self.attentionTitle(workspace.reason))
                 .font(.system(size: 12, weight: .semibold))
-            Text(Self.attentionDetail(workspace))
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            if let detail = Self.informativeDetail(
+                headline: Self.attentionTitle(workspace.reason),
+                detail: Self.attentionDetail(workspace)
+            ) {
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(Self.criticalRemedy(workspace.reason))
+                .font(.system(size: 11, weight: .medium))
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(color.opacity(0.32), lineWidth: 1))
+        .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.red.opacity(0.32), lineWidth: 1))
     }
 
-    private func metaLine(_ workspace: WorkspaceStatus) -> some View {
+    private var degradedStatusLine: some View {
+        Text(Self.degradedStatusText)
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func statusSummary(_ workspace: WorkspaceStatus) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(primaryStatusText(workspace))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary)
+            if let detail = secondaryStatusText(workspace) {
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func primaryStatusText(_ workspace: WorkspaceStatus) -> String {
+        if let fileCount = workspace.fileCount {
+            let count = Self.integerFormatter.string(from: NSNumber(value: fileCount)) ?? "\(fileCount)"
+            return "\(count) files · \(stateSummary(workspace))"
+        }
+
         var parts: [String] = []
         if let last = workspace.lastSyncedAt {
             parts.append("Last synced \(relativeTime(last))")
@@ -228,33 +269,62 @@ struct MenuContentView: View {
         if let sequence = workspace.sequence {
             parts.append("seq \(sequence)")
         }
-        if workspace.state == .synced, let filesTotal = workspace.operation?.filesTotal {
-            parts.append("\(Self.integerFormatter.string(from: NSNumber(value: filesTotal)) ?? "\(filesTotal)") files")
-        }
-
-        return Text(parts.isEmpty ? "No sync metadata yet" : parts.joined(separator: " · "))
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .lineLimit(2)
+        return parts.isEmpty ? stateSummary(workspace).capitalized : parts.joined(separator: " · ")
     }
 
-    private func actionButton(for workspace: WorkspaceStatus) -> some View {
+    private func secondaryStatusText(_ workspace: WorkspaceStatus) -> String? {
+        guard workspace.fileCount != nil else { return nil }
+        var parts: [String] = []
+        if let last = workspace.lastSyncedAt {
+            parts.append("Last synced \(relativeTime(last))")
+        }
+        if let sequence = workspace.sequence {
+            parts.append("seq \(sequence)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func stateSummary(_ workspace: WorkspaceStatus) -> String {
+        switch workspace.severityTier {
+        case .degraded:
+            return "periodic scans active"
+        case .critical:
+            return "not syncing"
+        case .ok:
+            switch workspace.state {
+            case .synced: return "in sync"
+            case .syncing: return "syncing"
+            case .paused: return "paused"
+            case .attention: return "in sync"
+            }
+        }
+    }
+
+    private func pauseResumeButton(for workspace: WorkspaceStatus) -> some View {
         let disabled = workspace.rootPath == nil
         let title: String
         let symbol: String
-        if workspace.state == .attention {
-            title = disabled ? "Restart Unavailable: Missing Root" : "Restart Background Sync"
-            symbol = "arrow.clockwise"
-        } else if workspace.state == .paused {
-            title = disabled ? "Resume Unavailable: Missing Root" : "Resume Background Sync"
+        if workspace.state == .paused {
+            title = disabled ? "Resume unavailable: missing root" : "Resume rbox"
             symbol = "play.fill"
         } else {
-            title = disabled ? "Pause Unavailable: Missing Root" : "Pause Syncing"
+            title = disabled ? "Pause unavailable: missing root" : "Pause rbox"
             symbol = "pause.fill"
         }
 
         return itemButton(title: title, symbol: symbol, disabled: disabled) {
-            model.startOrStopSelected()
+            model.pauseOrResumeSelected()
+        }
+    }
+
+    private func restartButton(for workspace: WorkspaceStatus) -> some View {
+        let disabled = workspace.rootPath == nil
+        return itemButton(
+            title: disabled ? "Restart unavailable: missing root" : "Restart rbox",
+            symbol: "arrow.clockwise",
+            disabled: disabled
+        ) {
+            model.restartSelected()
         }
     }
 
@@ -278,9 +348,29 @@ struct MenuContentView: View {
         .opacity(disabled ? 0.5 : 1)
     }
 
-    private var footer: some View {
+    private func updateButton(_ availableVersion: String) -> some View {
+        Button {
+            model.copyInstallCommand()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: model.copiedInstallCommand ? "checkmark" : "arrow.down.circle")
+                    .frame(width: 14)
+                Text(model.copiedInstallCommand ? "Copied install command" : "Update available: \(availableVersion)")
+                    .lineLimit(1)
+                Spacer()
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func footer(_ workspace: WorkspaceStatus?) -> some View {
         HStack {
-            Text(versionLabel)
+            Text(versionLabel(workspace))
             Spacer()
             Text(shortHostName())
         }
@@ -372,6 +462,8 @@ struct MenuContentView: View {
         }
     }
 
+    static let degradedStatusText = "File watching degraded — periodic scans keep syncing (~1 min latency)."
+
     static func attentionDetail(_ workspace: WorkspaceStatus) -> String {
         let ageText: String
         if let age = workspace.heartbeatAgeSeconds {
@@ -398,6 +490,53 @@ struct MenuContentView: View {
         }
     }
 
+    static func informativeDetail(headline: String, detail: String) -> String? {
+        let normalizedHeadline = normalizedComparisonText(headline)
+        let normalizedDetail = normalizedComparisonText(detail)
+        guard !normalizedDetail.isEmpty else { return nil }
+        guard !normalizedHeadline.isEmpty else { return detail }
+
+        if normalizedDetail == normalizedHeadline
+            || normalizedDetail.hasPrefix(normalizedHeadline + " ") {
+            return nil
+        }
+
+        let headlineWords = Set(normalizedHeadline.split(separator: " "))
+        let detailWords = Set(normalizedDetail.split(separator: " "))
+        let sharedWordCount = headlineWords.intersection(detailWords).count
+        let substantiallyRepeatsHeadline = headlineWords.count >= 3
+            && sharedWordCount >= 3
+            && Double(sharedWordCount) / Double(headlineWords.count) >= 0.75
+
+        return substantiallyRepeatsHeadline ? nil : detail
+    }
+
+    private static func normalizedComparisonText(_ text: String) -> String {
+        let punctuationStripped = text.lowercased()
+            .unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? String($0) : " " }
+            .joined()
+        return punctuationStripped
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+    }
+
+    static func criticalRemedy(_ reason: String?) -> String {
+        switch reason {
+        case "quota":
+            return "Upgrade storage; rbox retries automatically."
+        case "owner":
+            return "A newer rbox took over; this one will exit."
+        case "halt":
+            return "Resolve the logged cause, then restart rbox."
+        case "dead", "error", nil:
+            return "Restart rbox; open logs if it returns."
+        default:
+            return "Restart rbox; open logs if it returns."
+        }
+    }
+
     private func relativeTime(_ date: Date) -> String {
         let seconds = max(0, Int(Date().timeIntervalSince(date)))
         if seconds < 60 { return "just now" }
@@ -408,9 +547,18 @@ struct MenuContentView: View {
         return "\(hours / 24) d ago"
     }
 
-    private var versionLabel: String {
-        let v = model.versionText
+    private func versionLabel(_ workspace: WorkspaceStatus?) -> String {
+        let v = workspace?.daemonVersion ?? model.versionText
         return v.lowercased().hasPrefix("rbox") ? v : "rbox \(v)"
+    }
+
+    static func displayPath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if path == home { return "~" }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
     }
 
     private func shortHostName() -> String {

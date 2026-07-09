@@ -64,6 +64,8 @@ struct WorkspaceStatus: Identifiable, Equatable {
     var attentionReason: AmbientAttentionReason? = nil
     var operation: SyncOperation?
     var sequence: Int?
+    var fileCount: Int? = nil
+    var daemonVersion: String? = nil
     var lastSyncedAt: Date?
     var heartbeatAgeSeconds: Double?
     var desiredState: String?
@@ -85,6 +87,8 @@ extension WorkspaceStatus {
             reason: nil,
             operation: nil,
             sequence: nil,
+            fileCount: nil,
+            daemonVersion: nil,
             lastSyncedAt: nil,
             heartbeatAgeSeconds: nil,
             desiredState: nil
