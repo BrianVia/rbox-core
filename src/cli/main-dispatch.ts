@@ -343,7 +343,8 @@ export async function main(): Promise<void> {
       break;
     }
     case "recover": {
-      await recoverCmd(recoveryKitOptionsFromFlags(flags));
+      const { recoverWorkspaceCmd } = await import("./recover-cmd.js");
+      await recoverWorkspaceCmd(positional[0], { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
       break;
     }
     case "versions": {
@@ -383,13 +384,14 @@ export async function main(): Promise<void> {
       if (sub === "status") await keyStatus({ json: jsonMode });
       else if (sub === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
       else if (sub === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
+      else if (sub === "recover") await recoverCmd(recoveryKitOptionsFromFlags(flags));
       else {
         const { createCiKey, materializeCmd, listKeys, revokeKey } = await import("./key-cmd.js");
         if (sub === "create-ci") await createCiKey(flags);
         else if (sub === "materialize") await materializeCmd(flags);
         else if (sub === "list") await listKeys({ json: jsonMode });
         else if (sub === "revoke") await revokeKey(positional[1] ?? "");
-        else fail("usage: rbox key <status | backup | genesis --yes | create-ci --expires <dur> | materialize | list | revoke <id>>");
+        else fail("usage: rbox key <status | backup | genesis --yes | recover | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
     }

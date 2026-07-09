@@ -1519,7 +1519,7 @@ export async function applyGitSections(
   // Fail closed ONCE, before any per-repo work: git sections (incl. pending ones) are
   // E2EE artifacts — without the key nothing below can decrypt-verify.
   if (!cfg.kek && keys.some((k) => remote.gitRepos?.[k] !== undefined || pending[k] !== undefined)) {
-    throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox recover`.");
+    throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox key recover`.");
   }
 
   const commonDirGroupFor = async (repoDir: string, hasDotGit: boolean): Promise<number | undefined> => {

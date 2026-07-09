@@ -48,7 +48,7 @@ export async function createCiKey(flags: Record<string, string>): Promise<void> 
   const creds = await loadCredentials();
   if (!creds?.accountId) throw new Error("not logged in or missing account id — run `rbox login` first");
   const loaded = await loadDevice(creds.accountId);
-  if (!loaded || !("secrets" in loaded)) throw new Error("this device is not enrolled for encryption — run `rbox pair`/`rbox recover` first");
+  if (!loaded || !("secrets" in loaded)) throw new Error("this device is not enrolled for encryption — run `rbox pair`/`rbox key recover` first");
 
   const bearer = createPatToken();
   const deviceId = newAgentId();

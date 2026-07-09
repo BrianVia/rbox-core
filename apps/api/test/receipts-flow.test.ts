@@ -46,10 +46,20 @@ const used = async (id: string) =>
   Number((await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(id).first())!.used_bytes);
 
 const fakeState = () =>
-  ({
-    setWebSocketAutoResponse() {},
-    storage: { kv: new Map(), transactionSync(fn: () => void) { fn(); } },
-  }) as unknown as DurableObjectState;
+  {
+    const kv = new Map<string, unknown>();
+    return {
+      setWebSocketAutoResponse() {},
+      storage: {
+        kv: {
+          get: (key: string) => kv.get(key),
+          put: (key: string, value: unknown) => kv.set(key, value),
+          delete: (key: string) => kv.delete(key),
+        },
+        transactionSync(fn: () => void) { fn(); },
+      },
+    } as unknown as DurableObjectState;
+  };
 
 async function redeem(accountId: string, receipts: Record<string, unknown>): Promise<Response> {
   const sync = new WorkspaceSync(fakeState(), env);

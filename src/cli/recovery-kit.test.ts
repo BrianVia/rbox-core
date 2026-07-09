@@ -47,7 +47,7 @@ describe("recovery kit", () => {
     expect(body).toContain(`Account: ${ACCOUNT}`);
     expect(body).toContain("Device: laptop (devA)");
     expect(body).toContain(PHRASE);
-    expect(body).toContain("rbox recover");
+    expect(body).toContain("rbox key recover");
     expect(body).toContain("Anyone with this phrase can decrypt your rbox data.");
     expect(body).toContain("rbox has no escrow and can never reset this phrase for you.");
   });

@@ -76,7 +76,7 @@ export function renderKit(input: RenderKitInput): string {
     "2. Sign in on the new machine:",
     "   rbox login",
     "3. Re-enroll encryption:",
-    "   rbox recover",
+    "   rbox key recover",
     "4. Paste the 24-word phrase above when prompted.",
     "",
     "Warnings:",

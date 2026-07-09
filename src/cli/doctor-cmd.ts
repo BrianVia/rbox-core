@@ -126,8 +126,8 @@ async function checkEnrollment(creds: Credentials | undefined): Promise<DoctorCh
   if (!creds?.accountId) return { ok: false, label: "encryption", message: "credential has no account id", hint: "run `rbox login` again" };
   try {
     const loaded = await loadDevice(creds.accountId);
-    if (!loaded) return { ok: false, label: "encryption", message: "device key is missing", hint: "run `rbox pair` or `rbox recover`" };
-    if (!("secrets" in loaded)) return { ok: false, label: "encryption", message: "device key is present but master key is missing", hint: "run `rbox recover` or sync once to self-heal if possible" };
+    if (!loaded) return { ok: false, label: "encryption", message: "device key is missing", hint: "run `rbox pair` or `rbox key recover`" };
+    if (!("secrets" in loaded)) return { ok: false, label: "encryption", message: "device key is present but master key is missing", hint: "run `rbox key recover` or sync once to self-heal if possible" };
     return { ok: true, label: "encryption", message: "device key and master key present" };
   } catch {
     return { ok: false, label: "encryption", message: "could not read local key material", hint: "check `~/.rbox/e2ee` permissions" };

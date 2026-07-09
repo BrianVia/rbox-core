@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
-import { json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
-import { startOp, type MetricEvent } from "./metrics.js";
+import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { emit as emitMetric, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
   commitAccounting,
@@ -49,13 +49,17 @@ async function quotaExceededBody(db: D1Database, accountId: string, overCap: { u
  * parsing (caps, capped body read, §24 ref-mode discriminator) live in
  * commit-envelope.ts; this class orchestrates.
  *
- * DO storage (SQLite-backed, synchronous KV): `head` (number) and `seq:<n>`
- * (JSON of the full SignedCommit). Authoritative; D1 `commits` is a best-effort
- * mirror for cross-workspace queries.
+ * DO storage (SQLite-backed, synchronous KV): `head` ({sequence, commitHash}),
+ * `headWatermark` (highest acked sequence), and `seq:<n>` (JSON of the full
+ * SignedCommit). Authoritative; D1 `commits` is a best-effort mirror for
+ * cross-workspace queries and explicit repair only.
  */
 export class WorkspaceSync {
   private bootstrapped = false;
   private bootstrapPromise?: Promise<void>;
+  private repairRequired = false;
+  private bootWs = "";
+  private bootProj = "";
 
   constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {
     // Answer protocol-level heartbeats without waking the DO from hibernation.
@@ -69,6 +73,7 @@ export class WorkspaceSync {
     // and BEFORE any positional path parsing, so any projectId — including one containing "/" —
     // purges without mis-parsing the action segment (the §3 wedge). deleteAll needs no ws/proj.
     if (req.method === "POST" && url.pathname === "/purge") return this.purge();
+    if (req.method === "POST" && url.pathname === "/repair") return this.repair(req, url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
 
     // SERVER-INTERNAL roots/prune (design 37 §4f follow-up): the GC reachability scan and the
     // retention prune address the DO from D1, where project_id may contain "/". A positional
@@ -78,6 +83,7 @@ export class WorkspaceSync {
     // positional handlers below remain for any direct caller.
     if (url.pathname === "/roots" || url.pathname === "/prune") {
       await this.ensureBootstrap(url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
+      if (this.repairRequired) return this.repairRequiredResponse();
       if (url.pathname === "/roots" && req.method === "GET") return this.roots();
       if (url.pathname === "/prune" && req.method === "POST") return this.prune(req);
       return json({ error: "not_found" }, 404);
@@ -90,6 +96,7 @@ export class WorkspaceSync {
     const subaction = seg[6] ?? "";
 
     await this.ensureBootstrap(ws, proj);
+    if (this.repairRequired && action !== "repair") return this.repairRequiredResponse();
 
     if (action === "connect" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
       return acceptConnection(this.ctx, url);
@@ -105,6 +112,7 @@ export class WorkspaceSync {
     // GC support (M6): authoritative retained roots + retention prune.
     if (action === "roots" && req.method === "GET") return this.roots();
     if (action === "prune" && req.method === "POST") return this.prune(req);
+    if (action === "repair" && req.method === "POST") return this.repair(req, ws, proj);
     return json({ error: "not_found" }, 404);
   }
 
@@ -119,25 +127,66 @@ export class WorkspaceSync {
   }
 
   private async doBootstrap(ws: string, proj: string): Promise<void> {
-    const head = this.ctx.storage.kv.get("head");
-    if (head === undefined && ws && proj) {
-      // Seed from any pre-DO D1 state so existing workspaces don't reconcile against empty.
-      // §32 FLAG: `commits` is account-data, but this DO bootstrap only knows (ws, proj) —
-      // the owning account isn't forwarded on a first-touch read. Account-less at N=1 (one
-      // shard); a real shard cutover needs a (ws → shard) directory index here.
-      const row = await dbFor(this.env, "")
-        .prepare("SELECT sequence, commit_hash, body, sig FROM commits WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT 1")
-        .bind(ws, proj)
-        .first<{ sequence: number; commit_hash: string; body: string; sig: string }>();
-      if (row) {
-        const stored = JSON.stringify({ commitHash: row.commit_hash, sig: row.sig, body: row.body });
-        this.ctx.storage.transactionSync(() => {
-          this.ctx.storage.kv.put("head", Number(row.sequence));
-          this.ctx.storage.kv.put(`seq:${row.sequence}`, stored);
-        });
-      }
+    this.bootWs = ws;
+    this.bootProj = proj;
+    const rawHead = this.ctx.storage.kv.get("head") as StoredHead | number | undefined;
+    if (typeof rawHead === "number") {
+      await this.migrateNumericHead(ws, proj, rawHead);
+      this.bootstrapped = true;
+      return;
     }
+    if (isStoredHead(rawHead)) {
+      this.ensureWatermarkAtLeast(rawHead.sequence);
+      this.bootstrapped = true;
+      return;
+    }
+
+    const watermark = this.ctx.storage.kv.get("headWatermark") as number | undefined;
+    const floor = this.ctx.storage.kv.get("pruneFloor") as number | undefined;
+    const hasSeqEvidence = await this.hasRetainedSeqEvidence();
+    if (watermark !== undefined || (floor ?? 0) > 0 || hasSeqEvidence) {
+      metric(this.env, "bootstrap_head_missing");
+      if (hasSeqEvidence) metric(this.env, "head_missing_with_retained_seq");
+      this.repairRequired = true;
+      this.bootstrapped = true;
+      return;
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put("head", { sequence: 0, commitHash: GENESIS_HASH });
+      this.ctx.storage.kv.put("headWatermark", 0);
+    });
     this.bootstrapped = true;
+  }
+
+  private async migrateNumericHead(_ws: string, _proj: string, seq: number): Promise<void> {
+    const hash = this.hashForSeq(seq);
+    if (seq > 0 && !hash) {
+      this.repairRequired = true;
+      metric(this.env, "bootstrap_head_missing");
+      return;
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put("head", { sequence: seq, commitHash: hash ?? GENESIS_HASH });
+      this.ctx.storage.kv.put("headWatermark", Math.max(seq, (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? 0));
+    });
+  }
+
+  private ensureWatermarkAtLeast(seq: number): void {
+    const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? seq;
+    if (watermark < seq) this.ctx.storage.kv.put("headWatermark", seq);
+  }
+
+  private async hasRetainedSeqEvidence(): Promise<boolean> {
+    const storage = this.ctx.storage as DurableObjectStorage & { kv?: { list?: (opts?: { prefix?: string; limit?: number }) => Map<string, unknown> | Promise<Map<string, unknown>> } };
+    const kvList = storage.kv?.list;
+    if (typeof kvList === "function") {
+      return (await kvList.call(storage.kv, { prefix: "seq:", limit: 1 })).size > 0;
+    }
+    const storageList = storage.list;
+    if (typeof storageList === "function") {
+      return (await storageList.call(storage, { prefix: "seq:", limit: 1 })).size > 0;
+    }
+    return false;
   }
 
   // ---- commit (the atomic sequencer) ----
@@ -204,6 +253,7 @@ export class WorkspaceSync {
     if (!Number.isInteger(cb.seq) || !Number.isInteger(cb.parentSeq) || (cb.seq as number) !== (cb.parentSeq as number) + 1) {
       return json({ error: "bad_request", message: "seq must be parentSeq+1" }, 400);
     }
+    const commitSeq = cb.seq as number;
     if (parent !== cb.parentSeq) return json({ error: "bad_request", message: "parentSequence mismatch" }, 400);
     if (!Number.isInteger(cb.accountEpoch)) return json({ error: "bad_request", message: "bad accountEpoch" }, 400);
     const commitEpoch = cb.accountEpoch as number;
@@ -286,14 +336,16 @@ export class WorkspaceSync {
     // Atomic head check + advance — synchronous, no await inside. We store the full
     // SignedCommit verbatim (opaque); parent===head guarantees next === cb.seq.
     const stored = JSON.stringify({ commitHash: commit.commitHash, sig: commit.sig, body: commit.body });
-    let outcome: { sequence: number } | { conflict: number } | { epochStale: number };
+    let outcome: { sequence: number; watermark: number } | { conflict: number; equivocation?: true } | { epochStale: number };
     const doT0 = performance.now();
     try {
       let next = 0;
       this.ctx.storage.transactionSync(() => {
-        const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
-        if (parent !== head) {
-          outcome = { conflict: head };
+        const head = readHead(this.ctx.storage.kv.get("head"));
+        const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? head.sequence;
+        if (parent !== head.sequence) {
+          const sameSeqHash = commitSeq <= watermark ? this.hashForSeq(commitSeq) : undefined;
+          outcome = { conflict: head.sequence, ...(sameSeqHash && sameSeqHash !== commit.commitHash ? { equivocation: true as const } : {}) };
           throw ABORT;
         }
         // C4: refuse a commit signed under any epoch != the account's current one
@@ -303,11 +355,18 @@ export class WorkspaceSync {
           outcome = { epochStale: currentEpoch };
           throw ABORT;
         }
-        next = head + 1;
-        this.ctx.storage.kv.put("head", next);
+        if (commitSeq !== watermark + 1) {
+          const sameSeqHash = commitSeq <= watermark ? this.hashForSeq(commitSeq) : undefined;
+          outcome = { conflict: head.sequence, ...(sameSeqHash && sameSeqHash !== commit.commitHash ? { equivocation: true as const } : {}) };
+          throw ABORT;
+        }
+        next = head.sequence + 1;
+        const nextHead = { sequence: next, commitHash: commit.commitHash };
+        this.ctx.storage.kv.put("head", nextHead);
+        this.ctx.storage.kv.put("headWatermark", nextHead.sequence);
         this.ctx.storage.kv.put(`seq:${next}`, stored);
       });
-      outcome = { sequence: next };
+      outcome = { sequence: next, watermark: next };
     } catch (e) {
       if (e !== ABORT) throw e;
     } finally {
@@ -315,6 +374,7 @@ export class WorkspaceSync {
     }
 
     if ("conflict" in outcome!) {
+      if (outcome!.equivocation) metric(this.env, "same_sequence_different_hash");
       emitCommit("conflict");
       return json({ error: "conflict", head: outcome!.conflict }, 409);
     }
@@ -404,7 +464,7 @@ export class WorkspaceSync {
    *  (pruneFloor, head], the referenced content addresses parsed FROM the stored
    *  commit body — so the mark phase needs no R2 manifest fetch. */
   private async roots(): Promise<Response> {
-    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> = [];
     // FAIL CLOSED (§24.3 M3): GC condemns anything NOT named here, so any inability to
@@ -441,7 +501,7 @@ export class WorkspaceSync {
    *  them. Authoritative — operates on DO storage. */
   private async prune(req: Request): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as { floor?: number };
-    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     const curFloor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const target = Math.min(Number(body.floor ?? 0), head - 1); // never prune the head
     if (!Number.isFinite(target) || target <= curFloor) return json({ pruned: 0, pruneFloor: curFloor });
@@ -471,7 +531,7 @@ export class WorkspaceSync {
   private async commits(url: URL): Promise<Response> {
     const since = Number(url.searchParams.get("since") ?? "0");
     if (!Number.isInteger(since) || since < 0) return json({ error: "bad_request", message: "bad since" }, 400);
-    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     if (since >= head) return json({ commits: [] }); // caller already at/ahead of head
     if (head - since > MAX_COMMIT_SPAN) return json({ error: "needs_rebaseline", head, maxSpan: MAX_COMMIT_SPAN }, 409);
     const commits: SignedCommit[] = [];
@@ -494,11 +554,69 @@ export class WorkspaceSync {
   }
 
   private async latest(): Promise<Response> {
-    const head = (this.ctx.storage.kv.get("head") as number | undefined) ?? 0;
+    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     if (head === 0) return json({ sequence: 0, commit: null });
     const raw = this.ctx.storage.kv.get(`seq:${head}`) as string | undefined;
     if (!raw) return json({ error: "commit_pointer_missing" }, 500);
     return json({ sequence: head, commit: JSON.parse(raw) as SignedCommit });
+  }
+
+  private async repair(req: Request, ws: string, proj: string): Promise<Response> {
+    if (!this.isPlatform(req)) return json({ error: "not_found" }, 404);
+    if (!this.bootstrapped) await this.ensureBootstrap(ws || this.bootWs, proj || this.bootProj);
+    metric(this.env, "repair_invoked");
+    const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? 0;
+    const retainedSeq = await this.highestRetainedSeq();
+    const mirrorRow = ws && proj ? await loadBodyMirrorHead(dbFor(this.env, ""), ws, proj) : null;
+    const reconstructedSeq = Math.max(retainedSeq ?? 0, mirrorRow?.sequence ?? 0);
+    const target = Math.max(reconstructedSeq, watermark);
+    const commitHash = target === 0 ? GENESIS_HASH : this.hashForSeq(target) ?? (mirrorRow?.sequence === target ? mirrorRow.commit_hash : undefined);
+    if (!commitHash) return json({ error: "repair_unresolvable", watermark, target }, 409);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put("head", { sequence: target, commitHash });
+      this.ctx.storage.kv.put("headWatermark", Math.max(target, watermark));
+    });
+    this.repairRequired = false;
+    return json({ ok: true, head: target, watermark: Math.max(target, watermark), commitHash });
+  }
+
+  private repairRequiredResponse(): Response {
+    metric(this.env, "repair_required_served");
+    return json({ error: "repair_required" }, 409);
+  }
+
+  private isPlatform(req: Request): boolean {
+    const h = req.headers.get("x-rbox-platform") ?? "";
+    return !!this.env.RBOX_PLATFORM_SECRET && ctEqual(h, this.env.RBOX_PLATFORM_SECRET);
+  }
+
+  private hashForSeq(seq: number): string | undefined {
+    if (seq === 0) return GENESIS_HASH;
+    const raw = this.ctx.storage.kv.get(`seq:${seq}`) as string | undefined;
+    if (!raw) return undefined;
+    try {
+      const sc = JSON.parse(raw) as SignedCommit;
+      return typeof sc.commitHash === "string" ? sc.commitHash : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async highestRetainedSeq(): Promise<number | undefined> {
+    const storage = this.ctx.storage as DurableObjectStorage & { kv?: { list?: (opts?: { prefix?: string; limit?: number }) => Map<string, unknown> | Promise<Map<string, unknown>> } };
+    const kvList = storage.kv?.list;
+    const rows =
+      typeof kvList === "function"
+        ? await kvList.call(storage.kv, { prefix: "seq:" })
+        : typeof storage.list === "function"
+          ? await storage.list({ prefix: "seq:" })
+          : new Map<string, unknown>();
+    let max: number | undefined;
+    for (const key of rows.keys()) {
+      const seq = Number(key.slice("seq:".length));
+      if (Number.isInteger(seq) && seq > (max ?? 0)) max = seq;
+    }
+    return max;
   }
 
   /** Account-scoped (M7): a sha is "have it" only if THIS account is entitled
@@ -577,3 +695,45 @@ export class WorkspaceSync {
 }
 
 const ABORT = Symbol("abort-commit-txn");
+
+const GENESIS_HASH = "0".repeat(64);
+
+interface StoredHead {
+  sequence: number;
+  commitHash: string;
+}
+
+function isStoredHead(v: unknown): v is StoredHead {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    Number.isInteger((v as { sequence?: unknown }).sequence) &&
+    typeof (v as { commitHash?: unknown }).commitHash === "string"
+  );
+}
+
+function readHead(v: unknown): StoredHead {
+  if (isStoredHead(v)) return v;
+  if (typeof v === "number" && Number.isInteger(v)) return { sequence: v, commitHash: v === 0 ? GENESIS_HASH : "" };
+  return { sequence: 0, commitHash: GENESIS_HASH };
+}
+
+interface BodyMirrorHeadRow {
+  sequence: number;
+  commit_hash: string;
+  body: string;
+  sig: string;
+}
+
+async function loadBodyMirrorHead(db: D1Database, ws: string, proj: string): Promise<BodyMirrorHeadRow | null> {
+  return (
+    (await db
+      .prepare("SELECT sequence, commit_hash, body, sig FROM commits WHERE workspace_id = ? AND project_id = ? ORDER BY sequence DESC LIMIT 1")
+      .bind(ws, proj)
+      .first<BodyMirrorHeadRow>()) ?? null
+  );
+}
+
+function metric(env: Env, outcome: string): void {
+  emitMetric(env, { op: "head_authority", outcome });
+}

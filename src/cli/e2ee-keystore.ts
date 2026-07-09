@@ -192,7 +192,11 @@ export async function savePin(accountId: string, workspaceId: string, pin: HeadP
   await writeSecret(path.join(root(accountId), "ws", `${workspaceId}.pin.json`), JSON.stringify(pin));
 }
 
+export async function clearPin(accountId: string, workspaceId: string): Promise<void> {
+  await fs.rm(path.join(root(accountId), "ws", `${workspaceId}.pin.json`), { force: true });
+}
+
 /** A keystore-backed PinStore for the E2EE transport (production). */
-export function keystorePinStore(accountId: string, workspaceId: string): { load(): Promise<HeadPin | undefined>; save(pin: HeadPin): Promise<void> } {
-  return { load: () => loadPin(accountId, workspaceId), save: (pin) => savePin(accountId, workspaceId, pin) };
+export function keystorePinStore(accountId: string, workspaceId: string): { load(): Promise<HeadPin | undefined>; save(pin: HeadPin): Promise<void>; clear(): Promise<void> } {
+  return { load: () => loadPin(accountId, workspaceId), save: (pin) => savePin(accountId, workspaceId, pin), clear: () => clearPin(accountId, workspaceId) };
 }

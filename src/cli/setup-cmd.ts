@@ -334,7 +334,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
 
   if (method === "later") {
     writeStderr(
-      `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox recover` with your phrase — then re-run `rbox setup`.")}\n`
+      `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox key recover` with your phrase — then re-run `rbox setup`.")}\n`
     );
     return false;
   }
@@ -347,7 +347,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
     }
     await redeemPair(remote, token);
   } else {
-    // Recover — same no-echo phrase prompt as `rbox recover` (auth-cmd.ts).
+    // Recover — same no-echo phrase prompt as `rbox key recover` (auth-cmd.ts).
     const phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
     if (!phrase) {
       writeStderr(e.yellow("no phrase entered — re-run `rbox setup` when you're ready.\n"));
