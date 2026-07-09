@@ -88,8 +88,11 @@ interface DaemonInternals {
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   startWatcherFn: TestStartWatcher;
   startLiveWatch(): Promise<void>;
+  watcher?: Watcher;
+  watcherDegraded: boolean;
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
+  doFullScan(): Promise<void>;
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
@@ -346,6 +349,32 @@ async function waitForAmbientState(state: string, timeoutMs = 1000): Promise<Rec
   throw new Error(`ambient status did not become ${state}: ${JSON.stringify(last)}`);
 }
 
+async function writeOwnedDaemonPid(): Promise<void> {
+  const runtime = daemonRuntimeDir(root);
+  await fs.mkdir(runtime, { recursive: true });
+  await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-test\n`);
+}
+
+async function closeWatcherTimers(daemon: DaemonInternals): Promise<void> {
+  if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+  if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+  await daemon.watcher?.close();
+}
+
+function captureWatcherErrors(daemon: DaemonInternals): { fire(err: Error): void } {
+  let onError: ((err: Error) => void) | undefined;
+  daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
+    onError = opts.onError;
+    return { close: async () => {} };
+  };
+  return {
+    fire(err) {
+      if (!onError) throw new Error("watcher error callback was not installed");
+      onError(err);
+    },
+  };
+}
+
 test("a committed push writes shell.line: v1, state ok, committed sequence (design 46)", async () => {
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
@@ -393,6 +422,95 @@ test("ambient status writes beside the pidfile and carries local-only currentPat
       sequence: null,
       operation: { kind: "push", phase: "encrypt", filesDone: 1, filesTotal: 3, currentPath: "src/private-file.ts" },
     });
+  });
+});
+
+test("transient watcher degradation clears after a clean covering scan and stays synced", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const errors = captureWatcherErrors(daemon);
+    await writeOwnedDaemonPid();
+
+    try {
+      await daemon.startLiveWatch();
+      errors.fire(new Error("Events were dropped by the FSEvents client"));
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(true);
+      expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
+
+      daemon.want.fullScan = true;
+      await daemon.pump();
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(false);
+      expect(await readAmbientStatus()).toMatchObject({ state: "synced" });
+
+      daemon.want.fullScan = true;
+      await daemon.pump();
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(false);
+      expect(await readAmbientStatus()).toMatchObject({ state: "synced" });
+    } finally {
+      await closeWatcherTimers(daemon);
+    }
+  });
+});
+
+test("a second watcher error during the covering scan keeps status degraded", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const errors = captureWatcherErrors(daemon);
+    const scanEntered = deferred<void>();
+    const releaseScan = deferred<void>();
+    const realFullScan = daemon.doFullScan.bind(daemon);
+    daemon.doFullScan = async () => {
+      scanEntered.resolve();
+      await releaseScan.promise;
+      await realFullScan();
+    };
+    await writeOwnedDaemonPid();
+
+    try {
+      await daemon.startLiveWatch();
+      errors.fire(new Error("first dropped-events warning"));
+      daemon.want.fullScan = true;
+      const pumpDone = daemon.pump();
+      await scanEntered.promise;
+      errors.fire(new Error("second dropped-events warning"));
+      releaseScan.resolve();
+      await pumpDone;
+      await daemon.activityWrite;
+
+      expect(daemon.watcherDegraded).toBe(true);
+      expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
+    } finally {
+      releaseScan.resolve();
+      await closeWatcherTimers(daemon);
+    }
+  });
+});
+
+test("watch-unavailable degradation never self-clears without a live watcher", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    daemon.startWatcherFn = async () => {
+      throw new Error("forced watcher-init failure");
+    };
+    await writeOwnedDaemonPid();
+
+    try {
+      await daemon.startLiveWatch();
+      await daemon.activityWrite;
+      expect(daemon.watcher).toBeUndefined();
+      expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
+
+      daemon.want.fullScan = true;
+      await daemon.pump();
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(true);
+      expect(await readAmbientStatus()).toMatchObject({ state: "attention", attentionReason: "watcher-degraded" });
+    } finally {
+      await closeWatcherTimers(daemon);
+    }
   });
 });
 
