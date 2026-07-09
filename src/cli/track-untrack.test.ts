@@ -12,6 +12,7 @@ let dir: string;
 let home: string;
 let logs: string[];
 const origLog = console.log;
+const origFetch = globalThis.fetch;
 
 beforeEach(async () => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-"));
@@ -22,9 +23,32 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   console.log = origLog;
+  globalThis.fetch = origFetch;
+  delete process.env.RBOX_TOKEN;
   delete process.env.RBOX_HOME;
   await fs.rm(dir, { recursive: true, force: true });
   await fs.rm(home, { recursive: true, force: true });
+});
+
+test("track forwards --name when creating a new workspace", async () => {
+  process.env.RBOX_TOKEN = "tok_track";
+  let requestUrl = "";
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requestUrl = String(input);
+    return new Response(JSON.stringify({ workspaceId: "ws_named" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const { cfg } = await track(
+    dir,
+    { name: "Conductor Workspaces", project: "proj_track", "no-interactive": "true" },
+    "https://api.test"
+  );
+
+  expect(cfg.remoteWorkspaceId).toBe("ws_named");
+  expect(requestUrl).toBe("https://api.test/v1/workspaces?project=proj_track&name=Conductor%20Workspaces");
 });
 
 test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async () => {

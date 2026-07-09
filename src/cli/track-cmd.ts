@@ -71,7 +71,7 @@ export async function track(
       // Create-new — also the non-interactive default. Needs a login.
       const { createRemoteWorkspace } = await import("./remote.js");
       if (!creds) throw new Error("run `rbox login` before creating a workspace");
-      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
+      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId, flags.name);
     }
   }
 
