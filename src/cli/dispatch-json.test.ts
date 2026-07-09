@@ -20,14 +20,51 @@ afterEach(async () => {
   await fs.rm(cwd, { recursive: true, force: true });
 });
 
-function run(args: string[], runCwd = cwd): { status: number | null; stdout: string; stderr: string } {
+function run(args: string[], runCwd = cwd, envOverrides: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+  const env = { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", RBOX_HOME: home };
+  delete env.RBOX_API;
+  delete env.RBOX_API_QUIET;
   const res = spawnSync(process.execPath, [cliEntry, ...args], {
     cwd: runCwd,
-    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", RBOX_HOME: home },
+    env: { ...env, ...envOverrides },
     encoding: "utf8",
   });
   return { status: res.status, stdout: res.stdout, stderr: res.stderr };
 }
+
+test("RBOX_API override warning is printed exactly once on stderr", () => {
+  const res = run(["version"], cwd, { RBOX_API: "https://api.test" });
+  expect(res.status).toBe(0);
+  expect(res.stdout.trim()).not.toBe("");
+  expect(res.stderr).toBe("⚠ RBOX_API override: https://api.test\n");
+
+  const fastPath = run(["prompt-status"], cwd, { RBOX_API: "https://api.test" });
+  expect(fastPath.status).toBe(0);
+  expect(fastPath.stderr).toBe("⚠ RBOX_API override: https://api.test\n");
+});
+
+test("RBOX_API override warning is absent when unset or set to production", () => {
+  expect(run(["version"]).stderr).toBe("");
+  expect(run(["version"], cwd, { RBOX_API: "https://api.rbox.to" }).stderr).toBe("");
+});
+
+test("RBOX_API_QUIET=1 suppresses the override warning", () => {
+  const res = run(["version"], cwd, { RBOX_API: "https://api.test", RBOX_API_QUIET: "1" });
+  expect(res.status).toBe(0);
+  expect(res.stderr).toBe("");
+});
+
+test("RBOX_API override warning leaves JSON command stdout valid", async () => {
+  const root = await makeWorkspace();
+  try {
+    const res = run(["trash", "list", "--json"], root, { RBOX_API: "https://api.test" });
+    expect(res.status).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({ entries: [], totalBytes: 0 });
+    expect(res.stderr).toBe("⚠ RBOX_API override: https://api.test\n");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 async function makeWorkspace(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-dispatch-ws-"));

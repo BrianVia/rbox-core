@@ -1,3 +1,5 @@
+import "./api-base.js";
+
 async function run(): Promise<void> {
   const cmd = process.argv[2];
   if (cmd === "prompt-status") {
