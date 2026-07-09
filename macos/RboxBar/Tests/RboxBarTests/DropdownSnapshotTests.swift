@@ -11,14 +11,15 @@ final class DropdownSnapshotTests: XCTestCase {
                     attentionReason: AmbientAttentionReason? = nil,
                     seq: Int? = 247, lastSyncedAgo: TimeInterval? = 120,
                     hbAge: Double? = nil, name: String = "Development",
-                    fileCount: Int? = 128_517, daemonVersion: String? = "0.9.16") -> WorkspaceStatus {
+                    fileCount: Int? = 128_517, totalBytes: Int64? = 15_600_000_000,
+                    daemonVersion: String? = "0.9.16") -> WorkspaceStatus {
         WorkspaceStatus(
             name: name,
             rootPath: "/Users/via/Development",
             dirURL: URL(fileURLWithPath: "/tmp/daemons/\(name)"),
             logURL: URL(fileURLWithPath: "/tmp/daemon.log"),
             state: state, reason: reason, attentionReason: attentionReason,
-            operation: op, sequence: seq, fileCount: fileCount, daemonVersion: daemonVersion,
+            operation: op, sequence: seq, fileCount: fileCount, totalBytes: totalBytes, daemonVersion: daemonVersion,
             lastSyncedAt: lastSyncedAgo.map { Date().addingTimeInterval(-$0) },
             heartbeatAgeSeconds: hbAge, desiredState: state == .paused ? "stopped" : "running"
         )

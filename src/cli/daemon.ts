@@ -38,6 +38,7 @@ import { RBOX_VERSION } from "./version.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
+  totalBytes: number;
   daemonVersion: string;
   workspaceRoot: string;
 };
@@ -835,6 +836,7 @@ export class RboxDaemon {
         currentPath: this.activeProgressPath,
       }),
       fileCount: this.manifest.files.length,
+      totalBytes: this.manifest.files.reduce((n, f) => n + f.size, 0),
       daemonVersion: RBOX_VERSION,
       workspaceRoot: this.root,
     };
@@ -876,6 +878,7 @@ export class RboxDaemon {
     return {
       ...pausedAmbientDaemonStatus(now, previous),
       fileCount: previous.fileCount,
+      totalBytes: previous.totalBytes,
       daemonVersion: previous.daemonVersion,
       workspaceRoot: previous.workspaceRoot,
     };

@@ -50,6 +50,7 @@ struct StatusReader {
             operation: verdict.operation,
             sequence: verdict.sequence,
             fileCount: verdict.fileCount,
+            totalBytes: verdict.totalBytes,
             daemonVersion: verdict.daemonVersion,
             lastSyncedAt: verdict.lastSyncedAt,
             heartbeatAgeSeconds: verdict.heartbeatAgeSeconds,
@@ -92,6 +93,7 @@ struct StatusReader {
                     operation: status.operation,
                     sequence: status.sequence,
                     fileCount: status.fileCount,
+                    totalBytes: status.totalBytes,
                     daemonVersion: status.daemonVersion,
                     workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
@@ -110,6 +112,7 @@ struct StatusReader {
                     operation: status.operation,
                     sequence: status.sequence,
                     fileCount: status.fileCount,
+                    totalBytes: status.totalBytes,
                     daemonVersion: status.daemonVersion,
                     workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
@@ -128,6 +131,7 @@ struct StatusReader {
             operation: status?.operation,
             sequence: status?.sequence,
             fileCount: status?.fileCount,
+            totalBytes: status?.totalBytes,
             daemonVersion: status?.daemonVersion,
             workspaceRoot: status?.workspaceRoot,
             lastSyncedAt: status?.lastSyncedAt,
@@ -189,6 +193,7 @@ struct StatusReader {
 
             let reason = (object["attentionReason"] as? String).flatMap(AmbientAttentionReason.init(rawValue:))
             let fileCount = (object["fileCount"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
+            let totalBytes = int64Value(object["totalBytes"]).flatMap { $0 >= 0 ? $0 : nil }
             let daemonVersion = (object["daemonVersion"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let workspaceRoot = (object["workspaceRoot"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             return .valid(DaemonStatus(
@@ -196,6 +201,7 @@ struct StatusReader {
                 heartbeatAt: heartbeatAt,
                 sequence: object["sequence"] as? Int,
                 fileCount: fileCount,
+                totalBytes: totalBytes,
                 daemonVersion: daemonVersion,
                 workspaceRoot: workspaceRoot,
                 lastSyncedAt: lastSyncedAt,
@@ -321,6 +327,7 @@ private struct DaemonStatus {
     var heartbeatAt: Date
     var sequence: Int?
     var fileCount: Int?
+    var totalBytes: Int64?
     var daemonVersion: String?
     var workspaceRoot: String?
     var lastSyncedAt: Date?
@@ -341,6 +348,7 @@ private struct Verdict {
     var operation: SyncOperation? = nil
     var sequence: Int? = nil
     var fileCount: Int? = nil
+    var totalBytes: Int64? = nil
     var daemonVersion: String? = nil
     var workspaceRoot: String? = nil
     var lastSyncedAt: Date? = nil
