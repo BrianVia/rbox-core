@@ -3,12 +3,6 @@ export function errMsg(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }
 
-/** Best-effort human-readable message with API sentinel codes mapped to friendly copy. */
-export function friendlyErr(e: unknown): string {
-	const m = errMsg(e);
-	return m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
-}
-
 /** Compact relative time ("just now", "3h ago", "5d ago"), or "never" for null. */
 export function relativeTime(ms: number | null, now: number = Date.now()): string {
 	if (ms == null) return 'never';

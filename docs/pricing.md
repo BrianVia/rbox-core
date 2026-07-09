@@ -12,7 +12,7 @@ Solo and Pro include a 14-day card-upfront trial. Annual billing is two months f
 - $20/mo or $200/yr
 - 250 GB project storage
 - Unlimited devices
-- 365-day version history
+- 90-day version history
 - Larger manifests/projects
 - Advanced hydration/ignore rules
 
