@@ -47,12 +47,21 @@ final class DropdownSnapshotTests: XCTestCase {
         let syncingModel = AppModel(previewWorkspaces: [ws(state: DaemonState.syncing, op: op)], version: "0.9.11")
         let attentionModel = AppModel(previewWorkspaces: [ws(state: DaemonState.attention, reason: "dead",
             seq: 244, lastSyncedAgo: 10800, hbAge: 42.0)], version: "0.9.11")
+        let watcherWorkspace = ws(state: DaemonState.attention, reason: "watcher",
+            seq: 244, lastSyncedAgo: 120, hbAge: 2.0)
+        let watcherModel = AppModel(previewWorkspaces: [watcherWorkspace], version: "0.9.11")
+
+        XCTAssertEqual(MenuContentView.attentionTitle(watcherWorkspace.reason),
+                       "File watching is degraded.")
+        XCTAssertEqual(MenuContentView.attentionDetail(watcherWorkspace),
+                       "Periodic scans keep syncing (~1 min latency).")
 
         for scheme in [ColorScheme.dark, .light] {
             let suffix = scheme == .dark ? "dark" : "light"
             render(syncedModel, "synced-\(suffix)", scheme: scheme)
             render(syncingModel, "syncing-\(suffix)", scheme: scheme)
             render(attentionModel, "attention-\(suffix)", scheme: scheme)
+            render(watcherModel, "watcher-degraded-\(suffix)", scheme: scheme)
         }
     }
 }

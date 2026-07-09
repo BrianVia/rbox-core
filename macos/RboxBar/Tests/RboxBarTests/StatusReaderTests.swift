@@ -120,6 +120,15 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(only().reason, "quota")
     }
 
+    func testWatcherDegradedReasonMapping() {
+        write("daemon.pid", "v2 999999 boot")
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"attention","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
+         "attentionReason":"watcher-degraded"}
+        """)
+        XCTAssertEqual(only().reason, "watcher")
+    }
+
     func testFreshPopulateWithLivePidWins() {
         // A live populate marker overrides an absent daemon.status.json.
         write("populate.status.json", """

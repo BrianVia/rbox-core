@@ -187,9 +187,9 @@ struct MenuContentView: View {
 
     private func attentionBanner(_ workspace: WorkspaceStatus) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(attentionTitle(workspace.reason))
+            Text(Self.attentionTitle(workspace.reason))
                 .font(.system(size: 12, weight: .semibold))
-            Text(attentionDetail(workspace))
+            Text(Self.attentionDetail(workspace))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -337,7 +337,7 @@ struct MenuContentView: View {
         return max(0, min(1, Double(done) / Double(total)))
     }
 
-    private func attentionTitle(_ reason: String?) -> String {
+    static func attentionTitle(_ reason: String?) -> String {
         switch reason {
         case "quota":
             return "Storage quota needs attention."
@@ -352,7 +352,7 @@ struct MenuContentView: View {
         }
     }
 
-    private func attentionDetail(_ workspace: WorkspaceStatus) -> String {
+    static func attentionDetail(_ workspace: WorkspaceStatus) -> String {
         let ageText: String
         if let age = workspace.heartbeatAgeSeconds {
             ageText = "\(Int(age.rounded())) s ago"
@@ -360,11 +360,22 @@ struct MenuContentView: View {
             ageText = "unknown"
         }
 
-        if workspace.reason == "dead" || workspace.reason == nil {
+        switch workspace.reason {
+        case "dead", nil:
             return "Last heartbeat \(ageText) - changes are not being synced."
+        case "quota":
+            return "Storage is full - changes are not being synced."
+        case "watcher":
+            return "Periodic scans keep syncing (~1 min latency)."
+        case "owner":
+            return "Workspace ownership changed - changes are not being synced."
+        case "halt":
+            return "Background sync is halted - changes are not being synced."
+        case "error":
+            return "Background sync error - changes are not being synced."
+        default:
+            return "Background sync error - changes are not being synced."
         }
-
-        return "Reason: \(workspace.reason ?? "error") - changes are not being synced."
     }
 
     private func relativeTime(_ date: Date) -> String {
