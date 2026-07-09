@@ -129,6 +129,9 @@ export class RboxDaemon {
    *  scan never backs off again (fail-safe toward pre-design-49 behavior). */
   private watcherHealthy = true;
   private watcherDegraded = false;
+  /** Monotonic post-init watcher error generation. A successful full/deep scan may
+   *  clear the visible degradation only if this did not advance after that scan began. */
+  private watcherErrorGeneration = 0;
   private reconnectAttempt = 0;
   private stopped = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
@@ -255,6 +258,7 @@ export class RboxDaemon {
             if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
             this.watcherHealthy = false;
             this.watcherDegraded = true;
+            this.watcherErrorGeneration++;
             this.writeAmbientStatus();
             this.pinSafetyFloor();
           },
@@ -385,6 +389,7 @@ export class RboxDaemon {
         // is keyed on it (a halt is only healed by a success of the SAME kind).
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
         const opWatcherGeneration = this.watcherUnsettledGeneration;
+        const opWatcherErrorGeneration = this.watcherErrorGeneration;
         try {
           let pushedToRemote = false;
           this.pushTerminalBlocked = false;
@@ -395,9 +400,11 @@ export class RboxDaemon {
           try {
             if (op === "deepScan") {
               await this.doDeepScan();
+              this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
               this.requestPush();
             } else if (op === "fullScan") {
               await this.doFullScan();
+              this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
               if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
               this.requestPush();
             } else if (op === "pull") {
@@ -779,6 +786,15 @@ export class RboxDaemon {
     if (!this.watcherUnsettled || this.watcherUnsettledGeneration > opWatcherGeneration || this.pendingEvents.length > 0) return;
     const refreshedLocalTruth = this.appliedPendingEventsInOp || op === "pull" || op === "fullScan" || op === "deepScan";
     if (refreshedLocalTruth) this.watcherUnsettled = false;
+  }
+
+  /** A completed full-tree scan covers the dropped-events window. Clear the ambient
+   *  warning only for a live watcher that reported no further error during that scan;
+   *  periodic-scan mode has no watcher to recover and therefore remains degraded. */
+  private maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number): void {
+    if (!this.watcher || !this.watcherDegraded || this.watcherErrorGeneration !== opWatcherErrorGeneration) return;
+    this.watcherDegraded = false;
+    this.writeAmbientStatus();
   }
 
   private localSnapshot(settled: boolean, now: number): DaemonActivity["local"] | undefined {
