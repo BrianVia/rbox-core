@@ -17,7 +17,25 @@ import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, bl
  *  Because the hash proves when we finally have correct bytes, the safe response is to
  *  RE-FETCH, not fail the whole sync. This is the ceiling on such re-fetches. */
 const BLOB_INTEGRITY_RETRIES = envInt("RBOX_NET_INTEGRITY_RETRIES", 4, 0, 20);
-const INTEGRITY_MISMATCH_MARKER = "download integrity mismatch";
+
+/** A completed download whose bytes hash to the wrong sha. Carries the byte count so a
+ *  field occurrence self-identifies its mechanism: bytesReceived < expectedSize is a
+ *  truncation/abort bug; bytesReceived === expectedSize with an unknown hash is true
+ *  same-length corruption (the 2026-07-09 incident couldn't be discriminated because
+ *  the error didn't record this — codex-Sol review amendment). */
+export class BlobDownloadIntegrityError extends Error {
+  constructor(
+    readonly wanted: string,
+    readonly got: string,
+    readonly bytesReceived: number,
+    readonly expectedSize: number | undefined
+  ) {
+    super(
+      `download integrity mismatch: wanted ${wanted}, got ${got} ` +
+        `(received ${bytesReceived} bytes${expectedSize !== undefined ? ` of expected ${expectedSize}` : ""})`
+    );
+  }
+}
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
@@ -109,7 +127,8 @@ export async function putBlobFile(
  *  fires only if no bytes arrive for {@link DOWNLOAD_IDLE_MS}, reset on every chunk. This is the
  *  fix for the 110-minute black-holed fetch (a stuck socket at 0 CPU): a stalled stream trips the
  *  watchdog, which the retry loop treats as transient and re-drives (a GET is idempotent). A hash
- *  mismatch is NOT transient and propagates on the first attempt. */
+ *  mismatch is caught before the file is published or used; the bad attempt is removed and
+ *  re-fetched (bounded) — see the integrity-retry loop below. */
 export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -117,13 +136,19 @@ export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath
         op: `downloading blob ${sha256}`,
         rerunHint: "safe to re-run `rbox pull`: already-downloaded blobs are skipped",
       });
+      if (attempt > 0) {
+        // A recovered mismatch is a real field event (transport corrupted bytes and the
+        // re-fetch healed it) — make it visible instead of silently succeeding.
+        process.stderr.write(`rbox: blob ${sha256.slice(0, 12)}… download integrity recovered after ${attempt} retr${attempt === 1 ? "y" : "ies"}\n`);
+      }
       return;
     } catch (e) {
-      // A hash mismatch means the bytes arrived corrupt (and were discarded, not written).
-      // Re-fetch: a later attempt lands as the concurrent pool drains — the low-concurrency
-      // condition that reliably delivers correct bytes. Bounded so a genuinely-unfetchable
-      // blob still fails loudly with the resume hint rather than looping forever.
-      if (attempt < BLOB_INTEGRITY_RETRIES && e instanceof Error && e.message.includes(INTEGRITY_MISMATCH_MARKER)) {
+      // Corrupt-but-complete bytes were discarded, never written to destPath. Re-fetch:
+      // a later attempt lands as the concurrent pool drains — the low-concurrency
+      // condition that reliably delivers correct bytes. Bounded so a genuinely-
+      // unfetchable blob still fails loudly with the resume hint.
+      if (attempt < BLOB_INTEGRITY_RETRIES && e instanceof BlobDownloadIntegrityError) {
+        // Backoff ≈ 125–375ms, 250–750ms, …, capped so jittered sleep never exceeds ~3s.
         await new Promise((r) => setTimeout(r, Math.min(2000, 250 * 2 ** attempt) * (0.5 + Math.random())));
         continue;
       }
@@ -150,11 +175,13 @@ async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: 
     const out = fs.createWriteStream(destPath, { flags: "w" }); // every retry starts from byte 0
     const written = finished(out);
     try {
+      let received = 0;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         armIdle(); // progress → reset the no-progress watchdog
         if (value?.byteLength) {
+          received += value.byteLength;
           hash.update(value);
           if (!out.write(value)) await once(out, "drain");
         }
@@ -162,7 +189,7 @@ async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: 
       out.end();
       await written;
       const actual = hash.digest("hex");
-      if (actual !== sha256) throw new Error(`download integrity mismatch: wanted ${sha256}, got ${actual}`);
+      if (actual !== sha256) throw new BlobDownloadIntegrityError(sha256, actual, received, expectedSize);
     } catch (e) {
       await reader.cancel().catch(() => {});
       if (!out.destroyed) out.destroy();

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BlobShaMismatchError, RboxApi } from "../remote.js";
+import { BlobDownloadIntegrityError } from "./blobs.js";
 import { FakeServer } from "../e2ee-fake-server.js";
 import { encryptFileToTemp, generateKek } from "../../engine/crypto.js";
 import type { FileEntry } from "../../engine/types.js";
@@ -15,6 +16,8 @@ import {
 } from "./blob-batch.js";
 
 const origFetch = globalThis.fetch;
+// per-sha: serve this many CORRUPT (bit-flipped, same-length) single-GET responses first.
+const corruptNextGets = new Map<string, number>();
 const origDateNow = Date.now;
 const ENV_KEYS = [
   "RBOX_BATCH_BLOBS",
@@ -80,6 +83,12 @@ beforeEach(async () => {
         return jsonResponse(200, { ok: true, sha256: s, sizeBytes: rawBody.byteLength, receipt: `single:${s}` });
       }
       const b = singles.get(m[1]!);
+      if (b && (corruptNextGets.get(m[1]!) ?? 0) > 0) {
+        corruptNextGets.set(m[1]!, corruptNextGets.get(m[1]!)! - 1);
+        const bad = new Uint8Array(b); // same length, flipped first byte → wrong hash, not truncation
+        bad[0] = bad[0]! ^ 0xff;
+        return new Response(bad, { status: 200 });
+      }
       return b ? new Response(b, { status: 200 }) : new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
     }
     return new Response("not found", { status: 404 });
@@ -87,6 +96,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  corruptNextGets.clear();
   globalThis.fetch = origFetch;
   Date.now = origDateNow;
   for (const k of ENV_KEYS) {
@@ -663,3 +673,30 @@ function frame(sha: string, payload: Uint8Array, status: boolean): Uint8Array {
   out.set(payload, BATCH_FRAME_HEADER_BYTES);
   return out;
 }
+
+describe("download integrity self-healing (codex-Sol reviewed)", () => {
+  test("a corrupt-then-clean large single-GET heals via bounded integrity retries", async () => {
+    const bytes = new Uint8Array(2048).fill(7);
+    const sha = shaBytes(bytes);
+    singles.set(sha, bytes);
+    corruptNextGets.set(sha, 2); // two corrupt deliveries, then correct
+    const p = dest("heal");
+    await api().getBlobToFile(sha, p, DEFAULT_BATCH_RECORD_BYTES + 1); // force the streaming single path
+    expect(shaBytes(new Uint8Array(await fs.readFile(p)))).toBe(sha);
+  });
+
+  test("persistent corruption exhausts retries into a typed error carrying the byte count", async () => {
+    const bytes = new Uint8Array(1024).fill(9);
+    const sha = shaBytes(bytes);
+    singles.set(sha, bytes);
+    corruptNextGets.set(sha, 99); // never clean
+    const p = dest("exhaust");
+    const err = await api().getBlobToFile(sha, p, DEFAULT_BATCH_RECORD_BYTES + 1).then(
+      () => undefined,
+      (e: unknown) => e
+    );
+    expect(err).toBeInstanceOf(BlobDownloadIntegrityError);
+    expect((err as BlobDownloadIntegrityError).bytesReceived).toBe(1024); // same-length corruption, not truncation
+    await expect(fs.stat(p)).rejects.toThrow(); // no corrupt file left behind
+  });
+});
