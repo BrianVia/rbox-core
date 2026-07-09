@@ -35,9 +35,9 @@ struct StatusReader {
 
     private func workspaceStatus(for dir: URL, now: Date) -> WorkspaceStatus {
         let desired = readDesired(dir.appendingPathComponent("desired.json"))
-        let rootPath = desired?.rootPath
-        let name = displayName(rootPath: rootPath, dirName: dir.lastPathComponent)
         let verdict = verdict(for: dir, now: now)
+        let rootPath = verdict.workspaceRoot ?? desired?.rootPath
+        let name = displayName(rootPath: rootPath, dirName: dir.lastPathComponent)
 
         return WorkspaceStatus(
             name: name,
@@ -49,6 +49,8 @@ struct StatusReader {
             attentionReason: verdict.attentionReason,
             operation: verdict.operation,
             sequence: verdict.sequence,
+            fileCount: verdict.fileCount,
+            daemonVersion: verdict.daemonVersion,
             lastSyncedAt: verdict.lastSyncedAt,
             heartbeatAgeSeconds: verdict.heartbeatAgeSeconds,
             desiredState: desired?.state
@@ -89,6 +91,9 @@ struct StatusReader {
                     attentionReason: status.state == .attention ? status.attentionReason : nil,
                     operation: status.operation,
                     sequence: status.sequence,
+                    fileCount: status.fileCount,
+                    daemonVersion: status.daemonVersion,
+                    workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
                     heartbeatAgeSeconds: age
                 )
@@ -104,6 +109,9 @@ struct StatusReader {
                     reason: nil,
                     operation: status.operation,
                     sequence: status.sequence,
+                    fileCount: status.fileCount,
+                    daemonVersion: status.daemonVersion,
+                    workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
                     heartbeatAgeSeconds: age
                 )
@@ -119,6 +127,9 @@ struct StatusReader {
             reason: "dead",
             operation: status?.operation,
             sequence: status?.sequence,
+            fileCount: status?.fileCount,
+            daemonVersion: status?.daemonVersion,
+            workspaceRoot: status?.workspaceRoot,
             lastSyncedAt: status?.lastSyncedAt,
             heartbeatAgeSeconds: age
         )
@@ -177,10 +188,16 @@ struct StatusReader {
             }
 
             let reason = (object["attentionReason"] as? String).flatMap(AmbientAttentionReason.init(rawValue:))
+            let fileCount = (object["fileCount"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
+            let daemonVersion = (object["daemonVersion"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let workspaceRoot = (object["workspaceRoot"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             return .valid(DaemonStatus(
                 state: state,
                 heartbeatAt: heartbeatAt,
                 sequence: object["sequence"] as? Int,
+                fileCount: fileCount,
+                daemonVersion: daemonVersion,
+                workspaceRoot: workspaceRoot,
                 lastSyncedAt: lastSyncedAt,
                 operation: operation,
                 attentionReason: reason
@@ -303,6 +320,9 @@ private struct DaemonStatus {
     var state: DaemonState
     var heartbeatAt: Date
     var sequence: Int?
+    var fileCount: Int?
+    var daemonVersion: String?
+    var workspaceRoot: String?
     var lastSyncedAt: Date?
     var operation: SyncOperation?
     var attentionReason: AmbientAttentionReason?
@@ -320,6 +340,9 @@ private struct Verdict {
     var attentionReason: AmbientAttentionReason? = nil
     var operation: SyncOperation? = nil
     var sequence: Int? = nil
+    var fileCount: Int? = nil
+    var daemonVersion: String? = nil
+    var workspaceRoot: String? = nil
     var lastSyncedAt: Date? = nil
     var heartbeatAgeSeconds: Double? = nil
 }

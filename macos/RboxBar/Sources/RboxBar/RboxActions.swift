@@ -33,25 +33,26 @@ enum RboxActions {
                 return
             }
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: binary)
-            process.arguments = [action.rawValue, rootPath]
-            process.currentDirectoryURL = URL(fileURLWithPath: rootPath, isDirectory: true)
-            let pipe = Pipe()
-            process.standardError = pipe
-            process.standardOutput = pipe
+            do {
+                try run(binary: binary, arguments: [action.rawValue, rootPath], rootPath: rootPath)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    static func restart(rootPath: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        queue.async {
+            guard let binary = resolveBinary() else {
+                completion(.failure(RboxActionError.binaryNotFound))
+                return
+            }
 
             do {
-                try process.run()
-                process.waitUntilExit()
-                if process.terminationStatus == 0 {
-                    completion(.success(()))
-                } else {
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let message = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    completion(.failure(RboxActionError.commandFailed(message?.isEmpty == false ? message! : "rbox \(action.rawValue) failed.")))
-                }
+                try run(binary: binary, arguments: [SyncAction.stop.rawValue, rootPath], rootPath: rootPath)
+                try run(binary: binary, arguments: [SyncAction.start.rawValue, rootPath], rootPath: rootPath)
+                completion(.success(()))
             } catch {
                 completion(.failure(error))
             }
@@ -105,6 +106,26 @@ enum RboxActions {
 
     static func openLog(_ url: URL) {
         NSWorkspace.shared.open(url)
+    }
+
+    private static func run(binary: String, arguments: [String], rootPath: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+        let pipe = Pipe()
+        process.standardError = pipe
+        process.standardOutput = pipe
+
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let command = arguments.first ?? "command"
+            throw RboxActionError.commandFailed(message?.isEmpty == false ? message! : "rbox \(command) failed.")
+        }
     }
 
     private static func resolveBinary() -> String? {

@@ -54,6 +54,35 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertNotNil(ws.lastSyncedAt)
     }
 
+    func testAdditiveBarFieldsParseAndAmbientRootWins() {
+        write("desired.json", """
+        {"rootPath":"/tmp/old-root","state":"running","accountId":"a","workspaceId":"w","at":"\(iso(1))"}
+        """)
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":"\(iso(120))",
+         "fileCount":128517,"daemonVersion":"0.9.16","workspaceRoot":"/tmp/current-root"}
+        """)
+        let ws = only()
+        XCTAssertEqual(ws.fileCount, 128_517)
+        XCTAssertEqual(ws.daemonVersion, "0.9.16")
+        XCTAssertEqual(ws.rootPath, "/tmp/current-root")
+        XCTAssertEqual(ws.name, "current-root")
+    }
+
+    func testOldDaemonFieldsRemainOptionalAndDesiredRootIsFallback() {
+        write("desired.json", """
+        {"rootPath":"/tmp/fallback-root","state":"running","accountId":"a","workspaceId":"w","at":"\(iso(1))"}
+        """)
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":null}
+        """)
+        let ws = only()
+        XCTAssertNil(ws.fileCount)
+        XCTAssertNil(ws.daemonVersion)
+        XCTAssertEqual(ws.rootPath, "/tmp/fallback-root")
+        XCTAssertEqual(ws.sequence, 247, "old daemons keep the sequence fallback")
+    }
+
     func testFreshSyncingPushKeepsOperation() {
         write("daemon.pid", "v2 999999 boot")
         write("daemon.status.json", """
@@ -70,12 +99,16 @@ final class StatusReaderTests: XCTestCase {
     func testStaleWithPidfileIsDead() {
         write("daemon.pid", "v2 999999 boot")
         write("daemon.status.json", """
-        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(42))","sequence":244,"lastSyncedAt":"\(iso(9000))"}
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(42))","sequence":244,"lastSyncedAt":"\(iso(9000))",
+         "fileCount":42,"daemonVersion":"0.9.16","workspaceRoot":"/tmp/stale-root"}
         """)
         let ws = only()
         XCTAssertEqual(ws.state, .attention)
         XCTAssertEqual(ws.reason, "dead")
         XCTAssertEqual(ws.sequence, 244, "dead verdict should preserve last-known sequence")
+        XCTAssertEqual(ws.fileCount, 42, "dead verdict should preserve last-known file count")
+        XCTAssertEqual(ws.daemonVersion, "0.9.16")
+        XCTAssertEqual(ws.rootPath, "/tmp/stale-root")
     }
 
     func testAbsentStatusWithPidfileIsDead() {
