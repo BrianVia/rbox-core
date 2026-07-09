@@ -12,19 +12,77 @@ let dir: string;
 let home: string;
 let logs: string[];
 const origLog = console.log;
+const origFetch = globalThis.fetch;
+const origHome = process.env.HOME;
 
 beforeEach(async () => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-"));
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-home-"));
+  process.env.HOME = home; // isolate credentials loaded by track
   process.env.RBOX_HOME = home; // redirect ~/.rbox so daemon runtime files are inspectable
   logs = [];
   console.log = (...m: unknown[]) => void logs.push(m.map(String).join(" "));
 });
 afterEach(async () => {
   console.log = origLog;
+  globalThis.fetch = origFetch;
+  delete process.env.RBOX_TOKEN;
+  delete process.env.RBOX_DEVICE_ID;
   delete process.env.RBOX_HOME;
+  if (origHome === undefined) delete process.env.HOME;
+  else process.env.HOME = origHome;
   await fs.rm(dir, { recursive: true, force: true });
   await fs.rm(home, { recursive: true, force: true });
+});
+
+test("track forwards --name when creating a new workspace", async () => {
+  process.env.RBOX_TOKEN = "tok_track";
+  let requestUrl = "";
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requestUrl = String(input);
+    return new Response(JSON.stringify({ workspaceId: "ws_named" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const { cfg } = await track(
+    dir,
+    { name: "Conductor Workspaces", project: "proj_track", "no-interactive": "true" },
+    "https://api.test"
+  );
+
+  expect(cfg.remoteWorkspaceId).toBe("ws_named");
+  expect(requestUrl).toBe("https://api.test/v1/workspaces?project=proj_track&name=Conductor%20Workspaces");
+});
+
+test("logged-in track uses the credential device id for a new binding", async () => {
+  process.env.RBOX_TOKEN = "tok_track";
+  process.env.RBOX_DEVICE_ID = "dev_credential";
+
+  const { cfg } = await track(dir, { workspace: "ws_existing" }, "https://api.test");
+
+  expect(cfg.deviceId).toBe("dev_credential");
+  expect((await loadConfig(dir)).deviceId).toBe("dev_credential");
+});
+
+test("offline --workspace track still mints a device id", async () => {
+  const { cfg } = await track(dir, { workspace: "ws_offline" }, "https://api.test");
+
+  expect(cfg.deviceId).toMatch(/^dev_[0-9a-f]{8}$/);
+});
+
+test("track --device overrides the credential device id", async () => {
+  process.env.RBOX_TOKEN = "tok_track";
+  process.env.RBOX_DEVICE_ID = "dev_credential";
+
+  const { cfg } = await track(
+    dir,
+    { workspace: "ws_existing", device: "dev_explicit" },
+    "https://api.test"
+  );
+
+  expect(cfg.deviceId).toBe("dev_explicit");
 });
 
 test("track writes a `.rbox/` binding; untrack removes it (round-trip)", async () => {

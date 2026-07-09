@@ -32,6 +32,8 @@ export async function track(
   const root = path.resolve(pathArg ?? process.cwd());
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
+  const { loadCredentials } = await import("./credentials.js");
+  const creds = await loadCredentials();
 
   // New workspace → create it server-side (ownership at creation, M7). Joining an
   // existing one (--workspace) requires the caller's account to own it; that's
@@ -39,9 +41,6 @@ export async function track(
   let workspaceId = flags.workspace;
   let pickedName: string | undefined; // picker-supplied label, cached locally for `rbox status`
   if (!workspaceId) {
-    const { loadCredentials } = await import("./credentials.js");
-    const creds = await loadCredentials();
-
     // On a TTY (and not explicitly --no-interactive), ASK before creating: a bare
     // `rbox track <dir>` used to silently create a brand-new workspace even when you
     // meant to attach an existing one. Now it offers create-or-pick-by-name.
@@ -71,7 +70,7 @@ export async function track(
       // Create-new — also the non-interactive default. Needs a login.
       const { createRemoteWorkspace } = await import("./remote.js");
       if (!creds) throw new Error("run `rbox login` before creating a workspace");
-      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId);
+      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId, flags.name);
     }
   }
 
@@ -93,7 +92,11 @@ export async function track(
     schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
     remoteWorkspaceId: workspaceId,
     projectId,
-    deviceId: flags.device ?? prev?.deviceId ?? `dev_${crypto.randomUUID().slice(0, 8)}`,
+    deviceId:
+      flags.device ??
+      prev?.deviceId ??
+      (creds?.deviceId !== "env" ? creds?.deviceId : undefined) ??
+      `dev_${crypto.randomUUID().slice(0, 8)}`,
     rootPath: root,
     remoteUrl,
     token: "", // token comes from `rbox login` (per-machine credential), never config

@@ -9,7 +9,7 @@ import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesir
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { PROD_REMOTE } from "./credentials.js";
+import { DEFAULT_REMOTE } from "./api-base.js";
 import { fail, setJsonErrorMode, style } from "./style.js";
 import { spinner } from "./spinner.js";
 import { resolveAlias } from "./deprecations.js";
@@ -19,8 +19,6 @@ import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags } from "./flags.js";
 import { readStdinTrimmed } from "./read-stdin.js";
-
-const DEFAULT_REMOTE = process.env.RBOX_API ?? PROD_REMOTE;
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
 function printHelp(cmd: string | undefined, positional: string[]): void {
