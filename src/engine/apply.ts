@@ -74,6 +74,7 @@ export async function applyActions(
 
   const deletes = actions.filter((a) => a.kind === "delete");
   const rest = actions.filter((a) => a.kind !== "delete");
+  const prepared = new Map<Action, string>();
 
   // Ancestor preflight (§3, design-review M3): a FILE or SYMLINK squatting on a
   // path component a write needs as a directory makes mkdir throw ENOTDIR. Resolve
@@ -92,13 +93,6 @@ export async function applyActions(
     }
   }
   const shallowFirst = [...needDirs].sort((a, b) => a.split("/").length - b.split("/").length);
-  for (const comp of shallowFirst) {
-    const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
-    if (st && (st.isFile() || st.isSymbolicLink())) {
-      opts.onTypeFlip?.(comp);
-      await moveAside(destRoot, comp, conflictName(comp, device, now));
-    }
-  }
 
   // Writes/conflicts target distinct paths and are independent, so fetch+decrypt
   // them through a bounded pool — a pull was a sequential per-blob download, which
@@ -122,18 +116,50 @@ export async function applyActions(
         return entry?.type === "file" && !!entry.encSha;
       }).length
     : 0;
-  await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
-    await poolMap(rest, dlConc, async (a) => {
-      if (a.kind === "write") {
-        await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
-      } else if (a.kind === "conflict") {
-        // Reconcile already decided both sides diverged: keep local aside, take remote.
-        await moveAside(destRoot, a.path, a.keepLocalAs);
-        await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
+  try {
+    await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
+      // A file-valued ancestor makes the normal beside-target temp impossible to
+      // create. Verify those entries first beside the shallowest obstruction (same
+      // filesystem), before the unchanged serial ancestor pre-pass moves anything.
+      // The retained temp is published after the obstruction has been preserved.
+      for (const a of rest) {
+        const entry = a.entry;
+        const obstruction = await firstFileAncestor(destRoot, entry.path);
+        if (!obstruction) continue;
+        const tmp = tmpName(path.join(destRoot, obstruction));
+        try {
+          await stageEntryToTemp(tmp, entry, store, opts.kek);
+        } catch (e) {
+          throw stagingError(entry.path, e);
+        }
+        prepared.set(a, tmp);
       }
-      opts.onProgress?.(++done, rest.length);
+
+      // Ancestor preflight remains serial and shallowest-first so siblings cannot
+      // race one obstruction. Entries affected by an obstruction are fully staged
+      // and verified above before any local path is displaced.
+      for (const comp of shallowFirst) {
+        const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
+        if (st && (st.isFile() || st.isSymbolicLink())) {
+          opts.onTypeFlip?.(comp);
+          await moveAside(destRoot, comp, conflictName(comp, device, now));
+        }
+      }
+
+      await poolMap(rest, dlConc, async (a) => {
+        if (a.kind === "write") {
+          await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip, undefined, prepared.get(a));
+        } else if (a.kind === "conflict") {
+          // Reconcile already decided both sides diverged. Stage and verify the
+          // remote first; only then preserve the local at its chosen conflict name.
+          await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip, a.keepLocalAs, prepared.get(a));
+        }
+        opts.onProgress?.(++done, rest.length);
+      });
     });
-  });
+  } finally {
+    await Promise.all([...prepared.values()].map((tmp) => fs.rm(tmp, { force: true }).catch(() => {})));
+  }
   for (const a of deletes) {
     await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
   }
@@ -150,7 +176,9 @@ async function writeEntry(
   now: string,
   kek?: Buffer,
   trash?: TrashBatch,
-  onTypeFlip?: (relPath: string) => void
+  onTypeFlip?: (relPath: string) => void,
+  keepLocalAs?: string,
+  preparedTmp?: string
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -158,11 +186,20 @@ async function writeEntry(
 
   const tmp = tmpName(abs);
   try {
-    await stageEntryToTemp(tmp, entry, store, kek);
+    if (preparedTmp) await fs.rename(preparedTmp, tmp);
+    else {
+      try {
+        await stageEntryToTemp(tmp, entry, store, kek);
+      } catch (e) {
+        throw stagingError(entry.path, e);
+      }
+    }
 
     // Final precondition: does the target still match what reconcile assumed?
     const current = await currentEntryAt(destRoot, entry.path);
-    if (!sameContent(current, expectedLocal) && current) {
+    if (current && keepLocalAs) {
+      await moveAside(destRoot, entry.path, keepLocalAs);
+    } else if (!sameContent(current, expectedLocal) && current) {
       // The user created/edited it in the window — preserve those bytes.
       await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
     }
@@ -233,6 +270,28 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
   if (store.getToFile) await store.getToFile(entry.sha256, tmp);
   else await fs.writeFile(tmp, await store.get(entry.sha256));
   await fs.chmod(tmp, entry.mode);
+}
+
+function stagingError(relPath: string, cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(`${relPath}: ${detail}`, { cause });
+}
+
+async function firstFileAncestor(destRoot: string, relPath: string): Promise<string | undefined> {
+  const parts = relPath.split("/");
+  let rel = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    rel = rel ? `${rel}/${parts[i]!}` : parts[i]!;
+    try {
+      const st = await fs.lstat(path.join(destRoot, rel));
+      if (st.isFile() || st.isSymbolicLink()) return rel;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+      throw e;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -313,17 +372,34 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
  *  (same device) collide — probe and suffix `~2`, `~3`… (design-50 review). */
 async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
   const from = path.join(destRoot, fromRel);
+  const st = await fs.lstat(from);
   let to = path.join(destRoot, toRel);
   await fs.mkdir(path.dirname(to), { recursive: true });
   for (let i = 2; ; i++) {
-    try {
-      await fs.access(to);
-      to = path.join(destRoot, `${toRel}~${i}`);
-    } catch {
-      break;
-    }
+    if (await moveNoClobber(from, to, st)) return;
+    to = path.join(destRoot, `${toRel}~${i}`);
   }
-  await fs.rename(from, to);
+}
+
+/** Move without overwriting an existing conflict name. Each destination claim is
+ * exclusive at the filesystem operation itself, avoiding access-then-rename races. */
+async function moveNoClobber(from: string, to: string, st: { isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
+  try {
+    if (st.isDirectory()) {
+      await fs.mkdir(to);
+      await fs.rename(from, to);
+    } else if (st.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(from), to);
+      await fs.unlink(from);
+    } else {
+      await fs.link(from, to);
+      await fs.unlink(from);
+    }
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw e;
+  }
 }
 
 

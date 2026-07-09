@@ -416,6 +416,75 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     expect(await fs.readFile(path.join(root2, "b.txt"), "utf8")).toBe("new\n");
   });
 
+  test("failed seq-653 pull cannot construct seq-654 from the unapplied head or resurrect its poisoned base", async () => {
+    const server = new ObservedServer();
+    const secrets = await bootstrapOnto(server, ACCT, "dev-resurrection", NOW);
+    const rootA = await tmp();
+    await fs.writeFile(path.join(rootA, "a-blocker"), "base blocker\n");
+    await fs.writeFile(path.join(rootA, "z-log"), "append-hot log\n");
+    const remoteA = await remoteFor(server, secrets);
+    const cfgA = await cfgFor(rootA, secrets, remoteA);
+    await push(rootA, cfgA, { remote: remoteA });
+
+    const seq1 = (await loadState(rootA, syncStreamId(cfgA))).lastSyncedManifest;
+    const blockerBase = seq1.files.find((f) => f.path === "a-blocker")!;
+    const coherentLog = seq1.files.find((f) => f.path === "z-log")!;
+    const poisonLog = { ...coherentLog, size: coherentLog.size - 1 };
+    await expect(remoteA.commit(1, secrets.deviceId, { generatedAt: "", files: [blockerBase, poisonLog] })).resolves.toEqual({ sequence: 2 });
+
+    // The receiver already holds the bytes, so byte-identity reconcile accepts the
+    // poisoned size metadata without a false conflict and persists it as seq 2.
+    const rootB = await tmp();
+    await fs.writeFile(path.join(rootB, "a-blocker"), "base blocker\n");
+    await fs.writeFile(path.join(rootB, "z-log"), "append-hot log\n");
+    const remoteB = await remoteFor(server, secrets);
+    const cfgB = await cfgFor(rootB, secrets, remoteB);
+    expect(await pull(rootB, cfgB, { remote: remoteB })).toEqual([]);
+    expect((await loadState(rootB, syncStreamId(cfgB))).lastSyncedSequence).toBe(2);
+    await fs.rm(path.join(rootB, "a-blocker"));
+    await fs.rm(path.join(rootB, "z-log"));
+
+    const makeRawEntry = async (rel: string, plaintext: Buffer) => {
+      const blob = await encryptFileNameProbe(new Uint8Array(cfgA.kek!), new Uint8Array(plaintext));
+      await server.store.put(blob.encSha, blob.ciphertext);
+      return {
+        path: rel,
+        type: "file" as const,
+        sha256: blob.plaintextSha,
+        encSha: blob.encSha,
+        size: plaintext.length,
+        mode: 0o644,
+        mtimeMs: 0,
+      };
+    };
+    const encryptedWrongBytes = await makeRawEntry("a-blocker", Buffer.from("ciphertext for another image\n"));
+    const badBlocker = { ...encryptedWrongBytes, sha256: shaBytes(Buffer.from("declared blocker image\n")) };
+    const healedLog = await makeRawEntry("z-log", Buffer.alloc(0));
+    await expect(remoteA.commit(2, secrets.deviceId, { generatedAt: "", files: [badBlocker, healedLog] })).resolves.toEqual({ sequence: 3 });
+
+    const previousConcurrency = process.env.RBOX_DOWNLOAD_CONCURRENCY;
+    process.env.RBOX_DOWNLOAD_CONCURRENCY = "1";
+    try {
+      await expect(pull(rootB, cfgB, { remote: remoteB })).rejects.toThrow(/a-blocker/);
+      const applied = await loadState(rootB, syncStreamId(cfgB));
+      expect(applied.lastSyncedSequence).toBe(2);
+      expect(applied.lastSyncedManifest.files.find((f) => f.path === "z-log")?.size).toBe(poisonLog.size);
+      await expect(fs.stat(path.join(rootB, "z-log"))).rejects.toThrow();
+
+      const signedBeforePush = server.commitSignedCalls;
+      await expect(push(rootB, cfgB, { remote: remoteB, backoff: async () => {} })).rejects.toThrow(/a-blocker/);
+      expect(server.commitSignedCalls).toBe(signedBeforePush); // no parentSeq=2 + hash(seq3) envelope
+      expect(server.commits).toHaveLength(3); // no seq-654 analogue
+      const head = await remoteA.latest();
+      expect(head.sequence).toBe(3);
+      expect(head.manifest.files.find((f) => f.path === "z-log")?.sha256).toBe(healedLog.sha256);
+      expect(head.manifest.files.find((f) => f.path === "z-log")?.size).toBe(0);
+    } finally {
+      if (previousConcurrency === undefined) delete process.env.RBOX_DOWNLOAD_CONCURRENCY;
+      else process.env.RBOX_DOWNLOAD_CONCURRENCY = previousConcurrency;
+    }
+  });
+
   test("design 43: gitRepos artifact blobs join the commit blobRefs (union, deduped across repos); server sees zero git plaintext", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA", NOW);

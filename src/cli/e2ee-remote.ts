@@ -409,6 +409,15 @@ export class E2eeRemote implements SyncRemote {
     const epoch = account.currentKeyEpoch;
     const kek = await this.kekFor(epoch, account, true);
     const pin = await this.pins.load();
+    // verifiedHead advances the anti-rollback pin as soon as a pull authenticates
+    // the remote head, before the caller has applied that manifest. Never combine
+    // an applied parent sequence with a newer, merely-observed parent hash: that
+    // would let failed-pull state leak into commit construction. Treat the mismatch
+    // exactly like the parent conflict it represents so the push loop pulls first;
+    // if apply fails again, the push stops before signing or posting anything.
+    if ((pin?.commitSeq ?? 0) !== parentSequence) {
+      return { conflict: true, head: pin?.commitSeq ?? 0 };
+    }
     const parentCommitHash = pin?.commitHash ?? GENESIS_PARENT_HASH;
 
     // The blobRef list is the UNIQUE set of blobs this commit references — many

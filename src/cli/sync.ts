@@ -498,6 +498,11 @@ async function runPushAttempt(
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  // One authority for every push decision: the persisted base records the last
+  // pull that applied completely. A newer remote manifest may have been verified
+  // (and its anti-rollback head pinned) before apply failed, but it is not a base.
+  const appliedSequence = state.lastSyncedSequence;
+  const appliedBase = state.lastSyncedManifest;
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
   const scannedFilePaths = new Set(local.files.filter((f) => f.type === "file").map((f) => f.path));
 
@@ -507,14 +512,14 @@ async function runPushAttempt(
   // non-ignored file is still absent-and-not-ignored → a genuine deletion.)
   if (!purgeIgnored) {
     const present = new Set(local.files.map((f) => f.path));
-    const carried = state.lastSyncedManifest.files.filter((e) => !present.has(e.path) && matcher.ignores(e.path));
+    const carried = appliedBase.files.filter((e) => !present.has(e.path) && matcher.ignores(e.path));
     if (carried.length) {
       local = { ...local, files: [...local.files, ...carried].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
     }
   }
 
   if (purgeIgnored) {
-    const deleted = diffManifests(state.lastSyncedManifest, local).deleted;
+    const deleted = diffManifests(appliedBase, local).deleted;
     assertNoUnevaluatedPurgeDeletes(matcher, deleted);
   }
 
@@ -533,7 +538,7 @@ async function runPushAttempt(
   local = { ...local, gitRepos: gitPlan.gitRepos };
 
   const filesUnchanged = (() => {
-    const d = diffManifests(state.lastSyncedManifest, local);
+    const d = diffManifests(appliedBase, local);
     return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
   })();
   const gitUnchanged = !gitPlan.changed;
@@ -560,15 +565,15 @@ async function runPushAttempt(
     ) {
       await report.phase("state-save", () => saveState(root, {
         stream: syncStreamId(cfg),
-        lastSyncedSequence: state.lastSyncedSequence,
-        lastSyncedManifest: state.lastSyncedManifest,
+        lastSyncedSequence: appliedSequence,
+        lastSyncedManifest: appliedBase,
         gitReposRemoved: gitPlan.gitReposRemoved,
         gitNeedsResolution: gitPlan.gitNeedsResolution,
         gitPendingRemote: gitPlan.gitPendingRemote,
       }));
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
-    return { done: true, result: { sequence: state.lastSyncedSequence, manifest: local, committed: false } };
+    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false } };
   }
   // §10 forensic line — only when git-sync did something beyond a steady carry.
   if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
@@ -585,7 +590,7 @@ async function runPushAttempt(
   // encryptAndUpload retries it a bounded number of times and then DEFERS it (returns its
   // path) rather than aborting the entire push. We commit the stable subset; the daemon's
   // watcher + safety/deep scans naturally re-queue the deferred files once they settle.
-  const { deferred } = await encryptAndUpload(api, root, cfg, local, state.lastSyncedManifest, report, deps.onProgress, backoff, {
+  const { deferred } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
@@ -597,7 +602,7 @@ async function runPushAttempt(
   // deferred file is simply omitted. Invariant: every blob the committed manifest references
   // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
   // ref, no phantom deletion.
-  const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, state.lastSyncedManifest, deferred));
+  const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
 
   // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
   // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
@@ -605,10 +610,10 @@ async function runPushAttempt(
   // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
   // that the artifact blobs were missing.
   if (deferred.size > 0 && forceGitRecapture.size === 0) {
-    const dd = diffManifests(state.lastSyncedManifest, committed);
+    const dd = diffManifests(appliedBase, committed);
     if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
       reportDeferred(deferred);
-      return { done: true, result: { sequence: state.lastSyncedSequence, manifest: committed, deferred: [...deferred], committed: false } };
+      return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], committed: false } };
     }
   }
 
@@ -617,10 +622,10 @@ async function runPushAttempt(
   // intended cleanup — publishing it wedges every OTHER device (each halts ⚠ on its next pull).
   // Refuse to COMMIT until a human consents. Counted on `committed` (post-defer) so the number
   // is exact, and gated on the op-scoped consent field so the recovery pull can't inherit it.
-  const pushDeletes = diffManifests(state.lastSyncedManifest, committed).deleted.length;
-  if (!deps.allowMassDeletePush && pushDeletes >= MASS_DELETE_MIN_FILES && pushDeletes * 2 >= state.lastSyncedManifest.files.length) {
+  const pushDeletes = diffManifests(appliedBase, committed).deleted.length;
+  if (!deps.allowMassDeletePush && pushDeletes >= MASS_DELETE_MIN_FILES && pushDeletes * 2 >= appliedBase.files.length) {
     throw new Error(
-      `push would delete ${pushDeletes} of ${state.lastSyncedManifest.files.length} tracked files — refusing (mass-delete guard). ` +
+      `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`rbox push --allow-mass-delete\` to publish it once.`
     );
   }
@@ -633,7 +638,7 @@ async function runPushAttempt(
       ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
     };
   }
-  const res = await report.phase("commit", () => api.commit(state.lastSyncedSequence, cfg.deviceId, committed, commitOptions));
+  const res = await report.phase("commit", () => api.commit(appliedSequence, cfg.deviceId, committed, commitOptions));
   if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
 
   if (res.epochStale !== undefined) {
@@ -660,7 +665,7 @@ async function runPushAttempt(
   // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
   // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
   // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
-  const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, state.lastSyncedManifest.gitRepos);
+  const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
   await report.phase("state-save", () => saveState(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: res.sequence!,

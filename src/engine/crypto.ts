@@ -121,7 +121,11 @@ export interface EncryptedBlob {
   payloadSha?: string;
 }
 
-export type EncryptFileOptions = { compress?: boolean; bufferedCompressionMaxBytes?: number };
+export type EncryptFileOptions = {
+  compress?: boolean;
+  bufferedCompressionMaxBytes?: number;
+  expected?: { sha256: string; size: number };
+};
 export type DecryptFileOptions = { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number };
 
 type CryptoPoolSelection = {
@@ -179,6 +183,11 @@ export async function encryptFileToTempInline(srcPath: string, kek: Buffer, tmpD
     await fs.copyFile(srcPath, snapPath); // single read of the live file → immutable copy
     const plaintextSha = await hashFile(snapPath); // fresh hash of the snapshot bytes
     const plaintextSize = (await fs.stat(snapPath)).size;
+    if (opts.expected && (plaintextSha !== opts.expected.sha256 || plaintextSize !== opts.expected.size)) {
+      const err = new Error(`source changed while encrypting: ${srcPath}`);
+      (err as NodeJS.ErrnoException).code = "RBOX_SOURCE_CHANGED";
+      throw err;
+    }
     let payloadPath = snapPath;
     let payloadBuffer: Buffer | undefined;
     let payloadSha = plaintextSha;
@@ -250,7 +259,7 @@ export async function encryptFileToTempInline(srcPath: string, kek: Buffer, tmpD
   }
 }
 
-export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string, opts: { compress?: boolean; bufferedCompressionMaxBytes?: number } = {}): Promise<EncryptedBlob> {
+export async function encryptFileToTemp(srcPath: string, kek: Buffer, tmpDir?: string, opts: EncryptFileOptions = {}): Promise<EncryptedBlob> {
   const pool = cryptoPoolSelector?.(kek);
   return pool ? pool.encrypt(srcPath, tmpDir, opts) : encryptFileToTempInline(srcPath, kek, tmpDir, opts);
 }

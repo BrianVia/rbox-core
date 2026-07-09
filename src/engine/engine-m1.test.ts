@@ -49,6 +49,17 @@ test("validateManifest rejects exact and case-insensitive duplicate paths", () =
   expect(validateManifest({ files: [goodEntry({ path: "Foo.ts" }), goodEntry({ path: "foo.ts" })] }).ok).toBe(false);
 });
 
+test("validateManifest rejects file/descendant prefix collisions including case-folded and intervening sort keys", () => {
+  for (const files of [
+    [goodEntry({ path: "foo" }), goodEntry({ path: "foo/bar" })],
+    [goodEntry({ path: "foo/bar" }), goodEntry({ path: "foo" })],
+    [goodEntry({ path: "Foo" }), goodEntry({ path: "foo/bar" })],
+    [goodEntry({ path: "foo" }), goodEntry({ path: "foo-bar" }), goodEntry({ path: "foo/bar" })],
+  ]) {
+    expect(validateManifest({ files }).ok).toBe(false);
+  }
+});
+
 test("validateManifest rejects malformed entries", () => {
   expect(validateManifest({ files: [goodEntry({ sha256: "xyz" })] }).ok).toBe(false); // bad sha
   expect(validateManifest({ files: [goodEntry({ type: "weird" as never })] }).ok).toBe(false); // bad type

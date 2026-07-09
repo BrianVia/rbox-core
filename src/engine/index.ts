@@ -32,7 +32,15 @@ export {
   type RepoCtx,
 } from "./git-state.js";
 export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
-export { generateKek, kekToPhrase, kekFromPhrase, encryptFileToTemp, decryptFileToPath, type EncryptedBlob } from "./crypto.js";
+export {
+  generateKek,
+  kekToPhrase,
+  kekFromPhrase,
+  encryptFileToTemp,
+  decryptFileToPath,
+  type EncryptedBlob,
+  type EncryptFileOptions,
+} from "./crypto.js";
 export { cryptoPoolStatus, withCryptoPool, type CryptoPoolStatus } from "./crypto-pool.js";
 export { hashFile, hashBytes } from "./hash.js";
 export {

@@ -17,6 +17,7 @@ import {
   scanManifest,
   type BlobStore,
   type EncryptedBlob,
+  type EncryptFileOptions,
   type FileEntry,
   type GitSection,
   type Manifest,
@@ -238,9 +239,9 @@ async function readEncryptCache(): Promise<{ entries: Record<string, { encSha: s
 
 function countingEncrypt() {
   let calls = 0;
-  const fn: NonNullable<SyncDeps["encryptFileToTemp"]> = async (srcPath: string, kek: Buffer, tmpDir?: string): Promise<EncryptedBlob> => {
+  const fn: NonNullable<SyncDeps["encryptFileToTemp"]> = async (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions): Promise<EncryptedBlob> => {
     calls++;
-    return encryptFileToTemp(srcPath, kek, tmpDir);
+    return encryptFileToTemp(srcPath, kek, tmpDir, opts);
   };
   return { fn, calls: () => calls };
 }
@@ -259,6 +260,27 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.commitCalls).toBe(before); // ZERO new commits — no echo
   expect(seq).toBe(1);
   expect(remote.headSeq()).toBe(1);
+});
+
+test("metadata heal commits corrected size, reuses ciphertext, and reconcile creates no false conflict", async () => {
+  const remote = new FakeRemote();
+  const content = "coherent bytes\n";
+  await write("heal.txt", content);
+  const coherent = await remote.seedEntry("heal.txt", content);
+  const poisoned = { ...coherent, size: coherent.size - 1 };
+  remote.injectCommit([poisoned]);
+
+  const actions = await pull(root, cfg, deps(remote));
+  expect(actions).toEqual([]); // same plaintext identity: no write or conflict
+
+  const counter = countingEncrypt();
+  const res = await push(root, cfg, { ...deps(remote), encryptFileToTemp: counter.fn });
+  expect(res.committed).toBe(true);
+  expect(counter.calls()).toBe(0);
+  const healed = (await remote.latest()).manifest.files.find((f) => f.path === "heal.txt")!;
+  expect(healed.size).toBe(Buffer.byteLength(content));
+  expect(healed.sha256).toBe(coherent.sha256);
+  expect(healed.encSha).toBe(coherent.encSha);
 });
 
 test("pull never applies a remote entry that LOCAL rules ignore (legacy .git pointer files)", async () => {
@@ -642,6 +664,43 @@ test("a file that VANISHES between scan and encrypt is deferred; the push commit
   expect(committed.files.some((f) => f.path === "ghost.txt")).toBe(false); // never-synced → omitted
   expect(committed.files.some((f) => f.path === "stable.txt")).toBe(true);
   for (const f of committed.files) if (f.type === "file") expect(remote.hasBlob(f.encSha!)).toBe(true);
+});
+
+test("scan-to-encrypt source change defers without metadata patch, then a settled cycle commits one coherent image", async () => {
+  const remote = new FakeRemote();
+  await write("append.log", "before\n");
+  const scanned = await scanManifest(root);
+  const scannedEntry = scanned.files.find((f) => f.path === "append.log")!;
+  let injected = false;
+  const encrypt: NonNullable<SyncDeps["encryptFileToTemp"]> = async (srcPath, kek, tmpDir, opts) => {
+    if (!injected) {
+      injected = true;
+      await fs.appendFile(srcPath, "after\n");
+    }
+    return encryptFileToTemp(srcPath, kek, tmpDir, opts);
+  };
+
+  const first = await pushManifest(root, cfg, scanned, { ...deps(remote), encryptFileToTemp: encrypt });
+  expect(first.committed).toBe(false);
+  expect(first.deferred).toEqual(["append.log"]);
+  expect(scannedEntry.size).toBe(Buffer.byteLength("before\n"));
+  expect(scannedEntry.sha256).toBe(sha("before\n"));
+  expect(remote.headSeq()).toBe(0);
+
+  const second = await push(root, cfg, deps(remote));
+  expect(second.committed).toBe(true);
+  const entry = (await remote.latest()).manifest.files.find((f) => f.path === "append.log")!;
+  const bytes = await fs.readFile(path.join(root, "append.log"));
+  expect(entry.size).toBe(bytes.length);
+  expect(entry.sha256).toBe(shaBytes(bytes));
+
+  const other = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-source-change-pull-"));
+  try {
+    await pull(other, { ...cfg, rootPath: other, deviceId: "settled-reader" }, deps(remote));
+    expect(Buffer.from(await fs.readFile(path.join(other, "append.log"))).equals(bytes)).toBe(true);
+  } finally {
+    await fs.rm(other, { recursive: true, force: true });
+  }
 });
 
 test("a mismatch ONCE then settles is INCLUDED (bounded per-file retry heals it, not deferred)", async () => {

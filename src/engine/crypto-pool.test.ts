@@ -96,6 +96,37 @@ describe("crypto worker pool", () => {
     }
   });
 
+  test("inline and worker snapshot expectation mismatches carry RBOX_SOURCE_CHANGED and clean temps", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-"));
+    const inlineTmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-inline-"));
+    const workerTmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-worker-"));
+    try {
+      const src = path.join(root, "append.log");
+      await fs.writeFile(src, "after scan\n");
+      const kek = generateKek();
+      const expected = { sha256: "0".repeat(64), size: 1 };
+
+      const inline = encryptFileToTempInline(src, kek, inlineTmp, { expected });
+      await expect(inline).rejects.toMatchObject({ code: "RBOX_SOURCE_CHANGED" });
+
+      let workerErr: NodeJS.ErrnoException | undefined;
+      await withCryptoPool(kek, 1, 1, async () => {
+        try {
+          await encryptFileToTemp(src, kek, workerTmp, { expected });
+        } catch (e) {
+          workerErr = e as NodeJS.ErrnoException;
+        }
+      });
+      expect(workerErr?.code).toBe("RBOX_SOURCE_CHANGED");
+      expect(await fs.readdir(inlineTmp)).toEqual([]);
+      expect(await fs.readdir(workerTmp)).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(inlineTmp, { recursive: true, force: true });
+      await fs.rm(workerTmp, { recursive: true, force: true });
+    }
+  });
+
   test("decrypt integrity messages survive the worker boundary verbatim enough for callers", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-integrity-"));
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-integrity-ct-"));

@@ -42,8 +42,9 @@ export type ValidationResult = { ok: true } | { ok: false; error: string };
 
 /**
  * Validate a parsed manifest object. Returns the first problem found, or ok.
- * Enforces: safe relative paths, no duplicate paths (incl. case-insensitive,
- * for APFS/NTFS collisions), known types, well-formed shas/modes, bounded size.
+ * Enforces: safe relative paths, no duplicate or file/descendant paths (incl.
+ * case-insensitive, for APFS/NTFS collisions), known types, well-formed
+ * shas/modes, bounded size.
  */
 export function validateManifest(m: unknown): ValidationResult {
   if (m == null || typeof m !== "object") return { ok: false, error: "manifest is not an object" };
@@ -55,6 +56,7 @@ export function validateManifest(m: unknown): ValidationResult {
 
   const seen = new Set<string>();
   const seenLower = new Set<string>();
+  const pathsLower: string[] = [];
 
   for (const entry of files) {
     if (entry == null || typeof entry !== "object") return { ok: false, error: "entry is not an object" };
@@ -68,6 +70,7 @@ export function validateManifest(m: unknown): ValidationResult {
     if (seenLower.has(lower)) return { ok: false, error: `case-insensitive duplicate path: ${p}` };
     seen.add(p);
     seenLower.add(lower);
+    pathsLower.push(lower);
 
     if (e.type !== "file" && e.type !== "symlink") return { ok: false, error: `bad type for ${p}: ${JSON.stringify(e.type)}` };
     if (typeof e.sha256 !== "string" || !SHA_RE.test(e.sha256)) return { ok: false, error: `bad sha256 for ${p}` };
@@ -93,6 +96,15 @@ export function validateManifest(m: unknown): ValidationResult {
       // Note: the target STRING may point anywhere (legitimate symlinks do). Writing a symlink
       // does not write *through* it; the real defense against a symlink+file traversal combo is
       // the apply-time realpath-within-root guard (see apply.ts), not target validation here.
+    }
+  }
+
+  for (const child of pathsLower) {
+    const segments = child.split("/");
+    let parent = "";
+    for (let i = 0; i < segments.length - 1; i++) {
+      parent = parent ? `${parent}/${segments[i]!}` : segments[i]!;
+      if (seenLower.has(parent)) return { ok: false, error: `file/descendant path collision: ${parent} and ${child}` };
     }
   }
 

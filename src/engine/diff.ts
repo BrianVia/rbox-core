@@ -39,7 +39,7 @@ export function diffManifests(base: Manifest, next: Manifest): ManifestDiff {
   for (const [p, entry] of n) {
     const prev = b.get(p);
     if (!prev) added.push(entry);
-    else if (!sameContent(prev, entry)) changed.push(entry);
+    else if (!sameContent(prev, entry) || prev.size !== entry.size) changed.push(entry);
   }
   for (const p of b.keys()) {
     if (!n.has(p)) deleted.push(p);
