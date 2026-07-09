@@ -698,5 +698,6 @@ describe("download integrity self-healing (codex-Sol reviewed)", () => {
     expect(err).toBeInstanceOf(BlobDownloadIntegrityError);
     expect((err as BlobDownloadIntegrityError).bytesReceived).toBe(1024); // same-length corruption, not truncation
     await expect(fs.stat(p)).rejects.toThrow(); // no corrupt file left behind
-  });
+    // 5 attempts × jittered backoff can exceed bun's 5s default timeout (worst case ~5.6s).
+  }, 30_000);
 });
