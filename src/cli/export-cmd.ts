@@ -203,7 +203,7 @@ async function publishFileNoOverwrite(tmpFile: string, finalFile: string): Promi
  */
 export async function runExportCore(req: ExportRequest, accountId: string, seams: ExportSeams): Promise<ExportResult> {
   if (!seams.enrolled) {
-    throw new Error("encryption key missing on this machine; run `rbox recover`, then retry.");
+    throw new Error("encryption key missing on this machine; run `rbox key recover`, then retry.");
   }
 
   const target = resolveExportTarget(req.out, await defaultExportDir(accountId, seams.now(), seams.homeDir));

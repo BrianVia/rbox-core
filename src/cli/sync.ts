@@ -234,7 +234,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // manifest with encrypted entries but no key on this device → fail closed.
   const kek = cfg.kek;
   if (!kek && remote.files.some((f) => f.encSha)) {
-    throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox recover`.");
+    throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox key recover`.");
   }
 
   // A remote entry that LOCAL rules ignore must never touch this tree — neither
@@ -578,7 +578,7 @@ async function runPushAttempt(
   // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
   // E2EE is the only mode (design 12 D6): a non-encrypted config reaching the sync
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
-  if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox recover`)");
+  if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
   // Encrypt + upload. Live-folder resilience (replaces #36's whole-tree re-scan+give-up):
   // a file that keeps changing under us can never produce a hash-matching ciphertext, so

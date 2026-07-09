@@ -252,7 +252,7 @@ describe("device-code post-approval encryption handling", () => {
     expect(result).toBe("existing-keys");
     expect(err.join("")).toContain("device-code login authorized this machine");
     expect(err.join("")).toContain("`rbox pair`");
-    expect(err.join("")).toContain("`rbox recover`");
+    expect(err.join("")).toContain("`rbox key recover`");
   });
 
   test("keyless non-TTY prints the explicit genesis command and mints nothing", async () => {

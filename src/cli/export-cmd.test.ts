@@ -284,7 +284,7 @@ describe("runExportCore", () => {
       return [ws("ws_alpha001", "Alpha")];
     };
     seams.enrolled = false;
-    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/enrolled.*rbox recover|rbox recover/);
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/enrolled.*rbox key recover|rbox key recover/);
     expect(listed).toBe(false);
     expect(pulled).toBe(false);
     await expect(fs.stat(path.dirname(out))).rejects.toThrow();

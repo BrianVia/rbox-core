@@ -24,9 +24,9 @@ const MIN_LOGIN_BACKOFF_MS = 1000;
 const MAX_LOGIN_BACKOFF_MS = 60_000;
 const NO_KIT: RecoveryKitOptions = { kit: false };
 export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
-  "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox recover`.";
+  "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.";
 const DEVICE_CODE_ENROLLMENT_NOTE =
-  "note: device-code login authorized this machine, but encryption is not enrolled. Run `rbox pair` on an enrolled machine or `rbox recover`.";
+  "note: device-code login authorized this machine, but encryption is not enrolled. Run `rbox pair` on an enrolled machine or `rbox key recover`.";
 const GENESIS_COMMAND = "rbox key genesis --yes";
 const HEADLESS_GENESIS_COMMAND_NOTE = `note: no encryption keys yet — run \`${GENESIS_COMMAND}\` to set up this first machine.`;
 const ENCRYPTION_ENROLLED_MESSAGE = "encryption enrolled — this workspace will be end-to-end encrypted.";
@@ -337,7 +337,7 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
  *  NEVER sent to the server (design 12 §14.6). Printed once; treat as a secret. */
 export async function pairCreate(): Promise<void> {
   const creds = await requireCreds();
-  if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap`, `rbox pair`-connect, or `rbox recover` first.");
+  if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap`, `rbox pair`-connect, or `rbox key recover` first.");
   const loaded = await loadDevice(creds.accountId);
   if (!loaded || !("secrets" in loaded)) throw new Error("no encryption key on this device — pair/recover this machine before creating a pairing token.");
 
@@ -369,7 +369,7 @@ export async function redeemPair(remoteUrl: string, pairToken: string): Promise<
   console.log(`device authorized + encryption enrolled: ${deviceId}`);
 }
 
-/** `rbox recover` — re-enroll this machine from the recovery phrase (needs an
+/** `rbox key recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
 export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   let phrase: string;
@@ -377,7 +377,7 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
     // No-echo — the phrase is key material (mask:false = matches the old no-echo).
     phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
   } else {
-    // Piped (`echo "<phrase>" | rbox recover`) — drain stdin like `connect` does so
+    // Piped (`echo "<phrase>" | rbox key recover`) — drain stdin like `connect` does so
     // recovery still works in CI / non-TTY, where inquirer can't run.
     phrase = await readStdinTrimmed();
   }
@@ -405,7 +405,7 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`device:   ${creds.deviceId}`);
   console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
   if (!creds.accountId) return;
-  console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox recover`"}`);
+  console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));
 }
@@ -501,7 +501,7 @@ async function recoveryKitStatusLine(accountId: string, hasCachedRk: boolean): P
   if (!record) {
     return hasCachedRk
       ? "recovery kit: none recorded — run `rbox key backup --kit`"
-      : "recovery kit: none recorded — no cached phrase on this device; use the copy you saved at setup, or `rbox recover` (which will offer a kit)";
+      : "recovery kit: none recorded — no cached phrase on this device; use the copy you saved at setup, or `rbox key recover` (which will offer a kit)";
   }
   const written = record.writtenAt.slice(0, 10);
   const shown = displayPath(record.path);

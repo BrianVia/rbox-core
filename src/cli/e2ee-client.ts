@@ -160,7 +160,7 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
  *  (the caller logged in first); RK unlocks MK + RSK to self-admit. */
 export async function enrollViaRecovery(phrase: string, now: number): Promise<{ accountId: string; deviceId: string }> {
   const creds = await loadCredentials();
-  if (!creds?.accountId) throw new Error("`rbox recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
+  if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   const api = new RboxApi(creds.remoteUrl, creds.token, "", "");
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
@@ -239,7 +239,7 @@ async function ensureSecrets(api: RboxApi, accountId: string): Promise<DeviceSec
   const loaded = await loadDevice(accountId);
   if (loaded && "secrets" in loaded) return loaded.secrets;
   if (!loaded) {
-    throw new Error("this machine isn't enrolled for encryption — run `rbox pair` on a signed-in machine and connect with the token, or `rbox recover`.");
+    throw new Error("this machine isn't enrolled for encryption — run `rbox pair` on a signed-in machine and connect with the token, or `rbox key recover`.");
   }
   // device.json present, mk.key missing → re-derive MK from the server wrap (C7/D8),
   // using the account's verified current epoch (not a hardcoded 0).
@@ -247,7 +247,7 @@ async function ensureSecrets(api: RboxApi, accountId: string): Promise<DeviceSec
   if (!dto) throw new Error("account has no key material (fatal)");
   const { account } = await verifyDto(dto);
   const mine = dto.devices.find((d) => d.deviceId === loaded.device.deviceId);
-  if (!mine?.mkWrap) throw new Error("no MK wrap stored for this device — run `rbox recover`.");
+  if (!mine?.mkWrap) throw new Error("no MK wrap stored for this device — run `rbox key recover`.");
   const wrap = JSON.parse(mine.mkWrap) as Wrap;
   await assertMkWrapAuthorized(wrap, account);
   const mk = await openOwnMasterKey(loaded.device, account.currentEpoch, wrap);

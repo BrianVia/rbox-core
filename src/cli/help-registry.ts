@@ -319,11 +319,11 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "recover",
     group: "DEVICES & ACCOUNT",
-    summary: "re-enroll this machine from your recovery phrase",
-    usage: "rbox recover [--kit] [--kit-path <path>]",
+    summary: "clear the local head pin and re-baseline a halted workspace",
+    usage: "rbox recover [path] [--yes] [--allow-mass-delete]",
     flags: [
-      { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
-      { flag: "--kit-path <path>", desc: "write the entered recovery phrase to a specific recovery kit file" },
+      { flag: "--yes", desc: "skip the confirmation prompt" },
+      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
     ],
   },
   {
@@ -344,11 +344,21 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key",
     group: "DEVICES & ACCOUNT",
     summary: "encryption and agent sync keys",
-    usage: "rbox key <status | backup | genesis | create-ci | materialize | list | revoke>",
+    usage: "rbox key <status | backup | genesis | recover | create-ci | materialize | list | revoke>",
     flags: [
       { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "with `backup`, write the cached recovery phrase to a specific recovery kit file" },
+    ],
+  },
+  {
+    name: "key recover",
+    group: "DEVICES & ACCOUNT",
+    summary: "re-enroll this machine from your recovery phrase",
+    usage: "rbox key recover [--kit] [--kit-path <path>]",
+    flags: [
+      { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
+      { flag: "--kit-path <path>", desc: "write the entered recovery phrase to a specific recovery kit file" },
     ],
   },
   {
