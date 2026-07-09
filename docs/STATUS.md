@@ -5,11 +5,11 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-09 (evening) — session: design 92 ship + follow-ups._
+_Last updated: 2026-07-09 (night) — session: design 92 ship + follow-ups; v0.9.17 live fleet-wide._
 
 ## Where we are
 
-- **Version: v0.9.17** (tagged 2026-07-09). Fleet = Mac (`dev_932d7c…`, primary
+- **Version: v0.9.17** (live fleet-wide 2026-07-09: Mac + FM daemons in sync; via-desktop-ubuntu binary-only). First release run failed on a flaky retry-exhaustion test (#188 fixed: explicit 30s timeout; jittered 5-attempt backoff can exceed bun’s 5s default) — tag was moved to the fixed head. Fleet = Mac (`dev_932d7c…`, primary
   work machine) + flat-meadow/FM (`dev_de63e89a…`). Real workspace
   `ws_2b6e15da…` ≈ 128.5k files on `~/Development`.
 - **The 2026-07-09 poisoned-manifest incident class is dead** (design 92,
@@ -53,6 +53,13 @@ _Last updated: 2026-07-09 (evening) — session: design 92 ship + follow-ups._
   was moved to `~/p9-mirror-exec.log` on the Mac (writer fds survived the
   rename; still being written).** `~/Development/.rboxignore` now excludes
   `Dfinitiv/savvy-core/migration-state/*.log`.
+
+- **Repo hygiene (2026-07-09):** 40 stale worktrees removed (43→2 + primary), 65
+  shipped local branches deleted, remotes pruned. Dirty work was preserved on
+  branches first: `heal-hotfix-poison-skip` (emergency skip patch, committed),
+  `feat/dev-install` (unshipped feature), `web-dashboard-rebuild`,
+  `release-v0.9.8`, `feat/front-door`. ~81 local branches remain
+  (squash-shipped-but-unverified; optional deeper pass).
 
 ## Backlog (ledgered, not urgent)
 
