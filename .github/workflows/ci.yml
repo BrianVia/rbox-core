@@ -89,7 +89,15 @@ jobs:
       # Cache Bun's global package store (setup-bun caches only the bun binary),
       # keyed on the lockfile hash + --frozen-lockfile so versions come solely from
       # bun.lock (sha512-integrity-verified).
+      #
+      # ONLY on the GitHub-hosted fallback. The self-hosted-home box mounts a
+      # persistent host dir at ~/.bun/install/cache (docker-compose), so bun's
+      # cache already survives between jobs on-disk. Running actions/cache there
+      # would ship the whole store to GitHub's cache storage and back over the
+      # home uplink every run (~40-60s), which is what made self-hosted SLOWER
+      # than ubuntu-latest. Skipping it lets the local NVMe cache win.
       - name: Cache bun install store
+        if: needs.pick-runner.outputs.runner == 'ubuntu-latest'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.bun/install/cache
