@@ -114,9 +114,22 @@ async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitSta
     if (!st.isFile()) return "defer";
     return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "defer";
   } catch (err) {
-    if (["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException)?.code ?? "")) return "defer";
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "defer";
     throw err;
   }
+}
+
+/** The two churn classes encryption defers instead of failing the push: the file
+ *  vanished between scan and snapshot (ENOENT), or its bytes changed so the
+ *  snapshot no longer matches the scanned tuple (RBOX_SOURCE_CHANGED, design 92
+ *  §3.2 — committing the mismatched pair is what poisoned the manifest). Logs
+ *  the source-changed case so a permanently hot file is visible per cycle. */
+function isDeferrableChurn(err: unknown, relPath: string): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (code !== "ENOENT" && code !== "RBOX_SOURCE_CHANGED") return false;
+  if (code === "RBOX_SOURCE_CHANGED") console.error(`rbox: ${relPath} changed during encryption — deferred`);
+  return true;
 }
 
 export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
@@ -222,10 +235,7 @@ export async function encryptAndUpload(
           // not a push-fatal error: one vanished file must never kill a 126k-file
           // push. Defer it — deferManifest carries the base entry (or omits a
           // never-synced one) and the next scan sees the deletion for real.
-          if (["ENOENT", "RBOX_SOURCE_CHANGED"].includes((err as NodeJS.ErrnoException)?.code ?? "")) {
-            if ((err as NodeJS.ErrnoException)?.code === "RBOX_SOURCE_CHANGED") {
-              console.error(`rbox: ${f.path} changed during encryption — deferred`);
-            }
+          if (isDeferrableChurn(err, f.path)) {
             deferred.add(f.path);
             onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
@@ -292,10 +302,7 @@ export async function encryptAndUpload(
           } catch (err) {
             // Vanished mid-push (same churn class as the encrypt-stage catch above):
             // defer this file instead of failing the whole push.
-            if (["ENOENT", "RBOX_SOURCE_CHANGED"].includes((err as NodeJS.ErrnoException)?.code ?? "")) {
-              if ((err as NodeJS.ErrnoException)?.code === "RBOX_SOURCE_CHANGED") {
-                console.error(`rbox: ${f.path} changed during encryption — deferred`);
-              }
+            if (isDeferrableChurn(err, f.path)) {
               byteTracker.defer(f.path);
               emitUploadProgress(f.path);
               return null;

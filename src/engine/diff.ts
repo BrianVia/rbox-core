@@ -28,6 +28,16 @@ export function sameContent(a?: FileEntry, b?: FileEntry): boolean {
   );
 }
 
+/** Push equality is `sameContent` PLUS size (design 92 I3): a same-SHA entry
+ *  whose declared size was wrong (the poisoned-manifest incident) must be
+ *  commit-worthy so the next honest writer heals the head. Do NOT fold size
+ *  into `sameContent` — reconcile/apply use it as byte-identity, and making
+ *  them size-sensitive would manufacture false conflicts on devices that
+ *  already hold the correct bytes. */
+function samePushEntry(a: FileEntry, b: FileEntry): boolean {
+  return sameContent(a, b) && a.size === b.size;
+}
+
 /** What changed going from `base` to `next`. Used for "what to push". */
 export function diffManifests(base: Manifest, next: Manifest): ManifestDiff {
   const b = indexByPath(base);
@@ -39,7 +49,7 @@ export function diffManifests(base: Manifest, next: Manifest): ManifestDiff {
   for (const [p, entry] of n) {
     const prev = b.get(p);
     if (!prev) added.push(entry);
-    else if (!sameContent(prev, entry) || prev.size !== entry.size) changed.push(entry);
+    else if (!samePushEntry(prev, entry)) changed.push(entry);
   }
   for (const p of b.keys()) {
     if (!n.has(p)) deleted.push(p);

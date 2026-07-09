@@ -416,6 +416,13 @@ export class E2eeRemote implements SyncRemote {
     // exactly like the parent conflict it represents so the push loop pulls first;
     // if apply fails again, the push stops before signing or posting anything.
     if ((pin?.commitSeq ?? 0) !== parentSequence) {
+      // Say what actually happened: this is a LOCAL apply lag, not remote
+      // contention — the shared conflict path's retry telemetry (commit-409
+      // metrics, "remote is moving faster" exhaustion copy) would otherwise
+      // misattribute a wedged device during exactly the incident this guards.
+      process.stderr.write(
+        `rbox: local state lags the verified head (applied ${parentSequence}, seen ${pin?.commitSeq ?? 0}) — pulling before push\n`
+      );
       return { conflict: true, head: pin?.commitSeq ?? 0 };
     }
     const parentCommitHash = pin?.commitHash ?? GENESIS_PARENT_HASH;

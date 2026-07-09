@@ -118,41 +118,54 @@ export async function applyActions(
     : 0;
   try {
     await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
-      // A file-valued ancestor makes the normal beside-target temp impossible to
-      // create. Verify those entries first beside the shallowest obstruction (same
-      // filesystem), before the unchanged serial ancestor pre-pass moves anything.
-      // The retained temp is published after the obstruction has been preserved.
-      for (const a of rest) {
-        const entry = a.entry;
-        const obstruction = await firstFileAncestor(destRoot, entry.path);
-        if (!obstruction) continue;
-        const tmp = tmpName(path.join(destRoot, obstruction));
-        try {
-          await stageEntryToTemp(tmp, entry, store, opts.kek);
-        } catch (e) {
-          throw stagingError(entry.path, e);
-        }
-        prepared.set(a, tmp);
-      }
-
-      // Ancestor preflight remains serial and shallowest-first so siblings cannot
-      // race one obstruction. Entries affected by an obstruction are fully staged
-      // and verified above before any local path is displaced.
+      // One serial lstat pass over the unique ancestor comps detects every
+      // file/symlink obstruction (shallowest-first, so a nested comp under an
+      // obstructing file just reads ENOTDIR→absent, same as the pre-92 loop).
+      // Detection is split from displacement so obstruction-affected entries can
+      // be staged and VERIFIED before anything local moves (design 92 I5).
+      const obstructed = new Set<string>();
       for (const comp of shallowFirst) {
         const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
-        if (st && (st.isFile() || st.isSymbolicLink())) {
-          opts.onTypeFlip?.(comp);
-          await moveAside(destRoot, comp, conflictName(comp, device, now));
+        if (st && (st.isFile() || st.isSymbolicLink())) obstructed.add(comp);
+      }
+
+      // A file-valued ancestor makes the normal beside-target temp impossible to
+      // create. Verify those entries first beside the shallowest obstruction (same
+      // filesystem — its parent dir is real). Zero cost on the no-obstruction
+      // steady state: no per-entry probing, just the one detection pass above.
+      if (obstructed.size > 0) {
+        for (const a of rest) {
+          const obstruction = shallowestObstructedAncestor(a.entry.path, obstructed);
+          if (!obstruction) continue;
+          const tmp = tmpName(path.join(destRoot, obstruction));
+          try {
+            await stageEntryToTemp(tmp, a.entry, store, opts.kek);
+          } catch (e) {
+            throw stagingError(a.entry.path, e);
+          }
+          prepared.set(a, tmp);
         }
+      }
+
+      // Displacement stays serial and shallowest-first so siblings cannot race
+      // one obstruction; every affected entry is already staged+verified above.
+      for (const comp of shallowFirst) {
+        if (!obstructed.has(comp)) continue;
+        opts.onTypeFlip?.(comp);
+        await moveAside(destRoot, comp, conflictName(comp, device, now));
       }
 
       await poolMap(rest, dlConc, async (a) => {
         if (a.kind === "write") {
-          await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip, undefined, prepared.get(a));
+          await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
+            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a),
+          });
         } else if (a.kind === "conflict") {
           // Reconcile already decided both sides diverged. Stage and verify the
           // remote first; only then preserve the local at its chosen conflict name.
-          await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip, a.keepLocalAs, prepared.get(a));
+          await writeEntry(destRoot, a.entry, undefined, store, device, now, {
+            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
+          });
         }
         opts.onProgress?.(++done, rest.length);
       });
@@ -166,7 +179,17 @@ export async function applyActions(
 }
 
 /** Stage the remote entry to a temp, re-check the target, preserve any surprise
- *  bytes as a conflict copy, then atomically publish. */
+ *  bytes as a conflict copy, then atomically publish. `keepLocalAs` (conflict
+ *  actions) and `preparedTmp` (obstruction pre-stage) are named fields, not
+ *  positionals — both are strings, and transposing them would silently break
+ *  verify-before-displace. */
+type WriteEntryOptions = {
+  kek?: Buffer;
+  trash?: TrashBatch;
+  onTypeFlip?: (relPath: string) => void;
+  keepLocalAs?: string;
+  preparedTmp?: string;
+};
 async function writeEntry(
   destRoot: string,
   entry: FileEntry,
@@ -174,11 +197,7 @@ async function writeEntry(
   store: BlobStore,
   device: string,
   now: string,
-  kek?: Buffer,
-  trash?: TrashBatch,
-  onTypeFlip?: (relPath: string) => void,
-  keepLocalAs?: string,
-  preparedTmp?: string
+  { kek, trash, onTypeFlip, keepLocalAs, preparedTmp }: WriteEntryOptions = {}
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -272,24 +291,23 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
   await fs.chmod(tmp, entry.mode);
 }
 
+/** Wrap a staging failure so it NAMES its file (design 92 I6 — the 2026-07-09
+ *  incident required decrypting the head manifest just to learn which entry was
+ *  poisoned). The original typed error stays reachable via `cause`. */
 function stagingError(relPath: string, cause: unknown): Error {
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(`${relPath}: ${detail}`, { cause });
 }
 
-async function firstFileAncestor(destRoot: string, relPath: string): Promise<string | undefined> {
+/** Shallowest ancestor of `relPath` present in `obstructed` (in-memory; the
+ *  lstat evidence was gathered once by the detection pass). Shallowest matters:
+ *  the pre-staged temp is created beside it, where the parent dir is real. */
+function shallowestObstructedAncestor(relPath: string, obstructed: Set<string>): string | undefined {
+  let acc = "";
   const parts = relPath.split("/");
-  let rel = "";
   for (let i = 0; i < parts.length - 1; i++) {
-    rel = rel ? `${rel}/${parts[i]!}` : parts[i]!;
-    try {
-      const st = await fs.lstat(path.join(destRoot, rel));
-      if (st.isFile() || st.isSymbolicLink()) return rel;
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-      throw e;
-    }
+    acc = acc ? `${acc}/${parts[i]!}` : parts[i]!;
+    if (obstructed.has(acc)) return acc;
   }
   return undefined;
 }

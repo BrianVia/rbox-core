@@ -99,11 +99,15 @@ export function validateManifest(m: unknown): ValidationResult {
     }
   }
 
+  // File/descendant prefix collisions (design 92 §3.5): `foo` and `foo/bar`
+  // cannot both be entries — one materializes as a file where the other needs a
+  // directory, so parallel apply hits EISDIR/ENOTDIR or silently displaces an
+  // applied child. Case-folded like the duplicate check above. Runs per pull
+  // over the whole manifest: walk parents by slicing at separators (no split()
+  // array or prefix-concat churn per path).
   for (const child of pathsLower) {
-    const segments = child.split("/");
-    let parent = "";
-    for (let i = 0; i < segments.length - 1; i++) {
-      parent = parent ? `${parent}/${segments[i]!}` : segments[i]!;
+    for (let idx = child.lastIndexOf("/"); idx > 0; idx = child.lastIndexOf("/", idx - 1)) {
+      const parent = child.slice(0, idx);
       if (seenLower.has(parent)) return { ok: false, error: `file/descendant path collision: ${parent} and ${child}` };
     }
   }
