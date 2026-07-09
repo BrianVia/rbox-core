@@ -5,10 +5,12 @@ import {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   encryptFileToTemp as defaultEncryptFileToTemp,
+  isSourceChangedError,
   poolMap,
   withCryptoPool,
   type EncryptedBlob,
   type EncryptAddressCacheContext,
+  type EncryptFileOptions,
   type FileEntry,
   type Manifest,
   type PhaseReport,
@@ -53,7 +55,7 @@ const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
 
-type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: { compress?: boolean }) => Promise<EncryptedBlob>;
+type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
 
 type CipherDescriptor = {
   encSha: string;
@@ -105,17 +107,30 @@ function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheCo
   };
 }
 
-type CacheHitStatus = "accept" | "encrypt" | "defer";
+type CacheHitStatus = "accept" | "defer";
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
 
 async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitStatus> {
   try {
     const st = await fs.lstat(path.join(root, f.path));
-    if (!st.isFile()) return "encrypt";
-    return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "encrypt";
+    if (!st.isFile()) return "defer";
+    return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "defer";
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return "defer";
+    if (hasErrorCode(err, "ENOENT") || hasErrorCode(err, "ENOTDIR")) return "defer";
     throw err;
   }
+}
+
+/** Missing sources and snapshots that no longer match the scanned tuple are
+ *  deferred; source changes are logged once per attempted cycle. */
+function isDeferrableChurn(err: unknown, relPath: string): boolean {
+  if (hasErrorCode(err, "ENOENT")) return true;
+  if (!isSourceChangedError(err)) return false;
+  console.error(`rbox: ${relPath} changed during encryption — deferred`);
+  return true;
 }
 
 export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
@@ -126,17 +141,12 @@ export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfi
 
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
- *  ciphertext blobs by `encSha`. Mutates `local`'s entries (encSha + fresh sha).
+ *  ciphertext blobs by `encSha`. Mutates only `local`'s cipher descriptors; the
+ *  scan-time plaintext SHA and size remain authoritative.
  *
- *  Live-folder resilience: a file that keeps changing under the push can never
- *  produce a ciphertext that hash-matches its committed `encSha` (the blob PUT
- *  400/412s as `sha_mismatch`, or the reused-from-base re-encrypt yields a different
- *  address). Rather than aborting the WHOLE push (the old behavior), each such file
- *  is retried a bounded number of times (re-encrypting a fresh stable snapshot each
- *  time, adopting whatever address that snapshot hashes to); if it still won't settle
- *  it is DEFERRED — returned in `deferred` (by path) so the caller drops it from THIS
- *  commit and lets the daemon re-queue it once it settles. The common stable-file
- *  path (first encrypt → upload that exact temp) is untouched. */
+ *  Snapshot mismatches and missing sources defer immediately. Ciphertext upload
+ *  mismatches retry within a fixed per-file budget. Deferred paths are omitted or
+ *  carried from the applied base, so no mismatched plaintext tuple is committed. */
 export async function encryptAndUpload(
   api: SyncRemote,
   root: string,
@@ -210,21 +220,23 @@ export async function encryptAndUpload(
         cacheMisses++;
         let e;
         try {
-          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, encryptOpts);
+          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, {
+            ...encryptOpts,
+            expected: { sha256: f.sha256, size: f.size },
+          });
         } catch (err) {
           // Vanished between scan and snapshot (agent/build churn deletes files
           // constantly on a live tree). This is the churn case design 38 defers,
           // not a push-fatal error: one vanished file must never kill a 126k-file
           // push. Defer it — deferManifest carries the base entry (or omits a
           // never-synced one) and the next scan sees the deletion for real.
-          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          if (isDeferrableChurn(err, f.path)) {
             deferred.add(f.path);
             onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
           }
           throw err;
         }
-        f.sha256 = e.plaintextSha; // fresh-hashed actual bytes (review #1)
         applyCipherDescriptor(f, descriptorFromEncryptedBlob(e));
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
@@ -261,9 +273,9 @@ export async function encryptAndUpload(
 
     /**
      * Upload ONE file's blob with bounded per-file retry. Each retry re-encrypts a fresh
-     * snapshot of THIS file and adopts whatever address it hashes to, so a moving file
-     * eventually pins to a settled snapshot; if it never settles within the bound the file
-     * is deferred (returns null). Mutates only `f` (its fresh sha256/encSha). Returns the
+     * snapshot of THIS file and requires it to match `f`'s scanned SHA and size. A changed
+     * source defers immediately; repeated ciphertext upload mismatches remain bounded.
+     * Mutates only `f`'s cipher descriptor. Returns the
      * wire bytes actually sent (0 if a convergent peer already uploaded the address).
      */
     const uploadFileWithRetry = async (f: FileEntry): Promise<number | null> => {
@@ -272,25 +284,25 @@ export async function encryptAndUpload(
         let ct = ctByEnc.get(f.encSha!);
         if (!ct) {
           // No temp for this address (reused-from-base but server lost it, or a retry):
-          // re-encrypt a fresh snapshot of THIS file NOW and adopt whatever address it
-          // hashes to. Committing the fresh address (not insisting on the stale one) is what
-          // lets a file that changed since the manifest was built still upload consistently.
+          // re-encrypt a fresh snapshot of THIS file NOW, but only if it still
+          // matches the manifest tuple. Source churn defers rather than patching `f`.
           let re;
           try {
             const t0 = LANE_TIMING ? performance.now() : 0;
-            re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, encryptOpts);
+            re = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, {
+              ...encryptOpts,
+              expected: { sha256: f.sha256, size: f.size },
+            });
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
-            // Vanished mid-push (same churn class as the encrypt-stage catch above):
-            // defer this file instead of failing the whole push.
-            if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            // Source churn defers instead of mutating the scanned manifest tuple.
+            if (isDeferrableChurn(err, f.path)) {
               byteTracker.defer(f.path);
               emitUploadProgress(f.path);
               return null;
             }
             throw err;
           }
-          f.sha256 = re.plaintextSha;
           applyCipherDescriptor(f, descriptorFromEncryptedBlob(re));
           const freshEncSha = re.encSha;
           ct = re.ciphertextPath;

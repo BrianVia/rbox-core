@@ -74,6 +74,7 @@ export async function applyActions(
 
   const deletes = actions.filter((a) => a.kind === "delete");
   const rest = actions.filter((a) => a.kind !== "delete");
+  const prepared = new Map<Action, string>();
 
   // Ancestor preflight (§3, design-review M3): a FILE or SYMLINK squatting on a
   // path component a write needs as a directory makes mkdir throw ENOTDIR. Resolve
@@ -92,13 +93,6 @@ export async function applyActions(
     }
   }
   const shallowFirst = [...needDirs].sort((a, b) => a.split("/").length - b.split("/").length);
-  for (const comp of shallowFirst) {
-    const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
-    if (st && (st.isFile() || st.isSymbolicLink())) {
-      opts.onTypeFlip?.(comp);
-      await moveAside(destRoot, comp, conflictName(comp, device, now));
-    }
-  }
 
   // Writes/conflicts target distinct paths and are independent, so fetch+decrypt
   // them through a bounded pool — a pull was a sequential per-blob download, which
@@ -122,25 +116,83 @@ export async function applyActions(
         return entry?.type === "file" && !!entry.encSha;
       }).length
     : 0;
-  await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
-    await poolMap(rest, dlConc, async (a) => {
-      if (a.kind === "write") {
-        await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
-      } else if (a.kind === "conflict") {
-        // Reconcile already decided both sides diverged: keep local aside, take remote.
-        await moveAside(destRoot, a.path, a.keepLocalAs);
-        await writeEntry(destRoot, a.entry, undefined, store, device, now, opts.kek, opts.trash, opts.onTypeFlip);
+  try {
+    await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
+      // Detection is serial and shallowest-first; ENOTDIR below an already-found
+      // obstruction is equivalent to absence. Other filesystem errors remain fatal.
+      // Detection precedes displacement so affected entries can be verified first.
+      const obstructed = new Set<string>();
+      for (const comp of shallowFirst) {
+        try {
+          const st = await fs.lstat(path.join(destRoot, comp));
+          if (st.isFile() || st.isSymbolicLink()) obstructed.add(comp);
+        } catch (error) {
+          if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) continue;
+          throw error;
+        }
       }
-      opts.onProgress?.(++done, rest.length);
+
+      // A file-valued ancestor makes the normal beside-target temp impossible to
+      // create. Verify those entries first beside the shallowest obstruction (same
+      // filesystem — its parent dir is real). Zero cost on the no-obstruction
+      // steady state: no per-entry probing, just the one detection pass above.
+      if (obstructed.size > 0) {
+        for (const a of rest) {
+          const obstruction = shallowestObstructedAncestor(a.entry.path, obstructed);
+          if (!obstruction) continue;
+          const tmp = tmpName(path.join(destRoot, obstruction));
+          try {
+            await stageEntryToTemp(tmp, a.entry, store, opts.kek);
+          } catch (e) {
+            throw stagingError(a.entry.path, e);
+          }
+          prepared.set(a, tmp);
+        }
+      }
+
+      // Displacement stays serial and shallowest-first so siblings cannot race
+      // one obstruction; every affected entry is already staged+verified above.
+      for (const comp of shallowFirst) {
+        if (!obstructed.has(comp)) continue;
+        opts.onTypeFlip?.(comp);
+        await moveAside(destRoot, comp, conflictName(comp, device, now));
+      }
+
+      await poolMap(rest, dlConc, async (a) => {
+        if (a.kind === "write") {
+          await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
+            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a),
+          });
+        } else if (a.kind === "conflict") {
+          // Reconcile already decided both sides diverged. Stage and verify the
+          // remote first; only then preserve the local at its chosen conflict name.
+          await writeEntry(destRoot, a.entry, undefined, store, device, now, {
+            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
+          });
+        }
+        opts.onProgress?.(++done, rest.length);
+      });
     });
-  });
+  } finally {
+    await Promise.all([...prepared.values()].map((tmp) => fs.rm(tmp, { force: true }).catch(() => {})));
+  }
   for (const a of deletes) {
     await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
   }
 }
 
 /** Stage the remote entry to a temp, re-check the target, preserve any surprise
- *  bytes as a conflict copy, then atomically publish. */
+ *  bytes as a conflict copy, then atomically publish. `keepLocalAs` (conflict
+ *  actions) and `preparedTmp` (obstruction pre-stage) are named fields, not
+ *  positionals — both are strings, and transposing them would silently break
+ *  verify-before-displace. */
+type WriteEntryOptions = {
+  kek?: Buffer;
+  trash?: TrashBatch;
+  onTypeFlip?: (relPath: string) => void;
+  keepLocalAs?: string;
+  preparedTmp?: string;
+};
 async function writeEntry(
   destRoot: string,
   entry: FileEntry,
@@ -148,9 +200,7 @@ async function writeEntry(
   store: BlobStore,
   device: string,
   now: string,
-  kek?: Buffer,
-  trash?: TrashBatch,
-  onTypeFlip?: (relPath: string) => void
+  { kek, trash, onTypeFlip, keepLocalAs, preparedTmp }: WriteEntryOptions = {}
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
@@ -158,11 +208,20 @@ async function writeEntry(
 
   const tmp = tmpName(abs);
   try {
-    await stageEntryToTemp(tmp, entry, store, kek);
+    if (preparedTmp) await fs.rename(preparedTmp, tmp);
+    else {
+      try {
+        await stageEntryToTemp(tmp, entry, store, kek);
+      } catch (e) {
+        throw stagingError(entry.path, e);
+      }
+    }
 
     // Final precondition: does the target still match what reconcile assumed?
     const current = await currentEntryAt(destRoot, entry.path);
-    if (!sameContent(current, expectedLocal) && current) {
+    if (current && keepLocalAs) {
+      await moveAside(destRoot, entry.path, keepLocalAs);
+    } else if (!sameContent(current, expectedLocal) && current) {
       // The user created/edited it in the window — preserve those bytes.
       await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
     }
@@ -235,6 +294,25 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
   await fs.chmod(tmp, entry.mode);
 }
 
+/** Staging failures name the entry and retain the original typed error as `cause`. */
+function stagingError(relPath: string, cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(`${relPath}: ${detail}`, { cause });
+}
+
+/** Shallowest ancestor of `relPath` present in `obstructed` (in-memory; the
+ *  lstat evidence was gathered once by the detection pass). Shallowest matters:
+ *  the pre-staged temp is created beside it, where the parent dir is real. */
+function shallowestObstructedAncestor(relPath: string, obstructed: ReadonlySet<string>): string | undefined {
+  let acc = "";
+  const parts = relPath.split("/");
+  for (let i = 0; i < parts.length - 1; i++) {
+    acc = acc ? `${acc}/${parts[i]!}` : parts[i]!;
+    if (obstructed.has(acc)) return acc;
+  }
+  return undefined;
+}
+
 /**
  * Restore ONE file from a past version onto disk (design 12 §15). Unlike the pull
  * writer this is an EXPLICIT OVERWRITE — no reconcile precondition, no conflict-copy
@@ -292,10 +370,9 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   try {
     st = await fs.lstat(abs);
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
     // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
     // can't exist, so it's already gone (design-review M1).
-    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    if (hasErrorCode(e, "ENOENT") || hasErrorCode(e, "ENOTDIR")) return undefined;
     throw e;
   }
   if (st.isSymbolicLink()) {
@@ -313,17 +390,38 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
  *  (same device) collide — probe and suffix `~2`, `~3`… (design-50 review). */
 async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
   const from = path.join(destRoot, fromRel);
+  const st = await fs.lstat(from);
   let to = path.join(destRoot, toRel);
   await fs.mkdir(path.dirname(to), { recursive: true });
   for (let i = 2; ; i++) {
-    try {
-      await fs.access(to);
-      to = path.join(destRoot, `${toRel}~${i}`);
-    } catch {
-      break;
-    }
+    if (await moveNoClobber(from, to, st)) return;
+    to = path.join(destRoot, `${toRel}~${i}`);
   }
-  await fs.rename(from, to);
+}
+
+/** Move without overwriting an existing conflict name. Each destination claim is
+ * exclusive at the filesystem operation itself, avoiding access-then-rename races. */
+async function moveNoClobber(from: string, to: string, st: { isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
+  try {
+    if (st.isDirectory()) {
+      await fs.mkdir(to);
+      await fs.rename(from, to);
+    } else if (st.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(from), to);
+      await fs.unlink(from);
+    } else {
+      await fs.link(from, to);
+      await fs.unlink(from);
+    }
+    return true;
+  } catch (e) {
+    if (hasErrorCode(e, "EEXIST")) return false;
+    throw e;
+  }
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 

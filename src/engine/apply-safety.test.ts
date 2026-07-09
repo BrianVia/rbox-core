@@ -14,6 +14,7 @@ import {
   type Manifest,
 } from "./index.js";
 import { openTrashBatch, listTrash } from "./trash.js";
+import { encryptFileToTempInline, generateKek } from "./crypto.js";
 
 // Drive the real apply/watch pipeline against a real filesystem and assert on the
 // resulting bytes + trash contents — the safety guarantees are all on-disk effects.
@@ -64,6 +65,29 @@ const conflictCopies = async (dir = "") => {
   return names.filter((n) => n.includes(".conflict"));
 };
 
+const encryptedEntry = async (rel: string, content: Buffer, kek: Buffer, compress: boolean): Promise<{ entry: FileEntry; ciphertext: Buffer }> => {
+  const src = path.join(storeDir, `${rel.replaceAll("/", "-")}.src`);
+  const tmp = path.join(storeDir, "crypto-tmp");
+  await fs.mkdir(tmp, { recursive: true });
+  await fs.writeFile(src, content);
+  const blob = await encryptFileToTempInline(src, kek, tmp, { compress });
+  const ciphertext = await fs.readFile(blob.ciphertextPath);
+  await store.put(blob.encSha, ciphertext);
+  return {
+    entry: {
+      path: rel,
+      type: "file",
+      sha256: blob.plaintextSha,
+      encSha: blob.encSha,
+      size: content.length,
+      mode: 0o644,
+      mtimeMs: 0,
+      ...(blob.comp ? { comp: blob.comp, payloadSha: blob.payloadSha, cipherSize: blob.cipherSize } : {}),
+    },
+    ciphertext,
+  };
+};
+
 test("dir-obstruction write: the directory lands in trash, the entry publishes, onTypeFlip fires once", async () => {
   // Local has a materialized directory where the remote now has a file (the Conductor flip).
   await write("foo/inner.txt", "inner-bytes");
@@ -97,6 +121,80 @@ test("ancestor-file obstruction with two children in one call: exactly one confl
   const copies = await conflictCopies();
   expect(copies).toHaveLength(1);
   expect(await read(copies[0]!)).toBe("old file at a"); // the obstructing file's bytes survive
+});
+
+test("poisoned conflict and ancestor-obstruction writes verify before displacing any local bytes", async () => {
+  const kek = generateKek();
+  const incoming = await encryptedEntry("placeholder", Buffer.from("remote bytes\n"), kek, false);
+  const poisoned = (rel: string): FileEntry => ({ ...incoming.entry, path: rel, sha256: hashBytes(Buffer.from("different expected bytes")) });
+
+  await write("live.log", "local writer bytes\n");
+  const conflict: Action = { kind: "conflict", path: "live.log", keepLocalAs: "live.device.20260709000000.conflict.log", entry: poisoned("live.log") };
+  await expect(applyActions(root, [conflict], store, { kek })).rejects.toThrow(/live\.log/);
+  expect(await read("live.log")).toBe("local writer bytes\n");
+  expect(await exists("live.device.20260709000000.conflict.log")).toBe(false);
+
+  await write("tree", "ancestor obstruction\n");
+  const child: Action = { kind: "write", entry: poisoned("tree/child.txt"), expectedLocal: undefined };
+  await expect(applyActions(root, [child], store, { kek })).rejects.toThrow(/tree\/child\.txt/);
+  expect(await lstatType("tree")).toBe("file");
+  expect(await read("tree")).toBe("ancestor obstruction\n");
+  expect((await conflictCopies()).some((name) => name.startsWith("tree."))).toBe(false);
+});
+
+test("size-cap, plaintext-SHA, GCM, and zstd staging failures all name the entry path", async () => {
+  const kek = generateKek();
+  const compressedBytes = Buffer.from("highly compressible integrity payload\n".repeat(2_000));
+  const compressed = await encryptedEntry("base-compressed", compressedBytes, kek, true);
+  expect(compressed.entry.comp).toBe("zstd");
+  const raw = await encryptedEntry("base-raw", Buffer.from("raw ciphertext interpreted as zstd\n"), kek, false);
+
+  const tamperedAddress = hashBytes(Buffer.from("tampered-address"));
+  const tampered = Buffer.from(compressed.ciphertext);
+  tampered[0] = tampered[0]! ^ 0xff;
+  await store.put(tamperedAddress, tampered);
+
+  const cases: Array<{ path: string; entry: FileEntry; message: RegExp }> = [
+    {
+      path: "errors/size-cap.log",
+      entry: { ...compressed.entry, path: "errors/size-cap.log", size: compressedBytes.length - 1 },
+      message: /exceeds declared size/,
+    },
+    {
+      path: "errors/plaintext-sha.log",
+      entry: { ...compressed.entry, path: "errors/plaintext-sha.log", sha256: hashBytes(Buffer.from("wrong plaintext sha")) },
+      message: /decrypt integrity mismatch/,
+    },
+    {
+      path: "errors/gcm.log",
+      entry: { ...compressed.entry, path: "errors/gcm.log", encSha: tamperedAddress },
+      message: /authenticate|operation-specific reason/i,
+    },
+    {
+      path: "errors/zstd.log",
+      entry: {
+        ...raw.entry,
+        path: "errors/zstd.log",
+        comp: "zstd",
+        payloadSha: raw.entry.sha256,
+        cipherSize: raw.ciphertext.length,
+      },
+      message: /zstd|frame|data|compression|dictionary/i,
+    },
+  ];
+
+  for (const c of cases) {
+    let error: Error | undefined;
+    try {
+      await applyActions(root, [{ kind: "write", entry: c.entry, expectedLocal: undefined }], store, { kek });
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      error = e;
+    }
+    expect(error?.message).toContain(c.path);
+    expect(error?.message).toMatch(c.message);
+    expect(await exists(c.path)).toBe(false);
+  }
 });
 
 test("clean delete routes the file into trash, not oblivion", async () => {

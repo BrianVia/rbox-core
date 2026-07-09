@@ -28,6 +28,13 @@ export function sameContent(a?: FileEntry, b?: FileEntry): boolean {
   );
 }
 
+/** Push equality includes declared size so invalid metadata is commit-worthy.
+ *  Reconcile/apply intentionally remain size-insensitive: `sameContent` models
+ *  byte identity and must not create conflicts for already-correct bytes. */
+function samePushEntry(a: FileEntry, b: FileEntry): boolean {
+  return sameContent(a, b) && a.size === b.size;
+}
+
 /** What changed going from `base` to `next`. Used for "what to push". */
 export function diffManifests(base: Manifest, next: Manifest): ManifestDiff {
   const b = indexByPath(base);
@@ -39,7 +46,7 @@ export function diffManifests(base: Manifest, next: Manifest): ManifestDiff {
   for (const [p, entry] of n) {
     const prev = b.get(p);
     if (!prev) added.push(entry);
-    else if (!sameContent(prev, entry)) changed.push(entry);
+    else if (!samePushEntry(prev, entry)) changed.push(entry);
   }
   for (const p of b.keys()) {
     if (!n.has(p)) deleted.push(p);

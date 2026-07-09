@@ -409,6 +409,15 @@ export class E2eeRemote implements SyncRemote {
     const epoch = account.currentKeyEpoch;
     const kek = await this.kekFor(epoch, account, true);
     const pin = await this.pins.load();
+    // The parent sequence and hash must describe the same applied head. A verified
+    // but unapplied head advances the anti-rollback pin only, so it must pull first.
+    if ((pin?.commitSeq ?? 0) !== parentSequence) {
+      // Distinguish local apply lag before reusing the conflict retry path.
+      process.stderr.write(
+        `rbox: local state lags the verified head (applied ${parentSequence}, seen ${pin?.commitSeq ?? 0}) — pulling before push\n`
+      );
+      return { conflict: true, head: pin?.commitSeq ?? 0 };
+    }
     const parentCommitHash = pin?.commitHash ?? GENESIS_PARENT_HASH;
 
     // The blobRef list is the UNIQUE set of blobs this commit references — many
