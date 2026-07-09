@@ -11,14 +11,14 @@ round-trips for status; the menu is rebuilt from local JSON files every ~2.5s.
 
 ## What it shows
 
-- **Menu-bar icon**: the R monogram, template-tinted to the bar, with a state
-  badge — checkmark (synced), up/down arrow (pushing/pulling), red bang
-  (attention), pause (paused). Attention renders red so it actually alarms.
+- **Menu-bar icon**: an open-box template glyph, automatically tinted for the
+  bar, with no badge when healthy, an amber dot when degraded, and a red dot
+  only for critical attention. The box itself never changes color.
 - **Dropdown** (matches the mockup, light + dark):
   - Header: workspace name + a colored state pill.
   - Syncing: a Status / File (middle-truncated, monospaced) / Progress block
     with a blue progress bar.
-  - Attention: a red "Background sync isn't responding" banner + heartbeat age.
+  - Attention: an amber degraded banner or red critical banner + status detail.
   - Last-synced + sequence meta, then Pause/Resume/Restart · Open Dashboard ·
     View Daemon Log, and a version/hostname footer.
 - Multi-workspace: a segmented switcher appears when more than one workspace
@@ -30,9 +30,9 @@ round-trips for status; the menu is rebuilt from local JSON files every ~2.5s.
 swift test
 ```
 
-`StatusReaderTests` locks the verdict matrix (staleness = 15s, absent/corrupt/
-paused/populate handling) against the reference reader. `DropdownSnapshotTests`
-renders each state to `/tmp/rboxbar-snapshots/*.png` for visual review.
+`StatusReaderTests` locks the verdict matrix and severity mapping against the
+reference reader. `DropdownSnapshotTests` renders ok, degraded, and critical
+tiers to `/tmp/rboxbar-snapshots/*.png` for visual review.
 
 ## Build
 

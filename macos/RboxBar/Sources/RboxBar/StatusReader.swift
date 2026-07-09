@@ -46,6 +46,7 @@ struct StatusReader {
             logURL: dir.appendingPathComponent("daemon.log"),
             state: verdict.state,
             reason: verdict.reason,
+            attentionReason: verdict.attentionReason,
             operation: verdict.operation,
             sequence: verdict.sequence,
             lastSyncedAt: verdict.lastSyncedAt,
@@ -85,6 +86,7 @@ struct StatusReader {
                 return Verdict(
                     state: status.state,
                     reason: status.state == .attention ? mapReason(status.attentionReason) : nil,
+                    attentionReason: status.state == .attention ? status.attentionReason : nil,
                     operation: status.operation,
                     sequence: status.sequence,
                     lastSyncedAt: status.lastSyncedAt,
@@ -174,7 +176,7 @@ struct StatusReader {
                 operation = parseOperation(operationObject, defaultKind: nil)
             }
 
-            let reason = (object["attentionReason"] as? String).flatMap(AttentionReason.init(rawValue:))
+            let reason = (object["attentionReason"] as? String).flatMap(AmbientAttentionReason.init(rawValue:))
             return .valid(DaemonStatus(
                 state: state,
                 heartbeatAt: heartbeatAt,
@@ -237,7 +239,7 @@ struct StatusReader {
         return nil
     }
 
-    private func mapReason(_ reason: AttentionReason?) -> String {
+    private func mapReason(_ reason: AmbientAttentionReason?) -> String {
         switch reason {
         case .halt:
             return "halt"
@@ -303,7 +305,7 @@ private struct DaemonStatus {
     var sequence: Int?
     var lastSyncedAt: Date?
     var operation: SyncOperation?
-    var attentionReason: AttentionReason?
+    var attentionReason: AmbientAttentionReason?
 }
 
 private enum DaemonStatusResult {
@@ -315,6 +317,7 @@ private enum DaemonStatusResult {
 private struct Verdict {
     var state: DaemonState
     var reason: String? = nil
+    var attentionReason: AmbientAttentionReason? = nil
     var operation: SyncOperation? = nil
     var sequence: Int? = nil
     var lastSyncedAt: Date? = nil

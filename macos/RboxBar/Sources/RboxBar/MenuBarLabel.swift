@@ -1,73 +1,57 @@
 import AppKit
 import SwiftUI
 
-/// The menu-bar item: a single composited `NSImage` of the R monogram plus a small
-/// state badge (checkmark / up / down / bang / pause). Built as one image — not a
-/// SwiftUI ZStack — because `MenuBarExtra` renders any `Text` in the label view
-/// (including an `.accessibilityLabel`) as a visible title next to the icon.
-///
-/// Normal states render as a monochrome **template** so macOS tints them to match a
-/// light or dark bar. `attention` renders non-template in red so it actually alarms —
-/// the one state whose entire purpose (design 88) is to be noticed.
+/// A template-rendered open box with an optional severity dot. The glyph and dot
+/// stay as separate layers so macOS can tint the box for any menu-bar appearance
+/// without recoloring the amber/red badge.
 struct MenuBarLabel: View {
     let workspace: WorkspaceStatus
 
     var body: some View {
-        Image(nsImage: MenuBarIcon.make(for: workspace))
+        ZStack(alignment: .bottomTrailing) {
+            Image(nsImage: MenuBarIcon.glyphImage())
+                .renderingMode(.template)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: MenuBarIcon.side, height: MenuBarIcon.side)
+
+            if let badgeColor = MenuBarIcon.badgeColor(for: workspace.severityTier) {
+                Circle()
+                    .fill(.white)
+                    .frame(width: MenuBarIcon.badgeDiameter + (2 * MenuBarIcon.badgeGap),
+                           height: MenuBarIcon.badgeDiameter + (2 * MenuBarIcon.badgeGap))
+                    .blendMode(.destinationOut)
+
+                Circle()
+                    .fill(Color(nsColor: badgeColor))
+                    .frame(width: MenuBarIcon.badgeDiameter, height: MenuBarIcon.badgeDiameter)
+                    .padding(MenuBarIcon.badgeGap)
+            }
+        }
+        .frame(width: MenuBarIcon.side, height: MenuBarIcon.side)
+        .compositingGroup()
     }
 }
 
 enum MenuBarIcon {
-    static func make(for workspace: WorkspaceStatus) -> NSImage {
-        let attention = workspace.state == .attention
-        let size = NSSize(width: 19, height: 16)
-        let symbol = badgeSymbol(for: workspace)
+    static let side: CGFloat = 18
+    static let badgeDiameter: CGFloat = 5
+    static let badgeGap: CGFloat = 1
 
-        let image = NSImage(size: size, flipped: false) { _ in
-            // R monogram (left), sized from the glyph's 376×484 aspect ratio.
-            let glyphHeight: CGFloat = 15
-            let glyphWidth = glyphHeight * (376.0 / 484.0)
-            glyph()?.draw(
-                in: NSRect(x: 0, y: (size.height - glyphHeight) / 2, width: glyphWidth, height: glyphHeight),
-                from: .zero, operation: .sourceOver, fraction: 1
-            )
-
-            // State badge, bottom-trailing.
-            if let badge = symbolImage(symbol) {
-                let side: CGFloat = 9
-                badge.draw(
-                    in: NSRect(x: size.width - side, y: 0, width: side, height: side),
-                    from: .zero, operation: .sourceOver, fraction: 1
-                )
-            }
-
-            // Single tint over everything drawn (recolors via source-atop).
-            (attention ? NSColor.systemRed : NSColor.black).set()
-            NSRect(origin: .zero, size: size).fill(using: .sourceAtop)
-            return true
-        }
-        image.isTemplate = !attention
-        return image
-    }
-
-    private static func badgeSymbol(for workspace: WorkspaceStatus) -> String {
-        switch workspace.state {
-        case .synced: return "checkmark"
-        case .syncing: return workspace.operation?.kind == .push ? "arrow.up" : "arrow.down"
-        case .attention: return "exclamationmark"
-        case .paused: return "pause.fill"
+    static func badgeColor(for tier: SeverityTier) -> NSColor? {
+        switch tier {
+        case .ok:
+            return nil
+        case .degraded:
+            return .systemOrange
+        case .critical:
+            return .systemRed
         }
     }
 
-    private static func symbolImage(_ name: String) -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
-        return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-            .withSymbolConfiguration(config)
-    }
-
-    /// The vector R glyph from the bundle. Prefers the compiled asset-catalog image,
-    /// falls back to the raw template PDF SwiftPM copies in, then an SF Symbol.
-    private static func glyph() -> NSImage? {
+    /// The vector open-box glyph from the bundle. The image is always a template;
+    /// severity color belongs exclusively to the separate badge layer above.
+    static func glyphImage() -> NSImage {
         if let image = Bundle.module.image(forResource: "RGlyph") {
             image.isTemplate = true
             return image
@@ -79,6 +63,8 @@ enum MenuBarIcon {
             image.isTemplate = true
             return image
         }
-        return NSImage(systemSymbolName: "r.square.fill", accessibilityDescription: nil)
+        let image = NSImage(systemSymbolName: "shippingbox", accessibilityDescription: nil) ?? NSImage()
+        image.isTemplate = true
+        return image
     }
 }

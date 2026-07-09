@@ -15,7 +15,7 @@ template-rendered vector PDF glyph loaded as `NSImage(named:"RGlyph", bundle:.mo
 Package.swift
 Sources/RboxBar/
   RboxBarApp.swift        // @main App + MenuBarExtra(.window) + AppModel wiring
-  Models.swift            // WorkspaceStatus, DaemonState, AttentionReason, Operation, TransferPhase
+  Models.swift            // WorkspaceStatus, DaemonState, severity/reason enums, Operation, TransferPhase
   StatusReader.swift      // discovery + verdict logic (mirror the TS/py reference EXACTLY)
   AppModel.swift          // ObservableObject: holds [WorkspaceStatus], selection, poll Timer
   MenuBarLabel.swift      // the menu-bar icon view (RGlyph template + state badge)
@@ -106,20 +106,16 @@ Constants: `STALE_MS = 15_000` (heartbeat*3). Order:
    A real (non-stale) `attention` state uses that mapped reason.
 
 `WorkspaceStatus` fields: name, rootPath?, dirURL, logURL, state (enum), reason? (string),
+attentionReason? (enum; the single source for ok/degraded/critical severity),
 operation? (kind, phase?, filesDone?, filesTotal?, currentPath?, bytesDone?, bytesTotal?),
 sequence: Int?, lastSyncedAt: Date?, heartbeatAgeSeconds: Double?, desiredState? ("running"/"stopped").
 
 ## Menu-bar label (MenuBarLabel.swift)
-- Base = `Image("RGlyph", bundle:.module)` rendered `.template` → `.foregroundStyle(.primary)`
-  so it adapts to light/dark bar. Size ~ 16pt height.
-- State badge overlaid bottom-trailing (a small filled circle + SF Symbol), colored by state:
-  - synced → green, SF Symbol `checkmark` (or a small `checkmark.circle.fill` styled green)
-  - syncing pull → blue `arrow.down`; push → blue `arrow.up`
-  - attention → red `exclamationmark`
-  - paused → gray `pause` (or hollow circle `circle`)
-  Use a compact ZStack; badge ~9pt. If ANY workspace is attention, the bar badge shows red
-  (attention wins); else if any syncing, show the syncing arrow (prefer the selected ws's op);
-  else synced/paused of the selected/aggregate. Keep it readable — one glyph + one badge.
+- Base = an 18pt open-box `RGlyph` rendered as a template so it adapts to the
+  light/dark bar. The box itself is never severity-tinted.
+- Severity badge = a 5pt bottom-trailing dot with a 1pt knockout gap: none for
+  ok, systemOrange for degraded, and systemRed for critical. Critical workspaces
+  win over degraded ones when choosing the aggregate label workspace.
 - The label must render crisp; don't add text counts in the bar (badge only) to stay clean.
 
 ## Dropdown (MenuContentView.swift) — match docs/design/assets/88-menubar-mockup.html
@@ -128,7 +124,7 @@ is dark — use materials / semantic colors so light mode looks native too). Use
 `.menuBarExtraStyle(.window)`. Structure per selected workspace:
 - **Header**: workspace name (13pt semibold) + spacer + a state **pill** (colored dot + label):
   synced→green "Synced", syncing→blue "Pushing"/"Pulling" (by op.kind: push→Pushing, pull→Pulling),
-  attention→red "Attention", paused→gray "Paused". Pill colors per the mockup CSS.
+  degraded→orange "Degraded", critical→red "Attention", paused→gray "Paused".
 - **If syncing** — an op block:
   - `Status` row: the phase (encrypting/uploading/scanning/downloading/…). Map phase→verb:
     scan→"scanning", gitcap→"reading git", encrypt→"encrypting", upload→"uploading", download→"downloading".
@@ -139,7 +135,7 @@ is dark — use materials / semantic colors so light mode looks native too). Use
   - A progress bar: fraction = filesDone/filesTotal clamped 0..1 (if total<=0 show a thin
     indeterminate/empty track). Blue gradient fill like the mockup.
   Key column labels ("Status/File/Progress") are a fixed ~58pt-wide dim column.
-- **If attention** — a red banner box: bold "Background sync isn't responding." then a second
+- **If attention** — a severity banner (orange for degraded, red for critical): bold reason title then a second
   line "Last heartbeat NN s ago — changes are not being synced." (use heartbeatAgeSeconds; if
   the reason isn't "dead", phrase it from the reason, e.g. quota/watcher/owner/halt — a short
   human sentence). Red translucent background + border per mockup `.banner`.

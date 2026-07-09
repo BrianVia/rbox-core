@@ -111,22 +111,44 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(only().state, .attention)
     }
 
-    func testAttentionReasonMapping() {
+    func testEveryAmbientAttentionReasonMapsToExactlyOneTier() {
+        let expectedPromptReasons: [AmbientAttentionReason: String] = [
+            .halt: "halt",
+            .outOfStorage: "quota",
+            .watcherDegraded: "watcher",
+            .ownershipLost: "owner",
+            .unknownError: "error",
+        ]
+
+        XCTAssertEqual(Set(AmbientAttentionReason.allCases), Set(expectedPromptReasons.keys))
+        XCTAssertEqual(AmbientAttentionReason.allCases.filter { $0.severityTier == .degraded },
+                       [.watcherDegraded], "watcher-degraded is the only degraded reason")
+        XCTAssertEqual(AmbientAttentionReason.allCases.filter { $0.severityTier == .critical }.count, 4)
+
         write("daemon.pid", "v2 999999 boot")
-        write("daemon.status.json", """
-        {"schemaVersion":1,"state":"attention","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
-         "attentionReason":"out-of-storage"}
-        """)
-        XCTAssertEqual(only().reason, "quota")
+        for reason in AmbientAttentionReason.allCases {
+            write("daemon.status.json", """
+            {"schemaVersion":1,"state":"attention","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
+             "attentionReason":"\(reason.rawValue)"}
+            """)
+            let workspace = only()
+            XCTAssertEqual(workspace.attentionReason, reason)
+            XCTAssertEqual(workspace.reason, expectedPromptReasons[reason])
+            XCTAssertEqual(workspace.severityTier, reason.severityTier)
+        }
     }
 
-    func testWatcherDegradedReasonMapping() {
+    func testNonAttentionAndSyntheticDeadSeverityTiers() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null}
+        """)
+        XCTAssertEqual(only().severityTier, .ok)
+
         write("daemon.pid", "v2 999999 boot")
         write("daemon.status.json", """
-        {"schemaVersion":1,"state":"attention","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
-         "attentionReason":"watcher-degraded"}
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(42))","sequence":1,"lastSyncedAt":null}
         """)
-        XCTAssertEqual(only().reason, "watcher")
+        XCTAssertEqual(only().severityTier, .critical)
     }
 
     func testFreshPopulateWithLivePidWins() {

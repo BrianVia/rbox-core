@@ -8,6 +8,7 @@ import SwiftUI
 @MainActor
 final class DropdownSnapshotTests: XCTestCase {
     private func ws(state: DaemonState, op: SyncOperation? = nil, reason: String? = nil,
+                    attentionReason: AmbientAttentionReason? = nil,
                     seq: Int? = 247, lastSyncedAgo: TimeInterval? = 120,
                     hbAge: Double? = nil, name: String = "Development") -> WorkspaceStatus {
         WorkspaceStatus(
@@ -15,13 +16,14 @@ final class DropdownSnapshotTests: XCTestCase {
             rootPath: "/Users/via/Development",
             dirURL: URL(fileURLWithPath: "/tmp/daemons/\(name)"),
             logURL: URL(fileURLWithPath: "/tmp/daemon.log"),
-            state: state, reason: reason, operation: op, sequence: seq,
+            state: state, reason: reason, attentionReason: attentionReason,
+            operation: op, sequence: seq,
             lastSyncedAt: lastSyncedAgo.map { Date().addingTimeInterval(-$0) },
             heartbeatAgeSeconds: hbAge, desiredState: state == .paused ? "stopped" : "running"
         )
     }
 
-    private func render(_ model: AppModel, _ name: String, scheme: ColorScheme) {
+    private func render(_ model: AppModel, _ name: String, scheme: ColorScheme) throws {
         let view = MenuContentView(model: model)
             .environment(\.colorScheme, scheme)
             .frame(width: 296)
@@ -34,23 +36,26 @@ final class DropdownSnapshotTests: XCTestCase {
             XCTFail("render failed for \(name)"); return
         }
         let dir = URL(fileURLWithPath: "/tmp/rboxbar-snapshots")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? png.write(to: dir.appendingPathComponent("\(name).png"))
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let output = dir.appendingPathComponent("\(name).png")
+        try png.write(to: output, options: .atomic)
+        XCTAssertGreaterThan((try output.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0, 0)
     }
 
-    func testRenderAllStates() {
-        let syncedModel = AppModel(previewWorkspaces: [ws(state: DaemonState.synced)], version: "0.9.11")
-        let op = SyncOperation(kind: OperationKind.push, phase: TransferPhase.encrypt,
-                           filesDone: 1204, filesTotal: 3412,
-                           currentPath: "Personal/rbox-core/src/cli/sync.ts",
-                           bytesDone: nil, bytesTotal: nil)
-        let syncingModel = AppModel(previewWorkspaces: [ws(state: DaemonState.syncing, op: op)], version: "0.9.11")
-        let attentionModel = AppModel(previewWorkspaces: [ws(state: DaemonState.attention, reason: "dead",
-            seq: 244, lastSyncedAgo: 10800, hbAge: 42.0)], version: "0.9.11")
-        let watcherWorkspace = ws(state: DaemonState.attention, reason: "watcher",
-            seq: 244, lastSyncedAgo: 120, hbAge: 2.0)
-        let watcherModel = AppModel(previewWorkspaces: [watcherWorkspace], version: "0.9.11")
+    func testRenderAllSeverityTiers() throws {
+        try? FileManager.default.removeItem(atPath: "/tmp/rboxbar-snapshots")
 
+        let okModel = AppModel(previewWorkspaces: [ws(state: .synced)], version: "0.9.11")
+        let watcherWorkspace = ws(state: DaemonState.attention, reason: "watcher",
+            attentionReason: .watcherDegraded, seq: 244, lastSyncedAgo: 120, hbAge: 2.0)
+        let degradedModel = AppModel(previewWorkspaces: [watcherWorkspace], version: "0.9.11")
+        let criticalWorkspace = ws(state: .attention, reason: "error",
+            attentionReason: .unknownError, seq: 244, lastSyncedAgo: 10800, hbAge: 42.0)
+        let criticalModel = AppModel(previewWorkspaces: [criticalWorkspace], version: "0.9.11")
+
+        XCTAssertEqual(okModel.labelWorkspace.severityTier, .ok)
+        XCTAssertEqual(degradedModel.labelWorkspace.severityTier, .degraded)
+        XCTAssertEqual(criticalModel.labelWorkspace.severityTier, .critical)
         XCTAssertEqual(MenuContentView.attentionTitle(watcherWorkspace.reason),
                        "File watching is degraded.")
         XCTAssertEqual(MenuContentView.attentionDetail(watcherWorkspace),
@@ -58,10 +63,9 @@ final class DropdownSnapshotTests: XCTestCase {
 
         for scheme in [ColorScheme.dark, .light] {
             let suffix = scheme == .dark ? "dark" : "light"
-            render(syncedModel, "synced-\(suffix)", scheme: scheme)
-            render(syncingModel, "syncing-\(suffix)", scheme: scheme)
-            render(attentionModel, "attention-\(suffix)", scheme: scheme)
-            render(watcherModel, "watcher-degraded-\(suffix)", scheme: scheme)
+            try render(okModel, "ok-\(suffix)", scheme: scheme)
+            try render(degradedModel, "degraded-\(suffix)", scheme: scheme)
+            try render(criticalModel, "critical-\(suffix)", scheme: scheme)
         }
     }
 }

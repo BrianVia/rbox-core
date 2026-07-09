@@ -7,12 +7,27 @@ enum DaemonState: String, Codable, CaseIterable {
     case paused
 }
 
-enum AttentionReason: String, Codable {
+enum SeverityTier: CaseIterable, Equatable {
+    case ok
+    case degraded
+    case critical
+}
+
+enum AmbientAttentionReason: String, Codable, CaseIterable, Hashable {
     case halt
     case outOfStorage = "out-of-storage"
     case watcherDegraded = "watcher-degraded"
     case ownershipLost = "ownership-lost"
     case unknownError = "unknown-error"
+
+    var severityTier: SeverityTier {
+        switch self {
+        case .watcherDegraded:
+            return .degraded
+        case .halt, .outOfStorage, .ownershipLost, .unknownError:
+            return .critical
+        }
+    }
 }
 
 enum OperationKind: String, Codable {
@@ -46,6 +61,7 @@ struct WorkspaceStatus: Identifiable, Equatable {
     var logURL: URL
     var state: DaemonState
     var reason: String?
+    var attentionReason: AmbientAttentionReason? = nil
     var operation: SyncOperation?
     var sequence: Int?
     var lastSyncedAt: Date?
@@ -54,6 +70,11 @@ struct WorkspaceStatus: Identifiable, Equatable {
 }
 
 extension WorkspaceStatus {
+    var severityTier: SeverityTier {
+        guard state == .attention else { return .ok }
+        return attentionReason?.severityTier ?? .critical
+    }
+
     static var empty: WorkspaceStatus {
         WorkspaceStatus(
             name: "No workspaces",

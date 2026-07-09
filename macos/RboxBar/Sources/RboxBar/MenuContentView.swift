@@ -34,7 +34,7 @@ struct MenuContentView: View {
                 Text("No workspaces")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                statePill(state: .paused, operation: nil)
+                statePill(.empty)
             }
             Text("No daemon status directories were found.")
                 .font(.system(size: 12))
@@ -97,32 +97,50 @@ struct MenuContentView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 8)
-            statePill(state: workspace.state, operation: workspace.operation)
+            statePill(workspace)
         }
     }
 
-    private func statePill(state: DaemonState, operation: SyncOperation?) -> some View {
+    private func statePill(_ workspace: WorkspaceStatus) -> some View {
         let label: String = {
-            switch state {
+            switch workspace.severityTier {
+            case .degraded:
+                return "Degraded"
+            case .critical:
+                return "Attention"
+            case .ok:
+                break
+            }
+
+            switch workspace.state {
             case .synced:
                 return "Synced"
             case .syncing:
-                return operation?.kind == .push ? "Pushing" : "Pulling"
+                return workspace.operation?.kind == .push ? "Pushing" : "Pulling"
             case .attention:
-                return "Attention"
+                return "Synced"
             case .paused:
                 return "Paused"
             }
         }()
 
         let color: Color = {
-            switch state {
+            switch workspace.severityTier {
+            case .degraded:
+                return .orange
+            case .critical:
+                return .red
+            case .ok:
+                break
+            }
+
+            switch workspace.state {
             case .synced:
                 return .green
             case .syncing:
                 return .blue
             case .attention:
-                return .red
+                return .green
             case .paused:
                 return .gray
             }
@@ -186,7 +204,9 @@ struct MenuContentView: View {
     }
 
     private func attentionBanner(_ workspace: WorkspaceStatus) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let color: Color = workspace.severityTier == .degraded ? .orange : .red
+
+        return VStack(alignment: .leading, spacing: 4) {
             Text(Self.attentionTitle(workspace.reason))
                 .font(.system(size: 12, weight: .semibold))
             Text(Self.attentionDetail(workspace))
@@ -196,8 +216,8 @@ struct MenuContentView: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.red.opacity(0.32), lineWidth: 1))
+        .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(color.opacity(0.32), lineWidth: 1))
     }
 
     private func metaLine(_ workspace: WorkspaceStatus) -> some View {

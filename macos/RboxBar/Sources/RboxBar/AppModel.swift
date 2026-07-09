@@ -20,8 +20,11 @@ final class AppModel: ObservableObject {
     }
 
     var labelWorkspace: WorkspaceStatus {
-        if let attention = workspaces.first(where: { $0.state == .attention }) {
-            return attention
+        if let critical = workspaces.first(where: { $0.severityTier == .critical }) {
+            return critical
+        }
+        if let degraded = workspaces.first(where: { $0.severityTier == .degraded }) {
+            return degraded
         }
         if let selected = selectedWorkspace, selected.state == .syncing {
             return selected
