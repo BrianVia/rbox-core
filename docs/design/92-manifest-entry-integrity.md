@@ -354,3 +354,21 @@ caller:
 | `src/cli/daemon.ts:787` daemon change counts | `changed` | intentional — a size-only repair should register as a change |
 | `src/cli/status-cmd.ts:305` status counts | `changed` | intentional — same |
 | `src/engine/engine.test.ts:155` | test-only | n/a |
+
+## Appendix B. Field-gate findings (2026-07-09 run)
+
+All three §5.2 gates passed on dev builds (`0.9.14-dev+7bc1f4f` Mac,
+`+745b97f` Ubuntu) against a throwaway dev-API account. Two findings worth
+retaining:
+
+1. **The join-fatal poison is zstd-gated.** The declared-size cap lives in the
+   decompression counter, so a poisoned entry on an INCOMPRESSIBLE (raw-stored)
+   file never trips it: the plaintext SHA matches and the join succeeds with
+   the size lie riding along until the 3.3 comparator heals it — annoying
+   metadata, not an outage. Only compressible files (the incident was a text
+   log) produce the fresh-join brick. Consequence for test harnesses: a poison
+   repro MUST use compressible data or it will silently "pass".
+2. A live append-hot producer heals via a fresh coherent successor entry (the
+   file grew past the poisoned snapshot), not the same-SHA/size-only commit —
+   both converge the head; the same-SHA path is pinned by the §5.1.2
+   deterministic test.
