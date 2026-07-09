@@ -402,22 +402,3 @@ test("json error mode emits {error} to stderr", () => {
   expect(err.join("")).toBe('{"error":"forced failure"}\n');
   expect(process.exitCode).toBe(1);
 });
-
-test("CLI error output preserves the relative path for every apply-integrity failure kind", () => {
-  const err: string[] = [];
-  process.stderr.write = ((chunk: string | Uint8Array) => {
-    err.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-    return true;
-  }) as typeof process.stderr.write;
-  setJsonErrorMode(false);
-  const messages = [
-    "errors/size-cap.log: decompressed plaintext exceeds declared size",
-    "errors/plaintext-sha.log: decrypt integrity mismatch",
-    "errors/gcm.log: unable to authenticate data",
-    "errors/zstd.log: invalid zstd frame",
-  ];
-  for (const message of messages) fail(message);
-  const output = err.join("");
-  for (const message of messages) expect(output).toContain(message);
-  expect(process.exitCode).toBe(1);
-});

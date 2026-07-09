@@ -128,6 +128,19 @@ export type EncryptFileOptions = {
 };
 export type DecryptFileOptions = { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number };
 
+const SOURCE_CHANGED_ERROR_CODE = "RBOX_SOURCE_CHANGED";
+type SourceChangedError = Error & { readonly code: typeof SOURCE_CHANGED_ERROR_CODE };
+
+function sourceChangedError(srcPath: string): SourceChangedError {
+  const tag: { readonly code: typeof SOURCE_CHANGED_ERROR_CODE } = { code: SOURCE_CHANGED_ERROR_CODE };
+  return Object.assign(new Error(`source changed while encrypting: ${srcPath}`), tag);
+}
+
+/** Source-change classification must survive crypto-worker serialization. */
+export function isSourceChangedError(error: unknown): error is { readonly code: typeof SOURCE_CHANGED_ERROR_CODE } {
+  return typeof error === "object" && error !== null && "code" in error && error.code === SOURCE_CHANGED_ERROR_CODE;
+}
+
 type CryptoPoolSelection = {
   encrypt(srcPath: string, tmpDir?: string, opts?: EncryptFileOptions): Promise<EncryptedBlob>;
   decrypt(ctPath: string, plaintextSha: string, destPath: string, opts?: DecryptFileOptions): Promise<void>;
@@ -184,9 +197,7 @@ export async function encryptFileToTempInline(srcPath: string, kek: Buffer, tmpD
     const plaintextSha = await hashFile(snapPath); // fresh hash of the snapshot bytes
     const plaintextSize = (await fs.stat(snapPath)).size;
     if (opts.expected && (plaintextSha !== opts.expected.sha256 || plaintextSize !== opts.expected.size)) {
-      const err = new Error(`source changed while encrypting: ${srcPath}`);
-      (err as NodeJS.ErrnoException).code = "RBOX_SOURCE_CHANGED";
-      throw err;
+      throw sourceChangedError(srcPath);
     }
     let payloadPath = snapPath;
     let payloadBuffer: Buffer | undefined;

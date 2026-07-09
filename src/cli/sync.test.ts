@@ -262,7 +262,7 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.headSeq()).toBe(1);
 });
 
-test("metadata heal commits corrected size, reuses ciphertext, and reconcile creates no false conflict", async () => {
+test("same-SHA size mismatch commits a metadata heal without re-encrypting or conflicting", async () => {
   const remote = new FakeRemote();
   const content = "coherent bytes\n";
   await write("heal.txt", content);

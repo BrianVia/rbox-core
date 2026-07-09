@@ -5,10 +5,12 @@ import {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   encryptFileToTemp as defaultEncryptFileToTemp,
+  isSourceChangedError,
   poolMap,
   withCryptoPool,
   type EncryptedBlob,
   type EncryptAddressCacheContext,
+  type EncryptFileOptions,
   type FileEntry,
   type Manifest,
   type PhaseReport,
@@ -18,7 +20,6 @@ import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
 import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
-import type { EncryptFileOptions } from "../engine/crypto.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -108,27 +109,27 @@ function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheCo
 
 type CacheHitStatus = "accept" | "defer";
 
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
 async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitStatus> {
   try {
     const st = await fs.lstat(path.join(root, f.path));
     if (!st.isFile()) return "defer";
     return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "defer";
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT" || code === "ENOTDIR") return "defer";
+    if (hasErrorCode(err, "ENOENT") || hasErrorCode(err, "ENOTDIR")) return "defer";
     throw err;
   }
 }
 
-/** The two churn classes encryption defers instead of failing the push: the file
- *  vanished between scan and snapshot (ENOENT), or its bytes changed so the
- *  snapshot no longer matches the scanned tuple (RBOX_SOURCE_CHANGED, design 92
- *  §3.2 — committing the mismatched pair is what poisoned the manifest). Logs
- *  the source-changed case so a permanently hot file is visible per cycle. */
+/** Missing sources and snapshots that no longer match the scanned tuple are
+ *  deferred; source changes are logged once per attempted cycle. */
 function isDeferrableChurn(err: unknown, relPath: string): boolean {
-  const code = (err as NodeJS.ErrnoException)?.code;
-  if (code !== "ENOENT" && code !== "RBOX_SOURCE_CHANGED") return false;
-  if (code === "RBOX_SOURCE_CHANGED") console.error(`rbox: ${relPath} changed during encryption — deferred`);
+  if (hasErrorCode(err, "ENOENT")) return true;
+  if (!isSourceChangedError(err)) return false;
+  console.error(`rbox: ${relPath} changed during encryption — deferred`);
   return true;
 }
 
@@ -143,15 +144,9 @@ export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfi
  *  ciphertext blobs by `encSha`. Mutates only `local`'s cipher descriptors; the
  *  scan-time plaintext SHA and size remain authoritative.
  *
- *  Live-folder resilience: a file that keeps changing under the push can never
- *  produce a ciphertext that hash-matches its committed `encSha` (the blob PUT
- *  400/412s as `sha_mismatch`, or the reused-from-base re-encrypt yields a different
- *  address). Rather than aborting the WHOLE push (the old behavior), each such file
- *  is retried a bounded number of times (re-encrypting a fresh stable snapshot each
- *  time, requiring every snapshot to match the scanned tuple); if it changed, it is
- *  DEFERRED — returned in `deferred` (by path) so the caller drops it from THIS
- *  commit and lets the daemon re-queue it once it settles. The common stable-file
- *  path (first encrypt → upload that exact temp) is untouched. */
+ *  Snapshot mismatches and missing sources defer immediately. Ciphertext upload
+ *  mismatches retry within a fixed per-file budget. Deferred paths are omitted or
+ *  carried from the applied base, so no mismatched plaintext tuple is committed. */
 export async function encryptAndUpload(
   api: SyncRemote,
   root: string,
@@ -300,8 +295,7 @@ export async function encryptAndUpload(
             });
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
-            // Vanished mid-push (same churn class as the encrypt-stage catch above):
-            // defer this file instead of failing the whole push.
+            // Source churn defers instead of mutating the scanned manifest tuple.
             if (isDeferrableChurn(err, f.path)) {
               byteTracker.defer(f.path);
               emitUploadProgress(f.path);

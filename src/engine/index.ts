@@ -38,6 +38,7 @@ export {
   kekFromPhrase,
   encryptFileToTemp,
   decryptFileToPath,
+  isSourceChangedError,
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "./crypto.js";

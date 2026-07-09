@@ -118,15 +118,18 @@ export async function applyActions(
     : 0;
   try {
     await withCryptoPool(opts.kek, opts.keyEpoch, encryptedEntryCount, async () => {
-      // One serial lstat pass over the unique ancestor comps detects every
-      // file/symlink obstruction (shallowest-first, so a nested comp under an
-      // obstructing file just reads ENOTDIR→absent, same as the pre-92 loop).
-      // Detection is split from displacement so obstruction-affected entries can
-      // be staged and VERIFIED before anything local moves (design 92 I5).
+      // Detection is serial and shallowest-first; ENOTDIR below an already-found
+      // obstruction is equivalent to absence. Other filesystem errors remain fatal.
+      // Detection precedes displacement so affected entries can be verified first.
       const obstructed = new Set<string>();
       for (const comp of shallowFirst) {
-        const st = await fs.lstat(path.join(destRoot, comp)).catch(() => undefined);
-        if (st && (st.isFile() || st.isSymbolicLink())) obstructed.add(comp);
+        try {
+          const st = await fs.lstat(path.join(destRoot, comp));
+          if (st.isFile() || st.isSymbolicLink()) obstructed.add(comp);
+        } catch (error) {
+          if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) continue;
+          throw error;
+        }
       }
 
       // A file-valued ancestor makes the normal beside-target temp impossible to
@@ -291,9 +294,7 @@ async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore,
   await fs.chmod(tmp, entry.mode);
 }
 
-/** Wrap a staging failure so it NAMES its file (design 92 I6 — the 2026-07-09
- *  incident required decrypting the head manifest just to learn which entry was
- *  poisoned). The original typed error stays reachable via `cause`. */
+/** Staging failures name the entry and retain the original typed error as `cause`. */
 function stagingError(relPath: string, cause: unknown): Error {
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(`${relPath}: ${detail}`, { cause });
@@ -302,7 +303,7 @@ function stagingError(relPath: string, cause: unknown): Error {
 /** Shallowest ancestor of `relPath` present in `obstructed` (in-memory; the
  *  lstat evidence was gathered once by the detection pass). Shallowest matters:
  *  the pre-staged temp is created beside it, where the parent dir is real. */
-function shallowestObstructedAncestor(relPath: string, obstructed: Set<string>): string | undefined {
+function shallowestObstructedAncestor(relPath: string, obstructed: ReadonlySet<string>): string | undefined {
   let acc = "";
   const parts = relPath.split("/");
   for (let i = 0; i < parts.length - 1; i++) {
@@ -369,10 +370,9 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   try {
     st = await fs.lstat(abs);
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
     // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
     // can't exist, so it's already gone (design-review M1).
-    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    if (hasErrorCode(e, "ENOENT") || hasErrorCode(e, "ENOTDIR")) return undefined;
     throw e;
   }
   if (st.isSymbolicLink()) {
@@ -415,9 +415,13 @@ async function moveNoClobber(from: string, to: string, st: { isDirectory(): bool
     }
     return true;
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+    if (hasErrorCode(e, "EEXIST")) return false;
     throw e;
   }
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 

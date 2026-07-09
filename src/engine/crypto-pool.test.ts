@@ -96,7 +96,7 @@ describe("crypto worker pool", () => {
     }
   });
 
-  test("inline and worker snapshot expectation mismatches carry RBOX_SOURCE_CHANGED and clean temps", async () => {
+  test("snapshot changes remain deferrable across the worker boundary and clean temps", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-"));
     const inlineTmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-inline-"));
     const workerTmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-source-change-worker-"));
@@ -109,15 +109,9 @@ describe("crypto worker pool", () => {
       const inline = encryptFileToTempInline(src, kek, inlineTmp, { expected });
       await expect(inline).rejects.toMatchObject({ code: "RBOX_SOURCE_CHANGED" });
 
-      let workerErr: NodeJS.ErrnoException | undefined;
       await withCryptoPool(kek, 1, 1, async () => {
-        try {
-          await encryptFileToTemp(src, kek, workerTmp, { expected });
-        } catch (e) {
-          workerErr = e as NodeJS.ErrnoException;
-        }
+        await expect(encryptFileToTemp(src, kek, workerTmp, { expected })).rejects.toMatchObject({ code: "RBOX_SOURCE_CHANGED" });
       });
-      expect(workerErr?.code).toBe("RBOX_SOURCE_CHANGED");
       expect(await fs.readdir(inlineTmp)).toEqual([]);
       expect(await fs.readdir(workerTmp)).toEqual([]);
     } finally {

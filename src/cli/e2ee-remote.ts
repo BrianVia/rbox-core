@@ -409,17 +409,10 @@ export class E2eeRemote implements SyncRemote {
     const epoch = account.currentKeyEpoch;
     const kek = await this.kekFor(epoch, account, true);
     const pin = await this.pins.load();
-    // verifiedHead advances the anti-rollback pin as soon as a pull authenticates
-    // the remote head, before the caller has applied that manifest. Never combine
-    // an applied parent sequence with a newer, merely-observed parent hash: that
-    // would let failed-pull state leak into commit construction. Treat the mismatch
-    // exactly like the parent conflict it represents so the push loop pulls first;
-    // if apply fails again, the push stops before signing or posting anything.
+    // The parent sequence and hash must describe the same applied head. A verified
+    // but unapplied head advances the anti-rollback pin only, so it must pull first.
     if ((pin?.commitSeq ?? 0) !== parentSequence) {
-      // Say what actually happened: this is a LOCAL apply lag, not remote
-      // contention — the shared conflict path's retry telemetry (commit-409
-      // metrics, "remote is moving faster" exhaustion copy) would otherwise
-      // misattribute a wedged device during exactly the incident this guards.
+      // Distinguish local apply lag before reusing the conflict retry path.
       process.stderr.write(
         `rbox: local state lags the verified head (applied ${parentSequence}, seen ${pin?.commitSeq ?? 0}) — pulling before push\n`
       );

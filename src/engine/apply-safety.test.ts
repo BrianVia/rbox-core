@@ -188,7 +188,8 @@ test("size-cap, plaintext-SHA, GCM, and zstd staging failures all name the entry
     try {
       await applyActions(root, [{ kind: "write", entry: c.entry, expectedLocal: undefined }], store, { kek });
     } catch (e) {
-      error = e as Error;
+      if (!(e instanceof Error)) throw e;
+      error = e;
     }
     expect(error?.message).toContain(c.path);
     expect(error?.message).toMatch(c.message);

@@ -585,11 +585,9 @@ async function runPushAttempt(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
-  // Encrypt + upload. Live-folder resilience (replaces #36's whole-tree re-scan+give-up):
-  // a file that keeps changing under us can never produce a hash-matching ciphertext, so
-  // encryptAndUpload retries it a bounded number of times and then DEFERS it (returns its
-  // path) rather than aborting the entire push. We commit the stable subset; the daemon's
-  // watcher + safety/deep scans naturally re-queue the deferred files once they settle.
+  // Missing or scan-mismatched sources defer immediately; ciphertext upload
+  // mismatches retry within a bounded per-file budget. Only the stable subset is
+  // committed, and watcher/safety scans re-queue deferred paths once they settle.
   const { deferred } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,

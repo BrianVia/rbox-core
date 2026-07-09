@@ -416,7 +416,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     expect(await fs.readFile(path.join(root2, "b.txt"), "utf8")).toBe("new\n");
   });
 
-  test("failed seq-653 pull cannot construct seq-654 from the unapplied head or resurrect its poisoned base", async () => {
+  test("failed pull keeps the applied base authoritative and blocks signing from the observed head", async () => {
     const server = new ObservedServer();
     const secrets = await bootstrapOnto(server, ACCT, "dev-resurrection", NOW);
     const rootA = await tmp();
@@ -432,8 +432,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const poisonLog = { ...coherentLog, size: coherentLog.size - 1 };
     await expect(remoteA.commit(1, secrets.deviceId, { generatedAt: "", files: [blockerBase, poisonLog] })).resolves.toEqual({ sequence: 2 });
 
-    // The receiver already holds the bytes, so byte-identity reconcile accepts the
-    // poisoned size metadata without a false conflict and persists it as seq 2.
+    // Byte-identity reconcile accepts the existing bytes without a false conflict.
     const rootB = await tmp();
     await fs.writeFile(path.join(rootB, "a-blocker"), "base blocker\n");
     await fs.writeFile(path.join(rootB, "z-log"), "append-hot log\n");
@@ -473,8 +472,8 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
 
       const signedBeforePush = server.commitSignedCalls;
       await expect(push(rootB, cfgB, { remote: remoteB, backoff: async () => {} })).rejects.toThrow(/a-blocker/);
-      expect(server.commitSignedCalls).toBe(signedBeforePush); // no parentSeq=2 + hash(seq3) envelope
-      expect(server.commits).toHaveLength(3); // no seq-654 analogue
+      expect(server.commitSignedCalls).toBe(signedBeforePush); // no mixed parent-sequence/hash envelope
+      expect(server.commits).toHaveLength(3);
       const head = await remoteA.latest();
       expect(head.sequence).toBe(3);
       expect(head.manifest.files.find((f) => f.path === "z-log")?.sha256).toBe(healedLog.sha256);

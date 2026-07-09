@@ -28,12 +28,9 @@ export function sameContent(a?: FileEntry, b?: FileEntry): boolean {
   );
 }
 
-/** Push equality is `sameContent` PLUS size (design 92 I3): a same-SHA entry
- *  whose declared size was wrong (the poisoned-manifest incident) must be
- *  commit-worthy so the next honest writer heals the head. Do NOT fold size
- *  into `sameContent` — reconcile/apply use it as byte-identity, and making
- *  them size-sensitive would manufacture false conflicts on devices that
- *  already hold the correct bytes. */
+/** Push equality includes declared size so invalid metadata is commit-worthy.
+ *  Reconcile/apply intentionally remain size-insensitive: `sameContent` models
+ *  byte identity and must not create conflicts for already-correct bytes. */
 function samePushEntry(a: FileEntry, b: FileEntry): boolean {
   return sameContent(a, b) && a.size === b.size;
 }
