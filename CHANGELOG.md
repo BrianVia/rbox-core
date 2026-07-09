@@ -6,6 +6,25 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.14] — 2026-07-09 — commit-fork recovery (`rbox recover`) + un-regressable head (design 91)
+
+### Added
+- **`rbox recover`** — a supported, one-command re-baseline when a workspace's
+  local head pin has diverged from the server (reset the pin, re-verify the
+  server chain, reconcile local files via keep-both, re-push local diffs).
+  Replaces the need to hand-delete a keystore pin file. (The former phrase
+  re-enrollment moved to `rbox key recover`.)
+
+### Fixed
+- **The commit sequencer can no longer fork under a Durable Object restart
+  (design 91).** The workspace head is DO-authoritative and fail-closed: a
+  missing head with evidence of prior life serves `repair_required` instead of
+  reseeding from the best-effort D1 mirror (the reseed was what let a
+  deploy-triggered DO restart re-issue an already-used sequence and fork the
+  chain). Server-side same-sequence equivocation is now rejected. The server
+  fix deployed with the prior `apps/api` push; this release ships the client
+  `rbox recover` companion.
+
 ## [0.9.13] — 2026-07-08 — join/populate reliability (design-87 dogfood fixes)
 
 ### Fixed
