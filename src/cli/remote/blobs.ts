@@ -8,7 +8,16 @@ import type { RemoteContext } from "./context.js";
 import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
-import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
+import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, envInt, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
+
+/** A content-addressed download that arrives with the WRONG hash is corruption we
+ *  CAUGHT before writing — observed as a rare Bun `fetch` byte mis-reassembly on large
+ *  blobs under sustained heavy concurrent load (verified: the blob is correct in R2 and
+ *  `curl`/isolated fetches always get it right; only the full-pipeline load corrupts it).
+ *  Because the hash proves when we finally have correct bytes, the safe response is to
+ *  RE-FETCH, not fail the whole sync. This is the ceiling on such re-fetches. */
+const BLOB_INTEGRITY_RETRIES = envInt("RBOX_NET_INTEGRITY_RETRIES", 4, 0, 20);
+const INTEGRITY_MISMATCH_MARKER = "download integrity mismatch";
 
 const MiB = 1024 * 1024;
 const SINGLE_PUT_MAX = 90 * MiB; // must match the Worker's threshold
@@ -102,10 +111,25 @@ export async function putBlobFile(
  *  watchdog, which the retry loop treats as transient and re-drives (a GET is idempotent). A hash
  *  mismatch is NOT transient and propagates on the first attempt. */
 export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
-  await retryTransient(() => downloadToFileOnce(ctx, sha256, destPath, expectedSize), {
-    op: `downloading blob ${sha256}`,
-    rerunHint: "safe to re-run `rbox pull`: already-downloaded blobs are skipped",
-  });
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await retryTransient(() => downloadToFileOnce(ctx, sha256, destPath, expectedSize), {
+        op: `downloading blob ${sha256}`,
+        rerunHint: "safe to re-run `rbox pull`: already-downloaded blobs are skipped",
+      });
+      return;
+    } catch (e) {
+      // A hash mismatch means the bytes arrived corrupt (and were discarded, not written).
+      // Re-fetch: a later attempt lands as the concurrent pool drains — the low-concurrency
+      // condition that reliably delivers correct bytes. Bounded so a genuinely-unfetchable
+      // blob still fails loudly with the resume hint rather than looping forever.
+      if (attempt < BLOB_INTEGRITY_RETRIES && e instanceof Error && e.message.includes(INTEGRITY_MISMATCH_MARKER)) {
+        await new Promise((r) => setTimeout(r, Math.min(2000, 250 * 2 ** attempt) * (0.5 + Math.random())));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
