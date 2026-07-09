@@ -57,6 +57,28 @@ All incident facts below were field-verified on 2026-07-09.
    escaped both SHA-keyed ciphertext reuse and size-blind equality, so a
    consistent successor entry reached the head. That was the only available
    path that stale carry-forward could not resurrect.
+9. Within roughly one hour of the first remediation, the same failure recurred
+   at 40 times the scale. The Mac's failed pull had moved a live 5.3GB migration
+   log aside to a conflict name before verifying the incoming entry. The writer
+   held its file descriptor across the rename, so the conflict copy became the
+   append-hot file and continued growing at roughly 1.5MB/s. This is direct
+   evidence that pull-side move-aside-before-verify damages live user state, not
+   merely that it leaves a failed download behind.
+10. Backlog pushes then committed that conflict copy with another stale-size
+    tuple. FM observed declared size 5,205,792,143 while recovered plaintext had
+    already reached 5,205,803,008 bytes, re-deadlocking the fleet. Poison at head
+    plus design 91's head-gated push is therefore a proven repeatable
+    fleet-wide write deadlock, not a one-off.
+11. Adding the log to `.rboxignore` could not deliver the cure. Forward-only
+    ignore froze the poisoned entry at head, while the `.rboxignore` change rode
+    in the same manifest that blocked un-updated pullers: they could receive
+    neither the poison nor the rule that ignored it. Per-entry quarantine breaks
+    that cycle because the ignore file can apply while the bad entry remains
+    pending.
+12. The second remediation moved the live log out of the workspace (the rename
+    preserved the writer's open descriptor), removed the ignore, pushed the
+    deletion, and then restored the ignore. That follows the CLI's existing
+    delete-first guidance (`src/cli/ignore-cmd.ts:31-32`).
 
 ## 2. Root cause
 
@@ -94,17 +116,23 @@ Four independent safety gaps composed into the incident.
 - **I3 - integrity remains fail-closed per file.** A remote file is published
   locally only after GCM, zstd, declared-size, and plaintext-SHA verification.
   Quarantine narrows failure scope; it does not bypass or downgrade a check.
-- **I4 - quarantine does not disturb user data.** No target, conflict copy, or
-  ancestor obstruction is moved before the incoming entry is fully staged and
-  verified. Local and systemic failures such as `ENOSPC` and `EACCES` remain
-  pull-fatal.
-- **I5 - sequence and applied base are distinct.** A pull may advance the
-  verified remote sequence after quarantining a file, but that path's applied
-  base does not advance. Its newest remote entry lives in explicit pending
-  state until apply succeeds or the remote deletes it.
-- **I6 - pending remote truth wins every outbound tie.** A pending path cannot
-  become a deletion and cannot regress to an older applied-base entry. It is
-  retried on every pull, independently of ordinary reconcile equality.
+- **I4 - verification precedes target mutation.** Co-located staging for a
+  target completes every integrity check before that target, its conflict copy,
+  or a required ancestor obstruction moves. The shallowest-first ancestor
+  pre-pass remains serial; entries that need it stage first, and quarantine
+  suppresses their eviction and every dependent prefix delete. Local and
+  systemic failures such as `ENOSPC` and `EACCES` remain pull-fatal.
+- **I5 - sequence, applied base, and pending truth are distinct.** A pull may
+  advance the verified remote sequence after quarantining a file, but that
+  path's applied base advances only after the exact remote tuple verifies. The
+  newest remote entry is an immutable pending snapshot until verification, a
+  successful local-successor commit, or a newer remote deletion resolves it.
+- **I6 - pending precedence is three-way.** At a pending path, unchanged local
+  state carries pending truth outbound; changed local state, including a true
+  deletion, wins outbound while pending truth remains the effective base. Thus
+  pending cannot invent a fresh-join deletion or regress to an older base, but a
+  real local edit or deletion is the explicit escape hatch. Every retry bypasses
+  ordinary reconcile equality and verifies the remote tuple end to end.
 - **I7 - size is push metadata, not reconcile identity.** Same SHA with a
   different size is commit-worthy on push. Reconcile remains byte-identity
   based so a device already holding correct bytes does not manufacture a false
@@ -194,19 +222,41 @@ entries. The catch must not move upward to `pull`, around `poolMap`, or into the
 crypto functions; those positions would respectively lose per-entry isolation,
 confuse local failures with integrity failures, or weaken verification.
 
-Staging moves to a private per-pull directory under `.rbox/state` on the same
-filesystem as the workspace. This is required because current ancestor
-preflight can move file/symlink path components before any download
-(`src/engine/apply.ts:78-101`), and the conflict branch moves the target before
-staging (`:129-132`). For each write/conflict action the order becomes:
+Staging remains at the existing co-located `tmpName` beside the target
+(`src/engine/apply.ts:330-334`). Moving it under `.rbox/state` would introduce an
+`EXDEV` risk without strengthening the boundary. For each write/conflict action
+the target-scoped order becomes:
 
 ```text
-stage outside destination hierarchy -> verify -> prepare/evict ancestors ->
+stage beside target -> verify exact tuple -> final target precondition ->
 move conflicting local target if required -> atomic rename into place
 ```
 
-Thus an integrity failure cannot change the target or its ancestors. Temporary
-staged data is removed on quarantine or fatal exit.
+The existing ancestor-obstruction pre-pass remains serial and
+shallowest-first before the write pool (`src/engine/apply.ts:78-101`); its
+serialization prevents sibling writes from racing the same obstruction. Make
+it quarantine-aware only where needed: entries whose ancestors require
+eviction are staged and verified first, serially, before the ancestor moves.
+An entry that quarantines does not trigger eviction. All other entries retain
+the pre-pass and then enter the bounded pool. Temporary staged data is removed
+on quarantine or fatal exit.
+
+Reconcile/apply also treats prefix-related actions as one transactional group.
+If a write quarantines, every delete above or below that path is suppressed for
+this pull and retried as pending-adjacent work on the next pull. This covers both
+required type-flip shapes: remote `foo/child` disappears while poisoned file
+`foo` arrives, so the child delete must not run; and local/base file `foo` is
+replaced by poisoned `foo/child`, so deletion of `foo` must not run. Shared
+manifest validation additionally rejects file/descendant prefix collisions,
+including case-folded collisions, extending the existing duplicate-path checks
+at `src/engine/manifest-validate.ts:56-70`.
+
+Conflict-copy publication uses exclusive-create/no-replace semantics rather
+than the current access-then-rename probe (`src/engine/apply.ts:311-327`). The
+final-precondition-to-rename window remains: an editor can save over the target
+after the check and before publish (`src/engine/apply.ts:163-182`). That is a
+pre-existing limitation and a follow-up, not a syscall-level no-replace publish
+change in this design.
 
 For every quarantine, print one loud path-bearing warning, for example:
 
@@ -216,9 +266,13 @@ plaintext exceeds declared size (120635392 > 120632126); local path unchanged;
 retrying next pull
 ```
 
-After the pool finishes, pull continues through deletes, Git apply, cache save,
-and state save, then exits 0 with a warning summary. Successfully applied paths
-remain applied; only quarantined entries remain pending.
+After the pool finishes, pull continues through safe deletes, Git apply, cache
+save, and state save. Successfully applied paths remain applied; only
+quarantined entries and their suppressed prefix-dependent actions remain
+pending. A foreground `pull` or `sync` with one or more quarantines prints a
+warning summary and exits with code 3 (`partial`), distinct from success and
+fatal failure. The daemon consumes the same partial result as non-fatal and
+keeps syncing.
 
 Add local-only `filePendingRemote` beside `gitPendingRemote` in `SyncState`
 (`src/cli/config.ts:87-117`):
@@ -233,19 +287,34 @@ filePendingRemote?: Record<string, {
 Pull state transition for remote sequence `R` is:
 
 - save `lastSyncedSequence = R` after the partial-success pull;
-- for applied or already-matching paths, advance the per-path base to `R`;
+- for applied paths, advance the per-path base to `R`;
 - for each quarantined path, retain its prior applied base entry (or absence)
   and set `filePendingRemote[path]` to the newest remote entry and diagnostic;
-- retry every still-present pending entry on the next pull even when
-  `sameContent` would suppress an action; and
+- deep-clone and freeze that entry at record time so later in-place mutation by
+  `encryptAndUpload` cannot alias the pending snapshot;
+- retry every still-present pending entry on the next pull by skipping
+  reconcile's `sameContent(local, remote)` short-circuit
+  (`src/engine/reconcile.ts:58-66`) and staging and verifying the exact remote
+  tuple end to end; and
 - if a later remote manifest omits the path, remote absence supersedes pending:
   clear the record and reconcile the deletion normally.
 
-Pending clears only after the remote entry verifies and publishes, or after the
-newest remote deletes it. The persisted diagnostic is bounded to the newest
-entry per path; repeated failures update it rather than append history.
+Retry keeps ordinary three-way conflict semantics if local changed meanwhile:
+the local version is kept as a conflict copy and is never silently overwritten.
+Metadata equality can never advance the applied base at a pending path; actual
+verification is mandatory, including when restored correct bytes sit behind a
+poisoned SHA/size tuple. Pending clears only after the remote entry verifies and
+publishes, a changed local successor commits successfully, or the newest remote
+deletes it. The persisted diagnostic is bounded to the newest entry per path;
+repeated failures update it rather than append history.
 
-### 3.4 C - Self-healing push comparator
+A pending path that is also ignored is never scanned. It therefore remains
+frozen-but-quarantined rather than gaining a false local-deletion interpretation;
+join still succeeds, with a warning that names the pending count/path. The user
+resolution is the existing `rbox ignore` workflow: delete first, let the
+deletion sync, then ignore (`src/cli/ignore-cmd.ts:31-32`).
+
+### 3.4 C - Self-healing size metadata comparator
 
 Do not add size to `sameContent`. Reconcile and apply preconditions use that
 function (`src/engine/reconcile.ts:58-66`; `src/engine/apply.ts:163-168`) and
@@ -262,46 +331,79 @@ encryption address reuse is keyed by plaintext SHA
 (`src/cli/sync-recovery.ts:159-178`). The next upgraded writer that scans the
 correct bytes therefore commits corrected size metadata without re-encrypting
 or requiring an artificial content edit. A successor head immediately heals
-fresh joins; retained historical manifests remain immutable and may still
-contain the old entry.
+fresh joins from the incident's stale-size tuple; retained historical manifests
+remain immutable and may still contain the old entry.
+
+This mechanism heals size metadata only. It does not heal present-but-corrupt
+ciphertext for GCM or zstd failures: a correct-plaintext device sees reconcile
+byte equality and does not download, while SHA-keyed descriptor reuse keeps it
+from re-encrypting. Explicit descriptor repair is future work as stated in
+sections 7 and 8.
 
 ### 3.5 D - Carry-forward hygiene
 
 An un-applied remote manifest never replaces the ordinary applied base
 wholesale. The only un-applied file metadata allowed to affect push is the
-explicit, path-scoped `filePendingRemote` entry, whose purpose is to suppress a
-deletion or regression at that same path.
+explicit, path-scoped `filePendingRemote` entry. For each pending path `P`,
+compare `scannedLocal[P]` with `appliedBase[P]` using tuple identity, with two
+absences equal:
+
+1. **Local unchanged.** The tuples match, or both are absent. The pending entry
+   wins in both `outbound[P]` and `effectiveBase[P]`. This includes a fresh join
+   where the path never materialized: applied-base absent plus local absent is
+   unchanged, not a deletion.
+2. **Local changed.** New content, a type change, or applied-base present plus
+   local absent is a real local successor. Local wins `outbound[P]`, while the
+   pending entry remains `effectiveBase[P]` so the diff registers the successor.
+   A successful commit clears pending. Editing or deleting the file locally is
+   the user escape hatch; no tombstone or resolution command is added.
 
 Before every push attempt, derive:
 
 ```text
 effectiveBase = appliedBase overlaid by newest filePendingRemote entries
-outbound      = scannedLocal overlaid by newest filePendingRemote entries
+outbound[P]   = pending[P] when scannedLocal[P] is unchanged from appliedBase[P]
+                scannedLocal[P] otherwise
 ```
 
-The pending overlay wins last. Every file carry source and push decision uses
-those derived views: forward-only ignore carry, purge checks, diff/no-op,
-cipher-descriptor reuse, `deferManifest`, mass-delete checks, and final commit
-construction. Assert before commit that each still-pending outbound path equals
-its newest pending entry. No path may fall back to a direct
-`state.lastSyncedManifest` lookup after the views are built.
+Every file carry source and push decision uses those derived views:
+forward-only ignore carry, purge checks, diff/no-op, cipher-descriptor reuse,
+`deferManifest`, mass-delete checks, and final commit construction. No path may
+fall back to a direct `state.lastSyncedManifest` lookup after the views are
+built. Before commit, compare serialized tuples against the selected branch:
+pending for unchanged local, scanned local for changed local. Pending entries
+are deep-cloned/frozen when recorded because `encryptAndUpload` mutates
+`FileEntry` objects in place; reference equality would make this assertion
+vacuous.
 
 After an unrelated successful commit, a file analogue of
 `gitBaseAfterCommit` saves the committed manifest as the new base for ordinary
 paths but restores the old applied-base entry/absence at every pending path.
-`filePendingRemote` stays persisted. This permits the next pull to retry while
-the outbound overlay continues carrying the newest remote truth. If the pending
-entry is the only difference, `effectiveBase === outbound` and push is a no-op,
-so quarantine alone does not create echo commits.
+`filePendingRemote` stays persisted. If unchanged pending is the only
+difference, `effectiveBase === outbound` and push is a no-op; if local changed,
+the pending effective base makes the successor commit-worthy and successful
+commit clears the record.
+
+`saveState` is whole-object replacement, so all three state writers preserve
+`filePendingRemote`: the pull save (`src/cli/sync.ts:329-336`), the
+git-bookkeeping-only no-op save (`src/cli/sync.ts:549-568`), and the post-commit
+save (`src/cli/sync.ts:660-671`). The no-op writer is not exempt merely because
+it leaves manifest bytes unchanged.
+
+`PushResult.manifest` is committed outbound truth, not necessarily disk truth.
+Where the daemon assigns it to `this.manifest` (`src/cli/daemon.ts:514-535`), it
+restores the applied-base entry or absence at every still-pending path, matching
+the persisted-state rule. Otherwise the daemon could adopt a quarantined remote
+entry as its in-memory local tree and suppress the next repair.
 
 This closes the observed resurrection deterministically. After the Mac sees
 sequence 653 but cannot apply its healed size-0 entry, its old applied base may
 still contain the poison, but `filePendingRemote[path]` contains the newer
-sequence-653 entry. Both effective push base and outbound candidate use that
-newer entry. The push therefore either no-ops or carries the healed entry with
-an unrelated change; it can neither publish a deletion nor re-emit the older
-poison at sequence 654. No additional whole-push guard is needed if every carry
-site uses the derived views and the final assertion is enforced.
+sequence-653 entry. With local unchanged, both effective base and outbound use
+that newer entry, so push either no-ops or carries it alongside unrelated work.
+With a real local edit or deletion, the local successor wins outbound against
+the pending effective base and clears pending after commit. Neither branch can
+re-emit the older poison at sequence 654.
 
 ## 4. Compatibility
 
@@ -328,17 +430,45 @@ site uses the derived views and the final assertion is enforced.
 2. **Quarantine isolation.** Pull a 100-file manifest with one poisoned entry.
    Exactly 99 files apply, one is quarantined, the warning and persisted record
    contain its relative path, local data/ancestors at that path are unchanged,
-   and pull exits 0 with warning. The next pull retries that entry. Repeat once
-   with a conflict action and once with a file-valued ancestor obstruction.
+   and foreground pull exits 3. The daemon treats the same result as non-fatal.
+   The next pull retries that entry. Repeat once with a conflict action and once
+   with a file-valued ancestor obstruction.
 3. **Error boundary.** GCM, zstd, size, and plaintext-SHA failures quarantine.
    `ENOSPC`, `EACCES`, blob fetch failure, and worker crash remain pull-fatal.
    Cover compressed and raw declared-size mismatches.
-4. **Resurrection regression.** Applied base contains the poisoned entry; the
-   latest remote contains a healed entry; local lacks the file; apply
-   quarantines. The next push is a no-op when nothing else changed, and an
-   unrelated push carries the healed pending entry. It never emits the stale
-   entry or a deletion.
-5. **Metadata heal.** Base and local have the same SHA but different size. Push
+4. **Pending three-way precedence.** Cover all three local shapes against a
+   pending path: unchanged present carries pending; unchanged fresh-join absence
+   carries pending and never emits deletion; changed content/type or a true
+   base-present/local-absent deletion wins outbound against pending effective
+   base and clears pending only after commit. An unrelated push in the unchanged
+   case carries pending, never the stale applied entry.
+5. **Retry cannot re-bless.** A pending path whose local tuple compares equal to
+   remote still stages and verifies the exact remote entry. Correct bytes behind
+   poisoned metadata do not clear pending through `sameContent`; local divergence
+   during retry produces a conflict copy, never a silent overwrite.
+6. **Type-flip grouping.** With base/local `foo/child`, a poisoned remote file
+   `foo` quarantines and the child delete does not run. With base/local file
+   `foo`, a poisoned remote `foo/child` quarantines and deletion of `foo` does not
+   run. Both retry on the next pull. Validation rejects exact and case-folded
+   file/descendant manifest collisions.
+7. **Staging order and conflict exclusivity.** A quarantined target causes no
+   target, conflict-copy, or required-ancestor move; ancestor pre-stage remains
+   serial. Two same-name conflict attempts cannot replace one another.
+8. **State-writer preservation.** Exercise pull state-save, post-commit
+   state-save, and exactly quarantine -> git-bookkeeping-only no-op save ->
+   pending survives. Mutation of an outbound `FileEntry` cannot change the
+   frozen pending snapshot, and the serialized-tuple assertion detects drift.
+9. **Crash boundaries.** Inject a crash immediately before pull state-save and
+   after commit but before post-commit state-save, each with a pending path.
+   Recovery neither resurrects the old entry nor loses pending state.
+10. **Daemon disk truth.** A push result containing a carried pending entry does
+    not install it into the daemon's in-memory manifest; the applied-base
+    entry/absence remains at that path. Activity, status, ambient status, shell
+    state, init/join output, and the daemon line all expose the pending count.
+11. **Activity refresh.** A same-head retry may clear pending without changing
+    sequence. Verify that a cached activity count may remain stale only until
+    the next ordinary activity refresh, then converges to the persisted count.
+12. **Metadata heal.** Base and local have the same SHA but different size. Push
    commits the corrected size, reuses the coherent ciphertext descriptor, and
    reconcile on a device already holding the correct bytes produces no false
    conflict.
@@ -361,7 +491,7 @@ site uses the derived views and the final assertion is enforced.
 
 The deterministic suite, both fleet-host gates, and the Ubuntu standing gate
 must pass before release. A quarantine warning in the Ubuntu gate is a failure,
-not an acceptable degraded pass.
+not an acceptable degraded pass: the gate keys on exit code 3, not stderr text.
 
 ## 6. Rollout and observability
 
@@ -402,7 +532,31 @@ not an acceptable degraded pass.
 
 ## 9. Open decisions
 
-None. `ANALYSIS-92.log` is decision-complete. The live-code review only made two
-implicit requirements explicit: integrity errors must be reconstructed across
-crypto workers, and staging must precede ancestor eviction as well as conflict
-move-aside.
+None. Two independent design reviews (2026-07-09) were adjudicated into this
+revision. The material changes from the first draft: pending precedence became
+three-way (a real local edit or deletion beats pending and clears it), pending
+retries bypass reconcile equality, type-flip deletes are transactionally
+suppressed with their quarantined write, all three `saveState` writers preserve
+pending, staging stays co-located with the serial ancestor pre-pass intact, and
+the self-heal claim is narrowed to size metadata.
+
+## Appendix A. `diffManifests` caller audit (size-sensitivity)
+
+Making `diffManifests` size-sensitive (section 3.4) was audited against every
+caller:
+
+| Caller | Consumes | Size-sensitivity effect |
+|---|---|---|
+| `src/cli/sync.ts:517` purge preflight | `deleted` only | none — safe |
+| `src/cli/sync.ts:536` push no-op gate | full diff | required: this is the heal |
+| `src/cli/sync.ts:608` post-defer no-op | full diff | safe — deferred paths carry the selected base |
+| `src/cli/sync.ts:620` mass-delete count | `deleted` only | none — but the denominator must use the effective base |
+| `src/cli/daemon.ts:787` daemon change counts | `changed` | intentional, correct only while `this.manifest` stays disk truth (section 3.5) |
+| `src/cli/status-cmd.ts:305` status counts | `changed` | intentional — a size-only repair should show as a change |
+| `src/engine/engine.test.ts:155` | test-only | n/a |
+
+The daemon/status trigger sites run outside `runPushAttempt`'s derived views. A
+pending path can read as a spurious change there and trigger an echo push
+attempt; the authoritative overlay inside the push then no-ops it. That churn
+is accepted as intentionally benign — threading the overlay into every
+read-only trigger site would spread pending logic for no correctness gain.
