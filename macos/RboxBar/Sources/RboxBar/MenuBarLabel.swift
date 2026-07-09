@@ -52,11 +52,11 @@ enum MenuBarIcon {
     /// The vector open-box glyph from the bundle. The image is always a template;
     /// severity color belongs exclusively to the separate badge layer above.
     static func glyphImage() -> NSImage {
-        if let image = Bundle.module.image(forResource: "RGlyph") {
+        if let image = Bundle.appModule.image(forResource: "RGlyph") {
             image.isTemplate = true
             return image
         }
-        if let url = Bundle.module.url(
+        if let url = Bundle.appModule.url(
             forResource: "rbox-glyph", withExtension: "pdf",
             subdirectory: "Assets.xcassets/RGlyph.imageset"
         ), let image = NSImage(contentsOf: url) {
