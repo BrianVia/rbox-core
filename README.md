@@ -100,6 +100,13 @@ apps/web/     dashboard (app.rbox.to)
 
 The blob layer is content-addressed: a file's identity is `sha256(bytes)`, so dedup, integrity, and GC fall out for free. Commits are sequenced by the Durable Object with optimistic concurrency — a stale parent gets a 409 and the client pulls, re-scans, and retries.
 
+## Deployment
+
+Two independent pipelines — don't conflate them:
+
+- **API (`apps/api`) → prod on merge.** The control-plane Worker (`rbox-prod-api`, serving `api.rbox.to`) deploys via **Cloudflare's native GitHub integration (Workers Builds)** — *not* a GitHub Action. **Every merge to `main` auto-builds and deploys `apps/api` to production.** There is no separate deploy step and no approval gate: merge == prod deploy. A deploy restarts the `WorkspaceSync` Durable Object, so any DO change (or bug) is live on the next merge. This is why the sequencer is designed to be safe across a restart mid-commit (design 91: the head is DO-authoritative and fail-closed — a restart can never regress it). The dev Worker (`rbox-dev-api`, its own D1/R2 and a *separate* `WorkspaceSync` namespace) builds from the same connection; keep `RBOX_API` pointed at prod for any real workspace — the two namespaces do not share a head.
+- **CLI binaries → R2 on `v*` tag.** The `rbox` binaries are a separate GitHub Actions pipeline (`.github/workflows/release.yml`) triggered by pushing a `v*` tag; it signs the version manifest and publishes to the `rbox-releases` bucket, which `rbox upgrade` verifies. See [`docs/cicd-release-setup.md`](docs/cicd-release-setup.md).
+
 ## Docs
 
 - [`docs/usage.md`](docs/usage.md) — CLI usage guide (commands, config files, `.rboxignore` semantics)
