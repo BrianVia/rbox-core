@@ -1,0 +1,20 @@
+<svg width="376" height="484" viewBox="332 270 376 484" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    rbox menu-bar template glyph — the same R letterform as the app icon,
+    solid monochrome so macOS template rendering tints it to match the bar
+    (auto light/dark). No orbit ring: it must stay crisp at 16px.
+  -->
+  <g fill="#000000">
+    <path d="M362 300 h80 a12 12 0 0 1 12 12 V724 h-104 V312 a12 12 0 0 1 12 -12 Z"/>
+    <path fill-rule="evenodd" d="
+      M442 300 H566
+      C632 300 678 346 678 412
+      C678 478 632 524 566 524
+      H442 Z
+      M454 378 H560
+      C596 378 618 394 618 412
+      C618 430 596 448 560 448
+      H454 Z"/>
+    <path d="M470 486 L568 486 L664 724 L560 724 Z"/>
+  </g>
+</svg>
