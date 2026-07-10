@@ -35,7 +35,7 @@ test("parsePairToken extracts the token line from real pairCreate output", () =>
     "",
     "    tAbC123_redeem.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA",
     "",
-    'On the new machine: run `rbox`, choose "Connect this machine", and paste it.',
+    'On the new machine: run `rbox`, choose "Paste a pairing token", and paste it.',
   ].join("\n");
   expect(parsePairToken(stdout)).toBe("tAbC123_redeem.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA");
 });

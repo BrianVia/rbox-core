@@ -2,7 +2,7 @@ import path from "node:path";
 import { progressLabel } from "./status-view.js";
 import { findRoot } from "./config.js";
 import { pull, push } from "./sync.js";
-import { postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
+import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
 import { beginReport } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
@@ -253,6 +253,7 @@ export async function main(): Promise<void> {
       try {
         const { cfg, deps } = await buildAuthedRemote(root);
         deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+        attachGitSyncProgress(deps, sp, { verbose: flags["verbose"] === "true" });
         deps.allowMassDelete = flags["allow-mass-delete"] === "true";
         const report = beginReport("pull");
         deps.report = report;
@@ -269,7 +270,11 @@ export async function main(): Promise<void> {
     }
     case "sync": {
       const root = await resolveRoot(positional[0]);
-      await runSyncCommand(root, { allowMassDelete: flags["allow-mass-delete"] === "true", pullOnly: flags["pull-only"] === "true" });
+      await runSyncCommand(root, {
+        allowMassDelete: flags["allow-mass-delete"] === "true",
+        pullOnly: flags["pull-only"] === "true",
+        verbose: flags["verbose"] === "true",
+      });
       break;
     }
     case "export": {

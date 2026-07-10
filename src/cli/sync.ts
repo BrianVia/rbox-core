@@ -136,6 +136,10 @@ export interface SyncDeps {
    *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
    *  injects its timestamped logger so the lines land in the daemon log. */
   onGitLog?: (line: string) => void;
+  /** Per-repo progress during the pull-side git-apply loop (`done` advances once per
+   *  repo examined, including no-op "unchanged" ones) — lets a CLI collapse the N
+   *  per-repo `onGitLog` lines into a single updating "N/total" counter instead. */
+  onGitProgress?: (done: number, total: number) => void;
   /** Explicit human consent to a pull that deletes ≥half the baseline (design 44).
    *  Set ONLY by `rbox pull/sync --allow-mass-delete`; the daemon never sets it, so a
    *  runaway mass delete halts background sync instead of destroying the tree. */
@@ -320,7 +324,10 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
   const glog = deps.onGitLog ?? ((line: string) => console.error(line));
   const gitOutcome = await report.phase("git-apply", () =>
-    applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, { collectMetrics: report.enabled })
+    applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, {
+      collectMetrics: report.enabled,
+      onProgress: deps.onGitProgress,
+    })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
   if (gitOutcome.gitApplyMetrics) {

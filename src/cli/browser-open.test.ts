@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { openInBrowser, openAndShow, copyToClipboard, _setSpawner } from "./browser-open.js";
+import { openInBrowser, openAndShow, copyToClipboard, waitForKeypress, _setSpawner } from "./browser-open.js";
 
 // The value here is the cross-platform command/args selection and the TTY / missing-
 // binary control flow — not "is a string a string". We drive the real functions with
@@ -152,5 +152,48 @@ describe("copyToClipboard", () => {
     setPlatform("darwin");
     _setSpawner(fakeSpawner({ withStdin: false }));
     expect(copyToClipboard("hi")).toBe(false);
+  });
+});
+
+describe("waitForKeypress", () => {
+  const origStdinIsTTY = process.stdin.isTTY;
+  const origSetRawMode = (process.stdin as unknown as { setRawMode?: unknown }).setRawMode;
+  const origExit = process.exit;
+
+  function setStdinTTY(on: boolean): void {
+    Object.defineProperty(process.stdin, "isTTY", { value: on, configurable: true });
+  }
+
+  beforeEach(() => {
+    // Real setRawMode throws off a real TTY; stub it so the test can pretend stdin is one.
+    (process.stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = () => {};
+  });
+  afterEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: origStdinIsTTY, configurable: true });
+    (process.stdin as unknown as { setRawMode?: unknown }).setRawMode = origSetRawMode;
+    process.exit = origExit;
+  });
+
+  test("off a TTY it resolves undefined without waiting for input", async () => {
+    setStdinTTY(false);
+    expect(await waitForKeypress()).toBeUndefined();
+  });
+
+  test("resolves with the pressed key's name", async () => {
+    setStdinTTY(true);
+    const pending = waitForKeypress();
+    process.stdin.emit("keypress", "c", { name: "c" });
+    expect(await pending).toBe("c");
+  });
+
+  test("Ctrl-C re-raises as exit(130) instead of resolving (raw mode swallows the normal SIGINT)", () => {
+    setStdinTTY(true);
+    let exitCode: number | undefined;
+    process.exit = ((code?: number) => {
+      exitCode = code;
+    }) as never;
+    void waitForKeypress();
+    process.stdin.emit("keypress", undefined, { name: "c", ctrl: true });
+    expect(exitCode).toBe(130);
   });
 });

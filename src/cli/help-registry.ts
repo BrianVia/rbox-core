@@ -152,10 +152,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "sync",
     group: "SYNCING",
     summary: "sync once (pull, then push)",
-    usage: "rbox sync [path] [--allow-mass-delete] [--pull-only]",
+    usage: "rbox sync [path] [--allow-mass-delete] [--pull-only] [--verbose]",
     flags: [
       { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
       { flag: "--pull-only", desc: "pull remote changes and skip the push phase" },
+      { flag: "--verbose", desc: "print each git repo's apply/conflict/defer line instead of a running count" },
     ],
   },
   {
@@ -169,8 +170,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "pull",
     group: "SYNCING",
     summary: "apply remote changes",
-    usage: "rbox pull [path] [--allow-mass-delete]",
-    flags: [{ flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" }],
+    usage: "rbox pull [path] [--allow-mass-delete] [--verbose]",
+    flags: [
+      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
+      { flag: "--verbose", desc: "print each git repo's apply/conflict/defer line instead of a running count" },
+    ],
   },
   {
     name: "export",
