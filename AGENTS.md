@@ -5,6 +5,7 @@
 **Pushes to `main` auto-deploy** (GitHub Actions):
 
 - **API worker deploys are handled by Cloudflare's Workers Builds git integration** (connected in the Cloudflare dash; configured by the founder), not by GitHub Actions — the old `deploy-api.yml` was removed 2026-07-03. PR CI (`ci.yml`: typecheck + full test suites) remains the merge gate on every PR. NOTE: Workers Builds runs no tests itself — the PR gate is the only test gate before prod.
+  - Workers Builds config (dash-only, recorded 2026-07-10): root directory `apps/api`, watch paths `apps/api/**`, production branch `main`. Build command `npx wrangler d1 migrations apply rbox-prod-db --remote --env production`, deploy command `npx wrangler deploy --env production`, version command `npx wrangler versions upload --env production`. **So prod D1 migrations auto-apply on every main merge touching `apps/api/**`** — new migration files ship themselves; never rename applied ones (see `apps/api/migrations/README.md`). The dev DB (`rbox-dev-db`) has no such hook — apply dev migrations manually.
 - `.github/workflows/deploy-web.yml` — when `apps/web/**` changes → build + `wrangler pages deploy` (**`rbox-app` / `app.rbox.to`**), gated on `check` + `test`.
 - `.github/workflows/release.yml` — on `v*` tags → build/sign/publish the `rbox` CLI binaries to R2 (unchanged).
 
