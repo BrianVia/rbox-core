@@ -150,6 +150,26 @@ ledger + quota flip + surfaces) → IA tiering rider. Phase-0 copy fix (§7,
 90→365) verified ALREADY LANDED (README/pricing.md/plans.ts all 365).
 Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
 
+- **INCIDENT 2026-07-10 (afternoon): WorkspaceSync DO OOM on `/roots` —
+  CONTAINED (#198, merged → prod).** Root cause: `/roots` materializes every
+  retained sequence's full refset (~102k refs × 1,070 seqs ≈ 6.85 GiB JSON)
+  in a 128MiB DO — deterministic OOM ~8-14 seqs in, every hourly GC tick;
+  fleet WS connects died in the same isolate resets (this was the morning's
+  WS-churn mystery). Design 24 predicted this and prescribed a never-built
+  bound. Containment: fail-closed 503 `roots_too_large` (64 seqs / 500k refs
+  caps) — GC stays unavailable-but-safe for the big workspace; WS stability
+  restored. Full diagnosis: session scratchpad roots-oom-diagnosis.md.
+  **Follow-ups (blocking the manual GC run + design 95): paginated
+  snapshot-bounded `/roots` (fast functional fix), then a durable
+  retained-root index (steady-state; replaying every retained commit is the
+  wrong algorithm for 365d history).**
+- **Designs 94 + 95 in adversarial loops (2026-07-10):** design 94
+  (signin_method) ALIGNED after 7 codex rounds, implemented, PR #197 green —
+  awaiting founder merge/dev-gate call. Design 95 (GC purge automation) at
+  v7 after 6 rounds — protocol evolved to: RAISE-ABORT trigger fence +
+  two-phase intent (24h quiescence) + verify-after-delete + executor lease.
+  REVIEW-94/95.md in the worktrees carry the full round history.
+
 ## Backlog (ledgered, not urgent)
 
 - Stripe annual prices for design 86 (paid-only + trial + annual, PR #159);
