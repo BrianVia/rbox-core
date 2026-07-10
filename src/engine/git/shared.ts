@@ -41,6 +41,19 @@ export async function git(root: string, args: string[], opts: { maxBuffer?: numb
   return (await gitRaw(root, args, opts)).trim();
 }
 
+/** Parse `git config --get-regexp -z` output without trimming meaningful empty
+ * values. Shared by direct local reads and same-directory snapshot reads. */
+export function parseNullDelimitedGitConfig(raw: string): Array<[key: string, value: string]> {
+  if (raw === "") return [];
+  const records = raw.split("\0");
+  if (records.pop() !== "") throw new Error("git config -z returned an unterminated record");
+  return records.map((record) => {
+    const separator = record.indexOf("\n");
+    if (separator < 0) throw new Error("git config -z returned a record without a key/value separator");
+    return [record.slice(0, separator), record.slice(separator + 1)];
+  });
+}
+
 /** Read candidate design-93 keys from the local common config. Exit 1 is Git's
  * documented no-match result; every other subprocess failure remains loud. */
 export async function readLocalGitConfigEntries(root: string): Promise<Array<[key: string, value: string]>> {
@@ -51,14 +64,7 @@ export async function readLocalGitConfigEntries(root: string): Promise<Array<[ke
     if ((error as { code?: unknown }).code === 1) return [];
     throw error;
   }
-  if (raw === "") return [];
-  const records = raw.split("\0");
-  if (records.pop() !== "") throw new Error("git config -z returned an unterminated record");
-  return records.map((record) => {
-    const separator = record.indexOf("\n");
-    if (separator < 0) throw new Error("git config -z returned a record without a key/value separator");
-    return [record.slice(0, separator), record.slice(separator + 1)];
-  });
+  return parseNullDelimitedGitConfig(raw);
 }
 
 export async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {

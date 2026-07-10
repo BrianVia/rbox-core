@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import { fsyncDirectory } from "../fsutil.js";
 
 const MARKER_PREFIX = "rbox-93";
 const MARKER_MAX_BYTES = 1024;
@@ -236,7 +237,8 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
     if (bytesRead > MARKER_MAX_BYTES) return { raw: "", reason: "oversized lock marker" };
     const raw = bytes.subarray(0, bytesRead).toString("utf8");
-    return { raw, marker: parseLockMarker(raw), reason: parseLockMarker(raw) ? undefined : "malformed or foreign lock marker" };
+    const marker = parseLockMarker(raw);
+    return { raw, marker, reason: marker ? undefined : "malformed or foreign lock marker" };
   } catch (error) {
     if (["ENOENT", "ELOOP"].includes(errno(error) ?? "")) return { raw: "", reason: "lock changed during inspection" };
     throw error;
@@ -294,19 +296,6 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
   } finally {
     await handle?.close().catch(() => {});
     await fs.unlink(tempPath).catch(() => {});
-  }
-}
-
-async function fsyncDirectory(dir: string): Promise<boolean> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(dir, constants.O_RDONLY);
-    await handle.sync();
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await handle?.close().catch(() => {});
   }
 }
 
@@ -380,7 +369,8 @@ export class OwnedLock {
       const released = await unlinkIfExact(this.path, this.raw, () => this.hooks?.beforeReleaseUnlink?.(this.path));
       if (!released) return { released: false, durable: false };
       staleOwnedMarkers.delete(this.path);
-      return { released: true, durable: await fsyncDirectory(path.dirname(this.path)) };
+      const durable = await fsyncDirectory(path.dirname(this.path)).then(() => true, () => false);
+      return { released: true, durable };
     } catch (error) {
       staleOwnedMarkers.set(this.path, this.raw);
       return { released: false, durable: false, error };

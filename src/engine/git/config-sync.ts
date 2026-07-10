@@ -192,9 +192,11 @@ export function validateCanonicalGitConfig(input: unknown): GitConfigValidation 
   const sorted = [...keys].sort(compareConfigKeysBytewise);
   if (keys.some((key, i) => key !== sorted[i])) return { ok: false, reason: "config keys are not bytewise sorted" };
 
+  const parsedByKey = new Map<string, GitConfigKey>();
   for (const key of keys) {
     const parsed = parseGitConfigKey(key);
     if (!parsed) return { ok: false, reason: `config key is not allowlisted: ${key}` };
+    parsedByKey.set(key, parsed);
     const values = config[key];
     if (!Array.isArray(values) || values.length === 0) return { ok: false, reason: `config values are empty or malformed: ${key}` };
     const seen = new Set<string>();
@@ -207,7 +209,7 @@ export function validateCanonicalGitConfig(input: unknown): GitConfigValidation 
 
   const knownRemotes = remoteNames(config as Record<string, string[]>);
   for (const key of keys) {
-    const parsed = parseGitConfigKey(key)!;
+    const parsed = parsedByKey.get(key)!;
     if (parsed.section === "branch" && parsed.variable === "remote") {
       for (const value of config[key] as string[]) {
         if (!knownRemotes.has(value)) return { ok: false, reason: `branch remote is not in this config: ${value}` };
@@ -227,6 +229,7 @@ export function validateCanonicalGitConfig(input: unknown): GitConfigValidation 
  */
 export function canonicalizeGitConfig(entries: Iterable<readonly [string, string]>): GitConfigCanonicalization {
   const collected = new Map<string, string[]>();
+  const collectedValues = new Map<string, Set<string>>();
   const rejected: RejectedGitConfigValue[] = [];
   const overBounds = (bound: GitConfigBound, reason: string): GitConfigCanonicalization => ({
     ok: false,
@@ -252,8 +255,13 @@ export function canonicalizeGitConfig(entries: Iterable<readonly [string, string
       continue;
     }
     const values = collected.get(key) ?? [];
-    if (!values.includes(value)) values.push(value);
+    const seen = collectedValues.get(key) ?? new Set<string>();
+    if (!seen.has(value)) {
+      seen.add(value);
+      values.push(value);
+    }
     collected.set(key, values);
+    collectedValues.set(key, seen);
   }
 
   // A branch remote is meaningful only when that remote is defined by another key

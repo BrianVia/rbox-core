@@ -6,7 +6,7 @@ import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
-import type { WorkspaceSyncMutex } from "./sync-mutex.js";
+import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -275,7 +275,7 @@ function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: R
   return Object.keys(result).length === 0 ? undefined : result;
 }
 
-function stateFromRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
+export function stateFromRepoRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
   const gitRepos = mapFromRecords(records, (record) => record.base);
   return {
     ...state,
@@ -334,7 +334,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
           lastSyncedManifest: { ...global, gitRepos: undefined },
         }
       : current;
-    const next = stateFromRecords({
+    const next = stateFromRepoRecords({
       ...base,
       stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),
       stateRevision: validCounter(current.stateRevision) + 1,
@@ -464,11 +464,10 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
   let owned = heldMutex;
   let releaseOwned = false;
   if (!owned) {
-    const mutex = await import("./sync-mutex.js");
-    owned = await mutex.acquireWorkspaceSyncMutex(root, "cli");
+    owned = await acquireWorkspaceSyncMutex(root, "cli");
     releaseOwned = true;
   }
-  if (owned.root !== root) throw new Error("workspace sync mutex belongs to a different root");
+  assertSyncMutex(owned, root);
   try {
     await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
     const acquired = await acquireLock(stateLockPath(root));
@@ -505,8 +504,7 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
     }
   } finally {
     if (releaseOwned) {
-      const mutex = await import("./sync-mutex.js");
-      await mutex.releaseWorkspaceSyncMutex(owned);
+      await releaseWorkspaceSyncMutex(owned);
     }
   }
 }

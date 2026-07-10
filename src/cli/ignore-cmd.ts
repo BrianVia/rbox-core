@@ -58,9 +58,10 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     console.log("purge dry-run: nothing to delete.");
     return;
   }
-  const dirs = [...new Set(preview.purged.map((p) => p.split("/")[0] ?? p))].slice(0, 12);
+  const topLevelDirs = new Set(preview.purged.map((p) => p.split("/")[0] ?? p));
+  const dirs = [...topLevelDirs].slice(0, 12);
   console.log(`purge dry-run: ${preview.purged.length} path${preview.purged.length === 1 ? "" : "s"} would be deleted from other machines.`);
-  console.log(`top-level: ${dirs.join(", ")}${dirs.length < new Set(preview.purged.map((p) => p.split("/")[0] ?? p)).size ? ", ..." : ""}`);
+  console.log(`top-level: ${dirs.join(", ")}${dirs.length < topLevelDirs.size ? ", ..." : ""}`);
   if (!opts.yes) {
     if (process.stdin.isTTY !== true) throw new Error("refusing headless purge without --yes");
     const ok = await promptConfirm({ message: "Purge these ignored paths from synced state?", default: false });

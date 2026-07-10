@@ -83,38 +83,38 @@ export async function track(
   // baseline and the existing device id (re-tracking must not mint a new device).
   const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
   const cfg = await withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
-  const prev = await loadConfig(root).catch(() => undefined);
-  const next: WorkspaceConfig = {
-    schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
-    remoteWorkspaceId: workspaceId,
-    projectId,
-    deviceId:
-      flags.device ??
-      prev?.deviceId ??
-      (creds?.deviceId !== "env" ? creds?.deviceId : undefined) ??
-      `dev_${crypto.randomUUID().slice(0, 8)}`,
-    rootPath: root,
-    remoteUrl,
-    token: "", // token comes from `rbox login` (per-machine credential), never config
-    // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
-    // non-git root; pass --git false to opt out.
-    syncGit: flags.git !== "false",
-    respectGitignore: flags["respect-gitignore"] === "true",
-    // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
-    // no round-trip (manual-id / --workspace entry has none → status falls back to id).
-    ...(pickedName ? { name: pickedName } : {}),
-  };
-  if (prev && syncStreamId(prev) !== nextStream) {
-    await resetSyncState(root, nextStream, syncMutex);
-    await saveConfig(root, next);
-    console.error(
-      `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
-        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
-    );
-  } else {
-    await saveConfig(root, next);
-  }
-  return next;
+    const prev = await loadConfig(root).catch(() => undefined);
+    const next: WorkspaceConfig = {
+      schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
+      remoteWorkspaceId: workspaceId,
+      projectId,
+      deviceId:
+        flags.device ??
+        prev?.deviceId ??
+        (creds?.deviceId !== "env" ? creds?.deviceId : undefined) ??
+        `dev_${crypto.randomUUID().slice(0, 8)}`,
+      rootPath: root,
+      remoteUrl,
+      token: "", // token comes from `rbox login` (per-machine credential), never config
+      // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a
+      // non-git root; pass --git false to opt out.
+      syncGit: flags.git !== "false",
+      respectGitignore: flags["respect-gitignore"] === "true",
+      // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
+      // no round-trip (manual-id / --workspace entry has none → status falls back to id).
+      ...(pickedName ? { name: pickedName } : {}),
+    };
+    if (prev && syncStreamId(prev) !== nextStream) {
+      await resetSyncState(root, nextStream, syncMutex);
+      await saveConfig(root, next);
+      console.error(
+        `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+          `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
+      );
+    } else {
+      await saveConfig(root, next);
+    }
+    return next;
   });
   return { cfg, root };
 }

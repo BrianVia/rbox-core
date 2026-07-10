@@ -3,9 +3,11 @@ import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import type { BigIntStats } from "node:fs";
+import { fsyncDirectory } from "../fsutil.js";
+import { hashBytes } from "../hash.js";
 import { canonicalizeGitConfig, MAX_GIT_CONFIG_FILE_BYTES, validateCanonicalGitConfig, type GitConfig, type GitConfigCanonicalization } from "./config-sync.js";
 import { acquireLock, systemLockIdentity, type AcquireLockOptions, type LockIdentitySource, type OwnedLock, type ProcessIncarnation } from "./lockfile.js";
-import { gitRaw } from "./shared.js";
+import { gitRaw, parseNullDelimitedGitConfig } from "./shared.js";
 
 export type ConfigFaultDisposition = "permanent" | "transient";
 
@@ -129,6 +131,10 @@ function statToken(stat: BigIntStats): ConfigStatToken {
   };
 }
 
+export function sameConfigStatToken(a: ConfigStatToken | undefined, b: ConfigStatToken | undefined): boolean {
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
 async function stableOverCap(filePath: string, first: BigIntStats): Promise<ConfigReadResult> {
   try {
     const second = await fs.lstat(filePath, { bigint: true });
@@ -182,17 +188,6 @@ export async function readConfigSnapshot(filePath: string, phase: "initial" | "l
   }
 }
 
-function parseNullConfigOutput(raw: string): Array<[string, string]> {
-  if (raw === "") return [];
-  const records = raw.split("\0");
-  if (records.pop() !== "") throw new Error("git config -z returned an unterminated record");
-  return records.map((record) => {
-    const separator = record.indexOf("\n");
-    if (separator < 0) throw new Error("git config -z returned a record without a key/value separator");
-    return [record.slice(0, separator), record.slice(separator + 1)];
-  });
-}
-
 async function writeSnapshotTemp(configPath: string, bytes: Buffer): Promise<string> {
   const snapshotPath = path.join(path.dirname(configPath), `${path.basename(configPath)}.snapshot-${process.pid}-${crypto.randomBytes(16).toString("hex")}.rbox93`);
   const handle = await fs.open(snapshotPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -216,7 +211,7 @@ export async function parseConfigSnapshot(repoDir: string, configPath: string, s
       if ((error as { code?: unknown }).code === 1) raw = "";
       else return { ok: false, fault: fault("permanent", "parse-error", error) };
     }
-    return { ok: true, snapshot: { ...snapshot, entries: parseNullConfigOutput(raw) } };
+    return { ok: true, snapshot: { ...snapshot, entries: parseNullDelimitedGitConfig(raw) } };
   } catch (error) {
     return { ok: false, fault: errno(error) ? classifyConfigFsError(error) : fault("permanent", "parse-error", error) };
   } finally {
@@ -246,14 +241,7 @@ export async function readStableParsedConfigSnapshot(
     if (afterParse.isSymbolicLink()) return { ok: false, fault: fault("permanent", "symlink") };
     if (!afterParse.isFile()) return { ok: false, fault: fault("permanent", "non-regular") };
     if (afterParse.size > BigInt(MAX_GIT_CONFIG_FILE_BYTES)) return { ok: false, fault: fault("transient", "over-cap") };
-    const afterToken = statToken(afterParse);
-    if (
-      afterToken.dev !== parsed.snapshot.token.dev ||
-      afterToken.ino !== parsed.snapshot.token.ino ||
-      afterToken.size !== parsed.snapshot.token.size ||
-      afterToken.mtimeNs !== parsed.snapshot.token.mtimeNs ||
-      afterToken.ctimeNs !== parsed.snapshot.token.ctimeNs
-    ) {
+    if (!sameConfigStatToken(statToken(afterParse), parsed.snapshot.token)) {
       return { ok: false, fault: fault("transient", "unstable") };
     }
     return parsed;
@@ -287,15 +275,6 @@ async function reopenAndFsync(candidatePath: string): Promise<void> {
   }
 }
 
-async function fsyncDirectory(dir: string): Promise<void> {
-  const handle = await fs.open(dir, constants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
 async function cleanupCandidate(candidatePath: string | undefined): Promise<void> {
   if (!candidatePath) return;
   await Promise.all([
@@ -311,7 +290,7 @@ function transactionOutcome(attempt: number, faultValue: ConfigFault): ConfigTra
 }
 
 function configHash(config: GitConfig): string {
-  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex");
+  return hashBytes(Buffer.from(JSON.stringify(config)));
 }
 
 /** Optimistic-CAS add-only transaction. The rename is the sole commit point. */
@@ -322,6 +301,10 @@ export async function applyConfigTransaction(repoDir: string, configPath: string
   const identity = options.identity ?? systemLockIdentity;
   const runGit = options.git ?? gitRaw;
   let lastFault = fault("transient", "read-error");
+
+  // Sweep is best-effort and runs only when a config transaction is already due;
+  // it never adds per-cycle work to the warm carry path.
+  await sweepConfigTransactionOrphans(configPath, identity).catch(() => {});
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let candidatePath: string | undefined;
@@ -370,12 +353,13 @@ export async function applyConfigTransaction(repoDir: string, configPath: string
 
       const acquired = await acquireLock(`${configPath}.lock`, { ...options.lock, identity });
       if (acquired.status !== "acquired") {
+        const lockError = acquired.status === "error" ? classifyConfigFsError(acquired.error) : undefined;
         lastFault = acquired.status === "held"
           ? fault("transient", "lock-busy")
           : acquired.status === "unsupported"
             ? fault("permanent", "lock-unsupported", acquired.error)
-            : classifyConfigFsError(acquired.error).disposition === "permanent"
-              ? classifyConfigFsError(acquired.error)
+            : lockError?.disposition === "permanent"
+              ? lockError
               : fault("transient", "lock-error", acquired.error);
         if (lastFault.disposition === "permanent") return transactionOutcome(attempt, lastFault);
         await prepareRetry(lastFault);

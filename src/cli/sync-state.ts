@@ -6,6 +6,7 @@ import {
   loadRawState,
   repoRecordsForState,
   saveState,
+  stateFromRepoRecords,
   type FileOnlyManifest,
   type RepoRecord,
   type RepoRecordInput,
@@ -14,6 +15,15 @@ import {
 } from "./config.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+
+export function configLaneState(record: ConfigLaneState): ConfigLaneState {
+  return {
+    ...(record.cfgSynced === undefined ? {} : { cfgSynced: record.cfgSynced }),
+    ...(record.cfgApplied === undefined ? {} : { cfgApplied: record.cfgApplied }),
+    ...(record.cfgToken === undefined ? {} : { cfgToken: record.cfgToken }),
+    ...(record.cfgShape === undefined ? {} : { cfgShape: record.cfgShape }),
+  };
+}
 
 export interface RepoStateValues {
   bases?: Record<string, GitSection>;
@@ -83,10 +93,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
     ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
     ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
-    ...(lane.cfgSynced === undefined ? {} : { cfgSynced: lane.cfgSynced }),
-    ...(lane.cfgApplied === undefined ? {} : { cfgApplied: lane.cfgApplied }),
-    ...(lane.cfgToken === undefined ? {} : { cfgToken: lane.cfgToken }),
-    ...(lane.cfgShape === undefined ? {} : { cfgShape: lane.cfgShape }),
+    ...configLaneState(lane),
   }, source.authoredCfgHashByRepo?.[relPath]);
 }
 
@@ -117,24 +124,13 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
   const packet = composeStateSavePacket(snapshot, source);
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
-  const bases: Record<string, GitSection> = {};
-  const pending: Record<string, GitSection> = {};
-  const removed: Record<string, string> = {};
-  const resolutions: Record<string, string> = {};
-  for (const [relPath, record] of Object.entries(records)) {
-    if (record.base !== undefined) bases[relPath] = record.base;
-    if (record.pending !== undefined) pending[relPath] = record.pending;
-    if (record.removedKey !== undefined) removed[relPath] = record.removedKey;
-    if (record.resolutionKey !== undefined) resolutions[relPath] = record.resolutionKey;
-  }
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
   return {
-    ...snapshot,
-    lastSyncedSequence: packet.global ? source.sourceGlobalSeq : snapshot.lastSyncedSequence,
-    lastSyncedManifest: { ...manifest, gitRepos: Object.keys(bases).length ? bases : undefined },
-    gitPendingRemote: Object.keys(pending).length ? pending : undefined,
-    gitReposRemoved: Object.keys(removed).length ? removed : undefined,
-    gitNeedsResolution: Object.keys(resolutions).length ? resolutions : undefined,
+    ...stateFromRepoRecords({
+      ...snapshot,
+      lastSyncedSequence: packet.global ? source.sourceGlobalSeq : snapshot.lastSyncedSequence,
+      lastSyncedManifest: manifest,
+    }, records),
     // link()-unsupported fallback intentionally has no lane fence/state.
     stateNonce: undefined,
     stateRevision: undefined,

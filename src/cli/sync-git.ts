@@ -44,6 +44,7 @@ import {
   materializeFreshGitConfig,
   readConfigSnapshot,
   readParsedConfigSnapshot,
+  sameConfigStatToken,
   readStableParsedConfigSnapshot,
   type ConfigFault,
   type ConfigStatToken,
@@ -52,7 +53,7 @@ import {
 } from "../engine/git/config-txn.js";
 import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
-import { completeConfigApply, type ConfigLaneState } from "./sync-state.js";
+import { completeConfigApply, configLaneState, type ConfigLaneState } from "./sync-state.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 
@@ -188,10 +189,6 @@ async function readLocalGitConfig(
   };
 }
 
-function sameConfigToken(a: ConfigStatToken | undefined, b: ConfigStatToken | undefined): boolean {
-  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
-}
-
 function sameConfigShape(a: ConfigShapeIdentity | undefined, b: ConfigShapeIdentity | undefined): boolean {
   return a !== undefined && b !== undefined && a.shape === b.shape &&
     a.commonDir.realpath === b.commonDir.realpath && a.commonDir.dev === b.commonDir.dev &&
@@ -219,15 +216,6 @@ async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owned: bool
     },
   };
   return { owned: ctx.kind === "dir" && gitReal === commonReal && contained, shape, configPath: path.join(ctx.commonDir, "config") };
-}
-
-function configLaneOnly(record: RepoRecordInput): ConfigLaneState {
-  return {
-    ...(record.cfgSynced === undefined ? {} : { cfgSynced: record.cfgSynced }),
-    ...(record.cfgApplied === undefined ? {} : { cfgApplied: record.cfgApplied }),
-    ...(record.cfgToken === undefined ? {} : { cfgToken: record.cfgToken }),
-    ...(record.cfgShape === undefined ? {} : { cfgShape: record.cfgShape }),
-  };
 }
 
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
@@ -1853,10 +1841,10 @@ opts: {
 
   const laneRecord = (rel: string): RepoRecordInput => ({
     sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
-    ...(configLane[rel] ?? configLaneOnly(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
+    ...(configLane[rel] ?? configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
   });
   const replaceLane = (rel: string, record: RepoRecordInput): void => {
-    configLane[rel] = configLaneOnly(record);
+    configLane[rel] = configLaneState(record);
   };
   const invalidateLaneShape = (rel: string, shape: ConfigShapeIdentity | undefined): RepoRecordInput => {
     const current = laneRecord(rel);
@@ -2055,7 +2043,7 @@ opts: {
             configTarget = { fresh: false, shape: receiver.shape, configPath: receiver.configPath };
             const current = await readConfigSnapshot(receiver.configPath);
             const token = current.ok ? current.snapshot.token : undefined;
-            configDue = gitConfigHash(remoteSec.config) !== lane.cfgApplied || !sameConfigToken(token, lane.cfgToken);
+            configDue = gitConfigHash(remoteSec.config) !== lane.cfgApplied || !sameConfigStatToken(token, lane.cfgToken);
           }
         }
       }

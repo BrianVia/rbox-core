@@ -92,3 +92,20 @@
 
 - Added and registered `scripts/rig/scenarios/git-config-sync.ts`, using `provisionPair`, per-step recorder assertions, throttled A push/B pull, and normal account teardown. It creates a real tracked repo on A with remote/tracking config, verifies B's materialized `remote -v` and `status -sb`, deletes B's remote URL/fetch keys and proves a same-head pull heals them, publishes an A-only URL edit and verifies both devices' persisted wire view, then runs two A/B idle sync cycles and requires zero sequence growth.
 - Per the task instruction, the rig itself was not run. Scenario unit/registry coverage is green: `bun test scripts/rig/scenarios` — 16 pass, 0 fail; the new scenario is typecheck-clean.
+
+## Whole-branch cleanup pass
+
+- Reused the engine SHA-256 helper for canonical config hashes, moved directory fsync into `fsutil`, and shared the NUL-delimited Git config parser between direct and snapshot reads. Config stat-token equality, config-lane projection, and record-to-state projection now each have one implementation.
+- Wired the already-tested orphan sweeper into the config transaction itself. It runs best-effort only when an apply is due, so crash debris is reclaimed without adding work to warm carry cycles.
+- Made local config duplicate removal linear with per-key sets, while preserving first-seen value order and all canonicalization outcomes. The validator also reuses its first key parse instead of reparsing every key.
+- Removed reset's dynamic mutex imports, reused the common mutex assertion, collapsed daemon mutex release to one `finally`, removed repeated lock-marker parsing/error classification, and cleaned the incremental mutex-wrapper indentation seams.
+
+### Findings intentionally not changed
+
+- Did not replace lock-marker or config-candidate creation with `writeFileAtomic`: §7 requires `O_EXCL` + `O_NOFOLLOW`, a fully-fsynced marker followed by `link()`, and owner-checked publication; the general atomic writer does not provide those semantics.
+- Did not batch the per-value `git config --add` subprocesses or remove the candidate/final parses: §7 explicitly pins add-per-value construction and derives `C_post`/the post token from installed bytes while the lock is held.
+- Did not collapse B1/B2, the status/apply preflight read, or same-directory snapshot parsing. Those reads can look redundant, but §§4/6/7 bind the stability bracket, optimistic byte CAS, due-before-shortcut rule, and “Git never opens the live file” discipline.
+- Did not merge the workspace sync mutex with the short state/config locks. They fence different boundaries: the operation-wide decision→filesystem→state interval versus owner-checked atomic publication.
+- Did not remove the nonce-less/link-unsupported compatibility path or `state-incarnation.json`. §6 explicitly preserves legacy git-state behavior when the config lane cannot safely use hard links, and the incarnation marker fences reset/rebind while `state.json` remains absent.
+- Did not unify the config stat token with the divergence fingerprint's internal `StatToken`: the persisted token is lossless bigint identity for the config due predicate, while the fingerprint token is a broader cache-only shape with content/stat fallbacks.
+- Did not add cross-repo config parsing batches. Each owned repo has an independent common config and lock; the v4 divergence cache already makes warm carry/status cycles parse-free, while cold misses must use the per-repo snapshot parser required by §4.
