@@ -1632,7 +1632,8 @@ async function probeAndCacheDivergenceRepo(
   rel: string,
   cache: GitDivergenceCache,
   before: GitFingerprint,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  gitConfigRunner?: GitConfigRunner
 ): Promise<{ kind?: GitRepoKind; probe?: CachedDivergenceProbe }> {
   const realCtx = (await repoCtx(repoDirOf(root, rel)).catch(() => undefined)) ?? null;
   const repoKind = before.diskCtx?.kind ?? realCtx?.kind ?? hintKind;
@@ -1641,7 +1642,7 @@ async function probeAndCacheDivergenceRepo(
   for (let attempt = 0; attempt < 2; attempt++) {
     last = await probeDivergenceRepo(root, rel, realCtx);
     const localCfg = !last.busy && last.preflightOk
-      ? await readLocalGitConfig(root, rel, before.diskCtx ?? realCtx ?? undefined)
+      ? await readLocalGitConfig(root, rel, before.diskCtx ?? realCtx ?? undefined, gitConfigRunner)
       : undefined;
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
     const after = await gitFingerprint(run, root, rel);
@@ -1671,14 +1672,15 @@ async function cachedDivergenceProbe(
   rel: string,
   cache: GitDivergenceCache,
   out: Map<string, CachedDivergenceProbe>,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  gitConfigRunner?: GitConfigRunner
 ): Promise<GitRepoKind | undefined> {
   const hit = await fingerprintHitProbe(run, root, rel, cache, hintKind);
   if (hit.status === "hit") {
     out.set(rel, hit.probe);
     return hit.kind;
   }
-  const refreshed = await probeAndCacheDivergenceRepo(run, root, rel, cache, hit.fingerprint, hit.kind);
+  const refreshed = await probeAndCacheDivergenceRepo(run, root, rel, cache, hit.fingerprint, hit.kind, gitConfigRunner);
   if (refreshed.probe) out.set(rel, refreshed.probe);
   return refreshed.kind;
 }
@@ -2247,13 +2249,19 @@ export interface GitDivergenceStatus {
   configDisabled: Array<{ relPath: string; reason: string }>;
 }
 
+export interface GitDivergenceStatusOptions {
+  /** Deterministic §11 seam for forcing a config snapshot to remain unstable. */
+  gitConfigRunner?: GitConfigRunner;
+}
+
 export async function gitDivergenceStatus(
   root: string,
   cfg: WorkspaceConfig,
   state: SyncState,
   matcher?: IgnoreMatcher,
   discoveredRepos?: GitDivergenceRepoSource,
-  includeBaseRepos = true
+  includeBaseRepos = true,
+  options: GitDivergenceStatusOptions = {}
 ): Promise<GitDivergenceStatus> {
   if (!cfg.syncGit) return { count: 0, configChecking: [], configDisabled: [] };
   const base = state.lastSyncedManifest.gitRepos ?? {};
@@ -2280,7 +2288,7 @@ export async function gitDivergenceStatus(
     if (repo.kind) kindByPath.set(repo.relPath, repo.kind);
     if (pending[repo.relPath] || scheduled.has(repo.relPath)) return;
     scheduled.add(repo.relPath);
-    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes, repo.kind)
+    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes, repo.kind, options.gitConfigRunner)
       .then((kind) => {
         if (kind) kindByPath.set(repo.relPath, kind);
       })
@@ -2325,7 +2333,7 @@ export async function gitDivergenceStatus(
       if (shouldPublishGitConfig(baseSec.config, cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced)) n++;
       return;
     }
-    const localCfg = await readLocalGitConfig(root, rel);
+    const localCfg = await readLocalGitConfig(root, rel, undefined, options.gitConfigRunner);
     if (localCfg.status === "ok") {
       if (shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) n++;
       return;
