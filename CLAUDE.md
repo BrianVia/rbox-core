@@ -2,6 +2,10 @@
 look at AGENTS.md for your rules
 <!-- stripe-projects-cli managed:claude-md:end -->
 
+## Deployments
+
+@docs/DEPLOYMENTS.md
+
 ## D1 migrations (apps/api/migrations/README.md)
 
 Before adding or touching anything under `apps/api/migrations/`, read
