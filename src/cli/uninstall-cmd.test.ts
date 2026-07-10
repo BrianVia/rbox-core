@@ -29,6 +29,7 @@ test("dry run prints removal steps without acting", async () => {
       home,
       rboxHome,
       log: (line) => lines.push(line),
+      keystoreBackupAtRisk: async () => false,
       stopDaemon: async (root) => void stopped.push(root),
       disableAutostart: async () => void (disabled = true),
       rm: async () => void (removed = true),
@@ -61,6 +62,7 @@ test("--yes stops desired daemons, falls back to raw pidfiles, disables autostar
       home,
       rboxHome,
       log: (line) => lines.push(line),
+      keystoreBackupAtRisk: async () => false,
       readDesiredDaemonRows: async () => [
         {
           key: "desired-key",
@@ -91,4 +93,50 @@ test("--yes stops desired daemons, falls back to raw pidfiles, disables autostar
   expect(out).toContain("removed");
   expect(out).toContain("# >>> rbox PATH >>>");
   expect(out).toContain("# <<< rbox PATH <<<");
+});
+
+test("at-risk dry run warns about unrecoverable encrypted data and points to key backup", async () => {
+  await uninstallCmd({}, {
+    home,
+    rboxHome,
+    log: (line) => lines.push(line),
+    keystoreBackupAtRisk: async () => true,
+  });
+
+  const out = lines.join("\n");
+  expect(out).toContain("WARNING:");
+  expect(out).toContain("UNRECOVERABLE");
+  expect(out).toContain("rbox key backup");
+});
+
+test("at-risk --yes warns before removing rbox home and still proceeds", async () => {
+  const events: string[] = [];
+  await uninstallCmd({ yes: "true" }, {
+    home,
+    rboxHome,
+    log: (line) => {
+      lines.push(line);
+      events.push(`log:${line}`);
+    },
+    keystoreBackupAtRisk: async () => true,
+    readDesiredDaemonRows: async () => [],
+    disableAutostart: async () => {},
+    rm: async (target) => void events.push(`rm:${target}`),
+  });
+
+  expect(lines.join("\n")).toContain("rbox key backup");
+  expect(events.findIndex((event) => event.includes("WARNING:"))).toBeLessThan(events.findIndex((event) => event.startsWith("rm:")));
+  expect(events).toContain(`rm:${rboxHome}`);
+});
+
+test("not-at-risk uninstall prints no keystore warning", async () => {
+  await uninstallCmd({}, {
+    home,
+    rboxHome,
+    log: (line) => lines.push(line),
+    keystoreBackupAtRisk: async () => false,
+  });
+
+  expect(lines.join("\n")).not.toContain("WARNING:");
+  expect(lines.join("\n")).not.toContain("rbox key backup");
 });

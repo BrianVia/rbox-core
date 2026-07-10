@@ -318,17 +318,35 @@ function shallowestObstructedAncestor(relPath: string, obstructed: ReadonlySet<s
  * writer this is an EXPLICIT OVERWRITE — no reconcile precondition, no conflict-copy
  * (the user asked for these exact bytes at this version). Still fully guarded: the
  * symlink-parent traversal check, decrypt + plaintext-sha verify, and an atomic
- * rename (so a partial/failed restore never leaves a truncated target). Does NOT
- * commit or rewrite history — the next sync sees it as an ordinary local edit.
+ * rename (so a partial/failed restore never leaves a truncated target). When a
+ * trash batch is supplied, the previous on-disk copy is preserved there. Does
+ * NOT commit or rewrite history — the next sync sees it as an ordinary local edit.
  */
-export async function restoreEntryToPath(destRoot: string, entry: FileEntry, store: BlobStore, kek?: Buffer): Promise<void> {
+export async function restoreEntryToPath(
+  destRoot: string,
+  entry: FileEntry,
+  store: BlobStore,
+  kek?: Buffer,
+  opts: { trash?: TrashBatch } = {}
+): Promise<{ previousCopyTrashed: boolean }> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlinked-parent escape
   await fs.mkdir(path.dirname(abs), { recursive: true });
   const tmp = tmpName(abs);
   try {
     await stageEntryToTemp(tmp, entry, store, kek);
+    let previousCopyTrashed = false;
+    if (opts.trash) {
+      const exists = await fs.lstat(abs).then(() => true, (error: unknown) => {
+        if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return false;
+        throw error;
+      });
+      if (exists) {
+        previousCopyTrashed = await opts.trash.put(entry.path);
+      }
+    }
     await fs.rename(tmp, abs); // atomic replace of any existing file/symlink
+    return { previousCopyTrashed };
   } catch (e) {
     await fs.rm(tmp, { force: true }).catch(() => {});
     throw e;

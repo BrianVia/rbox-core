@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { restoreEntryToPath } from "../engine/index.js";
+import { openTrashBatch } from "../engine/trash.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { bootstrapOnto, cfgFor, FakeServer, remoteFor } from "./e2ee-fake-server.js";
@@ -14,6 +15,7 @@ const WS = "ws_vh";
 const FILE = "notes.txt";
 const V1 = "version one — the original\n";
 const V2 = "version two — edited later\n";
+const V3 = "version three — unpushed local edit\n";
 
 let dirs: string[] = [];
 async function tmp(): Promise<string> {
@@ -52,10 +54,41 @@ describe("E2EE version history + restore (design 12 §15)", () => {
     const { manifest, kek } = await remote.manifestAtSeq(1);
     const entry = manifest.files.find((f) => f.path === FILE);
     expect(entry).toBeDefined();
-    await restoreEntryToPath(root, entry!, remote.blobStore(), Buffer.from(kek));
+    const result = await restoreEntryToPath(root, entry!, remote.blobStore(), Buffer.from(kek));
 
     // The cardinal assertion: the on-disk file is byte-identical to the v1 content.
     expect(await fs.readFile(path.join(root, FILE), "utf8")).toBe(V1);
+    expect(result.previousCopyTrashed).toBe(false);
+  });
+
+  test("restore preserves an overwritten local edit in the local trash", async () => {
+    const { remote, root } = await twoVersions();
+    await fs.writeFile(path.join(root, FILE), V3);
+
+    const { manifest, kek } = await remote.manifestAtSeq(1);
+    const entry = manifest.files.find((f) => f.path === FILE)!;
+    const batch = openTrashBatch(root);
+    const result = await restoreEntryToPath(root, entry, remote.blobStore(), Buffer.from(kek), { trash: batch });
+    await batch.finish();
+
+    expect(result.previousCopyTrashed).toBe(true);
+    expect(await fs.readFile(path.join(root, FILE), "utf8")).toBe(V1);
+    expect(await fs.readFile(path.join(batch.dir, FILE), "utf8")).toBe(V3);
+  });
+
+  test("restore of a locally absent file reports that no previous copy was trashed", async () => {
+    const { remote, root } = await twoVersions();
+    await fs.rm(path.join(root, FILE));
+
+    const { manifest, kek } = await remote.manifestAtSeq(1);
+    const entry = manifest.files.find((f) => f.path === FILE)!;
+    const batch = openTrashBatch(root);
+    const result = await restoreEntryToPath(root, entry, remote.blobStore(), Buffer.from(kek), { trash: batch });
+    await batch.finish();
+
+    expect(result.previousCopyTrashed).toBe(false);
+    expect(await fs.readFile(path.join(root, FILE), "utf8")).toBe(V1);
+    expect(await fs.lstat(batch.dir).catch(() => undefined)).toBeUndefined();
   });
 
   test("versions lists the full verified chain newest-first (seq + device)", async () => {

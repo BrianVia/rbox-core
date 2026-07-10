@@ -337,7 +337,7 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
  *  NEVER sent to the server (design 12 §14.6). Printed once; treat as a secret. */
 export async function pairCreate(): Promise<void> {
   const creds = await requireCreds();
-  if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap`, `rbox pair`-connect, or `rbox key recover` first.");
+  if (!creds.accountId) throw new Error("this device isn't enrolled for encryption — run `rbox login --bootstrap <secret>`, `rbox connect` (paste a pairing token from an enrolled machine), or `rbox key recover` first.");
   const loaded = await loadDevice(creds.accountId);
   if (!loaded || !("secrets" in loaded)) throw new Error("no encryption key on this device — pair/recover this machine before creating a pairing token.");
 

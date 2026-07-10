@@ -94,7 +94,7 @@ test("finish removes the .active marker; a zero-put batch leaves nothing on disk
 
 test("a vanished source is not an error (already-gone delete semantics)", async () => {
   const batch = openTrashBatch(root);
-  await expect(batch.put("never-existed.txt")).resolves.toBeUndefined();
+  await expect(batch.put("never-existed.txt")).resolves.toBe(false);
   await batch.finish();
 });
 

@@ -4,6 +4,10 @@ import path from "node:path";
 import { disableAutostart, readDesiredDaemonRows } from "./autostart-cmd.js";
 import { parseDaemonPid, stopDaemon } from "./daemon-control.js";
 import { homeDir } from "./rbox-paths.js";
+import { loadCredentials } from "./credentials.js";
+import { loadDevice } from "./e2ee-keystore.js";
+import { readRecoveryKitRecord } from "./recovery-kit.js";
+import { style } from "./style.js";
 
 interface UninstallDeps {
   home?: string;
@@ -14,6 +18,22 @@ interface UninstallDeps {
   rm?: typeof fs.rm;
   log?: (line: string) => void;
   readDesiredDaemonRows?: typeof readDesiredDaemonRows;
+  keystoreBackupAtRisk?: () => Promise<boolean>;
+}
+
+async function keystoreBackupAtRisk(): Promise<boolean> {
+  const creds = await loadCredentials();
+  if (!creds?.accountId) return false;
+  const [device, kit] = await Promise.all([loadDevice(creds.accountId), readRecoveryKitRecord(creds.accountId)]);
+  return device !== undefined && kit === undefined;
+}
+
+async function warnIfKeystoreAtRisk(log: (line: string) => void, deps: UninstallDeps): Promise<void> {
+  const atRisk = await (deps.keystoreBackupAtRisk ?? keystoreBackupAtRisk)().catch(() => false);
+  if (!atRisk) return;
+  log(style.red("WARNING: this machine holds your encryption keys and no recovery kit has been saved."));
+  log("Removing ~/.rbox without a recovery phrase backup makes your encrypted data UNRECOVERABLE.");
+  log("Save your phrase first: rbox key backup");
 }
 
 interface StopResult {
@@ -83,10 +103,12 @@ export async function uninstallCmd(flags: Record<string, string>, deps: Uninstal
   const rc = targetRc(home);
 
   if (flags.yes !== "true") {
+    await warnIfKeystoreAtRisk(log, deps);
     printDryRun(log, rboxHome, rc);
     return;
   }
 
+  await warnIfKeystoreAtRisk(log, deps);
   const stopped = await stopTrackedDaemons(rboxHome, deps);
   await (deps.disableAutostart ?? disableAutostart)().catch(() => {});
   await (deps.rm ?? fs.rm)(rboxHome, { recursive: true, force: true });
