@@ -217,6 +217,22 @@ describe("crypto worker pool", () => {
     }
   });
 
+  test("reset prevents a failed health check from leaking disabled state", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-reset-"));
+    try {
+      __cryptoPoolTestHooks.setWorkerPath(path.join(root, "missing-worker.ts"));
+      await withCryptoPool(generateKek(), 1, 1, async () => {});
+      expect(cryptoPoolStatus().state).toBe("disabled");
+
+      await __cryptoPoolTestHooks.reset();
+      process.env.RBOX_CRYPTO_WORKERS = "0";
+      await sleep(25);
+      expect(cryptoPoolStatus().state).toBe("off");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("RBOX_CRYPTO_WORKERS=0 and job-count floor both keep operations inline", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-floor-"));
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-floor-ct-"));
