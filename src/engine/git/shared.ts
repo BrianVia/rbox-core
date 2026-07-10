@@ -327,6 +327,17 @@ export async function exists(p: string): Promise<boolean> {
   }
 }
 
+async function existsNoFollow(p: string): Promise<boolean> {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    // A busy probe must fail closed on inspection errors.
+    return true;
+  }
+}
+
 /** rename, with an EXDEV fallback (copy to a temp in the DEST dir, then rename) — a
  *  pointer repo's resolved gitdir (the main clone) may live on a different mount than
  *  the worktree where the apply staged its temp files. */
@@ -345,11 +356,11 @@ export async function moveFileAtomic(src: string, dest: string): Promise<void> {
 export async function gitBusy(ctx: RepoCtx): Promise<boolean> {
   // per-worktree locks live in the resolved gitdir; store-wide locks in the common dir
   for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "config.lock"), path.join(ctx.commonDir, "gc.pid")]) {
-    if (await exists(lock)) return true;
+    if (await existsNoFollow(lock)) return true;
   }
   // any *.lock under the SHARED refs/
   const refsDir = path.join(ctx.commonDir, "refs");
-  if (await exists(refsDir)) {
+  if (await existsNoFollow(refsDir)) {
     for (const rel of await walkFiles(refsDir)) if (rel.endsWith(".lock")) return true;
   }
   return false;
