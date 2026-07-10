@@ -2,6 +2,14 @@
 look at AGENTS.md for your rules
 <!-- stripe-projects-cli managed:claude-md:end -->
 
+## D1 migrations (apps/api/migrations/README.md)
+
+Before adding or touching anything under `apps/api/migrations/`, read
+`apps/api/migrations/README.md`: filenames are append-only (wrangler tracks
+applied migrations by filename — never rename), pick the next free number and
+re-check it after rebasing. A config-time guard in `apps/api/vitest.config.ts`
+fails the test suite on any new number collision.
+
 ## Session log (docs/STATUS.md)
 
 `docs/STATUS.md` is the living cross-host state snapshot. At the end of each
