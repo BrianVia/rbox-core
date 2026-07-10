@@ -16,8 +16,12 @@ container starts; every resource the rig creates is namespaced `rig-*`.
 - [Apple `container`](https://github.com/apple/container) v1.0.0 (`brew install container`).
 - `bun` on the host.
 - A dev bootstrap secret: env `RBOX_DEV_BOOTSTRAP`, or a line
-  `RBOX_DEV_BOOTSTRAP_SECRET=<secret>` in `dev-keys.local.secret` at the repo root
-  (gitignored; in a worktree the rig also probes the primary checkout). Never printed.
+  `RBOX_DEV_BOOTSTRAP_SECRET=<secret>` in `dev-keys.local.secret` at the repo root.
+- The dev platform secret: env `RBOX_DEV_PLATFORM_SECRET`, or a line
+  `RBOX_DEV_PLATFORM_SECRET=<secret>` in that same repo-root secret file.
+
+The secret file is gitignored; in a worktree the rig also probes the primary
+checkout. Secret values are never printed.
 
 Run `bun run rig doctor` first — it checks all of the above and prints fix-it
 commands. It never mutates anything.
@@ -37,7 +41,8 @@ Flags: `--api-url <url>` (overrides `RBOX_API`; prod is always refused),
 
 ### What `onboard-smoke` does
 
-1. **A** `rbox login --bootstrap` (secret injected by env, never argv).
+1. **A** `rbox login --bootstrap` (secret injected by env, never argv), then the rig
+   grants the throwaway account a `pro` plan through the dev-only admin endpoint.
 2. **A** seed a ~100-file deterministic corpus (`scripts/bench/corpus.ts`, shape
    `tiny`) + a symlink (historic regression shapes: empty, duplicate, symlink).
 3. **A** `rbox init --new`; read the workspace id from `.rbox/workspace.json`.

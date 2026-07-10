@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import * as C from "./lib/container.js";
 import { DEFAULT_DEV_API, GUEST, imageHash, NAMES, resolveConfig } from "./lib/config.js";
 import { Device } from "./lib/device.js";
-import { resolveBootstrapSecret } from "./lib/account.js";
+import { resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js";
 import { RunCapture } from "./lib/capture.js";
 import { renderReportMd } from "./lib/report.js";
 import { waitForConvergence, waitForPath } from "./lib/waiters.js";
@@ -169,7 +169,13 @@ async function resetGuests(devices: { a: Device; b: Device }, log: (l: string) =
  * handles + waiters), a guest reset, the P1 capture lifecycle, and the report
  * artifacts. Returns the report. Shared by the single-scenario path and the suite.
  */
-async function executeScenario(scenario: Scenario, apiUrl: string, flags: Record<string, string>, bootstrapSecret: string): Promise<ScenarioReport> {
+async function executeScenario(
+  scenario: Scenario,
+  apiUrl: string,
+  flags: Record<string, string>,
+  bootstrapSecret: string,
+  platformSecret: string
+): Promise<ScenarioReport> {
   const runDir = path.join(RUNS_DIR, `${timestamp()}-${scenario.name}`);
   fs.mkdirSync(runDir, { recursive: true });
   const logPath = path.join(runDir, "run.log");
@@ -190,6 +196,7 @@ async function executeScenario(scenario: Scenario, apiUrl: string, flags: Record
     b,
     apiUrl,
     bootstrapSecret,
+    platformSecret,
     runDir,
     keepAccount: flags["keep-account"] === "true",
     flags,
@@ -268,8 +275,9 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
   }
   // Resolve the secret up front (never printed) so a misconfig fails before any work.
   const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
+  const platformSecret = resolvePlatformSecret(REPO_ROOT);
   await ensureUp(apiUrl);
-  const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret);
+  const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret);
   return reportExit(report);
 }
 
@@ -280,13 +288,14 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
  */
 async function runSuite(apiUrl: string, flags: Record<string, string>): Promise<number> {
   const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
+  const platformSecret = resolvePlatformSecret(REPO_ROOT);
   await ensureUp(apiUrl);
 
   const results: ScenarioReport[] = [];
   for (const name of FAST_SUITE) {
     const scenario = getScenario(name)!;
     console.log(`\n═══ suite: ${name} (${results.length + 1}/${FAST_SUITE.length}) ═══`);
-    results.push(await executeScenario(scenario, apiUrl, flags, bootstrapSecret));
+    results.push(await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret));
   }
 
   const pad = Math.max(...results.map((r) => r.scenario.length));
@@ -444,6 +453,14 @@ async function doctor(apiUrl: string): Promise<number> {
     add("bootstrap secret resolvable", true, "found (redacted)");
   } catch (e) {
     add("bootstrap secret resolvable", false, e instanceof Error ? e.message : String(e), "set RBOX_DEV_BOOTSTRAP or add RBOX_DEV_BOOTSTRAP_SECRET= to dev-keys.local.secret");
+  }
+
+  // platform secret resolvable (never printed)
+  try {
+    resolvePlatformSecret(REPO_ROOT);
+    add("platform secret resolvable", true, "found (redacted)");
+  } catch (e) {
+    add("platform secret resolvable", false, e instanceof Error ? e.message : String(e), "set RBOX_DEV_PLATFORM_SECRET or add RBOX_DEV_PLATFORM_SECRET= to dev-keys.local.secret");
   }
 
   // dev API reachable (GET /health, 5s budget)

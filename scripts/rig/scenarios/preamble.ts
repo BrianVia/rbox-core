@@ -9,7 +9,7 @@
  * discipline as before; `rboxShell` masks them in transcripts.
  */
 import { GUEST } from "../lib/config.js";
-import { deleteAccount, readCredentials } from "../lib/account.js";
+import { deleteAccount, grantProPlan, readCredentials } from "../lib/account.js";
 import { daemonWatcherMode, type Device } from "../lib/device.js";
 import { waitForPath } from "../lib/waiters.js";
 import type { Recorder } from "./harness.js";
@@ -55,6 +55,16 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
       `bun ${GUEST.cliEntry} login --bootstrap "$RIG_BOOT" --remote "$RBOX_API" --no-interactive`,
       { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
     );
+  });
+
+  // Bootstrap creates the account in the locked `none` tier (design 86). Read the
+  // account id the CLI persisted, then unlock this throwaway account before its
+  // first workspace/push. `grantProPlan` independently refuses production.
+  await rec.step("[A] grant pro plan", async () => {
+    const creds = readCredentials(await ctx.a.readFile(`${GUEST.rboxHome}/credentials.json`));
+    if (!creds.accountId) throw new Error("A credentials.json missing accountId after bootstrap");
+    const grant = await grantProPlan(ctx.apiUrl, creds.accountId, ctx.platformSecret);
+    if (!grant.ok) throw new Error(`account plan grant ${grant.status}: ${grant.body.slice(0, 200)}`);
   });
 
   // 2. A: seed corpus (optional) + any scenario-specific extra (symlink, …). The
