@@ -236,9 +236,9 @@ export async function inspectLock(lockPath: string, identity: LockIdentitySource
   }
   const marker = read.marker;
   if (marker.hostId !== current.hostId) return { kind: "foreign", raw: read.raw, reason: "cross-host lock" };
-  if (marker.bootId !== current.bootId) return { kind: "foreign", raw: read.raw, reason: "cross-boot lock" };
+  if (marker.bootId !== current.bootId) return { kind: "dead", marker, raw: read.raw };
   const probe = await identity.probe(marker.pid);
-  if (probe.status === "unknown") return { kind: "foreign", raw: read.raw, reason: "owner liveness unknown" };
+  if (probe.status === "unknown") return { kind: "live", marker, raw: read.raw };
   if (probe.status === "dead" || probe.startTime !== marker.startTime) return { kind: "dead", marker, raw: read.raw };
   return { kind: "live", marker, raw: read.raw };
 }

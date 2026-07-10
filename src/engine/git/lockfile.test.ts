@@ -155,11 +155,10 @@ describe("reaper fencing", () => {
   });
 });
 
-describe("conservative recovery classes", () => {
-  test("cross-host, cross-boot, git-authored, malformed, symlink, and unknown-liveness locks are never removed", async () => {
+describe("liveness recovery classes", () => {
+  test("cross-host, git-authored, malformed, symlink, and unknown-liveness locks are never removed", async () => {
     const cases: Array<{ name: string; write(lockPath: string): Promise<void>; source?: LockIdentitySource }> = [
       { name: "cross-host", write: (p) => fs.writeFile(p, formatLockMarker(marker({ hostId: "cccccccc-cccc-cccc-cccc-cccccccccccc" }))) },
-      { name: "cross-boot", write: (p) => fs.writeFile(p, formatLockMarker(marker({ bootId: "dddddddd-dddd-dddd-dddd-dddddddddddd" }))) },
       { name: "git-authored", write: (p) => fs.writeFile(p, "") },
       { name: "malformed", write: (p) => fs.writeFile(p, "rbox-93 broken") },
       { name: "symlink", write: async (p) => fs.symlink("missing", p) },
@@ -173,10 +172,26 @@ describe("conservative recovery classes", () => {
       const root = await tempDir();
       const lockPath = path.join(root, "config.lock");
       await item.write(lockPath);
+      if (item.name === "unknown") expect((await inspectLock(lockPath, item.source)).kind).toBe("live");
       const acquired = await acquireLock(lockPath, { identity: item.source ?? identity(), token: () => "f".repeat(32) });
       expect(acquired.status, item.name).toBe("held");
       expect(await fs.lstat(lockPath), item.name).toBeDefined();
     }
+  });
+
+  test("a same-host marker from a different boot is reaped after power-loss recovery", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "sync.lock");
+    const priorBoot = formatLockMarker(marker({ bootId: "dddddddd-dddd-dddd-dddd-dddddddddddd", token: "0".repeat(32) }));
+    await fs.writeFile(lockPath, priorBoot);
+
+    expect((await inspectLock(lockPath, identity())).kind).toBe("dead");
+    const acquired = await acquireLock(lockPath, { identity: identity(), token: () => "f".repeat(32) });
+    expect(acquired.status).toBe("acquired");
+    if (acquired.status !== "acquired") return;
+    expect(await fs.readFile(lockPath, "utf8")).toBe(acquired.lock.raw);
+    expect(acquired.lock.raw).not.toBe(priorBoot);
+    await acquired.lock.release();
   });
 
   test("pid reuse is dead by start-time mismatch and is reaped", async () => {
