@@ -66,6 +66,13 @@ double5 = bytes        (commit body / blob size)
 double6 = count        (blobs per commit, parts)
 double7 = ratio        (0..1, e.g. missingBlobs / referenced)
 double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
+double9 = serverTotalMs    (commit handler wall time returned to the client)
+double10 = envelopeMs      (commit request read, parse, and validation)
+double11 = accountingMs    (receipt/entitlement accounting or legacy existence check)
+double12 = sidecarMs       (sidecar resolution, including its lookup and parse)
+double13 = commitMs        (Durable Object head CAS)
+double14 = mirrorMs        (alarm scheduling, fanout, and D1 mirror)
+double15 = responseMs      (response payload assembly before final serialization)
 ```
 
 Query via the [AE SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).

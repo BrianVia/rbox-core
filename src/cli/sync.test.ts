@@ -158,7 +158,16 @@ class FakeRemote implements SyncRemote {
       this.forceUnsatisfiedOnce = false;
       return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map(addr) };
     }
-    options?.onCommitTimings?.({ refreshMs: 1, sidecarMs: 2, encodeMs: 3, encryptMs: 4, uploadMs: 5, postMs: 6, encBytes: 7 });
+    options?.onCommitTimings?.({
+      refreshMs: 1,
+      sidecarMs: 2,
+      encodeMs: 3,
+      encryptMs: 4,
+      uploadMs: 5,
+      postMs: 6,
+      encBytes: 7,
+      serverTimings: { totalMs: 13, envelopeMs: 1, accountingMs: 2, sidecarMs: 3, commitMs: 4, mirrorMs: 2, responseMs: 1 },
+    });
     this.head += 1;
     this.log.set(this.head, manifest);
     return { sequence: this.head };
@@ -946,7 +955,16 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   expect(j.phases.encrypt!.ciphertextBytes).toBeGreaterThan(0);
   expect(j.phases.encrypt!.changedBytes).toBe(j.phases.encrypt!.ciphertextBytes);
   expect(j.phases.upload!.wireBytes).toBeGreaterThan(0);
-  expect(Object.keys(j.phases.commit!.details ?? {}).sort()).toEqual(["encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "sidecarMs", "uploadMs"]);
+  expect(Object.keys(j.phases.commit!.details ?? {}).sort()).toEqual(["encBytes", "encodeMs", "encryptMs", "postMs", "refreshMs", "serverTimings", "sidecarMs", "uploadMs"]);
+  expect(j.phases.commit!.details?.serverTimings).toEqual({
+    totalMs: 13,
+    envelopeMs: 1,
+    accountingMs: 2,
+    sidecarMs: 3,
+    commitMs: 4,
+    mirrorMs: 2,
+    responseMs: 1,
+  });
   // The summary line is emitted (a phase was recorded) and stays PII-free.
   const lines: string[] = [];
   report.logSummaryTo((l) => lines.push(l));
