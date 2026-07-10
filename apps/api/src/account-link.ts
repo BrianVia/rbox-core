@@ -371,8 +371,8 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
  *  routes through its own §32 seam (`dirDb` vs `dbFor`). */
 export async function accountStatus(env: Env, p: Principal): Promise<Response> {
   const [row, acct] = await Promise.all([
-    dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string }>(),
+    dirDb(env).prepare("SELECT clerk_user_id, signin_method FROM clerk_users WHERE account_id = ?").bind(p.accountId).first<{ clerk_user_id: string; signin_method: string | null }>(),
     dbFor(env, p.accountId).prepare("SELECT plan FROM accounts WHERE id = ?").bind(p.accountId).first<{ plan: string }>(),
   ]);
-  return json({ accountId: p.accountId, linked: !!row, plan: acct?.plan ?? "none" });
+  return json({ accountId: p.accountId, linked: !!row, plan: acct?.plan ?? "none", signInMethod: row?.signin_method ?? null });
 }

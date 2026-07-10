@@ -5,6 +5,7 @@ import { AccountGoneError, createWebSession } from "./auth.js";
 import { refreshOwnerEmail } from "./notify.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingNewAccount } from "./slackpipes.js";
+import { signinMethodsOf } from "./clerk-signin.js";
 
 /**
  * Web auth via Clerk (M11). The browser signs in with Clerk and POSTs its
@@ -138,8 +139,8 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     const candAcct = randomId("acct", 8);
     const candUser = randomId("user", 8);
     await dirDb(env)
-      .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at) VALUES (?, ?, ?, ?)")
-      .bind(sub, candAcct, candUser, nowMs)
+      .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at, signin_method, signin_method_updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(sub, candAcct, candUser, nowMs, clerkUser.signInMethod, clerkUser.clerkUpdatedAt)
       .run();
     map = await dirDb(env)
       .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
@@ -224,16 +225,8 @@ export async function deleteClerkUser(env: Env, sub: string): Promise<boolean> {
 interface ClerkUserFacts {
   verified: boolean;
   email: string | null;
-  signInMethod: string | null; // "github" | "google" | "email" (external-account provider, oauth_ stripped)
-}
-
-/** Clerk `external_accounts[].provider` → a short sign-in method label. No external
- *  account ⇒ "email" (email/password or email-code). Unknown providers pass through
- *  with the `oauth_` prefix stripped (honest over guessing). */
-function signInMethodOf(u: { external_accounts?: Array<{ provider?: string }> }): string {
-  const provider = u.external_accounts?.[0]?.provider;
-  if (typeof provider === "string" && provider.length) return provider.replace(/^oauth_/, "");
-  return "email";
+  signInMethod: string | null;
+  clerkUpdatedAt: number | null;
 }
 
 /** Fetch the Clerk user once for the provisioning gate + signup ping. FAIL CLOSED on the
@@ -242,16 +235,18 @@ function signInMethodOf(u: { external_accounts?: Array<{ provider?: string }> })
 async function fetchClerkUser(env: Env, sub: string): Promise<ClerkUserFacts> {
   try {
     const res = await fetch(`https://api.clerk.com/v1/users/${sub}`, { headers: { authorization: `Bearer ${env.CLERK_SECRET_KEY}` } });
-    if (!res.ok) return { verified: false, email: null, signInMethod: null };
+    if (!res.ok) return { verified: false, email: null, signInMethod: null, clerkUpdatedAt: null };
     const u = (await res.json()) as {
       email_addresses?: Array<{ id: string; email_address?: string; verification?: { status?: string } }>;
       primary_email_address_id?: string;
-      external_accounts?: Array<{ provider?: string }>;
+      external_accounts?: Array<{ provider?: string; verification?: { status?: string } }>;
+      password_enabled?: boolean;
+      updated_at?: number;
     };
     const primary = u.email_addresses?.find((e) => e.id === u.primary_email_address_id) ?? u.email_addresses?.[0];
-    const verified = primary?.verification?.status === "verified";
-    return { verified, email: (verified && primary?.email_address) || null, signInMethod: signInMethodOf(u) };
+    const verified = primary?.verification?.status === "verified" && typeof u.updated_at === "number";
+    return { verified, email: (verified && primary?.email_address) || null, signInMethod: signinMethodsOf(u), clerkUpdatedAt: u.updated_at ?? null };
   } catch {
-    return { verified: false, email: null, signInMethod: null }; // fail closed on provisioning
+    return { verified: false, email: null, signInMethod: null, clerkUpdatedAt: null }; // fail closed on provisioning
   }
 }

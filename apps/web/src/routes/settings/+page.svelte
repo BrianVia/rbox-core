@@ -15,6 +15,7 @@
 
 	let linked = $state<boolean | null>(null);
 	let accountId = $state('');
+	let signInMethod = $state<string | null>(null);
 	let error = $state('');
 	let busy = $state(false);
 	let confirming = $state(false);
@@ -58,6 +59,7 @@
 			const s = await fetchAccountStatus(authState.clerk);
 			linked = s.linked;
 			accountId = s.accountId;
+			signInMethod = s.signInMethod ?? null;
 			error = '';
 		} catch (e) {
 			error = errMsg(e);
@@ -109,6 +111,9 @@
 				This dashboard login is connected to your rbox account
 				<code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{accountId}</code>.
 			</p>
+			{#if signInMethod}
+				<p class="mt-2 text-sm text-muted-foreground">sign-in: {signInMethod}</p>
+			{/if}
 			<p class="mt-2 text-sm text-muted-foreground">
 				Disconnecting signs this web login out of that account and gives it a fresh, empty one.
 				<strong class="font-medium text-foreground">Your devices and files are untouched</strong> —
