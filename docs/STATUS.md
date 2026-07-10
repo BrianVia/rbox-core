@@ -175,15 +175,21 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
   a delete) + two-phase delete w/ verify-after-delete + lease-guarded
   fence drops. 371 API tests incl. the full race matrix;
   `scripts/gc-drain.ts` is the supervised drain tool.
-- **Design 96 (retained roots at O(churn)): ALIGNED after 5 codex rounds,
-  NOT yet implemented** (branch `design/96-roots-index` + REVIEW-96.md).
-  The dropped-set index: reachable = ROOTS(head) ∪ dropped(>floor) ∪
-  seq_roots — proven exact; per-isolate fold mutex; measured heap/CPU rig
-  gates; PER_WORKSPACE_ROOTS_COST=90 imported by 95's arithmetic.
-  **NEXT SESSION: implement 96 → rig gates → dev → prod backfill →
-  design-95 rollout (dry-run audit → supervised drain ~62 GiB → enable
-  cron) → then design 89.** Session paused here per founder instruction
-  (after 95's merge).
+- **Design 96: MERGED (#200, 2026-07-10 night)** — implemented same
+  session (409 API tests first-run green incl. the index-vs-brute-force
+  property test), post-merge CI green on main. Prod backfill starts via
+  DO alarms once Workers Builds deploys (~1,241 seqs on the primary
+  workspace, ~25 MiB/fold, 5× under FOLD_MAX_REFS). The §6.2 250k-scale
+  rig gate is DEFERRED until any commit-admission cap change (field max
+  102k). **REMAINING ROLLOUT (founder-supervised): watch index_state →
+  ready (503 index_building until then; GC Phase 1 starts completing) →
+  dry-run audit (expect ≈62 GiB / ≈70k) → scripts/gc-drain.ts → flip
+  RBOX_GC_PURGE_DISABLED → design 89.** Then: designs 84/85 revision
+  loops (founder-confirmed next after 96's merge; round-1 ledgers on
+  their branches). Prod facts checked tonight: exactly ONE workspace row
+  (ws_2b6e15da/root, 1,241 commits) — the founder IS the whale; the
+  lingering old-workspace data is the unreferenced-blob layer (the drain
+  target), not workspace rows.
 
 - **Designs 84 + 85 staleness reviews (2026-07-10 evening): both REVISE,
   materially stale vs current main** (branches `design/84-review` /
