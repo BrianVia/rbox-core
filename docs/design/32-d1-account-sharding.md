@@ -1,6 +1,14 @@
 # §32 — D1 account sharding (a routing seam, deployable at N=1 today)
 
-**Status:** DRAFT v4 — design only, no implementation. v4 closes the last codex round
+**Status:** 🟢 PHASE 0 SHIPPED (2026-06-30, `6baa9a57`) — the `dbFor(env,
+accountId)` / `dirDb(env)` routing seam is live at N=1 in
+`apps/api/src/db.ts`; all call sites route through it (the one remaining
+raw-binding ref, `diagnostics.ts:354`, is the metrics span-wrap clone, not a
+bypass). Header verified against code 2026-07-10. **Phases 1+ (real shard
+provisioning, the accounts split, data moves, cutover) remain UNBUILT**, and
+the gating founder decision (split vs placement-constraint) remains open.
+Shard tripwires recorded in docs/STATUS.md (D1 >2-3GB, recurring hot-path
+429s, cron budget alarms). Original v4 header follows. v4 closes the last codex round
 (NEEDS-WORK): the projection fail-closed guard must be **in-batch aborting** (FK / `BEFORE
 INSERT ON blob_refs` trigger, like `accounts_cap_guard`), never a post-commit `changes===0`
 check that fires after the grant already committed (§5); and `account_notify_prefs` is removed
