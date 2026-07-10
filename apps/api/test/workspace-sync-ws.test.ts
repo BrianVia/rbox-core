@@ -30,7 +30,10 @@ function fakeCtx(sockets: WebSocket[], kv = new Map<string, unknown>()): Durable
           return out;
         },
       },
+      sql: { exec: () => ({ toArray: () => [] }) },
       transactionSync: (fn: () => void) => fn(),
+      getAlarm: async () => null,
+      setAlarm: async () => {},
     },
     getWebSockets: () => sockets,
     setWebSocketAutoResponse: () => {},

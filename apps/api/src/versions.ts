@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import { blobKey, json, manifestKey } from "./util.js";
 import { dbFor } from "./db.js";
 import { startOp } from "./metrics.js";
+import { loadSidecarRefs } from "./sidecar.js";
 
 // §32 FLAG: global GC (mark/purge) enumerates `workspaces`/`blobs`/`blob_refs`/
 // `gc_candidates` across ALL accounts and keys the per-blob deletes by `sha256` — an
@@ -17,30 +18,108 @@ import { startOp } from "./metrics.js";
  * commit body and hands back the content addresses directly, so GC needs NO R2 manifest
  * fetch and stays zero-knowledge.
  *
- * FAIL CLOSED: a single unreadable DO (non-2xx) THROWS — `Promise.all` rejects on the first
- * failure — so GC never treats a transient DO error as "unreachable" and wrongly reclaims
- * live content. The DO fetches run in parallel (latency); `Set.add` is synchronous between
- * awaits so the union stays race-free on JS's single thread.
+ * FAIL CLOSED: a single unreadable DO or exhausted bound throws, so GC never treats a
+ * partial snapshot as "unreachable" and wrongly reclaims live content. Workspaces are
+ * deliberately sequential so peak memory is the merged set plus one bounded local set.
  */
+export const MAX_DROPPED_PAGES = 16;
+export const MAX_SEQROOTS_PAGES = 4;
+export const MAX_SNAPSHOT_RETRIES = 2;
+export const MAX_UNIQUE_ROOTS = 750_000;
+export const PER_WORKSPACE_ROOTS_COST = 90;
+const ROOTS_PAGE_LIMIT = 20_000;
+
+interface RootsPage {
+  head: number;
+  pruneFloor: number;
+  indexGeneration: number;
+  gap: Array<{
+    manifestSha: string;
+    carrierSha?: string;
+    inlineRefs?: string[];
+    sidecar?: { sha: string; count: number; size: number };
+  }>;
+  droppedPage: string[];
+  nextSha?: string;
+  seqRootsPage: Array<{ manifestSha: string; carrierSha?: string }>;
+  nextSeq?: number;
+}
+
+function addRoot(env: Env, global: Set<string>, local: Set<string>, sha: string): void {
+  if (!sha || local.has(sha) || global.has(sha)) return;
+  if (global.size + local.size >= MAX_UNIQUE_ROOTS) {
+    metric(env, "gc.roots.cardinality_exceeded", global.size + local.size + 1, 0, "fail_closed");
+    throw new Error(`GC abort (fail-closed): reachable roots exceed ${MAX_UNIQUE_ROOTS}`);
+  }
+  local.add(sha);
+}
+
 export async function reachableFromWorkspaces(env: Env, rows: Array<{ workspace_id: string; project_id: string }>): Promise<Set<string>> {
   const reachable = new Set<string>();
-  await Promise.all(
-    rows.map(async (w) => {
+  for (const w of rows) {
+    let complete: Set<string> | null = null;
+    for (let attempt = 0; attempt <= MAX_SNAPSHOT_RETRIES && !complete; attempt++) {
+      const local = new Set<string>();
       const id = env.WORKSPACE_SYNC.idFromName(`${w.workspace_id}/${w.project_id}`);
       // Slash-safe addressing (design 37 §4f follow-up): a positional `…/proj/:proj/roots` path
       // mis-parses a project_id containing "/" → 404 → the fail-closed sweep reclaims NOTHING
       // (indefinite leak of blobs the account-deletion path condemned). Use the DO's FIXED
       // `/roots` path with ws/proj in the query instead.
-      const q = `?ws=${encodeURIComponent(w.workspace_id)}&proj=${encodeURIComponent(w.project_id)}`;
-      const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/roots${q}`);
-      if (!res.ok) throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`);
-      const { roots } = (await res.json()) as { roots: Array<{ encManifestSha: string; encShas: string[] }> };
-      for (const r of roots) {
-        if (r.encManifestSha) reachable.add(r.encManifestSha); // the encrypted manifest (itself a normal blob)
-        for (const s of r.encShas) reachable.add(s); // every referenced ciphertext blob
+      let fromSha = "";
+      let fromSeq = "";
+      let droppedPages = 0;
+      let seqRootsPages = 0;
+      let gapRead = false;
+      let pin: Pick<RootsPage, "head" | "pruneFloor" | "indexGeneration"> | null = null;
+      try {
+        while (fromSha !== "done" || fromSeq !== "done") {
+          if (fromSha !== "done" && ++droppedPages > MAX_DROPPED_PAGES) throw new Error("dropped-page cap exceeded");
+          if (fromSeq !== "done" && ++seqRootsPages > MAX_SEQROOTS_PAGES) throw new Error("seq-roots-page cap exceeded");
+          const q = new URLSearchParams({ ws: w.workspace_id, proj: w.project_id, fromSha, fromSeq, limit: String(ROOTS_PAGE_LIMIT) });
+          if (pin) {
+            q.set("pinHead", String(pin.head));
+            q.set("pinFloor", String(pin.pruneFloor));
+            q.set("pinGen", String(pin.indexGeneration));
+          }
+          const res = await env.WORKSPACE_SYNC.get(id).fetch(`https://do/roots?${q}`);
+          if (res.status === 409) throw new DOMException("snapshot changed", "AbortError");
+          if (!res.ok) throw new Error(`roots status ${res.status}`);
+          const page = (await res.json()) as RootsPage;
+          pin ??= page;
+          for (const sha of page.droppedPage) addRoot(env, reachable, local, sha);
+          for (const root of page.seqRootsPage) {
+            addRoot(env, reachable, local, root.manifestSha);
+            if (root.carrierSha) addRoot(env, reachable, local, root.carrierSha);
+          }
+          if (!gapRead) {
+            for (const gap of page.gap) {
+              addRoot(env, reachable, local, gap.manifestSha);
+              if (gap.carrierSha) addRoot(env, reachable, local, gap.carrierSha);
+              for (const sha of gap.inlineRefs ?? []) addRoot(env, reachable, local, sha);
+              if (gap.sidecar) {
+                addRoot(env, reachable, local, gap.sidecar.sha);
+                const loaded = await loadSidecarRefs(env, gap.sidecar.sha, gap.sidecar.count);
+                if (!loaded.ok) throw new Error(`gap sidecar ${loaded.reason}`);
+                let totalBytes = 0;
+                for (const ref of loaded.refs) totalBytes += ref.size;
+                if (totalBytes !== gap.sidecar.size) throw new Error("gap sidecar descriptor size mismatch");
+                for (const ref of loaded.refs) addRoot(env, reachable, local, ref.encSha);
+              }
+            }
+            gapRead = true;
+          }
+          fromSha = fromSha === "done" ? "done" : page.nextSha ?? "done";
+          fromSeq = fromSeq === "done" ? "done" : page.nextSeq == null ? "done" : String(page.nextSeq);
+        }
+        complete = local;
+      } catch (e) {
+        local.clear(); // release the partial workspace accumulator before a retry
+        if (e instanceof DOMException && e.name === "AbortError" && attempt < MAX_SNAPSHOT_RETRIES) continue;
+        throw new Error(`GC abort (fail-closed): cannot read roots for ${w.workspace_id}/${w.project_id}`, { cause: e });
       }
-    }),
-  );
+    }
+    for (const sha of complete!) reachable.add(sha);
+  }
   return reachable;
 }
 
@@ -62,7 +141,7 @@ export const ADMIN_PURGE_DEADLINE_MS = 60 * 1000;
 export function gcExecuteLimit(workspaceCount: number): number {
   return Math.max(
     0,
-    Math.min(GC_MAX_EXECUTE_ROWS, Math.floor((GC_BUDGET_SAFE - (1 + workspaceCount) - GC_FIXED_COST - GC_P1_COST) / GC_PER_EXECUTE)),
+    Math.min(GC_MAX_EXECUTE_ROWS, Math.floor((GC_BUDGET_SAFE - 1 - workspaceCount * PER_WORKSPACE_ROOTS_COST - GC_FIXED_COST - GC_P1_COST) / GC_PER_EXECUTE)),
   );
 }
 
@@ -126,7 +205,7 @@ async function workspaceSnapshot(env: Env, maxW: number): Promise<Array<{ worksp
 export async function gcMark(env: Env, graceMs: number, nowMs: number = Date.now()): Promise<Response> {
   const op = startOp(env, "gc.mark");
   const db = dbFor(op.env, "");
-  const maxW = GC_BUDGET_SAFE - GC_FIXED_COST - 3; // workspace query + list + insert batch
+  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - 3) / PER_WORKSPACE_ROOTS_COST); // workspace query + list + insert batch
   const workspaces = await workspaceSnapshot(op.env, maxW);
   if (!workspaces) {
     op.done("budget_exceeded");
@@ -367,7 +446,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
   const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const deadlineAt = startedAt + (options.deadlineMs ?? 15 * 60 * 1000);
-  const maxW = GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1;
+  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
   const workspaces = await workspaceSnapshot(op.env, maxW);
   if (!workspaces) {
     op.done("budget_exceeded");
@@ -413,7 +492,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
 
 /** Read-only, paginated operator audit. It never acquires a lease or writes a cursor/intent. */
 export async function gcAudit(env: Env, graceMs: number, cursor: string | null, requestedLimit: number, nowMs: number = Date.now()): Promise<Response> {
-  const maxW = GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1;
+  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
   const workspaces = await workspaceSnapshot(env, maxW);
   if (!workspaces) return json({ wouldIntent: 0, wouldDelete: 0, budgetExceeded: true, cursor: null });
   const pageMax = gcExecuteLimit(workspaces.length);

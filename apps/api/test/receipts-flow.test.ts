@@ -57,7 +57,10 @@ const fakeState = () =>
           put: (key: string, value: unknown) => kv.set(key, value),
           delete: (key: string) => kv.delete(key),
         },
+        sql: { exec: () => ({ toArray: () => [] }) },
         transactionSync(fn: () => void) { fn(); },
+        async getAlarm() { return null; },
+        async setAlarm() {},
       },
     } as unknown as DurableObjectState;
   };
