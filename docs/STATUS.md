@@ -5,7 +5,7 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (morning) — v0.9.18 live fleet-wide: design 93 shipped end-to-end._
+_Last updated: 2026-07-10 (midday) — v0.9.18 fleet-wide; savvy-core conflict resolved; all design-93 threads closed._
 
 ## Where we are
 
@@ -44,11 +44,17 @@ _Last updated: 2026-07-10 (morning) — v0.9.18 live fleet-wide: design 93 shipp
   bounds-in-fingerprint cache invalidation (#194), crypto-pool test
   isolation (#195, ledger item closed). Release-gate flake pattern repeated
   (tag moved to fixed head, same as v0.9.17).
-- **KNOWN: Dfinitiv/savvy-core sits at a needs-resolution git conflict on
-  the Mac** (since 2026-07-10 02:35Z; born from deferred pulls while
-  BrianVia/arch-raw-error-records was checked out in a linked worktree).
-  Config lane correctly holds there — savvy-core's remotes won't sync to
-  fresh hosts until Brian resolves the conflict. Everything else publishes.
+- **savvy-core needs-resolution conflict: RESOLVED 2026-07-10 midday.**
+  Root cause: overnight pulls deferred while BrianVia/arch-raw-error-records
+  (PR #756, merged) was checked out in a linked worktree; the residual
+  divergence had decayed to ONE missing deploy tag. Fix: tag-aligned local
+  to head, removed the stale worktree + branch (local + GitHub). Marker
+  cleared on the next cycle; savvy-core's config (74 keys) is at head —
+  the lane's hold-then-self-heal behavior worked exactly as designed.
+- **RboxBar** rebuilt from main and relaunched on the Mac: carries #190
+  (workspace size display, from a parallel session) + #185 (dropdown UX).
+  Reminder: the bar app ships by local rebuild (`macos/RboxBar/scripts/
+  bundle.sh` → copy to /Applications), NOT via the CLI release.
 - **Design 93 (git config sync) — SHIPPED v0.9.18.** The
   2026-07-10 deal-breaker (rbox-materialized repos have no remotes/tracking;
   ~90/host found on Ubuntu, 179 hand-healed) is closed permanently:
