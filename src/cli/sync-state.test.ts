@@ -25,7 +25,7 @@ import {
   stampConfigAck,
   type StateSource,
 } from "./sync-state.js";
-import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
 
 const stream = "https://api.test::ws_93::root";
 const nonce = "a".repeat(32);
@@ -92,6 +92,51 @@ describe("design 93 §6 sync-point truth table", () => {
 });
 
 describe("design 93 §6 transactional unit", () => {
+  test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {
+    const unavailable: LockIdentitySource = {
+      current: async () => { throw new Error("no identity source"); },
+      probe: async () => ({ status: "unknown" }),
+    };
+    const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", {
+      lock: { identity: unavailable },
+      attempts: 1,
+      onDegraded: () => {},
+    });
+    expect(workspaceSyncMutexDegraded(syncMutex)).toBe(true);
+
+    const initial = baseState({
+      r: { repoGen: 3, sourceSeq: 1, base: section("base"), cfgSynced: "old", cfgApplied: "old" },
+    });
+    let lockedApplyCalled = false;
+    const saved = await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 2,
+      globalManifest: manifest("two", { r: section("next") }),
+      observedRepos: ["r"],
+      values: {
+        bases: { r: section("next") },
+        configLane: { r: { cfgSynced: "new", cfgApplied: "new" } },
+      },
+    }, {
+      forceLegacy: workspaceSyncMutexDegraded(syncMutex),
+      apply: async () => {
+        lockedApplyCalled = true;
+        throw new Error("must not acquire the transactional state lock");
+      },
+    });
+    expect(lockedApplyCalled).toBe(false);
+    expect(saved.stateNonce).toBeUndefined();
+    expect(saved.stateRevision).toBeUndefined();
+    expect(saved.repoRecords).toBeUndefined();
+    expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
+
+    await resetSyncState(root, "next-stream", syncMutex);
+    const reset = await loadState(root, "next-stream");
+    expect(reset.stateNonce).toBeUndefined();
+    expect(reset.repoRecords).toBeUndefined();
+    await releaseWorkspaceSyncMutex(syncMutex);
+  });
+
   test("file-only global candidate rebuilds gitRepos solely from records", async () => {
     await saveState(root, baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }));
     const packet = composeStateSavePacket(baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }), {

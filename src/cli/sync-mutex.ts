@@ -6,7 +6,10 @@ export type SyncMutexMode = "cli" | "daemon";
 
 export interface WorkspaceSyncMutex {
   readonly root: string;
-  readonly lock: OwnedLock;
+  readonly lock?: OwnedLock;
+  /** No safe identity/link primitive exists. Callers continue through the legacy
+   * unlocked state path with the workspace config lane disabled. */
+  readonly degraded?: { reason: string };
 }
 
 export type DaemonMutexResult =
@@ -18,9 +21,12 @@ export interface SyncMutexOptions {
   attempts?: number;
   retryDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Test/embedding seam for the once-per-workspace degradation surface. */
+  onDegraded?: (message: string) => void;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const surfacedDegradedRoots = new Set<string>();
 
 export const syncMutexPath = (root: string): string => path.join(root, ".rbox", "state", "sync.lock");
 
@@ -28,6 +34,22 @@ function heldDetail(inspection: Exclude<LockInspection, { kind: "absent" }>): st
   if (inspection.kind === "live" || inspection.kind === "dead") return `pid ${inspection.marker.pid}`;
   return inspection.reason;
 }
+
+function degradedHandle(root: string, error: unknown, onDegraded?: (message: string) => void): WorkspaceSyncMutex {
+  const reason = String(error);
+  if (!surfacedDegradedRoots.has(root)) {
+    surfacedDegradedRoots.add(root);
+    const message = `workspace locking unavailable; git config sync disabled, continuing with legacy state saves (${reason})`;
+    try {
+      (onDegraded ?? ((line) => process.stderr.write(`warning: ${line}\n`)))(message);
+    } catch {
+      // Surfacing is advisory; the entire point of this bucket is never-fatal sync.
+    }
+  }
+  return { root, degraded: { reason } };
+}
+
+export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
 
 /**
  * Acquire the one workspace-wide sync mutex. CLI owners wait briefly and fail
@@ -61,7 +83,10 @@ export async function acquireWorkspaceSyncMutex(
       const handle = { root, lock: result.lock };
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
-    if (result.status === "unsupported") throw new Error(`workspace sync mutex is unsupported: ${String(result.error)}`);
+    if (result.status === "unsupported") {
+      const handle = degradedHandle(root, result.error, options.onDegraded);
+      return mode === "daemon" ? { status: "acquired", handle } : handle;
+    }
     if (result.status === "error") throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
     lastDetail = heldDetail(result.inspection);
     if (mode === "daemon") return { status: "contended", detail: lastDetail };
@@ -75,6 +100,7 @@ export function assertSyncMutex(handle: WorkspaceSyncMutex, root: string): void 
 }
 
 export async function releaseWorkspaceSyncMutex(handle: WorkspaceSyncMutex): Promise<void> {
+  if (!handle.lock) return;
   const released = await handle.lock.release();
   if (!released.released) throw new Error("workspace sync mutex ownership was lost before release");
 }

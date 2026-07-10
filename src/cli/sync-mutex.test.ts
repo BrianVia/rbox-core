@@ -8,6 +8,8 @@ import {
   acquireWorkspaceSyncMutex,
   releaseWorkspaceSyncMutex,
   syncMutexPath,
+  withWorkspaceSyncMutex,
+  workspaceSyncMutexDegraded,
   type DaemonMutexResult,
 } from "./sync-mutex.js";
 
@@ -32,6 +34,36 @@ beforeEach(async () => {
 afterEach(async () => fs.rm(root, { recursive: true, force: true }));
 
 describe("design 93 §6 workspace sync mutex", () => {
+  test("identity unavailability is surfaced once and CLI/daemon work proceeds on the legacy path", async () => {
+    const unavailable: LockIdentitySource = {
+      current: async () => { throw new Error("no identity source"); },
+      probe: async () => ({ status: "unknown" }),
+    };
+    const surfaced: string[] = [];
+    const degradedOptions = {
+      ...options(unavailable),
+      onDegraded: (message: string) => surfaced.push(message),
+    };
+
+    const cli = await acquireWorkspaceSyncMutex(root, "cli", degradedOptions);
+    expect(workspaceSyncMutexDegraded(cli)).toBe(true);
+    await releaseWorkspaceSyncMutex(cli);
+
+    let ran = false;
+    await withWorkspaceSyncMutex(root, async (handle) => {
+      ran = true;
+      expect(workspaceSyncMutexDegraded(handle)).toBe(true);
+    }, degradedOptions);
+    expect(ran).toBe(true);
+
+    const daemon = await acquireWorkspaceSyncMutex(root, "daemon", degradedOptions);
+    expect(daemon.status).toBe("acquired");
+    if (daemon.status === "acquired") await releaseWorkspaceSyncMutex(daemon.handle);
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toContain("git config sync disabled");
+    expect(surfaced[0]).toContain("legacy state saves");
+  });
+
   test("CLI contender exits loudly with owner pid", async () => {
     const owner = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
     await expect(acquireWorkspaceSyncMutex(root, "cli", options(identity()))).rejects.toThrow(/another sync is in progress \(pid 9301\)/);
@@ -52,7 +84,7 @@ describe("design 93 §6 workspace sync mutex", () => {
   test("cross-boot power-loss marker is recovered", async () => {
     await acquireWorkspaceSyncMutex(root, "cli", options(identity("b00-01d", 10, "10")));
     const recovered = await acquireWorkspaceSyncMutex(root, "cli", options(identity("b00-0e0", 20, "20")));
-    expect(await recovered.lock.isOwner()).toBe(true);
+    expect(await recovered.lock?.isOwner()).toBe(true);
     await releaseWorkspaceSyncMutex(recovered);
   });
 

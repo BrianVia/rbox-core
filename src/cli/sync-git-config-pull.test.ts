@@ -157,6 +157,23 @@ test("cfgToken detects a manual config delete and heals it through the first unc
   expect(healed.configLane?.["."]?.cfgToken).not.toEqual(lane.cfgToken);
 });
 
+test("workspace-wide legacy degradation leaves receiver config untouched and advances Git", async () => {
+  const remote = { ...base, config: desired };
+  let configApplyCalls = 0;
+  const outcome = await apply(remote, stateWith(base), {
+    disableConfigLane: true,
+    applyConfig: async () => {
+      configApplyCalls++;
+      throw new Error("config lane must not apply");
+    },
+  });
+  expect(configApplyCalls).toBe(0);
+  expect(outcome.gitPendingRemote).toBeUndefined();
+  expect(outcome.gitRepos?.["."]).toEqual(remote);
+  expect(outcome.configLane).toBeUndefined();
+  expect(await git(receiver, "config", "--get", "remote.upstream.url").catch(() => "missing")).toBe("missing");
+});
+
 test("config-only failure holds pending and old base through BOTH unchanged shortcuts", async () => {
   const shape = await dirShape();
   const oldLane = { cfgShape: shape, cfgApplied: "old-applied", cfgSynced: "old-synced" };

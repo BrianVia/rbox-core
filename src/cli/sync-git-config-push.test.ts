@@ -124,6 +124,28 @@ test("trusted fast carry cannot hide the presence rule and authorship is wire-ex
   expect(cached.authoredCfgHashByRepo["."]).toBe(gitConfigHash(cached.gitRepos!["."]!.config!));
 });
 
+test("workspace-wide legacy degradation carries the base config without reading or authoring the lane", async () => {
+  const oldConfig: GitConfig = { "remote.origin.url": ["git@example.com:old.git"] };
+  const based = { ...baseSection, config: oldConfig };
+  await runGit(root, "remote", "add", "origin", "git@example.com:new.git");
+  const degraded = await planGitSections(
+    root,
+    cfg,
+    stateWith(based),
+    remote,
+    new Set(),
+    buildIgnoreMatcher(root),
+    undefined,
+    undefined,
+    {
+      disableConfigLane: true,
+      gitConfigRunner: async () => { throw new Error("config lane must not be read"); },
+    }
+  );
+  expect(degraded.gitRepos?.["."]?.config).toEqual(oldConfig);
+  expect(degraded.authoredCfgHashByRepo).toEqual({});
+});
+
 test("over-bounds config carries each host base verbatim with no authorship or oscillation", async () => {
   for (let i = 0; i < 65; i++) {
     await runGit(root, "config", `remote.r${i}.url`, `git@example.com:r${i}.git`);

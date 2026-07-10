@@ -37,7 +37,7 @@ import {
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
-import { assertSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
 import { RboxApi, type CommitOptions, type CommitTimings, type LatestTimings, type SyncRemote } from "./remote.js";
 
@@ -333,6 +333,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, {
       collectMetrics: report.enabled,
       onProgress: deps.onGitProgress,
+      disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
     })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
@@ -357,7 +358,10 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
     },
-  }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
+  }, {
+    allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+    forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+  }));
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);
@@ -555,7 +559,10 @@ async function runPushAttempt(
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
   const gitPlan = await report.phase("git-plan", () =>
-    planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, { onGitLog: deps.onGitLog })
+    planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
+      onGitLog: deps.onGitLog,
+      disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+    })
   );
   if (report.enabled) {
     report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
@@ -602,7 +609,10 @@ async function runPushAttempt(
         sourceGlobalSeq: appliedSequence,
         observedRepos: changedSidecarRepoKeys(state, values),
         values,
-      }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
+      }, {
+        allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+        forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+      }));
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false } };
@@ -709,7 +719,10 @@ async function runPushAttempt(
     observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
     values: ackValues,
     authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
-  }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
+  }, {
+    allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+    forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+  }));
   if (deferred.size > 0) reportDeferred(deferred);
   return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
 }

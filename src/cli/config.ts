@@ -6,7 +6,7 @@ import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
-import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -470,25 +470,39 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
   assertSyncMutex(owned, root);
   try {
     await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-    const acquired = await acquireLock(stateLockPath(root));
-    if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
-    try {
-      const prior = await loadRawState(root);
-      const reset = {
-        stream: nextStream,
-        stateNonce: crypto.randomBytes(16).toString("hex"),
-        stateRevision: validCounter(prior?.stateRevision) + 1,
-      };
-      let owner = true;
-      await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
-      await writeFileAtomic(stateIncarnationPath(root), JSON.stringify(reset, null, 2), {
-        beforeRename: async () => (owner = await acquired.lock.isOwner()),
-      });
-      if (!owner) throw new Error("sync state reset lock ownership was lost");
-      if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
+    const legacyReset = async (): Promise<void> => {
+      // Same deliberate fence-free fallback as legacy saves: remove both state
+      // representations so the next load starts from nextStream with no lane state.
+      await fs.rm(stateIncarnationPath(root), { force: true });
       await fs.rm(statePath(root), { force: true });
-    } finally {
-      await acquired.lock.release();
+    };
+    if (workspaceSyncMutexDegraded(owned)) {
+      await legacyReset();
+    } else {
+      const acquired = await acquireLock(stateLockPath(root));
+      if (acquired.status === "unsupported") {
+        await legacyReset();
+      } else {
+        if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
+        try {
+          const prior = await loadRawState(root);
+          const reset = {
+            stream: nextStream,
+            stateNonce: crypto.randomBytes(16).toString("hex"),
+            stateRevision: validCounter(prior?.stateRevision) + 1,
+          };
+          let owner = true;
+          await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
+          await writeFileAtomic(stateIncarnationPath(root), JSON.stringify(reset, null, 2), {
+            beforeRename: async () => (owner = await acquired.lock.isOwner()),
+          });
+          if (!owner) throw new Error("sync state reset lock ownership was lost");
+          if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
+          await fs.rm(statePath(root), { force: true });
+        } finally {
+          await acquired.lock.release();
+        }
+      }
     }
 
     for (const p of [

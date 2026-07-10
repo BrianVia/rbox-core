@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import {
   formatLockMarker,
   inspectLock,
   parseLockMarker,
+  resolveLinuxHostId,
   type LockIdentitySource,
   type LockMarker,
   type ProcessProbe,
@@ -42,6 +44,53 @@ describe("rbox-93 marker grammar", () => {
     expect(parseLockMarker(formatLockMarker(value))).toEqual(value);
     expect(parseLockMarker("rbox-93 host boot 1 2 token\n")).toBeUndefined();
     expect(parseLockMarker(`${formatLockMarker(value)}extra`)).toBeUndefined();
+  });
+});
+
+describe("Linux host identity fallback chain", () => {
+  test("prefers /etc/machine-id and does not probe later sources", async () => {
+    const reads: string[] = [];
+    let hostnameCalls = 0;
+    const hostId = await resolveLinuxHostId({
+      readFile: async (filePath) => {
+        reads.push(filePath);
+        return "AABBCCDD\n";
+      },
+      hostname: () => {
+        hostnameCalls++;
+        return "unused";
+      },
+    });
+    expect(hostId).toBe("aabbccdd");
+    expect(reads).toEqual(["/etc/machine-id"]);
+    expect(hostnameCalls).toBe(0);
+  });
+
+  test("falls back through dbus machine-id and then hostname", async () => {
+    const dbusReads: string[] = [];
+    const dbus = await resolveLinuxHostId({
+      readFile: async (filePath) => {
+        dbusReads.push(filePath);
+        if (filePath === "/etc/machine-id") throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        return "DB05FACE\n";
+      },
+      hostname: () => "unused",
+    });
+    expect(dbus).toBe("db05face");
+    expect(dbusReads).toEqual(["/etc/machine-id", "/var/lib/dbus/machine-id"]);
+
+    const hostname = await resolveLinuxHostId({
+      readFile: async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      hostname: () => "Apple-Guest.local",
+    });
+    expect(hostname).toBe(crypto.createHash("sha256").update("hostname:apple-guest.local").digest("hex"));
+  });
+
+  test("reports unsupported only after every source is unavailable", async () => {
+    await expect(resolveLinuxHostId({
+      readFile: async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      hostname: () => "   ",
+    })).rejects.toThrow("no Linux host identity source");
   });
 });
 

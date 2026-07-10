@@ -383,6 +383,9 @@ export interface GitPlanOptions {
   onGitLog?: (line: string) => void;
   /** Deterministic test seam for the snapshot-only config subprocess. */
   gitConfigRunner?: GitConfigRunner;
+  /** Workspace lock identity/link support is unavailable. Preserve Git syncing,
+   * but neither read nor author config-lane updates. */
+  disableConfigLane?: boolean;
 }
 
 /**
@@ -509,6 +512,7 @@ export async function planGitSections(
   const carryOwnedWithConfig = async (rel: string, baseSec: GitSection, bracketed?: LocalCfgRead, knownCtx?: RepoCtx): Promise<void> => {
     out[rel] = baseSec;
     carried.push(rel);
+    if (options.disableConfigLane) return;
     const diskCtx = knownCtx ?? (await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined));
     if (!diskCtx || diskCtx.kind !== "dir") {
       logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
@@ -549,6 +553,7 @@ export async function planGitSections(
     return carried;
   };
   const captureWithConfig = async (rel: string, section: GitSection): Promise<GitSection> => {
+    if (options.disableConfigLane) return carryBaseConfig(section, base[rel]);
     const repoDir = repoDirOf(root, rel);
     const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
     if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
@@ -653,7 +658,8 @@ export async function planGitSections(
         kind,
         probeBeforeFingerprint,
         recomputeCacheProbe,
-        () => noteCredentialSkip(rel)
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane
       ).catch(() => undefined);
       deferOne(rel, "git busy (lock present)");
       return;
@@ -698,7 +704,8 @@ export async function planGitSections(
         pf.kind ?? kind,
         probeBeforeFingerprint,
         recomputeCacheProbe,
-        () => noteCredentialSkip(rel)
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane
       ).catch(() => undefined);
       // STRUCTURAL refusal (shallow/bare/alternates/…): the shape can't sync and won't
       // heal by waiting — DROP the section instead of carrying it. Carrying would be
@@ -732,7 +739,8 @@ export async function planGitSections(
       liveKind,
       probeBeforeFingerprint,
       recomputeCacheProbe,
-      () => noteCredentialSkip(rel)
+      () => noteCredentialSkip(rel),
+      options.disableConfigLane
     ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
     if (!id) {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
@@ -824,7 +832,7 @@ export async function planGitSections(
     // 6 probe is plannable-clean with a valid preflight kind
     // 7 design-43 §7 carry matrix reaches carry
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
-      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind);
+      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane);
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
@@ -833,7 +841,7 @@ export async function planGitSections(
         if (!probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && carryMatrixMatches(baseSec, pfKind, probe.identityKey)) {
           // A trusted summary can prove a verbatim carry. If publication is due,
           // fall through: the wire needs the canonical config, not merely its hash.
-          if (!shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced)) {
+          if (options.disableConfigLane || (fastLookup.cachedLocalCfg && !shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced))) {
             out[rel] = baseSec;
             carried.push(rel);
             fastPathParentRel.set(rel, probe.parentRel);
@@ -851,7 +859,7 @@ export async function planGitSections(
     // skipped after `sectioned` is known, but a trusted cached parentRel lets us
     // defer that decision without paying the identity/preflight spawn floor.
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
-      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind);
+      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane);
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
@@ -1539,7 +1547,7 @@ function sameDivergenceProbe(a: CachedDivergenceProbe | undefined, b: CachedDive
 }
 
 type FingerprintHitProbeResult =
-  | { status: "hit"; fingerprint: GitFingerprint; probe: CachedDivergenceProbe; cachedLocalCfg: CachedLocalCfg; kind?: GitRepoKind }
+  | { status: "hit"; fingerprint: GitFingerprint; probe: CachedDivergenceProbe; cachedLocalCfg?: CachedLocalCfg; kind?: GitRepoKind }
   | { status: "miss"; fingerprint: GitFingerprint; kind?: GitRepoKind }
   | { status: "untrusted"; fingerprint: GitFingerprint; kind?: GitRepoKind };
 
@@ -1554,14 +1562,15 @@ async function fingerprintHitProbe(
   root: string,
   rel: string,
   cache: GitDivergenceCache,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  requireConfigSummary = true
 ): Promise<FingerprintHitProbeResult> {
   const fresh = await gitFingerprint(run, root, rel);
   const cached = cache.repos.get(rel);
   const kind = cached?.kind ?? fresh.diskCtx?.kind ?? hintKind;
   // Missing cachedLocalCfg is a legacy/incomplete entry: force exactly one slow
   // bracketed pass so config presence can never disappear behind a git fast hit.
-  if (cached?.fingerprint !== fresh.hash || !cached.probe || !cached.cachedLocalCfg) {
+  if (cached?.fingerprint !== fresh.hash || !cached.probe || (requireConfigSummary && !cached.cachedLocalCfg)) {
     return { status: "miss", fingerprint: fresh, kind };
   }
   if (!trustedGitFingerprintHit(fresh, cached)) {
@@ -1581,13 +1590,14 @@ async function writeDivergenceCacheEntry(
   hintKind: GitRepoKind | undefined,
   beforeFingerprint: GitFingerprint,
   recompute?: () => Promise<DivergenceCacheProbeSnapshot>,
-  onCredentialSkip?: () => void
+  onCredentialSkip?: () => void,
+  skipConfig = false
 ): Promise<DivergenceCacheWriteResult> {
   let before = beforeFingerprint;
   let currentProbe = probe;
   let currentKind = hintKind;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const localCfg = !currentProbe.busy && currentProbe.preflightOk
+    const localCfg = !skipConfig && !currentProbe.busy && currentProbe.preflightOk
       ? await readLocalGitConfig(root, rel, before.diskCtx, undefined, onCredentialSkip)
       : undefined;
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
@@ -1781,6 +1791,8 @@ export async function applyGitSections(
 opts: {
     collectMetrics?: boolean;
     onProgress?: (done: number, total: number) => void;
+    /** Workspace-wide legacy fallback: Git applies, config is left untouched. */
+    disableConfigLane?: boolean;
     /** Deterministic fault injection for §11 pull-lane tests. */
     applyConfig?: typeof applyConfigTransaction;
     materializeFreshConfig?: typeof materializeFreshGitConfig;
@@ -2016,7 +2028,7 @@ opts: {
     // the new identity in this pull's atomic repo transition.
     let configDue = false;
     let configTarget: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string } | undefined;
-    if (remoteSec.config !== undefined) {
+    if (!opts.disableConfigLane && remoteSec.config !== undefined) {
       if (!dotGit) {
         invalidateLaneShape(rel, undefined);
         configDue = true;

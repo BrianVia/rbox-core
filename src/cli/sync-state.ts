@@ -144,8 +144,13 @@ export async function saveStateSource(
   root: string,
   initialSnapshot: SyncState,
   source: StateSource,
-  options: { apply?: typeof applyStateSavePacket; allowLegacyStreamReplacement?: boolean } = {},
+  options: { apply?: typeof applyStateSavePacket; allowLegacyStreamReplacement?: boolean; forceLegacy?: boolean } = {},
 ): Promise<SyncState> {
+  if (options.forceLegacy) {
+    const next = legacyState(initialSnapshot, source);
+    await saveState(root, next);
+    return next;
+  }
   const apply = options.apply ?? applyStateSavePacket;
   let snapshot = initialSnapshot;
   for (let attempt = 0; attempt < 3; attempt++) {

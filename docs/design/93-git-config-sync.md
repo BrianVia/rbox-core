@@ -219,7 +219,14 @@ yield fresh nonces, so a delayed pre-reset packet always rejects.
 The `link()`-unsupported legacy fallback forfeits these fences BY DESIGN:
 on such filesystems the config lane is disabled entirely, no lane state
 exists to protect, and git-state behavior remains exactly today's status
-quo.
+quo. **Host/boot identity unavailability maps to the SAME bucket** (field
+gate 2026-07-10: minimal Linux container images lack `/etc/machine-id`):
+the Linux host-id resolution chain is `/etc/machine-id` →
+`/var/lib/dbus/machine-id` → hostname (a weak id is safe where the
+filesystem is private, and cross-host misclassification remains FOREIGN by
+the different-host rule); if NO source resolves, the lane degrades to the
+legacy path with a surfaced status — identity failure must NEVER fail
+init/sync themselves.
 
 The no-op bookkeeping site (sync.ts:554-573) emits per-repo transitions for
 exactly the repos whose sidecar/lane values it changed, with NO global

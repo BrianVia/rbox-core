@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fsyncDirectory } from "../fsutil.js";
 
@@ -137,6 +138,33 @@ async function linuxProcessStart(pid: number): Promise<string> {
   return parseLinuxProcStart(await fs.readFile(`/proc/${pid}/stat`, "utf8"));
 }
 
+export interface LinuxHostIdOptions {
+  readFile?: (filePath: string) => Promise<string>;
+  hostname?: () => string;
+}
+
+/** Resolve the Linux host identity in design-93 order. Hostnames are hashed into
+ * the marker's hex grammar; this preserves their (weak) equality semantics without
+ * allowing punctuation or whitespace to make an otherwise usable source invalid. */
+export async function resolveLinuxHostId(options: LinuxHostIdOptions = {}): Promise<string> {
+  const readFile = options.readFile ?? ((filePath: string) => fs.readFile(filePath, "utf8"));
+  for (const filePath of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+    try {
+      const candidate = (await readFile(filePath)).trim().toLowerCase();
+      if (ID_RE.test(candidate)) return candidate;
+    } catch {
+      // Continue through the ordered fallback chain.
+    }
+  }
+  try {
+    const hostname = (options.hostname ?? os.hostname)().trim().toLowerCase();
+    if (hostname) return crypto.createHash("sha256").update(`hostname:${hostname}`).digest("hex");
+  } catch {
+    // The caller maps total identity-source failure to the legacy lock bucket.
+  }
+  throw new Error("no Linux host identity source");
+}
+
 async function processStart(pid: number): Promise<string> {
   if (process.platform === "darwin") return darwinProcessStart(pid);
   if (process.platform === "linux") return linuxProcessStart(pid);
@@ -183,7 +211,7 @@ async function currentSystemIncarnation(): Promise<ProcessIncarnation> {
     }
   } else if (process.platform === "linux") {
     [hostId, bootId] = await Promise.all([
-      fs.readFile("/etc/machine-id", "utf8").then((v) => v.trim().toLowerCase()),
+      resolveLinuxHostId(),
       fs.readFile("/proc/sys/kernel/random/boot_id", "utf8").then((v) => v.trim().toLowerCase()),
     ]);
   } else {
