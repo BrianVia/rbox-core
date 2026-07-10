@@ -379,26 +379,38 @@ degradation is only ever learned from an acquisition result,
 `sync-mutex.ts:80-89`, and the daemon's first acquisition happens inside
 the pump, `daemon.ts:425`):
 
-- **Capability is established BEFORE the listener exists.** The daemon's
-  startup sequence already runs the initial-convergence pump before any
-  delegation surface would come up (`daemon.ts:247-252`); that pump's FIRST
-  mutex acquisition attempt doubles as the probe and always resolves the
-  capability: `acquired` → exclusive; `contended` → exclusive (someone
-  holds a REAL lock, so the primitive demonstrably works); `unsupported` →
-  degraded; `error` → the daemon fails loudly as today. The socket listener
-  is created only after this probe has recorded `lockMode`; a
-  `lockMode = degraded` daemon still starts the listener but answers every
-  hello `reject: {reason: "lock-degraded"}` (so the CLI gets a fast,
+- **Capability is established BEFORE the listener exists — read off the
+  HANDLE, because the daemon API hides degradation inside `acquired` (R6
+  F3).** `acquireWorkspaceSyncMutex(root, "daemon")` maps an unsupported
+  lock primitive to `{status: "acquired", handle}` with a degraded handle
+  (`sync-mutex.ts:85-89`) — there is no `unsupported` status at this
+  boundary, so every capability statement is defined in terms of
+  `workspaceSyncMutexDegraded(handle)`. The daemon's startup sequence
+  already runs the initial-convergence pump before any delegation surface
+  exists (`daemon.ts:247-252`); that pump's FIRST acquisition doubles as
+  the probe: result `acquired` → `lockMode =
+  workspaceSyncMutexDegraded(handle) ? degraded : exclusive`; result
+  `contended` → exclusive (someone holds a REAL lock, so the primitive
+  demonstrably works); `error` → the daemon fails loudly as today. The
+  probe handle needs no separate lifecycle — it IS that pump iteration's
+  ordinary op handle, released by the pump's existing `finally`
+  (`daemon.ts:538-540`). The socket listener is created only after
+  `lockMode` is recorded; a degraded daemon still starts the listener but
+  answers every hello `reject: {reason: "lock-degraded"}` (a fast,
   explicit LOCAL signal instead of a connect timeout). No hello can be
   acked as exclusive from ignorance.
-- **Later unexpected degradation is terminal for delegation.** If any
-  subsequent acquisition returns `unsupported` (filesystem changed under a
-  running daemon), `lockMode` flips to degraded and sticks: every BOUND
-  delegated entry receives an error `result` (`error: "lock-degraded"`),
-  unbound entries are cancelled with `{cancelled}`, and all further hellos
-  are rejected. The CLI treats that error result as a normal terminal —
-  it may then choose LOCAL, which is exactly the exposure a degraded
-  workspace has today.
+- **Later unexpected degradation is terminal for delegation — checked per
+  acquisition, before mutation.** Every pump acquisition that will run an
+  op with BOUND delegated entries re-checks
+  `workspaceSyncMutexDegraded(handle)` on the handle it just received; if
+  degraded (filesystem changed under a running daemon), `lockMode` flips
+  to degraded and sticks BEFORE any mutation of the bound op: every bound
+  entry receives an error `result` (`error: "lock-degraded"`), unbound
+  entries are cancelled with `{cancelled}`, all further hellos are
+  rejected, and the iteration proceeds (or not) as an ordinary AMBIENT op
+  exactly as the degraded legacy path behaves today. The CLI treats that
+  error result as a normal terminal — it may then choose LOCAL, which is
+  exactly the exposure a degraded workspace has today.
 
 Post-ack, every CLI fallback arm that reasons from a mutex acquisition must
 check `workspaceSyncMutexDegraded` on the handle it got: a degraded
@@ -488,15 +500,26 @@ are fed by AMBIENT causes (watcher batches, WS catch-up, safety/deep ticks,
 post-pull chaining, `daemon.ts:445-461`), and cannot prove which request
 owns which terminal result — so delegated demand is a SEPARATE source that
 never reads or writes `want`: the daemon keeps `delegated: Map<opId,
-{needs: ("pull"|"push")[], socket, acc}>` (`push`→`["push"]`,
-`pull`→`["pull"]`, `sync`→`["pull","push"]`). The pump loop's continue
-condition becomes "any `want` set OR `delegated` non-empty," and per-kind
-demand at op selection is `want[kind] || anyDelegatedHead(kind)`; when an op
-runs, `want[kind]` is cleared only if it was set (ambient demand is consumed
-exactly as today). When the pump STARTS an op it binds every delegated entry
-whose head-of-`needs` matches that op kind; on op success it pops that leg
-(an entry with empty `needs` gets its `result`); on op failure every bound
-entry gets an error `result` naming the failed leg. **Cancellation
+{op: "push"|"pull"|"sync", socket, acc}>`. The pump loop's continue
+condition becomes "any `want` set OR `delegated` non-empty," and demand at
+op selection sees each delegated entry's kind. **Delegated `sync` is ONE
+composite pump iteration, not two (R6 F1 — the pump acquires and releases
+the mutex per iteration, `daemon.ts:425-431,538-540`, while local sync
+deliberately holds one `withWorkspaceSyncMutex` across the whole `sync()`
+call, `sync-cmd.ts:58-84`; splitting the legs across iterations would let
+another top-level owner interpose between pull and push, breaking design
+93's decision→mutation→state-save interval for exactly the operation the
+caller asked to be atomic).** The pump gains a composite `sync` op kind
+that runs `doPull` then `doPush` inside a SINGLE iteration under the SAME
+mutex handle — precisely mirroring the shared `sync()` composition the CLI
+uses. Demand accounting for the composite: it consumes `want.pull` and
+`want.push` if set (it performs both, so ambient demand is covered, not
+stolen); standalone delegated `pull` entries may bind to its pull phase and
+`push` entries to its push phase, each resolved by that phase's outcome.
+When the pump STARTS an op (or composite phase) it binds every matching
+delegated entry; a bound entry's `result` is built when its op completes;
+on failure every bound entry gets an error `result` naming the failed leg
+(a composite's pull-phase failure aborts its push phase). **Cancellation
 therefore never touches `want` at all:** a pre-bind cancel just removes the
 map entry — ambient demand is structurally incapable of being consumed by
 it, and a cancelled-away delegated op runs nothing spurious because the
@@ -517,9 +540,9 @@ extending R2 F5's separation): the post-pull auto-chain is SKIPPED iff the
 pull iteration's only demand was delegated standalone-`pull` entries and
 `want.push` was not already set. Any ambient co-demand (a watcher batch, an
 already-queued push, `want.pull` set by WS catch-up) keeps the chain; a
-delegated `sync` never depends on the chain at all — its
-`needs: ["pull","push"]` entry contributes its own push demand, and its
-push leg binds to that. Daemon convergence is unharmed by the suppression:
+delegated `sync` never depends on the chain at all — its composite
+iteration runs its own push phase internally (R6 F1, correlation above).
+Daemon convergence is unharmed by the suppression:
 real local divergence is republished by the next watcher batch or safety
 tick exactly as if the delegated pull had never happened — the rule removes
 only the push the CLI did not ask for. On a live daemon, ambient pushes
@@ -556,14 +579,14 @@ up to 50 conflicts and explicitly truncated past it. The CLI runs `postSyncNudge
 design 29's `RBOX_NO_DRIFT`/config gates are the CLI's to apply). When
 `writtenPathsElided` is set the nudge is skipped — best-effort by contract
 (`sync-cmd.ts:33-44`), and a 500+-file pull is not a lockfile-drift
-situation. A sync's two legs bind to two different pump iterations, so the
-terminal frame is built from a per-opId accumulator (`acc`), not from "the
-last iteration": the pull leg records the payload above and the push leg
-records `{sequence, committed, files, deferred}`; the `result` frame
-carries both plus `failedLeg: "pull"|"push"` on error, and with
-`metrics:true` the phase reports of both legs. Gate 6 tests the narrowed
-contract: `--json` schema-identical with exact totals; human output
-identical below the caps. A
+situation. A sync's two legs run inside one composite iteration (R6 F1)
+but are still distinct phases, so the terminal frame is built from a
+per-opId accumulator (`acc`): the pull phase records the payload above and
+the push phase records `{sequence, committed, files, deferred}`; the
+`result` frame carries both plus `failedLeg: "pull"|"push"` on error, and
+with `metrics:true` the phase reports of both legs. Gate 6 tests the
+narrowed contract: `--json` schema-identical with exact totals; human
+output identical below the caps. A
 delegated op jumps no queue: the single-flight pump (`daemon.ts:419+`)
 serializes it against watcher batches and safety ticks — no new concurrency
 inside the daemon. Before a bound push the daemon drains pending watcher
@@ -609,7 +632,14 @@ LOCAL (withWorkspaceSyncMutex,  ▼                     │                │ {
   CLI makes ONE ordinary mutex acquisition attempt (the standard 16×50ms);
   if it acquires a REAL lock (`workspaceSyncMutexDegraded` false — a
   degraded handle proves nothing, R2 F2, and counts as contended), the
-  daemon has no op in flight and LOCAL is safe; if contended or degraded,
+  daemon has no op in flight and the CLI continues locally **under the
+  handle it already owns** (R6 F2): it invokes the same operation body the
+  normal wrapper would (`withWorkspaceSyncMutex` is already
+  body-as-`fn(handle)`, `sync-mutex.ts:108-119`), passing the probe handle
+  as `deps.syncMutex` and releasing it exactly once in `finally` — NEVER by
+  re-entering the wrapper, which would self-contend on its own probe, and
+  NEVER by releasing first and re-acquiring, which would hand the daemon a
+  gap that dissolves the proof. If contended or degraded,
   it exits nonzero with a distinct code and message
   ("delegated push state unknown — daemon pid N still running; see `rbox
   status` / `rbox logs`, or retry") rather than racing a live owner. A
@@ -833,27 +863,49 @@ measurement-only, behind `RBOX_METRICS`/soak flags, no behavior change):
   truth as `this.manifest` (`daemon.ts:1148`), so at scan N+1 the ordinary
   incremental-vs-fresh diff is clean even for a genuine drop)** — each
   surviving candidate is persisted to the soak sidecar as
-  `{path, expected, observed, firstSeenAtMs, eventGenAtScan}`, where
-  `expected` is the pre-heal incremental entry (or explicit absence) and
-  `observed` the first fresh observation: the pending set IS the
-  counterfactual, held deliberately outside the manifest that healing
-  overwrites. At the NEXT deep scan (the natural 30m audit horizon) each
-  pending candidate is resolved: RETRACTED as `late-covered` if any
-  watcher event for its path arrived anywhere in the inter-scan interval
-  (watcher latency, not loss); otherwise CONFIRMED as a drop iff that
-  scan's fresh disk truth still differs from the RETAINED `expected` —
-  disk having mutated further without any event is still a confirmed
-  miss, because the test is "the incremental state of record was wrong
-  about this path and the watcher said nothing about it across the whole
-  horizon." An event delayed beyond a full deep-scan interval is
-  indistinguishable from a drop and counts as one — stated, and
-  acceptable, since the safety cadence being tuned is itself an order of
-  magnitude shorter. Only confirmed drops from quiescent-tagged scans
+  `{path, expected, observed, firstSeenAtMs, eventGenAtScan, bootId,
+  watcherSessionId, errorGenAtScan}`, where `expected` is the pre-heal
+  incremental entry (or explicit absence) and `observed` the first fresh
+  observation: the pending set IS the counterfactual, held deliberately
+  outside the manifest that healing overwrites. At the NEXT deep scan
+  (the natural 30m audit horizon) each pending candidate is resolved
+  under continuity and coverage rules (R6 F4):
+  - **Continuity first:** attribution requires one continuously observed
+    watcher interval. If the daemon restarted (bootId differs), the
+    watcher instance was recreated (`watcherSessionId` differs), the
+    error generation advanced, or the watcher was unhealthy at any point
+    between the scans, the candidate resolves `unattributable` — its own
+    class, never confirmed, never gated (a disk change in an unobserved
+    gap is not watcher loss).
+  - **Coverage uses `applyWatchEvents` semantics, not exact-path match:**
+    a candidate is covered by an event iff the event names the path
+    itself, OR is an `addDir`/`unlinkDir` whose subtree contains it, OR
+    (rename) is one side of a create/delete pair whose other side is the
+    candidate path — the same ancestor/subtree relations the daemon's
+    event application uses (`manifest.ts:134-182`).
+  - **Covered ≠ automatically exculpatory:** a covering event RETRACTS
+    the candidate as `late-covered` only when its re-derived truth
+    matches the recorded `observed` — plausibly the late delivery of the
+    very mutation the scan caught. A covering event that reflects a
+    LATER, different state resolves `covered-ambiguous`: excluded from
+    confirmed drops AND from clean retractions, reported separately
+    (treating every later same-path event as exoneration would erase a
+    genuine first drop behind an unrelated second edit).
+  - **Otherwise CONFIRMED** iff that scan's fresh disk truth still
+    differs from the RETAINED `expected` — disk having mutated further
+    WITHOUT any covering event is still a confirmed miss, because the
+    test is "the incremental state of record was wrong about this path
+    and the watcher said nothing about it across one continuously
+    observed horizon."
+  An event delayed beyond a full deep-scan interval is indistinguishable
+  from a drop and counts as one — stated, and acceptable, since the
+  safety cadence being tuned is itself an order of magnitude shorter. Only confirmed drops from quiescent-tagged scans
   feed the drop-rate GATE (everything else logs as lower-confidence
   evidence). Log one bounded non-PII line per deep scan: counts by class
-  (candidates, confirmed, late-covered, racing), quiescence tag, watcher
-  health + error generation, seconds since last safety scan, watcher
-  events since, whether ignore rules changed. Report per host/filesystem
+  (candidates, confirmed, late-covered, covered-ambiguous, unattributable,
+  racing), quiescence tag, watcher health + error generation, seconds
+  since last safety scan, watcher events since, whether ignore rules
+  changed. Report per host/filesystem
   over a 24h soak: deep scans, quiescent scans, confirmed drops, paths by
   class, max inferred drift age. Zero confirmed drops over the soak →
   evidence for design 49's cadence question (§9.3); nonzero → the number
@@ -894,7 +946,8 @@ concurrent designs cannot collide in the closed union.
 4. Daemon log: one line per delegated op (opId, requester pid, op,
    outcome, cancelled-or-completed); the P0.3 drift line
    (`deep-scan drift: candidates=C confirmed=D late-covered=L racing=R
-   quiescent=y/n …`) so a nonzero drop is loud, not silent; and the
+   ambiguous=X unattributable=U quiescent=y/n …`) so a nonzero drop is
+   loud, not silent; and the
    dedicated `pull conflicts:` line (200-path cap, §3.2/R5 F2) whenever a
    pull's conflicts exceed the wire sample cap — the shared
    `summarizeActions` 50-slot budget cannot be assumed to contain them.
@@ -921,7 +974,10 @@ runs on the shared WAN at a time — 83/84/85 serialize their gate runs.
    complete, tree converges, no 409 storm required to make it true. (d)
    Degraded-lock workspace (lock primitive unsupported): hello is rejected
    `lock-degraded` and the CLI runs LOCAL — delegation is provably never
-   active without an exclusive mutex.
+   active without an exclusive mutex. (e) Sync atomicity: a `--no-daemon`
+   push launched between a delegated sync's pull and push phases waits for
+   the WHOLE composite iteration (R6 F1) — the interposer never observes a
+   half-synced state interval.
 3. **Layer A warm full scan (if built per §5): ≤ 3s Mac / ≤ 6s Linux**, from
    6-15s; cold recorded alongside for the page-cache-fragility note. Applies
    to the daemon safety scan too (design 49 cadence cost ≤ 3s Mac). Dircache
@@ -1000,10 +1056,18 @@ Resolved in v3 (previously open or implicit):
     F1): the pump publishes local divergence on its own ambient schedule,
     never as a side effect of a CLI pull request.
 12. **Lock capability is positively probed before the listener exists**
-    (R4 F2): the initial-convergence pump's first acquisition attempt
-    resolves `lockMode` (contended counts as exclusive-capable); later
-    unexpected degradation errors out bound delegated ops and rejects all
-    further hellos.
+    (R4 F2; handle-level per R6 F3): the initial-convergence pump's first
+    acquisition resolves `lockMode` via `workspaceSyncMutexDegraded` on
+    the acquired handle (contended counts as exclusive-capable); every
+    delegated-bound acquisition re-checks its handle before mutation;
+    degradation errors out bound ops and rejects all further hellos.
+13. **Delegated `sync` is one composite pump iteration under one mutex
+    handle** (R6 F1): per-leg exclusivity is not operation exclusivity;
+    the composite mirrors local `sync()`'s single-owner interval.
+14. **The INDETERMINATE-arm fallback continues under its own probe
+    handle** (R6 F2): the operation body runs with the already-acquired
+    handle as `deps.syncMutex`, released exactly once — never wrapper
+    re-entry, never release-then-reacquire.
 
 Still the founder's calls:
 
