@@ -1,5 +1,5 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { phase1Mark, phase1Purge, reconcileUsage, perAccountReachable, runPhase1 } from "../src/gc-phase1.js";
 import { validateCommitRefs, commitAccounting } from "../src/commit-accounting.js";
@@ -311,13 +311,13 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
     // GOOD: no workspace → perAccountReachable returns empty → its stale orphan is markable.
     await addRef("good", "g", 10, NOW - 2 * HOUR);
     // BAD: has a workspace → perAccountReachable must read its DO roots. Break the DO
-    // explicitly (a namespace whose stubs 500 on /roots) — GOOD never touches the DO (no
+    // explicitly (a namespace whose stubs roots_too_large on /roots) — GOOD never touches the DO (no
     // workspace), so the same env exercises fail-closed isolation between the two.
     await db().prepare("INSERT INTO workspaces(workspace_id, project_id, account_id, created_at) VALUES ('ws_bad', 'root', 'bad', ?)").bind(NOW).run();
     await addRef("bad", "b", 20, NOW - 2 * HOUR);
     const brokenDO = {
       idFromName: (name: string) => env.WORKSPACE_SYNC.idFromName(name),
-      get: () => ({ fetch: async () => new Response("boom", { status: 500 }) }),
+      get: () => ({ fetch: async () => Response.json({ error: "roots_too_large", retained: 65 }, { status: 503 }) }),
     } as unknown as DurableObjectNamespace; // test double: only the two members reachableFromWorkspaces uses
     const envBroken = { ...env, WORKSPACE_SYNC: brokenDO };
 
@@ -325,9 +325,14 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
     await expect(perAccountReachable(envBroken, "bad")).rejects.toThrow();
     expect([...(await perAccountReachable(envBroken, "good"))]).toEqual([]);
 
-    const res = (await runPhase1(envBroken, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
-    expect(res.failed).toBeGreaterThanOrEqual(1); // bad failed closed
-    expect(res.processed).toBeGreaterThanOrEqual(1); // good still ran
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = (await runPhase1(envBroken, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
+      expect(res).toMatchObject({ processed: 1, failed: 1, marked: 1 });
+      expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('"event":"phase1_account_failed"'));
+    } finally {
+      errorLog.mockRestore();
+    }
 
     // GOOD's orphan was marked; BAD's ref + usage are completely untouched.
     expect(await candExists("good", "g")).toBe(true);
