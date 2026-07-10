@@ -6,6 +6,106 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-07-10 — the correctness milestone
+
+rbox reaches 1.0. The three correctness pillars are now field-proven fleet-wide:
+head authority (design 91) makes the commit chain un-forkable, manifest entry
+integrity (design 92) makes a push poison-proof and pulls self-healing, and git
+config sync (design 93) carries remotes and branch tracking with the repo. No
+functional changes over 0.9.18 — this release is the version bump that marks the
+milestone.
+
+## [0.9.18] — 2026-07-10 — git config sync (design 93): remotes and tracking travel with the repo
+
+### Added
+- **Git config sync (design 93) (#192).** A repo's remotes and branch-tracking
+  configuration now sync with its state — clone on a fresh machine and
+  `git fetch`/`git push`/`git pull` work without re-adding remotes by hand.
+  Config is embedded from a stability-bracketed snapshot at capture and applied
+  through a locked, optimistic-CAS config transaction, so a concurrent editor or
+  a mid-write power loss can never leave a partial config; the carry-base rule
+  means a config that can't be represented is preserved byte-for-byte rather than
+  stripped. Credential-bearing remote URLs are skipped (with a loud per-repo
+  log). `rbox status` gains a `config:` line. Host-identity resolution degrades
+  safely to the legacy path where it can't be established.
+
+### Changed
+- **Per-repo git-sync lines collapse into one progress counter (#191).** `rbox
+  sync`/`rbox pull` used to print one stderr line per repo during apply — alarming
+  at scale and easy to misread as failures. The default now shows a single
+  "git sync ran for N/total" counter; real conflicts/warnings still print
+  immediately. `--verbose` restores the per-repo dump. `rbox pair` also gains a
+  single-keypress `[c]` token copy and corrected setup wording.
+- **RboxBar shows total synced size instead of the sequence number (#190).** The
+  dropdown's secondary status line now reads a human-readable size (e.g. "15 GB")
+  computed from the daemon's in-memory manifest, falling back to "seq N" for
+  older daemons in a mixed-version fleet.
+
+### Fixed
+- **Design-93 rollout hardening (#193, #194).** Config-sync wire bounds raised
+  after field calibration (#193); the fingerprint cache is invalidated when those
+  bounds change and invalid incoming config fields are ignored, and the config
+  reader degrades rather than failing on unexpected input (#194).
+
+## [0.9.17] — 2026-07-09 — download self-heal + CLI hygiene + calmer menu bar
+
+### Fixed
+- **A full join no longer hard-fails on a corrupted blob download (#187).** Under
+  sustained high-concurrency load a large-body fetch could reassemble corrupt
+  bytes; content-addressing already caught it, but rbox aborted the whole sync
+  instead of re-fetching. `getBlobToFile` now bounded-retries on an integrity
+  mismatch with backoff (the re-fetch lands as the pool drains into the reliable
+  low-concurrency state), via a typed `BlobDownloadIntegrityError` that logs the
+  recovery; persistent corruption still fails loudly with no partial file left
+  behind.
+- **`rbox track` reuses your logged-in identity and forwards the workspace name
+  (#186).** Tracking a directory while logged in used to mint a fresh random
+  device id (polluting local config and the server roster); resolution order is
+  now `--device` > previous config > logged-in credential's device id > mint.
+
+### Changed
+- **RboxBar dropdown calmer and files-first (#185).** A degraded state (no user
+  action needed) drops the card for a dim one-line status; critical states keep
+  the card and carry a per-reason remedy. File count becomes the primary datum,
+  the footer shows daemon version and hostname, and a six-hour update check
+  renders a dim "Update available" row that copies the install command. Daemon
+  status gains additive fields (fileCount, daemonVersion, workspaceRoot) so old
+  and new bars interoperate.
+- **`RBOX_API` endpoint overrides now warn loudly (#186)**, so a stray override
+  can't silently point rbox at the wrong server.
+
+## [0.9.16] — 2026-07-09 — manifest entry integrity (design 92): poison-proof push, self-healing size, fail-closed carry
+
+### Fixed
+- **Manifest entries can no longer be poisoned, and pulls self-heal (design 92)
+  (#184).** Encrypt verify-defers an entry whose bytes changed mid-capture rather
+  than recording a mismatched address; a diff heals a stale entry size instead of
+  trusting it; carry is fail-closed (a base entry that can't be verified is
+  carried, never silently dropped); and apply verifies a blob before it displaces
+  a local file. Field-gated after real zstd-gated poison findings. The
+  simplification pass also removed a ~500k-lstat ancestor walk from a 123k-file
+  pull.
+- **RboxBar finds its resource bundle when installed (#183)**, so the menu bar app
+  renders correctly from an installed copy rather than only from the build tree.
+
+## [0.9.15] — 2026-07-09 — self-clearing watcher-degraded status + native menu bar app
+
+### Added
+- **Native RboxBar menu bar app (design 88 UI) (#177).** A SwiftUI `MenuBarExtra`
+  app (macOS 14+) replaces the SwiftBar shell plugin, reading the same atomic
+  daemon status files with no daemon round-trips. It mirrors the prompt-status
+  verdict rules exactly (15s staleness, absent/corrupt → dead, graceful paused
+  stays paused), reproduces the synced/syncing/attention states theme-aware for
+  light and dark, uses a custom R-monogram icon with a state badge, and is
+  multi-workspace aware.
+
+### Fixed
+- **A transient FSEvents drop no longer pins the status on "attention" until a
+  daemon restart (#182).** A dropped-events window is covered by a completed
+  full/deep scan, which may now clear the watcher-degraded flag — guarded by an
+  error-generation counter (no new watcher error since the scan began) and a live
+  watcher (a periodic-scan fallback stays degraded). Found dogfooding RboxBar.
+
 ## [0.9.14] — 2026-07-09 — commit-fork recovery (`rbox recover`) + un-regressable head (design 91)
 
 ### Added
@@ -391,6 +491,93 @@ workspace, run as a real customer would.
 - Behavior-preserving module splits across the engine, CLI, and API (antislop
   refactor pass).
 
-## [0.6.0] — nested-repo git sync
+## [0.6.0] — 2026-07-01 — nested-repo git sync
 - Nested-repo git sync: per-repo GitSections, worktree materialization, all E2EE
   (design 43).
+
+## [0.5.7] — 2026-07-01 — daemon rebind self-heal + dashboard rebuild
+- Stale-daemon rebind detection, forensic sync logs, and ignoring `.git` pointer
+  files (#42); setup sends the prompted workspace name on the create path (#40).
+- Batched the blob-check push preflight D1 reads (serial → `db.batch`) (#39);
+  customer dashboard rebuilt on Tailwind v4 + shadcn-svelte (#41).
+
+## [0.5.6] — 2026-07-01 — bulletproof live-folder sync
+- Snapshot-first encryption, safe against concurrent writes (#37); churning files
+  now defer instead of aborting the whole push (#38).
+
+## [0.5.5] — 2026-07-01 — setup names + live-folder resilience
+- `rbox setup` prompts for a workspace name (#35); push self-heals a live-folder
+  TOCTOU (`sha_mismatch`) (#36).
+
+## [0.5.4] — 2026-07-01 — interactive CLI revamp
+- `@inquirer` interactive surfaces + pick-workspace-by-name (#34).
+
+## [0.5.3] — 2026-07-01 — download grants (design 27 client)
+- The client presents signed download grants on blob GET, taking D1 off the
+  blob-GET hot path (#32).
+
+## [0.5.2] — 2026-07-01 — workspace names + track picker
+- Opt-in, server-visible workspace names in status, plus a pick-from-list for
+  track-existing (#31, #33); admin cockpit gains the Analytics-Engine SQL read
+  path (§25 Plane A) (#30).
+
+## [0.5.1] — 2026-07-01 — verify every upload path
+- Manifest signature is now verified on every upload path (#26).
+
+## [0.5.0] — 2026-07-01 — watcher scale + global daemon logs
+- `@parcel/watcher` backend: RSS 11 GB → 60 MB and no more dropped events
+  (§41) (#24). Daemon logs/pid move under `~/.rbox` (#21), and `rbox status`
+  shows account/plan/link status (#19). arm-Mac + Linux only.
+
+## [0.4.3] — 2026-07-01 — installer PATH + phase metrics
+- Installer persists PATH; the daemon no longer spawns from the compiled-binary
+  help menu (#16). Coarse client phase metrics (§35) (#17).
+
+## [0.4.2] — 2026-06-30 — native log tail + observability
+- `rbox logs` becomes a real native daemon log tail (#14). Self-serve account +
+  data deletion (GDPR/CCPA, design 37) (#12); §32 observability — Slackpipes
+  pings, Tail Worker, admin cockpit (#13); §33 per-account entitlement GC.
+
+## [0.4.1] — 2026-06-30 — multi-device fix + security email
+- Fixed the §31 admission-grant `notAfter` that bricked multi-device accounts
+  (P0). New-device security emails via Cloudflare Email Service (#10, #11); §30
+  large-ref commit accounting lifts the 6002-ref cap.
+
+## [0.4.0] — 2026-06-30 — version history + CLI redesign + device dashboard
+- CLI redesign: `rbox start`/`setup`, `track`/`untrack`, a `deps` group, `--help`,
+  and dependency-drift notifications (#9). Device-management dashboard (§22) (#5).
+
+## [0.3.2] — 2026-06-30 — CLI redesign groundwork
+- `rbox --help`/`-h` exit 0; the §29 CLI command redesign was finalized.
+
+## [0.3.1] — 2026-06-30 — version history under E2EE
+- Version history + restore under E2EE (design 12 §15); a device-management
+  dashboard (devices route + revoke + unlink); the CLI defaults to the prod API
+  (`api.rbox.to`); `rbox versions .` lists the whole workspace.
+
+## [0.3.0] — 2026-06-30 — git-sync under E2EE
+- §28 git-sync under E2EE — git artifacts encrypted, default on. §24 blobRef
+  sidecar makes the signed commit body O(1); upload/download concurrency raised
+  to 64.
+
+## [0.2.0] — 2026-06-30 — upload receipts (~6× faster sync)
+- §23 upload-receipts (direct-write) cut sync time ~6×. Account linking
+  (design 21): `rbox account link/status/unlink` plus a dashboard "Link your CLI
+  account" flow; §25 server observability streams per-op R2/D1/DO timing to
+  Analytics Engine.
+
+## [0.1.2] — 2026-06-29 — concurrency knee
+- Default upload/download concurrency 16 → 32 (measured knee) + a bench harness.
+
+## [0.1.1] — 2026-06-29 — sync perf + empty-file fix
+- Concurrent blob upload/encrypt and download with push/pull progress; empty-file
+  round-trip fixed; concurrent-push bugs found dogfooding a real repo. Dashboard
+  redesign (#1).
+
+## [0.1.0] — 2026-06-29 — first release: sync engine, control plane, CLI
+- Initial rbox: a continuous daemon (watcher + live push), a streaming /
+  multipart / resumable blob path, opt-in git-state sync, convergent E2EE blob
+  encryption, version history + restore, reachability GC + retention, multi-tenant
+  isolation, self-hosted device-token auth + machine pairing, plan/quota
+  enforcement, Stripe billing (checkout/portal/webhook), and a Clerk-authenticated
+  web dashboard.
