@@ -93,8 +93,17 @@ const fmtDetailBytes = (n: number): string => {
 const formatCommitTimings = (t: CommitTimings): string =>
   `r${fmtDetailSeconds(t.refreshMs)} sc${fmtDetailSeconds(t.sidecarMs)} e${fmtDetailSeconds(t.encodeMs)} c${fmtDetailSeconds(t.encryptMs)} u${fmtDetailSeconds(t.uploadMs)} p${fmtDetailSeconds(t.postMs)} ${fmtDetailBytes(t.encBytes)}`;
 const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}`;
-const formatScanStats = (s: ScanStats): string =>
-  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit}`;
+/** Design 85 §6.1: the scan details carry an explicit residual (wall minus the
+ *  five timed components — allocation, path construction, readlink, cache lookup,
+ *  loop overhead) and the mid-write deferral count from the P-1 guard. */
+type ScanDetails = ScanStats & { residualMs: number; midwriteDeferred: number };
+const scanDetailsOf = (s: ScanStats, wallMs: number, midwriteDeferred: number): ScanDetails => ({
+  ...s,
+  residualMs: Math.max(0, wallMs - (s.readdirMs + s.statMs + s.matcherMs + s.hashMs + s.sortMs)),
+  midwriteDeferred,
+});
+const formatScanStats = (s: ScanDetails): string =>
+  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred}`;
 
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
   const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
@@ -207,9 +216,14 @@ async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
+  const scanT0 = Date.now();
   let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
-  if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
+  if (scanStats) {
+    const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
+    report.recordDetails("scan", { ...details }, formatScanStats(details));
+  }
   await save();
   return local;
 }
@@ -238,11 +252,20 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = matcherForState(root, cfg, state);
   const scanStats = report.enabled ? deps.scanStats : undefined;
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats));
+  // Counting-only deferral sink: pull intentionally acts on no deferred set
+  // (see sync-scan-defer.test.ts — apply's expectedLocal guard is the protection),
+  // but the §6.1 details still report how many paths the P-1 guard dropped.
+  const scanDeferred = new Set<string>();
+  const scanT0 = Date.now();
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  const scanWallMs = Date.now() - scanT0;
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
-    if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
+    if (scanStats) {
+      const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
+      report.recordDetails("scan", { ...details }, formatScanStats(details));
+    }
   }
 
   // E2EE is the only mode (D6): the KEK is injected by buildAuthedRemote. A remote
@@ -396,13 +419,18 @@ export async function push(
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
+  const scanT0 = Date.now();
   let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   await save();
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
-    if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
+    if (scanStats) {
+      const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
+      report.recordDetails("scan", { ...details }, formatScanStats(details));
+    }
   }
   const { sequence, committed } = await pushManifest(root, cfg, local, deps, 0, purgeIgnored);
   return { sequence, committed };

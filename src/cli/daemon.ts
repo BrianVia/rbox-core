@@ -34,12 +34,15 @@ import {
   eventsCoverPath,
   horizonClass,
   loadDriftAudit,
+  mergePending,
   reverifyPath,
   resolveCoveredAtApply,
   saveDriftAudit,
   snapshotEntry,
   type DriftAuditState,
   type DriftCandidate,
+  type DriftCandidateDraft,
+  type EntrySnapshot,
 } from "./drift-audit.js";
 import { lowerIoPriority } from "./io-priority.js";
 import { QuotaExceededError, RboxApi } from "./remote.js";
@@ -83,14 +86,18 @@ export function scanStatsLine(kind: "safety scan" | "deep scan", stats: ScanStat
 }
 
 interface OpenDriftAudit {
-  candidates: DriftCandidate[];
+  scanStartMs: number;
+  candidates: DriftCandidateDraft[];
+  /** Fresh-scan snapshot per pending-candidate path, stashed at scan time so the
+   *  horizon can be resolved at SETTLE time (apply-time resolution only ever
+   *  removes pending entries, so the stash stays a superset). */
+  horizonInputs: Map<string, EntrySnapshot | null>;
   rawEvents: WatchEvent[];
   overflow: boolean;
   watcherHealthy: boolean;
   errorGen: number;
   sinceSafetyMs: number;
   rulesChanged: boolean;
-  horizon?: { confirmed: number; reverted: number; unattributable: number; maxDriftAgeMs: number; lateCovered: number; coveredAmbiguous: number };
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -189,6 +196,7 @@ export class RboxDaemon {
   private readonly openDriftAudits = new Set<OpenDriftAudit>();
   private driftState?: DriftAuditState;
   private driftIo: Promise<void> = Promise.resolve();
+  private driftSaveFailedLogged = false;
   private reconnectAttempt = 0;
   private stopped = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
@@ -1211,7 +1219,7 @@ export class RboxDaemon {
     const rulesChanged = this.rulesChangedSinceDeepScan;
     const stats = createScanStats();
     const audit: OpenDriftAudit = {
-      candidates: [], rawEvents: [], overflow: false,
+      scanStartMs, candidates: [], horizonInputs: new Map(), rawEvents: [], overflow: false,
       watcherHealthy: !!this.watcher && this.watcherHealthy,
       errorGen: this.watcherErrorGeneration,
       sinceSafetyMs: this.lastSafetyCompletedMs === undefined ? 0 : Math.max(0, scanStartMs - this.lastSafetyCompletedMs),
@@ -1230,39 +1238,20 @@ export class RboxDaemon {
     this.rulesChangedSinceDeepScan = false;
     if (metricsEnabled()) log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, deferred.size));
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
-    const current = new Map(freshManifest.files.map((entry) => [entry.path, snapshotEntry(entry)]));
-    let confirmed = 0, reverted = 0, unattributable = 0, maxDriftAgeMs = 0;
-    let resolved = { lateCovered: 0, coveredAmbiguous: 0 };
-    await this.mutateDriftState((state) => {
-      // Construct this inside the serialized mutation so raw/settled events that
-      // arrived during the scan or a queued sidecar transaction cannot be missed.
-      const pendingCoverage = [
-        ...audit.rawEvents,
-        ...this.pendingEvents,
-        ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const })),
-      ];
-      const awaitingApply: DriftCandidate[] = [];
-      for (const candidate of state.pending) {
-        // Event-time truth is binding: never consume a candidate whose covering
-        // batch has arrived but has not yet been applied/re-derived.
-        if (eventsCoverPath(pendingCoverage, candidate.path)) { awaitingApply.push(candidate); continue; }
-        const cls = horizonClass(candidate, current.get(candidate.path) ?? null, {
-          bootId: this.bootId, watcherSessionId: this.watcherSessionId,
-          errorGeneration: this.watcherErrorGeneration,
-          watcherUnhealthySince: !this.watcher || !this.watcherHealthy,
-        });
-        if (cls === "confirmed") { confirmed++; maxDriftAgeMs = Math.max(maxDriftAgeMs, scanStartMs - candidate.firstSeenAtMs); }
-        else if (cls === "reverted") reverted++; else unattributable++;
-      }
-      state.pending = awaitingApply;
-      resolved = state.resolvedSinceLastAudit;
-      state.resolvedSinceLastAudit = { lateCovered: 0, coveredAmbiguous: 0 };
-    });
     audit.candidates = diffForDrift(priorManifest, freshManifest, {
       firstSeenAtMs: scanStartMs, eventGenAtScan, bootId: this.bootId,
       watcherSessionId: this.watcherSessionId, errorGenAtScan: this.watcherErrorGeneration,
     });
-    this.scheduleDriftClassification(audit, { confirmed, reverted, unattributable, maxDriftAgeMs, lateCovered: resolved.lateCovered, coveredAmbiguous: resolved.coveredAmbiguous });
+    // Stash the fresh-scan snapshot for each PENDING candidate now (the fresh
+    // manifest is the horizon's disk truth) — but resolve nothing until the settle
+    // window closes: a covering event delivered during the next 4s must still be
+    // able to retract, and confirmation must share the settle's evidence barrier.
+    const current = new Map(freshManifest.files.map((entry) => [entry.path, snapshotEntry(entry)]));
+    await this.mutateDriftState((state) => {
+      audit.horizonInputs = new Map(state.pending.map((c) => [c.path, current.get(c.path) ?? null]));
+      return false; // read-only
+    });
+    this.scheduleDriftClassification(audit);
     // Trash retention (design 50 §2): the daemon owns pruning, on the infrequent deep tick
     // ONLY — never the sync hot path. Fire-and-forget: a prune failure must never surface as
     // a pump error. `.active`/young-batch protection (B3) lives in pruneTrash itself.
@@ -1288,21 +1277,33 @@ export class RboxDaemon {
     if (probe) {
       const summary = probe.summary();
       log(`scan probe: dirs=${summary.dirs} eligible=${summary.eligible} eligibleReaddirMs=${summary.eligibleReaddirMs} totalReaddirMs=${summary.totalReaddirMs} projectedDircacheBytes=${summary.projectedDircacheBytes} probeOverheadMs=${summary.probeOverheadMs}`);
-      await saveScanProbe(this.root, scanStartMs, probe);
+      // Measurement only — a probe sidecar write failure must never fail the scan op.
+      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${e instanceof Error ? e.message : String(e)}`));
     }
     return { freshManifest: fresh, deferred };
   }
 
   /** Serialized sidecar transaction. `fn` returning false means "unchanged" and
    *  skips the disk write — the empty-pending case runs on EVERY settled watch
-   *  batch and must cost nothing. */
+   *  batch and must cost nothing. Persistence failures are measurement-only:
+   *  the in-memory state stays coherent, the failure is logged once, and the
+   *  caller (the pump's apply path included) NEVER sees an error. */
   private async mutateDriftState(fn: (state: DriftAuditState) => boolean | void | Promise<boolean | void>): Promise<void> {
     const run = this.driftIo.then(async () => {
-      const state = this.driftState ??= await loadDriftAudit(this.root);
-      const dirty = await fn(state);
-      if (dirty !== false) await saveDriftAudit(this.root, state);
+      try {
+        const state = this.driftState ??= await loadDriftAudit(this.root);
+        const dirty = await fn(state);
+        if (dirty === false) return;
+        await saveDriftAudit(this.root, state);
+        this.driftSaveFailedLogged = false;
+      } catch (e) {
+        if (!this.driftSaveFailedLogged) {
+          this.driftSaveFailedLogged = true;
+          log(`drift audit sidecar write failed (measurement only, sync unaffected): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
     });
-    this.driftIo = run.catch(() => {});
+    this.driftIo = run;
     await run;
   }
 
@@ -1317,37 +1318,81 @@ export class RboxDaemon {
     });
   }
 
-  private scheduleDriftClassification(
-    audit: OpenDriftAudit,
-    horizon: { confirmed: number; reverted: number; unattributable: number; maxDriftAgeMs: number; lateCovered: number; coveredAmbiguous: number },
-  ): void {
-    audit.horizon = horizon;
-    audit.timer = setTimeout(() => { void this.runDriftAuditNow(audit, horizon); }, AUDIT_SETTLE_MS);
+  private scheduleDriftClassification(audit: OpenDriftAudit): void {
+    audit.timer = setTimeout(() => { void this.runDriftAuditNow(audit); }, AUDIT_SETTLE_MS);
     audit.timer.unref?.();
   }
 
-  /** Deterministic test seam: production reaches this from the unref'd settle timer. */
-  async runDriftAuditNow(
-    audit = this.openDriftAudits.values().next().value,
-    horizon = audit?.horizon ?? { confirmed: 0, reverted: 0, unattributable: 0, maxDriftAgeMs: 0, lateCovered: 0, coveredAmbiguous: 0 },
-  ): Promise<void> {
+  /** Close the audit's observation window: filter this scan's candidates
+   *  (racing / re-verify / quiescence stamp) AND resolve the prior horizon —
+   *  both inside ONE serialized sidecar transaction whose decision section is
+   *  synchronous, so no covering event can slip between "decided" and
+   *  "persisted": until the audit leaves `openDriftAudits` (inside that
+   *  section) raw events still buffer into it, and afterwards the candidate is
+   *  already in the in-memory pending set that apply-time resolution reads.
+   *  Deterministic test seam: production reaches this from the settle timer. */
+  async runDriftAuditNow(audit = this.openDriftAudits.values().next().value): Promise<void> {
     if (!audit || !this.openDriftAudits.has(audit)) return;
     if (audit.timer) clearTimeout(audit.timer);
     audit.timer = undefined;
-    this.openDriftAudits.delete(audit);
-    const pendingCoverage = [...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
-    const survivors: DriftCandidate[] = [];
-    let racing = 0;
-    for (const candidate of audit.candidates) {
-      if (audit.overflow || eventsCoverPath(audit.rawEvents, candidate.path) || eventsCoverPath(pendingCoverage, candidate.path)) { racing++; continue; }
-      const current = await reverifyPath(this.root, candidate.path);
-      if (current === undefined) { racing++; continue; }
-      // The same retained-expected mismatch must survive; healed scan churn is dropped.
-      if (candidateStillMismatch(candidate, current)) survivors.push(candidate);
+    try {
+      // Re-verification hashes candidate paths — do it OUTSIDE the transaction
+      // (the audit is still open, so its event buffer keeps accumulating; the
+      // final coverage check below re-reads it synchronously).
+      const reverified = new Map<string, EntrySnapshot | null | undefined>();
+      for (const candidate of audit.candidates) {
+        if (!audit.overflow) reverified.set(candidate.path, await reverifyPath(this.root, candidate.path));
+      }
+      let racing = 0, confirmed = 0, confirmedQuiescent = 0, reverted = 0, unattributable = 0, maxDriftAgeMs = 0;
+      let resolved = { lateCovered: 0, coveredAmbiguous: 0 };
+      let survivorCount = 0, pendingHeld = 0;
+      let quiescent = false;
+      await this.mutateDriftState((state) => {
+        // ---- synchronous decision section (no awaits past this point) ----
+        const pendingCoverage = [...audit.rawEvents, ...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
+        quiescent = !audit.overflow && audit.rawEvents.length === 0;
+        const survivors: DriftCandidate[] = [];
+        for (const candidate of audit.candidates) {
+          if (audit.overflow || eventsCoverPath(pendingCoverage, candidate.path)) { racing++; continue; }
+          const current = reverified.get(candidate.path);
+          if (current === undefined) { racing++; continue; }
+          // The same retained-expected mismatch must survive; healed scan churn is dropped.
+          if (candidateStillMismatch(candidate, current)) survivors.push({ ...candidate, quiescentAtScan: quiescent });
+        }
+        const held: DriftCandidate[] = [];
+        const continuity = {
+          bootId: this.bootId, watcherSessionId: this.watcherSessionId,
+          errorGeneration: this.watcherErrorGeneration,
+          watcherUnhealthySince: !this.watcher || !this.watcherHealthy,
+        };
+        for (const candidate of state.pending) {
+          // Event-time truth is binding: a candidate covered by ANY event seen
+          // through this settle window — raw, settled-but-unapplied, or deferred —
+          // stays pending for apply-time resolution. A candidate this audit never
+          // stashed a disk observation for (an overlapping audit's survivor) holds too.
+          if (eventsCoverPath(pendingCoverage, candidate.path) || !audit.horizonInputs.has(candidate.path)) { held.push(candidate); continue; }
+          const cls = horizonClass(candidate, audit.horizonInputs.get(candidate.path) ?? null, continuity);
+          if (cls === "confirmed") {
+            confirmed++;
+            if (candidate.quiescentAtScan) confirmedQuiescent++;
+            maxDriftAgeMs = Math.max(maxDriftAgeMs, audit.scanStartMs - candidate.firstSeenAtMs);
+          } else if (cls === "reverted") reverted++;
+          else unattributable++;
+        }
+        const before = state.pending.length;
+        state.pending = mergePending(held, survivors);
+        survivorCount = survivors.length;
+        pendingHeld = held.length;
+        resolved = state.resolvedSinceLastAudit;
+        state.resolvedSinceLastAudit = { lateCovered: 0, coveredAmbiguous: 0 };
+        this.openDriftAudits.delete(audit); // window closed — atomically with the pending update
+        return before !== 0 || state.pending.length !== 0 || resolved.lateCovered !== 0 || resolved.coveredAmbiguous !== 0;
+      });
+      log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
+    } catch (e) {
+      this.openDriftAudits.delete(audit);
+      log(`drift audit failed (measurement only, sync unaffected): ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (survivors.length > 0) await this.mutateDriftState((state) => { state.pending.push(...survivors); });
-    const quiescent = !audit.overflow && audit.rawEvents.length === 0;
-    log(`deep-scan drift: candidates=${audit.candidates.length} confirmed=${horizon.confirmed} late-covered=${horizon.lateCovered} covered-ambiguous=${horizon.coveredAmbiguous} unattributable=${horizon.unattributable} racing=${racing} reverted=${horizon.reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${horizon.maxDriftAgeMs}`);
   }
 
   /**

@@ -13,6 +13,8 @@ import {
   eventCoversPath,
   horizonClass,
   loadDriftAudit,
+  mergePending,
+  PENDING_CAP,
   resolveCoveredAtApply,
   snapshotEntry,
   type DriftCandidate,
@@ -84,6 +86,85 @@ test("daemon deep audit records, confirms, and races without sleeping", async ()
     console.log = oldLog;
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("a candidate born in a NON-quiescent scan never counts as a quiescent-gated confirm", async () => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-drift-quiescence-")));
+  const logs: string[] = [];
+  const oldLog = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+  try {
+    await fs.writeFile(path.join(root, "f.txt"), "old");
+    const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
+    const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
+    daemon.cache = await HashCache.load(root);
+    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.watcher = { close: async () => {} };
+    daemon.watcherSessionId = "session";
+
+    await fs.writeFile(path.join(root, "f.txt"), "drifted"); // no watcher event
+    await daemon.doDeepScan();
+    // A raw event for an UNRELATED path lands inside the settle window: the scan
+    // is non-quiescent, but the candidate is not covered and survives.
+    const audit = daemon.openDriftAudits.values().next().value;
+    audit.rawEvents.push({ relPath: "unrelated.txt", kind: "change" });
+    await daemon.runDriftAuditNow();
+    expect((await loadDriftAudit(root)).pending[0]).toMatchObject({ quiescentAtScan: false });
+
+    await daemon.doDeepScan();
+    await daemon.runDriftAuditNow();
+    const line = logs.find((l) => l.includes("deep-scan drift:") && l.includes("confirmed=1"))!;
+    expect(line).toBeDefined();
+    expect(line).toContain("confirmedQuiescent=0"); // never feeds the quiescent-only gate
+  } finally {
+    console.log = oldLog;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("drift sidecar write failure is measurement-only — the apply path never throws", async () => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-drift-failsoft-")));
+  const logs: string[] = [];
+  const oldLog = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+  try {
+    await fs.writeFile(path.join(root, "f.txt"), "old");
+    const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
+    const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
+    daemon.cache = await HashCache.load(root);
+    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.watcher = { close: async () => {} };
+    daemon.watcherSessionId = "session";
+
+    await fs.writeFile(path.join(root, "f.txt"), "drifted");
+    await daemon.doDeepScan();
+    await daemon.runDriftAuditNow();
+    expect((await loadDriftAudit(root)).pending).toHaveLength(1);
+
+    // Squat a directory on the sidecar path so the atomic rename fails.
+    await fs.rm(path.join(root, ".rbox/state/drift-audit.json"), { force: true });
+    await fs.mkdir(path.join(root, ".rbox/state/drift-audit.json"));
+    daemon.pendingEvents.push({ relPath: "f.txt", kind: "change" });
+    await daemon.applyPendingWatchEvents(); // must not throw
+    expect(logs.some((l) => l.includes("drift audit sidecar write failed"))).toBe(true);
+    // In-memory state stayed coherent: the covering event resolved the candidate.
+    expect(daemon.driftState.pending).toHaveLength(0);
+  } finally {
+    console.log = oldLog;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("mergePending dedups by path (older candidate wins) and caps growth", () => {
+  const cand = (p: string, firstSeenAtMs: number): DriftCandidate => ({
+    path: p, kind: "modified", expected: null, observed: null,
+    firstSeenAtMs, eventGenAtScan: 0, bootId: "b", errorGenAtScan: 0, quiescentAtScan: true,
+  });
+  const merged = mergePending([cand("a", 1)], [cand("a", 2), cand("b", 3)]);
+  expect(merged).toHaveLength(2);
+  expect(merged.find((c) => c.path === "a")!.firstSeenAtMs).toBe(1); // older evidence kept
+  const flood = mergePending([], Array.from({ length: PENDING_CAP + 50 }, (_, i) => cand(`p${i}`, i)));
+  expect(flood).toHaveLength(PENDING_CAP);
 });
 
 test("corrupt drift sidecars are safely discarded", async () => {
@@ -168,7 +249,7 @@ describe("deep scan drift pure classification", () => {
     expect(candidateStillMismatch(modified, null)).toBe(false);
   });
   test("event-apply truth resolves late-covered versus covered-ambiguous", () => {
-    const candidate: DriftCandidate = diffForDrift(manifest(entry("p")), manifest(entry("p", { sha256: "b" })), context)[0]!;
+    const candidate: DriftCandidate = { ...diffForDrift(manifest(entry("p")), manifest(entry("p", { sha256: "b" })), context)[0]!, quiescentAtScan: true };
     const events: WatchEvent[] = [{ relPath: "p", kind: "change" }];
     const late = resolveCoveredAtApply([candidate], events, new Set(), manifest(entry("p", { sha256: "b" })));
     expect(late).toMatchObject({ lateCovered: 1, coveredAmbiguous: 0, pending: [] });

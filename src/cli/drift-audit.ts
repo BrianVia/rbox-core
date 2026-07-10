@@ -5,6 +5,10 @@ import { RBOX_DIR } from "./config.js";
 
 export const AUDIT_SETTLE_MS = 4_000;
 export const AUDIT_EVENT_CAP = 10_000;
+/** Bound on persisted pending candidates — a soak sidecar must not grow without
+ *  bound or amplify apply-time work. Overflow drops the excess (measurement is
+ *  fail-soft; a real fleet drift count is orders of magnitude smaller). */
+export const PENDING_CAP = 500;
 export type DriftKind = "added" | "deleted" | "modified";
 export type DriftClass = "racing" | "late-covered" | "covered-ambiguous" | "unattributable" | "confirmed" | "reverted";
 export type EntrySnapshot = Pick<FileEntry, "type" | "sha256" | "size" | "mode" | "symlinkTarget">;
@@ -20,6 +24,9 @@ export interface DriftCandidate {
   bootId: string;
   watcherSessionId?: string;
   errorGenAtScan: number;
+  /** Origin scan's quiescence tag — only confirmed drops born in a QUIESCENT scan
+   *  feed the design's drop-rate gate (§5 P0.3 filter c). */
+  quiescentAtScan: boolean;
 }
 export interface DriftAuditState {
   version: 1;
@@ -33,11 +40,14 @@ export const snapshotEntry = snap;
 export function sameSnapshot(a: EntrySnapshot | null, b: EntrySnapshot | null): boolean {
   return a === b || (!!a && !!b && a.type === b.type && a.sha256 === b.sha256 && a.size === b.size && a.mode === b.mode && a.symlinkTarget === b.symlinkTarget);
 }
-export function diffForDrift(expected: Manifest, observed: Manifest, context: Omit<DriftCandidate, "path" | "kind" | "expected" | "observed">): DriftCandidate[] {
+/** A candidate before its origin scan's quiescence is known (stamped at settle time). */
+export type DriftCandidateDraft = Omit<DriftCandidate, "quiescentAtScan">;
+
+export function diffForDrift(expected: Manifest, observed: Manifest, context: Omit<DriftCandidateDraft, "path" | "kind" | "expected" | "observed">): DriftCandidateDraft[] {
   const before = new Map(expected.files.map((x) => [x.path, x]));
   const after = new Map(observed.files.map((x) => [x.path, x]));
   const paths = new Set([...before.keys(), ...after.keys()]);
-  const out: DriftCandidate[] = [];
+  const out: DriftCandidateDraft[] = [];
   for (const p of paths) {
     const a = snap(before.get(p)); const b = snap(after.get(p));
     if (sameSnapshot(a, b)) continue;
@@ -49,14 +59,14 @@ export function eventCoversPath(event: WatchEvent, candidatePath: string): boole
   return event.relPath === candidatePath || ((event.kind === "addDir" || event.kind === "unlinkDir") && candidatePath.startsWith(`${event.relPath}/`));
 }
 export function eventsCoverPath(events: WatchEvent[], candidatePath: string): boolean { return events.some((e) => eventCoversPath(e, candidatePath)); }
-export function continuityBroken(candidate: DriftCandidate, now: ContinuityContext): boolean {
+export function continuityBroken(candidate: DriftCandidateDraft, now: ContinuityContext): boolean {
   return candidate.bootId !== now.bootId || candidate.watcherSessionId !== now.watcherSessionId || candidate.errorGenAtScan !== now.errorGeneration || now.watcherUnhealthySince;
 }
-export function horizonClass(candidate: DriftCandidate, currentObserved: EntrySnapshot | null, continuity: ContinuityContext): "confirmed" | "reverted" | "unattributable" {
+export function horizonClass(candidate: DriftCandidateDraft, currentObserved: EntrySnapshot | null, continuity: ContinuityContext): "confirmed" | "reverted" | "unattributable" {
   if (continuityBroken(candidate, continuity)) return "unattributable";
   return sameSnapshot(candidate.expected, currentObserved) ? "reverted" : "confirmed";
 }
-export function candidateStillMismatch(candidate: DriftCandidate, current: EntrySnapshot | null): boolean {
+export function candidateStillMismatch(candidate: DriftCandidateDraft, current: EntrySnapshot | null): boolean {
   if (candidate.kind === "added") return current !== null;
   if (candidate.kind === "deleted") return current === null;
   return current !== null && !sameSnapshot(candidate.expected, current);
@@ -70,6 +80,14 @@ export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEv
     return false;
   });
   return { pending: kept, lateCovered, coveredAmbiguous };
+}
+
+/** Held-back pending + this scan's survivors, deduplicated by path (the OLDER
+ *  candidate wins — it carries the original drop evidence and age) and capped. */
+export function mergePending(held: DriftCandidate[], survivors: DriftCandidate[]): DriftCandidate[] {
+  const byPath = new Map(held.map((c) => [c.path, c]));
+  for (const s of survivors) if (!byPath.has(s.path)) byPath.set(s.path, s);
+  return [...byPath.values()].slice(0, PENDING_CAP);
 }
 
 const auditPath = (root: string) => path.join(root, RBOX_DIR, "state", "drift-audit.json");
@@ -91,9 +109,12 @@ export async function loadDriftAudit(root: string): Promise<DriftAuditState> {
       Number.isFinite(candidate.firstSeenAtMs) && Number.isFinite(candidate.eventGenAtScan) &&
       Number.isFinite(candidate.errorGenAtScan) && typeof candidate.bootId === "string" &&
       (candidate.watcherSessionId === undefined || typeof candidate.watcherSessionId === "string") &&
+      typeof candidate.quiescentAtScan === "boolean" &&
       validSnapshot(candidate.expected) && validSnapshot(candidate.observed)
     );
-    return x?.version === 1 && validPending && validCounters ? x : emptyDriftAuditState();
+    if (!(x?.version === 1 && validPending && validCounters)) return emptyDriftAuditState();
+    x.pending = x.pending.slice(0, PENDING_CAP);
+    return x;
   }
   catch { return emptyDriftAuditState(); }
 }
