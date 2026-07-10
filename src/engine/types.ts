@@ -94,6 +94,10 @@ export interface GitSection {
   indexTree?: string;
   /** op-state file path (relative to .git) → artifact ref: MERGE_HEAD, REBASE_HEAD, rebase-merge/**, etc. */
   opState?: Record<string, GitArtifactRef>;
+  /** Allowlisted common `.git/config` values (design 93). Present only when the
+   * sender captured an owned dir repo. Absent means unsupported/carried;
+   * `{}` means supported with no allowlisted keys. */
+  config?: Record<string, string[]>;
   /** Ref semantics of this section (design 43 §2): stamped "all" for dir-repo captures,
    *  "scoped" for pointer-repo (worktree/submodule) captures. Gates apply-side ref
    *  deletion and identity projection (§7). */

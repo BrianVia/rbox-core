@@ -827,6 +827,37 @@ test("validateManifest: gitRepos keys — '.', safe rel paths ok; traversal/dup/
   expect(validateManifest(m43({ ".": { ...section(), head: "d".repeat(40), refs: {} } })).ok).toBe(true); // detached HEAD needs no refs
 });
 
+test("validateManifest: git config is additive, canonical, and unknown git-section fields remain tolerated", () => {
+  const config = {
+    "branch.main.merge": ["refs/heads/main"],
+    "branch.main.remote": ["origin"],
+    "remote.origin.fetch": ["+refs/heads/*:refs/remotes/origin/*"],
+    "remote.origin.url": ["https://example.com/repo.git"],
+  };
+  const withUnknown = { ...section({ config }), futureGitField: { preserved: true } };
+  expect(validateManifest(m43({ ".": withUnknown })).ok).toBe(true);
+  expect(withUnknown.futureGitField).toEqual({ preserved: true });
+  expect(withUnknown.config).toBe(config);
+
+  // Absent and explicitly empty are distinct rollout states, and both are valid.
+  expect(validateManifest(m43({ ".": section() })).ok).toBe(true);
+  expect(validateManifest(m43({ ".": section({ config: {} }) })).ok).toBe(true);
+});
+
+test("validateManifest: git config rejects every non-canonical wire shape", () => {
+  const check = (config: unknown) => validateManifest(m43({ ".": { ...section(), config } })).ok;
+  expect(check({ "remote.origin.url": ["https://example.com/repo.git"] })).toBe(true);
+  expect(check({
+    "remote.origin.url": ["https://example.com/repo.git"],
+    "branch.main.remote": ["origin"],
+  })).toBe(false); // keys not bytewise sorted
+  expect(check({ "remote.origin.url": [] })).toBe(false);
+  expect(check({ "remote.origin.url": ["https://example.com", "https://example.com"] })).toBe(false);
+  expect(check({ "remote.origin.pushurl": ["ssh://git@example.com/repo"] })).toBe(false);
+  expect(check({ "remote.origin.url": ["https://user@example.com/repo"] })).toBe(false);
+  expect(check({ "branch.main.remote": ["missing"] })).toBe(false);
+});
+
 test("validateManifest: MAX_GIT_REPOS is a LOUD error at the boundary, not a silent drop", () => {
   const at = Object.fromEntries(Array.from({ length: MAX_GIT_REPOS }, (_, i) => [`r${i}`, section()]));
   expect(validateManifest(m43(at)).ok).toBe(true);

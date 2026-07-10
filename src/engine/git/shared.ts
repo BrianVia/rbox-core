@@ -23,7 +23,9 @@ export function setGitSpawnObserver(observer: ((root: string, args: readonly str
 
 export const HEX40 = /^[0-9a-f]{40}$/;
 
-export async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+/** Run Git without altering stdout bytes. Required for NUL-delimited config reads,
+ * where trimming would erase a successful empty value. */
+export async function gitRaw(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   gitSpawnObserver?.(root, args);
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
@@ -32,7 +34,31 @@ export async function git(root: string, args: string[], opts: { maxBuffer?: numb
     // load-bearing for the apply shape refusal + gitBusy) at a FOREIGN repo.
     env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv,
   });
-  return stdout.toString().trim();
+  return stdout.toString();
+}
+
+export async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+  return (await gitRaw(root, args, opts)).trim();
+}
+
+/** Read candidate design-93 keys from the local common config. Exit 1 is Git's
+ * documented no-match result; every other subprocess failure remains loud. */
+export async function readLocalGitConfigEntries(root: string): Promise<Array<[key: string, value: string]>> {
+  let raw: string;
+  try {
+    raw = await gitRaw(root, ["config", "--local", "--no-includes", "--get-regexp", "-z", "^(remote|branch)\\."]);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 1) return [];
+    throw error;
+  }
+  if (raw === "") return [];
+  const records = raw.split("\0");
+  if (records.pop() !== "") throw new Error("git config -z returned an unterminated record");
+  return records.map((record) => {
+    const separator = record.indexOf("\n");
+    if (separator < 0) throw new Error("git config -z returned a record without a key/value separator");
+    return [record.slice(0, separator), record.slice(separator + 1)];
+  });
 }
 
 export async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
@@ -318,7 +344,7 @@ export async function moveFileAtomic(src: string, dest: string): Promise<void> {
 
 export async function gitBusy(ctx: RepoCtx): Promise<boolean> {
   // per-worktree locks live in the resolved gitdir; store-wide locks in the common dir
-  for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "gc.pid")]) {
+  for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "config.lock"), path.join(ctx.commonDir, "gc.pid")]) {
     if (await exists(lock)) return true;
   }
   // any *.lock under the SHARED refs/
