@@ -89,14 +89,15 @@ test("validateManifest accepts only complete compressed file descriptors", () =>
 
 // ---- hash cache (the performance fast-path) -------------------------------
 
-test("HashCache.lookup hits only on matching mtime+size", () => {
+test("HashCache.lookup hits only on matching mtime+size+ctime", () => {
   const c = new HashCache();
-  c.record("a.ts", { mtimeMs: 100, size: 5, sha256: "deadbeef" });
-  expect(c.lookup("a.ts", 100, 5)).toBe("deadbeef"); // hit
-  expect(c.lookup("a.ts", 101, 5)).toBeUndefined(); // mtime changed
-  expect(c.lookup("a.ts", 100, 6)).toBeUndefined(); // size changed
+  c.record("a.ts", { mtimeMs: 100, size: 5, ctimeMs: 200, sha256: "deadbeef" });
+  expect(c.lookup("a.ts", 100, 5, 200)).toBe("deadbeef"); // hit
+  expect(c.lookup("a.ts", 101, 5, 200)).toBeUndefined(); // mtime changed
+  expect(c.lookup("a.ts", 100, 6, 200)).toBeUndefined(); // size changed
+  expect(c.lookup("a.ts", 100, 5, 201)).toBeUndefined(); // ctime changed
   c.invalidate("a.ts");
-  expect(c.lookup("a.ts", 100, 5)).toBeUndefined(); // invalidated
+  expect(c.lookup("a.ts", 100, 5, 200)).toBeUndefined(); // invalidated
 });
 
 test("scanManifest consults the cache (seeded wrong sha is returned, proving no re-hash)", async () => {
@@ -106,9 +107,9 @@ test("scanManifest consults the cache (seeded wrong sha is returned, proving no 
     await fs.writeFile(abs, "hello");
     const st = await fs.stat(abs);
 
-    // Seed the cache with a BOGUS sha for the exact (mtime,size) on disk.
+    // Seed the cache with a BOGUS sha for the exact (mtime,size,ctime) on disk.
     const cache = new HashCache();
-    cache.record("a.txt", { mtimeMs: st.mtimeMs, size: st.size, sha256: "bogus".padEnd(64, "0") });
+    cache.record("a.txt", { mtimeMs: st.mtimeMs, size: st.size, ctimeMs: st.ctimeMs, sha256: "bogus".padEnd(64, "0") });
 
     const m = await scanManifest(dir, undefined, cache);
     const entry = m.files.find((f) => f.path === "a.txt")!;
@@ -166,10 +167,72 @@ test("HashCache persists and reloads (atomic save round-trip)", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-hc-"));
   try {
     const c = new HashCache();
-    c.record("x.ts", { mtimeMs: 1, size: 2, sha256: "c".repeat(64) });
+    c.record("x.ts", { mtimeMs: 1, size: 2, ctimeMs: 3, sha256: "c".repeat(64) });
     await c.save(dir);
+    expect(JSON.parse(await fs.readFile(path.join(dir, ".rbox/state/hashcache.json"), "utf8"))).toEqual({
+      version: 2,
+      entries: { "x.ts": { mtimeMs: 1, size: 2, ctimeMs: 3, sha256: "c".repeat(64) } },
+    });
     const loaded = await HashCache.load(dir);
-    expect(loaded.lookup("x.ts", 1, 2)).toBe("c".repeat(64));
+    expect(loaded.lookup("x.ts", 1, 2, 3)).toBe("c".repeat(64));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a same-size edit with restored mtime is re-hashed, never served the stale sha (ctime in the fingerprint)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-hc-touch-r-"));
+  try {
+    const abs = path.join(dir, "f.txt");
+    const t = new Date(Math.floor(Date.now() / 1000) * 1000 - 5000); // whole-second, exactly restorable
+    await fs.writeFile(abs, "aaaa");
+    await fs.utimes(abs, t, t);
+    const st1 = await fs.stat(abs);
+
+    const cache = new HashCache();
+    const m1 = await scanManifest(dir, undefined, cache);
+    expect(m1.files[0]!.sha256).toBe(createHash("sha256").update("aaaa").digest("hex"));
+
+    await fs.writeFile(abs, "bbbb"); // same size, new content
+    await fs.utimes(abs, t, t); // the touch -r: (mtime,size) now match the cached entry again
+    const st2 = await fs.stat(abs);
+    expect(st2.mtimeMs).toBe(st1.mtimeMs); // the old (mtime,size) fingerprint WOULD have hit
+    expect(st2.size).toBe(st1.size);
+
+    const m2 = await scanManifest(dir, undefined, cache);
+    expect(m2.files[0]!.sha256).toBe(createHash("sha256").update("bbbb").digest("hex"));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("HashCache discards legacy bare-map files and rewrites v2 after a record", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-hc-legacy-"));
+  try {
+    const abs = path.join(dir, ".rbox/state/hashcache.json");
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, JSON.stringify({ "old.ts": { mtimeMs: 1, size: 2, sha256: "a".repeat(64) } }));
+
+    const loaded = await HashCache.load(dir);
+    expect(loaded.lookup("old.ts", 1, 2, 3)).toBeUndefined();
+    loaded.record("new.ts", { mtimeMs: 4, size: 5, ctimeMs: 6, sha256: "b".repeat(64) });
+    await loaded.save(dir);
+    expect(JSON.parse(await fs.readFile(abs, "utf8"))).toEqual({
+      version: 2,
+      entries: { "new.ts": { mtimeMs: 4, size: 5, ctimeMs: 6, sha256: "b".repeat(64) } },
+    });
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("HashCache loads corrupt files as empty", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-hc-corrupt-"));
+  try {
+    const abs = path.join(dir, ".rbox/state/hashcache.json");
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, "not json");
+    expect((await HashCache.load(dir)).lookup("a.ts", 1, 2, 3)).toBeUndefined();
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

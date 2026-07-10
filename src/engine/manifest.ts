@@ -20,7 +20,7 @@ export interface WatchEvent {
  * Ignored directories are pruned (never descended into) so `node_modules` and
  * friends cost nothing. Symlinks are recorded by their target, never followed.
  *
- * With a {@link HashCache}, unchanged files (same mtime+size) skip re-hashing —
+ * With a {@link HashCache}, unchanged files (same mtime+size+ctime) skip re-hashing —
  * turning a full scan into a stat-only pass for the common case. The cache is a
  * fast-path hint only; identity is still the content sha (see FileEntry).
  */
@@ -71,7 +71,9 @@ export async function scanManifest(
   /** Optional metrics sink. Readdir/sort/hash timing is batched at the operation
    *  level; stat and matcher timing stays at the checked-entry level because the
    *  current walk interleaves them with pruning and recursion. */
-  scanStats?: ScanStats
+  scanStats?: ScanStats,
+  /** Out-param: files that changed between discovery and their deferred hash. */
+  deferred?: Set<string>
 ): Promise<Manifest> {
   const files: FileEntry[] = [];
   let discovered = 0;
@@ -80,7 +82,7 @@ export async function scanManifest(
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats);
+  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats, deferred);
   if (scanStats) {
     const t0 = Date.now();
     files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -202,9 +204,21 @@ export async function applyWatchEvents(
  *  caller can RETRY a mid-write on the hot path instead of waiting for the safety scan. */
 type StatHashResult = { kind: "entry"; entry: FileEntry } | { kind: "gone" } | { kind: "midwrite" };
 
+/** Exact identity and metadata contract for accepting a stat → hash → stat tuple. */
+export function statsStableAcrossHash(pre: Stats, post: Stats): boolean {
+  return pre.isFile() &&
+    post.isFile() &&
+    pre.ino === post.ino &&
+    pre.dev === post.dev &&
+    pre.size === post.size &&
+    pre.mtimeMs === post.mtimeMs &&
+    pre.ctimeMs === post.ctimeMs &&
+    pre.mode === post.mode;
+}
+
 /**
  * Stat → hash → stat-again for a single path. Never returns a torn snapshot: if the
- * file vanished it's `gone`; if mtime/size shifted across the hash (active write) it's
+ * file vanished it's `gone`; if identity or metadata shifted across the hash it's
  * `midwrite` (retry, don't bake). Symlinks and non-files handled too.
  */
 async function statHashEntry(root: string, rel: string, cache?: HashCache): Promise<StatHashResult> {
@@ -221,14 +235,14 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
   }
   if (!st1.isFile()) return { kind: "gone" };
 
-  const cached = cache?.lookup(rel, st1.mtimeMs, st1.size);
+  const cached = cache?.lookup(rel, st1.mtimeMs, st1.size, st1.ctimeMs);
   if (cached) return { kind: "entry", entry: { path: rel, type: "file", sha256: cached, size: st1.size, mode: st1.mode & 0o777, mtimeMs: st1.mtimeMs } };
 
   const sha256 = await hashFile(abs, st1.size);
   const st2 = await fs.lstat(abs).catch(() => undefined);
   if (!st2) return { kind: "gone" };
-  if (st2.mtimeMs !== st1.mtimeMs || st2.size !== st1.size) return { kind: "midwrite" };
-  cache?.record(rel, { mtimeMs: st2.mtimeMs, size: st2.size, sha256 });
+  if (!statsStableAcrossHash(st1, st2)) return { kind: "midwrite" };
+  cache?.record(rel, { mtimeMs: st2.mtimeMs, size: st2.size, ctimeMs: st2.ctimeMs, sha256 });
   return { kind: "entry", entry: { path: rel, type: "file", sha256, size: st2.size, mode: st2.mode & 0o777, mtimeMs: st2.mtimeMs } };
 }
 
@@ -236,9 +250,7 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
 interface PendingHash {
   childRel: string;
   abs: string;
-  size: number;
-  mode: number;
-  mtimeMs: number;
+  st: Stats;
 }
 
 const HASH_CONCURRENCY = 16; // bound on parallel hashing — saturates disk without fd storms
@@ -253,7 +265,8 @@ async function walk(
   onDiscover?: () => void,
   onGitRepo?: (repo: DiscoveredGitRepo) => void,
   discoveryPruned = false,
-  scanStats?: ScanStats
+  scanStats?: ScanStats,
+  deferred?: Set<string>
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
@@ -286,7 +299,7 @@ async function walk(
           ? timedMatcher(scanStats, () => matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir))
           : matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
       if (scanStats ? timedMatcher(scanStats, () => matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) : matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats);
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats, deferred);
     } else if (entry.isSymbolicLink()) {
       if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
       onDiscover?.();
@@ -315,13 +328,13 @@ async function walk(
       } else {
         st = await fs.stat(abs);
       }
-      const cached = cache?.lookup(childRel, st.mtimeMs, st.size);
+      const cached = cache?.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs);
       if (cached) {
         if (scanStats) scanStats.filesSkippedCacheHit += 1;
         out.push({ path: childRel, type: "file", sha256: cached, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
       } else {
         // Defer the hash — sequential per-file hashing dominates a cold scan.
-        toHash.push({ childRel, abs, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
+        toHash.push({ childRel, abs, st });
       }
     }
   }
@@ -330,10 +343,10 @@ async function walk(
     if (scanStats) {
       scanStats.filesHashed += toHash.length;
       const t0 = Date.now();
-      await drainHashes(toHash, out, cache);
+      await drainHashes(toHash, out, cache, deferred);
       scanStats.hashMs += Date.now() - t0;
     } else {
-      await drainHashes(toHash, out, cache);
+      await drainHashes(toHash, out, cache, deferred);
     }
   }
 }
@@ -348,14 +361,19 @@ function timedMatcher(scanStats: ScanStats, fn: () => boolean): boolean {
 }
 
 /** Hash the deferred cache-miss files with bounded concurrency. */
-async function drainHashes(pending: PendingHash[], out: FileEntry[], cache?: HashCache): Promise<void> {
+async function drainHashes(pending: PendingHash[], out: FileEntry[], cache?: HashCache, deferred?: Set<string>): Promise<void> {
   let i = 0;
   const worker = async () => {
     for (let idx = i++; idx < pending.length; idx = i++) {
       const p = pending[idx]!;
-      const sha256 = await hashFile(p.abs, p.size);
-      cache?.record(p.childRel, { mtimeMs: p.mtimeMs, size: p.size, sha256 });
-      out.push({ path: p.childRel, type: "file", sha256, size: p.size, mode: p.mode, mtimeMs: p.mtimeMs });
+      const sha256 = await hashFile(p.abs, p.st.size);
+      const post = await fs.lstat(p.abs).catch(() => undefined);
+      if (!post || !statsStableAcrossHash(p.st, post)) {
+        deferred?.add(p.childRel);
+        continue;
+      }
+      cache?.record(p.childRel, { mtimeMs: post.mtimeMs, size: post.size, ctimeMs: post.ctimeMs, sha256 });
+      out.push({ path: p.childRel, type: "file", sha256, size: post.size, mode: post.mode & 0o777, mtimeMs: post.mtimeMs });
     }
   };
   await Promise.all(Array.from({ length: Math.min(HASH_CONCURRENCY, pending.length) }, worker));
