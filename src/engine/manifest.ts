@@ -97,8 +97,8 @@ export async function scanManifest(
  * Patch a manifest in place from a settled batch of watcher events — the hot
  * path, O(changed) not O(repo). File add/change re-hash that one path; unlink
  * drops it; a directory unlink removes the whole `dir/**` prefix; a directory
- * add recursively scans just that subtree. A file that's mid-write (mtime/size
- * shifts across the hash) is left for the next round rather than baked torn.
+ * add recursively scans just that subtree. A file that's mid-write (stats
+ * shifted across the hash) is left for the next round rather than baked torn.
  */
 export async function applyWatchEvents(
   base: Manifest,
@@ -106,7 +106,7 @@ export async function applyWatchEvents(
   matcher: IgnoreMatcher,
   events: WatchEvent[],
   cache?: HashCache,
-  /** Out-param: paths that were mid-write (mtime/size shifted across the hash) and
+  /** Out-param: paths that were mid-write (stats shifted across the hash) and
    *  should be retried by the caller rather than left to the safety scan. */
   deferred?: Set<string>
 ): Promise<Manifest> {

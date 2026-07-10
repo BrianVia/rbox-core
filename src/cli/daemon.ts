@@ -1161,8 +1161,9 @@ export class RboxDaemon {
       .catch(() => {});
   }
 
-  /** Install a coherent full-scan result. Paths that moved while being hashed carry
-   *  their previous entry and enter the existing prompt write-finish retry loop. */
+  /** Install a coherent full-scan result. A path that changed under its deferred
+   *  hash carries `previous`'s entry (never a torn tuple, never a deletion) and
+   *  enters the existing write-finish retry loop. */
   private async replaceManifestFromScan(cache: HashCache, previous: Manifest): Promise<void> {
     const deferred = new Set<string>();
     const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, undefined, deferred);

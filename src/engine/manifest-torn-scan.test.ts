@@ -10,11 +10,10 @@ let mutation: Mutation | undefined;
 
 mock.module("./hash.js", () => ({
   hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
-  hashFile: async (abs: string, sizeHint?: number): Promise<string> => {
+  hashFile: async (abs: string): Promise<string> => {
     const run = mutation;
     mutation = undefined;
     if (run) await run(abs);
-    void sizeHint;
     return createHash("sha256").update(await fs.readFile(abs)).digest("hex");
   },
 }));
