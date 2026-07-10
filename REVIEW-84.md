@@ -155,3 +155,21 @@ Both findings accepted:
 2. **MINOR (Phase D "PASS") — accepted.** Reworded to "the §7.3 target
    stands"; PASS/FAIL is decided by the actual §7.3 gate run after D ships,
    since the O(N) `resultHash` cost is not isolated in raw-v0 samples.
+
+## Round A2 — codex
+
+I re-verified the Round-A1 revision against §6.1 and §7. The projected
+post-C2 floor consistently retains `sidecarMs` and is stated as `refresh +
+sidecar + post + residual` = **9.3s Linux / 9.2s Mac** in the §6.1
+projection and verdict, with the §7 preamble quoting the same range as
+≈9.2–9.3s. The C2 win is consistently **4.3–4.5s (~30%)**, and the Linux
+`e+c+u` median cell correctly reads **4.3s**. Phase D is recorded as **the
+§7.3 target stands**, with PASS/FAIL explicitly deferred to the actual gate
+run after D ships. Finally, the `postMs` pipeline discussion is labeled as
+attribution/hypothesis pending a server-side `OpSpan` read, and the
+instrumentation-gap note correctly says client timing cannot split the
+opaque POST round trip.
+
+No remaining findings.
+
+Verdict: ALIGNED
