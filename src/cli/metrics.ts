@@ -14,10 +14,9 @@ import path from "node:path";
 import { PhaseReport, writeFileAtomic } from "../engine/index.js";
 import { RBOX_DIR } from "./config.js";
 
-/** Per-run phase metrics (design §35) are opt-in via `RBOX_METRICS` — OFF by default so
- *  the daemon hot path and no-op tick pay nothing. When on, one-shot commands print a
- *  phase summary and the daemon writes one to its log (surfaced by `rbox logs`). */
-export const metricsEnabled = (): boolean => process.env.RBOX_METRICS === "1" || process.env.RBOX_METRICS === "true";
+/** Per-run phase metrics (design §35/85) are on by default. Measured scan overhead is
+ *  <=3% in the worst cache-hit profile; set `RBOX_METRICS=0` (or `false`) to opt out. */
+export const metricsEnabled = (): boolean => process.env.RBOX_METRICS !== "0" && process.env.RBOX_METRICS !== "false";
 
 /** An ENABLED per-run report when metrics are on, else `undefined` — so the daemon hot
  *  path and no-op tick allocate nothing. Callers wire the result into `SyncDeps.report`
