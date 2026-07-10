@@ -17,6 +17,7 @@ import { IN_LIST_CHUNK, STMTS_PER_BATCH } from "../src/d1-batch.js";
 import { MAX_MISSING_SHAS_RESPONSE, unsatisfiedBlobsBody } from "../src/commit-envelope.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { blobKey } from "../src/util.js";
+import { multipartComplete } from "../src/blobs.js";
 
 // §23.2 (staging PUT) + §23.4 (commit accounting) against real D1 + R2 (workerd).
 // The DO head-advance (transactionSync) isn't available in this runtime, so we drive
@@ -118,6 +119,73 @@ describe("§23.2 PUT → canonical + receipt (direct-write, zero D1 on the hot p
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE sha256=?").bind(s).first()).toBeNull();
     expect(await used(a.accountId)).toBe(0); // un-charged until commit
   });
+
+  test("open delete intent refuses receipt minting, then succeeds after unwind", async () => {
+    const a = await bootstrap("rcpt-put-fence");
+    const content = "receipt-fenced-content";
+    const s = sha(content);
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(s).run();
+
+    const blocked = await SELF.fetch(`${BASE}/v1/blobs/${s}`, {
+      method: "PUT",
+      headers: authed(a.token, { "content-length": String(content.length), ...RCPT }),
+      body: content,
+    });
+    expect(blocked.status).toBe(503);
+    expect(await blocked.json()).toEqual({ error: "retry_later" });
+    expect(await env.rbox_dev_blobs.get(blobKey(s))).toBeTruthy(); // bytes carry no authority
+    await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
+    expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, {
+      method: "PUT",
+      headers: authed(a.token, { "content-length": String(content.length), ...RCPT }),
+      body: content,
+    })).status).toBe(200);
+  });
+
+  test("legacy publish maps the fence abort to retry_later and succeeds after unwind", async () => {
+    const a = await bootstrap("legacy-put-fence");
+    const content = "legacy-fenced-content";
+    const s = sha(content);
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(s).run();
+    const put = () => SELF.fetch(`${BASE}/v1/blobs/${s}`, {
+      method: "PUT",
+      headers: authed(a.token, { "content-length": String(content.length) }),
+      body: content,
+    });
+    const blocked = await put();
+    expect(blocked.status).toBe(503);
+    expect(await blocked.json()).toEqual({ error: "retry_later" });
+    await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
+    expect((await put()).status).toBe(200);
+  });
+
+  test("legacy multipart COMPLETE maps the fence abort to retry_later and succeeds after unwind", async () => {
+    const a = await bootstrap("legacy-multipart-fence");
+    const content = new TextEncoder().encode("multipart-fenced-content");
+    const s = sha("multipart-fenced-content");
+    const stage = async (suffix: string) => {
+      const stagingKey = `staging/${s}/${suffix}`;
+      const mpu = await env.rbox_dev_blobs.createMultipartUpload(stagingKey);
+      const part = await mpu.uploadPart(1, content);
+      await db().batch([
+        db().prepare("INSERT INTO uploads(upload_id,sha256,staging_key,part_size,total_parts,size,created_at,account_id) VALUES (?,?,?,?,1,?,?,?)")
+          .bind(mpu.uploadId, s, stagingKey, content.byteLength, content.byteLength, Date.now(), a.accountId),
+        db().prepare("INSERT INTO upload_parts(upload_id,part_number,etag,size) VALUES (?,1,?,?)").bind(mpu.uploadId, part.etag, content.byteLength),
+      ]);
+      return mpu.uploadId;
+    };
+
+    await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES (?,'blob',1,2)").bind(s).run();
+    const blocked = await multipartComplete(env, s, await stage("blocked"), a.accountId);
+    expect(blocked.status).toBe(503);
+    expect(await blocked.json()).toEqual({ error: "retry_later" });
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).toBeNull();
+
+    await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
+    const ok = await multipartComplete(env, s, await stage("retry"), a.accountId);
+    expect(ok.status).toBe(200);
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).not.toBeNull();
+  });
 });
 
 describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + grant, no promote)", () => {
@@ -188,6 +256,60 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
     const v = await validateCommitRefs(env, op.env.rbox_dev_db, a.accountId, [orphan], {}, Date.now());
     expect(v).toEqual({ ok: false, needsUpload: [orphan] });
   });
+
+  test("one fenced sha aborts a multi-sha accounting batch atomically and returns the whole batch", async () => {
+    const a = await bootstrap("rcpt-fence-atomic");
+    const refs = [{ sha: sha("fence-a"), size: 7 }, { sha: sha("fence-b"), size: 9 }];
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(refs[1]!.sha).run();
+    expect(await commitAccounting(db(), a.accountId, refs, Date.now())).toEqual({ needsUpload: refs.map((r) => r.sha) });
+    expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256 IN (?,?)").bind(...refs.map((r) => r.sha)).first()).toBeNull();
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=?").bind(a.accountId).first()).toBeNull();
+    expect(await used(a.accountId)).toBe(0);
+  });
+
+  test("blob_refs and blobs-present fence triggers cover their exact publication writes", async () => {
+    const a = await bootstrap("fence-trigger-shapes");
+    const open = sha("trigger-open");
+    const sibling = sha("trigger-sibling");
+    await db().batch([
+      db().prepare("INSERT INTO blobs(sha256, size_bytes, present) VALUES (?, 1, 0)").bind(open),
+      db().prepare("INSERT INTO blobs(sha256, size_bytes, present) VALUES (?, 1, 1)").bind(sibling),
+      db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(open),
+    ]);
+
+    await expect(db().prepare("UPDATE blobs SET present=1 WHERE sha256=?").bind(open).run()).rejects.toThrow(/rbox_delete_fence/);
+    expect(Number((await db().prepare("SELECT present FROM blobs WHERE sha256=?").bind(open).first())!.present)).toBe(0);
+
+    await expect(db().batch([
+      db().prepare("INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES (?, ?, 1)").bind(a.accountId, sibling),
+      db().prepare("INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES (?, ?, 1)").bind(a.accountId, open),
+    ])).rejects.toThrow(/rbox_delete_fence/);
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=?").bind(a.accountId).first()).toBeNull();
+  });
+
+  test("validateCommitRefs steers an entitled open-intent sha to needsUpload", async () => {
+    const a = await bootstrap("rcpt-fence-steer");
+    const staged = await putStaged(a.token, "steering-content");
+    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "steering-content".length }], Date.now())).toEqual({ ok: true });
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(staged.sha).run();
+    expect(await validateCommitRefs(env, db(), a.accountId, [staged.sha], {}, Date.now())).toEqual({ ok: false, needsUpload: [staged.sha] });
+  });
+
+  test("blobs/check reports open intents missing in receipts and legacy modes", async () => {
+    const a = await bootstrap("blob-check-fence-steer");
+    const staged = await putStaged(a.token, "check-steering-content");
+    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "check-steering-content".length }], Date.now())).toEqual({ ok: true });
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(staged.sha).run();
+    for (const headers of [{}, RCPT]) {
+      const res = await SELF.fetch(`${BASE}/v1/blobs/check`, {
+        method: "POST",
+        headers: authed(a.token, { "content-type": "application/json", ...headers }),
+        body: JSON.stringify({ shas: [staged.sha] }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ missing: [staged.sha] });
+    }
+  });
 });
 
 describe("design 71 receipt redemption and ref-scale guards", () => {
@@ -223,6 +345,16 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     expect(second.status).toBe(200);
     expect(await second.json()).toEqual({ granted: 0, alreadyEntitled: 3, rejected: 0 });
     expect(await used(a.accountId)).toBe("manifest".length + "file-a".length + "file-b".length);
+  });
+
+  test("redeem converts a fence abort to the partial-redeem 422 shape", async () => {
+    const a = await bootstrap("rcpt-redeem-fence");
+    const staged = await Promise.all(["redeem-fence-a", "redeem-fence-b"].map((c) => putStaged(a.token, c)));
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(staged[1]!.sha).run();
+    const res = await redeem(a.accountId, Object.fromEntries(staged.map((s) => [s.sha, s.receipt])));
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ error: "unsatisfied_blobs", missing: staged.map((s) => s.sha), missingTotal: 2 });
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=?").bind(a.accountId).first()).toBeNull();
   });
 
   test("redeem rejects invalid HMACs in the response count without granting them", async () => {

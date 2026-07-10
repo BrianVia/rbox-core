@@ -406,7 +406,7 @@ export async function push(
  *  the no-op and everything-deferred short-circuits, so callers can say "already in
  *  sync" instead of reporting a publish that never happened (design 44: the setup
  *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
-type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; committed: boolean };
+type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean };
 
 /**
  * The one typed recovery structure behind pushManifest's bounded retry loop. A failed
@@ -630,7 +630,7 @@ async function runPushAttempt(
   // Missing or scan-mismatched sources defer immediately; ciphertext upload
   // mismatches retry within a bounded per-file budget. Only the stable subset is
   // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+  const { deferred, retryLater } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
@@ -653,7 +653,7 @@ async function runPushAttempt(
     const dd = diffManifests(appliedBase, committed);
     if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
       reportDeferred(deferred);
-      return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], committed: false } };
+      return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
     }
   }
 
@@ -724,7 +724,7 @@ async function runPushAttempt(
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
   }));
   if (deferred.size > 0) reportDeferred(deferred);
-  return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
+  return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true } };
 }
 
 function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: string[]): void {

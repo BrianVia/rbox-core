@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
-import { BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
+import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 import {
   buildIgnoreMatcher,
   ENCRYPT_ADDRESS_CACHE_REL,
@@ -99,6 +99,7 @@ class FakeRemote implements SyncRemote {
   // that keeps changing — exercises the bounded-retry give-up).
   forceShaMismatchOnce?: string;
   forceShaMismatchAlways?: string;
+  forceRetryLater?: string;
 
   /** Encrypt + seed a blob (as the uploading client would); return its FileEntry. */
   async seedEntry(rel: string, content: string): Promise<FileEntry> {
@@ -130,6 +131,7 @@ class FakeRemote implements SyncRemote {
     return shas.filter((s) => !this.blobs.has(s));
   }
   async putBlobFile(sha256: string, absPath: string): Promise<void> {
+    if (this.forceRetryLater === sha256) throw new BlobRetryLaterError();
     if (this.forceShaMismatchAlways === sha256) throw new BlobShaMismatchError(sha256);
     if (this.forceShaMismatchOnce === sha256) {
       this.forceShaMismatchOnce = undefined; // heal on the re-scan retry
@@ -647,6 +649,22 @@ test("a file that NEVER settles is deferred; the push SUCCEEDS committing the OT
   expect(remote.hasBlob((await enc("stable content\n")).encSha)).toBe(true);
   // Invariant: the committed manifest references no blob that isn't present on the server.
   for (const f of committed.files) if (f.type === "file") expect(remote.hasBlob(f.encSha!)).toBe(true);
+});
+
+test("retry_later defers one file without retrying its upload or blocking stable progress", async () => {
+  const remote = new FakeRemote();
+  await write("stable.txt", "stable content\n");
+  await write("fenced.txt", "fenced content\n");
+  remote.forceRetryLater = (await enc("fenced content\n")).encSha;
+
+  const res = await pushManifest(root, cfg, await scanManifest(root), deps(remote));
+
+  expect(res.sequence).toBe(1);
+  expect(res.deferred).toEqual(["fenced.txt"]);
+  expect(res.retryLater).toEqual(["fenced.txt"]);
+  const committed = (await remote.latest()).manifest;
+  expect(committed.files.some((f) => f.path === "fenced.txt")).toBe(false);
+  expect(committed.files.some((f) => f.path === "stable.txt")).toBe(true);
 });
 
 test("a file that VANISHES between scan and encrypt is deferred; the push commits the rest", async () => {

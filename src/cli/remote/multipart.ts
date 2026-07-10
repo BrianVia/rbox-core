@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, QuotaExceededError, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
+import { BlobRetryLaterError, BlobShaMismatchError, QuotaExceededError, isRetryLater, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
 import { fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
 
@@ -36,6 +36,7 @@ export async function putBlobMultipart(
       if (uploadsDir) await fsp.rm(path.join(uploadsDir, `${sha256}.json`), { force: true }).catch(() => {});
       throw e;
     }
+    if (e instanceof BlobRetryLaterError) throw e;
     if (e instanceof QuotaExceededError) throw e;
     // A resume against an expired/dead upload (or any mid-flight error) — clear
     // the token and retry once from a fresh init. If the second attempt fails,
@@ -142,6 +143,14 @@ async function multipartAttempt(
     headers: ctx.auth,
   }, { op: "finalizing upload", retries: 0 });
   if (!done.ok) {
+    const retryText = done.status === 503 ? await done.clone().text() : undefined;
+    if (isRetryLater(done.status, retryText)) {
+      // COMPLETE consumed the server upload row even though its publication write was
+      // fenced. Drop the stale local token and defer instead of probing/re-initializing:
+      // the fence is intentionally hours-lived, so an immediate MPU retry only churns.
+      if (tokenPath) await fsp.rm(tokenPath, { force: true });
+      throw new BlobRetryLaterError();
+    }
     // A concurrent uploader of the same content-addressed sha may have clobbered
     // our server upload row (uploads PK = sha) and finished first. If the blob is
     // now present, the content is correct regardless of who completed it.

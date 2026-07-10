@@ -19,6 +19,7 @@ import { expectedStateNonce, loadConfig, loadState, syncStreamId, trashConfig, t
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
+import { deferManifest } from "./sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, loadMetrics, saveMetrics, type SyncMetrics } from "./metrics.js";
@@ -47,6 +48,7 @@ type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
+const GC_FENCE_RETRY_MS = 6 * 60 * 60_000; // open purge intents live 24–48h; never hot-reupload
 const DEEP_SCAN_MS = 30 * 60_000; // infrequent cache-bypassing re-hash (heals mtime+size-stable drift)
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
@@ -153,6 +155,9 @@ export class RboxDaemon {
   private readonly writeFinishRetries = new Map<string, number>();
   private readonly writeFinishRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   private readonly deferredRetryPaths = new Set<string>();
+  /** Publication-fenced paths remain base-carried across unrelated safety pushes
+   * until their hours-scale retry timer deliberately releases them. */
+  private readonly gcFenceRetryPaths = new Set<string>();
   private watcherUnsettled = false;
   private watcherUnsettledGeneration = 0;
   private activePumpOp?: keyof Wants;
@@ -353,6 +358,7 @@ export class RboxDaemon {
     for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
     this.writeFinishRetryTimers.clear();
     this.deferredRetryPaths.clear();
+    this.gcFenceRetryPaths.clear();
     this.stopWsKeepalive();
     try {
       this.ws?.close();
@@ -567,7 +573,10 @@ export class RboxDaemon {
     const report = beginReport("push");
     let res: Awaited<ReturnType<typeof pushManifest>>;
     try {
-      res = await pushManifest(this.root, this.cfg, this.manifest, {
+      const pushManifestInput = this.gcFenceRetryPaths.size > 0 && this.syncBase
+        ? deferManifest(this.manifest, this.syncBase.lastSyncedManifest, this.gcFenceRetryPaths)
+        : this.manifest;
+      res = await pushManifest(this.root, this.cfg, pushManifestInput, {
         ...this.e2ee,
         cache: this.cache,
         syncMutex,
@@ -612,7 +621,12 @@ export class RboxDaemon {
     // per-path retry budget as mid-write files — a pathologically-churning file gives up
     // to the safety/deep scan instead of hot-looping. res.manifest already carries their
     // base (or omits them), so a genuine settle is re-detected by the change event's re-hash.
-    if (res.deferred && res.deferred.length > 0) this.scheduleWriteFinishRetry(new Set(res.deferred));
+    if (res.deferred && res.deferred.length > 0) {
+      const retryLater = new Set(res.retryLater ?? []);
+      const writeFinish = new Set(res.deferred.filter((p) => !retryLater.has(p)));
+      if (writeFinish.size > 0) this.scheduleWriteFinishRetry(writeFinish);
+      if (retryLater.size > 0) this.scheduleGcFenceRetry(retryLater);
+    }
     await this.loadSyncBase();
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
@@ -716,6 +730,30 @@ export class RboxDaemon {
       }
       this.request("push");
     }, RETRY_DELAY_MS);
+    this.writeFinishRetryTimers.add(timer);
+  }
+
+  /** A GC publication fence is deliberately long-lived. Keep these paths in the
+   * existing deferred set (so status remains unsettled), but requeue only on an
+   * hours-scale timer; the ordinary 200ms write-finish loop would re-upload bytes
+   * that the server has already accepted and deterministically receive another 503. */
+  private scheduleGcFenceRetry(paths: Set<string>): void {
+    for (const p of paths) {
+      this.deferredRetryPaths.add(p);
+      this.gcFenceRetryPaths.add(p);
+    }
+    if (paths.size === 0 || this.stopped) return;
+    const timer = setTimeout(() => {
+      this.writeFinishRetryTimers.delete(timer);
+      if (this.stopped) return;
+      for (const p of paths) {
+        this.deferredRetryPaths.delete(p);
+        this.gcFenceRetryPaths.delete(p);
+        this.pendingEvents.push({ relPath: p, kind: "change" });
+      }
+      this.request("push");
+    }, GC_FENCE_RETRY_MS);
+    timer.unref?.();
     this.writeFinishRetryTimers.add(timer);
   }
 

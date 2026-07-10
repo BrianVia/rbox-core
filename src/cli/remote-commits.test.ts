@@ -50,6 +50,36 @@ test("commitSigned redeems first and posts an empty receipts map", async () => {
   expect(ctx.receipts.size).toBe(0);
 });
 
+test("commitSigned maps a redeem fence abort to per-blob staging without posting the manifest", async () => {
+  const fenced = sha("fenced");
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(fenced, "stale-receipt");
+  const paths: string[] = [];
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url) => {
+    paths.push(new URL(url).pathname);
+    return json(422, { error: "unsatisfied_blobs", missing: [fenced], missingTotal: 1 });
+  };
+
+  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({
+    unsatisfiedBlobs: [fenced],
+    unsatisfiedTotal: 1,
+  });
+  expect(paths).toEqual(["/v1/ws/ws/proj/root/receipts/redeem"]);
+  expect(ctx.receipts.has(fenced)).toBe(false);
+});
+
+test("redeemReceipts clears the whole caught batch when a 422 omits missing detail", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  const shas = [sha("one"), sha("two")];
+  for (const s of shas) ctx.receipts.set(s, `receipt-${s}`);
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => json(422, { error: "unsatisfied_blobs" });
+
+  await expect(redeemReceipts(ctx)).resolves.toEqual([
+    { granted: 0, alreadyEntitled: 0, rejected: 0, needsUpload: shas },
+  ]);
+  expect(ctx.receipts.size).toBe(0);
+});
+
 test("commitSigned maps too_many_refs 413 to CommitRejectedError with count and max", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>

@@ -1,5 +1,5 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   BATCH_BLOB_CONTENT_TYPE,
@@ -14,7 +14,8 @@ import {
 import { mintGrant, GRANT_TTL_MS } from "../src/grants.js";
 import { blobKey } from "../src/util.js";
 import type { Env } from "../src/env.js";
-import { verifyReceipt } from "../src/receipts.js";
+import { RECEIPT_TTL_MS, verifyReceipt } from "../src/receipts.js";
+import { directWriteWithReceipt, ReceiptFenceError } from "../src/blobs.js";
 
 const BASE = "https://example.com";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -82,11 +83,27 @@ function r2Object(bytes: Uint8Array): R2ObjectBody {
   } as R2ObjectBody;
 }
 
-function fakePutEnv(opts: { throwSha?: string; metrics?: Array<{ blobs: string[]; doubles: number[] }> } = {}): Env & { putKeys: string[] } {
+function fakePutEnv(opts: {
+  throwSha?: string;
+  metrics?: Array<{ blobs: string[]; doubles: number[] }>;
+  fenceSha?: string;
+  fenceReadError?: boolean;
+  onFenceRead?: () => void;
+} = {}): Env & { putKeys: string[] } {
   const putKeys: string[] = [];
   return {
     RBOX_RECEIPT_KEY: "r".repeat(40),
-    rbox_dev_db: {},
+    rbox_dev_db: {
+      prepare: () => ({
+        bind: () => ({
+          first: () => {
+            opts.onFenceRead?.();
+            if (opts.fenceReadError) return Promise.reject(new Error("D1 unavailable"));
+            return Promise.resolve(opts.fenceSha ? { sha256: opts.fenceSha } : null);
+          },
+        }),
+      }),
+    },
     rbox_metrics: opts.metrics
       ? { writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => opts.metrics!.push(point) }
       : undefined,
@@ -314,6 +331,56 @@ describe("POST /v1/blob-batch/put", () => {
     expect(body.results[0]?.ok).toBe(true);
     expect(await env.rbox_dev_blobs.get(blobKey(s))).not.toBeNull();
     expect((await verifyReceipt(env, body.results[0]!.receipt!, { accountId: a.accountId, encSha: s, size: payload.byteLength, nowMs: Date.now() })).ok).toBe(true);
+  });
+
+  test("one open intent refuses every receipt in the batch with one fail-closed response", async () => {
+    const a = await bootstrap("batch-put-fence");
+    const records = ["batch-fence-a", "batch-fence-b"].map((s) => ({ sha: sha(s), payload: new TextEncoder().encode(s) }));
+    await env.rbox_dev_db.prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(records[1]!.sha).run();
+    const req = () => SELF.fetch(`${BASE}/v1/blob-batch/put`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": BATCH_BLOB_CONTENT_TYPE, "x-rbox-protocol": "upload-receipts-v1" }),
+      body: batchPutBody(records),
+    });
+    const blocked = await req();
+    expect(blocked.status).toBe(503);
+    expect(await blocked.json()).toEqual({ error: "retry_later" });
+    for (const record of records) expect(await env.rbox_dev_blobs.get(blobKey(record.sha))).not.toBeNull();
+    await env.rbox_dev_db.prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(records[1]!.sha).run();
+    expect((await req()).status).toBe(200);
+  });
+
+  test("single and batch receipts remain anchored to the fence-check time after a delayed mint", async () => {
+    const checkedAt = 1_700_000_000_000;
+    const late = checkedAt + RECEIPT_TTL_MS + 60_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(checkedAt);
+    try {
+      const singlePayload = new TextEncoder().encode("delayed-single");
+      const singleSha = sha("delayed-single");
+      const singleEnv = fakePutEnv({ onFenceRead: () => now.mockReturnValue(late) });
+      const single = await directWriteWithReceipt(singleEnv, "acct", singleSha, singlePayload, (fn) => fn());
+      expect((await verifyReceipt(singleEnv, single.receipt, { accountId: "acct", encSha: singleSha, nowMs: checkedAt + RECEIPT_TTL_MS + 1 })).ok).toBe(false);
+
+      now.mockReturnValue(checkedAt);
+      const batchPayload = new TextEncoder().encode("delayed-batch");
+      const batchSha = sha("delayed-batch");
+      const batchEnv = fakePutEnv({ onFenceRead: () => now.mockReturnValue(late) });
+      const res = await batchPutDirect(batchPutBody([{ sha: batchSha, payload: batchPayload }]), batchEnv);
+      const result = ((await res.json()) as { results: Array<{ receipt: string }> }).results[0]!;
+      expect((await verifyReceipt(batchEnv, result.receipt, { accountId: "acct_batch_put", encSha: batchSha, nowMs: checkedAt + RECEIPT_TTL_MS + 1 })).ok).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test("a D1 fence-read error mints nothing in single and batch PUTs", async () => {
+    const payload = new TextEncoder().encode("fence-read-error");
+    const s = sha("fence-read-error");
+    const singleEnv = fakePutEnv({ fenceReadError: true });
+    await expect(directWriteWithReceipt(singleEnv, "acct", s, payload, (fn) => fn())).rejects.toBeInstanceOf(ReceiptFenceError);
+    const batch = await batchPutDirect(batchPutBody([{ sha: s, payload }]), fakePutEnv({ fenceReadError: true }));
+    expect(batch.status).toBe(503);
+    expect(await batch.json()).toEqual({ error: "retry_later" });
   });
 
   test("rejects malformed frames, empty batches, and lying content-length over the actual byte cap", async () => {

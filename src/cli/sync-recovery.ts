@@ -15,7 +15,7 @@ import {
   type Manifest,
   type PhaseReport,
 } from "../engine/index.js";
-import { BlobShaMismatchError, type SyncRemote } from "./remote.js";
+import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "./remote.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
@@ -157,7 +157,7 @@ export async function encryptAndUpload(
   onProgress: TransferProgress | undefined,
   backoff: (attempt: number) => Promise<void>,
   options: EncryptAndUploadOptions = {}
-): Promise<{ deferred: Set<string> }> {
+): Promise<{ deferred: Set<string>; retryLater: Set<string> }> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
@@ -171,6 +171,7 @@ export async function encryptAndUpload(
   const ctByEnc = new Map<string, string>();
   const ctSizeByEnc = new Map<string, number>();
   const deferred = new Set<string>();
+  const retryLater = new Set<string>();
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
     const toEncrypt: FileEntry[] = [];
@@ -350,6 +351,12 @@ export async function encryptAndUpload(
           uploaded.add(uploadEncSha);
           return size; // settled — the committed manifest can safely reference f.encSha
         } catch (e) {
+          if (e instanceof BlobRetryLaterError) {
+            byteTracker.defer(f.path);
+            retryLater.add(f.path);
+            emitUploadProgress(f.path);
+            return null;
+          }
           if (!(e instanceof BlobShaMismatchError)) throw e;
           // The streamed ciphertext no longer hash-matched (the file moved again). Drop
           // the stale temp so the next attempt re-encrypts, back off, and retry — bounded.
@@ -399,7 +406,7 @@ export async function encryptAndUpload(
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
-  return { deferred };
+  return { deferred, retryLater };
 }
 
 /** Build the manifest to COMMIT when some files were deferred (never settled under a

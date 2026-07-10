@@ -315,6 +315,10 @@ export class WorkspaceSync {
         return json(unsatisfiedBlobsBody(v.needsUpload), 422);
       }
       const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
+      if ("needsUpload" in acct) {
+        emit(shas.length)("unsatisfied_blobs", { ratio: acct.needsUpload.length / shas.length });
+        return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
+      }
       if ("overCap" in acct) {
         emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
         return json(await quotaExceededBody(dbFor(op.env, accountId), accountId, acct.overCap), 402);
@@ -452,6 +456,10 @@ export class WorkspaceSync {
     }
 
     const acct = await commitAccounting(db, accountId, newRefs, nowMs);
+    if ("needsUpload" in acct) {
+      op.done("unsatisfied_blobs", { count: entries.length, ratio: entries.length ? acct.needsUpload.length / entries.length : 0 });
+      return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
+    }
     if ("overCap" in acct) {
       op.done("quota_exceeded", { count: entries.length });
       return json(await quotaExceededBody(db, accountId, acct.overCap), 402);
@@ -668,7 +676,8 @@ export class WorkspaceSync {
           .prepare(
             `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
              WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${chunk.map(() => "?").join(",")})
-               AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
+               AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)
+               AND NOT EXISTS (SELECT 1 FROM gc_candidates g WHERE g.sha256 = r.sha256 AND g.deleting_at IS NOT NULL)`,
           )
           .bind(accountId, ...chunk),
       (rows) => {

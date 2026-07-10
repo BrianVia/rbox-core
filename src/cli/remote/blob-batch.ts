@@ -5,7 +5,7 @@ import { hashBytes } from "../../engine/hash.js";
 import { fromHex, toHex } from "../../engine/e2ee/index.js";
 import type { RemoteContext } from "./context.js";
 import { getBlobToFile, putBlobFile } from "./blobs.js";
-import { BlobShaMismatchError, translateRemoteError } from "./errors.js";
+import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater, translateRemoteError } from "./errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, envInt } from "./resilient.js";
 import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 
@@ -686,6 +686,14 @@ export class BlobBatchUploader {
         uploadDisabledForProcess = true;
         this.drainQueuedAsSingles();
         await this.fallbackAll(pending);
+        return;
+      }
+      if (res.status === 503 && isRetryLater(res.status, await res.clone().text())) {
+        // The server wrote every accepted record before its one amortized fence
+        // read. Defer the whole request; falling back to singles would immediately
+        // re-upload the same bytes into the same hours-lived fence.
+        for (const group of pending.values()) this.rejectGroup(group, new BlobRetryLaterError());
+        pending.clear();
         return;
       }
       if (!res.ok) {

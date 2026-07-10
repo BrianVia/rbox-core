@@ -51,6 +51,8 @@ export interface ReceiptRedeemResult {
   granted: number;
   alreadyEntitled: number;
   rejected: number;
+  /** A fence aborted this whole redeem batch. These addresses need fresh staging. */
+  needsUpload?: string[];
 }
 
 function commitRejectedMessage(reason: CommitRejectReason, count?: number, max?: number): string {
@@ -132,6 +134,19 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
       headers: { ...ctx.protoAuth, "content-type": "application/json" },
       body: JSON.stringify({ receipts: Object.fromEntries(batch) }),
     }, { op: "redeeming upload receipts" });
+    if (r.status === 422) {
+      const body = (await r.json()) as { missing?: string[] };
+      // The server identifies the caught accounting super-batch as the safe failure
+      // unit. Discard exactly those receipts: retaining them would make the next commit
+      // try the same fenced authority again, while unaffected siblings can still redeem.
+      const needsUpload = body.missing?.length ? body.missing : batch.map(([sha]) => sha);
+      results.push({ granted: 0, alreadyEntitled: 0, rejected: 0, needsUpload });
+      const failed = new Set(needsUpload);
+      for (const [sha, receipt] of batch) {
+        if (failed.has(sha) && ctx.receipts.get(sha) === receipt) ctx.receipts.delete(sha);
+      }
+      continue;
+    }
     if (!r.ok) {
       const { quota, text } = await readQuotaExceeded(r);
       if (quota) throw quota;
@@ -155,7 +170,11 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   // SAFE TO RETRY — same `parentSequence === head` CAS as commit() above; a duplicate after a
   // socket close 409s benignly (see the note there). Sending all still-valid receipts each attempt
   // is already idempotent (the server charges 0 for already-entitled refs).
-  await redeemReceipts(ctx);
+  const redeemed = await redeemReceipts(ctx);
+  const redeemNeedsUpload = [...new Set(redeemed.flatMap((r) => r.needsUpload ?? []))];
+  if (redeemNeedsUpload.length > 0) {
+    return { unsatisfiedBlobs: redeemNeedsUpload, unsatisfiedTotal: redeemNeedsUpload.length };
+  }
   const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
     method: "POST",
     headers: { ...ctx.protoAuth, "content-type": "application/json" },
