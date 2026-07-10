@@ -1,6 +1,9 @@
 # §35 — Phase 0: client phase metrics (the measurement foundation)
 
-**Status:** DRAFT v1 — first draft, no adversarial review yet. This is **Phase 0** of the
+**Status:** 🟢 SHIPPED — coarse phase metrics landed in v0.4.3 (#17,
+`src/engine/phase-report.ts` + `src/cli/metrics.ts`); commit/latest/scan sub-step
+instrumentation followed via designs 83–85 phase-0 (#161) and v0.9.11 (#165).
+Header updated 2026-07-10; the doc body below is the original draft. This is **Phase 0** of the
 performance architecture proposal (`docs/performance-architecture-proposal.md:706-731`) and
 its **#1 prioritized candidate** ("High decision quality / Low risk / Prevents another
 speculative cycle", `performance-architecture-proposal.md:770`). It builds **nothing that
