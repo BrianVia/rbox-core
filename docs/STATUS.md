@@ -166,15 +166,24 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
 - **Design 94 (signin_method): SHIPPED** — ALIGNED after 7 codex rounds,
   implemented, merged (#197); prod migration 0023 auto-applied, dev applied.
   Founder row backfills on next dashboard login.
-- **Design 95 (GC purge automation): ALIGNED after 10 codex rounds**
-  (branch `design/95-gc-purge-automation`, REVIEW-95.md = full ledger).
-  Final protocol: RAISE-ABORT trigger fence on publication writes +
-  checkTime-anchored receipt authority (no authority spans a delete:
-  12h TTL < 24h intent quiescence) + two-phase delete with verify-after-
-  delete + lease-guarded fence drops. **Implementation gated on the
-  paginated-/roots fix** (G4 fail-closes on the primary workspace since
-  #198). Order: paginated roots → implement 95 → supervised manual drain
-  (~62 GiB) → design 89.
+- **Design 95 (GC purge automation): MERGED (#199, 2026-07-10 evening),
+  SHIPS DISABLED** (`RBOX_GC_PURGE_DISABLED=1` both env blocks; migration
+  0024 auto-applied to prod incl. the fence triggers — those + validation
+  steering are ACTIVE and wanted). 10 adversarial rounds; REVIEW-95.md is
+  the ledger. Protocol: RAISE-ABORT publication fence + checkTime-anchored
+  receipt authority (12h TTL < 24h intent quiescence — no authority spans
+  a delete) + two-phase delete w/ verify-after-delete + lease-guarded
+  fence drops. 371 API tests incl. the full race matrix;
+  `scripts/gc-drain.ts` is the supervised drain tool.
+- **Design 96 (retained roots at O(churn)): ALIGNED after 5 codex rounds,
+  NOT yet implemented** (branch `design/96-roots-index` + REVIEW-96.md).
+  The dropped-set index: reachable = ROOTS(head) ∪ dropped(>floor) ∪
+  seq_roots — proven exact; per-isolate fold mutex; measured heap/CPU rig
+  gates; PER_WORKSPACE_ROOTS_COST=90 imported by 95's arithmetic.
+  **NEXT SESSION: implement 96 → rig gates → dev → prod backfill →
+  design-95 rollout (dry-run audit → supervised drain ~62 GiB → enable
+  cron) → then design 89.** Session paused here per founder instruction
+  (after 95's merge).
 
 ## Backlog (ledgered, not urgent)
 
