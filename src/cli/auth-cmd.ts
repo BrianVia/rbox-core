@@ -1,7 +1,7 @@
 import os from "node:os";
 import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
-import { copyToClipboard, openInBrowser } from "./browser-open.js";
+import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
 import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
@@ -359,7 +359,14 @@ export async function pairCreate(): Promise<void> {
   const full = `${token}.${toB64url(tokenSecret)}`; // <redeemToken>.<tokenSecret>
   console.log(`\nPairing token (valid ~10 min, single use — carries your encryption key):\n`);
   console.log(`    ${full}\n`);
-  console.log(`On the new machine: run \`rbox\`, choose "Connect this machine", and paste it.`);
+  console.log(`On the new machine: run \`rbox\`, choose "Paste a pairing token", and paste it.`);
+
+  if (isInteractive()) {
+    process.stdout.write("Press [c] to copy the token to your clipboard, any other key to continue... ");
+    const key = await waitForKeypress();
+    process.stdout.write("\n");
+    if (key === "c") console.log(copyToClipboard(full) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the token above manually.");
+  }
 }
 
 /** Redeem a split-secret pairing token → device credential + E2EE enrollment.
