@@ -1,10 +1,18 @@
 # 84 — Commit envelope at O(change): manifest delta encoding
 
-Status: Design draft v3, 2026-07-10 — full revision after adversarial review
-round 1 (codex gpt-5.6-sol: 3 blockers, 5 majors, 2 minors — ledger in
-REVIEW-84.md) against current main, which now includes designs 91 (head
-authority), 92 (manifest entry integrity), 93 (generation-CAS state writer),
-95 (GC purge automation), and 96 (roots index v2). Full-stack (client
+Status: Design draft v4, 2026-07-10 — round-2 revision (ledger in
+REVIEW-84.md). v3 was the full round-1 rework against current main (designs
+91/92/93/95/96); v4 closes round 2: repair mode bypasses the no-op/defer
+short-circuits (an unchanged tree still publishes the healing snapshot);
+`manifestSchema` is carried verbatim in the delta header (both transition
+directions encodable); `GlobalManifestMeta` persists the base's signed
+epochs (I4 has a truthful input) and the base's EXACT verified chain (the
+fast path performs the full I3b list match, not an aggregate check); meta is
+suppressed whenever the design-93 repo-pending projection diverges from the
+described manifest; the recover ceremony retains the prior pin until the
+replacement head verifies (equal-seq/different-hash refused against the
+retained pin); `MAX_MANIFEST_DELTA_CHAIN = 16` is normative and the vacuous
+retention trigger is replaced by the rooting proof. Full-stack (client
 wire/storage + signed-body field + server validation/roots). Target: staged —
 Phase A is *analysis of already-shipped instrumentation* (§5), then fleet-wide
 read capability before ANY write-side change (§6). Gated per host like designs
@@ -136,14 +144,15 @@ state.
   AEAD's AAD binds `keyEpoch` (`manifest-crypto.ts:21-23`), so a cross-epoch
   link fails to open even if a buggy writer violates this.
 - **I5 — folding is a pure, total, deterministic function.** `fold(base, ops,
-  generatedAt)` reproduces the writer's folded manifest **byte-for-byte in
-  canonical form**, including `generatedAt`: the delta envelope carries the
-  folded manifest's `generatedAt` verbatim, and the canonical manifest hash
-  (§3.2) covers it. `Manifest.generatedAt` is mandatory and stamped per scan
-  (`src/engine/types.ts:109-111`, `src/engine/manifest.ts:86-91`), so ops
-  alone cannot reproduce the writer's fold — carrying it in the envelope is
-  what makes `resultHash` checkable with zero validator changes. Pure also
-  means **non-mutating**: fold never modifies its base input (§4.6).
+  header)` reproduces the writer's folded manifest **byte-for-byte in
+  canonical form**. Manifest-level scalars the ops cannot derive —
+  `generatedAt` (mandatory, stamped per scan: `src/engine/types.ts:109-111`,
+  `src/engine/manifest.ts:86-91`) and `manifestSchema` (stamped per commit:
+  `src/cli/sync.ts:99-106`) — are carried VERBATIM in the delta header and
+  covered by `resultHash`/the canonical manifest hash (§3.2), which is what
+  makes the fold checkable with zero validator changes and no second copy of
+  any stamping rule. Pure also means **non-mutating**: fold never modifies
+  its base input (§4.6).
 - **I6 — canonical delta form (wire hygiene).** At most ONE final op per file
   path and per git-repo key; ops sorted deterministically (§3.2). Correctness
   does not depend on this — `resultHash` is computed over the folded result —
@@ -153,7 +162,8 @@ state.
   indistinguishable from a snapshot, so reconcile/trash (design 50) semantics
   are unchanged (§4.5).
 - **I8 — base metadata is part of the design-93 CAS unit.** The delta writer's
-  base identity (`encManifestSha` + folded-manifest hash + chain position)
+  base identity (`encManifestSha` + folded-manifest hash + signed epochs +
+  exact verified chain)
   lives INSIDE `StateSavePacket.global` and lands only when the packet's
   stream/nonce/global-sequence preconditions accept (§3.4). It NEVER updates
   on verify-only pin advancement, decode/fold failure, partial apply, a
@@ -207,6 +217,11 @@ are malformed → fail closed):**
   "baseEncSha": "<encSha of the immediate base blob>",   // next blob to fetch
   "baseManifestHash": "<canonical hash of the base FOLDED manifest>",
   "generatedAt": "<the folded manifest's generatedAt, carried verbatim>", // I5
+  "manifestSchema": 4,         // OPTIONAL — the FOLDED manifest's schema
+                               // stamp, carried verbatim (same I5 rule as
+                               // generatedAt); ABSENT ⇒ the folded manifest
+                               // carries NO manifestSchema key (the schema-0
+                               // strip, src/cli/sync.ts:101-104)
   "resultHash": "<canonical hash of this commit's folded manifest>" }
 ```
 
@@ -224,7 +239,9 @@ Bounds (all fail closed, checked before any body work):
   compression-bomb posture as design 79's decompression size cap,
   `src/engine/crypto.ts:78-88`), and short output is equally malformed.
 - Hash fields 64-hex; `generatedAt` a non-empty string (its content is
-  covered by `resultHash`, not re-validated).
+  covered by `resultHash`, not re-validated); `manifestSchema`, when present,
+  a positive safe integer ≤ `KNOWN_MANIFEST_SCHEMA` (the existing
+  newer-schema fail-closed gate applies at the header, before any fold work).
 
 **Canonical manifest hash** = sha256 of the JCS canonical form
 (`src/engine/e2ee/jcs.ts`) of the full `Manifest` object (`generatedAt`,
@@ -265,11 +282,17 @@ to resolve. So, explicitly:
    (`src/engine/manifest.ts:86-91`).
 3. **Fold:** apply `set`/`del` onto the base's path-indexed map, apply
    `git-set`/`git-del` onto `gitRepos`, re-sort `files`, stamp the envelope's
-   `generatedAt`, carry `manifestSchema` from the ops' folded result (the
-   writer stamps it pre-encode via `stampManifestSchemaForCommit`,
-   `src/cli/sync.ts:99-106`, so schema rides the fold as ordinary state — a
-   schema change between base and target emits as part of the diff), run
-   `validateManifest` on the fold, verify `resultHash`.
+   `generatedAt` verbatim, stamp the envelope's `manifestSchema` verbatim
+   (present → set; absent → the folded manifest has no `manifestSchema` key —
+   both transition directions are wire-encodable, including 3→4 on a first
+   compressed entry and 4→absent on its removal), run `validateManifest` on
+   the fold (which enforces schema sufficiency: ≥2 for `gitRepos`, ≥4 for
+   compressed descriptors, `src/engine/manifest-validate.ts:117-149`,
+   `:79-86`), verify `resultHash`. The writer computes the header's schema
+   value with today's `stampManifestSchemaForCommit` (`src/cli/sync.ts:
+   99-106`) on the TARGET manifest — the fold never re-derives it, exactly as
+   it never re-derives `generatedAt` (I5: carried state, checkable via
+   `resultHash`, no second copy of the stamping rule on the read side).
 4. **Decode-side enforcement:** duplicate keys, unsorted ops, a no-op `set`
    (identical to the base entry), a `del`/`git-del` of an absent key, or a
    non-canonical ops serialization are rejected as malformed — one encoding
@@ -293,17 +316,24 @@ when ANY holds, else it emits a `delta` based on its applied base:
    after upgrading to the §3.4 state fields, or the persisted base metadata
    is absent/mismatched (e.g. right after `rbox recover`, a stream reset, or
    a legacy-fallback state write, §3.4). Can't delta without a proven base.
-2. **Epoch boundary (I4)** — `keyEpoch`/`accountEpoch` differs from the base
-   commit's. Fires automatically through the epoch-stale retry: the server's
-   `epoch_stale` 409 (`workspace-sync.ts:396-399`) makes the client refresh
-   its write context and re-scan (`sync.ts:494-497`), and the refreshed
-   `keyEpoch` ≠ base epoch trips this trigger.
+2. **Epoch boundary (I4)** — the current write context's `keyEpoch` or
+   `accountEpoch` (`currentKek()`, `e2ee-remote.ts:164-174`) differs from the
+   base commit's SIGNED epochs, which are persisted in
+   `manifestMeta.keyEpoch`/`accountEpoch` (§3.4) precisely so this comparison
+   has a truthful, applied-base input — the pin's `accountEpoch` describes
+   the verified head, not necessarily the applied base, and carries no
+   `keyEpoch` at all (`e2ee-remote.ts:122-129`). The check is LOCAL and runs
+   on every delta-eligible commit (it does not depend on the server's
+   `epoch_stale` 409, `workspace-sync.ts:396-399`, though that retry path —
+   refresh write context + re-scan, `sync.ts:494-497` — also lands here).
 3. **Chain-length cap** — the fold chain would exceed
-   `MAX_MANIFEST_DELTA_CHAIN` (open decision §10.1; propose 16). Semantics
-   pinned in §3.5: the constant bounds `manifestChain.length`, i.e. the
-   number of blobs BELOW the head (terminal snapshot + intermediate deltas);
-   fold depth = `manifestChain.length + 1`. Enforced server-side as a shape
-   gate (§3.5.1) with the same constant.
+   **`MAX_MANIFEST_DELTA_CHAIN = 16` (normative — one shared engine constant,
+   imported by the client trigger, the decode bound, and the Worker shape
+   gate, like `MAX_PACK_CHAIN`)**. Semantics pinned in §3.5: the constant
+   bounds `manifestChain.length`, i.e. the number of blobs BELOW the head
+   (terminal snapshot + intermediate deltas); fold depth =
+   `manifestChain.length + 1`. Retuning it later is a §10.1 call; shipping
+   C2 with an unpinned value is not an option (wire interop).
 4. **Byte-bound recompaction** — cumulative delta CIPHERTEXT bytes since the
    base snapshot ≥ the base snapshot's ciphertext bytes: the
    `exceedsPackChainByteBound` heuristic (`src/cli/sync-git.ts:241-244`),
@@ -311,7 +341,7 @@ when ANY holds, else it emits a `delta` based on its applied base:
    own spec, §3.2). Bytes are ciphertext byte lengths as observed by the
    writer at upload time and by readers on fetch (content-addressed +
    AEAD-authenticated, so the observed length is trustworthy); they persist
-   in `chainPos` (§3.4).
+   in `manifestMeta.chainBytes` (§3.4).
 5. **Impossible-link 422 (fail-safe compaction).** If a commit bounce lists
    any sha that is in this commit's `manifestChain` (a chain link the server
    reports unsatisfied — GC-marked, delete-fenced, or lost), the retry MUST
@@ -320,10 +350,17 @@ when ANY holds, else it emits a `delta` based on its applied base:
    side; this rule is what makes every such degradation self-healing.
 6. **Chain-integrity repair (§3.6.3)** — a repair commit is always a
    snapshot.
-7. **Retention guard (defense-in-depth for I3)** — never let a live chain's
-   base fall below where a re-baselining peer could still fetch it. In
-   practice subsumed by (3)/(4) at fleet scale, but stated so a future
-   retention change can't silently strand a chain.
+
+There is deliberately NO retention-based trigger (the first draft had one):
+chain-link availability is INDEPENDENT of the retention floor by
+construction. A link is fetchable because it is a present blob rooted by the
+signed `manifestChain` of the head (and of every retained sequence, §3.5.5)
+— prune drops `seq:<n>` POINTERS (`workspace-sync.ts:698-714`), never listed
+blobs, and a re-baselining peer fetches links by address from the head's
+signed list, not by walking pruned commits. A trigger with no observable
+input on the commit path would be dead policy; the real guarantees are
+§3.5.5's roots and §3.3.5's snapshot fallback if a link is nevertheless
+lost.
 
 ### 3.4 Client state: base metadata inside the design-93 packet
 
@@ -341,14 +378,26 @@ so it rides that exact mechanism:
 ```ts
 // config.ts — the new global-truth shape inside the packet
 export interface GlobalManifestMeta {
-  /** encManifestSha of the blob whose fold equals the packet's manifest. */
+  /** encManifestSha of the blob whose fold equals the described manifest. */
   encManifestSha: string;
   /** Canonical hash (§3.2) of that folded manifest. */
   manifestHash: string;
-  /** Chain position: terminal snapshot + cumulative link count / ciphertext
-   *  bytes — the §3.3.3/4 trigger inputs. Snapshot ⇒ {snapshotEncSha: <self>,
-   *  links: 0, bytes: 0}. */
-  chainPos: { snapshotEncSha: string; links: number; bytes: number };
+  /** The base commit's SIGNED epochs (from its parsed body) — the §3.3.2 /
+   *  I4 trigger inputs. Without these, a rotation between base and next
+   *  commit is undetectable from persisted state and the writer would emit
+   *  a cross-epoch delta (unreadable by construction). */
+  accountEpoch: number;
+  keyEpoch: number;
+  /** The base's EXACT verified chain, base-first — the base blob's signed
+   *  `manifestChain` as list-verified at apply time (§3.6.1). `chain[0]` is
+   *  the terminal snapshot; a snapshot base ⇒ []. Bounded by
+   *  MAX_MANIFEST_DELTA_CHAIN (≤ 16 × 64 hex ≈ 1KB — negligible beside the
+   *  45MB manifest). `links` is chain.length; carrying the LIST (not a
+   *  count) is what lets the Phase-D fast path do I3b's exact-match without
+   *  refetching (§3.6.1). */
+  chain: string[];
+  /** Cumulative delta ciphertext bytes since chain[0] — §3.3.4's input. */
+  chainBytes: number;
 }
 export interface StateSavePacket {
   // ...unchanged...
@@ -371,16 +420,42 @@ Semantics (all inherited from the packet, stated to be testable):
   decode/fold/apply never reaches `saveStateSource` (`sync.ts:343-364`), so
   the base metadata cannot describe an unapplied head — the design-92
   applied-base rule (`sync.ts:530-536`) extends to the delta base for free.
+- **Suppressed whenever the projection diverges (the design-93 repo-pending
+  rule).** `applyStateSavePacket` stores the FILE-ONLY global verbatim and
+  reconstructs `lastSyncedManifest.gitRepos` from the per-repo generation
+  records (`config.ts:329-345`) — so when any repo apply is pending/lagging,
+  the persisted manifest is deliberately NOT the folded remote head. A meta
+  certifying the head beside a projected manifest would poison both the delta
+  writer (ops diffed from a base that isn't what `encManifestSha` folds to)
+  and the fast fold. Rule: the packet writer includes `manifestMeta` **iff
+  the post-application projection equals the described manifest** — and
+  since the file layer is stored verbatim, the ONLY divergence channel is
+  `gitRepos`, so the check is a deep-equal of the reconstructed `gitRepos`
+  projection against the source manifest's `gitRepos` (≤ ~100 repos — cheap;
+  concretely: no repo left `pending`, no repo transition retained by a newer
+  `sourceSeq`, `sync-state.ts:84-98`). On divergence the packet carries
+  `manifestMeta: undefined` — which CLEARS any prior meta (global writes
+  replace the global member wholesale) — and the next commit takes the
+  §3.3.1 snapshot path until a fully-applied pull re-establishes it.
+  Additionally, any repo-only packet (no global) whose transitions change a
+  repo `base` clears a present meta for the same reason. Fail-to-snapshot,
+  never fail-to-wrong-base.
 - **Writers of the packet:**
   - *Pull apply* (`sync.ts:343-364`): meta = the pulled head's
     `encManifestSha`, the verified fold's hash (= the checked
-    `manifestHash`/`resultHash`, no recompute), and the chain position read
-    off the fetched chain (snapshot → reset; delta → base's persisted
-    `chainPos` + this fetch's links/bytes, or the full walked chain's
-    tally on a cold fold).
+    `manifestHash`/`resultHash`, no recompute), the head's signed
+    `accountEpoch`/`keyEpoch` (from the `parseCommit`ed body `verifiedHead`
+    already produced), and the head's list-verified `manifestChain` +
+    cumulative bytes (snapshot → `[]`/0) — subject to the suppression rule
+    above.
   - *Push commit* (`sync.ts:715-725`): meta = the just-built envelope's
-    `encManifestSha`, the writer's `resultHash` (computed anyway), and the
-    updated `chainPos` (snapshot → reset; delta → increment).
+    `encManifestSha`, the writer's `resultHash` (computed anyway), the
+    epochs it signed under (the D1-checked write context,
+    `e2ee-remote.ts:406-410`), and the chain it emitted (snapshot → `[]`/0;
+    delta → `base.chain + [base.encManifestSha]`, bytes incremented) —
+    same suppression rule (a commit that carried a pending repo's section
+    keeps the OLD base in state, `gitBaseAfterCommit`, `sync.ts:708`, so the
+    projection diverges and the meta is suppressed).
   - *409 recovery* is pull-then-retry (`sync.ts:489-493`) — both writers
     above run in order; no third path exists.
 - **Degraded/legacy paths fail to SNAPSHOT, not to corruption.** The
@@ -397,11 +472,17 @@ Pull-side reconstruction:
 
 - **Fast path (steady state, Phase D):** `latest` returns the head commit;
   fetch + decrypt the head blob. If it's a `delta` whose
-  `baseEncSha === state.manifestMeta.encManifestSha` and
-  `baseManifestHash === state.manifestMeta.manifestHash`, fold ops onto the
-  in-memory `lastSyncedManifest` (pure — a new object; the base is not
-  mutated, §4.6) → O(change) network, one O(N) local `resultHash` check.
-  Until Phase D the client folds from the fetched chain.
+  `baseEncSha === meta.encManifestSha`,
+  `baseManifestHash === meta.manifestHash`, AND whose signed `manifestChain`
+  equals `meta.chain + [meta.encManifestSha]` element-for-element (the full
+  I3b exact-match, §3.6.1 — the persisted list makes it checkable with no
+  extra fetch), fold ops onto the in-memory `lastSyncedManifest` (pure — a
+  new object; the base is not mutated, §4.6) → O(change) network, one O(N)
+  local `resultHash` check. ANY mismatch — including a list that keeps the
+  same snapshot/length/immediate base but substitutes or reorders an
+  intermediate — falls back to the cold chain walk (whose §3.6.1 check then
+  rules); it is never silently accepted. Until Phase D the client folds from
+  the fetched chain.
 - **Chain fetch:** otherwise the signed `manifestChain` (§3.5) IS the fetch
   plan: fetch all listed blobs **in parallel by address**, then verify the
   decrypted linkage against the list (§3.6.1) and fold forward from the
@@ -600,15 +681,21 @@ address list equals the commit's signed `manifestChain` exactly:
 - no extras, no duplicates, and the head's own `encManifestSha` is NOT in the
   list.
 
-The fast path (§3.4) walks only the head blob; its obligations reduce to:
-`baseEncSha` matches the persisted base AND the head's `manifestChain` is
-consistent with the persisted `chainPos` + base position (the persisted base
-was itself list-verified when it was applied, inductively). Any mismatch —
-here or on a full walk — is a **chain-integrity failure**: a signer published
-a list that does not describe its chain. Fail closed (§3.6.2), then repair
-(§3.6.3). This check is what turns §3.5's syntactic server gate into I3's
-composite invariant: an omitted/extra/reordered link cannot survive a single
-honest pull.
+The fast path (§3.4) walks only the head blob, so it performs the SAME
+exact-match against persisted evidence rather than aggregates: the head's
+signed `manifestChain` must equal `meta.chain + [meta.encManifestSha]`
+element-for-element, and the envelope's `baseEncSha`/`baseManifestHash` must
+match the meta. This is sound inductively — `meta.chain` is the base's OWN
+list as verified when the base was applied (cold walks verify directly;
+each fast-path apply extends verified evidence by exactly the one link it
+authenticated) — and it is complete: an intermediate substitution/reorder
+that preserves the snapshot, the length, and the immediate base still fails
+the element-wise compare. A fast-path mismatch demotes to the cold walk; a
+cold-walk mismatch — omitted, extra, reordered, or head-included link — is a
+**chain-integrity failure**: a signer published a list that does not
+describe its chain. Fail closed (§3.6.2), then repair (§3.6.3). This check
+is what turns §3.5's syntactic server gate into I3's composite invariant: a
+wrong list cannot survive a single honest pull.
 
 #### 3.6.2 Failure semantics — fail closed, no fictional fallback
 
@@ -666,6 +753,22 @@ repair manifest is then built by the standard push pipeline against the
 recovered applied base (scan → git-plan → defer/carry → encrypt/upload →
 `stampManifestSchemaForCommit`), emitted as a SNAPSHOT envelope with an empty
 `manifestChain`.
+
+**The commit is unconditional — repair mode bypasses every pre-commit
+short-circuit.** The COMMON repair case is an unchanged local tree: the
+break is in the remote envelope, so the repair manifest is content-identical
+to the recovered base. On the normal path that hits the no-op short-circuit
+(`filesUnchanged && gitUnchanged` returns before `commit()`,
+`sync.ts:575-619`) or the everything-deferred short-circuit
+(`sync.ts:652-658`) — either exit would return sequence A with broken head N
+still authoritative and the fleet still wedged. Repair mode therefore skips
+both exits and ALWAYS posts the snapshot child of the pinned head: the
+commit's purpose is to replace the unreadable head, not to record a diff,
+and a content-identical snapshot at seq N+1 is precisely the healing
+artifact (readers fold it directly; the chain resets). The
+unchanged-tree-repair case is a named §7.4 test. (Deferred paths, if any,
+carry base entries exactly as in a normal push — deferral shrinks the
+snapshot's content, never suppresses the commit.)
 
 **Destructive-publication guards, in order:**
 
@@ -740,28 +843,36 @@ close because long-offline devices become more common at delta cadence:
 1. `rbox recover` re-fetches + re-verifies the account chains
    (`refreshAccount` — roster, key-state, account anti-rollback pins:
    unchanged, `e2ee-remote.ts:540-562`).
-2. Floor precheck before the pin is cleared: server head sequence ≥ pinned
-   sequence, else refuse (rollback evident) — existing behavior. Equal
-   sequence: proceed; the post-clear pull's equivocation checks
-   (`e2ee-remote.ts:240, 249, 256`) refuse a different hash at any verified
-   point.
-3. Post-clear pull, unpruned workspace: `commitsSince(0)` verifies from
-   genesis — existing behavior.
-4. Post-clear pull, PRUNED workspace (the gap; today this 409s and recover
-   fails): the no-pin verify path catches `NeedsRebaselineError` ONLY under
-   an active recover ceremony and falls back to: fetch `latest`; verify the
-   head's signature against the verified roster (`verifyCommitSig` via
-   `assertSignedByOwnRoster`); verify the longest retained segment terminates
-   at that head (`retainedSegmentEndingAtHead`'s existing binary search,
+2. **The old pin is RETAINED until the replacement head is verified — there
+   is no cleared window.** (Fix over the current ceremony, which clears the
+   pin after only a sequence-floor precheck, `recover-cmd.ts:59-67`; once
+   cleared, the genesis-anchored re-verify has no old hash left to compare,
+   so an equal-sequence different-hash chain — an equivocation — would pass.
+   Round-2 finding 6.) The ceremony holds the prior pin as `priorPin`, and
+   the replacement head it verifies below MUST satisfy the floor rule
+   against it: `head.seq > priorPin.commitSeq`, OR `head.seq ===
+   priorPin.commitSeq && head.commitHash === priorPin.commitHash`. An
+   equal-sequence different-hash head is refused as equivocation — the
+   comparison is against the RETAINED pin, not against post-clear state.
+3. Verify the replacement chain. Unpruned workspace: `commitsSince(0)` from
+   genesis — existing behavior. PRUNED workspace (the gap; today this 409s
+   and recover fails): the ceremony catches `NeedsRebaselineError` and falls
+   back to: fetch `latest`; verify the head's signature against the verified
+   roster (`verifyCommitSig` via `assertSignedByOwnRoster`); verify the
+   longest retained segment terminates at that head
+   (`retainedSegmentEndingAtHead`'s existing binary search,
    `e2ee-remote.ts:363-390`). Continuity beyond retention is what the human
    explicitly consented to give up — precisely design 91's recover
    threat-model, now stated instead of implied.
+4. Only after step 3 succeeds AND step 2's floor/equivocation rule passes is
+   the pin OVERWRITTEN (one `pins.save`, never a `clear` followed by a
+   window) with the verified replacement head.
 5. Decode the head by folding its `manifestChain` (every link rooted ⇒
-   present; else §3.6 fail-closed → §3.6.3 repair path).
-6. **Ordering:** the pin re-advances inside `verifiedHead` after chain verify
-   (before decode — unchanged, and safe: the pin is anti-rollback only, I8
-   keeps state truthful); base metadata + applied base land only in the
-   post-apply packet.
+   present; else §3.6 fail-closed → §3.6.3 repair path, which uses the pin
+   written in step 4 as its parent authority).
+6. **Ordering:** the pin write (step 4) precedes decode — unchanged posture,
+   and safe: the pin is anti-rollback only; I8 keeps applied state truthful.
+   Base metadata + applied base land only in the post-apply packet.
 
 ### 4.4 Design-70 cache gateway
 No interaction. `CachedReleases` serves only the public release path;
@@ -940,35 +1051,50 @@ move them — say so, don't fake precision).
    - canonical form (I6): reduction produces one op per key in sorted order;
      decode rejects duplicates/unsorted/no-op sets/absent-key dels and every
      §3.2 header/bounds violation (unknown magic version, over-cap header,
-     bodyBytes mismatch, zstd over/under-run).
+     bodyBytes mismatch, zstd over/under-run, `manifestSchema` above
+     `KNOWN_MANIFEST_SCHEMA`); schema transitions fold in both directions
+     (3→4 on a first compressed entry; 4→absent on removal).
    - chain integrity (§3.6.1/2): missing link, corrupted link, list-mismatch
      (omitted / extra / reordered / head-included), `resultHash` /
      `baseManifestHash` mismatch, over-cap chain, cross-epoch link — each
      fails closed as `ManifestChainError` with nothing applied and
-     `manifestMeta` untouched.
+     `manifestMeta` untouched. The list-mismatch cases run through BOTH the
+     cold walk AND the Phase-D fast path (an intermediate substitution that
+     preserves snapshot/length/immediate-base must fail the fast path's
+     element-wise compare, §3.4/§3.6.1).
    - **repair transaction (§3.6.3):** a broken-chain head with applied < head
      → daemon auto-repair publishes a snapshot child of the pinned head when
      the suffix is self-authored; halts (loud) when a peer's commit is in the
      suffix; `rbox recover` chain-case supersedes with consent;
      best-ancestor recovery applies the newest foldable seq first; a peer
-     racing the repair converges (409 → re-verify → resume or re-repair).
+     racing the repair converges (409 → re-verify → resume or re-repair);
+     **an UNCHANGED local tree still publishes the repair snapshot** (the
+     no-op and everything-deferred short-circuits are bypassed in repair
+     mode — the round-2 blocker case).
    - **422-partition (§3.5.4):** a bounce naming a chain link → snapshot
      retry (never a link re-upload); naming only data refs → today's
      recovery; a design-95 fence abort maps the same way.
    - state packet (I8/§3.4): `manifestMeta` lands only with an accepted
      global; rejected packets, verify-only pulls, decode failures, degraded/
      legacy writes, and `resetSyncState` leave/clear it per spec; undefined
-     meta forces the snapshot path.
+     meta forces the snapshot path. **Repo-pending suppression:** a pull with
+     one pending repo persists NO meta (and clears a prior one); the next
+     push snapshots; the next fast-path pull is skipped (cold walk); a
+     later fully-applied pull re-establishes the meta.
    - design-92 parity (§4.6): a poisoned `set` tuple fails at apply exactly
      as via snapshot; deferred carry emits no op; a verified-but-unapplied
      head never becomes a delta base; compressed-descriptor entry changes
      round-trip.
-   - epoch boundary (I4): a simulated rotation forces a snapshot; decode
-     rejects a chain spanning epochs (AAD failure surfaces as a named chain
-     error).
+   - epoch boundary (I4): a simulated rotation forces a snapshot — including
+     the round-2 case where the APPLIED base predates the rotation while the
+     pin has already advanced (the trigger reads `manifestMeta`'s persisted
+     signed epochs, not the pin); decode rejects a chain spanning epochs
+     (AAD failure surfaces as a named chain error).
    - re-baseline (§4.3): recover on a pruned workspace verifies the retained
-     segment + head signature under the ceremony; floor/equivocation rules
-     enforced.
+     segment + head signature under the ceremony; the floor/equivocation
+     rule compares against the RETAINED prior pin (an equal-sequence
+     different-hash replacement chain is refused; the pin is overwritten
+     only after verification — no cleared window).
    - cross-host rename round-trips end-to-end through the delta path (the
      design-82 rename test, re-run).
    - trash/tombstone (I7): a `del` op drives the same reconcile+trash outcome
@@ -1039,9 +1165,10 @@ Owned by other designs / explicitly out:
 
 ## 10. Open decisions (founder-level calls)
 
-1. **Snapshot cadence constants.** `MAX_MANIFEST_DELTA_CHAIN` (propose 16 =
-   `manifestChain.length` cap, fold depth 17) and whether byte-bound (§3.3.4)
-   or length cap is primary. Server cap must equal the client constant.
+1. **Snapshot cadence retuning.** `MAX_MANIFEST_DELTA_CHAIN = 16` is
+   normative for C2 (§3.3.3 — one shared constant, wire interop). The open
+   call is only whether to RETUNE it (and the byte-bound's primacy) after
+   soak data; a change is a coordinated release, read-side first.
 2. **Compat window.** How long the fleet writes raw-v0 after Phase B before
    C1/C2 enable. With 2 devices this can be one release; the contract (B
    fleet-confirmed before any write change) is the invariant, the *duration*
