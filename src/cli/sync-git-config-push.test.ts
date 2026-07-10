@@ -10,6 +10,7 @@ import { gitRaw } from "../engine/git/shared.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
 import {
+  GIT_FINGERPRINT_VERSION,
   GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS,
   gitConfigHash,
   gitDivergenceStatus,
@@ -188,13 +189,13 @@ test("legacy cache version is discarded and forces one slow pass", async () => {
   const first = await plan();
   expect(first.gitPlanStats?.spawnedRepos).toBe(1);
   const cachePath = path.join(root, ".rbox", "state", "git-divergence.json");
-  const legacy = JSON.parse(await fs.readFile(cachePath, "utf8")) as { version: number };
+  const legacy = JSON.parse(await fs.readFile(cachePath, "utf8")) as { version: string | number };
   legacy.version = 3;
   await fs.writeFile(cachePath, JSON.stringify(legacy));
 
   const migrated = await plan();
   expect(migrated.gitPlanStats?.spawnedRepos).toBe(1);
-  expect((JSON.parse(await fs.readFile(cachePath, "utf8")) as { version: number }).version).toBe(4);
+  expect((JSON.parse(await fs.readFile(cachePath, "utf8")) as { version: string }).version).toBe(GIT_FINGERPRINT_VERSION);
 });
 
 test("non-publishing coverage rows carry verbatim or drop structurally with no authorship", async () => {

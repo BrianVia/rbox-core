@@ -844,22 +844,22 @@ test("validateManifest: git config is additive, canonical, and unknown git-secti
   expect(validateManifest(m43({ ".": section({ config: {} }) })).ok).toBe(true);
 });
 
-test("validateManifest: scoped wire sections cannot carry config", () => {
-  expect(validateManifest(m43({ ".": section({ refScope: "scoped", config: {} }) })).ok).toBe(false);
+test("validateManifest: scoped wire config is reader-tolerated as an ignorable field", () => {
+  expect(validateManifest(m43({ ".": section({ refScope: "scoped", config: {} }) })).ok).toBe(true);
 });
 
-test("validateManifest: git config rejects every non-canonical wire shape", () => {
+test("validateManifest: invalid git config is never manifest-fatal", () => {
   const check = (config: unknown) => validateManifest(m43({ ".": { ...section(), config } })).ok;
   expect(check({ "remote.origin.url": ["https://example.com/repo.git"] })).toBe(true);
   expect(check({
     "remote.origin.url": ["https://example.com/repo.git"],
     "branch.main.remote": ["origin"],
-  })).toBe(false); // keys not bytewise sorted
-  expect(check({ "remote.origin.url": [] })).toBe(false);
-  expect(check({ "remote.origin.url": ["https://example.com", "https://example.com"] })).toBe(false);
-  expect(check({ "remote.origin.pushurl": ["ssh://git@example.com/repo"] })).toBe(false);
-  expect(check({ "remote.origin.url": ["https://user@example.com/repo"] })).toBe(false);
-  expect(check({ "branch.main.remote": ["missing"] })).toBe(false);
+  })).toBe(true); // keys not bytewise sorted: field is ignored by the reader
+  expect(check({ "remote.origin.url": [] })).toBe(true);
+  expect(check({ "remote.origin.url": ["https://example.com", "https://example.com"] })).toBe(true);
+  expect(check({ "remote.origin.pushurl": ["ssh://git@example.com/repo"] })).toBe(true);
+  expect(check({ "remote.origin.url": ["https://user@example.com/repo"] })).toBe(true);
+  expect(check({ "branch.main.remote": ["missing"] })).toBe(true);
 });
 
 test("validateManifest: MAX_GIT_REPOS is a LOUD error at the boundary, not a silent drop", () => {

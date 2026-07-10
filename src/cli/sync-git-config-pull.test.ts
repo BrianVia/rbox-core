@@ -10,10 +10,11 @@ import {
   captureGitState,
   gitIdentity,
   gitIdentityKey,
+  validateManifest,
   type GitSection,
   type Manifest,
 } from "../engine/index.js";
-import type { GitConfig } from "../engine/git/config-sync.js";
+import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../engine/git/config-sync.js";
 import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "./config.js";
 import { composeStateSavePacket, observedRepoKeys } from "./sync-state.js";
 import { applyGitSections, gitConfigHash } from "./sync-git.js";
@@ -172,6 +173,57 @@ test("workspace-wide legacy degradation leaves receiver config untouched and adv
   expect(outcome.gitRepos?.["."]).toEqual(remote);
   expect(outcome.configLane).toBeUndefined();
   expect(await git(receiver, "config", "--get", "remote.upstream.url").catch(() => "missing")).toBe("missing");
+});
+
+test("over-current-bound incoming config validates, is ignored once, and Git applies", async () => {
+  await commit(source, "two\n", "two");
+  const overBound = Object.fromEntries(
+    Array.from({ length: MAX_GIT_CONFIG_KEYS + 1 }, (_, i) => [
+      `remote.r${i.toString().padStart(3, "0")}.url`,
+      ["git@example.com:team/repo.git"],
+    ])
+  );
+  const incoming = { ...(await capture()), config: overBound };
+  const wire = manifest(incoming);
+  expect(validateManifest(wire).ok).toBe(true);
+
+  const logs: string[] = [];
+  let configApplyCalls = 0;
+  const first = await applyGitSections(receiver, cfg(), stateWith(base), wire, store, buildIgnoreMatcher(receiver), (line) => logs.push(line), {
+    applyConfig: async () => {
+      configApplyCalls++;
+      throw new Error("invalid config lane must not apply");
+    },
+  });
+  const applied = first.gitRepos?.["."];
+  expect(configApplyCalls).toBe(0);
+  expect(first.gitPendingRemote).toBeUndefined();
+  expect(applied?.config).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+
+  await applyGitSections(receiver, cfg(), stateWith(applied), wire, store, buildIgnoreMatcher(receiver), (line) => logs.push(line));
+  expect(logs.filter((line) => line.includes("ignored invalid incoming config") && line.includes(`exceeds ${MAX_GIT_CONFIG_KEYS} keys`))).toHaveLength(1);
+});
+
+test("grammar-invalid incoming config is ignored while Git state applies", async () => {
+  await commit(source, "two\n", "two");
+  const incoming = { ...(await capture()), config: { "remote.origin.url": [] } };
+  const wire = manifest(incoming);
+  expect(validateManifest(wire).ok).toBe(true);
+
+  const logs: string[] = [];
+  let configApplyCalls = 0;
+  const outcome = await applyGitSections(receiver, cfg(), stateWith(base), wire, store, buildIgnoreMatcher(receiver), (line) => logs.push(line), {
+    applyConfig: async () => {
+      configApplyCalls++;
+      throw new Error("invalid config lane must not apply");
+    },
+  });
+  expect(configApplyCalls).toBe(0);
+  expect(outcome.gitPendingRemote).toBeUndefined();
+  expect(outcome.gitRepos?.["."]?.config).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+  expect(logs.filter((line) => line.includes("ignored invalid incoming config") && line.includes("values are empty or malformed"))).toHaveLength(1);
 });
 
 test("config-only failure holds pending and old base through BOTH unchanged shortcuts", async () => {

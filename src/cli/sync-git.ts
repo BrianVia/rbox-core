@@ -38,7 +38,15 @@ import {
 } from "../engine/index.js";
 import { repoCtx } from "../engine/git/shared.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../engine/manifest-validate.js";
-import { canonicalizeGitConfig, type GitConfig } from "../engine/git/config-sync.js";
+import {
+  canonicalizeGitConfig,
+  MAX_GIT_CONFIG_KEYS,
+  MAX_GIT_CONFIG_KEY_BYTES,
+  MAX_GIT_CONFIG_SERIALIZED_BYTES,
+  MAX_GIT_CONFIG_VALUE_BYTES,
+  validateCanonicalGitConfig,
+  type GitConfig,
+} from "../engine/git/config-sync.js";
 import {
   applyConfigTransaction,
   materializeFreshGitConfig,
@@ -72,6 +80,9 @@ const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
 /** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
  * loud once per workspace/repo without repeating forever on every pull. */
 const configOwnershipSkipLogged = new Set<string>();
+/** Invalid incoming config is an additive-field compatibility event. Keep it
+ * loud once per workspace/repo while the independent Git lane continues. */
+const configInvalidSkipLogged = new Set<string>();
 /** Credential-bearing URLs are a capture-side security event, not ordinary bad
  * grammar. Log them once per workspace/repo while continuing with the safe
  * projection so a daemon cannot flood its log on every tick. */
@@ -1043,11 +1054,37 @@ export function gitForceForMissingBlobs(committedGit: Record<string, GitSection>
 
 const GIT_DIVERGENCE_CONCURRENCY = 8;
 const GIT_DIVERGENCE_CACHE_REL = ".rbox/state/git-divergence.json";
-// File-level bump: v3 entries have no config summary and must take one slow,
-// bracketed pass before any fast carry can be trusted for design 93.
-const GIT_DIVERGENCE_CACHE_VERSION = 4;
-// Release-internal until design 83 ships; shape-only rewrites can stay on v4.
-const GIT_FINGERPRINT_VERSION = 4;
+const GIT_FINGERPRINT_SCHEMA_VERSION = 4;
+export interface GitConfigWireBounds {
+  maxKeys: number;
+  maxSerializedBytes: number;
+  maxKeyBytes: number;
+  maxValueBytes: number;
+}
+
+/** Bind cached git decisions to the wire bounds that produced them. A bounds
+ * recalibration changes this version even when every watched git file is
+ * unchanged, forcing one fresh probe before the cache self-heals. */
+export function gitFingerprintVersionForBounds(bounds: GitConfigWireBounds): string {
+  return hashBytes(
+    Buffer.from(
+      JSON.stringify({
+        schema: GIT_FINGERPRINT_SCHEMA_VERSION,
+        configWireBounds: [bounds.maxKeys, bounds.maxSerializedBytes, bounds.maxKeyBytes, bounds.maxValueBytes],
+      })
+    )
+  );
+}
+
+export const GIT_FINGERPRINT_VERSION = gitFingerprintVersionForBounds({
+  maxKeys: MAX_GIT_CONFIG_KEYS,
+  maxSerializedBytes: MAX_GIT_CONFIG_SERIALIZED_BYTES,
+  maxKeyBytes: MAX_GIT_CONFIG_KEY_BYTES,
+  maxValueBytes: MAX_GIT_CONFIG_VALUE_BYTES,
+});
+// The file version shares the fingerprint version so stale entries are excluded
+// from fast repo discovery as well as rejected by per-repo fingerprint checks.
+const GIT_DIVERGENCE_CACHE_VERSION = GIT_FINGERPRINT_VERSION;
 const PACKED_REFS_HASH_MAX_BYTES = 1024 * 1024;
 const LOOSE_REF_HASH_MAX_BYTES = 4096;
 // Large indexes fall back to stat+ctime under the racy-clean margin. Real index
@@ -1180,7 +1217,7 @@ async function fastRepoAdmitted(root: string, matcher: IgnoreMatcher, rel: strin
 async function loadGitDivergenceCache(root: string): Promise<GitDivergenceCache> {
   try {
     const raw = await fs.readFile(path.join(root, GIT_DIVERGENCE_CACHE_REL), "utf8");
-    const parsed = JSON.parse(raw) as { version?: number; repos?: Record<string, unknown> };
+    const parsed = JSON.parse(raw) as { version?: string; repos?: Record<string, unknown> };
     if (parsed.version !== GIT_DIVERGENCE_CACHE_VERSION) return { repos: new Map(), dirty: true };
     const repos = new Map<string, GitDivergenceCacheEntry>();
     for (const [rel, entry] of Object.entries(parsed.repos ?? {})) {
@@ -1933,7 +1970,28 @@ opts: {
   };
 
   const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
-    const remoteSec = remote.gitRepos?.[rel];
+    const wireRemoteSec = remote.gitRepos?.[rel];
+    let remoteSec = wireRemoteSec;
+    if (wireRemoteSec?.config !== undefined) {
+      const config = validateCanonicalGitConfig(wireRemoteSec.config);
+      const invalidReason = !config.ok
+        ? config.reason
+        : wireRemoteSec.refScope === "scoped"
+          ? "scoped git section cannot carry config"
+          : undefined;
+      if (invalidReason) {
+        // Treat the field as truly absent for every downstream decision and for
+        // the persisted base/pending section. This prevents a later push from
+        // carrying the invalid field back onto the wire.
+        remoteSec = { ...wireRemoteSec };
+        delete remoteSec.config;
+        const logKey = `${root}\0${rel}`;
+        if (!configInvalidSkipLogged.has(logKey)) {
+          configInvalidSkipLogged.add(logKey);
+          glog(`git-sync WARNING ${rel}: ignored invalid incoming config (${invalidReason}); Git state continues`);
+        }
+      }
+    }
     const baseSec = baseRepos[rel];
     const pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
