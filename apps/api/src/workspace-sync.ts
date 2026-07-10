@@ -25,6 +25,9 @@ import {
 } from "./commit-envelope.js";
 import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
 
+const ROOTS_MAX_RETAINED_SEQUENCES = 64;
+const ROOTS_MAX_TOTAL_REFS = 500_000;
+
 async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
   if (overCap.reason === "no_plan") return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, reason: "no_plan" as const };
   const row = await db.prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
@@ -462,11 +465,15 @@ export class WorkspaceSync {
 
   /** Authoritative retained roots (GC): for every sequence the DO still holds
    *  (pruneFloor, head], the referenced content addresses parsed FROM the stored
-   *  commit body — so the mark phase needs no R2 manifest fetch. */
+   *  commit body — so the mark phase needs no R2 manifest fetch.
+   *  2026-07-10 OOM diagnosis: enforce design 24's previously unimplemented whole-pass bound before materializing sidecars. */
   private async roots(): Promise<Response> {
     const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
+    const retainedCount = head - floor;
+    if (retainedCount > ROOTS_MAX_RETAINED_SEQUENCES) return json({ error: "roots_too_large", retained: retainedCount }, 503);
     const roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> = [];
+    let totalRefs = 0;
     // FAIL CLOSED (§24.3 M3): GC condemns anything NOT named here, so any inability to
     // enumerate a retained commit's reachable set (a gap in (floor, head], or a sidecar that's
     // missing/oversized/corrupt/unparseable) must abort the WHOLE pass (non-2xx → gcMark throws),
@@ -480,6 +487,9 @@ export class WorkspaceSync {
       const mode = readRefMode(cb);
       if (!mode) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
       const encManifestSha = typeof cb.encManifestSha === "string" ? cb.encManifestSha : "";
+      const sequenceRefs = mode.kind === "inline" ? mode.refShas.length : mode.count;
+      if (sequenceRefs > ROOTS_MAX_TOTAL_REFS - totalRefs) return json({ error: "roots_too_large", retained: retainedCount }, 503);
+      totalRefs += sequenceRefs;
       if (mode.kind === "inline") {
         roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha, encShas: mode.refShas });
         continue;
