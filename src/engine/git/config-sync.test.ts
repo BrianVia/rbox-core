@@ -154,6 +154,19 @@ describe("design 93 canonicalization and wire bounds", () => {
     ]);
   });
 
+  test("unknown entries and non-bound grammar failures remain skippable", () => {
+    const result = canonicalizeGitConfig([
+      [`unknown.${"a".repeat(MAX_GIT_CONFIG_KEY_BYTES + 1)}`, "x".repeat(MAX_GIT_CONFIG_VALUE_BYTES + 1)],
+      ["branch.main.rebase", "TRUE"],
+      ["remote.origin.url", "https://example.com/repo.git"],
+    ]);
+    expect(result).toMatchObject({
+      ok: true,
+      config: { "remote.origin.url": ["https://example.com/repo.git"] },
+      rejected: [{ key: "branch.main.rebase", reason: "invalid value grammar", credential: false }],
+    });
+  });
+
   test("wire validator requires exact bytewise key order", () => {
     expect(validateCanonicalGitConfig(valid()).ok).toBe(true);
     const unsorted = {
@@ -197,7 +210,40 @@ describe("design 93 canonicalization and wire bounds", () => {
     expect(validateCanonicalGitConfig({ "remote.origin.url": [`${at}a`] }).ok).toBe(false);
   });
 
-  test("serialized projection is accepted through 16 KiB and omitted above it", () => {
+  const overBoundsCases: Array<{
+    label: string;
+    bound: "key-count" | "key-bytes" | "name-bytes" | "value-bytes";
+    entries: Array<readonly [string, string]>;
+  }> = [
+    {
+      label: "65th projected key",
+      bound: "key-count",
+      entries: Array.from({ length: MAX_GIT_CONFIG_KEYS }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, `https://e.test/${i}`] as const),
+    },
+    {
+      label: "201-byte otherwise-allowlisted key",
+      bound: "key-bytes",
+      entries: [[`branch.${"a".repeat(MAX_GIT_CONFIG_KEY_BYTES - "branch..merge".length + 1)}.merge`, "refs/heads/main"]],
+    },
+    {
+      label: "121-byte otherwise-allowlisted remote name",
+      bound: "name-bytes",
+      entries: [[`remote.${"a".repeat(MAX_GIT_CONFIG_NAME_BYTES + 1)}.url`, "https://e.test/repo"]],
+    },
+    {
+      label: "1025-byte otherwise-valid value",
+      bound: "value-bytes",
+      entries: [["remote.origin.url", `https://e.test/${"a".repeat(MAX_GIT_CONFIG_VALUE_BYTES - "https://e.test/".length + 1)}`]],
+    },
+  ];
+
+  test.each(overBoundsCases)("capture returns a non-partial over-bounds outcome for $label", ({ bound, entries }) => {
+    const result = canonicalizeGitConfig([["remote.valid.url", "https://e.test/valid"], ...entries]);
+    expect(result).toMatchObject({ ok: false, overBounds: true, bound });
+    expect("config" in result).toBe(false);
+  });
+
+  test("serialized projection is accepted through 16 KiB and returns over-bounds above it", () => {
     const make = (valueLength: number) => Array.from({ length: 16 }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, `https://e.test/${"a".repeat(valueLength)}${i}`] as const);
     let low = 0;
     let high = MAX_GIT_CONFIG_VALUE_BYTES - "https://e.test/".length - 2;
@@ -214,6 +260,8 @@ describe("design 93 canonicalization and wire bounds", () => {
     const over = canonicalizeGitConfig(make(low + 1));
     expect(over.ok).toBe(false);
     if (over.ok) return;
+    expect(over).toMatchObject({ overBounds: true, bound: "serialized-bytes" });
+    expect("config" in over).toBe(false);
     expect(over.reason).toContain(String(MAX_GIT_CONFIG_SERIALIZED_BYTES));
   });
 });

@@ -29,9 +29,18 @@ export interface RejectedGitConfigValue {
   credential: boolean;
 }
 
+export type GitConfigBound = "key-count" | "key-bytes" | "name-bytes" | "value-bytes" | "serialized-bytes";
+
 export type GitConfigCanonicalization =
   | { ok: true; config: GitConfig; rejected: RejectedGitConfigValue[] }
-  | { ok: false; reason: string; rejected: RejectedGitConfigValue[] };
+  | { ok: false; overBounds: false; reason: string; rejected: RejectedGitConfigValue[] }
+  | {
+      ok: false;
+      overBounds: true;
+      bound: GitConfigBound;
+      reason: string;
+      rejected: RejectedGitConfigValue[];
+    };
 
 const utf8 = new TextEncoder();
 const CONTROL_OR_DEL = /[\u0000-\u001f\u007f]/;
@@ -71,15 +80,15 @@ export function branchNameOk(name: string): boolean {
   return byteLength(name) <= MAX_GIT_CONFIG_NAME_BYTES && refNameOk(name);
 }
 
-/** Parse an exact allowlisted key. Literal section/variable names are canonical lowercase. */
-export function parseGitConfigKey(key: string): GitConfigKey | undefined {
-  if (CONTROL_OR_DEL.test(key) || byteLength(key) > MAX_GIT_CONFIG_KEY_BYTES) return undefined;
+/** Parse an allowlisted key without applying the wire byte bounds. */
+function parseUnboundedGitConfigKey(key: string): GitConfigKey | undefined {
+  if (CONTROL_OR_DEL.test(key)) return undefined;
   for (const variable of GIT_CONFIG_ALLOWLIST.remote) {
     const prefix = "remote.";
     const suffix = `.${variable}`;
     if (key.startsWith(prefix) && key.endsWith(suffix)) {
       const name = key.slice(prefix.length, -suffix.length);
-      if (remoteNameOk(name)) return { section: "remote", name, variable };
+      if (REMOTE_NAME.test(name)) return { section: "remote", name, variable };
     }
   }
   for (const variable of GIT_CONFIG_ALLOWLIST.branch) {
@@ -87,10 +96,17 @@ export function parseGitConfigKey(key: string): GitConfigKey | undefined {
     const suffix = `.${variable}`;
     if (key.startsWith(prefix) && key.endsWith(suffix)) {
       const name = key.slice(prefix.length, -suffix.length);
-      if (branchNameOk(name)) return { section: "branch", name, variable };
+      if (refNameOk(name)) return { section: "branch", name, variable };
     }
   }
   return undefined;
+}
+
+/** Parse an exact allowlisted key. Literal section/variable names are canonical lowercase. */
+export function parseGitConfigKey(key: string): GitConfigKey | undefined {
+  const parsed = parseUnboundedGitConfigKey(key);
+  if (!parsed || byteLength(key) > MAX_GIT_CONFIG_KEY_BYTES || byteLength(parsed.name) > MAX_GIT_CONFIG_NAME_BYTES) return undefined;
+  return parsed;
 }
 
 function parsedUrl(value: string): URL | undefined {
@@ -212,9 +228,25 @@ export function validateCanonicalGitConfig(input: unknown): GitConfigValidation 
 export function canonicalizeGitConfig(entries: Iterable<readonly [string, string]>): GitConfigCanonicalization {
   const collected = new Map<string, string[]>();
   const rejected: RejectedGitConfigValue[] = [];
+  const overBounds = (bound: GitConfigBound, reason: string): GitConfigCanonicalization => ({
+    ok: false,
+    overBounds: true,
+    bound,
+    reason,
+    rejected,
+  });
   for (const [key, value] of entries) {
-    const parsed = parseGitConfigKey(key);
+    const parsed = parseUnboundedGitConfigKey(key);
     if (!parsed) continue;
+    if (byteLength(key) > MAX_GIT_CONFIG_KEY_BYTES) {
+      return overBounds("key-bytes", `config key exceeds ${MAX_GIT_CONFIG_KEY_BYTES} bytes: ${key}`);
+    }
+    if (byteLength(parsed.name) > MAX_GIT_CONFIG_NAME_BYTES) {
+      return overBounds("name-bytes", `config name exceeds ${MAX_GIT_CONFIG_NAME_BYTES} bytes: ${parsed.name}`);
+    }
+    if (byteLength(value) > MAX_GIT_CONFIG_VALUE_BYTES) {
+      return overBounds("value-bytes", `config value exceeds ${MAX_GIT_CONFIG_VALUE_BYTES} bytes: ${key}`);
+    }
     if (!gitConfigValueOk(parsed, value)) {
       rejected.push({ key, value, reason: "invalid value grammar", credential: parsed.section === "remote" && parsed.variable === "url" && hasHttpUserinfo(value) });
       continue;
@@ -241,7 +273,15 @@ export function canonicalizeGitConfig(entries: Iterable<readonly [string, string
   }
 
   const config = Object.fromEntries([...collected.entries()].sort(([a], [b]) => compareConfigKeysBytewise(a, b)));
+  if (Object.keys(config).length > MAX_GIT_CONFIG_KEYS) {
+    return overBounds("key-count", `config exceeds ${MAX_GIT_CONFIG_KEYS} keys`);
+  }
+  if (serializedSize(config) > MAX_GIT_CONFIG_SERIALIZED_BYTES) {
+    return overBounds("serialized-bytes", `config exceeds ${MAX_GIT_CONFIG_SERIALIZED_BYTES} serialized bytes`);
+  }
   const validation = validateCanonicalGitConfig(config);
-  if (!validation.ok) return { ok: false, reason: validation.reason, rejected };
+  // The projection above removes all non-bound grammar failures. Keep the
+  // validator as a final invariant check without turning one into a partial ok.
+  if (!validation.ok) return { ok: false, overBounds: false, reason: validation.reason, rejected };
   return { ok: true, config: validation.config, rejected };
 }
