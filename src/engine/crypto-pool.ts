@@ -341,7 +341,8 @@ export class CryptoPool {
 
   handleWorkerCrash(slot: CryptoWorkerSlot, reason: string): void {
     const idx = this.workers.indexOf(slot);
-    if (idx >= 0) this.workers.splice(idx, 1);
+    const wasRegistered = idx >= 0;
+    if (wasRegistered) this.workers.splice(idx, 1);
     const crash = workerCrashError(reason);
     for (const record of slot.inFlight.values()) {
       slot.inFlight.delete(record.message.id);
@@ -352,7 +353,10 @@ export class CryptoPool {
         this.queue.unshift(record);
       }
     }
-    if (!this.closed) {
+    // A slot can fail its health check before spawnWorker() registers it.
+    // Its caller owns that startup failure; starting a replacement here would
+    // leave an untracked task that can mutate module state after a test reset.
+    if (!this.closed && wasRegistered) {
       void this.spawnReplacement();
       this.dispatch();
     }
@@ -445,6 +449,9 @@ export class CryptoPool {
       this.dispatch();
       this.signalQueueSpace();
     } catch (err) {
+      // The pool may have been reset while a replacement was starting. Stale
+      // replacement work must not re-disable worker selection after reset.
+      if (this.closed) return;
       disabledReason = `crypto worker replacement failed: ${err instanceof Error ? err.message : String(err)}`;
       await this.close();
     }
