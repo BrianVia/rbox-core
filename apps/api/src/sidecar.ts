@@ -11,7 +11,7 @@
 import type { Env } from "./env.js";
 import { blobKey, sha256Hex } from "./util.js";
 import { verifyReceipt } from "./receipts.js";
-import { parseRefset, refsetByteLength } from "../../../src/engine/refset.js";
+import { parseRefset, parseRefsetShaSet, refsetByteLength } from "../../../src/engine/refset.js";
 
 /** The §24 sidecar descriptor as it appears in the signed commit body. (Defined locally so
  *  the Worker shares only the dependency-free refset codec with the engine, not its crypto graph.) */
@@ -42,6 +42,19 @@ export async function loadSidecarRefs(env: Env, sidecarSha: string, count: numbe
   if ((await sha256Hex(buf)) !== sidecarSha) return { ok: false, reason: "sha256 mismatch" };
   try {
     return { ok: true, refs: parseRefset(buf) }; // strict: magic, exact length, sorted, no dup, safe sizes
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : "parse failed" };
+  }
+}
+
+export async function loadSidecarShaSet(env: Env, sidecarSha: string, count: number): Promise<{ ok: true; refs: Set<string> } | { ok: false; reason: string }> {
+  const obj = await env.rbox_dev_blobs.get(blobKey(sidecarSha));
+  if (!obj) return { ok: false, reason: "missing" };
+  if (obj.size !== refsetByteLength(count)) return { ok: false, reason: `size ${obj.size} != expected ${refsetByteLength(count)}` };
+  const buf = new Uint8Array(await obj.arrayBuffer());
+  if ((await sha256Hex(buf)) !== sidecarSha) return { ok: false, reason: "sha256 mismatch" };
+  try {
+    return { ok: true, refs: parseRefsetShaSet(buf) };
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : "parse failed" };
   }

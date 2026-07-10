@@ -9,7 +9,7 @@ import {
   MAX_REFS_PER_COMMIT,
   type RefWithSize,
 } from "./commit-accounting.js";
-import { resolveSidecarBytes, loadSidecarRefs } from "./sidecar.js";
+import { resolveSidecarBytes, loadSidecarShaSet } from "./sidecar.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { verifyReceipt } from "./receipts.js";
@@ -25,8 +25,17 @@ import {
 } from "./commit-envelope.js";
 import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
 
-const ROOTS_MAX_RETAINED_SEQUENCES = 64;
-const ROOTS_MAX_TOTAL_REFS = 500_000;
+const ROOTS_PAGE_LIMIT = 20_000;
+const ROOTS_OUTER_MAX_REFS = 3_000_000;
+const GAP_MAX = 8;
+const FOLD_MAX_REFS = 250_000;
+const FOLD_CHUNK = 5_000;
+const SWEEP_CHUNK = 500;
+let isolateFoldActive = false;
+
+type IndexState = "building" | "ready" | "lagging";
+type FoldCursor = { phase: "removed" | "added"; lastSha: string };
+type SqlRow = Record<string, unknown>;
 
 async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
   if (overCap.reason === "no_plan") return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, reason: "no_plan" as const };
@@ -63,6 +72,7 @@ export class WorkspaceSync {
   private repairRequired = false;
   private bootWs = "";
   private bootProj = "";
+  private foldPrevCache?: { seq: number; value: { refs: Set<string>; manifestSha: string; carrierSha: string | null } };
 
   constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {
     // Answer protocol-level heartbeats without waking the DO from hibernation.
@@ -87,7 +97,7 @@ export class WorkspaceSync {
     if (url.pathname === "/roots" || url.pathname === "/prune") {
       await this.ensureBootstrap(url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
       if (this.repairRequired) return this.repairRequiredResponse();
-      if (url.pathname === "/roots" && req.method === "GET") return this.roots();
+      if (url.pathname === "/roots" && req.method === "GET") return this.roots(url);
       if (url.pathname === "/prune" && req.method === "POST") return this.prune(req);
       return json({ error: "not_found" }, 404);
     }
@@ -113,7 +123,7 @@ export class WorkspaceSync {
     // GET /v1/ws/:ws/proj/:proj/manifests/:seq — a specific historical commit.
     if (seg[5] === "manifests" && seg[6] && req.method === "GET") return this.commitAt(Number(seg[6]));
     // GC support (M6): authoritative retained roots + retention prune.
-    if (action === "roots" && req.method === "GET") return this.roots();
+    if (action === "roots" && req.method === "GET") return this.roots(url);
     if (action === "prune" && req.method === "POST") return this.prune(req);
     if (action === "repair" && req.method === "POST") return this.repair(req, ws, proj);
     return json({ error: "not_found" }, 404);
@@ -132,14 +142,19 @@ export class WorkspaceSync {
   private async doBootstrap(ws: string, proj: string): Promise<void> {
     this.bootWs = ws;
     this.bootProj = proj;
+    this.sql().exec("CREATE TABLE IF NOT EXISTS dropped_index (sha256 TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
+    this.sql().exec("CREATE INDEX IF NOT EXISTS idx_dropped_last ON dropped_index (last_seq)");
+    this.sql().exec("CREATE TABLE IF NOT EXISTS seq_roots (seq INTEGER PRIMARY KEY, manifest_sha TEXT NOT NULL, carrier_sha TEXT)");
     const rawHead = this.ctx.storage.kv.get("head") as StoredHead | number | undefined;
     if (typeof rawHead === "number") {
       await this.migrateNumericHead(ws, proj, rawHead);
+      if (!this.repairRequired) await this.initializeIndex(rawHead, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
       this.bootstrapped = true;
       return;
     }
     if (isStoredHead(rawHead)) {
       this.ensureWatermarkAtLeast(rawHead.sequence);
+      await this.initializeIndex(rawHead.sequence, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
       this.bootstrapped = true;
       return;
     }
@@ -157,8 +172,28 @@ export class WorkspaceSync {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.kv.put("head", { sequence: 0, commitHash: GENESIS_HASH });
       this.ctx.storage.kv.put("headWatermark", 0);
+      this.ctx.storage.kv.put("index_synced_seq", 0);
+      this.ctx.storage.kv.put("index_generation", 0);
+      this.ctx.storage.kv.put("index_state", "ready");
     });
     this.bootstrapped = true;
+  }
+
+  private async initializeIndex(head: number, floor: number): Promise<void> {
+    if (this.ctx.storage.kv.get("index_state") !== undefined) return;
+    this.ctx.storage.transactionSync(() => {
+      if (head === 0 && floor === 0) {
+        this.ctx.storage.kv.put("index_synced_seq", 0);
+        this.ctx.storage.kv.put("index_generation", 0);
+        this.ctx.storage.kv.put("index_state", "ready");
+      } else {
+        this.ctx.storage.kv.put("index_synced_seq", floor);
+        this.ctx.storage.kv.put("index_generation", 0);
+        this.ctx.storage.kv.put("index_state", "building");
+        this.ctx.storage.kv.put("backfill_cursor", floor + 1);
+      }
+    });
+    if (head > floor) await this.armAlarm(Date.now());
   }
 
   private async migrateNumericHead(_ws: string, _proj: string, seq: number): Promise<void> {
@@ -372,6 +407,7 @@ export class WorkspaceSync {
         this.ctx.storage.kv.put("head", nextHead);
         this.ctx.storage.kv.put("headWatermark", nextHead.sequence);
         this.ctx.storage.kv.put(`seq:${next}`, stored);
+        if (this.ctx.storage.kv.get("index_state") === "ready") this.ctx.storage.kv.put("index_state", "lagging");
       });
       outcome = { sequence: next, watermark: next };
     } catch (e) {
@@ -390,6 +426,7 @@ export class WorkspaceSync {
       return json({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409);
     }
     const sequence = outcome!.sequence;
+    await this.armAlarm(Date.now());
 
     wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }));
 
@@ -407,6 +444,122 @@ export class WorkspaceSync {
     // R2/D1/DO split (dbMs+dbCalls from missingBlobs & mirror, doMs from the txn).
     emitCommit("ok"); // ratio defaults to 0
     return json({ sequence, commitHash: commit.commitHash });
+  }
+
+  /** One alarm folds exactly one sequence. The module-level guard is deliberately
+   * isolate-wide: two DO instances must not hold two pairs of 250k sets. */
+  async alarm(): Promise<void> {
+    if (isolateFoldActive) {
+      await this.armAlarm(Date.now() + 5_000);
+      return;
+    }
+    isolateFoldActive = true;
+    try {
+      const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+      const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
+      const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
+      if (synced < head) await this.foldSequence(synced + 1, head, floor);
+      this.sweepIndex(floor);
+      const nowHead = readHead(this.ctx.storage.kv.get("head")).sequence;
+      const nowSynced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
+      if (nowSynced < nowHead) await this.armAlarm(Date.now());
+    } catch (e) {
+      logErr("roots_index_fold_failed", e);
+      metric(this.env, "index_fold_failed");
+      await this.armAlarm(Date.now() + 5_000);
+    } finally {
+      isolateFoldActive = false;
+    }
+  }
+
+  private async foldSequence(seq: number, observedHead: number, floor: number): Promise<void> {
+    const state = (this.ctx.storage.kv.get("index_state") as IndexState | undefined) ?? "building";
+    const current = await this.refSetAt(seq);
+    if (!current) throw new Error(`unreadable fold input ${seq}`);
+    if (current.refs.size > FOLD_MAX_REFS) {
+      this.ctx.storage.kv.put("index_state", "lagging");
+      metric(this.env, "index_fold_max_refs");
+      throw new Error(`fold refs exceed ${FOLD_MAX_REFS}`);
+    }
+
+    // The first retained sequence is an atomic seed, not a diff against pruned history.
+    if (state === "building" && seq === floor + 1 && this.ctx.storage.kv.get("fold_subcursor") === undefined) {
+      this.ctx.storage.transactionSync(() => {
+        this.sql().exec("INSERT OR REPLACE INTO seq_roots(seq,manifest_sha,carrier_sha) VALUES(?,?,?)", seq, current.manifestSha, current.carrierSha);
+        this.ctx.storage.kv.put("index_synced_seq", seq);
+        this.ctx.storage.kv.put("backfill_cursor", seq);
+        this.ctx.storage.kv.put("index_generation", ((this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0) + 1);
+        if (seq === readHead(this.ctx.storage.kv.get("head")).sequence) this.ctx.storage.kv.put("index_state", "ready");
+      });
+      this.foldPrevCache = { seq, value: current };
+      return;
+    }
+
+    const previous = this.foldPrevCache?.seq === seq - 1 ? this.foldPrevCache.value : await this.refSetAt(seq - 1);
+    if (!previous) throw new Error(`unreadable fold base ${seq - 1}`);
+    if (previous.refs.size > FOLD_MAX_REFS) throw new Error(`fold refs exceed ${FOLD_MAX_REFS}`);
+    let cursor = (this.ctx.storage.kv.get("fold_subcursor") as FoldCursor | undefined) ?? { phase: "removed", lastSha: "" };
+    while (cursor.phase === "removed") {
+      const chunk = diffChunk(previous.refs, current.refs, cursor.lastSha);
+      if (!chunk.length) {
+        cursor = { phase: "added", lastSha: "" };
+        this.ctx.storage.transactionSync(() => this.ctx.storage.kv.put("fold_subcursor", cursor));
+        break;
+      }
+      this.ctx.storage.transactionSync(() => {
+        for (const sha of chunk) this.sql().exec("INSERT INTO dropped_index(sha256,last_seq) VALUES(?,?) ON CONFLICT(sha256) DO UPDATE SET last_seq=excluded.last_seq", sha, seq - 1);
+        this.ctx.storage.kv.put("fold_subcursor", { phase: "removed", lastSha: chunk[chunk.length - 1]! } satisfies FoldCursor);
+      });
+      cursor = { phase: "removed", lastSha: chunk[chunk.length - 1]! };
+    }
+    while (cursor.phase === "added") {
+      const chunk = diffChunk(current.refs, previous.refs, cursor.lastSha);
+      if (!chunk.length) break;
+      this.ctx.storage.transactionSync(() => {
+        for (const sha of chunk) this.sql().exec("DELETE FROM dropped_index WHERE sha256 = ?", sha);
+        this.ctx.storage.kv.put("fold_subcursor", { phase: "added", lastSha: chunk[chunk.length - 1]! } satisfies FoldCursor);
+      });
+      cursor = { phase: "added", lastSha: chunk[chunk.length - 1]! };
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.sql().exec("INSERT OR REPLACE INTO seq_roots(seq,manifest_sha,carrier_sha) VALUES(?,?,?)", seq, current.manifestSha, current.carrierSha);
+      this.ctx.storage.kv.put("index_synced_seq", seq);
+      this.ctx.storage.kv.put("backfill_cursor", seq);
+      this.ctx.storage.kv.put("index_generation", ((this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0) + 1);
+      this.ctx.storage.kv.delete("fold_subcursor");
+      const liveHead = readHead(this.ctx.storage.kv.get("head")).sequence;
+      this.ctx.storage.kv.put("index_state", seq === liveHead ? "ready" : liveHead - seq > GAP_MAX ? "lagging" : state);
+    });
+    this.foldPrevCache = { seq, value: current };
+    metric(this.env, observedHead - seq > GAP_MAX ? "index_lagging" : "index_folded");
+  }
+
+  private async refSetAt(seq: number): Promise<{ refs: Set<string>; manifestSha: string; carrierSha: string | null } | null> {
+    if (seq === 0) return { refs: new Set(), manifestSha: GENESIS_HASH, carrierSha: null };
+    const raw = this.ctx.storage.kv.get(`seq:${seq}`) as string | undefined;
+    if (!raw) return null;
+    const sc = JSON.parse(raw) as SignedCommit;
+    const cb = JSON.parse(sc.body) as CommitBodyView;
+    const mode = readRefMode(cb);
+    if (!mode || typeof cb.encManifestSha !== "string") return null;
+    if (mode.kind === "inline") return { refs: new Set([...mode.refShas].sort()), manifestSha: cb.encManifestSha, carrierSha: null };
+    const loaded = await loadSidecarShaSet(this.env, mode.sidecarSha, mode.count);
+    if (!loaded.ok) return null;
+    return { refs: loaded.refs, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha };
+  }
+
+  private sweepIndex(floor: number): void {
+    this.sql().exec("DELETE FROM dropped_index WHERE sha256 IN (SELECT sha256 FROM dropped_index WHERE last_seq <= ? LIMIT ?)", floor, SWEEP_CHUNK);
+    this.sql().exec("DELETE FROM seq_roots WHERE seq IN (SELECT seq FROM seq_roots WHERE seq <= ? LIMIT ?)", floor, SWEEP_CHUNK);
+  }
+
+  private async armAlarm(at: number): Promise<void> {
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null || alarm > at) await this.ctx.storage.setAlarm(at);
+  }
+
+  private sql(): { exec(query: string, ...bindings: unknown[]): { toArray(): SqlRow[] } } {
+    return this.ctx.storage.sql as unknown as { exec(query: string, ...bindings: unknown[]): { toArray(): SqlRow[] } };
   }
 
   private async redeemReceipts(req: Request): Promise<Response> {
@@ -471,47 +624,72 @@ export class WorkspaceSync {
     return json({ granted: newRefs.length, alreadyEntitled, rejected });
   }
 
-  /** Authoritative retained roots (GC): for every sequence the DO still holds
-   *  (pruneFloor, head], the referenced content addresses parsed FROM the stored
-   *  commit body — so the mark phase needs no R2 manifest fetch.
-   *  2026-07-10 OOM diagnosis: enforce design 24's previously unimplemented whole-pass bound before materializing sidecars. */
-  private async roots(): Promise<Response> {
+  /** Design 96 v2 snapshot: two independent SQL streams plus the small raw gap. */
+  private async roots(url: URL): Promise<Response> {
     const head = readHead(this.ctx.storage.kv.get("head")).sequence;
     const floor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
-    const retainedCount = head - floor;
-    if (retainedCount > ROOTS_MAX_RETAINED_SEQUENCES) return json({ error: "roots_too_large", retained: retainedCount }, 503);
-    const roots: Array<{ seq: number; commitHash: string; encManifestSha: string; encShas: string[] }> = [];
-    let totalRefs = 0;
-    // FAIL CLOSED (§24.3 M3): GC condemns anything NOT named here, so any inability to
-    // enumerate a retained commit's reachable set (a gap in (floor, head], or a sidecar that's
-    // missing/oversized/corrupt/unparseable) must abort the WHOLE pass (non-2xx → gcMark throws),
-    // never silently omit roots. A sidecar commit's sidecarSha is itself a root (losing it must
-    // prevent condemnation, since future reachability proofs need it).
-    for (let s = floor + 1; s <= head; s++) {
+    const generation = (this.ctx.storage.kv.get("index_generation") as number | undefined) ?? 0;
+    const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? floor;
+    const state = (this.ctx.storage.kv.get("index_state") as IndexState | undefined) ?? "building";
+    if (url.searchParams.get("rebuild") === "1") {
+      this.ctx.storage.transactionSync(() => {
+        this.sql().exec("DELETE FROM dropped_index");
+        this.sql().exec("DELETE FROM seq_roots");
+        this.ctx.storage.kv.put("index_synced_seq", floor);
+        this.ctx.storage.kv.put("index_state", head === floor ? "ready" : "building");
+        this.ctx.storage.kv.put("backfill_cursor", floor + 1);
+        this.ctx.storage.kv.delete("fold_subcursor");
+        this.ctx.storage.kv.put("index_generation", generation + 1);
+      });
+      await this.armAlarm(Date.now());
+      return json({ error: "index_building" }, 503);
+    }
+    if (state === "building") return json({ error: "index_building" }, 503);
+    if (head - synced > GAP_MAX) return json({ error: "index_lagging" }, 503);
+
+    const pins = [url.searchParams.get("pinHead"), url.searchParams.get("pinFloor"), url.searchParams.get("pinGen")];
+    if (pins.some((x) => x !== null) && (pins.some((x) => x === null) || Number(pins[0]) !== head || Number(pins[1]) !== floor || Number(pins[2]) !== generation)) {
+      return json({ error: "snapshot_changed" }, 409);
+    }
+    const requested = Number(url.searchParams.get("limit") ?? ROOTS_PAGE_LIMIT);
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(ROOTS_PAGE_LIMIT, Math.trunc(requested))) : ROOTS_PAGE_LIMIT;
+    const fromSha = url.searchParams.get("fromSha") ?? "";
+    const fromSeqRaw = url.searchParams.get("fromSeq") ?? "";
+    const droppedRows = fromSha === "done" ? [] : this.sql().exec(
+      "SELECT sha256 FROM dropped_index WHERE last_seq > ? AND sha256 > ? ORDER BY sha256 LIMIT ?",
+      floor, fromSha, limit + 1,
+    ).toArray();
+    const droppedPage = droppedRows.slice(0, limit).map((r) => String(r.sha256));
+    const seqRows = fromSeqRaw === "done" ? [] : this.sql().exec(
+      "SELECT seq,manifest_sha,carrier_sha FROM seq_roots WHERE seq > ? AND seq <= ? AND seq > ? ORDER BY seq LIMIT ?",
+      floor, head, fromSeqRaw ? Number(fromSeqRaw) : floor, limit + 1,
+    ).toArray();
+    const seqRootsPage = seqRows.slice(0, limit).map((r) => ({
+      seq: Number(r.seq), manifestSha: String(r.manifest_sha), ...(r.carrier_sha == null ? {} : { carrierSha: String(r.carrier_sha) }),
+    }));
+    const gap: Array<Record<string, unknown>> = [];
+    let gapRefs = 0;
+    for (let s = Math.max(1, synced); s <= head; s++) {
       const raw = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
       if (!raw) return json({ error: "roots_incomplete", message: `retained gap at seq ${s}` }, 409);
       const sc = JSON.parse(raw) as SignedCommit;
       const cb = JSON.parse(sc.body) as CommitBodyView;
       const mode = readRefMode(cb);
       if (!mode) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
-      const encManifestSha = typeof cb.encManifestSha === "string" ? cb.encManifestSha : "";
-      const sequenceRefs = mode.kind === "inline" ? mode.refShas.length : mode.count;
-      if (sequenceRefs > ROOTS_MAX_TOTAL_REFS - totalRefs) return json({ error: "roots_too_large", retained: retainedCount }, 503);
-      totalRefs += sequenceRefs;
       if (mode.kind === "inline") {
-        roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha, encShas: mode.refShas });
+        gapRefs += mode.refShas.length;
+        gap.push({ seq: s, manifestSha: cb.encManifestSha, inlineRefs: mode.refShas });
         continue;
       }
-      // Sidecar: fetch+bound+verify+parse to recover the reachable data refs; sidecarSha is a root.
-      // (count + carriers was accepted at commit time, so loadSidecarRefs's size gate bounds the bytes.)
-      const loaded = await loadSidecarRefs(this.env, mode.sidecarSha, mode.count);
-      if (!loaded.ok) {
-        logErr("roots_sidecar_unreadable", new Error(`seq ${s}: ${loaded.reason}`));
-        return json({ error: "roots_incomplete", message: `sidecar unreadable at seq ${s}` }, 409);
-      }
-      roots.push({ seq: s, commitHash: sc.commitHash, encManifestSha, encShas: [mode.sidecarSha, ...loaded.refs.map((r) => r.encSha)] });
+      gapRefs += mode.count;
+      gap.push({ seq: s, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha, sidecar: { sha: mode.sidecarSha, count: mode.count, size: mode.totalBytes } });
     }
-    return json({ head, pruneFloor: floor, roots });
+    if (gapRefs > ROOTS_OUTER_MAX_REFS) return json({ error: "roots_too_large" }, 503);
+    return json({
+      head, pruneFloor: floor, indexGeneration: generation, indexSyncedSeq: synced, gap,
+      droppedPage, ...(droppedRows.length > limit ? { nextSha: droppedPage[droppedPage.length - 1] } : {}),
+      seqRootsPage, ...(seqRows.length > limit ? { nextSeq: seqRootsPage[seqRootsPage.length - 1]!.seq } : {}),
+    });
   }
 
   /** Retention prune (M6): drop seq pointers ≤ floor (NEVER the head). The blobs
@@ -523,6 +701,11 @@ export class WorkspaceSync {
     const curFloor = (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0;
     const target = Math.min(Number(body.floor ?? 0), head - 1); // never prune the head
     if (!Number.isFinite(target) || target <= curFloor) return json({ pruned: 0, pruneFloor: curFloor });
+    const synced = (this.ctx.storage.kv.get("index_synced_seq") as number | undefined) ?? 0;
+    if (target >= synced) {
+      metric(this.env, "prune_deferred");
+      return json({ error: "prune_deferred", indexSyncedSeq: synced }, 409);
+    }
     this.ctx.storage.transactionSync(() => {
       for (let s = curFloor + 1; s <= target; s++) this.ctx.storage.kv.delete(`seq:${s}`);
       this.ctx.storage.kv.put("pruneFloor", target);
@@ -595,6 +778,7 @@ export class WorkspaceSync {
       this.ctx.storage.kv.put("headWatermark", Math.max(target, watermark));
     });
     this.repairRequired = false;
+    await this.initializeIndex(target, (this.ctx.storage.kv.get("pruneFloor") as number | undefined) ?? 0);
     return json({ ok: true, head: target, watermark: Math.max(target, watermark), commitHash });
   }
 
@@ -735,6 +919,18 @@ function readHead(v: unknown): StoredHead {
   if (isStoredHead(v)) return v;
   if (typeof v === "number" && Number.isInteger(v)) return { sequence: v, commitHash: v === 0 ? GENESIS_HASH : "" };
   return { sequence: 0, commitHash: GENESIS_HASH };
+}
+
+/** Bounded iterator diff. Canonical sidecars and the sorted inline fallback make
+ * Set iteration stable; only the returned SQL chunk is materialized. */
+function diffChunk(left: Set<string>, right: Set<string>, after: string): string[] {
+  const out: string[] = [];
+  for (const sha of left) {
+    if (sha <= after || right.has(sha)) continue;
+    out.push(sha);
+    if (out.length === FOLD_CHUNK) break;
+  }
+  return out;
 }
 
 interface BodyMirrorHeadRow {

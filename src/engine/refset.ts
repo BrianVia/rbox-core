@@ -102,3 +102,25 @@ export function parseRefset(bytes: Uint8Array): Ref[] {
   }
   return refs;
 }
+
+/** Memory-lean parser used by the retained-root index fold. It performs the
+ * same strict validation as parseRefset, but retains only sha strings. */
+export function parseRefsetShaSet(bytes: Uint8Array): Set<string> {
+  if (bytes.length < REFSET_HEADER) throw new Error("refset: too short");
+  for (let i = 0; i < MAGIC_BYTES.length; i++) if (bytes[i] !== MAGIC_BYTES[i]) throw new Error("refset: bad magic");
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = dv.getUint32(14, false);
+  if (bytes.length !== refsetByteLength(count)) throw new Error("refset: length mismatch (trailing/short bytes)");
+  const refs = new Set<string>();
+  let prevHex = "";
+  let off = REFSET_HEADER;
+  for (let i = 0; i < count; i++) {
+    const encSha = bytes32ToHex(bytes, off);
+    if (i > 0 && encSha <= prevHex) throw new Error("refset: not strictly ascending / duplicate sha");
+    prevHex = encSha;
+    if (dv.getBigUint64(off + 32, false) > BigInt(MAX_REF_SIZE)) throw new Error("refset: size exceeds safe integer range");
+    refs.add(encSha);
+    off += REFSET_REC;
+  }
+  return refs;
+}

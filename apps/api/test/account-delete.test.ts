@@ -410,7 +410,7 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
     const fakeEnv = {
       rbox_dev_db: fakeDb,
       rbox_dev_blobs: {},
-      WORKSPACE_SYNC: { idFromName: (name: string) => ({ name }), get: () => ({ fetch: async (url: string) => (captured.push(new URL(url)), Response.json({ head: 0, pruneFloor: 0, roots: [] })) }) },
+      WORKSPACE_SYNC: { idFromName: (name: string) => ({ name }), get: () => ({ fetch: async (url: string) => (captured.push(new URL(url)), Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] })) }) },
     } as unknown as Env;
     await gcPurge(fakeEnv, 0);
     const roots = captured.find((u) => u.pathname === "/roots");

@@ -8,6 +8,7 @@ import {
   GC_INSERT_ROWS,
   GC_P1_COST,
   GC_PER_EXECUTE,
+  PER_WORKSPACE_ROOTS_COST,
   INTENT_QUIESCENCE_MS,
   PURGE_LEASE_TTL_MS,
   STALE_INTENT_MS,
@@ -321,7 +322,7 @@ describe("design 95 candidacy classes and cursors", () => {
       ...env,
       WORKSPACE_SYNC: {
         idFromName: () => ({}) as DurableObjectId,
-        get: () => ({ fetch: async () => Response.json({ roots: [{ encManifestSha: "", encShas: [ordinary, intent] }] }) }),
+        get: () => ({ fetch: async () => Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, gap: [], droppedPage: [ordinary, intent], seqRootsPage: [] }) }),
       } as unknown as DurableObjectNamespace,
     } as Env;
     await gcPurge(rooted, GRACE, { nowMs: NOW, owner: "roots" });
@@ -355,7 +356,7 @@ describe("design 95 bounded work and read-only audit", () => {
   });
 
   it("sentinel-W exits before any DO fan-out or GC mutation", async () => {
-    const maxW = GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1;
+    const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
     for (let base = 0; base < maxW + 1; base += 30) {
       const n = Math.min(30, maxW + 1 - base); // 30 rows × 3 binds = 90 < D1's ~100-param limit
       await db().prepare(`INSERT INTO workspaces(workspace_id,project_id,created_at) VALUES ${Array.from({ length: n }, () => "(?,?,?)").join(",")}`)
@@ -364,7 +365,7 @@ describe("design 95 bounded work and read-only audit", () => {
     let calls = 0;
     const guarded = {
       ...env,
-      WORKSPACE_SYNC: { idFromName: () => ({}), get: () => ({ fetch: async () => { calls++; return Response.json({ roots: [] }); } }) } as unknown as DurableObjectNamespace,
+      WORKSPACE_SYNC: { idFromName: () => ({}), get: () => ({ fetch: async () => { calls++; return Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] }); } }) } as unknown as DurableObjectNamespace,
     } as Env;
     expect(await body(await gcPurge(guarded, GRACE, { nowMs: NOW, owner: "budget" }))).toMatchObject({ budgetExceeded: true, purged: 0, opened: 0 });
     expect(calls).toBe(0);
