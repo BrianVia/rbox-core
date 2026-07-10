@@ -230,6 +230,38 @@ export async function readParsedConfigSnapshot(repoDir: string, configPath: stri
   return parseConfigSnapshot(repoDir, configPath, read.snapshot, runGit);
 }
 
+/** Capture/status read: keep the live file inside the stability bracket while Git
+ * parses the bounded snapshot. Git still receives only the same-directory temp;
+ * this final no-follow stat detects a writer that commits during the subprocess. */
+export async function readStableParsedConfigSnapshot(
+  repoDir: string,
+  configPath: string,
+  phase: "initial" | "locked" = "initial",
+  runGit: GitConfigRunner = gitRaw
+): Promise<ParsedConfigReadResult> {
+  const parsed = await readParsedConfigSnapshot(repoDir, configPath, phase, runGit);
+  if (!parsed.ok) return parsed;
+  try {
+    const afterParse = await fs.lstat(configPath, { bigint: true });
+    if (afterParse.isSymbolicLink()) return { ok: false, fault: fault("permanent", "symlink") };
+    if (!afterParse.isFile()) return { ok: false, fault: fault("permanent", "non-regular") };
+    if (afterParse.size > BigInt(MAX_GIT_CONFIG_FILE_BYTES)) return { ok: false, fault: fault("transient", "over-cap") };
+    const afterToken = statToken(afterParse);
+    if (
+      afterToken.dev !== parsed.snapshot.token.dev ||
+      afterToken.ino !== parsed.snapshot.token.ino ||
+      afterToken.size !== parsed.snapshot.token.size ||
+      afterToken.mtimeNs !== parsed.snapshot.token.mtimeNs ||
+      afterToken.ctimeNs !== parsed.snapshot.token.ctimeNs
+    ) {
+      return { ok: false, fault: fault("transient", "unstable") };
+    }
+    return parsed;
+  } catch (error) {
+    return { ok: false, fault: classifyConfigFsError(error) };
+  }
+}
+
 function candidateName(configPath: string, incarnation: ProcessIncarnation, token: string): string {
   return path.join(path.dirname(configPath), `${path.basename(configPath)}.${incarnation.hostId}-${incarnation.pid}-${incarnation.startTime}-${token}.rbox93`);
 }

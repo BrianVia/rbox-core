@@ -554,7 +554,9 @@ async function runPushAttempt(
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await report.phase("git-plan", () => planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff));
+  const gitPlan = await report.phase("git-plan", () =>
+    planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, { onGitLog: deps.onGitLog })
+  );
   if (report.enabled) {
     report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
     if (gitPlan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: gitPlan.gitPlanStats }, formatGitPlanStats(gitPlan.gitPlanStats));

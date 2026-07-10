@@ -4,8 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../engine/index.js";
+import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../engine/index.js";
 import type { GitConfig } from "../engine/git/config-sync.js";
+import { gitRaw } from "../engine/git/shared.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
 import {
@@ -52,6 +53,11 @@ async function trustCache(): Promise<void> {
     entry.writtenAtMs = Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 5_000;
   }
   await fs.writeFile(cachePath, JSON.stringify(cache));
+}
+
+function captureRemote(): SyncRemote {
+  const store = new LocalBlobStore(path.join(root, ".rbox", "test-config-capture-blobs"));
+  return { blobStore: () => store } as SyncRemote;
 }
 
 beforeEach(async () => {
@@ -242,3 +248,183 @@ test("in-tree linked pointer is non-owned: late policy skip removes provisional 
   expect(result.authoredCfgHashByRepo.linked).toBeUndefined();
   expect(result.skipped.some((item) => item.relPath === "linked")).toBe(true);
 });
+
+test("real capture parses only a stability-bracketed snapshot and carries base config on persistent churn", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:local.git");
+  const baseConfig: GitConfig = { "remote.base.url": ["git@example.com:base.git"] };
+  const base = { ...baseSection, config: baseConfig };
+  const configPath = path.join(root, ".git", "config");
+  let parses = 0;
+
+  const result = await planGitSections(
+    root,
+    cfg,
+    stateWith(base),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+    undefined,
+    undefined,
+    {
+      gitConfigRunner: async (repoDir, args) => {
+        expect(args[2]).not.toBe(configPath);
+        await fs.appendFile(configPath, `# capture churn ${++parses}\n`);
+        return gitRaw(repoDir, args);
+      },
+    }
+  );
+
+  expect(parses).toBe(3);
+  expect(result.captured).toContain(".");
+  expect(result.gitRepos?.["."]?.config).toEqual(baseConfig);
+  expect(result.gitRepos?.["."]?.config).not.toEqual({});
+  expect(result.authoredCfgHashByRepo).toEqual({});
+  expect(result.deferred.some((item) => item.reason.includes("unstable") && item.reason.includes("carrying base config"))).toBe(true);
+
+  const subprocessFailure = await planGitSections(
+    root,
+    cfg,
+    stateWith(base),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+    undefined,
+    undefined,
+    {
+      gitConfigRunner: async () => {
+        throw new Error("simulated snapshot parser failure");
+      },
+    }
+  );
+  expect(subprocessFailure.captured).toContain(".");
+  expect(subprocessFailure.gitRepos?.["."]?.config).toEqual(baseConfig);
+  expect(subprocessFailure.authoredCfgHashByRepo).toEqual({});
+  expect(subprocessFailure.deferred.some((item) => item.reason.includes("parse-error") && item.reason.includes("carrying base config"))).toBe(true);
+}, 30_000);
+
+test("credential-bearing URL is skipped and logged loudly only once per repo across real captures", async () => {
+  await runGit(root, "remote", "add", "origin", "https://user:secret@example.com/team/repo.git");
+  const logs: string[] = [];
+  const options = { onGitLog: (line: string) => logs.push(line) };
+
+  const first = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+    undefined,
+    undefined,
+    options
+  );
+  const second = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+    undefined,
+    undefined,
+    options
+  );
+
+  for (const result of [first, second]) {
+    expect(result.gitRepos?.["."]?.config?.["remote.origin.url"]).toBeUndefined();
+    expect(result.authoredCfgHashByRepo["."]).toBe(gitConfigHash(result.gitRepos!["."]!.config!));
+  }
+  expect(logs.filter((line) => line.includes("credential-bearing remote URL"))).toHaveLength(1);
+}, 20_000);
+
+test("real-capture ownership gate embeds for an owned dir repo and never for a pointer/scoped repo", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:owned.git");
+  const owned = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root)
+  );
+  expect(owned.gitRepos?.["."]?.refScope).toBe("all");
+  expect(owned.gitRepos?.["."]?.config?.["remote.origin.url"]).toEqual(["git@example.com:owned.git"]);
+  expect(owned.authoredCfgHashByRepo["."]).toBe(gitConfigHash(owned.gitRepos!["."]!.config!));
+
+  const main = path.join(root, "outside-main");
+  const pointer = path.join(root, "pointer-worktree");
+  await fs.mkdir(main, { recursive: true });
+  await runGit(main, "init", "-q");
+  await runGit(main, "config", "user.email", "test@example.com");
+  await runGit(main, "config", "user.name", "Test");
+  await fs.writeFile(path.join(main, "tracked.txt"), "pointer\n");
+  await runGit(main, "add", "tracked.txt");
+  await runGit(main, "commit", "-qm", "pointer base");
+  await runGit(main, "remote", "add", "origin", "git@example.com:pointer.git");
+  await runGit(main, "worktree", "add", "-qb", "pointer", pointer);
+  const pointerIdentity = (await gitIdentity(pointer))!;
+  const pointerBase: GitSection = {
+    ...pointerIdentity,
+    bundleSha: "c".repeat(64),
+    bundleEncSha: "d".repeat(64),
+    bundleCipherSize: 1,
+    generatedAt: "2026-07-09T00:00:00.000Z",
+  };
+  const pointerCfg = { ...cfg, rootPath: pointer };
+  const logs: string[] = [];
+  const pointerResult = await planGitSections(
+    pointer,
+    pointerCfg,
+    stateWith(pointerBase),
+    { blobStore: () => new LocalBlobStore(path.join(pointer, ".rbox", "test-blobs")) } as SyncRemote,
+    new Set(["."]),
+    buildIgnoreMatcher(pointer),
+    undefined,
+    undefined,
+    { onGitLog: (line) => logs.push(line) }
+  );
+  expect(pointerResult.gitRepos?.["."]?.refScope).toBe("scoped");
+  expect(pointerResult.gitRepos?.["."]?.config).toBeUndefined();
+  expect(pointerResult.authoredCfgHashByRepo["."]).toBeUndefined();
+  expect(logs.some((line) => line.includes("does not own the common config"))).toBe(true);
+}, 30_000);
+
+test("real capture suppresses over-bounds config, carries base, and records no authorship", async () => {
+  for (let i = 0; i < 65; i++) await runGit(root, "config", `remote.r${i}.url`, `git@example.com:r${i}.git`);
+  const baseConfig: GitConfig = { "remote.base.url": ["git@example.com:base.git"] };
+  const base = { ...baseSection, config: baseConfig };
+
+  const result = await planGitSections(
+    root,
+    cfg,
+    stateWith(base),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root)
+  );
+  expect(result.captured).toContain(".");
+  expect(result.gitRepos?.["."]?.config).toEqual(baseConfig);
+  expect(result.authoredCfgHashByRepo).toEqual({});
+  expect(result.deferred.some((item) => item.reason.includes("capture config suppressed") && item.reason.includes("carrying base config"))).toBe(true);
+}, 20_000);
+
+test("old-writer strip presence republishes config after a real capture", async () => {
+  await runGit(root, "remote", "add", "origin", "git@example.com:repo.git");
+  const captured = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root)
+  );
+  const wire = captured.gitRepos!["."]!;
+  expect(wire.config?.["remote.origin.url"]).toEqual(["git@example.com:repo.git"]);
+  expect(captured.authoredCfgHashByRepo["."]).toBe(gitConfigHash(wire.config!));
+
+  const stripped = { ...wire };
+  delete stripped.config;
+  const healed = await planGitSections(root, cfg, stateWith(stripped), remote, new Set(), buildIgnoreMatcher(root));
+  expect(healed.gitRepos?.["."]?.config).toEqual(wire.config);
+  expect(healed.authoredCfgHashByRepo["."]).toBe(gitConfigHash(wire.config!));
+}, 20_000);

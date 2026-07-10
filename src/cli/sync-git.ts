@@ -44,9 +44,11 @@ import {
   materializeFreshGitConfig,
   readConfigSnapshot,
   readParsedConfigSnapshot,
+  readStableParsedConfigSnapshot,
   type ConfigFault,
   type ConfigStatToken,
   type ConfigTransactionResult,
+  type GitConfigRunner,
 } from "../engine/git/config-txn.js";
 import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
@@ -69,6 +71,10 @@ const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
 /** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
  * loud once per workspace/repo without repeating forever on every pull. */
 const configOwnershipSkipLogged = new Set<string>();
+/** Credential-bearing URLs are a capture-side security event, not ordinary bad
+ * grammar. Log them once per workspace/repo while continuing with the safe
+ * projection so a daemon cannot flood its log on every tick. */
+const configCredentialSkipLogged = new Set<string>();
 
 const envInt = (name: string, fallback: number, min: number, max: number): number => {
   const raw = process.env[name]?.trim();
@@ -137,7 +143,13 @@ export function shouldPublishGitConfig(
   return local.hash !== baseHash && local.hash !== cfgSynced;
 }
 
-async function readLocalGitConfig(root: string, rel: string, diskCtx?: RepoCtx): Promise<LocalCfgRead> {
+async function readLocalGitConfig(
+  root: string,
+  rel: string,
+  diskCtx?: RepoCtx,
+  runGit?: GitConfigRunner,
+  onCredentialSkip?: () => void
+): Promise<LocalCfgRead> {
   const repoDir = repoDirOf(root, rel);
   const ctx = diskCtx ?? (await repoCtxFromDisk(repoDir).catch(() => undefined));
   if (!ctx) {
@@ -149,13 +161,14 @@ async function readLocalGitConfig(root: string, rel: string, diskCtx?: RepoCtx):
   const configPath = path.join(ctx.commonDir, "config");
   let lastFault: ConfigFault | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const read = await readParsedConfigSnapshot(repoDir, configPath);
+    const read = await readStableParsedConfigSnapshot(repoDir, configPath, "initial", runGit);
     if (!read.ok) {
       lastFault = read.fault;
       if (read.fault.disposition === "permanent") return { status: "failed", fault: read.fault };
       continue;
     }
     const canonical = canonicalizeGitConfig(read.snapshot.entries);
+    if (canonical.rejected.some((item) => item.credential)) onCredentialSkip?.();
     if (!canonical.ok) {
       if (canonical.overBounds) return { status: "over-bounds", reason: canonical.reason };
       return {
@@ -377,6 +390,13 @@ export interface GitPlanStats {
   captured: number;
 }
 
+export interface GitPlanOptions {
+  /** Forensic sink shared with the surrounding sync operation. */
+  onGitLog?: (line: string) => void;
+  /** Deterministic test seam for the snapshot-only config subprocess. */
+  gitConfigRunner?: GitConfigRunner;
+}
+
 /**
  * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
  * repo either CARRY (pending section, needs-resolution checkpoint, or unchanged identity
@@ -398,7 +418,8 @@ export async function planGitSections(
    *  capture settles so `done` is a truthful completed-count under bounded concurrency;
    *  `detail` is the repo just captured. Display-only. */
   onProgress?: TransferProgress,
-  backoff?: (attempt: number) => Promise<void>
+  backoff?: (attempt: number) => Promise<void>,
+  options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
@@ -426,6 +447,17 @@ export async function planGitSections(
     carried: 0,
     captured: 0,
   };
+  const glog = options.onGitLog ?? ((line: string) => console.error(line));
+  const logOnce = (seen: Set<string>, rel: string, line: string) => {
+    const key = `${root}\0${rel}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    glog(line);
+  };
+  const noteCredentialSkip = (rel: string) =>
+    logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
+  const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
+    readLocalGitConfig(root, rel, diskCtx, options.gitConfigRunner, () => noteCredentialSkip(rel));
   const plan = (): GitPushPlan => {
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
     // pending repo the last commit carried the pending section itself (see the per-repo
@@ -486,10 +518,20 @@ export async function planGitSections(
   let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
 
   let toCapture: string[] = [];
-  const carryOwnedWithConfig = async (rel: string, baseSec: GitSection, bracketed?: LocalCfgRead): Promise<void> => {
-    const localCfg = bracketed ?? (await readLocalGitConfig(root, rel));
+  const carryOwnedWithConfig = async (rel: string, baseSec: GitSection, bracketed?: LocalCfgRead, knownCtx?: RepoCtx): Promise<void> => {
     out[rel] = baseSec;
     carried.push(rel);
+    const diskCtx = knownCtx ?? (await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined));
+    if (!diskCtx || diskCtx.kind !== "dir") {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
+      return;
+    }
+    const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
+    if (!receiver?.owned) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local common config is outside workspace ownership`);
+      return;
+    }
+    const localCfg = bracketed ?? (await readConfigForPush(rel));
     if (localCfg.status === "over-bounds") {
       const item = {
         relPath: rel,
@@ -511,6 +553,68 @@ export async function planGitSections(
     if (!shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) return;
     out[rel] = { ...baseSec, config: localCfg.config };
     authoredCfgHashByRepo[rel] = localCfg.cached.hash;
+  };
+  const carryBaseConfig = (section: GitSection, baseSec: GitSection | undefined): GitSection => {
+    const carried = { ...section };
+    delete carried.config;
+    if (baseSec?.config !== undefined) carried.config = baseSec.config;
+    return carried;
+  };
+  const captureWithConfig = async (rel: string, section: GitSection): Promise<GitSection> => {
+    const repoDir = repoDirOf(root, rel);
+    const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
+      logOnce(
+        configOwnershipSkipLogged,
+        rel,
+        `git-sync config skipped ${rel}: capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config`
+      );
+      const unowned = { ...section };
+      delete unowned.config;
+      return unowned;
+    }
+    let receiver: Awaited<ReturnType<typeof configReceiver>>;
+    try {
+      receiver = await configReceiver(root, diskCtx);
+    } catch (error) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture ownership could not be proven (${errMsg(error)})`);
+      return carryBaseConfig(section, undefined);
+    }
+    if (!receiver.owned) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture common config is outside workspace ownership`);
+      return carryBaseConfig(section, undefined);
+    }
+
+    let localCfg: LocalCfgRead;
+    try {
+      localCfg = await readConfigForPush(rel, diskCtx);
+    } catch (error) {
+      localCfg = {
+        status: "failed",
+        fault: { disposition: "transient", reason: "read-error", error },
+      };
+    }
+    if (localCfg.status === "over-bounds") {
+      const item = {
+        relPath: rel,
+        reason: `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return carryBaseConfig(section, base[rel]);
+    }
+    if (localCfg.status === "failed") {
+      const item = {
+        relPath: rel,
+        reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} during capture (${localCfg.fault.reason}) — carrying base config`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return carryBaseConfig(section, base[rel]);
+    }
+    const embedded = { ...section, config: localCfg.config };
+    authoredCfgHashByRepo[rel] = gitConfigHash(embedded.config);
+    return embedded;
   };
   /** Per-repo failure → defer. Forced (422) repos take the M5 non-looping DROP instead:
    *  their base section references exactly the blobs the server lost, so carrying it
@@ -560,7 +664,8 @@ export async function planGitSections(
         probe,
         kind,
         probeBeforeFingerprint,
-        recomputeCacheProbe
+        recomputeCacheProbe,
+        () => noteCredentialSkip(rel)
       ).catch(() => undefined);
       deferOne(rel, "git busy (lock present)");
       return;
@@ -596,7 +701,17 @@ export async function planGitSections(
       const builtProbe = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
       if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
       const probe = builtProbe.probe;
-      await writeDivergenceCacheEntry(fingerprintRun, root, rel, cache, probe, pf.kind ?? kind, probeBeforeFingerprint, recomputeCacheProbe).catch(() => undefined);
+      await writeDivergenceCacheEntry(
+        fingerprintRun,
+        root,
+        rel,
+        cache,
+        probe,
+        pf.kind ?? kind,
+        probeBeforeFingerprint,
+        recomputeCacheProbe,
+        () => noteCredentialSkip(rel)
+      ).catch(() => undefined);
       // STRUCTURAL refusal (shallow/bare/alternates/…): the shape can't sync and won't
       // heal by waiting — DROP the section instead of carrying it. Carrying would be
       // permanent poison: identity can't see the structural property, so a base section
@@ -628,7 +743,8 @@ export async function planGitSections(
       probe,
       liveKind,
       probeBeforeFingerprint,
-      recomputeCacheProbe
+      recomputeCacheProbe,
+      () => noteCredentialSkip(rel)
     ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
     if (!id) {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
@@ -653,7 +769,7 @@ export async function planGitSections(
       }
       const carry = carryMatrixMatches(baseSec, liveKind, idKey);
       if (carry) {
-        await carryOwnedWithConfig(rel, baseSec, cacheWrite.localCfg);
+        await carryOwnedWithConfig(rel, baseSec, cacheWrite.localCfg, builtProbe.diskCtx);
         return;
       }
     }
@@ -848,7 +964,7 @@ export async function planGitSections(
         (abs) => noteRepoBytes(rel, abs)
       );
       if (sec) {
-        out[rel] = sec;
+        out[rel] = await captureWithConfig(rel, sec);
         captured.push(rel);
       } else {
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
@@ -1476,14 +1592,15 @@ async function writeDivergenceCacheEntry(
   probe: CachedDivergenceProbe,
   hintKind: GitRepoKind | undefined,
   beforeFingerprint: GitFingerprint,
-  recompute?: () => Promise<DivergenceCacheProbeSnapshot>
+  recompute?: () => Promise<DivergenceCacheProbeSnapshot>,
+  onCredentialSkip?: () => void
 ): Promise<DivergenceCacheWriteResult> {
   let before = beforeFingerprint;
   let currentProbe = probe;
   let currentKind = hintKind;
   for (let attempt = 0; attempt < 2; attempt++) {
     const localCfg = !currentProbe.busy && currentProbe.preflightOk
-      ? await readLocalGitConfig(root, rel, before.diskCtx)
+      ? await readLocalGitConfig(root, rel, before.diskCtx, undefined, onCredentialSkip)
       : undefined;
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
     const after = await gitFingerprint(run, root, rel);
