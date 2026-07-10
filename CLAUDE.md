@@ -2,6 +2,14 @@
 look at AGENTS.md for your rules
 <!-- stripe-projects-cli managed:claude-md:end -->
 
+## Development flow (anything non-trivial)
+
+Design doc in `docs/design/N-title.md` → codex adversarial review loop
+(`/arbitrage`) until Claude + GPT align → implement via `codex exec` →
+validate for real (fleet dev build or test rig) → `/simplify` +
+`/antislop-codebase` → merge on green CI → optional CLI release.
+Full version in AGENTS.md.
+
 ## Deployments
 
 @docs/DEPLOYMENTS.md

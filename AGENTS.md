@@ -1,5 +1,23 @@
 # rbox — agent rules
 
+## Development flow (anything non-trivial)
+
+Brian's preferred loop — follow it unless told otherwise:
+
+1. Put a design document in `docs/design/N-title.md` (next free N; check after
+   rebasing — same collision rule as migrations).
+2. Iterate with subagents + `/arbitrage`: have codex (GPT) adversarially review
+   the design, revise here, re-dispatch — repeat until BOTH agents (Claude and
+   GPT) are in alignment. Keep the review rounds in a `REVIEW-N.md` beside the
+   worktree (see design 93's 11 rounds for the pattern).
+3. Implement via `codex exec` against the agreed design (spec-first dispatch).
+4. Validate the design is actually working: a dev build shipped to the local
+   fleet, or the test rig (`bun run rig`) — not just unit tests.
+5. Run `/simplify` and `/antislop-codebase`.
+6. Merge only after all CI is green and no remaining issues are found.
+7. (Optional) release a new CLI build if the change warrants it
+   (`docs/DEPLOYMENTS.md` has the release flow).
+
 ## Deployment & local dev
 
 **How every surface ships (API worker / web dashboard / CLI binaries), the
