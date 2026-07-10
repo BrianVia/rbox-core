@@ -24,6 +24,7 @@ import { blobBatchGetWithVerifiedGrant } from "./blob-batch.js";
 import { blobGetWithVerifiedGrant } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
+import { gcMark, gcPurge } from "./versions.js";
 import { sweepDiagnostics } from "./diagnostics.js";
 import { json, logErr, SHA256_HEX_RE } from "./util.js";
 import { startOp } from "./metrics.js";
@@ -59,6 +60,9 @@ export class CachedReleases extends WorkerEntrypoint<Env> {
 // purpose (over-cap partials, abandoned uploads) while never racing a real push;
 // the durable fix, if ever needed, is a granted_at keepalive on active sessions.
 const GRACE_1_MS = 24 * 60 * 60 * 1000;
+export const GC_MARK_UTC_HOUR = 8;
+export const GC_PURGE_UTC_HOUR = 9;
+export const GC_PHASE2_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext & { exports: WorkerEntrypointExports }): Promise<Response> {
@@ -97,19 +101,34 @@ export default {
     return res;
   },
   /**
-   * Scheduled GC (cron, hourly). Plan-driven retention prune → §33 Phase 1, in order:
-   * retention sets each workspace's prune floor from its account's plan, then Phase 1
-   * (per account, D1-only) marks now-unreachable `blob_refs`, purges those still
-   * unreachable past grace (releasing `used_bytes`), and reconciles. Idempotent +
-   * fail-safe + fail-closed per account; a thrown phase is logged and the next run retries.
-   *
-   * §33 founder decision: Phase 2 (canonical R2 + `blobs` reclaim) stays OFF the cron —
-   * R2 has no conditional/atomic delete, so a cron R2-delete races a concurrent direct
-   * PUT (irreducible TOCTOU). It remains the manual/quiescent `/v1/admin/gc?phase=purge`
-   * sweep. Phase 1 NEVER deletes an R2 object; it only condemns last-ref blobs into
-   * `gc_candidates` for that manual sweep.
+   * Hourly scheduling is keyed to the platform-provided scheduledTime: 08 UTC runs
+   * bounded mark; 09 UTC runs fenced P2/P3 then P1 intent stamping; the other 22
+   * ticks run regular maintenance. Design 95's publication fence and check-time-
+   * anchored receipts make canonical deletion cron-safe. The rollout switch gates
+   * only the 09 UTC cron executor; mark and the admin escape hatch stay live.
    */
-  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env): Promise<void> {
+    const hour = new Date(event.scheduledTime).getUTCHours();
+    if (hour === GC_MARK_UTC_HOUR) {
+      try {
+        await gcMark(env, GC_PHASE2_GRACE_MS, event.scheduledTime);
+      } catch (e) {
+        logErr("scheduled_gc_mark_failed", e);
+      }
+      return;
+    }
+    if (hour === GC_PURGE_UTC_HOUR) {
+      if (env.RBOX_GC_PURGE_DISABLED !== "1") {
+        try {
+          // Hour selection is scheduledTime-keyed; lease TTLs and intent stamps use
+          // invocation time so a delayed cron delivery cannot create an already-stale lease.
+          await gcPurge(env, GC_PHASE2_GRACE_MS);
+        } catch (e) {
+          logErr("scheduled_gc_purge_failed", e);
+        }
+      }
+      return;
+    }
     try {
       // Retention precedes Phase 1 (a just-pruned version's now-unreachable refs become
       // visible to the mark). retentionPrune FAILS CLOSED on the first unreadable DO `/prune`
@@ -123,7 +142,7 @@ export default {
     }
     try {
       // §33 Phase 1: per-account entitlement prune (closes the design 30 §3 / 07b §d
-      // `used_bytes` leak) + reconciler. GRACE_1 = 1h (≥ the slowest in-flight commit + skew).
+      // `used_bytes` leak) + reconciler. GRACE_1 = 24h (protects long first publishes).
       // D1-only → cron-safe with the candidate-aware commit barrier. Itself per-account
       // fail-closed (one broken DO aborts only that account) — kept in its OWN try so a
       // retention failure above can't starve it.

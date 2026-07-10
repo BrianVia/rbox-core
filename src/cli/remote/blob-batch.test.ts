@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { BlobShaMismatchError, RboxApi } from "../remote.js";
+import { BlobRetryLaterError, BlobShaMismatchError, RboxApi } from "../remote.js";
 import { BlobDownloadIntegrityError } from "./blobs.js";
 import { FakeServer } from "../e2ee-fake-server.js";
 import { encryptFileToTemp, generateKek } from "../../engine/crypto.js";
@@ -371,6 +371,15 @@ describe("BlobBatchUploader queueing", () => {
 });
 
 describe("BlobBatchUploader fallback behavior", () => {
+  test("whole-batch retry_later defers every record without immediate single re-upload", async () => {
+    const files = await Promise.all([uploadFile("batch-fenced-a", "a"), uploadFile("batch-fenced-b", "b")]);
+    const a = api();
+    batchPutHandler = () => jsonResponse(503, { error: "retry_later" });
+    const settled = await Promise.allSettled(files.map((f) => a.putBlobFile(f.sha, f.file, f.size)));
+    expect(settled.every((r) => r.status === "rejected" && r.reason instanceof BlobRetryLaterError)).toBe(true);
+    expect(singlePutCalls()).toHaveLength(0);
+  });
+
   test("per-record sha_mismatch rejects that file while r2_error and too_large fall back singly", async () => {
     process.env.RBOX_BATCH_RECORDS = "4";
     const ok = await uploadFile("u-ok", "ok");

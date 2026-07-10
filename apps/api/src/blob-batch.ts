@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { isEntitled } from "./authz.js";
 import { readBodyCapped, readBytesCapped } from "./commit-envelope.js";
 import { startOp, type Op } from "./metrics.js";
-import { directWriteWithReceipt, usesReceipts } from "./blobs.js";
+import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
 import { blobKey, json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
 // Wire twin: src/cli/remote/blob-batch.ts — the framing constants and codec are
@@ -30,6 +30,9 @@ interface BatchPutRecord {
   sha: string;
   payload: Uint8Array;
 }
+type WrittenBatchPutResult =
+  | { sha256: string; ok: true; sizeBytes: number }
+  | { sha256: string; ok: false; error: BatchPutError };
 
 const textEncoder = new TextEncoder();
 
@@ -73,7 +76,14 @@ export async function blobBatchPut(req: Request, env: Env, accountId: string): P
     return parsed.response;
   }
 
-  const results = await writeBatchPutRecords(op, parsed.records, accountId);
+  let results: BatchPutResult[];
+  try {
+    results = await writeBatchPutRecords(op, parsed.records, accountId);
+  } catch (e) {
+    if (!(e instanceof ReceiptFenceError)) throw e;
+    op.done("retry_later", { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
+    return json({ error: "retry_later" }, 503);
+  }
   const outcome = results.every((r) => r.ok) ? "ok" : "partial";
   op.done(outcome, { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
   return json({ results });
@@ -142,20 +152,30 @@ async function writeBatchPutRecords(op: Op, records: BatchPutRecord[], accountId
   }
 
   const settled = await Promise.allSettled(unique.map((record) => putOneRecord(op, record, accountId)));
-  const bySha = new Map<string, BatchPutResult>();
+  const written: Array<{ sha: string; size: number }> = [];
+  const preliminary = new Map<string, WrittenBatchPutResult>();
   for (let i = 0; i < settled.length; i++) {
     const record = unique[i]!;
     const result = settled[i]!;
-    bySha.set(record.sha, result.status === "fulfilled" ? result.value : { sha256: record.sha, ok: false, error: "r2_error" });
+    const value: WrittenBatchPutResult = result.status === "fulfilled" ? result.value : { sha256: record.sha, ok: false, error: "r2_error" };
+    preliminary.set(record.sha, value);
+    if (value.ok) written.push({ sha: value.sha256, size: value.sizeBytes });
+  }
+  // One amortized fence point-read for the whole upload batch. If it fails or
+  // finds any open intent, no receipt in this request is minted.
+  const receipts = await mintFenceCheckedReceipts(op.env, accountId, written);
+  const bySha = new Map<string, BatchPutResult>();
+  for (const [sha, value] of preliminary) {
+    bySha.set(sha, value.ok ? { ...value, ...receipts.get(sha)! } : value);
   }
   return records.map((record) => bySha.get(record.sha)!);
 }
 
-async function putOneRecord(op: Op, record: BatchPutRecord, accountId: string): Promise<BatchPutResult> {
+async function putOneRecord(op: Op, record: BatchPutRecord, _accountId: string): Promise<WrittenBatchPutResult> {
   if (record.payload.byteLength > MAX_BATCH_RECORD_BYTES) return { sha256: record.sha, ok: false, error: "too_large" };
   if (await sha256Hex(record.payload) !== record.sha) return { sha256: record.sha, ok: false, error: "sha_mismatch" };
-  const written = await directWriteWithReceipt(op.env, accountId, record.sha, record.payload, op.span.r2.bind(op.span));
-  return { sha256: record.sha, ok: true, ...written };
+  const sizeBytes = await directWriteVerified(op.env, record.sha, record.payload, op.span.r2.bind(op.span));
+  return { sha256: record.sha, ok: true, sizeBytes };
 }
 
 function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPreauth?: boolean }): ReadableStream<Uint8Array> {

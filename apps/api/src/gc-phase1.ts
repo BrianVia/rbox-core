@@ -203,7 +203,7 @@ export async function reconcileUsage(db: D1Database, accountId: string): Promise
  * §33 §3.4 cron orchestration — per account: reachable (fail-closed) → mark → purge →
  * reconcile. One account's failure (e.g. an unreadable DO) is logged and skipped; it
  * never starves the rest (idempotent: mark is INSERT OR IGNORE, purge is conditional).
- * D1-only — Phase 2 (R2) stays the manual `/v1/admin/gc?phase=purge` sweep.
+ * D1-only — Phase 2's separately fenced executor runs on its own daily cron hour.
  */
 export async function runPhase1(env: Env, graceMs: number, nowMs: number = Date.now()): Promise<Response> {
   // §32 FLAG: global account fan-out has no account in scope → dbFor(env, "") (the one

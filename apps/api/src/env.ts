@@ -46,6 +46,9 @@ export interface WorkerEntrypointExports {
 
 export interface Env {
   rbox_dev_db: D1Database;
+  /** Design 95 Phase-2 cron kill switch. Defaults to "1" in every deployed env;
+   *  the platform-admin drain remains available while scheduled purge is disabled. */
+  RBOX_GC_PURGE_DISABLED?: string;
   /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
    *  in local bun tests and until the queue is provisioned — enqueue then no-ops and the
    *  cron backstop drives delivery off the durable outbox instead. */

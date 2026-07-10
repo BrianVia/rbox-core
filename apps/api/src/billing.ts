@@ -72,7 +72,7 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
         .prepare("INSERT INTO blob_refs (account_id, sha256, granted_at) VALUES (?, ?, ?) ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at")
         .bind(accountId, sha, nowMs),
       db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha),
-      db.prepare("DELETE FROM gc_candidates WHERE sha256 = ?").bind(sha),
+      db.prepare("DELETE FROM gc_candidates WHERE sha256 = ? AND deleting_at IS NULL").bind(sha),
     ]);
   } catch (e) {
     // accounts_cap_guard RAISE(ABORT,'over_cap') rolled the whole batch back → nothing granted.

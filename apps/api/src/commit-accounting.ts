@@ -12,6 +12,10 @@ import type { Env } from "./env.js";
 import { verifyReceipt } from "./receipts.js";
 import { isOverCapAbort } from "./auth.js";
 
+export function isDeleteFenceAbort(e: unknown): boolean {
+  return e instanceof Error && e.message.includes("rbox_delete_fence");
+}
+
 export interface RefWithSize {
   sha: string;
   size: number;
@@ -78,7 +82,8 @@ export async function validateCommitRefs(
       .prepare(
         `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
          WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${c.map(() => "?").join(",")})
-           AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)`,
+           AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)
+           AND NOT EXISTS (SELECT 1 FROM gc_candidates g WHERE g.sha256 = r.sha256 AND g.deleting_at IS NOT NULL)`,
       )
       .bind(accountId, ...c),
   );
@@ -104,7 +109,10 @@ export async function validateCommitRefs(
   return { ok: true, newRefs };
 }
 
-export type AccountingResult = { ok: true } | { overCap: { used: number; cap: number; reason?: "no_plan" } };
+export type AccountingResult =
+  | { ok: true }
+  | { overCap: { used: number; cap: number; reason?: "no_plan" } }
+  | { needsUpload: string[] };
 
 /** Catalog (present=1) + charge + grant + un-condemn for `newRefs` in ONE chunked,
  *  atomic D1 batch (the accounts_cap_guard trigger rolls the whole batch back on over-cap).
@@ -166,7 +174,7 @@ export async function commitAccounting(
           .bind(...c.flatMap((r) => [accountId, r.sha])),
       );
       // Un-condemn: a re-uploaded blob clears its GC candidacy (the canonical object is fresh).
-      stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE sha256 IN (${inList})`).bind(...shas));
+      stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE deleting_at IS NULL AND sha256 IN (${inList})`).bind(...shas));
       // §33: a (re-)grant clears this account's Phase-1 prune marker, atomically with the
       // grant — so a marked ref this commit re-establishes can NEVER be dropped by a later
       // purge (its candidate row is gone). The dedup path bumps `granted_at` here too via
@@ -179,6 +187,9 @@ export async function commitAccounting(
       // so we do NOT wrap in span.d1() (that would double-count).
       await db.batch(stmts);
     } catch (e) {
+      // The trigger has no sha payload. The immutable safe failure unit is this
+      // whole caught super-batch; never shrink it with a post-hoc intent read.
+      if (isDeleteFenceAbort(e)) return { needsUpload: superBatch.map((r) => r.sha) };
       // accounts_cap_guard RAISE(ABORT,'over_cap') → THIS super-batch rolled back; earlier
       // ones stayed committed (design 30 §3). Report over-cap; the client gets a 402.
       if (isOverCapAbort(e)) {

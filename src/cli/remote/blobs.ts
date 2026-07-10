@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { RemoteContext } from "./context.js";
-import { BlobShaMismatchError, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
+import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater, isShaMismatch, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fileStream } from "./stream.js";
 import { putBlobMultipart } from "./multipart.js";
 import { BUFFERED_GET_TIMEOUT_MS, DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, envInt, fetchBufferedGet, fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
@@ -106,6 +106,7 @@ export async function putBlobFile(
       if (!res.ok) {
         const { quota, text } = await readQuotaExceeded(res);
         if (quota) throw quota;
+        if (isRetryLater(res.status, text)) throw new BlobRetryLaterError();
         if (isShaMismatch(res.status, text)) throw new BlobShaMismatchError(sha256); // live-folder TOCTOU → let push re-scan + retry
         throw new Error(translateRemoteError(res.status, "blob PUT failed", text, "workspace not found — check you're in the right directory"));
       }

@@ -44,9 +44,8 @@
   // tail worker is provisioned — see tail/README.md.)
   // "tail_consumers": [{ "service": "rbox-dev-tail" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceSync"] }],
-  // §33 founder decision: Phase 1 (per-account entitlement prune) runs HOURLY to drain
-  // the `used_bytes` leak promptly. retentionPrune + the notify sweep ride the same tick
-  // (both idempotent). Phase 2 (R2 delete) stays the manual `/v1/admin/gc?phase=purge` sweep.
+  // Hourly: regular maintenance on 22 ticks; bounded mark at 08:23 UTC; fenced
+  // Phase-2 purge at 09:23 UTC (disabled by default below during rollout).
   "triggers": {
     "crons": ["23 * * * *"]
   },
@@ -95,7 +94,8 @@
     // Deploy-env discriminator for observability pings (dev vs prod). See env.ts.
     // (Deploys ride Cloudflare Workers Builds — see AGENTS.md "Deployment".)
     "RBOX_ENV": "dev",
-    "RBOX_ALLOW_BOOTSTRAP_PLAN": "1"
+    "RBOX_ALLOW_BOOTSTRAP_PLAN": "1",
+    "RBOX_GC_PURGE_DISABLED": "1"
   },
   // Production environment: separate worker (rbox-prod-api) + its own D1/R2/DO,
   // served at api.rbox.to. Binding NAMES are kept identical to dev so the code is
@@ -170,7 +170,7 @@
       // RBOX_ALLOW_BOOTSTRAP_PLAN is EXPLICITLY "0" in prod (the dev-only bootstrap plan
       // override, design 56 §7). Present-but-off because wrangler refuses env-targeted
       // commands (d1 migrations apply --env production) when a top-level var is absent here.
-      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod", "RBOX_ALLOW_BOOTSTRAP_PLAN": "0" },
+      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod", "RBOX_ALLOW_BOOTSTRAP_PLAN": "0", "RBOX_GC_PURGE_DISABLED": "1" },
       "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]
     }
   }

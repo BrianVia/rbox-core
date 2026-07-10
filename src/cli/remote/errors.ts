@@ -26,6 +26,25 @@ export class BlobShaMismatchError extends Error {
   }
 }
 
+/** The server accepted blob bytes but temporarily refused publication (for example,
+ * while GC holds a delete fence). Callers must defer the owning file; an immediate
+ * retry would only re-upload the same bytes into the still-open fence. */
+export class BlobRetryLaterError extends Error {
+  constructor() {
+    super("blob publication deferred by the server");
+    this.name = "BlobRetryLaterError";
+  }
+}
+
+export function isRetryLater(status: number, text: string | undefined): boolean {
+  if (status !== 503 || !text) return false;
+  try {
+    return (JSON.parse(text) as { error?: unknown }).error === "retry_later";
+  } catch {
+    return false;
+  }
+}
+
 /** The one-shot account genesis claim lost a race to another device. The caller
  *  must discard locally pre-persisted genesis material before degrading to
  *  pair/recover. */

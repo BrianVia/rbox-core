@@ -11,6 +11,7 @@
 export {
   NeedsRebaselineError,
   BlobShaMismatchError,
+  BlobRetryLaterError,
   AccountAlreadyBootstrappedError,
   QuotaExceededError,
   NetworkError,
