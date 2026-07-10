@@ -32,6 +32,11 @@ _Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu 
   design 85 (scan) and 39/74 (pull apply) follow. Deliberately deferred past
   1.0 — perf is the 1.1 track.
 
+- **Migration numbering hardened (#196, 2026-07-10):** the duplicate-number
+  pairs (0014×2, 0016×2) are verified applied in prod + dev in lexicographic
+  order — frozen forever (wrangler tracks by filename; never rename). New
+  collisions now fail the test suite at config time; rules in
+  `apps/api/migrations/README.md` + root CLAUDE.md pointer.
 - **Host-env notes (via-desktop-ubuntu, 2026-07-10):** `GITHUB_TOKEN` in
   `~/.profile` was stale (shadowed valid gh keyring auth) — replaced with the
   keyring token. `node_modules` installed for the first time (was binary-only).
