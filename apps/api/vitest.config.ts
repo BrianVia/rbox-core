@@ -1,8 +1,38 @@
 import { defineWorkersConfig, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { readdirSync } from "node:fs";
+
+// wrangler tracks applied migrations BY FILENAME in every environment's
+// d1_migrations table, so filenames are append-only: renaming an applied file
+// makes it look unapplied and re-runs it. These two number collisions came from
+// parallel worktrees, are applied everywhere (prod + dev, in lexicographic
+// order), and are frozen forever — do NOT rename them, do NOT extend this set.
+const FROZEN_DUPLICATE_MIGRATIONS = new Set([
+  "0014_account_linking.sql",
+  "0014_upload_receipts.sql",
+  "0016_cap_bytes_insert_materialize.sql",
+  "0016_device_notifications.sql",
+]);
+
+/** Fail fast (before any test runs) on a NEW migration-number collision. */
+function assertMigrationNumbering(dir: string): void {
+  const byNumber = new Map<string, string>();
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    const m = /^(\d{4})_[a-z0-9_]+\.sql$/.exec(file);
+    if (!m) throw new Error(`migration "${file}" must match NNNN_snake_case.sql`);
+    const prior = byNumber.get(m[1]);
+    if (prior && !(FROZEN_DUPLICATE_MIGRATIONS.has(prior) && FROZEN_DUPLICATE_MIGRATIONS.has(file))) {
+      throw new Error(
+        `duplicate migration number ${m[1]}: "${prior}" vs "${file}" — renumber the newer file to the next free number (rebase check: another worktree may have taken yours)`,
+      );
+    }
+    byNumber.set(m[1], file);
+  }
+}
 
 // Real DO + D1 + R2 bindings via workerd (Miniflare). D1 migrations are read at
 // config time and applied per-test against the local D1 (see test/setup).
 export default defineWorkersConfig(async () => {
+  assertMigrationNumbering("./migrations");
   const migrations = await readD1Migrations("./migrations");
   return {
     cacheDir: "../../.cache/vitest/apps-api",
