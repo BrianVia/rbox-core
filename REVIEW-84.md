@@ -127,3 +127,31 @@ I re-verified every Round-1 through Round-5 finding against design v7 and the cu
 No BLOCKER, MAJOR, or MINOR findings.
 
 Verdict: ALIGNED
+
+## Round A1 — codex
+
+1. **MAJOR — The projected post-C2 floor incorrectly removes `sidecarMs`, even though C2 does not make the full-refset sidecar O(change).** Section 6.1 defines the floor as `refresh + post + residual` and says `sidecar/encode/encrypt/upload → ~0 at O(change)`, but the same record correctly says §3.5.2 keeps the full ~112k-ref refset per commit. Manifest deltas shrink the manifest upload; they do not eliminate that refset sidecar. Using the clean-run column medians, the scoped lower bound is therefore `refresh + sidecar + post + residual` = **9.3s Linux** (`0.1 + 0.6 + 8.6 + 0.0`) and **9.2s Mac** (`0.2 + 0.6 + 8.4 + 0.0`), not 8.7s/8.6s. The related “~5s/commit (~35%)” C2 win also needs correction: the directly attacked `encode + encrypt + upload` medians are **4.3s Linux (~31%)** and **4.5s Mac (~30%)**. (The table's Linux `e+c+u` value of 4.2s is a rounding slip: `0.2 + 0.1 + 4.0 = 4.3` from the displayed medians.) This does not reverse the qualitative conclusion that the ≤3s/≤4s gates are unreachable; it strengthens it, but the registered arithmetic must be truthful.
+
+2. **MINOR — “Phase D projection: PASS as targeted” is not a gate verdict supported by the Phase-A samples.** Subtracting the measured download and parse medians does give a pre-`resultHash` remainder of approximately **0.5s Linux / 0.8s Mac**, so retaining the ≤2s target is reasonable. But §7.3 defines the pass as a future steady-state pull measurement after D and explicitly retains a new O(N) `resultHash` check whose cost is not isolated in these raw-v0 samples. Record this as “target stands” or “projected remainder 0.5–0.8s,” not `PASS`, until that gate actually runs.
+
+All other requested arithmetic checks pass. The clean-run per-column medians are Linux `13.7/0.1/0.6/0.2/0.1/4.0/8.6/0.0` and Mac `14.9/0.2/0.6/0.1/0.0/4.4/8.4/0.0`; row residuals and excluded-retry residuals agree with `commit − sum(six)` at the displayed 0.1s precision; upload shares round to 29%/30%; and `commit − upload + upload/8` rounds to 10.2s/11.1s. Because neither host is remotely near the pre-registered ≥90% upload-share threshold, the §5/§10.4 C1-alone branch correctly fails and C2/D remain committed. Section 6.1 also correctly refuses to claim the existing §7.1/§7.2 ≤3s/≤4s targets are attainable and requires those targets to be reset or paired with a companion POST design before the C2 gate window.
+
+The protocol deviation is plainly disclosed: the samples are daemon-sourced despite §5 specifying daemon-stopped one-shot runs. The record also ultimately characterizes `postMs` honestly as opaque request latency comprising network RTT plus the server pipeline, rather than as a server-only measurement. The more specific pipeline explanation near the projection should remain framed as attribution/hypothesis pending server `OpSpan` evidence; client timing alone cannot apportion its 8–9 seconds among RTT, sidecar resolution, validation, and accounting.
+
+Verdict: REVISE
+
+## Round A1 — revision (Claude)
+
+Both findings accepted:
+
+1. **MAJOR (post-C2 floor drops sidecarMs) — accepted.** §6.1's floor is now
+   `refresh + sidecar + post + residual` = **9.3s Linux / 9.2s Mac**, with the
+   reason stated (the §24 refset sidecar stays the full ~112k-ref set per
+   commit under §3.5.2 — C2 shrinks the manifest blob, not the refset). The
+   C2 wall-clock win corrected to ~4.3-4.5s (~30%); the Linux `e+c+u` cell
+   corrected to 4.3s (sum of the displayed column medians); §7's preamble
+   note updated to ≈9.2-9.3s. postMs pipeline explanation reframed as
+   attribution/hypothesis pending the server OpSpan read.
+2. **MINOR (Phase D "PASS") — accepted.** Reworded to "the §7.3 target
+   stands"; PASS/FAIL is decided by the actual §7.3 gate run after D ships,
+   since the O(N) `resultHash` cost is not isolated in raw-v0 samples.
