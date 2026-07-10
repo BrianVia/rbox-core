@@ -40,6 +40,8 @@ type PurgeResult = {
   bytes?: number;
   executeLimit?: number;
   leaseBusy?: boolean;
+  retryAfterMs?: number;
+  error?: string;
   budgetExceeded?: boolean;
 };
 
@@ -205,7 +207,9 @@ describe("design 95 delete/head/P3 order and re-entry", () => {
     await candidate(death, NOW - 10 * DAY, NOW - 2 * DAY);
     const real = env.rbox_dev_blobs;
     const dying = envWithBucket({ delete: (key: string) => real.delete(key), head: async () => { throw new Error("worker died"); } });
-    await expect(gcPurge(dying, GRACE, { nowMs: NOW, owner: "dead" })).rejects.toThrow("worker died");
+    const failed = await gcPurge(dying, GRACE, { nowMs: NOW, owner: "dead" });
+    expect(failed.status).toBe(500);
+    expect(await body(failed)).toMatchObject({ error: "gc_purge_failed" });
     expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=? AND deleting_at IS NOT NULL", death)).toBe(true);
     expect(await body(await gcPurge(env, GRACE, { nowMs: NOW + 1, owner: "retry" }))).toMatchObject({ purged: 1 });
     expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", death)).toBe(false);
@@ -217,9 +221,55 @@ describe("design 95 exclusive lease", () => {
     const active = { owner: "B", acquired: NOW, expires: NOW + PURGE_LEASE_TTL_MS };
     await db().prepare("INSERT INTO gc_state(k,v) VALUES ('purge_lease',?)").bind(JSON.stringify(active)).run();
     const runAt = (at: number) => gcPurge(env, GRACE, { nowMs: at, owner: "A", clock: () => at });
-    expect(await body(await runAt(NOW + PURGE_LEASE_TTL_MS))).toMatchObject({ leaseBusy: true });
+    expect(await body(await runAt(NOW + PURGE_LEASE_TTL_MS))).toMatchObject({ leaseBusy: true, retryAfterMs: TAKEOVER_QUIESCENCE_MS + 1 });
     expect(await body(await runAt(active.expires + TAKEOVER_QUIESCENCE_MS))).toMatchObject({ leaseBusy: true });
     expect((await body(await runAt(active.expires + TAKEOVER_QUIESCENCE_MS + 1))).leaseBusy).not.toBe(true);
+  });
+
+  it("retries a transient lease release failure after a purge error", async () => {
+    const doomed = sha("release-retry");
+    await catalog(doomed);
+    await put(doomed);
+    await candidate(doomed, NOW - 10 * DAY, NOW - 2 * DAY);
+    let releaseAttempts = 0;
+    const realDb = env.rbox_dev_db;
+    const flakyDb = new Proxy(realDb, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.startsWith("DELETE FROM gc_state WHERE k='purge_lease'")) return statement;
+          return new Proxy(statement, {
+            get(stmt, stmtProperty, stmtReceiver) {
+              if (stmtProperty !== "bind") return Reflect.get(stmt, stmtProperty, stmtReceiver);
+              return (...args: unknown[]) => {
+                const bound = stmt.bind(...args);
+                return new Proxy(bound, {
+                  get(boundStmt, boundProperty, boundReceiver) {
+                    if (boundProperty !== "run") return Reflect.get(boundStmt, boundProperty, boundReceiver);
+                    return async () => {
+                      releaseAttempts++;
+                      if (releaseAttempts === 1) throw new Error("transient D1 failure");
+                      return boundStmt.run();
+                    };
+                  },
+                });
+              };
+            },
+          });
+        };
+      },
+    }) as D1Database;
+    const real = env.rbox_dev_blobs;
+    const failing: Env = {
+      ...envWithBucket({ delete: (key: string) => real.delete(key), head: async () => { throw new Error("execute failed"); } }),
+      rbox_dev_db: flakyDb,
+    };
+
+    const response = await gcPurge(failing, GRACE, { nowMs: NOW, owner: "flaky-release" });
+    expect(response.status).toBe(500);
+    expect(releaseAttempts).toBe(2);
+    expect(await exists("SELECT 1 FROM gc_state WHERE k='purge_lease'")).toBe(false);
   });
 
   it("re-verifies lease expiry immediately before dispatch and leaves the fence intact", async () => {
