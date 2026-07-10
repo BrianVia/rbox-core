@@ -17,6 +17,13 @@ function bundle(raw: object): string {
 }
 
 describe("rbox key materialize", () => {
+  test("rejects when no key input is provided", async () => {
+    delete process.env.RBOX_KEY;
+    await expect(materializeCmd({})).rejects.toThrow(
+      "no key provided — set RBOX_KEY, pass --key-file <path>, or pipe the bundle with --key -"
+    );
+  });
+
   test("RBOX_KEY bundle decodes and materializes keystore files with private modes", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-"));
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-home-"));
@@ -68,5 +75,37 @@ describe("rbox key materialize", () => {
     await expect(fs.stat(path.join(home, ".rbox", "credentials.json"))).rejects.toThrow();
     await fs.rm(tmp, { recursive: true, force: true });
     await fs.rm(home, { recursive: true, force: true });
+  });
+
+  test("reads a bundle from --key-file", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-file-"));
+    const boot = await bootstrapAccount("acct_agentfile", "agent_devfile", 1_900_000_000_000);
+    const raw = bundle({
+      v: 1,
+      kind: "agent",
+      bearer: "rbox_pat_fileBearer",
+      accountId: boot.secrets.accountId,
+      deviceId: boot.secrets.deviceId,
+      device: {
+        sigPubKey: toB64url(boot.secrets.sigPubKey),
+        sigPrivPkcs8: toB64url(boot.secrets.sigPrivPkcs8),
+        encPubSpki: toB64url(boot.secrets.encPubSpki),
+        encPrivPkcs8: toB64url(boot.secrets.encPrivPkcs8),
+      },
+      mk: toB64url(boot.secrets.mk),
+      keks: [],
+    });
+    const keyFile = path.join(tmp, "bundle.txt");
+    const target = path.join(tmp, "target");
+    await fs.writeFile(keyFile, raw);
+    const oldLog = console.log;
+    console.log = () => {};
+    try {
+      await materializeCmd({ "key-file": keyFile, dir: target });
+    } finally {
+      console.log = oldLog;
+    }
+    expect((await fs.stat(path.join(target, ".rbox", "e2ee", "acct_agentfile", "mk.key"))).mode & 0o777).toBe(0o600);
+    await fs.rm(tmp, { recursive: true, force: true });
   });
 });

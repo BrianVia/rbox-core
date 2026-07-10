@@ -65,7 +65,7 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
 
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
+  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
   return root;
 }
 

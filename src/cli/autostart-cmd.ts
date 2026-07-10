@@ -6,7 +6,7 @@ import { RBOX_DIR } from "./config.js";
 import { currentWorkspaceId, daemonRuntimeDir, startDaemon, stopDaemon } from "./daemon-control.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { homeDir } from "./rbox-paths.js";
-import { style } from "./style.js";
+import { fail, style } from "./style.js";
 
 export const BOOT_RESUME_MARKER = "__boot-resume";
 const AUTOSTART_LABEL = "to.rbox.daemon";
@@ -40,7 +40,7 @@ export type AutostartWorkspaceStatus = DesiredDaemonState & {
   reason?: string;
 };
 
-type ExecCommand = (cmd: string, args: string[]) => Promise<void>;
+type ExecCommand = (cmd: string, args: string[]) => Promise<string | void>;
 
 interface CommonDeps {
   loadCredentials?: typeof loadCredentials;
@@ -120,9 +120,9 @@ WantedBy=default.target
 `;
 }
 
-function execFilePromise(cmd: string, args: string[]): Promise<void> {
+function execFilePromise(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, (err) => (err ? reject(err) : resolve()));
+    execFile(cmd, args, { encoding: "utf8" }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
   });
 }
 
@@ -292,11 +292,12 @@ async function realBinaryPath(binaryPath: string): Promise<string> {
   }
 }
 
-async function tryExec(exec: ExecCommand, cmd: string, args: string[]): Promise<void> {
+async function tryExec(exec: ExecCommand, cmd: string, args: string[]): Promise<string | void> {
   try {
-    await exec(cmd, args);
+    return await exec(cmd, args);
   } catch {
     // Best-effort cleanup before the state-setting operation.
+    return undefined;
   }
 }
 
@@ -365,7 +366,12 @@ async function printAutostartStatus(deps: AutostartDeps = {}): Promise<void> {
   }
 
   if (platform === "linux") {
-    console.log(style.dim("note: systemd user units need a login session; headless servers may need `loginctl enable-linger $USER`."));
+    const exec = deps.exec ?? execFilePromise;
+    const user = process.env.USER ?? os.userInfo().username;
+    const output = await tryExec(exec, "loginctl", ["show-user", user, "--property=Linger"]);
+    if (typeof output === "string" && output.includes("Linger=no")) {
+      console.log(style.dim("note: systemd user units need a login session; headless servers may need `loginctl enable-linger $USER`."));
+    }
   }
 }
 
@@ -379,7 +385,6 @@ export async function autostartCmd(subcommand: string | undefined, deps: Autosta
   } else if (subcommand === "status") {
     await printAutostartStatus(deps);
   } else {
-    console.log("usage: rbox autostart <enable | disable | status>");
-    process.exitCode = 1;
+    fail("usage: rbox autostart <enable | disable | status>");
   }
 }

@@ -435,7 +435,7 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`device:   ${creds.deviceId}`);
   console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
   if (!creds.accountId) return;
-  console.log(`encryption: ${enrolled ? "enrolled (MK present)" : loaded ? "device key present, MK missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
+  console.log(`encryption: ${enrolled ? "enrolled (master key present)" : loaded ? "device key present, master key missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));
 }
