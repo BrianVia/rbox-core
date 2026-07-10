@@ -153,8 +153,11 @@ export interface SyncDeps {
    *  Deliberately SEPARATE from {@link allowMassDelete} (design-review B2): pushManifest's
    *  409-recovery reuses this same deps object to PULL, and pull-side consent must NOT be
    *  implied by push consent — a `rbox push --allow-mass-delete` must never let the recovery
-   *  pull silently apply a mass delete. Set ONLY by `rbox push --allow-mass-delete`. */
+   *  pull silently apply a mass delete. Set by `rbox push --allow-mass-delete`, or by
+   *  `rbox sync --allow-mass-delete` alongside pull-side consent. */
   allowMassDeletePush?: boolean;
+  /** Command shown when either mass-delete guard refuses this operation. */
+  massDeleteHint?: string;
   /** A pull evicted a local directory that the remote now flips to a file/symlink
    *  (design 50 §3, review M2): the dir moved to trash. The CLI/daemon logs it and
    *  counts it into `lastPull.conflicts`. Threaded into applyActions via `onTypeFlip`. */
@@ -271,7 +274,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
     throw new Error(
       `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
-        `If this deletion is intentional, run \`rbox pull --allow-mass-delete\` to apply it once.`
+        `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`
     );
   }
   const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
@@ -666,7 +669,7 @@ async function runPushAttempt(
   if (!deps.allowMassDeletePush && pushDeletes >= MASS_DELETE_MIN_FILES && pushDeletes * 2 >= appliedBase.files.length) {
     throw new Error(
       `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
-        `If this deletion is intentional, run \`rbox push --allow-mass-delete\` to publish it once.`
+        `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` to publish it once.`
     );
   }
 

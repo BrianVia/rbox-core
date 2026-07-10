@@ -13,14 +13,13 @@ import { verifyAndParseManifest } from "./upgrade-cmd.js";
 import { RBOX_VERSION } from "./version.js";
 import { semverGt } from "./semver.js";
 import { style } from "./style.js";
+import { friendlyHttpError } from "./http-error.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
 const SECTION_STRING_CAP_BYTES = 2 * 1024;
 const FETCH_TIMEOUT_MS = 3500;
 const STALE_EXCLUDED = { excluded: "stale daemon binding" } as const;
-export const DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE =
-  "diagnostics upload is off by default; re-run with --diagnostics (or set RBOX_DIAGNOSTICS=1) to enable for this invocation";
 const NOTICE =
   "this includes your daemon log tail, which contains file and folder names/paths from this workspace, your device id, and raw error messages; it is stored UNENCRYPTED for support for 30 days.";
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
@@ -395,13 +394,6 @@ export function diagnosticsUploadEnabled(opts: { diagnostics?: boolean }): boole
   return opts.diagnostics === true || process.env.RBOX_DIAGNOSTICS === "1";
 }
 
-export function refuseDisabledDiagnosticsUpload(opts: { report: boolean; diagnostics?: boolean }): boolean {
-  if (!opts.report || diagnosticsUploadEnabled(opts)) return false;
-  console.log(DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE);
-  process.exitCode = 1;
-  return true;
-}
-
 async function writePreviewFile(preview: string): Promise<string> {
   const dir = rboxHome();
   await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -435,6 +427,13 @@ export async function presentDiagnosticsPreview(bundle: DiagnosticsBundle, opts:
   return promptConfirm({ message: "Upload this plaintext diagnostics report to rbox support?", default: false });
 }
 
+function printDiagnosticsPreview(bundle: DiagnosticsBundle): void {
+  const preview = JSON.stringify(bundle, null, 2);
+  console.log(`\n--- diagnostics preview (${byteLen(preview)} bytes) ---`);
+  process.stdout.write(preview + "\n");
+  console.log("--- end diagnostics preview ---");
+}
+
 async function uploadDiagnostics(creds: Credentials | undefined, bundle: DiagnosticsBundle): Promise<void> {
   if (!creds?.token) throw new Error("not logged in — run `rbox login` before uploading diagnostics");
   const body = JSON.stringify(bundle, null, 2);
@@ -443,19 +442,26 @@ async function uploadDiagnostics(creds: Credentials | undefined, bundle: Diagnos
     headers: { authorization: `Bearer ${creds.token}`, "content-type": "application/json" },
     body,
   });
-  if (!res.ok) throw new Error(`diagnostics upload failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw await friendlyHttpError(res, "diagnostics upload");
   const uploaded = (await res.json()) as { id: string; expiresAt: string };
   console.log(`report uploaded — reference ${uploaded.id} (auto-deletes ${uploaded.expiresAt.slice(0, 10)})`);
 }
 
 export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<void> {
-  if (refuseDisabledDiagnosticsUpload(opts)) return;
+  if (opts.diagnostics === true && !opts.report) {
+    throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
+  }
   const ctx = await collectDoctorContext(root);
   console.log(renderDoctor(ctx.checks));
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);
-    if (await presentDiagnosticsPreview(bundle, { yes: opts.yes })) await uploadDiagnostics(ctx.creds, bundle);
-    else console.log("diagnostics report not uploaded");
+    if (diagnosticsUploadEnabled(opts)) {
+      if (await presentDiagnosticsPreview(bundle, { yes: opts.yes })) await uploadDiagnostics(ctx.creds, bundle);
+      else console.log("diagnostics report not uploaded");
+    } else {
+      printDiagnosticsPreview(bundle);
+      console.log("nothing was uploaded — add --diagnostics to send this report to rbox support");
+    }
   }
   if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;
 }

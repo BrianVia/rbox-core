@@ -122,6 +122,7 @@ test("push that deletes ≥half the baseline is REFUSED by the mass-delete guard
 
   const before = (await remote.latest()).sequence;
   await expect(push(root, cfg, deps(remote))).rejects.toThrow(/refusing \(mass-delete guard\)/);
+  await expect(push(root, cfg, deps(remote, { massDeleteHint: "rbox sync --allow-mass-delete" }))).rejects.toThrow(/rbox sync --allow-mass-delete/);
   // Fail-closed at the source: the remote head never advanced — no device sees the wipe.
   expect((await remote.latest()).sequence).toBe(before);
 });

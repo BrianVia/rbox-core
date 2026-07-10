@@ -154,7 +154,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "sync once (pull, then push)",
     usage: "rbox sync [path] [--allow-mass-delete] [--pull-only] [--verbose]",
     flags: [
-      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
+      { flag: "--allow-mass-delete", desc: "consent to both pull-side and push-side mass-delete guards for this run" },
       { flag: "--pull-only", desc: "pull remote changes and skip the push phase" },
       { flag: "--verbose", desc: "print each git repo's apply/conflict/defer line instead of a running count" },
     ],
@@ -318,7 +318,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "connect",
     group: "DEVICES & ACCOUNT",
     summary: "add this machine from a pasted token (stdin)",
-    usage: "echo <token> | rbox connect",
+    usage: "rbox connect",
+    examples: ["rbox connect", "echo <token> | rbox connect"],
   },
   {
     name: "recover",
@@ -358,7 +359,7 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "key recover",
     group: "DEVICES & ACCOUNT",
-    summary: "re-enroll this machine from your recovery phrase",
+    summary: "re-enroll this machine from your recovery phrase (requires `rbox login` first)",
     usage: "rbox key recover [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
@@ -435,11 +436,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "check workspace health; optionally upload a support report",
-    usage: "rbox doctor [--report] [--diagnostics] [--yes]",
+    usage: "rbox doctor [--report] [--diagnostics] [--yes] [--path <dir>]",
     flags: [
-      { flag: "--report", desc: "preview/upload a plaintext support report stored 30 days; upload requires opt-in" },
-      { flag: "--diagnostics", desc: "opt in to uploading the support report for this invocation" },
-      { flag: "--yes", desc: "skip the consent prompt; required with --report in non-interactive mode" },
+      { flag: "--report", desc: "build and print the support report locally" },
+      { flag: "--diagnostics", desc: "with --report, upload the report to rbox support (stored unencrypted for 30 days)" },
+      { flag: "--yes", desc: "skip the upload consent prompt; required with --report --diagnostics in non-interactive mode" },
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
     ],
   },
   {

@@ -9,6 +9,7 @@ import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
+import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
   displayPath,
@@ -94,7 +95,7 @@ async function startDeviceCode(remoteUrl: string, label: string): Promise<Device
       continue;
     }
     if (res.status === 429) throw new Error("login rate-limited — wait a minute and run `rbox login` again");
-    throw new Error(`login start failed: ${res.status}`);
+    throw await friendlyHttpError(res, "login");
   }
 }
 
@@ -189,7 +190,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
   }
   if (bootstrapSecret) {
     const res = await postJson(`${remoteUrl}/v1/auth/device/bootstrap`, { secret: bootstrapSecret, label, ...(bootstrapPlan !== undefined ? { plan: bootstrapPlan } : {}) });
-    if (!res.ok) throw new Error(`bootstrap failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw await friendlyHttpError(res, "login --bootstrap");
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
     console.log(`logged in (bootstrapped) as device ${deviceId}`);
@@ -227,11 +228,18 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
       const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
       // Device cap does not clear through polling.
       if (pollRes.status === 409) {
-        const body = (await pollRes.json().catch(() => ({}))) as { error?: string; cap?: number; plan?: string };
+        const responseBody = await pollRes.text().catch(() => "");
+        const body = (() => {
+          try {
+            return JSON.parse(responseBody) as { error?: string; cap?: number; plan?: string };
+          } catch {
+            return {};
+          }
+        })();
         if (body.error === "device_limit_reached") {
           throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — revoke a device or upgrade`);
         }
-        throw new Error(`login poll failed: ${pollRes.status}`);
+        throw await friendlyHttpError(pollRes, "login", responseBody);
       }
       // Non-OK poll responses are transient until the device code expires.
       if (!pollRes.ok) {
@@ -304,14 +312,14 @@ async function requireCreds() {
 export async function approveDevice(userCode: string): Promise<void> {
   const creds = await requireCreds();
   const res = await postJson(`${creds.remoteUrl}/v1/auth/device/approve`, { userCode }, creds.token);
-  if (!res.ok) throw new Error(`approve failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw await friendlyHttpError(res, "device approve");
   console.log(`approved ${userCode}`);
 }
 
 export async function listDevices(opts: { json?: boolean } = {}): Promise<void> {
   const creds = await requireCreds();
   const res = await fetch(`${creds.remoteUrl}/v1/auth/devices`, { headers: { authorization: `Bearer ${creds.token}` } });
-  if (!res.ok) throw new Error(`list failed: ${res.status}`);
+  if (!res.ok) throw await friendlyHttpError(res, "device list");
   const { devices } = (await res.json()) as { devices: Array<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null; isSelf: boolean }> };
   if (opts.json) {
     emitJson({
@@ -354,7 +362,7 @@ export async function pairCreate(): Promise<void> {
     creds.token
   );
   if (res.status === 429) throw new Error("too many active pairing tokens — redeem or wait for one to expire");
-  if (!res.ok) throw new Error(`pair failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw await friendlyHttpError(res, "pair");
   const { token } = (await res.json()) as { token: string };
   const full = `${token}.${toB64url(tokenSecret)}`; // <redeemToken>.<tokenSecret>
   console.log(`\nPairing token (valid ~10 min, single use — carries your encryption key):\n`);
@@ -376,9 +384,24 @@ export async function redeemPair(remoteUrl: string, pairToken: string): Promise<
   console.log(`device authorized + encryption enrolled: ${deviceId}`);
 }
 
+interface PairingTokenInputDeps {
+  isInteractive?: typeof isInteractive;
+  promptPassword?: typeof promptPassword;
+  readStdin?: typeof readStdinTrimmed;
+}
+
+export async function readPairingTokenInteractive(deps: PairingTokenInputDeps = {}): Promise<string> {
+  const token = (deps.isInteractive ?? isInteractive)()
+    ? await (deps.promptPassword ?? promptPassword)({ message: "Paste pairing token" })
+    : await (deps.readStdin ?? readStdinTrimmed)();
+  return token.trim();
+}
+
 /** `rbox key recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
 export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
+  const creds = await loadCredentials();
+  if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   let phrase: string;
   if (isInteractive()) {
     // No-echo — the phrase is key material (mask:false = matches the old no-echo).
@@ -447,7 +470,7 @@ export async function keyBackup(kitOpts: RecoveryKitOptions = NO_KIT): Promise<v
 export async function revokeDevice(deviceId: string): Promise<void> {
   const creds = await requireCreds();
   const res = await postJson(`${creds.remoteUrl}/v1/auth/devices/${deviceId}/revoke`, {}, creds.token);
-  if (!res.ok) throw new Error(`revoke failed: ${res.status}`);
+  if (!res.ok) throw await friendlyHttpError(res, "device revoke");
   console.log(`revoked ${deviceId}`);
 }
 

@@ -1,5 +1,6 @@
 import { requireCredentials } from "./credentials.js";
 import { formatBinaryBytes } from "./quota-format.js";
+import { friendlyHttpError } from "./http-error.js";
 
 export interface AccountUsageDTO {
   plan: string;
@@ -24,7 +25,7 @@ export async function usageCmd(opts: { json?: boolean } = {}): Promise<void> {
     headers: { authorization: `Bearer ${c.token}` },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`usage failed: ${res.status} ${text}`);
+  if (!res.ok) throw await friendlyHttpError(res, "usage", text);
   if (opts.json) {
     console.log(text);
     return;

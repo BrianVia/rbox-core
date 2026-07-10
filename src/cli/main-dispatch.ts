@@ -18,7 +18,6 @@ import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedH
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags } from "./flags.js";
-import { readStdinTrimmed } from "./read-stdin.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
@@ -302,9 +301,9 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "doctor": {
       const report = flags.report === "true";
       const diagnostics = flags.diagnostics === "true";
-      const { doctorCmd, refuseDisabledDiagnosticsUpload } = await import("./doctor-cmd.js");
-      if (refuseDisabledDiagnosticsUpload({ report, diagnostics })) break;
-      const root = await resolveRoot(undefined);
+      if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
+      const { doctorCmd } = await import("./doctor-cmd.js");
+      const root = await resolvePathFlagRoot(flags.path);
       await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics });
       break;
     }
@@ -346,9 +345,9 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // Enroll this machine from a pairing token read on STDIN (never argv, C11):
       //   rbox pair        # on a signed-in machine → prints the token
       //   echo <token> | rbox connect
-      const { redeemPair } = await import("./auth-cmd.js");
-      const token = await readStdinTrimmed();
-      if (!token) throw new Error("no pairing token on stdin (pipe the token from `rbox pair`)");
+      const { readPairingTokenInteractive, redeemPair } = await import("./auth-cmd.js");
+      const token = await readPairingTokenInteractive();
+      if (!token) throw new Error("no pairing token provided (run `rbox pair` on a signed-in machine, then paste the token here or pipe it: echo <token> | rbox connect)");
       await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
       break;
     }

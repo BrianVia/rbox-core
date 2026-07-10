@@ -1,5 +1,6 @@
 import { requireCredentials } from "./credentials.js";
 import { openAndShow } from "./browser-open.js";
+import { friendlyHttpError } from "./http-error.js";
 
 /**
  * `rbox subscribe [plan]` / `rbox billing` (design 21 §3.4.1) — the PRIMARY billing
@@ -31,7 +32,7 @@ export async function checkoutUrl(plan: SubscribePlan, cadence: BillingCadence =
   });
   if (res.status === 409) return "already_subscribed";
   if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
-  if (!res.ok) throw new Error(`subscribe failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw await friendlyHttpError(res, "subscribe");
   const { url } = (await res.json()) as { url: string };
   if (!url) throw new Error("subscribe failed: checkout returned no URL");
   return url;
@@ -64,7 +65,7 @@ export async function billingPortal(): Promise<void> {
   });
   if (res.status === 409) throw new Error("no subscription yet — run `rbox subscribe <plan>` first.");
   if (res.status === 501) throw new Error("billing isn't enabled on this server yet.");
-  if (!res.ok) throw new Error(`billing portal failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw await friendlyHttpError(res, "billing");
   const { url } = (await res.json()) as { url: string };
   openAndShow(url, "Opening your billing portal...", "Open your billing portal:");
 }
