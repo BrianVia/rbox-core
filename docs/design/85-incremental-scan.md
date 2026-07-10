@@ -373,17 +373,38 @@ handle with no lock and everyone continues through the legacy state path
 `sync-mutex.ts:52`). On such a workspace the "exactly one owner" proof does
 not exist for ANYONE, and — worse for the state machine — a post-ack CLI
 mutex probe would "succeed" instantly with a degraded handle while the live
-daemon is still mutating. So: the daemon tracks whether any of its mutex
-acquisitions degraded (the condition is a property of the root's filesystem
-and sticky in practice — `surfacedDegradedRoots`, `sync-mutex.ts:29`) and
-carries a `lock: "exclusive" | "degraded"` field in its hello handling; a
-degraded daemon REJECTS delegation (`reject: {reason: "lock-degraded"}`)
-and the CLI runs LOCAL — exactly today's degraded-workspace behavior, no
-worse, no new race. Post-ack, every fallback arm that reasons from a mutex
-acquisition must check `workspaceSyncMutexDegraded` on the handle it got: a
-degraded acquisition proves nothing and is treated as CONTENDED (→
-INDETERMINATE), never as "no daemon op in flight." The proven-death arm is
-unaffected — it reasons from process liveness, not the lock.
+daemon is still mutating. Two rules close it, POSITIVELY (R4 F2 — "no
+degradation observed yet" is not evidence the primitive works, because
+degradation is only ever learned from an acquisition result,
+`sync-mutex.ts:80-89`, and the daemon's first acquisition happens inside
+the pump, `daemon.ts:425`):
+
+- **Capability is established BEFORE the listener exists.** The daemon's
+  startup sequence already runs the initial-convergence pump before any
+  delegation surface would come up (`daemon.ts:247-252`); that pump's FIRST
+  mutex acquisition attempt doubles as the probe and always resolves the
+  capability: `acquired` → exclusive; `contended` → exclusive (someone
+  holds a REAL lock, so the primitive demonstrably works); `unsupported` →
+  degraded; `error` → the daemon fails loudly as today. The socket listener
+  is created only after this probe has recorded `lockMode`; a
+  `lockMode = degraded` daemon still starts the listener but answers every
+  hello `reject: {reason: "lock-degraded"}` (so the CLI gets a fast,
+  explicit LOCAL signal instead of a connect timeout). No hello can be
+  acked as exclusive from ignorance.
+- **Later unexpected degradation is terminal for delegation.** If any
+  subsequent acquisition returns `unsupported` (filesystem changed under a
+  running daemon), `lockMode` flips to degraded and sticks: every BOUND
+  delegated entry receives an error `result` (`error: "lock-degraded"`),
+  unbound entries are cancelled with `{cancelled}`, and all further hellos
+  are rejected. The CLI treats that error result as a normal terminal —
+  it may then choose LOCAL, which is exactly the exposure a degraded
+  workspace has today.
+
+Post-ack, every CLI fallback arm that reasons from a mutex acquisition must
+check `workspaceSyncMutexDegraded` on the handle it got: a degraded
+acquisition proves nothing and is treated as CONTENDED (→ INDETERMINATE),
+never as "no daemon op in flight." The proven-death arm is unaffected — it
+reasons from process liveness, not the lock.
 
 **Discovery and liveness.** Reuse `isDaemonRunning`
 (`src/cli/daemon-control.ts:216-219`), which verifies the pidfile's pid is
@@ -392,7 +413,8 @@ bootId/pidfile match alone (bootId can come from env, `daemon.ts:213`; it is
 an ownership token, not a liveness proof).
 
 **Transport: unix domain socket**, listener owned by the daemon, created
-after the startup binding and removed on graceful stop. Decided, not open —
+only after the initial-convergence pump has recorded `lockMode` (the
+positive lock probe above) and removed on graceful stop. Decided, not open —
 the file-based alternative (request file + response file, daemon polls) loses
 on every axis that matters: (a) ack latency — the daemon's pump is
 event-driven; a request file needs a sub-second poll loop (idle churn design
@@ -437,9 +459,8 @@ daemon → CLI:  {progress: {phase, done, total, bytes?}}      — streamed, ≥
                {cancelled: {opId}}                           — terminal (pre-bind cancel)
                {result: {opId, ok, error?, failedLeg?,
                          push?: {committed, sequence, files, deferred},
-                         pull?: {writes, deletes,
-                                 conflicts: [{path, keepLocalAs}],
-                                 conflictsElided,
+                         pull?: {writes, deletes, conflictsTotal,
+                                 conflictSamples: [{path, keepLocalAs}],
                                  writtenPaths, writtenPathsElided},
                          phaseReports?}}                     — terminal
 ```
@@ -484,30 +505,57 @@ into one push iteration and each receives the same terminal result under
 its own opId — semantics: "a push cycle covering your request completed,"
 which is exactly what the coalescing pump means today.
 
+**Delegated standalone `pull` suppresses the pump's post-pull push chain
+(R4 F1).** The current pump unconditionally chains `requestPush()` after a
+successful `doPull` ("publish any local divergence after taking remote",
+`daemon.ts:460-465`) — correct for the daemon's own convergence, but a
+foreground `rbox pull` / `sync --pull-only` performs NO push, so delegating
+pull through the unmodified chain would mutate the remote as a consequence
+of the CLI's request, after the CLI already reported success — a different
+remote-mutation contract, not an output detail. Rule (demand provenance,
+extending R2 F5's separation): the post-pull auto-chain is SKIPPED iff the
+pull iteration's only demand was delegated standalone-`pull` entries and
+`want.push` was not already set. Any ambient co-demand (a watcher batch, an
+already-queued push, `want.pull` set by WS catch-up) keeps the chain; a
+delegated `sync` never depends on the chain at all — its
+`needs: ["pull","push"]` entry contributes its own push demand, and its
+push leg binds to that. Daemon convergence is unharmed by the suppression:
+real local divergence is republished by the next watcher batch or safety
+tick exactly as if the delegated pull had never happened — the rule removes
+only the push the CLI did not ask for. On a live daemon, ambient pushes
+continue as always; a delegated pull just doesn't ADD one — which is
+precisely the foreground contract.
+
 **Pull and sync result contracts (R2 F6; pull parity per R3 F3).** A local
 pull returns the individual actions: `summarize` prints per-conflict
 `path`/`keepLocalAs` lines, and `postSyncNudge` needs the WRITTEN paths for
 the design-29 drift notice (`main-dispatch.ts:258-274`;
 `sync-cmd.ts:66-73`). Counts alone cannot reproduce that, so the `pull`
 result payload (used by delegated `pull`, `sync --pull-only`, and the sync
-accumulator's pull leg alike) carries: `writes`/`deletes` counts; the
-conflict list as `{path, keepLocalAs}` pairs, capped at 50 with a
-`conflictsElided` count (same cap philosophy as the daemon log's
-`LOG_PATHS_MAX`); and `writtenPaths` capped at 500 with a
-`writtenPathsElided` flag. The CLI renders `summarize` from the payload and
-runs `postSyncNudge` CLI-SIDE from `writtenPaths` — the daemon never runs
-the nudge (it is a foreground advisory; design 29's `RBOX_NO_DRIFT`/config
-gates are the CLI's to apply). When `writtenPathsElided` is set the nudge
-is skipped — it is best-effort by contract (`sync-cmd.ts:33-44`), and a
-500+-file pull is not a lockfile-drift situation. A sync's two legs bind to
-two different pump iterations, so the terminal frame is built from a
-per-opId accumulator (`acc`), not from "the last iteration": the pull leg
-records the payload above and the push leg records
-`{sequence, committed, files, deferred}`; the `result` frame carries both
-plus `failedLeg: "pull"|"push"` on error, and with `metrics:true` the phase
-reports of both legs. The CLI renders output — human and `--json` — exactly
-as the local path does from the same data, which is what makes gate 6's
-schema-equivalence testable for all three delegated ops. A
+accumulator's pull leg alike) carries: `writes`/`deletes` counts; an
+EXPLICIT `conflictsTotal` plus `conflictSamples` as `{path, keepLocalAs}`
+pairs capped at 50 (R4 F4 — the total must never be derived from a capped
+list: local `summarize` counts the full action set, `sync-cmd.ts:46-52`,
+so the frame carries the true total and the CLI prints it from that,
+renders one line per sample, and appends an explicit truncation notice
+`(+N more conflicts — see rbox logs)` beyond the cap); and `writtenPaths`
+capped at 500 with a `writtenPathsElided` flag. Parity claim, narrowed
+accordingly: counts and `--json` schema/totals are ALWAYS identical to the
+local path; human per-conflict lines are identical up to 50 conflicts and
+explicitly truncated past it — the full list remains in the daemon log
+(`LOG_PATHS_MAX` forensics). The CLI runs `postSyncNudge` CLI-SIDE from
+`writtenPaths` — the daemon never runs the nudge (a foreground advisory;
+design 29's `RBOX_NO_DRIFT`/config gates are the CLI's to apply). When
+`writtenPathsElided` is set the nudge is skipped — best-effort by contract
+(`sync-cmd.ts:33-44`), and a 500+-file pull is not a lockfile-drift
+situation. A sync's two legs bind to two different pump iterations, so the
+terminal frame is built from a per-opId accumulator (`acc`), not from "the
+last iteration": the pull leg records the payload above and the push leg
+records `{sequence, committed, files, deferred}`; the `result` frame
+carries both plus `failedLeg: "pull"|"push"` on error, and with
+`metrics:true` the phase reports of both legs. Gate 6 tests the narrowed
+contract: `--json` schema-identical with exact totals; human output
+identical below the caps. A
 delegated op jumps no queue: the single-flight pump (`daemon.ts:419+`)
 serializes it against watcher batches and safety ticks — no new concurrency
 inside the daemon. Before a bound push the daemon drains pending watcher
@@ -769,14 +817,26 @@ measurement-only, behind `RBOX_METRICS`/soak flags, no behavior change):
   disk (P-1-grade stat/hash) and must still mismatch the pre-scan
   incremental manifest in the same direction; (c) **quiescence tag** — the
   whole scan is tagged quiescent iff zero raw watcher events arrived from
-  scan start through the settle window; only quiescent scans feed the
-  drop-rate GATE (non-quiescent scans still log their post-filter
-  candidates as lower-confidence evidence). Log one bounded non-PII line
-  per deep scan: counts by class, quiescence tag, watcher health + error
-  generation, seconds since last safety scan, watcher events since,
-  whether ignore rules changed. Report per host/filesystem over a 24h
-  soak: deep scans, quiescent scans, scans with nonzero post-filter drift,
-  paths by class, max inferred drift age. Zero drops over the soak →
+  scan start through the settle window; (d) **audit-horizon confirmation
+  (R4 F3 — a finite settle window cannot distinguish a LATE event from a
+  DROPPED one, so no single-window candidate ever feeds the gate)** —
+  surviving candidates are held in a pending set until the NEXT deep scan
+  (the natural 30m audit horizon) and attributed as drops only then, iff
+  no watcher event for the path arrived anywhere in the inter-scan
+  interval AND the next scan re-confirms the same divergence direction
+  against what the incremental state should have shown; a candidate whose
+  event arrives late is RETRACTED and logged `late-covered` (evidence of
+  watcher latency, not loss). An event delayed beyond a full deep-scan
+  interval is indistinguishable from a drop and counts as one — stated,
+  and acceptable, since the safety cadence being tuned is itself an order
+  of magnitude shorter. Only confirmed drops from quiescent-tagged scans
+  feed the drop-rate GATE (everything else logs as lower-confidence
+  evidence). Log one bounded non-PII line per deep scan: counts by class
+  (candidates, confirmed, late-covered, racing), quiescence tag, watcher
+  health + error generation, seconds since last safety scan, watcher
+  events since, whether ignore rules changed. Report per host/filesystem
+  over a 24h soak: deep scans, quiescent scans, confirmed drops, paths by
+  class, max inferred drift age. Zero confirmed drops over the soak →
   evidence for design 49's cadence question (§9.3); nonzero → the number
   the safety cadence must answer to.
 - **P0.4 — platform semantic probes (new; R1 F13).** A scripted probe (test
@@ -858,7 +918,11 @@ runs on the shared WAN at a time — 83/84/85 serialize their gate runs.
    `racing`) across the soak.
 6. **Parity:** full `bun test` green; `--no-daemon` output equivalent to a
    daemon-stopped run; a cross-host rename and delete apply correctly through
-   a delegated push; delegated `--json` output schema-identical to local.
+   a delegated push; delegated `--json` output schema-identical to local
+   with exact totals, human output identical below the §3.2 caps (explicit
+   truncation notice beyond); a delegated `pull` against local divergence
+   leaves the remote sequence unadvanced (chain suppression, R4 F1) while
+   the daemon's own next ambient cycle still publishes it.
 
 ## 8. Rollout
 
@@ -906,8 +970,18 @@ Resolved in v3 (previously open or implicit):
 9. **The rule-file inventory is OBSERVED, per-file P-2-fingerprinted** (R3
    F2): derived from walked+cached listings plus the root files, never from
    the root-only `effectiveIgnoreRules` set.
-10. **Delegated pull returns actions, not counts** (R3 F3): capped
-    conflict pairs + written paths; `postSyncNudge` runs CLI-side only.
+10. **Delegated pull returns actions, not counts** (R3 F3; totals made
+    explicit per R4 F4): true `conflictsTotal` + capped samples + written
+    paths; `postSyncNudge` runs CLI-side only; parity claim narrowed to
+    "identical below the caps, explicit truncation beyond."
+11. **Delegated standalone pull suppresses the post-pull push chain** (R4
+    F1): the pump publishes local divergence on its own ambient schedule,
+    never as a side effect of a CLI pull request.
+12. **Lock capability is positively probed before the listener exists**
+    (R4 F2): the initial-convergence pump's first acquisition attempt
+    resolves `lockMode` (contended counts as exclusive-capable); later
+    unexpected degradation errors out bound delegated ops and rejects all
+    further hellos.
 
 Still the founder's calls:
 
