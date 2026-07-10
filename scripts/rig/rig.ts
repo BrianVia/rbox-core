@@ -130,7 +130,13 @@ async function ensureUp(apiUrl: string): Promise<void> {
     { source: path.join(REPO_ROOT, "scripts"), target: GUEST.scriptsMount, readonly: true },
   ];
   for (const name of [NAMES.a, NAMES.b]) {
-    if (!(await C.containerExists(name))) {
+    let exists = await C.containerExists(name);
+    if (exists && !(await C.containerHasMounts(name, mounts))) {
+      console.log(`${name} belongs to another checkout (stale bind mounts) → recreating`);
+      await C.deleteContainer(name);
+      exists = false;
+    }
+    if (!exists) {
       console.log(`creating ${name}`);
       await C.createContainer({ name, image: NAMES.image, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl } });
     }

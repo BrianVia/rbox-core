@@ -484,6 +484,42 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     }
   });
 
+  test("design 93: initial encrypted publish carries config through fresh materialization", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-config-first-publish", NOW);
+    const rootA = await tmp();
+    const repoA = path.join(rootA, "repo");
+    await fs.mkdir(repoA, { recursive: true });
+    await git(repoA, "init", "-qb", "main");
+    await fs.writeFile(path.join(repoA, "tracked.txt"), "initial config publish\n");
+    await git(repoA, "add", "tracked.txt");
+    await git(repoA, "-c", "user.name=Config Test", "-c", "user.email=config@example.com", "commit", "-qm", "initial");
+    await git(repoA, "remote", "add", "origin", "https://example.test/config-first-publish.git");
+    await git(repoA, "config", "branch.main.remote", "origin");
+    await git(repoA, "config", "branch.main.merge", "refs/heads/main");
+
+    const remoteA = await remoteFor(server, secrets);
+    const cfgA: WorkspaceConfig = { ...(await cfgFor(rootA, secrets, remoteA)), syncGit: true };
+    await push(rootA, cfgA, { remote: remoteA });
+
+    const first = await remoteA.latest();
+    expect(first.manifest.gitRepos?.repo?.config).toEqual({
+      "branch.main.merge": ["refs/heads/main"],
+      "branch.main.remote": ["origin"],
+      "remote.origin.fetch": ["+refs/heads/*:refs/remotes/origin/*"],
+      "remote.origin.url": ["https://example.test/config-first-publish.git"],
+    });
+
+    const rootB = await tmp();
+    const remoteB = await remoteFor(server, secrets);
+    const cfgB: WorkspaceConfig = { ...(await cfgFor(rootB, secrets, remoteB)), syncGit: true };
+    await pull(rootB, cfgB, { remote: remoteB });
+    const repoB = path.join(rootB, "repo");
+    expect(await git(repoB, "remote", "-v")).toContain("origin\thttps://example.test/config-first-publish.git (fetch)");
+    expect(await git(repoB, "config", "--local", "--get", "branch.main.remote")).toBe("origin");
+    expect(await git(repoB, "config", "--local", "--get", "branch.main.merge")).toBe("refs/heads/main");
+  }, 30_000);
+
   test("design 43: gitRepos artifact blobs join the commit blobRefs (union, deduped across repos); server sees zero git plaintext", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA", NOW);

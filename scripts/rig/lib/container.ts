@@ -220,6 +220,49 @@ export interface Mount {
   type?: "bind" | "volume";
 }
 
+/**
+ * Does an Apple-container inspect payload contain every expected bind mount?
+ *
+ * Rig containers have process-global names but worktree-local source mounts. A
+ * container created from another checkout therefore exists while still running
+ * that checkout's CLI. Inspect uses the OCI `configuration.mounts` shape; the
+ * capitalized aliases keep this tolerant of older container releases.
+ */
+export function inspectHasMounts(inspect: unknown, expected: readonly Mount[]): boolean {
+  const rows = Array.isArray(inspect) ? inspect : [inspect];
+  const mounts = rows.flatMap((row) => {
+    if (!row || typeof row !== "object") return [];
+    const record = row as Record<string, unknown>;
+    const configuration = record.configuration ?? record.Configuration;
+    const configured = configuration && typeof configuration === "object"
+      ? (configuration as Record<string, unknown>).mounts ?? (configuration as Record<string, unknown>).Mounts
+      : undefined;
+    const raw = configured ?? record.mounts ?? record.Mounts;
+    return Array.isArray(raw) ? raw : [];
+  });
+
+  return expected.every((want) => mounts.some((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const mount = candidate as Record<string, unknown>;
+    const source = mount.source ?? mount.Source;
+    const target = mount.destination ?? mount.Destination ?? mount.target ?? mount.Target;
+    return source === want.source && target === want.target;
+  }));
+}
+
+/** Existing containers are reusable only when their host sources belong to the
+ * checkout running this harness. Malformed/unsupported inspect output fails
+ * closed and causes the rig-owned container to be recreated. */
+export async function containerHasMounts(name: string, expected: readonly Mount[]): Promise<boolean> {
+  const r = await run(["inspect", name], { allowFail: true });
+  if (r.exitCode !== 0) return false;
+  try {
+    return inspectHasMounts(JSON.parse(r.stdout), expected);
+  } catch {
+    return false;
+  }
+}
+
 function mountArg(m: Mount): string {
   const parts: string[] = [];
   if (m.type) parts.push(`type=${m.type}`);

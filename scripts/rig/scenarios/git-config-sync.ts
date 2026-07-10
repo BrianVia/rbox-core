@@ -77,7 +77,12 @@ export const gitConfigSync: Scenario = {
           configValue(ctx.b, "branch.main.remote"),
           configValue(ctx.b, "branch.main.merge"),
         ]);
-        rec.assert("B remote -v has origin", remotes.stdout.includes(`origin\t${URL_ONE}`), remotes.stdout.trim());
+        const remoteOutput = remotes.stdout.trim();
+        if (!remoteOutput) {
+          rec.assert("B remote -v has origin", false, "git remote -v returned empty output");
+          throw new Error("B materialized repository has no git remotes");
+        }
+        rec.assert("B remote -v has origin", remoteOutput.includes(`origin\t${URL_ONE}`), remoteOutput);
         rec.assert("B status -sb has upstream tracking", status.stdout.includes("main...origin/main"), status.stdout.trim());
         rec.assert("B remote URL materialized", url === URL_ONE, url ?? "missing");
         rec.assert("B remote fetch materialized", fetch === "+refs/heads/*:refs/remotes/origin/*", fetch ?? "missing");
