@@ -1077,6 +1077,10 @@ endgame.** The delta engine (C2/D) stays committed unless Phase A measures
 gates on both hosts — in which case C2/D defer with the measurement on record
 (§10.4).
 
+**Phase A ran 2026-07-10 — results and gate verdicts recorded in §6.1**
+(upload share 29%/30% → C1-alone FAIL, C2/D committed; `postMs` dominates
+the phase, so the §7 commit targets move).
+
 ## 6. Staged rollout (largest of the three envelope designs — phase it)
 
 Hard rule, restated because the first draft violated it: **no write-side
@@ -1121,13 +1125,176 @@ Each phase is independently shippable and gated. B strictly precedes C1 and
 C2; C1 precedes C2 (measurement sequencing); the server side of C2 precedes
 the client side of C2 (roots before chains).
 
+### 6.1 Phase A gate record (run 2026-07-10, v1.0.0 fleet)
+
+Campaign per §5 on the real workspace (`ws_2b6e15da`, 121.7k files / 99 git
+repos; scan-visible count 111.9k), both hosts on release v1.0.0, WAN
+serialized (one probe cycle at a time, alternating direction). One protocol
+deviation from §5.1, recorded honestly: samples come from the **daemons**
+(both restarted with `RBOX_METRICS=1`, founder-blessed, left enabled), not
+from one-shot pushes with the daemon stopped — same `sync.ts` code path,
+same `recordDetails` channel, and it measures the workload this design
+actually targets (the natural daemon churn cycle). Probe: append one ~55B
+line to a workspace-root scratch file, wait for the origin daemon's changed
+push and the peer daemon's pull, alternate directions. Hosts: Mac = M2 Max
+(12c, macOS 26.5.1, WiFi), Linux = Ryzen 9 5950X (wired). Raw lines: each
+host's `daemon.log`, 2026-07-10T20:48–21:18Z window.
+
+#### Commit split — changed pushes (seconds; `encBytes` constant 39.2MB)
+
+Linux, 16 samples (14 clean; 2 conflict-retry runs excluded from medians —
+finding 2):
+
+| ts (UTC) | changed | commit | refresh | sidecar | encode | encrypt | upload | post | resid |
+|---|---|---|---|---|---|---|---|---|---|
+| 20:49:49 | 0B | 14.6 | 0.1 | 0.8 | 0.2 | 0.1 | 3.5 | 9.9 | 0.0 |
+| 20:52:33 | 8.7KB | 13.3 | 0.1 | 0.6 | 0.2 | 0.1 | 4.6 | 7.7 | 0.0 |
+| 20:53:29 | 54.2KB | 12.8 | 0.1 | 0.5 | 0.2 | 0.1 | 3.8 | 8.1 | 0.0 |
+| 20:54:11 | 1.2KB | 13.1 | 0.1 | 0.6 | 0.2 | 0.1 | 3.7 | 8.4 | 0.0 |
+| 20:54:55 | 109B | 14.3 | 0.1 | 0.5 | 0.2 | 0.1 | 3.6 | 9.8 | 0.0 |
+| 20:55:33 | 4.4KB | 13.0 | 0.1 | 0.6 | 0.2 | 0.1 | 4.0 | 8.0 | 0.0 |
+| 20:56:11 | 118B | 14.0 | 0.1 | 0.5 | 0.2 | 0.1 | 3.9 | 9.1 | 0.1 |
+| 20:57:16 | 126B | 15.7 | 0.1 | 0.6 | 0.2 | 0.1 | 4.2 | 10.5 | 0.0 |
+| 20:59:38 | 97.0KB | 14.9 | 0.2 | 0.6 | 0.2 | 0.1 | 4.5 | 9.3 | 0.0 |
+| 21:00:25 | 97.0KB | 14.5 | 0.2 | 0.8 | 0.2 | 0.1 | 4.5 | 8.7 | 0.0 |
+| 21:02:31 | 99.6KB | 12.3 | 0.1 | 0.6 | 0.2 | 0.1 | 3.4 | 7.9 | 0.0 |
+| 21:03:12 | 0B | 13.3 | 0.1 | 0.5 | 0.2 | 0.1 | 4.3 | 8.1 | 0.0 |
+| 21:04:09 | 0B | 12.9 | 0.2 | 0.6 | 0.2 | 0.1 | 4.2 | 7.6 | 0.0 |
+| 21:06:13 | 1.9KB | 15.2 | 0.1 | 0.6 | 0.2 | 0.1 | 3.9 | 10.3 | 0.0 |
+
+(Excluded retries: 20:51:53 commit 30.2 / resid 14.2; 21:01:49 commit 25.9 /
+resid 13.0.)
+
+Mac, 5 samples (3 clean + 2 conflict-retry; the retries' last-attempt
+splits agree with the clean runs):
+
+| ts (UTC) | changed | commit | refresh | sidecar | encode | encrypt | upload | post | resid | flag |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 20:58:52 | 139B | 13.5 | 0.3 | 0.6 | 0.1 | 0.0 | 4.2 | 8.3 | 0.0 | |
+| 21:05:35 | 167B | 15.1 | 0.2 | 0.6 | 0.1 | 0.0 | 5.7 | 8.4 | 0.1 | |
+| 21:07:41 | 172B | 14.9 | 0.2 | 0.6 | 0.1 | 0.0 | 4.4 | 9.6 | 0.0 | |
+| 21:09:21 | 178B | 26.1 | 0.2 | 0.5 | 0.1 | 0.0 | 4.3 | 8.4 | 12.6 | retry |
+| 21:16:26 | 192B | 57.3 | 0.2 | 0.7 | 0.1 | 0.0 | 4.1 | 10.0 | 42.2 | retry ×N |
+
+Medians (clean runs):
+
+| host | commit | refresh | sidecar | encode | encrypt | upload | post | resid | upload share | e+c+u share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Linux (14) | 13.7 | 0.1 | 0.6 | 0.2 | 0.1 | 4.0 | **8.6** | 0.0 | **29%** | 31% (4.3s) |
+| Mac (3) | 14.9 | 0.2 | 0.6 | 0.1 | 0.0 | 4.4 | **8.4** | 0.0 | **30%** | 30% (4.5s) |
+
+#### `latest` split — pulls (medians; `encBytes` constant 39.2MB)
+
+| host | n | latest | download | decrypt | parse | resid | pull wall |
+|---|---|---|---|---|---|---|---|
+| Linux | 18 | 2.5 | 1.5 | 0.1 | 0.4 | 0.4 | 11.7 |
+| Mac | 21 | 3.4 | 2.5 | 0.1 | 0.3 | 0.7 | 15.6 |
+
+(Per-sample rows in each `daemon.log`. The `latest` residual is
+`verifiedHead` — roster/key-state refresh + commit-chain verify + pin —
+which the details deliberately do not cover and Phase D does not remove.)
+
+#### Decision arithmetic (§5 rule, over the shipped fields)
+
+- **C1-alone branch (defer C2/D, §10.4): requires ≥90% upload share of
+  `commit` on BOTH hosts. Measured 29% (Linux) / 30% (Mac) → decisive FAIL
+  → the delta engine (C2/D) stays committed.** Absolute cross-check: C1
+  projection `commit − upload + upload/8` (zstd CPU excluded, which favors
+  C1) ≈ **10.2s** Linux / **11.1s** Mac — nowhere near the §7 targets.
+- **§1.1's decomposition prior is falsified in emphasis (design 82's
+  lesson, again).** The client-side O(workspace) trio this design attacks —
+  encode + encrypt + upload of the 39.2MB blob — is only **4.3s ≈ 31%**
+  (Linux) / **4.5s ≈ 30%** (Mac) of the commit phase. The dominant term on
+  BOTH hosts is **`postMs`: 8.6s ≈ 63% (Linux) / 8.4s ≈ 56% (Mac)** — the
+  `commitSigned` POST round-trip. Attribution (hypothesis pending a
+  server-side OpSpan read, finding 1): that request pays network RTT plus
+  the server commit pipeline (`resolveSidecarBytes` R2 fetch + parse of
+  the ~112k-ref refset, `validateCommitRefs` presence/entitlement over the
+  full set, receipts accounting — `apps/api/src/workspace-sync.ts:298-350`)
+  — O(workspace refs) per commit **on the server**, which no phase of this
+  design shrinks: §3.5.2 keeps the full refset per commit by design.
+- **Projected post-C2 commit floor** = refresh + **sidecar** + post +
+  residual ≈ **9.3s Linux / 9.2s Mac** (encode/encrypt/upload → ~0 at
+  O(change); `sidecarMs` STAYS — the §24 refset sidecar remains the full
+  ~112k-ref set per commit under §3.5.2, so C2 does not shrink it).
+  The §7.1/§7.2 commit gates (≤3s / ≤4s) are therefore NOT reachable by
+  C1+C2 as scoped. §7 pre-committed to honesty here ("targets pending the
+  Phase-A record… say so, don't fake precision"): they move. C2's honest
+  wall-clock win is ~4.3-4.5s/commit (~30%) plus the 39.2MB→~KB
+  upload-byte elimination; reaching ≤3-4s additionally requires an
+  O(change) commit-POST (ref accounting) design — new scope, a companion
+  design, not a quiet §7 renumber.
+- **Phase D projection: the §7.3 target stands.** D removes download
+  (1.5/2.5s) + parse (0.4/0.3s), leaving a projected pre-`resultHash`
+  remainder of **0.5-0.8s** (decrypt + verify residual). The ≤2s target is
+  credible, but PASS/FAIL is decided by the §7.3 gate run after D ships —
+  the O(N) `resultHash` cost is not isolated in these raw-v0 samples.
+- **Bytes are exactly as modeled.** `encBytes` = 39.2MB on every one of the
+  21 changed commits and every pull in the window — byte-identical across
+  ~100B–100KB changes — confirming §1.3/§1.5's O(workspace)-per-commit
+  transfer at v1.0.0 scale. C1 (~8x) and C2 (→~KB) remain worth shipping
+  for bytes/quota/409-window reasons independent of the wall-clock gates.
+
+#### Absolute latency vs the 2026-07-08 baseline
+
+Same order, modestly better: push wall median 20.9s Linux / 24.4s Mac
+(design-82-era publish 24.6s), pull wall 11.7s / 15.6s (apply 17.1s);
+a cross-host probe round (append → peer applied) ran ~35-80s wall including
+daemon debounce. The ~40s-class changed-push sync cycle still stands, and
+`commit` + `latest` remain its largest owned phases.
+
+#### Findings / instrumentation gaps
+
+1. **`postMs` is a single opaque number** covering network RTT plus the
+   whole server-side commit pipeline. Client-side instrumentation cannot
+   split it; read the server's own per-op metrics (`apps/api/src/metrics.ts`
+   OpSpan) before targeting the POST. Phase A records it as the largest
+   single term and the top open question for C2's wall-clock gates.
+2. **Conflict retries double-count the commit phase and overwrite its
+   details.** Four runs across both hosts hit the 409/pull-first retry
+   path: the `commit` phase timer accumulates every attempt (up to 57.3s on
+   a multi-retry Mac run) while `onCommitTimings` keeps only the last
+   attempt's split, leaving a 12–42s pseudo-residual. Excluded from
+   medians; flagged so a retry run is never read as unattributed time.
+   Clean-run residual is ~0.0s — the six fields close the phase timer
+   almost exactly, and design-82 phase coverage stays ~96% of push wall.
+   The retry runs are also live evidence for §1.6: every 409 re-pays the
+   full O(workspace) commit.
+3. **No JSON emitter is wired** for `PhaseReportJson` — one-shot commands
+   and the daemon emit only the summary line (0.1s / formatted-byte
+   precision). Sufficient for Phase A; a bench harness wanting exact ms
+   must add a sink.
+4. `missing` (the pre-upload probe) runs 3-4s per changed push on both
+   hosts — another O(workspace)-flavored term, outside `commit` and outside
+   this design's scope (§8), noted for the fleet phase-cost map.
+
+#### Verdict
+
+- **C1 gate (compression-alone, §5/§10.4): FAIL** — upload share 29%/30%
+  vs ≥90% required → **C2/D remain committed. Proceed with Phase B (read
+  capability) next.**
+- **C2 wall-clock targets (§7.1/§7.2): NOT credible as written** — revise
+  the commit gates against the measured post-C2 floor (~9.2-9.3s), or pair
+  C2 with an O(change) commit-POST companion design before holding C2 to
+  ≤3-4s. C2's byte-side case is confirmed and sufficient on its own.
+- **Phase D target (§7.3): stands** (projected pre-`resultHash` remainder
+  0.5-0.8s; the actual gate runs after D ships).
+
+Fleet note: both daemons were left running with `RBOX_METRICS=1` (the one
+persistent change from this campaign, founder-blessed) — future gate runs
+can harvest `daemon.log` directly. The probe file was removed.
+
 ## 7. Per-host acceptance gates
 
 Same discipline as designs 81–82: compiled dev build vs the prior release,
 A/B on both fleet hosts, serialized on the shared WAN. **Fleet rule (shared
 with designs 83/85): only one design's A/B gate window runs on the shared WAN
 at a time.** Numbers below are targets pending the Phase-A record (which may
-move them — say so, don't fake precision).
+move them — say so, don't fake precision). *Phase A (§6.1) moved them:
+gates 1–2's ≤3s/≤4s commit targets are not reachable by C1+C2 at the
+measured split (post-C2 floor ≈ 9.2-9.3s, dominated by `postMs`) — re-set
+the commit gates (or scope the companion commit-POST design) before the C2
+gate window; gate 3's `latest` ≤2s stands.*
 
 1. **Mac, one-file commit (C2).** `RBOX_METRICS=1 rbox push` with a 1-file
    touch, daemon stopped. Pass: `commit` phase ≤ **3s** (from 13.2–17.5s);
