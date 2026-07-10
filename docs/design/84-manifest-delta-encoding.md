@@ -1,7 +1,11 @@
 # 84 — Commit envelope at O(change): manifest delta encoding
 
-Status: Design draft v5, 2026-07-10 — round-3 revision (ledger in
-REVIEW-84.md). v5 closes round 3: `GlobalManifestMeta.snapshotBytes` makes
+Status: Design draft v6, 2026-07-10 — round-4 revision (ledger in
+REVIEW-84.md). v6 closes round 4's minor: `validManifestMeta` is a normative
+runtime validator gating every meta consumption point (base selection, epoch
+trigger, fast-fold match, byte arithmetic) — any partial/malformed persisted
+meta normalizes wholesale to `undefined` (fail-to-snapshot), so no JS
+coercion can fail a trigger open. v5 closed round 3: `GlobalManifestMeta.snapshotBytes` makes
 the byte-bound trigger implementable (encode-then-compare, threshold includes
 the proposed head, observed lengths propagated across deltas); repo-only
 packets clear a stale meta via a normative rule inside `applyStateSavePacket`
@@ -359,8 +363,9 @@ when ANY holds, else it emits a `delta` based on its applied base:
    fetch — content-addressed + AEAD, so observed lengths are trustworthy)
    and propagated unchanged across deltas — the steady-state fast path never
    fetches the snapshot to size it. Migration/restore need no special case:
-   any state without a meta (or with a legacy meta shape) has no base and
-   snapshots anyway (§3.3.1).
+   any state without a meta — including a partial/malformed one, which
+   §3.4's `validManifestMeta` normalizes to `undefined` before this
+   arithmetic can see it — has no base and snapshots anyway (§3.3.1).
 5. **Impossible-link 422 (fail-safe compaction).** If a commit bounce lists
    any sha that is in this commit's `manifestChain` (a chain link the server
    reports unsatisfied — GC-marked, delete-fenced, or lost), the retry MUST
@@ -505,9 +510,27 @@ Semantics (all inherited from the packet, stated to be testable):
   fence; they persist `manifestMeta: undefined` (drop it), so the next commit
   takes the §3.3.1 snapshot path rather than trusting an unfenced value.
   `resetSyncState` (`config.ts:463-524`) wipes it with everything else.
-- **Migration:** old state files load with `manifestMeta` undefined → first
-  post-upgrade commit is a snapshot (§3.3.1). Backward-tolerant, no
-  migration step.
+- **Runtime validation — malformed meta normalizes to `undefined` (round-4
+  finding).** State loading is an unchecked `JSON.parse` cast
+  (`config.ts:191-200`), so "legacy shape ⇒ snapshot" must be enforced by a
+  validator, not a TypeScript interface: a hand-edited, partial, or
+  older-schema meta would otherwise flow into JS arithmetic and fail OPEN
+  (e.g. a missing `snapshotBytes` makes `chainBytes + n >= undefined`
+  evaluate `false` via `NaN` — the byte-bound trigger would never fire).
+  Normative: `validManifestMeta(v)` gates EVERY consumption point
+  (delta-base selection, the §3.3.2 epoch trigger, the fast-fold match, the
+  §3.3.4 byte arithmetic) — `encManifestSha`/`manifestHash` 64-hex; `chain`
+  an array of ≤ `MAX_MANIFEST_DELTA_CHAIN` unique 64-hex entries not
+  containing `encManifestSha`; `accountEpoch`/`keyEpoch` non-negative safe
+  integers; `snapshotBytes` a positive safe integer; `chainBytes` a
+  non-negative safe integer with snapshot-base consistency
+  (`chain.length === 0 ⇒ chainBytes === 0`). ANY missing/invalid field ⇒
+  the WHOLE meta is treated as `undefined` (→ §3.3.1 snapshot path / cold
+  walk) before any epoch check, list match, or byte arithmetic runs.
+- **Migration:** old state files load with `manifestMeta` undefined — and
+  partial/malformed persisted metas normalize to undefined per the validator
+  above — → first post-upgrade commit is a snapshot (§3.3.1).
+  Backward-tolerant, no migration step.
 
 Pull-side reconstruction:
 
@@ -1128,8 +1151,14 @@ move them — say so, don't fake precision).
    - byte-bound trigger (§3.3.4): `chainBytes + candidateDeltaBytes ≥
      snapshotBytes` re-emits as snapshot (threshold includes the proposed
      head); `snapshotBytes` propagates unchanged across fast-path applies
-     and is recorded from the fetched length on a cold walk; absent/legacy
-     meta shapes force the snapshot path (migration/restore).
+     and is recorded from the fetched length on a cold walk.
+   - meta validation (§3.4): absent, PARTIAL, and MALFORMED persisted metas
+     (missing `snapshotBytes`, non-hex hash, over-cap/duplicate chain,
+     head-sha-in-chain, negative/NaN counters, chain-vs-chainBytes
+     inconsistency) each normalize the whole meta to `undefined` and force
+     the snapshot path / cold walk — asserted at every consumption point
+     (base selection, epoch trigger, fast-fold match, byte arithmetic), so
+     no trigger can silently no-op on a coerced value.
    - design-92 parity (§4.6): a poisoned `set` tuple fails at apply exactly
      as via snapshot; deferred carry emits no op; a verified-but-unapplied
      head never becomes a delta base; compressed-descriptor entry changes
