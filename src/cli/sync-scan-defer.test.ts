@@ -23,7 +23,7 @@ mock.module("../engine/hash.js", () => ({
   },
 }));
 
-const { push } = await import("./sync.js");
+const { push, pull } = await import("./sync.js");
 const { loadState, syncStreamId } = await import("./config.js");
 const { encryptFileNameProbe } = await import("../engine/e2ee/e2ee-e2e.helpers.js");
 type SyncDeps = import("./sync.js").SyncDeps;
@@ -42,6 +42,15 @@ class FakeRemote implements SyncRemote {
   private head = 0;
   private readonly log = new Map<number, Manifest>();
   private readonly blobs = new Map<string, Buffer>();
+  async seedEntry(rel: string, content: string): Promise<FileEntry> {
+    const p = await encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+    this.blobs.set(p.encSha, Buffer.from(p.ciphertext));
+    return { path: rel, type: "file", sha256: p.plaintextSha, encSha: p.encSha, size: content.length, mode: 0o644, mtimeMs: 1 };
+  }
+  injectCommit(files: FileEntry[]): void {
+    this.head += 1;
+    this.log.set(this.head, { generatedAt: "", files });
+  }
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     return { sequence: this.head, manifest: this.log.get(this.head) ?? { generatedAt: "", files: [] } };
   }
@@ -133,6 +142,43 @@ test("push commits the BASE entry for a scan-deferred path — never torn, never
   expect(a!.sha256).toBe(base.sha256); // the BASE entry, not the mid-mutation hash
   expect(a!.size).toBe(base.size);
   expect(committed.files.some((f) => f.path === "b.txt")).toBe(true); // stable subset committed
+});
+
+// Pull sites intentionally pass NO deferred set (impl review D1-R2): a path the
+// pre-apply scan dropped reaches reconcile as locally-absent, and every branch is
+// byte-preserving — remote-untouched takes the no-action arm; remote-changed plans
+// a write whose expectedLocal (absent) mismatches the on-disk churn, so apply
+// moves the local bytes to a conflict copy before publishing; deletes are planned
+// only from sameContent(local, base), never from absence. These two tests pin that.
+test("pull with the churning path deferred and remote UNCHANGED leaves the local file untouched", async () => {
+  const remote = new FakeRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  await push(root, cfg, deps(remote)); // synced baseline (sequence 1)
+
+  await fs.rm(path.join(root, ".rbox/state/hashcache.json"), { force: true });
+  mutations.set("a.txt", async (abs) => fs.appendFile(abs, "-edit"));
+
+  const actions = await pull(root, cfg, deps(remote));
+  expect(actions).toEqual([]); // no write, no delete, no conflict
+  expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("one-edit");
+});
+
+test("pull with the churning path deferred and remote CHANGED preserves the local bytes as a conflict copy", async () => {
+  const remote = new FakeRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  await push(root, cfg, deps(remote)); // synced baseline (sequence 1)
+  remote.injectCommit([await remote.seedEntry("a.txt", "two")]); // remote is ahead
+
+  await fs.rm(path.join(root, ".rbox/state/hashcache.json"), { force: true });
+  mutations.set("a.txt", async (abs) => fs.appendFile(abs, "-edit"));
+
+  await pull(root, cfg, deps(remote));
+  expect(mutations.size).toBe(0); // the churn really fired during the pre-apply scan
+  expect(await fs.readFile(path.join(root, "a.txt"), "utf8")).toBe("two"); // remote applied
+  const names = await fs.readdir(root);
+  const conflict = names.find((n) => n.includes(".conflict"));
+  expect(conflict).toBeDefined(); // the mid-write bytes survived
+  expect(await fs.readFile(path.join(root, conflict!), "utf8")).toBe("one-edit");
 });
 
 test("push with every change scan-deferred publishes no torn entry and makes no spurious commit", async () => {
