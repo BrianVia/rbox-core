@@ -65,6 +65,7 @@ struct WorkspaceStatus: Identifiable, Equatable {
     var operation: SyncOperation?
     var sequence: Int?
     var fileCount: Int? = nil
+    var totalBytes: Int64? = nil
     var daemonVersion: String? = nil
     var lastSyncedAt: Date?
     var heartbeatAgeSeconds: Double?
@@ -88,6 +89,7 @@ extension WorkspaceStatus {
             operation: nil,
             sequence: nil,
             fileCount: nil,
+            totalBytes: nil,
             daemonVersion: nil,
             lastSyncedAt: nil,
             heartbeatAgeSeconds: nil,

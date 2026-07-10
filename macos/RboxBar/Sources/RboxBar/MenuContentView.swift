@@ -266,8 +266,8 @@ struct MenuContentView: View {
         if let last = workspace.lastSyncedAt {
             parts.append("Last synced \(relativeTime(last))")
         }
-        if let sequence = workspace.sequence {
-            parts.append("seq \(sequence)")
+        if let sizeLabel = sizeOrSequenceLabel(workspace) {
+            parts.append(sizeLabel)
         }
         return parts.isEmpty ? stateSummary(workspace).capitalized : parts.joined(separator: " · ")
     }
@@ -278,10 +278,20 @@ struct MenuContentView: View {
         if let last = workspace.lastSyncedAt {
             parts.append("Last synced \(relativeTime(last))")
         }
-        if let sequence = workspace.sequence {
-            parts.append("seq \(sequence)")
+        if let sizeLabel = sizeOrSequenceLabel(workspace) {
+            parts.append(sizeLabel)
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func sizeOrSequenceLabel(_ workspace: WorkspaceStatus) -> String? {
+        if let totalBytes = workspace.totalBytes {
+            return Self.byteCountFormatter.string(fromByteCount: totalBytes)
+        }
+        if let sequence = workspace.sequence {
+            return "seq \(sequence)"
+        }
+        return nil
     }
 
     private func stateSummary(_ workspace: WorkspaceStatus) -> String {
@@ -572,6 +582,13 @@ struct MenuContentView: View {
     private static let integerFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
+        return formatter
+    }()
+
+    private static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
         return formatter
     }()
 }

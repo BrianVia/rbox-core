@@ -422,10 +422,27 @@ test("ambient status writes beside the pidfile and carries local-only currentPat
       state: "syncing",
       sequence: null,
       fileCount: 0,
+      totalBytes: 0,
       daemonVersion: RBOX_VERSION,
       workspaceRoot: root,
       operation: { kind: "push", phase: "encrypt", filesDone: 1, filesTotal: 3, currentPath: "src/private-file.ts" },
     });
+  });
+});
+
+test("ambient status totalBytes sums the tracked manifest's file sizes", async () => {
+  await withIsolatedDaemonHome(async () => {
+    await fs.writeFile(path.join(root, "a.txt"), "hello"); // 5 bytes
+    await fs.writeFile(path.join(root, "b.txt"), "hello world!"); // 12 bytes
+    const daemon = await makeDaemon(new MiniRemote());
+    await writeOwnedDaemonPid();
+
+    daemon.want.push = true;
+    await daemon.pump();
+    await daemon.activityWrite;
+
+    const status = await readAmbientStatus();
+    expect(status).toMatchObject({ fileCount: 2, totalBytes: 17 });
   });
 });
 

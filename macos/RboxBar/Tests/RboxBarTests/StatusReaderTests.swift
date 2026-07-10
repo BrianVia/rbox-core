@@ -69,6 +69,16 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.name, "current-root")
     }
 
+    func testTotalBytesParses() {
+        write("daemon.pid", "v2 999999 boot")
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":"\(iso(120))",
+         "fileCount":128517,"totalBytes":15600000000,"daemonVersion":"0.9.17"}
+        """)
+        let ws = only()
+        XCTAssertEqual(ws.totalBytes, 15_600_000_000)
+    }
+
     func testOldDaemonFieldsRemainOptionalAndDesiredRootIsFallback() {
         write("desired.json", """
         {"rootPath":"/tmp/fallback-root","state":"running","accountId":"a","workspaceId":"w","at":"\(iso(1))"}
@@ -78,6 +88,7 @@ final class StatusReaderTests: XCTestCase {
         """)
         let ws = only()
         XCTAssertNil(ws.fileCount)
+        XCTAssertNil(ws.totalBytes)
         XCTAssertNil(ws.daemonVersion)
         XCTAssertEqual(ws.rootPath, "/tmp/fallback-root")
         XCTAssertEqual(ws.sequence, 247, "old daemons keep the sequence fallback")
