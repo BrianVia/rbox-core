@@ -29,6 +29,14 @@ interface HashCacheFileV2 {
 
 const CACHE_REL = ".rbox/state/hashcache.json";
 
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+function isValidEntry(e: unknown): e is HashCacheEntry {
+  if (typeof e !== "object" || e === null) return false;
+  const { mtimeMs, size, ctimeMs, sha256 } = e as Record<string, unknown>;
+  return Number.isFinite(mtimeMs) && Number.isFinite(size) && Number.isFinite(ctimeMs) && typeof sha256 === "string" && SHA256_HEX.test(sha256);
+}
+
 export class HashCache {
   private readonly map: Map<string, HashCacheEntry>;
   private dirty = false;
@@ -87,7 +95,13 @@ export class HashCache {
         (parsed as { entries?: unknown }).entries === null ||
         Array.isArray((parsed as { entries?: unknown }).entries)
       ) return new HashCache();
-      return new HashCache((parsed as HashCacheFileV2).entries);
+      const entries = (parsed as HashCacheFileV2).entries;
+      // One malformed entry condemns the whole file — the cache is safe-to-discard
+      // by contract, and a damaged sha must never flow into a manifest.
+      for (const e of Object.values(entries)) {
+        if (!isValidEntry(e)) return new HashCache();
+      }
+      return new HashCache(entries);
     } catch {
       return new HashCache(); // missing OR corrupt cache → empty; only costs a re-hash
     }

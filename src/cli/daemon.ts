@@ -789,9 +789,13 @@ export class RboxDaemon {
     }
     // The pull advanced the local base sequence; remember it so the follow-up no-op
     // push isn't logged as if THIS daemon published the remotely-produced sequence.
-    this.lastLoggedSeq = (await this.loadSyncBase()).lastSyncedSequence;
+    const base = await this.loadSyncBase();
+    this.lastLoggedSeq = base.lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
-    await this.replaceManifestFromScan(this.cache, this.manifest);
+    // Deferred paths carry the POST-pull base entry, never the pre-pull manifest —
+    // carrying pre-pull truth would let the follow-up push publish a stale entry
+    // over the version this pull just applied.
+    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest);
   }
 
   private bumpConflict(_kind: "commit"): void {

@@ -108,3 +108,26 @@ test("applyWatchEvents defers chmod during hashing and emits no torn entry", asy
   expect([...deferred]).toEqual(["file.txt"]);
   expect(manifest.files).toEqual([]);
 });
+
+test("unlinkDir subtree rescan defers a churning child instead of deleting its prior entry", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-torn-scan-"));
+  roots.push(root);
+  await fs.mkdir(path.join(root, "dir"));
+  const abs = path.join(root, "dir/file.txt");
+  await fs.writeFile(abs, "settled");
+  const matcher = buildIgnoreMatcher(root);
+
+  // Prior coherent truth for the subtree, established without churn.
+  const base = await scanManifest(root);
+  const prior = base.files.find((f) => f.path === "dir/file.txt")!;
+
+  // A stale unlinkDir (dir still exists) triggers the authoritative subtree
+  // rescan; the child churns during its hash. Absence from the fresh walk must
+  // read as UNSTABLE (keep prior entry + defer), never as a deletion.
+  mutation = async (target) => fs.appendFile(target, "-appended");
+  const deferred = new Set<string>();
+  const manifest = await applyWatchEvents(base, root, matcher, [{ relPath: "dir", kind: "unlinkDir" }], undefined, deferred);
+
+  expect([...deferred]).toEqual(["dir/file.txt"]);
+  expect(manifest.files.find((f) => f.path === "dir/file.txt")).toEqual(prior);
+});

@@ -198,6 +198,7 @@ test("a same-size edit with restored mtime is re-hashed, never served the stale 
     const st2 = await fs.stat(abs);
     expect(st2.mtimeMs).toBe(st1.mtimeMs); // the old (mtime,size) fingerprint WOULD have hit
     expect(st2.size).toBe(st1.size);
+    expect(st2.ctimeMs).not.toBe(st1.ctimeMs); // the P-2 dimension: the write bumped ctime
 
     const m2 = await scanManifest(dir, undefined, cache);
     expect(m2.files[0]!.sha256).toBe(createHash("sha256").update("bbbb").digest("hex"));
@@ -233,6 +234,28 @@ test("HashCache loads corrupt files as empty", async () => {
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, "not json");
     expect((await HashCache.load(dir)).lookup("a.ts", 1, 2, 3)).toBeUndefined();
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("HashCache discards a v2 file wholesale when any entry is malformed", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-hc-badentry-"));
+  try {
+    const abs = path.join(dir, ".rbox/state/hashcache.json");
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    const good = { mtimeMs: 1, size: 2, ctimeMs: 3, sha256: "a".repeat(64) };
+    for (const bad of [
+      { ...good, sha256: "not-a-sha" }, // damaged sha must never flow into a manifest
+      { ...good, ctimeMs: "3" }, // wrong type
+      { mtimeMs: 1, size: 2, sha256: "a".repeat(64) }, // legacy shape smuggled into a v2 envelope
+      null,
+    ]) {
+      await fs.writeFile(abs, JSON.stringify({ version: 2, entries: { "good.ts": good, "bad.ts": bad } }));
+      const loaded = await HashCache.load(dir);
+      expect(loaded.lookup("good.ts", 1, 2, 3)).toBeUndefined(); // wholesale, not per-entry
+      expect(loaded.lookup("bad.ts", 1, 2, 3)).toBeUndefined();
+    }
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

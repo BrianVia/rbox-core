@@ -148,15 +148,20 @@ export async function applyWatchEvents(
       if (st?.isDirectory()) {
         if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
         const sub: FileEntry[] = [];
-        await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false);
+        // A child the walk deferred (mutated during its hash) is absent from `sub`
+        // because it's UNSTABLE, not gone — keep its prior entry out of the
+        // authoritative-subtree cleanup, and surface it for the caller's retry.
+        const subDeferred = new Set<string>();
+        await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false, undefined, subDeferred);
         const fresh = new Set(sub.map((e) => e.path));
         for (const k of [...map.keys()]) {
-          if ((k === rel || k.startsWith(prefix)) && !fresh.has(k)) {
+          if ((k === rel || k.startsWith(prefix)) && !fresh.has(k) && !subDeferred.has(k)) {
             map.delete(k);
             cache?.invalidate(k);
           }
         }
         for (const e of sub) map.set(e.path, e);
+        for (const p of subDeferred) deferred?.add(p);
       } else {
         for (const k of [...map.keys()]) {
           if (k.startsWith(prefix)) {
@@ -180,7 +185,7 @@ export async function applyWatchEvents(
     } else if (ev.kind === "addDir") {
       if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
       const sub: FileEntry[] = [];
-      await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false);
+      await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false, undefined, deferred);
       for (const e of sub) map.set(e.path, e);
     } else {
       // add | change
