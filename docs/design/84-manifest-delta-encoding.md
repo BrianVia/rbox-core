@@ -1,7 +1,12 @@
 # 84 — Commit envelope at O(change): manifest delta encoding
 
-Status: Design draft v6, 2026-07-10 — round-4 revision (ledger in
-REVIEW-84.md). v6 closes round 4's minor: `validManifestMeta` is a normative
+Status: Design draft v7, 2026-07-10 — round-5 revision (ledger in
+REVIEW-84.md). v7 closes round 5: the bounded-422 contract is explicit on
+both sides (server fronts all chain misses in `missing` — they always fit —
+on every 422 producer incl. the fence-abort path; client conservatively
+snapshots on ANY truncated response with a non-empty attempted chain), and
+`validManifestMeta`'s chain/bytes consistency is bidirectional
+(`chainBytes === 0 ⇔ chain.length === 0`). v6 closed round 4's minor: `validManifestMeta` is a normative
 runtime validator gating every meta consumption point (base selection, epoch
 trigger, fast-fold match, byte arithmetic) — any partial/malformed persisted
 meta normalizes wholesale to `undefined` (fail-to-snapshot), so no JS
@@ -523,8 +528,12 @@ Semantics (all inherited from the packet, stated to be testable):
   an array of ≤ `MAX_MANIFEST_DELTA_CHAIN` unique 64-hex entries not
   containing `encManifestSha`; `accountEpoch`/`keyEpoch` non-negative safe
   integers; `snapshotBytes` a positive safe integer; `chainBytes` a
-  non-negative safe integer with snapshot-base consistency
-  (`chain.length === 0 ⇒ chainBytes === 0`). ANY missing/invalid field ⇒
+  non-negative safe integer with BIDIRECTIONAL chain consistency
+  (`chainBytes === 0 ⇔ chain.length === 0` — a non-empty chain accumulated
+  at least its first delta's positive ciphertext length, so zero bytes under
+  a non-empty chain is impossible-by-construction state that would
+  undercount the §3.3.4 trigger; round-5 finding 2). ANY missing/invalid
+  field ⇒
   the WHOLE meta is treated as `undefined` (→ §3.3.1 snapshot path / cold
   walk) before any epoch check, list match, or byte arithmetic runs.
 - **Migration:** old state files load with `manifestMeta` undefined — and
@@ -657,7 +666,7 @@ no separate "clear the marker" step to forget: the §33 barrier
 (`gc-phase1.ts:20-26`) plus the marker-clear inside `commitAccounting`
 (`:177-182`) already implement the only two transitions.
 
-#### 3.5.4 Client-side of the 422 contract (restated as protocol)
+#### 3.5.4 The 422 contract, bounded (both sides)
 
 On `unsatisfied_blobs`, partition `missing`:
 `missing ∩ manifestChain ≠ ∅` ⇒ the retry commit is a SNAPSHOT (drop the
@@ -665,6 +674,31 @@ chain; nothing to re-upload); the remaining data refs follow today's
 re-upload/recapture recovery (`sync.ts:691-703`). This is the §3.3.5 trigger
 and MUST be implemented in the same 422 classification that currently derives
 `gitForceForMissingBlobs`.
+
+**Truncation rule (round-5 finding 1).** `unsatisfiedBlobsBody` caps the
+response at `MAX_MISSING_SHAS_RESPONSE = 10_000` entries with the full count
+in `missingTotal` (`apps/api/src/commit-envelope.ts:27-36`) — a naive union
+order could push an unsatisfied chain link past the bound, hiding it from
+the intersection test and looping the client on data-ref re-uploads that can
+never satisfy the invisible link. Two rules, either of which alone closes
+it; both ship:
+
+- **Server (ordering):** every 422 that lists a sha ∈ the commit's
+  `manifestChain` places ALL such shas (≤ `MAX_MANIFEST_DELTA_CHAIN` = 16,
+  so they always fit) at the FRONT of `missing`, before any data refs. This
+  is a partition at the `unsatisfiedBlobsBody` call sites and applies to
+  every 422 producer on the commit path: the `validateCommitRefs` miss, the
+  delete-fence `commitAccounting` super-batch abort (`commit-accounting.ts:
+  190-192` — filter the returned batch against the request's chain set), and
+  the legacy `missingBlobs` probe.
+- **Client (conservative floor):** if the response is truncated
+  (`missingTotal > missing.length`) AND the attempted commit carried a
+  non-empty `manifestChain`, retry as a SNAPSHOT regardless of the visible
+  intersection — correct even against an old/other server that doesn't
+  implement the ordering rule, at worst costing one unnecessary snapshot on
+  a >10k-miss cold push (which is already a full-upload event).
+
+§7.5 covers the truncation boundary on both server paths.
 
 #### 3.5.5 Roots — design 96 v2 integration (the real one, not "one line")
 
@@ -1137,7 +1171,10 @@ move them — say so, don't fake precision).
      mode — the round-2 blocker case).
    - **422-partition (§3.5.4):** a bounce naming a chain link → snapshot
      retry (never a link re-upload); naming only data refs → today's
-     recovery; a design-95 fence abort maps the same way.
+     recovery; a design-95 fence abort maps the same way. **Truncation
+     floor:** a truncated response (`missingTotal > missing.length`) with a
+     non-empty attempted chain → snapshot retry even when no chain sha is
+     visible in `missing`.
    - state packet (I8/§3.4): `manifestMeta` lands only with an accepted
      global; rejected packets, verify-only pulls, decode failures, degraded/
      legacy writes, and `resetSyncState` leave/clear it per spec; undefined
@@ -1155,7 +1192,9 @@ move them — say so, don't fake precision).
    - meta validation (§3.4): absent, PARTIAL, and MALFORMED persisted metas
      (missing `snapshotBytes`, non-hex hash, over-cap/duplicate chain,
      head-sha-in-chain, negative/NaN counters, chain-vs-chainBytes
-     inconsistency) each normalize the whole meta to `undefined` and force
+     inconsistency IN BOTH DIRECTIONS — empty chain with non-zero bytes AND
+     non-empty chain with zero bytes) each normalize the whole meta to
+     `undefined` and force
      the snapshot path / cold walk — asserted at every consumption point
      (base selection, epoch trigger, fast-fold match, byte arithmetic), so
      no trigger can silently no-op on a coerced value.
@@ -1179,7 +1218,11 @@ move them — say so, don't fake precision).
      as the same deletion via snapshot.
 5. **Server validation tests (block C2 server merge):** `manifestChain`
    over-cap / non-hex / duplicate entries → 400; absent/marked/fenced-link
-   entries → 422 listing the link (receipts AND legacy paths); accounted
+   entries → 422 listing the link (receipts AND legacy paths); **truncation
+   boundary (§3.5.4): with >`MAX_MISSING_SHAS_RESPONSE` data misses plus one
+   chain miss, the chain sha appears at the FRONT of `missing` — on both the
+   `validateCommitRefs` path and the delete-fence `commitAccounting`
+   super-batch path;** accounted
    ref-count budget includes the chain; chain refs enter `refSetAt`'s fold
    set, `dropped_index` on snapshot reset, and the gap's `chainRefs`;
    `reachableFromWorkspaces` unions them under `MAX_UNIQUE_ROOTS`; a
