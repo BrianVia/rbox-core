@@ -17,7 +17,7 @@ import { isKnownTopLevel } from "./command-catalog.js";
 import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
-import { parseFlags } from "./flags.js";
+import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
@@ -116,6 +116,14 @@ export async function main(): Promise<void> {
   const jsonMode = rawJsonMode && commandSupportsFlag(cmd, positional, "--json");
   setJsonErrorMode(jsonMode);
   if (rawJsonMode && !jsonMode) flags.json = "false";
+
+  if (cmd && cmd !== "help" && !cmd.startsWith("__") && cmd !== BOOT_RESUME_MARKER) {
+    const err = unknownFlagError(cmd, positional, flags);
+    if (err) {
+      fail(err);
+      return;
+    }
+  }
 
   // Bare `rbox` (cmd === undefined) is excluded too: in a tracked dir it renders the
   // status block (whose own update line covers this — nudging here would print BEFORE
@@ -330,7 +338,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const root = await resolvePathFlagRoot(flags.path);
       if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
       else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
-      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
+      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root, { full: flags.list === "true" });
       else await addIgnorePattern(root, positional[0]!);
       break;
     }
@@ -409,7 +417,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // `eval "$(rbox shell-init zsh)"` in .zshrc. Only zsh today (bash/fish use the
       // starship snippet in docs/shell-integration.md).
       if (positional[0] !== "zsh") {
-        process.stderr.write("usage: rbox shell-init zsh\n");
+        process.stderr.write("usage: rbox shell-init zsh\n(zsh only today — bash/fish users: see docs/shell-integration.md in the rbox repo for the prompt snippet)\n");
         process.exitCode = 1;
         break;
       }
@@ -420,7 +428,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "completions": {
       // design 46: print the zsh completion script (generated from COMMAND_HELP).
       if (positional[0] !== "zsh") {
-        process.stderr.write("usage: rbox completions zsh\n");
+        process.stderr.write("usage: rbox completions zsh\n(zsh only today — bash/fish are not yet supported)\n");
         process.exitCode = 1;
         break;
       }

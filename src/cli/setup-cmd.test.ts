@@ -193,3 +193,19 @@ test("keyed setup requires key input when --workspace is present", async () => {
     else process.env.RBOX_KEY = oldKey;
   }
 });
+
+test("guided setup warns about keyed-only flags before the non-TTY exit", async () => {
+  const writes: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    writes.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { daemon: "true" } });
+    expect(writes.join("")).toContain("note: --dir/--daemon/--pull-only/--force only apply to keyed setup");
+  } finally {
+    process.stderr.write = originalWrite;
+    process.exitCode = 0;
+  }
+});

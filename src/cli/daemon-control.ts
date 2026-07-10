@@ -256,7 +256,7 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
     const bound = readDaemonBinding(root);
     const current = currentWorkspaceId(root);
     if (bound && current && bound !== current) {
-      console.log(`rbox daemon (pid ${existing}) is bound to ${bound}, but this root is now ${current} — restarting`);
+      console.log(`background sync (process ${existing}) was serving workspace ${bound}, but this folder is now ${current} — restarting`);
       try {
         // Re-verify ownership at the moment of signalling (PID-reuse window), and
         // swallow ESRCH — "already exited" is success here, not an error.
@@ -268,12 +268,12 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
         // Never escalate to SIGKILL: a forced kill can land mid git-sync `.git`
         // mutation, whose rollback is JS-level and dies with the process. SIGTERM
         // shutdown is graceful (awaits the pump) — just try again shortly.
-        console.log(`old daemon (pid ${existing}) hasn't exited yet — re-run \`rbox start\` in a moment`);
+        console.log(`the previous background sync (process ${existing}) hasn't exited yet — re-run \`rbox start\` in a moment`);
         return "retry-later";
       }
       await fsp.rm(pidPath(root), { force: true });
     } else {
-      console.log(`rbox daemon already running (pid ${existing})`);
+      console.log(`background sync already running (process ${existing})`);
       return "already-running";
     }
   } else if (existing) {
@@ -300,21 +300,21 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
   fs.closeSync(out);
 
   if (child.pid) fs.writeFileSync(pidPath(root), `v2 ${child.pid} ${bootId}\n`);
-  console.log(`rbox daemon started (pid ${child.pid}). logs: ${logPath(root)}`);
+  console.log(`background sync started (process ${child.pid}). logs: ${logPath(root)}`);
   return "started";
 }
 
 export async function stopDaemon(root: string): Promise<void> {
   const pid = readPid(root);
   if (!pid) {
-    console.log("rbox daemon not running (no pidfile)");
+    console.log("background sync is not running");
     return;
   }
   if (isOurDaemon(pid, root)) {
     process.kill(pid, "SIGTERM");
-    console.log(`sent SIGTERM to rbox daemon (pid ${pid})`);
+    console.log(`stopping background sync (sent SIGTERM to process ${pid})`);
   } else {
-    console.log(`stale pidfile (pid ${pid} is not our daemon); cleaning up`);
+    console.log(`found a leftover record of an old background sync (process ${pid} is gone or not ours) — cleaned up`);
   }
   await fsp.rm(pidPath(root), { force: true });
 }
