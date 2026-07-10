@@ -5,7 +5,7 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (overnight) — session: design 93 git config sync built end-to-end (PR #192)._
+_Last updated: 2026-07-10 (morning) — v0.9.18 live fleet-wide: design 93 shipped end-to-end._
 
 ## Where we are
 
@@ -38,7 +38,18 @@ _Last updated: 2026-07-10 (overnight) — session: design 93 git config sync bui
   web sessions remain. Note: auth revoke is access-only — cryptographic key
   eviction needs epoch rotation (design 22 §1.3, unbuilt).
 
-- **Design 93 (git config sync) — PR #192, awaiting merge sign-off.** The
+- **Version: v0.9.18** (live fleet-wide 2026-07-10: Mac + FM daemons + Ubuntu
+  binary). Ships design 93 (#192) + field-driven hardening: bounds 64→512
+  keys (#193), reader-side config invalidity IGNORED never pull-fatal +
+  bounds-in-fingerprint cache invalidation (#194), crypto-pool test
+  isolation (#195, ledger item closed). Release-gate flake pattern repeated
+  (tag moved to fixed head, same as v0.9.17).
+- **KNOWN: Dfinitiv/savvy-core sits at a needs-resolution git conflict on
+  the Mac** (since 2026-07-10 02:35Z; born from deferred pulls while
+  BrianVia/arch-raw-error-records was checked out in a linked worktree).
+  Config lane correctly holds there — savvy-core's remotes won't sync to
+  fresh hosts until Brian resolves the conflict. Everything else publishes.
+- **Design 93 (git config sync) — SHIPPED v0.9.18.** The
   2026-07-10 deal-breaker (rbox-materialized repos have no remotes/tracking;
   ~90/host found on Ubuntu, 179 hand-healed) is closed permanently:
   allowlisted `remote.*`/`branch.*` keys travel in the encrypted git
