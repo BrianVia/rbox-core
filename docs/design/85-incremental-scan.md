@@ -153,8 +153,13 @@ already gives that process.
 > a directory and then restores its timestamps (`utimes` restores mtime; no
 > userspace call restores ctime, but clock manipulation plus collision could
 > in principle align both) is outside the fast path's proof and is healed by
-> the next unpruned deep scan (≤30m, `DEEP_SCAN_MS`). The deep scan is not
-> "insurance" — it is part of the invariant.
+> the next unpruned scan within `DEEP_SCAN_MS` (30m) — and that bound holds
+> on EVERY path, not only under a daemon (R3 F1): the daemon's deep scan is
+> unpruned on that cadence, and ANY scan (including a daemonless /
+> `--no-daemon` CLI one-shot) that finds the dircache's last unpruned
+> rebuild older than the same bound runs unpruned itself and rebuilds
+> (§3.1). The unpruned scan is not "insurance" — it is part of the
+> invariant, on every path.
 
 ### 3.0 Prerequisite ships (standalone, before Layer A and before phase-0's drift measurement)
 
@@ -221,12 +226,15 @@ Persist a per-directory listing table alongside `HashCache`
 corruption, absence, or version mismatch only costs a full readdir walk):
 
 ```
-header:  { version, ruleFingerprint, lastScanStartMs }
+header:  { version, lastScanStartMs, lastUnprunedScanAtMs,
+           ruleFiles: [{relPath, size, mtimeMs, ctimeMs} | {relPath, absent: true}] }
 entries: dirRelPath -> { mtimeMs, ctimeMs, children: [{name, type: file|dir|symlink}] }
 ```
 
 `scanManifest` gains an explicit dircache parameter with two modes — the mode
-is chosen by the CALL SITE, never defaulted inside the engine:
+is chosen by the CALL SITE, never defaulted inside the engine, and a `pruned`
+request self-demotes to `unpruned` when the header says the deadline or the
+rules require it:
 
 - **`pruned`** (CLI scans; daemon startup/ignore-rebuild/post-pull/safety
   sites): before `readdir(dir)`, **reuse** the cached child listing (names +
@@ -242,28 +250,67 @@ is chosen by the CALL SITE, never defaulted inside the engine:
   run the ignore matcher per child. **Miss** → `readdir` as today, rewrite
   the dir's entry stamped racy-or-clean.
 - **`unpruned`** (deep scan; degraded-watcher recovery scans; the
-  rules-changed path): the dircache is NEVER consulted. The walk readdirs
-  everything and **rebuilds** the dircache from the observed truth (fresh
-  header, fresh entries), exactly as `doDeepScan` already rebuilds the
-  HashCache from a fresh instance (`daemon.ts:1147-1149`). The scan stats
-  assert `dirsReusedFromCache === 0` in this mode. This closes review R1
-  F2: v2 would have let the deep scan reuse the same stale listing it exists
-  to catch — the backstop must not share the fast path's assumption.
+  rules-changed path; the deadline path below): the dircache is NEVER
+  consulted. The walk readdirs everything and **rebuilds** the dircache from
+  the observed truth (fresh header including `lastUnprunedScanAtMs = now`
+  and a fresh rule-file inventory, fresh entries), exactly as `doDeepScan`
+  already rebuilds the HashCache from a fresh instance
+  (`daemon.ts:1147-1149`). The scan stats assert `dirsReusedFromCache === 0`
+  in this mode. This closes review R1 F2: v2 would have let the deep scan
+  reuse the same stale listing it exists to catch — the backstop must not
+  share the fast path's assumption.
+
+**The unpruned deadline is path-independent (R3 F1).** The invariant's
+bounded-staleness promise previously leaned on the daemon-owned deep-scan
+timer (`daemon.ts:270`) — but a workspace used only through one-shot CLI
+commands has no daemon, so a timestamp-aliased listing could in principle
+have been reused forever there. Rule: a `pruned` scan first checks
+`now - lastUnprunedScanAtMs`; if it exceeds `DEEP_SCAN_MS` (30m — one
+constant, shared with the daemon's deep cadence), the scan self-demotes to
+`unpruned` and rebuilds. A `lastUnprunedScanAtMs` in the future (backward
+wall-clock jump) drops the table, same as the existing `lastScanStartMs`
+rule. Consequence stated honestly: daemonless CLI one-shots more than 30m
+apart never prune — which is exactly today's cost, so Layer A's CLI value
+concentrates where the pain is (retry legs and rapid sequences within an
+operation window, and the daemon's 60s safety ticks). This keeps §9's
+founder-call 2 honest rather than quietly inflating Layer A's CLI benefit.
 
 Three review fixes are load-bearing here:
 
-1. **Ignore-rule invalidation (v1 review BLOCKER).** Cached listings were
-   pruned under the rules in force when cached — a rule change can un-ignore
-   a subtree the cache never descended into. The daemon already full-rescans
-   on any ignore-rule file event (`daemon.ts:688-691`) and after a pull that
-   wrote rules (`daemon.ts:787-789`); Layer A must match: the table header
-   carries a `ruleFingerprint` (path + size + mtime of every effective
-   ignore-rule file, the `src/engine/ignore.ts:693` set); any mismatch drops
-   the ENTIRE table and the walk runs unpruned (rebuilding it). Whole-table
-   drop is deliberately simpler and safer than per-dir invalidation — rules
-   have non-local effects (negations). Cached listings are stored UNFILTERED
-   (raw readdir output) with the matcher applied on every reuse, so filtering
-   can never be stale independently of the fingerprint.
+1. **Ignore-rule invalidation (v1 review BLOCKER; inventory + fingerprint
+   fixed per R3 F2).** Cached listings were pruned under the rules in force
+   when cached — a rule change can un-ignore a subtree the cache never
+   descended into. The daemon already full-rescans on any ignore-rule file
+   event (`daemon.ts:688-691`) and after a pull that wrote rules
+   (`daemon.ts:787-789`); Layer A must match, and v3's first cut had two
+   holes R3 caught. (a) **Fingerprint strength:** `(path,size,mtime)` is the
+   exact tuple P-2 exists to reject — a same-size rule edit + `touch -r`
+   would leave it unchanged. Rule files use the P-2-grade
+   `(size, mtimeMs, ctimeMs)` tuple, recorded per file in the header's
+   `ruleFiles` inventory (absence recorded explicitly so creation of a root
+   file is a mismatch too). (b) **Inventory completeness:** the previously
+   cited `effectiveIgnoreRules` (`ignore.ts:693`) reads only the ROOT
+   `.gitignore`/`.rboxignore`, but the active matcher also lazily reads each
+   git-repo base's nested `.gitignore` (`getGitLayer`,
+   `ignore.ts:296-303`) and `isIgnoreRuleFile` recognizes nested rule files
+   at any depth (`ignore.ts:228-229`). The inventory is therefore defined as
+   OBSERVED, not enumerated a priori: every path matching `isIgnoreRuleFile`
+   in the listings the walk consumed (fresh readdirs AND reused cached
+   listings — children names are stored raw, so the set is derivable from
+   the table itself), plus the two root files unconditionally. This is not
+   circular: CREATING or DELETING a rule file bumps its parent dir's
+   mtime+ctime → that dir misses → readdir observes it (adversarial
+   timestamp restoration on the parent falls under the invariant's
+   unpruned-deadline bound, §3.1 above); EDITING an inventoried file is
+   caught by its per-file tuple, stat'd every scan (rule files are few —
+   trivial cost). Any mismatch — tuple, appearance, disappearance — drops
+   the ENTIRE table and the scan restarts unpruned (bounded: at most one
+   restart per scan), rebuilding matcher-visible state and dircache from
+   the same observed rule snapshot. Whole-table drop is deliberately
+   simpler and safer than per-dir invalidation — rules have non-local
+   effects (negations). Cached listings are stored UNFILTERED (raw readdir
+   output) with the matcher applied on every reuse, so filtering can never
+   be stale independently of the inventory.
 2. **No childCount in the check (v1 review MAJOR — circular).** You cannot
    know the current childCount without paying the readdir the check exists to
    skip. The check is dir `(mtime,ctime)` + racy-clean margin only; the
@@ -382,25 +429,37 @@ ENOENT/ECONNREFUSED as "no daemon" → local path.
 **Protocol** (newline-delimited JSON, versioned hello):
 
 ```
-CLI → daemon:  {v:1, op:"push"|"pull"|"sync", root, metrics:bool}
+CLI → daemon:  {v:1, op:"push"|"pull"|"sync", root, token, pid, metrics:bool}
 daemon → CLI:  {ack: {opId}} | {reject: {reason}}            — within 2s
 CLI → daemon:  {cancel: {opId}}                              — optional, any time
 daemon → CLI:  {progress: {phase, done, total, bytes?}}      — streamed, ≥1/10s
                {log: line}                                   — verbatim, --verbose fodder
                {cancelled: {opId}}                           — terminal (pre-bind cancel)
-               {result: {opId, ok, committed, sequence,
-                         files, deferred, error?,
-                         phaseReport?}}                      — terminal
+               {result: {opId, ok, error?, failedLeg?,
+                         push?: {committed, sequence, files, deferred},
+                         pull?: {writes, deletes,
+                                 conflicts: [{path, keepLocalAs}],
+                                 conflictsElided,
+                                 writtenPaths, writtenPathsElided},
+                         phaseReports?}}                     — terminal
 ```
+
+Framing rules (R3 F4): the hello carries the freshly read delegation
+`token` and the CLI `pid` — they are part of the normative wire schema, not
+prose; every frame is a single line, hard-capped (64KB request frames; 1MB
+result frames, sized by the caps below); an oversized, non-JSON, or
+schema-invalid frame is answered `reject: {reason: "malformed"}` (pre-ack)
+or dropped with the connection closed (post-ack, → the CLI's socket-close
+arm); the token is never echoed into any daemon log line (the per-op
+forensic line carries opId/pid/outcome only).
 
 `reject` reasons are enumerated: `version` (protocol mismatch), `root`
 (hello root ≠ daemon root), `auth` (missing/mismatched delegation token),
-`lock-degraded` (workspace locking unsupported — no exclusivity proof
-exists, R2 F2), `pull-only` (daemon started pull-only suppresses pushes,
-`daemon.ts:383-385` — a delegated `push`/`sync` is rejected, a delegated
-`pull` is fine), `unsupported` (future op). Any reject → CLI local path,
-chosen before any lock was taken. The hello also carries the CLI's pid for
-the daemon's per-op forensic log line.
+`malformed` (framing violation), `lock-degraded` (workspace locking
+unsupported — no exclusivity proof exists, R2 F2), `pull-only` (daemon
+started pull-only suppresses pushes, `daemon.ts:383-385` — a delegated
+`push`/`sync` is rejected, a delegated `pull` is fine), `unsupported`
+(future op). Any reject → CLI local path, chosen before any lock was taken.
 
 **Request↔result correlation and coalescing (R1 F12; demand separation per
 R2 F5).** The `want` booleans (`daemon.ts:179,387-395`) coalesce by design,
@@ -425,16 +484,30 @@ into one push iteration and each receives the same terminal result under
 its own opId — semantics: "a push cycle covering your request completed,"
 which is exactly what the coalescing pump means today.
 
-**Delegated `sync` result aggregation (R2 F6).** A sync's two legs bind to
+**Pull and sync result contracts (R2 F6; pull parity per R3 F3).** A local
+pull returns the individual actions: `summarize` prints per-conflict
+`path`/`keepLocalAs` lines, and `postSyncNudge` needs the WRITTEN paths for
+the design-29 drift notice (`main-dispatch.ts:258-274`;
+`sync-cmd.ts:66-73`). Counts alone cannot reproduce that, so the `pull`
+result payload (used by delegated `pull`, `sync --pull-only`, and the sync
+accumulator's pull leg alike) carries: `writes`/`deletes` counts; the
+conflict list as `{path, keepLocalAs}` pairs, capped at 50 with a
+`conflictsElided` count (same cap philosophy as the daemon log's
+`LOG_PATHS_MAX`); and `writtenPaths` capped at 500 with a
+`writtenPathsElided` flag. The CLI renders `summarize` from the payload and
+runs `postSyncNudge` CLI-SIDE from `writtenPaths` — the daemon never runs
+the nudge (it is a foreground advisory; design 29's `RBOX_NO_DRIFT`/config
+gates are the CLI's to apply). When `writtenPathsElided` is set the nudge
+is skipped — it is best-effort by contract (`sync-cmd.ts:33-44`), and a
+500+-file pull is not a lockfile-drift situation. A sync's two legs bind to
 two different pump iterations, so the terminal frame is built from a
 per-opId accumulator (`acc`), not from "the last iteration": the pull leg
-records the applied-action summary (writes/deletes/conflicts — what
-`summarize` prints locally) and the push leg records
+records the payload above and the push leg records
 `{sequence, committed, files, deferred}`; the `result` frame carries both
 plus `failedLeg: "pull"|"push"` on error, and with `metrics:true` the phase
-reports of both legs. The CLI renders it exactly as local `rbox sync` does
-(pulled summary line, then push line), and `--json` emits the same schema as
-the local path — which is what makes gate 6's schema-equivalence testable. A
+reports of both legs. The CLI renders output — human and `--json` — exactly
+as the local path does from the same data, which is what makes gate 6's
+schema-equivalence testable for all three delegated ops. A
 delegated op jumps no queue: the single-flight pump (`daemon.ts:419+`)
 serializes it against watcher batches and safety ticks — no new concurrency
 inside the daemon. Before a bound push the daemon drains pending watcher
@@ -724,7 +797,7 @@ concurrent designs cannot collide in the closed union.
 
 1. `scan` recordDetails (extends the SHIPPED ScanStats): adds
    `{ dirsReusedFromCache, midwriteDeferred, residualMs,
-   dircache: "hit"|"cold"|"rules-dropped"|"unpruned" }` to the existing
+   dircache: "hit"|"cold"|"rules-dropped"|"deadline"|"unpruned" }` to the existing
    readdir/stat/matcher/hash/sort/counts — makes P0.1/P0.2 self-reporting in
    the field and catches any regression that silently turns a pruned scan
    back into a full walk (design 82 §8 lesson). The unpruned mode asserts
@@ -770,7 +843,10 @@ runs on the shared WAN at a time — 83/84/85 serialize their gate runs.
 3. **Layer A warm full scan (if built per §5): ≤ 3s Mac / ≤ 6s Linux**, from
    6-15s; cold recorded alongside for the page-cache-fragility note. Applies
    to the daemon safety scan too (design 49 cadence cost ≤ 3s Mac). Dircache
-   bytes on the founder workspace ≤ 25% of hashcache.json's size.
+   bytes on the founder workspace ≤ 25% of hashcache.json's size. A pruned
+   request against a dircache past the 30m unpruned deadline (daemon
+   stopped) self-demotes: asserted via `dircache: "deadline"` +
+   `dirsReusedFromCache === 0`.
 4. **Correctness soak: 500 daemon cycles with injected edge cases** —
    mtime-preserving same-size edit, `touch -r` restore (file AND directory),
    atomic-rename save, case-only rename on APFS, create+delete+recreate of
@@ -824,6 +900,14 @@ Resolved in v3 (previously open or implicit):
    future hardening.
 7. **Delegation requires an exclusive workspace mutex** (R2 F2): a
    lock-degraded workspace rejects delegation and keeps today's behavior.
+8. **The unpruned deadline is path-independent** (R3 F1): any pruned scan —
+   daemon or daemonless — past 30m since the last unpruned rebuild
+   self-demotes, so the invariant's staleness bound needs no daemon.
+9. **The rule-file inventory is OBSERVED, per-file P-2-fingerprinted** (R3
+   F2): derived from walked+cached listings plus the root files, never from
+   the root-only `effectiveIgnoreRules` set.
+10. **Delegated pull returns actions, not counts** (R3 F3): capped
+    conflict pairs + written paths; `postSyncNudge` runs CLI-side only.
 
 Still the founder's calls:
 
