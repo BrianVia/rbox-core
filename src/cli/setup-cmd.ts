@@ -89,6 +89,9 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
     await runKeyedSetup(opts.cwd, opts.defaultRemote, flags);
     return;
   }
+  if (["dir", "daemon", "pull-only", "force"].some((flag) => flags[flag] !== undefined)) {
+    process.stderr.write("note: --dir/--daemon/--pull-only/--force only apply to keyed setup (--workspace <name|id> with a key) — ignored in the guided flow.\n");
+  }
   if (process.stdin.isTTY !== true) {
     process.stderr.write(
       "rbox setup is interactive. For scripts/CI use `rbox init` " +

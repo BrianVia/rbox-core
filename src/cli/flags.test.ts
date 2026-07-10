@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { parseFlags } from "./flags.js";
+import { parseFlags, unknownFlagError } from "./flags.js";
 
 test("--json is a boolean long flag before or after a status path", () => {
   expect(parseFlags(["--json", "."])).toEqual({ positional: ["."], flags: { json: "true" } });
@@ -26,4 +26,16 @@ test("ignore respect-gitignore consumes on/off value", () => {
     positional: [],
     flags: { "respect-gitignore": "on", path: "." },
   });
+});
+
+test("unknown flags are rejected against command and subcommand help", () => {
+  expect(unknownFlagError("start", [], { pullonly: "true" })).toContain("--pullonly");
+  expect(unknownFlagError("start", [], { pullonly: "true" })).toContain("rbox start --help");
+  expect(unknownFlagError("start", [], { "pull-only": "true" })).toBeUndefined();
+  expect(unknownFlagError("key", ["materialize"], { "key-file": "x" })).toBeUndefined();
+});
+
+test("global and real undocumented flags remain allowed", () => {
+  expect(unknownFlagError("track", [], { "no-interactive": "true" })).toBeUndefined();
+  expect(unknownFlagError("status", [], { json: "true" })).toBeUndefined();
 });

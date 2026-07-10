@@ -1,13 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import {
   buildDiagnosticsBundle,
-  DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE,
   doctorCmd,
   presentDiagnosticsPreview,
   type DiagnosticsBundle,
@@ -111,7 +108,6 @@ async function expectReportReachesConsent(opts: { diagnostics?: boolean; env?: b
     await expect(doctorCmd(root, { report: true, yes: false, diagnostics: opts.diagnostics })).rejects.toThrow(/--yes/);
     expect(calls.length).toBeGreaterThan(0);
     expect(logs.join("\n")).toContain("doctor");
-    expect(logs.join("\n")).not.toContain(DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -178,36 +174,25 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
   }
 });
 
-test("doctor --report refuses when diagnostics upload is disabled before network work", async () => {
-  let fetches = 0;
-  globalThis.fetch = (() => {
-    fetches++;
-    throw new Error("diagnostics gate should not fetch");
-  }) as typeof fetch;
-
-  await doctorCmd("/does/not/need/a/workspace", { report: true, yes: true });
-
-  expect(fetches).toBe(0);
-  expect(process.exitCode).toBe(1);
-  process.exitCode = 0;
-  expect(logs).toEqual([DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE]);
+test("doctor --report prints a local preview and does not upload", async () => {
+  const root = await makeWorkspace();
+  try {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const calls = recordFetches();
+    await doctorCmd(root, { report: true, yes: false });
+    expect(calls.some((url) => url.endsWith("/v1/diagnostics"))).toBe(false);
+    expect(logs.join("\n")).toContain("--- diagnostics preview (");
+    expect(logs.join("\n")).toContain("--- end diagnostics preview ---");
+    expect(logs.join("\n")).toContain("nothing was uploaded — add --diagnostics to send this report to rbox support");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
-test("dispatcher refuses doctor --report before resolving the workspace", async () => {
-  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-noworkspace-"));
-  try {
-    const cliEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
-    const res = spawnSync(process.execPath, [cliEntry, "doctor", "--report"], {
-      cwd,
-      env: { ...process.env, RBOX_HOME: home },
-      encoding: "utf8",
-    });
-    expect(res.status).toBe(1);
-    expect(res.stdout.trim()).toBe(DIAGNOSTICS_UPLOAD_DISABLED_MESSAGE);
-    expect(res.stderr).not.toContain("Not inside an rbox workspace");
-  } finally {
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
+test("doctor --diagnostics without --report errors with guidance", async () => {
+  await expect(doctorCmd("/does/not/need/a/workspace", { report: false, yes: false, diagnostics: true })).rejects.toThrow(
+    "--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics"
+  );
 });
 
 test("doctor --report --diagnostics proceeds to the normal preview consent flow", async () => {

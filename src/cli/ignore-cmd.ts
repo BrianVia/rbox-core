@@ -6,6 +6,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { promptConfirm } from "./prompt.js";
 import { pushManifest } from "./sync.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
+import { style } from "./style.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -27,17 +28,24 @@ export async function addIgnorePattern(root: string, pattern: string): Promise<v
   await fs.writeFile(file, next);
   console.log(`added to ${RBOXIGNORE}: ${pattern}`);
   if (isSlashlessNegation(pattern)) {
-    console.warn(`warning: slashless .rboxignore negation disables gitignore directory pruning; scans stay correct but may be slower.`);
+    console.warn("note: a negation pattern without a slash (like `!name`) makes rbox check every folder instead of skipping ignored ones — syncing stays correct, but scans of big trees can get slower.");
   }
   console.log(`(forward-only: already-synced matches keep their last copy on other machines and stop syncing.`);
   console.log(` to remove a file from all machines, delete it FIRST, let that sync, then ignore it.)`);
 }
 
 /** Print the effective ignore rule set, labeled by source, in precedence order. */
-export function listIgnoreRules(root: string): void {
+export function listIgnoreRules(root: string, opts: { full?: boolean } = {}): void {
   const rules = effectiveIgnoreRules(root);
   console.log(`effective ignore rules (precedence: builtin → .gitignore → .rboxignore):`);
-  for (const r of rules) console.log(`  [${r.source}] ${r.pattern}`);
+  if (opts.full) {
+    for (const r of rules) console.log(`  [${r.source}] ${r.pattern}`);
+  } else {
+    const builtinCount = rules.filter((r) => r.source === "builtin").length;
+    console.log(`  [builtin] ${builtinCount} default patterns (node_modules, .git, build caches, …) — see them all with \`rbox ignore --list\``);
+    for (const r of rules) if (r.source !== "builtin") console.log(`  [${r.source}] ${r.pattern}`);
+  }
+  console.log(style.dim("add a pattern:  rbox ignore '<glob>'    ·    respect .gitignore: rbox ignore --respect-gitignore <on|off>"));
 }
 
 export async function setRespectGitignore(root: string, raw: string | undefined): Promise<void> {

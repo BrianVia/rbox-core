@@ -38,7 +38,7 @@ function count(actions: Action[], kind: Action["kind"]): number {
 
 export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: RecoverOptions = {}, deps: RecoverDeps = {}): Promise<void> {
   const root = await (deps.findRoot ?? findRoot)(pathArg ?? process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
+  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
   if (!opts.yes) {
     const ok = await (deps.confirm ?? promptConfirm)({
       message: `Recover ${root}? This clears the local verified-head pin, pulls the server head, reconciles files, then pushes remaining local diffs.`,

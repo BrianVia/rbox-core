@@ -28,6 +28,7 @@ export interface CommandHelp {
   /** Full invocation, e.g. "rbox track <path> [--workspace <id>]". */
   usage: string;
   flags?: { flag: string; desc: string }[];
+  notes?: string[];
   examples?: string[];
   /** Excluded from the grouped screen (init, deprecated aliases, internal). */
   hidden?: boolean;
@@ -52,7 +53,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "guided onboarding: account → workspace → start syncing",
     usage: "rbox setup [--workspace <name|id>] [--dir <path>] [--key -] [--key-file <path>] [--daemon] [--pull-only] [--force]",
     flags: [
-      { flag: "--workspace <name|id>", desc: "with RBOX_KEY, sync an existing workspace non-interactively" },
+      { flag: "--workspace <name|id>", desc: "with RBOX_KEY, sync an existing workspace non-interactively (alias: -w)" },
       { flag: "--dir <path>", desc: "target directory for keyed setup" },
       { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
       { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
@@ -68,10 +69,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "authorize this machine",
     usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--kit] [--kit-path <path>]",
     flags: [
-      { flag: "--bootstrap <secret>", desc: "create a new account from a bootstrap secret (genesis device)" },
+      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret (a one-time secret; this machine becomes the account's first key-holding device)" },
       { flag: "--plan <solo|pro>", desc: "request a bootstrap plan when the server supports plan selection" },
-      { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
-      { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
+      { flag: "--kit", desc: "save the recovery phrase to a plaintext 'recovery kit' file at the default path" },
+      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
     ],
   },
   {
@@ -94,15 +96,16 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox init [--new | --workspace <id>] [--root <path>] [--respect-gitignore] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
     flags: [
       { flag: "--new", desc: "create a new workspace" },
-      { flag: "--workspace <id>", desc: "join an existing workspace" },
+      { flag: "--workspace <id>", desc: "join an existing workspace (alias: -w)" },
       { flag: "--root <path>", desc: "directory to track (default: cwd)" },
-      { flag: "--bootstrap <secret>", desc: "create a new account before initializing" },
+      { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret before initializing" },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
-      { flag: "--kit", desc: "write the bootstrap recovery phrase to the default recovery kit path" },
-      { flag: "--kit-path <path>", desc: "write the bootstrap recovery phrase to a specific recovery kit file" },
+      { flag: "--kit", desc: "save the recovery phrase to a plaintext 'recovery kit' file at the default path" },
+      { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file" },
       { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
+      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)" },
     ],
-    hidden: true, // documented under `rbox help init`, not in the grouped screen
   },
 
   // ── SYNCING ──────────────────────────────────────────────────────────────
@@ -143,9 +146,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "tail background-sync logs",
     usage: "rbox logs [path] [--follow] [--limit N]",
     flags: [
-      { flag: "--follow", desc: "stream new log lines (Ctrl-C to exit)" },
+      { flag: "--follow", desc: "stream new log lines (Ctrl-C to exit) (alias: -f)" },
       { flag: "--limit N", desc: "show the last N lines (default 50)" },
-      { flag: "--lines N", desc: "alias for --limit" },
+      { flag: "--lines N", desc: "alias for --limit (alias: -n)" },
     ],
   },
   {
@@ -154,7 +157,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "sync once (pull, then push)",
     usage: "rbox sync [path] [--allow-mass-delete] [--pull-only] [--verbose]",
     flags: [
-      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
+      { flag: "--allow-mass-delete", desc: "consent to both pull-side and push-side mass-delete guards for this run" },
       { flag: "--pull-only", desc: "pull remote changes and skip the push phase" },
       { flag: "--verbose", desc: "print each git repo's apply/conflict/defer line instead of a running count" },
     ],
@@ -183,7 +186,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox export [--all | --workspace <id>] [--out <dir | file.tar.gz>]",
     flags: [
       { flag: "--all", desc: "export every workspace (default)" },
-      { flag: "--workspace <id>", desc: "export one workspace" },
+      { flag: "--workspace <id>", desc: "export one workspace (alias: -w)" },
       { flag: "--out <path>", desc: "write to a directory or .tar.gz (default: ~/Downloads)" },
     ],
     examples: ["rbox export", "rbox export --workspace ws_ab12cd34", "rbox export --out ~/backup.tar.gz"],
@@ -192,11 +195,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "track",
     group: "SYNCING",
     summary: "bind a directory to a workspace (create/join; no first sync)",
-    usage: "rbox track <path> [--workspace <id>] [--respect-gitignore]",
+    usage: "rbox track [path] [--workspace <id>] [--respect-gitignore]",
     flags: [
-      { flag: "--workspace <id>", desc: "join an existing workspace instead of creating one" },
+      { flag: "--workspace <id>", desc: "join an existing workspace instead of creating one (alias: -w)" },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
+      { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)" },
     ],
+    notes: ["[path] defaults to the current directory"],
     examples: ["rbox track ~/code/myapp", "rbox track ~/code/myapp --workspace ws_ab12cd34"],
   },
   {
@@ -216,9 +222,10 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--list", desc: "print the effective ignore rules" },
       { flag: "--respect-gitignore <on|off>", desc: "toggle skipping gitignored untracked files" },
       { flag: "--purge", desc: "delete already-synced paths that are now ignored after a dry-run" },
-      { flag: "--yes", desc: "confirm --purge in headless mode" },
+      { flag: "--yes", desc: "confirm --purge in headless mode (alias: -y)" },
       { flag: "--allow-mass-delete", desc: "also consent to the push-side mass-delete guard" },
     ],
+    examples: ["rbox ignore 'dist/**'", "rbox ignore --list"],
   },
   {
     name: "trash list",
@@ -239,6 +246,7 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
       { flag: "--batch <name>", desc: "restore from a specific trash batch (default: newest)" },
     ],
+    notes: ["restores files rbox itself moved to the local trash — to fetch an older synced version, see `rbox restore`"],
   },
   {
     name: "trash empty",
@@ -251,17 +259,24 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "versions",
     group: "SYNCING",
     summary: "list version history (or a file's change history)",
-    usage: "rbox versions [path] [--limit <n>] [--json]",
+    usage: "rbox versions [file] [--limit <n>] [--json]",
     flags: [
       { flag: "--limit <n>", desc: "maximum versions to show" },
       { flag: "--json", desc: "print JSON" },
     ],
+    notes: ["[file] is a path INSIDE the current directory's workspace (it scopes history to that file); unlike other commands, it does not locate the workspace."],
+    examples: ["rbox versions", "rbox versions src/app.ts --limit 20"],
   },
   {
     name: "restore",
     group: "SYNCING",
     summary: "restore a file from a past version",
-    usage: "rbox restore <path>@<seq>",
+    usage: "rbox restore <file>@<seq>",
+    notes: [
+      "<file> is resolved inside the current directory's workspace.",
+      "restores from synced version history — for files rbox moved to the local trash, see `rbox trash restore`",
+    ],
+    examples: ["rbox restore src/app.ts@3"],
   },
 
   // ── DEPENDENCIES ─────────────────────────────────────────────────────────
@@ -318,7 +333,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "connect",
     group: "DEVICES & ACCOUNT",
     summary: "add this machine from a pasted token (stdin)",
-    usage: "echo <token> | rbox connect",
+    usage: "rbox connect",
+    flags: [{ flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" }],
+    examples: ["rbox connect", "echo <token> | rbox connect"],
   },
   {
     name: "recover",
@@ -326,7 +343,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "clear the local head pin and re-baseline a halted workspace",
     usage: "rbox recover [path] [--yes] [--allow-mass-delete]",
     flags: [
-      { flag: "--yes", desc: "skip the confirmation prompt" },
+      { flag: "--yes", desc: "skip the confirmation prompt (alias: -y)" },
       { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
     ],
   },
@@ -356,9 +373,26 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
+    name: "key status",
+    group: "DEVICES & ACCOUNT",
+    summary: "show this machine's encryption enrollment state",
+    usage: "rbox key status [--json]",
+    flags: [{ flag: "--json", desc: "print JSON" }],
+  },
+  {
+    name: "key backup",
+    group: "DEVICES & ACCOUNT",
+    summary: "re-show your recovery phrase (if it was cached at setup)",
+    usage: "rbox key backup [--kit] [--kit-path <path>]",
+    flags: [
+      { flag: "--kit", desc: "write the cached recovery phrase to the default recovery kit path" },
+      { flag: "--kit-path <path>", desc: "write the cached recovery phrase to a specific recovery kit file" },
+    ],
+  },
+  {
     name: "key recover",
     group: "DEVICES & ACCOUNT",
-    summary: "re-enroll this machine from your recovery phrase",
+    summary: "re-enroll this machine from your recovery phrase (requires `rbox login` first)",
     usage: "rbox key recover [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--kit", desc: "write the entered recovery phrase to the default recovery kit path after recovery" },
@@ -371,7 +405,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "set up encryption on the first machine",
     usage: "rbox key genesis --yes [--kit] [--kit-path <path>]",
     flags: [
-      { flag: "--yes", desc: "required to mint the account's first encryption keys" },
+      { flag: "--yes", desc: "required to mint the account's first encryption keys (alias: -y)" },
       { flag: "--kit", desc: "write the recovery phrase to the default recovery kit path" },
       { flag: "--kit-path <path>", desc: "write the recovery phrase to a specific recovery kit file" },
     ],
@@ -391,8 +425,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key materialize",
     group: "DEVICES & ACCOUNT",
     summary: "unpack RBOX_KEY into the local keystore",
-    usage: "rbox key materialize [--dir <path>]",
-    flags: [{ flag: "--dir <path>", desc: "RBOX_HOME directory to write (default: standard location)" }],
+    usage: "rbox key materialize [--dir <path>] [--key -] [--key-file <path>]",
+    flags: [
+      { flag: "--dir <path>", desc: "RBOX_HOME directory to write (default: standard location)" },
+      { flag: "--key -", desc: "read the bundle from stdin; the RBOX_KEY env var is read automatically — literal --key=<value> is rejected (argv leaks)" },
+      { flag: "--key-file <path>", desc: "read the RBOX_KEY bundle from a file" },
+    ],
   },
   {
     name: "key list",
@@ -435,11 +473,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "check workspace health; optionally upload a support report",
-    usage: "rbox doctor [--report] [--diagnostics] [--yes]",
+    usage: "rbox doctor [--report] [--diagnostics] [--yes] [--path <dir>]",
     flags: [
-      { flag: "--report", desc: "preview/upload a plaintext support report stored 30 days; upload requires opt-in" },
-      { flag: "--diagnostics", desc: "opt in to uploading the support report for this invocation" },
-      { flag: "--yes", desc: "skip the consent prompt; required with --report in non-interactive mode" },
+      { flag: "--report", desc: "build and print the support report locally" },
+      { flag: "--diagnostics", desc: "with --report, upload the report to rbox support (stored unencrypted for 30 days)" },
+      { flag: "--yes", desc: "skip the upload consent prompt; required with --report --diagnostics in non-interactive mode (alias: -y)" },
+      { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
     ],
   },
   {
@@ -447,14 +486,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "update the rbox binary",
     usage: "rbox upgrade [--check]",
-    flags: [{ flag: "--check", desc: "report whether an update is available, without installing" }],
+    flags: [
+      { flag: "--check", desc: "report whether an update is available, without installing" },
+      { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
+    ],
   },
   {
     name: "uninstall",
     group: "BILLING & MAINTENANCE",
     summary: "remove local rbox state and installed files",
     usage: "rbox uninstall [--yes]",
-    flags: [{ flag: "--yes", desc: "perform the removal; without it, print the steps only" }],
+    flags: [{ flag: "--yes", desc: "perform the removal; without it, print the steps only (alias: -y)" }],
   },
   {
     name: "version",
@@ -467,6 +509,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "print shell integration (prompt status + completions)",
     usage: "rbox shell-init zsh",
+    notes: ["adds the rbox status segment to your prompt and installs tab-completions for rbox commands"],
     examples: ['eval "$(rbox shell-init zsh)"'],
   },
   {
@@ -474,6 +517,8 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "BILLING & MAINTENANCE",
     summary: "print shell completions",
     usage: "rbox completions zsh",
+    notes: ["`rbox shell-init zsh` already includes these completions — use `completions` only if you manage compdef yourself"],
+    examples: ["rbox completions zsh > ~/.zsh/completions/_rbox"],
   },
   {
     name: "prompt-status",
@@ -503,8 +548,8 @@ const byName = new Map(COMMAND_HELP.map((c) => [c.name, c]));
  */
 export function helpFor(commandPath: string): CommandHelp[] | undefined {
   const exact = byName.get(commandPath);
-  if (exact) return [exact];
   const subs = COMMAND_HELP.filter((c) => c.name.startsWith(`${commandPath} `));
+  if (exact) return [exact, ...subs];
   return subs.length ? subs : undefined;
 }
 
@@ -514,6 +559,7 @@ export function renderCommand(c: CommandHelp): string {
   lines.push(`${style.bold(c.name)} — ${c.summary}`);
   lines.push("");
   lines.push(`${style.dim("usage:")} ${c.usage}`);
+  if (c.notes?.length) for (const note of c.notes) lines.push(style.dim(note));
   if (c.alias) lines.push(style.yellow(`deprecated: use \`rbox ${c.alias}\``));
   if (c.flags?.length) {
     lines.push("");

@@ -8,6 +8,7 @@ import { emitJson } from "./json.js";
 import { isInteractive, promptConfirm } from "./prompt.js";
 import { shQuote } from "./shell-quote.js";
 import { encodeAgentKeyBundle, materializeAgentKey, type AgentKeyBundle } from "./agent-key-bundle.js";
+import { readKeyBundle } from "./setup-keyed.js";
 
 function parseDuration(raw: string | undefined): number {
   if (!raw || raw === "true") throw new Error("usage: rbox key create-ci --expires <duration> (suggested: 90d)");
@@ -23,8 +24,13 @@ function parseDuration(raw: string | undefined): number {
 }
 
 export async function materializeCmd(flags: Record<string, string>): Promise<void> {
-  if (!process.env.RBOX_KEY) throw new Error("RBOX_KEY is not set");
-  const out = await materializeAgentKey(process.env.RBOX_KEY, { dir: flags.dir && flags.dir !== "true" ? flags.dir : undefined });
+  if (flags.key && flags.key !== "true" && flags.key !== "-") {
+    throw new Error("refusing --key=<value>: argv leaks secrets via shell history and process listings. Use RBOX_KEY, --key-file <path>, or --key -.");
+  }
+  if (!process.env.RBOX_KEY && !flags["key-file"] && flags.key !== "-") {
+    throw new Error("no key provided — set RBOX_KEY, pass --key-file <path>, or pipe the bundle with --key - (bundles come from `rbox key create-ci`)");
+  }
+  const out = await materializeAgentKey(await readKeyBundle(flags), { dir: flags.dir && flags.dir !== "true" ? flags.dir : undefined });
   console.log(`export RBOX_HOME=${shQuote(out.home)}`);
   console.log(`export RBOX_TOKEN=${shQuote(out.token)}`);
   console.log(`export RBOX_ACCOUNT_ID=${shQuote(out.accountId)}`);

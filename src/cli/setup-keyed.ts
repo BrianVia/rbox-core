@@ -18,7 +18,7 @@ export function hasKeyInput(flags: Record<string, string>): boolean {
   return Boolean(process.env.RBOX_KEY || flags["key-file"] || flags.key);
 }
 
-async function readKeyBundle(flags: Record<string, string>): Promise<string> {
+export async function readKeyBundle(flags: Record<string, string>): Promise<string> {
   if (flags.key === "-") return readStdinTrimmed();
   if (flags["key-file"]) {
     if (flags["key-file"] === "true") throw new Error("--key-file requires a path");

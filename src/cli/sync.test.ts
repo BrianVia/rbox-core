@@ -1104,6 +1104,7 @@ test("mass-delete guard: a pull deleting ≥half the baseline fails closed until
 
   remote.injectCommit([]); // the remote head becomes EMPTY (poisoned/reset stream)
   await expect(pull(root, cfg, deps(remote))).rejects.toThrow(/mass-delete guard/);
+  await expect(pull(root, cfg, { ...deps(remote), massDeleteHint: "rbox sync --allow-mass-delete" })).rejects.toThrow(/rbox sync --allow-mass-delete/);
   expect(await read("f0.txt")).toBe("0\n"); // fails closed BEFORE touching disk
   expect(await read("f119.txt")).toBe("119\n");
 

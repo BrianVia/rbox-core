@@ -5,6 +5,8 @@ import path from "node:path";
 import {
   handleDeviceCodePostApprovalEncryption,
   login,
+  readPairingTokenInteractive,
+  recoverCmd,
   runGenesisEnrollment,
 } from "./auth-cmd.js";
 import { _setSpawner } from "./browser-open.js";
@@ -39,10 +41,58 @@ let home: string;
 const origLog = console.log;
 const origFetch = globalThis.fetch;
 const origSetTimeout = globalThis.setTimeout;
+const origHome = process.env.HOME;
+
+test("pairing token input prompts without echo on an interactive terminal", async () => {
+  let promptMessage = "";
+  let read = false;
+  const token = await readPairingTokenInteractive({
+    isInteractive: () => true,
+    promptPassword: async (opts) => {
+      promptMessage = opts.message;
+      return "  secret-token  ";
+    },
+    readStdin: async () => {
+      read = true;
+      return "stdin-token";
+    },
+  });
+  expect(token).toBe("secret-token");
+  expect(promptMessage).toBe("Paste pairing token");
+  expect(read).toBe(false);
+});
+
+test("pairing token input drains stdin when non-interactive", async () => {
+  let prompted = false;
+  const token = await readPairingTokenInteractive({
+    isInteractive: () => false,
+    promptPassword: async () => {
+      prompted = true;
+      return "prompt-token";
+    },
+    readStdin: async () => "  stdin-token  ",
+  });
+  expect(token).toBe("stdin-token");
+  expect(prompted).toBe(false);
+});
+
+test("key recover requires login before reading the recovery phrase", async () => {
+  const token = process.env.RBOX_TOKEN;
+  const accountId = process.env.RBOX_ACCOUNT_ID;
+  delete process.env.RBOX_TOKEN;
+  delete process.env.RBOX_ACCOUNT_ID;
+  try {
+    await expect(recoverCmd()).rejects.toThrow("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
+  } finally {
+    if (token !== undefined) process.env.RBOX_TOKEN = token;
+    if (accountId !== undefined) process.env.RBOX_ACCOUNT_ID = accountId;
+  }
+});
 
 beforeEach(async () => {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-auth-home-"));
   process.env.RBOX_HOME = home;
+  process.env.HOME = home;
   console.log = () => {};
   _setSpawner(() => ({ on: () => {}, unref: () => {} }));
 });
@@ -53,6 +103,8 @@ afterEach(async () => {
   globalThis.setTimeout = origSetTimeout;
   _setSpawner();
   delete process.env.RBOX_HOME;
+  if (origHome === undefined) delete process.env.HOME;
+  else process.env.HOME = origHome;
   await fs.rm(home, { recursive: true, force: true });
 });
 

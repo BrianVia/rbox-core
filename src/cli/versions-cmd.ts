@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { isSafeRelPath, restoreEntryToPath } from "../engine/index.js";
+import { openTrashBatch } from "../engine/trash.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { emitJson } from "./json.js";
@@ -104,7 +105,16 @@ export async function restoreCmd(root: string, spec: string): Promise<void> {
     throw new Error("refusing to restore: file entry has no ciphertext address (encSha) — workspace is not E2EE-consistent.");
   }
 
-  await restoreEntryToPath(root, entry, remote.blobStore(), Buffer.from(kek));
+  const batch = openTrashBatch(root);
+  let previousCopyTrashed = false;
+  try {
+    ({ previousCopyTrashed } = await restoreEntryToPath(root, entry, remote.blobStore(), Buffer.from(kek), { trash: batch }));
+  } finally {
+    await batch.finish();
+  }
   console.log(`${style.green("restored")} ${style.cyan(rel)} ${style.dim("←")} version @${style.cyan(String(seq))}`);
+  if (previousCopyTrashed) {
+    console.log(style.dim(`previous copy of ${rel} moved to the local trash — undo with: rbox trash restore ${rel}`));
+  }
   console.log(style.dim("(written to disk as a local change — run `rbox push`/`rbox sync` to publish it as a new version)"));
 }

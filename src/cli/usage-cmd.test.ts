@@ -63,7 +63,15 @@ describe("rbox usage", () => {
     expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, read-only)");
     expect(out).toContain("workspaces: 1 / 1");
     expect(out).toContain("retention:  0 days (current state only)");
-    expect(out).toContain("grace:      none");
-    expect(out).toContain("read-only:  yes");
+    expect(out).not.toContain("grace:");
+    expect(out).toContain("read-only:  yes (over quota or subscription lapsed — pushes are blocked)");
+  });
+
+  test("human render explains an active billing grace period", async () => {
+    stub(JSON.stringify({ ...dto, graceUntil: 1_700_000_000_000, readOnly: false }));
+    await usageCmd();
+    const out = logs[0]!;
+    expect(out).toContain("grace:      until 2023-11-14T22:13:20.000Z (billing lapsed — syncing keeps working until then)");
+    expect(out).not.toContain("read-only:");
   });
 });

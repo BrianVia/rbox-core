@@ -1,5 +1,6 @@
 import { requireCredentials } from "./credentials.js";
 import { formatBinaryBytes } from "./quota-format.js";
+import { friendlyHttpError } from "./http-error.js";
 
 export interface AccountUsageDTO {
   plan: string;
@@ -24,7 +25,7 @@ export async function usageCmd(opts: { json?: boolean } = {}): Promise<void> {
     headers: { authorization: `Bearer ${c.token}` },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`usage failed: ${res.status} ${text}`);
+  if (!res.ok) throw await friendlyHttpError(res, "usage", text);
   if (opts.json) {
     console.log(text);
     return;
@@ -47,13 +48,13 @@ function renderUsage(u: AccountUsageDTO): string {
   const storageNote = u.storageCap === null ? "unlimited" : `${pct}%${u.readOnly ? ", read-only" : ""}`;
   const workspaceCap = u.workspaceCap === null ? "unlimited" : u.workspaceCap.toLocaleString("en-US");
   const retention = u.retentionDays === 0 ? "0 days (current state only)" : `${u.retentionDays.toLocaleString("en-US")} day${u.retentionDays === 1 ? "" : "s"}`;
-  const grace = u.graceUntil === null ? "none" : new Date(u.graceUntil).toISOString();
-  return [
+  const lines = [
     `plan:       ${renderPlan(u.plan)}`,
     `storage:    ${bar}  ${storage}   (${storageNote})`,
     `workspaces: ${u.workspaces.toLocaleString("en-US")} / ${workspaceCap}`,
     `retention:  ${retention}`,
-    `grace:      ${grace}`,
-    `read-only:  ${u.readOnly ? "yes" : "no"}`,
-  ].join("\n");
+  ];
+  if (u.graceUntil !== null) lines.push(`grace:      until ${new Date(u.graceUntil).toISOString()} (billing lapsed — syncing keeps working until then)`);
+  if (u.readOnly) lines.push("read-only:  yes (over quota or subscription lapsed — pushes are blocked)");
+  return lines.join("\n");
 }

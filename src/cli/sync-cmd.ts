@@ -61,6 +61,8 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
       deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
       attachGitSyncProgress(deps, sp, { verbose: opts.verbose });
       deps.allowMassDelete = opts.allowMassDelete === true;
+      deps.allowMassDeletePush = opts.allowMassDelete === true;
+      deps.massDeleteHint = "rbox sync --allow-mass-delete";
       const report = beginReport(opts.pullOnly ? "pull" : "sync");
       deps.report = report;
       if (opts.pullOnly) {

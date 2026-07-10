@@ -31,7 +31,7 @@ export interface TrashBatch {
   /** Atomically move `root/<relPath>` (file, symlink, or whole directory)
    *  into this batch, creating parents. A vanished source is not an error
    *  (delete semantics: already gone). Same-name collisions get `~2`, `~3`… */
-  put(relPath: string): Promise<void>;
+  put(relPath: string): Promise<boolean>;
   /** Mark the batch settled (removes `.active`). Call after the apply phase;
    *  a batch that never received a put leaves nothing on disk. */
   finish(): Promise<void>;
@@ -61,7 +61,7 @@ export function openTrashBatch(root: string, now: Date = new Date()): TrashBatch
   let armed = false; // batch dir + marker created lazily on first put
   return {
     dir,
-    async put(relPath: string): Promise<void> {
+    async put(relPath: string): Promise<boolean> {
       assertSafeRel(relPath);
       const from = path.join(root, relPath);
       let to = path.join(dir, relPath);
@@ -83,9 +83,10 @@ export function openTrashBatch(root: string, now: Date = new Date()): TrashBatch
       }
       try {
         await fs.rename(from, to);
+        return true;
       } catch (e) {
         const code = (e as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") return; // already gone / ancestor evicted
+        if (code === "ENOENT" || code === "ENOTDIR") return false; // already gone / ancestor evicted
         throw e;
       }
     },

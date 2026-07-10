@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { COMMAND_HELP, helpFor, helpKeyFor, renderGroupedHelp } from "./help-registry.js";
+import { COMMAND_HELP, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
 import { ALIAS_COMMANDS, KNOWN_TOP_LEVEL, PUBLIC_COMMANDS } from "./command-catalog.js";
 import { resolveAlias } from "./deprecations.js";
 
@@ -11,6 +11,26 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track).toHaveLength(1);
   expect(track![0]!.name).toBe("track");
   expect(track![0]!.usage).toContain("rbox track");
+});
+
+test("per-command help: a command with registered sub-verbs includes them", () => {
+  expect(helpFor("key")?.map((entry) => entry.name)).toEqual([
+    "key",
+    "key status",
+    "key backup",
+    "key recover",
+    "key genesis",
+    "key create-ci",
+    "key materialize",
+    "key list",
+    "key revoke",
+  ]);
+});
+
+test("per-command help renders notes after usage", () => {
+  const rendered = renderCommand(byName.get("restore")!);
+  expect(rendered.indexOf("usage:")).toBeLessThan(rendered.indexOf("<file> is resolved inside"));
+  expect(rendered).toContain("rbox trash restore");
 });
 
 test("per-command help: the deps group is currently empty (commented out, design 51)", () => {
@@ -69,5 +89,5 @@ test("grouped screen renders every public group and omits hidden commands", () =
   expect(screen).not.toContain("DEPENDENCIES");
   expect(screen).toContain("setup");
   expect(screen).not.toContain("hydrate"); // disabled alongside `deps` (design 51)
-  expect(screen).not.toMatch(/^\s*init\s/m); // init is hidden from the main screen
+  expect(screen).toMatch(/^\s*init\s/m);
 });

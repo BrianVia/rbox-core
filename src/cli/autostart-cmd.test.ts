@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   autostartWorkspaceStatuses,
+  autostartCmd,
   bootResume,
   desiredStatePath,
   enableAutostart,
@@ -113,6 +114,37 @@ test("enable autostart writes a oneshot systemd resume", async () => {
   expect(unit).toContain("ExecStart=%h/.rbox/bin/rbox __boot-resume");
   expect(unit).not.toContain("Restart=");
   expect(commands).toEqual(["systemctl --user daemon-reload", "systemctl --user enable rbox.service"]);
+});
+
+for (const [lingerOutput, showsNote] of [["Linger=no\n", true], ["Linger=yes\n", false]] as const) {
+  test(`autostart status ${showsNote ? "shows" : "hides"} the linger note for ${lingerOutput.trim()}`, async () => {
+    const lines: string[] = [];
+    const oldLog = console.log;
+    console.log = (line?: unknown) => void lines.push(String(line ?? ""));
+    try {
+      await autostartCmd("status", { platform: "linux", home, loadCredentials: async () => undefined, exec: async () => lingerOutput });
+    } finally {
+      console.log = oldLog;
+    }
+    expect(lines.some((line) => line.includes("enable-linger"))).toBe(showsNote);
+  });
+}
+
+test("autostart status hides the linger note when loginctl fails", async () => {
+  const lines: string[] = [];
+  const oldLog = console.log;
+  console.log = (line?: unknown) => void lines.push(String(line ?? ""));
+  try {
+    await autostartCmd("status", {
+      platform: "linux",
+      home,
+      loadCredentials: async () => undefined,
+      exec: async () => { throw new Error("loginctl unavailable"); },
+    });
+  } finally {
+    console.log = oldLog;
+  }
+  expect(lines.some((line) => line.includes("enable-linger"))).toBe(false);
 });
 
 test("start and stop record desired state with account and workspace guards", async () => {

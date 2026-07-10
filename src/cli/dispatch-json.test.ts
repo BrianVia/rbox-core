@@ -54,6 +54,14 @@ test("RBOX_API_QUIET=1 suppresses the override warning", () => {
   expect(res.stderr).toBe("");
 });
 
+test("unknown flags fail before command dispatch", () => {
+  const res = run(["start", "--pullonly"]);
+  expect(res.status).toBe(1);
+  expect(res.stdout).toBe("");
+  expect(res.stderr).toContain("unknown flag --pullonly");
+  expect(res.stderr).toContain("rbox start --help");
+});
+
 test("RBOX_API override warning leaves JSON command stdout valid", async () => {
   const root = await makeWorkspace();
   try {

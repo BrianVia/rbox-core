@@ -17,8 +17,7 @@ import { isKnownTopLevel } from "./command-catalog.js";
 import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
-import { parseFlags } from "./flags.js";
-import { readStdinTrimmed } from "./read-stdin.js";
+import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
@@ -66,7 +65,7 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
 
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox track <path>` first.");
+  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
   return root;
 }
 
@@ -117,6 +116,14 @@ export async function main(): Promise<void> {
   const jsonMode = rawJsonMode && commandSupportsFlag(cmd, positional, "--json");
   setJsonErrorMode(jsonMode);
   if (rawJsonMode && !jsonMode) flags.json = "false";
+
+  if (cmd && cmd !== "help" && !cmd.startsWith("__") && cmd !== BOOT_RESUME_MARKER) {
+    const err = unknownFlagError(cmd, positional, flags);
+    if (err) {
+      fail(err);
+      return;
+    }
+  }
 
   // Bare `rbox` (cmd === undefined) is excluded too: in a tracked dir it renders the
   // status block (whose own update line covers this — nudging here would print BEFORE
@@ -302,9 +309,9 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "doctor": {
       const report = flags.report === "true";
       const diagnostics = flags.diagnostics === "true";
-      const { doctorCmd, refuseDisabledDiagnosticsUpload } = await import("./doctor-cmd.js");
-      if (refuseDisabledDiagnosticsUpload({ report, diagnostics })) break;
-      const root = await resolveRoot(undefined);
+      if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
+      const { doctorCmd } = await import("./doctor-cmd.js");
+      const root = await resolvePathFlagRoot(flags.path);
       await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics });
       break;
     }
@@ -331,7 +338,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const root = await resolvePathFlagRoot(flags.path);
       if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
       else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
-      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root);
+      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root, { full: flags.list === "true" });
       else await addIgnorePattern(root, positional[0]!);
       break;
     }
@@ -346,9 +353,9 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // Enroll this machine from a pairing token read on STDIN (never argv, C11):
       //   rbox pair        # on a signed-in machine → prints the token
       //   echo <token> | rbox connect
-      const { redeemPair } = await import("./auth-cmd.js");
-      const token = await readStdinTrimmed();
-      if (!token) throw new Error("no pairing token on stdin (pipe the token from `rbox pair`)");
+      const { readPairingTokenInteractive, redeemPair } = await import("./auth-cmd.js");
+      const token = await readPairingTokenInteractive();
+      if (!token) throw new Error("no pairing token provided (run `rbox pair` on a signed-in machine, then paste the token here or pipe it: echo <token> | rbox connect)");
       await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
       break;
     }
@@ -410,7 +417,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // `eval "$(rbox shell-init zsh)"` in .zshrc. Only zsh today (bash/fish use the
       // starship snippet in docs/shell-integration.md).
       if (positional[0] !== "zsh") {
-        process.stderr.write("usage: rbox shell-init zsh\n");
+        process.stderr.write("usage: rbox shell-init zsh\n(zsh only today — bash/fish users: see docs/shell-integration.md in the rbox repo for the prompt snippet)\n");
         process.exitCode = 1;
         break;
       }
@@ -421,7 +428,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "completions": {
       // design 46: print the zsh completion script (generated from COMMAND_HELP).
       if (positional[0] !== "zsh") {
-        process.stderr.write("usage: rbox completions zsh\n");
+        process.stderr.write("usage: rbox completions zsh\n(zsh only today — bash/fish are not yet supported)\n");
         process.exitCode = 1;
         break;
       }
