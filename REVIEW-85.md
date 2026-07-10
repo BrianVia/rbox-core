@@ -147,3 +147,12 @@ Re-verified every prior finding against the current design and branch at `4547d2
 2. **MINOR — the conflict truncation notice points to a full daemon-log list that current logging cannot contain.** The revision says omitted conflicts remain in the daemon log and tells the user `see rbox logs`, citing `LOG_PATHS_MAX`. Current `summarizeActions`, however, records only the first 50 action paths total, in action order (`src/cli/daemon.ts:65-95`), then emits `(+N more)`. Writes/deletes can consume all 50 slots, so conflicts omitted from the result's 50 conflict samples may also be absent from the log; even a conflict-only pull logs no more than the same 50. Specify a separate conflict forensic sink/cap that actually supports the claim, or change the notice and prose to state that omitted conflict paths are unavailable rather than directing the user to incomplete logs.
 
 Verdict: REVISE
+
+## Round 5 — revision (Claude)
+
+Both findings accepted; dispositions:
+
+1. **MAJOR (P0.3 confirmation destroys its own counterfactual) — ACCEPTED.** P0.3 filter (d) rewritten: each surviving candidate is persisted to the soak sidecar as `{path, expected, observed, firstSeenAtMs, eventGenAtScan}` — `expected` being the pre-heal incremental entry or explicit absence — so the pending set itself is the retained counterfactual, deliberately outside the manifest that deep-scan healing overwrites (`daemon.ts:1148`). At the next deep scan: retract as `late-covered` on any intervening path event; otherwise confirm iff that scan's fresh disk truth still differs from the RETAINED `expected` (further uncovered mutation still confirms — the test is "the state of record was wrong and the watcher said nothing across the whole horizon"). No shadow manifest needed.
+2. **MINOR (truncation notice points at logs that can't contain the conflicts) — ACCEPTED.** `summarizeActions`' 50 shared action slots acknowledged (`daemon.ts:73-96`); whenever a pull's conflicts exceed the wire sample cap the daemon logs a DEDICATED `pull conflicts:` line with its own 200-path cap, independent of the shared budget (§3.2 + §6.4); notice wording changed to "(+N more conflicts — up to 200 listed in rbox logs)" and past 200 the remainder is explicitly stated unavailable, never implied logged.
+
+No pushback — R5 F1 was a genuine self-inflicted hole in the round-4 fix (the healer and the auditor shared state), and R5 F2 was an overclaim against verified log behavior.

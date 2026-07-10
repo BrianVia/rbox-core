@@ -538,12 +538,20 @@ pairs capped at 50 (R4 F4 — the total must never be derived from a capped
 list: local `summarize` counts the full action set, `sync-cmd.ts:46-52`,
 so the frame carries the true total and the CLI prints it from that,
 renders one line per sample, and appends an explicit truncation notice
-`(+N more conflicts — see rbox logs)` beyond the cap); and `writtenPaths`
-capped at 500 with a `writtenPathsElided` flag. Parity claim, narrowed
-accordingly: counts and `--json` schema/totals are ALWAYS identical to the
-local path; human per-conflict lines are identical up to 50 conflicts and
-explicitly truncated past it — the full list remains in the daemon log
-(`LOG_PATHS_MAX` forensics). The CLI runs `postSyncNudge` CLI-SIDE from
+beyond the cap); and `writtenPaths` capped at 500 with a
+`writtenPathsElided` flag. The truncation notice must not point at
+forensics that don't exist (R5 F2): the existing pull log line
+(`summarizeActions`, `daemon.ts:73-96`) caps FIFTY action paths TOTAL in
+action order, so writes/deletes can consume every slot and elided
+conflicts may appear nowhere. Whenever a pull's conflict count exceeds the
+wire sample cap, the daemon therefore logs a DEDICATED conflicts line
+(`pull conflicts: p1 p2 … (+N more)`) with its own 200-path cap,
+independent of the shared action budget. Notice wording matches reality:
+`(+N more conflicts — up to 200 listed in rbox logs)`, and past 200 the
+remainder is stated as unavailable rather than implied to be logged.
+Parity claim, narrowed accordingly: counts and `--json` schema/totals are
+ALWAYS identical to the local path; human per-conflict lines are identical
+up to 50 conflicts and explicitly truncated past it. The CLI runs `postSyncNudge` CLI-SIDE from
 `writtenPaths` — the daemon never runs the nudge (a foreground advisory;
 design 29's `RBOX_NO_DRIFT`/config gates are the CLI's to apply). When
 `writtenPathsElided` is set the nudge is skipped — best-effort by contract
@@ -819,17 +827,28 @@ measurement-only, behind `RBOX_METRICS`/soak flags, no behavior change):
   whole scan is tagged quiescent iff zero raw watcher events arrived from
   scan start through the settle window; (d) **audit-horizon confirmation
   (R4 F3 — a finite settle window cannot distinguish a LATE event from a
-  DROPPED one, so no single-window candidate ever feeds the gate)** —
-  surviving candidates are held in a pending set until the NEXT deep scan
-  (the natural 30m audit horizon) and attributed as drops only then, iff
-  no watcher event for the path arrived anywhere in the inter-scan
-  interval AND the next scan re-confirms the same divergence direction
-  against what the incremental state should have shown; a candidate whose
-  event arrives late is RETRACTED and logged `late-covered` (evidence of
-  watcher latency, not loss). An event delayed beyond a full deep-scan
-  interval is indistinguishable from a drop and counts as one — stated,
-  and acceptable, since the safety cadence being tuned is itself an order
-  of magnitude shorter. Only confirmed drops from quiescent-tagged scans
+  DROPPED one, so no single-window candidate ever feeds the gate; R5 F1 —
+  and the confirmation must judge against a RETAINED counterfactual,
+  because deep scan N itself HEALS the divergence when it installs fresh
+  truth as `this.manifest` (`daemon.ts:1148`), so at scan N+1 the ordinary
+  incremental-vs-fresh diff is clean even for a genuine drop)** — each
+  surviving candidate is persisted to the soak sidecar as
+  `{path, expected, observed, firstSeenAtMs, eventGenAtScan}`, where
+  `expected` is the pre-heal incremental entry (or explicit absence) and
+  `observed` the first fresh observation: the pending set IS the
+  counterfactual, held deliberately outside the manifest that healing
+  overwrites. At the NEXT deep scan (the natural 30m audit horizon) each
+  pending candidate is resolved: RETRACTED as `late-covered` if any
+  watcher event for its path arrived anywhere in the inter-scan interval
+  (watcher latency, not loss); otherwise CONFIRMED as a drop iff that
+  scan's fresh disk truth still differs from the RETAINED `expected` —
+  disk having mutated further without any event is still a confirmed
+  miss, because the test is "the incremental state of record was wrong
+  about this path and the watcher said nothing about it across the whole
+  horizon." An event delayed beyond a full deep-scan interval is
+  indistinguishable from a drop and counts as one — stated, and
+  acceptable, since the safety cadence being tuned is itself an order of
+  magnitude shorter. Only confirmed drops from quiescent-tagged scans
   feed the drop-rate GATE (everything else logs as lower-confidence
   evidence). Log one bounded non-PII line per deep scan: counts by class
   (candidates, confirmed, late-covered, racing), quiescence tag, watcher
@@ -873,9 +892,12 @@ concurrent designs cannot collide in the closed union.
    prints it with `scan` details `{source: "daemon-delegated"}` plus
    `delegation: {ackMs, queuedMs, totalMs}`.
 4. Daemon log: one line per delegated op (opId, requester pid, op,
-   outcome, cancelled-or-completed), and the P0.3 drift line
-   (`deep-scan drift: added=A deleted=D modified=M racing=R quiescent=y/n …`)
-   so a nonzero drop is loud, not silent.
+   outcome, cancelled-or-completed); the P0.3 drift line
+   (`deep-scan drift: candidates=C confirmed=D late-covered=L racing=R
+   quiescent=y/n …`) so a nonzero drop is loud, not silent; and the
+   dedicated `pull conflicts:` line (200-path cap, §3.2/R5 F2) whenever a
+   pull's conflicts exceed the wire sample cap — the shared
+   `summarizeActions` 50-slot budget cannot be assumed to contain them.
 
 ## 7. Acceptance gates
 
