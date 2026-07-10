@@ -163,12 +163,18 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
   snapshot-bounded `/roots` (fast functional fix), then a durable
   retained-root index (steady-state; replaying every retained commit is the
   wrong algorithm for 365d history).**
-- **Designs 94 + 95 in adversarial loops (2026-07-10):** design 94
-  (signin_method) ALIGNED after 7 codex rounds, implemented, PR #197 green —
-  awaiting founder merge/dev-gate call. Design 95 (GC purge automation) at
-  v7 after 6 rounds — protocol evolved to: RAISE-ABORT trigger fence +
-  two-phase intent (24h quiescence) + verify-after-delete + executor lease.
-  REVIEW-94/95.md in the worktrees carry the full round history.
+- **Design 94 (signin_method): SHIPPED** — ALIGNED after 7 codex rounds,
+  implemented, merged (#197); prod migration 0023 auto-applied, dev applied.
+  Founder row backfills on next dashboard login.
+- **Design 95 (GC purge automation): ALIGNED after 10 codex rounds**
+  (branch `design/95-gc-purge-automation`, REVIEW-95.md = full ledger).
+  Final protocol: RAISE-ABORT trigger fence on publication writes +
+  checkTime-anchored receipt authority (no authority spans a delete:
+  12h TTL < 24h intent quiescence) + two-phase delete with verify-after-
+  delete + lease-guarded fence drops. **Implementation gated on the
+  paginated-/roots fix** (G4 fail-closes on the primary workspace since
+  #198). Order: paginated roots → implement 95 → supervised manual drain
+  (~62 GiB) → design 89.
 
 ## Backlog (ledgered, not urgent)
 
