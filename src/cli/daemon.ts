@@ -244,7 +244,7 @@ export class RboxDaemon {
     this.rebuildMatcher(initialState);
 
     // Initial convergence: full scan, then a real pull+push cycle.
-    this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+    await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest);
     this.pruneCache();
     await this.cache.save(this.root);
     this.want.pull = true;
@@ -687,7 +687,7 @@ export class RboxDaemon {
       // incremental matcher would otherwise be stale until restart. [M3b]
       if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
         this.rebuildMatcher(await this.loadSyncBase());
-        this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+        await this.replaceManifestFromScan(this.cache, this.manifest);
       } else {
         const deferred = new Set<string>();
         this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
@@ -791,7 +791,7 @@ export class RboxDaemon {
     // push isn't logged as if THIS daemon published the remotely-produced sequence.
     this.lastLoggedSeq = (await this.loadSyncBase()).lastSyncedSequence;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
-    this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+    await this.replaceManifestFromScan(this.cache, this.manifest);
   }
 
   private bumpConflict(_kind: "commit"): void {
@@ -1137,7 +1137,7 @@ export class RboxDaemon {
 
   private async doFullScan(): Promise<void> {
     await this.reloadWorkspaceConfigIfChanged();
-    this.manifest = await scanManifest(this.root, this.matcher, this.cache);
+    await this.replaceManifestFromScan(this.cache, this.manifest);
     this.pruneCache();
   }
 
@@ -1145,7 +1145,7 @@ export class RboxDaemon {
   private async doDeepScan(): Promise<void> {
     await this.reloadWorkspaceConfigIfChanged();
     const fresh = new HashCache();
-    this.manifest = await scanManifest(this.root, this.matcher, fresh);
+    await this.replaceManifestFromScan(fresh, this.manifest);
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
     // Trash retention (design 50 §2): the daemon owns pruning, on the infrequent deep tick
     // ONLY — never the sync hot path. Fire-and-forget: a prune failure must never surface as
@@ -1155,6 +1155,15 @@ export class RboxDaemon {
         if (r.removedBatches) log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
       })
       .catch(() => {});
+  }
+
+  /** Install a coherent full-scan result. Paths that moved while being hashed carry
+   *  their previous entry and enter the existing prompt write-finish retry loop. */
+  private async replaceManifestFromScan(cache: HashCache, previous: Manifest): Promise<void> {
+    const deferred = new Set<string>();
+    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, undefined, deferred);
+    this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
+    if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
   }
 
   /**
