@@ -171,12 +171,24 @@ stats once (`manifest.ts:306-317`), defers the hash (`:322-325`), and
 hash is baked with sha-of-new-bytes + metadata-of-old. Design 92 makes this
 unrepairable downstream: manifest-entry integrity verification propagates a
 poisoned tuple, it cannot heal it. Fix: `drainHashes` re-lstats after
-hashing; on mtime/size shift, drop the entry and surface the path via the
-existing deferred mechanism (same contract as `midwrite`). Test gate: an
-append, an atomic replace, and a chmod injected between a scan's stat and its
-deferred hash must each yield a deferred path, never a mixed tuple. Ships
-first; it is also a prerequisite for P0.3's drift attribution (§5) — without
-it, deep-scan diffs cannot distinguish watcher drops from scan tears.
+hashing and applies ONE exact stability predicate (R2 F1 — "mtime/size
+shift" is not enough because a chmod changes mode and ctime but ordinarily
+neither mtime nor size): pre- and post-hash lstat must agree on **file type,
+`ino`, `dev`, `size`, `mtimeMs`, `ctimeMs`, and permission mode** (Node
+exposes ino/dev on both shipped platforms; ino+dev catches atomic
+replacement even under restored timestamps, ctime catches chmod/xattr/owner
+changes, mode is asserted explicitly as belt-and-suspenders). On any
+mismatch, drop the entry and surface the path via the existing deferred
+mechanism; on a match, record the POST-hash stat's values. The predicate is
+one shared, unit-tested function, and the incremental `statHashEntry` guard
+— today mtime/size-only (`manifest.ts:230`) — is upgraded to call the same
+function, so "same contract as midwrite" becomes true by construction
+rather than by aspiration. Test gate: an append, an atomic replace (same
+size, `touch -r`-restored timestamps), and a chmod injected between a
+scan's stat and its deferred hash must each yield a deferred path, never a
+mixed tuple. Ships first; it is also a prerequisite for P0.3's drift
+attribution (§5) — without it, deep-scan diffs cannot distinguish watcher
+drops from scan tears.
 
 **P-2: HashCache v2 — `(mtime, size, ctime)` fingerprint with format
 versioning.** This is a TODAY-bug fix for the CLI, not Layer A support: the
@@ -306,6 +318,26 @@ fatal shape: a CLI that held its own lock could never be serviced by a daemon
 whose pump re-queues on contention (`sync-mutex.ts:92`,
 `daemon.ts:426-431`) — the two would starve by design.
 
+**Degraded locking disables delegation (R2 F2).** The mutex deliberately has
+an UNLOCKED degraded mode: when the lock primitive is unsupported on the
+workspace filesystem, `acquireWorkspaceSyncMutex` returns an acquired-shaped
+handle with no lock and everyone continues through the legacy state path
+(`sync-mutex.ts:38-50,86-89`; `workspaceSyncMutexDegraded`,
+`sync-mutex.ts:52`). On such a workspace the "exactly one owner" proof does
+not exist for ANYONE, and — worse for the state machine — a post-ack CLI
+mutex probe would "succeed" instantly with a degraded handle while the live
+daemon is still mutating. So: the daemon tracks whether any of its mutex
+acquisitions degraded (the condition is a property of the root's filesystem
+and sticky in practice — `surfacedDegradedRoots`, `sync-mutex.ts:29`) and
+carries a `lock: "exclusive" | "degraded"` field in its hello handling; a
+degraded daemon REJECTS delegation (`reject: {reason: "lock-degraded"}`)
+and the CLI runs LOCAL — exactly today's degraded-workspace behavior, no
+worse, no new race. Post-ack, every fallback arm that reasons from a mutex
+acquisition must check `workspaceSyncMutexDegraded` on the handle it got: a
+degraded acquisition proves nothing and is treated as CONTENDED (→
+INDETERMINATE), never as "no daemon op in flight." The proven-death arm is
+unaffected — it reasons from process liveness, not the lock.
+
 **Discovery and liveness.** Reuse `isDaemonRunning`
 (`src/cli/daemon-control.ts:216-219`), which verifies the pidfile's pid is
 alive AND is our daemon for this root via ps-command match — never
@@ -324,10 +356,23 @@ daemon-died-mid-cycle signal. Surface: one localhost socket at
 `$TMPDIR/rbox-<sha256(root)[0:16]>.sock` (deterministic per root; `sun_path`
 is ~104 bytes on macOS, so no length risk), mode 0600 inside a 0700
 per-uid directory, path recorded beside the pidfile. **Peer authentication
-(R1 F12):** "same uid" is enforced, not assumed — the daemon checks peer
-credentials on accept (`SO_PEERCRED` on Linux, `getpeereid`/`LOCAL_PEERCRED`
-on macOS) and drops any connection whose euid differs from its own; the 0700
-directory + 0600 socket are defense-in-depth, not the mechanism. **Stale
+(R1 F12, mechanism made runnable per R2 F4):** "same uid" is enforced by a
+filesystem-permission capability, not by socket peer credentials — Bun's
+`net` surface exposes no `SO_PEERCRED`/`getpeereid`, and the only FFI seam
+in the tree is the narrow io-priority shim, so specifying peercred would
+force an implementer to improvise security-critical native code. Instead:
+at socket creation the daemon writes a fresh random 32-byte token to
+`.rbox/state/delegation-token` with mode 0600 (regenerated each daemon
+start, unlinked on graceful stop); the CLI reads it and presents it in the
+hello; a hello with a missing/mismatched token is rejected
+(`reject: {reason: "auth"}`) and logged with the peer's pid if provided.
+Only a process running as the owning uid (or root, who owns the machine
+anyway) can read a 0600 file, so token possession IS the same-uid proof —
+same trust primitive as the existing pidfile/state files. The 0700 socket
+directory and 0600 socket are defense-in-depth. `SO_PEERCRED`/
+`LOCAL_PEERCRED` via a reviewed FFI shim is noted as optional future
+hardening, not a v1 dependency. Tests: token mismatch → reject; token
+rotation on daemon restart → stale client rejected. **Stale
 socket rules:** on startup the daemon connects to any existing socket path;
 if the connect succeeds and helloes as a live rbox daemon for this root, the
 new daemon defers to the pidfile arbitration (existing stale-daemon logic);
@@ -349,24 +394,47 @@ daemon → CLI:  {progress: {phase, done, total, bytes?}}      — streamed, ≥
 ```
 
 `reject` reasons are enumerated: `version` (protocol mismatch), `root`
-(hello root ≠ daemon root), `pull-only` (daemon started pull-only suppresses
-pushes, `daemon.ts:383-385` — a delegated `push`/`sync` is rejected, a
-delegated `pull` is fine), `unsupported` (future op). Any reject → CLI local
-path, chosen before any lock was taken.
+(hello root ≠ daemon root), `auth` (missing/mismatched delegation token),
+`lock-degraded` (workspace locking unsupported — no exclusivity proof
+exists, R2 F2), `pull-only` (daemon started pull-only suppresses pushes,
+`daemon.ts:383-385` — a delegated `push`/`sync` is rejected, a delegated
+`pull` is fine), `unsupported` (future op). Any reject → CLI local path,
+chosen before any lock was taken. The hello also carries the CLI's pid for
+the daemon's per-op forensic log line.
 
-**Request↔result correlation and coalescing (R1 F12).** The `want` booleans
-(`daemon.ts:179,387-395`) coalesce by design and cannot prove which request
-owns which terminal result — so delegated requests get their own bookkeeping
-on top: the daemon keeps `delegated: Map<opId, {needs: ("pull"|"push")[],
-socket}>` (`push`→`["push"]`, `pull`→`["pull"]`, `sync`→`["pull","push"]`)
-and sets the corresponding `want` flags. When the pump STARTS an op it binds
-every delegated entry whose head-of-`needs` matches that op kind to the
-running iteration; on op success it pops that leg (an entry with empty
-`needs` gets its `result` built from that iteration's outcome); on op failure
-every bound entry gets an error `result`. Two clients requesting push
-coalesce into one push iteration and each receives the same terminal result
-under its own opId — semantics: "a push cycle covering your request
-completed," which is exactly what the coalescing pump means today. A
+**Request↔result correlation and coalescing (R1 F12; demand separation per
+R2 F5).** The `want` booleans (`daemon.ts:179,387-395`) coalesce by design,
+are fed by AMBIENT causes (watcher batches, WS catch-up, safety/deep ticks,
+post-pull chaining, `daemon.ts:445-461`), and cannot prove which request
+owns which terminal result — so delegated demand is a SEPARATE source that
+never reads or writes `want`: the daemon keeps `delegated: Map<opId,
+{needs: ("pull"|"push")[], socket, acc}>` (`push`→`["push"]`,
+`pull`→`["pull"]`, `sync`→`["pull","push"]`). The pump loop's continue
+condition becomes "any `want` set OR `delegated` non-empty," and per-kind
+demand at op selection is `want[kind] || anyDelegatedHead(kind)`; when an op
+runs, `want[kind]` is cleared only if it was set (ambient demand is consumed
+exactly as today). When the pump STARTS an op it binds every delegated entry
+whose head-of-`needs` matches that op kind; on op success it pops that leg
+(an entry with empty `needs` gets its `result`); on op failure every bound
+entry gets an error `result` naming the failed leg. **Cancellation
+therefore never touches `want` at all:** a pre-bind cancel just removes the
+map entry — ambient demand is structurally incapable of being consumed by
+it, and a cancelled-away delegated op runs nothing spurious because the
+entry no longer contributes demand. Two clients requesting push coalesce
+into one push iteration and each receives the same terminal result under
+its own opId — semantics: "a push cycle covering your request completed,"
+which is exactly what the coalescing pump means today.
+
+**Delegated `sync` result aggregation (R2 F6).** A sync's two legs bind to
+two different pump iterations, so the terminal frame is built from a
+per-opId accumulator (`acc`), not from "the last iteration": the pull leg
+records the applied-action summary (writes/deletes/conflicts — what
+`summarize` prints locally) and the push leg records
+`{sequence, committed, files, deferred}`; the `result` frame carries both
+plus `failedLeg: "pull"|"push"` on error, and with `metrics:true` the phase
+reports of both legs. The CLI renders it exactly as local `rbox sync` does
+(pulled summary line, then push line), and `--json` emits the same schema as
+the local path — which is what makes gate 6's schema-equivalence testable. A
 delegated op jumps no queue: the single-flight pump (`daemon.ts:419+`)
 serializes it against watcher batches and safety ticks — no new concurrency
 inside the daemon. Before a bound push the daemon drains pending watcher
@@ -399,8 +467,9 @@ LOCAL (withWorkspaceSyncMutex,  ▼                     │                │ {
 - **Post-ack, the CLI gets exactly one of four terminals:** (1) a `result`
   frame; (2) a cancellation acknowledgement — `cancel` for an opId not yet
   BOUND to a running pump iteration removes it immediately and answers
-  `{cancelled}` (the daemon deflates the corresponding `want` flag only if no
-  other requester needs it); a cancel for a BOUND opId is answered by the
+  `{cancelled}` (removal of the map entry alone — ambient `want` demand is a
+  separate source and is never touched, see correlation below); a cancel for
+  a BOUND opId is answered by the
   op's eventual `result` (the daemon never aborts a mutation mid-flight —
   same principle as its SIGTERM drain, `daemon.ts:369-374`); (3) **proven
   daemon death** — socket closed without a terminal AND `isDaemonRunning`
@@ -409,8 +478,10 @@ LOCAL (withWorkspaceSyncMutex,  ▼                     │                │ {
   **explicit INDETERMINATE** — socket closed without a terminal but the
   daemon process is still alive (stuck, or the CLI was disconnected): the
   CLI makes ONE ordinary mutex acquisition attempt (the standard 16×50ms);
-  if it acquires, the daemon has no op in flight and LOCAL is safe; if
-  contended, it exits nonzero with a distinct code and message
+  if it acquires a REAL lock (`workspaceSyncMutexDegraded` false — a
+  degraded handle proves nothing, R2 F2, and counts as contended), the
+  daemon has no op in flight and LOCAL is safe; if contended or degraded,
+  it exits nonzero with a distinct code and message
   ("delegated push state unknown — daemon pid N still running; see `rbox
   status` / `rbox logs`, or retry") rather than racing a live owner. A
   client disconnect is treated by the daemon as an implicit cancel with
@@ -504,9 +575,12 @@ in the standard format with scan details `{source: "daemon-delegated"}` plus
 9. **concurrent CLI + daemon.** By construction now: the workspace mutex
    serializes every top-level owner (design 93); a delegated op has exactly
    one owner (the daemon); a LOCAL op has exactly one owner (the CLI); the
-   state machine never creates a second concurrent owner. Gate 2 (§7) kills
-   a daemon mid-delegation and asserts both the proven-death and the
-   indeterminate arms.
+   state machine never creates a second concurrent owner. On a workspace
+   where locking itself is degraded there is no exclusivity for anyone —
+   so delegation is rejected outright there (§3.2, R2 F2) and the exposure
+   is exactly today's, not a new one. Gate 2 (§7) kills a daemon
+   mid-delegation and asserts the proven-death, indeterminate, and
+   degraded-reject arms.
 
 ### 3.4 Rejected alternative: the persisted-manifest sidecar (v1 Layer B)
 
@@ -607,16 +681,31 @@ measurement-only, behind `RBOX_METRICS`/soak flags, no behavior change):
   is invisible. Add, inside `doDeepScan`: snapshot the pre-scan incremental
   manifest; build the fresh manifest (hash-cache-bypassing as today, and
   dircache-UNPRUNED per §3.1); diff on path/type/sha/size/mode/symlink
-  target; classify added/deleted/modified. Exclude-or-separately-classify
-  churn: any diff path that is in `pendingEvents`/`deferredRetryPaths`, or
-  whose re-lstat during classification mismatches the fresh entry, counts as
-  `racing`, never as a drop — otherwise live churn is mislabeled as watcher
-  loss. Log one bounded non-PII line per deep scan: counts by class, watcher
-  health + error generation, seconds since last safety scan, watcher events
-  since, whether ignore rules changed. Report per host/filesystem over a 24h
-  soak: deep scans, scans with nonzero drift, paths by class, max inferred
-  drift age. Zero drops over the soak → evidence for design 49's cadence
-  question (§9.3); nonzero → the number the safety cadence must answer to.
+  target; classify added/deleted/modified — as drift CANDIDATES only.
+  Attribution then survives the scan-window races R2 F3 identified (an
+  add/delete DURING the walk whose watcher event has not yet been
+  delivered is legitimate churn: it can look consistent to both the fresh
+  manifest and a re-lstat, and the old-manifest snapshot is not a temporal
+  snapshot of the filesystem). Three filters before anything counts as a
+  drop: (a) **event cover** — record the raw-event generation
+  (`watcherUnsettledGeneration`) and pending queue at scan start; after the
+  scan, wait out the watcher's settle window (debounce max 3s + margin)
+  and drain; any candidate covered by a watcher event delivered since scan
+  start, or present in `pendingEvents`/`deferredRetryPaths`, is `racing`;
+  (b) **re-verification** — each surviving candidate is re-checked against
+  disk (P-1-grade stat/hash) and must still mismatch the pre-scan
+  incremental manifest in the same direction; (c) **quiescence tag** — the
+  whole scan is tagged quiescent iff zero raw watcher events arrived from
+  scan start through the settle window; only quiescent scans feed the
+  drop-rate GATE (non-quiescent scans still log their post-filter
+  candidates as lower-confidence evidence). Log one bounded non-PII line
+  per deep scan: counts by class, quiescence tag, watcher health + error
+  generation, seconds since last safety scan, watcher events since,
+  whether ignore rules changed. Report per host/filesystem over a 24h
+  soak: deep scans, quiescent scans, scans with nonzero post-filter drift,
+  paths by class, max inferred drift age. Zero drops over the soak →
+  evidence for design 49's cadence question (§9.3); nonzero → the number
+  the safety cadence must answer to.
 - **P0.4 — platform semantic probes (new; R1 F13).** A scripted probe (test
   rig, not fleet) on real APFS and ext4 recording Node-observed dir
   `mtimeMs`/`ctimeMs`/inode before/after: create, unlink, same-dir rename,
@@ -650,10 +739,10 @@ concurrent designs cannot collide in the closed union.
 3. Delegated runs: the daemon's phase report rides the result frame; the CLI
    prints it with `scan` details `{source: "daemon-delegated"}` plus
    `delegation: {ackMs, queuedMs, totalMs}`.
-4. Daemon log: one line per delegated op (opId, requester pid/uid, op,
+4. Daemon log: one line per delegated op (opId, requester pid, op,
    outcome, cancelled-or-completed), and the P0.3 drift line
-   (`deep-scan drift: added=A deleted=D modified=M racing=R …`) so a nonzero
-   drop is loud, not silent.
+   (`deep-scan drift: added=A deleted=D modified=M racing=R quiescent=y/n …`)
+   so a nonzero drop is loud, not silent.
 
 ## 7. Acceptance gates
 
@@ -674,7 +763,10 @@ runs on the shared WAN at a time — 83/84/85 serialize their gate runs.
    mutex, and exits with the distinct INDETERMINATE code without having
    mutated anything. (c) Concurrency-by-mutex: a `--no-daemon` CLI push and
    a delegated push issued together serialize — one waits/requeues, both
-   complete, tree converges, no 409 storm required to make it true.
+   complete, tree converges, no 409 storm required to make it true. (d)
+   Degraded-lock workspace (lock primitive unsupported): hello is rejected
+   `lock-degraded` and the CLI runs LOCAL — delegation is provably never
+   active without an exclusive mutex.
 3. **Layer A warm full scan (if built per §5): ≤ 3s Mac / ≤ 6s Linux**, from
    6-15s; cold recorded alongside for the page-cache-fragility note. Applies
    to the daemon safety scan too (design 49 cadence cost ≤ 3s Mac). Dircache
@@ -727,6 +819,11 @@ Resolved in v3 (previously open or implicit):
    pair (§3.1) — one racy-clean/equality discipline everywhere.
 5. **Watcher self-clear requires an unpruned scan** once Layer A exists
    (§3.1.3); cadence/trust semantics unchanged from design 49.
+6. **Delegation auth is a 0600 token file, not socket peer credentials**
+   (R2 F4): runnable today with zero native code; peercred is optional
+   future hardening.
+7. **Delegation requires an exclusive workspace mutex** (R2 F2): a
+   lock-degraded workspace rejects delegation and keeps today's behavior.
 
 Still the founder's calls:
 
