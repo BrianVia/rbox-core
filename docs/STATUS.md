@@ -12,11 +12,13 @@ _Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu 
 - **Version: v1.0.0 — the correctness milestone (2026-07-10).** No functional
   change over 0.9.18; the tag marks designs 91/92/93 field-proven. Release run
   went green first try (6m41s, no gate flake). Live on Mac + FM daemons.
-  **Open: via-desktop-ubuntu daemon is DOWN post-upgrade** — its
-  `~/.rbox/credentials.json` holds the agent PAT (`agent_7Z8R70…`) revoked in
-  the 07-09 roster cleanup; the old daemon survived on a pre-revocation
-  session, the restarted one exits "signed out". Needs an interactive
-  `rbox login` on that host. (Not a 1.0.0 regression — any restart would hit it.)
+  ~~Open: via-desktop-ubuntu daemon DOWN post-upgrade~~ **RESOLVED same day**:
+  its credential was the agent PAT (`agent_7Z8R70…`) revoked in the 07-09
+  roster cleanup (old daemon survived on a pre-revocation session). Re-enrolled
+  via headless pairing — `rbox pair` on the Mac → `RBOX_PAIR_TOKEN=… rbox login`
+  on Ubuntu (env-var redemption, `src/cli/auth-cmd.ts:184`) — now device
+  `dev_fdca6ca3…`, daemon healthy on 1.0.0. Roster note: the host's previous
+  device entry (`dev_df5d3b6c…`) is now orphaned; revoke at next cleanup.
 - **CHANGELOG.md is now the full record** — backfilled v0.1.0 (2026-06-29)
   → v1.0.0, all 51 tags, first commit 2026-06-26. Keep it current per release.
 - **Design 35 (client phase metrics) doc header was stale — it SHIPPED** in
@@ -126,6 +128,13 @@ _Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu 
   commit-envelope delta encoding, scan; then git cold lane, per-job crypto.
 - Bun 1.3.14 release-runtime A/B; crypto-pool test isolation.
 - Epoch rotation / true key eviction (design 22) — unbuilt, known ceiling.
+- Surface the web login's auth provider (Google OAuth vs password) in
+  `rbox account status` + dashboard: capture `external_accounts` from the
+  Clerk user fetch (`apps/api/src/notify.ts:269` already makes the call) into
+  `clerk_users`, return it from account status. Today D1 stores only the
+  email; auth method is invisible outside the Clerk dashboard. Fleet account
+  is `brian.via.dev@gmail.com` (`acct_b4e0b81…`) — the ONLY prod web account;
+  a browser session on any other identity would silently create a fresh one.
 
 ## Standing rules (hard-won)
 
