@@ -206,7 +206,9 @@ async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps
   const { cache, save } = await withCache(root, deps.cache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const scanStats = report.enabled ? deps.scanStats : undefined;
-  const local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats));
+  const scanDeferred = new Set<string>();
+  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   if (scanStats) report.recordDetails("scan", { ...scanStats }, formatScanStats(scanStats));
   await save();
   return local;
@@ -393,7 +395,9 @@ export async function push(
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats));
+  const scanDeferred = new Set<string>();
+  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   await save();
   if (report.enabled) {
     report.files = fileCountOf(local);

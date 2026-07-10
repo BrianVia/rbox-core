@@ -214,7 +214,9 @@ test("status hashcache write-back is guarded by daemon pidfile presence", async 
 
   await fs.rm(path.join(runtime, "daemon.pid"), { force: true });
   await captureStdout(() => statusCmd(tmp, { json: true }));
-  expect(JSON.parse(await fs.readFile(cachePath, "utf8"))["file.txt"]).toBeDefined();
+  const savedCache = JSON.parse(await fs.readFile(cachePath, "utf8"));
+  expect(savedCache.version).toBe(2);
+  expect(savedCache.entries["file.txt"]).toBeDefined();
 });
 
 test("status --json trusts attributed fresh local and skips hashcache and manifest scan", async () => {
