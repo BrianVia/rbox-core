@@ -1,7 +1,13 @@
 # 84 — Commit envelope at O(change): manifest delta encoding
 
-Status: Design draft v4, 2026-07-10 — round-2 revision (ledger in
-REVIEW-84.md). v3 was the full round-1 rework against current main (designs
+Status: Design draft v5, 2026-07-10 — round-3 revision (ledger in
+REVIEW-84.md). v5 closes round 3: `GlobalManifestMeta.snapshotBytes` makes
+the byte-bound trigger implementable (encode-then-compare, threshold includes
+the proposed head, observed lengths propagated across deltas); repo-only
+packets clear a stale meta via a normative rule inside `applyStateSavePacket`
+(atomic with the accepted transitions — the packet shape has no global member
+to carry a clear); `MAX_MANIFEST_PLAINTEXT`/`MAX_ENVELOPE_HEADER` are
+normative protocol constants (only post-soak retuning stays open). v3 was the full round-1 rework against current main (designs
 91/92/93/95/96); v4 closes round 2: repair mode bypasses the no-op/defer
 short-circuits (an unchanged tree still publishes the healing snapshot);
 `manifestSchema` is carried verbatim in the delta header (both transition
@@ -228,10 +234,14 @@ are malformed → fail closed):**
 Bounds (all fail closed, checked before any body work):
 
 - Header line ≤ `MAX_ENVELOPE_HEADER = 64 KiB` (no newline within the bound →
-  malformed).
+  malformed). **Normative protocol constant** (shared engine export, like
+  `MAX_MANIFEST_DELTA_CHAIN`).
 - `bodyBytes` ≤ `MAX_MANIFEST_PLAINTEXT = 512 MiB` (10× today's 47MB;
   `validateManifest`'s `MAX_ENTRIES = 200_000` bounds the decoded object,
-  `src/engine/manifest-validate.ts:13`).
+  `src/engine/manifest-validate.ts:13`). **Normative protocol constant**;
+  writers must refuse to EMIT past it too, so an honest envelope is readable
+  by construction. Retuning either constant post-soak is a coordinated,
+  read-side-first release (§10.8).
 - `comp` absent → actual body length MUST equal `bodyBytes` exactly.
 - `comp: "zstd"` → decompress via design 79's zstd machinery
   (`src/engine/crypto.ts:38-50`) with a **streaming output cap at
@@ -334,14 +344,23 @@ when ANY holds, else it emits a `delta` based on its applied base:
    (terminal snapshot + intermediate deltas); fold depth =
    `manifestChain.length + 1`. Retuning it later is a §10.1 call; shipping
    C2 with an unpinned value is not an option (wire interop).
-4. **Byte-bound recompaction** — cumulative delta CIPHERTEXT bytes since the
-   base snapshot ≥ the base snapshot's ciphertext bytes: the
-   `exceedsPackChainByteBound` heuristic (`src/cli/sync-git.ts:241-244`),
-   which IS sound precedent for *sizing* (only the op semantics needed their
-   own spec, §3.2). Bytes are ciphertext byte lengths as observed by the
-   writer at upload time and by readers on fetch (content-addressed +
-   AEAD-authenticated, so the observed length is trustworthy); they persist
-   in `manifestMeta.chainBytes` (§3.4).
+4. **Byte-bound recompaction** — the `exceedsPackChainByteBound` heuristic
+   (`src/cli/sync-git.ts:241-244`), which IS sound precedent for *sizing*
+   (only the op semantics needed their own spec, §3.2). Implementable form
+   (round-3 finding 1): the writer first ENCODES + encrypts the candidate
+   delta (cheap — it is O(change)), then fires the trigger when
+   `meta.chainBytes + candidateDeltaCipherBytes ≥ meta.snapshotBytes` —
+   i.e. the threshold INCLUDES the head being proposed; on fire the
+   candidate delta is discarded and the commit re-emits as a snapshot. Both
+   inputs are persisted in `GlobalManifestMeta` (§3.4): `chainBytes`
+   accumulates per applied/emitted delta, and `snapshotBytes` is the
+   terminal snapshot's ciphertext length, recorded once from an observed
+   length (writer: its own upload; reader: the cold walk's authenticated
+   fetch — content-addressed + AEAD, so observed lengths are trustworthy)
+   and propagated unchanged across deltas — the steady-state fast path never
+   fetches the snapshot to size it. Migration/restore need no special case:
+   any state without a meta (or with a legacy meta shape) has no base and
+   snapshots anyway (§3.3.1).
 5. **Impossible-link 422 (fail-safe compaction).** If a commit bounce lists
    any sha that is in this commit's `manifestChain` (a chain link the server
    reports unsatisfied — GC-marked, delete-fenced, or lost), the retry MUST
@@ -398,6 +417,12 @@ export interface GlobalManifestMeta {
   chain: string[];
   /** Cumulative delta ciphertext bytes since chain[0] — §3.3.4's input. */
   chainBytes: number;
+  /** The terminal snapshot's ciphertext byte length (chain[0]'s — or, for a
+   *  snapshot base, this blob's own) — §3.3.4's threshold. Recorded from an
+   *  OBSERVED length (the writer's own upload; the reader's authenticated
+   *  fetch on a cold walk) and PROPAGATED UNCHANGED across deltas, so the
+   *  steady-state fast path never refetches the snapshot just to size it. */
+  snapshotBytes: number;
 }
 export interface StateSavePacket {
   // ...unchanged...
@@ -437,22 +462,38 @@ Semantics (all inherited from the packet, stated to be testable):
   `manifestMeta: undefined` — which CLEARS any prior meta (global writes
   replace the global member wholesale) — and the next commit takes the
   §3.3.1 snapshot path until a fully-applied pull re-establishes it.
-  Additionally, any repo-only packet (no global) whose transitions change a
-  repo `base` clears a present meta for the same reason. Fail-to-snapshot,
-  never fail-to-wrong-base.
+  **Repo-only packets clear meta INSIDE the applier, not via the packet
+  shape** (round-3 finding 2: `manifestMeta` lives only in `packet.global`,
+  and a repo-only packet has no global member — omission cannot mean both
+  "preserve" and "clear", and synthesizing a global would wrongly enter the
+  global-sequence CAS). Normative rule in `applyStateSavePacket`: after the
+  accepted repo transitions are folded (`config.ts:325-345`), if the packet
+  carried no `global` and any accepted transition CHANGED a record's
+  projected `base` (deep-unequal old vs new `base` for that relPath), the
+  persisted `manifestMeta` is cleared in the SAME atomic state write. A
+  rejected packet (stream/nonce/repo-generation/owner-lost) changes nothing,
+  including meta; a retained newer-`sourceSeq` transition re-writes the
+  current record (`sync-state.ts:84-98`) so its `base` is unchanged and meta
+  is preserved. The legacy/`forceLegacy` writers already drop meta
+  unconditionally (above), which subsumes this rule off the fenced path.
+  Fail-to-snapshot, never fail-to-wrong-base.
 - **Writers of the packet:**
   - *Pull apply* (`sync.ts:343-364`): meta = the pulled head's
     `encManifestSha`, the verified fold's hash (= the checked
     `manifestHash`/`resultHash`, no recompute), the head's signed
     `accountEpoch`/`keyEpoch` (from the `parseCommit`ed body `verifiedHead`
-    already produced), and the head's list-verified `manifestChain` +
-    cumulative bytes (snapshot → `[]`/0) — subject to the suppression rule
+    already produced), the head's list-verified `manifestChain` + cumulative
+    bytes (snapshot → `[]`/0), and `snapshotBytes` (fast path: propagated
+    from the prior meta; cold walk: the terminal snapshot's fetched length;
+    snapshot head: its own fetched length) — subject to the suppression rule
     above.
   - *Push commit* (`sync.ts:715-725`): meta = the just-built envelope's
     `encManifestSha`, the writer's `resultHash` (computed anyway), the
     epochs it signed under (the D1-checked write context,
-    `e2ee-remote.ts:406-410`), and the chain it emitted (snapshot → `[]`/0;
-    delta → `base.chain + [base.encManifestSha]`, bytes incremented) —
+    `e2ee-remote.ts:406-410`), and the chain it emitted (snapshot → `[]`/0
+    with `snapshotBytes` = its own uploaded ciphertext length; delta →
+    `base.chain + [base.encManifestSha]`, bytes incremented, `snapshotBytes`
+    propagated) —
     same suppression rule (a commit that carried a pending repo's section
     keeps the OLD base in state, `gitBaseAfterCommit`, `sync.ts:708`, so the
     projection diverges and the meta is suppressed).
@@ -1080,7 +1121,15 @@ move them — say so, don't fake precision).
      meta forces the snapshot path. **Repo-pending suppression:** a pull with
      one pending repo persists NO meta (and clears a prior one); the next
      push snapshots; the next fast-path pull is skipped (cold walk); a
-     later fully-applied pull re-establishes the meta.
+     later fully-applied pull re-establishes the meta. **Repo-only clear:**
+     an accepted repo-only packet that changes a projected `base` clears a
+     present meta atomically; a repo-generation-rejected packet and a
+     retained newer-`sourceSeq` transition both preserve it.
+   - byte-bound trigger (§3.3.4): `chainBytes + candidateDeltaBytes ≥
+     snapshotBytes` re-emits as snapshot (threshold includes the proposed
+     head); `snapshotBytes` propagates unchanged across fast-path applies
+     and is recorded from the fetched length on a cold walk; absent/legacy
+     meta shapes force the snapshot path (migration/restore).
    - design-92 parity (§4.6): a poisoned `set` tuple fails at apply exactly
      as via snapshot; deferred carry emits no op; a verified-but-unapplied
      head never becomes a delta base; compressed-descriptor entry changes
@@ -1186,8 +1235,10 @@ Owned by other designs / explicitly out:
 7. **Daemon auto-repair policy (§3.6.3).** Proposed: automatic iff the
    unreadable suffix is entirely self-authored; otherwise halt + ceremony.
    Alternatives: never automatic (always ceremony), or a suffix-length bound.
-8. **`MAX_MANIFEST_PLAINTEXT` / `MAX_ENVELOPE_HEADER`.** Proposed 512 MiB /
-   64 KiB (§3.2).
+8. **Retuning `MAX_MANIFEST_PLAINTEXT` (512 MiB) / `MAX_ENVELOPE_HEADER`
+   (64 KiB).** Both are NORMATIVE for B/C (§3.2 — reader/writer interop and
+   the compression-bomb posture depend on shared values); the open call is
+   only post-soak retuning, read-side first.
 
 ## 11. Lessons (to fill after the gate, per design 82 §8)
 

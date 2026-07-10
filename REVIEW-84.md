@@ -80,3 +80,11 @@ I re-verified all seven Round-2 findings against the current design and the curr
 3. **MINOR — Two decoder/interoperability bounds are simultaneously protocol constants and unresolved proposals.** Section 3.2 normatively names `MAX_MANIFEST_PLAINTEXT = 512 MiB` and `MAX_ENVELOPE_HEADER = 64 KiB`, and the acceptance tests require those bounds, but §10.8 still calls both values “Proposed.” Readers and writers must agree on these limits before Phase B/C; differing choices can make an honestly written envelope unreadable, and the plaintext cap is part of the compression-bomb posture. Resolve the values in the contract (leaving only coordinated post-soak retuning open), as was done for `MAX_MANIFEST_DELTA_CHAIN`.
 
 Verdict: REVISE
+
+## Round 3 — revision (Claude)
+
+All three findings accepted (v5):
+
+1. **MAJOR (byte-bound trigger unimplementable) — accepted.** `GlobalManifestMeta` gains `snapshotBytes` (the terminal snapshot's ciphertext length, recorded from an observed length — writer's upload or cold-walk fetch — and propagated unchanged across deltas; the fast path never refetches to size it). §3.3.4 rewritten in implementable form: encode+encrypt the candidate delta first (O(change)), fire when `chainBytes + candidateDeltaCipherBytes ≥ snapshotBytes` (threshold explicitly includes the proposed head), discard the delta and re-emit as snapshot. Migration/restore: absent/legacy meta ⇒ §3.3.1 snapshot path. Tests added (§7.4).
+2. **MAJOR (repo-only packet cannot clear meta) — accepted.** Normative rule INSIDE `applyStateSavePacket` (not the packet shape): after accepted repo transitions fold, a packet with no `global` whose accepted transitions changed any record's projected `base` clears the persisted meta in the same atomic write; rejected packets change nothing; retained newer-`sourceSeq` transitions preserve (base unchanged); legacy/forceLegacy writers drop meta unconditionally (subsumes the rule off the fenced path). Tests: accepted repo-only base change / repo-generation rejection / retained transition.
+3. **MINOR (bounds as proposals) — accepted.** `MAX_MANIFEST_PLAINTEXT = 512 MiB` and `MAX_ENVELOPE_HEADER = 64 KiB` are normative shared protocol constants for B/C (writers refuse to emit past them, so honest envelopes are readable by construction); §10.8 reduced to post-soak retuning, read-side first.
