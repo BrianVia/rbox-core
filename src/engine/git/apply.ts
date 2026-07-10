@@ -123,7 +123,13 @@ export async function applyGitState(
   section: GitSection,
   store: BlobStore,
   kek: Buffer,
-  opts: { beforeMutate?: () => Promise<void>; beforeMutateWipesRefs?: boolean } = {}
+  opts: {
+    beforeMutate?: () => Promise<void>;
+    beforeMutateWipesRefs?: boolean;
+    /** Final mutation in the rollback boundary. Design 93 uses this for config:
+     * its rename is the combined git+config commit point. */
+    afterGitMutate?: () => Promise<void>;
+  } = {}
 ): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
   if (!v.ok) return { applied: false, reason: `invalid git section: ${v.reason}` };
@@ -205,7 +211,8 @@ export async function applyGitState(
   let incomingNs: string | undefined;
   const cleanupIncoming = async () => {
     if (!incomingNs) return;
-    for (const ref of await listRefs(repoDir, incomingNs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    const refs = await listRefs(repoDir, incomingNs).catch(() => []);
+    for (const ref of refs) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
     incomingNs = undefined;
   };
   const importIncoming = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
@@ -340,6 +347,10 @@ export async function applyGitState(
         else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined);
         return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
+      // Must remain LAST inside the mutation boundary. A pre-commit throw follows
+      // the row's existing rollback disposition; successful config rename makes
+      // all cleanup below best-effort/non-fatal.
+      await opts.afterGitMutate?.();
     } catch (e) {
       // ROLLBACK on any mutation error (fresh target: remove the .git we created)
       if (createdGit) await removeFreshGit();
@@ -351,6 +362,6 @@ export async function applyGitState(
     return { applied: true, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
   } finally {
     await cleanupIncoming();
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 }

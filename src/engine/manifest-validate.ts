@@ -272,6 +272,7 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   if (s.config !== undefined) {
     const config = validateCanonicalGitConfig(s.config);
     if (!config.ok) return { ok: false, reason: `bad config: ${config.reason}` };
+    if (s.refScope === "scoped") return { ok: false, reason: "scoped git section cannot carry config" };
   }
   // design 43 §2: refScope is mandatory — it gates apply-side ref deletion (§7).
   if (s.refScope !== "all" && s.refScope !== "scoped") return { ok: false, reason: "bad refScope" };

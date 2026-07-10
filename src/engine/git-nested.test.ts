@@ -844,6 +844,10 @@ test("validateManifest: git config is additive, canonical, and unknown git-secti
   expect(validateManifest(m43({ ".": section({ config: {} }) })).ok).toBe(true);
 });
 
+test("validateManifest: scoped wire sections cannot carry config", () => {
+  expect(validateManifest(m43({ ".": section({ refScope: "scoped", config: {} }) })).ok).toBe(false);
+});
+
 test("validateManifest: git config rejects every non-canonical wire shape", () => {
   const check = (config: unknown) => validateManifest(m43({ ".": { ...section(), config } })).ok;
   expect(check({ "remote.origin.url": ["https://example.com/repo.git"] })).toBe(true);

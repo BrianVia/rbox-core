@@ -39,9 +39,18 @@ import {
 import { repoCtx } from "../engine/git/shared.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../engine/manifest-validate.js";
 import { canonicalizeGitConfig, type GitConfig } from "../engine/git/config-sync.js";
-import { readParsedConfigSnapshot, type ConfigFault } from "../engine/git/config-txn.js";
-import type { SyncState, WorkspaceConfig } from "./config.js";
+import {
+  applyConfigTransaction,
+  materializeFreshGitConfig,
+  readConfigSnapshot,
+  readParsedConfigSnapshot,
+  type ConfigFault,
+  type ConfigStatToken,
+  type ConfigTransactionResult,
+} from "../engine/git/config-txn.js";
+import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
+import { completeConfigApply, type ConfigLaneState } from "./sync-state.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 
@@ -57,6 +66,9 @@ import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 /** Bundling is CPU/IO heavy — bound concurrent captures (design 43 §6.3). */
 const GIT_CAPTURE_CONCURRENCY = 4;
 const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
+/** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
+ * loud once per workspace/repo without repeating forever on every pull. */
+const configOwnershipSkipLogged = new Set<string>();
 
 const envInt = (name: string, fallback: number, min: number, max: number): number => {
   const raw = process.env[name]?.trim();
@@ -160,6 +172,48 @@ async function readLocalGitConfig(root: string, rel: string, diskCtx?: RepoCtx):
   return {
     status: "failed",
     fault: lastFault ?? { disposition: "transient", reason: "read-error" },
+  };
+}
+
+function sameConfigToken(a: ConfigStatToken | undefined, b: ConfigStatToken | undefined): boolean {
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+function sameConfigShape(a: ConfigShapeIdentity | undefined, b: ConfigShapeIdentity | undefined): boolean {
+  return a !== undefined && b !== undefined && a.shape === b.shape &&
+    a.commonDir.realpath === b.commonDir.realpath && a.commonDir.dev === b.commonDir.dev &&
+    a.commonDir.ino === b.commonDir.ino && a.commonDir.birthtime === b.commonDir.birthtime;
+}
+
+/** Design 93 §9 receiver ownership: only a standalone dir repo whose common
+ * store is contained by this workspace owns its local config lane. */
+async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owned: boolean; shape: ConfigShapeIdentity; configPath: string }> {
+  const [rootReal, gitReal, commonReal, stat] = await Promise.all([
+    fs.realpath(root),
+    fs.realpath(ctx.gitDir),
+    fs.realpath(ctx.commonDir),
+    fs.stat(ctx.commonDir, { bigint: true }),
+  ]);
+  const relative = path.relative(rootReal, commonReal);
+  const contained = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  const shape: ConfigShapeIdentity = {
+    shape: ctx.kind,
+    commonDir: {
+      realpath: commonReal,
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      birthtime: stat.birthtimeNs > 0n ? stat.birthtimeNs.toString() : "0",
+    },
+  };
+  return { owned: ctx.kind === "dir" && gitReal === commonReal && contained, shape, configPath: path.join(ctx.commonDir, "config") };
+}
+
+function configLaneOnly(record: RepoRecordInput): ConfigLaneState {
+  return {
+    ...(record.cfgSynced === undefined ? {} : { cfgSynced: record.cfgSynced }),
+    ...(record.cfgApplied === undefined ? {} : { cfgApplied: record.cfgApplied }),
+    ...(record.cfgToken === undefined ? {} : { cfgToken: record.cfgToken }),
+    ...(record.cfgShape === undefined ? {} : { cfgShape: record.cfgShape }),
   };
 }
 
@@ -1518,6 +1572,9 @@ export interface GitPullOutcome {
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
+  /** Completed/invalidation config-lane updates, saved atomically with this
+   * pull's base and pending transitions by the step-4 packet composer. */
+  configLane?: Record<string, ConfigLaneState>;
   gitApplyMetrics?: GitApplyMetrics;
 }
 
@@ -1614,13 +1671,21 @@ export async function applyGitSections(
   store: BlobStore,
   matcher: IgnoreMatcher,
   glog: (line: string) => void,
-  opts: { collectMetrics?: boolean; onProgress?: (done: number, total: number) => void } = {}
+opts: {
+    collectMetrics?: boolean;
+    onProgress?: (done: number, total: number) => void;
+    /** Deterministic fault injection for §11 pull-lane tests. */
+    applyConfig?: typeof applyConfigTransaction;
+    materializeFreshConfig?: typeof materializeFreshGitConfig;
+  } = {}
 ): Promise<GitPullOutcome> {
   const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
   const applied: Record<string, GitSection> = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
+  const records = repoRecordsForState(state);
+  const configLane: Record<string, ConfigLaneState> = {};
   let commonDirGroups: Map<string, number> | undefined;
   let metrics: GitApplyMetrics | undefined;
   const pack = (): GitPullOutcome => ({
@@ -1628,6 +1693,7 @@ export async function applyGitSections(
     gitReposRemoved: emptyToUndef(removedMem),
     gitNeedsResolution: emptyToUndef(needsRes),
     gitPendingRemote: emptyToUndef(pending),
+    configLane: emptyToUndef(configLane),
     gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
   });
   if (!cfg.syncGit) return pack();
@@ -1664,6 +1730,87 @@ export async function applyGitSections(
       commonDirGroups.set(key, group);
     }
     return group;
+  };
+
+  const laneRecord = (rel: string): RepoRecordInput => ({
+    sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
+    ...(configLane[rel] ?? configLaneOnly(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
+  });
+  const replaceLane = (rel: string, record: RepoRecordInput): void => {
+    configLane[rel] = configLaneOnly(record);
+  };
+  const invalidateLaneShape = (rel: string, shape: ConfigShapeIdentity | undefined): RepoRecordInput => {
+    const current = laneRecord(rel);
+    if (sameConfigShape(current.cfgShape, shape)) return current;
+    const reset: RepoRecordInput = { sourceSeq: current.sourceSeq, ...(shape === undefined ? {} : { cfgShape: shape }) };
+    replaceLane(rel, reset);
+    return reset;
+  };
+  const completeLane = (
+    rel: string,
+    shape: ConfigShapeIdentity,
+    hashes: { pre: string; post: string; incoming: string; basePre?: string; postToken: ConfigStatToken }
+  ): void => {
+    replaceLane(rel, {
+      ...completeConfigApply(laneRecord(rel), {
+        pre: hashes.pre,
+        post: hashes.post,
+        incoming: hashes.incoming,
+        ...(hashes.basePre === undefined ? {} : { basePre: hashes.basePre }),
+        postToken: hashes.postToken,
+      }),
+      cfgShape: shape,
+    });
+  };
+  const configFailure = (result: Exclude<ConfigTransactionResult, { status: "completed" }>): Error =>
+    new Error(`config ${result.status}: ${result.fault.reason}`);
+
+  /** Run the config mutation only after the caller has selected the correct Git
+   * disposition. Existing repos use the optimistic locked transaction; a truly
+   * fresh repo uses the step-3 private-target helper. */
+  const runConfigApply = async (
+    rel: string,
+    repoDir: string,
+    incoming: GitConfig,
+    baseConfig: GitConfig | undefined,
+    receiver: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string }
+  ): Promise<void> => {
+    if (receiver.fresh) {
+      await (opts.materializeFreshConfig ?? materializeFreshGitConfig)(repoDir, incoming, path.join(repoDir, ".git"));
+      const ctx = await repoCtxFromDisk(repoDir);
+      if (!ctx) throw new Error("fresh config apply lost repository context");
+      const owned = await configReceiver(root, ctx);
+      if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
+      const installed = await readParsedConfigSnapshot(repoDir, owned.configPath, "locked");
+      if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
+      const post = canonicalizeGitConfig(installed.snapshot.entries);
+      if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
+      completeLane(rel, owned.shape, {
+        pre: gitConfigHash({}),
+        post: gitConfigHash(post.config),
+        incoming: gitConfigHash(incoming),
+        ...(baseConfig === undefined ? {} : { basePre: gitConfigHash(baseConfig) }),
+        postToken: installed.snapshot.token,
+      });
+      return;
+    }
+
+    const result = await (opts.applyConfig ?? applyConfigTransaction)(repoDir, receiver.configPath, incoming, { baseConfig });
+    if (result.status !== "completed") throw configFailure(result);
+    for (const warning of result.warnings) {
+      try {
+        glog(`git-sync WARNING ${rel}: config ${warning}`);
+      } catch {
+        // Observability after the rename commit point is strictly non-fatal.
+      }
+    }
+    completeLane(rel, receiver.shape, {
+      pre: result.preHash,
+      post: result.postHash,
+      incoming: result.incomingHash,
+      ...(result.baseHash === undefined ? {} : { basePre: result.baseHash }),
+      postToken: result.postToken,
+    });
   };
 
   const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
@@ -1750,11 +1897,80 @@ export async function applyGitSections(
       }
     }
 
+    const defer = (reason: string) => {
+      pending[rel] = remoteSec; // [v5]: outbound pushes carry newest unapplied truth
+      glog(`git-sync deferred ${rel}: ${reason}`);
+    };
+
+    // Design 93 §6/§9. The config predicate is deliberately decided before
+    // EITHER unchanged shortcut. Receiver ownership is local shape, not sender
+    // shape; cross-shape rows skip config loudly once while Git keeps its existing
+    // disposition. A shape mismatch first clears the old lane markers and records
+    // the new identity in this pull's atomic repo transition.
+    let configDue = false;
+    let configTarget: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string } | undefined;
+    if (remoteSec.config !== undefined) {
+      if (!dotGit) {
+        invalidateLaneShape(rel, undefined);
+        configDue = true;
+        configTarget = { fresh: true };
+      } else {
+        const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+        if (!diskCtx) {
+          invalidateLaneShape(rel, undefined);
+          const logKey = `${root}\0${rel}`;
+          if (!configOwnershipSkipLogged.has(logKey)) {
+            configOwnershipSkipLogged.add(logKey);
+            glog(`git-sync config skipped ${rel}: receiver repository shape is unreadable/non-owned`);
+          }
+        } else {
+          const receiver = await configReceiver(root, diskCtx);
+          const lane = invalidateLaneShape(rel, receiver.shape);
+          if (!receiver.owned) {
+            const logKey = `${root}\0${rel}`;
+            if (!configOwnershipSkipLogged.has(logKey)) {
+              configOwnershipSkipLogged.add(logKey);
+              glog(`git-sync config skipped ${rel}: receiver ${diskCtx.kind} shape does not own the common config`);
+            }
+          } else {
+            configTarget = { fresh: false, shape: receiver.shape, configPath: receiver.configPath };
+            const current = await readConfigSnapshot(receiver.configPath);
+            const token = current.ok ? current.snapshot.token : undefined;
+            configDue = gitConfigHash(remoteSec.config) !== lane.cfgApplied || !sameConfigToken(token, lane.cfgToken);
+          }
+        }
+      }
+    }
+
+    // A conflict checkpoint owns the Git disposition until the user changes the
+    // recorded local identity. Config waits; after that change the same due
+    // predicate above feeds either the converged shortcut or a new conflict/apply.
+    let resolutionChanged = false;
+    if (needsRes[rel] !== undefined) {
+      if (gitIdentityKey(localId) === needsRes[rel]) {
+        return { result: "unchanged", commonDirGroup };
+      }
+      delete needsRes[rel];
+      resolutionChanged = true;
+    }
+
+    const applyConfigOnly = async (): Promise<boolean> => {
+      if (!configDue || !configTarget || configTarget.fresh) return !configDue;
+      try {
+        await runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget);
+        return true;
+      } catch (error) {
+        defer(errMsg(error));
+        return false;
+      }
+    };
+
     // Projected identity comparison on the NARROWER of the two scopes (§7) — what makes
     // worktree→standalone→worktree round-trips converge without apply ping-pong.
     const cmpScope = narrowerScope(remoteSec.refScope, baseSec?.refScope);
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
-    if (!remoteChanged && !pend) {
+    if (!remoteChanged && !pend && !resolutionChanged && !(configDue && configTarget?.fresh)) {
+      if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
       return { result: "unchanged", commonDirGroup };
     }
@@ -1766,6 +1982,7 @@ export async function applyGitSections(
     if (localId && !cleanMaterialize) {
       const n = narrowerScope(localId.refScope, remoteSec.refScope);
       if (projectedKey(localId, n) === projectedKey(remoteSec, n)) {
+        if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
         applied[rel] = remoteSec;
         delete pending[rel];
         delete removedMem[rel];
@@ -1787,10 +2004,6 @@ export async function applyGitSections(
     }
 
     // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
-    const defer = (reason: string) => {
-      pending[rel] = remoteSec; // [v5]: outbound pushes now carry THIS section; retry next pull
-      glog(`git-sync deferred ${rel}: ${reason}`);
-    };
     if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
       defer("target is inside an ignored subtree — refusing to materialize");
       return { result: "deferred", commonDirGroup };
@@ -1811,20 +2024,26 @@ export async function applyGitSections(
     // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
     // update-only apply is the whole treatment; the memory clears on success.
     const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
+    const configAfterGit = configDue && configTarget && remoteSec.config !== undefined
+      ? async () => runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget!)
+      : undefined;
     const res = await applyGitState(
       repoDir,
       remoteSec,
       store,
       kek,
-      wipeLeftover
-        ? {
+      {
+        ...(wipeLeftover
+          ? {
             beforeMutateWipesRefs: true,
             beforeMutate: async () => {
               await quarantineAndWipeGitState(repoDir);
               delete removedMem[rel]; // leftover quarantined + wiped — the memory served its purpose
             },
           }
-        : {}
+          : {}),
+        ...(configAfterGit ? { afterGitMutate: configAfterGit } : {}),
+      }
     );
     if (res.applied) {
       // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).

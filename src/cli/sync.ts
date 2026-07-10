@@ -348,12 +348,14 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
       pending: gitOutcome.gitPendingRemote,
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
+      configLane: gitOutcome.configLane,
     }),
     values: {
       bases: gitOutcome.gitRepos,
       pending: gitOutcome.gitPendingRemote,
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
+      configLane: gitOutcome.configLane,
     },
   }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
   if (actions.length > 0) {

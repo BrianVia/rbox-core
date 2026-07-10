@@ -13,11 +13,17 @@ import {
   type SyncState,
 } from "./config.js";
 
+export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+
 export interface RepoStateValues {
   bases?: Record<string, GitSection>;
   pending?: Record<string, GitSection>;
   removed?: Record<string, string>;
   resolutions?: Record<string, string>;
+  /** A present entry replaces this repo's local-only config lane fields. Missing
+   * means preserve them. This rides the same generation-CAS transition as base and
+   * pending; there is never a second config-only state write. */
+  configLane?: Record<string, ConfigLaneState>;
 }
 
 export interface StateSource {
@@ -70,16 +76,17 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
   // ordering half of the generation CAS: older pending/absence cannot regress a
   // newer success, while the transition still records that this path was observed.
   if (current.sourceSeq > source.sourceGlobalSeq) return inputRecord(current);
+  const lane = source.values.configLane?.[relPath] ?? current;
   return stampConfigAck({
     sourceSeq: source.sourceGlobalSeq,
     ...(source.values.bases?.[relPath] === undefined ? {} : { base: source.values.bases[relPath] }),
     ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
     ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
     ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
-    ...(current.cfgSynced === undefined ? {} : { cfgSynced: current.cfgSynced }),
-    ...(current.cfgApplied === undefined ? {} : { cfgApplied: current.cfgApplied }),
-    ...(current.cfgToken === undefined ? {} : { cfgToken: current.cfgToken }),
-    ...(current.cfgShape === undefined ? {} : { cfgShape: current.cfgShape }),
+    ...(lane.cfgSynced === undefined ? {} : { cfgSynced: lane.cfgSynced }),
+    ...(lane.cfgApplied === undefined ? {} : { cfgApplied: lane.cfgApplied }),
+    ...(lane.cfgToken === undefined ? {} : { cfgToken: lane.cfgToken }),
+    ...(lane.cfgShape === undefined ? {} : { cfgShape: lane.cfgShape }),
   }, source.authoredCfgHashByRepo?.[relPath]);
 }
 
@@ -175,6 +182,7 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.pending ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
+    ...Object.keys(values.configLane ?? {}),
   ])].sort();
 }
 

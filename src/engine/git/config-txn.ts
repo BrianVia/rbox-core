@@ -56,8 +56,12 @@ export type ConfigTransactionResult =
       attempts: number;
       pre: GitConfigCanonicalization;
       post: GitConfigCanonicalization;
+      preHash: string;
+      postHash: string;
+      incomingHash: string;
+      baseHash?: string;
       postBytes: Buffer;
-      postToken?: ConfigStatToken;
+      postToken: ConfigStatToken;
       warnings: string[];
     }
   | { status: "deferred"; attempts: number; fault: ConfigFault }
@@ -80,6 +84,9 @@ export interface ConfigTransactionOptions {
   git?: GitConfigRunner;
   retryDelay?: (attempt: number, fault: ConfigFault) => void | Promise<void>;
   hooks?: ConfigTransactionHooks;
+  /** Base config at the start of this pull apply. Hashed while the transaction
+   * lock is held so the caller can apply the §6 sync-point rule exactly. */
+  baseConfig?: GitConfig;
 }
 
 export interface SweepResult {
@@ -271,6 +278,10 @@ function transactionOutcome(attempt: number, faultValue: ConfigFault): ConfigTra
     : { status: "deferred", attempts: attempt, fault: faultValue };
 }
 
+function configHash(config: GitConfig): string {
+  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex");
+}
+
 /** Optimistic-CAS add-only transaction. The rename is the sole commit point. */
 export async function applyConfigTransaction(repoDir: string, configPath: string, desired: GitConfig, options: ConfigTransactionOptions = {}): Promise<ConfigTransactionResult> {
   const validation = validateCanonicalGitConfig(desired);
@@ -359,13 +370,31 @@ export async function applyConfigTransaction(repoDir: string, configPath: string
         continue;
       }
 
+      // Design 93 §6: every apply-decision hash is derived while config.lock is
+      // held. The canonical maps themselves were built from the bracketed B1 and
+      // candidate snapshots; hashing them here keeps the persisted sync point tied
+      // to this exact transaction.
+      const pre = canonicalizeGitConfig(b1.snapshot.entries);
+      const candidatePost = canonicalizeGitConfig(candidate.snapshot.entries);
+      if (!pre.ok) {
+        lastFault = fault("permanent", "parse-error", new Error(pre.reason));
+        return transactionOutcome(attempt, lastFault);
+      }
+      if (!candidatePost.ok) {
+        lastFault = fault("permanent", "parse-error", new Error(candidatePost.reason));
+        return transactionOutcome(attempt, lastFault);
+      }
+      const preHash = configHash(pre.config);
+      const incomingHash = configHash(desired);
+      const baseHash = options.baseConfig === undefined ? undefined : configHash(options.baseConfig);
+
       await fs.rename(candidatePath, configPath);
       committed = true;
       candidatePath = undefined;
       const warnings: string[] = [];
       let postBytes = candidate.snapshot.bytes;
-      let postToken: ConfigStatToken | undefined;
-      let post = canonicalizeGitConfig(candidate.snapshot.entries);
+      let postToken: ConfigStatToken = candidate.snapshot.token;
+      let post: GitConfigCanonicalization = candidatePost;
       try {
         await options.hooks?.afterRename?.(configPath, attempt);
         const installed = await readConfigSnapshot(configPath, "locked");
@@ -379,6 +408,10 @@ export async function applyConfigTransaction(repoDir: string, configPath: string
       } catch (error) {
         warnings.push(`post-rename hook: ${errno(error) ?? String(error)}`);
       }
+      // Capture the final sync-point hash before releasing config.lock. Cleanup
+      // below is deliberately non-fatal, but it must not move hash computation
+      // outside the transaction boundary.
+      const postHash = post.ok ? configHash(post.config) : configHash(candidatePost.config);
       try {
         await fsyncDirectory(path.dirname(configPath));
       } catch (error) {
@@ -389,8 +422,12 @@ export async function applyConfigTransaction(repoDir: string, configPath: string
       return {
         status: "completed",
         attempts: attempt,
-        pre: canonicalizeGitConfig(b1.snapshot.entries),
+        pre,
         post,
+        preHash,
+        postHash,
+        incomingHash,
+        ...(baseHash === undefined ? {} : { baseHash }),
         postBytes,
         postToken,
         warnings,
