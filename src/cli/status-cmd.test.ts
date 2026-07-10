@@ -144,3 +144,23 @@ test("status does not suppress local changes for a fresh populate marker on an a
   expect(out).not.toContain("initial sync in progress");
   expect(out).toContain("sequence 7");
 });
+
+test("status renders the design-93 indeterminate config lane and never reports zero-on-error", async () => {
+  cfg.syncGit = true;
+  await saveConfig(root, cfg);
+  const d = scanDeps();
+  d.gitDivergenceStatus = async () => ({ count: 1, configChecking: ["repo"], configDisabled: [] });
+
+  const lines: string[] = [];
+  const oldLog = console.log;
+  console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
+  try {
+    await statusCmdWithDeps(root, {}, d);
+  } finally {
+    console.log = oldLog;
+  }
+
+  const out = lines.join("\n");
+  expect(out).toContain("git changes in 1 repo");
+  expect(out).toContain("config: checking (repo)");
+});

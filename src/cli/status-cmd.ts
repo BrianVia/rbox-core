@@ -16,7 +16,13 @@ import {
   trashLine,
   type StatusRemoteHead,
 } from "./status-view.js";
-import { gitDivergenceCount, gitDivergenceFastRepoSource, type GitDivergenceRepoHint } from "./sync-git.js";
+import {
+  gitDivergenceCount,
+  gitDivergenceFastRepoSource,
+  gitDivergenceStatus,
+  type GitDivergenceRepoHint,
+  type GitDivergenceStatus,
+} from "./sync-git.js";
 import { style } from "./style.js";
 import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
@@ -34,6 +40,8 @@ interface StatusLocalCountsBase {
   deleted: number;
   trackedFiles: number;
   gitChanged: number;
+  gitConfigChecking?: string[];
+  gitConfigDisabled?: GitDivergenceStatus["configDisabled"];
 }
 
 type StatusLocalCounts =
@@ -45,6 +53,8 @@ export interface StatusCmdDeps {
   loadHashCache: (root: string) => Promise<HashCache>;
   scanManifest: typeof scanManifest;
   gitDivergenceCount: typeof gitDivergenceCount;
+  /** Optional so existing embedders/test fakes using the numeric API remain valid. */
+  gitDivergenceStatus?: typeof gitDivergenceStatus;
   gitDivergenceFastRepoSource: (
     root: string,
     baseGitRepos: SyncState["lastSyncedManifest"]["gitRepos"],
@@ -59,6 +69,7 @@ const defaultStatusDeps: StatusCmdDeps = {
   loadHashCache: (root) => HashCache.load(root),
   scanManifest,
   gitDivergenceCount,
+  gitDivergenceStatus,
   gitDivergenceFastRepoSource,
   daemonBindingStatus,
   readDaemonPidRecord,
@@ -258,6 +269,28 @@ export async function statusCmdWithDeps(
       livePidfileBootId: alive.bootId,
     });
 
+  const evaluateGit = async (
+    matcher: IgnoreMatcher | undefined,
+    source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
+    includeBaseRepos = true
+  ): Promise<GitDivergenceStatus> => {
+    if (!cfg.syncGit) return { count: 0, configChecking: [], configDisabled: [] };
+    try {
+      if (deps.gitDivergenceStatus) {
+        return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
+      }
+      return {
+        count: await deps.gitDivergenceCount(root, cfg, state, matcher, source, includeBaseRepos),
+        configChecking: [],
+        configDisabled: [],
+      };
+    } catch {
+      // Design 93 §6: an indeterminate config lane is conservatively divergent;
+      // status must never collapse an evaluation failure to zero.
+      return { count: 1, configChecking: ["*"], configDisabled: [] };
+    }
+  };
+
   let counts: StatusLocalCounts;
   if (trusted) {
     const matcher = buildIgnoreMatcher(root, {
@@ -265,13 +298,15 @@ export async function statusCmdWithDeps(
       knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
     });
     const repoHints = cfg.syncGit ? await deps.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
-    const gitChanged = await deps.gitDivergenceCount(root, cfg, state, undefined, repoHints, false).catch(() => 0);
+    const gitStatus = await evaluateGit(undefined, repoHints, false);
     counts = {
       added: trusted.local.added,
       changed: trusted.local.changed,
       deleted: trusted.local.deleted,
       trackedFiles: trusted.local.trackedFiles,
-      gitChanged,
+      gitChanged: gitStatus.count,
+      gitConfigChecking: gitStatus.configChecking,
+      gitConfigDisabled: gitStatus.configDisabled,
       source: "daemon",
       ageMs: trusted.ageMs,
     };
@@ -291,7 +326,7 @@ export async function statusCmdWithDeps(
     });
     const hashCache = await deps.loadHashCache(root);
     const gitRepoFeed = createGitRepoFeed();
-    const gitChangedP = deps.gitDivergenceCount(root, cfg, state, matcher, gitRepoFeed.iterable).catch(() => 0);
+    const gitChangedP = evaluateGit(matcher, gitRepoFeed.iterable);
     let localManifest;
     try {
       localManifest = await deps.scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
@@ -304,12 +339,15 @@ export async function statusCmdWithDeps(
     }
     const manifestDiff = diffManifests(state.lastSyncedManifest, localManifest);
     const deleted = manifestDiff.deleted.filter((p) => !matcher.ignores(p)).length;
+    const gitStatus = await gitChangedP;
     counts = {
       added: manifestDiff.added.length,
       changed: manifestDiff.changed.length,
       deleted,
       trackedFiles: localManifest.files.length,
-      gitChanged: await gitChangedP,
+      gitChanged: gitStatus.count,
+      gitConfigChecking: gitStatus.configChecking,
+      gitConfigDisabled: gitStatus.configDisabled,
       source: "computed",
     };
   }
@@ -348,6 +386,15 @@ export async function statusCmdWithDeps(
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
       crypto,
+      ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
+        ? {
+          gitConfig: {
+            state: counts.gitConfigChecking?.length ? "checking" : "disabled",
+            checking: counts.gitConfigChecking ?? [],
+            disabled: counts.gitConfigDisabled ?? [],
+          },
+        }
+        : {}),
     };
     emitJson(statusJson);
     return;
@@ -416,6 +463,13 @@ export async function statusCmdWithDeps(
     }
     if (pending) parts.push(style.yellow(`${pending} pending`));
     if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
+    if (counts.gitConfigChecking?.length) {
+      const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
+      parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
+    }
+    if (counts.gitConfigDisabled?.length) {
+      parts.push(style.yellow(`config: disabled (${counts.gitConfigDisabled.map((issue) => `${issue.relPath}: ${issue.reason}`).join("; ")})`));
+    }
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
   }
   const m = await loadMetrics(root);
