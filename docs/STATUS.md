@@ -5,9 +5,52 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu daemon pending re-login); CHANGELOG backfilled to inception._
+_Last updated: 2026-07-10 (evening) — designs 84/85 ALIGNED + built through their gates (#201–#205); GC drain phase 1 live in prod (1,400 intents); CLI audit shipped._
 
 ## Where we are
+
+- **2026-07-10 evening sprint (5 PRs merged, all via subagent+codex tracks):**
+  - **Design 84 v7 ALIGNED** (#201, 6 codex rounds, zero final findings) then
+    **Phase A measured** (#204, gate record in doc §6.1): the 39.2MB
+    O(workspace) manifest transfer is confirmed, BUT `postMs` (the commit
+    POST — server-side full-refset pipeline) dominates at 8.4–8.6s of the
+    ~14s commit (56–63%); upload is only ~4s. **C1-alone FAILS its gate;
+    commit ≤3–4s targets unreachable without a server-side O(change)
+    commit-POST companion design (unwritten; next step = OpSpan decomposition
+    of a commit). Phase D (fast pulls, ≤2s) stands; C1 still pays for bytes
+    (39.2→~5MB).** Fleet daemons now run `RBOX_METRICS=1` permanently.
+  - **Design 85 v3 ALIGNED** (#202, 7 codex rounds; Layer B rebuilt around the
+    design-93 mutex, dircache reuse keyed on directory ctime) and its two
+    **prerequisite correctness ships MERGED** (#205): torn-scan stability
+    predicate (`statsStableAcrossHash`: ino/dev/size/mtime/ctime/mode across
+    the hash) + HashCache v2 `(mtime,size,ctime)` with versioned format.
+    Deliverable 2 (P0 instrumentation) in flight; founder directive: flip
+    RBOX_METRICS default-ON if measured overhead is negligible; all new
+    instrumentation output must stay path-free/non-PII.
+  - **CLI usability audit landed** (#203): audit doc at
+    `docs/audits/2026-07-09-cli-usability-audit.md` + 4 fix batches —
+    `restore` now trash-tier-backed (undoable), uninstall keystore warning,
+    doctor/connect/recover/sync paper cuts, `friendlyHttpError`, help
+    coverage, global unknown-flag detection. Ships to fleet at next `v*`.
+    Deferred product calls listed in the final PR body (config-only settings
+    CLI surfaces, env-var flag parity, account/pair/connect disambiguation).
+- **GC drain (design 95/96) — Phase 1 LIVE in prod, deletes unlock 2026-07-11
+  ~20:01Z.** Timeline 07-10: #200 deployed 19:19Z → DO index backfill done
+  <40min → first-ever successful Phase 1 mark at the 20:23Z cron (38,313
+  entitlement rows) → dry-run audit walked all 504 pages: 70,040 candidates
+  (~61.3GB), wouldIntent 5,410 (7-day grace gates the rest; they age in
+  through ~07-15), wouldDelete 0 → **1,400 delete intents stamped** via
+  supervised `gc-drain.ts execute` passes. **Known bug found: an execute
+  invocation that 500s (likely D1/subrequest exhaustion under rapid passes)
+  opens its 200 intents but orphans its lease → 20min TTL + 30min takeover
+  quiescence ≈ 50min lockout; recurs every few invocations.** Runbook
+  2026-07-11: `wrangler tail` from the Mac during one execute to capture the
+  exception → fix (incl. crash-robust lease release) → verify the 1,400
+  delete after quiescence → stamp the rest → THEN flip
+  `RBOX_GC_PURGE_DISABLED` for the daily cron. Secrets:
+  `prod-keys.local.secret` at repo root (rbox-synced to both hosts) has
+  `RBOX_PLATFORM_SECRET`; usage string in the script header. Pace executes
+  ≥60s apart.
 
 - **Version: v1.0.0 — the correctness milestone (2026-07-10).** No functional
   change over 0.9.18; the tag marks designs 91/92/93 field-proven. Release run
