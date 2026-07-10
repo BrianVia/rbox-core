@@ -185,6 +185,27 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
   cron) → then design 89.** Session paused here per founder instruction
   (after 95's merge).
 
+- **Designs 84 + 85 staleness reviews (2026-07-10 evening): both REVISE,
+  materially stale vs current main** (branches `design/84-review` /
+  `design/85-review`, REVIEW-84/85.md). Design 84's headline: its recovery
+  story is IMPOSSIBLE post-design-91 (head authority rejects the
+  fresh-snapshot escape; a broken delta chain wedges every writer), its GC
+  chain-rooting invariant is unenforceable as written, and its Phase-0
+  plan describes building instrumentation that already shipped. Design
+  85's headline: design 93's workspace mutex materially changes Layer B's
+  daemon-delegation shape, and Layer A must not start before the P0
+  measurements. **Both need full revision loops (fresh session — they are
+  design-94/95-scale efforts) before the 1.1 perf track implements.**
+- **D1 scaling posture (discussed 2026-07-10):** ship design 32's
+  `dbFor(accountId)` seam at N=1 EARLY (behavior-preserving refactor,
+  founder decision gating: split vs placement-constraint), define shard
+  tripwires (D1 >2-3GB, recurring hot-path 429s, cron budget alarms),
+  keep design 57 (PlanetScale) break-glass for >10TiB whale accounts.
+  Ratio: metadata ≈ 1MB per GiB content ⇒ one D1 ≈ 10TiB content.
+- **codex fast mode enabled on via-desktop-ubuntu** (`service_tier="fast"`
+  + `[features].fast_mode`, ~2.5× credit rate; smoke-tested on
+  gpt-5.6-sol).
+
 ## Backlog (ledgered, not urgent)
 
 - Stripe annual prices for design 86 (paid-only + trial + annual, PR #159);
