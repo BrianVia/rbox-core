@@ -43,6 +43,7 @@ import type { Env } from "./env.js";
  *    double6 = count        (blobs per commit, parts, etc.)
  *    double7 = ratio        (0..1, e.g. missingBlobs / referenced)
  *    double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
+ *    double9..15 = commit server total/envelope/accounting/sidecar/CAS/mirror/response ms
  */
 export interface MetricEvent {
   /** Low-cardinality op name, e.g. "request" | "commit" | "blob.put". */
@@ -69,6 +70,13 @@ export interface MetricEvent {
   count?: number;
   /** Ratio 0..1 (e.g. missing/referenced). */
   ratio?: number;
+  serverTotalMs?: number;
+  envelopeMs?: number;
+  accountingMs?: number;
+  sidecarMs?: number;
+  commitMs?: number;
+  mirrorMs?: number;
+  responseMs?: number;
 }
 
 export function emit(env: Env, e: MetricEvent): void {
@@ -79,7 +87,12 @@ export function emit(env: Env, e: MetricEvent): void {
       indexes: [e.op],
       blobs: [e.op, e.route ?? "", e.outcome],
       // POSITIONAL — keep docs/observability-server-metrics.md + dashboard SQL in sync.
-      doubles: [e.ms ?? 0, e.dbMs ?? 0, e.storeMs ?? 0, e.doMs ?? 0, e.bytes ?? 0, e.count ?? 0, e.ratio ?? 0, e.dbCalls ?? 0],
+      doubles: [
+        e.ms ?? 0, e.dbMs ?? 0, e.storeMs ?? 0, e.doMs ?? 0,
+        e.bytes ?? 0, e.count ?? 0, e.ratio ?? 0, e.dbCalls ?? 0,
+        e.serverTotalMs ?? 0, e.envelopeMs ?? 0, e.accountingMs ?? 0,
+        e.sidecarMs ?? 0, e.commitMs ?? 0, e.mirrorMs ?? 0, e.responseMs ?? 0,
+      ],
     });
   } catch {
     // telemetry must never break the request path

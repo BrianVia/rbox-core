@@ -17,5 +17,5 @@ export {
   NetworkError,
 } from "./remote/errors.js";
 export { isTransientNetworkError, transferTimeoutMs } from "./remote/resilient.js";
-export { CommitRejectedError, type CommitOptions, type CommitResult, type CommitTimings, type LatestOptions, type LatestTimings } from "./remote/commits.js";
+export { CommitRejectedError, type CommitOptions, type CommitResult, type CommitTimings, type ServerTimings, type LatestOptions, type LatestTimings } from "./remote/commits.js";
 export { RboxApi, RemoteBlobStore, createRemoteWorkspace, type SyncRemote } from "./remote/api.js";

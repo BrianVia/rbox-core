@@ -499,7 +499,16 @@ export class E2eeRemote implements SyncRemote {
       if (e instanceof CommitRejectedError && blobRefset) e.fingerprint = blobRefset.sidecarSha;
       throw e;
     }
-    onCommitTimings?.({ refreshMs, sidecarMs, encodeMs, encryptMs, uploadMs, postMs, encBytes: built.encManifest.byteLength });
+    onCommitTimings?.({
+      refreshMs,
+      sidecarMs,
+      encodeMs,
+      encryptMs,
+      uploadMs,
+      postMs,
+      encBytes: built.encManifest.byteLength,
+      ...(res.serverTimings ? { serverTimings: res.serverTimings } : {}),
+    });
     if (res.conflict) return { conflict: true, head: res.head };
     if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
     if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry

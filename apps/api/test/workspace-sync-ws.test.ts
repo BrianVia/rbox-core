@@ -126,12 +126,17 @@ function commitReq(seq: number, hashSeed = "b") {
 
 function metricsEnv(rows: Parameters<typeof fakeDb>[2] = {}) {
   const metrics: string[] = [];
+  const metricPoints: Array<{ blobs?: string[]; doubles?: number[] }> = [];
   return {
     rbox_dev_db: fakeDb([], {}, rows),
     rbox_metrics: {
-      writeDataPoint: (point: { blobs?: string[] }) => metrics.push(point.blobs?.[2] ?? ""),
+      writeDataPoint: (point: { blobs?: string[]; doubles?: number[] }) => {
+        metrics.push(point.blobs?.[2] ?? "");
+        metricPoints.push(point);
+      },
     },
     __metrics: metrics,
+    __metricPoints: metricPoints,
   };
 }
 
@@ -275,15 +280,36 @@ describe("workspace sync websocket fanout", () => {
 
     const first = await sync.fetch(commitReq(475, "a"));
     expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { sequence: number; commitHash: string; serverTimings: Record<string, unknown> };
+    expect(firstBody).toMatchObject({ sequence: 475, commitHash: sha("a") });
+    expect(Object.keys(firstBody.serverTimings).sort()).toEqual([
+      "accountingMs", "commitMs", "envelopeMs", "mirrorMs", "responseMs", "sidecarMs", "totalMs",
+    ]);
+    expect(Object.values(firstBody.serverTimings).every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)).toBe(true);
+    const successMetric = env.__metricPoints.find((point) => point.blobs?.[2] === "ok");
+    expect(successMetric?.doubles?.slice(8, 15)).toEqual([
+      firstBody.serverTimings.totalMs,
+      firstBody.serverTimings.envelopeMs,
+      firstBody.serverTimings.accountingMs,
+      firstBody.serverTimings.sidecarMs,
+      firstBody.serverTimings.commitMs,
+      firstBody.serverTimings.mirrorMs,
+      firstBody.serverTimings.responseMs,
+    ]);
 
     const retry = await sync.fetch(commitReq(475, "a"));
     expect(retry.status).toBe(409);
-    expect(await retry.json()).toEqual({ error: "conflict", head: 475 });
+    const retryBody = (await retry.json()) as { error: string; head: number; serverTimings: Record<string, unknown> };
+    expect(retryBody).toMatchObject({ error: "conflict", head: 475 });
+    expect(Object.keys(retryBody.serverTimings).sort()).toEqual([
+      "accountingMs", "commitMs", "envelopeMs", "mirrorMs", "responseMs", "sidecarMs", "totalMs",
+    ]);
+    expect(Object.values(retryBody.serverTimings).every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)).toBe(true);
     expect(env.__metrics).not.toContain("same_sequence_different_hash");
 
     const fork = await sync.fetch(commitReq(475, "b"));
     expect(fork.status).toBe(409);
-    expect(await fork.json()).toEqual({ error: "conflict", head: 475 });
+    expect(await fork.json()).toMatchObject({ error: "conflict", head: 475, serverTimings: expect.any(Object) });
     expect(env.__metrics).toContain("same_sequence_different_hash");
   });
 });

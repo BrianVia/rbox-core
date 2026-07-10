@@ -9,6 +9,7 @@ const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const commit: SignedCommit = { body: "{}", commitHash: "a".repeat(64), sig: "sig" };
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const serverTimings = { totalMs: 7, envelopeMs: 1, accountingMs: 2, sidecarMs: 0, commitMs: 1, mirrorMs: 2, responseMs: 0 };
 
 test("redeemReceipts drains 12,001 receipts in 5k batches and clears each successful batch", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
@@ -38,16 +39,32 @@ test("commitSigned redeems first and posts an empty receipts map", async () => {
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     if (url.endsWith("/receipts/redeem")) return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
     commitBodies.push(body);
-    return json(200, { sequence: 1 });
+    return json(200, { sequence: 1, serverTimings });
   };
 
-  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({ sequence: 1 });
+  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({ sequence: 1, serverTimings });
   expect(paths.map((p) => new URL(p).pathname)).toEqual([
     "/v1/ws/ws/proj/root/receipts/redeem",
     "/v1/ws/ws/proj/root/manifests",
   ]);
   expect(commitBodies).toEqual([{ parentSequence: 0, commit, receipts: {} }]);
   expect(ctx.receipts.size).toBe(0);
+});
+
+test("commitSigned preserves validated server timings on a conflict", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+    json(409, { error: "conflict", head: 4, serverTimings });
+
+  await expect(commitSigned(ctx, 3, commit)).resolves.toEqual({ conflict: true, head: 4, serverTimings });
+});
+
+test("commitSigned ignores malformed server timings from an old or mixed server", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+    json(200, { sequence: 1, serverTimings: { ...serverTimings, mirrorMs: "slow" } });
+
+  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({ sequence: 1 });
 });
 
 test("commitSigned maps a redeem fence abort to per-blob staging without posting the manifest", async () => {

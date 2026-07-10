@@ -37,6 +37,16 @@ type IndexState = "building" | "ready" | "lagging";
 type FoldCursor = { phase: "removed" | "added"; lastSha: string };
 type SqlRow = Record<string, unknown>;
 
+interface ServerTimings {
+  totalMs: number;
+  envelopeMs: number;
+  accountingMs: number;
+  sidecarMs: number;
+  commitMs: number;
+  mirrorMs: number;
+  responseMs: number;
+}
+
 async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
   if (overCap.reason === "no_plan") return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, reason: "no_plan" as const };
   const row = await db.prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
@@ -230,6 +240,29 @@ export class WorkspaceSync {
   // ---- commit (the atomic sequencer) ----
 
   private async commit(req: Request, ws: string, proj: string): Promise<Response> {
+    const startedAt = Date.now();
+    const serverTimings: ServerTimings = {
+      totalMs: 0,
+      envelopeMs: 0,
+      accountingMs: 0,
+      sidecarMs: 0,
+      commitMs: 0,
+      mirrorMs: 0,
+      responseMs: 0,
+    };
+    let timingsFinalized = false;
+    const metricTimings = (): Pick<MetricEvent, "serverTotalMs" | "envelopeMs" | "accountingMs" | "sidecarMs" | "commitMs" | "mirrorMs" | "responseMs"> => {
+      if (!timingsFinalized) serverTimings.totalMs = Date.now() - startedAt;
+      return {
+        serverTotalMs: serverTimings.totalMs,
+        envelopeMs: serverTimings.envelopeMs,
+        accountingMs: serverTimings.accountingMs,
+        sidecarMs: serverTimings.sidecarMs,
+        commitMs: serverTimings.commitMs,
+        mirrorMs: serverTimings.mirrorMs,
+        responseMs: serverTimings.responseMs,
+      };
+    };
     const ROUTE = "/v1/ws/:ws/proj/:proj/manifests"; // templated (no ids) for telemetry
     // op.span accumulates this commit's D1 (missingBlobs + mirror, incl. helpers) and
     // DO (transactionSync) time + call count; op.done emits the one metric. Created up
@@ -241,7 +274,8 @@ export class WorkspaceSync {
     // isolate via req.json(). readBodyCapped aborts the stream past MAX_REQUEST_BODY BEFORE parse.
     const raw = await readBodyCapped(req, MAX_REQUEST_BODY);
     if (raw === null) {
-      op.done("body_too_large", { bytes: MAX_REQUEST_BODY });
+      serverTimings.envelopeMs = Date.now() - startedAt;
+      op.done("body_too_large", { bytes: MAX_REQUEST_BODY, ...metricTimings() });
       return json({ error: "body_too_large", message: "request body too large", max: MAX_REQUEST_BODY }, 413);
     }
     let body: {
@@ -274,7 +308,8 @@ export class WorkspaceSync {
     if (commit.body.length > MAX_COMMIT_BODY) {
       // Directly relevant to the commit-body-scaling TODO: track how often bodies
       // hit the cap (the signal that blobRefs need to move out of the signed body).
-      op.done("body_too_large", { bytes: commit.body.length });
+      serverTimings.envelopeMs = Date.now() - startedAt;
+      op.done("body_too_large", { bytes: commit.body.length, ...metricTimings() });
       return json({ error: "body_too_large", message: "commit body too large", count: commit.body.length, max: MAX_COMMIT_BODY }, 400);
     }
 
@@ -303,6 +338,7 @@ export class WorkspaceSync {
     if (mode.kind === "sidecar" && !useReceipts) return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
     const deviceId = typeof cb.deviceId === "string" ? cb.deviceId : null;
     const bodyBytes = commit.body.length;
+    serverTimings.envelopeMs = Date.now() - startedAt;
 
     // Blob-existence: refuse to advance head past a commit referencing blobs we don't have
     // (the encrypted manifest is itself a normal blob the client uploaded first), or every
@@ -310,7 +346,23 @@ export class WorkspaceSync {
     // the resolved sidecar (below); the existence set always includes encManifestSha and,
     // for sidecar commits, sidecarSha itself (so the published head's sidecar is durable).
     let shas: string[];
-    const emit = (count: number) => (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, { bytes: bodyBytes, count, ...extra });
+    const emit = (count: number) => (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, {
+      bytes: bodyBytes,
+      count,
+      ...metricTimings(),
+      ...extra,
+    });
+
+    const timedResponse = (payload: Record<string, unknown>, status: number, outcome: string, emitOutcome: (outcome: string) => void): Response => {
+      const responseStartedAt = Date.now();
+      const responsePayload = { ...payload };
+      serverTimings.responseMs = Date.now() - responseStartedAt;
+      serverTimings.totalMs = Date.now() - startedAt;
+      timingsFinalized = true;
+      responsePayload.serverTimings = { ...serverTimings };
+      emitOutcome(outcome);
+      return json(responsePayload, status);
+    };
 
     if (useReceipts) {
       // §23.4 + §24: resolve refs → validate (present=1+entitled OR receipt) → catalog+charge
@@ -326,7 +378,9 @@ export class WorkspaceSync {
           emit(accountedCount)("too_many_refs");
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
+        const sidecarStartedAt = Date.now();
         const sc = await resolveSidecarBytes(this.env, dbFor(op.env, accountId), accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
+        serverTimings.sidecarMs = Date.now() - sidecarStartedAt;
         if (!sc.ok) {
           if ("needsUpload" in sc) {
             emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
@@ -347,12 +401,15 @@ export class WorkspaceSync {
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
       }
+      const accountingStartedAt = Date.now();
       const v = await validateCommitRefs(this.env, dbFor(op.env, accountId), accountId, shas, receipts, nowMs);
+      serverTimings.accountingMs = Date.now() - accountingStartedAt;
       if (!v.ok) {
         emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
         return json(unsatisfiedBlobsBody(v.needsUpload), 422);
       }
       const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
+      serverTimings.accountingMs = Date.now() - accountingStartedAt;
       if ("needsUpload" in acct) {
         emit(shas.length)("unsatisfied_blobs", { ratio: acct.needsUpload.length / shas.length });
         return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
@@ -366,7 +423,9 @@ export class WorkspaceSync {
       // so `mode` here is always inline; the guard narrows the type and is defensive.
       if (mode.kind !== "inline") return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
       shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+      const accountingStartedAt = Date.now();
       const missing = await this.missingBlobs(dbFor(op.env, accountId), shas, accountId);
+      serverTimings.accountingMs = Date.now() - accountingStartedAt;
       if (missing.length > 0) {
         // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
         emit(shas.length)("unsatisfied_blobs", { ratio: missing.length / shas.length });
@@ -380,6 +439,7 @@ export class WorkspaceSync {
     const stored = JSON.stringify({ commitHash: commit.commitHash, sig: commit.sig, body: commit.body });
     let outcome: { sequence: number; watermark: number } | { conflict: number; equivocation?: true } | { epochStale: number };
     const doT0 = performance.now();
+    const commitStartedAt = Date.now();
     try {
       let next = 0;
       this.ctx.storage.transactionSync(() => {
@@ -414,18 +474,18 @@ export class WorkspaceSync {
       if (e !== ABORT) throw e;
     } finally {
       op.span.doMs += performance.now() - doT0; // DO transactionSync hold (contention signal)
+      serverTimings.commitMs = Date.now() - commitStartedAt;
     }
 
     if ("conflict" in outcome!) {
       if (outcome!.equivocation) metric(this.env, "same_sequence_different_hash");
-      emitCommit("conflict");
-      return json({ error: "conflict", head: outcome!.conflict }, 409);
+      return timedResponse({ error: "conflict", head: outcome!.conflict }, 409, "conflict", emitCommit);
     }
     if ("epochStale" in outcome!) {
-      emitCommit("epoch_stale");
-      return json({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409);
+      return timedResponse({ error: "epoch_stale", currentEpoch: outcome!.epochStale }, 409, "epoch_stale", emitCommit);
     }
     const sequence = outcome!.sequence;
+    const mirrorStartedAt = Date.now();
     await this.armAlarm(Date.now());
 
     wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }));
@@ -440,10 +500,10 @@ export class WorkspaceSync {
     } catch (e) {
       logErr("d1_commit_mirror_failed", e); // no raw error (binds carry ws/proj/body/device)
     }
+    serverTimings.mirrorMs = Date.now() - mirrorStartedAt;
     // Success: the headline commit-latency / body-size / blobs-per-commit + the
     // R2/D1/DO split (dbMs+dbCalls from missingBlobs & mirror, doMs from the txn).
-    emitCommit("ok"); // ratio defaults to 0
-    return json({ sequence, commitHash: commit.commitHash });
+    return timedResponse({ sequence, commitHash: commit.commitHash }, 200, "ok", emitCommit);
   }
 
   /** One alarm folds exactly one sequence. The module-level guard is deliberately

@@ -34,6 +34,29 @@ export interface CommitTimings {
   uploadMs: number;
   postMs: number;
   encBytes: number;
+  serverTimings?: ServerTimings;
+}
+
+export interface ServerTimings {
+  totalMs: number;
+  envelopeMs: number;
+  accountingMs: number;
+  sidecarMs: number;
+  commitMs: number;
+  mirrorMs: number;
+  responseMs: number;
+}
+
+const SERVER_TIMING_KEYS = ["totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs"] as const;
+
+function readServerTimings(value: unknown): ServerTimings | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>;
+  for (const key of SERVER_TIMING_KEYS) {
+    const n = candidate[key];
+    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;
+  }
+  return Object.fromEntries(SERVER_TIMING_KEYS.map((key) => [key, candidate[key]])) as unknown as ServerTimings;
 }
 
 export interface LatestTimings {
@@ -73,6 +96,7 @@ export interface CommitResult {
   unsatisfiedTotal?: number;
   /** The signed commit used a stale account epoch; refresh E2EE write context and retry. */
   epochStale?: number;
+  serverTimings?: ServerTimings;
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {
@@ -181,9 +205,10 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
     body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: {} }),
   }, { op: "publishing your changes" });
   if (r.status === 409) {
-    const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number };
-    if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0 };
-    return { conflict: true, head: b.head };
+    const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number; serverTimings?: unknown };
+    const serverTimings = readServerTimings(b.serverTimings);
+    if (b.error === "epoch_stale") return { epochStale: b.currentEpoch ?? 0, ...(serverTimings ? { serverTimings } : {}) };
+    return { conflict: true, head: b.head, ...(serverTimings ? { serverTimings } : {}) };
   }
   if (r.status === 422) {
     const b = (await r.json()) as { missing?: string[]; missingTotal?: number };
@@ -213,9 +238,11 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
     if (quota) throw quota;
     throw new Error(translateRemoteError(r.status, "commit failed", text, "workspace not found — check you're in the right directory"));
   }
-  const seq = ((await r.json()) as { sequence: number }).sequence;
+  const body = (await r.json()) as { sequence: number; serverTimings?: unknown };
+  const seq = body.sequence;
+  const serverTimings = readServerTimings(body.serverTimings);
   ctx.receipts.clear(); // published → receipts consumed
-  return { sequence: seq };
+  return { sequence: seq, ...(serverTimings ? { serverTimings } : {}) };
 }
 
 export async function latest(ctx: RemoteContext): Promise<{ sequence: number; manifest: Manifest }> {
