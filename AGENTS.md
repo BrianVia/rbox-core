@@ -4,6 +4,8 @@
 
 Brian's preferred loop — follow it unless told otherwise:
 
+0. Work in a git worktree by default — `.claude/worktrees/<slug>` off main,
+   never the primary checkout — so parallel sessions don't clobber each other.
 1. Put a design document in `docs/design/N-title.md` (next free N; check after
    rebasing — same collision rule as migrations).
 2. Iterate with subagents + `/arbitrage`: have codex (GPT) adversarially review

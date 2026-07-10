@@ -4,6 +4,7 @@ look at AGENTS.md for your rules
 
 ## Development flow (anything non-trivial)
 
+Always in a worktree (`.claude/worktrees/<slug>`), never the primary checkout.
 Design doc in `docs/design/N-title.md` → codex adversarial review loop
 (`/arbitrage`) until Claude + GPT align → implement via `codex exec` →
 validate for real (fleet dev build or test rig) → `/simplify` +
