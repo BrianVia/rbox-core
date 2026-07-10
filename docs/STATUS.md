@@ -122,6 +122,34 @@ _Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu 
   `release-v0.9.8`, `feat/front-door`. ~81 local branches remain
   (squash-shipped-but-unverified; optional deeper pass).
 
+## Active: storage-quota & GC program (opened 2026-07-10, founder decisions locked)
+
+Plan from the 2026-07-10 deep-dive (three subagent reports + live prod numbers:
+145.4 GiB blobs stored vs 83.1 GiB referenced, ~62 GiB dead, 70k condemned
+candidates never purged). **Founder decisions (2026-07-10):**
+
+1. **Purge automation: REVERSES the design-33 standing decision** ("Phase 2
+   stays off the cron", `worker.ts:106-110`). Approach = cron with narrowing
+   gates per design 33 §3.3 — receipts-path candidate-aware validate (the
+   real hole), R2 object-age gate re-read at delete, days-long grace —
+   accepting the residual milliseconds-wide TOCTOU. The DO delete-barrier was
+   considered and rejected (hot-path tax + new availability surface for a
+   ~zero-probability, self-healing event).
+2. **Cadence: daily purge, 7-day grace.**
+3. **IA tiering: GO, history blobs >30d old** — explicit CopyObject class
+   flips from the reachability job (R2 lifecycle rules are prefix-only and
+   can't see reachability); never tier blobs due for retention-prune within
+   30d (IA minimum billing). Verified 2026-07-10: IA $0.01 vs $0.015/GB-mo,
+   retrieval synchronous, $0.01/GB fee.
+4. **Design 89 params confirmed as drafted**: quota = live bytes, K=4
+   stuffing bound (thin-don't-block), retention solo 30d / pro 365d / team
+   90d, Team pooled-storage question deferred until Team ships.
+
+Sequencing: design 95 (purge automation) → design 89 implementation (live
+ledger + quota flip + surfaces) → IA tiering rider. Phase-0 copy fix (§7,
+90→365) verified ALREADY LANDED (README/pricing.md/plans.ts all 365).
+Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
+
 ## Backlog (ledgered, not urgent)
 
 - Stripe annual prices for design 86 (paid-only + trial + annual, PR #159);
