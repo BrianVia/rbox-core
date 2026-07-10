@@ -196,8 +196,9 @@ describe("design 93 canonicalization and wire bounds", () => {
     expect(validateCanonicalGitConfig({ "remote.origin.url": ["https://example.com/\u007f"] }).ok).toBe(false);
   });
 
-  test("key count is accepted at 64 and rejected at 65", () => {
-    const at = Object.fromEntries(Array.from({ length: MAX_GIT_CONFIG_KEYS }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, [`https://e.test/${i}`]]));
+  test("key count is accepted at 512 and rejected at 513", () => {
+    expect(MAX_GIT_CONFIG_KEYS).toBe(512);
+    const at = Object.fromEntries(Array.from({ length: MAX_GIT_CONFIG_KEYS }, (_, i) => [`remote.r${String(i).padStart(3, "0")}.url`, [`https://e.test/${i}`]]));
     expect(validateCanonicalGitConfig(at).ok).toBe(true);
     expect(validateCanonicalGitConfig({ ...at, "remote.zz.url": ["https://e.test/z"] }).ok).toBe(false);
   });
@@ -216,9 +217,9 @@ describe("design 93 canonicalization and wire bounds", () => {
     entries: Array<readonly [string, string]>;
   }> = [
     {
-      label: "65th projected key",
+      label: "513th projected key",
       bound: "key-count",
-      entries: Array.from({ length: MAX_GIT_CONFIG_KEYS }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, `https://e.test/${i}`] as const),
+      entries: Array.from({ length: MAX_GIT_CONFIG_KEYS }, (_, i) => [`remote.r${String(i).padStart(3, "0")}.url`, `https://e.test/${i}`] as const),
     },
     {
       label: "201-byte otherwise-allowlisted key",
@@ -243,8 +244,9 @@ describe("design 93 canonicalization and wire bounds", () => {
     expect("config" in result).toBe(false);
   });
 
-  test("serialized projection is accepted through 16 KiB and returns over-bounds above it", () => {
-    const make = (valueLength: number) => Array.from({ length: 16 }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, `https://e.test/${"a".repeat(valueLength)}${i}`] as const);
+  test("serialized projection is accepted through 64 KiB and returns over-bounds above it", () => {
+    expect(MAX_GIT_CONFIG_SERIALIZED_BYTES).toBe(64 * 1024);
+    const make = (valueLength: number) => Array.from({ length: 64 }, (_, i) => [`remote.r${String(i).padStart(2, "0")}.url`, `https://e.test/${"a".repeat(valueLength)}${i}`] as const);
     let low = 0;
     let high = MAX_GIT_CONFIG_VALUE_BYTES - "https://e.test/".length - 2;
     while (low < high) {

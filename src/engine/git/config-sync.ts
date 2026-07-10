@@ -3,11 +3,11 @@
 
 export type GitConfig = Record<string, string[]>;
 
-export const MAX_GIT_CONFIG_KEYS = 64;
+export const MAX_GIT_CONFIG_KEYS = 512;
 export const MAX_GIT_CONFIG_KEY_BYTES = 200;
 export const MAX_GIT_CONFIG_NAME_BYTES = 120;
 export const MAX_GIT_CONFIG_VALUE_BYTES = 1024;
-export const MAX_GIT_CONFIG_SERIALIZED_BYTES = 16 * 1024;
+export const MAX_GIT_CONFIG_SERIALIZED_BYTES = 64 * 1024;
 export const MAX_GIT_CONFIG_FILE_BYTES = 1024 * 1024;
 
 /** The single allowlist used by capture projection and wire validation. */

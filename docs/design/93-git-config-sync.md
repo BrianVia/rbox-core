@@ -1,6 +1,6 @@
 # Design 93 — Git config sync (remotes + branch tracking travel with the repo)
 
-Status: draft v10 (2026-07-10). Rounds 1–9 in REVIEW-93.md. Round 7 verified
+Status: draft v11 (2026-07-10). Rounds 1–9 in REVIEW-93.md. Round 7 verified
 the persistence CAS (both landing orders, value-ABA, no-op isolation,
 single rebind race, snapshot parsing, dispositions). v8 adds: the workspace
 sync mutex (brings filesystem mutation inside the interprocess fence — also
@@ -55,7 +55,14 @@ config?: Record<string, string[]>;   // on GitSection; §9 ownership rules
 
 Canonical wire form ENFORCED at `validateGitSection` (implemented): sorted
 keys, non-empty arrays, no duplicate values, C0/DEL rejected. Bounds:
-≤ 64 keys; key ≤ 200 B (`<name>` ≤ 120 B); value ≤ 1 KiB; total ≤ 16 KiB.
+≤ 512 keys; key ≤ 200 B (`<name>` ≤ 120 B); value ≤ 1 KiB; total ≤ 64 KiB.
+
+**v11 field amendment 2026-07-10: bounds recalibrated; priority-projection
+for pathological repos remains a ledgered follow-up.** Real repositories
+exceeded the original key-count ceiling. Reads remain bounded at 1 MiB + 1,
+and the lock hold is only a byte comparison plus rename, so this wire-bound
+increase has nil I/O impact.
+
 **Over WIRE bounds ⇒ publish-disabled for that repo (rounds 7–8):** the
 section CARRIES the base config verbatim (never strips, never ships an
 omitted config as if authored), the edit/presence rules are suspended for

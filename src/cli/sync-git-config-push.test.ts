@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../engine/index.js";
-import type { GitConfig } from "../engine/git/config-sync.js";
+import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../engine/git/config-sync.js";
 import { gitRaw } from "../engine/git/shared.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
@@ -44,6 +44,14 @@ function stateWith(section: GitSection, cfgSynced?: string): SyncState {
 
 async function plan(section = baseSection, cfgSynced?: string) {
   return planGitSections(root, cfg, stateWith(section, cfgSynced), remote, new Set(), buildIgnoreMatcher(root));
+}
+
+async function appendOverBoundsConfig(repo: string): Promise<void> {
+  const sections = Array.from(
+    { length: MAX_GIT_CONFIG_KEYS + 1 },
+    (_, i) => `[remote "r${i}"]\n\turl = git@example.com:r${i}.git\n`,
+  ).join("");
+  await fs.appendFile(path.join(repo, ".git", "config"), sections);
 }
 
 async function trustCache(): Promise<void> {
@@ -147,9 +155,7 @@ test("workspace-wide legacy degradation carries the base config without reading 
 });
 
 test("over-bounds config carries each host base verbatim with no authorship or oscillation", async () => {
-  for (let i = 0; i < 65; i++) {
-    await runGit(root, "config", `remote.r${i}.url`, `git@example.com:r${i}.git`);
-  }
+  await appendOverBoundsConfig(root);
   const hostA = { ...baseSection, config: { "remote.origin.url": ["git@example.com:a.git"] } };
   const hostB = { ...baseSection, config: { "remote.origin.url": ["git@example.com:b.git"] } };
 
@@ -412,7 +418,7 @@ test("real-capture ownership gate embeds for an owned dir repo and never for a p
 }, 30_000);
 
 test("real capture suppresses over-bounds config, carries base, and records no authorship", async () => {
-  for (let i = 0; i < 65; i++) await runGit(root, "config", `remote.r${i}.url`, `git@example.com:r${i}.git`);
+  await appendOverBoundsConfig(root);
   const baseConfig: GitConfig = { "remote.base.url": ["git@example.com:base.git"] };
   const base = { ...baseSection, config: baseConfig };
 
