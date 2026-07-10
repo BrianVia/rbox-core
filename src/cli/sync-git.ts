@@ -1483,7 +1483,7 @@ export async function applyGitSections(
   store: BlobStore,
   matcher: IgnoreMatcher,
   glog: (line: string) => void,
-  opts: { collectMetrics?: boolean } = {}
+  opts: { collectMetrics?: boolean; onProgress?: (done: number, total: number) => void } = {}
 ): Promise<GitPullOutcome> {
   const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
   const applied: Record<string, GitSection> = { ...baseRepos };
@@ -1716,6 +1716,7 @@ export async function applyGitSections(
   const queuedAt = Date.now();
   const commonDirLocks = new Map<string, Promise<void>>();
   const indexes = new Map(keys.map((rel, i) => [rel, i]));
+  let progressDone = 0;
   const runRepo = async (rel: string): Promise<void> => {
     const i = indexes.get(rel)!;
     let startedAt = Date.now();
@@ -1748,6 +1749,7 @@ export async function applyGitSections(
           commonDirGroup,
         });
       }
+      opts.onProgress?.(++progressDone, keys.length);
     }
   };
   await poolMap(nestedRepoChains(keys), gitApplyConcurrency(), async (chain) => {
