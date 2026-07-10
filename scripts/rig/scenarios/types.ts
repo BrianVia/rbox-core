@@ -13,6 +13,8 @@ export interface RigCtx {
   b: Device;
   apiUrl: string;
   bootstrapSecret: string;
+  /** Dev worker platform secret used only for provisioning throwaway account plans. */
+  platformSecret: string;
   runDir: string;
   /** Whether the per-run account teardown is skipped (`--keep-account`). */
   keepAccount: boolean;

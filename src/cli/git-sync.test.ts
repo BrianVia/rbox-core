@@ -1662,7 +1662,7 @@ test("gitDivergenceCount warm unchanged multi-repo fixture issues zero git spawn
   const cache = JSON.parse(await fs.readFile(path.join(rootA, ".rbox", "state", "git-divergence.json"), "utf8")) as {
     repos: { alpha: { kind?: string } };
   };
-  expect(cache.version).toBe(3);
+  expect(cache.version).toBe(4); // design 93: file-level bump for cachedLocalCfg
   expect(cache.repos.alpha.kind).toBe("dir");
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
@@ -1697,7 +1697,7 @@ test("gitDivergenceFastRepoSource filters cached and base repos through current 
   await fs.writeFile(
     cachePath,
     JSON.stringify({
-      version: 3,
+      version: 4,
       repos: {
         "cache-present": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
         "cache-missing": { fingerprint: "fp", writtenAtMs: Date.now(), identityKey: "id", kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "id" } },
@@ -1856,7 +1856,7 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
   const slow = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(slow.value).toBe(0);
   expect(slow.spawns).toBeGreaterThan(0);
-  expect(JSON.parse(await fs.readFile(cachePath, "utf8")).version).toBe(3);
+  expect(JSON.parse(await fs.readFile(cachePath, "utf8")).version).toBe(4);
 
   await markDivergenceCacheTrusted(rootA);
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
@@ -1866,7 +1866,7 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
 
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
 
-test("design 83: plan cache treats v2 as cold, writes v3, then serves trusted warm carries with zero git spawns", async () => {
+test("design 83/93: plan cache treats v2 as cold, writes v4, then serves trusted warm carries with zero git spawns", async () => {
   const repo = path.join(rootA, "d83-v2");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "base", "c1");
@@ -1885,7 +1885,7 @@ test("design 83: plan cache treats v2 as cold, writes v3, then serves trusted wa
   expect(cold.value.gitPlanStats?.fpMisses).toBe(1);
   expect(cold.value.gitPlanStats?.spawnedRepos).toBe(1);
   expect(cold.spawns).toBeGreaterThan(0);
-  expect((await readDivergenceCache(rootA)).version).toBe(3);
+  expect((await readDivergenceCache(rootA)).version).toBe(4);
 
   await markDivergenceCacheTrusted(rootA);
   const warm = await observeGitSpawns(async () => planGitSections(rootA, cfgA, state, remote, new Set(), matcher));
@@ -2231,7 +2231,7 @@ test("design 83: plan cache invalidates paused rebase op-state instead of fast-c
   expect(planned.spawns).toBeGreaterThan(0);
 }, 30_000);
 
-test("design 83: status and plan writers leave one loadable v3 cache", async () => {
+test("design 83/93: status and plan writers leave one loadable v4 cache", async () => {
   const repo = path.join(rootA, "d83-cross-writer");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "base", "c1");
@@ -2241,7 +2241,7 @@ test("design 83: status and plan writers leave one loadable v3 cache", async () 
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   let cache = await readDivergenceCache(rootA);
-  expect(cache.version).toBe(3);
+  expect(cache.version).toBe(4);
   expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
   expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
 
@@ -2249,7 +2249,7 @@ test("design 83: status and plan writers leave one loadable v3 cache", async () 
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(0);
   cache = await readDivergenceCache(rootA);
-  expect(cache.version).toBe(3);
+  expect(cache.version).toBe(4);
   expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
   expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
 }, 30_000);

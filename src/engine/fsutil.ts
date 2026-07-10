@@ -42,6 +42,17 @@ export async function writeFileAtomic(
   await fs.rename(tmp, absPath);
 }
 
+/** Flush directory metadata after publishing or removing an entry. Callers choose
+ * whether durability failure is fatal; the file-handle lifecycle is shared here. */
+export async function fsyncDirectory(dir: string): Promise<void> {
+  const handle = await fs.open(dir, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Refuse to operate on a path whose real parent escapes the workspace — e.g. a
  *  synced symlink `foo -> /etc` followed by a file entry `foo/passwd`. Static
  *  manifest validation can't catch this (it's runtime FS state), so this is the

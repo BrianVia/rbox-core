@@ -8,6 +8,7 @@ import { daemonIdleCpu } from "./daemon-idle-cpu.js";
 import { conductorInitialSync } from "./conductor-initial-sync.js";
 import { chaosRestart } from "./chaos-restart.js";
 import { gitEntanglement } from "./git-entanglement.js";
+import { gitConfigSync } from "./git-config-sync.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
@@ -16,6 +17,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "type-flip": typeFlip,
   "daemon-idle-cpu": daemonIdleCpu,
   "git-entanglement": gitEntanglement,
+  "git-config-sync": gitConfigSync,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };

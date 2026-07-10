@@ -38,8 +38,22 @@ import {
 } from "../engine/index.js";
 import { repoCtx } from "../engine/git/shared.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../engine/manifest-validate.js";
-import type { SyncState, WorkspaceConfig } from "./config.js";
+import { canonicalizeGitConfig, type GitConfig } from "../engine/git/config-sync.js";
+import {
+  applyConfigTransaction,
+  materializeFreshGitConfig,
+  readConfigSnapshot,
+  readParsedConfigSnapshot,
+  sameConfigStatToken,
+  readStableParsedConfigSnapshot,
+  type ConfigFault,
+  type ConfigStatToken,
+  type ConfigTransactionResult,
+  type GitConfigRunner,
+} from "../engine/git/config-txn.js";
+import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { SyncRemote } from "./remote.js";
+import { completeConfigApply, configLaneState, type ConfigLaneState } from "./sync-state.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 
@@ -55,6 +69,13 @@ import { PER_FILE_UPLOAD_ATTEMPTS } from "./sync-recovery.js";
 /** Bundling is CPU/IO heavy — bound concurrent captures (design 43 §6.3). */
 const GIT_CAPTURE_CONCURRENCY = 4;
 const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
+/** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
+ * loud once per workspace/repo without repeating forever on every pull. */
+const configOwnershipSkipLogged = new Set<string>();
+/** Credential-bearing URLs are a capture-side security event, not ordinary bad
+ * grammar. Log them once per workspace/repo while continuing with the safe
+ * projection so a daemon cannot flood its log on every tick. */
+const configCredentialSkipLogged = new Set<string>();
 
 const envInt = (name: string, fallback: number, min: number, max: number): number => {
   const raw = process.env[name]?.trim();
@@ -95,6 +116,107 @@ export const gitReposManifestSchema = (gitRepos: Record<string, GitSection> | un
   gitRepos ? (Object.values(gitRepos).some((s) => (s.packChain?.length ?? 0) > 0) ? 3 : 2) : undefined;
 const emptyToUndef = <T,>(o: Record<string, T>): Record<string, T> | undefined => (Object.keys(o).length ? o : undefined);
 const errMsg = (e: unknown): string => (e as Error)?.message ?? String(e);
+
+export interface CachedLocalCfg {
+  hash: string;
+  nonEmpty: boolean;
+}
+
+type LocalCfgRead =
+  | { status: "ok"; config: GitConfig; cached: CachedLocalCfg }
+  | { status: "over-bounds"; reason: string }
+  | { status: "failed"; fault: ConfigFault };
+
+/** Hash the canonical wire value, including the meaningful empty `{}` value. */
+export function gitConfigHash(config: GitConfig): string {
+  return hashBytes(Buffer.from(JSON.stringify(config)));
+}
+
+/** Design 93 §6 presence/edit predicate. Base presence is intentionally distinct
+ * from an empty base config, and an unset sync point never equals a real hash. */
+export function shouldPublishGitConfig(
+  baseConfig: GitConfig | undefined,
+  local: CachedLocalCfg,
+  cfgSynced: string | undefined
+): boolean {
+  if (baseConfig === undefined) return local.nonEmpty;
+  const baseHash = gitConfigHash(baseConfig);
+  return local.hash !== baseHash && local.hash !== cfgSynced;
+}
+
+async function readLocalGitConfig(
+  root: string,
+  rel: string,
+  diskCtx?: RepoCtx,
+  runGit?: GitConfigRunner,
+  onCredentialSkip?: () => void
+): Promise<LocalCfgRead> {
+  const repoDir = repoDirOf(root, rel);
+  const ctx = diskCtx ?? (await repoCtxFromDisk(repoDir).catch(() => undefined));
+  if (!ctx) {
+    return {
+      status: "failed",
+      fault: { disposition: "transient", reason: "read-error", error: new Error("git repository context unavailable") },
+    };
+  }
+  const configPath = path.join(ctx.commonDir, "config");
+  let lastFault: ConfigFault | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const read = await readStableParsedConfigSnapshot(repoDir, configPath, "initial", runGit);
+    if (!read.ok) {
+      lastFault = read.fault;
+      if (read.fault.disposition === "permanent") return { status: "failed", fault: read.fault };
+      continue;
+    }
+    const canonical = canonicalizeGitConfig(read.snapshot.entries);
+    if (canonical.rejected.some((item) => item.credential)) onCredentialSkip?.();
+    if (!canonical.ok) {
+      if (canonical.overBounds) return { status: "over-bounds", reason: canonical.reason };
+      return {
+        status: "failed",
+        fault: { disposition: "permanent", reason: "parse-error", error: new Error(canonical.reason) },
+      };
+    }
+    return {
+      status: "ok",
+      config: canonical.config,
+      cached: { hash: gitConfigHash(canonical.config), nonEmpty: Object.keys(canonical.config).length > 0 },
+    };
+  }
+  return {
+    status: "failed",
+    fault: lastFault ?? { disposition: "transient", reason: "read-error" },
+  };
+}
+
+function sameConfigShape(a: ConfigShapeIdentity | undefined, b: ConfigShapeIdentity | undefined): boolean {
+  return a !== undefined && b !== undefined && a.shape === b.shape &&
+    a.commonDir.realpath === b.commonDir.realpath && a.commonDir.dev === b.commonDir.dev &&
+    a.commonDir.ino === b.commonDir.ino && a.commonDir.birthtime === b.commonDir.birthtime;
+}
+
+/** Design 93 §9 receiver ownership: only a standalone dir repo whose common
+ * store is contained by this workspace owns its local config lane. */
+async function configReceiver(root: string, ctx: RepoCtx): Promise<{ owned: boolean; shape: ConfigShapeIdentity; configPath: string }> {
+  const [rootReal, gitReal, commonReal, stat] = await Promise.all([
+    fs.realpath(root),
+    fs.realpath(ctx.gitDir),
+    fs.realpath(ctx.commonDir),
+    fs.stat(ctx.commonDir, { bigint: true }),
+  ]);
+  const relative = path.relative(rootReal, commonReal);
+  const contained = relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  const shape: ConfigShapeIdentity = {
+    shape: ctx.kind,
+    commonDir: {
+      realpath: commonReal,
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      birthtime: stat.birthtimeNs > 0n ? stat.birthtimeNs.toString() : "0",
+    },
+  };
+  return { owned: ctx.kind === "dir" && gitReal === commonReal && contained, shape, configPath: path.join(ctx.commonDir, "config") };
+}
 
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
   if (cfg.git?.incremental === false || !baseSec || forced) return undefined;
@@ -230,6 +352,9 @@ export interface GitPushPlan {
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
+  /** Config hashes authored by this exact plan. Step 4 deliberately initializes
+   * this empty; publication/capture rows add entries in steps 5 and 7. */
+  authoredCfgHashByRepo: Record<string, string>;
   captured: string[];
   carried: string[];
   deferred: Array<{ relPath: string; reason: string }>;
@@ -253,6 +378,16 @@ export interface GitPlanStats {
   captured: number;
 }
 
+export interface GitPlanOptions {
+  /** Forensic sink shared with the surrounding sync operation. */
+  onGitLog?: (line: string) => void;
+  /** Deterministic test seam for the snapshot-only config subprocess. */
+  gitConfigRunner?: GitConfigRunner;
+  /** Workspace lock identity/link support is unavailable. Preserve Git syncing,
+   * but neither read nor author config-lane updates. */
+  disableConfigLane?: boolean;
+}
+
 /**
  * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
  * repo either CARRY (pending section, needs-resolution checkpoint, or unchanged identity
@@ -274,7 +409,8 @@ export async function planGitSections(
    *  capture settles so `done` is a truthful completed-count under bounded concurrency;
    *  `detail` is the repo just captured. Display-only. */
   onProgress?: TransferProgress,
-  backoff?: (attempt: number) => Promise<void>
+  backoff?: (attempt: number) => Promise<void>,
+  options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
@@ -282,8 +418,10 @@ export async function planGitSections(
   const pending = { ...(state.gitPendingRemote ?? {}) };
   const captured: string[] = [];
   let carried: string[] = [];
+  const authoredCfgHashByRepo: Record<string, string> = {};
   const removed: string[] = [];
   const deferred: Array<{ relPath: string; reason: string }> = [];
+  const configLaneDefers = new Set<(typeof deferred)[number]>();
   const skipped: Array<{ relPath: string; reason: string }> = [];
   const out: Record<string, GitSection> = {};
   const cache = await loadGitDivergenceCache(root);
@@ -300,6 +438,17 @@ export async function planGitSections(
     carried: 0,
     captured: 0,
   };
+  const glog = options.onGitLog ?? ((line: string) => console.error(line));
+  const logOnce = (seen: Set<string>, rel: string, line: string) => {
+    const key = `${root}\0${rel}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    glog(line);
+  };
+  const noteCredentialSkip = (rel: string) =>
+    logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
+  const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
+    readLocalGitConfig(root, rel, diskCtx, options.gitConfigRunner, () => noteCredentialSkip(rel));
   const plan = (): GitPushPlan => {
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
     // pending repo the last commit carried the pending section itself (see the per-repo
@@ -319,6 +468,7 @@ export async function planGitSections(
       gitReposRemoved: emptyToUndef(removedMem),
       gitNeedsResolution: emptyToUndef(needsRes),
       gitPendingRemote: emptyToUndef(pending),
+      authoredCfgHashByRepo,
       captured,
       carried,
       deferred,
@@ -359,6 +509,106 @@ export async function planGitSections(
   let admitted = new Set([...Object.keys(base), ...Object.keys(pending)]).size;
 
   let toCapture: string[] = [];
+  const carryOwnedWithConfig = async (rel: string, baseSec: GitSection, bracketed?: LocalCfgRead, knownCtx?: RepoCtx): Promise<void> => {
+    out[rel] = baseSec;
+    carried.push(rel);
+    if (options.disableConfigLane) return;
+    const diskCtx = knownCtx ?? (await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined));
+    if (!diskCtx || diskCtx.kind !== "dir") {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
+      return;
+    }
+    const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
+    if (!receiver?.owned) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local common config is outside workspace ownership`);
+      return;
+    }
+    const localCfg = bracketed ?? (await readConfigForPush(rel));
+    if (localCfg.status === "over-bounds") {
+      const item = {
+        relPath: rel,
+        reason: `git config over wire bounds — publication disabled; carrying base verbatim (${localCfg.reason})`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return;
+    }
+    if (localCfg.status === "failed") {
+      const item = {
+        relPath: rel,
+        reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} (${localCfg.fault.reason}) — carrying base verbatim`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return;
+    }
+    if (!shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) return;
+    out[rel] = { ...baseSec, config: localCfg.config };
+    authoredCfgHashByRepo[rel] = localCfg.cached.hash;
+  };
+  const carryBaseConfig = (section: GitSection, baseSec: GitSection | undefined): GitSection => {
+    const carried = { ...section };
+    delete carried.config;
+    if (baseSec?.config !== undefined) carried.config = baseSec.config;
+    return carried;
+  };
+  const captureWithConfig = async (rel: string, section: GitSection): Promise<GitSection> => {
+    if (options.disableConfigLane) return carryBaseConfig(section, base[rel]);
+    const repoDir = repoDirOf(root, rel);
+    const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
+      logOnce(
+        configOwnershipSkipLogged,
+        rel,
+        `git-sync config skipped ${rel}: capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config`
+      );
+      const unowned = { ...section };
+      delete unowned.config;
+      return unowned;
+    }
+    let receiver: Awaited<ReturnType<typeof configReceiver>>;
+    try {
+      receiver = await configReceiver(root, diskCtx);
+    } catch (error) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture ownership could not be proven (${errMsg(error)})`);
+      return carryBaseConfig(section, undefined);
+    }
+    if (!receiver.owned) {
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture common config is outside workspace ownership`);
+      return carryBaseConfig(section, undefined);
+    }
+
+    let localCfg: LocalCfgRead;
+    try {
+      localCfg = await readConfigForPush(rel, diskCtx);
+    } catch (error) {
+      localCfg = {
+        status: "failed",
+        fault: { disposition: "transient", reason: "read-error", error },
+      };
+    }
+    if (localCfg.status === "over-bounds") {
+      const item = {
+        relPath: rel,
+        reason: `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return carryBaseConfig(section, base[rel]);
+    }
+    if (localCfg.status === "failed") {
+      const item = {
+        relPath: rel,
+        reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} during capture (${localCfg.fault.reason}) — carrying base config`,
+      };
+      deferred.push(item);
+      configLaneDefers.add(item);
+      return carryBaseConfig(section, base[rel]);
+    }
+    const embedded = { ...section, config: localCfg.config };
+    authoredCfgHashByRepo[rel] = gitConfigHash(embedded.config);
+    return embedded;
+  };
   /** Per-repo failure → defer. Forced (422) repos take the M5 non-looping DROP instead:
    *  their base section references exactly the blobs the server lost, so carrying it
    *  would 422 forever — drop from THIS commit; the daemon re-captures when possible. */
@@ -407,7 +657,9 @@ export async function planGitSections(
         probe,
         kind,
         probeBeforeFingerprint,
-        recomputeCacheProbe
+        recomputeCacheProbe,
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane
       ).catch(() => undefined);
       deferOne(rel, "git busy (lock present)");
       return;
@@ -443,7 +695,18 @@ export async function planGitSections(
       const builtProbe = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
       if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
       const probe = builtProbe.probe;
-      await writeDivergenceCacheEntry(fingerprintRun, root, rel, cache, probe, pf.kind ?? kind, probeBeforeFingerprint, recomputeCacheProbe).catch(() => undefined);
+      await writeDivergenceCacheEntry(
+        fingerprintRun,
+        root,
+        rel,
+        cache,
+        probe,
+        pf.kind ?? kind,
+        probeBeforeFingerprint,
+        recomputeCacheProbe,
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane
+      ).catch(() => undefined);
       // STRUCTURAL refusal (shallow/bare/alternates/…): the shape can't sync and won't
       // heal by waiting — DROP the section instead of carrying it. Carrying would be
       // permanent poison: identity can't see the structural property, so a base section
@@ -467,7 +730,7 @@ export async function planGitSections(
     const idKey = builtProbe.probe.identityKey;
     const liveKind = pf.kind ?? kind;
     const probe = builtProbe.probe;
-    await writeDivergenceCacheEntry(
+    const cacheWrite = await writeDivergenceCacheEntry(
       fingerprintRun,
       root,
       rel,
@@ -475,8 +738,10 @@ export async function planGitSections(
       probe,
       liveKind,
       probeBeforeFingerprint,
-      recomputeCacheProbe
-    ).catch(() => undefined);
+      recomputeCacheProbe,
+      () => noteCredentialSkip(rel),
+      options.disableConfigLane
+    ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
     if (!id) {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
       if (baseSec) {
@@ -500,8 +765,7 @@ export async function planGitSections(
       }
       const carry = carryMatrixMatches(baseSec, liveKind, idKey);
       if (carry) {
-        out[rel] = baseSec;
-        carried.push(rel);
+        await carryOwnedWithConfig(rel, baseSec, cacheWrite.localCfg, builtProbe.diskCtx);
         return;
       }
     }
@@ -568,18 +832,22 @@ export async function planGitSections(
     // 6 probe is plannable-clean with a valid preflight kind
     // 7 design-43 §7 carry matrix reaches carry
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
-      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind);
+      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane);
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
         const probe = fastLookup.probe;
         const pfKind = probe.preflightKind;
         if (!probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && carryMatrixMatches(baseSec, pfKind, probe.identityKey)) {
-          out[rel] = baseSec;
-          carried.push(rel);
-          fastPathParentRel.set(rel, probe.parentRel);
-          stats.fpHits++;
-          continue;
+          // A trusted summary can prove a verbatim carry. If publication is due,
+          // fall through: the wire needs the canonical config, not merely its hash.
+          if (options.disableConfigLane || (fastLookup.cachedLocalCfg && !shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced))) {
+            out[rel] = baseSec;
+            carried.push(rel);
+            fastPathParentRel.set(rel, probe.parentRel);
+            stats.fpHits++;
+            continue;
+          }
         }
         stats.fpMisses++;
       } else {
@@ -591,7 +859,7 @@ export async function planGitSections(
     // skipped after `sectioned` is known, but a trusted cached parentRel lets us
     // defer that decision without paying the identity/preflight spawn floor.
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
-      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind);
+      fastLookup = await fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane);
       if (fastLookup.status === "untrusted") {
         stats.fpUntrusted++;
       } else if (fastLookup.status === "hit") {
@@ -628,6 +896,12 @@ export async function planGitSections(
   const skippedRelPaths = new Set<string>();
   const skipLinkedWorktreePointer = (rel: string, parentRel: string) => {
     skippedRelPaths.add(rel);
+    // Ownership is known only now. Undo any provisional slow-carry lane result:
+    // linked pointers are non-owned and therefore carry their base verbatim.
+    delete authoredCfgHashByRepo[rel];
+    for (let i = deferred.length - 1; i >= 0; i--) {
+      if (deferred[i]!.relPath === rel && configLaneDefers.has(deferred[i]!)) deferred.splice(i, 1);
+    }
     const b = base[rel];
     if (b) out[rel] = b; // base-carry: never a remote absence, never a removal memory
     else delete out[rel]; // fresh pointer: never authored
@@ -686,7 +960,7 @@ export async function planGitSections(
         (abs) => noteRepoBytes(rel, abs)
       );
       if (sec) {
-        out[rel] = sec;
+        out[rel] = await captureWithConfig(rel, sec);
         captured.push(rel);
       } else {
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
@@ -769,7 +1043,9 @@ export function gitForceForMissingBlobs(committedGit: Record<string, GitSection>
 
 const GIT_DIVERGENCE_CONCURRENCY = 8;
 const GIT_DIVERGENCE_CACHE_REL = ".rbox/state/git-divergence.json";
-const GIT_DIVERGENCE_CACHE_VERSION = 3;
+// File-level bump: v3 entries have no config summary and must take one slow,
+// bracketed pass before any fast carry can be trusted for design 93.
+const GIT_DIVERGENCE_CACHE_VERSION = 4;
 // Release-internal until design 83 ships; shape-only rewrites can stay on v4.
 const GIT_FINGERPRINT_VERSION = 4;
 const PACKED_REFS_HASH_MAX_BYTES = 1024 * 1024;
@@ -797,6 +1073,7 @@ interface GitDivergenceCacheEntry {
   identityKey: string;
   kind?: GitRepoKind;
   probe?: CachedDivergenceProbe;
+  cachedLocalCfg?: CachedLocalCfg;
 }
 
 interface GitDivergenceCache {
@@ -858,6 +1135,13 @@ function isCacheEntry(v: unknown): v is GitDivergenceCacheEntry {
   const e = v as GitDivergenceCacheEntry;
   if (typeof e.fingerprint !== "string" || typeof e.writtenAtMs !== "number" || typeof e.identityKey !== "string") return false;
   if (e.kind !== undefined && !isGitRepoKind(e.kind)) return false;
+  if (
+    e.cachedLocalCfg !== undefined &&
+    (e.cachedLocalCfg === null ||
+      typeof e.cachedLocalCfg !== "object" ||
+      typeof e.cachedLocalCfg.hash !== "string" ||
+      typeof e.cachedLocalCfg.nonEmpty !== "boolean")
+  ) return false;
   if (e.probe !== undefined) {
     const p = e.probe as CachedDivergenceProbe;
     if (p === null || typeof p !== "object") return false;
@@ -1263,7 +1547,7 @@ function sameDivergenceProbe(a: CachedDivergenceProbe | undefined, b: CachedDive
 }
 
 type FingerprintHitProbeResult =
-  | { status: "hit"; fingerprint: GitFingerprint; probe: CachedDivergenceProbe; kind?: GitRepoKind }
+  | { status: "hit"; fingerprint: GitFingerprint; probe: CachedDivergenceProbe; cachedLocalCfg?: CachedLocalCfg; kind?: GitRepoKind }
   | { status: "miss"; fingerprint: GitFingerprint; kind?: GitRepoKind }
   | { status: "untrusted"; fingerprint: GitFingerprint; kind?: GitRepoKind };
 
@@ -1278,19 +1562,24 @@ async function fingerprintHitProbe(
   root: string,
   rel: string,
   cache: GitDivergenceCache,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  requireConfigSummary = true
 ): Promise<FingerprintHitProbeResult> {
   const fresh = await gitFingerprint(run, root, rel);
   const cached = cache.repos.get(rel);
   const kind = cached?.kind ?? fresh.diskCtx?.kind ?? hintKind;
-  if (cached?.fingerprint !== fresh.hash || !cached.probe) {
+  // Missing cachedLocalCfg is a legacy/incomplete entry: force exactly one slow
+  // bracketed pass so config presence can never disappear behind a git fast hit.
+  if (cached?.fingerprint !== fresh.hash || !cached.probe || (requireConfigSummary && !cached.cachedLocalCfg)) {
     return { status: "miss", fingerprint: fresh, kind };
   }
   if (!trustedGitFingerprintHit(fresh, cached)) {
     return { status: "untrusted", fingerprint: fresh, kind };
   }
-  return { status: "hit", fingerprint: fresh, probe: cached.probe, kind };
+  return { status: "hit", fingerprint: fresh, probe: cached.probe, cachedLocalCfg: cached.cachedLocalCfg, kind };
 }
+
+type DivergenceCacheWriteResult = { kind?: GitRepoKind; localCfg?: LocalCfgRead };
 
 async function writeDivergenceCacheEntry(
   run: GitFingerprintRun,
@@ -1300,12 +1589,17 @@ async function writeDivergenceCacheEntry(
   probe: CachedDivergenceProbe,
   hintKind: GitRepoKind | undefined,
   beforeFingerprint: GitFingerprint,
-  recompute?: () => Promise<DivergenceCacheProbeSnapshot>
-): Promise<GitRepoKind | undefined> {
+  recompute?: () => Promise<DivergenceCacheProbeSnapshot>,
+  onCredentialSkip?: () => void,
+  skipConfig = false
+): Promise<DivergenceCacheWriteResult> {
   let before = beforeFingerprint;
   let currentProbe = probe;
   let currentKind = hintKind;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const localCfg = !skipConfig && !currentProbe.busy && currentProbe.preflightOk
+      ? await readLocalGitConfig(root, rel, before.diskCtx, undefined, onCredentialSkip)
+      : undefined;
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
     const after = await gitFingerprint(run, root, rel);
     const afterKind = after.diskCtx?.kind ?? currentKind;
@@ -1316,17 +1610,18 @@ async function writeDivergenceCacheEntry(
         identityKey: currentProbe.identityKey,
         ...(afterKind ? { kind: afterKind } : {}),
         probe: currentProbe,
+        ...(localCfg?.status === "ok" ? { cachedLocalCfg: localCfg.cached } : {}),
       });
       cache.dirty = true;
-      return afterKind;
+      return { kind: afterKind, localCfg };
     }
-    if (!recompute || attempt === 1) return afterKind;
+    if (!recompute || attempt === 1) return { kind: afterKind };
     const next = await recompute();
     before = next.beforeFingerprint;
     currentProbe = next.probe;
     currentKind = next.kind;
   }
-  return currentKind;
+  return { kind: currentKind };
 }
 
 async function probeAndCacheDivergenceRepo(
@@ -1335,7 +1630,8 @@ async function probeAndCacheDivergenceRepo(
   rel: string,
   cache: GitDivergenceCache,
   before: GitFingerprint,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  gitConfigRunner?: GitConfigRunner
 ): Promise<{ kind?: GitRepoKind; probe?: CachedDivergenceProbe }> {
   const realCtx = (await repoCtx(repoDirOf(root, rel)).catch(() => undefined)) ?? null;
   const repoKind = before.diskCtx?.kind ?? realCtx?.kind ?? hintKind;
@@ -1343,9 +1639,13 @@ async function probeAndCacheDivergenceRepo(
   let previous: CachedDivergenceProbe | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
     last = await probeDivergenceRepo(root, rel, realCtx);
+    const localCfg = !last.busy && last.preflightOk
+      ? await readLocalGitConfig(root, rel, before.diskCtx ?? realCtx ?? undefined, gitConfigRunner)
+      : undefined;
     if (before.diskCtx) run.commonDirFingerprints.delete(path.resolve(before.diskCtx.commonDir));
     const after = await gitFingerprint(run, root, rel);
-    if (after.hash === before.hash || sameDivergenceProbe(previous, last)) {
+    const exactFingerprint = after.hash === before.hash;
+    if (exactFingerprint || sameDivergenceProbe(previous, last)) {
       const afterKind = after.diskCtx?.kind ?? repoKind;
       cache.repos.set(rel, {
         fingerprint: after.hash,
@@ -1353,6 +1653,7 @@ async function probeAndCacheDivergenceRepo(
         identityKey: last.identityKey,
         ...(afterKind ? { kind: afterKind } : {}),
         probe: last,
+        ...(exactFingerprint && localCfg?.status === "ok" ? { cachedLocalCfg: localCfg.cached } : {}),
       });
       cache.dirty = true;
       return { kind: afterKind, probe: last };
@@ -1369,14 +1670,15 @@ async function cachedDivergenceProbe(
   rel: string,
   cache: GitDivergenceCache,
   out: Map<string, CachedDivergenceProbe>,
-  hintKind?: GitRepoKind
+  hintKind?: GitRepoKind,
+  gitConfigRunner?: GitConfigRunner
 ): Promise<GitRepoKind | undefined> {
   const hit = await fingerprintHitProbe(run, root, rel, cache, hintKind);
   if (hit.status === "hit") {
     out.set(rel, hit.probe);
     return hit.kind;
   }
-  const refreshed = await probeAndCacheDivergenceRepo(run, root, rel, cache, hit.fingerprint, hit.kind);
+  const refreshed = await probeAndCacheDivergenceRepo(run, root, rel, cache, hit.fingerprint, hit.kind, gitConfigRunner);
   if (refreshed.probe) out.set(rel, refreshed.probe);
   return refreshed.kind;
 }
@@ -1387,6 +1689,9 @@ export interface GitPullOutcome {
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
+  /** Completed/invalidation config-lane updates, saved atomically with this
+   * pull's base and pending transitions by the step-4 packet composer. */
+  configLane?: Record<string, ConfigLaneState>;
   gitApplyMetrics?: GitApplyMetrics;
 }
 
@@ -1483,13 +1788,23 @@ export async function applyGitSections(
   store: BlobStore,
   matcher: IgnoreMatcher,
   glog: (line: string) => void,
-  opts: { collectMetrics?: boolean; onProgress?: (done: number, total: number) => void } = {}
+opts: {
+    collectMetrics?: boolean;
+    onProgress?: (done: number, total: number) => void;
+    /** Workspace-wide legacy fallback: Git applies, config is left untouched. */
+    disableConfigLane?: boolean;
+    /** Deterministic fault injection for §11 pull-lane tests. */
+    applyConfig?: typeof applyConfigTransaction;
+    materializeFreshConfig?: typeof materializeFreshGitConfig;
+  } = {}
 ): Promise<GitPullOutcome> {
   const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
   const applied: Record<string, GitSection> = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
+  const records = repoRecordsForState(state);
+  const configLane: Record<string, ConfigLaneState> = {};
   let commonDirGroups: Map<string, number> | undefined;
   let metrics: GitApplyMetrics | undefined;
   const pack = (): GitPullOutcome => ({
@@ -1497,6 +1812,7 @@ export async function applyGitSections(
     gitReposRemoved: emptyToUndef(removedMem),
     gitNeedsResolution: emptyToUndef(needsRes),
     gitPendingRemote: emptyToUndef(pending),
+    configLane: emptyToUndef(configLane),
     gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
   });
   if (!cfg.syncGit) return pack();
@@ -1533,6 +1849,87 @@ export async function applyGitSections(
       commonDirGroups.set(key, group);
     }
     return group;
+  };
+
+  const laneRecord = (rel: string): RepoRecordInput => ({
+    sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
+    ...(configLane[rel] ?? configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
+  });
+  const replaceLane = (rel: string, record: RepoRecordInput): void => {
+    configLane[rel] = configLaneState(record);
+  };
+  const invalidateLaneShape = (rel: string, shape: ConfigShapeIdentity | undefined): RepoRecordInput => {
+    const current = laneRecord(rel);
+    if (sameConfigShape(current.cfgShape, shape)) return current;
+    const reset: RepoRecordInput = { sourceSeq: current.sourceSeq, ...(shape === undefined ? {} : { cfgShape: shape }) };
+    replaceLane(rel, reset);
+    return reset;
+  };
+  const completeLane = (
+    rel: string,
+    shape: ConfigShapeIdentity,
+    hashes: { pre: string; post: string; incoming: string; basePre?: string; postToken: ConfigStatToken }
+  ): void => {
+    replaceLane(rel, {
+      ...completeConfigApply(laneRecord(rel), {
+        pre: hashes.pre,
+        post: hashes.post,
+        incoming: hashes.incoming,
+        ...(hashes.basePre === undefined ? {} : { basePre: hashes.basePre }),
+        postToken: hashes.postToken,
+      }),
+      cfgShape: shape,
+    });
+  };
+  const configFailure = (result: Exclude<ConfigTransactionResult, { status: "completed" }>): Error =>
+    new Error(`config ${result.status}: ${result.fault.reason}`);
+
+  /** Run the config mutation only after the caller has selected the correct Git
+   * disposition. Existing repos use the optimistic locked transaction; a truly
+   * fresh repo uses the step-3 private-target helper. */
+  const runConfigApply = async (
+    rel: string,
+    repoDir: string,
+    incoming: GitConfig,
+    baseConfig: GitConfig | undefined,
+    receiver: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string }
+  ): Promise<void> => {
+    if (receiver.fresh) {
+      await (opts.materializeFreshConfig ?? materializeFreshGitConfig)(repoDir, incoming, path.join(repoDir, ".git"));
+      const ctx = await repoCtxFromDisk(repoDir);
+      if (!ctx) throw new Error("fresh config apply lost repository context");
+      const owned = await configReceiver(root, ctx);
+      if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
+      const installed = await readParsedConfigSnapshot(repoDir, owned.configPath, "locked");
+      if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
+      const post = canonicalizeGitConfig(installed.snapshot.entries);
+      if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
+      completeLane(rel, owned.shape, {
+        pre: gitConfigHash({}),
+        post: gitConfigHash(post.config),
+        incoming: gitConfigHash(incoming),
+        ...(baseConfig === undefined ? {} : { basePre: gitConfigHash(baseConfig) }),
+        postToken: installed.snapshot.token,
+      });
+      return;
+    }
+
+    const result = await (opts.applyConfig ?? applyConfigTransaction)(repoDir, receiver.configPath, incoming, { baseConfig });
+    if (result.status !== "completed") throw configFailure(result);
+    for (const warning of result.warnings) {
+      try {
+        glog(`git-sync WARNING ${rel}: config ${warning}`);
+      } catch {
+        // Observability after the rename commit point is strictly non-fatal.
+      }
+    }
+    completeLane(rel, receiver.shape, {
+      pre: result.preHash,
+      post: result.postHash,
+      incoming: result.incomingHash,
+      ...(result.baseHash === undefined ? {} : { basePre: result.baseHash }),
+      postToken: result.postToken,
+    });
   };
 
   const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
@@ -1619,11 +2016,80 @@ export async function applyGitSections(
       }
     }
 
+    const defer = (reason: string) => {
+      pending[rel] = remoteSec; // [v5]: outbound pushes carry newest unapplied truth
+      glog(`git-sync deferred ${rel}: ${reason}`);
+    };
+
+    // Design 93 §6/§9. The config predicate is deliberately decided before
+    // EITHER unchanged shortcut. Receiver ownership is local shape, not sender
+    // shape; cross-shape rows skip config loudly once while Git keeps its existing
+    // disposition. A shape mismatch first clears the old lane markers and records
+    // the new identity in this pull's atomic repo transition.
+    let configDue = false;
+    let configTarget: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string } | undefined;
+    if (!opts.disableConfigLane && remoteSec.config !== undefined) {
+      if (!dotGit) {
+        invalidateLaneShape(rel, undefined);
+        configDue = true;
+        configTarget = { fresh: true };
+      } else {
+        const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+        if (!diskCtx) {
+          invalidateLaneShape(rel, undefined);
+          const logKey = `${root}\0${rel}`;
+          if (!configOwnershipSkipLogged.has(logKey)) {
+            configOwnershipSkipLogged.add(logKey);
+            glog(`git-sync config skipped ${rel}: receiver repository shape is unreadable/non-owned`);
+          }
+        } else {
+          const receiver = await configReceiver(root, diskCtx);
+          const lane = invalidateLaneShape(rel, receiver.shape);
+          if (!receiver.owned) {
+            const logKey = `${root}\0${rel}`;
+            if (!configOwnershipSkipLogged.has(logKey)) {
+              configOwnershipSkipLogged.add(logKey);
+              glog(`git-sync config skipped ${rel}: receiver ${diskCtx.kind} shape does not own the common config`);
+            }
+          } else {
+            configTarget = { fresh: false, shape: receiver.shape, configPath: receiver.configPath };
+            const current = await readConfigSnapshot(receiver.configPath);
+            const token = current.ok ? current.snapshot.token : undefined;
+            configDue = gitConfigHash(remoteSec.config) !== lane.cfgApplied || !sameConfigStatToken(token, lane.cfgToken);
+          }
+        }
+      }
+    }
+
+    // A conflict checkpoint owns the Git disposition until the user changes the
+    // recorded local identity. Config waits; after that change the same due
+    // predicate above feeds either the converged shortcut or a new conflict/apply.
+    let resolutionChanged = false;
+    if (needsRes[rel] !== undefined) {
+      if (gitIdentityKey(localId) === needsRes[rel]) {
+        return { result: "unchanged", commonDirGroup };
+      }
+      delete needsRes[rel];
+      resolutionChanged = true;
+    }
+
+    const applyConfigOnly = async (): Promise<boolean> => {
+      if (!configDue || !configTarget || configTarget.fresh) return !configDue;
+      try {
+        await runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget);
+        return true;
+      } catch (error) {
+        defer(errMsg(error));
+        return false;
+      }
+    };
+
     // Projected identity comparison on the NARROWER of the two scopes (§7) — what makes
     // worktree→standalone→worktree round-trips converge without apply ping-pong.
     const cmpScope = narrowerScope(remoteSec.refScope, baseSec?.refScope);
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
-    if (!remoteChanged && !pend) {
+    if (!remoteChanged && !pend && !resolutionChanged && !(configDue && configTarget?.fresh)) {
+      if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
       return { result: "unchanged", commonDirGroup };
     }
@@ -1635,6 +2101,7 @@ export async function applyGitSections(
     if (localId && !cleanMaterialize) {
       const n = narrowerScope(localId.refScope, remoteSec.refScope);
       if (projectedKey(localId, n) === projectedKey(remoteSec, n)) {
+        if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
         applied[rel] = remoteSec;
         delete pending[rel];
         delete removedMem[rel];
@@ -1656,10 +2123,6 @@ export async function applyGitSections(
     }
 
     // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
-    const defer = (reason: string) => {
-      pending[rel] = remoteSec; // [v5]: outbound pushes now carry THIS section; retry next pull
-      glog(`git-sync deferred ${rel}: ${reason}`);
-    };
     if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
       defer("target is inside an ignored subtree — refusing to materialize");
       return { result: "deferred", commonDirGroup };
@@ -1680,20 +2143,26 @@ export async function applyGitSections(
     // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
     // update-only apply is the whole treatment; the memory clears on success.
     const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
+    const configAfterGit = configDue && configTarget && remoteSec.config !== undefined
+      ? async () => runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget!)
+      : undefined;
     const res = await applyGitState(
       repoDir,
       remoteSec,
       store,
       kek,
-      wipeLeftover
-        ? {
+      {
+        ...(wipeLeftover
+          ? {
             beforeMutateWipesRefs: true,
             beforeMutate: async () => {
               await quarantineAndWipeGitState(repoDir);
               delete removedMem[rel]; // leftover quarantined + wiped — the memory served its purpose
             },
           }
-        : {}
+          : {}),
+        ...(configAfterGit ? { afterGitMutate: configAfterGit } : {}),
+      }
     );
     if (res.applied) {
       // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).
@@ -1771,15 +2240,30 @@ export async function applyGitSections(
  * guess). Identity reads use `git write-tree`, which may add unreferenced tree
  * objects — the same "harmless, like `git status`" footprint sync itself has.
  */
-export async function gitDivergenceCount(
+export interface GitDivergenceStatus {
+  count: number;
+  /** Repos whose config snapshot could not be stabilized/read. These count as
+   * divergent and render as the explicit indeterminate `config: checking` state. */
+  configChecking: string[];
+  /** Permanently disabled or over-wire-bounds config lanes, surfaced loudly. */
+  configDisabled: Array<{ relPath: string; reason: string }>;
+}
+
+export interface GitDivergenceStatusOptions {
+  /** Deterministic §11 seam for forcing a config snapshot to remain unstable. */
+  gitConfigRunner?: GitConfigRunner;
+}
+
+export async function gitDivergenceStatus(
   root: string,
   cfg: WorkspaceConfig,
   state: SyncState,
   matcher?: IgnoreMatcher,
   discoveredRepos?: GitDivergenceRepoSource,
-  includeBaseRepos = true
-): Promise<number> {
-  if (!cfg.syncGit) return 0;
+  includeBaseRepos = true,
+  options: GitDivergenceStatusOptions = {}
+): Promise<GitDivergenceStatus> {
+  if (!cfg.syncGit) return { count: 0, configChecking: [], configDisabled: [] };
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const pending = state.gitPendingRemote ?? {};
   const needsRes = state.gitNeedsResolution ?? {};
@@ -1804,7 +2288,7 @@ export async function gitDivergenceCount(
     if (repo.kind) kindByPath.set(repo.relPath, repo.kind);
     if (pending[repo.relPath] || scheduled.has(repo.relPath)) return;
     scheduled.add(repo.relPath);
-    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes, repo.kind)
+    const p = cachedDivergenceProbe(run, root, repo.relPath, cache, probes, repo.kind, options.gitConfigRunner)
       .then((kind) => {
         if (kind) kindByPath.set(repo.relPath, kind);
       })
@@ -1841,6 +2325,28 @@ export async function gitDivergenceCount(
   };
 
   let n = 0;
+  const configChecking: string[] = [];
+  const configDisabled: Array<{ relPath: string; reason: string }> = [];
+  const countConfigDisposition = async (rel: string, baseSec: GitSection): Promise<void> => {
+    const cachedLocalCfg = cache.repos.get(rel)?.cachedLocalCfg;
+    if (cachedLocalCfg) {
+      if (shouldPublishGitConfig(baseSec.config, cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced)) n++;
+      return;
+    }
+    const localCfg = await readLocalGitConfig(root, rel, undefined, options.gitConfigRunner);
+    if (localCfg.status === "ok") {
+      if (shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) n++;
+      return;
+    }
+    n++; // conservative: the lane must never report zero on an unreadable decision
+    if (localCfg.status === "over-bounds") {
+      configDisabled.push({ relPath: rel, reason: localCfg.reason });
+    } else if (localCfg.fault.disposition === "permanent") {
+      configDisabled.push({ relPath: rel, reason: localCfg.fault.reason });
+    } else {
+      configChecking.push(rel);
+    }
+  };
   for (const rel of keys) {
     if (pending[rel]) continue; // unapplied remote truth is carried, never local divergence
     const kind = kindByPath.get(rel);
@@ -1890,6 +2396,18 @@ export async function gitDivergenceCount(
     const pfKind = probe.preflightKind ?? kind;
     const carry = carryMatrixMatches(baseSec, pfKind, key);
     if (!carry) n++;
+    else await countConfigDisposition(rel, baseSec);
   }
-  return n;
+  return { count: n, configChecking, configDisabled };
+}
+
+export async function gitDivergenceCount(
+  root: string,
+  cfg: WorkspaceConfig,
+  state: SyncState,
+  matcher?: IgnoreMatcher,
+  discoveredRepos?: GitDivergenceRepoSource,
+  includeBaseRepos = true
+): Promise<number> {
+  return (await gitDivergenceStatus(root, cfg, state, matcher, discoveredRepos, includeBaseRepos)).count;
 }

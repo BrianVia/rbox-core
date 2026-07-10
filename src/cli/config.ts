@@ -1,8 +1,12 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection, Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
+import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
+import type { ConfigStatToken } from "../engine/git/config-txn.js";
+import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -114,6 +118,60 @@ export interface SyncState {
    *  suppressed, and each pull retries the apply. Cleared on successful apply or when
    *  the remote deletes the repo ([v6] absence supersedes pending). */
   gitPendingRemote?: Record<string, GitSection>;
+  /** Random state-file incarnation. A delayed packet from before a reset/rebind
+   * cannot land even when the stream later changes A→B→A. */
+  stateNonce?: string;
+  /** Monotonic whole-state write revision (diagnostic/defense-in-depth only). */
+  stateRevision?: number;
+  /** Generation-CAS records. These are authoritative for gitRepos and all local
+   * per-repo sidecars once present; legacy physical maps are folded in on read. */
+  repoRecords?: Record<string, RepoRecord>;
+}
+
+export interface ConfigShapeIdentity {
+  shape: string;
+  commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
+}
+
+export interface RepoRecord {
+  repoGen: number;
+  sourceSeq: number;
+  base?: GitSection;
+  pending?: GitSection;
+  removedKey?: string;
+  resolutionKey?: string;
+  cfgSynced?: string;
+  cfgApplied?: string;
+  cfgToken?: ConfigStatToken;
+  cfgShape?: ConfigShapeIdentity;
+}
+
+export type RepoRecordInput = Omit<RepoRecord, "repoGen">;
+
+export interface RepoTransition {
+  relPath: string;
+  expectedRepoGen: number;
+  newRecord: RepoRecordInput;
+}
+
+export type FileOnlyManifest = Omit<Manifest, "gitRepos"> & { gitRepos?: never };
+
+export interface StateSavePacket {
+  expectedStream: string;
+  expectedNonce: string;
+  sourceGlobalSeq: number;
+  global?: { manifest: FileOnlyManifest };
+  repos: RepoTransition[];
+}
+
+export type StateSaveResult =
+  | { status: "accepted"; state: SyncState }
+  | { status: "rejected"; reason: "stream" | "nonce" | "repo-generation" | "global-sequence" | "owner-lost"; state: SyncState }
+  | { status: "busy"; detail: string }
+  | { status: "unsupported"; error: unknown };
+
+export interface StateSaveOptions {
+  lock?: AcquireLockOptions;
 }
 
 export const RBOX_DIR = ".rbox";
@@ -122,7 +180,176 @@ const STATE_FILE = "state.json";
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 
 const configPath = (root: string) => path.join(root, RBOX_DIR, CONFIG_FILE);
-const statePath = (root: string) => path.join(root, RBOX_DIR, STATE_FILE);
+export const statePath = (root: string) => path.join(root, RBOX_DIR, STATE_FILE);
+export const stateLockPath = (root: string) => `${statePath(root)}.lock`;
+const stateIncarnationPath = (root: string) => path.join(root, RBOX_DIR, "state", "state-incarnation.json");
+
+const freshState = (stream: string): SyncState => ({ stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST });
+const streamMismatchFreshStates = new WeakSet<SyncState>();
+export const stateWasStreamMismatch = (state: SyncState): boolean => streamMismatchFreshStates.has(state);
+
+function parseState(raw: string, file: string): SyncState {
+  try {
+    return JSON.parse(raw) as SyncState;
+  } catch {
+    throw new Error(
+      `Corrupt sync state at ${file}. Refusing to reset to an empty base ` +
+        `(that would force a destructive reconcile). Inspect the file, or delete it to ` +
+        `intentionally re-baseline from scratch.`
+    );
+  }
+}
+
+/** Raw state load for the transactional writer. Unlike loadState, this never
+ * hides a stream mismatch by manufacturing a fresh baseline. */
+export async function loadRawState(root: string): Promise<SyncState | undefined> {
+  try {
+    return parseState(await fs.readFile(statePath(root), "utf8"), statePath(root));
+  } catch (error) {
+    if (isENOENT(error)) {
+      try {
+        const marker = JSON.parse(await fs.readFile(stateIncarnationPath(root), "utf8")) as {
+          stream?: unknown; stateNonce?: unknown; stateRevision?: unknown;
+        };
+        if (typeof marker.stream === "string" && typeof marker.stateNonce === "string") {
+          return {
+            ...freshState(marker.stream),
+            stateNonce: marker.stateNonce,
+            stateRevision: validCounter(marker.stateRevision),
+            repoRecords: {},
+          };
+        }
+        throw new Error(`Corrupt sync state incarnation at ${stateIncarnationPath(root)}`);
+      } catch (markerError) {
+        if (isENOENT(markerError)) return undefined;
+        throw markerError;
+      }
+    }
+    throw error;
+  }
+}
+
+function validCounter(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/** Fold the legacy parallel maps into complete records. Every later state write
+ * reconstructs gitRepos and sidecars solely from this returned record set. */
+export function repoRecordsForState(state: SyncState): Record<string, RepoRecord> {
+  const keys = new Set([
+    ...Object.keys(state.repoRecords ?? {}),
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.keys(state.gitPendingRemote ?? {}),
+    ...Object.keys(state.gitReposRemoved ?? {}),
+    ...Object.keys(state.gitNeedsResolution ?? {}),
+  ]);
+  const records: Record<string, RepoRecord> = {};
+  for (const relPath of keys) {
+    const saved = state.repoRecords?.[relPath];
+    if (saved) {
+      // Once a record exists it is authoritative, including property absence.
+      // Falling back to a legacy map here would resurrect an observed deletion.
+      records[relPath] = { ...saved, repoGen: validCounter(saved.repoGen), sourceSeq: validCounter(saved.sourceSeq) };
+      continue;
+    }
+    records[relPath] = {
+      repoGen: 0,
+      sourceSeq: validCounter(state.lastSyncedSequence),
+      ...(state.lastSyncedManifest.gitRepos?.[relPath] === undefined ? {} : { base: state.lastSyncedManifest.gitRepos[relPath] }),
+      ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
+      ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
+      ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),
+    };
+  }
+  return records;
+}
+
+export const expectedStateNonce = (state: SyncState): string => state.stateNonce ?? "legacy";
+
+function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined {
+  const result: Record<string, T> = {};
+  for (const [relPath, record] of Object.entries(records)) {
+    const value = pick(record);
+    if (value !== undefined) result[relPath] = value;
+  }
+  return Object.keys(result).length === 0 ? undefined : result;
+}
+
+export function stateFromRepoRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
+  const gitRepos = mapFromRecords(records, (record) => record.base);
+  return {
+    ...state,
+    lastSyncedManifest: { ...state.lastSyncedManifest, gitRepos },
+    gitReposRemoved: mapFromRecords(records, (record) => record.removedKey),
+    gitNeedsResolution: mapFromRecords(records, (record) => record.resolutionKey),
+    gitPendingRemote: mapFromRecords(records, (record) => record.pending),
+    repoRecords: records,
+  };
+}
+
+function packetNonceMatches(expected: string, actual: string | undefined): boolean {
+  return expected === "legacy" ? actual === undefined : expected === actual;
+}
+
+function busyDetail(result: Exclude<Awaited<ReturnType<typeof acquireLock>>, { status: "acquired" }>): string {
+  if (result.status !== "held") return result.status;
+  const inspection = result.inspection;
+  if (inspection.kind === "live" || inspection.kind === "dead") return `pid ${inspection.marker.pid}`;
+  return inspection.reason;
+}
+
+/** Apply one generation-CAS packet under `<state>.lock`. Rejection is whole-packet:
+ * no global or per-repo member lands unless every precondition succeeds. */
+export async function applyStateSavePacket(root: string, packet: StateSavePacket, options: StateSaveOptions = {}): Promise<StateSaveResult> {
+  await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
+  const acquired = await acquireLock(stateLockPath(root), options.lock);
+  if (acquired.status === "unsupported") return { status: "unsupported", error: acquired.error };
+  if (acquired.status === "error") return { status: "busy", detail: String(acquired.error) };
+  if (acquired.status === "held") return { status: "busy", detail: busyDetail(acquired) };
+  const lock = acquired.lock;
+  try {
+    const raw = await loadRawState(root);
+    const current = raw ?? freshState(packet.expectedStream);
+    if (current.stream !== packet.expectedStream) return { status: "rejected", reason: "stream", state: current };
+    if (!packetNonceMatches(packet.expectedNonce, current.stateNonce)) return { status: "rejected", reason: "nonce", state: current };
+    if (packet.global && packet.sourceGlobalSeq < current.lastSyncedSequence) {
+      return { status: "rejected", reason: "global-sequence", state: current };
+    }
+
+    const records = repoRecordsForState(current);
+    for (const transition of packet.repos) {
+      if ((records[transition.relPath]?.repoGen ?? 0) !== transition.expectedRepoGen) {
+        return { status: "rejected", reason: "repo-generation", state: current };
+      }
+    }
+    for (const transition of packet.repos) {
+      records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
+    }
+
+    const global = packet.global?.manifest;
+    const base: SyncState = global
+      ? {
+          ...current,
+          lastSyncedSequence: packet.sourceGlobalSeq,
+          lastSyncedManifest: { ...global, gitRepos: undefined },
+        }
+      : current;
+    const next = stateFromRepoRecords({
+      ...base,
+      stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),
+      stateRevision: validCounter(current.stateRevision) + 1,
+    }, records);
+    let owner = true;
+    await writeFileAtomic(statePath(root), JSON.stringify(next, null, 2), {
+      beforeRename: async () => (owner = await lock.isOwner()),
+    });
+    if (!owner) return { status: "rejected", reason: "owner-lost", state: current };
+    await fs.rm(stateIncarnationPath(root), { force: true }).catch(() => {});
+    return { status: "accepted", state: next };
+  } finally {
+    await lock.release();
+  }
+}
 
 function configForDisk(cfg: WorkspaceConfig): WorkspaceConfig {
   return {
@@ -195,30 +422,27 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
  * stamp; every save since writes one).
  */
 export async function loadState(root: string, stream: string): Promise<SyncState> {
-  const fresh: SyncState = { stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST };
+  const fresh = freshState(stream);
   let raw: string;
   try {
     raw = await fs.readFile(statePath(root), "utf8");
   } catch (e) {
-    if (isENOENT(e)) return fresh;
+    if (isENOENT(e)) {
+      const reset = await loadRawState(root);
+      if (!reset) return fresh;
+      if (reset.stream === stream) return reset;
+      return fresh;
+    }
     throw e;
   }
-  let state: SyncState;
-  try {
-    state = JSON.parse(raw) as SyncState;
-  } catch {
-    throw new Error(
-      `Corrupt sync state at ${statePath(root)}. Refusing to reset to an empty base ` +
-        `(that would force a destructive reconcile). Inspect the file, or delete it to ` +
-        `intentionally re-baseline from scratch.`
-    );
-  }
+  const state = parseState(raw, statePath(root));
   if (state.stream === undefined) return { ...state, stream }; // pre-stamp legacy: adopt
   if (state.stream !== stream) {
     console.error(
       `sync state at ${statePath(root)} belongs to stream ${state.stream}, ` +
         `not ${stream} — starting from a fresh baseline (files on disk untouched).`
     );
+    streamMismatchFreshStates.add(fresh);
     return fresh;
   }
   return state;
@@ -236,17 +460,65 @@ export async function saveState(root: string, state: SyncState): Promise<void> {
  *  the activity record AND the design-46 `shell.line` prompt sidecar both describe
  *  the OLD binding's halt/trail and must not render under the new one.
  *  Missing files = already reset. */
-export async function resetSyncState(root: string): Promise<void> {
-  for (const p of [
-    statePath(root),
-    path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
-    path.join(root, RBOX_DIR, "state", "activity.json"),
-    path.join(root, RBOX_DIR, "state", "shell.line"),
-  ]) {
-    try {
-      await fs.rm(p);
-    } catch (e) {
-      if (!isENOENT(e)) throw e;
+export async function resetSyncState(root: string, nextStream: string, heldMutex?: WorkspaceSyncMutex): Promise<void> {
+  let owned = heldMutex;
+  let releaseOwned = false;
+  if (!owned) {
+    owned = await acquireWorkspaceSyncMutex(root, "cli");
+    releaseOwned = true;
+  }
+  assertSyncMutex(owned, root);
+  try {
+    await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
+    const legacyReset = async (): Promise<void> => {
+      // Same deliberate fence-free fallback as legacy saves: remove both state
+      // representations so the next load starts from nextStream with no lane state.
+      await fs.rm(stateIncarnationPath(root), { force: true });
+      await fs.rm(statePath(root), { force: true });
+    };
+    if (workspaceSyncMutexDegraded(owned)) {
+      await legacyReset();
+    } else {
+      const acquired = await acquireLock(stateLockPath(root));
+      if (acquired.status === "unsupported") {
+        await legacyReset();
+      } else {
+        if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
+        try {
+          const prior = await loadRawState(root);
+          const reset = {
+            stream: nextStream,
+            stateNonce: crypto.randomBytes(16).toString("hex"),
+            stateRevision: validCounter(prior?.stateRevision) + 1,
+          };
+          let owner = true;
+          await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
+          await writeFileAtomic(stateIncarnationPath(root), JSON.stringify(reset, null, 2), {
+            beforeRename: async () => (owner = await acquired.lock.isOwner()),
+          });
+          if (!owner) throw new Error("sync state reset lock ownership was lost");
+          if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
+          await fs.rm(statePath(root), { force: true });
+        } finally {
+          await acquired.lock.release();
+        }
+      }
+    }
+
+    for (const p of [
+      path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
+      path.join(root, RBOX_DIR, "state", "activity.json"),
+      path.join(root, RBOX_DIR, "state", "shell.line"),
+    ]) {
+      try {
+        await fs.rm(p);
+      } catch (e) {
+        if (!isENOENT(e)) throw e;
+      }
+    }
+  } finally {
+    if (releaseOwned) {
+      await releaseWorkspaceSyncMutex(owned);
     }
   }
 }

@@ -15,7 +15,7 @@ import {
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
+import { expectedStateNonce, loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -35,6 +35,8 @@ import {
 } from "./ambient-status.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "./version.js";
+import { daemonBindingMatches } from "./sync-state.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -97,6 +99,10 @@ interface Wants {
   fullScan: boolean;
   deepScan: boolean;
 }
+
+/** Contention disposition pin: only a successful acquire authorizes consuming
+ * the queued daemon wakeup. */
+export const daemonConsumesWakeup = (result: DaemonMutexResult): boolean => result.status === "acquired";
 
 /**
  * The rbox daemon: passive, continuous, resource-disciplined sync.
@@ -181,14 +187,28 @@ export class RboxDaemon {
   private activeProgressPath?: string;
   private readonly bootId: string;
   private readonly pullOnly: boolean;
+  private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
+  private readonly syncMutexBackoff: () => Promise<void>;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, opts: { bootId?: string; pullOnly?: boolean } = {}) {
+  constructor(
+    private readonly root: string,
+    private cfg: WorkspaceConfig,
+    private readonly e2ee: SyncDeps,
+    opts: {
+      bootId?: string;
+      pullOnly?: boolean;
+      acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
+      syncMutexBackoff?: () => Promise<void>;
+    } = {},
+  ) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
+    this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
+    this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
   }
 
   async start(): Promise<void> {
@@ -396,116 +416,135 @@ export class RboxDaemon {
         // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
         // is keyed on it (a halt is only healed by a success of the SAME kind).
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
-        const opWatcherGeneration = this.watcherUnsettledGeneration;
-        const opWatcherErrorGeneration = this.watcherErrorGeneration;
+        const acquired = await this.acquireSyncMutexFn(this.root);
+        if (acquired.status === "contended") {
+          // Do not clear want[op]: contention must requeue, never consume, this tick.
+          log(`pump op ${op}: another sync is in progress (${acquired.detail}); re-queued`);
+          await this.syncMutexBackoff();
+          continue;
+        }
+        const syncMutex = acquired.handle;
         try {
-          let pushedToRemote = false;
-          this.pushTerminalBlocked = false;
-          this.want[op] = false;
-          this.activePumpOp = op;
-          this.writeAmbientStatus();
-          this.appliedPendingEventsInOp = false;
+          const binding = this.syncBase ?? await this.loadSyncBase();
+          const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
+          if (!bindingMatches) {
+            log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
+            this.stopped = true;
+            break;
+          }
+          const opWatcherGeneration = this.watcherUnsettledGeneration;
+          const opWatcherErrorGeneration = this.watcherErrorGeneration;
           try {
-            if (op === "deepScan") {
-              await this.doDeepScan();
-              this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
-              this.requestPush();
-            } else if (op === "fullScan") {
-              await this.doFullScan();
-              this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
-              if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
-              this.requestPush();
-            } else if (op === "pull") {
-              const catchUpGeneration = this.pendingCatchUpGeneration;
-              this.pendingCatchUpGeneration = undefined;
-              await this.doPull();
-              if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-              this.requestPush(); // publish any local divergence after taking remote
-            } else {
-              const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
-              this.outOfStorageProbeArmed = false;
-              if (this.activity.outOfStorage && !quotaProbe) {
-                await this.applyPendingWatchEvents();
-              } else {
-                await this.doPush();
-                pushedToRemote = true;
-              }
-            }
-            this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
-          } finally {
-            this.activePumpOp = undefined;
-            this.activeProgressPath = undefined;
+            let pushedToRemote = false;
+            this.pushTerminalBlocked = false;
+            this.want[op] = false;
+            this.activePumpOp = op;
             this.writeAmbientStatus();
-          }
-          // Op completed: any live progress is over. A standing halt is healed ONLY by
-          // a success of the op kind that recorded it — a mass-delete-guard halt from a
-          // pull must survive the queued push's no-op success and every safety scan
-          // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
-          // Persist when something visible changed (or as a throttled heartbeat, so
-          // `rbox status` can say "last checked: Ns ago" without idle disk churn).
-          const terminalBlocked = op === "push" && this.pushTerminalBlocked;
-          const heals = !terminalBlocked && this.activity.halt !== undefined && this.activity.halt.op === op;
-          const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
-          const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
-          this.activity.active = undefined;
-          this.activeProgressPath = undefined;
-          if (heals) {
-            this.activity.halt = undefined;
-          }
-          if (clearsOutOfStorage) {
-            this.activity.outOfStorage = undefined;
-          }
-          if (heals || clearsOutOfStorage) {
-            // The healed failure's dedup streak ends with it: a LATER failure with the
-            // same message is a new episode that must log and persist a fresh visible
-            // state, not silently count as repeat 2..9 and leave activity.json healed.
-            this.lastErrMsg = "";
-            this.errRepeat = 0;
-          }
-          if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
-        } catch (e) {
-          // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
-          // first hit and every 10th after, with the running count — so the log stays
-          // readable while still showing exactly how long the failure has persisted.
-          const msg = e instanceof Error ? e.message : String(e);
-          this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
-          this.lastErrMsg = msg;
-          const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
-          if (e instanceof QuotaExceededError) {
-            const visibleChanged = this.recordOutOfStorage(e, op);
-            if (shouldLogRepeat) log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-            if (visibleChanged || shouldLogRepeat) this.writeActivity();
-            await sleep(jitter(1000));
-            continue;
-          }
-          if (e instanceof CommitRejectedError) {
+            this.appliedPendingEventsInOp = false;
+            try {
+              if (op === "deepScan") {
+                await this.doDeepScan();
+                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
+                this.requestPush();
+              } else if (op === "fullScan") {
+                await this.doFullScan();
+                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
+                if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
+                this.requestPush();
+              } else if (op === "pull") {
+                const catchUpGeneration = this.pendingCatchUpGeneration;
+                this.pendingCatchUpGeneration = undefined;
+                await this.doPull(syncMutex);
+                if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
+                this.requestPush(); // publish any local divergence after taking remote
+              } else {
+                const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
+                this.outOfStorageProbeArmed = false;
+                if (this.activity.outOfStorage && !quotaProbe) {
+                  await this.applyPendingWatchEvents();
+                } else {
+                  await this.doPush(syncMutex);
+                  pushedToRemote = true;
+                }
+              }
+              this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+            } finally {
+              this.activePumpOp = undefined;
+              this.activeProgressPath = undefined;
+              this.writeAmbientStatus();
+            }
+            // Op completed: any live progress is over. A standing halt is healed ONLY by
+            // a success of the op kind that recorded it — a mass-delete-guard halt from a
+            // pull must survive the queued push's no-op success and every safety scan
+            // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
+            // Persist when something visible changed (or as a throttled heartbeat, so
+            // `rbox status` can say "last checked: Ns ago" without idle disk churn).
+            const terminalBlocked = op === "push" && this.pushTerminalBlocked;
+            const heals = !terminalBlocked && this.activity.halt !== undefined && this.activity.halt.op === op;
+            const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
+            const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
             this.activity.active = undefined;
             this.activeProgressPath = undefined;
-            this.activity.halt = {
-              at: new Date().toISOString(),
-              reason: msg,
-              count: this.errRepeat,
-              op,
-              ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
-            };
+            if (heals) {
+              this.activity.halt = undefined;
+            }
+            if (clearsOutOfStorage) {
+              this.activity.outOfStorage = undefined;
+            }
+            if (heals || clearsOutOfStorage) {
+              // The healed failure's dedup streak ends with it: a LATER failure with the
+              // same message is a new episode that must log and persist a fresh visible
+              // state, not silently count as repeat 2..9 and leave activity.json healed.
+              this.lastErrMsg = "";
+              this.errRepeat = 0;
+            }
+            if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
+          } catch (e) {
+            // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
+            // first hit and every 10th after, with the running count — so the log stays
+            // readable while still showing exactly how long the failure has persisted.
+            const msg = e instanceof Error ? e.message : String(e);
+            this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
+            this.lastErrMsg = msg;
+            const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
+            if (e instanceof QuotaExceededError) {
+              const visibleChanged = this.recordOutOfStorage(e, op);
+              if (shouldLogRepeat) log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              if (visibleChanged || shouldLogRepeat) this.writeActivity();
+              await sleep(jitter(1000));
+              continue;
+            }
+            if (e instanceof CommitRejectedError) {
+              this.activity.active = undefined;
+              this.activeProgressPath = undefined;
+              this.activity.halt = {
+                at: new Date().toISOString(),
+                reason: msg,
+                count: this.errRepeat,
+                op,
+                ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
+              };
+              if (shouldLogRepeat) {
+                log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+                this.writeActivity();
+              }
+              await sleep(jitter(1000));
+              continue;
+            }
+            // The halt record is the failure's user-visible surface (design 45): without
+            // it a mass-delete-guard refusal (design 44) stalls background sync with no
+            // indicator anywhere but this log. Persisted on the log-line schedule.
+            this.activity.active = undefined;
+            this.activeProgressPath = undefined;
+            this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
             if (shouldLogRepeat) {
-              log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
               this.writeActivity();
             }
-            await sleep(jitter(1000));
-            continue;
+            await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
           }
-          // The halt record is the failure's user-visible surface (design 45): without
-          // it a mass-delete-guard refusal (design 44) stalls background sync with no
-          // indicator anywhere but this log. Persisted on the log-line schedule.
-          this.activity.active = undefined;
-          this.activeProgressPath = undefined;
-          this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
-          if (shouldLogRepeat) {
-            log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-            this.writeActivity();
-          }
-          await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
+        } finally {
+          await releaseWorkspaceSyncMutex(syncMutex);
         }
       }
       await this.cache.save(this.root);
@@ -521,7 +560,7 @@ export class RboxDaemon {
     }
   }
 
-  private async doPush(): Promise<void> {
+  private async doPush(syncMutex: WorkspaceSyncMutex): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     await this.applyPendingWatchEvents();
     const blockedFingerprint = this.terminalPushBlock();
@@ -531,6 +570,7 @@ export class RboxDaemon {
       res = await pushManifest(this.root, this.cfg, this.manifest, {
         ...this.e2ee,
         cache: this.cache,
+        syncMutex,
         blockedFingerprint,
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
@@ -679,7 +719,7 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
-  private async doPull(): Promise<void> {
+  private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
@@ -689,6 +729,7 @@ export class RboxDaemon {
     const actions = await pull(this.root, this.cfg, {
       ...this.e2ee,
       cache: this.cache,
+      syncMutex,
       report,
       onGitLog: log,
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
@@ -1308,7 +1349,7 @@ export async function runDaemon(root: string): Promise<void> {
   // start() returns after initial convergence; timers/watcher/ws keep the loop alive.
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** ± up to 50% jitter so a fleet of daemons never aligns its ticks/reconnects. */
 const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
 

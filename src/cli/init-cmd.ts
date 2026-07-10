@@ -24,6 +24,7 @@ import { promptSelect, promptInput } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -163,111 +164,119 @@ async function executeInitPlan(
     throw e;
   }
 
-  // 3. Write the per-device binding (token injected at runtime, never persisted).
-  //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
-  //    its sync baseline describes the OLD stream — reconciling the new one against
-  //    it reads every old file as remotely deleted (the 2026-07-01 mass-delete
-  //    incident). Reset the baseline explicitly (loadState also guards via the
-  //    stream stamp; this keeps the on-disk state truthful) and say so.
-  const prev = await loadConfig(plan.root).catch(() => undefined);
-  const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
-  if (prev && syncStreamId(prev) !== nextStream) {
-    await resetSyncState(plan.root);
-    process.stderr.write(
-      `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
-        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
-    );
-  }
-  const cfg: WorkspaceConfig = {
-    schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
-    remoteWorkspaceId: workspaceId,
-    projectId: plan.workspace.project,
-    deviceId,
-    rootPath: plan.root,
-    remoteUrl: plan.remoteUrl,
-    token: "",
-    // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a non-git root;
-    // pass --git false to opt out. This is the git-native sync the product is built around.
-    syncGit: plan.syncGit,
-    respectGitignore: plan.respectGitignore,
-    // Cache the workspace name LOCALLY so `rbox status` shows it with no round-trip.
-    // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
-    ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
-  };
-  await saveConfig(plan.root, cfg);
-
-  // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
-  process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
-
-  // 5. First sync through the E2EE transport. Pre-check enrollment so a join via
-  //    device-code (which authorizes but doesn't carry the key) gives clear
-  //    guidance up front rather than failing mid-spinner.
-  if (creds.accountId && !(await hasDevice(creds.accountId))) {
-    fail("this machine isn't enrolled for encryption yet.");
-    process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
-    process.exitCode = 1;
-    return undefined;
-  }
-  const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
-  if (plan.firstSync === "push") {
-    const sp = spinner("publishing initial snapshot — scanning files");
-    try {
-      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-      const { sequence: seq, committed } = await push(plan.root, authed, deps);
-      // Never report a publish that didn't happen (design 44): the incident setup
-      // printed "published → sequence 75" for a push that uploaded zero bytes.
-      sp.succeed(
-        committed
-          ? `published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
-          : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+  // Init/setup owns one mutex across the complete rebind/reset + first-sync
+  // decision, mutation, and state-save interval. Nested pull/push calls inherit it.
+  const syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
+  try {
+    // 3. Write the per-device binding (token injected at runtime, never persisted).
+    //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
+    //    its sync baseline describes the OLD stream — reconciling the new one against
+    //    it reads every old file as remotely deleted (the 2026-07-01 mass-delete
+    //    incident). Reset the baseline explicitly (loadState also guards via the
+    //    stream stamp; this keeps the on-disk state truthful) and say so.
+    const prev = await loadConfig(plan.root).catch(() => undefined);
+    const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
+    if (prev && syncStreamId(prev) !== nextStream) {
+      await resetSyncState(plan.root, nextStream, syncMutex);
+      process.stderr.write(
+        `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+          `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
       );
-    } catch (e) {
-      sp.fail("initial push failed");
-      throw e;
     }
-  } else if (plan.firstSync === "sync") {
-    const sp = spinner("syncing from remote — scanning files");
-    const populate = createPopulateStatusWriter(plan.root, authed);
-    try {
-      await populate.start();
-      deps.onProgress = (done, total, phase, detail, bytes) => {
-        sp.update(progressLabel(phase, done, total, detail, bytes));
-        populate.update(done, total, phase, bytes);
-      };
-      const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
-      sp.stop();
-      const conflicts = pulled.filter((a) => a.kind === "conflict");
-      const writes = pulled.filter((a) => a.kind === "write").length;
-      console.log(
-        `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
-      );
-      for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
-    } catch (e) {
-      sp.fail("initial sync failed");
-      throw e;
-    } finally {
-      await populate.stop();
+    const cfg: WorkspaceConfig = {
+      schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
+      remoteWorkspaceId: workspaceId,
+      projectId: plan.workspace.project,
+      deviceId,
+      rootPath: plan.root,
+      remoteUrl: plan.remoteUrl,
+      token: "",
+      // §28: git-sync defaults ON (git artifacts are E2EE-encrypted). No-ops on a non-git root;
+      // pass --git false to opt out. This is the git-native sync the product is built around.
+      syncGit: plan.syncGit,
+      respectGitignore: plan.respectGitignore,
+      // Cache the workspace name LOCALLY so `rbox status` shows it with no round-trip.
+      // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
+      ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
+    };
+    await saveConfig(plan.root, cfg);
+
+    // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
+    process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);
+
+    // 5. First sync through the E2EE transport. Pre-check enrollment so a join via
+    //    device-code (which authorizes but doesn't carry the key) gives clear
+    //    guidance up front rather than failing mid-spinner.
+    if (creds.accountId && !(await hasDevice(creds.accountId))) {
+      fail("this machine isn't enrolled for encryption yet.");
+      process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
+      process.exitCode = 1;
+      return undefined;
     }
-  } else if (plan.firstSync === "pull") {
-    const sp = spinner("pulling from remote");
-    const populate = createPopulateStatusWriter(plan.root, authed);
-    try {
-      await populate.start();
-      deps.onProgress = (done, total, phase, detail, bytes) => {
-        sp.update(progressLabel(phase, done, total, detail, bytes));
-        populate.update(done, total, phase, bytes);
-      };
-      const actions = await pull(plan.root, authed, deps);
-      sp.stop();
-      const conflicts = actions.filter((a) => a.kind === "conflict");
-      const writes = actions.filter((a) => a.kind === "write").length;
-      console.log(`${style.bold("pulled")}: ${style.green(`${writes} written`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")}`);
-    } catch (e) {
-      sp.fail("initial pull failed");
-      throw e;
-    } finally {
-      await populate.stop();
+    const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
+    deps.syncMutex = syncMutex;
+    if (plan.firstSync === "push") {
+      const sp = spinner("publishing initial snapshot — scanning files");
+      try {
+        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+        const { sequence: seq, committed } = await push(plan.root, authed, deps);
+        // Never report a publish that didn't happen (design 44): the incident setup
+        // printed "published → sequence 75" for a push that uploaded zero bytes.
+        sp.succeed(
+          committed
+            ? `published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
+            : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+        );
+      } catch (e) {
+        sp.fail("initial push failed");
+        throw e;
+      }
+    } else if (plan.firstSync === "sync") {
+      const sp = spinner("syncing from remote — scanning files");
+      const populate = createPopulateStatusWriter(plan.root, authed);
+      try {
+        await populate.start();
+        deps.onProgress = (done, total, phase, detail, bytes) => {
+          sp.update(progressLabel(phase, done, total, detail, bytes));
+          populate.update(done, total, phase, bytes);
+        };
+        const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
+        sp.stop();
+        const conflicts = pulled.filter((a) => a.kind === "conflict");
+        const writes = pulled.filter((a) => a.kind === "write").length;
+        console.log(
+          `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
+        );
+        for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
+      } catch (e) {
+        sp.fail("initial sync failed");
+        throw e;
+      } finally {
+        await populate.stop();
+      }
+    } else if (plan.firstSync === "pull") {
+      const sp = spinner("pulling from remote");
+      const populate = createPopulateStatusWriter(plan.root, authed);
+      try {
+        await populate.start();
+        deps.onProgress = (done, total, phase, detail, bytes) => {
+          sp.update(progressLabel(phase, done, total, detail, bytes));
+          populate.update(done, total, phase, bytes);
+        };
+        const actions = await pull(plan.root, authed, deps);
+        sp.stop();
+        const conflicts = actions.filter((a) => a.kind === "conflict");
+        const writes = actions.filter((a) => a.kind === "write").length;
+        console.log(`${style.bold("pulled")}: ${style.green(`${writes} written`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")}`);
+      } catch (e) {
+        sp.fail("initial pull failed");
+        throw e;
+      } finally {
+        await populate.stop();
+      }
     }
+  } finally {
+    await releaseWorkspaceSyncMutex(syncMutex);
   }
 
   // 6. Done — show how to bring another machine online (unless the caller, e.g.

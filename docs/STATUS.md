@@ -5,7 +5,7 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-09 (night) — session: design 92 ship + follow-ups; v0.9.17 live fleet-wide._
+_Last updated: 2026-07-10 (overnight) — session: design 93 git config sync built end-to-end (PR #192)._
 
 ## Where we are
 
@@ -37,6 +37,19 @@ _Last updated: 2026-07-09 (night) — session: design 92 ship + follow-ups; v0.9
   `rbox device revoke`; agents were already revoked; only Mac + FM + ephemeral
   web sessions remain. Note: auth revoke is access-only — cryptographic key
   eviction needs epoch rotation (design 22 §1.3, unbuilt).
+
+- **Design 93 (git config sync) — PR #192, awaiting merge sign-off.** The
+  2026-07-10 deal-breaker (rbox-materialized repos have no remotes/tracking;
+  ~90/host found on Ubuntu, 179 hand-healed) is closed permanently:
+  allowlisted `remote.*`/`branch.*` keys travel in the encrypted git
+  section, fill-only apply, self-healing presence rule. 11 adversarial
+  design rounds (REVIEW-93.md in the d93 worktree); new infra: reusable
+  lockfile primitive, transactional per-repo state CAS, workspace sync
+  mutex (also retires the pre-existing daemon-vs-CLI sync race). Live rig
+  gate PASS (materialize/heal/propagate/zero-echo; runs/20260710-071943).
+  Post-merge, pre-release: GATES.md Lane 2 — RC scratch-join on
+  via-desktop-ubuntu incl. a real-GitHub probe repo — then fleet upgrade.
+  Rig now grants dev plans (design-86 fix) + validates container mounts.
 
 ## Recent history (compressed)
 

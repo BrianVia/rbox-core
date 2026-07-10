@@ -8,6 +8,7 @@
  * Pure string logic only (no node:*), so it bundles cleanly into the Worker.
  */
 import type { GitArtifactRef } from "./types.js";
+import { validateCanonicalGitConfig } from "./git/config-sync.js";
 
 export const MAX_PATH_BYTES = 1024;
 export const MAX_ENTRIES = 200_000; // monorepo headroom; plan-tied caps come in M7b
@@ -267,6 +268,11 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
     const okRel = OP_STATE_FILES.includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
     if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };
     if (!validArtifactRef(ref)) return { ok: false, reason: `bad opState ref ${rel}` };
+  }
+  if (s.config !== undefined) {
+    const config = validateCanonicalGitConfig(s.config);
+    if (!config.ok) return { ok: false, reason: `bad config: ${config.reason}` };
+    if (s.refScope === "scoped") return { ok: false, reason: "scoped git section cannot carry config" };
   }
   // design 43 §2: refScope is mandatory — it gates apply-side ref deletion (§7).
   if (s.refScope !== "all" && s.refScope !== "scoped") return { ok: false, reason: "bad refScope" };

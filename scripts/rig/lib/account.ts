@@ -1,17 +1,19 @@
 /**
- * Account lifecycle glue: resolve the dev bootstrap secret (never printing it) and
- * run the host-side per-run teardown (`DELETE /v1/account`), which doubles as a
- * live exercise of the design-37 deletion cascade.
+ * Account lifecycle glue: resolve the dev bootstrap/platform secrets (never printing
+ * them), grant throwaway accounts a plan, and run the host-side per-run teardown
+ * (`DELETE /v1/account`), which doubles as a live exercise of design-37 deletion.
  *
  * The secret resolution + file parse + redaction are PURE (unit-tested with fs
- * fixtures); the network teardown is a thin `fetch`.
+ * fixtures); plan grant and teardown are thin `fetch` calls.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { assertNotProd } from "./config.js";
 
 const SECRET_FILE = "dev-keys.local.secret";
-const SECRET_KEY = "RBOX_DEV_BOOTSTRAP_SECRET";
-const ENV_KEY = "RBOX_DEV_BOOTSTRAP";
+const BOOTSTRAP_SECRET_KEY = "RBOX_DEV_BOOTSTRAP_SECRET";
+const BOOTSTRAP_ENV_KEY = "RBOX_DEV_BOOTSTRAP";
+const PLATFORM_SECRET_KEY = "RBOX_DEV_PLATFORM_SECRET";
 
 /** Extract `KEY=<value>` from a `.local.secret` (KEY=VALUE, one per line). Quotes
  *  and surrounding whitespace are stripped; a missing key returns undefined. PURE. */
@@ -62,18 +64,38 @@ export interface SecretDeps {
  * checkout), else a hard error naming both options. NEVER logs the value.
  */
 export function resolveBootstrapSecret(repoRoot: string, deps: SecretDeps = defaultSecretDeps()): string {
-  const fromEnv = deps.env[ENV_KEY]?.trim();
+  const fromEnv = deps.env[BOOTSTRAP_ENV_KEY]?.trim();
   if (fromEnv) return fromEnv;
   for (const root of candidateRoots(repoRoot)) {
     const content = deps.readFile(path.join(root, SECRET_FILE));
     if (content) {
-      const v = parseSecretFile(content, SECRET_KEY);
+      const v = parseSecretFile(content, BOOTSTRAP_SECRET_KEY);
       if (v) return v;
     }
   }
   throw new Error(
-    `rig: no dev bootstrap secret. Set ${ENV_KEY}=<secret>, or add a line ` +
-      `${SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
+    `rig: no dev bootstrap secret. Set ${BOOTSTRAP_ENV_KEY}=<secret>, or add a line ` +
+      `${BOOTSTRAP_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
+  );
+}
+
+/**
+ * Resolve the dev platform secret: env `RBOX_DEV_PLATFORM_SECRET` wins, else the
+ * same key in `dev-keys.local.secret` (worktree → primary checkout). NEVER logs it.
+ */
+export function resolvePlatformSecret(repoRoot: string, deps: SecretDeps = defaultSecretDeps()): string {
+  const fromEnv = deps.env[PLATFORM_SECRET_KEY]?.trim();
+  if (fromEnv) return fromEnv;
+  for (const root of candidateRoots(repoRoot)) {
+    const content = deps.readFile(path.join(root, SECRET_FILE));
+    if (content) {
+      const v = parseSecretFile(content, PLATFORM_SECRET_KEY);
+      if (v) return v;
+    }
+  }
+  throw new Error(
+    `rig: no dev platform secret. Set ${PLATFORM_SECRET_KEY}=<secret>, or add a line ` +
+      `${PLATFORM_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
   );
 }
 
@@ -94,6 +116,34 @@ export interface DeleteResult {
   ok: boolean;
   status: number;
   body: string;
+}
+
+export interface PlanGrantResult {
+  ok: boolean;
+  status: number;
+  body: string;
+}
+
+type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** Grant the rig's freshly bootstrapped account a pro plan through the dev-only
+ * platform endpoint. The local prod assertion is defense in depth: callers already
+ * resolve the rig URL through `resolveApiUrl`, but this privileged request refuses
+ * production on its own too. */
+export async function grantProPlan(
+  apiUrl: string,
+  accountId: string,
+  platformSecret: string,
+  fetchFn: FetchFn = fetch
+): Promise<PlanGrantResult> {
+  assertNotProd(apiUrl);
+  const base = apiUrl.replace(/\/+$/, "");
+  const res = await fetchFn(`${base}/v1/admin/account/${encodeURIComponent(accountId)}/plan?plan=pro`, {
+    method: "POST",
+    headers: { "x-rbox-platform": platformSecret },
+  });
+  const body = await res.text();
+  return { ok: res.ok, status: res.status, body };
 }
 
 /**

@@ -6,6 +6,7 @@ import { progressLabel } from "./status-view.js";
 import { pull, sync, type SyncDeps } from "./sync.js";
 import { style, stderrStyle } from "./style.js";
 import { type WorkspaceConfig } from "./config.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Quiet-by-default wiring for the pull-side git-apply forensics (per-repo
  *  apply/conflict/defer lines, design 43 §10): instead of one `console.error`
@@ -54,30 +55,33 @@ export function summarize(label: string, actions: { kind: string; path?: string;
 export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean; pullOnly?: boolean; verbose?: boolean } = {}): Promise<void> {
   const sp = spinner("syncing");
   try {
-    const { cfg, deps } = await buildAuthedRemote(root);
-    deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-    attachGitSyncProgress(deps, sp, { verbose: opts.verbose });
-    deps.allowMassDelete = opts.allowMassDelete === true;
-    const report = beginReport(opts.pullOnly ? "pull" : "sync");
-    deps.report = report;
-    if (opts.pullOnly) {
-      const pulled = await pull(root, cfg, deps);
+    await withWorkspaceSyncMutex(root, async (syncMutex) => {
+      const { cfg, deps } = await buildAuthedRemote(root);
+      deps.syncMutex = syncMutex;
+      deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+      attachGitSyncProgress(deps, sp, { verbose: opts.verbose });
+      deps.allowMassDelete = opts.allowMassDelete === true;
+      const report = beginReport(opts.pullOnly ? "pull" : "sync");
+      deps.report = report;
+      if (opts.pullOnly) {
+        const pulled = await pull(root, cfg, deps);
+        sp.stop();
+        summarize("pulled", pulled, root);
+        report?.logSummaryTo((l) => console.log(style.dim(l)));
+        await postSyncNudge(root, pulled, cfg);
+        return;
+      }
+      const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
       sp.stop();
       summarize("pulled", pulled, root);
+      console.log(
+        pushCommitted
+          ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
+          : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
+      );
       report?.logSummaryTo((l) => console.log(style.dim(l)));
       await postSyncNudge(root, pulled, cfg);
-      return;
-    }
-    const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
-    sp.stop();
-    summarize("pulled", pulled, root);
-    console.log(
-      pushCommitted
-        ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
-        : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
-    );
-    report?.logSummaryTo((l) => console.log(style.dim(l)));
-    await postSyncNudge(root, pulled, cfg);
+    });
   } catch (e) {
     sp.fail("sync failed");
     throw e;
