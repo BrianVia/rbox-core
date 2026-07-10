@@ -5,10 +5,34 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (midday) — v0.9.18 fleet-wide; savvy-core conflict resolved; all design-93 threads closed._
+_Last updated: 2026-07-10 (afternoon) — **v1.0.0 shipped** fleet-wide (Ubuntu daemon pending re-login); CHANGELOG backfilled to inception._
 
 ## Where we are
 
+- **Version: v1.0.0 — the correctness milestone (2026-07-10).** No functional
+  change over 0.9.18; the tag marks designs 91/92/93 field-proven. Release run
+  went green first try (6m41s, no gate flake). Live on Mac + FM daemons.
+  **Open: via-desktop-ubuntu daemon is DOWN post-upgrade** — its
+  `~/.rbox/credentials.json` holds the agent PAT (`agent_7Z8R70…`) revoked in
+  the 07-09 roster cleanup; the old daemon survived on a pre-revocation
+  session, the restarted one exits "signed out". Needs an interactive
+  `rbox login` on that host. (Not a 1.0.0 regression — any restart would hit it.)
+- **CHANGELOG.md is now the full record** — backfilled v0.1.0 (2026-06-29)
+  → v1.0.0, all 51 tags, first commit 2026-06-26. Keep it current per release.
+- **Design 35 (client phase metrics) doc header was stale — it SHIPPED** in
+  v0.4.3 (#17) + designs 83–85 phase-0 (#161/#165): `src/engine/phase-report.ts`,
+  `src/cli/metrics.ts`. The measurement gate for designs 84/85 is already met.
+- **Steady-state sync latency, measured end-to-end 2026-07-10:** a 103-byte
+  file took ~42s Linux→Mac (24.6s write→publish + 17.1s publish→applied, WS
+  connected the whole time — no fallback path involved; both legs are
+  O(workspace) machinery). Design 84 (manifest delta encoding) is the marquee
+  lever, targeting the 13–17.5s commit envelope + 2.2–7s pull `latest`;
+  design 85 (scan) and 39/74 (pull apply) follow. Deliberately deferred past
+  1.0 — perf is the 1.1 track.
+
+- **Host-env notes (via-desktop-ubuntu, 2026-07-10):** `GITHUB_TOKEN` in
+  `~/.profile` was stale (shadowed valid gh keyring auth) — replaced with the
+  keyring token. `node_modules` installed for the first time (was binary-only).
 - **Version: v0.9.17** (live fleet-wide 2026-07-09: Mac + FM daemons in sync; via-desktop-ubuntu binary-only). First release run failed on a flaky retry-exhaustion test (#188 fixed: explicit 30s timeout; jittered 5-attempt backoff can exceed bun’s 5s default) — tag was moved to the fixed head. Fleet = Mac (`dev_932d7c…`, primary
   work machine) + flat-meadow/FM (`dev_de63e89a…`). Real workspace
   `ws_2b6e15da…` ≈ 128.5k files on `~/Development`.
