@@ -5,6 +5,7 @@ import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { promptConfirm } from "./prompt.js";
 import { pushManifest } from "./sync.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -52,6 +53,43 @@ export async function setRespectGitignore(root: string, raw: string | undefined)
 
 export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMassDelete?: boolean } = {}): Promise<void> {
   const { cfg, deps } = await buildAuthedRemote(root);
+  const preview = await computePurgeCandidate(root, cfg);
+  if (preview.purged.length === 0) {
+    console.log("purge dry-run: nothing to delete.");
+    return;
+  }
+  const dirs = [...new Set(preview.purged.map((p) => p.split("/")[0] ?? p))].slice(0, 12);
+  console.log(`purge dry-run: ${preview.purged.length} path${preview.purged.length === 1 ? "" : "s"} would be deleted from other machines.`);
+  console.log(`top-level: ${dirs.join(", ")}${dirs.length < new Set(preview.purged.map((p) => p.split("/")[0] ?? p)).size ? ", ..." : ""}`);
+  if (!opts.yes) {
+    if (process.stdin.isTTY !== true) throw new Error("refusing headless purge without --yes");
+    const ok = await promptConfirm({ message: "Purge these ignored paths from synced state?", default: false });
+    if (!ok) {
+      console.log("purge cancelled.");
+      return;
+    }
+  }
+
+  await withWorkspaceSyncMutex(root, async (syncMutex) => {
+    // The preview is presentation only. Recompute the final deletion set and
+    // manifest after confirmation while holding the operation mutex.
+    const final = await computePurgeCandidate(root, cfg);
+    if (final.purged.length === 0) {
+      console.log("purge made no remote change (the confirmed paths changed before the lock was acquired)");
+      return;
+    }
+    deps.syncMutex = syncMutex;
+    deps.allowMassDeletePush = opts.allowMassDelete === true;
+    const res = await pushManifest(root, cfg, final.local, deps, 0, true);
+    console.log(
+      res.committed
+        ? `purged ${final.purged.length} ignored path${final.purged.length === 1 ? "" : "s"} -> sequence ${res.sequence}`
+        : `purge made no remote change (sequence ${res.sequence})`
+    );
+  });
+}
+
+async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeof buildAuthedRemote>>["cfg"]): Promise<{ local: Awaited<ReturnType<typeof scanManifest>>; purged: string[] }> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
     respectGitignore: cfg.respectGitignore === true,
@@ -74,28 +112,7 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     );
   }
   const purged = deleted.filter((p) => matcher.ignores(p)).sort();
-  if (purged.length === 0) {
-    console.log("purge dry-run: nothing to delete.");
-    return;
-  }
-  const dirs = [...new Set(purged.map((p) => p.split("/")[0] ?? p))].slice(0, 12);
-  console.log(`purge dry-run: ${purged.length} path${purged.length === 1 ? "" : "s"} would be deleted from other machines.`);
-  console.log(`top-level: ${dirs.join(", ")}${dirs.length < new Set(purged.map((p) => p.split("/")[0] ?? p)).size ? ", ..." : ""}`);
-  if (!opts.yes) {
-    if (process.stdin.isTTY !== true) throw new Error("refusing headless purge without --yes");
-    const ok = await promptConfirm({ message: "Purge these ignored paths from synced state?", default: false });
-    if (!ok) {
-      console.log("purge cancelled.");
-      return;
-    }
-  }
-  deps.allowMassDeletePush = opts.allowMassDelete === true;
-  const res = await pushManifest(root, cfg, local, deps, 0, true);
-  console.log(
-    res.committed
-      ? `purged ${purged.length} ignored path${purged.length === 1 ? "" : "s"} -> sequence ${res.sequence}`
-      : `purge made no remote change (sequence ${res.sequence})`
-  );
+  return { local, purged };
 }
 
 function parseOnOff(raw: string | undefined): boolean | undefined {

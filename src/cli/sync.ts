@@ -35,7 +35,9 @@ import {
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { loadState, saveState, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
+import { assertSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
 import { RboxApi, type CommitOptions, type CommitTimings, type LatestTimings, type SyncRemote } from "./remote.js";
 
@@ -110,6 +112,9 @@ export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
  * deps object flows through pull/push/pushManifest/sync and its bounded retry loop.
  */
 export interface SyncDeps {
+  /** Held once by the named top-level owner. Nested pull/push/retry operations
+   * inherit this exact handle and must never reacquire the workspace mutex. */
+  syncMutex?: WorkspaceSyncMutex;
   cache?: HashCache;
   remote?: SyncRemote;
   backoff?: (attempt: number) => Promise<void>;
@@ -211,6 +216,7 @@ async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps
  * the filesystem (never trust the network). Returns the actions taken.
  */
 export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
+  if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
@@ -333,14 +339,23 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
-  await report.phase("state-save", () => saveState(root, {
-    stream: syncStreamId(cfg),
-    lastSyncedSequence: sequence,
-    lastSyncedManifest: { ...remote, gitRepos: gitOutcome.gitRepos },
-    gitReposRemoved: gitOutcome.gitReposRemoved,
-    gitNeedsResolution: gitOutcome.gitNeedsResolution,
-    gitPendingRemote: gitOutcome.gitPendingRemote,
-  }));
+  await report.phase("state-save", () => saveStateSource(root, state, {
+    expectedStream: syncStreamId(cfg),
+    sourceGlobalSeq: sequence,
+    globalManifest: remote,
+    observedRepos: observedRepoKeys(state, remote.gitRepos, {
+      bases: gitOutcome.gitRepos,
+      pending: gitOutcome.gitPendingRemote,
+      removed: gitOutcome.gitReposRemoved,
+      resolutions: gitOutcome.gitNeedsResolution,
+    }),
+    values: {
+      bases: gitOutcome.gitRepos,
+      pending: gitOutcome.gitPendingRemote,
+      removed: gitOutcome.gitReposRemoved,
+      resolutions: gitOutcome.gitNeedsResolution,
+    },
+  }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);
@@ -362,6 +377,7 @@ export async function push(
   deps: SyncDeps = {},
   purgeIgnored = false
 ): Promise<{ sequence: number; committed: boolean }> {
+  if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
@@ -440,6 +456,7 @@ export async function pushManifest(
   purgeIgnored = false,
   forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE
 ): Promise<PushResult> {
+  if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
   const backoff = deps.backoff ?? defaultBackoff;
@@ -570,14 +587,18 @@ async function runPushAttempt(
         !same(gitPlan.gitNeedsResolution, state.gitNeedsResolution) ||
         !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
     ) {
-      await report.phase("state-save", () => saveState(root, {
-        stream: syncStreamId(cfg),
-        lastSyncedSequence: appliedSequence,
-        lastSyncedManifest: appliedBase,
-        gitReposRemoved: gitPlan.gitReposRemoved,
-        gitNeedsResolution: gitPlan.gitNeedsResolution,
-        gitPendingRemote: gitPlan.gitPendingRemote,
-      }));
+      const values = {
+        bases: appliedBase.gitRepos,
+        pending: gitPlan.gitPendingRemote,
+        removed: gitPlan.gitReposRemoved,
+        resolutions: gitPlan.gitNeedsResolution,
+      };
+      await report.phase("state-save", () => saveStateSource(root, state, {
+        expectedStream: syncStreamId(cfg),
+        sourceGlobalSeq: appliedSequence,
+        observedRepos: changedSidecarRepoKeys(state, values),
+        values,
+      }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false } };
@@ -671,14 +692,20 @@ async function runPushAttempt(
   // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
   // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
   const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
-  await report.phase("state-save", () => saveState(root, {
-    stream: syncStreamId(cfg),
-    lastSyncedSequence: res.sequence!,
-    lastSyncedManifest: { ...committed, gitRepos: stateGit },
-    gitReposRemoved: gitPlan.gitReposRemoved,
-    gitNeedsResolution: gitPlan.gitNeedsResolution,
-    gitPendingRemote: gitPlan.gitPendingRemote,
-  }));
+  const ackValues = {
+    bases: stateGit,
+    pending: gitPlan.gitPendingRemote,
+    removed: gitPlan.gitReposRemoved,
+    resolutions: gitPlan.gitNeedsResolution,
+  };
+  await report.phase("state-save", () => saveStateSource(root, state, {
+    expectedStream: syncStreamId(cfg),
+    sourceGlobalSeq: res.sequence!,
+    globalManifest: committed,
+    observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
+    values: ackValues,
+    authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
+  }, { allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state) }));
   if (deferred.size > 0) reportDeferred(deferred);
   return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], committed: true } };
 }
@@ -701,6 +728,7 @@ export async function sync(
   cfg: WorkspaceConfig,
   deps: SyncDeps = {}
 ): Promise<{ pulled: Action[]; pushedSequence: number; pushCommitted: boolean }> {
+  if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("sync");
   deps = withReportScanStats(deps, report);
   const pulled = await pull(root, cfg, deps);

@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -80,15 +81,10 @@ export async function track(
   // this, but a LEGACY unstamped baseline would be adopted by the new binding, so
   // track must reset explicitly). A re-track of the SAME workspace keeps both the
   // baseline and the existing device id (re-tracking must not mint a new device).
+  const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
+  const cfg = await withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
   const prev = await loadConfig(root).catch(() => undefined);
-  if (prev && syncStreamId(prev) !== syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId })) {
-    await resetSyncState(root);
-    console.error(
-      `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
-        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
-    );
-  }
-  const cfg: WorkspaceConfig = {
+  const next: WorkspaceConfig = {
     schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
     remoteWorkspaceId: workspaceId,
     projectId,
@@ -108,7 +104,18 @@ export async function track(
     // no round-trip (manual-id / --workspace entry has none → status falls back to id).
     ...(pickedName ? { name: pickedName } : {}),
   };
-  await saveConfig(root, cfg);
+  if (prev && syncStreamId(prev) !== nextStream) {
+    await resetSyncState(root, nextStream, syncMutex);
+    await saveConfig(root, next);
+    console.error(
+      `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+        `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
+    );
+  } else {
+    await saveConfig(root, next);
+  }
+  return next;
+  });
   return { cfg, root };
 }
 

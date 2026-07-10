@@ -316,6 +316,9 @@ async function defaultPullWorkspace(
   await saveConfig(stagingRoot, synthetic);
   const { cfg, deps } = await buildAuthedRemote(stagingRoot);
   deps.onProgress = onProgress;
+  // Design 93 §6 explicit mutex exemption: stagingRoot is a unique, ephemeral,
+  // process-private export tree. It cannot mutate a live workspace tree/state and
+  // is removed or atomically published after this pull.
   await pull(stagingRoot, cfg, deps);
 }
 

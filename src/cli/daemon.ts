@@ -15,7 +15,7 @@ import {
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
+import { expectedStateNonce, loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
 import { pull, pushManifest, type SyncDeps } from "./sync.js";
@@ -35,6 +35,8 @@ import {
 } from "./ambient-status.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "./version.js";
+import { daemonBindingMatches } from "./sync-state.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -97,6 +99,10 @@ interface Wants {
   fullScan: boolean;
   deepScan: boolean;
 }
+
+/** Contention disposition pin: only a successful acquire authorizes consuming
+ * the queued daemon wakeup. */
+export const daemonConsumesWakeup = (result: DaemonMutexResult): boolean => result.status === "acquired";
 
 /**
  * The rbox daemon: passive, continuous, resource-disciplined sync.
@@ -181,14 +187,28 @@ export class RboxDaemon {
   private activeProgressPath?: string;
   private readonly bootId: string;
   private readonly pullOnly: boolean;
+  private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
+  private readonly syncMutexBackoff: () => Promise<void>;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
-  constructor(private readonly root: string, private cfg: WorkspaceConfig, private readonly e2ee: SyncDeps, opts: { bootId?: string; pullOnly?: boolean } = {}) {
+  constructor(
+    private readonly root: string,
+    private cfg: WorkspaceConfig,
+    private readonly e2ee: SyncDeps,
+    opts: {
+      bootId?: string;
+      pullOnly?: boolean;
+      acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
+      syncMutexBackoff?: () => Promise<void>;
+    } = {},
+  ) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
+    this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
+    this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
   }
 
   async start(): Promise<void> {
@@ -396,6 +416,28 @@ export class RboxDaemon {
         // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
         // is keyed on it (a halt is only healed by a success of the SAME kind).
         const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
+        const acquired = await this.acquireSyncMutexFn(this.root);
+        if (acquired.status === "contended") {
+          // Do not clear want[op]: contention must requeue, never consume, this tick.
+          log(`pump op ${op}: another sync is in progress (${acquired.detail}); re-queued`);
+          await this.syncMutexBackoff();
+          continue;
+        }
+        const syncMutex = acquired.handle;
+        let bindingMatches: boolean;
+        try {
+          const binding = this.syncBase ?? await this.loadSyncBase();
+          bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
+        } catch (error) {
+          await releaseWorkspaceSyncMutex(syncMutex);
+          throw error;
+        }
+        if (!bindingMatches) {
+          log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
+          this.stopped = true;
+          await releaseWorkspaceSyncMutex(syncMutex);
+          break;
+        }
         const opWatcherGeneration = this.watcherUnsettledGeneration;
         const opWatcherErrorGeneration = this.watcherErrorGeneration;
         try {
@@ -418,7 +460,7 @@ export class RboxDaemon {
             } else if (op === "pull") {
               const catchUpGeneration = this.pendingCatchUpGeneration;
               this.pendingCatchUpGeneration = undefined;
-              await this.doPull();
+              await this.doPull(syncMutex);
               if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
               this.requestPush(); // publish any local divergence after taking remote
             } else {
@@ -427,7 +469,7 @@ export class RboxDaemon {
               if (this.activity.outOfStorage && !quotaProbe) {
                 await this.applyPendingWatchEvents();
               } else {
-                await this.doPush();
+                await this.doPush(syncMutex);
                 pushedToRemote = true;
               }
             }
@@ -506,6 +548,8 @@ export class RboxDaemon {
             this.writeActivity();
           }
           await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
+        } finally {
+          await releaseWorkspaceSyncMutex(syncMutex);
         }
       }
       await this.cache.save(this.root);
@@ -521,7 +565,7 @@ export class RboxDaemon {
     }
   }
 
-  private async doPush(): Promise<void> {
+  private async doPush(syncMutex: WorkspaceSyncMutex): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     await this.applyPendingWatchEvents();
     const blockedFingerprint = this.terminalPushBlock();
@@ -531,6 +575,7 @@ export class RboxDaemon {
       res = await pushManifest(this.root, this.cfg, this.manifest, {
         ...this.e2ee,
         cache: this.cache,
+        syncMutex,
         blockedFingerprint,
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
@@ -679,7 +724,7 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
-  private async doPull(): Promise<void> {
+  private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
@@ -689,6 +734,7 @@ export class RboxDaemon {
     const actions = await pull(this.root, this.cfg, {
       ...this.e2ee,
       cache: this.cache,
+      syncMutex,
       report,
       onGitLog: log,
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
@@ -1308,7 +1354,7 @@ export async function runDaemon(root: string): Promise<void> {
   // start() returns after initial convergence; timers/watcher/ws keep the loop alive.
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** ± up to 50% jitter so a fleet of daemons never aligns its ticks/reconnects. */
 const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
 

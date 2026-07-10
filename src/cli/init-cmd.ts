@@ -24,6 +24,7 @@ import { promptSelect, promptInput } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -163,6 +164,11 @@ async function executeInitPlan(
     throw e;
   }
 
+  // Init/setup owns one mutex across the complete rebind/reset + first-sync
+  // decision, mutation, and state-save interval. Nested pull/push calls inherit it.
+  const syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
+  try {
+
   // 3. Write the per-device binding (token injected at runtime, never persisted).
   //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
   //    its sync baseline describes the OLD stream — reconciling the new one against
@@ -172,7 +178,7 @@ async function executeInitPlan(
   const prev = await loadConfig(plan.root).catch(() => undefined);
   const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
   if (prev && syncStreamId(prev) !== nextStream) {
-    await resetSyncState(plan.root);
+    await resetSyncState(plan.root, nextStream, syncMutex);
     process.stderr.write(
       `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
         `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
@@ -209,6 +215,7 @@ async function executeInitPlan(
     return undefined;
   }
   const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
+  deps.syncMutex = syncMutex;
   if (plan.firstSync === "push") {
     const sp = spinner("publishing initial snapshot — scanning files");
     try {
@@ -268,6 +275,9 @@ async function executeInitPlan(
     } finally {
       await populate.stop();
     }
+  }
+  } finally {
+    await releaseWorkspaceSyncMutex(syncMutex);
   }
 
   // 6. Done — show how to bring another machine online (unless the caller, e.g.

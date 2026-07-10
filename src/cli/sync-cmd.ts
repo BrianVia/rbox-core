@@ -6,6 +6,7 @@ import { progressLabel } from "./status-view.js";
 import { pull, sync, type SyncDeps } from "./sync.js";
 import { style, stderrStyle } from "./style.js";
 import { type WorkspaceConfig } from "./config.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Quiet-by-default wiring for the pull-side git-apply forensics (per-repo
  *  apply/conflict/defer lines, design 43 §10): instead of one `console.error`
@@ -54,7 +55,9 @@ export function summarize(label: string, actions: { kind: string; path?: string;
 export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean; pullOnly?: boolean; verbose?: boolean } = {}): Promise<void> {
   const sp = spinner("syncing");
   try {
+    await withWorkspaceSyncMutex(root, async (syncMutex) => {
     const { cfg, deps } = await buildAuthedRemote(root);
+    deps.syncMutex = syncMutex;
     deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
     attachGitSyncProgress(deps, sp, { verbose: opts.verbose });
     deps.allowMassDelete = opts.allowMassDelete === true;
@@ -78,6 +81,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
     );
     report?.logSummaryTo((l) => console.log(style.dim(l)));
     await postSyncNudge(root, pulled, cfg);
+    });
   } catch (e) {
     sp.fail("sync failed");
     throw e;

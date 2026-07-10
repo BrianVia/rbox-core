@@ -9,6 +9,7 @@ import { RboxApi } from "./remote.js";
 import { pull, push } from "./sync.js";
 import { postSyncNudge, summarize } from "./sync-cmd.js";
 import { style } from "./style.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 export interface RecoverOptions {
   yes?: boolean;
@@ -49,6 +50,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     }
   }
 
+  await withWorkspaceSyncMutex(root, async (syncMutex) => {
   const cfg0 = await (deps.loadConfig ?? loadConfig)(root);
   const creds = await (deps.loadCredentials ?? loadCredentials)();
   if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
@@ -64,6 +66,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
   await pins.clear();
 
   const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
+  built.deps.syncMutex = syncMutex;
   built.deps.allowMassDelete = opts.allowMassDelete === true;
   const report = (deps.beginReport ?? beginReport)("sync");
   built.deps.report = report;
@@ -81,6 +84,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
   (deps.log ?? console.log)(
     `${style.bold("recover")}: pin cleared, ${count(pulled, "write")} pulled, ${count(pulled, "delete")} trashed/deleted, ${count(pulled, "conflict")} keep-both conflict(s)`
   );
+  });
 }
 
 async function latestCommitHead(remoteUrl: string, token: string, workspaceId: string, projectId: string): Promise<{ sequence: number }> {

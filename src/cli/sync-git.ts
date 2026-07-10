@@ -230,6 +230,9 @@ export interface GitPushPlan {
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
+  /** Config hashes authored by this exact plan. Step 4 deliberately initializes
+   * this empty; publication/capture rows add entries in steps 5 and 7. */
+  authoredCfgHashByRepo: Record<string, string>;
   captured: string[];
   carried: string[];
   deferred: Array<{ relPath: string; reason: string }>;
@@ -319,6 +322,7 @@ export async function planGitSections(
       gitReposRemoved: emptyToUndef(removedMem),
       gitNeedsResolution: emptyToUndef(needsRes),
       gitPendingRemote: emptyToUndef(pending),
+      authoredCfgHashByRepo: {},
       captured,
       carried,
       deferred,

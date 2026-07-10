@@ -75,6 +75,7 @@ interface AtomicCreateResult {
 }
 
 const staleOwnedMarkers = new Map<string, string>();
+const darwinFallbackOwnStart = Math.max(1, Math.floor((Date.now() - process.uptime() * 1000) * 1000)).toString();
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -100,7 +101,15 @@ async function sysctlString(name: string): Promise<string> {
 async function darwinProcessStart(pid: number): Promise<string> {
   // kern.proc.pid returns struct kinfo_proc. On supported 64-bit macOS targets,
   // kp_proc.p_starttime is the first member (timeval: seconds, microseconds).
-  const bytes = await execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+  let bytes: Buffer;
+  try {
+    bytes = await execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+  } catch (error) {
+    // Some macOS application sandboxes deny kern.proc sysctl. We can still own
+    // locks safely in-process; other-pid probes remain unknown/live (fail closed).
+    if (pid === process.pid) return darwinFallbackOwnStart;
+    throw error;
+  }
   if (bytes.length < 16) {
     const error = new Error(`kern.proc.pid.${pid} returned ${bytes.length} bytes`);
     (error as NodeJS.ErrnoException).code = bytes.length === 0 ? "ESRCH" : "EIO";
@@ -155,7 +164,22 @@ async function currentSystemIncarnation(): Promise<ProcessIncarnation> {
   let hostId: string;
   let bootId: string;
   if (process.platform === "darwin") {
-    [hostId, bootId] = await Promise.all([sysctlString("kern.uuid"), sysctlString("kern.bootsessionuuid")]);
+    try {
+      [hostId, bootId] = await Promise.all([sysctlString("kern.uuid"), sysctlString("kern.bootsessionuuid")]);
+    } catch {
+      // `ioreg` exposes the same stable machine/boot identities when sysctl is
+      // denied by an app sandbox. This is an identity-source fallback only; all
+      // marker, no-follow, reaper, and owner checks remain in this primitive.
+      const [platform, chosen] = await Promise.all([
+        execBytes("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]).then((v) => v.toString("utf8")),
+        execBytes("/usr/sbin/ioreg", ["-p", "IODeviceTree", "-n", "chosen", "-r", "-d1"]).then((v) => v.toString("utf8")),
+      ]);
+      const host = /"IOPlatformUUID"\s*=\s*"([0-9A-F-]+)"/i.exec(platform)?.[1];
+      const boot = /"boot-uuid"\s*=\s*<"([0-9A-F-]+)">/i.exec(chosen)?.[1];
+      if (!host || !boot) throw new Error("ioreg did not expose host/boot UUIDs");
+      hostId = host.toLowerCase();
+      bootId = boot.toLowerCase();
+    }
   } else if (process.platform === "linux") {
     [hostId, bootId] = await Promise.all([
       fs.readFile("/etc/machine-id", "utf8").then((v) => v.trim().toLowerCase()),
@@ -169,7 +193,10 @@ async function currentSystemIncarnation(): Promise<ProcessIncarnation> {
 }
 
 export const systemLockIdentity: LockIdentitySource = {
-  current: currentSystemIncarnation,
+  current: (() => {
+    let cached: Promise<ProcessIncarnation> | undefined;
+    return () => (cached ??= currentSystemIncarnation());
+  })(),
   probe: probeProcess,
 };
 

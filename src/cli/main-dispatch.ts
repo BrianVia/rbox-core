@@ -19,6 +19,7 @@ import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags } from "./flags.js";
 import { readStdinTrimmed } from "./read-stdin.js";
+import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
 function printHelp(cmd: string | undefined, positional: string[]): void {
@@ -227,20 +228,23 @@ export async function main(): Promise<void> {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pushing");
       try {
-        const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-        // Push-side consent (design 50 §4, review B2): op-scoped — NEVER the pull-side
-        // `allowMassDelete`, which the 409-recovery pull inside pushManifest would inherit.
-        deps.allowMassDeletePush = flags["allow-mass-delete"] === "true";
-        const report = beginReport("push");
-        deps.report = report;
-        const { sequence: seq, committed } = await push(root, cfg, deps);
-        sp.succeed(
-          committed
-            ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
-            : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
-        );
-        report?.logSummaryTo((l) => console.log(style.dim(l)));
+        await withWorkspaceSyncMutex(root, async (syncMutex) => {
+          const { cfg, deps } = await buildAuthedRemote(root);
+          deps.syncMutex = syncMutex;
+          deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+          // Push-side consent (design 50 §4, review B2): op-scoped — NEVER the pull-side
+          // `allowMassDelete`, which the 409-recovery pull inside pushManifest would inherit.
+          deps.allowMassDeletePush = flags["allow-mass-delete"] === "true";
+          const report = beginReport("push");
+          deps.report = report;
+          const { sequence: seq, committed } = await push(root, cfg, deps);
+          sp.succeed(
+            committed
+              ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
+              : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+          );
+          report?.logSummaryTo((l) => console.log(style.dim(l)));
+        });
       } catch (e) {
         sp.fail("push failed");
         throw e;
@@ -251,17 +255,20 @@ export async function main(): Promise<void> {
       const root = await resolveRoot(positional[0]);
       const sp = spinner("pulling");
       try {
-        const { cfg, deps } = await buildAuthedRemote(root);
-        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-        attachGitSyncProgress(deps, sp, { verbose: flags["verbose"] === "true" });
-        deps.allowMassDelete = flags["allow-mass-delete"] === "true";
-        const report = beginReport("pull");
-        deps.report = report;
-        const actions = await pull(root, cfg, deps);
-        sp.stop();
-        summarize("pulled", actions, root);
-        report?.logSummaryTo((l) => console.log(style.dim(l)));
-        await postSyncNudge(root, actions, cfg);
+await withWorkspaceSyncMutex(root, async (syncMutex) => {
+          const { cfg, deps } = await buildAuthedRemote(root);
+          deps.syncMutex = syncMutex;
+          deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+          attachGitSyncProgress(deps, sp, { verbose: flags["verbose"] === "true" });
+          deps.allowMassDelete = flags["allow-mass-delete"] === "true";
+          const report = beginReport("pull");
+          deps.report = report;
+          const actions = await pull(root, cfg, deps);
+          sp.stop();
+          summarize("pulled", actions, root);
+          report?.logSummaryTo((l) => console.log(style.dim(l)));
+          await postSyncNudge(root, actions, cfg);
+        });
       } catch (e) {
         sp.fail("pull failed");
         throw e;
