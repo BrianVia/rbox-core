@@ -242,21 +242,26 @@ export async function gcMark(env: Env, graceMs: number, nowMs: number = Date.now
   return json({ marked, cursor: next });
 }
 
-async function acquireLease(db: D1Database, nowMs: number, owner = crypto.randomUUID()): Promise<PurgeLease | null> {
+type LeaseAcquisition = { lease: PurgeLease; retryAfterMs: 0 } | { lease: null; retryAfterMs: number };
+
+async function acquireLease(db: D1Database, nowMs: number, owner = crypto.randomUUID()): Promise<LeaseAcquisition> {
   const lease: PurgeLease = { owner, acquired: nowMs, expires: nowMs + PURGE_LEASE_TTL_MS };
   const inserted = await db.prepare("INSERT OR IGNORE INTO gc_state (k, v) VALUES ('purge_lease', ?)").bind(JSON.stringify(lease)).run();
-  if ((inserted.meta.changes ?? 0) === 1) return lease;
+  if ((inserted.meta.changes ?? 0) === 1) return { lease, retryAfterMs: 0 };
   const prior = await db.prepare("SELECT v FROM gc_state WHERE k='purge_lease'").first<{ v: string }>();
-  if (!prior) return null;
+  if (!prior) return { lease: null, retryAfterMs: PURGE_LEASE_TTL_MS + TAKEOVER_QUIESCENCE_MS };
   let parsed: PurgeLease;
   try {
     parsed = JSON.parse(prior.v) as PurgeLease;
   } catch {
-    return null; // malformed durable state fails closed
+    return { lease: null, retryAfterMs: PURGE_LEASE_TTL_MS + TAKEOVER_QUIESCENCE_MS }; // malformed durable state fails closed
   }
-  if (nowMs <= Number(parsed.expires) + TAKEOVER_QUIESCENCE_MS) return null;
+  const retryAfterMs = Math.max(1, Number(parsed.expires) + TAKEOVER_QUIESCENCE_MS - nowMs + 1);
+  if (nowMs <= Number(parsed.expires) + TAKEOVER_QUIESCENCE_MS) return { lease: null, retryAfterMs };
   const taken = await db.prepare("UPDATE gc_state SET v=? WHERE k='purge_lease' AND v=?").bind(JSON.stringify(lease), prior.v).run();
-  return (taken.meta.changes ?? 0) === 1 ? lease : null;
+  return (taken.meta.changes ?? 0) === 1
+    ? { lease, retryAfterMs: 0 }
+    : { lease: null, retryAfterMs: PURGE_LEASE_TTL_MS + TAKEOVER_QUIESCENCE_MS };
 }
 
 async function renewLease(db: D1Database, lease: PurgeLease, nowMs: number): Promise<boolean> {
@@ -274,6 +279,18 @@ async function renewLease(db: D1Database, lease: PurgeLease, nowMs: number): Pro
 
 async function releaseLease(db: D1Database, owner: string): Promise<void> {
   await db.prepare("DELETE FROM gc_state WHERE k='purge_lease' AND json_extract(v, '$.owner')=?").bind(owner).run();
+}
+
+async function releaseLeaseWithRetry(db: D1Database, owner: string): Promise<void> {
+  const backoffs = [250, 1000];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await releaseLease(db, owner);
+      return;
+    } catch {
+      if (attempt < backoffs.length) await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
+    }
+  }
 }
 
 const leaseGuard =
@@ -460,10 +477,11 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
     return json({ purged: 0, opened: 0, executeLimit: 0 });
   }
   const db = dbFor(op.env, "");
-  const lease = await acquireLease(db, startedAt, options.owner);
+  const acquired = await acquireLease(db, startedAt, options.owner);
+  const lease = acquired.lease;
   if (!lease) {
     op.done("lease_busy");
-    return json({ purged: 0, opened: 0, leaseBusy: true }, 409);
+    return json({ purged: 0, opened: 0, leaseBusy: true, retryAfterMs: acquired.retryAfterMs }, 409);
   }
   let executed: Awaited<ReturnType<typeof executePage>> = { purged: 0, unwound: 0, bytes: 0, touched: new Set(), cursor: null };
   let intents = { opened: 0, resurrected: 0, cursor: null as GcCursor | null };
@@ -485,8 +503,11 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
     metric(env, "gc.purge.cursor", 1);
     op.done("ok", { count: executed.purged, bytes: executed.bytes });
     return json({ purged: executed.purged, unwound: executed.unwound, resurrected: intents.resurrected, opened: intents.opened, bytes: executed.bytes, executeLimit });
+  } catch {
+    op.done("error", { count: executed.purged, bytes: executed.bytes });
+    return json({ error: "gc_purge_failed" }, 500);
   } finally {
-    await releaseLease(db, lease.owner);
+    await releaseLeaseWithRetry(db, lease.owner);
   }
 }
 
