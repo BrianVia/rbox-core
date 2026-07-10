@@ -556,6 +556,15 @@ describe("worker integration (real DO + D1 + R2)", () => {
   const KID = "test-kid-1";
   const ISS = "https://clerk.test";
   const AZP = "https://app.test";
+  interface MockClerkState {
+    updatedAt: number;
+    externalAccounts?: Array<{ provider: string; verification: { status: string } }>;
+    passwordEnabled?: boolean;
+    emailStatus?: string;
+    responseStatus?: number;
+  }
+  const clerkStates = new Map<string, MockClerkState>();
+  const clerkFetches = new Map<string, number>();
 
   beforeAll(async () => {
     const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
@@ -572,8 +581,20 @@ describe("worker integration (real DO + D1 + R2)", () => {
       .intercept({ path: /^\/v1\/users\//, method: "GET" })
       .reply((opts: { path: string }) => {
         const sub = decodeURIComponent(opts.path.split("/").pop() ?? "");
-        const status = sub === "user_unverified" ? "unverified" : "verified";
-        return { statusCode: 200, data: JSON.stringify({ primary_email_address_id: "e1", email_addresses: [{ id: "e1", verification: { status } }] }) };
+        clerkFetches.set(sub, (clerkFetches.get(sub) ?? 0) + 1);
+        const state = clerkStates.get(sub) ?? { updatedAt: 100 };
+        if (state.responseStatus) return { statusCode: state.responseStatus, data: "{}" };
+        const status = state.emailStatus ?? (sub === "user_unverified" ? "unverified" : "verified");
+        return {
+          statusCode: 200,
+          data: JSON.stringify({
+            primary_email_address_id: "e1",
+            email_addresses: [{ id: "e1", email_address: "owner@example.com", verification: { status } }],
+            external_accounts: state.externalAccounts ?? [],
+            password_enabled: state.passwordEnabled ?? false,
+            updated_at: state.updatedAt,
+          }),
+        };
       })
       .persist();
   });
@@ -604,6 +625,102 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const a1 = (await (await webExchange(await signJwt(claims({ sub: "user_dup" })))).json()) as { accountId: string };
     const a2 = (await (await webExchange(await signJwt(claims({ sub: "user_dup" })))).json()) as { accountId: string };
     expect(a1.accountId).toBe(a2.accountId);
+  });
+
+  test("provisioning INSERT captures the composite and account status returns it", async () => {
+    const sub = "user_signin_insert";
+    clerkStates.set(sub, {
+      updatedAt: 110,
+      externalAccounts: [{ provider: "oauth_github", verification: { status: "verified" } }],
+      passwordEnabled: true,
+    });
+    const login = await webExchange(await signJwt(claims({ sub })));
+    const { token } = (await login.json()) as { token: string };
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: "github+password", signin_method_updated_at: 110 });
+    const status = await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(token) });
+    expect((await status.json()) as { signInMethod: string | null }).toMatchObject({ signInMethod: "github+password" });
+  });
+
+  test("returning login refreshes when email is stale", async () => {
+    const sub = "user_signin_email_stale";
+    clerkStates.set(sub, { updatedAt: 120, externalAccounts: [{ provider: "oauth_google", verification: { status: "verified" } }] });
+    await webExchange(await signJwt(claims({ sub })));
+    clerkStates.set(sub, { updatedAt: 121, passwordEnabled: true });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at, email FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number; email: string }>();
+    expect(row).toEqual({ signin_method: "password", signin_method_updated_at: 121, email: "owner@example.com" });
+  });
+
+  test("never-observed method refreshes despite a fresh email cache", async () => {
+    const sub = "user_signin_never_observed";
+    clerkStates.set(sub, { updatedAt: 130 });
+    await webExchange(await signJwt(claims({ sub })));
+    await env.rbox_dev_db.prepare("UPDATE clerk_users SET email_updated_at = ?, signin_method = NULL, signin_method_updated_at = NULL WHERE clerk_user_id = ?").bind(Date.now(), sub).run();
+    clerkStates.set(sub, { updatedAt: 131, externalAccounts: [{ provider: "oauth_google", verification: { status: "verified" } }] });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: "google", signin_method_updated_at: 131 });
+  });
+
+  test("second login after observed-empty does not refetch", async () => {
+    const sub = "user_signin_observed_empty";
+    clerkStates.set(sub, { updatedAt: 140 });
+    await webExchange(await signJwt(claims({ sub })));
+    await env.rbox_dev_db.prepare("UPDATE clerk_users SET email_updated_at = ?, signin_method_updated_at = NULL WHERE clerk_user_id = ?").bind(Date.now(), sub).run();
+    clerkStates.set(sub, { updatedAt: 141 });
+    await webExchange(await signJwt(claims({ sub })));
+    expect(clerkFetches.get(sub)).toBe(2);
+    await webExchange(await signJwt(claims({ sub })));
+    expect(clerkFetches.get(sub)).toBe(2);
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string | null; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: null, signin_method_updated_at: 141 });
+  });
+
+  test("absent email still writes the sign-in method", async () => {
+    const sub = "user_signin_absent_email";
+    clerkStates.set(sub, { updatedAt: 150 });
+    await webExchange(await signJwt(claims({ sub })));
+    await env.rbox_dev_db.prepare("UPDATE clerk_users SET email_updated_at = ?, signin_method_updated_at = NULL WHERE clerk_user_id = ?").bind(Date.now(), sub).run();
+    clerkStates.set(sub, { updatedAt: 151, emailStatus: "unverified", externalAccounts: [{ provider: "oauth_github", verification: { status: "verified" } }] });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: "github", signin_method_updated_at: 151 });
+  });
+
+  test("Clerk error writes neither method nor version", async () => {
+    const sub = "user_signin_error";
+    clerkStates.set(sub, { updatedAt: 160, externalAccounts: [{ provider: "oauth_google", verification: { status: "verified" } }] });
+    await webExchange(await signJwt(claims({ sub })));
+    await env.rbox_dev_db.prepare("UPDATE clerk_users SET email_updated_at = ?, signin_method_updated_at = NULL WHERE clerk_user_id = ?").bind(Date.now(), sub).run();
+    clerkStates.set(sub, { updatedAt: 161, responseStatus: 500 });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number | null }>();
+    expect(row).toEqual({ signin_method: "google", signin_method_updated_at: null });
+  });
+
+  test("deleting the last credential writes NULL with the newer version", async () => {
+    const sub = "user_signin_deleted_last";
+    clerkStates.set(sub, { updatedAt: 170, externalAccounts: [{ provider: "oauth_google", verification: { status: "verified" } }] });
+    await webExchange(await signJwt(claims({ sub })));
+    clerkStates.set(sub, { updatedAt: 171 });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string | null; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: null, signin_method_updated_at: 171 });
+  });
+
+  test.each([
+    ["older", 180, 181],
+    ["equal", 191, 191],
+  ])("%s Clerk version loses the conditional update", async (_name, fetchedVersion, storedVersion) => {
+    const sub = `user_signin_guard_${_name}`;
+    clerkStates.set(sub, { updatedAt: fetchedVersion - 1 });
+    await webExchange(await signJwt(claims({ sub })));
+    await env.rbox_dev_db.prepare("UPDATE clerk_users SET signin_method = 'github', signin_method_updated_at = ?, email_updated_at = NULL WHERE clerk_user_id = ?").bind(storedVersion, sub).run();
+    clerkStates.set(sub, { updatedAt: fetchedVersion, passwordEnabled: true });
+    await webExchange(await signJwt(claims({ sub })));
+    const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number }>();
+    expect(row).toEqual({ signin_method: "github", signin_method_updated_at: storedVersion });
   });
 
   test("forged signature → 401", async () => {

@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { signinMethodsOf } from "./clerk-signin.js";
 import { hmacSha256Hex, logErr } from "./util.js";
 import { dbFor, dirDb } from "./db.js";
 
@@ -244,6 +245,10 @@ async function settle(env: Env, row: OutboxRow, clerkId: string, status: "sent" 
 // ── recipient address resolution (cache → live Clerk, never persisted in ledger) ──
 
 type EmailLookup = { kind: "ok"; address: string } | { kind: "absent" } | { kind: "error" };
+type ClerkLookup =
+  | { kind: "ok"; address: string; signinMethod: string | null; clerkUpdatedAt: number }
+  | { kind: "absent"; signinMethod: string | null; clerkUpdatedAt: number }
+  | { kind: "error" };
 
 /** Resolve the owner's primary verified email for a Clerk id: cached column first,
  *  else one live Clerk fetch (opportunistically caching the result). */
@@ -263,15 +268,23 @@ async function cacheOwnerEmail(env: Env, clerkUserId: string, address: string, n
 /** The Clerk Backend API primary-verified-email fetch. `ok` → an address; `absent` →
  *  the user exists but has no verified email (terminal skip); `error` → transient
  *  (config/network/5xx), which must RETRY, never skip a security alert. */
-async function fetchClerkPrimaryEmail(env: Env, sub: string): Promise<EmailLookup> {
+async function fetchClerkPrimaryEmail(env: Env, sub: string): Promise<ClerkLookup> {
   if (!env.CLERK_SECRET_KEY) return { kind: "error" }; // can't determine → retry (fail loud)
   try {
     const res = await fetch(`https://api.clerk.com/v1/users/${sub}`, { headers: { authorization: `Bearer ${env.CLERK_SECRET_KEY}` } });
     if (!res.ok) return { kind: "error" };
-    const u = (await res.json()) as { email_addresses?: Array<{ id: string; email_address?: string; verification?: { status?: string } }>; primary_email_address_id?: string };
+    const u = (await res.json()) as {
+      email_addresses?: Array<{ id: string; email_address?: string; verification?: { status?: string } }>;
+      primary_email_address_id?: string;
+      external_accounts?: Array<{ provider?: string; verification?: { status?: string } }>;
+      password_enabled?: boolean;
+      updated_at?: number;
+    };
+    if (typeof u.updated_at !== "number") return { kind: "error" };
     const primary = u.email_addresses?.find((e) => e.id === u.primary_email_address_id) ?? u.email_addresses?.[0];
-    if (primary?.verification?.status === "verified" && primary.email_address) return { kind: "ok", address: primary.email_address };
-    return { kind: "absent" };
+    const facts = { signinMethod: signinMethodsOf(u), clerkUpdatedAt: u.updated_at };
+    if (primary?.verification?.status === "verified" && primary.email_address) return { kind: "ok", address: primary.email_address, ...facts };
+    return { kind: "absent", ...facts };
   } catch {
     return { kind: "error" };
   }
@@ -281,11 +294,18 @@ async function fetchClerkPrimaryEmail(env: Env, sub: string): Promise<EmailLooku
  *  is non-fatal — it's a cache refresh, not the auth path. Also populates the cache on
  *  first login (NULL `email_updated_at`). */
 export async function refreshOwnerEmail(env: Env, sub: string, now: number): Promise<void> {
-  const row = await dirDb(env).prepare("SELECT email_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ email_updated_at: number | null }>();
+  const row = await dirDb(env).prepare("SELECT email_updated_at, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ email_updated_at: number | null; signin_method_updated_at: number | null }>();
   if (!row) return; // no mapping (shouldn't happen post-provision) → nothing to refresh
-  if (row.email_updated_at && now - row.email_updated_at < EMAIL_REFRESH_MS) return; // throttled
+  if (row.signin_method_updated_at !== null && row.email_updated_at && now - row.email_updated_at < EMAIL_REFRESH_MS) return; // throttled
   const fetched = await fetchClerkPrimaryEmail(env, sub);
   if (fetched.kind === "ok") await cacheOwnerEmail(env, sub, fetched.address, now);
+  if (fetched.kind !== "error") {
+    await dirDb(env)
+      .prepare("UPDATE clerk_users SET signin_method = ?, signin_method_updated_at = ? WHERE clerk_user_id = ? AND (signin_method_updated_at IS NULL OR signin_method_updated_at < ?)")
+      .bind(fetched.signinMethod, fetched.clerkUpdatedAt, sub, fetched.clerkUpdatedAt)
+      .run()
+      .catch(() => {});
+  }
 }
 
 // ── feature flags ────────────────────────────────────────────────────────────

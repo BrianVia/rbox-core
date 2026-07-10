@@ -12,8 +12,23 @@ const plain = (s: string) => s.replace(/\[[0-9;]*m/g, "");
 
 const origFetch = globalThis.fetch;
 const origLog = console.log;
+const origStdout = process.stdout.write.bind(process.stdout);
 let calls: { url: string; init?: RequestInit }[] = [];
 let logs: string[] = [];
+
+async function captureStdout(fn: () => Promise<void>): Promise<string> {
+  const out: string[] = [];
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = origStdout;
+  }
+  return out.join("");
+}
 
 function stub(responder: (url: string) => { status: number; body?: unknown }): void {
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
@@ -39,6 +54,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = origFetch;
   console.log = origLog;
+  process.stdout.write = origStdout;
   delete process.env.RBOX_TOKEN;
   delete process.env.RBOX_API;
   delete process.env.RBOX_DEVICE_ID;
@@ -72,12 +88,41 @@ describe("rbox account link", () => {
 
 describe("rbox account status / unlink", () => {
   test("status prints the account id, plan and linked state", async () => {
-    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro" } }));
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro", signInMethod: "github+password" } }));
     await accountStatus();
     const out = logs.join("\n");
     expect(out).toContain("acct_xyz");
     expect(out).toMatch(/plan:\s*pro/i);
     expect(out).toMatch(/linked:\s*yes/i);
+    expect(out).toMatch(/sign-in:\s*github\+password/i);
+  });
+
+  test.each([
+    ["null", null],
+    ["absent", undefined],
+  ])("status omits sign-in for %s", async (_name, signInMethod) => {
+    stub(() => ({ status: 200, body: { accountId: "acct_unknown", linked: true, plan: "none", ...(signInMethod !== undefined ? { signInMethod } : {}) } }));
+    await accountStatus();
+    expect(logs.join("\n")).not.toMatch(/sign-in:/i);
+  });
+
+  test.each([
+    ["null", null],
+    ["absent", undefined],
+  ])("--json omits signInMethod for %s", async (_name, signInMethod) => {
+    stub((url) => url.endsWith("/v1/account/status")
+      ? { status: 200, body: { accountId: "acct_json", linked: true, ...(signInMethod !== undefined ? { signInMethod } : {}) } }
+      : { status: 200, body: { plan: "solo", graceUntil: null, readOnly: false } });
+    const out = await captureStdout(() => accountStatus({ json: true }));
+    expect(JSON.parse(out)).not.toHaveProperty("signInMethod");
+  });
+
+  test("--json includes a known signInMethod", async () => {
+    stub((url) => url.endsWith("/v1/account/status")
+      ? { status: 200, body: { accountId: "acct_json", linked: true, signInMethod: "google" } }
+      : { status: 200, body: { plan: "solo" } });
+    const out = await captureStdout(() => accountStatus({ json: true }));
+    expect(JSON.parse(out)).toMatchObject({ signInMethod: "google" });
   });
 
   test("unlink maps 409 → billing error and 404 → not-linked error", async () => {
@@ -100,13 +145,14 @@ describe("rbox account status / unlink", () => {
 // account fetch would take the whole (otherwise-local) `rbox status` down with it.
 describe("rbox status — account section", () => {
   test("ok: formats account id, plan and linked=yes", async () => {
-    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "solo" } }));
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "solo", signInMethod: "google" } }));
     const summary = await fetchAccountSummary();
-    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_xyz", plan: "solo", linked: true } });
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_xyz", plan: "solo", linked: true, signInMethod: "google" } });
     const out = plain(formatAccountSummary(summary).join("\n"));
     expect(out).toContain("acct_xyz");
     expect(out).toMatch(/plan:\s*solo/i);
     expect(out).toMatch(/linked:\s*yes/i);
+    expect(out).toMatch(/sign-in:\s*google/i);
   });
 
   test("ok: an API without the plan field degrades to no active plan, not a failure", async () => {
@@ -115,6 +161,14 @@ describe("rbox status — account section", () => {
     expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "none", linked: false } });
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*no active plan/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/linked:\s*no/i);
+    expect(plain(formatAccountSummary(summary).join("\n"))).not.toMatch(/sign-in:/i);
+  });
+
+  test("a null sign-in method is omitted from the summary shape and renderer", async () => {
+    stub(() => ({ status: 200, body: { accountId: "acct_null", linked: true, plan: "none", signInMethod: null } }));
+    const summary = await fetchAccountSummary();
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_null", linked: true, plan: "none" } });
+    expect(plain(formatAccountSummary(summary).join("\n"))).not.toMatch(/sign-in:/i);
   });
 
   test("graceful degradation: a thrown fetch resolves to `unavailable`, never rejects", async () => {

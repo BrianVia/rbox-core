@@ -160,10 +160,10 @@ export async function fetchWorkspaces(
 }
 
 /** Whether a Clerk identity manages this account (drives the empty-state nudge). */
-export async function fetchAccountStatus(clerk: Clerk): Promise<{ accountId: string; linked: boolean }> {
+export async function fetchAccountStatus(clerk: Clerk): Promise<{ accountId: string; linked: boolean; signInMethod?: string | null }> {
 	const res = await authed(clerk, '/v1/account/status');
 	if (!res.ok) throw new Error(`status failed (${res.status})`);
-	return res.json() as Promise<{ accountId: string; linked: boolean }>;
+	return res.json() as Promise<{ accountId: string; linked: boolean; signInMethod?: string | null }>;
 }
 
 /** Revoke a device's access (design 22 §4.1). ACCESS-ONLY — it cuts the device off

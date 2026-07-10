@@ -36,6 +36,7 @@ export interface AccountStatus {
   readOnly?: boolean;
   /** Whether a web (Clerk) login manages this account. */
   linked: boolean;
+  signInMethod?: string | null;
 }
 
 /** Best-effort account status for the local-first `rbox status` command. NEVER throws
@@ -59,8 +60,8 @@ export async function fetchAccountSummary(timeoutMs = 3500): Promise<AccountSumm
       signal: ctrl.signal,
     });
     if (!res.ok) return { state: "unavailable" };
-    const { accountId, linked, plan } = (await res.json()) as { accountId: string; linked: boolean; plan?: string };
-    return { state: "ok", status: { accountId, linked: !!linked, plan: plan ?? "none" } };
+    const { accountId, linked, plan, signInMethod } = (await res.json()) as { accountId: string; linked: boolean; plan?: string; signInMethod?: string | null };
+    return { state: "ok", status: { accountId, linked: !!linked, plan: plan ?? "none", ...(signInMethod != null ? { signInMethod } : {}) } };
   } catch {
     // Offline, DNS failure, timeout/abort, malformed body — all degrade to the same
     // "we couldn't reach the account plane" outcome. Local status still renders.
@@ -80,11 +81,12 @@ export function formatAccountSummary(s: AccountSummary): string[] {
   if (s.state === "unavailable") {
     return [`${style.bold("account")} ${style.yellow("(unavailable — offline?)")}`];
   }
-  const { accountId, plan, linked } = s.status;
+  const { accountId, plan, linked, signInMethod } = s.status;
   return [
     `${style.bold("account")} ${style.cyan(accountId)}`,
     `  ${style.dim("plan:")} ${renderPlan(plan)}`,
     `  ${style.dim("web login linked:")} ${linked ? style.green("yes") : style.yellow("no")}`,
+    ...(signInMethod != null ? [`  ${style.dim("sign-in:")} ${signInMethod}`] : []),
   ];
 }
 
@@ -97,7 +99,7 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
   const c = await requireCredentials();
   const res = await fetch(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
   if (!res.ok) throw new Error(`status failed: ${res.status}`);
-  const { accountId, linked, plan } = (await res.json()) as { accountId: string; linked: boolean; plan?: string };
+  const { accountId, linked, plan, signInMethod } = (await res.json()) as { accountId: string; linked: boolean; plan?: string; signInMethod?: string | null };
   if (opts.json) {
     const usage = await fetch(`${c.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${c.token}` } });
     if (!usage.ok) throw new Error(`usage failed: ${usage.status}`);
@@ -108,12 +110,14 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
       graceUntil: u.graceUntil ?? null,
       readOnly: u.readOnly === true,
       linked: !!linked,
+      ...(signInMethod != null ? { signInMethod } : {}),
     });
     return;
   }
   console.log(`account:          ${accountId}`);
   console.log(`plan:             ${renderPlan(plan)}`);
   console.log(`web login linked: ${linked ? "yes" : "no"}`);
+  if (signInMethod != null) console.log(`sign-in:          ${signInMethod}`);
 }
 
 /** `rbox account unlink` — detach the web login (rebinds it to a fresh empty shell). */
