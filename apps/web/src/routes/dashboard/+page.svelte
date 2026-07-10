@@ -5,7 +5,7 @@
 	import { authState, requireAuth } from '$lib/auth.svelte';
 	import { fetchUsage, fetchAccountStatus, startCheckout, openBillingPortal, type Usage } from '$lib/api';
 	import { consumePlanIntent } from '$lib/plan-intent';
-	import { formatBytes, errMsg } from '$lib/format';
+	import { formatBytes, errMsg, friendlyErr } from '$lib/format';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
@@ -16,6 +16,7 @@
 	import Loading from '$lib/components/loading.svelte';
 	import CommandRow from '$lib/components/command-row.svelte';
 	import Step from '$lib/components/step.svelte';
+	import ApiKeysSection from '$lib/components/api-keys-section.svelte';
 	import CheckIcon from '@lucide/svelte/icons/check';
 	import ArrowRightIcon from '@lucide/svelte/icons/arrow-right';
 	import Link2Icon from '@lucide/svelte/icons/link-2';
@@ -49,8 +50,7 @@
 			usage = u.value;
 			error = '';
 		} else {
-			const m = errMsg(u.reason);
-			error = m === 'WEB_AUTH_NOT_ENABLED' ? 'Web auth isn’t enabled on the API yet.' : m;
+			error = friendlyErr(u.reason);
 		}
 		linked = s.status === 'fulfilled' ? s.value.linked : null;
 
@@ -111,7 +111,7 @@
 			label: 'Pro',
 			monthlyPrice: '$20',
 			annualPrice: '$16.67',
-			features: ['250 GB storage', '90-day version history', 'Advanced hydration'],
+			features: ['250 GB storage', '365-day version history', 'Advanced hydration'],
 			featured: true
 		}
 	];
@@ -253,6 +253,8 @@
 			</ol>
 		</div>
 	</details>
+
+	<ApiKeysSection class="mt-8" />
 
 	{#if noPlan}
 		<!-- Locked → trial. Cards make the choice + value obvious. Paid users change
