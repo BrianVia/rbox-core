@@ -44,6 +44,7 @@ import {
   MAX_GIT_CONFIG_KEY_BYTES,
   MAX_GIT_CONFIG_SERIALIZED_BYTES,
   MAX_GIT_CONFIG_VALUE_BYTES,
+  validateCanonicalGitConfig,
   type GitConfig,
 } from "../engine/git/config-sync.js";
 import {
@@ -79,6 +80,9 @@ const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
 /** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
  * loud once per workspace/repo without repeating forever on every pull. */
 const configOwnershipSkipLogged = new Set<string>();
+/** Invalid incoming config is an additive-field compatibility event. Keep it
+ * loud once per workspace/repo while the independent Git lane continues. */
+const configInvalidSkipLogged = new Set<string>();
 /** Credential-bearing URLs are a capture-side security event, not ordinary bad
  * grammar. Log them once per workspace/repo while continuing with the safe
  * projection so a daemon cannot flood its log on every tick. */
@@ -1966,7 +1970,28 @@ opts: {
   };
 
   const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
-    const remoteSec = remote.gitRepos?.[rel];
+    const wireRemoteSec = remote.gitRepos?.[rel];
+    let remoteSec = wireRemoteSec;
+    if (wireRemoteSec?.config !== undefined) {
+      const config = validateCanonicalGitConfig(wireRemoteSec.config);
+      const invalidReason = !config.ok
+        ? config.reason
+        : wireRemoteSec.refScope === "scoped"
+          ? "scoped git section cannot carry config"
+          : undefined;
+      if (invalidReason) {
+        // Treat the field as truly absent for every downstream decision and for
+        // the persisted base/pending section. This prevents a later push from
+        // carrying the invalid field back onto the wire.
+        remoteSec = { ...wireRemoteSec };
+        delete remoteSec.config;
+        const logKey = `${root}\0${rel}`;
+        if (!configInvalidSkipLogged.has(logKey)) {
+          configInvalidSkipLogged.add(logKey);
+          glog(`git-sync WARNING ${rel}: ignored invalid incoming config (${invalidReason}); Git state continues`);
+        }
+      }
+    }
     const baseSec = baseRepos[rel];
     const pend = pending[rel];
     const repoDir = repoDirOf(root, rel);

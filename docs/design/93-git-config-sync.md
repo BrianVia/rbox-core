@@ -54,7 +54,18 @@ config?: Record<string, string[]>;   // on GitSection; §9 ownership rules
 ```
 
 Canonical wire form ENFORCED at `validateGitSection` (implemented): sorted
-keys, non-empty arrays, no duplicate values, C0/DEL rejected. Bounds:
+keys, non-empty arrays, no duplicate values, C0/DEL rejected.
+**v12 field amendment (2026-07-10, reader-side): config invalidity is NEVER
+manifest-fatal.** An incoming section whose `config` fails validation (bounds
+OR grammar) has the field IGNORED for that repo — loud once-per-repo log,
+config lane skips it, git state applies normally. Rationale: the RC rollout
+proved the fatal path is a pull-DoS — a 76-key config (valid under the new
+512 bound) bricked every pull on a reader still enforcing 64. An additive
+convenience field must never brick pulls (the design-92 lesson). WRITERS
+remain strict (capture/publish enforce the full grammar and bounds); the
+security posture is unchanged because invalid config is never APPLIED —
+ignoring and rejecting differ only in whether the rest of the manifest
+survives, and it must. Bounds:
 ≤ 512 keys; key ≤ 200 B (`<name>` ≤ 120 B); value ≤ 1 KiB; total ≤ 64 KiB.
 
 **v11 field amendment 2026-07-10: bounds recalibrated; priority-projection
