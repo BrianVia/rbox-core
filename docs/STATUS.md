@@ -5,7 +5,59 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (night) — 8 PRs today (#201–#208); GC drain fully staged (5,410 intents, hardened executor); fleet on 1.0.0-dev+16fea15 soak (P0 + serverTimings collecting)._
+_Last updated: 2026-07-11 (day) — perf design program: 7 designs merged (#210–#212, #214–#216 + decisions #217); serverTimings live in prod (accounting = ~87% of commit POST, measured); GC drain matures ~20:01Z today._
+
+## 2026-07-11 — performance design day (all six audit-driven designs ALIGNED + merged)
+
+- **Trigger:** codex sync-performance audit merged as #209
+  (`docs/audits/2026-07-10-sync-performance-audit.md`, 15 findings). Founder
+  framing that set priorities: **initial upload is THE conversion moment**
+  (first-run experience), and passive-sync propagation matters equally.
+- **Six designs drafted in parallel worktrees (opus agents, codex adversarial
+  loops to ALIGNED), all merged:**
+  - **98 first-publish pipeline** (#210, 6 rounds + 3 joint): encrypt→upload→
+    receipt overlap; reservation-based disk backpressure; rolling
+    server-satisfied check replaces the missingBlobs barrier; ReceiptDrainer
+    redeems during upload. Attacks the 599s / 363s-encrypt first publish.
+  - **99 fused crypto worker jobs** (#215, 6 rounds + 3 joint): byte-bounded
+    multi-file jobs, in-memory ciphertext under a `CiphertextBudget`,
+    ≥30%-encrypt-cut gate. **98↔99 seam reconciled in 3 joint codex rounds
+    with both docs visible** — found consumer-spill + abort-bridge holes the
+    single-doc loops could not see. Contract: 99 §10 normative
+    (`CiphertextLease`, one charging authority, spill producer-only).
+  - **100 fresh-join cold apply** (#211, 6 rounds): Git chain prefetch
+    (gated on measured fetch stalls), directory-trie apply plan, size-aware
+    lanes, base-exclusion model for case-collision entries. Attacks the 84s
+    join / 34s Git phase.
+  - **101 parallel multipart** (#212, 5 rounds, clean ALIGNED): pooled parts
+    under a global byte budget; completion-reread characterized not weakened;
+    found two pre-existing R2 orphan gaps (staging + row-less canonical) with
+    lifecycle-rule fixes.
+  - **103 steady-sync quick wins** (#214, 3 rounds): early stale-parent/epoch
+    rejection (server) + change-only blob preflight (client). Found a latent
+    bug: 422-recovery drops the unsatisfied SHA list (`sync.ts:464`) — must be
+    threaded before any narrowed preflight ships.
+  - **102 O(change) commit admission** (#216, 7 rounds, hardest design):
+    server-computed parent→child refset delta (streaming two-pointer merge);
+    carried-ref safety proven on the `blob_refs` durability invariant;
+    off/shadow/enforce rollout with zero-harmful-divergence flip gate;
+    fail-closed full-validation fallback.
+- **First-ever measured prod commit decomposition** (#213, merged): #207's
+  serverTimings were threaded but never rendered — 5-line formatter fix, live
+  on the Ubuntu daemon. Zero-file push on ~114k blobs: POST p=7.9–8.6s →
+  server 6.8–7.5s, of which **accountingMs 5.8–6.6s (~87%)** — audit Finding 1
+  confirmed by direct measurement; design 102's motivation is now empirical.
+  Also notable: **idle workspaces pay the full ~20s push cycle** publishing
+  zero file changes (git-identity churn suspected — free win if spurious;
+  flagged in #214 Q1).
+- **Founder decisions recorded in-doc (#217):** 98 orphan entitlements
+  ACCEPTED (lazy GC cleanup); 99 ciphertext budget prototype-decided; 100
+  unrepresentable-entries indicator SHIPS in `rbox status` + dashboard; 101
+  greenlit with synthetic multi-GiB rig validation.
+- **Implementation queue (not started):** 103 (smallest, ships first —
+  respect its 102-coexistence precondition), 102 shadow mode, 98/99 (Phase-0
+  prototypes first per founder decisions), 100, 101. Design-84 C1/C2/D pairs
+  with 102 for the ≤3–4s commit target.
 
 - **Late-night additions (post-evening entry):**
   - **#206 GC drain hardening** — crash-robust lease release (3× backoff in
