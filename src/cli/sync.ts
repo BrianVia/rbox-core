@@ -465,7 +465,9 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; r
 type RecoveryAction =
   | { kind: "pull-first" }
   | { kind: "epoch-stale" }
-  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number };
+  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[] };
+
+const RECOVER_ACCUM_MAX = 100_000;
 
 /** The result of ONE push attempt: either done (committed / no-op / everything deferred),
  *  or a classified recovery to apply, carrying the error to throw once the shared
@@ -508,9 +510,11 @@ export async function pushManifest(
   let currentLocal = local;
   let currentForce = forceGitRecapture;
   let previousUnsatisfiedTotal: number | undefined;
+  const recoverAccum = new Set<string>();
+  let recoverFullAudit = false;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce);
+    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) process.stderr.write(`${lane}\n`);
@@ -536,6 +540,8 @@ export async function pushManifest(
       currentForce = NO_GIT_FORCE;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
+      for (const sha of outcome.action.unsatisfiedBlobs) recoverAccum.add(sha);
+      if (recoverAccum.size > RECOVER_ACCUM_MAX) recoverFullAudit = true;
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
     }
@@ -556,7 +562,9 @@ async function runPushAttempt(
   deps: SyncDeps,
   backoff: (attempt: number) => Promise<void>,
   purgeIgnored: boolean,
-  forceGitRecapture: ReadonlySet<string>
+  forceGitRecapture: ReadonlySet<string>,
+  recoverAddresses: ReadonlySet<string>,
+  forceFullAudit: boolean
 ): Promise<AttemptOutcome> {
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
@@ -673,6 +681,8 @@ async function runPushAttempt(
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
+    recoverAddresses,
+    forceFullAudit,
   });
 
   // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
@@ -736,7 +746,13 @@ async function runPushAttempt(
     const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
     return {
       done: false,
-      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: committed, unsatisfiedTotal: res.unsatisfiedTotal },
+      action: {
+        kind: "reupload",
+        forceGitRecapture: gitForce,
+        localForRetry: committed,
+        unsatisfiedTotal: res.unsatisfiedTotal,
+        unsatisfiedBlobs: res.unsatisfiedBlobs ?? [],
+      },
       exhaustedError: "push: server keeps reporting missing blobs after re-upload",
     };
   }

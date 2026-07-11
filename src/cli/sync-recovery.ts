@@ -90,10 +90,23 @@ export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
   encryptCacheFlushMs?: number;
   pruneLivePaths?: ReadonlySet<string>;
+  /** Addresses reported unsatisfied on prior 422 attempts of this push loop. */
+  recoverAddresses?: ReadonlySet<string>;
+  /** Recovery accumulation overflowed, so audit the complete refset. */
+  forceFullAudit?: boolean;
 }
 
 const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
+const MAX_SHAS_PER_CHECK = 50_000;
 const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
+  const missing = new Set<string>();
+  for (let i = 0; i < shas.length; i += MAX_SHAS_PER_CHECK) {
+    for (const sha of await api.missingBlobs(shas.slice(i, i + MAX_SHAS_PER_CHECK))) missing.add(sha);
+  }
+  return [...missing];
+}
 
 function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheContext {
   if (!cfg.accountId) throw new Error("E2EE write context missing accountId; refusing to use encrypt address cache");
@@ -253,11 +266,40 @@ export async function encryptAndUpload(
       // (hits/misses are only known here, after classifyCacheHit ran per file).
       report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
 
-    const encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
+    const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
+    const fullAudit = preflightDelta && (process.env.RBOX_PREFLIGHT_FULL === "1" || options.forceFullAudit === true);
+    const allEncShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
+
+    let encShas: string[];
+    let introduced = 0;
+    let recover = 0;
+    if (!preflightDelta) {
+      encShas = allEncShas;
+    } else if (fullAudit) {
+      encShas = allEncShas;
+    } else {
+      const candidate = new Set<string>();
+      for (const f of toEncrypt) if (f.encSha && !deferred.has(f.path)) candidate.add(f.encSha);
+      introduced = candidate.size;
+      for (const sha of options.recoverAddresses ?? []) {
+        if (!candidate.has(sha)) recover++;
+        candidate.add(sha);
+      }
+      encShas = [...candidate];
+    }
     const missingT0 = LANE_TIMING ? performance.now() : 0;
-    const missing = new Set(await report.phase("missing", () => api.missingBlobs(encShas)));
+    const missing = new Set(await report.phase("missing", () =>
+      fullAudit ? missingBlobsChunked(api, encShas) : api.missingBlobs(encShas)
+    ));
     if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
     report.record("missing", { count: encShas.length });
+    if (preflightDelta) {
+      report.recordDetails(
+        "missing",
+        { introduced, recover, sent: encShas.length, fullAudit: fullAudit ? 1 : 0 },
+        `i${introduced}r${recover}s${encShas.length}fa${fullAudit ? 1 : 0}`
+      );
+    }
     if (report.enabled) report.blobs = encShas.length; // guarded: disabled reports are shared singletons
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
 

@@ -49,6 +49,7 @@ function fakeDb(
     failBodyRead?: boolean;
     blockMirror?: boolean;
     missingBlobRefs?: boolean;
+    missingBlobSha?: string;
   } = {},
 ): D1Database {
   const makeStmt = (sql: string) => {
@@ -90,7 +91,13 @@ function fakeDb(
     batch: async (stmts: D1PreparedStatement[]) =>
       stmts.map((stmt) => {
         const s = stmt as unknown as { sql: string; args: unknown[] };
-        if (s.sql.includes("FROM blob_refs")) return { results: rows.missingBlobRefs ? [] : s.args.slice(1).map((sha256) => ({ sha256 })) };
+        if (s.sql.includes("FROM blob_refs")) {
+          return {
+            results: rows.missingBlobRefs
+              ? []
+              : s.args.slice(1).filter((sha256) => sha256 !== rows.missingBlobSha).map((sha256) => ({ sha256 })),
+          };
+        }
         return { results: [] };
       }),
   } as unknown as D1Database;
@@ -178,6 +185,41 @@ function metricsEnv(rows: Parameters<typeof fakeDb>[2] = {}) {
 }
 
 describe("workspace sync websocket fanout", () => {
+  test("full admission rejects a lost carried ref even when another ref is introduced", async () => {
+    const introduced = sha("c");
+    const carriedNowAbsent = sha("d");
+    // carried = present in the parent (seq 1) refset; a design-102 narrowed admission that
+    // skips parent-carried refs would advance the head here and fail this pin loudly.
+    const e = metricsEnv({ missingBlobSha: carriedNowAbsent });
+    const parent = {
+      ...signed(1, "a"),
+      body: JSON.stringify({
+        ...commitBody(1, "a"),
+        blobRefs: [{ encSha: carriedNowAbsent, size: 1 }],
+      }),
+    };
+    const ctx = fakeCtx([], new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("a") }],
+      ["headWatermark", 1],
+      ["seq:1", JSON.stringify(parent)],
+    ]));
+
+    const res = await new WorkspaceSync(ctx, e as never).fetch(customCommitReq({
+      seq: 2,
+      parent: 1,
+      refs: [introduced, carriedNowAbsent],
+      receipts: true,
+    }));
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({
+      error: "unsatisfied_blobs",
+      missing: [carriedNowAbsent],
+      missingTotal: 1,
+    });
+    expect(ctx.__kv.get("head")).toMatchObject({ sequence: 1 });
+  });
+
   test("broadcast echoes committed frames to the originating device too", () => {
     const sent: string[] = [];
     const sockets = [
