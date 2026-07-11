@@ -1,6 +1,6 @@
 # 101 — Parallel multipart part transfer (upload) + completion-pass measurement
 
-Status: Design draft v4 (codex review rounds 1-3 folded in — see
+Status: Design draft v5 (codex review rounds 1-4 folded in — see
 `REVIEW-101.md`). Client-dominant. Shipped scope is **multipart UPLOAD
 parallelization plus completion-pass measurement**; ranged parallel *download*
 is descoped to a Phase-0 measurement outcome that, if its gate passes, opens a
@@ -259,17 +259,23 @@ capacity-bound uplink. Two mechanisms therefore work together:
    aborts an in-flight PUT); on busy, no NEW admission occurs while in-flight
    part bytes exceed the reduced cap; on drain (batch queue empty, no active
    batch), the full budget is restored and FIFO admission resumes.
-   **Check/admission coordination (R3 item 6):** the busy flag is not a polled
-   observation — `BlobBatchUploader.enqueue` flips the shared flag
-   **synchronously, before its first await**, and every budget admission
-   re-reads the flag at grant time; both run on the single JS event loop, so
-   the only residual interleave is one admission already granted in the same
-   task as an enqueue that had not yet run — bounded by ONE part. Time-to-effect
-   of the reduced cap (worst case: that one interleaved part plus the largest
-   in-flight part's remaining transfer) is therefore bounded and is measured
-   under G3. First-publish reality: small files finish their batches early and
-   the big blob then gets the whole budget — the throttle costs nothing once
-   the small lane is idle.
+   **Check/admission coordination (R3 item 6; linearization made real per R4
+   item 2):** the busy flag and budget grants share one linearization point —
+   the budget's grant loop. `BlobBatchUploader.enqueue` flips the shared flag
+   **synchronously, before its first await**; the grant loop (run on every
+   release/drain) **re-checks the flag before each individual permit and stops
+   immediately when it flips**, and — because a synchronous multi-grant burst
+   could otherwise admit a whole budget window before the enqueue task ever
+   runs — **the loop yields to the event loop between permits (one permit per
+   turn)**. A yield per ≥ 8 MiB part is negligible overhead and restores the
+   real bound: at most ONE part admitted between an enqueue and the throttle
+   taking effect. Test (R4 item 2): an enqueue racing a queue drain with many
+   eligible waiters admits at most one part after the flag flips.
+   Time-to-effect of the reduced cap (worst case: that one interleaved part
+   plus the largest in-flight part's remaining transfer) is therefore bounded
+   and is measured under G3. First-publish reality: small files finish their
+   batches early and the big blob then gets the whole budget — the throttle
+   costs nothing once the small lane is idle.
 
 **Scheduler semantics (R1 item 3), specified, not implied:**
 
@@ -484,15 +490,22 @@ redefinition (R1 item 1).
   R3 item 2).** Fault classes, injected identically into serial (control) and
   parallel: **F1** lost part ack (server accepted, client saw failure); **F2**
   kill during an active part fetch; **F3** abort landing during retry backoff;
-  **F4** process kill with k parts accepted and j in flight (k, j ≥ 2); **F5**
-  resume against a dead/expired MPU; **F6** completion-response loss. **Samples:**
-  10 runs per class per mode, identical schedules. **Acceptance bounds, all
-  explicit:** (a) **success rate 100% in both modes** — any run whose resume
-  fails to complete fails G2 outright (categorical, no statistics needed);
-  (b) per class, resume completion wall p50 (parallel) ≤ 1.10 × p50 (serial);
-  (c) per class, total retransmitted bytes p50 (parallel) ≤ 1.10 × p50 (serial);
-  (d) re-init counts are sparse, so they are summed ACROSS the whole matrix:
-  parallel's total ≤ serial's total. **Correctness ceiling (separate invariant
+  **F4a** process kill with k ≥ 2 parts accepted and exactly **j = 1** in
+  flight — the control-compatible kill (a serial control can never have more
+  than one part in flight, so only j = 1 admits a like-for-like schedule; R4
+  item 1); **F5** resume against a dead/expired MPU; **F6**
+  completion-response loss. **Samples:** 10 runs per class per mode, identical
+  schedules. **Acceptance bounds, all explicit:** (a) **success rate 100% in
+  both modes** — any run whose resume fails to complete fails G2 outright
+  (categorical, no statistics needed); (b) per class, resume completion wall
+  p50 (parallel) ≤ 1.10 × p50 (serial); (c) per class, total retransmitted
+  bytes p50 (parallel) ≤ 1.10 × p50 (serial); (d) re-init counts are sparse,
+  so they are summed ACROSS the whole matrix: parallel's total ≤ serial's
+  total. **F4b — parallel-only correctness/ceiling test (no serial comparison
+  claimed):** process kill with k ≥ 2 accepted and **j ≥ 2** in flight, 10
+  runs; asserts success-rate 100%, the max-in-flight retransmission ceiling
+  below, and the §3.1 resume-set correctness — it feeds NO regression
+  statistic, because no identical serial schedule exists. **Correctness ceiling (separate invariant
   test, not the acceptance criterion):** in every single run, ambiguous
   retransmission never exceeds the configured max in-flight
   (≤ `MULTIPART_PARTS_PER_BLOB` parts / `MULTIPART_INFLIGHT_BYTES`). Resume-set
@@ -517,7 +530,15 @@ redefinition (R1 item 1).
   within 20%, and **pooled per-batch queue-wait p99 within 2× of the
   serial-large control's pooled p99** (tail coverage, R2 item 8); max queue
   wait is reported (worst across samples) but not gated — a single-observation
-  maximum is not a supportable gate statistic. **Predeclared, finite tuning (R2
+  maximum is not a supportable gate statistic. **Large-blob liveness under the
+  same gate (R4 item 4):** in the sustained-arrival sub-workload, the 2 GiB
+  blob's completion wall (parallel, candidate cap) ≤ 1.10 × the serial-large
+  mixed control's p50 — so a candidate cannot pass by giving the batch lane
+  absolute priority while starving the blob. This binds the `0` candidate
+  specifically: with cap 0, multipart admission depends on the batch lane
+  draining between arrival bursts, and the liveness bound is what proves that
+  eventual admission actually happens on the measured workload; a `0` candidate
+  that starves the blob fails G3 and is recorded as such. **Predeclared, finite tuning (R2
   item 7):** the ONLY tunable is `MULTIPART_INFLIGHT_BYTES_WHEN_BATCH_BUSY`,
   over the preregistered candidate set `{32 MiB, 16 MiB, 8 MiB, 0}` (0 = no new
   admissions while batch work is queued, §3.2), one full sample set per
@@ -566,13 +587,15 @@ failure point leaves, and its reaper:
 | Worker dies **after grant, before response** | canonical published + granted; staging object | consistent | Client's existing lost-ack recovery: `missingBlobs` present-check succeeds (`multipart.ts:157-161`) → done. Staging: rule B; `uploads` row: init sweep |
 | Fence 503 at accounting (handled response) | canonical verified; staging deleted in `finally` | consistent (deferred) | in-request `finally`; client defers (`multipart.ts:145-153`) |
 
-**Explicit bounds per class (R3 item 7):** incomplete MPU ≤ 7d (rule A);
-completed staging object ≤ 24h (rule B); stale `uploads`/`upload_parts` rows —
-swept at the account's next `multipartInit` (`blobs.ts:332`), else cleared by
-the §8.2 audit (they are inert D1 metadata: no R2 cost, no accounting effect);
-row-less canonical orphan — healed at the client's next retry (typically the
-daemon's next push-pump cycle), else reaped by the §8.2 audit with ≥ 7d
-eligibility. Every state is either healed by the client's existing recovery
+**Explicit bounds per class (R3 item 7; deadlines per R4 item 3):** incomplete
+MPU ≤ 7d (rule A); completed staging object ≤ 24h (rule B); stale
+`uploads`/`upload_parts` rows — swept at the account's next `multipartInit`
+(`blobs.ts:332`), else cleared by the scheduled §8.2 audit within ≤ 7d
+(expiry) + 1d (cron) — inert D1 metadata meanwhile (no R2 cost, no accounting
+effect); row-less canonical orphan — healed at the client's next retry
+(typically the daemon's next push-pump cycle), else reaped end-to-end within
+**≤ 10 days** (7d eligibility + ≤ 1d scheduled audit + ≤ 2d design-95 P2
+quiescence/execution; §8.2). Every state is either healed by the client's existing recovery
 (which always converges on "canonical verified + accounted" because parts,
 canonical PUT, insert, and grant are all idempotent) or reaped by a named
 reaper within its stated bound. No state requires adopting unverified bytes.
@@ -649,9 +672,17 @@ by P2's existing re-checks — the audit can never delete a blob an account stil
 legitimately holds, because such a blob has rows. The audit also deletes
 `uploads`/`upload_parts` rows older than `UPLOAD_EXPIRY_MS` (the same sweep
 `multipartInit` does, `blobs.ts:332`, for accounts that never multipart again).
-Retention bound for the class: "next audit run"; the audit is operator-cadence
-(run with the periodic GC drain), and the class's steady-state size is ≤ one
-object per crashed completion — P0.3 measures the actual rate.
+**The audit is SCHEDULED, not operator-cadence (R4 item 3):** it runs from the
+same daily Worker cron design 95's GC automation already owns ("daily cron
+jitter", `docs/design/95-gc-purge-automation.md:104`); the admin-secret trigger
+remains for tests and manual runs. The class bound is therefore explicit and
+falsifiable: **eligibility (7d) + ≤ 1d scheduler interval + design-95 P2
+quiescence/execution (≤ 2d) → a row-less canonical orphan is deleted within
+10 days of its creation**, and stale `uploads`/`upload_parts` rows within 7d
+(`UPLOAD_EXPIRY_MS` ≈ 6d) + 1d. A cron run that finds audit work overdue past
+its bound emits the existing GC drain's overdue signal. Steady-state class
+size is ≤ one object per crashed completion — P0.3 measures the actual rate,
+and the automated test asserts counts reach zero within the stated bounds.
 
 **GC isolation, unchanged.** `gc_candidates` condemns *canonical* blobs by
 `sha256` (`blobs.ts:62,148,183`); `staging/` objects carry no `blobs`/`gc_

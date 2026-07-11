@@ -57,7 +57,18 @@ Revised doc for Round 3.
 
 Revised doc for Round 4.
 
-## Round 4
+## Round 4 — VERDICT: REVISE (4 items; R3 items 1, 3, 5 confirmed resolved; no new integrity/revocation/chunk-sync/shipped-work findings)
+
+| # | Item | Disposition |
+|---|------|-------------|
+| 1 | G2's F4 (j ≥ 2 in flight) cannot run identically on the serial control. | FIXED. Split: **F4a** (k ≥ 2 accepted, exactly j = 1 in flight) is the control-compatible regression class; **F4b** (j ≥ 2) is a parallel-only correctness/ceiling test (success rate, max-in-flight ceiling, resume-set correctness) feeding NO regression statistic. §7.2. |
+| 2 | "One extra admission" bound did not follow — a synchronous release/drain burst can grant many waiters before the enqueue task runs. | FIXED. Grant loop is the shared linearization point: re-checks the busy flag before EACH permit, stops on flip, and **yields to the event loop between permits (one permit per turn)** — restoring the one-part bound with a real mechanism (negligible cost per ≥ 8 MiB part). Test added: enqueue racing a many-waiter drain admits ≤ 1 part post-flip. §3.2. |
+| 3 | "Next audit run" is not a falsifiable bound (admin-triggered, unspecified cadence). | FIXED. Audit is SCHEDULED on design 95's existing daily GC cron (admin trigger kept for tests); explicit end-to-end bounds: canonical orphan ≤ 10d (7d eligibility + ≤ 1d cron + ≤ 2d P2 quiescence/execution), stale rows ≤ 7d + 1d; overdue work emits the GC drain's existing overdue signal. §8, §8.2. |
+| 4 | The `0` busy-cap candidate can pass G3 while starving the large blob (G-part measured only in isolation). | FIXED. G3 gains a large-blob liveness bound on the sustained-arrival sub-workload: parallel completion wall ≤ 1.10 × serial-large mixed control p50 — binding the `0` candidate specifically; a starving candidate fails G3 and is recorded. §7.2. |
+
+Revised doc for Round 5.
+
+## Round 5
 
 Verdict: _pending_
 </content>
