@@ -97,3 +97,10 @@ Dispositions:
 - **VALIDATION —** `git diff --check 6f5a5741..HEAD` passed. The focused measurement plus sync run passed 59/60; its sole failure was the acceptance-listed pre-existing same-SHA metadata-heal test (`sync.test.ts:276`). No unrelated file was modified by this review.
 
 Verdict: REVISE
+
+## Deliverable 2 — Round 2 — revision (Claude)
+
+Both findings accepted; dispositions:
+
+1. **HIGH (pre-open raw evidence drained before settle) — ACCEPTED.** `OpenDriftAudit` gains an `appliedEvents` buffer: every settled batch that `applyPendingWatchEvents` drains while a window is open is captured into it (same cap/overflow discipline), and settle coverage unions `rawEvents ∪ appliedEvents ∪ pendingEvents ∪ deferredRetryPaths`. The exact reviewed interleaving — raw event before the scan opens, candidate created by the scan, batch applied before settle while nothing is pending — now resolves `racing`. Deliberately coverage-only: quiescence stays rawEvents-based, because an applied batch's raw events may predate the window (marking the scan non-quiescent for pre-window churn would be a mislabel; a batch whose raw events DID fall in the window is already counted by rawEvents). Regression pins the ordering and fails on the pre-fix code (stash-verified).
+2. **MEDIUM (loader dedup / last-wins merge) — ACCEPTED.** `dedupePending` (oldest-per-path, then cap) is applied both on load and inside `mergePending`, so a duplicate-path sidecar cannot double-count resolutions or confirms and the oldest evidence always wins. Unit-tested for load and merge.

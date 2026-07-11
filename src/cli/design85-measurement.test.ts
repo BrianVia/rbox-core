@@ -155,6 +155,59 @@ test("drift sidecar write failure is measurement-only — the apply path never t
   }
 });
 
+test("a batch applied between scan and settle covers the candidate — never a false confirmed drop (D2-R2)", async () => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-drift-preopen-")));
+  const logs: string[] = [];
+  const oldLog = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.join(" ")); };
+  try {
+    await fs.writeFile(path.join(root, "f.txt"), "old");
+    const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
+    const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
+    daemon.cache = await HashCache.load(root);
+    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.watcher = { close: async () => {} };
+    daemon.watcherSessionId = "session";
+
+    // The raw event fired BEFORE the scan opened (so no rawEvents trace); the
+    // deep scan sees the mutation as a candidate; the settled batch is applied
+    // BEFORE the settle window closes — while the candidate is not yet pending.
+    await fs.writeFile(path.join(root, "f.txt"), "drifted");
+    await daemon.doDeepScan();
+    daemon.pendingEvents.push({ relPath: "f.txt", kind: "change" });
+    await daemon.applyPendingWatchEvents(); // drains the batch; nothing pending yet
+    await daemon.runDriftAuditNow();
+
+    // The applied batch is watcher evidence: the candidate resolves racing,
+    // never survives to be confirmed as a drop at the next horizon.
+    expect((await loadDriftAudit(root)).pending).toHaveLength(0);
+    const line = logs.find((l) => l.includes("deep-scan drift:"))!;
+    expect(line).toContain("racing=1");
+    expect(line).toContain("survivors=0");
+  } finally {
+    console.log = oldLog;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a duplicate-path sidecar dedups on load (oldest candidate wins)", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-drift-dup-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    const cand = (firstSeenAtMs: number) => ({
+      path: "p", kind: "modified", expected: null, observed: null,
+      firstSeenAtMs, eventGenAtScan: 0, bootId: "b", errorGenAtScan: 0, quiescentAtScan: true,
+    });
+    await fs.writeFile(
+      path.join(root, ".rbox", "state", "drift-audit.json"),
+      JSON.stringify({ version: 1, pending: [cand(5), cand(2)], resolvedSinceLastAudit: { lateCovered: 0, coveredAmbiguous: 0 } })
+    );
+    const loaded = await loadDriftAudit(root);
+    expect(loaded.pending).toHaveLength(1);
+    expect(loaded.pending[0]!.firstSeenAtMs).toBe(2);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test("mergePending dedups by path (older candidate wins) and caps growth", () => {
   const cand = (p: string, firstSeenAtMs: number): DriftCandidate => ({
     path: p, kind: "modified", expected: null, observed: null,

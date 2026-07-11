@@ -82,12 +82,20 @@ export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEv
   return { pending: kept, lateCovered, coveredAmbiguous };
 }
 
-/** Held-back pending + this scan's survivors, deduplicated by path (the OLDER
- *  candidate wins — it carries the original drop evidence and age) and capped. */
-export function mergePending(held: DriftCandidate[], survivors: DriftCandidate[]): DriftCandidate[] {
-  const byPath = new Map(held.map((c) => [c.path, c]));
-  for (const s of survivors) if (!byPath.has(s.path)) byPath.set(s.path, s);
+/** Deduplicate candidates by path — the OLDEST candidate wins, since it carries
+ *  the original drop evidence and true drift age — then cap. */
+export function dedupePending(candidates: DriftCandidate[]): DriftCandidate[] {
+  const byPath = new Map<string, DriftCandidate>();
+  for (const c of candidates) {
+    const prev = byPath.get(c.path);
+    if (!prev || c.firstSeenAtMs < prev.firstSeenAtMs) byPath.set(c.path, c);
+  }
   return [...byPath.values()].slice(0, PENDING_CAP);
+}
+
+/** Held-back pending + this scan's survivors, oldest-per-path, capped. */
+export function mergePending(held: DriftCandidate[], survivors: DriftCandidate[]): DriftCandidate[] {
+  return dedupePending([...held, ...survivors]);
 }
 
 const auditPath = (root: string) => path.join(root, RBOX_DIR, "state", "drift-audit.json");
@@ -113,7 +121,9 @@ export async function loadDriftAudit(root: string): Promise<DriftAuditState> {
       validSnapshot(candidate.expected) && validSnapshot(candidate.observed)
     );
     if (!(x?.version === 1 && validPending && validCounters)) return emptyDriftAuditState();
-    x.pending = x.pending.slice(0, PENDING_CAP);
+    // A duplicate-path sidecar would double-count resolutions/confirms — dedupe
+    // on load with the same oldest-wins rule the merge uses.
+    x.pending = dedupePending(x.pending);
     return x;
   }
   catch { return emptyDriftAuditState(); }

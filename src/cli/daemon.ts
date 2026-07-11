@@ -93,6 +93,14 @@ interface OpenDriftAudit {
    *  removes pending entries, so the stash stays a superset). */
   horizonInputs: Map<string, EntrySnapshot | null>;
   rawEvents: WatchEvent[];
+  /** Settled batches APPLIED while this window was open. A raw event that fired
+   *  BEFORE the scan opened leaves no rawEvents trace, but its batch applying
+   *  during the window is still watcher evidence for a candidate — without it,
+   *  apply-time resolution (which ran before the candidate persisted) and settle
+   *  coverage would both miss it and mint a false confirmed drop (D2-R2 HIGH).
+   *  Coverage evidence only — quiescence stays rawEvents-based, since these raw
+   *  events may predate the window. */
+  appliedEvents: WatchEvent[];
   overflow: boolean;
   watcherHealthy: boolean;
   errorGen: number;
@@ -739,6 +747,12 @@ export class RboxDaemon {
       const events = this.pendingEvents;
       this.pendingEvents = [];
       this.appliedPendingEventsInOp = true;
+      for (const audit of this.openDriftAudits) {
+        for (const e of events) {
+          if (audit.appliedEvents.length < AUDIT_EVENT_CAP) audit.appliedEvents.push(e);
+          else { audit.overflow = true; break; }
+        }
+      }
       // If the ignore rules themselves changed, rebuild the matcher and full-rescan
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
@@ -1219,7 +1233,7 @@ export class RboxDaemon {
     const rulesChanged = this.rulesChangedSinceDeepScan;
     const stats = createScanStats();
     const audit: OpenDriftAudit = {
-      scanStartMs, candidates: [], horizonInputs: new Map(), rawEvents: [], overflow: false,
+      scanStartMs, candidates: [], horizonInputs: new Map(), rawEvents: [], appliedEvents: [], overflow: false,
       watcherHealthy: !!this.watcher && this.watcherHealthy,
       errorGen: this.watcherErrorGeneration,
       sinceSafetyMs: this.lastSafetyCompletedMs === undefined ? 0 : Math.max(0, scanStartMs - this.lastSafetyCompletedMs),
@@ -1349,7 +1363,7 @@ export class RboxDaemon {
       let quiescent = false;
       await this.mutateDriftState((state) => {
         // ---- synchronous decision section (no awaits past this point) ----
-        const pendingCoverage = [...audit.rawEvents, ...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
+        const pendingCoverage = [...audit.rawEvents, ...audit.appliedEvents, ...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
         quiescent = !audit.overflow && audit.rawEvents.length === 0;
         const survivors: DriftCandidate[] = [];
         for (const candidate of audit.candidates) {
