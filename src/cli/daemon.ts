@@ -38,7 +38,7 @@ import {
   reverifyPath,
   resolveCoveredAtApply,
   saveDriftAudit,
-  snapshotEntry,
+  snapshotAtPath,
   type DriftAuditState,
   type DriftCandidate,
   type DriftCandidateDraft,
@@ -79,6 +79,12 @@ export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
+
+/** Sanitized error identifier for measurement-failure log lines. Node fs errors
+ *  embed absolute paths in `message` — only the errno code may be emitted (the
+ *  founder's no-raw-filenames rule covers failure lines too, D2-R3). */
+const errCode = (e: unknown): string =>
+  e && typeof e === "object" && "code" in e && typeof (e as { code?: unknown }).code === "string" ? (e as { code: string }).code : "unknown";
 
 export function scanStatsLine(kind: "safety scan" | "deep scan", stats: ScanStats, wallMs: number, deferred: number): string {
   const accounted = stats.readdirMs + stats.statMs + stats.matcherMs + stats.hashMs + stats.sortMs;
@@ -1260,9 +1266,8 @@ export class RboxDaemon {
     // manifest is the horizon's disk truth) — but resolve nothing until the settle
     // window closes: a covering event delivered during the next 4s must still be
     // able to retract, and confirmation must share the settle's evidence barrier.
-    const current = new Map(freshManifest.files.map((entry) => [entry.path, snapshotEntry(entry)]));
     await this.mutateDriftState((state) => {
-      audit.horizonInputs = new Map(state.pending.map((c) => [c.path, current.get(c.path) ?? null]));
+      audit.horizonInputs = new Map(state.pending.map((c) => [c.path, snapshotAtPath(freshManifest, c.path)]));
       return false; // read-only
     });
     this.scheduleDriftClassification(audit);
@@ -1292,7 +1297,7 @@ export class RboxDaemon {
       const summary = probe.summary();
       log(`scan probe: dirs=${summary.dirs} eligible=${summary.eligible} eligibleReaddirMs=${summary.eligibleReaddirMs} totalReaddirMs=${summary.totalReaddirMs} projectedDircacheBytes=${summary.projectedDircacheBytes} probeOverheadMs=${summary.probeOverheadMs}`);
       // Measurement only — a probe sidecar write failure must never fail the scan op.
-      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${e instanceof Error ? e.message : String(e)}`));
+      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${errCode(e)}`));
     }
     return { freshManifest: fresh, deferred };
   }
@@ -1313,7 +1318,7 @@ export class RboxDaemon {
       } catch (e) {
         if (!this.driftSaveFailedLogged) {
           this.driftSaveFailedLogged = true;
-          log(`drift audit sidecar write failed (measurement only, sync unaffected): ${e instanceof Error ? e.message : String(e)}`);
+          log(`drift audit sidecar write failed (measurement only, sync unaffected): ${errCode(e)}`);
         }
       }
     });
@@ -1405,7 +1410,7 @@ export class RboxDaemon {
       log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
     } catch (e) {
       this.openDriftAudits.delete(audit);
-      log(`drift audit failed (measurement only, sync unaffected): ${e instanceof Error ? e.message : String(e)}`);
+      log(`drift audit failed (measurement only, sync unaffected): ${errCode(e)}`);
     }
   }
 

@@ -118,3 +118,10 @@ Both findings accepted; dispositions:
 - **VALIDATION —** `git diff --check 6f5a5741..HEAD` passed. The focused measurement plus sync run passed 61/62; the sole failure remains the acceptance-listed pre-existing same-SHA metadata-heal test at `src/cli/sync.test.ts:276`. No file other than this review was modified by Round 3.
 
 Verdict: REVISE
+
+## Deliverable 2 — Round 3 — revision (Claude)
+
+Both findings accepted (orchestrator granted a one-round extension); dispositions:
+
+1. **HIGH (fail-soft logs leak raw paths) — ACCEPTED.** All three measurement-failure sites (scan-probe save, drift sidecar transaction, audit catch) now emit a fixed message plus `errCode(e)` — the errno code only, never `e.message`/`String(e)` (Node fs errors embed absolute paths). The fail-soft regression now asserts the failure line contains neither the workspace root nor the sidecar filename.
+2. **HIGH (per-batch whole-manifest map) — ACCEPTED.** `resolveCoveredAtApply` no longer builds a manifest-wide map: coverage is decided first and only COVERED candidates (≤ PENDING_CAP) are looked up via `snapshotAtPath`, a binary search over the sorted-by-path manifest invariant. The deep scan's `horizonInputs` stash (per-30m, pending-sized) uses the same lookup, dropping its full-manifest snapshot map too. Unit test covers first/middle/last/missing/empty.

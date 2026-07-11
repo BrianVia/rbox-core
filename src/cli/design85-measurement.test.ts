@@ -16,6 +16,7 @@ import {
   mergePending,
   PENDING_CAP,
   resolveCoveredAtApply,
+  snapshotAtPath,
   snapshotEntry,
   type DriftCandidate,
 } from "./drift-audit.js";
@@ -146,7 +147,12 @@ test("drift sidecar write failure is measurement-only — the apply path never t
     await fs.mkdir(path.join(root, ".rbox/state/drift-audit.json"));
     daemon.pendingEvents.push({ relPath: "f.txt", kind: "change" });
     await daemon.applyPendingWatchEvents(); // must not throw
-    expect(logs.some((l) => l.includes("drift audit sidecar write failed"))).toBe(true);
+    const failLine = logs.find((l) => l.includes("drift audit sidecar write failed"))!;
+    expect(failLine).toBeDefined();
+    // Sanitized failure line: fs error messages embed absolute paths — only the
+    // errno code may be emitted (no workspace root, no sidecar path, D2-R3).
+    expect(failLine).not.toContain(root);
+    expect(failLine).not.toContain("drift-audit.json");
     // In-memory state stayed coherent: the covering event resolved the candidate.
     expect(daemon.driftState.pending).toHaveLength(0);
   } finally {
@@ -206,6 +212,15 @@ test("a duplicate-path sidecar dedups on load (oldest candidate wins)", async ()
     expect(loaded.pending).toHaveLength(1);
     expect(loaded.pending[0]!.firstSeenAtMs).toBe(2);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("snapshotAtPath binary-searches the sorted manifest without a whole-tree pass", () => {
+  const m = manifest(entry("a/1"), entry("b/2", { sha256: "x" }), entry("c/3"));
+  expect(snapshotAtPath(m, "a/1")).toMatchObject({ sha256: "a" });
+  expect(snapshotAtPath(m, "b/2")).toMatchObject({ sha256: "x" });
+  expect(snapshotAtPath(m, "c/3")).toMatchObject({ sha256: "a" });
+  expect(snapshotAtPath(m, "b/1.5")).toBeNull();
+  expect(snapshotAtPath(manifest(), "a")).toBeNull();
 });
 
 test("mergePending dedups by path (older candidate wins) and caps growth", () => {

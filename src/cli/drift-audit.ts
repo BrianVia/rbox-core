@@ -71,12 +71,27 @@ export function candidateStillMismatch(candidate: DriftCandidateDraft, current: 
   if (candidate.kind === "deleted") return current === null;
   return current !== null && !sameSnapshot(candidate.expected, current);
 }
+/** Snapshot at `p` via binary search — manifest.files is sorted by path (the
+ *  scan/applyWatchEvents invariant), and only COVERED candidates (≤ PENDING_CAP)
+ *  are ever looked up, so the apply hot path never pays a whole-manifest pass. */
+export function snapshotAtPath(manifest: Manifest, p: string): EntrySnapshot | null {
+  const files = manifest.files;
+  let lo = 0, hi = files.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const fp = files[mid]!.path;
+    if (fp === p) return snap(files[mid]);
+    if (fp < p) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return null;
+}
+
 export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEvent[], deferred: Set<string>, manifest: Manifest): { pending: DriftCandidate[]; lateCovered: number; coveredAmbiguous: number } {
-  const truth = new Map(manifest.files.map((x) => [x.path, snap(x)]));
   let lateCovered = 0, coveredAmbiguous = 0;
   const kept = pending.filter((candidate) => {
     if (deferred.has(candidate.path) || !eventsCoverPath(events, candidate.path)) return true;
-    if (sameSnapshot(candidate.observed, truth.get(candidate.path) ?? null)) lateCovered++; else coveredAmbiguous++;
+    if (sameSnapshot(candidate.observed, snapshotAtPath(manifest, candidate.path))) lateCovered++; else coveredAmbiguous++;
     return false;
   });
   return { pending: kept, lateCovered, coveredAmbiguous };
