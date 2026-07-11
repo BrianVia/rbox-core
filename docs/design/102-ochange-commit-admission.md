@@ -1,12 +1,13 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v1, 2026-07-11 — pending adversarial review (REVIEW-102.md).
+Status: DRAFT v2, 2026-07-11 — round 1 folded (REVIEW-102.md). Under adversarial
+review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
 shrink the *client* manifest lane but "no phase of this design shrinks" the
 *server's* O(workspace-refs) commit admission — that is this design's job. This
 is the sufficient half of the pair: design 84 makes the bytes O(change); design
-102 makes the server admission O(change). Together they make the ≤3–4s commit
+102 makes the server D1 admission O(change). Together they make the ≤3–4s commit
 POST reachable; design 84 alone leaves a projected ~9.3s Linux / ~9.2s Mac floor
 (design 84 §6.1 decision arithmetic).
 
@@ -28,13 +29,15 @@ Zero-file pushes on the ~114k-blob workspace (2026-07-11, prod, design-97
 issues ~1,245 `SELECT` statements across ~37 sequential `db.batch` groups
 (`commit-accounting.ts:80–93`) — for a commit that changed **zero files**.
 
-The pathology: admission cost scales with **workspace size**, not with the
-**change**. A one-byte edit re-validates and re-accounts every one of ~112k
-references. The client-side 41.2MB manifest upload (u≈3.1–3.4s) is design 84's
+The pathology: **D1** admission cost scales with **workspace size**, not with the
+**change**. This design removes the O(workspace) **D1** work. It does **not** (in
+v1) remove the O(workspace) sidecar **parse/fetch** CPU — that residual is the
+wire-delta follow-on's target (§8), and §7's total-admission gate measures it
+honestly. The client-side 41.2MB manifest upload (u≈3.1–3.4s) is design 84's
 territory, explicitly **not** this design's.
 
 The governing rule (audit §Final assessment): *a small change must perform work
-proportional to the change.* This design makes commit admission obey it.
+proportional to the change.* This design makes commit **D1** admission obey it.
 
 ---
 
@@ -42,75 +45,62 @@ proportional to the change.* This design makes commit admission obey it.
 
 All of `commit()` runs **inside the `WorkspaceSync` Durable Object**
 (`apps/api/src/workspace-sync.ts`), the authoritative per-(workspace, project)
-sequencer. The receipts-protocol path (the only path a §24 sidecar client takes):
+sequencer. The receipts-protocol sidecar path:
 
-1. **Envelope parse** (`workspace-sync.ts:275–341`). Capped body read, JSON
-   parse, shape/hash/seq/epoch field checks, `readRefMode` discriminates
-   inline vs sidecar. `serverTimings.envelopeMs` ends here.
-
-2. **Sidecar resolution** (`resolveSidecarBytes`, `sidecar.ts:72–112`, timed as
-   `sidecarMs`). Entitlement gate (receipt or entitled+present) **before** the
-   R2 GET; then `loadSidecarRefs` GETs the canonical sidecar object, checks
+1. **Envelope parse** (`workspace-sync.ts:275–341`). Capped body read, JSON parse,
+   shape/hash/seq/epoch field checks, `readRefMode` discriminates inline vs
+   sidecar. `serverTimings.envelopeMs` ends here.
+2. **Sidecar resolution** (`resolveSidecarBytes`, `sidecar.ts:72–112`, timed
+   `sidecarMs`). Entitlement gate (receipt or entitled+present) **before** the R2
+   GET; then `loadSidecarRefs` GETs the canonical sidecar object, checks
    `obj.size === refsetByteLength(count)` before buffering, hash-verifies
-   `sidecarSha`, and `parseRefset` strictly decodes (magic, exact length,
-   **sorted ascending by raw sha**, no dups, safe sizes — `refset.ts:82–104`).
-   `totalBytes` is re-summed and matched to the signed descriptor. Returns the
-   full child data-ref array (`refShas`), already in canonical sorted order.
-
+   `sidecarSha`, `parseRefset` strictly decodes (magic, exact length, **sorted
+   ascending by raw sha**, no dups, safe sizes — `refset.ts:82–104`), and
+   re-sums+matches `totalBytes` to the signed descriptor. Returns the full child
+   data-ref array, canonically sorted.
 3. **Build the accounting SHA set** (`workspace-sync.ts:392`):
-   `shas = [encManifestSha, sidecarSha, ...sc.refShas]` — the two carriers plus
+   `shas = [encManifestSha, sidecarSha, ...sc.refShas]` — two carriers plus
    **every** data ref (~112k).
-
-4. **`validateCommitRefs`** (`commit-accounting.ts:61–109`, timed as
-   `accountingMs`). For every SHA, an entitled-AND-present `SELECT` batched
-   ≤90/statement, ≤34 statements/`db.batch`. The have-set `SELECT` folds in two
-   `NOT EXISTS` barriers (`commit-accounting.ts:83–86`):
-   - **`blob_ref_candidates`** (this account's Phase-1 prune marker), and
-   - **`gc_candidates` with `deleting_at IS NOT NULL`** (an active deletion
-     intent).
-   A ref matching either barrier reads as **not-satisfied** and falls through to
-   `newRefs` (needs a receipt), which forces `commitAccounting` to **re-grant**
-   it and clear the barrier — the side effect this design must reproduce exactly.
-
+4. **`validateCommitRefs`** (`commit-accounting.ts:61–109`, timed `accountingMs`).
+   Per SHA, an entitled-AND-present `SELECT` batched ≤90/statement, ≤34/`db.batch`.
+   The have-set `SELECT` folds two `NOT EXISTS` barriers
+   (`commit-accounting.ts:83–86`): **`blob_ref_candidates`** (this account's
+   Phase-1 prune marker) and **`gc_candidates` with `deleting_at IS NOT NULL`** (an
+   active deletion intent). A ref hitting either barrier reads **not-satisfied**,
+   falls to `newRefs`, needs a valid receipt, and its chargeable **size comes from
+   `verifyReceipt`** (`:104–106`) — never from the sidecar. `commitAccounting`
+   then re-grants it and clears the barrier.
 5. **`commitAccounting`** (`commit-accounting.ts:122–210`). For `newRefs` only:
    catalog `present=1`, charge `used_bytes` via `NOT EXISTS blob_refs`, grant
    (`ON CONFLICT … granted_at`), un-condemn `gc_candidates` (`deleting_at IS
-   NULL`), clear `blob_ref_candidates` — one chunked atomic `db.batch` per ≤3,000
-   refs, each under the `accounts_cap_guard` trigger. The `blob_refs`/`blobs`
-   inserts are also fenced by the migration-0024 `rbox_delete_fence` triggers: an
-   insert/present-update on a sha under an active `gc_candidates` intent
-   `RAISE(ABORT,'rbox_delete_fence')`, aborting the super-batch → 422 needsUpload.
+   NULL`), clear `blob_ref_candidates` — chunked atomic `db.batch` per ≤3,000 refs,
+   under the `accounts_cap_guard` trigger. The `blob_refs`/`blobs` inserts are
+   fenced by the migration-0024 `rbox_delete_fence` triggers: an insert/present=1
+   on a sha under an active `gc_candidates` intent `RAISE(ABORT)` → the caught
+   super-batch's shas become `needsUpload` → 422.
+6. **Final atomic parent/epoch CAS** (`workspace-sync.ts:443–471`). Synchronous
+   `transactionSync`, no `await` inside: re-read `head`, assert `parent ===
+   head.sequence` (else 409 conflict + equivocation detection), `commitEpoch ===
+   currentEpoch` (else 409 epoch_stale), `commitSeq === watermark + 1`, then
+   advance `head`/`headWatermark`, persist the full `SignedCommit` verbatim at
+   `seq:<next>`, mark the roots index `lagging`. Timed `commitMs` (≈0).
 
-6. **Final atomic parent/epoch CAS** (`workspace-sync.ts:443–471`). A
-   synchronous `transactionSync` with no `await` inside: re-read `head`, assert
-   `parent === head.sequence` (else 409 conflict, with equivocation detection),
-   assert `commitEpoch === currentEpoch` (else 409 epoch_stale), assert
-   `commitSeq === watermark + 1`, then advance `head`/`headWatermark`, persist
-   the full `SignedCommit` verbatim at `seq:<next>`, mark the roots index
-   `lagging`. Timed as `commitMs` (≈0 — the work is all in steps 4–5).
-
-Steps 4–5 are the ~6s pole. Steps 2 (parse) and 6 (CAS) are cheap. **The parent
-commit is never read**: admission re-derives satisfiability for the entire child
-set from scratch, ignoring that the parent — the current authoritative head — was
-already fully validated and accounted when *it* published.
+Steps 4–5 are the ~6s pole. **The parent commit is never read**: admission
+re-derives satisfiability for the entire child set from scratch, ignoring that the
+parent — the current authoritative head — was already fully validated and
+accounted when *it* published.
 
 ### 2.1 What the DO already has
 
-The DO stores every commit body verbatim at `seq:<n>` and exposes
-`refSetAt(seq)` (`workspace-sync.ts:597–609`), which parses the refset (inline or
-via `loadSidecarShaSet`) for any retained sequence. The roots-index folder
-(`foldSequence`, `:535–595`) *already* computes a parent→child ref delta lazily
-in the alarm via `diffChunk` (`:986–994`) over two sorted sets. **This design
-does synchronously, at admission time, the same parent→child diff the folder
-does asynchronously** — from the same immutable `seq:<n>` bodies through the same
-`refset.ts` codec, so the two can never disagree about what the delta is.
-
-Crucially, **the parent of an admitted commit is, by construction, the current
-head** (`parent === cb.parentSeq`, and the final CAS asserts `parent ===
-head.sequence`). `seq:<parent>` is therefore always present (the head is never
-pruned) and immutable (a `seq:<n>` key is written once, when sequence n
-publishes). The parent refset is available with zero R2 dependence beyond the
-parent sidecar object it already references.
+The DO stores every commit body verbatim at `seq:<n>` and exposes `refSetAt(seq)`
+(`workspace-sync.ts:597–609`). The roots-index folder (`foldSequence`, `:535–595`)
+already computes a parent→child ref delta lazily in the alarm via `diffChunk`
+(`:986–994`). Crucially, **the parent of an admitted commit is, by construction,
+the current head** (`parent === cb.parentSeq`, and the final CAS re-asserts
+`parent === head.sequence`). `seq:<parent>` is therefore always present (the head
+is never pruned; prune only drops `seq ≤ floor < head`) and **immutable** (a
+`seq:<n>` key is written once, at publish). The parent refset is available with
+one R2 GET of the parent's sidecar object.
 
 ---
 
@@ -118,336 +108,420 @@ parent sidecar object it already references.
 
 ### 3.1 Shape
 
-Replace step 3–4's "build the full child SHA set and validate all of it" with a
-server-computed delta:
+Replace steps 3–4's "build the full child SHA set and validate all of it" with a
+server-computed delta. `admitSet` is a **SHA list** fed to the **unchanged**
+`validateCommitRefs`/`commitAccounting` — no sizes flow through the diff:
 
 ```
-parentRefs  ← parseRefset( parent sidecar or inline )   // sorted, with sizes
-childRefs   ← sc.refShas (already sorted, with sizes)    // from resolveSidecarBytes
-delta       ← mergeDiff(parentRefs, childRefs)           // O(N) two-pointer, no Sets
-fenceSet    ← activeFenceShasForCommit(accountId)        // small; often empty
-admitSet    ← [encManifestSha, sidecarSha]               // carriers, always
-            ∪ delta.added                                 // child-only refs
-            ∪ { c ∈ delta.carried : c ∈ fenceSet }        // carried-needing-regrant
-validate+account(admitSet)                                // today's functions, tiny input
-// removed refs: nothing at commit time (unchanged — Phase-1 reclaims on unreachability)
+parentBytes ← R2 GET + strict parse of parent sidecar (or inline refs)   // sorted 40B records
+childBytes  ← sc.refShas bytes (already fetched+parsed by resolveSidecarBytes)
+added[]     ← mergeAddedShas(parentBytes, childBytes)   // child-only SHAs, streaming over buffers
+fence∩carr  ← fenceProbe(accountId) intersect carried   // MUST be empty (invariant §3.3); else fallback
+admitSet    ← [encManifestSha, sidecarSha, ...added]     // SHA list, no sizes
+validateCommitRefs(admitSet, receipts) → newRefs         // sizes from verifyReceipt, UNCHANGED
+commitAccounting(newRefs)                                // UNCHANGED
+// removed/carried refs: zero D1 work (unchanged — Phase-1 reclaims on unreachability)
 ```
 
-`validate+account` is the **existing** `validateCommitRefs` + `commitAccounting`,
-called with a set proportional to the change instead of the workspace. Their
-internal semantics — batched candidacy-aware `SELECT`, `NOT EXISTS` charge,
-`ON CONFLICT` grant, cap guard, fence triggers, receipt verify — are **untouched**.
+`validateCommitRefs`/`commitAccounting` are byte-for-byte the existing functions.
+The **only** change is that `admitSet` is proportional to the change instead of
+the workspace. §4.1 proves the resulting `newRefs` is **identical** to today's.
 
-For a zero-file commit the refset is byte-identical to the parent's, so
-`sidecarSha` is **carried** (same bytes → same sha, already entitled+present) and
-`delta.added` is empty; `encManifestSha` is new (a fresh manifest snapshot each
-commit) → one added carrier. `admitSet` ≈ 2 refs → a handful of D1 statements.
-That is the ≤200ms target.
+For a zero-file commit: `sidecarSha` is byte-identical to the parent's (same
+refset → same bytes → same sha), so it is already entitled+present → lands in
+`have` → charged 0; `encManifestSha` is new → one added carrier; `added` is empty.
+`admitSet` = 2 SHAs → a handful of D1 statements → the ≤200ms accounting target.
 
-### 3.2 Delta computation — bounded, streaming
+### 3.2 Delta computation — streaming over byte buffers (bounded heap)
 
-`mergeDiff` is a two-pointer merge over two **sorted** `Ref[]` arrays
-(`parseRefset` guarantees ascending-by-raw-sha, deduped — `refset.ts:96`):
+The diff runs as a **two-pointer merge over the two sidecar byte buffers**, never
+materializing `Ref[]` arrays or `Set`s. A sidecar is `18 + 40·count` bytes; record
+`k` is at offset `18 + 40k`, its 32 raw sha bytes at `[18+40k, 18+40k+32)`, and the
+records are **strictly ascending by raw sha** (guaranteed by `parseRefset`, which
+already ran in step 2 for the child and runs once for the parent). We compare
+32-byte slices directly:
 
 ```
 i=j=0
-while i<P and j<C:
-  if P[i].sha == C[j].sha:  carried++;      i++; j++   // (optionally probe fenceSet)
-  elif P[i].sha <  C[j].sha: removed++;      i++          // parent-only
-  else:                      added.push(C[j]); j++        // child-only (carries size)
-drain P → removed;  drain C → added
+while i<P.count and j<C.count:
+  cmp = compare32(parentBytes, 18+40i, childBytes, 18+40j)
+  if cmp == 0: carried++; (probe fence); i++; j++
+  elif cmp < 0: removed++; i++                       // parent-only
+  else: added.push(hex(childBytes, 18+40j)); j++     // child-only
+drain P → removed++;  drain C → added.push(...)
 ```
 
-- **No 112k-entry `Set`s.** Peak added memory is the parent `Ref[]` (~112k ×
-  ~48B ≈ 5.4MB) plus the child array `resolveSidecarBytes` already holds. Worst
-  case at the `MAX_REFS_PER_COMMIT` (250k) cap: two arrays ≈ 24MB, well under the
-  128MB isolate budget. The child count is already capped before the R2 GET
-  (`workspace-sync.ts:376–380`); the parent count is capped identically at parse.
-- **`added` carries R2-measured `size`** (from the strictly-validated child
-  refset) so quota is priced by the server, never by the client.
-- **Only `added` and `carried∩fence` cross into D1.** `removed` and
-  `carried∖fence` cost zero D1 statements. Admission D1 work is
-  O(added + fenceSet), not O(workspace).
+- **Heap:** the two byte buffers only. Child buffer already held by
+  `resolveSidecarBytes`. Parent buffer = `18 + 40·count` (≈4.5MB at 112k, ≤10MB at
+  the 250k cap). The single materialized product is the `added` **SHA list**, which
+  for an O(change) commit is tiny and is bounded by `MAX_REFS_PER_COMMIT` (a large
+  legitimate change is the same bound today's full path already handles). **No
+  112k/250k `Set`.** This also removes the commit-vs-alarm-fold combined-peak
+  concern (item 11): the merge holds ~one extra 10MB buffer, not two large sets.
+  The peak-heap rig gate (§7) measures this at 250k disjoint under a concurrent
+  alarm fold.
+- **Sizes never touch the diff.** `mergeAddedShas` reads only the 32 sha bytes of
+  each record; the 8-byte size field is ignored. Chargeable sizes for `added` refs
+  come exclusively from `verifyReceipt` inside `validateCommitRefs` (§4.1).
+- **D1 work is O(added), not O(workspace).** `removed` and `carried` cost zero D1
+  statements.
 
-### 3.3 The fence set — carried-ref regrant, defined precisely
+### 3.3 Carried-ref safety — the D1 invariant, not a snapshot
 
-**The subtlest requirement.** Today's full `validateCommitRefs` provides
-carried-ref fence-regrant as a side effect: it re-checks *every* child ref
-against the two `NOT EXISTS` barriers, so a **carried** ref under an active
-barrier is pulled into `newRefs` and regranted (clearing the marker) or fenced
-(422). If the delta path validated only `added` refs it would **skip carried
-refs entirely** — and a carried ref that a concurrent GC has marked or condemned
-would slip past, publishing a head that references a blob Phase-1 is about to
-drop or Phase-2 is about to delete. **That is data loss / a dangling ref.** It
-must not happen.
+**Round 1's central finding.** A carried ref (in both parent and child) is **not**
+sent to `validateCommitRefs`/`commitAccounting`, so it does not pass through the
+candidacy-fold or the `rbox_delete_fence` trigger. If a carried ref could fall
+under an active deletion intent between admission and publication, its blob could
+be physically deleted while the new head references it — data loss. The safety
+argument must therefore be a **D1-serialized invariant**, not a
+read-then-hope snapshot. It is:
 
-The barrier predicates are exactly two, and both populations are **small tables
-independent of workspace size**:
+> **Carried-ref invariant.** A ref carried by an admitted commit holds a live
+> `blob_refs(account_id, sha)` row for this account continuously across admission
+> and publication, and therefore (a) **no active deletion intent can exist or be
+> created against it**, and (b) **it can never be Phase-1-purged**.
 
-- `blob_ref_candidates WHERE account_id = ?` — this account's Phase-1 prune
-  markers (`gc-phase1.ts:47–78`; PK `(account_id, sha256)` → prefix scan).
-- `gc_candidates WHERE deleting_at IS NOT NULL` — active deletion intents
-  (`versions.ts:openIntents`; indexed by `idx_gc_candidates_execute` on
-  `(deleting_at, sha256)`). encShas are account-unique
-  (`gc-phase1.ts:151–153`), so a global active intent on a carried ref of this
-  account belongs to this account.
+Proof, from the GC code:
 
-`activeFenceShasForCommit(accountId)` loads both into one `Set<string>` (capped
-at `FENCE_SET_MAX`, below), then `mergeDiff` tests each **carried** ref for
-membership; matches join `admitSet`. This reproduces today's newRefs set on
-carried refs **exactly** — the same two predicates over the same two
-populations, intersected with the same carried refs. `added` refs, which always
-go through `validateCommitRefs`, get identical fence treatment to today (the
-folded `NOT EXISTS` still runs on them). The carriers (`encManifestSha`,
-`sidecarSha`) always go through `validateCommitRefs` too, so they are
-fence-checked identically to today.
+- **(a) Intent creation is D1-blocked by the live ref.** The only site that sets
+  `deleting_at` (opens an intent) is `openIntents`
+  (`versions.ts:431`): `UPDATE gc_candidates SET deleting_at=? WHERE sha256=? AND
+  deleting_at IS NULL AND NOT EXISTS (SELECT 1 FROM blob_refs WHERE sha256=?)`. The
+  `NOT EXISTS blob_refs` guard means an intent **cannot** be opened against any sha
+  that has *any* `blob_refs` row. A carried ref has this account's row (granted
+  when the parent — or an earlier commit — admitted it, and never dropped, by (b)).
+  So the `rbox_delete_fence` trigger's precondition (an active intent) **never
+  arises** for a carried ref. This is the D1-level serialization: the persistence
+  of the carried ref's `blob_refs` row *is* the barrier. No fence snapshot is
+  relied upon.
+- **(b) Phase-1 never drops a carried ref's row.** `phase1Purge` drops a
+  `blob_refs` row only for a candidate that is **still unreachable** at a
+  freshly-recomputed reachability (`gc-phase1.ts:104–149`); a reachable candidate
+  is **resurrected** (unmarked), not dropped (`:114–118`). Reachability
+  (`reachableFromWorkspaces`) reads the DO `/roots` **including the live gap
+  `seq:synced+1..head`** and **fails closed** (throws, aborting the account's GC)
+  on any unreadable page. A carried ref is in the parent = the current head ⟹ in
+  `ROOTS(head)` ⟹ reachable ⟹ resurrected, never dropped. Equivalently, the global
+  `gcMark` (`versions.ts:219–221`) and `phase1Mark` (`gc-phase1.ts:59–63`) both
+  filter out reachable shas, so a head-reachable ref is **never even marked**.
+- **Induction closes the "was it clean at parent-publish?" gap.** When a ref first
+  enters the workspace it is an *added* ref of some commit, admitted through the
+  full validate/account path (or this design's `added` path — identical, §4.1),
+  which clears any marker and is fenced. Thereafter, while it stays reachable, (a)
+  and (b) keep it clean. A ref that is dropped by an intermediate commit and later
+  re-added is *added* again (not carried) relative to that re-adding commit's
+  parent, so it re-runs full validation. Hence every carried ref of every admitted
+  commit satisfies the invariant.
 
-**Why a healthy commit's fence set is ~empty** (the inductive backbone): a ref
-is `blob_ref_candidate`-marked or `gc_candidate`-intented only when it is
-**unreachable from the DO's authoritative roots** (`gc-phase1.ts:47–63`,
-`versions.ts:reachableFromWorkspaces` reads the live gap `seq:synced+1..head`, so
-the reachable set always includes the current head's refs and GC **never** marks
-a ref reachable from head). A carried ref is in the parent = the current head =
-reachable, so a correctly-behaving GC never marks it. Inductively: every
-published commit already clears the markers/fences on its own `added` and
-`carried∩fence` refs (a commit that couldn't clear a fence gets a 422 and never
-publishes), so when the parent is head all its refs are present and unmarked; a
-child's carried refs ⊆ the parent's refs are therefore clean at parent-publish
-time. The only way a carried ref is fenced at admission is a **concurrent** GC
-marking in the narrow window since the parent published — precisely the case the
-live fence-set probe catches. **Invariant preserved: `carried ⟹ (present ∧
-unmarked) ∨ (in fenceSet)`.** The fallback (§3.5) closes the residual: any
-carried ref that is somehow neither present nor fenced is caught by
-fail-closed full validation.
+**The fence probe is a fail-closed bug-detector, not the barrier.**
+`fenceProbe(accountId)` still reads the two small fence tables
+(`blob_ref_candidates WHERE account_id=?`; `gc_candidates WHERE deleting_at IS NOT
+NULL`, capped at `FENCE_SET_MAX`) and intersects with the carried stream. By the
+invariant this intersection is **provably empty**. So we assert it: a **nonempty**
+`fence ∩ carried` means the invariant was violated (a GC bug, or an unmodeled
+state) → the commit **falls back to full validation** (which handles it correctly
+via the candidacy-fold + fence trigger) **and emits a high-severity alert**. This
+converts round 1's "TOCTOU dependence" into a monitor that fails safe: the barrier
+is the `blob_refs` invariant; the probe only catches its violation. The
+deterministic race rig (§7 gate R) exercises fence-snapshot → intent-create →
+publish → physical-delete interleavings and asserts no carried root is ever
+deleted and no such interleaving even reaches intent-creation.
 
-### 3.4 Never trust a client additions list
+### 3.4 Trust model — authoritative parent, fully-validated additions
 
-The delta is derived **server-side** from (a) the authoritative, immutable
-`seq:<parent>` body and (b) the strictly-validated child sidecar (hash-,
-encoding-, size-, `totalBytes`-checked). The client supplies neither the parent
-refset (read from DO storage) nor an additions list. A client cannot:
+Round 1 correctly noted that hash-verifying the child sidecar proves *bytes match
+`sidecarSha`*, not that the bytes are "server-authored." Restated precisely:
 
-- make a ref "carried" that is not in the parent (the parent bytes are the
-  server's, immutable);
-- hide an added ref (any child ref absent from the parent **is** added and **is**
-  charged);
-- forge or replay a refset (the child sidecar's `sidecarSha` is hash-verified
-  against its bytes and the signed descriptor; a replayed old sidecar simply
-  yields its own honest delta against the parent).
+- The **parent** refset is server-authoritative (immutable DO `seq:<parent>`).
+- The **child** refset is client-chosen. A client may author any canonical sorted
+  refset, or replay an old sidecar. That is fine, because:
+  - every **added** ref (child ∖ parent) is independently admitted by the unchanged
+    `validateCommitRefs` — receipt-verified or already entitled+present — so the
+    client gains nothing by listing a ref it cannot prove;
+  - every **carried** ref is safe by the §3.3 invariant regardless of the child
+    bytes;
+  - **removed** refs (parent ∖ child) grant no authority (they are simply not in
+    the new head).
+- No **additions list** is ever taken from the client; `added` is derived
+  server-side by diffing the authoritative parent against the strictly-validated
+  child. Under-charging by delta manipulation is impossible: any ref the client
+  puts in the child that is not in the parent **is** added and **is** charged.
 
-Under-charging via delta manipulation is therefore impossible: the added set is a
-pure function of two server-authoritative inputs.
+Adversarial tests (§7): replay of a prior sidecar; omission of a ref present in the
+signed body's descriptor (blocked by `resolveSidecarBytes` count/`totalBytes`
+gate); substitution of one ref for another (each substitute is `added` → charged);
+duplicate carriers or data refs (rejected by `parseRefset` dedup and the carrier
+de-dup); a sidecar descriptor reused across two commits or across an epoch
+boundary (epoch fallback, §3.5).
 
-### 3.5 Fallback — fail CLOSED to full validation
+### 3.5 Fallback — fail CLOSED, and distinguish corruption from a miss
 
 The delta path is an **optimization layered over** today's full validation, which
-remains present and is the correctness backstop. Fall back to the full
-`validateCommitRefs` over the entire child set (chunked exactly as today) on
-**any** of:
+stays present as the correctness backstop. Two fallback classes:
 
-1. **First commit / genesis** (`parent === 0`): `refSetAt(0)` is the empty set;
-   the whole child is "added" — run full validation (identical result, no delta
-   benefit).
-2. **Parent refset unavailable**: `seq:<parent>` missing, or its body/sidecar
-   fails to parse/verify (missing R2 object, hash/encoding/size mismatch).
-3. **Epoch rotation**: the parent commit's `accountEpoch` ≠ the child's
-   `commitEpoch`. Across a rotation nearly every ref is re-encrypted (new
-   encShas) → an all-added delta with no benefit; the full path is the proven
-   behavior and this keeps responses identical.
-4. **Fence set too large**: `activeFenceShasForCommit` exceeds `FENCE_SET_MAX`
-   (a mass GC sweep) — cheaper and safer to full-validate than to hold a huge
-   fence set.
-5. **Refset too large to diff**: parent or child count exceeds `FOLD_MAX_REFS`
-   (250k, the roots-index fold cap) — bounds Worker CPU/heap.
-6. **Any delta-integrity doubt**: parent/child not both strictly sorted (a codec
-   invariant violation), or any internal assertion in `mergeDiff` trips.
+**(A) Benign optimization-fallback** — run full `validateCommitRefs` over the whole
+child set (chunked, exactly as today), identical response, on:
 
-Fallback is **never fail-open**: an unreadable parent produces *more* validation,
-not less. When enforced, fallback is silent-correct (identical response);
-counters record its frequency so an unexpectedly high fallback rate is visible.
+1. **First commit / genesis** (`parent === 0`): the whole child is "added"; no
+   delta benefit.
+2. **Epoch rotation**: parent commit's `accountEpoch` ≠ child's `commitEpoch` —
+   nearly all refs re-encrypt to new addresses (all-added), no benefit, and the
+   full path is the proven behavior.
+3. **Refset too large to diff**: parent or child `count > FOLD_MAX_REFS` (250k) —
+   bounds Worker CPU/heap.
+4. **Fence probe over cap**: `fenceProbe` would exceed `FENCE_SET_MAX` (a mass GC
+   sweep) — full-validate rather than hold a large set.
 
-### 3.6 Bounded 422 recovery
+**(B) Authoritative-history corruption** — `seq:<parent>` missing, or its
+body/sidecar fails to parse/verify (missing R2 object, hash/encoding/size/`total
+Bytes` mismatch), or a **nonempty `fence ∩ carried`** (§3.3). This is **not** an
+ordinary miss: an unreadable retained head means design-96 folding will 503 and GC
+is already disabled for the workspace (both fail closed). Handling:
 
-The delta path returns the **same** 422 `unsatisfiedBlobsBody(needsUpload)` the
-full path returns, because it calls the same `validateCommitRefs`/
-`commitAccounting` and surfaces the same `needsUpload`/fence-abort/over-cap
-results — just over `admitSet`. A carried ref that turns out fenced yields its
-sha in `needsUpload` → the client re-PUTs the bytes (the fresh PUT un-condemns
-via the accounting path) and retries, exactly as today. The 422 recovery loop is
-byte-identical; only the set of shas that can appear in it is (correctly) the
-change plus any concurrently-fenced carried refs.
+- **Do not fail open.** Fall back to full child validation so blob admission stays
+  correct (the new commit either succeeds against present blobs or 422s on genuine
+  misses).
+- **Do not silently succeed as if healthy.** Emit a **distinct high-severity**
+  metric (`commit.delta.parent_unreadable` / `commit.delta.fence_violation`) that
+  **pages**, mirroring design 84 §3.6's "fail loud, then repair" posture. GC/prune
+  remaining disabled on that workspace is the correct, already-fail-closed
+  consequence; the alert drives repair, not a wedge.
+- **Never fail open under any fallback:** an unreadable parent yields *more*
+  validation, never a skipped check.
 
-### 3.7 Placement and the CAS
+### 3.6 Placement and the CAS
 
 The delta admission slots in exactly where steps 3–5 are today
-(`workspace-sync.ts:392–420`), between `resolveSidecarBytes` and the final CAS.
-The final atomic parent/epoch CAS (`:443–471`) is **unchanged, byte-for-byte**.
-TOCTOU safety: the delta is computed against the immutable `seq:<parent>`; if a
-concurrent commit advances the head during our (awaited) delta/accounting work,
-the final CAS observes `parent !== head.sequence` and returns 409 — the
-accounting we did is already durable and benign (refs entitled+present; a retry
+(`workspace-sync.ts:392–420`), between `resolveSidecarBytes` and the final CAS,
+which is **unchanged, byte-for-byte** (`:443–471`). TOCTOU: the delta is computed
+against the immutable `seq:<parent>`; if a concurrent commit advances the head
+during our awaited work, the CAS observes `parent !== head.sequence` → 409 — the
+accounting already done is durable and benign (refs entitled+present; a retry
 charges 0), identical to today's account-then-publish semantics.
 
 If design 103's early parent/epoch preflight ships, it runs **before** this
-admission (a cheap head read short-circuits known-stale commits to 409/422 before
-any delta work). On the clean path 103 changes nothing and the delta runs; on the
-stale path the delta never runs. They compose without overlap (§9).
+admission (§9).
 
 ---
 
 ## 4. Correctness requirements (the audit's nine)
 
-Each subsection states the invariant and why the delta path preserves it.
+### 4.1 Server-priced quota — `newRefs` identity proof
 
-### 4.1 Server-priced quota
+**Sizes come from receipts, never the sidecar.** `admitSet` is a SHA list; the
+unchanged `validateCommitRefs` sources each added ref's chargeable size from
+`verifyReceipt` (`commit-accounting.ts:104–106`). The sidecar `size` field is
+advisory (`sidecar.ts:106–109`, "never bill") and is never read by the diff.
 
-`added` refs carry `size` from the **strictly-validated child sidecar**
-(R2-measured, `refset.ts` safe-integer bound), never a client number.
-`commitAccounting` charges via `NOT EXISTS blob_refs`. **Equivalence proof:** for
-any carried, already-entitled ref, today's `commitAccounting` charges exactly 0
-(the `NOT EXISTS blob_refs` sub-select in the `used_bytes` UPDATE yields 0) and
-re-grants a no-op (bumps `granted_at` only, which is *explicitly not* a
-correctness barrier — `blob_ref_candidates` is; `gc-phase1.ts:8–10`,
-`commit-accounting.ts:178–182`). Omitting carried non-fenced refs from accounting
-therefore changes `used_bytes` by **0** and changes durable state only by *not*
-bumping `granted_at` on unchanged refs. The resulting `used_bytes` is
-byte-identical to today's.
+**Identity of the accounting input.** Let `have_full` be the set
+`validateCommitRefs` computes over the full child set: refs that are entitled AND
+present=1 AND not `blob_ref_candidate`-marked AND not under an active intent.
+Today's `newRefs_full` = (fullChildSet ∪ carriers) ∖ `have_full`. The delta path
+runs `validateCommitRefs(admitSet)` where `admitSet` = carriers ∪ `added`, giving
+`newRefs_delta` = admitSet ∖ `have`. Every child ref **omitted** from `admitSet` is
+a **carried, non-fenced** ref, which by §3.3 is entitled + present + unmarked +
+unintented ⟹ ∈ `have_full` ⟹ ∉ `newRefs_full`. Therefore **`newRefs_delta` ===
+`newRefs_full`** — the same SHAs, and (because both iterate the canonically-sorted
+child refs and prepend the same carriers) in the same order. `commitAccounting`
+receives an identical list → identical `used_bytes`, identical charge. For any
+carried non-fenced ref, today already charges 0 (`NOT EXISTS blob_refs` yields 0)
+and only bumps `granted_at` (explicitly **not** a barrier — `gc-phase1.ts:8–10`);
+omitting it changes durable state by nothing but that un-bumped timestamp.
 
 ### 4.2 Idempotent receipt redemption
 
-Receipts are verified only for refs in `admitSet` that are not entitled+present
-(inside `validateCommitRefs`), unchanged. Re-running an admitted commit charges 0
-/ grants no-ops (NOT-EXISTS / ON CONFLICT), unchanged. The standalone
-`redeemReceipts` path (`workspace-sync.ts:625–685`) is not touched. Fewer refs
-are presented to receipt verification, never more; a receipt for a carried
-non-fenced ref is simply never needed (that ref is already entitled).
+Receipts are verified only for `admitSet` refs not in `have`, unchanged. Re-running
+charges 0 / grants no-ops. The standalone `redeemReceipts` path
+(`workspace-sync.ts:625–685`) is untouched. Fewer refs reach receipt verification,
+never more; a carried non-fenced ref never needs a receipt (it is already
+entitled).
 
 ### 4.3 Account entitlement
 
-The have-set / grant machinery is unchanged. Carried non-fenced refs are already
-entitled (the parent published them); skipping their re-grant does not revoke
-entitlement (grants are not TTL'd; only Phase-1 purge drops a `blob_refs` row,
-and it never drops a ref reachable from head — §3.3). Carried fenced refs and
-added refs are (re-)granted through the unchanged path.
+Unchanged grant machinery. Carried non-fenced refs are already entitled and, by
+§3.3(b), keep their `blob_refs` row; skipping their re-grant revokes nothing.
 
 ### 4.4 `blob_ref_candidates` regrant
 
-A carried ref under this account's Phase-1 marker is in `fenceSet` → in
-`admitSet` → `commitAccounting` clears its `blob_ref_candidates` row atomically
-with the (re-)grant (`commit-accounting.ts:182`), identical to today. Added refs
-that happen to be marked are handled by the same folded `NOT EXISTS` inside
-`validateCommitRefs`. The marker barrier is thus never bypassed by the delta.
+By §3.3, a carried ref is never marked (head-reachable ⟹ `phase1Mark` skips it),
+so `fence ∩ carried = ∅`. **Added** refs that happen to be marked are handled by
+the unchanged folded `NOT EXISTS` inside `validateCommitRefs` → forced into
+`newRefs` → `commitAccounting` clears the marker (`commit-accounting.ts:182`),
+identical to today. A nonempty `fence ∩ carried` is an invariant violation →
+fallback + page (§3.5B). The marker barrier is never silently bypassed.
 
 ### 4.5 Active `gc_candidates` deletion fences (RAISE-ABORT)
 
-A carried ref under an active intent is in `fenceSet` → in `admitSet` → its
-`blob_refs`/`blobs` (re-)insert in `commitAccounting` hits the migration-0024
-`rbox_delete_fence` trigger and `RAISE(ABORT,'rbox_delete_fence')`, aborting the
-super-batch → `{ needsUpload }` → 422, exactly as today. The delta path can never
-publish a head referencing a sha with an open delete intent, because every such
-carried ref is forced through the fenced accounting batch.
+By §3.3(a) an active intent cannot exist against a carried ref (the `NOT EXISTS
+blob_refs` guard on intent-open). **Added** refs traverse `commitAccounting`'s
+fenced `blob_refs`/`blobs` inserts unchanged → `RAISE(ABORT,'rbox_delete_fence')`
+→ caught super-batch → 422, exactly as today. No published head can reference a sha
+with an open delete intent.
 
 ### 4.6 Retained history roots
 
 The complete child sidecar remains the retained root: `resolveSidecarBytes` still
-GETs and strictly validates the **full** child sidecar (needed both to diff and
-to keep the head's sidecar durable), and the final CAS still persists the full
-`SignedCommit` body verbatim at `seq:<next>` **unchanged**. The delta path
-removes O(N) *D1* work; it removes **no** stored state and shortens **no** retained
-representation.
+GETs and strictly validates the **full** child sidecar (needed to diff and to keep
+the head's sidecar durable), and the CAS still persists the full `SignedCommit`
+verbatim at `seq:<next>` **unchanged**. The delta removes O(N) *D1* work; it
+removes **no** stored state and shortens **no** retained representation.
 
-### 4.7 Design-96 root-index invariants (delta feeds the index)
+### 4.7 Design-96 root-index invariants
 
-The roots index (`dropped_index`, `seq_roots`) is maintained by the crash-safe,
-cursored alarm folder (`foldSequence`) and is **not moved onto the commit hot
-path** — doing so would risk divergence and add work to the pole we are
-shrinking. The index stays correct because commit still stores the full child
-body verbatim at `seq:<next>` (the folder's only input) unchanged. The admission
-delta and the fold delta are computed from the *same* immutable `seq:<n>` bodies
-through the *same* `refset.ts` codec and the *same* two-pointer semantics, so
-they are **equal by construction** — the audit's "feed the same delta into the
-root index" is satisfied as an equality-of-derivation, not a second writer.
-(Optionally priming `foldPrevCache` with the just-computed child refset is a
-pure-performance follow-on, out of scope — §8.)
+**This design does not feed the index, and does not need to.** The index
+(`dropped_index`, `seq_roots`) is maintained solely by the crash-safe cursored
+alarm folder (`foldSequence`), whose only input — the full child body at
+`seq:<next>` — this design stores **unchanged**. Every design-96 invariant (I1
+fail-closed, I2 exact union, I3 hot-path-preserved) is therefore untouched. Round
+1 rightly rejected "equality-of-derivation" as an operational guarantee: the folder
+independently re-reads R2, re-parses, and cursors partial updates, so it can
+diverge *operationally* even where the ideal deltas match. We therefore make no
+correctness claim that this path feeds the index. Two concrete, non-load-bearing
+additions:
 
-### 4.8 Bounded 422 recovery — see §3.6
+- **Divergence monitor:** compare the admission delta's `added/removed/carried`
+  counts against the folder's eventual `dropped_index` deltas for the same
+  sequence; a mismatch increments `commit.delta.index_divergence` for
+  investigation (it is not a gate on admission).
+- **Follow-on (out of scope, §8):** priming `foldPrevCache` with the just-parsed
+  child refset, or persisting a canonical delta digest the folder verifies, is a
+  pure-performance optimization to be designed separately with its own proof.
 
-Parent-refset-missing/corrupt is a **fallback trigger** (§3.5 item 2), not a 422:
-the commit still admits via full chunked validation and either succeeds or 422s
-on genuinely-missing blobs. Fail-closed: an unreadable parent yields more
-validation, never a skipped check.
+### 4.8 Bounded 422 recovery
+
+Parent-refset-missing/corrupt is a **fallback trigger** (§3.5B), not a 422: the
+commit admits via full chunked validation and either succeeds or 422s on genuine
+misses. `needsUpload` responses are identical (§4.10). Fail-closed: an unreadable
+parent yields more validation, never a skipped check.
 
 ### 4.9 Final atomic parent/epoch CAS — unchanged
 
-`workspace-sync.ts:443–471` is byte-for-byte unchanged: same head re-read, same
-`parent === head.sequence` / `commitEpoch === currentEpoch` / `commitSeq ===
-watermark + 1` assertions, same equivocation detection, same head/watermark/seq
-persistence, same `index_state → lagging`. The 409/422/epoch responses are
-byte-identical.
+`workspace-sync.ts:443–471` is byte-for-byte unchanged. The 409/epoch_stale/
+conflict responses are byte-identical.
+
+### 4.10 Response equivalence — precisely scoped
+
+Because `newRefs_delta === newRefs_full` as an ordered list (§4.1),
+`commitAccounting` runs on identical input → identical super-batch membership →
+identical `rbox_delete_fence` `needsUpload` and identical `accounts_cap_guard`
+over-cap `{used,cap}`. Therefore:
+
+- **409 conflict / epoch_stale** — byte-identical (unchanged CAS).
+- **402 over-cap** — byte-identical `{used,cap,reason}` (identical charge, identical
+  batching).
+- **422 needsUpload** — the same set of SHAs; identical array under the natural
+  construction (both prepend the same carriers to the sorted added refs), asserted
+  by a response-golden test. Where a test requires exact array equality, the
+  `admitSet` ordering is fixed to match the full path's `[encManifestSha,
+  sidecarSha, ...sorted refShas]` filtered to non-`have`.
+
+The **only** conceivable `newRefs` divergence is a *carried* ref that is
+unexpectedly not-present-or-not-entitled — precluded by §3.3(b), detected by shadow
+mode (§6), and caught by fallback (§3.5B). We claim scoped **semantic
+equivalence** (identical outcome class + identical `{used,cap}` + set-equal
+`needsUpload`), and byte-identical 409/epoch/402, rather than a blanket
+"byte-identical everything."
 
 ---
 
 ## 5. Phase 0 — measurement (privacy-hard)
 
-`serverTimings.accountingMs` already renders live. Add counters (SHA/count only —
-**HARD RULE: no raw file names or paths in any metric or log; SHAs are opaque
-hashes and are fine**):
+`serverTimings.accountingMs` already renders live. Add counters (**HARD RULE: no
+raw file names or paths in any metric or log; SHAs are opaque hashes and are
+fine**), and split the residual O(N) work (round 1 item 13):
 
-- `commit.delta.added`, `commit.delta.removed`, `commit.delta.carried` — delta
-  sizes.
-- `commit.delta.carried_fenced` — carried refs pulled in for regrant.
-- `commit.delta.admit_stmts` — D1 statements issued by admission (the falsifiable
+- Delta sizes: `commit.delta.added`, `.removed`, `.carried`, `.carried_fenced`.
+- D1: `commit.delta.admit_stmts` (statements issued by admission — the
   "proportional to delta" signal).
-- `commit.delta.fallback{reason}` — fallback frequency by trigger (§3.5).
-- `commit.delta.divergence` — shadow-mode disagreement count (§6).
-
-These attach to the existing `op.done`/metric event; no new PII surface. The
-existing `accountingMs` split lets Phase 0 confirm the D1 pole collapses before
-any behavior flips.
+- Per-phase timings: `parentFetchMs`, `parentParseMs`, `childParseMs` (folded into
+  existing `sidecarMs` today), `diffMs`, `fenceQueryMs`, and the D1 `admitAccount
+  Ms` — so the ≤200ms D1 gate is separable from the residual O(N) parse/fetch.
+- `commit.delta.fallback{reason}` — by trigger (§3.5); a bounded, low-cardinality
+  reason label.
+- High-severity: `commit.delta.parent_unreadable`, `commit.delta.fence_violation`
+  (page — §3.5B).
+- `commit.delta.divergence` (shadow, §6) and `commit.delta.index_divergence`
+  (§4.7) — **bounded payload** (item 9): counts + a stable digest (sha256 of the
+  sorted divergent SHAs) + ≤`DIVERGENCE_SAMPLE` (e.g. 16) sample SHAs. The same
+  bound caps any logged `needsUpload`.
 
 ---
 
-## 6. Shadow mode
+## 6. Shadow mode — one immutable pre-state, read-only comparison
 
-An intermediate flag state that computes the delta **without making it
-authoritative**:
+Round 1 item 8: the naive "admitSet vs newRefs" compare is ill-typed and mutating.
+Corrected protocol, run entirely from **one immutable pre-state** (no accounting
+executed during comparison):
 
-- Run today's **full** `validateCommitRefs` + `commitAccounting` as the real,
-  charging authority (behavior 100% unchanged).
-- **Separately** compute `admitSet` via the delta path as a **dry** derivation
-  (no accounting executed — avoids double-charge).
-- Compare the delta's would-charge/would-validate set against the full path's
-  `newRefs`, and compare the would-be outcome (ok / 422-needsUpload / 402-overCap
-  / fence-abort). Any symmetric-difference or outcome mismatch increments
-  `commit.delta.divergence` and logs `{ head seq, added/removed/carried counts,
-  divergent shas }` — SHAs only.
+1. Run the authoritative path once — but split `validateCommitRefs` (read-only)
+   from `commitAccounting` (mutating). Capture the full path's read-only products:
+   `have_full`, `unsatisfied_full` (needsUpload), and `newRefs_full` (receipt-valid
+   new refs, with sizes).
+2. Compute the delta path's read-only products from the **same** pre-state:
+   `admitSet`, then `validateCommitRefs(admitSet)` → `newRefs_delta`.
+3. **Compare:** `newRefs_delta` vs `newRefs_full` (SHA set + per-sha size), and
+   `unsatisfied_delta ⊆ unsatisfied_full` restricted to `admitSet`. Any mismatch
+   increments `commit.delta.divergence` with the bounded payload (§5).
+4. Only **after** comparison, execute accounting **once** (the authoritative full
+   result in shadow; the delta result in enforce) — so quota/entitlement mutate
+   exactly once, never twice.
 
-Shadow mode is safe by construction (the enforced result is the proven full
-path). The **divergence gate**: `commit.delta.divergence` must read **zero** over
-the soak window (§7) — across Workload A *and* real fleet traffic, including at
-least one commit that exercises each of a clean change, a carried-fence regrant, a
-quota-boundary charge, and a concurrent-GC window — before the flag flips to
-enforce.
+**Blind spots called out:** fence-abort and multi-super-batch over-cap outcomes
+are **not** observable read-only (they depend on executing the fenced/guarded
+batch). Their equivalence is proven **not** by shadow mode but by the deterministic
+injected-race rig and the property tests (§7 gates R, 5) — shadow mode explicitly
+does not claim to cover them. The **divergence gate**: `commit.delta.divergence`
+and `commit.delta.index_divergence` read **zero** over the §7 soak before the flag
+flips to enforce.
 
 ---
 
 ## 7. Falsifiable gates
 
-On the fixed ~112k-ref Workload A (audit §Workload A):
+Corpora: Workload A at **112k** and a **250k** worst-case (audit §Workload A),
+plus a delta-size matrix of `added ∈ {0, 1, 10, 100, 1k, 10k}`. Statistics: 10
+warm + 5 cold per cell; report p50/p95/p99 + raw counts (audit §Statistical
+discipline).
 
-1. **Clean one-file commit POST p50 ≤ 2s** (from ~8s — the headline audit gate).
-2. **`accountingMs` is O(added refs), not O(workspace).** A near-zero-change
-   commit's `accountingMs` ≤ 200ms.
-3. **D1 statements per commit proportional to delta size.**
-   `commit.delta.admit_stmts` scales with `added + carried_fenced + 2`, with **no
-   full-ref statement growth** as the workspace grows.
-4. **Zero divergence in shadow mode** over the soak (§6) — the flip precondition.
-5. **Identical behavior under the candidate / fence / quota race suites.** Rerun
-   the design-95/96 fence and race rigs, the quota/over-cap suite, and the
-   E2EE-determinism suite: pass unchanged.
-6. **409 / 422 / epoch responses byte-identical** between delta and full paths
-   (asserted directly by the shadow-mode outcome comparison and a response-golden
-   test).
+1. **Total commit POST p50 ≤ 2s** on Workload A one-file change (from ~8s). The
+   headline audit gate. Reported alongside the per-phase split so the residual O(N)
+   parse/fetch is visible, not hidden.
+2. **D1 accounting sub-phase O(added).** `admitAccountMs` ≤ **200ms** for `added ≤
+   1`; and across the matrix, a linear fit of `admitAccountMs` and
+   `commit.delta.admit_stmts` vs **workspace size** (at fixed `added`) has slope
+   **not distinguishable from zero** (95% CI includes 0). `admit_stmts` ≤
+   `5·ceil((added + 2)/33) + SELECTS_PER_BATCH·ceil((added+2)/90)` + a small
+   constant — i.e. no workspace term.
+3. **Total server admission** (`sidecarMs + diffMs + fenceQueryMs +
+   admitAccountMs`) at 112k and 250k is reported; its residual is attributed to
+   parse/fetch (the wire-delta follow-on's target), not D1.
+4. **Peak-heap rig gate.** At 250k disjoint parent/child, with max receipts,
+   fallback exercised, shadow comparison on, **and a concurrent alarm fold active in
+   the same isolate**, measured peak heap < a fixed budget (proposed **110 MiB**,
+   matching design 96 §4.2's rig) — else the paired-cap contingency (lower
+   `FOLD_MAX_REFS`/`MAX_REFS_PER_COMMIT`) applies.
+5. **Race suites pass unchanged.** The design-95/96 fence + race rigs, the
+   quota/over-cap suite, and the E2EE-determinism suite.
+6. **Response goldens.** 409 / epoch_stale / 402 byte-identical; 422 `needsUpload`
+   set-equal (array-equal under the fixed ordering) — delta vs full, asserted by
+   test.
+7. **Zero divergence** — `commit.delta.divergence` and `.index_divergence` = 0 over
+   the soak (§6), denominator ≥ **N_SOAK** commits (proposed 5,000 across dev+fleet)
+   and ≥ **T_SOAK** (proposed 72h), covering the delta-size matrix and ≥1 each of a
+   clean change, an added-ref-under-marker regrant, a quota-boundary charge, and a
+   concurrent-GC window.
+8. **Fallback ceilings.** In enforce, `commit.delta.fallback{reason≠first_commit,
+   epoch_rotation}` rate below a fixed ceiling (proposed 0.1%); any
+   `parent_unreadable`/`fence_violation` pages regardless of rate.
+9. **Gate R — deterministic race rig (round 1 item 15).** A single-isolate
+   interleaving harness over: parent read, fence snapshot, `phase1Mark`, P1
+   intent-open, P2 activity-unwind, P3 physical delete, delta accounting, final
+   CAS, index fold, prune. For **every** interleaving, assert: (i) intent-open
+   against a carried (live-`blob_refs`) sha is **rejected** by the `NOT EXISTS`
+   guard — it never reaches a physical delete; (ii) a published retained root is
+   present and entitled; (iii) incomplete roots disable GC (fail-closed); (iv)
+   `used_bytes` equals authoritative newly-entitled bytes; (v) the roots index
+   equals brute-force retained history.
 
 Any gate failing falsifies the design as scoped; none is a promise.
 
@@ -456,74 +530,65 @@ Any gate failing falsifies the design as scoped; none is a promise.
 ## 8. Out of scope
 
 - **Manifest snapshot compression / O(change) manifest deltas** — design 84
-  (C1/C2/D). This design shrinks server admission; design 84 shrinks client
-  bytes. Necessary-but-not-sufficient in both directions (audit Finding 4).
-- **A refset-delta wire representation** (client sends only the change; server
-  never parses two full sidecars) — the audit's "later refset delta
-  representation." This v1 still parses both complete sidecars (O(N) Worker CPU),
-  removing only the O(N) **D1** work, which is the measured ~6s pole. The
-  wire-delta is a follow-on that removes the residual parse/R2 cost.
-- **Client preflight + early stale/epoch rejection** — design 103 (sibling,
-  drafted in parallel). 103's preflight runs *before* this admission; on the
-  stale path the delta never runs, on the clean path 103 changes nothing. See §9.
-- **Moving the roots-index fold onto the commit hot path** — the delta feeds the
-  index by equality-of-derivation (§4.7); an explicit hot-path prime of
-  `foldPrevCache` is a pure-perf follow-on.
+  (C1/C2/D). Server admission vs client bytes; necessary-but-not-sufficient both
+  ways (audit Finding 4).
+- **Refset-delta wire representation** (client sends only the change; server never
+  parses two full sidecars) — the audit's "later refset delta representation." This
+  v1 still parses both complete sidecars (O(N) Worker CPU/R2), removing only the
+  O(N) **D1** work (the measured ~6s pole). The wire-delta removes the residual
+  parse/fetch measured by §7 gate 3.
+- **Client preflight + early stale/epoch rejection** — design 103 (sibling). §9.
+- **Feeding / priming the design-96 index from the admission delta** — a
+  performance follow-on (§4.7), not part of this design's correctness.
 
 ---
 
 ## 9. Composition with design 103
 
-Design 103 (early stale-parent / epoch rejection, audit Finding 2) adds a cheap
-head/epoch preflight after envelope parse and before the expensive admission
-work. Ordering when both ship:
-
 ```
 parse envelope
-  → [103] cheap preflight: read head; if parent≠head → 409, if epoch≠current → 409
-  → resolveSidecarBytes (child)          ← [102] begins here
+  → [103] cheap preflight: read head; parent≠head → 409, epoch≠current → 409
+  → resolveSidecarBytes (child)          ← [102] begins
   → delta admission (this design)
   → final atomic CAS (unchanged authority for both)
 ```
 
-103 is a fast-reject optimization; 102 is a fast-admit optimization. They touch
-disjoint code and share the unchanged CAS as the single source of authority. On a
-known-stale commit, 103 returns before 102 runs (102 does zero R2/D1 work). On a
-clean commit, 103 is a no-op and 102 does the O(change) admission. Neither
-weakens the other; the CAS remains the sole authority that can publish a head.
+103 is a fast-reject; 102 a fast-admit. They touch disjoint code and share the
+unchanged CAS as the single authority. On a known-stale commit 103 returns before
+102 does any R2/D1 work; on a clean commit 103 is a no-op and 102 runs. Neither
+weakens the other.
 
 ---
 
 ## 10. Rollout
 
-Flag-gated by a worker env var `RBOX_COMMIT_DELTA_ADMISSION ∈ {off, shadow,
-enforce}`, read per request. **No D1 migration** — pure code plus the env var, so
-the auto-apply-migrations Workers-Builds hook (`docs/DEPLOYMENTS.md`) is not
-engaged and the change is reversible by flipping the var.
+Flag-gated by worker env var `RBOX_COMMIT_DELTA_ADMISSION ∈ {off, shadow,
+enforce}`, read per request. **No D1 migration** — pure code + env var, so the
+auto-apply-migrations Workers-Builds hook (`docs/DEPLOYMENTS.md`) is not engaged
+and rollback is a var flip, not a redeploy.
 
-1. **Dev worker first** (`rbox-dev-api`, per the DEPLOYMENTS dev-first rule):
-   deploy with `off`, then `shadow`. Run Workload A + real dev-fleet traffic.
-2. **Soak in shadow** until the divergence gate (§6/§7.4) reads **zero** over the
-   window: a minimum commit count and wall-clock duration that exercises clean,
-   carried-fence, quota-boundary, and concurrent-GC cases with 0 divergence.
-3. **Flip dev to `enforce`**; confirm gates 1–3, 5, 6 on dev. Soak.
-4. **Prod**: merge to `main` (auto-deploys the worker) with the var **defaulting
-   `off`**; flip prod to `shadow` via the var, soak with the divergence gate on
-   prod traffic, then `enforce`. Because the flag is an env var, rollback at any
-   step is a var flip, not a redeploy. The full-validation path stays in the code
-   as the permanent fallback (§3.5) even after `enforce`.
+1. **Dev worker first** (`rbox-dev-api`, DEPLOYMENTS dev-first): deploy `off`, then
+   `shadow`. Run Workload A (112k + 250k), the delta-size matrix, and dev-fleet
+   traffic.
+2. **Soak in shadow** until §7 gate 7 (zero divergence) holds over `N_SOAK`/
+   `T_SOAK`.
+3. **Flip dev to `enforce`**; confirm §7 gates 1–6, 8, 9 on dev. Soak.
+4. **Prod**: merge to `main` (auto-deploys) with the var **defaulting `off`**; flip
+   prod `shadow`, soak with the divergence gate on prod traffic, then `enforce`.
+   The full-validation path stays in code as the permanent fallback (§3.5) after
+   `enforce`.
 
 ---
 
 ## 11. Open questions for the founder
 
-1. **Fence-set cap.** `FENCE_SET_MAX` bounds the active-intent set we will hold;
-   above it we full-validate. A value (e.g. 50k) trades a rare mass-GC commit's
-   speed for a hard memory bound. Acceptable, or prefer a paginated fence probe?
-2. **Soak thresholds.** What commit-count × duration (and which fleet hosts)
-   constitutes a sufficient zero-divergence window before each `shadow→enforce`
-   flip on dev and on prod?
-3. **Enforce-time fallback telemetry.** Should a nonzero
-   `commit.delta.fallback{reason≠first_commit}` rate in `enforce` page/alert (it
-   means parent-refset reads or epoch detection are misbehaving), or only
-   dashboard?
+1. **Soak thresholds.** §7 proposes `N_SOAK`=5,000 commits, `T_SOAK`=72h, fallback
+   ceiling 0.1%, heap budget 110 MiB. Confirm or set the enforcement criteria (they
+   are the flip preconditions).
+2. **Parent-unreadable posture.** §3.5B falls back + pages but still admits the new
+   commit atop an unreadable retained head (refusing would wedge the workspace,
+   GC/prune already fail-closed). Acceptable, or should a corrupt retained head
+   hard-reject new commits with a retryable integrity error until repaired?
+3. **`FENCE_SET_MAX` / `FOLD_MAX_REFS` interplay.** Fence-probe cap vs a paginated
+   probe; and whether the 250k `MAX_REFS_PER_COMMIT` cap should drop if the §7 gate
+   4 heap budget is not met.
