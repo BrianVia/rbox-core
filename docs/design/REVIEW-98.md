@@ -114,6 +114,31 @@ All 12 accepted. Dispositions:
     internals are a MEASURED high-water target (gate 4), not a claimed hard
     bound (§3.2).
 
-## Round 3
+## Round 3 — VERDICT: REVISE (4 items)
+
+All 4 accepted. Dispositions:
+
+1. **Server-satisfied ready blobs never hit `putFile` → temp/reservation leak**
+   — ACCEPTED: release rule generalized to "disposition settlement": a temp and
+   its disk charge are released when the blob's DISPOSITION settles — `putFile`
+   promise settlement, OR a server-satisfied rolling-check answer, OR
+   convergent-duplicate satisfaction (§3.2).
+2. **No explicit EOF/drain protocol for successful completion** — ACCEPTED:
+   defined — producers close the readiness stream after the last encrypt
+   settles; queue EOF propagates; the rolling checker flushes its final partial
+   batch on EOF (not timer-dependent); commit is reached only after the ordered
+   barrier: producers settled → queue drained → consumers settled → final
+   checker flush → `drainer.flush()` (§3.6).
+3. **Crypto cancellation interface unstated** — ACCEPTED: stated — the pool
+   provides NO cooperative cancellation and this design adds none; abort stops
+   NEW dispatch only, in-flight `CryptoPool.encrypt` jobs are AWAITED, and temp
+   unlink / `fs.rm(tmpDir)` runs only AFTER the producer-termination barrier
+   (all in-flight encrypts settled) so workers never write into deleted storage
+   (§3.5).
+4. **P0.2 `expected overlap` is a free parameter** — ACCEPTED: replaced with a
+   parameter-free optimistic upper bound (redemption assumed fully overlapped)
+   fixed before measurement (§5.2).
+
+## Round 4
 
 Status: pending

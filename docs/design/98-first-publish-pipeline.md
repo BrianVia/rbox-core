@@ -1,7 +1,7 @@
 # 98 — First-publish pipeline: overlap encrypt → upload → receipt redemption
 
-Status: Design draft v3 (v1 → round-1 REVISE, 20 items; v2 → round-2 REVISE,
-12 items; all accepted — see `REVIEW-98.md`). Owns audit Findings 6 (phase-serialized publish)
+Status: Design draft v4 (v1 → round-1 REVISE, 20 items; v2 → round-2 REVISE,
+12 items; v3 → round-3 REVISE, 4 items; all accepted — see `REVIEW-98.md`). Owns audit Findings 6 (phase-serialized publish)
 and 8 (receipt redemption after all uploads). Finding 9 (batch bearer-auth) is
 a **measurement-and-deferral record only** (§4), not a build in this design.
 Client-and-server-adjacent. Pending the Phase 0 measurements in §5 before the
@@ -190,7 +190,7 @@ producer-consumer graph under a shared abort scope:
                                      backlog-capped; owns needsUpload accumulator;
                                      redeems DURING upload)
                                             │
-   producers+consumers settle OR abort fires┘
+   EOF/drain barrier (§3.6) OR abort fires ┘
                                             ▼
                              drainer.flush() → { needsUpload } → commit residue loop
 ```
@@ -284,24 +284,33 @@ admitted one-at-a-time on the disk axis. Defaults are a calibration output
    race two files of the same `encSha` and both PUT — correct because PUT is
    content-addressed idempotent (the current serialized `poolMap` upload has the
    same race); the pipeline does not regress it.
-3. **Single-release temp lifetime: `putFile` settlement is the SOLE release
-   point (round-2 item 6, replacing v2's ref-count).** The pipeline cannot
-   observe the batch uploader's internal ownership transitions (batch-encode
-   read, fallback-single dispatch, duplicate-waiter service are asynchronous
-   and internal), so per-consumer ref-counting is impossible at the seam.
-   Instead: a temp is unlinked and its disk-axis charge released exactly when
-   the `api.putBlobFile(...)` promise for that temp SETTLES (resolve or
-   reject) — and the uploader's contract is strengthened to guarantee **no
-   read of the path after its `putFile` promise settles**, which the shipped
-   implementation already satisfies: every read (`encodeBatchBody`'s
-   `fs.readFile`, the single-PUT fallback stream) happens before the group's
-   waiters are resolved/rejected, and duplicate waiters never have their own
-   path read (only the FIRST waiter's path is read, `dispatchSingleGroup`,
-   `blob-batch.ts:771–786`) — a duplicate waiter therefore releases its temp on
-   its own settlement with no extra lease. A test pins the no-read-after-settle
-   contract. On rejection followed by retry, `uploadFileWithRetry` already
-   re-encrypts a fresh snapshot when `ctByEnc` has no temp for the address
-   (`:286–333`), so releasing on settlement cannot strand a retry.
+3. **Single-release temp lifetime: DISPOSITION settlement is the SOLE release
+   point (round-2 item 6, replacing v2's ref-count; extended round-3 item 1).**
+   The pipeline cannot observe the batch uploader's internal ownership
+   transitions (batch-encode read, fallback-single dispatch, duplicate-waiter
+   service are asynchronous and internal), so per-consumer ref-counting is
+   impossible at the seam. Instead, every ready blob has exactly one
+   DISPOSITION, and its temp is unlinked and its disk-axis charge released
+   exactly when that disposition settles:
+   - **uploaded** — the `api.putBlobFile(...)` promise for that temp settles
+     (resolve or reject);
+   - **server-satisfied skip** — the rolling check answers satisfied, so
+     `putFile` is never called: released when that check settles (round-3
+     item 1 — otherwise a freshly-encrypted-but-already-satisfied blob leaks
+     its temp and reservation until final cleanup, and can deadlock the queue);
+   - **convergent-duplicate skip** — another file with the same `encSha`
+     already settled: released immediately on dedup.
+   The uploader's contract is strengthened to guarantee **no read of the path
+   after its `putFile` promise settles**, which the shipped implementation
+   already satisfies: every read (`encodeBatchBody`'s `fs.readFile`, the
+   single-PUT fallback stream) happens before the group's waiters are
+   resolved/rejected, and duplicate waiters never have their own path read
+   (only the FIRST waiter's path is read, `dispatchSingleGroup`,
+   `blob-batch.ts:771–786`). A test pins the no-read-after-settle contract and
+   the two skip-path releases. On rejection followed by retry,
+   `uploadFileWithRetry` already re-encrypts a fresh snapshot when `ctByEnc`
+   has no temp for the address (`:286–333`), so releasing on settlement cannot
+   strand a retry.
 
 **Progress totals may grow** as ciphertext sizes become known; `UploadByteTracker`
 (`sync-recovery.ts:272`) already tolerates `reviseTotal` (`:337`).
@@ -423,12 +432,46 @@ SIGINT. On abort:
   the in-flight window at abort time, ≤ active batch slots + active single-lane
   slots (a fixed, config-derived number recorded in the metric). Gate 3b
   asserts on this counter, not on wall-clock inference.
+- **In-flight crypto jobs are AWAITED, never force-cancelled (round-3 item 3,
+  Tier-1 requirement).** `CryptoPool` provides no cooperative cancellation
+  (`crypto-pool.ts` has no abort surface on a dispatched `encrypt`) and this
+  design adds none: abort stops producers from DISPATCHING new encrypts, and
+  the abort path then awaits every already-dispatched encrypt's settlement —
+  the **producer-termination barrier**. Only after that barrier do temp unlink
+  and `fs.rm(tmpDir)` run, so a worker can never finish into deleted storage or
+  recreate a file after cleanup;
 - the drainer stops kicking; `flush()` re-throws the latched error;
-- temp cleanup: every unsettled temp is unlinked, then `fs.rm(tmpDir)` (the
-  existing `finally`, `:406`) is the backstop;
+- temp cleanup (after the producer-termination barrier): every unsettled temp
+  is unlinked, then `fs.rm(tmpDir)` (the existing `finally`, `:406`) is the
+  backstop;
 - the error propagates to `pushManifest`, which surfaces it exactly as today
   (a 402 becomes the existing `QuotaExceeded`, `commits.ts:175`; other faults
   become the existing push error). A re-run resumes per §6.1.
+
+### 3.6 Normal completion: the EOF/drain protocol (round-3 item 2)
+
+Successful termination is an ordered barrier chain, not "Promise.all settled":
+
+1. **Producer EOF.** When the `poolMap` over `toEncrypt` (including files
+   re-queued from the cache-hit lane, §3.1) has settled every entry, producers
+   CLOSE the ReadyQueue for writing. The cache-hit checker closes its lane the
+   same way once every cache-hit address has a settled disposition (satisfied,
+   or re-queued into `toEncrypt` BEFORE producer EOF is declared — the
+   re-queue happens inside the same `poolMap` scope, so EOF cannot race a
+   pending re-queue).
+2. **Queue drain.** Consumers observe EOF after draining every queued item;
+   each item reaches a settled disposition (§3.2 item 3).
+3. **Final rolling-check flush.** On queue EOF the coalescing buffer FLUSHES
+   its final partial batch immediately — a below-threshold tail must not
+   depend on the idle timer.
+4. **Consumer settlement.** All `putFile` promises and multipart transfers
+   settle; the last receipt is captured.
+5. **Drainer flush.** Only now does `drainer.flush()` run (§3.3), returning the
+   residual `needsUpload`; the commit proceeds only when it is empty.
+
+Each barrier is awaited in order; a test publishes a corpus whose tail is
+smaller than every batch/threshold size and asserts no descriptor is left
+buffered at commit time.
 
 ## 4. Finding 9 — measurement and deferral record only (NOT built here)
 
@@ -510,11 +553,14 @@ run-to-run spread of the control on the same host/network**).
   receiptRedemptionWall + commitWall + fixed overhead`, measured directly (NOT
   reconstructed) as the push command wall. Every later gate compares the pipeline
   build's measured end-to-end wall `W_pipe` against `W_ctrl` (round-1 item 14).
-- **P0.2 — overlap headroom.** `H_p50 = p50(W_ctrl) − (p50(max(encryptWall,
-  uploadCriticalPath)) + p50(receiptRedemptionWall)×(1 − expected overlap) +
-  p50(commitWall))`. **GATE:** if `H_p50 < 0.10 × p50(W_ctrl)`, STOP — not
-  worth the complexity. (Inferred large from the 575% CPU observation, but
-  measured.)
+- **P0.2 — overlap headroom (parameter-free, round-3 item 4).** The headroom is
+  the OPTIMISTIC upper bound with redemption assumed fully overlapped:
+  `H_p50 = p50(W_ctrl) − (p50(max(encryptWall, uploadCriticalPath)) +
+  p50(commitWall))` — every term is a directly measured control stage wall;
+  there is no tunable parameter. **GATE:** if `H_p50 < 0.10 × p50(W_ctrl)`,
+  STOP — even the optimistic bound is not worth the complexity. (Inferred large
+  from the 575% CPU observation, but measured.) Because `H_p50` is optimistic,
+  gate 1's "reclaim ≥ half of `H_p50`" is a conservative bar.
 - **P0.3 — owner-sizing.** From `peakTempDiskBytes` /
   `peakUploaderFramingBytes` on the control, confirm the batch-PUT framing owner
   and the largest single ciphertext, so §5.3's caps are set against measured
