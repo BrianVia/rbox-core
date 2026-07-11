@@ -41,6 +41,8 @@ export interface SyncRemote {
     onBytes?: ByteProgressCallback
   ): Promise<void>;
   ownsUploadLaneTiming?(size: number): boolean;
+  closeUploader?(err: Error): Promise<void>;
+  uploaderDispatchCount?(): number;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
@@ -82,6 +84,14 @@ export class RboxApi implements SyncRemote {
 
   ownsUploadLaneTiming(size: number): boolean {
     return this.batchUploader.ownsLaneTiming(size);
+  }
+
+  closeUploader(err: Error): Promise<void> {
+    return this.batchUploader.close(err);
+  }
+
+  uploaderDispatchCount(): number {
+    return this.batchUploader.uploaderDispatchCount();
   }
 
   getBlobToFile(sha256: string, destPath: string, expectedSize?: number): Promise<void> {

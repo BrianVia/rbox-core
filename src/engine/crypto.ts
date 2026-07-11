@@ -225,7 +225,23 @@ export async function encryptFileToTempInline(srcPath: string, kek: Buffer, tmpD
   let compressedPath: string | undefined;
   let ctPath: string | undefined;
   try {
-    await fs.copyFile(srcPath, snapPath); // single read of the live file → immutable copy
+    if (opts.expected) {
+      let copied = 0;
+      const cap = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          copied += chunk.byteLength;
+          if (copied > opts.expected!.size) callback(sourceChangedError(srcPath));
+          else callback(null, chunk);
+        },
+      });
+      await pipeline(
+        fsSync.createReadStream(srcPath, { end: opts.expected.size }),
+        cap,
+        fsSync.createWriteStream(snapPath, { flags: "wx", mode: 0o600 }),
+      );
+    } else {
+      await fs.copyFile(srcPath, snapPath); // single read of the live file → immutable copy
+    }
     const plaintextSha = await hashFile(snapPath); // fresh hash of the snapshot bytes
     const plaintextSize = (await fs.stat(snapPath)).size;
     if (opts.expected && (plaintextSha !== opts.expected.sha256 || plaintextSize !== opts.expected.size)) {

@@ -76,6 +76,8 @@ export interface ReceiptRedeemResult {
   rejected: number;
   /** A fence aborted this whole redeem batch. These addresses need fresh staging. */
   needsUpload?: string[];
+  /** Addresses whose current receipts were cleanly redeemed and removed. */
+  settled?: string[];
 }
 
 function commitRejectedMessage(reason: CommitRejectReason, count?: number, max?: number): string {
@@ -177,10 +179,14 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
       throw new Error(translateRemoteError(r.status, "receipt redeem failed", text, "workspace not found — check you're in the right directory"));
     }
     const body = (await r.json()) as ReceiptRedeemResult;
-    results.push(body);
+    const settled: string[] = [];
     for (const [sha, receipt] of batch) {
-      if (ctx.receipts.get(sha) === receipt) ctx.receipts.delete(sha);
+      if (ctx.receipts.get(sha) === receipt) {
+        ctx.receipts.delete(sha);
+        settled.push(sha);
+      }
     }
+    results.push({ ...body, settled });
   }
   return results;
 }

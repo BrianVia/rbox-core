@@ -13,6 +13,8 @@ import {
   BATCH_STATUS_BIT,
   DEFAULT_BATCH_RECORD_BYTES,
   resetBatchBlobStateForTests,
+  resetUploaderDispatchCountForTests,
+  uploaderDispatchCount,
 } from "./blob-batch.js";
 
 const origFetch = globalThis.fetch;
@@ -47,6 +49,7 @@ let batchPutHandler: (body: Uint8Array, headers: Record<string, string>) => Resp
 
 beforeEach(async () => {
   resetBatchBlobStateForTests();
+  resetUploaderDispatchCountForTests();
   calls = [];
   singles = new Map();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-batch-test-"));
@@ -299,6 +302,44 @@ describe("BlobBatchDownloader fallback behavior", () => {
 });
 
 describe("BlobBatchUploader queueing", () => {
+  test("close rejects queued groups and prevents later dispatch", async () => {
+    process.env.RBOX_BATCH_RECORDS = "32";
+    const f = await uploadFile("queued-close", "queued");
+    const a = api();
+    const pending = a.putBlobFile(f.sha, f.file, f.size);
+    const before = uploaderDispatchCount();
+    const err = new Error("stopped");
+    await a.closeUploader(err);
+    await expect(pending).rejects.toBe(err);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(uploaderDispatchCount() - before).toBe(0);
+    expect(batchPutCalls()).toHaveLength(0);
+  });
+
+  test("close awaits an already-dispatched batch", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    const f = await uploadFile("inflight-close", "inflight");
+    let entered!: () => void;
+    const dispatched = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    batchPutHandler = async (body) => {
+      entered();
+      await new Promise<void>((resolve) => { release = resolve; });
+      const records = decodeBatchPutFrames(body)!;
+      return jsonResponse(200, { results: records.map(({ sha, payload }) => ({ sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `r:${sha}` })) });
+    };
+    const a = api();
+    const upload = a.putBlobFile(f.sha, f.file, f.size);
+    await dispatched;
+    let closed = false;
+    const closing = a.closeUploader(new Error("stopped")).then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    release();
+    await Promise.all([upload, closing]);
+    expect(uploaderDispatchCount()).toBe(1);
+  });
+
   test("coalesces concurrent same-sha uploads into one batch record and settles all waiters", async () => {
     const f = await uploadFile("same-sha", "shared ciphertext");
     const a = api();
