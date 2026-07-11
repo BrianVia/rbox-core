@@ -81,3 +81,39 @@ with rounds 4–5 tightening the memory-lease lifecycle at the edges. Remaining
 non-blocking choices are the flagged founder questions in §11 (budget size,
 primed-batch size, in-flight=1vs2, and the design-98 shared-contract ownership),
 each explicitly deferred to Phase-0 measurement or founder decision.
+
+## Round 6 (confirmation, main-session dispatch) — VERDICT: ALIGNED
+
+Focused round verifying the post-cap round-5 fix (posted-job JOB_RESERVE
+retention through cancel/close). Codex confirmed the full
+reservation→charge→lease lifecycle sound: posted jobs retain JOB_RESERVE until
+result-received-and-discarded or confirmed worker termination (whichever
+first); receipt atomically converts to exact per-file charges; crash/malformed
+paths discard buffers before releasing the parent reservation; release
+authority is consistent (pre-receipt = JOB_RESERVE only, post-receipt = guarded
+leases only); no double-release. Formal ALIGNED.
+
+## Seam reconciliation with design 98 (2026-07-11, main session)
+
+§11 Q4 (blocking cross-design item) RESOLVED by the founder session: design 99
+§10 is the NORMATIVE home of the seam contract (the budget lives in the crypto
+pool, so the producer owns the contract); design 98 §3.4 Tier 2 adopts it
+verbatim — CiphertextLease/CiphertextLocation as the single shared type, the
+pool's CiphertextBudget as the single charging authority (98's maxHeapBytes
+axis never counts memory-variant ciphertext; it covers the uploader-owned
+framing copies of every file-location lease, native Tier 1 or producer-spilled
+Tier 2), and the single disposition protocol (spill is producer-only; 98's
+abort releases queued/undispatched delivered leases immediately as abandoned
+and already-dispatched leases at HTTP settlement, after invoking this design's
+cancel() and awaiting the posted-job terminal barrier). No separate interface
+doc — one normative home plus verbatim adoption avoids drift. 98's §3.4/§3.5
+were amended accordingly in its own worktree/PR (#210).
+
+Three joint codex rounds ran with BOTH documents visible (the per-design loops
+could each see only one side): round J1 found 4 items (stale §3.2 heap claim in
+98; stale "not yet reconciled" in this §10; consumer spill contradiction with
+§4.2; missing Tier-2 abort bridge in 98 §3.5) — all fixed as prescribed. Round
+J2 verified those and left 3 wording items (spill residue in §4.1; §5.2
+combined-peak claim replaced by the measured gate-3 claim; file-variant framing
+coverage) — fixed. Round J3 verified all and left one echo (this §10's Tier-1
+framing wording) — fixed above. Seam treated as ALIGNED.

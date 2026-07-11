@@ -218,8 +218,9 @@ copy), so the one reservation covers it (Round-2 item 1).
   receipt, and the whole `JOB_RESERVE` only before receipt.
 - **Release exactly once, at settlement — via the lease.** A per-file charge is
   held until that file's `CiphertextLease.release()` fires (§10): the owning
-  consumer calls it **after HTTP settlement** or after it spills/rejects/dedups/
-  abandons the bytes. Because the framed body references the leased buffer
+  consumer calls it **after HTTP settlement** or after it rejects/dedups/
+  abandons the bytes (spill is producer-only, §4.2 — never a consumer
+  disposition). Because the framed body references the leased buffer
   (§7.5), the bytes are never counted twice nor released while live.
 - **Budget size** `CIPHERTEXT_BUDGET_BYTES` = **96 MiB** (§5.2). This is the
   in-memory-path budget; large/spilled/file-sourced uploads use the existing
@@ -297,7 +298,7 @@ the prototype and the bounds, nothing more.
 | `FUSE_MAX_JOB_BYTES` (Σ plaintext/job) | **4 MiB** | Bounds a job's retained ciphertext (§7.2); matches `BUFFERED_COMPRESS_MAX_BYTES`. |
 | `FUSE_MAX_JOB_FILES` | **512** | Bounds results-array/clone cost and stops a 105k-empty-file corpus forming one unbounded job; ~105k files → ~205+ jobs, not 105k messages. |
 | fused jobs in flight / worker | **1** | A fused job retains **all** its ciphertext until it posts (§7.2); capping at 1 keeps per-worker retention to one job's worth and avoids two jobs overlapping serialization. Per-file `encrypt`/`decrypt` still use the other slot. (Round-1 item 5.) |
-| `CIPHERTEXT_BUDGET_BYTES` (§4.1) | **96 MiB** | Global cap on all live ciphertext; below the uploader's existing 192 MiB in-flight ceiling (24×8 MiB, `blob-batch.ts:22, 570`) so combined peak ≈ prior peak, not additive. |
+| `CIPHERTEXT_BUDGET_BYTES` (§4.1) | **96 MiB** | Global cap on all live ciphertext; sized below the uploader's existing 192 MiB in-flight ceiling (24×8 MiB, `blob-batch.ts:22, 570`). No combined-peak claim is made here — §8 gate 3 MEASURES peak RSS against control + budget (§4.1). |
 | `SPILL_WATERMARK` | **75%** of budget | Starts spill before the encrypt lane stalls (§4.2). |
 | coalescer flush idle timer | **10 ms** (`FLUSH_DELAY_MS`) | Same tail-flush as the uploader (`blob-batch.ts:32`); last partial group never hangs. |
 | primed first batch (§10) | **≤ 64 KiB or 16 files** | The stream's *first* fused job flushes early/small so time-to-first-upload is not held for a full 4 MiB group (Round-1 item 14). |
@@ -681,9 +682,10 @@ interface CiphertextLease {
   readonly size: number;
   readonly location: CiphertextLocation;
   /** Consumer MUST call exactly once after it has taken ownership of the bytes:
-   *  after HTTP settlement (uploaded), or after it spills/rejects/dedups/
-   *  abandons them. Frees the §4.1 budget reservation. Idempotent guard: a
-   *  second call throws in dev, is ignored in prod. */
+   *  after HTTP settlement (uploaded), or after it rejects/dedups/abandons
+   *  them. Spill is NOT a consumer disposition — §4.2 spills only
+   *  producer-owned, undelivered results. Frees the §4.1 budget reservation.
+   *  Idempotent guard: a second call throws in dev, is ignored in prod. */
   release(): void;
 }
 ```
@@ -692,19 +694,22 @@ interface CiphertextLease {
 enough for an async consumer, so the budget is governed by explicit per-file
 charges (§4.1): once a lease is delivered, the consumer owns its exact
 `cipherSize` charge until `release()`. 98 calls `release()` at exactly the events
-budget correctness depends on — framed and acknowledged on the wire, spilled,
-rejected, deduped, or abandoned. The uploader frames the `memory` variant **by
+budget correctness depends on — framed and acknowledged on the wire, rejected,
+deduped, or abandoned (never spill: a delivered lease is not spillable, joint
+round item 3). The uploader frames the `memory` variant **by
 reference** to `lease.location.bytes` (no copy, §4.1/§7.5), so `release()` at HTTP
 settlement is the single point the bytes leave memory. The `file` variant carries
 no memory charge; its `release()` is a no-op that still lets the producer delete a
 spilled temp once uploaded.
 
-**Single normative owner — a blocking cross-design requirement (Round-3 item 4).**
-Design 98 is drafted in parallel and is not yet reconciled with this doc; its
-overlapping-pipeline consumer MUST NOT introduce a *second* budget (e.g. its own
-heap cap) or a second cancellation authority, or the two owners will
-double-count and disagree on release. The normative contract, which 98 must
-adopt verbatim before either design's overlap gate (§8 gate 6) runs:
+**Single normative owner (Round-3 item 4; RECONCILED 2026-07-11).** This
+section is the normative seam contract, and design 98 §3.4 adopts it verbatim
+(PR #210). 98's consumer introduces no *second* budget (its `maxHeapBytes`
+covers the uploader-owned framing copies of every `file`-location lease —
+native Tier 1 or producer-spilled Tier 2 — never memory-variant ciphertext)
+and no second cancellation authority (98's Tier-2 abort invokes this design's
+`cancel()` and awaits the posted-job terminal barrier, releasing only
+already-delivered leases). The contract both designs are bound to:
 - **One type:** the `CiphertextLease`/`CiphertextLocation` above is the single
   shared type (reconcile any naming — e.g. `memory` vs a 98-local `buffer` — to
   this one).
@@ -714,7 +719,7 @@ adopt verbatim before either design's overlap gate (§8 gate 6) runs:
   owns it from `onReady` until `release()`; `cancel()` reclaims only
   undelivered charges (§6.4). In-flight consumer leases always settle via
   `release()`.
-This reconciliation is tracked as an open founder question (§11 Q4).
+The reconciliation record lives in §11 Q4 and REVIEW-99 "Seam reconciliation".
 
 **Granularity — decided: readiness fires per file at fused-job completion, not
 incrementally within a job.** A fused job posts one `results` message; its files'
@@ -745,9 +750,13 @@ keeps the §4.1 budget below the spill watermark.
 3. **Fused in-flight = 1 vs 2 per worker.** 1 bounds retention cleanly (§7.2);
    2 could raise utilization if memory allows. Decide from the §5.3 prototype's
    RSS-vs-throughput curve, or fix at 1 for safety?
-4. **Design 98 reconciliation (blocking).** §10 requires 98 to adopt one shared
-   `CiphertextLease` type, one charging authority (this pool's
-   `CiphertextBudget`), and one disposition protocol. Who owns landing that
-   shared contract, and should it live in its own tiny interface doc that both 98
-   and 99 import rather than being duplicated in each? Neither design's overlap
-   gate can run until this is settled.
+4. **Design 98 reconciliation — RESOLVED (2026-07-11, main session).** §10 is
+   the normative home of the seam contract (the budget lives in this pool, so
+   the producer owns it); design 98 §3.4 Tier 2 adopts it verbatim rather than
+   duplicating it in a third doc. Specifically: `CiphertextLease`/
+   `CiphertextLocation` is the single shared type, this pool's
+   `CiphertextBudget` is the single charging authority (98's `maxHeapBytes`
+   axis covers only its own Tier-1 framing copies, never memory-variant
+   ciphertext), and 98's abort path releases every held lease under the
+   rejected/abandoned disposition. See REVIEW-99 "Seam reconciliation" and
+   design 98 §3.4 (PR #210).
