@@ -633,9 +633,14 @@ prior run exited, because ciphertext temps never survive a run.
   can be true of an unrelated process and would leak the directory forever.
   Instead, ownership is established by the design-93 workspace sync mutex:
   every push (CLI or daemon) runs under it, so AT PUSH START, UNDER THE MUTEX,
-  no other pipeline for this workspace can be mid-run — every sibling `enc-*`
-  directory not created by the current process is stale BY CONSTRUCTION and is
-  reclaimed unconditionally. A stale dir contains only dead ciphertext, so
+  no other pipeline for this workspace can be mid-run — reclamation therefore
+  removes EVERY pre-existing `enc-*` sibling directory before creating the
+  current run's directory. Process identity plays no role in the exemption
+  (round-6 item 1): the only directory that survives is the one this run
+  creates AFTER the sweep, so a restarted daemon that happens to reuse a stale
+  directory's embedded pid, or a long-lived daemon's own leftover from a prior
+  failed cleanup, is still reclaimed. A stale dir contains only dead
+  ciphertext, so
   reclamation is always correctness-safe. Gate 3 includes a repeated-SIGKILL
   run asserting no cross-run temp accumulation, plus a PID-reuse simulation
   (a live unrelated process holding a stale dir's embedded pid) asserting the

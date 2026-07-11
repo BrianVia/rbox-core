@@ -172,14 +172,30 @@ All 3 accepted. Dispositions:
    (the embedded pid becomes diagnostic only). Gate 3 gains a PID-reuse
    simulation case (§6.1, gate 3).
 
+## Round 6 (confirmation, main-session dispatch) — VERDICT: REVISE (1 wording item) → resolved
+
+Focused round verifying only the post-cap §6.1 fix. Codex confirmed the mutex
+mechanism itself is sound (item 2: no double-reclaim race, safe across daemon
+restart and concurrent publishers, no contradiction elsewhere in the doc), but
+caught residual PID-flavored wording (item 1): "not created by the current
+process" still made process identity the exemption test, which breaks when a
+restarted daemon reuses a stale directory's embedded pid, or when a long-lived
+daemon leaves its own prior failed-cleanup directory behind.
+
+1. **Process identity must play no role** — ACCEPTED and fixed with the
+   reviewer's prescribed remedy: under the mutex, reclamation removes EVERY
+   pre-existing `enc-*` sibling directory before creating the current run's
+   directory; the only exempt directory is the one created after the sweep
+   (§6.1).
+2. **Mutex mechanism otherwise sound** — no action needed.
+
 ## Final state
 
-The loop converged 20 → 12 → 4 → 3 → 1 items across five rounds; every item in
-every round was accepted and incorporated, and the single round-5 item was
-fixed with the reviewer's own prescribed remedy after the round cap was
-reached. There is NO open disagreement between Claude and GPT on any design
-point — the residual formal state is "REVISE at cap with the last item
-resolved as prescribed," not a substantive dispute. Recommended founder
-treatment: read the round-5 item and its §6.1 fix (the only text codex has not
-re-verified) before implementation begins; everything else carries an explicit
-reviewer disposition.
+The loop converged 20 → 12 → 4 → 3 → 1 → 1 items across six rounds; every item
+in every round was accepted and incorporated. Round 6 was a focused
+confirmation of the post-cap round-5 fix: codex confirmed the mutex-based
+mechanism sound and prescribed a final wording correction (sweep-all-then-create
+instead of a process-identity exemption), which was applied verbatim. The
+mechanism now carries an explicit reviewer disposition on every design point,
+with the reviewer's own text stating "with that wording corrected, the mutex
+mechanism is sound; no other contradiction was found." Treated as ALIGNED.
