@@ -1,0 +1,119 @@
+# REVIEW-99 — adversarial review ledger for design 99 (fused crypto worker jobs)
+
+Reviewer: `codex exec` (gpt-5.6-sol), read-only, adversarial. Loop caps at 5
+rounds; stop at `VERDICT: ALIGNED` or record standing disagreement.
+
+## Round 1 — VERDICT: REVISE (18 items)
+
+codex (gpt-5.6-sol, read-only). Summary of items and disposition:
+
+1. Memory bound not a real bound (clone dup, worker results retention, framing body). → **FIXED**: single global ciphertext byte-semaphore spanning worker-output→HTTP-settlement, mandatory transfer lists, reservation before dispatch (§4.1, §7.2).
+2. Backpressure too late (results returned before capacity reserved). → **FIXED**: reserve conservative bytes at dispatch time, release on upload-ownership/spill (§4.1).
+3. Spill underspecified/inconsistent ("single job can't fit idle" is dead code). → **FIXED**: real trigger = reservation pressure at result-receipt; main isolate writes spill, per-file promise settles file-backed, budget released (§4.2).
+4. 256 KiB equivalence false (eligibility plaintext vs batch cap ciphertext). → **FIXED**: added byte-backed single PUT `putBytes`; over-cap memory ciphertext uploads from memory, no temp (§7.5); threshold note (§5.2).
+5. Worker memory arithmetic ignores batch retention. → **FIXED**: honest lifecycle model, fused in-flight/worker = 1, recomputed peak (§7.2).
+6. Failure isolation only for expected fs errors. → **FIXED**: explicit serializable per-file error allowlist; everything else fails envelope → bounded retry (§7.4).
+7. Whole-job crash retry blast radius. → **FIXED**: split-on-retry decomposition to singleton; pathological input isolated (§6.3, §7.4).
+8. Result protocol completeness (index uniqueness/exactly-one/malformed). → **FIXED**: validation rules; malformed fails all unresolved slots, never cross-resolves (§6.1).
+9. Retry ownership (re-encrypt vs retain body). → **FIXED**: transport retries reuse retained immutable bytes; re-encrypt only on source loss/mismatch; cleanup matrix (§7.5).
+10. P0 formula not falsifiable (additive sum, overlap). → **FIXED**: replaced with measurement-only A/B micro-prototype on real corpus, critical-path wall; decomposition demoted to diagnostic (§5.3).
+11. Baseline conflict (v1.0.0 vs main). → **FIXED**: one pinned control (remeasured `main` @ pinned commit/flags/corpus/hardware/cache); v1.0.0 historical only (§5.4, §8).
+12. Unfalsifiable gates (tolerances/method). → **FIXED**: numeric margins, sampling, host-min memory, APFS+ext4 aggregation, worker-vs-main RSS attribution (§8).
+13. Gate 1 wrong boundary (Finding 6 full-publish wall). → **FIXED**: added paired full-publish critical-path gate with 98 enabled (§8 gate 6).
+14. Readiness operationally coarsened; "tens of ms" unmeasured. → **FIXED**: primed small first batch; measured p50/p99 readiness-delay + time-to-first-upload gate (§8 gate 7, §10).
+15. Small-push "guaranteed" too broad. → **FIXED**: replaced with numeric regression gate, pool-off + pool-on partial-batch (§8 gate 5).
+16. Determinism coverage incomplete. → **FIXED**: property/mutation-schedule matrix; eligibility revalidated from bytes actually read (§7.1).
+17. Refactor claimed untouched but reroutes inline path. → **FIXED**: `encryptFileToTempInline` kept intact as ORACLE; fused helper is separate, validated byte-for-byte against it (§6.2, §7.1).
+18. Shipped work partially re-touched. → **FIXED**: explicit unchanged-vs-touched inventory (§1.1).
+
+## Round 2 — VERDICT: REVISE (7 items)
+
+codex (gpt-5.6-sol). Narrower/deeper holes in the v2 revision:
+
+1. Budget contradiction: releasing on frame-copy hides the framed body's memory; "combined ≈ prior peak" false. → **FIXED**: one lease held dispatch→**HTTP settlement**; uploader frames by **reference** (no copy); single combined budget, gated by measured peak not "≈ prior" (§4.1, §8 gate 3).
+2. Reservation/bounds rely on stale scan sizes; files can grow yet stay individually eligible → aggregate overrun. → **FIXED**: fixed per-job reservation = job cap (independent of scan sizes); worker enforces aggregate at read time, over-cap files returned `requeue` (§4.1, §6.1, §6.3).
+3. Retry accounting unbounded/lifecycle-incomplete; reservation ownership across splits undefined; release-vs-retry contradiction. → **FIXED**: explicit retry-tree state machine, per-file attempt cap K=3, parent releases before children re-reserve (§6.3).
+4. 98 interface lacks ownership/settlement protocol; per-file promise insufficient. → **FIXED**: `CiphertextLease` with `release()`/`cancel()`; budget freed exactly on framed/spilled/rejected/deduped/abandoned; early-stop reclaims leases (§10, §4.1).
+5. §6.4 doesn't prove streaming per-file readiness (not input-order/after-map). → **FIXED**: two concrete producer APIs — legacy per-file promise (poolMap) and 98's `onReady(lease)` stream with backpressure+cancel (§6.4, §10).
+6. Gates 3/6/7 still soft ("materially closer", "measurement noise", no CI). → **FIXED**: numeric overlap-efficiency ≥0.5, ru_maxrss hard-peak bound + absolute slack, bootstrap 95% CI / Mann–Whitney (§8).
+7. Mutation correctness claim too broad when `expected` absent. → **FIXED**: `expected` MANDATORY in batch protocol (production call sites already pass it, `sync-recovery.ts:225,294`); snapshot-equivalence claim scoped to the with-expected case (§4, §6.1, §7.1).
+
+## Round 3 — VERDICT: REVISE (7 items)
+
+codex (gpt-5.6-sol). Convergence on the lease/budget ownership model + the 98 seam.
+
+1. Reservation granularity/ownership undefined (one indivisible JOB_RESERVE but per-file releases). → **FIXED**: chosen model — on validated receipt, atomically replace JOB_RESERVE with exact per-file charges (Σ cipherSize) and release the slack; every per-file lease holds exactly its cipherSize; spill/§7.5/§10 use this one model (§4.1).
+2. `cancel()` violates budget invariant (in-flight HTTP keeps bytes live). → **FIXED**: cancel reclaims ONLY undispatched producer-owned leases; consumer-owned/in-flight leases stay charged until their own disposition settles (§6.4, §10).
+3. Legacy ownership impossible (coalescer can't observe the caller's PUT). → **FIXED**: legacy path also returns a lease handle; the poolMap caller calls `release()` itself after its upload settles (§6.4).
+4. 98 seam not aligned (two budget owners, naming, conflicting cancel/release). → **ADDRESSED as shared-contract requirement**: 98 not in this worktree (reviewer inferred its type); doc now mandates ONE normative type + ONE charging authority (the pool's `CiphertextBudget`) + ONE disposition protocol that 98 MUST adopt, and flags the reconciliation as a blocking cross-design item (§10, §11 Q4).
+5. Retry-tree: transferred buffers on malformed envelope may become uncharged. → **FIXED**: transferred results are parent-owned until validation; on envelope failure discard every transferred buffer, THEN release parent reserve, THEN children re-reserve (§6.3).
+6. Gate 3 per-worker `ru_maxrss` impossible (Bun workers share the process). → **FIXED**: process-wide `ru_maxrss` hard-peak gate + worker-reported retained-byte counters + instrumented budget high-water; dropped per-worker ru_maxrss (§8 gate 3).
+7. Zero-copy "frames by reference" untested (gate 4 can't see a hidden copy). → **FIXED**: implementation-level buffer-identity ownership test + measured peak-framing-bytes assertion across batch/fallback/retry/skip/duplicate/abort (§7.5, §8 gate 4).
+
+## Round 4 — VERDICT: REVISE (4 items)
+
+codex (gpt-5.6-sol). Tight residuals on the lease model + gate statistics.
+
+1. Spill violates lease ownership (may spill consumer-owned/in-flight bytes). → **FIXED**: spill restricted to producer-owned, undelivered results; if none, dispatch stays blocked (§4.2).
+2. Receipt charge-conversion not secured (metadata could undercharge). → **FIXED**: validation now requires `ArrayBuffer.byteLength === cipherSize` per result, `Σ byteLength ≤ JOB_RESERVE`, and distinct (non-aliased) buffers before converting (§6.1).
+3. Cancellation wrongly enters the retry tree. → **FIXED**: split retry limited to crash-class/malformed-worker only; cancellation + orderly close terminally settle producer-owned entries, release the parent reserve, create no children (§6.3, §7.4).
+4. No-regression gates are "absence of evidence", not equivalence. → **FIXED**: gates 5/7 now use one-sided non-inferiority margins with explicit upper-CI bounds (§8).
+
+## Round 5 — VERDICT: REVISE (1 item) — 5-round cap reached
+
+codex (gpt-5.6-sol). A single tight residual, with the fix spelled out:
+
+1. Cancel/close could release `JOB_RESERVE` while a **posted** worker job is
+   still producing/transferring ciphertext → a late result leaves uncharged live
+   bytes. → **FIXED (incorporated post-cap)**: dispatch-state rule — undispatched
+   groups release immediately; a posted/in-flight job retains its reserve until
+   its terminal result is received-and-discarded OR the worker is
+   terminated/recycled with confirmed termination (§7.4, §6.4).
+
+## Outcome
+
+Convergence trajectory: **18 → 7 → 7 → 4 → 1** items. The 5-round cap was
+reached. Round 5 returned a single, non-controversial correctness refinement
+(not a disagreement) with the exact protocol supplied by the reviewer; it is
+incorporated in v6. No open disagreement remains between Claude and GPT on the
+design's soundness; the substantive design decisions were stable from v4 onward,
+with rounds 4–5 tightening the memory-lease lifecycle at the edges. Remaining
+non-blocking choices are the flagged founder questions in §11 (budget size,
+primed-batch size, in-flight=1vs2, and the design-98 shared-contract ownership),
+each explicitly deferred to Phase-0 measurement or founder decision.
+
+## Round 6 (confirmation, main-session dispatch) — VERDICT: ALIGNED
+
+Focused round verifying the post-cap round-5 fix (posted-job JOB_RESERVE
+retention through cancel/close). Codex confirmed the full
+reservation→charge→lease lifecycle sound: posted jobs retain JOB_RESERVE until
+result-received-and-discarded or confirmed worker termination (whichever
+first); receipt atomically converts to exact per-file charges; crash/malformed
+paths discard buffers before releasing the parent reservation; release
+authority is consistent (pre-receipt = JOB_RESERVE only, post-receipt = guarded
+leases only); no double-release. Formal ALIGNED.
+
+## Seam reconciliation with design 98 (2026-07-11, main session)
+
+§11 Q4 (blocking cross-design item) RESOLVED by the founder session: design 99
+§10 is the NORMATIVE home of the seam contract (the budget lives in the crypto
+pool, so the producer owns the contract); design 98 §3.4 Tier 2 adopts it
+verbatim — CiphertextLease/CiphertextLocation as the single shared type, the
+pool's CiphertextBudget as the single charging authority (98's maxHeapBytes
+axis never counts memory-variant ciphertext; it covers the uploader-owned
+framing copies of every file-location lease, native Tier 1 or producer-spilled
+Tier 2), and the single disposition protocol (spill is producer-only; 98's
+abort releases queued/undispatched delivered leases immediately as abandoned
+and already-dispatched leases at HTTP settlement, after invoking this design's
+cancel() and awaiting the posted-job terminal barrier). No separate interface
+doc — one normative home plus verbatim adoption avoids drift. 98's §3.4/§3.5
+were amended accordingly in its own worktree/PR (#210).
+
+Three joint codex rounds ran with BOTH documents visible (the per-design loops
+could each see only one side): round J1 found 4 items (stale §3.2 heap claim in
+98; stale "not yet reconciled" in this §10; consumer spill contradiction with
+§4.2; missing Tier-2 abort bridge in 98 §3.5) — all fixed as prescribed. Round
+J2 verified those and left 3 wording items (spill residue in §4.1; §5.2
+combined-peak claim replaced by the measured gate-3 claim; file-variant framing
+coverage) — fixed. Round J3 verified all and left one echo (this §10's Tier-1
+framing wording) — fixed above. Seam treated as ALIGNED.
