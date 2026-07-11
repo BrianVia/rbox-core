@@ -1,6 +1,6 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v4, 2026-07-11 — rounds 1–3 folded (REVIEW-102.md). Under adversarial
+Status: DRAFT v5, 2026-07-11 — rounds 1–4 folded (REVIEW-102.md). Under adversarial
 review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
@@ -113,14 +113,15 @@ server-computed delta. `admitSet` is a **SHA list** fed to the **unchanged**
 `validateCommitRefs`/`commitAccounting` — no sizes flow through the diff:
 
 ```
-parentBytes ← R2 GET + strict parse of parent sidecar (or inline refs)   // sorted 40B records
-childBytes  ← sc.refShas bytes (already fetched+parsed by resolveSidecarBytes)
+parentBytes ← loadSidecarRaw(parent sidecar) (or inline refs)   // verified, sorted 40B records
+childBytes  ← loadSidecarRaw(child sidecar)   // verified raw buffer (§3.2 loader refactor)
 added[]     ← mergeAddedShas(parentBytes, childBytes)   // child-only SHAs, streaming over buffers
-fence∩carr  ← fenceProbe(accountId) intersect carried   // MUST be empty (invariant §3.3); else fallback
-admitSet    ← [encManifestSha, sidecarSha, ...added]     // SHA list, no sizes
+markedCarr  ← blob_ref_candidates(accountId) ∩ carried  // §3.3: regrant these (small set)
+intentCarr  ← gc_candidates(deleting_at NOT NULL) ∩ carried  // §3.3: MUST be empty; else fallback+page
+admitSet    ← [encManifestSha, sidecarSha, ...added, ...markedCarr]   // SHA list, no sizes
 validateCommitRefs(admitSet, receipts) → newRefs         // sizes from verifyReceipt, UNCHANGED
 commitAccounting(newRefs)                                // UNCHANGED
-// removed/carried refs: zero D1 work (unchanged — Phase-1 reclaims on unreachability)
+// removed/unmarked-carried refs: zero D1 work (unchanged — Phase-1 reclaims on unreachability)
 ```
 
 `validateCommitRefs`/`commitAccounting` are byte-for-byte the existing functions.
@@ -421,12 +422,18 @@ Unchanged grant machinery. Carried non-fenced refs are already entitled and, by
 
 ### 4.4 `blob_ref_candidates` regrant
 
-By §3.3, a carried ref is never marked (head-reachable ⟹ `phase1Mark` skips it),
-so `fence ∩ carried = ∅`. **Added** refs that happen to be marked are handled by
-the unchanged folded `NOT EXISTS` inside `validateCommitRefs` → forced into
-`newRefs` → `commitAccounting` clears the marker (`commit-accounting.ts:182`),
-identical to today. A nonempty `fence ∩ carried` is an invariant violation →
-fallback + page (§3.5B). The marker barrier is never silently bypassed.
+A carried ref may transiently be Phase-1-`blob_ref_candidate`-marked (§3.3, the
+stale-snapshot re-add race). The fence probe reads `blob_ref_candidates WHERE
+account_id=?` and **pulls every marked carried ref into `admitSet`**, so
+`commitAccounting` re-grants it and clears the marker (`commit-accounting.ts:182`)
+**exactly as full validation would** — a routine regrant, not a page. **Added** refs
+that happen to be marked are handled identically by the unchanged folded `NOT
+EXISTS` inside `validateCommitRefs`. A marker landing **after** the probe is
+durability-benign (§3.3: present+entitled, resurrect protects it) and is cleared by
+the next carrying commit or reachable recompute. The marker barrier is thus never
+silently bypassed: observed markers regrant; post-probe markers are safe. (Only a
+`gc_candidates` **active-intent** ∩ carried — provably impossible by §3.3(a) — is a
+fallback + page, §3.5B.)
 
 ### 4.5 Active `gc_candidates` deletion fences (RAISE-ABORT)
 
@@ -522,7 +529,8 @@ the sole divergence is the benign, durability-safe re-upload skip above. We do
 raw file names or paths in any metric or log; SHAs are opaque hashes and are
 fine**), and split the residual O(N) work (round 1 item 13):
 
-- Delta sizes: `commit.delta.added`, `.removed`, `.carried`, `.carried_fenced`.
+- Delta sizes: `commit.delta.added`, `.removed`, `.carried`, `.carried_fenced`
+  (= marked carried refs pulled into `admitSet` for regrant, §3.3/§4.4).
 - D1: `commit.delta.admit_stmts` (statements issued by admission — the
   "proportional to delta" signal).
 - Per-phase timings: `parentFetchMs`, `parentParseMs`, `childParseMs` (folded into
@@ -547,29 +555,34 @@ Round 1 item 8: the naive "admitSet vs newRefs" compare is ill-typed and mutatin
 Corrected protocol, run entirely from **one immutable pre-state** (no accounting
 executed during comparison):
 
-1. Run an **instrumented read-only classify** over the **full** child set (the
-   `validateCommitRefs` have-set SELECT + receipt loop, but without the early
-   `needsUpload` return), capturing the complete classification: `have_full`,
-   `unsatisfied_full`, and `newRefs_full` (receipt-valid new refs, with sizes).
-   (Plain `validateCommitRefs` early-returns `needsUpload` and never yields
-   `newRefs` when anything is unsatisfied — round 2 item 2 — so shadow needs this
-   full-classify variant.)
-2. Compute the delta path's read-only products from the **same** pre-state:
-   `added`/`carried` (from the diff), `admitSet`, then the same instrumented
-   classify over `admitSet` → `have_delta`, `unsatisfied_delta`, `newRefs_delta`.
-3. **Classify each carried ref the full path deems unsatisfiable** (`unsatisfied
-   _full ∩ carried`) by a bounded per-sha D1 probe from the **same** pre-state —
-   `blobs.present` and `EXISTS gc_candidates(sha, deleting_at IS NOT NULL)`:
-   - **HARMFUL** (`commit.delta.divergence++`, **zero-tolerance**): the ref is
-     **not present** OR under an **active intent** — publishing it would dangle. This
-     is the primary safety detector (round 2 item 2; the case §3.3(a)+(b) preclude).
-   - **BENIGN** (`commit.delta.benign_marker_divergence++`, **not** a flip-blocker):
-     the ref **is present**, no active intent, only Phase-1-`blob_ref_candidate`-
-     marked — the §4.10 safe re-upload-skip. Expected to occur under the stale-
-     snapshot marker race; the delta path safely publishes.
-   Also assert (harmful ⟹ `divergence++`): **`newRefs_delta == newRefs_full`**
-   restricted to present, unintented refs (SHA set + per-sha size), and
-   **`have_full ⊇ carried ∖ fence ∖ post-probe-marked`**.
+1. **One returned state relation, not re-reads** (round 4 item 2). Issue a single
+   batched read over the **full** child set that returns, per sha, the four flags the
+   `have`-set query decides (`commit-accounting.ts:83–86`) **as columns** rather than
+   as a filter: `present` (`blobs.present=1`), `entitled` (a `blob_refs(account,sha)`
+   row exists), `marked` (`blob_ref_candidates(account,sha)`), `active_intent`
+   (`gc_candidates(sha, deleting_at IS NOT NULL)`). **Both** the full and the delta
+   classification, and the harmful/benign split, are computed **in-memory from this
+   one relation** — never a second D1 pass — so concurrent GC/deletion cannot
+   manufacture or hide divergence between reads. (Residual mutation during the single
+   read window is inherent and bounded; the classifier is conservative — any
+   ambiguity ⇒ HARMFUL.) This is a soak-only cost (shadow runs full validation
+   anyway), not the enforce hot path.
+2. From that relation derive: `have_full` = {present ∧ entitled ∧ ¬marked ∧
+   ¬active_intent}; `unsatisfied_full` = child ∖ `have_full` (minus receipt-covered);
+   `newRefs_full`; and the delta equivalents restricted to `admitSet`.
+3. **Classify each carried ref in `unsatisfied_full`** from the same relation:
+   - **BENIGN** (`commit.delta.benign_marker_divergence++`, **not** a flip-blocker)
+     ⟺ **present ∧ entitled ∧ marked ∧ ¬active_intent** — i.e. the ref is fully
+     backed and only Phase-1-marked (the §4.10 safe re-upload-skip / stale-snapshot
+     marker race). The delta path safely publishes.
+   - **HARMFUL** (`commit.delta.divergence++`, **zero-tolerance**) ⟺ **every other**
+     unsatisfied carried ref: not present, **or not entitled** (round 4 item 1 —
+     present-but-unentitled is harmful: quota/entitlement would be wrong and
+     `openIntents` could condemn a sha with no `blob_refs` row), or under an active
+     intent. Any of these would let the delta path publish an unbacked/mischarged
+     head. This is the primary safety detector.
+   Also assert (else `divergence++`): **`newRefs_delta == newRefs_full`** restricted
+   to backed refs (SHA set + per-sha size) and **`have_full ⊇ carried ∖ marked`**.
 4. Only **after** comparison, execute accounting **once** (the authoritative full
    result in shadow; the delta result in enforce) — quota/entitlement mutate exactly
    once, never twice.
@@ -596,16 +609,26 @@ discipline).
 1. **Total commit POST p50 ≤ 2s** on Workload A one-file change (from ~8s). The
    headline audit gate. Reported alongside the per-phase split so the residual O(N)
    parse/fetch is visible, not hidden.
-2. **D1 accounting sub-phase O(added).** The **primary, deterministic** gate:
-   `commit.delta.admit_stmts` ≤ `5·ceil((added + carried_fenced + 2)/33) +
-   SELECTS_PER_BATCH·ceil((added + carried_fenced + 2)/90)` — a **closed-form bound
-   with no workspace term**, asserted directly by test at 112k and 250k for identical
-   `added` (equal statement count ⟹ zero workspace dependence). The **secondary**
-   timing gate (fixed margins, not a noisy CI): `admitAccountMs` p50 ≤ **200ms** for
-   `added ≤ 1`, and the regression of `admitAccountMs` on workspace size at fixed
-   `added` has **slope ≤ 5ms per 100k refs** (a fixed maximum, not "CI includes
-   zero"). If the deterministic statement bound holds but timing does not, the fault
-   is R2/parse (gate 3), not D1.
+2. **D1 accounting sub-phase O(added) — deterministic statement bound (primary).**
+   `commit.delta.admit_stmts` counts **prepared D1 statements issued by the admission
+   phase** (`validateCommitRefs` + `commitAccounting`), excluding the CAS, the D1
+   commit-mirror, and receipt crypto (`verifyReceipt` is not D1). With `K = |admitSet|
+   = added + carried_fenced + 2` and `N = |newRefs| ≤ K`, and the frozen constants
+   `VALIDATE_IN_LIST_CHUNK = 90`, `ACCOUNTING_INSERT_CHUNK = 33`,
+   `ACCOUNTING_STATEMENTS_PER_CHUNK = 5` (all defined in `commit-accounting.ts:27–43`),
+   the exact count by outcome path is:
+   - **shared (validate):** `ceil(K/90)` IN-list SELECT statements.
+   - **422 unsatisfied** (accounting skipped): total `= ceil(K/90)`.
+   - **ok / 402:** `+ 1` (the `accounts` plan/used/cap SELECT) `+ 5·ceil(N/33)`
+     (catalog+charge+grant+un-condemn+marker-clear per chunk); 402 over-cap adds `+1`
+     (the used/cap re-read).
+   The gate: **`admit_stmts ≤ ceil(K/90) + 1 + 5·ceil(K/33) + 1`, containing no
+   workspace term.** Falsified directly by asserting **equal `admit_stmts` at 112k and
+   250k for identical `added`** (equal count ⟹ zero workspace dependence).
+   **Secondary timing gate** (fixed margins): `admitAccountMs` p50 ≤ **200ms** for
+   `added ≤ 1`; regression of `admitAccountMs` on workspace size at fixed `added` has
+   **slope ≤ 5ms / 100k refs**. If the statement bound holds but timing does not, the
+   fault is R2/parse (gate 3), not D1.
 3. **Total server admission** (`sidecarMs + diffMs + fenceQueryMs +
    admitAccountMs`) at 112k and 250k is reported; its residual is attributed to
    parse/fetch (the wire-delta follow-on's target), not D1.

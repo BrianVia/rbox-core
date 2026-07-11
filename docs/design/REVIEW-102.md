@@ -129,3 +129,30 @@ model now match the APIs) — **confirmed/PASS**. Two actionable items:
    closed-form bound** (primary) + a **fixed max timing slope** (≤5ms/100k, secondary).
 
 Revision written as draft v4. Proceeding to round 4.
+
+## Round 4 — VERDICT: REVISE (4 tightening items; core proof declared sound)
+
+Codex: "the underlying durability proof and benign-marker regrant mechanism are
+sound against the inspected GC code." Four precision items:
+
+1. **Shadow BENIGN too loose.** The `have` query requires present ∧ entitled ∧
+   ¬marked ∧ ¬active-intent (commit-accounting.ts:83). A present-but-**unentitled**
+   carried ref is HARMFUL (mischarge + `openIntents` could condemn). ACCEPT: §6 now
+   defines BENIGN ⟺ present ∧ entitled ∧ marked ∧ ¬active-intent; everything else
+   HARMFUL.
+2. **"One immutable pre-state" not implementable across re-reads.** ACCEPT: §6 now
+   issues **one batched read returning the four flags as columns**, and derives full
+   + delta + harmful/benign entirely in-memory from that single relation (no second
+   D1 pass); conservative (ambiguity ⇒ HARMFUL). Soak-only cost.
+3. **§4.4 stale** — still said "never marked"/page. ACCEPT: rewrote §4.4 to the §3.3
+   split (observed markers regrant; post-probe markers benign; only active-intent
+   pages).
+4. **`admit_stmts` bound not self-contained.** ACCEPT: gate 2 now defines what counts
+   (prepared statements, excluding CAS/mirror/receipt-crypto), freezes the three
+   named `commit-accounting.ts` constants, enumerates the count by outcome path
+   (422 / ok / 402), and gives the closed form `ceil(K/90)+1+5·ceil(K/33)+1` with no
+   workspace term — falsified by equal `admit_stmts` at 112k vs 250k for equal
+   `added`.
+
+Also fixed §3.1 pseudocode to show the split probe (regrant vs fallback). Draft v5.
+Proceeding to round 5.
