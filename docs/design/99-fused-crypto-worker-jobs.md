@@ -741,9 +741,11 @@ keeps the §4.1 budget below the spill watermark.
 
 ## 11. Open questions for the founder
 
-1. **Budget vs peak.** Is control + 96 MiB peak RSS (§8 gate 3) acceptable on
-   the smallest fleet host, or should `CIPHERTEXT_BUDGET_BYTES` shrink (less
-   encrypt/upload overlap headroom for a lower peak)?
+1. **Budget vs peak — DECIDED (founder, 2026-07-11): let the prototype
+   decide.** `CIPHERTEXT_BUDGET_BYTES` is selected from the §5.3 prototype's
+   measured RAM-vs-throughput curve rather than set by policy; 96 MiB is the
+   sweep's starting point and §8 gate 3 measures whatever value the curve
+   selects.
 2. **Primed-first-batch size.** ≤64 KiB / 16 files (§5.2) is a guess at the
    time-to-first-upload vs per-job-overhead trade; tune from §5.1 corpus shape or
    set by policy?

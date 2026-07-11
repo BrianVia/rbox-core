@@ -167,6 +167,11 @@ backpressure, cancellation, and crash-recovery model.
 > redeems before the commit POST, `commits.ts:197` before `:202`). It is
 > ACCEPTED semantics, bounded in §6.3, and reclaimed by the existing per-account
 > GC (design 33) exactly as any other unreferenced ref.
+>
+> **Founder decision (2026-07-11): ACCEPTED.** Lazy cleanup stands — no
+> un-redeem machinery. Zero new billing-path machinery, and lazy retention is
+> resume-friendly: a retried publish reuses already-redeemed refs instead of
+> re-uploading them.
 
 The correctness floor is the CURRENT code's: content-addressed idempotent PUT,
 race-safe receipt delete-if-unchanged (`commits.ts:170,182`), per-file
