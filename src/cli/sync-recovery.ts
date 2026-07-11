@@ -268,15 +268,15 @@ export async function encryptAndUpload(
 
     const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
     const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
-    const allEncShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
 
     let encShas: string[];
     let introduced = 0;
     let recover = 0;
     if (fullAudit) {
+      const allEncShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
       encShas = [...new Set(allEncShas)];
     } else if (!preflightDelta) {
-      encShas = allEncShas;
+      encShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
     } else {
       const candidate = new Set<string>();
       for (const f of toEncrypt) if (f.encSha && !deferred.has(f.path)) candidate.add(f.encSha);

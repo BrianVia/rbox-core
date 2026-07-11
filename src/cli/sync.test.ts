@@ -817,9 +817,9 @@ test("delta recovery accumulator overflow switches the retry to a full audit", a
   await write("changed.txt", "new\n");
   const originalCommit = remote.commit.bind(remote);
   const overflowPages = Array.from({ length: 11 }, (_, page) =>
-    Array.from({ length: 10_000 }, (_, index) => sha(`recovery-${page}-${index}`))
+    Array.from({ length: 10_000 }, (_, index) => `recovery-p${page}-i${index}`)
   );
-  const postOverflowPage = [sha("post-overflow-a"), sha("post-overflow-b")];
+  const postOverflowPage = ["post-overflow-a", "post-overflow-b"];
   const pages = [...overflowPages, postOverflowPage];
   let nextPage = 0;
   remote.commit = async (...args) => {
@@ -856,7 +856,7 @@ test("accumulateRecoveryPage clears on overflow and stays empty while latched", 
 });
 
 test("missingBlobsChunked splits checks at 50,000 and unions missing results", async () => {
-  const shas = Array.from({ length: 50_001 }, (_, i) => sha(`chunk-${i}`));
+  const shas = Array.from({ length: 50_001 }, (_, i) => `chunk-${i}`);
   const calls: string[][] = [];
   const expected = [shas[0], shas[49_999], shas[50_000]];
   const api = {

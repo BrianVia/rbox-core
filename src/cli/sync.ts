@@ -543,17 +543,14 @@ export async function pushManifest(
     // Shared budget: throw once we've exhausted MAX_ATTEMPTS (the just-failed attempt is
     // `attempt`), matching the original recursion's throw-before-retry ordering.
     if (consumesAttempt && attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
-    if (outcome.action.kind === "pull-first") {
-      await backoff(attempt);
-      await pull(root, cfg, deps);
+    if (outcome.action.kind !== "reupload") {
+      if (outcome.action.kind === "pull-first") {
+        await backoff(attempt);
+        await pull(root, cfg, deps);
+      } else {
+        await refreshWriteContext(cfg, deps);
+      }
       currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored); // disk changed under us
-      currentForce = NO_GIT_FORCE;
-      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
-      recoverAccum.clear();
-      recoverFullAudit = false;
-    } else if (outcome.action.kind === "epoch-stale") {
-      await refreshWriteContext(cfg, deps);
-      currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored);
       currentForce = NO_GIT_FORCE;
       // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
       recoverAccum.clear();
