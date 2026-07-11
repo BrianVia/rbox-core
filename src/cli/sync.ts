@@ -91,7 +91,11 @@ const fmtDetailBytes = (n: number): string => {
   return `${n}B`;
 };
 const formatCommitTimings = (t: CommitTimings): string =>
-  `r${fmtDetailSeconds(t.refreshMs)} sc${fmtDetailSeconds(t.sidecarMs)} e${fmtDetailSeconds(t.encodeMs)} c${fmtDetailSeconds(t.encryptMs)} u${fmtDetailSeconds(t.uploadMs)} p${fmtDetailSeconds(t.postMs)} ${fmtDetailBytes(t.encBytes)}`;
+  `r${fmtDetailSeconds(t.refreshMs)} sc${fmtDetailSeconds(t.sidecarMs)} e${fmtDetailSeconds(t.encodeMs)} c${fmtDetailSeconds(t.encryptMs)} u${fmtDetailSeconds(t.uploadMs)} p${fmtDetailSeconds(t.postMs)} ${fmtDetailBytes(t.encBytes)}${formatServerTimings(t.serverTimings)}`;
+/** Design 97: the server's own commit decomposition, echoed on the commit response.
+ *  Rendered only when the server sent it (older workers omit the field). */
+const formatServerTimings = (t: CommitTimings["serverTimings"]): string =>
+  t ? ` srv${fmtDetailSeconds(t.totalMs)} env${fmtDetailSeconds(t.envelopeMs)} acct${fmtDetailSeconds(t.accountingMs)} ssc${fmtDetailSeconds(t.sidecarMs)} cm${fmtDetailSeconds(t.commitMs)} mir${fmtDetailSeconds(t.mirrorMs)} rsp${fmtDetailSeconds(t.responseMs)}` : "";
 const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}`;
 /** Design 85 §6.1: the scan details carry an explicit residual (wall minus the
  *  five timed components — allocation, path construction, readlink, cache lookup,
