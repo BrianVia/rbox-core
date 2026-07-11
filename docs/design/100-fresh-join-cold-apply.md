@@ -1,7 +1,9 @@
 # 100 - Fresh join cold apply: directory-trie apply, size-aware lanes, Git chain prefetch
 
-Status: Design draft v5 (v1 → REVISE 18; v2 → REVISE 9; v3 → REVISE 6;
-v4 → REVISE 1; dispositions in `REVIEW-100.md`). Measurement-first, falsification-first —
+Status: Design draft v6. Five codex adversarial rounds (v1 → REVISE 18;
+v2 → REVISE 9; v3 → REVISE 6; v4 → REVISE 1; v5 → REVISE 1 — a §4.4/§3.1
+consistency fix the reviewer dictated verbatim while declaring the round-4
+state model sound; applied). Dispositions in `REVIEW-100.md`. Measurement-first, falsification-first —
 modelled on design 85's phase-0 discipline (measure, falsify, then build). Every
 build gate is stated so a phase-0 number can KILL the corresponding phase before
 a line ships. Client-only; no server or wire-format change.
@@ -541,15 +543,20 @@ A fresh join may run under a live daemon watching the same tree (R1 #5).
    and the persisted `lastSyncedManifest` in `state.json`. The handoff this
    design RELIES ON (and does not change) is the existing one: (i) the join,
    as a top-level mutex owner (design 93), writes `state.json` —
-   `lastSyncedManifest` now equals the pulled manifest — before releasing the
-   lock; (ii) the daemon's queued watcher events for the join's published
-   files are then applied through `applyWatchEvents`
+   `lastSyncedManifest` now equals the pulled manifest **MINUS any
+   unrepresentable entries skipped under §3.1's base-exclusion rule** — before
+   releasing the lock; (ii) the daemon's queued watcher events for the join's
+   published files are then applied through `applyWatchEvents`
    (`src/engine/manifest.ts:101–199` — re-stat/re-hash each settled path), so
-   its in-memory manifest converges to the on-disk truth the join created;
-   (iii) the daemon's next push computes divergence against the UPDATED
-   `lastSyncedManifest`, and join-authored bytes show zero divergence — the
-   drain is not "hiding" state updates, it is performing them, and a push with
-   nothing divergent is correctly empty. A CONCURRENT USER EDIT during the join
+   its in-memory manifest converges to the on-disk truth the join created —
+   the REPRESENTABLE subset, which is exactly what the excluded base
+   describes; (iii) the daemon's next push computes divergence against that
+   UPDATED (excluded) base: join-authored bytes show zero divergence, and a
+   deferred entry is **absent-on-disk + absent-in-base** — no local change, so
+   the push can never propose its remote delete (the same by-construction
+   guarantee as §3.1; an implementer must use the excluded base HERE too, or
+   the delete echo returns). The drain is not "hiding" state updates, it is
+   performing them, and a push with nothing divergent is correctly empty. A CONCURRENT USER EDIT during the join
    is real divergence and MUST survive the drain as a pending push. Tests: (a)
    drain the queue after a join under a live daemon → daemon manifest equals
    the pulled manifest, no push fires; (b) the SAME-TARGET adversarial case

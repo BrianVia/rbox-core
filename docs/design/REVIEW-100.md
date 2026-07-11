@@ -209,6 +209,31 @@ Reviewer explicitly declared atomicity, interruption recovery for
 representable entries, watcher handoff, trie prefix grouping, shipped-work
 boundaries, and pack-cache exclusion design-complete in this round.
 
-## Round 5 (final — cap)
+## Round 5 (final — cap) — VERDICT: REVISE (1 item, consistency-only; core fix declared sound)
 
-Status: pending (running)
+Raw output: scratchpad/review-100-r5.txt. The reviewer explicitly verified the
+round-4 base-exclusion model is SOUND on all three properties (push cannot
+propose a skipped entry's delete; pull re-emits and re-derives the deferral
+even on an unchanged remote sequence; winner deletion self-heals because
+grouping spans the full remote manifest and byte-order serializes the delete
+before the loser's write). The single REVISE item:
+
+1. **§4.4 wording contradicted the §3.1 state model** — it still said
+   `lastSyncedManifest` "equals the pulled manifest" and daemon convergence
+   targets "the pulled manifest," which an implementer could follow into
+   restoring the delete echo. ACCEPTED and applied exactly as dictated: §4.4
+   now states the persisted base is the pulled manifest MINUS skipped entries,
+   the daemon manifest converges to the representable on-disk subset (which is
+   what the excluded base describes), and a deferred entry is
+   absent-on-disk + absent-in-base at push time.
+
+## Outcome at the 5-round cap
+
+Final verdict line is REVISE, but the sole round-5 item was a two-clause
+documentation consistency fix, dictated by the reviewer and applied verbatim
+in v6; the reviewer simultaneously declared every substantive mechanism sound
+(round 4: atomicity, interruption recovery, watcher handoff, trie grouping,
+shipped-work boundaries, pack-cache exclusion "design-complete"; round 5: the
+state model "otherwise sound"). There is NO open substantive disagreement.
+Recorded honestly rather than running an unbudgeted sixth round; the founder
+can request one more confirmation round if a literal ALIGNED line is wanted.
