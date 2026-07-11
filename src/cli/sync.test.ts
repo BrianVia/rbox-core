@@ -691,27 +691,73 @@ test("flag-off preflight still sends the complete file address list", async () =
   expect(new Set(remote.missingBlobCalls[0])).toEqual(new Set([(await enc("base\n")).encSha, (await enc("new\n")).encSha]));
 });
 
+test("full preflight without delta checks the full deduped address set", async () => {
+  delete process.env.RBOX_PREFLIGHT_DELTA;
+  process.env.RBOX_PREFLIGHT_FULL = "1";
+  const remote = new FakeRemote();
+  await write("a.txt", "same\n");
+  await write("b.txt", "same\n");
+  await write("c.txt", "different\n");
+
+  const { committed } = await push(root, cfg, deps(remote));
+
+  expect(committed).toBe(true);
+  expect(remote.missingBlobCalls).toEqual([[(await enc("same\n")).encSha, (await enc("different\n")).encSha]]);
+});
+
+test("delta recovery retries with the distinct union of sequential 422 pages", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const address = (await enc("payload\n")).encSha;
+  const page1 = [sha("page-1-a"), sha("page-1-b")];
+  const page2 = [sha("page-2-a"), sha("page-2-b")];
+  const originalCommit = remote.commit.bind(remote);
+  let page = 0;
+  remote.commit = async (...args) => {
+    if (page === 0) {
+      page++;
+      return { unsatisfiedBlobs: page1, unsatisfiedTotal: 4 };
+    }
+    if (page === 1) {
+      page++;
+      return { unsatisfiedBlobs: page2, unsatisfiedTotal: 2 };
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(sequence).toBe(1);
+  expect(committed).toBe(true);
+  const expected = new Set([address, ...page1, ...page2]);
+  expect(remote.missingBlobCalls.some((call) => call.length === expected.size && call.every((sha) => expected.has(sha)))).toBe(true);
+});
+
 test("delta recovery accumulator overflow switches the retry to a full audit", async () => {
   process.env.RBOX_PREFLIGHT_DELTA = "1";
   const remote = new FakeRemote();
   await write("x.txt", "payload\n");
   const address = (await enc("payload\n")).encSha;
-  remote.forceUnsatisfiedTotals = [100_001];
-  remote.forceUnsatisfiedPageSize = 100_001;
-  // Synthetic distinct server page; only the real manifest address can be uploaded.
   const originalCommit = remote.commit.bind(remote);
-  let injected = false;
+  const pages = Array.from({ length: 11 }, (_, page) =>
+    Array.from({ length: 10_000 }, (_, index) => sha(`recovery-${page}-${index}`))
+  );
+  let nextPage = 0;
   remote.commit = async (...args) => {
-    if (!injected) {
-      injected = true;
-      return { unsatisfiedBlobs: [address, ...Array.from({ length: 100_000 }, (_, i) => sha(`recovery-${i}`))], unsatisfiedTotal: 100_001 };
+    if (nextPage < pages.length) {
+      const unsatisfiedBlobs = pages[nextPage];
+      const unsatisfiedTotal = 120_000 - nextPage * 10_000;
+      nextPage++;
+      return { unsatisfiedBlobs, unsatisfiedTotal };
     }
     return originalCommit(...args);
   };
 
-  const { sequence } = await push(root, cfg, deps(remote));
+  const { sequence, committed } = await push(root, cfg, deps(remote));
 
   expect(sequence).toBe(1);
+  expect(committed).toBe(true);
   expect(remote.missingBlobCalls.at(-1)).toEqual([address]);
 });
 

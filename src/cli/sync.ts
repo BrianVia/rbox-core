@@ -534,14 +534,25 @@ export async function pushManifest(
       await pull(root, cfg, deps);
       currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored); // disk changed under us
       currentForce = NO_GIT_FORCE;
+      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
+      recoverAccum.clear();
+      recoverFullAudit = false;
     } else if (outcome.action.kind === "epoch-stale") {
       await refreshWriteContext(cfg, deps);
       currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored);
       currentForce = NO_GIT_FORCE;
+      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
+      recoverAccum.clear();
+      recoverFullAudit = false;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
-      for (const sha of outcome.action.unsatisfiedBlobs) recoverAccum.add(sha);
-      if (recoverAccum.size > RECOVER_ACCUM_MAX) recoverFullAudit = true;
+      if (!recoverFullAudit) {
+        for (const sha of outcome.action.unsatisfiedBlobs) recoverAccum.add(sha);
+        if (recoverAccum.size > RECOVER_ACCUM_MAX) {
+          recoverFullAudit = true;
+          recoverAccum.clear();
+        }
+      }
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
     }

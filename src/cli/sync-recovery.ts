@@ -267,15 +267,15 @@ export async function encryptAndUpload(
       report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
 
     const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
-    const fullAudit = preflightDelta && (process.env.RBOX_PREFLIGHT_FULL === "1" || options.forceFullAudit === true);
+    const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
     const allEncShas = local.files.filter((f) => f.type === "file" && f.encSha).map((f) => f.encSha!);
 
     let encShas: string[];
     let introduced = 0;
     let recover = 0;
-    if (!preflightDelta) {
-      encShas = allEncShas;
-    } else if (fullAudit) {
+    if (fullAudit) {
+      encShas = [...new Set(allEncShas)];
+    } else if (!preflightDelta) {
       encShas = allEncShas;
     } else {
       const candidate = new Set<string>();
@@ -293,7 +293,7 @@ export async function encryptAndUpload(
     ));
     if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
     report.record("missing", { count: encShas.length });
-    if (preflightDelta) {
+    if (preflightDelta || fullAudit) {
       report.recordDetails(
         "missing",
         { introduced, recover, sent: encShas.length, fullAudit: fullAudit ? 1 : 0 },
