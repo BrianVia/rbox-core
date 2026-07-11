@@ -5,7 +5,7 @@ import {
   isSourceChangedError,
 } from "./crypto.js";
 import fs from "node:fs/promises";
-import type { CryptoWorkerEncryptBatchResult, CryptoWorkerJobMessage, CryptoWorkerMessage, SerializedError } from "./crypto-worker-protocol.js";
+import { FUSE_MAX_FILE_BYTES, type CryptoWorkerEncryptBatchResult, type CryptoWorkerJobMessage, type CryptoWorkerMessage, type SerializedError } from "./crypto-worker-protocol.js";
 
 declare const self: {
   onmessage: ((event: { data: CryptoWorkerMessage }) => void | Promise<void>) | null;
@@ -55,7 +55,6 @@ function testDelay(): Promise<void> {
 // This allowlist isolates per-file failures so healthy siblings do not fail with
 // the envelope. The caller's isDeferrableChurn still decides defer versus abort.
 const ISOLATED_FILE_ERROR_CODES = new Set(["RBOX_SOURCE_CHANGED", "ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR", "ESTALE", "EBUSY"]);
-const FUSE_MAX_FILE_BYTES = 256 * 1024;
 function isAllowlistedFileError(err: unknown): boolean {
   if (isSourceChangedError(err)) return true;
   return typeof err === "object" && err !== null && "code" in err && ISOLATED_FILE_ERROR_CODES.has(String(err.code));

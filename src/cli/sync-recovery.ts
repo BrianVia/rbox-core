@@ -49,15 +49,6 @@ const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_
 const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
 const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
 
-export const __syncRecoveryTestHooks = {
-  useFusedCrypto(poolAvailable: boolean, customEncryptor: boolean): boolean {
-    return poolAvailable && fuseEnabled() && !customEncryptor;
-  },
-  encryptViaSelectedPath<T>(fuse: boolean, coalesced: () => Promise<T>, oracle: () => Promise<T>): Promise<T> {
-    return fuse ? coalesced() : oracle();
-  },
-};
-
 async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
   // Phase 1's legacy consumer materializes a memory lease into the existing encup
   // temp flow and releases its charge there; the disk temp becomes the source of
@@ -87,6 +78,12 @@ export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
 
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
+let defaultEncryptObserverForTest: (() => void) | undefined;
+
+/** Narrow routing-test seam: observes entry into the production oracle. */
+export function setDefaultEncryptObserverForTest(observer: (() => void) | undefined): void {
+  defaultEncryptObserverForTest = observer;
+}
 
 type CipherDescriptor = {
   encSha: string;
@@ -119,8 +116,6 @@ function applyCipherDescriptor(f: FileEntry, descriptor: CipherDescriptor): void
 
 export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
-  /** Production-call-site injection used by fused-crypto integration tests. */
-  cryptoPoolForTest?: CryptoPool;
   encryptCacheFlushMs?: number;
   pruneLivePaths?: ReadonlySet<string>;
   /** Addresses reported unsatisfied on prior 422 attempts of this push loop. */
@@ -208,7 +203,10 @@ export async function encryptAndUpload(
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
-  const encryptFileToTemp = options.encryptFileToTemp ?? defaultEncryptFileToTemp;
+  const encryptFileToTemp = options.encryptFileToTemp ?? ((...args: Parameters<EncryptFileToTempForSync>) => {
+    defaultEncryptObserverForTest?.();
+    return defaultEncryptFileToTemp(...args);
+  });
   const encryptOpts = { compress: compressionEnabled() };
   const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
@@ -237,7 +235,7 @@ export async function encryptAndUpload(
     });
     report.record("address", { count: carried });
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
-      const fuse = __syncRecoveryTestHooks.useFusedCrypto(pool !== undefined, options.encryptFileToTemp !== undefined);
+      const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
       let enc = 0;
       let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
@@ -272,11 +270,9 @@ export async function encryptAndUpload(
         let e;
         try {
           const opts = { ...encryptOpts, expected: { sha256: f.sha256, size: f.size } };
-          e = await __syncRecoveryTestHooks.encryptViaSelectedPath(
-            fuse,
-            async () => materializeLease(await pool!.encryptCoalesced(path.join(root, f.path), f.size, tmpDir, opts), tmpDir),
-            async () => encryptFileToTemp(path.join(root, f.path), kek, tmpDir, opts),
-          );
+          e = fuse
+            ? await materializeLease(await pool!.encryptCoalesced(path.join(root, f.path), f.size, tmpDir, opts), tmpDir)
+            : await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, opts);
         } catch (err) {
           // Vanished between scan and snapshot (agent/build churn deletes files
           // constantly on a live tree). This is the churn case design 38 defers,
@@ -471,9 +467,7 @@ export async function encryptAndUpload(
     report.record("upload", { count: up, wireBytes: upWireBytes });
     };
 
-    if (options.cryptoPoolForTest !== undefined) {
-      await runCryptoAndUpload(options.cryptoPoolForTest);
-    } else if (options.encryptFileToTemp === undefined) {
+    if (options.encryptFileToTemp === undefined) {
       await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool));
     } else {
       await runCryptoAndUpload(undefined);

@@ -14,6 +14,7 @@ import type {
   CryptoWorkerResponse as WorkerResponse,
   SerializedError,
 } from "./crypto-worker-protocol.js";
+import { FUSE_MAX_FILE_BYTES } from "./crypto-worker-protocol.js";
 
 type BunWorker = {
   postMessage(message: unknown): void;
@@ -33,7 +34,6 @@ const WORKER_MEMORY_BYTES = 512 * 1024 * 1024;
 const MAX_WORKERS = 16;
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-const FUSE_MAX_FILE_BYTES = 256 * 1024;
 const FUSE_MAX_JOB_BYTES = 4 * 1024 * 1024;
 const FUSE_MAX_JOB_FILES = 512;
 const CLONE_SLACK = 64 * 1024;
@@ -253,6 +253,10 @@ function closeError(): Error {
   return err;
 }
 
+function streamCancelledError(): Error {
+  return Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" });
+}
+
 class CryptoWorkerSlot {
   readonly inFlight = new Map<number, JobRecord>();
   closing = false;
@@ -415,7 +419,7 @@ export class CryptoPool {
   ): { cancel(): void } {
     let cancelled = false;
     const owner = Symbol("crypto-stream");
-    const err = Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" });
+    const err = streamCancelledError();
     for (const item of items) {
       const expected = item.opts.expected;
       if (!expected) throw new Error("fused encryption requires expected source metadata");
@@ -510,12 +514,13 @@ export class CryptoPool {
 
   private async pumpFused(): Promise<void> {
     if (this.fusedPumping || this.closed) return;
+    const dispatchBound = fusedDispatchBound();
     this.fusedPumping = true;
     try {
-      while (!this.closed && this.fusedQueue.length && this.fusedInFlight < fusedDispatchBound()) {
+      while (!this.closed && this.fusedQueue.length && this.fusedInFlight < dispatchBound) {
         if (!await this.reserveJob()) break;
         const worker = this.availableFusedWorker();
-        if (this.closed || this.fusedQueue.length === 0 || this.fusedInFlight >= fusedDispatchBound() || !worker) {
+        if (this.closed || this.fusedQueue.length === 0 || this.fusedInFlight >= dispatchBound || !worker) {
           this.budget.release(JOB_RESERVE);
           break;
         }
@@ -596,7 +601,7 @@ export class CryptoPool {
         const lease = this.memoryLease(result.blob.encSha, bytes, result.blob.cipherSize);
         if (canceled) {
           lease.release();
-          file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
+          file.reject(streamCancelledError());
           continue;
         }
         const blob: CoalescedBlob = { plaintextSha: result.blob.plaintextSha, encSha: result.blob.encSha, cipherSize: result.blob.cipherSize,
@@ -605,25 +610,23 @@ export class CryptoPool {
         this.producerResults.push(held);
         this.deliveryTail = this.deliveryTail.then(() => this.deliverProducer(held));
       } else if (canceled) {
-        file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
+        file.reject(streamCancelledError());
       } else if ("requeue" in result) {
         const actual = await (requeueStatOverrideForTests ?? fs.stat)(file.srcPath).catch(() => undefined);
         if (file.owner !== undefined && this.canceledOwners.has(file.owner)) {
-          file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
+          file.reject(streamCancelledError());
         } else if (actual && actual.size > FUSE_MAX_FILE_BYTES) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
         else this.enqueueSplit([file]);
       } else file.reject(rehydrateError(result.error));
     }
-    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+    this.forgetOwnersOf(job);
     this.activeFusedJobs.delete(job);
     void this.pumpFused();
   }
 
   private async deliverProducer(held: ProducerResult): Promise<void> {
     if (held.delivered) return;
-    held.delivered = true;
-    const index = this.producerResults.indexOf(held);
-    if (index >= 0) this.producerResults.splice(index, 1);
+    this.takeProducer(held);
     try { await held.file.deliver(held.blob); } catch (err) { held.file.reject(err); }
   }
 
@@ -646,7 +649,7 @@ export class CryptoPool {
       const open = this.openGroup.splice(0);
       this.openBytes = 0;
       for (const file of [...retryable, ...queued, ...open]) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
-      for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+      this.forgetOwnersOf(job);
       this.activeFusedJobs.delete(job);
       return;
     }
@@ -666,7 +669,7 @@ export class CryptoPool {
       this.enqueueSplit(retry.slice(0, middle));
       this.enqueueSplit(retry.slice(middle));
     }
-    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+    this.forgetOwnersOf(job);
     this.activeFusedJobs.delete(job);
     void this.pumpFused();
   }
@@ -679,14 +682,22 @@ export class CryptoPool {
     this.canceledOwners.delete(owner);
   }
 
+  private forgetOwnersOf(job: FusedJob): void {
+    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+  }
+
+  private takeProducer(held: ProducerResult): void {
+    held.delivered = true;
+    const index = this.producerResults.indexOf(held);
+    if (index >= 0) this.producerResults.splice(index, 1);
+  }
+
   private enqueueSplit(files: PendingFile[]): void { if (files.length) this.fusedQueue.push({ files, reserved: false, posted: false }); }
 
   private spillOldest(): Promise<boolean> {
     const held = this.producerResults.find((x) => !x.delivered && x.blob.lease.location.kind === "memory");
     if (!held) return Promise.resolve(false);
-    held.delivered = true;
-    const index = this.producerResults.indexOf(held);
-    if (index >= 0) this.producerResults.splice(index, 1);
+    this.takeProducer(held);
     let settled = false;
     const work = (async (): Promise<boolean> => {
       const rejectClosed = (): boolean => {

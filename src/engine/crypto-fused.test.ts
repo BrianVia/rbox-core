@@ -7,9 +7,9 @@ import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
 import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "./crypto.js";
 import { hashBytes } from "./hash.js";
-import { __cryptoPoolTestHooks, withCryptoPool, type CryptoPool } from "./crypto-pool.js";
+import { __cryptoPoolTestHooks, CryptoPool, withCryptoPool } from "./crypto-pool.js";
 import { PhaseReport, type Manifest } from "./index.js";
-import { encryptAndUpload } from "../cli/sync-recovery.js";
+import { encryptAndUpload, setDefaultEncryptObserverForTest } from "../cli/sync-recovery.js";
 import type { SyncRemote } from "../cli/remote.js";
 import type { WorkspaceConfig } from "../cli/config.js";
 
@@ -224,31 +224,27 @@ describe("fused crypto", () => {
       const cfg: WorkspaceConfig = { remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "memory://", token: "", kek, accountId: "acct", accountEpoch: 1, keyEpoch: 1 };
       const remote = { missingBlobs: async () => [] } as unknown as SyncRemote;
       let coalescedCalls = 0;
-      let streamCalls = 0;
       let oracleCalls = 0;
-      const pool = {
-        workers: [],
-        encryptCoalesced: async () => {
-          coalescedCalls++;
-          const encrypted = await encryptBytesInMemory(bytes, kek, { expected: { sha256: hashBytes(bytes), size: bytes.length } });
-          let released = false;
-          return { ...encrypted, lease: { location: { kind: "memory" as const, bytes: new Uint8Array(encrypted.ciphertext) }, release() { if (released) throw new Error("released twice"); released = true; } } };
-        },
-        encryptStream: () => { streamCalls++; },
-      } as unknown as CryptoPool;
+      const originalEncryptCoalesced = CryptoPool.prototype.encryptCoalesced;
+      CryptoPool.prototype.encryptCoalesced = function (...args) {
+        coalescedCalls++;
+        return originalEncryptCoalesced.apply(this, args);
+      };
+      setDefaultEncryptObserverForTest(() => { oracleCalls++; });
       if (fused) process.env.RBOX_CRYPTO_FUSE = "1";
       else delete process.env.RBOX_CRYPTO_FUSE;
       try {
-        await encryptAndUpload(remote, root, cfg, local, base, PhaseReport.disabled(), undefined, async () => {}, {
-          cryptoPoolForTest: pool,
-          ...(fused ? {} : { encryptFileToTemp: async (...args: Parameters<typeof encryptFileToTempInline>) => { oracleCalls++; return encryptFileToTempInline(...args); } }),
-        });
-        return { coalescedCalls, streamCalls, oracleCalls };
-      } finally { await fs.rm(root, { recursive: true, force: true }); }
+        await encryptAndUpload(remote, root, cfg, local, base, PhaseReport.disabled(), undefined, async () => {});
+        return { coalescedCalls, oracleCalls };
+      } finally {
+        CryptoPool.prototype.encryptCoalesced = originalEncryptCoalesced;
+        setDefaultEncryptObserverForTest(undefined);
+        await fs.rm(root, { recursive: true, force: true });
+      }
     };
 
-    expect(await run(false)).toEqual({ coalescedCalls: 0, streamCalls: 0, oracleCalls: 1 });
-    expect(await run(true)).toEqual({ coalescedCalls: 1, streamCalls: 0, oracleCalls: 0 });
+    expect(await run(false)).toEqual({ coalescedCalls: 0, oracleCalls: 1 });
+    expect(await run(true)).toEqual({ coalescedCalls: 1, oracleCalls: 0 });
   });
 
   test("paused stream spills only queued producer results and leaves no budget charge", async () => {

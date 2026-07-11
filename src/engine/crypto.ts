@@ -7,6 +7,7 @@ import { Readable, Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
 import { hashBytes, hashFile } from "./hash.js";
+import type { InMemoryEncryptedBlob } from "./crypto-worker-protocol.js";
 
 /**
  * Convergent blob-content encryption (design 12, V4-5). AES-256-GCM with a
@@ -47,10 +48,10 @@ function createZstdDecompress(): Transform {
   return zstd.createZstdDecompress();
 }
 
-async function zstdCompressFileToBuffer(srcPath: string): Promise<Buffer> {
+async function collectZstd(source: Readable): Promise<Buffer> {
   const chunks: Buffer[] = [];
   await pipeline(
-    fsSync.createReadStream(srcPath),
+    source,
     createZstdCompressLevel3(),
     new Writable({
       write(chunk, _encoding, callback) {
@@ -62,20 +63,8 @@ async function zstdCompressFileToBuffer(srcPath: string): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-async function zstdCompressBufferToBuffer(src: Buffer): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  await pipeline(
-    Readable.from([src]),
-    createZstdCompressLevel3(),
-    new Writable({
-      write(chunk, _encoding, callback) {
-        chunks.push(chunk);
-        callback();
-      },
-    })
-  );
-  return Buffer.concat(chunks);
-}
+const zstdCompressFileToBuffer = (srcPath: string): Promise<Buffer> => collectZstd(fsSync.createReadStream(srcPath));
+const zstdCompressBufferToBuffer = (src: Buffer): Promise<Buffer> => collectZstd(Readable.from([src]));
 
 async function encryptBufferToFile(payload: Buffer, ctPath: string, dek: Buffer, nonce: Buffer): Promise<void> {
   const cipher = createCipheriv("aes-256-gcm", dek, nonce);
@@ -142,15 +131,6 @@ export type EncryptFileOptions = {
   expected?: { sha256: string; size: number };
 };
 export type DecryptFileOptions = { comp?: "zstd"; payloadSha?: string; maxPlaintextBytes?: number };
-
-export type InMemoryEncryptedBlob = {
-  plaintextSha: string;
-  encSha: string;
-  cipherSize: number;
-  comp?: "zstd";
-  payloadSha?: string;
-  ciphertext: ArrayBuffer;
-};
 
 const SOURCE_CHANGED_ERROR_CODE = "RBOX_SOURCE_CHANGED";
 type SourceChangedError = Error & { readonly code: typeof SOURCE_CHANGED_ERROR_CODE };

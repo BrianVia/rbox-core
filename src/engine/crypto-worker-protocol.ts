@@ -1,5 +1,7 @@
 import type { DecryptFileOptions, EncryptFileOptions } from "./crypto.js";
 
+export const FUSE_MAX_FILE_BYTES = 256 * 1024;
+
 export type SerializedError = {
   name?: string;
   message: string;
