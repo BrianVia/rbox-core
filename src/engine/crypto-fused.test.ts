@@ -8,6 +8,7 @@ import * as zlib from "node:zlib";
 import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "./crypto.js";
 import { hashBytes } from "./hash.js";
 import { __cryptoPoolTestHooks, withCryptoPool } from "./crypto-pool.js";
+import { __syncRecoveryTestHooks } from "../cli/sync-recovery.js";
 
 function seeded(size: number, compressible: boolean): Buffer {
   const out = Buffer.alloc(size);
@@ -57,7 +58,9 @@ describe("fused crypto", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-det-"));
     const sizes = [0, 127, 128, 129, 255, 512, 2048, 8192, 65535, 65536, 65537, 131072, 200001, 262143, 262144, 262145];
     const cases = sizes.flatMap((size) => size === 0 ? [seeded(0, true)] : [seeded(size, true), seeded(size, false)]);
-    cases.push(...await ratioEdges());
+    const edges = await ratioEdges();
+    expect(edges.length).toBe(2);
+    cases.push(...edges);
     const kek = generateKek();
     try {
       await withCryptoPool(kek, 1, cases.length, async (pool) => {
@@ -89,9 +92,10 @@ describe("fused crypto", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }, 30_000);
 
-  test("crash-class poison is split to a singleton while siblings succeed", async () => {
+  test("crash-class poison is attempted exactly K=3 times and isolated in a larger tree", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-split-"));
     const workerPath = path.join(root, "poison-worker.js");
+    const attemptsPath = path.join(root, "attempts.log");
     const cryptoUrl = new URL("./crypto.ts", import.meta.url).href;
     await fs.writeFile(workerPath, [
       `import fs from "node:fs/promises"; import { encryptBytesInMemory } from ${JSON.stringify(cryptoUrl)};`,
@@ -99,27 +103,86 @@ describe("fused crypto", () => {
       "if (m.kek) { kek=Buffer.from(m.kek); return; }",
       "if (m.kind==='health') { self.postMessage({id:m.id,ok:true,result:'ok'}); return; }",
       "if (m.kind==='encryptBatch') { const results=[]; const tx=[]; for (const j of m.jobs) {",
-      "if (j.srcPath.includes('poison')) { self.postMessage({id:m.id,ok:false,error:{message:'deterministic poison'}}); return; }",
+      `if (j.srcPath.includes('poison')) { await fs.appendFile(${JSON.stringify(attemptsPath)}, "x"); self.postMessage({id:m.id,ok:false,error:{message:'deterministic poison'}}); return; }`,
       "const src=await fs.readFile(j.srcPath); const blob=await encryptBytesInMemory(src,kek,{...j.opts,expected:j.expected}); results.push({index:j.index,ok:true,blob}); tx.push(blob.ciphertext); }",
       "self.postMessage({id:m.id,ok:true,result:{results}},tx); } };",
     ].join("\n"));
     __cryptoPoolTestHooks.setWorkerPath(workerPath);
     const kek = generateKek();
     try {
-      const files = await Promise.all(["left", "poison", "right"].map(async (name) => {
+      const names = Array.from({ length: 12 }, (_, index) => index === 7 ? "poison" : `sibling-${index}`);
+      const files = await Promise.all(names.map(async (name) => {
         const bytes = Buffer.from(name.repeat(100)); const srcPath = path.join(root, name);
         await fs.writeFile(srcPath, bytes); return { srcPath, bytes, expected: { sha256: hashBytes(bytes), size: bytes.length } };
       }));
       await withCryptoPool(kek, 1, files.length, async (pool) => {
         const settled = await Promise.allSettled(files.map((file) => pool!.encryptCoalesced(file.srcPath, file.bytes.length, root, { compress: true, expected: file.expected })));
-        expect(settled[0]!.status).toBe("fulfilled");
-        expect(settled[1]!.status).toBe("rejected");
-        expect(settled[2]!.status).toBe("fulfilled");
-        for (const index of [0, 2]) if (settled[index]!.status === "fulfilled") settled[index]!.value.lease.release();
+        expect(settled[7]!.status).toBe("rejected");
+        expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(files.length - 1);
+        expect((await fs.readFile(attemptsPath, "utf8")).length).toBe(3);
+        const sampleIndex = 3;
+        const sample = settled[sampleIndex]!;
+        if (sample.status !== "fulfilled") throw sample.reason;
+        const oracle = await encryptFileToTempInline(files[sampleIndex]!.srcPath, kek, root, { compress: true, expected: files[sampleIndex]!.expected });
+        const actual = sample.value.lease.location.kind === "memory" ? Buffer.from(sample.value.lease.location.bytes) : await fs.readFile(sample.value.lease.location.path);
+        expect(actual).toEqual(await fs.readFile(oracle.ciphertextPath));
+        await fs.rm(oracle.ciphertextPath, { force: true });
+        for (const result of settled) if (result.status === "fulfilled") result.value.lease.release();
         expect(pool!.fusedStatsForTest().used).toBe(0);
       });
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }, 10_000);
+
+  test("aggregate-overflow requeues resolve byte-identically without leaking charges", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-requeue-"));
+    const workerPath = path.join(root, "requeue-worker.js");
+    const cryptoUrl = new URL("./crypto.ts", import.meta.url).href;
+    await fs.writeFile(workerPath, [
+      `import fs from "node:fs/promises"; import { encryptBytesInMemory } from ${JSON.stringify(cryptoUrl)};`,
+      "let kek; let first=true; self.onmessage=async({data:m})=>{",
+      "if(m.kek){kek=Buffer.from(m.kek);return} if(m.kind==='health'){self.postMessage({id:m.id,ok:true,result:'ok'});return}",
+      "if(m.kind==='encryptBatch'){const results=[];const tx=[];const requeue=first;first=false;for(const j of m.jobs){",
+      "if(requeue && j.index%2===0){results.push({index:j.index,ok:false,requeue:true});continue}",
+      "const src=await fs.readFile(j.srcPath);const blob=await encryptBytesInMemory(src,kek,{...j.opts,expected:j.expected});results.push({index:j.index,ok:true,blob});tx.push(blob.ciphertext)}",
+      "self.postMessage({id:m.id,ok:true,result:{results}},tx)}};",
+    ].join("\n"));
+    __cryptoPoolTestHooks.setWorkerPath(workerPath);
+    const kek = generateKek();
+    try {
+      const files = await Promise.all(Array.from({ length: 8 }, async (_, index) => {
+        const bytes = seeded(1024 + index, index % 2 === 0);
+        const srcPath = path.join(root, `file-${index}`);
+        await fs.writeFile(srcPath, bytes);
+        return { srcPath, bytes, expected: { sha256: hashBytes(bytes), size: bytes.length } };
+      }));
+      await withCryptoPool(kek, 1, files.length, async (pool) => {
+        const blobs = await Promise.all(files.map((file) => pool!.encryptCoalesced(file.srcPath, file.bytes.length, root, { compress: true, expected: file.expected })));
+        for (let index = 0; index < files.length; index++) {
+          const oracle = await encryptFileToTempInline(files[index]!.srcPath, kek, root, { compress: true, expected: files[index]!.expected });
+          const actual = blobs[index]!.lease.location.kind === "memory" ? Buffer.from(blobs[index]!.lease.location.bytes) : await fs.readFile(blobs[index]!.lease.location.path);
+          expect(actual).toEqual(await fs.readFile(oracle.ciphertextPath));
+          blobs[index]!.lease.release();
+          await fs.rm(oracle.ciphertextPath, { force: true });
+        }
+        expect(pool!.fusedStatsForTest().used).toBe(0);
+      });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }, 10_000);
+
+  test("production flag-off routing invokes the oracle and never the coalescer", async () => {
+    delete process.env.RBOX_CRYPTO_FUSE;
+    const fuse = __syncRecoveryTestHooks.useFusedCrypto(true, false);
+    let coalescedCalls = 0;
+    let oracleCalls = 0;
+    const selected = await __syncRecoveryTestHooks.encryptViaSelectedPath(
+      fuse,
+      async () => { coalescedCalls++; return "coalesced"; },
+      async () => { oracleCalls++; return "oracle"; },
+    );
+    expect(selected).toBe("oracle");
+    expect(oracleCalls).toBe(1);
+    expect(coalescedCalls).toBe(0);
+  });
 
   test("paused stream spills only queued producer results and leaves no budget charge", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-spill-"));

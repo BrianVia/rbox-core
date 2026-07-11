@@ -49,6 +49,15 @@ const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_
 const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
 const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
 
+export const __syncRecoveryTestHooks = {
+  useFusedCrypto(poolAvailable: boolean, customEncryptor: boolean): boolean {
+    return poolAvailable && fuseEnabled() && !customEncryptor;
+  },
+  encryptViaSelectedPath<T>(fuse: boolean, coalesced: () => Promise<T>, oracle: () => Promise<T>): Promise<T> {
+    return fuse ? coalesced() : oracle();
+  },
+};
+
 async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
   let ciphertextPath: string;
   if (blob.lease.location.kind === "file") {
@@ -222,7 +231,7 @@ export async function encryptAndUpload(
     });
     report.record("address", { count: carried });
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
-      const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
+      const fuse = __syncRecoveryTestHooks.useFusedCrypto(pool !== undefined, options.encryptFileToTemp !== undefined);
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
       let enc = 0;
       let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
@@ -257,9 +266,11 @@ export async function encryptAndUpload(
         let e;
         try {
           const opts = { ...encryptOpts, expected: { sha256: f.sha256, size: f.size } };
-          e = fuse
-            ? await materializeLease(await pool.encryptCoalesced(path.join(root, f.path), f.size, tmpDir, opts), tmpDir)
-            : await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, opts);
+          e = await __syncRecoveryTestHooks.encryptViaSelectedPath(
+            fuse,
+            async () => materializeLease(await pool!.encryptCoalesced(path.join(root, f.path), f.size, tmpDir, opts), tmpDir),
+            async () => encryptFileToTemp(path.join(root, f.path), kek, tmpDir, opts),
+          );
         } catch (err) {
           // Vanished between scan and snapshot (agent/build churn deletes files
           // constantly on a live tree). This is the churn case design 38 defers,

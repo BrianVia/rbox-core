@@ -345,6 +345,8 @@ export class CryptoPool {
   private fusedInFlight = 0;
   private fusedPumping = false;
   private fusionDisabled = false;
+  private readonly canceledOwners = new Set<symbol>();
+  private readonly activeFusedJobs = new Set<FusedJob>();
   private readonly budget = new CiphertextBudget(Math.max(JOB_RESERVE, parsePositiveIntEnv("RBOX_CRYPTO_FUSE_BUDGET_BYTES") ?? CIPHERTEXT_BUDGET_BYTES));
   private readonly producerResults: ProducerResult[] = [];
   private spillDir: string | undefined;
@@ -424,7 +426,12 @@ export class CryptoPool {
         void this.encryptFileBacked(item.srcPath, pending.tmpDir, item.opts).then(pending.deliver, pending.reject);
       } else this.addPending(pending);
     }
-    return { cancel: () => { cancelled = true; this.cancelUndispatched(err, owner); } };
+    return { cancel: () => {
+      cancelled = true;
+      this.canceledOwners.add(owner);
+      this.cancelUndispatched(err, owner);
+      this.maybeForgetCanceledOwner(owner);
+    } };
   }
 
   fusedStatsForTest(): { used: number; highWater: number; spilledFiles: number; spilledBytes: number } {
@@ -498,11 +505,15 @@ export class CryptoPool {
     this.fusedPumping = true;
     try {
       while (!this.closed && this.fusedQueue.length && this.fusedInFlight < fusedDispatchBound()) {
-        const worker = this.availableFusedWorker();
-        if (!worker) break;
-        const job = this.fusedQueue[0]!;
         if (!await this.reserveJob()) break;
-        this.fusedQueue.shift(); job.reserved = true; job.posted = true; this.fusedInFlight++;
+        const worker = this.availableFusedWorker();
+        if (this.closed || this.fusedQueue.length === 0 || this.fusedInFlight >= fusedDispatchBound() || !worker) {
+          this.budget.release(JOB_RESERVE);
+          break;
+        }
+        const job = this.fusedQueue.shift()!;
+        job.reserved = true; job.posted = true; this.fusedInFlight++;
+        this.activeFusedJobs.add(job);
         for (const file of job.files) file.attempts++;
         const record: JobRecord = {
           message: { id: this.nextId(), kind: "encryptBatch", jobPlaintextCap: FUSE_MAX_JOB_BYTES,
@@ -530,6 +541,7 @@ export class CryptoPool {
         const blob = result.blob;
         if (!blob || !(blob.ciphertext instanceof ArrayBuffer) || blob.ciphertext.byteLength !== blob.cipherSize || buffers.has(blob.ciphertext)) return undefined;
         if (!Number.isSafeInteger(blob.cipherSize) || blob.cipherSize < 0 || typeof blob.plaintextSha !== "string" || typeof blob.encSha !== "string") return undefined;
+        if (blob.plaintextSha !== job.files[result.index]!.expected.sha256) return undefined;
         buffers.add(blob.ciphertext); total += blob.cipherSize;
       } else {
         const requeue = "requeue" in result && result.requeue === true && !("error" in result);
@@ -541,6 +553,7 @@ export class CryptoPool {
   }
 
   private async handleFusedResult(job: FusedJob, value: unknown): Promise<void> {
+    this.activeFusedJobs.delete(job);
     this.fusedInFlight--;
     if (this.closed) {
       if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
@@ -548,25 +561,50 @@ export class CryptoPool {
       return;
     }
     const results = this.validFusedResults(value, job);
-    if (!results) { await this.handleFusedCrash(job, new Error("malformed fused worker response"), false); return; }
+    if (!results) {
+      // Design 99 §6.1 step 0 / §6.3: discard transferred bytes before releasing
+      // the job reserve, so retry children cannot re-reserve while bytes remain live.
+      if (value && typeof value === "object" && "results" in value && Array.isArray(value.results)) {
+        for (const raw of value.results) {
+          if (!raw || typeof raw !== "object") continue;
+          if ("blob" in raw) {
+            const blob = raw.blob;
+            if (blob && typeof blob === "object" && "ciphertext" in blob) blob.ciphertext = null;
+            raw.blob = null;
+          }
+          if ("ciphertext" in raw) raw.ciphertext = null;
+        }
+      }
+      await this.handleFusedCrash(job, new Error("malformed fused worker response"), false);
+      return;
+    }
     const charges = results.filter((r): r is Extract<FusedResult, { ok: true }> => r.ok).map((r) => r.blob.cipherSize);
     this.budget.convert(JOB_RESERVE, charges); job.reserved = false;
     for (const result of results) {
       const file = job.files[result.index]!;
+      const canceled = file.owner !== undefined && this.canceledOwners.has(file.owner);
       if (result.ok) {
         const bytes = new Uint8Array(result.blob.ciphertext);
         const lease = this.memoryLease(result.blob.encSha, bytes, result.blob.cipherSize);
+        if (canceled) {
+          lease.release();
+          file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
+          continue;
+        }
         const blob: CoalescedBlob = { plaintextSha: result.blob.plaintextSha, encSha: result.blob.encSha, cipherSize: result.blob.cipherSize,
           comp: result.blob.comp, payloadSha: result.blob.payloadSha, lease };
         const held: ProducerResult = { file, blob, bytes, charge: result.blob.cipherSize, delivered: false };
         this.producerResults.push(held);
         this.deliveryTail = this.deliveryTail.then(() => this.deliverProducer(held));
+      } else if (canceled) {
+        file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
       } else if ("requeue" in result) {
         const actual = await fs.stat(file.srcPath).catch(() => undefined);
         if (actual && actual.size > FUSE_MAX_FILE_BYTES) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
         else this.enqueueSplit([file]);
       } else file.reject(rehydrateError(result.error));
     }
+    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner);
     void this.pumpFused();
   }
 
@@ -579,32 +617,52 @@ export class CryptoPool {
   }
 
   private async handleFusedCrash(job: FusedJob, err: unknown, decrement = true): Promise<void> {
+    this.activeFusedJobs.delete(job);
     if (decrement) this.fusedInFlight--;
     if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
     if (this.closed) {
       for (const file of job.files) file.reject(err);
       return;
     }
+    const retryable: PendingFile[] = [];
+    for (const file of job.files) {
+      if (file.owner !== undefined && this.canceledOwners.has(file.owner)) file.reject(err);
+      else retryable.push(file);
+    }
     if (typeof err === "object" && err !== null && "code" in err && err.code === "RBOX_CRYPTO_TRANSFER_UNSUPPORTED") {
       this.fusionDisabled = true;
       const queued = this.fusedQueue.splice(0).flatMap((item) => item.files);
       const open = this.openGroup.splice(0);
       this.openBytes = 0;
-      for (const file of [...job.files, ...queued, ...open]) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
+      for (const file of [...retryable, ...queued, ...open]) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
       return;
     }
     const retry: PendingFile[] = [];
-    for (const file of job.files) {
+    for (const file of retryable) {
       if (file.attempts >= FUSE_MAX_ENCRYPT_RETRIES) file.reject(err);
       else retry.push(file);
     }
     if (retry.length === 1) this.enqueueSplit(retry);
+    else if (retry.some((file) => file.attempts === FUSE_MAX_ENCRYPT_RETRIES - 1)) {
+      // The last allowed attempt must isolate every file; otherwise an innocent
+      // sibling still grouped with deterministic poison would fail collaterally.
+      for (const file of retry) this.enqueueSplit([file]);
+    }
     else if (retry.length > 1) {
       const middle = Math.ceil(retry.length / 2);
       this.enqueueSplit(retry.slice(0, middle));
       this.enqueueSplit(retry.slice(middle));
     }
+    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner);
     void this.pumpFused();
+  }
+
+  private maybeForgetCanceledOwner(owner: symbol): void {
+    if (!this.canceledOwners.has(owner)) return;
+    const owns = (file: PendingFile): boolean => file.owner === owner;
+    if (this.openGroup.some(owns) || this.fusedQueue.some((job) => job.files.some(owns)) ||
+        [...this.activeFusedJobs].some((job) => job.files.some(owns)) || this.producerResults.some((held) => owns(held.file))) return;
+    this.canceledOwners.delete(owner);
   }
 
   private enqueueSplit(files: PendingFile[]): void { if (files.length) this.fusedQueue.push({ files, reserved: false, posted: false }); }

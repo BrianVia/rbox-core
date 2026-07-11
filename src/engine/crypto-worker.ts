@@ -52,7 +52,8 @@ function testDelay(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, TEST_DELAY_MS));
 }
 
-const DEFERRABLE_FS_CODES = new Set(["ENOENT", "EACCES", "EPERM", "ENOTDIR", "EISDIR", "ESTALE", "EBUSY"]);
+// Keep this aligned with sync-recovery's isDeferrableChurn/classifyCacheHit.
+const DEFERRABLE_FS_CODES = new Set(["ENOENT", "ENOTDIR"]);
 const FUSE_MAX_FILE_BYTES = 256 * 1024;
 function isAllowlistedFileError(err: unknown): boolean {
   if (isSourceChangedError(err)) return true;
