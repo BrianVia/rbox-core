@@ -100,7 +100,7 @@ const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
 const MAX_SHAS_PER_CHECK = 50_000;
 const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
-async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
+export async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
   const missing = new Set<string>();
   for (let i = 0; i < shas.length; i += MAX_SHAS_PER_CHECK) {
     for (const sha of await api.missingBlobs(shas.slice(i, i + MAX_SHAS_PER_CHECK))) missing.add(sha);
