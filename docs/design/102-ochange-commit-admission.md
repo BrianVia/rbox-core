@@ -1,7 +1,12 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v6, 2026-07-11 — rounds 1–5 folded (REVIEW-102.md). Under adversarial
-review.
+Status: DRAFT v7, 2026-07-11 — rounds 1–6 folded (REVIEW-102.md). 6-round adversarial
+cap reached; the safety-critical core (durability proof, GC-fence invariants,
+quota/entitlement identity, harmful/benign shadow detection, Worker memory model,
+account-deletion scope) was confirmed sound by the reviewer in rounds 4–6. The only
+items open at the cap were measurement-gate (§7 gate 2) statement-count *arithmetic
+precision*, iterated in rounds 5–6 and resolved here — not a correctness or safety
+disagreement. Ready for founder review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
 shrink the *client* manifest lane but "no phase of this design shrinks" the
@@ -616,24 +621,29 @@ discipline).
    = added + carried_fenced + 2` and `N = |newRefs| ≤ K`, and the frozen constants
    `VALIDATE_IN_LIST_CHUNK = 90`, `ACCOUNTING_INSERT_CHUNK = 33`,
    `ACCOUNTING_STATEMENTS_PER_CHUNK = 5` (all defined in `commit-accounting.ts:27–43`),
-   the exact count by outcome path (verified against `commit-accounting.ts`) is:
+   the exact count by outcome path (verified against `commit-accounting.ts`; let
+   `C_N = 5·ceil(N/33)` = the 5 statements/chunk for `N` charged refs, and `C_fail` =
+   the 5·(chunks through the **failing ≤`MAX_REFS_PER_TXN`=3,000 super-batch**) issued
+   before an abort — later super-batches never prepare) is:
    - **shared (validate):** `ceil(K/90)` IN-list SELECT statements.
-   - **422 unsatisfied** (accounting never called): `= ceil(K/90)`.
+   - **422 validation-unsatisfied** (`commitAccounting` never called): `= ceil(K/90)`.
    - **ok, `N = 0`** (`commitAccounting` early-returns at `:128` before the accounts
      SELECT — e.g. a zero-file commit where every ref is entitled): `= ceil(K/90)`.
-   - **ok, `N > 0`:** `+ 1` (the `accounts` plan SELECT) `+ 5·ceil(N/33)`
-     (catalog+charge+grant+un-condemn+marker-clear per 33-ref chunk).
-   - **402 `no_plan`** (`plan==='none'`, returns at `:135` before any batch): `+ 1`
-     (accounts SELECT only) — **no** used/cap re-read.
-   - **402 trigger over_cap:** only chunks **through the failing ≤`MAX_REFS_PER_TXN`
-     (3,000) super-batch** are prepared (later super-batches never issue), `+ 1`
-     (accounts SELECT) `+ 1` (the used/cap re-read at `:196`).
+   - **ok, `N > 0`:** `= ceil(K/90) + 1` (the `accounts` plan SELECT) `+ C_N`.
+   - **402 `no_plan`** (`plan==='none'`, returns at `:135` before any batch):
+     `= ceil(K/90) + 1` (accounts SELECT only) — **no** used/cap re-read.
+   - **402 trigger over_cap** (`accounts_cap_guard` abort): `= ceil(K/90) + 1 + C_fail
+     + 1` (the used/cap re-read at `:196`).
+   - **422 delete-fence abort** (`rbox_delete_fence` in `commitAccounting`, round 6):
+     `= ceil(K/90) + 1 + C_fail` (validate + accounts SELECT + chunks through the
+     failing super-batch; then the caught super-batch's shas → `needsUpload`).
    Conservative closed-form **upper bound (any path):**
    **`admit_stmts ≤ ceil(K/90) + 5·ceil(K/33) + 2`, containing no workspace term.**
-   Falsified by asserting `admit_stmts` is a pure function of `K` (= `added +
-   carried_fenced + 2`) **and the outcome path** — identical at 112k and 250k for
-   **identical `K` and identical outcome** (hold `K` fixed, not merely `added`:
-   `carried_fenced` can differ at equal `added` — round 5).
+   Two-part falsifier: **(a)** across 112k and 250k, the K-only **upper bound** holds
+   (no workspace growth); **(b)** the **exact** count is a pure function of `(K, N,
+   outcome path, failing-super-batch index)` — assert equality at 112k vs 250k for a
+   fixture that fixes all of those (not merely `added`: `carried_fenced` shifts `K`
+   and `N` shifts the charged-chunk count — rounds 5–6).
    **Secondary timing gate** (fixed margins): `admitAccountMs` p50 ≤ **200ms** for
    `added ≤ 1`; regression of `admitAccountMs` on workspace size at fixed `added` has
    **slope ≤ 5ms / 100k refs**. If the statement bound holds but timing does not, the

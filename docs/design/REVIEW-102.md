@@ -172,3 +172,36 @@ remaining precision item on gate 2's statement enumeration:
    `added`).
 
 Draft v6. Proceeding to round 6 (final).
+
+## Round 6 — VERDICT: REVISE (2 items, both gate-2 arithmetic; no safety blocker)
+
+Both items refine the **same** §7 gate-2 statement-count formula — no correctness or
+safety finding. ACCEPT both:
+
+1. **Slope falsifier over-simplified.** At fixed `K`, the `ok N>0` count still varies
+   with `N` (and over_cap with the failing super-batch). Folded: the exact count is a
+   pure function of `(K, N, outcome, failing-super-batch index)`; the falsifier is now
+   two-part — (a) the K-only conservative upper bound shows no workspace growth, (b)
+   exact equality asserted on a fixture fixing all four variables.
+2. **Missing the 422 delete-fence-abort path.** Folded: enumerated separately from
+   422 validation-unsatisfied — `ceil(K/90) + 1 + C_fail`.
+
+## Disposition at the 6-round cap
+
+The adversarial loop converged monotonically: 15 → 3 → (2, items 2–4 PASS) → (1 of 4
+was a real safety refinement, rest tightening) → 1 → 2, with the trajectory moving
+from safety-critical findings (rounds 1–3: fence TOCTOU, quota sizing, memory,
+account-deletion scope, benign-marker race) to pure measurement-gate arithmetic
+(rounds 5–6). In rounds 4–6 the reviewer explicitly confirmed the safety-critical
+core sound against the code: the carried-ref durability invariant (`blob_refs`
+persistence vs `openIntents` `NOT EXISTS` guard + `phase1Purge` resurrect), the
+benign-marker regrant mechanism, the quota/entitlement `newRefs` identity, the
+harmful/benign shadow classifier, the loader refactor + memory model, and the
+account-deletion fallback.
+
+**The final REVISE is not a substantive disagreement.** The only items open when the
+cap was hit were the precise statement-count enumeration in §7 gate 2 — a checkable
+arithmetic fact about `commit-accounting.ts`, iterated in rounds 5–6 and resolved in
+v7 (the reviewer had not re-run against the v7 arithmetic). No safety, correctness,
+GC, quota, or memory concern remained open. Design is ready for founder review; the
+statement-count fixture is an implementation-time detail, not a design fork.
