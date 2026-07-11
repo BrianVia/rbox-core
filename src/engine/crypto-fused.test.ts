@@ -260,20 +260,30 @@ describe("fused crypto", () => {
     const gate = new Promise<void>((resolve) => { unblock = resolve; });
     try {
       const items = [];
+      const oracle = new Map<number, Buffer>();
       for (let index = 0; index < 18; index++) {
         const bytes = seeded(256 * 1024, false);
+        bytes.writeUInt32LE(index, 0);
         const srcPath = path.join(root, `stream-${index}`);
         await fs.writeFile(srcPath, bytes);
         items.push({ ref: index, srcPath, size: bytes.length, tmpDir: root, opts: { compress: true, expected: { sha256: hashBytes(bytes), size: bytes.length } } });
+        oracle.set(index, Buffer.from((await encryptBytesInMemory(bytes, kek, { compress: true, expected: { sha256: hashBytes(bytes), size: bytes.length } })).ciphertext));
       }
       await withCryptoPool(kek, 1, items.length, async (pool) => {
         let ready = 0;
+        let fileDeliveries = 0;
+        const deliveries = new Map<number, number>();
         const done = new Promise<void>((resolve) => {
           pool!.encryptStream(items, { onReady: async (ref, blob) => {
+            deliveries.set(ref, (deliveries.get(ref) ?? 0) + 1);
             if (ref === 0) await gate;
+            const ciphertext = blob.lease.location.kind === "file"
+              ? await fs.readFile(blob.lease.location.path)
+              : Buffer.from(blob.lease.location.bytes);
+            expect(ciphertext).toEqual(oracle.get(ref)!);
             if (blob.lease.location.kind === "file") {
-              const bytes = await fs.readFile(blob.lease.location.path);
-              expect(hashBytes(bytes)).toBe(blob.encSha);
+              fileDeliveries++;
+              expect(hashBytes(ciphertext)).toBe(blob.encSha);
             }
             blob.lease.release();
             if (++ready === items.length) resolve();
@@ -286,6 +296,8 @@ describe("fused crypto", () => {
         expect(spillDir).toBeDefined();
         unblock();
         await done;
+        expect([...deliveries.values()]).toEqual(Array(items.length).fill(1));
+        expect(fileDeliveries).toBe(pool!.fusedStatsForTest().spilledFiles);
         expect(pool!.fusedStatsForTest().used).toBe(0);
         await pool!.close();
         await expect(fs.stat(spillDir!)).rejects.toMatchObject({ code: "ENOENT" });

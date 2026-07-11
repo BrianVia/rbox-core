@@ -681,19 +681,23 @@ export class CryptoPool {
   private async spillOldest(): Promise<boolean> {
     const held = this.producerResults.find((x) => !x.delivered && x.blob.lease.location.kind === "memory");
     if (!held) return false;
+    held.delivered = true;
+    const index = this.producerResults.indexOf(held);
+    if (index >= 0) this.producerResults.splice(index, 1);
+    let pathname: string;
     try {
       this.spillDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "rbox-crypto-spill-"));
       await fs.chmod(this.spillDir, 0o700).catch(() => {});
-      const pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
+      pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
       await fs.writeFile(pathname, held.bytes, { mode: 0o600 });
-      held.blob.lease.release();
-      held.blob = { ...held.blob, lease: this.fileLease(held.blob.encSha, held.blob.cipherSize, pathname) };
-      this.spilledFiles++; this.spilledBytes += held.charge;
     } catch (err) {
-      held.blob.lease.release(); held.delivered = true; held.file.reject(err);
-      const index = this.producerResults.indexOf(held);
-      if (index >= 0) this.producerResults.splice(index, 1);
+      held.blob.lease.release(); held.file.reject(err);
+      return true;
     }
+    held.blob.lease.release();
+    const fileBlob = { ...held.blob, lease: this.fileLease(held.blob.encSha, held.blob.cipherSize, pathname) };
+    this.spilledFiles++; this.spilledBytes += held.charge;
+    try { await held.file.deliver(fileBlob); } catch (err) { held.file.reject(err); }
     return true;
   }
 
