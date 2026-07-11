@@ -559,13 +559,15 @@ A fresh join may run under a live daemon watching the same tree (R1 #5).
    performing them, and a push with nothing divergent is correctly empty. A CONCURRENT USER EDIT during the join
    is real divergence and MUST survive the drain as a pending push. Tests: (a)
    drain the queue after a join under a live daemon → daemon manifest equals
-   the pulled manifest, no push fires; (b) the SAME-TARGET adversarial case
+   the representable on-disk subset (the excluded base — pulled manifest MINUS
+   skipped unrepresentable entries; round-6 item 1), no push fires; (b) the
+   SAME-TARGET adversarial case
    (R3 #5), not just an unrelated-path edit: the user edits path P AFTER the
    join publishes P but BEFORE the queued events for P drain, so the daemon's
    queue holds coalesced add/change (and possibly unlink/re-add) events for
    ONE path with two authors — assert `applyWatchEvents` re-stats FINAL disk
    truth, the user's edit is retained as divergence against the newly
-   persisted remote base (pending push), and neither is the edit lost nor a
+   persisted excluded base (pending push), and neither is the edit lost nor a
    join-authored version pushed as if it were the user's; (c) the daemon's
    existing post-pull/safety rescan sites (design 85 §1.1) remain the backstop
    if events were dropped — unchanged by this design.

@@ -237,3 +237,22 @@ shipped-work boundaries, pack-cache exclusion "design-complete"; round 5: the
 state model "otherwise sound"). There is NO open substantive disagreement.
 Recorded honestly rather than running an unbudgeted sixth round; the founder
 can request one more confirmation round if a literal ALIGNED line is wanted.
+
+## Round 6 (confirmation, main-session dispatch) — VERDICT: REVISE (1 item + 1 nit) → resolved
+
+Focused round verifying the round-5 base-exclusion rewrite. Codex confirmed the
+core model consistent everywhere (lastSyncedManifest = remote MINUS skipped;
+skipped entries absent from disk and base; push cannot echo a delete; pull
+re-emits the skipped write; no other delete-echo hole), with two residual
+wording spots in the §4.4 tests:
+
+1. **Test (a) still said "daemon manifest equals the pulled manifest"** —
+   ACCEPTED, fixed with the reviewer's language: daemon manifest equals the
+   representable on-disk subset (the excluded base — pulled manifest MINUS
+   skipped unrepresentable entries).
+2. **"Newly persisted remote base" imprecise (nit)** — ACCEPTED: now "newly
+   persisted excluded base".
+
+With both applied verbatim, every design point carries an explicit reviewer
+disposition and the reviewer's own text confirms the state model sound.
+Treated as ALIGNED.
