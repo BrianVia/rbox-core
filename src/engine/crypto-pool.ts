@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setCryptoPoolSelectorForProcess, type DecryptFileOptions, type EncryptedBlob, type EncryptFileOptions } from "./crypto.js";
 import type {
+  CryptoWorkerEncryptBatchResult,
+  FusedResult,
   CryptoWorkerJobMessage as WorkerMessage,
   CryptoWorkerResponse as WorkerResponse,
   SerializedError,
@@ -31,6 +33,21 @@ const WORKER_MEMORY_BYTES = 512 * 1024 * 1024;
 const MAX_WORKERS = 16;
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
+const FUSE_MAX_FILE_BYTES = 256 * 1024;
+const FUSE_MAX_JOB_BYTES = 4 * 1024 * 1024;
+const FUSE_MAX_JOB_FILES = 512;
+const CLONE_SLACK = 64 * 1024;
+const JOB_RESERVE = FUSE_MAX_JOB_BYTES + FUSE_MAX_JOB_FILES * 16 + CLONE_SLACK;
+const CIPHERTEXT_BUDGET_BYTES = 96 * 1024 * 1024;
+const SPILL_WATERMARK_FRAC = 0.75;
+const FUSE_FLUSH_DELAY_MS = 10;
+const FUSE_PRIMED_FIRST_BYTES = 64 * 1024;
+const FUSE_PRIMED_FIRST_FILES = 16;
+const FUSE_MAX_ENCRYPT_RETRIES = 3;
+// Phase-0 found that streaming-zstd scales negatively at high concurrency (16
+// workers were 5–6x slower than 4). This global cap recovered the measured win.
+const FUSE_DISPATCH_BOUND_DEFAULT = 4;
+
 export type CryptoPoolStatus =
   | { state: "active" | "idle"; workers: number; jobsRun: number; workerExecutions: number }
   | { state: "disabled"; reason: string; workers: number; jobsRun: number; workerExecutions: number }
@@ -42,6 +59,7 @@ type JobRecord<T = unknown> = {
   health?: boolean;
   resolve: (value: unknown) => void;
   reject: (err: unknown) => void;
+  fused?: boolean;
 };
 
 type QueueWaiter = { resolve: () => void; reject: (err: unknown) => void };
@@ -70,6 +88,57 @@ function parsePositiveIntEnv(name: string): number | undefined {
   const n = Number(trimmed);
   return Number.isSafeInteger(n) ? n : undefined;
 }
+
+function fusedDispatchBound(): number {
+  return Math.max(1, parsePositiveIntEnv("RBOX_CRYPTO_FUSE_DISPATCH") ?? FUSE_DISPATCH_BOUND_DEFAULT);
+}
+
+export type CiphertextLocation = { kind: "memory"; bytes: Uint8Array } | { kind: "file"; path: string };
+export interface CiphertextLease {
+  readonly encSha: string;
+  readonly size: number;
+  readonly location: CiphertextLocation;
+  release(): void;
+}
+export type CoalescedBlob = {
+  plaintextSha: string; encSha: string; cipherSize: number; comp?: "zstd"; payloadSha?: string;
+  lease: CiphertextLease;
+};
+
+class CiphertextBudget {
+  used = 0;
+  highWater = 0;
+  private readonly waiters: (() => void)[] = [];
+  constructor(readonly cap: number) {}
+  tryReserve(n: number): boolean {
+    if (this.used + n > this.cap) return false;
+    this.used += n;
+    this.highWater = Math.max(this.highWater, this.used);
+    return true;
+  }
+  wait(): Promise<void> { return new Promise((resolve) => this.waiters.push(resolve)); }
+  convert(reserved: number, exactCharges: number[]): void {
+    const exact = exactCharges.reduce((n, x) => n + x, 0);
+    if (exact > reserved) throw new Error("fused ciphertext exceeds job reserve");
+    this.used -= reserved - exact;
+    this.wake();
+  }
+  release(n: number): void {
+    this.used -= n;
+    if (this.used < 0) throw new Error("ciphertext budget released below zero");
+    this.wake();
+  }
+  wake(): void { for (const waiter of this.waiters.splice(0)) waiter(); }
+}
+
+type PendingFile = {
+  srcPath: string; size: number; tmpDir: string; opts: EncryptFileOptions;
+  expected: { sha256: string; size: number }; attempts: number;
+  deliver: (blob: CoalescedBlob) => void | Promise<void>; reject: (err: unknown) => void;
+  owner?: symbol;
+};
+type FusedJob = { files: PendingFile[]; reserved: boolean; posted: boolean };
+type ProducerResult = { file: PendingFile; blob: CoalescedBlob; bytes: Uint8Array; charge: number; delivered: boolean };
 
 function minJobs(): number {
   const env = parsePositiveIntEnv("RBOX_CRYPTO_POOL_MIN_JOBS");
@@ -236,9 +305,9 @@ class CryptoWorkerSlot {
     });
   }
 
-  terminateIntentional(): void {
+  async terminateIntentional(): Promise<void> {
     this.closing = true;
-    void this.worker.terminate();
+    await this.worker.terminate();
   }
 
   private handleMessage(msg: WorkerResponse): void {
@@ -268,6 +337,21 @@ export class CryptoPool {
   closed = false;
   idleTimer: ReturnType<typeof setTimeout> | undefined;
   id = 1;
+  private openGroup: PendingFile[] = [];
+  private openBytes = 0;
+  private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private groupsFlushed = 0;
+  private readonly fusedQueue: FusedJob[] = [];
+  private fusedInFlight = 0;
+  private fusedPumping = false;
+  private fusionDisabled = false;
+  private readonly budget = new CiphertextBudget(Math.max(JOB_RESERVE, parsePositiveIntEnv("RBOX_CRYPTO_FUSE_BUDGET_BYTES") ?? CIPHERTEXT_BUDGET_BYTES));
+  private readonly producerResults: ProducerResult[] = [];
+  private spillDir: string | undefined;
+  private spillOrdinal = 0;
+  private spilledFiles = 0;
+  private spilledBytes = 0;
+  private deliveryTail: Promise<void> = Promise.resolve();
 
   constructor(
     readonly kek: Buffer,
@@ -310,6 +394,258 @@ export class CryptoPool {
     return this.run<EncryptedBlob>({ id: this.nextId(), kind: "encrypt", srcPath, tmpDir, opts });
   }
 
+  encryptCoalesced(srcPath: string, size: number, tmpDir: string, opts: EncryptFileOptions): Promise<CoalescedBlob> {
+    if (this.closed) throw closeError();
+    if (size > FUSE_MAX_FILE_BYTES || this.fusionDisabled) return this.encryptFileBacked(srcPath, tmpDir, opts);
+    if (!opts.expected) throw new Error("fused encryption requires expected source metadata");
+    return new Promise((resolve, reject) => {
+      this.addPending({ srcPath, size, tmpDir, opts, expected: opts.expected!, attempts: 0, deliver: resolve, reject });
+    });
+  }
+
+  encryptStream<T>(
+    items: { ref: T; srcPath: string; size: number; opts: EncryptFileOptions; tmpDir?: string }[],
+    handlers: { onReady: (ref: T, blob: CoalescedBlob) => void | Promise<void> }
+  ): { cancel(): void } {
+    let cancelled = false;
+    const owner = Symbol("crypto-stream");
+    const err = Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" });
+    for (const item of items) {
+      const expected = item.opts.expected;
+      if (!expected) throw new Error("fused encryption requires expected source metadata");
+      const pending: PendingFile = {
+        srcPath: item.srcPath, size: item.size, tmpDir: item.tmpDir ?? os.tmpdir(), opts: item.opts,
+        expected, attempts: 0,
+        owner,
+        deliver: async (blob) => { if (!cancelled) await handlers.onReady(item.ref, blob); else blob.lease.release(); },
+        reject: () => {},
+      };
+      if (item.size > FUSE_MAX_FILE_BYTES || this.fusionDisabled) {
+        void this.encryptFileBacked(item.srcPath, pending.tmpDir, item.opts).then(pending.deliver, pending.reject);
+      } else this.addPending(pending);
+    }
+    return { cancel: () => { cancelled = true; this.cancelUndispatched(err, owner); } };
+  }
+
+  fusedStatsForTest(): { used: number; highWater: number; spilledFiles: number; spilledBytes: number } {
+    return { used: this.budget.used, highWater: this.budget.highWater, spilledFiles: this.spilledFiles, spilledBytes: this.spilledBytes };
+  }
+
+  private async encryptFileBacked(srcPath: string, tmpDir: string, opts: EncryptFileOptions): Promise<CoalescedBlob> {
+    const blob = await this.encrypt(srcPath, tmpDir, opts);
+    return { ...blob, lease: this.fileLease(blob.encSha, blob.cipherSize, blob.ciphertextPath) };
+  }
+
+  private fileLease(encSha: string, size: number, pathname: string): CiphertextLease {
+    let released = false;
+    return { encSha, size, location: { kind: "file", path: pathname }, release: () => {
+      if (released && process.env.NODE_ENV !== "production") throw new Error("ciphertext lease released twice");
+      released = true;
+    } };
+  }
+
+  private memoryLease(encSha: string, bytes: Uint8Array, charge: number): CiphertextLease {
+    let released = false;
+    return { encSha, size: charge, location: { kind: "memory", bytes }, release: () => {
+      if (released) {
+        if (process.env.NODE_ENV !== "production") throw new Error("ciphertext lease released twice");
+        return;
+      }
+      released = true;
+      this.budget.release(charge);
+      void this.pumpFused();
+    } };
+  }
+
+  private addPending(file: PendingFile): void {
+    this.clearIdleTimer();
+    if (this.openGroup.length && (this.openGroup.length >= FUSE_MAX_JOB_FILES || this.openBytes + file.size > FUSE_MAX_JOB_BYTES)) this.flushOpenGroup();
+    this.openGroup.push(file);
+    this.openBytes += file.size;
+    if ((this.groupsFlushed === 0 && (this.openBytes >= FUSE_PRIMED_FIRST_BYTES || this.openGroup.length >= FUSE_PRIMED_FIRST_FILES)) ||
+        this.openBytes >= FUSE_MAX_JOB_BYTES || this.openGroup.length >= FUSE_MAX_JOB_FILES) this.flushOpenGroup();
+    else {
+      if (this.flushTimer) clearTimeout(this.flushTimer);
+      this.flushTimer = setTimeout(() => this.flushOpenGroup(), FUSE_FLUSH_DELAY_MS);
+    }
+  }
+
+  private flushOpenGroup(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    if (this.openGroup.length === 0 || this.closed) return;
+    this.fusedQueue.push({ files: this.openGroup, reserved: false, posted: false });
+    this.openGroup = [];
+    this.openBytes = 0;
+    this.groupsFlushed++;
+    void this.pumpFused();
+  }
+
+  private availableFusedWorker(): CryptoWorkerSlot | undefined {
+    return this.workers.filter((w) => w.available && ![...w.inFlight.values()].some((r) => r.fused)).sort((a, b) => a.inFlight.size - b.inFlight.size)[0];
+  }
+
+  private async reserveJob(): Promise<boolean> {
+    while (!this.closed && !this.budget.tryReserve(JOB_RESERVE)) {
+      if (this.budget.used > this.budget.cap * SPILL_WATERMARK_FRAC && await this.spillOldest()) continue;
+      await this.budget.wait();
+    }
+    return !this.closed;
+  }
+
+  private async pumpFused(): Promise<void> {
+    if (this.fusedPumping || this.closed) return;
+    this.fusedPumping = true;
+    try {
+      while (!this.closed && this.fusedQueue.length && this.fusedInFlight < fusedDispatchBound()) {
+        const worker = this.availableFusedWorker();
+        if (!worker) break;
+        const job = this.fusedQueue[0]!;
+        if (!await this.reserveJob()) break;
+        this.fusedQueue.shift(); job.reserved = true; job.posted = true; this.fusedInFlight++;
+        for (const file of job.files) file.attempts++;
+        const record: JobRecord = {
+          message: { id: this.nextId(), kind: "encryptBatch", jobPlaintextCap: FUSE_MAX_JOB_BYTES,
+            jobs: job.files.map((f, index) => ({ index, srcPath: f.srcPath, expected: f.expected, opts: { ...f.opts, expected: undefined } })) },
+          attempts: 0, fused: true,
+          resolve: (value) => void this.handleFusedResult(job, value),
+          reject: (err) => void this.handleFusedCrash(job, err),
+        };
+        worker.post(record);
+      }
+    } finally { this.fusedPumping = false; }
+  }
+
+  private validFusedResults(value: unknown, job: FusedJob): FusedResult[] | undefined {
+    if (!value || typeof value !== "object" || !("results" in value) || !Array.isArray((value as CryptoWorkerEncryptBatchResult).results)) return undefined;
+    const results = (value as CryptoWorkerEncryptBatchResult).results;
+    if (results.length !== job.files.length) return undefined;
+    const seen = new Set<number>();
+    const buffers = new Set<ArrayBuffer>();
+    let total = 0;
+    for (const result of results) {
+      if (!result || typeof result.index !== "number" || !Number.isInteger(result.index) || result.index < 0 || result.index >= job.files.length || seen.has(result.index)) return undefined;
+      seen.add(result.index);
+      if (result.ok) {
+        const blob = result.blob;
+        if (!blob || !(blob.ciphertext instanceof ArrayBuffer) || blob.ciphertext.byteLength !== blob.cipherSize || buffers.has(blob.ciphertext)) return undefined;
+        if (!Number.isSafeInteger(blob.cipherSize) || blob.cipherSize < 0 || typeof blob.plaintextSha !== "string" || typeof blob.encSha !== "string") return undefined;
+        buffers.add(blob.ciphertext); total += blob.cipherSize;
+      } else {
+        const requeue = "requeue" in result && result.requeue === true && !("error" in result);
+        const error = "error" in result && !("requeue" in result) && typeof result.error === "object" && result.error !== null && typeof result.error.message === "string";
+        if (!requeue && !error) return undefined;
+      }
+    }
+    return total <= JOB_RESERVE ? results : undefined;
+  }
+
+  private async handleFusedResult(job: FusedJob, value: unknown): Promise<void> {
+    this.fusedInFlight--;
+    if (this.closed) {
+      if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
+      for (const file of job.files) file.reject(closeError());
+      return;
+    }
+    const results = this.validFusedResults(value, job);
+    if (!results) { await this.handleFusedCrash(job, new Error("malformed fused worker response"), false); return; }
+    const charges = results.filter((r): r is Extract<FusedResult, { ok: true }> => r.ok).map((r) => r.blob.cipherSize);
+    this.budget.convert(JOB_RESERVE, charges); job.reserved = false;
+    for (const result of results) {
+      const file = job.files[result.index]!;
+      if (result.ok) {
+        const bytes = new Uint8Array(result.blob.ciphertext);
+        const lease = this.memoryLease(result.blob.encSha, bytes, result.blob.cipherSize);
+        const blob: CoalescedBlob = { plaintextSha: result.blob.plaintextSha, encSha: result.blob.encSha, cipherSize: result.blob.cipherSize,
+          comp: result.blob.comp, payloadSha: result.blob.payloadSha, lease };
+        const held: ProducerResult = { file, blob, bytes, charge: result.blob.cipherSize, delivered: false };
+        this.producerResults.push(held);
+        this.deliveryTail = this.deliveryTail.then(() => this.deliverProducer(held));
+      } else if ("requeue" in result) {
+        const actual = await fs.stat(file.srcPath).catch(() => undefined);
+        if (actual && actual.size > FUSE_MAX_FILE_BYTES) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
+        else this.enqueueSplit([file]);
+      } else file.reject(rehydrateError(result.error));
+    }
+    void this.pumpFused();
+  }
+
+  private async deliverProducer(held: ProducerResult): Promise<void> {
+    if (held.delivered) return;
+    held.delivered = true;
+    const index = this.producerResults.indexOf(held);
+    if (index >= 0) this.producerResults.splice(index, 1);
+    try { await held.file.deliver(held.blob); } catch (err) { held.file.reject(err); }
+  }
+
+  private async handleFusedCrash(job: FusedJob, err: unknown, decrement = true): Promise<void> {
+    if (decrement) this.fusedInFlight--;
+    if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
+    if (this.closed) {
+      for (const file of job.files) file.reject(err);
+      return;
+    }
+    if (typeof err === "object" && err !== null && "code" in err && err.code === "RBOX_CRYPTO_TRANSFER_UNSUPPORTED") {
+      this.fusionDisabled = true;
+      const queued = this.fusedQueue.splice(0).flatMap((item) => item.files);
+      const open = this.openGroup.splice(0);
+      this.openBytes = 0;
+      for (const file of [...job.files, ...queued, ...open]) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
+      return;
+    }
+    const retry: PendingFile[] = [];
+    for (const file of job.files) {
+      if (file.attempts >= FUSE_MAX_ENCRYPT_RETRIES) file.reject(err);
+      else retry.push(file);
+    }
+    if (retry.length === 1) this.enqueueSplit(retry);
+    else if (retry.length > 1) {
+      const middle = Math.ceil(retry.length / 2);
+      this.enqueueSplit(retry.slice(0, middle));
+      this.enqueueSplit(retry.slice(middle));
+    }
+    void this.pumpFused();
+  }
+
+  private enqueueSplit(files: PendingFile[]): void { if (files.length) this.fusedQueue.push({ files, reserved: false, posted: false }); }
+
+  private async spillOldest(): Promise<boolean> {
+    const held = this.producerResults.find((x) => !x.delivered && x.blob.lease.location.kind === "memory");
+    if (!held) return false;
+    try {
+      this.spillDir ??= await fs.mkdtemp(path.join(held.file.tmpDir, "rbox-crypto-spill-"));
+      await fs.chmod(this.spillDir, 0o700).catch(() => {});
+      const pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
+      await fs.writeFile(pathname, held.bytes, { mode: 0o600 });
+      held.blob.lease.release();
+      held.blob = { ...held.blob, lease: this.fileLease(held.blob.encSha, held.blob.cipherSize, pathname) };
+      this.spilledFiles++; this.spilledBytes += held.charge;
+    } catch (err) {
+      held.blob.lease.release(); held.delivered = true; held.file.reject(err);
+      const index = this.producerResults.indexOf(held);
+      if (index >= 0) this.producerResults.splice(index, 1);
+    }
+    return true;
+  }
+
+  private cancelUndispatched(err: Error, owner?: symbol): void {
+    const keepOpen: PendingFile[] = [];
+    for (const file of this.openGroup.splice(0)) {
+      if (owner === undefined || file.owner === owner) file.reject(err); else keepOpen.push(file);
+    }
+    this.openGroup = keepOpen;
+    this.openBytes = keepOpen.reduce((n, file) => n + file.size, 0);
+    const keepJobs: FusedJob[] = [];
+    for (const job of this.fusedQueue.splice(0)) {
+      const keep: PendingFile[] = [];
+      for (const file of job.files) {
+        if (owner === undefined || file.owner === owner) file.reject(err); else keep.push(file);
+      }
+      if (keep.length) keepJobs.push({ ...job, files: keep });
+    }
+    this.fusedQueue.push(...keepJobs);
+  }
+
   decrypt(ctPath: string, plaintextSha: string, destPath: string, opts: DecryptFileOptions = {}): Promise<void> {
     return this.run<void>({ id: this.nextId(), kind: "decrypt", ctPath, plaintextSha, destPath, opts });
   }
@@ -317,12 +653,22 @@ export class CryptoPool {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.budget.wake();
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.flushTimer) clearTimeout(this.flushTimer);
     const err = closeError();
+    this.cancelUndispatched(err);
+    for (const held of this.producerResults.splice(0)) {
+      if (!held.delivered) {
+        held.delivered = true;
+        held.blob.lease.release();
+        held.file.reject(err);
+      }
+    }
     for (const waiter of this.queueWaiters.splice(0)) waiter.reject(err);
     for (const record of this.queue.splice(0)) record.reject(err);
     for (const worker of this.workers.splice(0)) {
-      worker.terminateIntentional();
+      await worker.terminateIntentional();
       for (const record of worker.inFlight.values()) record.reject(err);
       worker.inFlight.clear();
     }
@@ -335,6 +681,7 @@ export class CryptoPool {
 
   afterWorkerSlotFreed(): void {
     this.dispatch();
+    void this.pumpFused();
     this.signalQueueSpace();
     this.armIdleTimer();
   }
@@ -346,7 +693,9 @@ export class CryptoPool {
     const crash = workerCrashError(reason);
     for (const record of slot.inFlight.values()) {
       slot.inFlight.delete(record.message.id);
-      if (record.health || record.attempts >= 1 || this.closed) {
+      if (record.fused) {
+        record.reject(crash);
+      } else if (record.health || record.attempts >= 1 || this.closed) {
         record.reject(crash);
       } else {
         record.attempts++;
@@ -474,7 +823,7 @@ export class CryptoPool {
 
   private armIdleTimer(): void {
     if (this.closed) return;
-    if (this.queue.length > 0 || this.workers.some((worker) => worker.inFlight.size > 0)) return;
+    if (this.queue.length > 0 || this.openGroup.length > 0 || this.fusedQueue.length > 0 || this.workers.some((worker) => worker.inFlight.size > 0)) return;
     this.clearIdleTimer();
     this.idleTimer = setTimeout(() => {
       void this.close();

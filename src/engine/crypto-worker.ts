@@ -1,12 +1,15 @@
 import {
   decryptFileToPathInline,
+  encryptBytesInMemory,
   encryptFileToTempInline,
+  isSourceChangedError,
 } from "./crypto.js";
-import type { CryptoWorkerJobMessage, CryptoWorkerMessage, SerializedError } from "./crypto-worker-protocol.js";
+import fs from "node:fs/promises";
+import type { CryptoWorkerEncryptBatchResult, CryptoWorkerJobMessage, CryptoWorkerMessage, SerializedError } from "./crypto-worker-protocol.js";
 
 declare const self: {
   onmessage: ((event: { data: CryptoWorkerMessage }) => void | Promise<void>) | null;
-  postMessage(message: unknown): void;
+  postMessage(message: unknown, transfer?: ArrayBuffer[]): void;
 };
 
 let kek: Buffer | undefined;
@@ -49,6 +52,13 @@ function testDelay(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, TEST_DELAY_MS));
 }
 
+const DEFERRABLE_FS_CODES = new Set(["ENOENT", "EACCES", "EPERM", "ENOTDIR", "EISDIR", "ESTALE", "EBUSY"]);
+const FUSE_MAX_FILE_BYTES = 256 * 1024;
+function isAllowlistedFileError(err: unknown): boolean {
+  if (isSourceChangedError(err)) return true;
+  return typeof err === "object" && err !== null && "code" in err && DEFERRABLE_FS_CODES.has(String(err.code));
+}
+
 self.onmessage = async (event) => {
   const msg = event.data;
   if ("kek" in msg && !("kind" in msg)) {
@@ -77,6 +87,34 @@ self.onmessage = async (event) => {
     if (job.kind === "encrypt") {
       const result = await encryptFileToTempInline(job.srcPath, kek, job.tmpDir, job.opts ?? {});
       self.postMessage({ id: job.id, ok: true, result });
+    } else if (job.kind === "encryptBatch") {
+      let usedPlaintext = 0;
+      const result: CryptoWorkerEncryptBatchResult = { results: [] };
+      const transfers: ArrayBuffer[] = [];
+      for (const entry of job.jobs) {
+        try {
+          const src = await fs.readFile(entry.srcPath);
+          if (src.length > FUSE_MAX_FILE_BYTES) {
+            throw Object.assign(new Error("source changed beyond fused eligibility"), { code: "RBOX_SOURCE_CHANGED" });
+          }
+          if (usedPlaintext + src.length > job.jobPlaintextCap) {
+            result.results.push({ index: entry.index, ok: false, requeue: true });
+            continue;
+          }
+          usedPlaintext += src.length;
+          const blob = await encryptBytesInMemory(src, kek, { ...entry.opts, expected: entry.expected });
+          result.results.push({ index: entry.index, ok: true, blob });
+          transfers.push(blob.ciphertext);
+        } catch (err) {
+          if (!isAllowlistedFileError(err)) throw err;
+          result.results.push({ index: entry.index, ok: false, error: serializeError(err) });
+        }
+      }
+      try {
+        self.postMessage({ id: job.id, ok: true, result }, transfers);
+      } catch {
+        self.postMessage({ id: job.id, ok: false, error: serializeError(Object.assign(new Error("ciphertext transfer unsupported"), { code: "RBOX_CRYPTO_TRANSFER_UNSUPPORTED" })) });
+      }
     } else {
       await decryptFileToPathInline(job.ctPath, kek, job.plaintextSha, job.destPath, job.opts ?? {});
       self.postMessage({ id: job.id, ok: true });
