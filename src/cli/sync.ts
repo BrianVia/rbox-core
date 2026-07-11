@@ -469,6 +469,20 @@ type RecoveryAction =
 
 const RECOVER_ACCUM_MAX = 100_000;
 
+/** Design 103 Part B: fold one 422 page into the recovery accumulator. Returns the
+ *  new full-audit latch state. Once latched (or newly overflowing RECOVER_ACCUM_MAX)
+ *  the set is cleared and stays empty — the chunked full audit needs no recovery set,
+ *  and holding 100k+ strings would be dead weight (unit-tested memory bound). */
+export function accumulateRecoveryPage(accum: Set<string>, latched: boolean, page: readonly string[]): boolean {
+  if (latched) return true;
+  for (const sha of page) accum.add(sha);
+  if (accum.size > RECOVER_ACCUM_MAX) {
+    accum.clear();
+    return true;
+  }
+  return false;
+}
+
 /** The result of ONE push attempt: either done (committed / no-op / everything deferred),
  *  or a classified recovery to apply, carrying the error to throw once the shared
  *  MAX_ATTEMPTS budget is exhausted. */
@@ -546,13 +560,7 @@ export async function pushManifest(
       recoverFullAudit = false;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
-      if (!recoverFullAudit) {
-        for (const sha of outcome.action.unsatisfiedBlobs) recoverAccum.add(sha);
-        if (recoverAccum.size > RECOVER_ACCUM_MAX) {
-          recoverFullAudit = true;
-          recoverAccum.clear();
-        }
-      }
+      recoverFullAudit = accumulateRecoveryPage(recoverAccum, recoverFullAudit, outcome.action.unsatisfiedBlobs);
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
     }

@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
+import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
 import { missingBlobsChunked } from "./sync-recovery.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
@@ -839,6 +839,20 @@ test("delta recovery accumulator overflow switches the retry to a full audit", a
   const postOverflowPreflight = remote.missingBlobCalls.at(-1)!;
   expect(postOverflowPreflight).toContain(carriedAddress);
   expect(pages.flat().some((synthetic) => postOverflowPreflight.includes(synthetic))).toBe(false);
+});
+
+test("accumulateRecoveryPage clears on overflow and stays empty while latched", () => {
+  const accum = new Set<string>();
+
+  expect(accumulateRecoveryPage(accum, false, ["a", "b"])).toBe(false);
+  expect(accum).toEqual(new Set(["a", "b"]));
+
+  const overflowPage = Array.from({ length: 100_001 }, (_, index) => `recovery-${index}`);
+  expect(accumulateRecoveryPage(accum, false, overflowPage)).toBe(true);
+  expect(accum.size).toBe(0);
+
+  expect(accumulateRecoveryPage(accum, true, ["post-overflow"])).toBe(true);
+  expect(accum.size).toBe(0);
 });
 
 test("missingBlobsChunked splits checks at 50,000 and unions missing results", async () => {
