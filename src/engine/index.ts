@@ -44,7 +44,7 @@ export {
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "./crypto.js";
-export { cryptoPoolStatus, withCryptoPool, type CryptoPoolStatus } from "./crypto-pool.js";
+export { cryptoPoolStatus, withCryptoPool, type CryptoPoolStatus, type CryptoPool, type CoalescedBlob } from "./crypto-pool.js";
 export { hashFile, hashBytes } from "./hash.js";
 export {
   BUILTIN_IGNORE,

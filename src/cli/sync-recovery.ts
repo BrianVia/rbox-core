@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
@@ -11,6 +12,8 @@ import {
   type EncryptedBlob,
   type EncryptAddressCacheContext,
   type EncryptFileOptions,
+  type CryptoPool,
+  type CoalescedBlob,
   type FileEntry,
   type Manifest,
   type PhaseReport,
@@ -43,6 +46,25 @@ const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
   return Number.isInteger(n) && n >= 1 && n <= max ? n : dflt;
 };
 const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, poolWorkers ? poolWorkers * 2 : 8); // CPU/disk bound
+const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
+const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
+
+async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
+  // Phase 1's legacy consumer materializes a memory lease into the existing encup
+  // temp flow and releases its charge there; the disk temp becomes the source of
+  // truth, like a producer spill. Design 98 activates Tier-2 by-reference framing
+  // and release at HTTP settlement (Design 99 §7.5/§10).
+  let ciphertextPath: string;
+  if (blob.lease.location.kind === "file") {
+    ciphertextPath = blob.lease.location.path;
+    blob.lease.release();
+  } else {
+    ciphertextPath = path.join(tmpDir, `${blob.plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
+    try { await fs.writeFile(ciphertextPath, blob.lease.location.bytes); }
+    finally { blob.lease.release(); }
+  }
+  return { plaintextSha: blob.plaintextSha, encSha: blob.encSha, ciphertextPath, cipherSize: blob.cipherSize, comp: blob.comp, payloadSha: blob.payloadSha };
+}
 // 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
 // ~7 D1 round-trips and concurrency past 32 just multiplied D1 contention. §23 moved D1 off
 // the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
@@ -56,6 +78,12 @@ export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
 
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
+let defaultEncryptObserverForTest: (() => void) | undefined;
+
+/** Narrow routing-test seam: observes entry into the production oracle. */
+export function setDefaultEncryptObserverForTest(observer: (() => void) | undefined): void {
+  defaultEncryptObserverForTest = observer;
+}
 
 type CipherDescriptor = {
   encSha: string;
@@ -175,7 +203,10 @@ export async function encryptAndUpload(
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
-  const encryptFileToTemp = options.encryptFileToTemp ?? defaultEncryptFileToTemp;
+  const encryptFileToTemp = options.encryptFileToTemp ?? ((...args: Parameters<EncryptFileToTempForSync>) => {
+    defaultEncryptObserverForTest?.();
+    return defaultEncryptFileToTemp(...args);
+  });
   const encryptOpts = { compress: compressionEnabled() };
   const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
@@ -203,14 +234,18 @@ export async function encryptAndUpload(
       }
     });
     report.record("address", { count: carried });
-    const runCryptoAndUpload = async (poolWorkers: number | undefined): Promise<void> => {
+    const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
+      const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
       let enc = 0;
       let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
       let cacheHits = 0;
       let cacheMisses = 0;
       await report.phase("encrypt", async () => {
-        await poolMap(toEncrypt, encryptConcurrency(poolWorkers), async (f) => {
+        // The budget and fused dispatch bound provide real backpressure; this wide
+        // caller window only lets the coalescer fill byte/count-bounded groups.
+        const encConc = fuse ? Math.min(toEncrypt.length, FUSED_ENCRYPT_CONCURRENCY_CAP) : encryptConcurrency(pool?.workers.length);
+        await poolMap(toEncrypt, encConc, async (f) => {
         const t0 = LANE_TIMING ? performance.now() : 0;
         const cached = encryptCache.lookup(f.sha256);
         if (cached) {
@@ -234,10 +269,10 @@ export async function encryptAndUpload(
         cacheMisses++;
         let e;
         try {
-          e = await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, {
-            ...encryptOpts,
-            expected: { sha256: f.sha256, size: f.size },
-          });
+          const opts = { ...encryptOpts, expected: { sha256: f.sha256, size: f.size } };
+          e = fuse
+            ? await materializeLease(await pool!.encryptCoalesced(path.join(root, f.path), f.size, tmpDir, opts), tmpDir)
+            : await encryptFileToTemp(path.join(root, f.path), kek, tmpDir, opts);
         } catch (err) {
           // Vanished between scan and snapshot (agent/build churn deletes files
           // constantly on a live tree). This is the churn case design 38 defers,
@@ -433,7 +468,7 @@ export async function encryptAndUpload(
     };
 
     if (options.encryptFileToTemp === undefined) {
-      await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool?.workers.length));
+      await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool));
     } else {
       await runCryptoAndUpload(undefined);
     }

@@ -3,10 +3,11 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
-import { Transform, Writable } from "node:stream";
+import { Readable, Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
 import { hashBytes, hashFile } from "./hash.js";
+import type { InMemoryEncryptedBlob } from "./crypto-worker-protocol.js";
 
 /**
  * Convergent blob-content encryption (design 12, V4-5). AES-256-GCM with a
@@ -47,10 +48,10 @@ function createZstdDecompress(): Transform {
   return zstd.createZstdDecompress();
 }
 
-async function zstdCompressFileToBuffer(srcPath: string): Promise<Buffer> {
+async function collectZstd(source: Readable): Promise<Buffer> {
   const chunks: Buffer[] = [];
   await pipeline(
-    fsSync.createReadStream(srcPath),
+    source,
     createZstdCompressLevel3(),
     new Writable({
       write(chunk, _encoding, callback) {
@@ -61,6 +62,9 @@ async function zstdCompressFileToBuffer(srcPath: string): Promise<Buffer> {
   );
   return Buffer.concat(chunks);
 }
+
+const zstdCompressFileToBuffer = (srcPath: string): Promise<Buffer> => collectZstd(fsSync.createReadStream(srcPath));
+const zstdCompressBufferToBuffer = (src: Buffer): Promise<Buffer> => collectZstd(Readable.from([src]));
 
 async function encryptBufferToFile(payload: Buffer, ctPath: string, dek: Buffer, nonce: Buffer): Promise<void> {
   const cipher = createCipheriv("aes-256-gcm", dek, nonce);
@@ -139,6 +143,34 @@ function sourceChangedError(srcPath: string): SourceChangedError {
 /** Source-change classification must survive crypto-worker serialization. */
 export function isSourceChangedError(error: unknown): error is { readonly code: typeof SOURCE_CHANGED_ERROR_CODE } {
   return typeof error === "object" && error !== null && "code" in error && error.code === SOURCE_CHANGED_ERROR_CODE;
+}
+
+/** Separate fused-job helper. The file-backed oracle below intentionally remains untouched. */
+export async function encryptBytesInMemory(src: Buffer, kek: Buffer, opts: EncryptFileOptions): Promise<InMemoryEncryptedBlob> {
+  const plaintextSha = hashBytes(src);
+  if (!opts.expected || plaintextSha !== opts.expected.sha256 || src.length !== opts.expected.size) {
+    throw sourceChangedError("<fused-source>");
+  }
+  let payload = src;
+  let payloadSha = plaintextSha;
+  let comp: "zstd" | undefined;
+  if (opts.compress && src.length >= COMPRESS_MIN_BYTES) {
+    const compressed = await zstdCompressBufferToBuffer(src);
+    if (compressed.length < src.length * COMPRESS_RATIO) {
+      payload = compressed;
+      payloadSha = hashBytes(compressed);
+      comp = "zstd";
+    }
+  }
+  const { dek, nonce } = deriveKeyNonce(kek, payloadSha);
+  const cipher = createCipheriv("aes-256-gcm", dek, nonce);
+  cipher.setAAD(AAD);
+  const body = cipher.update(payload);
+  cipher.final();
+  const ct = Buffer.concat([body, cipher.getAuthTag()]);
+  const ciphertext = ct.buffer.slice(ct.byteOffset, ct.byteOffset + ct.byteLength) as ArrayBuffer;
+  const base = { plaintextSha, encSha: hashBytes(ct), cipherSize: ct.length, ciphertext };
+  return comp ? { ...base, comp, payloadSha } : base;
 }
 
 type CryptoPoolSelection = {
