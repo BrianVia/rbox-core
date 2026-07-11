@@ -1,4 +1,5 @@
 import type { Env } from "./env.js";
+import { DIVERGENCE_SAMPLE } from "./commit-delta.js";
 
 /**
  * Server-side observability for the control plane (perf TODO, 2026-06-29).
@@ -100,6 +101,35 @@ export function emit(env: Env, e: MetricEvent): void {
     });
   } catch {
     // telemetry must never break the request path
+  }
+}
+
+export interface DeltaMetricFields {
+  count?: number;
+  ratio?: number;
+  bytes?: number;
+  dbCalls?: number;
+  reason?: string;
+  digest?: string;
+  sample?: string[];
+}
+
+/** Design 102 telemetry is a separate AE point: blobs are
+ * [op,outcome,reason,digest], doubles reuse [bytes,count,ratio,dbCalls]. Phase
+ * timings use `count` as milliseconds; sizes use count=added, ratio=carried,
+ * bytes=removed. This does
+ * not alter the frozen positional layout of the existing commit MetricEvent. */
+export function emitDelta(env: Env, outcome: string, fields: DeltaMetricFields = {}): void {
+  const ds = env.rbox_metrics;
+  try {
+    ds?.writeDataPoint({
+      indexes: ["commit.delta"],
+      blobs: ["commit.delta", outcome, fields.reason ?? "", fields.digest ?? ""],
+      doubles: [fields.bytes ?? 0, fields.count ?? 0, fields.ratio ?? 0, fields.dbCalls ?? 0],
+    });
+    if (fields.sample?.length) console.error(JSON.stringify({ event: "commit.delta.divergence", outcome, digest: fields.digest, sample: fields.sample.slice(0, DIVERGENCE_SAMPLE) }));
+  } catch {
+    // telemetry must never break commit admission
   }
 }
 

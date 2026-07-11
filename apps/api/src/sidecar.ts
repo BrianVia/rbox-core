@@ -11,7 +11,7 @@
 import type { Env } from "./env.js";
 import { blobKey, sha256Hex } from "./util.js";
 import { verifyReceipt } from "./receipts.js";
-import { parseRefset, parseRefsetShaSet, refsetByteLength } from "../../../src/engine/refset.js";
+import { parseRefset, parseRefsetShaSet, refsetByteLength, refsetShas, validateRefsetBytes } from "../../../src/engine/refset.js";
 
 /** The §24 sidecar descriptor as it appears in the signed commit body. (Defined locally so
  *  the Worker shares only the dependency-free refset codec with the engine, not its crypto graph.) */
@@ -27,6 +27,21 @@ export type SidecarResult =
   | { ok: false; badSidecar: string }; // present but corrupt/mismatched/unparseable → 400
 
 export type LoadSidecarResult = { ok: true; refs: ReturnType<typeof parseRefset> } | { ok: false; reason: string };
+export type LoadSidecarRawResult = { ok: true; buf: Uint8Array; totalBytes: number } | { ok: false; reason: string };
+
+export async function loadSidecarRaw(env: Env, sidecarSha: string, count: number): Promise<LoadSidecarRawResult> {
+  const obj = await env.rbox_dev_blobs.get(blobKey(sidecarSha));
+  if (!obj) return { ok: false, reason: "missing" };
+  if (obj.size !== refsetByteLength(count)) return { ok: false, reason: `size ${obj.size} != expected ${refsetByteLength(count)}` };
+  const buf = new Uint8Array(await obj.arrayBuffer());
+  if ((await sha256Hex(buf)) !== sidecarSha) return { ok: false, reason: "sha256 mismatch" };
+  try {
+    const totalBytes = validateRefsetBytes(buf);
+    return { ok: true, buf, totalBytes };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : "parse failed" };
+  }
+}
 
 /**
  * Fetch + strictly validate the sidecar OBJECT (no entitlement/descriptor logic — that's the
@@ -77,6 +92,19 @@ export async function resolveSidecarBytes(
   receipts: Record<string, string>,
   nowMs: number,
 ): Promise<SidecarResult> {
+  const raw = await resolveSidecarRaw(env, db, accountId, descriptor, receipts, nowMs);
+  if (!raw.ok) return raw;
+  return { ok: true, refShas: refsetShas(raw.buf) };
+}
+
+export async function resolveSidecarRaw(
+  env: Env,
+  db: D1Database,
+  accountId: string,
+  descriptor: SidecarDescriptor,
+  receipts: Record<string, string>,
+  nowMs: number,
+): Promise<{ ok: true; buf: Uint8Array; count: number } | { ok: false; needsUpload: string[] } | { ok: false; badSidecar: string }> {
   const { sidecarSha, count, totalBytes } = descriptor;
 
   // Entitlement gate BEFORE the R2 GET. Receipt first (no D1); else entitled+present (1 read).
@@ -98,15 +126,13 @@ export async function resolveSidecarBytes(
   // A receipt/entitlement proves the account uploaded the sidecar, but R2 could still lag a
   // just-uploaded object → treat a missing object as needsUpload; bytes that exist but don't
   // match the signed descriptor are a hard badSidecar (the size gate also pins count == count).
-  const loaded = await loadSidecarRefs(env, sidecarSha, count);
+  const loaded = await loadSidecarRaw(env, sidecarSha, count);
   if (!loaded.ok) {
     if (loaded.reason === "missing") return { ok: false, needsUpload: [sidecarSha] };
     return { ok: false, badSidecar: loaded.reason };
   }
   // Descriptor's totalBytes MUST match the canonical bytes (advisory fields gate, never bill).
-  let sum = 0;
-  for (const x of loaded.refs) sum += x.size;
-  if (sum !== totalBytes) return { ok: false, badSidecar: `sidecar totalBytes ${sum} != descriptor ${totalBytes}` };
+  if (loaded.totalBytes !== totalBytes) return { ok: false, badSidecar: `sidecar totalBytes ${loaded.totalBytes} != descriptor ${totalBytes}` };
 
-  return { ok: true, refShas: loaded.refs.map((x) => x.encSha) };
+  return { ok: true, buf: loaded.buf, count };
 }

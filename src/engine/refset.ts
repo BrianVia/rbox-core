@@ -36,7 +36,7 @@ for (let i = 0; i < REFSET_MAGIC.length; i++) MAGIC_BYTES[i] = REFSET_MAGIC.char
 function hexToBytes32(hex: string, out: Uint8Array, off: number): void {
   for (let i = 0; i < 32; i++) out[off + i] = parseInt(hex.substr(i * 2, 2), 16);
 }
-function bytes32ToHex(b: Uint8Array, off: number): string {
+export function bytes32ToHex(b: Uint8Array, off: number): string {
   let s = "";
   for (let i = 0; i < 32; i++) s += b[off + i]!.toString(16).padStart(2, "0");
   return s;
@@ -46,6 +46,44 @@ function bytes32ToHex(b: Uint8Array, off: number): string {
  *  against the R2 object's reported size, before allocating from a self-declared count). */
 export function refsetByteLength(count: number): number {
   return REFSET_HEADER + REFSET_REC * count;
+}
+
+/** Strictly validate canonical refset bytes without allocating SHA strings or Ref
+ * objects. Returns the sum of record sizes. */
+export function validateRefsetBytes(bytes: Uint8Array): number {
+  if (bytes.length < REFSET_HEADER) throw new Error("refset: too short");
+  for (let i = 0; i < MAGIC_BYTES.length; i++) {
+    if (bytes[i] !== MAGIC_BYTES[i]) throw new Error("refset: bad magic");
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = dv.getUint32(14, false);
+  if (bytes.length !== refsetByteLength(count)) throw new Error("refset: length mismatch (trailing/short bytes)");
+  let totalBytes = 0;
+  for (let i = 0; i < count; i++) {
+    const off = REFSET_HEADER + REFSET_REC * i;
+    if (i > 0) {
+      const prevOff = off - REFSET_REC;
+      let cmp = 0;
+      for (let j = 0; j < 32; j++) {
+        cmp = bytes[prevOff + j]! - bytes[off + j]!;
+        if (cmp !== 0) break;
+      }
+      if (cmp >= 0) throw new Error("refset: not strictly ascending / duplicate sha");
+    }
+    const sizeBig = dv.getBigUint64(off + 32, false);
+    if (sizeBig > BigInt(MAX_REF_SIZE)) throw new Error("refset: size exceeds safe integer range");
+    totalBytes += Number(sizeBig);
+  }
+  return totalBytes;
+}
+
+/** Extract SHA strings without validation. Only call for bytes already validated by
+ * validateRefsetBytes or parseRefset. */
+export function refsetShas(bytes: Uint8Array): string[] {
+  const count = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(14, false);
+  const shas = new Array<string>(count);
+  for (let i = 0; i < count; i++) shas[i] = bytes32ToHex(bytes, REFSET_HEADER + REFSET_REC * i);
+  return shas;
 }
 
 /**
