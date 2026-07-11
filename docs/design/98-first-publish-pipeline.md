@@ -1,7 +1,7 @@
 # 98 — First-publish pipeline: overlap encrypt → upload → receipt redemption
 
-Status: Design draft v4 (v1 → round-1 REVISE, 20 items; v2 → round-2 REVISE,
-12 items; v3 → round-3 REVISE, 4 items; all accepted — see `REVIEW-98.md`). Owns audit Findings 6 (phase-serialized publish)
+Status: Design draft v5 (review rounds 1–4 REVISE with 20/12/4/3 items, all
+accepted — see `REVIEW-98.md`). Owns audit Findings 6 (phase-serialized publish)
 and 8 (receipt redemption after all uploads). Finding 9 (batch bearer-auth) is
 a **measurement-and-deferral record only** (§4), not a build in this design.
 Client-and-server-adjacent. Pending the Phase 0 measurements in §5 before the
@@ -237,10 +237,18 @@ runs. The disk axis therefore works by RESERVATION: a producer reserves
 overhead bound; compression can only shrink it) BEFORE dispatching the encrypt,
 blocks if the reservation would exceed `maxTempDiskBytes`, and reconciles the
 reservation down to the actual `cipherSize` when the job completes (snapshot
-deleted, ciphertext measured). Occupancy on the disk axis is thus: crypto
-in-flight reservations + queued file-backed ready blobs + temps whose upload has
-not yet settled. This is what makes the disk-full row in §6.4 a bounded claim
-rather than a hope.
+deleted, ciphertext measured). **The snapshot itself must be SIZE-CAPPED for
+the reservation to hold (round-4 item 2):** the current snapshot copy reads the
+live source without a bound, so a file that GREW after scanning could write
+past its reservation before the hash/size validation rejects it as churn. The
+pipeline requires the snapshot read to stop at `expectedSize + 1` bytes and
+churn-defer the file the moment the source exceeds `expectedSize` — before any
+byte beyond the reservation is written (the same defer the post-copy validation
+produces today, just decided during the copy). Occupancy on the disk axis is
+thus: crypto in-flight reservations + queued file-backed ready blobs + temps
+whose upload has not yet settled — bounded regardless of live source growth.
+This is what makes the disk-full row in §6.4 a bounded claim rather than a
+hope.
 
 **Heap accounting is two-tier (round-2 item 12).** The pipeline can enforce a
 hard accounting bound ONLY over bytes it owns: queued buffer-backed ready blobs
@@ -452,13 +460,18 @@ SIGINT. On abort:
 
 Successful termination is an ordered barrier chain, not "Promise.all settled":
 
-1. **Producer EOF.** When the `poolMap` over `toEncrypt` (including files
-   re-queued from the cache-hit lane, §3.1) has settled every entry, producers
-   CLOSE the ReadyQueue for writing. The cache-hit checker closes its lane the
-   same way once every cache-hit address has a settled disposition (satisfied,
-   or re-queued into `toEncrypt` BEFORE producer EOF is declared — the
-   re-queue happens inside the same `poolMap` scope, so EOF cannot race a
-   pending re-queue).
+1. **Producer EOF (round-4 item 1 — a static `poolMap` cannot take late
+   work).** The encrypt lane is an explicitly CLOSEABLE dynamic work queue,
+   not a fixed `poolMap` over a pre-built array: scan-derived cache misses are
+   enqueued up front, and the cache-hit checker may enqueue re-encryption work
+   at any time until ITS lane closes. An `outstanding` counter covers every
+   unit of unfinished pre-ready work: unclassified cache-hit addresses,
+   enqueued-but-unfinished encrypts, and in-flight classification batches.
+   Producer EOF — closing the ReadyQueue for writing — is declared exactly
+   when (a) the scan-derived input is exhausted, (b) the cache-hit lane is
+   closed (every address classified), and (c) `outstanding === 0`. A
+   classification batch still in flight holds `outstanding > 0`, so EOF can
+   never race a re-queue.
 2. **Queue drain.** Consumers observe EOF after draining every queued item;
    each item reaches a settled disposition (§3.2 item 3).
 3. **Final rolling-check flush.** On queue EOF the coalescing buffer FLUSHES
@@ -608,6 +621,18 @@ prior run exited, because ciphertext temps never survive a run.
   flush are also lost; resume additionally re-encrypts that BOUNDED tail (at
   most one flush interval of encryptions). This is stated as expected, not a
   bug.
+- **Stale-temp reclamation (round-4 item 3):** `finally` never runs on
+  SIGKILL, so the run's temp DIRECTORY survives on disk — bounded per run but
+  unbounded across repeated hard kills without a reclamation policy. Pipeline
+  temps therefore live under a workspace-scoped parent
+  (`.rbox/state/tmp/enc-<pid>-<startMs>/`) whose name embeds the owning pid;
+  at every push start, before reserving anything, the pipeline reclaims sibling
+  directories whose owner pid is not alive (with an age floor of one hour as a
+  belt-and-suspenders against pid reuse — a stale dir is only ever dead
+  ciphertext, so reclamation is always safe for correctness, the floor only
+  avoids racing a just-started concurrent push, which the design-93 workspace
+  mutex already excludes). Gate 3 includes a repeated-SIGKILL run asserting no
+  cross-run temp accumulation.
 
 On resume, the rolling server-satisfied check (§3.2) classifies each address:
 
@@ -723,8 +748,10 @@ a documented external cause (host sleep, network change).
    cached address is still server-SATISFIED; re-uploads only the
    server-unsatisfied tail; re-encrypts only the (server-unsatisfied ∪
    post-last-flush) set; final account charge == single-run charge, byte-exact.
-   Run for both SIGINT and SIGKILL. Exact counts, no percentiles — this is a
-   correctness gate.
+   Run for both SIGINT and SIGKILL. A repeated-SIGKILL sequence (≥ 3 kills,
+   then a clean run) additionally asserts no cross-run temp-directory
+   accumulation (stale-temp reclamation, §6.1). Exact counts, no percentiles —
+   this is a correctness gate.
    - **3b. Post-abort dispatch bound.** On a mid-run quota 402:
      `dispatchCount` increments after the abort latch = 0 (the atomic counter of
      §3.5), and objects landed after the latch ≤ the recorded in-flight window

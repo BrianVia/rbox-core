@@ -139,6 +139,28 @@ All 4 accepted. Dispositions:
    parameter-free optimistic upper bound (redemption assumed fully overlapped)
    fixed before measurement (§5.2).
 
-## Round 4
+## Round 4 — VERDICT: REVISE (3 items)
+
+All 3 accepted. Dispositions:
+
+1. **EOF circular for re-queued cache hits (a static `poolMap` cannot take
+   late work)** — ACCEPTED: the encrypt lane is now an explicitly CLOSEABLE
+   dynamic work queue with an outstanding-work counter; producer EOF is
+   declared only when both input lanes are closed (scan-derived misses
+   exhausted AND cache-hit checker has classified every address) and
+   outstanding classification + re-encryption work is zero (§3.6).
+2. **Snapshot can exceed its reservation when a source grows after scan** —
+   ACCEPTED: the pipeline requires a SIZE-CAPPED snapshot: the snapshot copy
+   reads at most `expectedSize + 1` bytes and a source that exceeds
+   `expectedSize` mid-copy churn-defers immediately, before any write beyond
+   the reservation — making the disk bound hold regardless of live source
+   growth (§3.2).
+3. **Abandoned temp dirs leak across SIGKILL runs** — ACCEPTED: stale-temp
+   reclamation policy added — pipeline temps live under a workspace-scoped
+   directory embedding the owning pid; every push start reclaims directories
+   whose owner pid is dead (plus an age floor); gate covers repeated hard
+   kills (§6.1, gate 3).
+
+## Round 5
 
 Status: pending
