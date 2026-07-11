@@ -1,6 +1,6 @@
 # 99 — Fused byte-bounded crypto worker jobs + fewer encrypt temp passes
 
-Status: Design draft v4 (revised after REVIEW-99 rounds 1–3). Measurement-first
+Status: Design draft v5 (revised after REVIEW-99 rounds 1–4). Measurement-first
 (Phase 0 gate precedes any behaviour change). Client-only. Owns the crypto
 worker pool's job granularity and the first-publish encrypt temp-file lifecycle.
 Interfaces with **design 98** (first-publish overlapping encrypt→upload
@@ -235,12 +235,17 @@ code, removed). The real case is **sustained pressure**: many workers complete
 while the uploader lags, so held ciphertext approaches the budget and dispatch
 would stall the encrypt lane.
 
-- **Who / when:** the *main isolate*, at result-receipt, when held ciphertext
-  exceeds a high-water mark (`SPILL_WATERMARK` = 75% of budget) **and** the
-  uploader is saturated. It writes the oldest held ciphertext buffers to temp
-  files in the shared `tmpDir` (owner-only, as today), flips their
-  `ciphertextLocation` to `{ kind: "file", path }`, and **releases their budget
-  reservation**. Encryption keeps flowing.
+- **Who / when / WHAT (Round-4 item 1):** the *main isolate*, at result-receipt,
+  when held ciphertext exceeds `SPILL_WATERMARK` = 75% of budget **and** the
+  uploader is saturated. It may spill **only producer-owned, undelivered
+  results** — buffers not yet handed to a consumer via `onReady`/the legacy
+  lease. A consumer-owned buffer may already back an in-flight HTTP request;
+  relocating it and releasing its charge would undercount live bytes, so spill
+  MUST NOT touch it. If no producer-owned undelivered result exists to spill,
+  dispatch simply stays blocked until a consumer `release()` frees budget. A
+  spill-eligible buffer is written to a temp file in the shared `tmpDir`
+  (owner-only), flips to `{ kind: "file", path }`, and its per-file charge is
+  released. Encryption keeps flowing.
 - **Promise/lease settlement:** each spilled file's per-file promise/lease
   resolves normally with the file-backed location; the uploader takes the
   `putBlobFile` path for those (§7.5), and the spill write is exactly the event
@@ -367,13 +372,19 @@ group or, if a single file now exceeds the per-file cap, as a large single-file
 job). This keeps worker output inside its reservation even when files grew after
 scan.
 
-**Completeness validation (Round-1 item 8):** on receipt the pool asserts
-`results` has **exactly one** entry per requested `index`, indices unique and
-within the request set. Any violation (missing, duplicate, extra, malformed,
-non-`ok` envelope) **rejects every still-unresolved slot of that job promptly**
-with a crash-class error → bounded split retry (§6.3); a caller is never resolved
-with another file's ciphertext, and no promise hangs. Health/decrypt messages
-are unchanged.
+**Completeness + charge-securing validation (Round-1 item 8, Round-4 item 2):**
+on receipt, before the §4.1 conversion of `JOB_RESERVE` into per-file charges,
+the pool asserts: (a) `results` has **exactly one** entry per requested `index`,
+indices unique and within the request set; (b) each successful result's actual
+transferred `blob.ciphertext.byteLength === blob.cipherSize` (metadata cannot lie
+about live bytes); (c) `Σ byteLength ≤ JOB_RESERVE`; (d) every result buffer is a
+**distinct, non-aliased** `ArrayBuffer` (no two results share backing memory).
+Any violation (missing, duplicate, extra, malformed, size-mismatch, over-reserve,
+aliased, non-`ok` envelope) is crash-class: the pool **discards all transferred
+buffers of the job** and **rejects every still-unresolved slot promptly** →
+bounded split retry (§6.3). A caller is never resolved with another file's
+ciphertext, no promise hangs, and no malformed result can undercharge memory.
+Health/decrypt messages are unchanged.
 
 ### 6.2 Worker (`crypto-worker.ts`) — separate helper, not a reroute
 
@@ -524,12 +535,21 @@ Only an **allowlist of expected, serializable per-file errors** becomes a
 - `requeue` (aggregate overflow, §6.1) — not a failure at all: the coalescer
   re-submits the file, its lease/reservation was never taken.
 
-**Everything else** — programmer errors, invariant violations, cancellation,
-pool closure, OOM, resource exhaustion — MUST fail the **whole job envelope**
-(`ok:false` at the envelope), invoking bounded split retry (§6.3). Per-file
-resolution then applies today's classification (`sync-recovery.ts:228–239`):
-deferrable churn → defer that path only; else reject that file. Siblings settle
-normally.
+**Crash-class only → split retry.** Programmer errors, invariant violations,
+OOM/resource exhaustion, and malformed-worker envelopes fail the **whole job
+envelope** and invoke bounded split retry (§6.3). Per-file resolution then
+applies today's classification (`sync-recovery.ts:228–239`): deferrable churn →
+defer that path only; else reject that file. Siblings settle normally.
+
+**Cancellation and orderly pool close are NOT crash-class (Round-4 item 3).**
+`cancel()` (§6.4) and `close()` (`crypto-pool.ts:317–334`) do **not** enter the
+retry tree and create **no** children. They **terminally settle** every
+unresolved producer-owned entry (reject with the existing
+`RBOX_CRYPTO_POOL_CLOSED`/a cancel error, as `close()` already does at
+`:322–327`), release the parent `JOB_RESERVE`, and stop. Consumer-owned in-flight
+leases are untouched and settle via their own `release()` (§10). This removes the
+prior contradiction between "cancellation fails the envelope → split retry" and
+"cancel stops dispatch".
 
 ### 7.5 Upload path for in-memory ciphertext + retry ownership (Round-1 items 4, 9)
 
@@ -567,9 +587,10 @@ normally.
 ## 8. Gates (falsify, not promise) — with tolerances and method
 
 All on the §5.4 pinned control; ≥5 cold + ≥10 warm runs; distributions compared
-with a bootstrap 95% CI on the p50 delta (and Mann–Whitney U for the latency
-distributions in gates 5, 7); aggregated **per host and per filesystem** (APFS +
-ext4); a gate passes only if it holds on **both** filesystems. Memory is
+with a bootstrap 95% CI on the p50 delta; the no-regression gates (5, 7) are
+one-sided **non-inferiority** tests against a stated margin (an equivalence
+claim, not "no significant difference"); aggregated **per host and per
+filesystem** (APFS + ext4); a gate passes only if it holds on **both** filesystems. Memory is
 gated **process-wide** via `getrusage` `ru_maxrss` (the hard peak — Bun workers
 are threads in the same OS process, so per-worker `ru_maxrss` is not observable,
 Round-3 item 6); per-worker pressure is instead observed through
@@ -594,19 +615,24 @@ high-water.
    ownership test and peak-framing-bytes assertion pass for every case (batch,
    single fallback, retry, skip, duplicate-waiter, abort) — proving "frames by
    reference" so the 96 MiB bound is real (Round-3 item 7).
-5. **No small-push regression (numeric).** Workload A one-file change (audit
-   1227–1234): p50 wall ≤ control × 1.01 AND Mann–Whitney U shows no significant
-   slowdown (α = 0.05), measured in **both** pool-off (<`minJobs`) and pool-on
+5. **No small-push regression (non-inferiority, Round-4 item 4).** Workload A
+   one-file change (audit 1227–1234): a one-sided non-inferiority test with
+   margin **+1%** — the upper bound of the bootstrap 95% CI on the p50 wall delta
+   (fused − control)/control must be **< +0.01** (proving equivalence, not merely
+   failing to detect a difference), in **both** pool-off (<`minJobs`) and pool-on
    partial-batch cases.
 6. **Full-publish overlap efficiency (Finding 6, Round-1 item 13).** With design
    98 enabled: full first-publish wall p50 ≤ control, AND overlap efficiency
    `η = (encrypt_wall + upload_wall − full_wall) / min(encrypt_wall, upload_wall)
    ≥ 0.5` (i.e. at least half of the smaller phase is hidden) — a numeric
    threshold replacing "materially closer".
-7. **Readiness not coarsened (Round-1 item 14, Round-2 item 6).** Per-file
-   readiness-delay (enqueue → `ready`): p50 ≤ control × 1.05 and p99 ≤ control ×
-   1.10, bootstrap 95% CI; **time-to-first-upload** ≤ control × 1.05. The primed
-   first batch (§5.2) must keep first-upload no later than control.
+7. **Readiness not coarsened (non-inferiority, Round-1 item 14, Round-4 item
+   4).** Per-file readiness-delay (enqueue → `ready`): the **upper** bound of the
+   bootstrap 95% CI on the p50 delta must be **≤ +5%** and on the p99 delta **≤
+   +10%**; **time-to-first-upload** upper 95% CI bound **≤ +5%**. Stating the CI
+   bound explicitly (not "no significant difference") makes each an equivalence
+   claim. The primed first batch (§5.2) must keep first-upload no later than
+   control.
 8. **Full-corpus receiver diff clean** after a fused first publish (audit 658):
    a fresh join reproduces every file byte-for-byte.
 

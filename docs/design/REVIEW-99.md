@@ -50,6 +50,15 @@ codex (gpt-5.6-sol). Convergence on the lease/budget ownership model + the 98 se
 6. Gate 3 per-worker `ru_maxrss` impossible (Bun workers share the process). → **FIXED**: process-wide `ru_maxrss` hard-peak gate + worker-reported retained-byte counters + instrumented budget high-water; dropped per-worker ru_maxrss (§8 gate 3).
 7. Zero-copy "frames by reference" untested (gate 4 can't see a hidden copy). → **FIXED**: implementation-level buffer-identity ownership test + measured peak-framing-bytes assertion across batch/fallback/retry/skip/duplicate/abort (§7.5, §8 gate 4).
 
-## Round 4
+## Round 4 — VERDICT: REVISE (4 items)
+
+codex (gpt-5.6-sol). Tight residuals on the lease model + gate statistics.
+
+1. Spill violates lease ownership (may spill consumer-owned/in-flight bytes). → **FIXED**: spill restricted to producer-owned, undelivered results; if none, dispatch stays blocked (§4.2).
+2. Receipt charge-conversion not secured (metadata could undercharge). → **FIXED**: validation now requires `ArrayBuffer.byteLength === cipherSize` per result, `Σ byteLength ≤ JOB_RESERVE`, and distinct (non-aliased) buffers before converting (§6.1).
+3. Cancellation wrongly enters the retry tree. → **FIXED**: split retry limited to crash-class/malformed-worker only; cancellation + orderly close terminally settle producer-owned entries, release the parent reserve, create no children (§6.3, §7.4).
+4. No-regression gates are "absence of evidence", not equivalence. → **FIXED**: gates 5/7 now use one-sided non-inferiority margins with explicit upper-CI bounds (§8).
+
+## Round 5
 
 Status: pending (codex running).
