@@ -10,9 +10,7 @@ export const AUDIT_EVENT_CAP = 10_000;
  *  fail-soft; a real fleet drift count is orders of magnitude smaller). */
 export const PENDING_CAP = 500;
 export type DriftKind = "added" | "deleted" | "modified";
-export type DriftClass = "racing" | "late-covered" | "covered-ambiguous" | "unattributable" | "confirmed" | "reverted";
 export type EntrySnapshot = Pick<FileEntry, "type" | "sha256" | "size" | "mode" | "symlinkTarget">;
-export const ABSENT = null;
 
 export interface DriftCandidate {
   path: string;
