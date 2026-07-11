@@ -449,6 +449,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     for (const file of args.local.files) if (file.type === "file" && file.encSha) byAddress.set(file.encSha, file);
     if (!args.preflightDelta || args.fullAudit) {
       // Design 103 parity: legacy fullAudit also sweeps only manifest file addresses; git refs remain commit-422 authority.
+      // recoverAddresses are intentionally ignored under fullAudit, also parity: the retry loop CLEARS its recovery
+      // accumulator when the full-audit latch trips ("the chunked full audit needs no recovery set", sync.ts
+      // accumulateRecoveryPage), and legacy fullAudit builds encShas from local.files alone.
       const seen = args.fullAudit ? new Set<string>() : undefined;
       for (const file of args.local.files) {
         if (file.type !== "file" || !file.encSha || pipelineFiles.has(file) || seen?.has(file.encSha)) continue;
