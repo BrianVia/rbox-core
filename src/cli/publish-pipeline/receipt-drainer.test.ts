@@ -2,9 +2,14 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { RemoteContext } from "../remote/context.js";
 import { ReceiptDrainer } from "./receipt-drainer.js";
+import { redeemReceipts } from "../remote/commits.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
+const port = (ctx: RemoteContext) => ({
+  receiptCount: () => ctx.receipts.size,
+  redeem: () => redeemReceipts(ctx),
+});
 
 test("ReceiptDrainer is single-flight and signals drain completion", async () => {
   const ctx = new RemoteContext("https://test", "t", "w", "p");
@@ -17,7 +22,7 @@ test("ReceiptDrainer is single-flight and signals drain completion", async () =>
     return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
   };
   let completed = 0;
-  const drainer = new ReceiptDrainer(ctx, { threshold: 1, backlogMax: 2, onError() {} });
+  const drainer = new ReceiptDrainer(port(ctx), { threshold: 1, backlogMax: 2, onError() {} });
   drainer.onDrainComplete(() => { completed++; });
   drainer.capture();
   drainer.capture();
@@ -34,7 +39,7 @@ test("ReceiptDrainer latches errors and flush rethrows", async () => {
   const err = new Error("network");
   (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => { throw err; };
   let latched: Error | undefined;
-  const drainer = new ReceiptDrainer(ctx, { threshold: 1, backlogMax: 2, onError(e) { latched = e; } });
+  const drainer = new ReceiptDrainer(port(ctx), { threshold: 1, backlogMax: 2, onError(e) { latched = e; } });
   drainer.capture();
   await expect(drainer.flush()).rejects.toBe(err);
   expect(drainer.error).toBe(err);
@@ -49,7 +54,7 @@ test("ReceiptDrainer accumulates 422 residue until replacement is settled", asyn
     response++ === 0
       ? json(422, { missing: [address] })
       : json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
-  const drainer = new ReceiptDrainer(ctx, { threshold: 10, backlogMax: 20, onError() {} });
+  const drainer = new ReceiptDrainer(port(ctx), { threshold: 10, backlogMax: 20, onError() {} });
   ctx.receipts.set(address, "old");
   expect(await drainer.flush()).toEqual({ needsUpload: [address] });
   ctx.receipts.set(address, "replacement");

@@ -1,5 +1,9 @@
-import type { RemoteContext } from "../remote/context.js";
-import { redeemReceipts, type ReceiptRedeemResult } from "../remote/commits.js";
+import type { ReceiptRedeemResult } from "../remote/commits.js";
+
+export interface ReceiptPort {
+  receiptCount(): number;
+  redeem(): Promise<ReceiptRedeemResult[]>;
+}
 
 export interface ReceiptDrainerOptions {
   threshold: number;
@@ -16,7 +20,7 @@ export class ReceiptDrainer {
   private active: Promise<void> | undefined;
   private latchedError: Error | undefined;
 
-  constructor(private readonly ctx: RemoteContext, opts: ReceiptDrainerOptions) {
+  constructor(private readonly port: ReceiptPort, opts: ReceiptDrainerOptions) {
     this.threshold = Math.max(1, opts.threshold);
     this.backlogMax = Math.max(0, opts.backlogMax);
     this.onError = opts.onError;
@@ -25,7 +29,7 @@ export class ReceiptDrainer {
   get error(): Error | undefined { return this.latchedError; }
 
   capture(): void {
-    if (!this.latchedError && this.ctx.receipts.size >= this.threshold) this.kick();
+    if (!this.latchedError && this.port.receiptCount() >= this.threshold) this.kick();
   }
 
   onDrainComplete(cb: () => void): void {
@@ -36,7 +40,7 @@ export class ReceiptDrainer {
     for (;;) {
       if (this.latchedError) throw this.latchedError;
       if (this.active) await this.active;
-      else if (this.ctx.receipts.size > 0) this.kick();
+      else if (this.port.receiptCount() > 0) this.kick();
       else return { needsUpload: [...this.needsUpload] };
     }
   }
@@ -48,13 +52,13 @@ export class ReceiptDrainer {
     void generation.finally(() => {
       if (this.active === generation) this.active = undefined;
       for (const cb of this.drainCallbacks) cb();
-      if (!this.latchedError && this.ctx.receipts.size >= this.threshold) this.kick();
+      if (!this.latchedError && this.port.receiptCount() >= this.threshold) this.kick();
     }).catch(() => {});
   }
 
   private async drain(): Promise<void> {
     try {
-      const results = await redeemReceipts(this.ctx);
+      const results = await this.port.redeem();
       this.applyResults(results);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));

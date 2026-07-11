@@ -23,6 +23,8 @@ import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
 import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
+import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -74,6 +76,8 @@ async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<En
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
 const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 64); // network/latency bound
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
+const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
+const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
 
@@ -198,7 +202,7 @@ export async function encryptAndUpload(
   onProgress: TransferProgress | undefined,
   backoff: (attempt: number) => Promise<void>,
   options: EncryptAndUploadOptions = {}
-): Promise<{ deferred: Set<string>; retryLater: Set<string> }> {
+): Promise<{ deferred: Set<string>; retryLater: Set<string>; needsUpload?: Set<string> }> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
@@ -211,11 +215,12 @@ export async function encryptAndUpload(
   const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
   const baseEnc = new Map(base.files.map((f) => [f.sha256, descriptorFromEntry(f)]).filter((x): x is [string, CipherDescriptor] => x[1] !== undefined));
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
+  let tmpDir = "";
   const ctByEnc = new Map<string, string>();
   const ctSizeByEnc = new Map<string, number>();
   const deferred = new Set<string>();
   const retryLater = new Set<string>();
+  let needsUpload: Set<string> | undefined;
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
     const toEncrypt: FileEntry[] = [];
@@ -234,6 +239,38 @@ export async function encryptAndUpload(
       }
     });
     report.record("address", { count: carried });
+    const usePipeline = pipelineEnabled() && options.encryptFileToTemp === undefined && toEncrypt.length >= PIPELINE_MIN_FILES;
+    tmpDir = usePipeline
+      ? await createRunTempDir(root)
+      : await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
+
+    if (usePipeline) {
+      const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
+      const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+      const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({
+        api,
+        root,
+        kek,
+        tmpDir,
+        toEncrypt,
+        local,
+        encryptCache,
+        cacheWriter,
+        encryptOpts,
+        encryptFileToTemp,
+        report,
+        onProgress,
+        backoff,
+        pool,
+        preflightDelta,
+        fullAudit,
+        recoverAddresses: options.recoverAddresses,
+        deferred,
+        retryLater,
+        uploadsDir: path.join(root, ".rbox", "state", "uploads"),
+      }));
+      needsUpload = result.needsUpload;
+    } else {
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
       const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
@@ -472,6 +509,7 @@ export async function encryptAndUpload(
     } else {
       await runCryptoAndUpload(undefined);
     }
+    }
   } finally {
     try {
       const livePaths = new Set(options.pruneLivePaths ?? local.files.filter((f) => f.type === "file").map((f) => f.path));
@@ -480,10 +518,10 @@ export async function encryptAndUpload(
       cacheWriter.schedule();
       await cacheWriter.flush();
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
-  return { deferred, retryLater };
+  return { deferred, retryLater, ...(needsUpload ? { needsUpload } : {}) };
 }
 
 /** Build the manifest to COMMIT when some files were deferred (never settled under a

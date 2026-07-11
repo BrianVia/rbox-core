@@ -711,7 +711,7 @@ async function runPushAttempt(
   // Missing or scan-mismatched sources defer immediately; ciphertext upload
   // mismatches retry within a bounded per-file budget. Only the stable subset is
   // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred, retryLater } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+  const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
@@ -726,6 +726,21 @@ async function runPushAttempt(
   // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
   // ref, no phantom deletion.
   const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+
+  if (needsUpload && needsUpload.size > 0) {
+    const gitForce = gitForceForMissingBlobs(committed.gitRepos, needsUpload);
+    return {
+      done: false,
+      action: {
+        kind: "reupload",
+        forceGitRecapture: gitForce,
+        localForRetry: committed,
+        unsatisfiedTotal: needsUpload.size,
+        unsatisfiedBlobs: [...needsUpload],
+      },
+      exhaustedError: "push: server keeps reporting missing blobs after re-upload",
+    };
+  }
 
   // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
   // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
