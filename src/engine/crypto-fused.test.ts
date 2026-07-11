@@ -309,6 +309,60 @@ describe("fused crypto", () => {
     }
   }, 15_000);
 
+  test("close waits for an in-flight spill and prevents post-close delivery", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-spill-close-"));
+    process.env.RBOX_CRYPTO_FUSE_BUDGET_BYTES = String(4 * 1024 * 1024 + 512 * 16 + 64 * 1024 + 300 * 1024);
+    process.env.RBOX_CRYPTO_FUSE_DISPATCH = "2";
+    let resumeDelivery!: () => void;
+    const deliveryGate = new Promise<void>((resolve) => { resumeDelivery = resolve; });
+    let spillStarted!: (pathname: string) => void;
+    const spillPath = new Promise<string>((resolve) => { spillStarted = resolve; });
+    let resumeSpill!: () => void;
+    const spillGate = new Promise<void>((resolve) => { resumeSpill = resolve; });
+    __cryptoPoolTestHooks.setSpillWrite(async (pathname, bytes) => {
+      spillStarted(pathname);
+      await spillGate;
+      await fs.writeFile(pathname, bytes, { mode: 0o600 });
+    });
+    try {
+      const items = [];
+      for (let index = 0; index < 18; index++) {
+        const bytes = seeded(256 * 1024, false);
+        bytes.writeUInt32LE(index, 0);
+        const srcPath = path.join(root, `stream-${index}`);
+        await fs.writeFile(srcPath, bytes);
+        items.push({ ref: index, srcPath, size: bytes.length, tmpDir: root,
+          opts: { compress: true, expected: { sha256: hashBytes(bytes), size: bytes.length } } });
+      }
+      await withCryptoPool(generateKek(), 1, items.length, async (pool) => {
+        let deliveries = 0;
+        pool!.encryptStream(items, { onReady: async (_ref, blob) => {
+          deliveries++;
+          blob.lease.release();
+          await deliveryGate;
+        } });
+        const pathname = await spillPath;
+        const deliveriesAtClose = deliveries;
+        const closing = pool!.close();
+        expect(pool!.close()).toBe(closing);
+        let closed = false;
+        void closing.then(() => { closed = true; });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(closed).toBe(false);
+        resumeSpill();
+        resumeDelivery();
+        await closing;
+        expect(deliveries).toBe(deliveriesAtClose);
+        expect(pool!.fusedStatsForTest().used).toBe(0);
+        await expect(fs.stat(path.dirname(pathname))).rejects.toMatchObject({ code: "ENOENT" });
+      });
+    } finally {
+      delete process.env.RBOX_CRYPTO_FUSE_BUDGET_BYTES;
+      delete process.env.RBOX_CRYPTO_FUSE_DISPATCH;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("close retains then releases a posted job reserve after termination", async () => {
     process.env.RBOX_CRYPTO_WORKER_TEST_DELAY_MS = "200";
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-close-"));

@@ -74,6 +74,7 @@ let embeddedWorkerDir: string | undefined;
 let cleanupRegistered = false;
 let workerPathOverrideForTests: string | undefined;
 let requeueStatOverrideForTests: typeof fs.stat | undefined;
+let spillWriteOverrideForTests: ((pathname: string, bytes: Uint8Array) => Promise<void>) | undefined;
 
 const poolScope = new AsyncLocalStorage<CryptoPool | undefined>();
 
@@ -354,6 +355,8 @@ export class CryptoPool {
   private spillOrdinal = 0;
   private spilledFiles = 0;
   private spilledBytes = 0;
+  private readonly pendingSpills = new Set<Promise<unknown>>();
+  private closePromise: Promise<void> | undefined;
   private deliveryTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -678,27 +681,51 @@ export class CryptoPool {
 
   private enqueueSplit(files: PendingFile[]): void { if (files.length) this.fusedQueue.push({ files, reserved: false, posted: false }); }
 
-  private async spillOldest(): Promise<boolean> {
+  private spillOldest(): Promise<boolean> {
     const held = this.producerResults.find((x) => !x.delivered && x.blob.lease.location.kind === "memory");
-    if (!held) return false;
+    if (!held) return Promise.resolve(false);
     held.delivered = true;
     const index = this.producerResults.indexOf(held);
     if (index >= 0) this.producerResults.splice(index, 1);
-    let pathname: string;
-    try {
-      this.spillDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "rbox-crypto-spill-"));
-      await fs.chmod(this.spillDir, 0o700).catch(() => {});
-      pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
-      await fs.writeFile(pathname, held.bytes, { mode: 0o600 });
-    } catch (err) {
-      held.blob.lease.release(); held.file.reject(err);
+    let settled = false;
+    const work = (async (): Promise<boolean> => {
+      const rejectClosed = (): boolean => {
+        if (!this.closed) return false;
+        if (!settled) {
+          settled = true;
+          held.blob.lease.release();
+          held.file.reject(closeError());
+        }
+        return true;
+      };
+      if (rejectClosed()) return true;
+      let pathname: string;
+      try {
+        this.spillDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "rbox-crypto-spill-"));
+        if (rejectClosed()) return true;
+        await fs.chmod(this.spillDir, 0o700).catch(() => {});
+        if (rejectClosed()) return true;
+        pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
+        await (spillWriteOverrideForTests
+          ? spillWriteOverrideForTests(pathname, held.bytes)
+          : fs.writeFile(pathname, held.bytes, { mode: 0o600 }));
+        if (rejectClosed()) return true;
+      } catch (err) {
+        if (rejectClosed()) return true;
+        settled = true;
+        held.blob.lease.release(); held.file.reject(err);
+        return true;
+      }
+      settled = true;
+      held.blob.lease.release();
+      const fileBlob = { ...held.blob, lease: this.fileLease(held.blob.encSha, held.blob.cipherSize, pathname) };
+      this.spilledFiles++; this.spilledBytes += held.charge;
+      try { await held.file.deliver(fileBlob); } catch (err) { held.file.reject(err); }
       return true;
-    }
-    held.blob.lease.release();
-    const fileBlob = { ...held.blob, lease: this.fileLease(held.blob.encSha, held.blob.cipherSize, pathname) };
-    this.spilledFiles++; this.spilledBytes += held.charge;
-    try { await held.file.deliver(fileBlob); } catch (err) { held.file.reject(err); }
-    return true;
+    })();
+    const spill = work.finally(() => this.pendingSpills.delete(spill));
+    this.pendingSpills.add(spill);
+    return spill;
   }
 
   private cancelUndispatched(err: Error, owner?: symbol): void {
@@ -723,9 +750,14 @@ export class CryptoPool {
     return this.run<void>({ id: this.nextId(), kind: "decrypt", ctPath, plaintextSha, destPath, opts });
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
+    this.closePromise = this.finishClose();
+    return this.closePromise;
+  }
+
+  private async finishClose(): Promise<void> {
     try {
       this.budget.wake();
       if (this.idleTimer) clearTimeout(this.idleTimer);
@@ -752,6 +784,7 @@ export class CryptoPool {
       }
       await cleanupEmbeddedWorker();
     } finally {
+      await Promise.allSettled(this.pendingSpills);
       if (this.spillDir) await fs.rm(this.spillDir, { recursive: true, force: true }).catch(() => {});
       this.spillDir = undefined;
     }
@@ -979,6 +1012,7 @@ export const __cryptoPoolTestHooks = {
     configuredWorkersCache = undefined;
     workerPathOverrideForTests = undefined;
     requeueStatOverrideForTests = undefined;
+    spillWriteOverrideForTests = undefined;
     await cleanupEmbeddedWorker();
   },
   setWorkerPath(pathname: string | undefined): void {
@@ -986,6 +1020,9 @@ export const __cryptoPoolTestHooks = {
   },
   setRequeueStat(stat: typeof fs.stat | undefined): void {
     requeueStatOverrideForTests = stat;
+  },
+  setSpillWrite(write: ((pathname: string, bytes: Uint8Array) => Promise<void>) | undefined): void {
+    spillWriteOverrideForTests = write;
   },
   terminateBusiestWorker(): boolean {
     return activePool?.terminateBusiestWorkerForTest() ?? false;
