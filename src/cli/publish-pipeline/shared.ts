@@ -1,3 +1,10 @@
+/**
+ * Leaf helpers shared by the legacy serialized upload path (`sync-recovery.ts`)
+ * and the design-98 pipeline (`pipeline.ts`): cipher-descriptor mapping,
+ * cache-hit classification, churn-defer detection, concurrency clamps, and the
+ * design-99 lease materialization. Lives here (not in sync-recovery) so the
+ * pipeline never imports sync-recovery — keeping the module graph acyclic.
+ */
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";

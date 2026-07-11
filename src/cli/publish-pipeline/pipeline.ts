@@ -1,3 +1,17 @@
+/**
+ * Design 98 Tier 1 — the overlapped first-publish pipeline (flag-gated by
+ * RBOX_PUBLISH_PIPELINE, default off; routed from `encryptAndUpload`).
+ * Replaces the serialized encrypt → missing-check → upload barriers with one
+ * producer-consumer graph under a shared abort scope: a closeable dynamic
+ * encrypt lane (producers), a rolling server-satisfied check batching
+ * `missingBlobs` calls, and an upload scheduler (consumers) draining a
+ * budgeted ReadyQueue. Ciphertext temps are released at DISPOSITION
+ * settlement only (uploaded / satisfied-skip / duplicate-skip / abandoned —
+ * design 98 §3.2); receipts are redeemed DURING upload by the ReceiptDrainer
+ * (§3.3); abort follows the §3.5 barrier order (queue close → uploader close
+ * → producer termination → temp cleanup). Normative spec: SPEC-98-T1.md and
+ * docs/design/98-first-publish-pipeline.md §3.1–3.6.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {

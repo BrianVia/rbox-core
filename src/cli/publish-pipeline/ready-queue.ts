@@ -1,3 +1,9 @@
+/**
+ * Budgeted producer→consumer channel of ready ciphertexts (design 98 §3.1).
+ * `push` blocks under the items axis — that IS the encrypt-lane backpressure.
+ * The queue releases its own axes at pull; the temp + disk charge on each
+ * ReadyBlob are the pipeline's, released only at disposition settlement.
+ */
 import type { FileEntry } from "../../engine/index.js";
 import { ResourceBudget } from "./budget.js";
 

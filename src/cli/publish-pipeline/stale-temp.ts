@@ -1,3 +1,10 @@
+/**
+ * Stale ciphertext-temp reclamation (design 98 §6.1). Runs at push start under
+ * the design-93 workspace sync mutex, so every pre-existing `enc-*` sibling is
+ * stale by construction and swept unconditionally — process identity (the pid
+ * embedded in the dir name) is diagnostic only and plays NO role, closing the
+ * PID-reuse hole (design review rounds 5/6).
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Dirent } from "node:fs";

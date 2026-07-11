@@ -1,3 +1,10 @@
+/**
+ * Redeems upload receipts DURING upload instead of once at commit (design 98
+ * §3.3): single-flight, generation-safe, error-latched. Owns the durable
+ * `needsUpload` accumulator — a 422-fenced address is only forgotten once a
+ * replacement receipt for it REDEEMS (round-2 item 5); `flush()` returns the
+ * residue, which blocks the commit into the existing reupload recovery.
+ */
 import type { ReceiptRedeemResult } from "../remote/commits.js";
 
 export interface ReceiptPort {
