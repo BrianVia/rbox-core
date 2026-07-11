@@ -38,6 +38,18 @@ codex (gpt-5.6-sol). Narrower/deeper holes in the v2 revision:
 6. Gates 3/6/7 still soft ("materially closer", "measurement noise", no CI). → **FIXED**: numeric overlap-efficiency ≥0.5, ru_maxrss hard-peak bound + absolute slack, bootstrap 95% CI / Mann–Whitney (§8).
 7. Mutation correctness claim too broad when `expected` absent. → **FIXED**: `expected` MANDATORY in batch protocol (production call sites already pass it, `sync-recovery.ts:225,294`); snapshot-equivalence claim scoped to the with-expected case (§4, §6.1, §7.1).
 
-## Round 3
+## Round 3 — VERDICT: REVISE (7 items)
+
+codex (gpt-5.6-sol). Convergence on the lease/budget ownership model + the 98 seam.
+
+1. Reservation granularity/ownership undefined (one indivisible JOB_RESERVE but per-file releases). → **FIXED**: chosen model — on validated receipt, atomically replace JOB_RESERVE with exact per-file charges (Σ cipherSize) and release the slack; every per-file lease holds exactly its cipherSize; spill/§7.5/§10 use this one model (§4.1).
+2. `cancel()` violates budget invariant (in-flight HTTP keeps bytes live). → **FIXED**: cancel reclaims ONLY undispatched producer-owned leases; consumer-owned/in-flight leases stay charged until their own disposition settles (§6.4, §10).
+3. Legacy ownership impossible (coalescer can't observe the caller's PUT). → **FIXED**: legacy path also returns a lease handle; the poolMap caller calls `release()` itself after its upload settles (§6.4).
+4. 98 seam not aligned (two budget owners, naming, conflicting cancel/release). → **ADDRESSED as shared-contract requirement**: 98 not in this worktree (reviewer inferred its type); doc now mandates ONE normative type + ONE charging authority (the pool's `CiphertextBudget`) + ONE disposition protocol that 98 MUST adopt, and flags the reconciliation as a blocking cross-design item (§10, §11 Q4).
+5. Retry-tree: transferred buffers on malformed envelope may become uncharged. → **FIXED**: transferred results are parent-owned until validation; on envelope failure discard every transferred buffer, THEN release parent reserve, THEN children re-reserve (§6.3).
+6. Gate 3 per-worker `ru_maxrss` impossible (Bun workers share the process). → **FIXED**: process-wide `ru_maxrss` hard-peak gate + worker-reported retained-byte counters + instrumented budget high-water; dropped per-worker ru_maxrss (§8 gate 3).
+7. Zero-copy "frames by reference" untested (gate 4 can't see a hidden copy). → **FIXED**: implementation-level buffer-identity ownership test + measured peak-framing-bytes assertion across batch/fallback/retry/skip/duplicate/abort (§7.5, §8 gate 4).
+
+## Round 4
 
 Status: pending (codex running).
