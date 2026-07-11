@@ -29,6 +29,7 @@ class PipelineRemote {
   redeemImpl?: () => Promise<any[]>;
   putHook?: (sha: string, file: string, call: number) => void | Promise<void>;
   checkHook?: (shas: string[]) => void | Promise<void>;
+  closeHook?: () => void | Promise<void>;
   constructor(private readonly latency = 0, private readonly checkLatency = 0) {}
   async missingBlobs(shas: string[]): Promise<string[]> {
     this.checks.push([...shas]);
@@ -49,7 +50,7 @@ class PipelineRemote {
     this.receipts = 0;
     return result;
   } }; }
-  async closeUploader(): Promise<void> {}
+  async closeUploader(): Promise<void> { await this.closeHook?.(); }
   uploaderDispatchCount(): number { return this.puts.length; }
 }
 
@@ -73,6 +74,10 @@ async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemo
   cache?: EncryptAddressCache;
   writer?: EncryptAddressCacheWriter;
   encrypt?: typeof encryptFileToTemp;
+  toEncrypt?: FileEntry[];
+  preflightDelta?: boolean;
+  fullAudit?: boolean;
+  recoverAddresses?: ReadonlySet<string>;
 } = {}) {
   const cache = options.cache ?? new EncryptAddressCache({ accountId: "a", workspaceId: "w", accountEpoch: 1, keyEpoch: 1 });
   return runPublishPipeline({
@@ -80,7 +85,7 @@ async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemo
     root: fx.root,
     kek: generateKek(),
     tmpDir: fx.tmpDir,
-    toEncrypt: fx.local.files,
+    toEncrypt: options.toEncrypt ?? fx.local.files,
     local: fx.local,
     encryptCache: cache,
     cacheWriter: options.writer ?? new EncryptAddressCacheWriter(fx.root, cache, 60_000),
@@ -89,8 +94,9 @@ async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemo
     report: PhaseReport.disabled(),
     backoff: async () => {},
     pool: undefined,
-    preflightDelta: false,
-    fullAudit: false,
+    preflightDelta: options.preflightDelta ?? false,
+    fullAudit: options.fullAudit ?? false,
+    recoverAddresses: options.recoverAddresses,
     deferred: new Set(),
     retryLater: new Set(),
     uploadsDir: path.join(fx.root, ".rbox", "state", "uploads"),
@@ -200,6 +206,57 @@ test("drainer returns durable needsUpload residue", async () => {
     await withEnv({ RBOX_PIPELINE_REDEEM_THRESHOLD: "1" }, async () => {
       expect((await run(fx, remote)).needsUpload).toEqual(new Set([residue]));
     });
+  } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("pre-existing receipt backlog is drained before the first PUT", async () => {
+  const fx = await fixture(3);
+  try {
+    const remote = new PipelineRemote();
+    remote.receipts = 3;
+    let redeems = 0;
+    remote.redeemImpl = async () => { redeems++; return []; };
+    remote.putHook = () => { expect(redeems).toBeGreaterThan(0); };
+    await withEnv({ RBOX_PIPELINE_REDEEM_THRESHOLD: "1", RBOX_UPLOAD_CONCURRENCY: "1" }, async () => {
+      await run(fx, remote);
+    });
+    expect(redeems).toBeGreaterThan(0);
+    expect(remote.blobs.size).toBe(3);
+  } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("delta recovery checks mapped and address-only entries without uploading the latter", async () => {
+  const fx = await fixture(1);
+  try {
+    const mapped = "a".repeat(64);
+    const unmapped = "b".repeat(64);
+    fx.local.files[0]!.encSha = mapped;
+    let encrypts = 0;
+    const remote = new PipelineRemote();
+    await run(fx, remote, {
+      toEncrypt: [],
+      preflightDelta: true,
+      recoverAddresses: new Set([mapped, unmapped]),
+      encrypt: async (...args) => { encrypts++; return encryptFileToTemp(...args); },
+    });
+    expect(new Set(remote.checks.flat())).toEqual(new Set([mapped, unmapped, fx.local.files[0]!.encSha!]));
+    expect(encrypts).toBe(1);
+    expect(remote.puts).toEqual([fx.local.files[0]!.encSha!]);
+    expect(remote.puts).not.toContain(unmapped);
+  } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("classification failure retains ready temps through uploader close barrier", async () => {
+  const fx = await fixture(1);
+  const failure = new Error("check failed");
+  try {
+    const remote = new PipelineRemote();
+    remote.checkHook = async () => { throw failure; };
+    let tempsAtClose: string[] = [];
+    remote.closeHook = async () => { tempsAtClose = await fs.readdir(fx.tmpDir); };
+    await expect(run(fx, remote)).rejects.toBe(failure);
+    expect(tempsAtClose.length).toBeGreaterThan(0);
+    expect(await fs.readdir(fx.tmpDir)).toEqual([]);
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 

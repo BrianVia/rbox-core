@@ -29,7 +29,11 @@ export class ReceiptDrainer {
   get error(): Error | undefined { return this.latchedError; }
 
   capture(): void {
-    if (!this.latchedError && this.port.receiptCount() >= this.threshold) this.kick();
+    if (this.port.receiptCount() >= this.threshold) this.maybeKick();
+  }
+
+  maybeKick(): void {
+    if (!this.latchedError && !this.active && this.port.receiptCount() > 0) this.kick();
   }
 
   onDrainComplete(cb: () => void): void {
@@ -40,7 +44,7 @@ export class ReceiptDrainer {
     for (;;) {
       if (this.latchedError) throw this.latchedError;
       if (this.active) await this.active;
-      else if (this.port.receiptCount() > 0) this.kick();
+      else if (this.port.receiptCount() > 0) this.maybeKick();
       else return { needsUpload: [...this.needsUpload] };
     }
   }

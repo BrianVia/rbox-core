@@ -112,7 +112,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     if (checkTimer) { clearTimeout(checkTimer); checkTimer = undefined; }
     const abandonedChecks = checkBuffer.splice(0);
     for (const item of abandonedChecks) {
-      if (item.ready) releaseBlob(item.ready, "abandoned");
       item.reject(abortCause);
       outstanding--;
     }
@@ -133,6 +132,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     for (const wake of drainWaiters) wake();
     drainWaiters.clear();
   });
+  drainer?.maybeKick();
 
   const releaseBlob = (blob: ReadyBlob, disposition: Disposition): void => blob.release(disposition);
   const makeReady = (file: FileEntry, encrypted: EncryptedBlob): ReadyBlob => {
@@ -156,7 +156,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     return blob;
   };
 
-  type CheckItem = { file: FileEntry; ready?: ReadyBlob; resolve: (missing: boolean) => void; reject: (error: Error) => void };
+  type CheckItem = { address: string; file?: FileEntry; ready?: ReadyBlob; resolve: (missing: boolean) => void; reject: (error: Error) => void };
   let checkBuffer: CheckItem[] = [];
   let checkTimer: ReturnType<typeof setTimeout> | undefined;
   let checkerInflight = 0;
@@ -193,9 +193,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       return rejected;
     }
     outstanding++;
-    const promise = new Promise<boolean>((resolve, reject) => checkBuffer.push({ file, ready, resolve, reject }));
-    // A producer can be blocked in queue.push when abort rejects its classification.
-    // Mark it handled immediately; callers still observe the original rejection.
+    const promise = new Promise<boolean>((resolve, reject) => checkBuffer.push({ address: file.encSha!, file, ready, resolve, reject }));
+    // A producer can be blocked in queue.push when abort rejects this promise.
+    // Mark it handled immediately; the consumer still observes the original rejection.
     void promise.catch(() => {});
     if (ready) checkPromises.set(ready, promise);
     if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
@@ -207,6 +207,16 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   const submitAddressCheck = (file: FileEntry): void => {
     void submitCheck(file).catch(abort);
   };
+  const submitAddressOnlyCheck = (address: string): void => {
+    if (scope.signal.aborted) return;
+    outstanding++;
+    const promise = new Promise<boolean>((resolve, reject) => checkBuffer.push({ address, resolve, reject }));
+    void promise.catch(abort);
+    if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
+    else if (!checkTimer) {
+      checkTimer = setTimeout(() => { checkTimer = undefined; void flushChecks().catch(abort); }, 50);
+    }
+  };
 
   flushChecks = async (): Promise<void> => {
     if (checkTimer) { clearTimeout(checkTimer); checkTimer = undefined; }
@@ -215,14 +225,14 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     const batch = checkBuffer.splice(0, ROLLING_CHECK_BATCH);
     checkerInflight++;
     try {
-      const addresses = [...new Set(batch.map((item) => item.file.encSha!))];
+      const addresses = [...new Set(batch.map((item) => item.address))];
       const t0 = LANE_TIMING ? performance.now() : 0;
       const missing = new Set(await args.api.missingBlobs(addresses));
       if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - t0;
       checked += addresses.length;
       for (const item of batch) {
-        const isMissing = missing.has(item.file.encSha!);
-        if (isMissing && !item.ready) enqueueWork(item.file, true);
+        const isMissing = missing.has(item.address);
+        if (isMissing && item.file && !item.ready) enqueueWork(item.file, true);
         if (isMissing && item.ready) upTotal++;
         if (!isMissing && item.ready) releaseBlob(item.ready, "satisfied-skip");
         item.resolve(isMissing);
@@ -293,12 +303,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
     const ready = makeReady(file, encrypted);
     const classification = submitCheck(file, ready);
+    void classification.catch(() => {});
     try {
-      if (scope.signal.aborted) releaseBlob(ready, "abandoned");
-      else await queue.push(ready);
-      await classification;
+      if (scope.signal.aborted) throw abortCause;
+      await queue.push(ready);
     } catch (error) {
-      releaseBlob(ready, "abandoned");
+      if (!scope.signal.aborted) releaseBlob(ready, "abandoned");
       throw error;
     }
   };
@@ -328,6 +338,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     if (!port || !drainer) return;
     while (port.receiptCount() > drainer.backlogMax) {
       if (scope.signal.aborted) throw abortCause;
+      drainer.maybeKick();
       const before = drainGeneration;
       await new Promise<void>((resolve) => {
         const wake = () => { abortWakeups.delete(wake); resolve(); };
@@ -437,6 +448,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     const byAddress = new Map<string, FileEntry>();
     for (const file of args.local.files) if (file.type === "file" && file.encSha) byAddress.set(file.encSha, file);
     if (!args.preflightDelta || args.fullAudit) {
+      // Design 103 parity: legacy fullAudit also sweeps only manifest file addresses; git refs remain commit-422 authority.
       const seen = args.fullAudit ? new Set<string>() : undefined;
       for (const file of args.local.files) {
         if (file.type !== "file" || !file.encSha || pipelineFiles.has(file) || seen?.has(file.encSha)) continue;
@@ -446,7 +458,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     } else {
       for (const address of args.recoverAddresses ?? []) {
         const file = byAddress.get(address);
-        if (file && !pipelineFiles.has(file)) { recover++; submitAddressCheck(file); }
+        if (file && !pipelineFiles.has(file)) submitAddressCheck(file);
+        else if (!file) submitAddressOnlyCheck(address);
+        recover++;
       }
       introduced = args.toEncrypt.length;
     }

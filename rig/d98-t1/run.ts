@@ -21,6 +21,7 @@ const runs = option("--runs", 5);
 const putMs = option("--put-ms", 15);
 const missingMs = option("--missing-ms", 30);
 const usePool = argv.includes("--pool");
+const uploadConc = option("--upload-conc", 0); // 0 = unconstrained (production default); N caps BOTH arms
 if (!Number.isInteger(fileCount) || fileCount < 64) throw new Error("--files must be an integer >= 64 so Arm B reaches the production pipeline");
 if (!Number.isInteger(runs) || runs < 1) throw new Error("--runs must be a positive integer");
 
@@ -180,6 +181,7 @@ try {
   process.env.RBOX_CRYPTO_FUSE = "0";
   if (usePool) delete process.env.RBOX_CRYPTO_WORKERS;
   else process.env.RBOX_CRYPTO_WORKERS = "0";
+  if (uploadConc > 0) process.env.RBOX_UPLOAD_CONCURRENCY = String(uploadConc); // applied to BOTH arms — fair A/B
   for (let run = 1; run <= runs; run++) {
     const parent = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-d98-t1-"));
     try {

@@ -33,6 +33,20 @@ test("ReceiptDrainer is single-flight and signals drain completion", async () =>
   expect([calls, completed, drainer.backlogMax]).toEqual([1, 1, 2]);
 });
 
+test("ReceiptDrainer maybeKick drains below-threshold pre-existing receipts", async () => {
+  const ctx = new RemoteContext("https://test", "t", "w", "p");
+  ctx.receipts.set(sha("a"), "a");
+  let calls = 0;
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+    calls++;
+    return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+  };
+  const drainer = new ReceiptDrainer(port(ctx), { threshold: 10, backlogMax: 20, onError() {} });
+  drainer.maybeKick();
+  await drainer.flush();
+  expect(calls).toBe(1);
+});
+
 test("ReceiptDrainer latches errors and flush rethrows", async () => {
   const ctx = new RemoteContext("https://test", "t", "w", "p");
   ctx.receipts.set(sha("a"), "a");
