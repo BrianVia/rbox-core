@@ -199,3 +199,26 @@ instead of a process-identity exemption), which was applied verbatim. The
 mechanism now carries an explicit reviewer disposition on every design point,
 with the reviewer's own text stating "with that wording corrected, the mutex
 mechanism is sound; no other contradiction was found." Treated as ALIGNED.
+
+## Joint seam rounds with design 99 (2026-07-11, main session)
+
+After both loops closed, the 98↔99 seam was reconciled and reviewed in three
+joint codex rounds with BOTH documents visible — the per-design loops had each
+inferred the other's internals. Resolution: design 99 §10 is the normative seam
+contract; this design's §3.4 Tier 2 adopts it verbatim (single shared
+CiphertextLease/CiphertextLocation type; 99's CiphertextBudget as sole charging
+authority — maxHeapBytes covers only uploader-owned framing copies of
+file-location leases, native Tier 1 or producer-spilled Tier 2; single
+disposition protocol with spill producer-only).
+
+Joint round J1 (4 items, all fixed): stale §3.2 claim that the heap axis counts
+design-99 buffers; 99 §10's stale "not yet reconciled" text; consumer spill
+allowed here but forbidden by 99 §4.2 (resolved: spill removed from consumer
+dispositions — the consumer's memory-pressure lever is prompt draining); no
+Tier-2 abort bridge (resolved: §3.5 now invokes 99's cancel(), awaits the
+posted-job terminal barrier, and only then cleans up). J2 (3 wording items,
+fixed): §4.1 spill residue in 99; 99 §5.2 combined-peak claim replaced by the
+measured gate; file-variant framing coverage extended to producer-spilled
+Tier-2 leases with the abort settlement split (queued/undispatched → abandoned
+immediately; already-dispatched → release at HTTP settlement). J3: all
+verified, one wording echo in 99 §10 fixed as dictated. Seam ALIGNED.

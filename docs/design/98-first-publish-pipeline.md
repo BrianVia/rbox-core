@@ -22,13 +22,15 @@ redeem-all) run STRICTLY SERIALIZED — the wall is their SUM when it could be
 close to their MAX.
 
 **Interface note (load-bearing, stated up front).** This design and design 99
-(fused multi-file crypto worker jobs) share ONE seam. **This pipeline consumes a
-per-file readiness event `ready(encSha, size, ciphertextLocation)` and must NOT
-assume one-file-per-worker-job.** Design 99 may batch many files into one worker
-job, but it MUST preserve per-file readiness signaling. §3.4 states the contract
-normatively, distinguishes what ships in THIS design (file-backed, one event per
-single-file encrypt — exists today) from what is **gated on design 99**
-(buffer-backed ready blobs and fused-job streaming), and neither design may land
+(fused multi-file crypto worker jobs) share ONE seam, whose normative contract
+is design 99 §10 (reconciled 2026-07-11). **This pipeline consumes a per-file
+readiness unit — design 99's `CiphertextLease` (`encSha`, `size`,
+`CiphertextLocation`, `release()`) — and must NOT assume
+one-file-per-worker-job.** Design 99 may batch many files into one worker job,
+but it MUST preserve per-file readiness signaling. §3.4 adopts the contract,
+distinguishes what ships in THIS design (file-backed `file`-variant leases, one
+per single-file encrypt — exists today) from what is **gated on design 99**
+(`memory`-variant leases and fused-job streaming), and neither design may land
 a change to the seam without the other's gate re-run.
 
 All wall numbers here are from the design-81 105k-file benchmark
@@ -102,8 +104,9 @@ mechanism below.
 1. **Overlap without backpressure is a resource-exhaustion bug, not a speedup.**
    A 32-core encryptor races ahead of one uplink and fills disk (file temps) OR
    heap (design-99 buffers, and the shipped batch-PUT framing, evidence 5). →
-   §3.2 defines a memory/disk BUDGET over ALL owners, not just "ready"
-   descriptors, with an oversize-admission rule.
+   §3.2 ensures EVERY owner is under SOME budget — memory-variant ciphertext
+   under design 99's `CiphertextBudget` (via the §3.4 lease), everything this
+   pipeline itself copies under its own axes — with an oversize-admission rule.
 
 2. **The global `missingBlobs` preflight is a barrier, but skipping it is not
    free — and it is NOT a presence check.** `/v1/blobs/check` (`context.ts:74` →
@@ -252,9 +255,12 @@ whose upload has not yet settled — bounded regardless of live source growth.
 This is what makes the disk-full row in §6.4 a bounded claim rather than a
 hope.
 
-**Heap accounting is two-tier (round-2 item 12).** The pipeline can enforce a
-hard accounting bound ONLY over bytes it owns: queued buffer-backed ready blobs
-(design-99 lane, §3.4). The shipped batch-PUT uploader's internals —
+**Heap accounting is two-tier (round-2 item 12; seam-reconciled).** Memory-
+variant ciphertext is charged exclusively to design 99's `CiphertextBudget`
+through the lease (§3.4) — this pipeline holds delivered leases but never
+counts their bytes against `maxHeapBytes` (joint-round item 1: a second count
+here would double-charge the same bytes). What `maxHeapBytes` governs is the
+pipeline's OWN copies. The shipped batch-PUT uploader's internals —
 `fs.readFile` payloads, framed copies (`encodeBatchBody`, `blob-batch.ts:725`),
 fallback singles, response parsing — cannot be byte-reserved from outside the
 seam, so they are a MEASURED, CALIBRATED high-water target: modelled as
@@ -388,28 +394,46 @@ EXISTING `api.putBlobFile` (`api.ts:73`) → `BlobBatchUploader.putFile`. No new
 upload API, no design-99 dependency. This tier alone satisfies gate 1.
 
 **Tier 2 — GATED on design 99 (buffer-backed, prerequisite).** Design 99's fused
-small-file path returns ciphertext as an in-memory buffer (audit Finding 7's
-`SmallEncryptResult.ciphertext`). A `ready(encSha, size, { kind: "buffer";
-bytes })` event is accepted ONLY once design 99 also delivers a **batch
-buffer-PUT API** — because the SHIPPED uploader takes filesystem paths
+small-file path returns ciphertext as an in-memory buffer and delivers a **batch
+buffer-PUT API** — required because the SHIPPED uploader takes filesystem paths
 (`putFile`) and `encodeBatchBody` `fs.readFile`s them (`blob-batch.ts:726`);
 `putBlobBytes` exists (`api.ts:96`) but bypasses the batch/receipt path. Until
 that API exists and is reviewed under design 99, buffer-backed readiness is
-**out of scope here** and the heap axis (§3.2) carries only the shipped
-batch-PUT framing owner. The normative requirements design 99 MUST meet for
-Tier 2 to turn on:
+**out of scope here**.
 
-- one readiness event per file even when N files are fused into one worker job
-  (a fused result array of N emits N events);
-- per-file success/failure fidelity within a fused job (a partial batch may
-  succeed; failed files defer individually);
-- defined worker-death semantics: files in an in-flight fused job that dies are
-  reported as un-produced and re-queued, never silently dropped;
-- defined transfer-buffer ownership: a transferred `ArrayBuffer` is owned by the
-  uploader on receipt and released (allowing GC) only after upload settles,
-  counted against `maxHeapBytes` until then;
-- `encSha` computed over the COMPLETE ciphertext by the producer before the
-  event is emitted (whole-object integrity, §6.2).
+**Tier 2 adopts design 99 §10 VERBATIM as the seam contract (reconciled
+2026-07-11; resolves 99's §11 Q4).** The normative content lives in design 99
+§10; this design conforms to it rather than restating it. What that means for
+the machinery specified here:
+
+- The Tier-2 readiness unit is design 99's **`CiphertextLease`** —
+  `{ encSha, size, location, release() }` with `CiphertextLocation` of
+  `{ kind: "memory"; bytes }` or `{ kind: "file"; path }` (99's `memory`
+  supersedes the `buffer` naming from earlier drafts of this section; Tier 1's
+  file-backed events are the `file` variant, so ONE type covers both tiers).
+- **One charging authority:** memory-variant ciphertext is charged against the
+  crypto pool's `CiphertextBudget` (99 §4.1) from delivery until `release()`.
+  This pipeline's `maxHeapBytes` axis (§3.2) does NOT count memory-variant
+  ciphertext — it covers the uploader-owned copies made for EVERY
+  `file`-location lease (`encodeBatchBody` readFile buffers), whether that
+  lease is native Tier 1 or a producer-spilled Tier-2 file (joint-round
+  item 7: a spilled lease re-enters the file-backed upload path and creates
+  the same framing copies). `memory`-variant framing is by-reference to
+  `lease.location.bytes`, so no separate framing charge exists for it.
+- **One disposition protocol:** the consumer calls `release()` exactly once —
+  at HTTP settlement (uploaded), or on reject/dedup/abandon. **Spill is NOT a
+  consumer disposition** (joint-round item 3): design 99 §4.2 spills only
+  producer-owned, undelivered results; a delivered `memory` lease is never
+  converted to a file by this pipeline — under memory pressure the consumer's
+  only lever is draining (uploading) promptly, which is why §3.2's scheduling
+  prioritizes memory-variant leases. The abort protocol (§3.5) MUST
+  `release()` every DELIVERED lease held at abort under the rejected/abandoned
+  disposition — including leases sitting in the ReadyQueue and in the
+  uploader's closed-but-undispatched groups.
+- Design 99 additionally guarantees (its §6/§7): one lease per file even when
+  N files fuse into one worker job; per-file success/failure fidelity within a
+  fused job; worker-death re-queue (never silently dropped); `encSha` computed
+  over the COMPLETE ciphertext before delivery (whole-object integrity, §6.2).
 
 Neither design lands a seam change without re-running the other's gates. The
 Tier-1 seam is unit-testable in isolation with a fake single-file producer;
@@ -450,6 +474,22 @@ SIGINT. On abort:
   the **producer-termination barrier**. Only after that barrier do temp unlink
   and `fs.rm(tmpDir)` run, so a worker can never finish into deleted storage or
   recreate a file after cleanup;
+- **Tier-2 abort bridges to design 99's cancellation authority (joint-round
+  item 4).** Closing the ReadyQueue settles only DELIVERED leases; it does not
+  stop 99's fused dispatch or settle producer-owned entries, and this pipeline
+  MUST NOT reclaim them itself (that would create the forbidden second
+  cancellation authority). On abort with the fused path active, the pipeline
+  (a) invokes 99's bounded-authority `cancel()` — the sole mechanism that
+  reclaims undelivered charges — then (b) awaits 99's posted-job terminal
+  barrier (result received-and-discarded or confirmed worker termination,
+  99 §7) as the Tier-2 extension of the producer-termination barrier above,
+  and (c) settles the leases it already held at abort with the same split the
+  Tier-1 protocol uses for requests (joint-round item 5): queued/undispatched
+  delivered leases are `release()`d immediately under the abandoned
+  disposition, while leases whose bytes are in an already-dispatched in-flight
+  request stay charged until that request's HTTP promise settles (in-flight
+  requests are allowed to finish, above) and `release()` fires at settlement.
+  Cleanup ordering is unchanged: nothing is deleted until both barriers pass;
 - the drainer stops kicking; `flush()` re-throws the latched error;
 - temp cleanup (after the producer-termination barrier): every unsettled temp
   is unlinked, then `fs.rm(tmpDir)` (the existing `finally`, `:406`) is the
