@@ -49,9 +49,9 @@ const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
 };
 const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, poolWorkers ? poolWorkers * 2 : 8); // CPU/disk bound
 const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
-const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
+export const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
 
-async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
+export async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
   // Phase 1's legacy consumer materializes a memory lease into the existing encup
   // temp flow and releases its charge there; the disk temp becomes the source of
   // truth, like a producer spill. Design 98 activates Tier-2 by-reference framing

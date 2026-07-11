@@ -15,6 +15,7 @@ import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "../r
 import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
 import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { fuseEnabled, materializeLease } from "../sync-recovery.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type Disposition, type ReadyBlob } from "./ready-queue.js";
 import { ReceiptDrainer } from "./receipt-drainer.js";
@@ -108,6 +109,13 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     scope.abort(abortCause);
     queue.abort(abortCause);
     disk.close(abortCause);
+    if (checkTimer) { clearTimeout(checkTimer); checkTimer = undefined; }
+    const abandonedChecks = checkBuffer.splice(0);
+    for (const item of abandonedChecks) {
+      if (item.ready) releaseBlob(item.ready, "abandoned");
+      item.reject(abortCause);
+      outstanding--;
+    }
     for (const wake of workWaiters.splice(0)) wake();
     for (const wake of abortWakeups) wake();
     abortWakeups.clear();
@@ -179,13 +187,20 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   };
 
   const submitCheck = (file: FileEntry, ready?: ReadyBlob): Promise<boolean> => {
+    if (scope.signal.aborted) {
+      const rejected = Promise.reject<boolean>(abortCause ?? new Error("publish aborted"));
+      void rejected.catch(() => {});
+      return rejected;
+    }
     outstanding++;
     const promise = new Promise<boolean>((resolve, reject) => checkBuffer.push({ file, ready, resolve, reject }));
+    // A producer can be blocked in queue.push when abort rejects its classification.
+    // Mark it handled immediately; callers still observe the original rejection.
+    void promise.catch(() => {});
     if (ready) checkPromises.set(ready, promise);
     if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
     else if (!checkTimer) {
       checkTimer = setTimeout(() => { checkTimer = undefined; void flushChecks().catch(abort); }, 50);
-      checkTimer.unref?.();
     }
     return promise;
   };
@@ -195,6 +210,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
 
   flushChecks = async (): Promise<void> => {
     if (checkTimer) { clearTimeout(checkTimer); checkTimer = undefined; }
+    if (scope.signal.aborted) return;
     if (checkBuffer.length === 0) { maybeClose(); return; }
     const batch = checkBuffer.splice(0, ROLLING_CHECK_BATCH);
     checkerInflight++;
@@ -207,6 +223,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       for (const item of batch) {
         const isMissing = missing.has(item.file.encSha!);
         if (isMissing && !item.ready) enqueueWork(item.file, true);
+        if (isMissing && item.ready) upTotal++;
         if (!isMissing && item.ready) releaseBlob(item.ready, "satisfied-skip");
         item.resolve(isMissing);
         outstanding--;
@@ -251,7 +268,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     try {
       const opts = { ...args.encryptOpts, expected: { sha256: file.sha256, size: file.size } };
       const dispatched = args.pool
-        ? args.pool.encrypt(path.join(args.root, file.path), args.tmpDir, opts)
+        ? fuseEnabled()
+          ? args.pool.encryptCoalesced(path.join(args.root, file.path), file.size, args.tmpDir, opts).then((blob) => materializeLease(blob, args.tmpDir))
+          : args.pool.encrypt(path.join(args.root, file.path), args.tmpDir, opts)
         : args.encryptFileToTemp(path.join(args.root, file.path), args.kek, args.tmpDir, opts);
       encryptSettlements.add(dispatched);
       try { encrypted = await dispatched; }
@@ -302,8 +321,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   const uploaded = new Set<string>();
   const byteTracker = new UploadByteTracker();
   let up = 0;
+  let upTotal = 0;
   let upWireBytes = 0;
-  const emitUpload = (file?: FileEntry) => args.onProgress?.(up, args.toEncrypt.length, "upload", file?.path, byteTracker.progress());
+  const emitUpload = (file?: FileEntry) => args.onProgress?.(up, upTotal, "upload", file?.path, byteTracker.progress());
   const waitForBacklog = async (): Promise<void> => {
     if (!port || !drainer) return;
     while (port.receiptCount() > drainer.backlogMax) {
@@ -435,8 +455,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     consumers = Array.from({ length: uploadConcurrency() }, () => consumer());
     await flushChecks();
     await args.report.phase("upload", async () => {
-      await Promise.all(producers);
-      await Promise.all(consumers);
+      await Promise.all([Promise.all(producers), Promise.all(consumers)]);
       await flushChecks();
     });
     args.report.record("encrypt", { count: args.toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });

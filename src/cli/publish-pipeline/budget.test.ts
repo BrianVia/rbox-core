@@ -30,6 +30,7 @@ test("ResourceBudget admits one oversize reservation only at zero", async () => 
   budget.release(8);
   await pending;
   expect(budget.used).toBe(1);
+  expect(budget.highWater).toBeLessThanOrEqual(budget.cap + 8);
 });
 
 test("ResourceBudget close rejects pending and future reserves", async () => {
