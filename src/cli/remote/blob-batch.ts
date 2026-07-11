@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { countRename, mkdirCounted } from "../../engine/apply-stats.js";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import { hashBytes } from "../../engine/hash.js";
 import { fromHex, toHex } from "../../engine/e2ee/index.js";
@@ -537,7 +538,8 @@ export class BlobBatchDownloader {
       await fs.rm(tmp, { force: true }).catch(() => {});
       return;
     }
-    await fs.mkdir(path.dirname(req.destPath), { recursive: true });
+    await mkdirCounted(path.dirname(req.destPath));
+    countRename();
     await fs.rename(tmp, req.destPath);
     this.settleOk(req);
   }
@@ -546,7 +548,7 @@ export class BlobBatchDownloader {
     if (req.settled) return;
     const tmp = this.attemptPath(req);
     try {
-      await fs.mkdir(path.dirname(tmp), { recursive: true });
+      await mkdirCounted(path.dirname(tmp));
       await fs.writeFile(tmp, payload);
       await this.publishAttempt(req, tmp);
     } catch (e) {

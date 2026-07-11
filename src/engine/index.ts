@@ -25,8 +25,10 @@ export {
   inTreeWorktreeParentRelFromCtx,
   repoCtxFromDisk,
   setGitSpawnObserver,
+  zeroGitChainTimings,
   type ApplyGitResult,
   type GitIdentity,
+  type GitChainTimings,
   type GitRepoKind,
   type GitPreflightResult,
   type RepoCtx,
@@ -61,6 +63,10 @@ export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
 export { applyActions,
   laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
+export {
+  applyStatsDelta, applyStatsEnabled, setApplyStatsEnabled, snapshotApplyStats,
+  type ApplyStats,
+} from "./apply-stats.js";
 export { poolMap } from "./pool.js";
 export { PhaseReport, type PhaseName, type PhaseTotals, type PhaseBytes, type PhaseReportJson } from "./phase-report.js";
 export { HashCache, type HashCacheEntry } from "./hashcache.js";
