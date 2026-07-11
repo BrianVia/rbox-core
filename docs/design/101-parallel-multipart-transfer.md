@@ -764,10 +764,13 @@ each phase (`audit:1301`); keep the prior release as A/B control (`audit:1300`).
    lane and shared Wi-Fi links) or aggressive (maximize the single-giant-blob
    case)? The §9 sweep gives a knee per link type; the founder picks which link
    type sets the shipped default.
-4. **Is the single-giant-blob workload real for the fleet?** Parallel parts win
-   most when the large bytes are in *one* blob (§1.2). If fleet large-blob
-   publishes are already many-medium-blobs, the 64-wide lane may already saturate
-   the link and G-part may fail — in which case the honest outcome is "already
-   concurrent at the blob level," closing Finding 10's upload half. The §9 sweep
-   shows this.
+4. **Is the single-giant-blob workload real for the fleet? — DECIDED (founder,
+   2026-07-11): build it.** The founder's own fleet has few giant blobs, but
+   prospective users (video, disk images, ML checkpoints) make the workload
+   worth serving. Implementation proceeds with SYNTHETIC validation: generate
+   multi-GiB test blobs (incompressible + compressible, per Workload D) in the
+   test rig rather than waiting for a real workspace to hit one. The honest-
+   failure clause stands — if fleet-rig sweeps show the 64-wide lane already
+   saturates the link and G-part fails, the finding closes as "already
+   concurrent at the blob level."
 </content>

@@ -728,9 +728,12 @@ same corpus, same network class:
 3. **Kill-switch defaults.** Ship Phase 1's trie on-by-default after fleet
    validation, or soak it off-by-default behind `RBOX_APPLY_DIR_TRIE` for a
    release first (design 85 P-2 soak precedent)?
-4. **Surfacing standing unrepresentable deferrals (R3 #1 → R4 #1).** The
-   delete-echo risk is closed by construction (§3.1 base-exclusion: a skipped
-   entry is absent from both disk and base, so push proposes nothing). What
-   remains is product surface: should `rbox status` / the dashboard show a
-   standing "N entries unrepresentable on this volume" indicator, and should
-   there be an explicit resolution flow (rename remotely / choose a winner)?
+4. **Surfacing standing unrepresentable deferrals (R3 #1 → R4 #1) — DECIDED
+   (founder, 2026-07-11): surface it.** `rbox status` and the dashboard show a
+   standing "N entries unrepresentable on this volume (name conflicts)"
+   indicator — silent parking, even safe parking, erodes trust in a sync tool
+   the moment a user goes looking for a file. The indicator ships with
+   Phase 1; an explicit resolution flow (rename remotely / choose a winner)
+   remains future work. (The delete-echo risk itself is closed by
+   construction: §3.1 base-exclusion — a skipped entry is absent from both
+   disk and base, so push proposes nothing.)
