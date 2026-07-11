@@ -51,7 +51,6 @@ class PipelineRemote {
     return result;
   } }; }
   async closeUploader(): Promise<void> { await this.closeHook?.(); }
-  uploaderDispatchCount(): number { return this.puts.length; }
 }
 
 async function fixture(count: number, duplicate = false) {

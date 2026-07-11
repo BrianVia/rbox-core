@@ -10,33 +10,33 @@ import type {
   Manifest,
   PhaseReport,
 } from "../../engine/index.js";
-import { isSourceChangedError } from "../../engine/index.js";
 import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
 import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
-import { fuseEnabled, materializeLease } from "../sync-recovery.js";
 import { ResourceBudget } from "./budget.js";
-import { EOF, ReadyQueue, type Disposition, type ReadyBlob } from "./ready-queue.js";
+import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
 import { ReceiptDrainer } from "./receipt-drainer.js";
+import {
+  MAX_SHAS_PER_CHECK,
+  PER_FILE_UPLOAD_ATTEMPTS,
+  applyCipherDescriptor,
+  classifyCacheHit,
+  clampConc,
+  descriptorFromEncryptedBlob,
+  encryptConcurrency,
+  fuseEnabled,
+  isDeferrableChurn,
+  materializeLease,
+  uploadConcurrency,
+} from "./shared.js";
 
-const MAX_SHAS_PER_CHECK = 50_000;
 const ROLLING_CHECK_BATCH = Math.min(5_000, MAX_SHAS_PER_CHECK);
 const DEFAULT_QUEUE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_ITEMS = 2_048;
 const DEFAULT_REDEEM_THRESHOLD = 5_000;
-const PER_FILE_UPLOAD_ATTEMPTS = 3;
-
-const clamp = (value: string | undefined, fallback: number, max: number): number => {
-  const n = Number(value);
-  return Number.isInteger(n) && n >= 1 && n <= max ? n : fallback;
-};
-const encryptConcurrency = (workers?: number) => clamp(process.env.RBOX_ENCRYPT_CONCURRENCY, workers ? workers * 2 : 8, 512);
-const uploadConcurrency = () => clamp(process.env.RBOX_UPLOAD_CONCURRENCY, process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 64, 512);
-const hasCode = (error: unknown, code: string): boolean => typeof error === "object" && error !== null && "code" in error && error.code === code;
 
 type EncryptFn = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
-type Descriptor = { encSha: string; cipherSize?: number; comp?: "zstd"; payloadSha?: string };
 
 export interface PublishPipelineArgs {
   api: SyncRemote;
@@ -61,40 +61,9 @@ export interface PublishPipelineArgs {
   uploadsDir: string;
 }
 
-function descriptor(blob: EncryptedBlob): Descriptor {
-  return blob.comp ? { encSha: blob.encSha, comp: blob.comp, payloadSha: blob.payloadSha, cipherSize: blob.cipherSize } : { encSha: blob.encSha };
-}
-
-function applyDescriptor(file: FileEntry, value: Descriptor): void {
-  file.encSha = value.encSha;
-  if (value.comp) {
-    file.comp = value.comp;
-    file.payloadSha = value.payloadSha;
-    file.cipherSize = value.cipherSize;
-  } else {
-    delete file.comp;
-    delete file.payloadSha;
-    delete file.cipherSize;
-  }
-}
-
-async function cacheHitStillValid(root: string, file: FileEntry): Promise<boolean> {
-  try {
-    const stat = await fs.lstat(path.join(root, file.path));
-    return stat.isFile() && stat.size === file.size && stat.mtimeMs === file.mtimeMs;
-  } catch (error) {
-    if (hasCode(error, "ENOENT") || hasCode(error, "ENOTDIR")) return false;
-    throw error;
-  }
-}
-
-function deferrable(error: unknown): boolean {
-  return hasCode(error, "ENOENT") || isSourceChangedError(error);
-}
-
 export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ needsUpload: Set<string> }> {
-  const disk = new ResourceBudget(clamp(process.env.RBOX_PIPELINE_QUEUE_BYTES, DEFAULT_QUEUE_BYTES, Number.MAX_SAFE_INTEGER));
-  const queue = new ReadyQueue({ maxItems: clamp(process.env.RBOX_PIPELINE_ITEMS, DEFAULT_QUEUE_ITEMS, 1_000_000) });
+  const disk = new ResourceBudget(clampConc(process.env.RBOX_PIPELINE_QUEUE_BYTES, DEFAULT_QUEUE_BYTES, Number.MAX_SAFE_INTEGER));
+  const queue = new ReadyQueue({ maxItems: clampConc(process.env.RBOX_PIPELINE_ITEMS, DEFAULT_QUEUE_ITEMS, 1_000_000) });
   const held = new Set<ReadyBlob>();
   const cleanupSettlements = new Set<Promise<unknown>>();
   const encryptSettlements = new Set<Promise<unknown>>();
@@ -123,7 +92,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   process.on("SIGINT", sigint);
 
   const port = args.api.receiptPort?.();
-  const threshold = clamp(process.env.RBOX_PIPELINE_REDEEM_THRESHOLD, DEFAULT_REDEEM_THRESHOLD, 1_000_000);
+  const threshold = clampConc(process.env.RBOX_PIPELINE_REDEEM_THRESHOLD, DEFAULT_REDEEM_THRESHOLD, 1_000_000);
   const drainer = port ? new ReceiptDrainer(port, { threshold, backlogMax: threshold * 2, onError: abort }) : undefined;
   let drainGeneration = 0;
   const drainWaiters = new Set<() => void>();
@@ -134,7 +103,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   });
   drainer?.maybeKick();
 
-  const releaseBlob = (blob: ReadyBlob, disposition: Disposition): void => blob.release(disposition);
   const makeReady = (file: FileEntry, encrypted: EncryptedBlob): ReadyBlob => {
     let released = false;
     const blob: ReadyBlob = {
@@ -163,7 +131,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   let checked = 0;
   let introduced = 0;
   let recover = 0;
-  const checkPromises = new WeakMap<ReadyBlob, Promise<boolean>>();
   const work: Array<{ file: FileEntry; forceEncrypt: boolean }> = [];
   const workWaiters: Array<() => void> = [];
   let outstanding = 0;
@@ -179,6 +146,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   };
 
   let flushChecks!: () => Promise<void>;
+  const scheduleFlush = (): void => {
+    if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
+    else if (!checkTimer) {
+      checkTimer = setTimeout(() => { checkTimer = undefined; void flushChecks().catch(abort); }, 50);
+    }
+  };
   const maybeClose = (): void => {
     if (readyClosed || !initialFeedClosed || outstanding !== 0 || checkBuffer.length !== 0 || checkerInflight !== 0) return;
     readyClosed = true;
@@ -197,11 +170,8 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     // A producer can be blocked in queue.push when abort rejects this promise.
     // Mark it handled immediately; the consumer still observes the original rejection.
     void promise.catch(() => {});
-    if (ready) checkPromises.set(ready, promise);
-    if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
-    else if (!checkTimer) {
-      checkTimer = setTimeout(() => { checkTimer = undefined; void flushChecks().catch(abort); }, 50);
-    }
+    if (ready) ready.check = promise;
+    scheduleFlush();
     return promise;
   };
   const submitAddressCheck = (file: FileEntry): void => {
@@ -212,10 +182,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     outstanding++;
     const promise = new Promise<boolean>((resolve, reject) => checkBuffer.push({ address, resolve, reject }));
     void promise.catch(abort);
-    if (checkBuffer.length >= ROLLING_CHECK_BATCH) void flushChecks().catch(abort);
-    else if (!checkTimer) {
-      checkTimer = setTimeout(() => { checkTimer = undefined; void flushChecks().catch(abort); }, 50);
-    }
+    scheduleFlush();
   };
 
   flushChecks = async (): Promise<void> => {
@@ -234,7 +201,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         const isMissing = missing.has(item.address);
         if (isMissing && item.file && !item.ready) enqueueWork(item.file, true);
         if (isMissing && item.ready) upTotal++;
-        if (!isMissing && item.ready) releaseBlob(item.ready, "satisfied-skip");
+        if (!isMissing && item.ready) item.ready.release("satisfied-skip");
         item.resolve(isMissing);
         outstanding--;
       }
@@ -253,17 +220,24 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   let encCtBytes = 0;
   let cacheHits = 0;
   let cacheMisses = 0;
+  const reservationFor = (size: number): number => size + size + 4096;
+  const recordEncrypted = (file: FileEntry, encrypted: EncryptedBlob): void => {
+    const descriptor = descriptorFromEncryptedBlob(encrypted);
+    applyCipherDescriptor(file, descriptor);
+    args.encryptCache.record(encrypted.plaintextSha, { ...descriptor, cipherSize: encrypted.cipherSize, path: file.path });
+    args.cacheWriter.schedule();
+  };
   const encryptOne = async (file: FileEntry, forceEncrypt: boolean): Promise<void> => {
     const t0 = LANE_TIMING ? performance.now() : 0;
     const cached = forceEncrypt ? undefined : args.encryptCache.lookup(file.sha256);
     if (cached) {
-      if (!(await cacheHitStillValid(args.root, file))) {
+      if ((await classifyCacheHit(args.root, file)) === "defer") {
         args.deferred.add(file.path);
         args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
         return;
       }
       cacheHits++;
-      applyDescriptor(file, cached);
+      applyCipherDescriptor(file, cached);
       args.encryptCache.record(file.sha256, { ...cached, path: file.path });
       args.cacheWriter.schedule();
       if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
@@ -272,7 +246,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       return;
     }
     cacheMisses++;
-    const reservation = file.size + file.size + 4096;
+    const reservation = reservationFor(file.size);
     await disk.reserve(reservation);
     let encrypted: EncryptedBlob;
     try {
@@ -287,7 +261,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       finally { encryptSettlements.delete(dispatched); }
     } catch (error) {
       disk.release(reservation);
-      if (deferrable(error)) {
+      if (isDeferrableChurn(error, file.path)) {
         args.deferred.add(file.path);
         args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
         return;
@@ -295,20 +269,17 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       throw error;
     }
     disk.reconcile(reservation, encrypted.cipherSize);
-    applyDescriptor(file, descriptor(encrypted));
-    args.encryptCache.record(encrypted.plaintextSha, { ...descriptor(encrypted), cipherSize: encrypted.cipherSize, path: file.path });
-    args.cacheWriter.schedule();
+    recordEncrypted(file, encrypted);
     encCtBytes += encrypted.cipherSize;
     if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
     args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
     const ready = makeReady(file, encrypted);
-    const classification = submitCheck(file, ready);
-    void classification.catch(() => {});
+    submitCheck(file, ready);
     try {
       if (scope.signal.aborted) throw abortCause;
       await queue.push(ready);
     } catch (error) {
-      if (!scope.signal.aborted) releaseBlob(ready, "abandoned");
+      if (!scope.signal.aborted) ready.release("abandoned");
       throw error;
     }
   };
@@ -354,11 +325,11 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     let current = initial;
     for (let attempt = 0; attempt < PER_FILE_UPLOAD_ATTEMPTS; attempt++) {
       const file = current.file;
-      if (uploaded.has(current.encSha)) { releaseBlob(current, "duplicate-skip"); return 0; }
+      if (uploaded.has(current.encSha)) { current.release("duplicate-skip"); return 0; }
       byteTracker.migrate(file.path, current.encSha, current.cipherSize);
       emitUpload(file);
       await waitForBacklog();
-      if (scope.signal.aborted) { releaseBlob(current, "abandoned"); throw abortCause; }
+      if (scope.signal.aborted) { current.release("abandoned"); throw abortCause; }
       try {
         byteTracker.reviseTotal(current.encSha, current.cipherSize);
         const callerOwnsTiming = LANE_TIMING && args.api.ownsUploadLaneTiming?.(current.cipherSize) !== true;
@@ -375,10 +346,10 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         byteTracker.setProgress(current.encSha, current.cipherSize);
         uploaded.add(current.encSha);
         drainer?.capture();
-        releaseBlob(current, "uploaded");
+        current.release("uploaded");
         return current.cipherSize;
       } catch (error) {
-        releaseBlob(current, "uploaded");
+        current.release("uploaded");
         if (error instanceof BlobRetryLaterError) {
           byteTracker.defer(file.path);
           args.retryLater.add(file.path);
@@ -393,7 +364,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         }
         await args.backoff(attempt);
         if (scope.signal.aborted) throw abortCause;
-        const reservation = file.size + file.size + 4096;
+        const reservation = reservationFor(file.size);
         await disk.reserve(reservation);
         if (scope.signal.aborted) { disk.release(reservation); throw abortCause; }
         let encrypted: EncryptedBlob;
@@ -405,23 +376,21 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
           try { encrypted = await promise; } finally { encryptSettlements.delete(promise); }
         } catch (retryError) {
           disk.release(reservation);
-          if (deferrable(retryError)) { byteTracker.defer(file.path); emitUpload(file); return null; }
+          if (isDeferrableChurn(retryError, file.path)) { byteTracker.defer(file.path); emitUpload(file); return null; }
           throw retryError;
         }
         disk.reconcile(reservation, encrypted.cipherSize);
         if (scope.signal.aborted) {
           const abandoned = makeReady(file, encrypted);
-          releaseBlob(abandoned, "abandoned");
+          abandoned.release("abandoned");
           throw abortCause;
         }
-        applyDescriptor(file, descriptor(encrypted));
-        args.encryptCache.record(encrypted.plaintextSha, { ...descriptor(encrypted), cipherSize: encrypted.cipherSize, path: file.path });
-        args.cacheWriter.schedule();
+        recordEncrypted(file, encrypted);
         current = makeReady(file, encrypted);
         byteTracker.migrate(file.path, current.encSha, current.cipherSize);
-        if (scope.signal.aborted) { releaseBlob(current, "abandoned"); throw abortCause; }
+        if (scope.signal.aborted) { current.release("abandoned"); throw abortCause; }
         const missing = await args.api.missingBlobs([current.encSha]);
-        if (missing.length === 0) { releaseBlob(current, "satisfied-skip"); return 0; }
+        if (missing.length === 0) { current.release("satisfied-skip"); return 0; }
       }
     }
     return null;
@@ -432,7 +401,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       if (scope.signal.aborted) return;
       const item = await queue.pull();
       if (item === EOF) return;
-      const missing = await checkPromises.get(item)!;
+      const missing = await item.check!;
       if (!missing) continue;
       const size = await uploadReady(item);
       if (size === null) args.deferred.add(item.file.path);
@@ -445,8 +414,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   try {
     for (const file of args.toEncrypt) enqueueWork(file);
     const pipelineFiles = new Set(args.toEncrypt);
-    const byAddress = new Map<string, FileEntry>();
-    for (const file of args.local.files) if (file.type === "file" && file.encSha) byAddress.set(file.encSha, file);
     if (!args.preflightDelta || args.fullAudit) {
       // Design 103 parity: legacy fullAudit also sweeps only manifest file addresses; git refs remain commit-422 authority.
       // recoverAddresses are intentionally ignored under fullAudit, also parity: the retry loop CLEARS its recovery
@@ -459,6 +426,8 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         submitAddressCheck(file);
       }
     } else {
+      const byAddress = new Map<string, FileEntry>();
+      for (const file of args.local.files) if (file.type === "file" && file.encSha) byAddress.set(file.encSha, file);
       for (const address of args.recoverAddresses ?? []) {
         const file = byAddress.get(address);
         if (file && !pipelineFiles.has(file)) submitAddressCheck(file);
@@ -469,7 +438,8 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     }
     initialFeedClosed = true;
     producers = Array.from({ length: encryptConcurrency(args.pool?.workers.length) }, () => producer());
-    consumers = Array.from({ length: uploadConcurrency() }, () => consumer());
+    const consumerCount = Math.max(1, Math.min(uploadConcurrency(), args.toEncrypt.length + (args.recoverAddresses?.size ?? 0)));
+    consumers = Array.from({ length: consumerCount }, () => consumer());
     await flushChecks();
     await args.report.phase("upload", async () => {
       await Promise.all([Promise.all(producers), Promise.all(consumers)]);
@@ -495,7 +465,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     await Promise.allSettled(consumers);
     // Design 98 §3.5 / SPEC §7 step 5: Tier 1 has no encryptStream handle;
     // the Tier-2 cancellation bridge is therefore structurally inert here.
-    for (const blob of [...held]) releaseBlob(blob, "abandoned");
+    for (const blob of [...held]) blob.release("abandoned");
     await Promise.allSettled([...cleanupSettlements]);
     if (drainer?.error) await drainer.flush().catch(() => {});
     throw abortCause;

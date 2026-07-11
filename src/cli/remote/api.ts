@@ -44,7 +44,6 @@ export interface SyncRemote {
   ): Promise<void>;
   ownsUploadLaneTiming?(size: number): boolean;
   closeUploader?(err: Error): Promise<void>;
-  uploaderDispatchCount?(): number;
   receiptPort?(): ReceiptPort;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
@@ -91,10 +90,6 @@ export class RboxApi implements SyncRemote {
 
   closeUploader(err: Error): Promise<void> {
     return this.batchUploader.close(err);
-  }
-
-  uploaderDispatchCount(): number {
-    return this.batchUploader.uploaderDispatchCount();
   }
 
   receiptPort(): ReceiptPort {

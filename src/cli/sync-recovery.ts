@@ -1,19 +1,16 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   encryptFileToTemp as defaultEncryptFileToTemp,
-  isSourceChangedError,
   poolMap,
   withCryptoPool,
   type EncryptedBlob,
   type EncryptAddressCacheContext,
   type EncryptFileOptions,
   type CryptoPool,
-  type CoalescedBlob,
   type FileEntry,
   type Manifest,
   type PhaseReport,
@@ -25,6 +22,21 @@ import { UploadByteTracker } from "./upload-byte-tracker.js";
 import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
 import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
+import {
+  FUSED_ENCRYPT_CONCURRENCY_CAP,
+  MAX_SHAS_PER_CHECK,
+  PER_FILE_UPLOAD_ATTEMPTS,
+  applyCipherDescriptor,
+  classifyCacheHit,
+  descriptorFromEncryptedBlob,
+  descriptorFromEntry,
+  encryptConcurrency,
+  fuseEnabled,
+  isDeferrableChurn,
+  materializeLease,
+  uploadConcurrency,
+  type CipherDescriptor,
+} from "./publish-pipeline/shared.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -38,35 +50,6 @@ import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
  *  deferred out of this commit (design: partial progress — commit the stable subset,
  *  defer the file that won't settle). Bounded so a perpetually-churning file can never
  *  hot-loop the push; the daemon's watcher/safety scans re-queue it once it settles. */
-export const PER_FILE_UPLOAD_ATTEMPTS = 3;
-
-// Concurrency knobs (read at call-time so the bench harness + power users can tune
-// via env). Upload is the dominant cost on a first push (latency-bound), so it's
-// the highest. Bench sweeps RBOX_UPLOAD_CONCURRENCY to find the real optimum.
-const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
-  const n = Number(v);
-  return Number.isInteger(n) && n >= 1 && n <= max ? n : dflt;
-};
-const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, poolWorkers ? poolWorkers * 2 : 8); // CPU/disk bound
-const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
-export const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
-
-export async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
-  // Phase 1's legacy consumer materializes a memory lease into the existing encup
-  // temp flow and releases its charge there; the disk temp becomes the source of
-  // truth, like a producer spill. Design 98 activates Tier-2 by-reference framing
-  // and release at HTTP settlement (Design 99 §7.5/§10).
-  let ciphertextPath: string;
-  if (blob.lease.location.kind === "file") {
-    ciphertextPath = blob.lease.location.path;
-    blob.lease.release();
-  } else {
-    ciphertextPath = path.join(tmpDir, `${blob.plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
-    try { await fs.writeFile(ciphertextPath, blob.lease.location.bytes); }
-    finally { blob.lease.release(); }
-  }
-  return { plaintextSha: blob.plaintextSha, encSha: blob.encSha, ciphertextPath, cipherSize: blob.cipherSize, comp: blob.comp, payloadSha: blob.payloadSha };
-}
 // 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
 // ~7 D1 round-trips and concurrency past 32 just multiplied D1 contention. §23 moved D1 off
 // the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
@@ -74,12 +57,12 @@ export async function materializeLease(blob: CoalescedBlob, tmpDir: string): Pro
 // (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
 // win lived before design 80. With upload batching enabled, this pool becomes supply for the
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
-const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 64); // network/latency bound
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
 const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
+export { fuseEnabled, materializeLease, PER_FILE_UPLOAD_ATTEMPTS };
 
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
 let defaultEncryptObserverForTest: (() => void) | undefined;
@@ -89,34 +72,6 @@ export function setDefaultEncryptObserverForTest(observer: (() => void) | undefi
   defaultEncryptObserverForTest = observer;
 }
 
-type CipherDescriptor = {
-  encSha: string;
-  cipherSize?: number;
-  comp?: "zstd";
-  payloadSha?: string;
-};
-
-function descriptorFromEntry(f: FileEntry): CipherDescriptor | undefined {
-  if (!f.encSha) return undefined;
-  return f.comp ? { encSha: f.encSha, comp: f.comp, payloadSha: f.payloadSha, cipherSize: f.cipherSize } : { encSha: f.encSha };
-}
-
-function descriptorFromEncryptedBlob(e: EncryptedBlob): CipherDescriptor {
-  return e.comp ? { encSha: e.encSha, comp: e.comp, payloadSha: e.payloadSha, cipherSize: e.cipherSize } : { encSha: e.encSha };
-}
-
-function applyCipherDescriptor(f: FileEntry, descriptor: CipherDescriptor): void {
-  f.encSha = descriptor.encSha;
-  if (descriptor.comp) {
-    f.comp = descriptor.comp;
-    f.payloadSha = descriptor.payloadSha;
-    f.cipherSize = descriptor.cipherSize;
-  } else {
-    delete f.comp;
-    delete f.payloadSha;
-    delete f.cipherSize;
-  }
-}
 
 export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
@@ -129,7 +84,6 @@ export interface EncryptAndUploadOptions {
 }
 
 const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
-const MAX_SHAS_PER_CHECK = 50_000;
 const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 export async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
@@ -152,31 +106,6 @@ function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheCo
   };
 }
 
-type CacheHitStatus = "accept" | "defer";
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
-async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitStatus> {
-  try {
-    const st = await fs.lstat(path.join(root, f.path));
-    if (!st.isFile()) return "defer";
-    return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "defer";
-  } catch (err) {
-    if (hasErrorCode(err, "ENOENT") || hasErrorCode(err, "ENOTDIR")) return "defer";
-    throw err;
-  }
-}
-
-/** Missing sources and snapshots that no longer match the scanned tuple are
- *  deferred; source changes are logged once per attempted cycle. */
-function isDeferrableChurn(err: unknown, relPath: string): boolean {
-  if (hasErrorCode(err, "ENOENT")) return true;
-  if (!isSourceChangedError(err)) return false;
-  console.error(`rbox: ${relPath} changed during encryption — deferred`);
-  return true;
-}
 
 export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
   const cache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));

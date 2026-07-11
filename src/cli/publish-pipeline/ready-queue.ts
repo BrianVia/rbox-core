@@ -9,6 +9,7 @@ export interface ReadyBlob {
   cipherSize: number;
   path: string;
   diskCharge: number;
+  check?: Promise<boolean>;
   release(disposition: Disposition): void;
 }
 
@@ -36,9 +37,19 @@ export class ReadyQueue {
     this.heap = options.heap;
   }
 
+  private closedError(): Error {
+    return new Error("ready queue is closed for writing");
+  }
+
+  private resolveEofIfDrained(): void {
+    if (this.writingClosed && this.queued.length === 0) {
+      for (const pull of this.pulls.splice(0)) pull.resolve(EOF);
+    }
+  }
+
   async push(item: ReadyBlob): Promise<void> {
     if (this.aborted) throw this.aborted;
-    if (this.writingClosed) throw new Error("ready queue is closed for writing");
+    if (this.writingClosed) throw this.closedError();
     await this.items.reserve(1);
     try {
       await this.heap?.reserve(item.cipherSize);
@@ -49,7 +60,7 @@ export class ReadyQueue {
     if (this.aborted || this.writingClosed) {
       this.items.release(1);
       this.heap?.release(item.cipherSize);
-      throw this.aborted ?? new Error("ready queue is closed for writing");
+      throw this.aborted ?? this.closedError();
     }
     const pull = this.pulls.shift();
     if (pull) {
@@ -74,10 +85,10 @@ export class ReadyQueue {
   closeForWriting(): void {
     if (this.writingClosed || this.aborted) return;
     this.writingClosed = true;
-    const error = new Error("ready queue is closed for writing");
+    const error = this.closedError();
     this.items.close(error);
     this.heap?.close(error);
-    if (this.queued.length === 0) for (const pull of this.pulls.splice(0)) pull.resolve(EOF);
+    this.resolveEofIfDrained();
   }
 
   abort(err: Error): void {
@@ -93,8 +104,6 @@ export class ReadyQueue {
   private releaseAxes(item: ReadyBlob): void {
     this.items.release(1);
     this.heap?.release(item.cipherSize);
-    if (this.writingClosed && this.queued.length === 0) {
-      for (const pull of this.pulls.splice(0)) pull.resolve(EOF);
-    }
+    this.resolveEofIfDrained();
   }
 }

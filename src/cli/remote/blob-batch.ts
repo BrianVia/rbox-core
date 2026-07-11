@@ -888,8 +888,6 @@ export class BlobBatchUploader {
     }
   }
 
-  uploaderDispatchCount(): number { return uploaderDispatchCount(); }
-
   close(err: Error): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
