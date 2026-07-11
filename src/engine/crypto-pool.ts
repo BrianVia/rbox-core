@@ -439,6 +439,10 @@ export class CryptoPool {
     return { used: this.budget.used, highWater: this.budget.highWater, spilledFiles: this.spilledFiles, spilledBytes: this.spilledBytes };
   }
 
+  spillDirForTest(): string | undefined {
+    return this.spillDir;
+  }
+
   private async encryptFileBacked(srcPath: string, tmpDir: string, opts: EncryptFileOptions): Promise<CoalescedBlob> {
     const blob = await this.encrypt(srcPath, tmpDir, opts);
     return { ...blob, lease: this.fileLease(blob.encSha, blob.cipherSize, blob.ciphertextPath) };
@@ -678,7 +682,7 @@ export class CryptoPool {
     const held = this.producerResults.find((x) => !x.delivered && x.blob.lease.location.kind === "memory");
     if (!held) return false;
     try {
-      this.spillDir ??= await fs.mkdtemp(path.join(held.file.tmpDir, "rbox-crypto-spill-"));
+      this.spillDir ??= await fs.mkdtemp(path.join(os.tmpdir(), "rbox-crypto-spill-"));
       await fs.chmod(this.spillDir, 0o700).catch(() => {});
       const pathname = path.join(this.spillDir, `spill-${this.spillOrdinal++}.ct`);
       await fs.writeFile(pathname, held.bytes, { mode: 0o600 });
@@ -718,30 +722,35 @@ export class CryptoPool {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.budget.wake();
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    const err = closeError();
-    this.cancelUndispatched(err);
-    for (const held of this.producerResults.splice(0)) {
-      if (!held.delivered) {
-        held.delivered = true;
-        held.blob.lease.release();
-        held.file.reject(err);
+    try {
+      this.budget.wake();
+      if (this.idleTimer) clearTimeout(this.idleTimer);
+      if (this.flushTimer) clearTimeout(this.flushTimer);
+      const err = closeError();
+      this.cancelUndispatched(err);
+      for (const held of this.producerResults.splice(0)) {
+        if (!held.delivered) {
+          held.delivered = true;
+          held.blob.lease.release();
+          held.file.reject(err);
+        }
       }
+      for (const waiter of this.queueWaiters.splice(0)) waiter.reject(err);
+      for (const record of this.queue.splice(0)) record.reject(err);
+      for (const worker of this.workers.splice(0)) {
+        await worker.terminateIntentional();
+        for (const record of worker.inFlight.values()) record.reject(err);
+        worker.inFlight.clear();
+      }
+      this.signalQueueSpace();
+      if (activePool === this) {
+        activePool = undefined;
+      }
+      await cleanupEmbeddedWorker();
+    } finally {
+      if (this.spillDir) await fs.rm(this.spillDir, { recursive: true, force: true }).catch(() => {});
+      this.spillDir = undefined;
     }
-    for (const waiter of this.queueWaiters.splice(0)) waiter.reject(err);
-    for (const record of this.queue.splice(0)) record.reject(err);
-    for (const worker of this.workers.splice(0)) {
-      await worker.terminateIntentional();
-      for (const record of worker.inFlight.values()) record.reject(err);
-      worker.inFlight.clear();
-    }
-    this.signalQueueSpace();
-    if (activePool === this) {
-      activePool = undefined;
-    }
-    await cleanupEmbeddedWorker();
   }
 
   afterWorkerSlotFreed(): void {

@@ -282,9 +282,13 @@ describe("fused crypto", () => {
         const started = Date.now();
         while (pool!.fusedStatsForTest().spilledFiles === 0 && Date.now() - started < 5_000) await new Promise((resolve) => setTimeout(resolve, 10));
         expect(pool!.fusedStatsForTest().spilledFiles).toBeGreaterThan(0);
+        const spillDir = pool!.spillDirForTest();
+        expect(spillDir).toBeDefined();
         unblock();
         await done;
         expect(pool!.fusedStatsForTest().used).toBe(0);
+        await pool!.close();
+        await expect(fs.stat(spillDir!)).rejects.toMatchObject({ code: "ENOENT" });
       });
     } finally {
       delete process.env.RBOX_CRYPTO_FUSE_BUDGET_BYTES;
