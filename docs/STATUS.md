@@ -5,7 +5,37 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-11 (day) — perf design program: 7 designs merged (#210–#212, #214–#216 + decisions #217); serverTimings live in prod (accounting = ~87% of commit POST, measured); GC drain matures ~20:01Z today._
+_Last updated: 2026-07-11 (evening) — design 103 IMPLEMENTED + ROLLED OUT (#218 code, #219 flags): missing preflight 2.8–4.0s → **0.1s measured on the live fleet**; both daemons on `1.0.0-dev+2cb1ac5` with `RBOX_PREFLIGHT_DELTA=1`; prod worker early-reject flag ON. Design-99 Phase-0 prototype in flight. GC drain matures ~20:01Z._
+
+## 2026-07-11 evening — design 103 built, validated, rolled out (same day as its design)
+
+- **#218 (code, flag-gated default-off):** Part A server early stale-parent/
+  epoch 409 (`RBOX_COMMIT_EARLY_REJECT`) + Part B client change-only preflight
+  (`RBOX_PREFLIGHT_DELTA`), including the latent-bug fix (unsatisfiedBlobs now
+  threaded through the reupload action; was dropped at sync.ts:464), the
+  RECOVER_ACCUM_MAX=100k latch→chunked-full-audit, `RBOX_PREFLIGHT_FULL`
+  escape hatch, and the design-102 coexistence regression pin. 4-round codex
+  impl review to ALIGNED; /simplify + antislop clean; worker suite 420 pass
+  both flag states; client suite 1242 pass (2 known host failures only).
+  All implementation code written by codex (zero hand-written lines).
+- **Real-workload validation (114k-file workspace, one-file pushes):**
+  `missing` phase **2.8–4.0s → 0.1s**, `sent == introduced` exactly
+  (`i/r/s/fa` counters in push lines), no fallback latches. Push wall
+  19–22s → ~18s; the remaining wall is commit (~12s, design 102/84) + scan
+  (~8s, design 85).
+- **Rollout:** both fleet daemons rebuilt at `1.0.0-dev+2cb1ac5` and restarted
+  with `RBOX_PREFLIGHT_DELTA=1` (env-var flag — a manual daemon restart
+  without it reverts to full preflight, which is safe). #219 flips
+  `RBOX_COMMIT_EARLY_REJECT=1` on dev+prod workers via wrangler vars
+  (auto-deployed on merge; rollback = revert that line). Part A live
+  verification pending a natural 409 (watch for `earlyReject: 1` in AE
+  metrics / a fast conflict retry).
+- **`/blobs/check` server-side cap deliberately NOT shipped** (client-first
+  rollout per design §; ship only after fleet binaries are confirmed
+  upgraded).
+- **In flight:** design-99 Phase-0 A/B prototype (fused crypto measurement +
+  budget selection per founder decision). Next queued: design 102
+  implementation (shadow mode), design 84 C1/C2/D, 98/100/101 builds.
 
 ## 2026-07-11 — performance design day (all six audit-driven designs ALIGNED + merged)
 
