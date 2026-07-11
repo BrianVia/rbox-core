@@ -161,6 +161,25 @@ All 3 accepted. Dispositions:
    whose owner pid is dead (plus an age floor); gate covers repeated hard
    kills (§6.1, gate 3).
 
-## Round 5
+## Round 5 (FINAL, cap reached) — VERDICT: REVISE (1 item)
 
-Status: pending
+1. **Stale-temp reclamation not robust to PID reuse** — ACCEPTED and fixed
+   exactly as the reviewer prescribed: reclamation no longer reasons from PID
+   liveness at all. Ownership is established by the design-93 workspace sync
+   mutex — at push start, under the mutex, no other pipeline for this
+   workspace can be mid-run, so every sibling temp directory not created by
+   the current process is stale by construction and reclaimed unconditionally
+   (the embedded pid becomes diagnostic only). Gate 3 gains a PID-reuse
+   simulation case (§6.1, gate 3).
+
+## Final state
+
+The loop converged 20 → 12 → 4 → 3 → 1 items across five rounds; every item in
+every round was accepted and incorporated, and the single round-5 item was
+fixed with the reviewer's own prescribed remedy after the round cap was
+reached. There is NO open disagreement between Claude and GPT on any design
+point — the residual formal state is "REVISE at cap with the last item
+resolved as prescribed," not a substantive dispute. Recommended founder
+treatment: read the round-5 item and its §6.1 fix (the only text codex has not
+re-verified) before implementation begins; everything else carries an explicit
+reviewer disposition.

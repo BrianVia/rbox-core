@@ -1,7 +1,9 @@
 # 98 — First-publish pipeline: overlap encrypt → upload → receipt redemption
 
-Status: Design draft v5 (review rounds 1–4 REVISE with 20/12/4/3 items, all
-accepted — see `REVIEW-98.md`). Owns audit Findings 6 (phase-serialized publish)
+Status: Design draft v6. Adversarial review converged 20 → 12 → 4 → 3 → 1
+items over five rounds (all 40 accepted; the round-5 single item — PID-reuse in
+stale-temp reclamation — is fixed exactly as the reviewer prescribed; see
+`REVIEW-98.md` for the full ledger). Owns audit Findings 6 (phase-serialized publish)
 and 8 (receipt redemption after all uploads). Finding 9 (batch bearer-auth) is
 a **measurement-and-deferral record only** (§4), not a build in this design.
 Client-and-server-adjacent. Pending the Phase 0 measurements in §5 before the
@@ -621,18 +623,23 @@ prior run exited, because ciphertext temps never survive a run.
   flush are also lost; resume additionally re-encrypts that BOUNDED tail (at
   most one flush interval of encryptions). This is stated as expected, not a
   bug.
-- **Stale-temp reclamation (round-4 item 3):** `finally` never runs on
-  SIGKILL, so the run's temp DIRECTORY survives on disk — bounded per run but
-  unbounded across repeated hard kills without a reclamation policy. Pipeline
-  temps therefore live under a workspace-scoped parent
-  (`.rbox/state/tmp/enc-<pid>-<startMs>/`) whose name embeds the owning pid;
-  at every push start, before reserving anything, the pipeline reclaims sibling
-  directories whose owner pid is not alive (with an age floor of one hour as a
-  belt-and-suspenders against pid reuse — a stale dir is only ever dead
-  ciphertext, so reclamation is always safe for correctness, the floor only
-  avoids racing a just-started concurrent push, which the design-93 workspace
-  mutex already excludes). Gate 3 includes a repeated-SIGKILL run asserting no
-  cross-run temp accumulation.
+- **Stale-temp reclamation (round-4 item 3; PID-reuse hole closed per round-5
+  item 1):** `finally` never runs on SIGKILL, so the run's temp DIRECTORY
+  survives on disk — bounded per run but unbounded across repeated hard kills
+  without a reclamation policy. Pipeline temps therefore live under a
+  workspace-scoped parent (`.rbox/state/tmp/enc-<pid>-<startMs>/`; the pid in
+  the name is diagnostic only, NOT the ownership test). Reclamation does not
+  reason from PID liveness at all — PIDs are reusable, so "owner pid alive"
+  can be true of an unrelated process and would leak the directory forever.
+  Instead, ownership is established by the design-93 workspace sync mutex:
+  every push (CLI or daemon) runs under it, so AT PUSH START, UNDER THE MUTEX,
+  no other pipeline for this workspace can be mid-run — every sibling `enc-*`
+  directory not created by the current process is stale BY CONSTRUCTION and is
+  reclaimed unconditionally. A stale dir contains only dead ciphertext, so
+  reclamation is always correctness-safe. Gate 3 includes a repeated-SIGKILL
+  run asserting no cross-run temp accumulation, plus a PID-reuse simulation
+  (a live unrelated process holding a stale dir's embedded pid) asserting the
+  dir is still reclaimed.
 
 On resume, the rolling server-satisfied check (§3.2) classifies each address:
 
@@ -750,8 +757,10 @@ a documented external cause (host sleep, network change).
    post-last-flush) set; final account charge == single-run charge, byte-exact.
    Run for both SIGINT and SIGKILL. A repeated-SIGKILL sequence (≥ 3 kills,
    then a clean run) additionally asserts no cross-run temp-directory
-   accumulation (stale-temp reclamation, §6.1). Exact counts, no percentiles —
-   this is a correctness gate.
+   accumulation, including under a simulated PID-reuse (a live unrelated
+   process occupying a stale dir's embedded pid — reclamation must not depend
+   on PID liveness; §6.1). Exact counts, no percentiles — this is a
+   correctness gate.
    - **3b. Post-abort dispatch bound.** On a mid-run quota 402:
      `dispatchCount` increments after the abort latch = 0 (the atomic counter of
      §3.5), and objects landed after the latch ≤ the recorded in-flight window
