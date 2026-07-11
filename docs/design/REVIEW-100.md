@@ -181,6 +181,34 @@ Raw output: scratchpad/review-100-r3.txt. Items and disposition:
    the actual safety invariant, with measurement as evidence.
 7. Shipped-work + pack-cache boundaries acceptable — no action.
 
-## Round 4
+## Round 4 — VERDICT: REVISE (1 item; everything else declared design-complete)
+
+Raw output: scratchpad/review-100-r4.txt. Item and disposition:
+
+1. **Loud-deferral state not stable across base advancement** — the pull
+   advanced `lastSyncedManifest` to the FULL remote manifest, so the next
+   reconcile saw a skipped `a/x` as a local deletion (no re-pull, and a push
+   could propose the remote delete — the data-loss echo). ACCEPTED, and the
+   "pre-existing exposure" framing withdrawn: once this design deliberately
+   skips an action and returns success, it owns the state model. Fix
+   (reviewer's option 2, implemented via base-exclusion rather than a new
+   durable set): apply returns the skipped paths and the pull records
+   `lastSyncedManifest` = remote manifest MINUS skipped entries. Consequences
+   fall out of existing reconcile semantics: push sees absent-on-disk +
+   absent-in-base = no change → can never propose the delete (echo prevented
+   by construction); pull sees present-in-remote + absent-in-base → re-emits
+   the write, the group re-derives (grouping now computed over the FULL
+   manifest joined with pending actions, so a collision with an
+   already-synced winner is still detected), same byte-order rule re-defers
+   identically. Deferral is re-computed truth, not stored state; interruption
+   loses nothing; remote deletion of the winner self-heals the loser. §4.3
+   gains the three tests (no delete proposal; identical deferrals across
+   re-joins; self-heal). §8 Q4 narrowed to product surfacing only.
+
+Reviewer explicitly declared atomicity, interruption recovery for
+representable entries, watcher handoff, trie prefix grouping, shipped-work
+boundaries, and pack-cache exclusion design-complete in this round.
+
+## Round 5 (final — cap)
 
 Status: pending (running)

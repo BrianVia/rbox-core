@@ -1,7 +1,7 @@
 # 100 - Fresh join cold apply: directory-trie apply, size-aware lanes, Git chain prefetch
 
-Status: Design draft v4 (v1 → REVISE 18; v2 → REVISE 9; v3 → REVISE 6;
-dispositions in `REVIEW-100.md`). Measurement-first, falsification-first —
+Status: Design draft v5 (v1 → REVISE 18; v2 → REVISE 9; v3 → REVISE 6;
+v4 → REVISE 1; dispositions in `REVIEW-100.md`). Measurement-first, falsification-first —
 modelled on design 85's phase-0 discipline (measure, falsify, then build). Every
 build gate is stated so a phase-0 number can KILL the corresponding phase before
 a line ships. Client-only; no server or wire-format change.
@@ -274,24 +274,35 @@ interface DirectoryPlan {
   POOL — exactly today's behavior (today nothing is grouped at all), so the
   heuristic is strictly risk-reducing, never risk-adding; it is a mitigation,
   not a proof.
-- **Unrepresentable-pair terminal state (R3 #1).** When two manifest FILE
-  entries fold-collide on their FULL paths (e.g. `A/x` and `a/x`) and the
-  serial application of the second discovers the first group-member's
-  just-published bytes at its physical target, the volume has proven it cannot
-  represent both. Contract: the FIRST member (byte-order) is published; each
-  remaining colliding member is **skipped with a loud per-path deferral**
-  (reported in the join summary and logs by count + errno-style reason;
-  paths only in the existing forensic log, never in metrics) — NOT
-  conflict-copied and NOT re-fetched. This terminal state is STABLE: a re-run
-  reaches the same decision from the same manifest, so repeated joins do not
-  churn conflicts (R3 #1's non-convergence). Honest scope note: what a PUSH
-  from this device should do about an entry it cannot materialize (it must
-  not propose a remote delete) is a pre-existing cross-platform sync semantic
-  that exists TODAY on case-insensitive volumes independent of this design —
-  it is recorded as an open question (§8) and explicitly not solved here; the
-  file-plane convergence promise in §4.3 is correspondingly scoped to
-  representable entries, with unrepresentable ones converging to
-  "deferred-loudly," not to bytes on disk.
+- **Unrepresentable-pair terminal state — durable across base advancement
+  (R3 #1; R4 #1).** Grouping source: fold-key prefix grouping is computed over
+  the FULL target manifest's paths (joined with the pending action set), not
+  the action set alone — so an incoming `a/x` collides with an
+  already-synced/on-disk `A/x` even when `A/x` has no pending action. When two
+  manifest FILE entries fold-collide on their full paths and the serial
+  application of the second discovers the first group-member's bytes at its
+  physical target, the volume has proven it cannot represent both. Contract:
+  the FIRST member (byte-order) is published; each remaining colliding member
+  is **skipped with a loud per-path deferral** (join summary + logs by count
+  and errno-style reason; paths only in the existing forensic log, never in
+  metrics) — NOT conflict-copied, NOT re-fetched this run.
+  **State model (R4 #1 — the load-bearing rule):** apply returns the skipped
+  paths, and the pull **excludes those entries from the advanced base** —
+  `lastSyncedManifest` is recorded as the remote manifest MINUS the skipped
+  entries. Both convergence properties then follow from EXISTING reconcile
+  semantics, with no new durable pending-set: (a) **no delete echo** — a
+  subsequent PUSH sees "absent on disk, absent in base" for the skipped path,
+  i.e. no local change, so it can never propose the remote delete (the R4
+  data-loss echo is prevented by construction, not by a suppression list);
+  (b) **stability** — a subsequent PULL sees "present in remote, absent in
+  base" and re-emits the write action; the group is re-derived from the full
+  manifest and the same byte-order rule re-defers it identically. The
+  deferral is therefore re-computed truth, not stored state; an interruption
+  anywhere loses nothing (the base simply advances less). If the colliding
+  winner is later deleted remotely, the next pull's re-emitted action for the
+  loser applies cleanly — the deferral self-heals. §8's remaining founder
+  question is only whether/how to SURFACE the standing deferral (status/UI),
+  not its safety.
 - **One shallowest-first creation pre-pass, CLEAN path only.** Walk breadth-first;
   `mkdir` (non-recursive) each node once.
   - success → node prepared; descendants proceed.
@@ -501,8 +512,13 @@ two tiers:
   between attempts; a file merely re-seen from a prior attempt must NOT
   produce a conflict copy (reconcile, not apply, decides it). Entries the
   volume cannot represent (§3.1 unrepresentable-pair contract) converge to the
-  STABLE "deferred-loudly" terminal state — same decision on every re-run,
-  never repeated conflict churn.
+  STABLE "deferred-loudly" state: skipped entries are excluded from the
+  advanced base (R4 #1), so every re-run re-derives the same deferral, a push
+  can never propose their remote delete (absent-on-disk + absent-in-base = no
+  local change), and remote deletion of the colliding winner self-heals the
+  loser on a later pull. Tests: join → push cycle proposes NO delete for a
+  deferred entry; repeated joins yield identical deferrals and zero conflict
+  copies; remote delete of the winner materializes the loser next pull.
 - **Git plane (converge-or-defer-loudly):** SIGKILL mid-`git fetch` followed by
   a clean re-run either converges that repo (the common case — bundle import is
   re-runnable and scratch refs are pruned) or defers THAT REPO with a visible
@@ -703,10 +719,9 @@ same corpus, same network class:
 3. **Kill-switch defaults.** Ship Phase 1's trie on-by-default after fleet
    validation, or soak it off-by-default behind `RBOX_APPLY_DIR_TRIE` for a
    release first (design 85 P-2 soak precedent)?
-4. **Unrepresentable entries vs. push (pre-existing, surfaced by R3 #1).** On a
-   case-insensitive volume that cannot hold both `A/x` and `a/x`, what should a
-   PUSH from that device do about the entry it never materialized? Today's
-   behavior already has this exposure (the un-materialized entry looks locally
-   deleted); this design makes the apply side deterministic and loud but does
-   NOT change push semantics. Does this deserve its own small design (e.g. a
-   "deferred-unrepresentable" set that suppresses delete proposals)?
+4. **Surfacing standing unrepresentable deferrals (R3 #1 → R4 #1).** The
+   delete-echo risk is closed by construction (§3.1 base-exclusion: a skipped
+   entry is absent from both disk and base, so push proposes nothing). What
+   remains is product surface: should `rbox status` / the dashboard show a
+   standing "N entries unrepresentable on this volume" indicator, and should
+   there be an explicit resolution flow (rename remotely / choose a winner)?
