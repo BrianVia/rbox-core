@@ -55,7 +55,7 @@ export {
   type IgnoreMatcher,
   type IgnoreRule,
 } from "./ignore.js";
-export { scanManifest, createScanStats, applyWatchEvents, type ScanStats, type WatchEvent, type WatchEventKind } from "./manifest.js";
+export { scanManifest, createScanStats, applyWatchEvents, statsStableAcrossHash, type ScanStats, type DirProbeSample, type DirProbeSink, type WatchEvent, type WatchEventKind } from "./manifest.js";
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";

@@ -41,6 +41,20 @@ export interface ScanStats {
   sortMs: number;
 }
 
+export interface DirProbeSample {
+  key: string;
+  mtimeMs: number;
+  ctimeMs: number;
+  readdirMs: number;
+  childCount: number;
+  projectedBytes: number;
+}
+
+export interface DirProbeSink {
+  probeOverheadMs: number;
+  record(sample: DirProbeSample): void;
+}
+
 export function createScanStats(): ScanStats {
   return {
     dirsWalked: 0,
@@ -73,7 +87,8 @@ export async function scanManifest(
    *  current walk interleaves them with pruning and recursion. */
   scanStats?: ScanStats,
   /** Out-param: files that changed between discovery and their deferred hash. */
-  deferred?: Set<string>
+  deferred?: Set<string>,
+  dirProbe?: DirProbeSink
 ): Promise<Manifest> {
   const files: FileEntry[] = [];
   let discovered = 0;
@@ -82,7 +97,7 @@ export async function scanManifest(
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats, deferred);
+  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats, deferred, dirProbe);
   if (scanStats) {
     const t0 = Date.now();
     files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -271,7 +286,8 @@ async function walk(
   onGitRepo?: (repo: DiscoveredGitRepo) => void,
   discoveryPruned = false,
   scanStats?: ScanStats,
-  deferred?: Set<string>
+  deferred?: Set<string>,
+  dirProbe?: DirProbeSink
 ): Promise<void> {
   // Top-level call owns the pending list + drains it in parallel at the end;
   // recursive calls share the same list.
@@ -279,6 +295,7 @@ async function walk(
   const toHash = pending ?? [];
 
   let entries: Dirent[];
+  const readdirStart = dirProbe ? Date.now() : 0;
   if (scanStats) {
     const t0 = Date.now();
     entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
@@ -286,6 +303,21 @@ async function walk(
     scanStats.dirsWalked += 1;
   } else {
     entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  }
+  if (dirProbe) {
+    const readdirMs = Date.now() - readdirStart;
+    const overheadStart = Date.now();
+    const st = await fs.lstat(path.join(root, rel));
+    const children = entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }));
+    dirProbe.record({
+      key: hashBytes(Buffer.from(rel)).slice(0, 16),
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      readdirMs,
+      childCount: entries.length,
+      projectedBytes: Buffer.byteLength(JSON.stringify(children)),
+    });
+    dirProbe.probeOverheadMs += Date.now() - overheadStart;
   }
   for (const entry of entries) {
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
@@ -304,7 +336,7 @@ async function walk(
           ? timedMatcher(scanStats, () => matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir))
           : matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
       if (scanStats ? timedMatcher(scanStats, () => matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) : matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats, deferred);
+      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats, deferred, dirProbe);
     } else if (entry.isSymbolicLink()) {
       if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
       onDiscover?.();
