@@ -52,12 +52,13 @@ function testDelay(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, TEST_DELAY_MS));
 }
 
-// Keep this aligned with sync-recovery's isDeferrableChurn/classifyCacheHit.
-const DEFERRABLE_FS_CODES = new Set(["ENOENT", "ENOTDIR"]);
+// This allowlist isolates per-file failures so healthy siblings do not fail with
+// the envelope. The caller's isDeferrableChurn still decides defer versus abort.
+const ISOLATED_FILE_ERROR_CODES = new Set(["RBOX_SOURCE_CHANGED", "ENOENT", "ENOTDIR", "EACCES", "EPERM", "EISDIR", "ESTALE", "EBUSY"]);
 const FUSE_MAX_FILE_BYTES = 256 * 1024;
 function isAllowlistedFileError(err: unknown): boolean {
   if (isSourceChangedError(err)) return true;
-  return typeof err === "object" && err !== null && "code" in err && DEFERRABLE_FS_CODES.has(String(err.code));
+  return typeof err === "object" && err !== null && "code" in err && ISOLATED_FILE_ERROR_CODES.has(String(err.code));
 }
 
 self.onmessage = async (event) => {

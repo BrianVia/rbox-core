@@ -7,8 +7,11 @@ import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
 import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "./crypto.js";
 import { hashBytes } from "./hash.js";
-import { __cryptoPoolTestHooks, withCryptoPool } from "./crypto-pool.js";
-import { __syncRecoveryTestHooks } from "../cli/sync-recovery.js";
+import { __cryptoPoolTestHooks, withCryptoPool, type CryptoPool } from "./crypto-pool.js";
+import { PhaseReport, type Manifest } from "./index.js";
+import { encryptAndUpload } from "../cli/sync-recovery.js";
+import type { SyncRemote } from "../cli/remote.js";
+import type { WorkspaceConfig } from "../cli/config.js";
 
 function seeded(size: number, compressible: boolean): Buffer {
   const out = Buffer.alloc(size);
@@ -169,19 +172,44 @@ describe("fused crypto", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }, 10_000);
 
-  test("production flag-off routing invokes the oracle and never the coalescer", async () => {
-    delete process.env.RBOX_CRYPTO_FUSE;
-    const fuse = __syncRecoveryTestHooks.useFusedCrypto(true, false);
-    let coalescedCalls = 0;
-    let oracleCalls = 0;
-    const selected = await __syncRecoveryTestHooks.encryptViaSelectedPath(
-      fuse,
-      async () => { coalescedCalls++; return "coalesced"; },
-      async () => { oracleCalls++; return "oracle"; },
-    );
-    expect(selected).toBe("oracle");
-    expect(oracleCalls).toBe(1);
-    expect(coalescedCalls).toBe(0);
+  test("encryptAndUpload flag routing invokes only the selected pool or oracle path", async () => {
+    const run = async (fused: boolean) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-routing-"));
+      const bytes = Buffer.from("production routing");
+      const srcPath = path.join(root, "file.txt");
+      await fs.writeFile(srcPath, bytes);
+      const stat = await fs.stat(srcPath);
+      const local: Manifest = { generatedAt: "", files: [{ path: "file.txt", type: "file", sha256: hashBytes(bytes), size: bytes.length, mode: 0o644, mtimeMs: stat.mtimeMs }] };
+      const base: Manifest = { generatedAt: "", files: [] };
+      const kek = generateKek();
+      const cfg: WorkspaceConfig = { remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "memory://", token: "", kek, accountId: "acct", accountEpoch: 1, keyEpoch: 1 };
+      const remote = { missingBlobs: async () => [] } as unknown as SyncRemote;
+      let coalescedCalls = 0;
+      let streamCalls = 0;
+      let oracleCalls = 0;
+      const pool = {
+        workers: [],
+        encryptCoalesced: async () => {
+          coalescedCalls++;
+          const encrypted = await encryptBytesInMemory(bytes, kek, { expected: { sha256: hashBytes(bytes), size: bytes.length } });
+          let released = false;
+          return { ...encrypted, lease: { location: { kind: "memory" as const, bytes: new Uint8Array(encrypted.ciphertext) }, release() { if (released) throw new Error("released twice"); released = true; } } };
+        },
+        encryptStream: () => { streamCalls++; },
+      } as unknown as CryptoPool;
+      if (fused) process.env.RBOX_CRYPTO_FUSE = "1";
+      else delete process.env.RBOX_CRYPTO_FUSE;
+      try {
+        await encryptAndUpload(remote, root, cfg, local, base, PhaseReport.disabled(), undefined, async () => {}, {
+          cryptoPoolForTest: pool,
+          ...(fused ? {} : { encryptFileToTemp: async (...args: Parameters<typeof encryptFileToTempInline>) => { oracleCalls++; return encryptFileToTempInline(...args); } }),
+        });
+        return { coalescedCalls, streamCalls, oracleCalls };
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    };
+
+    expect(await run(false)).toEqual({ coalescedCalls: 0, streamCalls: 0, oracleCalls: 1 });
+    expect(await run(true)).toEqual({ coalescedCalls: 1, streamCalls: 0, oracleCalls: 0 });
   });
 
   test("paused stream spills only queued producer results and leaves no budget charge", async () => {

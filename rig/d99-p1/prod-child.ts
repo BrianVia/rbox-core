@@ -65,3 +65,6 @@ try {
 } finally {
   await fs.rm(tmp, { recursive: true, force: true });
 }
+// The crypto pool caches its Worker threads (idle-timeout close), which keep the
+// event loop alive. This is a one-shot measurement child — exit hard once reported.
+process.exit(0);

@@ -59,6 +59,10 @@ export const __syncRecoveryTestHooks = {
 };
 
 async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
+  // Phase 1's legacy consumer materializes a memory lease into the existing encup
+  // temp flow and releases its charge there; the disk temp becomes the source of
+  // truth, like a producer spill. Design 98 activates Tier-2 by-reference framing
+  // and release at HTTP settlement (Design 99 §7.5/§10).
   let ciphertextPath: string;
   if (blob.lease.location.kind === "file") {
     ciphertextPath = blob.lease.location.path;
@@ -115,6 +119,8 @@ function applyCipherDescriptor(f: FileEntry, descriptor: CipherDescriptor): void
 
 export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
+  /** Production-call-site injection used by fused-crypto integration tests. */
+  cryptoPoolForTest?: CryptoPool;
   encryptCacheFlushMs?: number;
   pruneLivePaths?: ReadonlySet<string>;
   /** Addresses reported unsatisfied on prior 422 attempts of this push loop. */
@@ -465,7 +471,9 @@ export async function encryptAndUpload(
     report.record("upload", { count: up, wireBytes: upWireBytes });
     };
 
-    if (options.encryptFileToTemp === undefined) {
+    if (options.cryptoPoolForTest !== undefined) {
+      await runCryptoAndUpload(options.cryptoPoolForTest);
+    } else if (options.encryptFileToTemp === undefined) {
       await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool));
     } else {
       await runCryptoAndUpload(undefined);

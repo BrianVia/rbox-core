@@ -553,11 +553,11 @@ export class CryptoPool {
   }
 
   private async handleFusedResult(job: FusedJob, value: unknown): Promise<void> {
-    this.activeFusedJobs.delete(job);
     this.fusedInFlight--;
     if (this.closed) {
       if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
       for (const file of job.files) file.reject(closeError());
+      this.activeFusedJobs.delete(job);
       return;
     }
     const results = this.validFusedResults(value, job);
@@ -604,7 +604,8 @@ export class CryptoPool {
         else this.enqueueSplit([file]);
       } else file.reject(rehydrateError(result.error));
     }
-    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner);
+    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+    this.activeFusedJobs.delete(job);
     void this.pumpFused();
   }
 
@@ -617,11 +618,11 @@ export class CryptoPool {
   }
 
   private async handleFusedCrash(job: FusedJob, err: unknown, decrement = true): Promise<void> {
-    this.activeFusedJobs.delete(job);
     if (decrement) this.fusedInFlight--;
     if (job.reserved) { job.reserved = false; this.budget.release(JOB_RESERVE); }
     if (this.closed) {
       for (const file of job.files) file.reject(err);
+      this.activeFusedJobs.delete(job);
       return;
     }
     const retryable: PendingFile[] = [];
@@ -635,6 +636,8 @@ export class CryptoPool {
       const open = this.openGroup.splice(0);
       this.openBytes = 0;
       for (const file of [...retryable, ...queued, ...open]) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
+      for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+      this.activeFusedJobs.delete(job);
       return;
     }
     const retry: PendingFile[] = [];
@@ -653,15 +656,16 @@ export class CryptoPool {
       this.enqueueSplit(retry.slice(0, middle));
       this.enqueueSplit(retry.slice(middle));
     }
-    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner);
+    for (const file of job.files) if (file.owner !== undefined) this.maybeForgetCanceledOwner(file.owner, job);
+    this.activeFusedJobs.delete(job);
     void this.pumpFused();
   }
 
-  private maybeForgetCanceledOwner(owner: symbol): void {
+  private maybeForgetCanceledOwner(owner: symbol, terminalJob?: FusedJob): void {
     if (!this.canceledOwners.has(owner)) return;
     const owns = (file: PendingFile): boolean => file.owner === owner;
     if (this.openGroup.some(owns) || this.fusedQueue.some((job) => job.files.some(owns)) ||
-        [...this.activeFusedJobs].some((job) => job.files.some(owns)) || this.producerResults.some((held) => owns(held.file))) return;
+        [...this.activeFusedJobs].some((job) => job !== terminalJob && job.files.some(owns)) || this.producerResults.some((held) => owns(held.file))) return;
     this.canceledOwners.delete(owner);
   }
 
