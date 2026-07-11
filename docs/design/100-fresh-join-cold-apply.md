@@ -1,6 +1,6 @@
 # 100 - Fresh join cold apply: directory-trie apply, size-aware lanes, Git chain prefetch
 
-Status: Design draft v3 (v1 → REVISE 18 items; v2 → REVISE 9 items;
+Status: Design draft v4 (v1 → REVISE 18; v2 → REVISE 9; v3 → REVISE 6;
 dispositions in `REVIEW-100.md`). Measurement-first, falsification-first —
 modelled on design 85's phase-0 discipline (measure, falsify, then build). Every
 build gate is stated so a phase-0 number can KILL the corresponding phase before
@@ -246,30 +246,52 @@ interface DirectoryPlan {
 }
 ```
 
-- **EXACT-BYTE trie nodes + conservative collision-group flagging (R1 #6;
-  R2 #2, #3).** Insert each target path into a trie of directory nodes keyed by
+- **EXACT-BYTE trie nodes + prefix-closed collision grouping (R1 #6; R2 #2, #3;
+  R3 #2).** Insert each target path into a trie of directory nodes keyed by
   exact bytes. Do NOT merge case/normalization variants in memory — no portable
   equivalence key exists (APFS case/normalization vary by volume; ext4 can
-  casefold), and merging would be WRONG on a case-sensitive volume. Instead,
-  while building the plan, ALSO group all action target paths (directories AND
-  files) by a conservative fold key (Unicode NFC + simple casefold). Any group
-  with >1 distinct exact-byte member is a **potential-collision group**: its
-  entries are REMOVED from the parallel write pool and from the trie pre-pass,
-  and are applied SERIALLY through today's per-entry path in deterministic
-  (byte-order) sequence. This is a conservative superset — on a case-SENSITIVE
-  volume the group members don't physically collide and serial application is
-  merely a few entries slower; on a case-INSENSITIVE volume the serial order
-  makes the outcome deterministic: the second entry's existing precondition
-  check (`currentEntryAt`, apply.ts:221–227) sees the first entry's bytes and
-  routes through the conflict-copy path — never a silent overwrite from two
-  concurrent `rename`s racing one physical target (R2 #2). Demotion is by
-  FOLD-KEY GROUP, not by exact-byte subtree: an obstruction or failure
-  discovered through one spelling demotes every fold-equivalent alias of that
-  subtree with it, so no alias keeps running concurrently against the same
-  physical directory (R2 #3). Residual risk stated honestly: a filesystem whose
-  equivalence is STRANGER than NFC+casefold (exotic normalizations) can evade
-  the flag; those cases land in the same precondition/conflict path serially
-  per entry — degraded to today's behavior, never worse.
+  casefold), and merging would be WRONG on a case-sensitive volume. Separately,
+  while building the plan, compute a conservative fold key (Unicode NFC +
+  simple casefold) for **every path prefix** of every action path — not just
+  full targets (R3 #2: `A/x` and `a/y` collide at the parent even though the
+  full paths don't). Any fold key with >1 distinct exact-byte spelling marks a
+  **colliding prefix set**; the **collision group** is the union of ALL actions
+  whose paths pass through ANY member of that set (transitively closed across
+  overlapping sets). The entire group is (a) EXCLUDED from the trie pre-pass —
+  no §4.5 "confirm on EEXIST and continue" applies to any node under a
+  colliding prefix; that shortcut exists only for non-colliding paths — and
+  (b) removed from the parallel write pool and applied SERIALLY through
+  today's per-entry path in deterministic (byte-order) sequence, which
+  performs its own mkdir/precondition work per entry exactly as today. On a
+  case-SENSITIVE volume the group members don't physically collide and serial
+  application is merely slower for those entries; on a case-INSENSITIVE volume
+  the serial order makes every physical-target interaction deterministic —
+  never two concurrent `rename`s racing one physical file (R2 #2), and any
+  obstruction/failure inside the group affects the group as a unit, so no
+  alias keeps running concurrently against the same physical subtree (R2 #3).
+  Honest coverage limit (R3 #2): a filesystem whose equivalence is STRANGER
+  than NFC+casefold evades the flag and those paths REMAIN IN THE PARALLEL
+  POOL — exactly today's behavior (today nothing is grouped at all), so the
+  heuristic is strictly risk-reducing, never risk-adding; it is a mitigation,
+  not a proof.
+- **Unrepresentable-pair terminal state (R3 #1).** When two manifest FILE
+  entries fold-collide on their FULL paths (e.g. `A/x` and `a/x`) and the
+  serial application of the second discovers the first group-member's
+  just-published bytes at its physical target, the volume has proven it cannot
+  represent both. Contract: the FIRST member (byte-order) is published; each
+  remaining colliding member is **skipped with a loud per-path deferral**
+  (reported in the join summary and logs by count + errno-style reason;
+  paths only in the existing forensic log, never in metrics) — NOT
+  conflict-copied and NOT re-fetched. This terminal state is STABLE: a re-run
+  reaches the same decision from the same manifest, so repeated joins do not
+  churn conflicts (R3 #1's non-convergence). Honest scope note: what a PUSH
+  from this device should do about an entry it cannot materialize (it must
+  not propose a remote delete) is a pre-existing cross-platform sync semantic
+  that exists TODAY on case-insensitive volumes independent of this design —
+  it is recorded as an open question (§8) and explicitly not solved here; the
+  file-plane convergence promise in §4.3 is correspondingly scoped to
+  representable entries, with unrepresentable ones converging to
+  "deferred-loudly," not to bytes on disk.
 - **One shallowest-first creation pre-pass, CLEAN path only.** Walk breadth-first;
   `mkdir` (non-recursive) each node once.
   - success → node prepared; descendants proceed.
@@ -292,16 +314,23 @@ interface DirectoryPlan {
   record that already carries the destination temp path gains the same boolean,
   set at enqueue time from the same plan; `writePayload`
   (blob-batch.ts:545–551) and `publishAttempt` (blob-batch.ts:535–542) skip
-  their `mkdir` iff it is set. Failure/retry semantics: the flag is an
-  OPTIMIZATION HINT with one meaning — "skip the mkdir" — and is DROPPED on any
-  retry or fallback leg (retries take today's mkdir path). No invalidation
-  protocol is needed: if a prepared parent vanished, the skip-path op fails
-  ENOENT/ENOTDIR, that one entry's failure routes through the existing
-  per-entry error path (`stagingError`, apply.ts:214–217; cleanup `catch`
-  apply.ts:242–244), and any retry runs unflagged. All safety checks
-  (`assertWithinRoot` at its current placement, precondition re-check, atomic
-  rename) run identically flagged or not — the flag can only remove an mkdir,
-  never a guard.
+  their `mkdir` iff it is set. Failure contract, stated against what the code
+  ACTUALLY does (R3 #4): `applyActions`' write pool is FAIL-FAST — `poolMap`
+  rejects on the first task failure (`src/engine/pool.ts:7–10`); there is no
+  per-entry retry in the apply layer today, and this design adds none. So a
+  flagged write that fails ENOENT/ENOTDIR (a prepared parent vanished)
+  **fails that apply run**, exactly as any staging failure fails it today, and
+  recovery is the §4.3 re-run contract: the next join builds a FRESH plan
+  against current disk truth and converges. Where retry legs DO exist — inside
+  the batch downloader (its internal re-attempts and its
+  fall-back-to-single-payload leg) — every retry leg MUST clear
+  `parentPrepared` and take the mkdir path: the flag is valid for exactly one
+  attempt. Both are tested: (a) remove a prepared parent mid-pool → the apply
+  fails loudly and a re-run converges; (b) a batch-internal retry after a
+  flagged ENOENT runs unflagged, recreates the directory, and succeeds. All
+  safety checks (`assertWithinRoot` at its current placement, precondition
+  re-check, atomic rename) run identically flagged or not — the flag can only
+  remove an mkdir, never a guard.
 
 **Expected reduction (confirmed by M-P1, gated by G2).** Directory creation drops
 from O(files × depth × layers) `mkdir(recursive)` component-stats to one
@@ -351,16 +380,22 @@ distinct things, stated precisely:
 - NEW, and a deliverable of THIS phase: an EARLY presence check in the producer —
   before acquiring a fetch slot for a historical link, run the same
   `gitTipsPresent` predicate; if the tips are present, the producer skips the
-  download entirely. Semantics when presence CHANGES between producer and
-  consumer: presence only ever grows during an apply (imports add objects, the
-  incoming namespace is never pruned mid-apply), so a producer MISS followed by
-  consumer-time presence (e.g. an earlier link's import made these tips present)
-  is caught by the authoritative import-time skip — the prefetched artifact is
-  discarded, wasted bytes only. The reverse (producer HIT, consumer-time absent)
-  cannot arise from rbox's own apply; a concurrent external `git` prune is
-  caught because the import-time check, not the early check, gates the skip.
-  The early check is an optimization with a one-sided failure mode (extra
-  download), never a correctness input.
+  download entirely. Semantics for BOTH presence transitions (R3 #3):
+  - producer MISS → consumer-time PRESENT (an earlier link's import made the
+    tips present): the authoritative import-time skip drops the prefetched
+    artifact — wasted bytes only.
+  - producer HIT (download skipped) → consumer-time ABSENT (cannot arise from
+    rbox's own apply, which only adds objects mid-apply; possible under a
+    concurrent external `git prune`): the consumer performs a **late fetch** —
+    the ordinary fetch+decrypt for that link under the same global
+    semaphore/byte budgets — then verifies and imports in chain order. The
+    consumer always holds the link descriptor, so nothing is missing; the
+    pipeline stalls one link, which is exactly today's serial cost. If the
+    late fetch fails, the repo defers via the existing per-repo catch.
+  With the late-fetch rule the early check has NO correctness role on either
+  transition: every imported link passed the authoritative import-time
+  decision with an artifact in hand. Test: inject tip removal between producer
+  skip and consumer import → link is late-fetched and imported.
 
 **Ordered bounded producer/consumer (R1 #10)** — not await-all-then-import:
 
@@ -458,13 +493,16 @@ Convergence rests on the next run's scan+reconcile, NOT on apply internals
 (invariant (d)). The gate (§4.3 tests), stated so it can actually pass (R2 #4) —
 two tiers:
 
-- **File plane (unconditional):** SIGKILL at phase boundaries AND at the
-  dangerous instruction-level windows (between obstruction-displace and
-  replacement-publish; between temp-stage and rename) followed by a clean re-run
-  CONVERGES the file tree with **no user bytes lost**. Conflict copies are
-  acceptable ONLY where the user actually diverged between attempts; a file
-  merely re-seen from a prior attempt must NOT produce a conflict copy
-  (reconcile, not apply, decides it).
+- **File plane (unconditional for representable entries, R3 #1):** SIGKILL at
+  phase boundaries AND at the dangerous instruction-level windows (between
+  obstruction-displace and replacement-publish; between temp-stage and rename)
+  followed by a clean re-run CONVERGES the file tree with **no user bytes
+  lost**. Conflict copies are acceptable ONLY where the user actually diverged
+  between attempts; a file merely re-seen from a prior attempt must NOT
+  produce a conflict copy (reconcile, not apply, decides it). Entries the
+  volume cannot represent (§3.1 unrepresentable-pair contract) converge to the
+  STABLE "deferred-loudly" terminal state — same decision on every re-run,
+  never repeated conflict churn.
 - **Git plane (converge-or-defer-loudly):** SIGKILL mid-`git fetch` followed by
   a clean re-run either converges that repo (the common case — bundle import is
   re-runnable and scratch refs are pruned) or defers THAT REPO with a visible
@@ -498,10 +536,16 @@ A fresh join may run under a live daemon watching the same tree (R1 #5).
    nothing divergent is correctly empty. A CONCURRENT USER EDIT during the join
    is real divergence and MUST survive the drain as a pending push. Tests: (a)
    drain the queue after a join under a live daemon → daemon manifest equals
-   the pulled manifest, no push fires; (b) inject a user edit mid-join → after
-   the drain, exactly that edit is pending push; (c) the daemon's existing
-   post-pull/safety rescan sites (design 85 §1.1) remain the backstop if events
-   were dropped — unchanged by this design.
+   the pulled manifest, no push fires; (b) the SAME-TARGET adversarial case
+   (R3 #5), not just an unrelated-path edit: the user edits path P AFTER the
+   join publishes P but BEFORE the queued events for P drain, so the daemon's
+   queue holds coalesced add/change (and possibly unlink/re-add) events for
+   ONE path with two authors — assert `applyWatchEvents` re-stats FINAL disk
+   truth, the user's edit is retained as divergence against the newly
+   persisted remote base (pending push), and neither is the edit lost nor a
+   join-authored version pushed as if it were the user's; (c) the daemon's
+   existing post-pull/safety rescan sites (design 85 §1.1) remain the backstop
+   if events were dropped — unchanged by this design.
 3. **No torn tuple.** Files publish by atomic rename (one settled event); design
    85's P-1 torn-scan guard and design 92 manifest-entry integrity are the
    backstop, unchanged. This design adds no new top-level mutex owner and takes no
@@ -509,22 +553,21 @@ A fresh join may run under a live daemon watching the same tree (R1 #5).
 
 ### 4.5 Case-sensitivity and symlink edge cases (R1 #6, #7, #8)
 
-- **Exact-byte trie + pre-apply collision-group serialization (R2 #2, #3).**
-  The trie never merges case/normalization variants in memory (unsafe on
-  case-sensitive volumes); instead §3.1's fold-key pass flags every
-  potential-collision group BEFORE the parallel pool and applies its members
-  serially through today's per-entry path in deterministic byte order. On a
-  case-INSENSITIVE volume this makes an unrepresentable pair (`A/x` and `a/x`
-  file/file) deterministic: the second entry's precondition check sees the
-  first's bytes and takes the existing conflict-copy path — no two concurrent
-  `rename`s ever race one physical target, no silent overwrite. On a
-  case-SENSITIVE volume the group members coexist and serial application is the
-  only cost. Directory-level aliases (`A/` and `a/`): the second spelling's
-  `mkdir` hits EEXIST-directory and confirms; any obstruction/failure demotes
-  the whole FOLD-KEY group, not one spelling. Test matrix: case-sensitive APFS,
+- **Exact-byte trie + prefix-closed collision groups (R2 #2, #3; R3 #1, #2).**
+  Normative rules live in §3.1; summary: fold keys are computed over EVERY
+  path prefix; a colliding prefix pulls its ENTIRE descendant action set into
+  one collision group; collision groups are wholly excluded from the trie
+  pre-pass (no EEXIST-confirm shortcut applies inside them — that shortcut is
+  for non-colliding paths only, resolving v3's §3.1/§4.5 contradiction, R3
+  #2) and applied serially through today's per-entry path in byte order. An
+  unrepresentable FILE pair converges to §3.1's stable loud-deferral terminal
+  state (first member published, rest deferred with visible reasons, no
+  conflict churn on re-join). Test matrix: case-sensitive APFS,
   case-insensitive APFS, decomposed vs. composed Unicode names, casefolded
-  ext4; file/file case collision, dir/file case collision, Unicode-equivalent
-  names; each asserting deterministic outcome and no lost bytes.
+  ext4; file/file full-path collision, dir/file case collision, parent-only
+  collision (`A/x` + `a/y` — one group, serialized, both land under one
+  physical dir), Unicode-equivalent names; each asserting a deterministic
+  outcome, no lost bytes, and re-run stability.
 - **Symlinked ancestors.** A node that exists as a symlink/file where the trie
   wants a directory is classified by the single-node `lstat` on EEXIST/ENOTDIR
   (not a sweep) and demotes the subtree to the serial resolver, which moves the
@@ -553,10 +596,18 @@ same corpus, same network class:
   process); silent discard is not allowed and ≥5 valid runs remain required.
 - Pass rule: candidate p50 improvement must exceed the control's own
   (p95 − p50) noise band on the gated quantity.
-- **Resource ceiling:** peak RSS, peak FDs, and peak temp-disk bytes sampled at
-  1 Hz over each run; candidate p50 of each peak must not exceed control p50 by
-  >10% on the same workload. Phase 3's prefetch byte budget is sized to hold
-  this.
+- **Resource ceiling — true peaks where obtainable, hard caps as the actual
+  invariant (R3 #6).** Memory: process HIGH-WATER RSS (`ru_maxrss` /
+  `VmHWM`), not sampling — a true peak. Temp disk: BYTE ACCOUNTING by the
+  owning code (the prefetch producer and blob stager account every temp byte
+  they allocate/free — exact by construction), reported as owned-temp
+  high-water. FDs: owned open/close accounting on the code paths this design
+  touches, plus 1 Hz `/proc` sampling as an honest LOWER-BOUND backstop
+  (labelled "sampled," never "peak"). Gate: candidate p50 of each TRUE peak
+  must not exceed control p50 by >10%. Independent of measurement, the safety
+  invariant is enforced by construction: Phase 3's global semaphore carries a
+  HARD configured byte cap and task cap, and Phase 2's lanes share a HARD
+  FD/RSS budget — the caps, not the measurements, are what bound the process.
 - "≈" in any counter gate means **within 2% or ±16 absolute, whichever is
   larger** (the constant absorbs fixed-count setup dirs like `.rbox`).
 
@@ -652,3 +703,10 @@ same corpus, same network class:
 3. **Kill-switch defaults.** Ship Phase 1's trie on-by-default after fleet
    validation, or soak it off-by-default behind `RBOX_APPLY_DIR_TRIE` for a
    release first (design 85 P-2 soak precedent)?
+4. **Unrepresentable entries vs. push (pre-existing, surfaced by R3 #1).** On a
+   case-insensitive volume that cannot hold both `A/x` and `a/x`, what should a
+   PUSH from that device do about the entry it never materialized? Today's
+   behavior already has this exposure (the un-materialized entry looks locally
+   deleted); this design makes the apply side deterministic and loud but does
+   NOT change push semantics. Does this deserve its own small design (e.g. a
+   "deferred-unrepresentable" set that suppresses delete proposals)?

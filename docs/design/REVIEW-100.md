@@ -135,6 +135,52 @@ Raw output: scratchpad/review-100-r2.txt. Items and disposition:
    skip catches it; one-sided failure mode = wasted download, never a
    correctness input).
 
-## Round 3
+## Round 3 — VERDICT: REVISE (6 items; item 7 = shipped-work + pack-cache boundaries now acceptable)
+
+Raw output: scratchpad/review-100-r3.txt. Items and disposition:
+
+1. **Unrepresentable manifest pairs don't converge** (conflict-copy path
+   churns on every re-join). ACCEPTED. §3.1 adds an explicit terminal-state
+   contract: first member (byte-order) published; remaining colliding members
+   skipped with LOUD per-path deferral (counts in metrics, paths only in the
+   forensic log), NOT conflict-copied, NOT re-fetched — stable across re-runs.
+   §4.3's file-plane convergence scoped to representable entries. The
+   push-side semantic (un-materialized entry must not become a remote delete)
+   is a PRE-EXISTING exposure recorded as founder open question #4, not solved
+   here.
+2. **Fold grouping not prefix-closed; §3.1/§4.5 contradiction.** ACCEPTED.
+   Fold keys now computed over EVERY path prefix; a colliding prefix pulls its
+   entire descendant action set into one group (transitively closed); groups
+   are wholly excluded from the trie pre-pass (the EEXIST-confirm shortcut is
+   for non-colliding paths only — contradiction resolved) and applied
+   serially. The false "exotic equivalences land serially" claim replaced with
+   the honest statement: missed groups remain in the parallel pool — exactly
+   today's behavior, so the heuristic is strictly risk-reducing, a mitigation
+   not a proof.
+3. **Early presence-skip reverse transition (producer HIT → consumer ABSENT
+   under external prune) had no artifact.** ACCEPTED. §3.3 adds the late-fetch
+   rule: consumer performs the ordinary fetch+decrypt for that link under the
+   same global budgets, then verifies/imports in order; failure defers the
+   repo. The early check now has no correctness role on either transition;
+   tested by injected tip removal.
+4. **parentPrepared "retry" didn't exist** (poolMap is fail-fast). ACCEPTED —
+   verified (`src/engine/pool.ts:7–10`). Contract restated against reality: a
+   flagged ENOENT/ENOTDIR fails the apply run exactly as staging failures do
+   today; recovery is the §4.3 re-run with a fresh plan. Batch-internal retry
+   legs (which do exist) MUST clear the flag. Both paths tested.
+5. **Watcher gate needed the same-target adversarial case.** ACCEPTED. §4.4
+   test (b) is now: user edits path P after join publishes P but before P's
+   queued events drain (coalesced add/change/unlink for one path, two
+   authors) → applyWatchEvents re-stats final disk truth, the edit survives as
+   divergence, nothing lost, no join-authored version misattributed.
+6. **1 Hz sampling can't falsify a peak gate.** ACCEPTED. §5 resource ceiling
+   now uses true peaks where obtainable (ru_maxrss/VmHWM for RSS; exact byte
+   accounting by the owning code for temp disk; owned FD open/close accounting
+   with sampling only as a labelled lower-bound backstop), and states that the
+   HARD configured caps (semaphore byte/task caps, lane FD/RSS budgets) are
+   the actual safety invariant, with measurement as evidence.
+7. Shipped-work + pack-cache boundaries acceptable — no action.
+
+## Round 4
 
 Status: pending (running)
