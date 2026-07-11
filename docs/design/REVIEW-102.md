@@ -156,3 +156,19 @@ sound against the inspected GC code." Four precision items:
 
 Also fixed §3.1 pseudocode to show the split probe (regrant vs fallback). Draft v5.
 Proceeding to round 5.
+
+## Round 5 — VERDICT: REVISE (1 item; other three round-4 fixes declared correct)
+
+Codex: "The other three round-4 fixes are correct and self-consistent." One
+remaining precision item on gate 2's statement enumeration:
+
+1. **Gate-2 per-path counts contradicted `commit-accounting.ts`.** ACCEPT: (a) `N=0`
+   OK path is `ceil(K/90)` only (early return at `:128`); (b) 402 `no_plan` adds the
+   accounts SELECT but **not** the used/cap re-read; (c) trigger over_cap counts only
+   chunks through the failing ≤3,000-ref super-batch, not `5·ceil(N/33)`. Rewrote the
+   enumeration accurately, kept `ceil(K/90)+5·ceil(K/33)+2` as an explicit
+   **conservative upper bound**, and changed the workspace-slope falsifier to hold
+   **identical `K` and outcome** (not just `added` — `carried_fenced` varies at equal
+   `added`).
+
+Draft v6. Proceeding to round 6 (final).

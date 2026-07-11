@@ -1,6 +1,6 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v5, 2026-07-11 — rounds 1–4 folded (REVIEW-102.md). Under adversarial
+Status: DRAFT v6, 2026-07-11 — rounds 1–5 folded (REVIEW-102.md). Under adversarial
 review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
@@ -616,15 +616,24 @@ discipline).
    = added + carried_fenced + 2` and `N = |newRefs| ≤ K`, and the frozen constants
    `VALIDATE_IN_LIST_CHUNK = 90`, `ACCOUNTING_INSERT_CHUNK = 33`,
    `ACCOUNTING_STATEMENTS_PER_CHUNK = 5` (all defined in `commit-accounting.ts:27–43`),
-   the exact count by outcome path is:
+   the exact count by outcome path (verified against `commit-accounting.ts`) is:
    - **shared (validate):** `ceil(K/90)` IN-list SELECT statements.
-   - **422 unsatisfied** (accounting skipped): total `= ceil(K/90)`.
-   - **ok / 402:** `+ 1` (the `accounts` plan/used/cap SELECT) `+ 5·ceil(N/33)`
-     (catalog+charge+grant+un-condemn+marker-clear per chunk); 402 over-cap adds `+1`
-     (the used/cap re-read).
-   The gate: **`admit_stmts ≤ ceil(K/90) + 1 + 5·ceil(K/33) + 1`, containing no
-   workspace term.** Falsified directly by asserting **equal `admit_stmts` at 112k and
-   250k for identical `added`** (equal count ⟹ zero workspace dependence).
+   - **422 unsatisfied** (accounting never called): `= ceil(K/90)`.
+   - **ok, `N = 0`** (`commitAccounting` early-returns at `:128` before the accounts
+     SELECT — e.g. a zero-file commit where every ref is entitled): `= ceil(K/90)`.
+   - **ok, `N > 0`:** `+ 1` (the `accounts` plan SELECT) `+ 5·ceil(N/33)`
+     (catalog+charge+grant+un-condemn+marker-clear per 33-ref chunk).
+   - **402 `no_plan`** (`plan==='none'`, returns at `:135` before any batch): `+ 1`
+     (accounts SELECT only) — **no** used/cap re-read.
+   - **402 trigger over_cap:** only chunks **through the failing ≤`MAX_REFS_PER_TXN`
+     (3,000) super-batch** are prepared (later super-batches never issue), `+ 1`
+     (accounts SELECT) `+ 1` (the used/cap re-read at `:196`).
+   Conservative closed-form **upper bound (any path):**
+   **`admit_stmts ≤ ceil(K/90) + 5·ceil(K/33) + 2`, containing no workspace term.**
+   Falsified by asserting `admit_stmts` is a pure function of `K` (= `added +
+   carried_fenced + 2`) **and the outcome path** — identical at 112k and 250k for
+   **identical `K` and identical outcome** (hold `K` fixed, not merely `added`:
+   `carried_fenced` can differ at equal `added` — round 5).
    **Secondary timing gate** (fixed margins): `admitAccountMs` p50 ≤ **200ms** for
    `added ≤ 1`; regression of `admitAccountMs` on workspace size at fixed `added` has
    **slope ≤ 5ms / 100k refs**. If the statement bound holds but timing does not, the
