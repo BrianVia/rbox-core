@@ -5,7 +5,35 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-10 (evening) — designs 84/85 ALIGNED + built through their gates (#201–#205); GC drain phase 1 live in prod (1,400 intents); CLI audit shipped._
+_Last updated: 2026-07-10 (night) — 8 PRs today (#201–#208); GC drain fully staged (5,410 intents, hardened executor); fleet on 1.0.0-dev+16fea15 soak (P0 + serverTimings collecting)._
+
+- **Late-night additions (post-evening entry):**
+  - **#206 GC drain hardening** — crash-robust lease release (3× backoff in
+    finally), structured `gc_purge_failed` 500s, `retryAfterMs` on 409,
+    paced `drain` mode in gc-drain.ts. Field-proven same hour: a mid-drain
+    500 recovered on the next pass instead of a 50-min lease lockout.
+  - **#207 design 97 (commit serverTimings)** — numbers-only per-segment
+    breakdown (envelope/accounting/sidecar/commit/mirror/response) on every
+    commit response + metric; clients nest it in commit phase details. This
+    is the data feed for the design-84 commit-POST companion decision.
+  - **#208 design 85 P0 instrumentation** — 4-round impl review; per-dir
+    probe behind `RBOX_SCAN_PROBE=1`, deep-scan drift audit (settle-
+    transaction evidence protocol, quiescence provenance, oldest-wins dedup
+    cap 500, fail-soft path-free sidecar), scan-site stats, and
+    **RBOX_METRICS default-ON** (opt-out `RBOX_METRICS=0`; measured worst-
+    case scan overhead 0.4–3.1%).
+  - **Drain end-state:** ALL 5,410 grace-eligible intents stamped (verified
+    in D1; lease released clean). Deletes mature from 2026-07-11 ~20:01Z —
+    run `bun scripts/gc-drain.ts drain` (secrets: prod-keys.local.secret),
+    verify ~5,410 purged + bytes, then flip RBOX_GC_PURGE_DISABLED.
+    Remaining ~64k candidates age past 7-day grace through ~07-15.
+  - **Fleet soak LIVE:** both daemons on dev build `1.0.0-dev+16fea15`
+    (backup at `~/.rbox/bin/rbox-1.0.0.bak` on each host; next release
+    supersedes). Collecting P0.1 stats + P0.3 drift + design-97 timings
+    passively. NOTE: the Mac's rbox-core checkout sits on old branch
+    `Codex/perf-improvement-search` with a modified AGENTS.md (not touched;
+    soak build came from a /tmp/rbox-soak-main worktree at origin/main —
+    remove when convenient).
 
 ## Where we are
 
