@@ -100,3 +100,32 @@ versions.ts:423, phase1Purge resurrect gc-phase1.ts:106, marker-guarded delete
    measured by Gate 4 — dropping the "combined-peak removed" overclaim.
 
 Revision written as draft v3. Proceeding to round 3.
+
+## Round 3 — VERDICT: REVISE (converging; items 2–4 PASS)
+
+Codex verified v3 against the code. Items 2 (account-deletion fallback
+implementable via `account_deletions status IN ('pending','purging')`), 3 (shadow
+`unsatisfied_full ∩ carried = ∅` correctly shaped), 4 (loader refactor + memory
+model now match the APIs) — **confirmed/PASS**. Two actionable items:
+
+1. **"Never marked" not airtight** (sharp). A stale `phase1Mark` reachability
+   snapshot can mark a carried ref that was re-added as an already-entitled (`have`)
+   ref — `commitAccounting` doesn't refresh `granted_at` for a `have` ref, so the
+   grace-skip doesn't fire, and the stale snapshot marks it. Codex confirms
+   **durability survives** (resurrect + `NOT EXISTS blob_refs` intent guard), but the
+   "never marked" invariant + `newRefs` identity + exact response-equivalence are too
+   strong. ACCEPT: §3.3 now leads with the **durability** invariant (load-bearing)
+   and acknowledges a **benign transient marker**; the fence probe splits by table —
+   `blob_ref_candidates ∩ carried` → **regrant** (matches full, routine, no page);
+   `gc_candidates active-intent ∩ carried` → **fallback + page** (provably
+   impossible). §4.1/§4.10 characterize the sole **benign divergence** (delta safely
+   publishes where full redundantly 422s a present ref). §6 splits shadow divergence
+   into **HARMFUL** (not-present/active-intent → zero-tolerance flip gate) vs
+   **BENIGN** (present + marked → counted, not a blocker). Gate R adds the
+   stale-snapshot marker interleaving.
+2. **Unfalsifiable thresholds + "95% CI includes zero."** ACCEPT: added §7.1
+   **normative constants table** (frozen before measurement, founder changes once
+   pre-soak); replaced the noisy CI slope with a **deterministic `admit_stmts`
+   closed-form bound** (primary) + a **fixed max timing slope** (≤5ms/100k, secondary).
+
+Revision written as draft v4. Proceeding to round 4.

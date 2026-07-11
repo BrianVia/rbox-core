@@ -1,6 +1,6 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v3, 2026-07-11 — rounds 1–2 folded (REVIEW-102.md). Under adversarial
+Status: DRAFT v4, 2026-07-11 — rounds 1–3 folded (REVIEW-102.md). Under adversarial
 review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
@@ -244,43 +244,54 @@ Proof, from the GC code (live account):
   `seq:synced+1..head`** and **fails closed** (throws, aborting the account's GC)
   on any unreadable page. A carried ref is in the parent = the current head ⟹ in
   `ROOTS(head)` ⟹ reachable ⟹ resurrected, never dropped.
-- **On "never marked" (round 2 item 1, made precise).** For the per-account
-  `phase1Mark`/`blob_ref_candidates` marker: `runPhase1` computes reachability then
-  marks **in the same pass** (`gc-phase1.ts:203–222`), and only marks a ref whose
-  `granted_at` is older than grace (`:61`). A ref that is carried but was *not* in
-  that pass's reachable snapshot must have entered head-reachability **after** the
-  snapshot — i.e. it was (re-)granted after the snapshot, so it is grace-fresh at
-  mark time and skipped; a ref already reachable at the snapshot is reachable-skipped.
-  Either way a carried ref is **never `blob_ref_candidate`-marked** ⟹ `fence ∩
-  carried = ∅` for that table. The **global** `gcMark` (`versions.ts:205–221`) keys
-  on object age, not `granted_at`, and can transiently leave a **`deleting_at IS
-  NULL`** `gc_candidates` row on a carried ref — but that row is **not an active
-  intent** (the fence probe reads only `deleting_at IS NOT NULL`), **cannot become
-  one** (the (a) `NOT EXISTS blob_refs` guard), and is **resurrected** by
-  `openIntents` on the next reachable recompute (`versions.ts:426–427`). It is
-  harmless: no fence, no delete, no false page.
-- **Induction closes the "was it clean at parent-publish?" gap.** When a ref first
-  enters the workspace it is an *added* ref of some commit, admitted through the
-  full validate/account path (or this design's `added` path — identical, §4.1),
-  which clears any marker and is fenced. Thereafter, while it stays reachable, (a)
-  and (b) keep it clean. A ref that is dropped by an intermediate commit and later
-  re-added is *added* again (not carried) relative to that re-adding commit's
-  parent, so it re-runs full validation. Hence every carried ref of every admitted
-  commit satisfies the invariant.
+- **A carried ref MAY transiently carry a benign Phase-1 marker (round 3 item 1 —
+  the "never marked" claim was too strong).** Interleaving: a ref R was dropped from
+  head (unreachable) but its `blob_refs` row still exists; a `phase1Mark` pass takes
+  its reachability snapshot; before that pass's mark step, a commit *re-adds* R — but
+  because R is still entitled+present, `validateCommitRefs` classes it in `have`, so
+  `commitAccounting` does **not** refresh `granted_at` (`commit-accounting.ts:97–98`
+  — a `have` ref is skipped). The mark step, using its stale snapshot (R ∉ reachable)
+  and R's old `granted_at` (> grace), **marks R** (`gc-phase1.ts:59–63`). R is now
+  carried by the next commit yet `blob_ref_candidate`-marked. **This is
+  durability-benign:** it violates neither (a) (the `NOT EXISTS blob_refs` guard —
+  R's row persists) nor (b) (`phase1Purge` recomputes reachability and **resurrects**
+  R, `gc-phase1.ts:114–118`). No intent, no fence, no deletion. What it *does* break
+  is the naive "never marked" claim and, with it, exact response-equivalence — see
+  below and §4.10. The global `gcMark` (`versions.ts:205–221`) can likewise leave a
+  benign `deleting_at IS NULL` row (not an active intent, cannot open one, resurrected).
+- **Induction (durability).** When a ref first enters the workspace it is *added*,
+  admitted through full validate/account (or this design's `added` path — §4.1),
+  which is fenced. Thereafter (a)+(b) keep its `blob_refs` row alive while it stays
+  head-reachable, through any transient benign marker. The load-bearing invariant is
+  **durability** (no intent, no deletion), not marker-absence.
 
-**The fence probe is a fail-closed bug-detector, not the barrier.**
-`fenceProbe(accountId)` still reads the two small fence tables
-(`blob_ref_candidates WHERE account_id=?`; `gc_candidates WHERE deleting_at IS NOT
-NULL`, capped at `FENCE_SET_MAX`) and intersects with the carried stream. By the
-invariant this intersection is **provably empty**. So we assert it: a **nonempty**
-`fence ∩ carried` means the invariant was violated (a GC bug, or an unmodeled
-state) → the commit **falls back to full validation** (which handles it correctly
-via the candidacy-fold + fence trigger) **and emits a high-severity alert**. This
-converts round 1's "TOCTOU dependence" into a monitor that fails safe: the barrier
-is the `blob_refs` invariant; the probe only catches its violation. The
-deterministic race rig (§7 gate R) exercises fence-snapshot → intent-create →
-publish → physical-delete interleavings and asserts no carried root is ever
-deleted and no such interleaving even reaches intent-creation.
+**The fence probe splits by table; only the impossible case pages.**
+`fenceProbe(accountId)` reads the two small fence tables (capped at `FENCE_SET_MAX`)
+and intersects each with the carried stream:
+
+- **`blob_ref_candidates WHERE account_id=?` ∩ carried → regrant.** These are
+  (benign) Phase-1 markers on carried refs. The delta path **pulls them into
+  `admitSet`**, so `commitAccounting` re-grants and clears the marker **exactly as
+  full validation would** (`commit-accounting.ts:182`). This is cheap (the set is
+  small) and makes marker handling for every marker *observed at probe time*
+  byte-identical to full. It is the belt-and-suspenders regrant — routine, **not** a
+  page.
+- **`gc_candidates WHERE deleting_at IS NOT NULL` ∩ carried → fallback + page.** By
+  invariant (a) this is **provably impossible** (an active intent cannot exist
+  against a live-`blob_refs` sha). If it ever occurs, it is a true invariant
+  violation → fall back to full validation **and** emit the high-severity
+  `commit.delta.fence_violation` (a "cannot happen" alarm), never a routine event.
+- **TOCTOU residual.** A Phase-1 marker (or gcMark row) that lands on a carried ref
+  **after** the probe but before the CAS is not regranted by this commit. It is
+  durability-safe (invariant (a)+(b)); its only observable effect is that a later
+  full validation would issue a redundant 422 re-upload of an already-present ref
+  while the delta path safely publishes (§4.10). The marker is cleared by the next
+  reachable recompute or the next commit that carries R through the probe.
+
+Gate R (§7) exercises the fence-snapshot → stale-`phase1Mark` → CAS interleaving and
+asserts: no carried root is ever physically deleted, intent-open against a
+live-`blob_refs` sha is rejected, and the marker case regrants-or-safely-publishes
+(never loses data).
 
 ### 3.4 Trust model — authoritative parent, fully-validated additions
 
@@ -332,11 +343,14 @@ child set (chunked, exactly as today), identical response, on:
    byte-for-byte identical to today under a commit⇄deletion race — the carried-ref
    invariant does not hold for a deleting account, so we do not rely on it.
 
-**(B) Authoritative-history corruption** — `seq:<parent>` missing, or its
-body/sidecar fails to parse/verify (missing R2 object, hash/encoding/size/`total
-Bytes` mismatch), or a **nonempty `fence ∩ carried`** (§3.3). This is **not** an
-ordinary miss: an unreadable retained head means design-96 folding will 503 and GC
-is already disabled for the workspace (both fail closed). Handling:
+**(B) Authoritative-history corruption / "cannot happen"** — `seq:<parent>`
+missing, or its body/sidecar fails to parse/verify (missing R2 object,
+hash/encoding/size/`totalBytes` mismatch), or a **nonempty `gc_candidates`
+active-intent ∩ carried** (§3.3 — provably impossible by invariant (a); a
+`blob_ref_candidates ∩ carried` hit is **not** here — it is the routine regrant of
+§3.3). This is **not** an ordinary miss: an unreadable retained head means design-96
+folding will 503 and GC is already disabled for the workspace (both fail closed).
+Handling:
 
 - **Do not fail open.** Fall back to full child validation so blob admission stays
   correct (the new commit either succeeds against present blobs or 422s on genuine
@@ -377,16 +391,20 @@ advisory (`sidecar.ts:106–109`, "never bill") and is never read by the diff.
 `validateCommitRefs` computes over the full child set: refs that are entitled AND
 present=1 AND not `blob_ref_candidate`-marked AND not under an active intent.
 Today's `newRefs_full` = (fullChildSet ∪ carriers) ∖ `have_full`. The delta path
-runs `validateCommitRefs(admitSet)` where `admitSet` = carriers ∪ `added`, giving
-`newRefs_delta` = admitSet ∖ `have`. Every child ref **omitted** from `admitSet` is
-a **carried, non-fenced** ref, which by §3.3 is entitled + present + unmarked +
-unintented ⟹ ∈ `have_full` ⟹ ∉ `newRefs_full`. Therefore **`newRefs_delta` ===
-`newRefs_full`** — the same SHAs, and (because both iterate the canonically-sorted
-child refs and prepend the same carriers) in the same order. `commitAccounting`
-receives an identical list → identical `used_bytes`, identical charge. For any
-carried non-fenced ref, today already charges 0 (`NOT EXISTS blob_refs` yields 0)
-and only bumps `granted_at` (explicitly **not** a barrier — `gc-phase1.ts:8–10`);
-omitting it changes durable state by nothing but that un-bumped timestamp.
+runs `validateCommitRefs(admitSet)` where `admitSet` = carriers ∪ `added` ∪
+(`blob_ref_candidates ∩ carried`, §3.3). Every child ref **omitted** from `admitSet`
+is a **carried ref that is not marked at probe time**; by §3.3 it is entitled +
+present + not-under-active-intent ⟹ ∈ `have_full` ⟹ ∉ `newRefs_full`. Therefore
+**`newRefs_delta` === `newRefs_full`** — same SHAs, same order (both iterate the
+canonically-sorted child refs and prepend the same carriers) — **except** for the
+one benign class in §4.10: a carried ref that acquires a Phase-1 marker in the
+TOCTOU window *after* the probe. Such a ref is in `newRefs_full` (full re-checks it
+later and finds it marked) but not in `admitSet`; the delta path safely publishes
+without the redundant re-upload. This is durability-benign (the ref is present; §3.3
+resurrect protects it) and is the sole, characterized divergence. For every other
+carried ref today already charges 0 (`NOT EXISTS blob_refs` yields 0) and only bumps
+`granted_at` (explicitly **not** a barrier — `gc-phase1.ts:8–10`); omitting it
+changes durable state by nothing but that un-bumped timestamp.
 
 ### 4.2 Idempotent receipt redemption
 
@@ -461,10 +479,10 @@ conflict responses are byte-identical.
 
 ### 4.10 Response equivalence — precisely scoped
 
-Because `newRefs_delta === newRefs_full` as an ordered list (§4.1),
-`commitAccounting` runs on identical input → identical super-batch membership →
-identical `rbox_delete_fence` `needsUpload` and identical `accounts_cap_guard`
-over-cap `{used,cap}`. Therefore:
+Because `newRefs_delta === newRefs_full` as an ordered list (§4.1) **modulo the
+benign class below**, `commitAccounting` runs on identical input → identical
+super-batch membership → identical `rbox_delete_fence` `needsUpload` and identical
+`accounts_cap_guard` over-cap `{used,cap}`. Therefore (absent a post-probe marker):
 
 - **409 conflict / epoch_stale** — byte-identical (unchanged CAS).
 - **402 over-cap** — byte-identical `{used,cap,reason}` (identical charge, identical
@@ -475,12 +493,26 @@ over-cap `{used,cap}`. Therefore:
   `admitSet` ordering is fixed to match the full path's `[encManifestSha,
   sidecarSha, ...sorted refShas]` filtered to non-`have`.
 
-The **only** conceivable `newRefs` divergence is a *carried* ref that is
-unexpectedly not-present-or-not-entitled — precluded by §3.3(b), **detected by the
-`unsatisfied_full ∩ carried = ∅` shadow assertion (§6)**, and caught by fallback
-(§3.5B). We claim scoped **semantic equivalence** (identical outcome class +
-identical `{used,cap}` + set-equal `needsUpload`), and byte-identical 409/epoch/402,
-rather than a blanket "byte-identical everything."
+Two `newRefs` divergence classes, one benign and one precluded:
+
+- **Benign (characterized, round 3 item 1):** a carried ref that acquires a Phase-1
+  `blob_ref_candidates` marker in the TOCTOU window between the fence probe and the
+  CAS. Full validation (re-checking all refs at its own later time) would place it in
+  `needsUpload` (a redundant re-upload of an **already-present** ref); the delta path
+  publishes 200. This is durability-safe (§3.3: the ref is present, no active intent,
+  resurrect protects it) — the delta path is if anything *better* (it skips a
+  spurious re-upload). It is counted as `commit.delta.benign_marker_divergence`
+  (§5), which is **not** a zero-divergence flip-blocker (§6).
+- **Harmful (precluded + zero-tolerance):** a carried ref that is genuinely
+  **not-present or under an active intent** — which would make the published head
+  reference an unbacked/condemned blob. Precluded by §3.3(a)+(b); detected by the
+  `unsatisfied_full ∩ carried` harmful-subset shadow assertion (§6); caught by
+  fallback (§3.5B). The zero-divergence gate is on this class.
+
+So: **byte-identical** 409/epoch_stale/402 (unchanged CAS, identical charge);
+**set-equal** `needsUpload` and identical outcome **absent a post-probe marker**;
+the sole divergence is the benign, durability-safe re-upload skip above. We do
+**not** claim blanket "byte-identical everything."
 
 ---
 
@@ -500,10 +532,12 @@ fine**), and split the residual O(N) work (round 1 item 13):
   reason label.
 - High-severity: `commit.delta.parent_unreadable`, `commit.delta.fence_violation`
   (page — §3.5B).
-- `commit.delta.divergence` (shadow, §6) and `commit.delta.index_divergence`
-  (§4.7) — **bounded payload** (item 9): counts + a stable digest (sha256 of the
-  sorted divergent SHAs) + ≤`DIVERGENCE_SAMPLE` (e.g. 16) sample SHAs. The same
-  bound caps any logged `needsUpload`.
+- `commit.delta.divergence` (shadow **harmful** divergence, §6),
+  `commit.delta.benign_marker_divergence` (the §4.10 safe re-upload-skip class —
+  expected nonzero, **not** a flip-blocker), and `commit.delta.index_divergence`
+  (§4.7) — all with a **bounded payload** (round 1 item 9): counts + a stable digest
+  (sha256 of the sorted divergent SHAs) + ≤`DIVERGENCE_SAMPLE` (e.g. 16) sample SHAs.
+  The same bound caps any logged `needsUpload`.
 
 ---
 
@@ -523,27 +557,32 @@ executed during comparison):
 2. Compute the delta path's read-only products from the **same** pre-state:
    `added`/`carried` (from the diff), `admitSet`, then the same instrumented
    classify over `admitSet` → `have_delta`, `unsatisfied_delta`, `newRefs_delta`.
-3. **Compare (all four must hold, else `commit.delta.divergence++`):**
-   - **`unsatisfied_full ∩ carried = ∅`** — the primary safety detector: a carried
-     ref the full path deems unsatisfiable (missing/unpresent/marked/intented) is
-     exactly the divergence that would let the delta path publish a dangling ref.
-     This directly closes round 2 item 2 (carried refs are outside `admitSet`, so
-     the old subset-compare was blind to them).
-   - **`have_full ⊇ carried ∖ fence`** — every non-fenced carried ref is entitled
-     +present in the full classification (the §4.1 identity's precondition).
-   - **`newRefs_delta == newRefs_full`** (SHA set + per-sha size).
-   - **`unsatisfied_delta == unsatisfied_full ∩ admitSet`**.
+3. **Classify each carried ref the full path deems unsatisfiable** (`unsatisfied
+   _full ∩ carried`) by a bounded per-sha D1 probe from the **same** pre-state —
+   `blobs.present` and `EXISTS gc_candidates(sha, deleting_at IS NOT NULL)`:
+   - **HARMFUL** (`commit.delta.divergence++`, **zero-tolerance**): the ref is
+     **not present** OR under an **active intent** — publishing it would dangle. This
+     is the primary safety detector (round 2 item 2; the case §3.3(a)+(b) preclude).
+   - **BENIGN** (`commit.delta.benign_marker_divergence++`, **not** a flip-blocker):
+     the ref **is present**, no active intent, only Phase-1-`blob_ref_candidate`-
+     marked — the §4.10 safe re-upload-skip. Expected to occur under the stale-
+     snapshot marker race; the delta path safely publishes.
+   Also assert (harmful ⟹ `divergence++`): **`newRefs_delta == newRefs_full`**
+   restricted to present, unintented refs (SHA set + per-sha size), and
+   **`have_full ⊇ carried ∖ fence ∖ post-probe-marked`**.
 4. Only **after** comparison, execute accounting **once** (the authoritative full
    result in shadow; the delta result in enforce) — quota/entitlement mutate exactly
    once, never twice.
 
 **Blind spots called out:** fence-abort and multi-super-batch over-cap outcomes
 are **not** observable read-only (they depend on executing the fenced/guarded
-batch). Their equivalence is proven **not** by shadow mode but by the deterministic
-injected-race rig and the property tests (§7 gates R, 5) — shadow mode explicitly
-does not claim to cover them. The **divergence gate**: `commit.delta.divergence`
-and `commit.delta.index_divergence` read **zero** over the §7 soak before the flag
-flips to enforce.
+batch); their equivalence is proven by the deterministic injected-race rig and
+property tests (§7 gates R, 5), not shadow mode. And a marker landing **after** the
+comparison pre-state (the pure TOCTOU residual, §3.3) is by construction invisible to
+shadow — but it is exactly the benign class (durability-safe by §3.3(a)+(b)), so
+enforce-mode safety does not depend on shadow catching it. The **flip gate**:
+`commit.delta.divergence` (harmful) and `commit.delta.index_divergence` read
+**zero** over the §7 soak before enforce; `benign_marker_divergence` may be nonzero.
 
 ---
 
@@ -557,12 +596,16 @@ discipline).
 1. **Total commit POST p50 ≤ 2s** on Workload A one-file change (from ~8s). The
    headline audit gate. Reported alongside the per-phase split so the residual O(N)
    parse/fetch is visible, not hidden.
-2. **D1 accounting sub-phase O(added).** `admitAccountMs` ≤ **200ms** for `added ≤
-   1`; and across the matrix, a linear fit of `admitAccountMs` and
-   `commit.delta.admit_stmts` vs **workspace size** (at fixed `added`) has slope
-   **not distinguishable from zero** (95% CI includes 0). `admit_stmts` ≤
-   `5·ceil((added + 2)/33) + SELECTS_PER_BATCH·ceil((added+2)/90)` + a small
-   constant — i.e. no workspace term.
+2. **D1 accounting sub-phase O(added).** The **primary, deterministic** gate:
+   `commit.delta.admit_stmts` ≤ `5·ceil((added + carried_fenced + 2)/33) +
+   SELECTS_PER_BATCH·ceil((added + carried_fenced + 2)/90)` — a **closed-form bound
+   with no workspace term**, asserted directly by test at 112k and 250k for identical
+   `added` (equal statement count ⟹ zero workspace dependence). The **secondary**
+   timing gate (fixed margins, not a noisy CI): `admitAccountMs` p50 ≤ **200ms** for
+   `added ≤ 1`, and the regression of `admitAccountMs` on workspace size at fixed
+   `added` has **slope ≤ 5ms per 100k refs** (a fixed maximum, not "CI includes
+   zero"). If the deterministic statement bound holds but timing does not, the fault
+   is R2/parse (gate 3), not D1.
 3. **Total server admission** (`sidecarMs + diffMs + fenceQueryMs +
    admitAccountMs`) at 112k and 250k is reported; its residual is attributed to
    parse/fetch (the wire-delta follow-on's target), not D1.
@@ -577,28 +620,49 @@ discipline).
 6. **Response goldens.** 409 / epoch_stale / 402 byte-identical; 422 `needsUpload`
    set-equal (array-equal under the fixed ordering) — delta vs full, asserted by
    test.
-7. **Zero divergence** — `commit.delta.divergence` and `.index_divergence` = 0 over
-   the soak (§6), denominator ≥ **N_SOAK** commits (proposed 5,000 across dev+fleet)
-   and ≥ **T_SOAK** (proposed 72h), covering the delta-size matrix and ≥1 each of a
-   clean change, an added-ref-under-marker regrant, a quota-boundary charge, and a
-   concurrent-GC window.
+7. **Zero HARMFUL divergence** — `commit.delta.divergence` (harmful, §6) and
+   `.index_divergence` = 0 over the soak; `benign_marker_divergence` may be nonzero.
+   Denominator ≥ **N_SOAK** and ≥ **T_SOAK** (normative values in §7.1), covering the
+   delta-size matrix and ≥1 each of a clean change, an added-ref-under-marker
+   regrant, a quota-boundary charge, and a concurrent-GC window.
 8. **Fallback ceilings.** In enforce, `commit.delta.fallback{reason≠first_commit,
-   epoch_rotation}` rate below a fixed ceiling (proposed 0.1%); any
+   epoch_rotation}` rate below the §7.1 ceiling; any
    `parent_unreadable`/`fence_violation` pages regardless of rate.
-9. **Gate R — deterministic race rig (round 1 item 15, round 2 item 1).** A
-   single-isolate interleaving harness over: parent read, fence snapshot,
-   `phase1Mark`, global `gcMark`, P1 intent-open, P2 activity-unwind, P3 physical
-   delete, delta accounting, final CAS, index fold, prune, **and an
-   account-deletion transition** (`account-delete` step 2 dropping `blob_refs`
-   concurrent with a commit → asserts the account-deletion fallback, §3.5A item 5,
-   engages and admission ≡ full). For **every** interleaving, assert: (i)
+9. **Gate R — deterministic race rig (round 1 item 15, round 2 item 1, round 3 item
+   1).** A single-isolate interleaving harness over: parent read, fence snapshot,
+   `phase1Mark` (including the **stale-snapshot re-add** that marks a carried,
+   already-`have` ref — round 3 item 1), global `gcMark`, P1 intent-open, P2
+   activity-unwind, P3 physical delete, delta accounting, final CAS, index fold,
+   prune, **and an account-deletion transition** (assert the `account_deletions`
+   tombstone is written **before** `account-delete` step 2 drops `blob_refs`, and the
+   delta path's `status IN ('pending','purging')` check reads it → fallback engages,
+   admission ≡ full — §3.5A item 5). For **every** interleaving, assert: (i)
    intent-open against a carried (live-`blob_refs`) sha is **rejected** by the `NOT
    EXISTS` guard — never reaching a physical delete; (ii) a published retained root
-   of a live account is present and entitled; (iii) incomplete roots disable GC
-   (fail-closed); (iv) `used_bytes` equals authoritative newly-entitled bytes; (v)
-   the roots index equals brute-force retained history.
+   of a live account is present and entitled; (iii) a stale-snapshot marker on a
+   carried ref is **regranted-or-safely-published** (never a physical delete, never a
+   dangling head); (iv) incomplete roots disable GC (fail-closed); (v) `used_bytes`
+   equals authoritative newly-entitled bytes; (vi) the roots index equals brute-force
+   retained history.
 
 Any gate failing falsifies the design as scoped; none is a promise.
+
+### 7.1 Normative constants (fixed before measurement)
+
+These are **frozen acceptance criteria**, set here and not movable after observing
+results (round 3 item 5). The founder may change a value **once, before the soak
+begins** (§11); thereafter they are fixed:
+
+| Constant | Value | Gate |
+|---|---:|---|
+| `N_SOAK` | 5,000 commits (dev + fleet) | 7 |
+| `T_SOAK` | 72 h | 7 |
+| Peak-heap budget | 110 MiB | 4 |
+| `admit_stmts` timing slope | ≤ 5 ms / 100k refs | 2 |
+| `admitAccountMs` p50 (`added ≤ 1`) | ≤ 200 ms | 2 |
+| Non-benign fallback rate (enforce) | ≤ 0.1 % | 8 |
+| `FENCE_SET_MAX` | 50,000 | §3.5A.4 |
+| `DIVERGENCE_SAMPLE` | 16 SHAs | §5 |
 
 ---
 
@@ -657,9 +721,10 @@ and rollback is a var flip, not a redeploy.
 
 ## 11. Open questions for the founder
 
-1. **Soak thresholds.** §7 proposes `N_SOAK`=5,000 commits, `T_SOAK`=72h, fallback
-   ceiling 0.1%, heap budget 110 MiB. Confirm or set the enforcement criteria (they
-   are the flip preconditions).
+1. **Soak thresholds (the §7.1 normative table).** `N_SOAK`=5,000, `T_SOAK`=72h,
+   fallback ceiling 0.1%, heap 110 MiB, `FENCE_SET_MAX`=50k. These are **frozen
+   before measurement**; the founder may change any value **once, before the soak
+   begins**, after which they are fixed acceptance criteria (round 3 item 5).
 2. **Parent-unreadable posture.** §3.5B falls back + pages but still admits the new
    commit atop an unreadable retained head (refusing would wedge the workspace,
    GC/prune already fail-closed). Acceptable, or should a corrupt retained head
