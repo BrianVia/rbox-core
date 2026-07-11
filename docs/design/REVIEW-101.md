@@ -43,7 +43,21 @@ Revised doc for Round 2.
 
 Revised doc for Round 3.
 
-## Round 3
+## Round 3 — VERDICT: REVISE (7 items; R2 items 1, 3, 6, 7, 8, 9, 10 confirmed resolved; no new integrity/revocation/chunk-sync/shipped-work findings)
+
+| # | Item | Disposition |
+|---|------|-------------|
+| 1 | §7.3 reintroduces the G2 ship-gate bug ("ships on G-part+G3"). | FIXED. §7.3 now states the identical three-gate condition (G-part AND G2 AND G3, same configuration). |
+| 2 | G2 still insufficiently falsifiable (no fault matrix, sample counts, or explicit bounds; sparse counts mishandled). | FIXED. Predeclared fault classes F1-F6 (lost ack, active-fetch kill, backoff abort, k-accepted/j-in-flight kill, dead MPU, completion-response loss); 10 runs per class per mode; explicit bounds: success rate 100% both modes (categorical), wall p50 ≤ 1.10× serial per class, retransmitted bytes p50 ≤ 1.10× serial per class, re-init counts summed across the whole matrix ≤ serial's sum; max-in-flight ceiling per run kept as a separate invariant test. §7.2. |
+| 3 | G3 "one run per candidate" incompatible with its tail statistics; p99 unsupportable at 10 samples. | FIXED. A "run" = the full preregistered sample set (10 samples per sub-workload per mode); tail statistics computed on POOLED per-batch queue-wait observations (hundreds-to-thousands per sample); max wait reported, not gated. §7.2. |
+| 4 | Canonical-orphan cleanup unnamed/unbounded; P0.3 didn't count row-less canonicals. | FIXED. §8.2 adds a named reaper: admin-triggered canonical-orphan audit (RBOX_PLATFORM_SECRET surface) that lists the canonical prefix, and for keys with no `blobs` row and R2 upload age ≥ 7d inserts a `gc_candidates` intent — design-95 P1/P2 then deletes under its existing quiescence/fence/activity-unwind. Eligibility proof: 7d > 6d client expiry; a live retry restores rows or is unwound by P2's re-checks. P0.3 extended to inject canonical-put→insert and insert→grant deaths and count row-less canonicals. §8, §8.2, §5 P0.3, §7.1. |
+| 5 | §8.1 fallback only replaced rule B; rule A unprovided if per-prefix rules unsupported. | FIXED. Rule A's fallback is R2's bucket-wide default incomplete-MPU abort at 7d (the TTL `blobs.ts:107` already assumes), verified by listing lifecycle config; if BOTH per-prefix and the default are absent, the cron fallback also aborts >7d `staging/` MPUs. Every branch meets the prerequisite. §8.1. |
+| 6 | batchLaneBusy check/admission race defeats "no new admissions". | FIXED. Busy flag flipped synchronously in `enqueue` before any await; admissions re-read at grant time on the single event loop; residual interleave bounded at ONE part and folded into G3's measured time-to-effect. §3.2. |
+| 7 | Orphan invariant overclaims ("every state reaped", counts "reach zero") without per-class bounds or a server-side path for client-absent states. | FIXED. Explicit per-class bounds added (MPU ≤ 7d; completed staging ≤ 24h; stale D1 rows: next init sweep or §8.2 audit; canonical orphan: next client retry or §8.2 audit ≥ 7d); §7.1 req 4 restated as healed-or-reaped within those bounds; §8.2 supplies the server-side path. §8, §7.1. |
+
+Revised doc for Round 4.
+
+## Round 4
 
 Verdict: _pending_
 </content>

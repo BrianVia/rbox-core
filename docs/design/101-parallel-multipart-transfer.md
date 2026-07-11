@@ -1,6 +1,6 @@
 # 101 — Parallel multipart part transfer (upload) + completion-pass measurement
 
-Status: Design draft v3 (codex review rounds 1-2 folded in — see
+Status: Design draft v4 (codex review rounds 1-3 folded in — see
 `REVIEW-101.md`). Client-dominant. Shipped scope is **multipart UPLOAD
 parallelization plus completion-pass measurement**; ranged parallel *download*
 is descoped to a Phase-0 measurement outcome that, if its gate passes, opens a
@@ -259,10 +259,17 @@ capacity-bound uplink. Two mechanisms therefore work together:
    aborts an in-flight PUT); on busy, no NEW admission occurs while in-flight
    part bytes exceed the reduced cap; on drain (batch queue empty, no active
    batch), the full budget is restored and FIFO admission resumes.
-   Time-to-effect of the reduced cap (worst case: the largest in-flight part's
-   remaining transfer) is measured under G3. First-publish reality: small files
-   finish their batches early and the big blob then gets the whole budget — the
-   throttle costs nothing once the small lane is idle.
+   **Check/admission coordination (R3 item 6):** the busy flag is not a polled
+   observation — `BlobBatchUploader.enqueue` flips the shared flag
+   **synchronously, before its first await**, and every budget admission
+   re-reads the flag at grant time; both run on the single JS event loop, so
+   the only residual interleave is one admission already granted in the same
+   task as an enqueue that had not yet run — bounded by ONE part. Time-to-effect
+   of the reduced cap (worst case: that one interleaved part plus the largest
+   in-flight part's remaining transfer) is therefore bounded and is measured
+   under G3. First-publish reality: small files finish their batches early and
+   the big blob then gets the whole budget — the throttle costs nothing once
+   the small lane is idle.
 
 **Scheduler semantics (R1 item 3), specified, not implied:**
 
@@ -375,10 +382,13 @@ R2-vs-D1 span split (`op.span.r2`, `blobs.ts:415`) is preserved.
 Enumerate and count, numbers only, the R2/D1 object states left by each failure
 point around completion (feeds §8's reaper design and the correctness proof):
 after a clean run; an interrupted-and-resumed run; a killed-mid-parts run; and —
-critically — a run killed **after `mpu.complete` but before staging delete**
-(the completed-but-abandoned staging object the reviewer named, R1 item 4).
-Count `uploads` rows, incomplete R2 MPUs, and **completed `staging/` objects**
-separately, so §8 can prove each state is reaped.
+critically — runs killed at each completion boundary: **after `mpu.complete`
+before staging delete** (the completed-but-abandoned staging object, R1 item
+4), **after the canonical `put` before the `blobs` insert**, and **after the
+insert before the grant** (the canonical-orphan states, R2 item 5 / R3 item 4).
+Count `uploads` rows, incomplete R2 MPUs, **completed `staging/` objects**, and
+**row-less canonical objects** separately, so §8 can prove each class is healed
+or reaped within its stated bound.
 
 ### Download-pole measurement (decides §6 only, not a shipped behavior)
 
@@ -437,10 +447,13 @@ that download was not the pole.
    flight, resume; assert the parts re-sent are exactly those the server reports
    missing **after all prior requests settle** — including a lost-ack part
    (server has it, client saw failure) which is NOT re-sent.
-4. **No orphaned uploads beyond a bounded, reaped set (R1 item 4).** Per §8: a
-   killed parallel-parts upload leaves the same one MPU + one staging key a
-   serial one leaves; every resulting object state is reaped by a named reaper
-   (§8 table). Test: P0.3 counts reach zero within the reaper's bound.
+4. **No orphaned uploads beyond a bounded, reaped set (R1 item 4; bounds per
+   R3 item 7).** Per §8: a killed parallel-parts upload leaves the same one MPU
+   + one staging key a serial one leaves; every resulting state — incomplete
+   MPU, completed staging object, stale D1 rows, row-less canonical object —
+   is healed or reaped within the explicit per-class bound stated in §8. Test:
+   P0.3 counts (including row-less canonical objects) reach zero within those
+   bounds under the §8 reapers.
 5. **Quota accounting unchanged.** Grant/charge happen once, at
    `multipartComplete`, on actual staged bytes (`blobs.ts:465`); the fail-fast
    over-cap check still runs at `multipartInit` before any part is staged
@@ -467,16 +480,23 @@ redefinition (R1 item 1).
   or is itself falsified.
 - **G-part.** ≥ 2× reduction in the **part-phase wall** (first part start →
   last part ack) for the same blob — what parallelizing parts can actually move.
-- **G2 — no resume regression (SHIP GATE; strengthened per R2 items 1-2).**
-  Under identical injected fault schedules applied to serial (control) and
-  parallel: (a) **resume completion wall** and (b) **total retransmitted bytes**
-  show no statistically material regression vs serial (p50 within noise per the
-  audit's sample discipline); (c) **re-init count** and **success rate** are no
-  worse. The correctness ceiling — ambiguous retransmission (lost acks, killed
-  requests) never exceeds the configured max in-flight
-  (≤ `MULTIPART_PARTS_PER_BLOB` parts / `MULTIPART_INFLIGHT_BYTES`) — is a
-  separate invariant test, NOT the acceptance criterion. Correctness of the
-  resume set is measured against the **server-observed completed set after all
+- **G2 — no resume regression (SHIP GATE; fault matrix and bounds predeclared,
+  R3 item 2).** Fault classes, injected identically into serial (control) and
+  parallel: **F1** lost part ack (server accepted, client saw failure); **F2**
+  kill during an active part fetch; **F3** abort landing during retry backoff;
+  **F4** process kill with k parts accepted and j in flight (k, j ≥ 2); **F5**
+  resume against a dead/expired MPU; **F6** completion-response loss. **Samples:**
+  10 runs per class per mode, identical schedules. **Acceptance bounds, all
+  explicit:** (a) **success rate 100% in both modes** — any run whose resume
+  fails to complete fails G2 outright (categorical, no statistics needed);
+  (b) per class, resume completion wall p50 (parallel) ≤ 1.10 × p50 (serial);
+  (c) per class, total retransmitted bytes p50 (parallel) ≤ 1.10 × p50 (serial);
+  (d) re-init counts are sparse, so they are summed ACROSS the whole matrix:
+  parallel's total ≤ serial's total. **Correctness ceiling (separate invariant
+  test, not the acceptance criterion):** in every single run, ambiguous
+  retransmission never exceeds the configured max in-flight
+  (≤ `MULTIPART_PARTS_PER_BLOB` parts / `MULTIPART_INFLIGHT_BYTES`). Resume-set
+  correctness is measured against the **server-observed completed set after all
   prior requests settle**; no "zero re-sends" claim (it conflicts with lost-ack
   reality).
 - **G3 — small-file lane unharmed (redefined, R1 item 2; loop closed per R2
@@ -486,22 +506,33 @@ redefinition (R1 item 1).
   present", impossible on a capacity-bound link). Two sub-workloads: (i) small
   files and the large blob start together (first-publish shape); (ii)
   **sustained-arrival**: small batches begin only after multipart reaches steady
-  state, measuring the throttle's time-to-effect. Acceptance: small-file batch
-  throughput within 10%, p95 latency within 20%, and **p99/max batch queue wait
-  within 2× of the serial-large control** (tail coverage, R2 item 8).
-  **Predeclared, finite tuning (R2 item 7):** the ONLY tunable is
-  `MULTIPART_INFLIGHT_BYTES_WHEN_BATCH_BUSY`, over the preregistered candidate
-  set `{32 MiB, 16 MiB, 8 MiB, 0}` (0 = no new admissions while batch work is
-  queued, §3.2), one run per candidate in that order, first passing candidate
-  selected; G-part and G2 must then hold at that SAME candidate. **If no
-  candidate passes all three gates, Phase 1 does not ship** — that is the
-  recorded outcome, not a tuning restart. **The lane's own 24/48/64 defaults are
-  never changed to pass this** (R1 item 13).
+  state, measuring the throttle's time-to-effect (which includes the ≤ one-part
+  admission interleave, §3.2). **Statistics sized to be supportable (R3 item
+  3):** a "run" of a candidate = the full preregistered sample set — 10 samples
+  per sub-workload per mode (audit discipline, `audit:1296`) — and each sample's
+  publish yields one per-batch queue-wait observation PER BATCH (hundreds to
+  thousands per sample), so tail statistics are computed on the **pooled
+  per-batch observations across the candidate's samples**, not on 10 numbers.
+  Acceptance: small-file batch throughput p50 within 10%, per-batch latency p95
+  within 20%, and **pooled per-batch queue-wait p99 within 2× of the
+  serial-large control's pooled p99** (tail coverage, R2 item 8); max queue
+  wait is reported (worst across samples) but not gated — a single-observation
+  maximum is not a supportable gate statistic. **Predeclared, finite tuning (R2
+  item 7):** the ONLY tunable is `MULTIPART_INFLIGHT_BYTES_WHEN_BATCH_BUSY`,
+  over the preregistered candidate set `{32 MiB, 16 MiB, 8 MiB, 0}` (0 = no new
+  admissions while batch work is queued, §3.2), one full sample set per
+  candidate in that order, first passing candidate selected; G-part and G2 must
+  then hold at that SAME candidate. **If no candidate passes all three gates,
+  Phase 1 does not ship** — that is the recorded outcome, not a tuning restart.
+  **The lane's own 24/48/64 defaults are never changed to pass this** (R1
+  item 13).
 
 ### 7.3 Completion-mitigation decision (decoupled, integrity-first, R1 item 12)
 
-Phase 1 ships on G-part+G3 **regardless** of the completion cost — its latency
-win is real. The completion reread is a **separate finding**:
+Phase 1 ships on the §7.2 condition — **G-part AND G2 AND G3 on the same
+configuration** — regardless of the completion cost (the same three-gate
+condition everywhere; R3 item 1). The completion reread is a **separate
+finding**:
 
 - If `rereadPutMs`+`cleanupMs` is a small fraction of the now-parallel part
   wall: **accept, document, close** (`audit:810-811`).
@@ -530,15 +561,21 @@ failure point leaves, and its reaper:
 | Killed before/among parts | incomplete MPU on `staging/<sha>/<uuid>` | `uploads` row | R2 abort-incomplete-MPU lifecycle at **7 days** (§8.1 rule A — retention deliberately UNCHANGED so resume within `UPLOAD_EXPIRY_MS` = 6d keeps working, R2 item 3); init-time sweep reaps the row (`blobs.ts:332`) |
 | Part PUT vs a vanished MPU | none (R2 already dropped it) | stale `uploads` row | `cleanupUpload` on the 410 (`blobs.ts:386-400`); else init sweep |
 | Worker dies **after `mpu.complete`, before `get(staging)`/canonical `put`** | **completed `staging/` object** | `uploads` row | §8.1 rule B (delete-objects, 24h). Client: `complete` response lost → `missingBlobs` says missing → outer recovery re-inits a FRESH MPU (old staging object is never adopted); safe because the completed staging object was deletable the moment its MPU was consumed — no resume path reads it (R2 item 3: rule B cannot break resume; only rule A could, and it is unchanged) |
-| Worker dies **after verified canonical `put`, before `blobs` insert** (R2 item 5) | canonical object (R2-verified bytes at the correct address) + completed staging object | `uploads` row; NO `blobs`/accounting row | Canonical-orphan: client recovery re-uploads (blobsCheck reads it as missing — no `present=1`/entitlement row); the retry's canonical `put` **overwrite-adopts** byte-identical verified content and its complete performs the insert + grant, healing accounting. Until then the row-less canonical object is exactly the "unpublished orphan … safe for P2 to reap" state the receipts path already documents (`blobs.ts:66-67`). Staging object: rule B |
+| Worker dies **after verified canonical `put`, before `blobs` insert** (R2 item 5) | canonical object (R2-verified bytes at the correct address) + completed staging object | `uploads` row; NO `blobs`/accounting row | Canonical-orphan: primarily healed by client retry (blobsCheck reads it as missing — no `present=1`/entitlement row → the retry's canonical `put` **overwrite-adopts** byte-identical verified content and its complete performs insert + grant, healing accounting; the daemon's push pump retries deferred uploads on its next cycle). If the client never returns: reaped by the **§8.2 canonical-orphan audit** (bound: next audit run, eligibility ≥ 7d). Staging object: rule B (≤ 24h) |
 | Worker dies **after `blobs` insert, before grant** | canonical + `blobs.present=1`; staging object | no entitlement for this account | Client account still sees "missing" (entitlement-gated check, `blobs.ts:119-193`) → re-uploads → retry's complete re-runs `INSERT OR IGNORE` (no-op) + grant, healing entitlement/quota. Staging: rule B |
 | Worker dies **after grant, before response** | canonical published + granted; staging object | consistent | Client's existing lost-ack recovery: `missingBlobs` present-check succeeds (`multipart.ts:157-161`) → done. Staging: rule B; `uploads` row: init sweep |
 | Fence 503 at accounting (handled response) | canonical verified; staging deleted in `finally` | consistent (deferred) | in-request `finally`; client defers (`multipart.ts:145-153`) |
 
-Every state above is either healed by the client's existing recovery (which
-always converges on "canonical verified + accounted" because parts, canonical
-PUT, insert, and grant are all idempotent) or reaped by a named lifecycle rule.
-No state requires adopting unverified bytes.
+**Explicit bounds per class (R3 item 7):** incomplete MPU ≤ 7d (rule A);
+completed staging object ≤ 24h (rule B); stale `uploads`/`upload_parts` rows —
+swept at the account's next `multipartInit` (`blobs.ts:332`), else cleared by
+the §8.2 audit (they are inert D1 metadata: no R2 cost, no accounting effect);
+row-less canonical orphan — healed at the client's next retry (typically the
+daemon's next push-pump cycle), else reaped by the §8.2 audit with ≥ 7d
+eligibility. Every state is either healed by the client's existing recovery
+(which always converges on "canonical verified + accounted" because parts,
+canonical PUT, insert, and grant are all idempotent) or reaped by a named
+reaper within its stated bound. No state requires adopting unverified bytes.
 
 **§8.1 — staging reapers (two DISTINCT lifecycle actions, R2 items 3-4).**
 Completed-object expiration and incomplete-MPU abortion are different R2
@@ -577,14 +614,44 @@ delete the rules — the system returns to today's behavior (orphaned completed
 staging objects persist, everything else unaffected). **The exact lifecycle
 capability (per-prefix delete-objects + abort-MPU actions) must be confirmed
 against the R2 configuration surface before this ships** — it is §11 open
-question 2, and §8.1 is a correctness-prerequisite *proposal* until then; if
-the surface lacks per-prefix rules, the fallback is a scheduled Worker cron
+question 2, and §8.1 is a correctness-prerequisite *proposal* until then.
+**Fallbacks cover BOTH rules (R3 item 5):** if the surface lacks per-prefix
+rules, rule A's fallback is R2's **bucket-wide default incomplete-MPU abort at
+7 days** — the exact TTL the code already assumes (`blobs.ts:107`) —
+verified by listing the bucket's lifecycle configuration and confirming the
+default multipart-abort rule is present (it is bucket-wide, so per-prefix
+support is not needed for A); rule B's fallback is a scheduled Worker cron
 listing `staging/` and deleting objects older than 24h (same semantics,
-code-owned).
+code-owned). Only if BOTH the per-prefix surface AND the bucket-wide default
+are absent does rule A also move into the cron (list in-progress `staging/`
+MPUs, abort those older than 7d) — the prerequisite is met in every branch.
 
 This is a **pre-existing gap this design surfaces, not one it introduces** —
 the completed-staging orphan already exists on the serial path. Parallel parts
 do not change its likelihood (same single staging key per attempt).
+
+**§8.2 — canonical-orphan audit (small server addition; named reaper for the
+row-less canonical class, R3 items 4, 7).** No collector exists today for a
+canonical object with no `blobs` row (verified: the GC pipeline is D1-driven —
+`gc-phase1.ts` marks from refs, design-95 P2 executes `gc_candidates` intents —
+so an object invisible to D1 is invisible to GC; the `blobs.ts:66-67` "safe for
+P2 to reap" comment covers only shas that acquire a candidate row). Addition:
+an **admin-triggered audit** (behind the existing `RBOX_PLATFORM_SECRET` admin
+surface, like the manual GC drain) that pages `list()` over the canonical blob
+prefix, and for each key with **no `blobs` row** and an R2 `uploaded` timestamp
+**older than 7 days** inserts a `gc_candidates` intent — after which design
+95's existing P1/P2 machinery (quiescence, delete fence, activity-unwind if a
+retry publishes meanwhile) deletes it with all its standing protections.
+Eligibility proof: 7d > the client's 6-day upload-state expiry and any
+daemon-pump retry cadence, so a live retry either already re-published
+(insert restores the `blobs` row → key no longer matches) or is fenced/unwound
+by P2's existing re-checks — the audit can never delete a blob an account still
+legitimately holds, because such a blob has rows. The audit also deletes
+`uploads`/`upload_parts` rows older than `UPLOAD_EXPIRY_MS` (the same sweep
+`multipartInit` does, `blobs.ts:332`, for accounts that never multipart again).
+Retention bound for the class: "next audit run"; the audit is operator-cadence
+(run with the periodic GC drain), and the class's steady-state size is ≤ one
+object per crashed completion — P0.3 measures the actual rate.
 
 **GC isolation, unchanged.** `gc_candidates` condemns *canonical* blobs by
 `sha256` (`blobs.ts:62,148,183`); `staging/` objects carry no `blobs`/`gc_
@@ -601,10 +668,11 @@ upload can neither resurrect a condemned canonical blob nor strand a
    `multipartComplete`, design-97 control-flow), P0.3 (orphan/state inventory).
    No behavior change. Ship, soak, collect Workload D on Wi-Fi and wired.
    Evaluate G-baseline-split and G-dl-pole.
-2. **§8.1 staging reapers (config-level, independent).** Confirm the R2
-   lifecycle capability (§11 Q2), apply rules A+B dev-first, verify with the
-   §8.1 boundary tests, record in DEPLOYMENTS. Correctness prerequisite for the
-   orphan invariant; not gated on Phase 1.
+2. **§8.1 staging reapers + §8.2 canonical-orphan audit (independent).**
+   Confirm the R2 lifecycle capability (§11 Q2), apply rules A+B dev-first
+   (fallbacks per §8.1), verify with the §8.1 boundary tests, record in
+   DEPLOYMENTS; land the §8.2 admin audit beside the existing GC drain.
+   Correctness prerequisites for the orphan invariant; not gated on Phase 1.
 3. **Phase 1 concurrency sweep (experimental, NOT default).** The parallel-parts
    implementation lands behind `RBOX_MULTIPART_PARTS` **defaulting off**. The
    sweep over `MULTIPART_PARTS_PER_BLOB` / `MULTIPART_INFLIGHT_BYTES` runs with
