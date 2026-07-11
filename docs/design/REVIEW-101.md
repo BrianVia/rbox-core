@@ -68,7 +68,19 @@ Revised doc for Round 4.
 
 Revised doc for Round 5.
 
-## Round 5
+## Round 5 — VERDICT: ALIGNED
 
-Verdict: _pending_
+All four round-4 items confirmed genuinely resolved (F4a/F4b split; grant-loop
+linearization with per-turn permits making the ≤ 1 interleaved-part claim
+mechanically testable; scheduled audit with the 10-day canonical-orphan ceiling
+and overdue signaling; large-blob liveness closing the zero-cap starvation
+hole). Fresh attack found no integrity/revocation weakening, resume safety
+adequately specified, small-file protection honest, gates falsifiable for
+implementation handoff, and scope disciplined (no chunk sync, no direct-R2
+bypass, no ranged-download implementation, no shipped-lane retuning). Reviewer
+notes Phase 1 may ship as an honestly labeled part-phase improvement while
+Finding 10 remains open unless the immutable end-to-end gate passes — which is
+exactly the design's own §7.2/§9 position.
+
+**Final state: draft v5, ALIGNED after 5 rounds (14 + 10 + 7 + 4 items → 0).**
 </content>
