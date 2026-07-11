@@ -172,6 +172,45 @@ describe("fused crypto", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }, 10_000);
 
+  test("cancel during requeue stat dispatches no retry child", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-cancel-requeue-"));
+    const workerPath = path.join(root, "requeue-worker.js");
+    const dispatchesPath = path.join(root, "dispatches.log");
+    await fs.writeFile(workerPath, [
+      `import fs from "node:fs/promises";`,
+      "self.onmessage=async({data:m})=>{",
+      "if(m.kek)return; if(m.kind==='health'){self.postMessage({id:m.id,ok:true,result:'ok'});return}",
+      `if(m.kind==='encryptBatch'){await fs.appendFile(${JSON.stringify(dispatchesPath)}, "x");self.postMessage({id:m.id,ok:true,result:{results:m.jobs.map(j=>({index:j.index,ok:false,requeue:true}))}})}};`,
+    ].join("\n"));
+    __cryptoPoolTestHooks.setWorkerPath(workerPath);
+    let statStarted!: () => void;
+    const started = new Promise<void>((resolve) => { statStarted = resolve; });
+    let resumeStat!: () => void;
+    const resume = new Promise<void>((resolve) => { resumeStat = resolve; });
+    __cryptoPoolTestHooks.setRequeueStat(async (pathname) => {
+      statStarted();
+      await resume;
+      return fs.stat(pathname);
+    });
+    const bytes = Buffer.from("cancel while requeue stat is pending");
+    const srcPath = path.join(root, "source");
+    await fs.writeFile(srcPath, bytes);
+    try {
+      await withCryptoPool(generateKek(), 1, 1, async (pool) => {
+        const stream = pool!.encryptStream([{ ref: "source", srcPath, size: bytes.length, tmpDir: root,
+          opts: { compress: true, expected: { sha256: hashBytes(bytes), size: bytes.length } } }],
+        { onReady: () => { throw new Error("canceled stream delivered a result"); } });
+        await started;
+        stream.cancel();
+        resumeStat();
+        await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 0 && stats.queue === 0);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(await fs.readFile(dispatchesPath, "utf8")).toBe("x");
+        expect(pool!.fusedStatsForTest().used).toBe(0);
+      });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }, 10_000);
+
   test("encryptAndUpload flag routing invokes only the selected pool or oracle path", async () => {
     const run = async (fused: boolean) => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-routing-"));

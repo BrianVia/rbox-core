@@ -73,6 +73,7 @@ let embeddedWorkerPath: string | undefined;
 let embeddedWorkerDir: string | undefined;
 let cleanupRegistered = false;
 let workerPathOverrideForTests: string | undefined;
+let requeueStatOverrideForTests: typeof fs.stat | undefined;
 
 const poolScope = new AsyncLocalStorage<CryptoPool | undefined>();
 
@@ -599,8 +600,10 @@ export class CryptoPool {
       } else if (canceled) {
         file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
       } else if ("requeue" in result) {
-        const actual = await fs.stat(file.srcPath).catch(() => undefined);
-        if (actual && actual.size > FUSE_MAX_FILE_BYTES) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
+        const actual = await (requeueStatOverrideForTests ?? fs.stat)(file.srcPath).catch(() => undefined);
+        if (file.owner !== undefined && this.canceledOwners.has(file.owner)) {
+          file.reject(Object.assign(new Error("crypto stream cancelled"), { code: "RBOX_CRYPTO_STREAM_CANCELLED" }));
+        } else if (actual && actual.size > FUSE_MAX_FILE_BYTES) void this.encryptFileBacked(file.srcPath, file.tmpDir, file.opts).then(file.deliver, file.reject);
         else this.enqueueSplit([file]);
       } else file.reject(rehydrateError(result.error));
     }
@@ -962,10 +965,14 @@ export const __cryptoPoolTestHooks = {
     workerExecutionsTotal = 0;
     configuredWorkersCache = undefined;
     workerPathOverrideForTests = undefined;
+    requeueStatOverrideForTests = undefined;
     await cleanupEmbeddedWorker();
   },
   setWorkerPath(pathname: string | undefined): void {
     workerPathOverrideForTests = pathname;
+  },
+  setRequeueStat(stat: typeof fs.stat | undefined): void {
+    requeueStatOverrideForTests = stat;
   },
   terminateBusiestWorker(): boolean {
     return activePool?.terminateBusiestWorkerForTest() ?? false;
