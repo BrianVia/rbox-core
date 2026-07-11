@@ -64,3 +64,39 @@ Codex (gpt-5.6-sol, medium) delivered a deep review. Dispositions:
 15. **Required deterministic race rig** — ACCEPT. Added as a named acceptance gate.
 
 Revision written as draft v2. Proceeding to round 2.
+
+## Round 2 — VERDICT: REVISE (3 items)
+
+Codex verified the round-1 fixes against the code and confirmed the core GC
+invariant holds for normal Phase-1/2 (cited openIntents `NOT EXISTS` guard
+versions.ts:423, phase1Purge resurrect gc-phase1.ts:106, marker-guarded delete
+:125, global zero-ref recheck versions.ts:349). Three residual items, all valid:
+
+1. **Persistence invariant not universal — account hard-deletion drops blob_refs.**
+   `account-delete.ts:228–254` unconditionally deletes the account's `blob_refs`
+   (step 2) BEFORE the DO purge (step 4, :301–316). ACCEPT: scoped the invariant to
+   **live (non-deleting) accounts**, added **"account deletion in progress" as a
+   fallback trigger** (§3.5A) so the delta path is provably ≡ full under deletion
+   races, and refined "never marked" — for `phase1Mark`/`blob_ref_candidates` it
+   holds via the grace+reachable argument (mark immediately follows the reachable
+   snapshot in `runPhase1`, so a ref that entered head after the snapshot is
+   grace-fresh); the global `gcMark` may leave a harmless `deleting_at IS NULL`
+   candidate row (not in the fence probe, cannot open an intent, resurrected). Added
+   the account-deletion transition to Gate R.
+2. **Shadow mode doesn't detect unsatisfied carried refs.** Because carried refs are
+   outside `admitSet`, the old `unsatisfied_delta ⊆ unsatisfied_full` compare misses
+   a carried ref that full validation would mark unsatisfied. ACCEPT: §6 now asserts
+   `unsatisfied_full ∩ carried = ∅` and `have_full ⊇ carried∖fence` explicitly, via
+   an instrumented read-only classify (validateCommitRefs early-returns needsUpload,
+   so shadow computes the full have/unsatisfied/newRefs classification). This is the
+   primary safety-divergence detector. §4.10 updated to cite it.
+3. **Byte-buffer memory model doesn't match the APIs.** `resolveSidecarBytes`
+   returns `refShas: string[]`, not the raw buffer (sidecar.ts:72–112). ACCEPT: §3.2
+   now specifies the loader refactor (`loadSidecarRaw` returns verified bytes; the
+   delta path merges over buffers and does NOT materialize `refShas`/`Set`; the
+   fallback path materializes as today; `totalBytes` streamed) and states the honest
+   simultaneous-allocation model (parent+child raw buffers + `added` hex strings +
+   at-most-one concurrent fold's two `Set`s, bounded by the isolate fold-mutex),
+   measured by Gate 4 — dropping the "combined-peak removed" overclaim.
+
+Revision written as draft v3. Proceeding to round 3.

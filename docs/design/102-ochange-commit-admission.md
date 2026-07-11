@@ -1,6 +1,6 @@
 # 102 — O(change) commit admission: server-side parent→child ref delta
 
-Status: DRAFT v2, 2026-07-11 — round 1 folded (REVIEW-102.md). Under adversarial
+Status: DRAFT v3, 2026-07-11 — rounds 1–2 folded (REVIEW-102.md). Under adversarial
 review.
 
 Companion to design 84 (§6.1 named this design explicitly): design 84's C1/C2/D
@@ -132,14 +132,13 @@ refset → same bytes → same sha), so it is already entitled+present → lands
 `have` → charged 0; `encManifestSha` is new → one added carrier; `added` is empty.
 `admitSet` = 2 SHAs → a handful of D1 statements → the ≤200ms accounting target.
 
-### 3.2 Delta computation — streaming over byte buffers (bounded heap)
+### 3.2 Delta computation — streaming over byte buffers (loader refactor + honest heap)
 
 The diff runs as a **two-pointer merge over the two sidecar byte buffers**, never
-materializing `Ref[]` arrays or `Set`s. A sidecar is `18 + 40·count` bytes; record
-`k` is at offset `18 + 40k`, its 32 raw sha bytes at `[18+40k, 18+40k+32)`, and the
-records are **strictly ascending by raw sha** (guaranteed by `parseRefset`, which
-already ran in step 2 for the child and runs once for the parent). We compare
-32-byte slices directly:
+materializing `Ref[]` arrays or `Set`s for the diff itself. A sidecar is `18 +
+40·count` bytes; record `k` is at offset `18 + 40k`, its 32 raw sha bytes at
+`[18+40k, 18+40k+32)`, records **strictly ascending by raw sha** (`parseRefset`
+invariant, `refset.ts:96`). We compare 32-byte slices directly:
 
 ```
 i=j=0
@@ -151,19 +150,49 @@ while i<P.count and j<C.count:
 drain P → removed++;  drain C → added.push(...)
 ```
 
-- **Heap:** the two byte buffers only. Child buffer already held by
-  `resolveSidecarBytes`. Parent buffer = `18 + 40·count` (≈4.5MB at 112k, ≤10MB at
-  the 250k cap). The single materialized product is the `added` **SHA list**, which
-  for an O(change) commit is tiny and is bounded by `MAX_REFS_PER_COMMIT` (a large
-  legitimate change is the same bound today's full path already handles). **No
-  112k/250k `Set`.** This also removes the commit-vs-alarm-fold combined-peak
-  concern (item 11): the merge holds ~one extra 10MB buffer, not two large sets.
-  The peak-heap rig gate (§7) measures this at 250k disjoint under a concurrent
-  alarm fold.
-- **Sizes never touch the diff.** `mergeAddedShas` reads only the 32 sha bytes of
-  each record; the 8-byte size field is ignored. Chargeable sizes for `added` refs
-  come exclusively from `verifyReceipt` inside `validateCommitRefs` (§4.1).
-- **D1 work is O(added), not O(workspace).** `removed` and `carried` cost zero D1
+**Loader refactor (round 2 item 3).** Current `resolveSidecarBytes`
+(`sidecar.ts:72–112`) returns `refShas: string[]` and does **not** retain the raw
+buffer; current admission then builds another array + `Set`
+(`workspace-sync.ts:381–405`). The delta path must NOT allocate those. Concretely:
+
+- Add `loadSidecarRaw(env, sidecarSha, count)` that performs the same strict gate
+  (size-before-buffer, hash-verify, magic/length/sorted/dup checks) and returns the
+  **verified raw `Uint8Array`**, computing `totalBytes` by **streaming the size
+  fields off the buffer** (no `Ref[]` materialization). `resolveSidecarBytes` keeps
+  its entitlement gate and calls `loadSidecarRaw`.
+- **Delta path:** hold the verified child raw buffer (from `loadSidecarRaw`), GET +
+  `loadSidecarRaw` the parent buffer, `mergeAddedShas` over the two buffers →
+  `added` SHA list. It never builds the full child `refShas` array or a `Set`.
+- **Fallback path (§3.5):** materializes the full child `refShas` from the same
+  buffer exactly as today (the O(N) allocation is acceptable there — it is the
+  proven path). Retain the child buffer only until whichever path consumes it.
+
+**Honest simultaneous-allocation model (round 2 item 3; do not claim "removed").**
+Peak heap during a delta admission is the sum of what is live at once:
+
+- parent raw buffer `18 + 40·count` — ≤10MB at the 250k cap;
+- child raw buffer — ≤10MB;
+- the `added` SHA list — for an O(change) commit ~0; worst case a fully-disjoint
+  250k change materializes up to 250k 64-hex strings (~18–34MB with V8 string
+  overhead), the **same** worst case today's full path already carries;
+- the in-flight request state (commit JSON, receipts map, D1 statement arrays);
+- **if** a design-96 alarm fold is active in the **same isolate**, its two
+  `Set<string>` from `refSetAt` (`workspace-sync.ts:597–608`) — but the
+  module-level `isolateFoldActive` mutex bounds this to **one** fold, and
+  `foldSequence` re-arms rather than overlapping a second.
+
+This is bounded but not trivially small; §7 **gate 4** measures the true peak at
+250k disjoint with a concurrent fold, max receipts, fallback, and shadow on, and
+lowers `MAX_REFS_PER_COMMIT`/`FOLD_MAX_REFS` via the pre-authorized paired-cap
+contingency if the budget is exceeded. The win versus today is that the **common
+O(change) case** allocates two ~small buffers and a near-empty `added` list instead
+of a 112k `have` `Set` plus ~1,245 D1 statement objects — but the worst case is
+budgeted, not hand-waved.
+
+- **Sizes never touch the diff.** `mergeAddedShas` reads only the 32 sha bytes;
+  chargeable sizes for `added` come exclusively from `verifyReceipt` inside
+  `validateCommitRefs` (§4.1).
+- **D1 work is O(added), not O(workspace).** `removed`/`carried` cost zero D1
   statements.
 
 ### 3.3 Carried-ref safety — the D1 invariant, not a snapshot
@@ -176,12 +205,23 @@ be physically deleted while the new head references it — data loss. The safety
 argument must therefore be a **D1-serialized invariant**, not a
 read-then-hope snapshot. It is:
 
-> **Carried-ref invariant.** A ref carried by an admitted commit holds a live
+> **Carried-ref invariant (live accounts).** For an account that is **not** in an
+> in-progress hard-deletion, a ref carried by an admitted commit holds a live
 > `blob_refs(account_id, sha)` row for this account continuously across admission
 > and publication, and therefore (a) **no active deletion intent can exist or be
 > created against it**, and (b) **it can never be Phase-1-purged**.
 
-Proof, from the GC code:
+**Deletion scope (round 2 item 1).** Account hard-deletion drops `blob_refs`
+unconditionally (`account-delete.ts:228–254`, step 2) before the DO purge (step 4,
+`:301–316`), so the invariant does **not** cover a deleting account. That path is a
+deliberate erase of the whole workspace (the head and its DO are purged too), so
+carried-ref durability is explicitly not a goal there. To keep the delta path
+provably equivalent to full validation even under a commit⇄deletion race, **an
+account with an in-progress deletion is a fallback trigger** (§3.5A): the delta path
+is simply disabled for it, so it behaves byte-for-byte like today. Gate R includes
+an account-deletion transition.
+
+Proof, from the GC code (live account):
 
 - **(a) Intent creation is D1-blocked by the live ref.** The only site that sets
   `deleting_at` (opens an intent) is `openIntents`
@@ -197,13 +237,28 @@ Proof, from the GC code:
 - **(b) Phase-1 never drops a carried ref's row.** `phase1Purge` drops a
   `blob_refs` row only for a candidate that is **still unreachable** at a
   freshly-recomputed reachability (`gc-phase1.ts:104–149`); a reachable candidate
-  is **resurrected** (unmarked), not dropped (`:114–118`). Reachability
+  is **resurrected** (unmarked), not dropped (`:114–118`), and the delete is
+  marker-guarded in the same D1 batch (`:135–147`) so a concurrent
+  `commitAccounting` marker-clear no-ops it. Reachability
   (`reachableFromWorkspaces`) reads the DO `/roots` **including the live gap
   `seq:synced+1..head`** and **fails closed** (throws, aborting the account's GC)
   on any unreadable page. A carried ref is in the parent = the current head ⟹ in
-  `ROOTS(head)` ⟹ reachable ⟹ resurrected, never dropped. Equivalently, the global
-  `gcMark` (`versions.ts:219–221`) and `phase1Mark` (`gc-phase1.ts:59–63`) both
-  filter out reachable shas, so a head-reachable ref is **never even marked**.
+  `ROOTS(head)` ⟹ reachable ⟹ resurrected, never dropped.
+- **On "never marked" (round 2 item 1, made precise).** For the per-account
+  `phase1Mark`/`blob_ref_candidates` marker: `runPhase1` computes reachability then
+  marks **in the same pass** (`gc-phase1.ts:203–222`), and only marks a ref whose
+  `granted_at` is older than grace (`:61`). A ref that is carried but was *not* in
+  that pass's reachable snapshot must have entered head-reachability **after** the
+  snapshot — i.e. it was (re-)granted after the snapshot, so it is grace-fresh at
+  mark time and skipped; a ref already reachable at the snapshot is reachable-skipped.
+  Either way a carried ref is **never `blob_ref_candidate`-marked** ⟹ `fence ∩
+  carried = ∅` for that table. The **global** `gcMark` (`versions.ts:205–221`) keys
+  on object age, not `granted_at`, and can transiently leave a **`deleting_at IS
+  NULL`** `gc_candidates` row on a carried ref — but that row is **not an active
+  intent** (the fence probe reads only `deleting_at IS NOT NULL`), **cannot become
+  one** (the (a) `NOT EXISTS blob_refs` guard), and is **resurrected** by
+  `openIntents` on the next reachable recompute (`versions.ts:426–427`). It is
+  harmless: no fence, no delete, no false page.
 - **Induction closes the "was it clean at parent-publish?" gap.** When a ref first
   enters the workspace it is an *added* ref of some commit, admitted through the
   full validate/account path (or this design's `added` path — identical, §4.1),
@@ -271,6 +326,11 @@ child set (chunked, exactly as today), identical response, on:
    bounds Worker CPU/heap.
 4. **Fence probe over cap**: `fenceProbe` would exceed `FENCE_SET_MAX` (a mass GC
    sweep) — full-validate rather than hold a large set.
+5. **Account deletion in progress** (§3.3 deletion scope): the account has an
+   in-progress hard-deletion (`account_deletions` status), where `blob_refs` are
+   being torn down unconditionally. Disabling the delta path here makes admission
+   byte-for-byte identical to today under a commit⇄deletion race — the carried-ref
+   invariant does not hold for a deleting account, so we do not rely on it.
 
 **(B) Authoritative-history corruption** — `seq:<parent>` missing, or its
 body/sidecar fails to parse/verify (missing R2 object, hash/encoding/size/`total
@@ -416,11 +476,11 @@ over-cap `{used,cap}`. Therefore:
   sidecarSha, ...sorted refShas]` filtered to non-`have`.
 
 The **only** conceivable `newRefs` divergence is a *carried* ref that is
-unexpectedly not-present-or-not-entitled — precluded by §3.3(b), detected by shadow
-mode (§6), and caught by fallback (§3.5B). We claim scoped **semantic
-equivalence** (identical outcome class + identical `{used,cap}` + set-equal
-`needsUpload`), and byte-identical 409/epoch/402, rather than a blanket
-"byte-identical everything."
+unexpectedly not-present-or-not-entitled — precluded by §3.3(b), **detected by the
+`unsatisfied_full ∩ carried = ∅` shadow assertion (§6)**, and caught by fallback
+(§3.5B). We claim scoped **semantic equivalence** (identical outcome class +
+identical `{used,cap}` + set-equal `needsUpload`), and byte-identical 409/epoch/402,
+rather than a blanket "byte-identical everything."
 
 ---
 
@@ -453,18 +513,29 @@ Round 1 item 8: the naive "admitSet vs newRefs" compare is ill-typed and mutatin
 Corrected protocol, run entirely from **one immutable pre-state** (no accounting
 executed during comparison):
 
-1. Run the authoritative path once — but split `validateCommitRefs` (read-only)
-   from `commitAccounting` (mutating). Capture the full path's read-only products:
-   `have_full`, `unsatisfied_full` (needsUpload), and `newRefs_full` (receipt-valid
-   new refs, with sizes).
+1. Run an **instrumented read-only classify** over the **full** child set (the
+   `validateCommitRefs` have-set SELECT + receipt loop, but without the early
+   `needsUpload` return), capturing the complete classification: `have_full`,
+   `unsatisfied_full`, and `newRefs_full` (receipt-valid new refs, with sizes).
+   (Plain `validateCommitRefs` early-returns `needsUpload` and never yields
+   `newRefs` when anything is unsatisfied — round 2 item 2 — so shadow needs this
+   full-classify variant.)
 2. Compute the delta path's read-only products from the **same** pre-state:
-   `admitSet`, then `validateCommitRefs(admitSet)` → `newRefs_delta`.
-3. **Compare:** `newRefs_delta` vs `newRefs_full` (SHA set + per-sha size), and
-   `unsatisfied_delta ⊆ unsatisfied_full` restricted to `admitSet`. Any mismatch
-   increments `commit.delta.divergence` with the bounded payload (§5).
+   `added`/`carried` (from the diff), `admitSet`, then the same instrumented
+   classify over `admitSet` → `have_delta`, `unsatisfied_delta`, `newRefs_delta`.
+3. **Compare (all four must hold, else `commit.delta.divergence++`):**
+   - **`unsatisfied_full ∩ carried = ∅`** — the primary safety detector: a carried
+     ref the full path deems unsatisfiable (missing/unpresent/marked/intented) is
+     exactly the divergence that would let the delta path publish a dangling ref.
+     This directly closes round 2 item 2 (carried refs are outside `admitSet`, so
+     the old subset-compare was blind to them).
+   - **`have_full ⊇ carried ∖ fence`** — every non-fenced carried ref is entitled
+     +present in the full classification (the §4.1 identity's precondition).
+   - **`newRefs_delta == newRefs_full`** (SHA set + per-sha size).
+   - **`unsatisfied_delta == unsatisfied_full ∩ admitSet`**.
 4. Only **after** comparison, execute accounting **once** (the authoritative full
-   result in shadow; the delta result in enforce) — so quota/entitlement mutate
-   exactly once, never twice.
+   result in shadow; the delta result in enforce) — quota/entitlement mutate exactly
+   once, never twice.
 
 **Blind spots called out:** fence-abort and multi-super-batch over-cap outcomes
 are **not** observable read-only (they depend on executing the fenced/guarded
@@ -495,11 +566,12 @@ discipline).
 3. **Total server admission** (`sidecarMs + diffMs + fenceQueryMs +
    admitAccountMs`) at 112k and 250k is reported; its residual is attributed to
    parse/fetch (the wire-delta follow-on's target), not D1.
-4. **Peak-heap rig gate.** At 250k disjoint parent/child, with max receipts,
+4. **Peak-heap rig gate** (the §3.2 simultaneous-allocation model). At 250k disjoint
+   parent/child, with max receipts, the fully-disjoint `added` list materialized,
    fallback exercised, shadow comparison on, **and a concurrent alarm fold active in
-   the same isolate**, measured peak heap < a fixed budget (proposed **110 MiB**,
-   matching design 96 §4.2's rig) — else the paired-cap contingency (lower
-   `FOLD_MAX_REFS`/`MAX_REFS_PER_COMMIT`) applies.
+   the same isolate** (its two `Set`s live), measured peak heap < a fixed budget
+   (proposed **110 MiB**, matching design 96 §4.2's rig) — else the pre-authorized
+   paired-cap contingency (lower `FOLD_MAX_REFS`/`MAX_REFS_PER_COMMIT`) applies.
 5. **Race suites pass unchanged.** The design-95/96 fence + race rigs, the
    quota/over-cap suite, and the E2EE-determinism suite.
 6. **Response goldens.** 409 / epoch_stale / 402 byte-identical; 422 `needsUpload`
@@ -513,15 +585,18 @@ discipline).
 8. **Fallback ceilings.** In enforce, `commit.delta.fallback{reason≠first_commit,
    epoch_rotation}` rate below a fixed ceiling (proposed 0.1%); any
    `parent_unreadable`/`fence_violation` pages regardless of rate.
-9. **Gate R — deterministic race rig (round 1 item 15).** A single-isolate
-   interleaving harness over: parent read, fence snapshot, `phase1Mark`, P1
-   intent-open, P2 activity-unwind, P3 physical delete, delta accounting, final
-   CAS, index fold, prune. For **every** interleaving, assert: (i) intent-open
-   against a carried (live-`blob_refs`) sha is **rejected** by the `NOT EXISTS`
-   guard — it never reaches a physical delete; (ii) a published retained root is
-   present and entitled; (iii) incomplete roots disable GC (fail-closed); (iv)
-   `used_bytes` equals authoritative newly-entitled bytes; (v) the roots index
-   equals brute-force retained history.
+9. **Gate R — deterministic race rig (round 1 item 15, round 2 item 1).** A
+   single-isolate interleaving harness over: parent read, fence snapshot,
+   `phase1Mark`, global `gcMark`, P1 intent-open, P2 activity-unwind, P3 physical
+   delete, delta accounting, final CAS, index fold, prune, **and an
+   account-deletion transition** (`account-delete` step 2 dropping `blob_refs`
+   concurrent with a commit → asserts the account-deletion fallback, §3.5A item 5,
+   engages and admission ≡ full). For **every** interleaving, assert: (i)
+   intent-open against a carried (live-`blob_refs`) sha is **rejected** by the `NOT
+   EXISTS` guard — never reaching a physical delete; (ii) a published retained root
+   of a live account is present and entitled; (iii) incomplete roots disable GC
+   (fail-closed); (iv) `used_bytes` equals authoritative newly-entitled bytes; (v)
+   the roots index equals brute-force retained history.
 
 Any gate failing falsifies the design as scoped; none is a promise.
 
