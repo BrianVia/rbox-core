@@ -364,6 +364,31 @@ export class WorkspaceSync {
       return json(responsePayload, status);
     };
 
+    // Design 103 Part A: cheap best-effort staleness fast-path. Returns a finished
+    // 409 Response when the commit is ALREADY stale on arrival, else null (proceed to
+    // the authoritative CAS). Only fires under the flag; checks ONLY the two predicates
+    // the transaction's CAS also applies (parent, then epoch — same order, so a
+    // doubly-stale commit classifies `conflict`). It does NOT replicate the
+    // watermark-gap branch. `declaredRefs` is the commit's DECLARED ref count from
+    // `mode` (no sidecar fetch): the count metric stays meaningful without R2.
+    const earlyStaleReject = (declaredRefs: number): Response | null => {
+      if (this.env.RBOX_COMMIT_EARLY_REJECT !== "1") return null;
+      const head = readHead(this.ctx.storage.kv.get("head"));
+      const watermark = (this.ctx.storage.kv.get("headWatermark") as number | undefined) ?? head.sequence;
+      if (parent !== head.sequence) {
+        // Same equivocation signal the transaction path emits (audit Finding 2).
+        const sameSeqHash = commitSeq <= watermark ? this.hashForSeq(commitSeq) : undefined;
+        if (sameSeqHash && sameSeqHash !== commit.commitHash) metric(this.env, "same_sequence_different_hash");
+        return timedResponse({ error: "conflict", head: head.sequence }, 409, "conflict",
+          (o) => emit(declaredRefs)(o, { earlyReject: 1 }));
+      }
+      if (commitEpoch !== currentEpoch) {
+        return timedResponse({ error: "epoch_stale", currentEpoch }, 409, "epoch_stale",
+          (o) => emit(declaredRefs)(o, { earlyReject: 1 }));
+      }
+      return null;
+    };
+
     if (useReceipts) {
       // §23.4 + §24: resolve refs → validate (present=1+entitled OR receipt) → catalog+charge
       // +grant, all BEFORE the head advance (account-then-publish). On head 409 the accounting
@@ -378,6 +403,7 @@ export class WorkspaceSync {
           emit(accountedCount)("too_many_refs");
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
+        { const early = earlyStaleReject(mode.count); if (early) return early; }
         const sidecarStartedAt = Date.now();
         const sc = await resolveSidecarBytes(this.env, dbFor(op.env, accountId), accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
         serverTimings.sidecarMs = Date.now() - sidecarStartedAt;
@@ -400,6 +426,7 @@ export class WorkspaceSync {
           emit(accountedCount)("too_many_refs");
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
+        { const early = earlyStaleReject(mode.refShas.length); if (early) return early; }
       }
       const accountingStartedAt = Date.now();
       const v = await validateCommitRefs(this.env, dbFor(op.env, accountId), accountId, shas, receipts, nowMs);
@@ -423,6 +450,7 @@ export class WorkspaceSync {
       // so `mode` here is always inline; the guard narrows the type and is defensive.
       if (mode.kind !== "inline") return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
       shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+      { const early = earlyStaleReject(mode.refShas.length); if (early) return early; }
       const accountingStartedAt = Date.now();
       const missing = await this.missingBlobs(dbFor(op.env, accountId), shas, accountId);
       serverTimings.accountingMs = Date.now() - accountingStartedAt;

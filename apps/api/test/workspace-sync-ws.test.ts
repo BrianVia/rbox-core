@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { broadcast } from "../src/ws-fanout.js";
+import { CARRIER_REFS, MAX_REFS_PER_COMMIT } from "../src/commit-accounting.js";
 
 const sha = (ch: string) => ch.repeat(64);
 
@@ -47,6 +48,7 @@ function fakeDb(
     body?: { sequence: number; commit_hash: string; body: string; sig: string };
     failBodyRead?: boolean;
     blockMirror?: boolean;
+    missingBlobRefs?: boolean;
   } = {},
 ): D1Database {
   const makeStmt = (sql: string) => {
@@ -88,7 +90,7 @@ function fakeDb(
     batch: async (stmts: D1PreparedStatement[]) =>
       stmts.map((stmt) => {
         const s = stmt as unknown as { sql: string; args: unknown[] };
-        if (s.sql.includes("FROM blob_refs")) return { results: s.args.slice(1).map((sha256) => ({ sha256 })) };
+        if (s.sql.includes("FROM blob_refs")) return { results: rows.missingBlobRefs ? [] : s.args.slice(1).map((sha256) => ({ sha256 })) };
         return { results: [] };
       }),
   } as unknown as D1Database;
@@ -121,6 +123,41 @@ function commitReq(seq: number, hashSeed = "b") {
     method: "POST",
     headers: { "x-rbox-account": "acct_1", "x-rbox-account-epoch": "0", "content-type": "application/json" },
     body: JSON.stringify({ parentSequence: seq - 1, commit: signed(seq, hashSeed) }),
+  });
+}
+
+function customCommitReq(options: {
+  seq: number;
+  parent?: number;
+  epoch?: number;
+  currentEpoch?: number;
+  hashSeed?: string;
+  refs?: string[];
+  sidecarCount?: number;
+  receipts?: boolean;
+}) {
+  const parent = options.parent ?? options.seq - 1;
+  const cb = {
+    ...commitBody(options.seq),
+    parentSeq: parent,
+    accountEpoch: options.epoch ?? 0,
+    ...(options.sidecarCount === undefined
+      ? { blobRefs: (options.refs ?? []).map((encSha) => ({ encSha, size: 1 })) }
+      : { blobRefs: undefined, blobRefset: { sidecarSha: sha("e"), count: options.sidecarCount, totalBytes: 0 } }),
+  };
+  return new Request("https://api.test/v1/ws/ws_1/proj/root/manifests", {
+    method: "POST",
+    headers: {
+      "x-rbox-account": "acct_1",
+      "x-rbox-account-epoch": String(options.currentEpoch ?? 0),
+      "content-type": "application/json",
+      ...(options.receipts ? { "x-rbox-protocol": "upload-receipts-v1" } : {}),
+    },
+    body: JSON.stringify({
+      parentSequence: parent,
+      commit: { body: JSON.stringify(cb), commitHash: sha(options.hashSeed ?? "b"), sig: "sig" },
+      receipts: {},
+    }),
   });
 }
 
@@ -311,5 +348,96 @@ describe("workspace sync websocket fanout", () => {
     expect(fork.status).toBe(409);
     expect(await fork.json()).toMatchObject({ error: "conflict", head: 475, serverTimings: expect.any(Object) });
     expect(env.__metrics).toContain("same_sequence_different_hash");
+  });
+
+  test("design 103 early stale-parent rejection is flag-gated and identified only on the fast path", async () => {
+    const make = (enabled: boolean) => {
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1], ["seq:1", JSON.stringify(signed(1, "a"))]]);
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      return { sync: new WorkspaceSync(fakeCtx([], kv), e as never), e };
+    };
+    const on = make(true);
+    const off = make(false);
+    const [early, authoritative] = await Promise.all([
+      on.sync.fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "a" })),
+      off.sync.fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "a" })),
+    ]);
+    expect(early.status).toBe(409);
+    expect(authoritative.status).toBe(409);
+    const earlyBody = await early.json() as Record<string, unknown>;
+    const authoritativeBody = await authoritative.json() as Record<string, unknown>;
+    expect(earlyBody).toMatchObject({ error: "conflict", head: 1, serverTimings: expect.any(Object) });
+    expect(Object.keys(earlyBody)).toEqual(Object.keys(authoritativeBody));
+    expect(on.e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
+    expect(off.e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(0);
+  });
+
+  test("design 103 epoch rejection preserves parent-first precedence and the forwarded epoch snapshot", async () => {
+    // There is no non-invasive mid-route pause seam. These direct requests pin that both
+    // paths decide from the same already-forwarded x-rbox-account-epoch snapshot.
+    for (const enabled of [false, true]) {
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      const fresh = new WorkspaceSync(fakeCtx([], new Map()), e as never);
+      const epoch = await fresh.fetch(customCommitReq({ seq: 1, epoch: 0, currentEpoch: 1 }));
+      expect(epoch.status).toBe(409);
+      expect(await epoch.json()).toMatchObject({ error: "epoch_stale", currentEpoch: 1, serverTimings: expect.any(Object) });
+      expect(e.__metricPoints.find((p) => p.blobs?.[2] === "epoch_stale")?.doubles?.[15]).toBe(enabled ? 1 : 0);
+
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+      const both = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(
+        customCommitReq({ seq: 1, parent: 0, epoch: 0, currentEpoch: 1 }),
+      );
+      expect(await both.json()).toMatchObject({ error: "conflict", head: 1 });
+    }
+  });
+
+  test("design 103 keeps structural 413 ahead of stale rejection", async () => {
+    for (const enabled of [false, true]) {
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      const res = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(customCommitReq({
+        seq: 1,
+        parent: 0,
+        sidecarCount: MAX_REFS_PER_COMMIT - CARRIER_REFS + 1,
+        receipts: true,
+      }));
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({ error: "too_many_refs", count: MAX_REFS_PER_COMMIT + 1, max: MAX_REFS_PER_COMMIT });
+    }
+  });
+
+  test("design 103 reports stale before unsatisfied I/O, then reaches 422 with a fresh parent", async () => {
+    const e = { ...metricsEnv({ missingBlobRefs: true }), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const sync = new WorkspaceSync(fakeCtx([], kv), e as never);
+    const stale = await sync.fetch(customCommitReq({ seq: 1, parent: 0, refs: [sha("f")] }));
+    expect(await stale.json()).toMatchObject({ error: "conflict", head: 1 });
+    const fresh = await sync.fetch(customCommitReq({ seq: 2, parent: 1, refs: [sha("f")] }));
+    expect(fresh.status).toBe(422);
+    expect(await fresh.json()).toMatchObject({ error: "unsatisfied_blobs" });
+  });
+
+  test("design 103 rejects a stale sidecar commit before R2 admission only when enabled", async () => {
+    const request = { seq: 1, parent: 0, sidecarCount: 3, receipts: true };
+    const kv = () => new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const earlyEnv = { ...metricsEnv({ missingBlobRefs: true }), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const early = await new WorkspaceSync(fakeCtx([], kv()), earlyEnv as never).fetch(customCommitReq(request));
+
+    expect(early.status).toBe(409);
+    expect(await early.json()).toMatchObject({ error: "conflict", head: 1 });
+    expect(earlyEnv.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
+
+    const admittedEnv = metricsEnv({ missingBlobRefs: true });
+    const admitted = await new WorkspaceSync(fakeCtx([], kv()), admittedEnv as never).fetch(customCommitReq(request));
+    expect(admitted.status).toBe(422);
+  });
+
+  test("design 103 early equivocation preserves the existing signal", async () => {
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1], ["seq:1", JSON.stringify(signed(1, "a"))]]);
+    const e = { ...metricsEnv(), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const res = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "b" }));
+    expect(res.status).toBe(409);
+    expect(e.__metrics).toContain("same_sequence_different_hash");
+    expect(e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
   });
 });

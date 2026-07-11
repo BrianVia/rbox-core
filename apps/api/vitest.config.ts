@@ -60,6 +60,8 @@ export default defineWorkersConfig(async () => {
               CLERK_SECRET_KEY: "sk_test_clerk_dummy",
               RBOX_RECEIPT_KEY: "test-receipt-key-at-least-32-bytes-long-xx",
               RBOX_GRANT_KEY: "test-grant-key-at-least-32-bytes-long-xxxxx",
+              // Design 103: allow the full Workers suite to exercise early rejection.
+              ...(process.env.RBOX_COMMIT_EARLY_REJECT ? { RBOX_COMMIT_EARLY_REJECT: process.env.RBOX_COMMIT_EARLY_REJECT } : {}),
               TEST_MIGRATIONS: migrations,
             },
           },
