@@ -1,6 +1,7 @@
 # 99 — Fused byte-bounded crypto worker jobs + fewer encrypt temp passes
 
-Status: Design draft v5 (revised after REVIEW-99 rounds 1–4). Measurement-first
+Status: Design draft v6 (revised after REVIEW-99 rounds 1–5; 5-round cap
+reached, all raised items incorporated — see REVIEW-99.md). Measurement-first
 (Phase 0 gate precedes any behaviour change). Client-only. Owns the crypto
 worker pool's job granularity and the first-publish encrypt temp-file lifecycle.
 Interfaces with **design 98** (first-publish overlapping encrypt→upload
@@ -465,13 +466,14 @@ rests on the second, specified concretely — not on "structurally unchanged".
   §4.1 budget (the producer blocks dispatch when consumers hold charges).
   **`cancel()` reclaims ONLY undispatched, producer-owned charges** (Round-3
   item 2): a lease already handed to the consumer via `onReady` is
-  consumer-owned and stays charged until the consumer's own `release()` — because
-  the consumer may have an HTTP PUT already in flight over those exact bytes, and
-  reclaiming its charge would let new work reuse capacity while the bytes are
-  still live. `cancel()` therefore stops further dispatch, frees only the
-  not-yet-delivered charges, and leaves in-flight leases to settle. §10 defines
-  the lease. This is the exact async interface 98 consumes — an event stream with
-  explicit per-file lease/release and a bounded-authority cancel.
+  consumer-owned and stays charged until the consumer's own `release()` — the
+  consumer may have an HTTP PUT already in flight over those exact bytes.
+  `cancel()` stops further dispatch and, for **undispatched** groups, frees their
+  reservation immediately; a **posted/in-flight** job's `JOB_RESERVE` is retained
+  until its bytes are provably gone per §7.4's dispatch-state rule (Round-5 item
+  1). §10 defines the lease. This is the exact async interface 98 consumes — an
+  event stream with explicit per-file lease/release and a bounded-authority
+  cancel.
 
 Both share one coalescer + budget; only the delivery surface differs.
 
@@ -546,10 +548,26 @@ defer that path only; else reject that file. Siblings settle normally.
 retry tree and create **no** children. They **terminally settle** every
 unresolved producer-owned entry (reject with the existing
 `RBOX_CRYPTO_POOL_CLOSED`/a cancel error, as `close()` already does at
-`:322–327`), release the parent `JOB_RESERVE`, and stop. Consumer-owned in-flight
-leases are untouched and settle via their own `release()` (§10). This removes the
-prior contradiction between "cancellation fails the envelope → split retry" and
-"cancel stops dispatch".
+`:322–327`) and stop. Consumer-owned in-flight leases are untouched and settle
+via their own `release()` (§10).
+
+**A posted job's `JOB_RESERVE` is retained until its bytes are provably gone
+(Round-5 item 1).** Settling the caller's promise does not stop a worker that is
+already producing/transferring ciphertext, so releasing `JOB_RESERVE` on
+cancel/close would let a late result land several MiB of *uncharged* live
+ciphertext — violating the central memory invariant. Rule, by dispatch state:
+- **Undispatched** group (still in the coalescer/queue) → release `JOB_RESERVE`
+  immediately; no bytes exist.
+- **Posted / in-flight** at a worker → the reservation is held until **either**
+  the job reaches a terminal result that the pool **receives and discards**
+  (transferred buffers dropped, §6.1 step 0), **or** the worker is
+  terminated/recycled (`terminateIntentional`, `crypto-pool.ts:239–242`) and
+  termination is **confirmed** — whichever first. Only then is `JOB_RESERVE`
+  released. Since `close()` terminates all workers (`:324–328`), confirmed
+  termination is the release trigger there.
+This removes the prior contradiction between "cancellation fails the envelope →
+split retry" and "cancel stops dispatch", and closes the late-result memory
+leak.
 
 ### 7.5 Upload path for in-memory ciphertext + retry ownership (Round-1 items 4, 9)
 

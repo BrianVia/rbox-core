@@ -59,6 +59,25 @@ codex (gpt-5.6-sol). Tight residuals on the lease model + gate statistics.
 3. Cancellation wrongly enters the retry tree. → **FIXED**: split retry limited to crash-class/malformed-worker only; cancellation + orderly close terminally settle producer-owned entries, release the parent reserve, create no children (§6.3, §7.4).
 4. No-regression gates are "absence of evidence", not equivalence. → **FIXED**: gates 5/7 now use one-sided non-inferiority margins with explicit upper-CI bounds (§8).
 
-## Round 5
+## Round 5 — VERDICT: REVISE (1 item) — 5-round cap reached
 
-Status: pending (codex running).
+codex (gpt-5.6-sol). A single tight residual, with the fix spelled out:
+
+1. Cancel/close could release `JOB_RESERVE` while a **posted** worker job is
+   still producing/transferring ciphertext → a late result leaves uncharged live
+   bytes. → **FIXED (incorporated post-cap)**: dispatch-state rule — undispatched
+   groups release immediately; a posted/in-flight job retains its reserve until
+   its terminal result is received-and-discarded OR the worker is
+   terminated/recycled with confirmed termination (§7.4, §6.4).
+
+## Outcome
+
+Convergence trajectory: **18 → 7 → 7 → 4 → 1** items. The 5-round cap was
+reached. Round 5 returned a single, non-controversial correctness refinement
+(not a disagreement) with the exact protocol supplied by the reviewer; it is
+incorporated in v6. No open disagreement remains between Claude and GPT on the
+design's soundness; the substantive design decisions were stable from v4 onward,
+with rounds 4–5 tightening the memory-lease lifecycle at the edges. Remaining
+non-blocking choices are the flagged founder questions in §11 (budget size,
+primed-batch size, in-flight=1vs2, and the design-98 shared-contract ownership),
+each explicitly deferred to Phase-0 measurement or founder decision.
