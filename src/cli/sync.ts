@@ -508,6 +508,21 @@ type AttemptOutcome =
   | { done: true; result: PushResult }
   | { done: false; action: RecoveryAction; exhaustedError: string };
 
+function reuploadOutcome(committed: Manifest, blobs: readonly string[], total?: number): AttemptOutcome {
+  const unsatisfiedBlobs = [...blobs];
+  return {
+    done: false,
+    action: {
+      kind: "reupload",
+      forceGitRecapture: gitForceForMissingBlobs(committed.gitRepos, new Set(unsatisfiedBlobs)),
+      localForRetry: committed,
+      unsatisfiedTotal: total,
+      unsatisfiedBlobs,
+    },
+    exhaustedError: "push: server keeps reporting missing blobs after re-upload",
+  };
+}
+
 /**
  * Push a pre-computed manifest: upload missing blobs, commit. Short-circuits to a
  * no-op (no upload, no commit) when nothing changed vs the last-synced manifest —
@@ -711,7 +726,7 @@ async function runPushAttempt(
   // Missing or scan-mismatched sources defer immediately; ciphertext upload
   // mismatches retry within a bounded per-file budget. Only the stable subset is
   // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred, retryLater } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+  const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
@@ -726,6 +741,10 @@ async function runPushAttempt(
   // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
   // ref, no phantom deletion.
   const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+
+  if (needsUpload && needsUpload.size > 0) {
+    return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
+  }
 
   // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
   // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
@@ -777,18 +796,7 @@ async function runPushAttempt(
     // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
     // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
     // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
-    const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
-    return {
-      done: false,
-      action: {
-        kind: "reupload",
-        forceGitRecapture: gitForce,
-        localForRetry: committed,
-        unsatisfiedTotal: res.unsatisfiedTotal,
-        unsatisfiedBlobs: res.unsatisfiedBlobs ?? [],
-      },
-      exhaustedError: "push: server keeps reporting missing blobs after re-upload",
-    };
+    return reuploadOutcome(committed, res.unsatisfiedBlobs, res.unsatisfiedTotal);
   }
 
   // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the

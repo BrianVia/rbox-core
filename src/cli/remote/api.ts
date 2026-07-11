@@ -6,6 +6,8 @@ import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob } from "./blobs.js";
 import { BlobBatchDownloader, BlobBatchUploader } from "./blob-batch.js";
 import { commit, commitSigned, commitsSince, commitTimes, latest, latestCommit, type CommitOptions, type CommitResult, type LatestOptions } from "./commits.js";
+import { redeemReceipts } from "./commits.js";
+import type { ReceiptPort } from "../publish-pipeline/receipt-drainer.js";
 import { WORKSPACE_MINT_RERUN_HINT, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { fetchResilient } from "./resilient.js";
 import {
@@ -41,6 +43,8 @@ export interface SyncRemote {
     onBytes?: ByteProgressCallback
   ): Promise<void>;
   ownsUploadLaneTiming?(size: number): boolean;
+  closeUploader?(err: Error): Promise<void>;
+  receiptPort?(): ReceiptPort;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;
@@ -82,6 +86,17 @@ export class RboxApi implements SyncRemote {
 
   ownsUploadLaneTiming(size: number): boolean {
     return this.batchUploader.ownsLaneTiming(size);
+  }
+
+  closeUploader(err: Error): Promise<void> {
+    return this.batchUploader.close(err);
+  }
+
+  receiptPort(): ReceiptPort {
+    return {
+      receiptCount: () => this.ctx.receipts.size,
+      redeem: () => redeemReceipts(this.ctx),
+    };
   }
 
   getBlobToFile(sha256: string, destPath: string, expectedSize?: number): Promise<void> {

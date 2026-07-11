@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { decryptFileToPath, encryptFileToTemp, generateKek } from "./crypto.js";
+import { decryptFileToPath, encryptFileToTemp, generateKek, isSourceChangedError } from "./crypto.js";
 
 /** Regression for the concurrency race: blob upload now encrypts files through a
  *  worker-pool, so two identical-content files (same plaintextSha) encrypt at the
@@ -377,6 +377,45 @@ describe("encryptFileToTemp under concurrency", () => {
         await decryptFileToPath(b.ciphertextPath, kek, b.plaintextSha, out);
         expect(fsSync.readFileSync(out).equals(content)).toBe(true);
       }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("encryptFileToTemp expected-size snapshot cap", () => {
+  test("rejects a source that grew past the scanned size and cleans the snapshot", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-snapshot-cap-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-snapshot-cap-ct-"));
+    try {
+      const src = path.join(root, "grown.bin");
+      const scanned = Buffer.from("scanned bytes");
+      await fs.writeFile(src, Buffer.concat([scanned, Buffer.alloc(128 * 1024, 1)]));
+      const expected = { sha256: createHash("sha256").update(scanned).digest("hex"), size: scanned.length };
+      let caught: unknown;
+      try { await encryptFileToTemp(src, generateKek(), tmpDir, { expected }); } catch (error) { caught = error; }
+      expect(isSourceChangedError(caught)).toBe(true);
+      expect(await fs.readdir(tmpDir)).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("expected-size encryption is byte-identical for an unchanged source", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-snapshot-exact-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-snapshot-exact-ct-"));
+    try {
+      const src = path.join(root, "exact.bin");
+      const content = Buffer.from("unchanged expected content\n".repeat(100));
+      await fs.writeFile(src, content);
+      const kek = generateKek();
+      const legacy = await encryptFileToTemp(src, kek, tmpDir);
+      const expected = { sha256: createHash("sha256").update(content).digest("hex"), size: content.length };
+      const bounded = await encryptFileToTemp(src, kek, tmpDir, { expected });
+      expect(bounded.encSha).toBe(legacy.encSha);
+      expect((await fs.readFile(bounded.ciphertextPath)).equals(await fs.readFile(legacy.ciphertextPath))).toBe(true);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
       await fs.rm(tmpDir, { recursive: true, force: true });
