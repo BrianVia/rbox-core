@@ -334,6 +334,101 @@ defined warm-up). v1.0.0 is cited only as historical context, never as the A/B
 control. Statistical discipline per audit 1294–1301 (p50/p95/range, WAN
 serialized, control retained for A/B).
 
+### 5.5 Phase 0 results (2026-07-11)
+
+Prototype: `rig/d99-p0/` (throwaway harness, branch `impl/99-phase0-prototype`;
+spec + execution amendments in `rig/d99-p0/SPEC-P0.md`; raw data in
+`rig/d99-p0/results/`). Method: A = the real `CryptoPool`/`crypto-worker.ts`/
+`encryptFileToTempInline` path at production caller width (`workers*2`); B = a
+fused byte-bounded in-memory prototype with `CiphertextBudget`, transfer-list
+handoff, §4.2 spill, and a null sink; over-cap files (>256 KiB) kept on the
+untouched oracle temp path. Corpus: 20,000 seeded synthetic files, ~410 MB
+(99% fuse-eligible by count, 68% by bytes; 60/40 compressible/incompressible;
+100% cache-miss). Host: linux x86_64, 32 logical CPUs (Ryzen 9 5950X), ext4,
+Bun 1.3.14, workers = 16 (production `configuredWorkers()`). 5 runs × 2 passes
+(distinct corpus seeds) per cell, uniform page-cache warm, interleaved cell
+order, per-cell child processes for RSS/FD attribution, bootstrap 95% CI on
+the p50 delta. One codex adversarial pass reviewed the harness for A/B honesty
+(its first verdict, BIASED-TOWARD-B, forced the cache-warming/caller-width/
+statistics fixes recorded in SPEC-P0 §8); cross-invocation reproducibility was
+confirmed on a third independent sweep (A p50 spread ≤ ~6% across
+invocations; pass-to-pass spread up to 15%, both far below the measured
+delta).
+
+- **Determinism: PASS** — 33 boundary/property cases (empty; 128∓1; zstd
+  keep/reject ratio-edge fixtures; 64 KiB stream-chunk edges; 256 KiB∓1;
+  compressible/incompressible) byte-identical (`plaintextSha`, `payloadSha`,
+  `encSha`, `cipherSize`, `comp`, ciphertext bytes) against the untouched
+  `encryptFileToTempInline` oracle. The E2EE determinism oracle holds for the
+  in-memory fused helper.
+- **Measured A/B encrypt-wall delta (the §5.3 gate):** A p50 10,008 ms; B at
+  the selected configuration 1,318 ms → **86.8% reduction, bootstrap 95% CI
+  [84.1%, 87.7%]**, peak RSS 620 MiB vs A's 1,042 MiB (bound: A + budget +
+  32 MiB — passes with the budget entirely unused as headroom), peak FD 102
+  vs A's 130. **Fusion alone** (same 16 workers, no dispatch throttle, 96 MiB
+  budget) is **33–36%** — above the 30% bar on p50 but with the CI straddling
+  it; the decisive win needs the dispatch cap below.
+- **RAM-vs-throughput curve** (settle = 40 ms residence-modeled, inflight 1):
+
+  | Budget MiB | dispatch cap | B p50 ms | files/s | HWM MiB | spilled bytes |
+  |---:|---:|---:|---:|---:|---:|
+  | 24 | none | 1,603 | 12,436 | 24 | 110,906,521 |
+  | 48 | none | 4,360 | 4,498 | 48 | 96,776,981 |
+  | 96 | none | 6,646 | 2,909 | 82 | 0 |
+  | 192 | none | 6,172 | 3,163 | 84 | 0 |
+  | 24 | 5 | 1,301 | 15,092 | 24 | 110,946,886 |
+  | 48 | 5 | 1,365 | 14,494 | 48 | 99,999,677 |
+  | 96 | 5 | 1,341 | 14,523 | 87 | 0 |
+  | 192 | 5 | 1,321 | 15,120 | 86 | 0 |
+
+- **SELECTED `CIPHERTEXT_BUDGET_BYTES` = 96 MiB** (founder Q1): the smallest
+  swept budget that is zero-spill under settlement residence while sustaining
+  full throughput — 24/48 MiB "win" the naive curve only by starving dispatch
+  and spill ~100 MB back to disk (violating §4.2's healthy-pipeline
+  expectation), so they must not be encoded as the production constant.
+- **GATE VERDICT: GO** — ≥30% encrypt-wall reduction holds with the full 95%
+  CI above the margin at the selected configuration, and holds on p50 even for
+  fusion alone.
+
+**Findings that change the build phases:**
+
+1. **Worker-concurrency collapse (both arms; biggest finding).** On this
+   host/runtime, the encrypt lane scales NEGATIVELY with concurrent jobs:
+   control A at 16 workers is 5–6× slower than at 4 workers (13.1 s vs 1.9 s
+   on the diagnostic); uncapped B collapses the same way (8.6 s vs 1.3 s).
+   Isolated one-variable probes attribute the bulk to **concurrent streaming
+   zstd** (`createZstdCompress` pipelines): in-worker microbenches show
+   stream-zstd at 16 workers = 2,151 ms vs **118 ms for `zstdCompressSync`**
+   (~18×, positively scaling), while no-compression drops to 81 ms.
+   Finding 7's premise (per-job/postMessage overhead) is real but NOT the
+   dominant residual here — concurrency contention is. Phase 1 MUST include a
+   **global fused-dispatch bound** (measured optimum ~4–6 concurrent jobs;
+   sweep on the pinned control) in the §6.3 coalescer dispatch policy; with it,
+   every budget ≥96 MiB delivers ~87%.
+2. **Budget and dispatch concurrency are separate knobs.** The first sweep
+   conflated them (small budgets looked fastest only because `JOB_RESERVE`
+   blocking throttled dispatch). With the cap in place the budget's only
+   remaining role is §4.1 residence headroom — exactly what §4 designed it
+   for — and 96 MiB is comfortably sufficient (HWM 87 MiB at 40 ms settle).
+3. **Sync-zstd is a large, separate opportunity that BREAKS address
+   stability.** `zstdCompressSync` cannot reproduce streaming bytes (probed:
+   frame-header window descriptor differs, and block decisions diverge on
+   mixed content and ≥128 KiB inputs even with `contentSizeFlag=0`; Bun
+   ignores `windowLog`). Adopting it would change `payloadSha`/`encSha` for
+   every compressed blob → convergent-address churn and a one-time fleet-wide
+   re-upload. Do NOT fold into design 99 (its §7.1 oracle forbids it); flag as
+   a separate founder decision (new design: sync/pooled compression with an
+   address-migration story, or upstreaming a pledged-window streaming mode).
+4. **Founder Q3 (in-flight 1 vs 2):** measured marginal (1,501 vs 1,433 ms at
+   the throughput-optimal cell in the second sweep) — keep **1** for the clean
+   §7.2 retention bound.
+5. **Caveats / owed to Phase 2:** warm-cache evidence only (no drop_caches
+   privilege on this host — §5.3's cold runs are NOT yet satisfied); single
+   host, ext4 + Bun 1.3.14; §5.4 demands the pinned control re-run on the
+   fleet (APFS + ext4) before §8 gates are evaluated. The contention finding
+   (#1) especially needs macOS confirmation, where the zstd threadpool
+   behavior may differ.
+
 ## 6. Phase 1 — implementation seam
 
 ### 6.1 Protocol (`crypto-worker-protocol.ts`) + completeness rules
