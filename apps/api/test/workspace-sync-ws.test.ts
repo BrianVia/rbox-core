@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { broadcast } from "../src/ws-fanout.js";
+import { CARRIER_REFS, MAX_REFS_PER_COMMIT } from "../src/commit-accounting.js";
 
 const sha = (ch: string) => ch.repeat(64);
 
@@ -47,6 +48,10 @@ function fakeDb(
     body?: { sequence: number; commit_hash: string; body: string; sig: string };
     failBodyRead?: boolean;
     blockMirror?: boolean;
+    missingBlobRefs?: boolean;
+    missingBlobSha?: string;
+    entitledBlobRefs?: boolean;
+    onFirstBatch?: () => void;
   } = {},
 ): D1Database {
   const makeStmt = (sql: string) => {
@@ -62,6 +67,7 @@ function fakeDb(
           if (rows.failBodyRead) throw new Error("body read failed");
           return rows.body ?? null;
         }
+        if (rows.entitledBlobRefs && sql.includes("FROM blob_refs")) return { 1: 1 };
         return null;
       },
       run: async () => {
@@ -85,12 +91,22 @@ function fakeDb(
 
   return {
     prepare: makeStmt,
-    batch: async (stmts: D1PreparedStatement[]) =>
-      stmts.map((stmt) => {
+    batch: async (stmts: D1PreparedStatement[]) => {
+      const onFirstBatch = rows.onFirstBatch;
+      rows.onFirstBatch = undefined;
+      onFirstBatch?.();
+      return stmts.map((stmt) => {
         const s = stmt as unknown as { sql: string; args: unknown[] };
-        if (s.sql.includes("FROM blob_refs")) return { results: s.args.slice(1).map((sha256) => ({ sha256 })) };
+        if (s.sql.includes("FROM blob_refs")) {
+          return {
+            results: rows.missingBlobRefs
+              ? []
+              : s.args.slice(1).filter((sha256) => sha256 !== rows.missingBlobSha).map((sha256) => ({ sha256 })),
+          };
+        }
         return { results: [] };
-      }),
+      });
+    },
   } as unknown as D1Database;
 }
 
@@ -124,6 +140,41 @@ function commitReq(seq: number, hashSeed = "b") {
   });
 }
 
+function customCommitReq(options: {
+  seq: number;
+  parent?: number;
+  epoch?: number;
+  currentEpoch?: number;
+  hashSeed?: string;
+  refs?: string[];
+  sidecarCount?: number;
+  receipts?: boolean;
+}) {
+  const parent = options.parent ?? options.seq - 1;
+  const cb = {
+    ...commitBody(options.seq),
+    parentSeq: parent,
+    accountEpoch: options.epoch ?? 0,
+    ...(options.sidecarCount === undefined
+      ? { blobRefs: (options.refs ?? []).map((encSha) => ({ encSha, size: 1 })) }
+      : { blobRefs: undefined, blobRefset: { sidecarSha: sha("e"), count: options.sidecarCount, totalBytes: 0 } }),
+  };
+  return new Request("https://api.test/v1/ws/ws_1/proj/root/manifests", {
+    method: "POST",
+    headers: {
+      "x-rbox-account": "acct_1",
+      "x-rbox-account-epoch": String(options.currentEpoch ?? 0),
+      "content-type": "application/json",
+      ...(options.receipts ? { "x-rbox-protocol": "upload-receipts-v1" } : {}),
+    },
+    body: JSON.stringify({
+      parentSequence: parent,
+      commit: { body: JSON.stringify(cb), commitHash: sha(options.hashSeed ?? "b"), sig: "sig" },
+      receipts: {},
+    }),
+  });
+}
+
 function metricsEnv(rows: Parameters<typeof fakeDb>[2] = {}) {
   const metrics: string[] = [];
   const metricPoints: Array<{ blobs?: string[]; doubles?: number[] }> = [];
@@ -140,7 +191,55 @@ function metricsEnv(rows: Parameters<typeof fakeDb>[2] = {}) {
   };
 }
 
+const SERVER_TIMING_KEYS = [
+  "totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs",
+];
+
+function expectServerTimings(body: Record<string, unknown>) {
+  // Pinned drift detector for the client parser in src/cli/remote/commits.ts (SERVER_TIMING_KEYS).
+  const timings = body.serverTimings as Record<string, unknown>;
+  expect(Object.keys(timings)).toEqual(SERVER_TIMING_KEYS);
+  expect(Object.values(timings).every(
+    (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+  )).toBe(true);
+}
+
 describe("workspace sync websocket fanout", () => {
+  test("full admission rejects a lost carried ref even when another ref is introduced", async () => {
+    const introduced = sha("c");
+    const carriedNowAbsent = sha("d");
+    // carried = present in the parent (seq 1) refset; a design-102 narrowed admission that
+    // skips parent-carried refs would advance the head here and fail this pin loudly.
+    const e = metricsEnv({ missingBlobSha: carriedNowAbsent });
+    const parent = {
+      ...signed(1, "a"),
+      body: JSON.stringify({
+        ...commitBody(1, "a"),
+        blobRefs: [{ encSha: carriedNowAbsent, size: 1 }],
+      }),
+    };
+    const ctx = fakeCtx([], new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("a") }],
+      ["headWatermark", 1],
+      ["seq:1", JSON.stringify(parent)],
+    ]));
+
+    const res = await new WorkspaceSync(ctx, e as never).fetch(customCommitReq({
+      seq: 2,
+      parent: 1,
+      refs: [introduced, carriedNowAbsent],
+      receipts: true,
+    }));
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({
+      error: "unsatisfied_blobs",
+      missing: [carriedNowAbsent],
+      missingTotal: 1,
+    });
+    expect(ctx.__kv.get("head")).toMatchObject({ sequence: 1 });
+  });
+
   test("broadcast echoes committed frames to the originating device too", () => {
     const sent: string[] = [];
     const sockets = [
@@ -311,5 +410,153 @@ describe("workspace sync websocket fanout", () => {
     expect(fork.status).toBe(409);
     expect(await fork.json()).toMatchObject({ error: "conflict", head: 475, serverTimings: expect.any(Object) });
     expect(env.__metrics).toContain("same_sequence_different_hash");
+  });
+
+  test("design 103 early stale-parent rejection is flag-gated and identified only on the fast path", async () => {
+    const make = (enabled: boolean) => {
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1], ["seq:1", JSON.stringify(signed(1, "a"))]]);
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      return { sync: new WorkspaceSync(fakeCtx([], kv), e as never), e };
+    };
+    const on = make(true);
+    const off = make(false);
+    const [early, authoritative] = await Promise.all([
+      on.sync.fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "a" })),
+      off.sync.fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "a" })),
+    ]);
+    expect(early.status).toBe(409);
+    expect(authoritative.status).toBe(409);
+    const earlyBody = await early.json() as Record<string, unknown>;
+    const authoritativeBody = await authoritative.json() as Record<string, unknown>;
+    expect(earlyBody).toMatchObject({ error: "conflict", head: 1, serverTimings: expect.any(Object) });
+    expect(Object.keys(earlyBody)).toEqual(Object.keys(authoritativeBody));
+    expect(Object.keys(earlyBody)).toEqual(["error", "head", "serverTimings"]);
+    expectServerTimings(earlyBody);
+    expectServerTimings(authoritativeBody);
+    expect(on.e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
+    expect(off.e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(0);
+  });
+
+  test("design 103 epoch rejection preserves parent-first precedence and the forwarded epoch snapshot", async () => {
+    // There is no non-invasive mid-route pause seam. These direct requests pin that both
+    // paths decide from the same already-forwarded x-rbox-account-epoch snapshot.
+    const bodies: Record<string, unknown>[] = [];
+    for (const enabled of [false, true]) {
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      const fresh = new WorkspaceSync(fakeCtx([], new Map()), e as never);
+      const epoch = await fresh.fetch(customCommitReq({ seq: 1, epoch: 0, currentEpoch: 1 }));
+      expect(epoch.status).toBe(409);
+      const epochBody = await epoch.json() as Record<string, unknown>;
+      expect(epochBody).toMatchObject({ error: "epoch_stale", currentEpoch: 1, serverTimings: expect.any(Object) });
+      expect(Object.keys(epochBody)).toEqual(["error", "currentEpoch", "serverTimings"]);
+      expectServerTimings(epochBody);
+      bodies.push(epochBody);
+      expect(e.__metricPoints.find((p) => p.blobs?.[2] === "epoch_stale")?.doubles?.[15]).toBe(enabled ? 1 : 0);
+
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+      const both = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(
+        customCommitReq({ seq: 1, parent: 0, epoch: 0, currentEpoch: 1 }),
+      );
+      expect(await both.json()).toMatchObject({ error: "conflict", head: 1 });
+    }
+    expect(Object.keys(bodies[0]!)).toEqual(Object.keys(bodies[1]!));
+  });
+
+  test("design 103 authoritative CAS catches a mid-flight head advance", async () => {
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const e = metricsEnv({
+      onFirstBatch: () => {
+        kv.set("head", { sequence: 2, commitHash: sha("b") });
+        kv.set("headWatermark", 2);
+      },
+    });
+    const env = { ...e, RBOX_COMMIT_EARLY_REJECT: "1" };
+    const res = await new WorkspaceSync(fakeCtx([], kv), env as never).fetch(
+      customCommitReq({ seq: 2, parent: 1, receipts: true }),
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "conflict", head: 2 });
+    expect(env.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(0);
+  });
+
+  test("design 103 watermark gaps remain transaction-only conflicts", async () => {
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 5]]);
+    const env = { ...metricsEnv(), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const res = await new WorkspaceSync(fakeCtx([], kv), env as never).fetch(
+      customCommitReq({ seq: 2, parent: 1, receipts: true }),
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "conflict", head: 1 });
+    expect(env.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(0);
+  });
+
+  test("design 103 keeps structural 413 ahead of stale rejection", async () => {
+    for (const enabled of [false, true]) {
+      const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+      const e = { ...metricsEnv(), ...(enabled ? { RBOX_COMMIT_EARLY_REJECT: "1" } : {}) };
+      const res = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(customCommitReq({
+        seq: 1,
+        parent: 0,
+        sidecarCount: MAX_REFS_PER_COMMIT - CARRIER_REFS + 1,
+        receipts: true,
+      }));
+      expect(res.status).toBe(413);
+      expect(await res.json()).toEqual({ error: "too_many_refs", count: MAX_REFS_PER_COMMIT + 1, max: MAX_REFS_PER_COMMIT });
+    }
+  });
+
+  test("design 103 reports stale before unsatisfied I/O, then reaches 422 with a fresh parent", async () => {
+    const e = { ...metricsEnv({ missingBlobRefs: true }), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const sync = new WorkspaceSync(fakeCtx([], kv), e as never);
+    const stale = await sync.fetch(customCommitReq({ seq: 1, parent: 0, refs: [sha("f")] }));
+    expect(await stale.json()).toMatchObject({ error: "conflict", head: 1 });
+    const fresh = await sync.fetch(customCommitReq({ seq: 2, parent: 1, refs: [sha("f")] }));
+    expect(fresh.status).toBe(422);
+    expect(await fresh.json()).toMatchObject({ error: "unsatisfied_blobs" });
+  });
+
+  test("design 103 rejects a stale sidecar commit before R2 admission only when enabled", async () => {
+    const request = { seq: 1, parent: 0, sidecarCount: 3, receipts: true };
+    const kv = () => new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const untouchedR2 = new Proxy({}, { get() { throw new Error("R2 touched"); } });
+    const earlyEnv = { ...metricsEnv({ missingBlobRefs: true }), rbox_dev_blobs: untouchedR2, RBOX_COMMIT_EARLY_REJECT: "1" };
+    const early = await new WorkspaceSync(fakeCtx([], kv()), earlyEnv as never).fetch(customCommitReq(request));
+
+    expect(early.status).toBe(409);
+    expect(await early.json()).toMatchObject({ error: "conflict", head: 1 });
+    expect(earlyEnv.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
+
+    const admittedEnv = metricsEnv({ missingBlobRefs: true });
+    const admitted = await new WorkspaceSync(fakeCtx([], kv()), admittedEnv as never).fetch(customCommitReq(request));
+    expect(admitted.status).toBe(422);
+  });
+
+  test("design 103 stale bad sidecar reports conflict before bad_sidecar", async () => {
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1]]);
+    const garbage = new Uint8Array(18 + 40 * 3);
+    const env = {
+      ...metricsEnv({ entitledBlobRefs: true }),
+      RBOX_COMMIT_EARLY_REJECT: "1",
+      rbox_dev_blobs: { get: async () => ({ size: garbage.byteLength, arrayBuffer: async () => garbage.buffer }) },
+    };
+    const sync = new WorkspaceSync(fakeCtx([], kv), env as never);
+
+    const stale = await sync.fetch(customCommitReq({ seq: 1, parent: 0, sidecarCount: 3, receipts: true }));
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: "conflict", head: 1 });
+
+    const fresh = await sync.fetch(customCommitReq({ seq: 2, parent: 1, sidecarCount: 3, receipts: true }));
+    expect(fresh.status).toBe(400);
+    expect(await fresh.json()).toMatchObject({ error: "bad_sidecar" });
+  });
+
+  test("design 103 early equivocation preserves the existing signal", async () => {
+    const kv = new Map<string, unknown>([["head", { sequence: 1, commitHash: sha("a") }], ["headWatermark", 1], ["seq:1", JSON.stringify(signed(1, "a"))]]);
+    const e = { ...metricsEnv(), RBOX_COMMIT_EARLY_REJECT: "1" };
+    const res = await new WorkspaceSync(fakeCtx([], kv), e as never).fetch(customCommitReq({ seq: 1, parent: 0, hashSeed: "b" }));
+    expect(res.status).toBe(409);
+    expect(e.__metrics).toContain("same_sequence_different_hash");
+    expect(e.__metricPoints.find((p) => p.blobs?.[2] === "conflict")?.doubles?.[15]).toBe(1);
   });
 });

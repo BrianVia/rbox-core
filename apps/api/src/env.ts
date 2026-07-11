@@ -49,6 +49,11 @@ export interface Env {
   /** Design 95 Phase-2 cron kill switch. Defaults to "1" in every deployed env;
    *  the platform-admin drain remains available while scheduled purge is disabled. */
   RBOX_GC_PURGE_DISABLED?: string;
+  /** Design 103 Part A. When "1", the commit DO runs a cheap synchronous
+   *  parent/epoch preflight (before sidecar/D1 I/O) and early-returns the same
+   *  409 the final CAS would. Unset/"0" → today's behavior (no early return).
+   *  Rollback = flip the flag; no schema, no migration. */
+  RBOX_COMMIT_EARLY_REJECT?: string;
   /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
    *  in local bun tests and until the queue is provisioned — enqueue then no-ops and the
    *  cron backstop drives delivery off the durable outbox instead. */

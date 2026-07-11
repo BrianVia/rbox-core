@@ -44,6 +44,7 @@ import type { Env } from "./env.js";
  *    double7 = ratio        (0..1, e.g. missingBlobs / referenced)
  *    double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
  *    double9..15 = commit server total/envelope/accounting/sidecar/CAS/mirror/response ms
+ *    double16 = earlyReject   (1 only when design-103's commit preflight rejects)
  */
 export interface MetricEvent {
   /** Low-cardinality op name, e.g. "request" | "commit" | "blob.put". */
@@ -77,6 +78,8 @@ export interface MetricEvent {
   commitMs?: number;
   mirrorMs?: number;
   responseMs?: number;
+  /** Design 103 Part A commit preflight fired. Numeric and low-cardinality. */
+  earlyReject?: number;
 }
 
 export function emit(env: Env, e: MetricEvent): void {
@@ -92,6 +95,7 @@ export function emit(env: Env, e: MetricEvent): void {
         e.bytes ?? 0, e.count ?? 0, e.ratio ?? 0, e.dbCalls ?? 0,
         e.serverTotalMs ?? 0, e.envelopeMs ?? 0, e.accountingMs ?? 0,
         e.sidecarMs ?? 0, e.commitMs ?? 0, e.mirrorMs ?? 0, e.responseMs ?? 0,
+        e.earlyReject ?? 0,
       ],
     });
   } catch {

@@ -465,7 +465,23 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; r
 type RecoveryAction =
   | { kind: "pull-first" }
   | { kind: "epoch-stale" }
-  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number };
+  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[] };
+
+const RECOVER_ACCUM_MAX = 100_000;
+
+/** Design 103 Part B: fold one 422 page into the recovery accumulator. Returns the
+ *  new full-audit latch state. Once latched (or newly overflowing RECOVER_ACCUM_MAX)
+ *  the set is cleared and stays empty — the chunked full audit needs no recovery set,
+ *  and holding 100k+ strings would be dead weight (unit-tested memory bound). */
+export function accumulateRecoveryPage(accum: Set<string>, latched: boolean, page: readonly string[]): boolean {
+  if (latched) return true;
+  for (const sha of page) accum.add(sha);
+  if (accum.size > RECOVER_ACCUM_MAX) {
+    accum.clear();
+    return true;
+  }
+  return false;
+}
 
 /** The result of ONE push attempt: either done (committed / no-op / everything deferred),
  *  or a classified recovery to apply, carrying the error to throw once the shared
@@ -508,9 +524,11 @@ export async function pushManifest(
   let currentLocal = local;
   let currentForce = forceGitRecapture;
   let previousUnsatisfiedTotal: number | undefined;
+  const recoverAccum = new Set<string>();
+  let recoverFullAudit = false;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce);
+    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) process.stderr.write(`${lane}\n`);
@@ -525,17 +543,21 @@ export async function pushManifest(
     // Shared budget: throw once we've exhausted MAX_ATTEMPTS (the just-failed attempt is
     // `attempt`), matching the original recursion's throw-before-retry ordering.
     if (consumesAttempt && attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
-    if (outcome.action.kind === "pull-first") {
-      await backoff(attempt);
-      await pull(root, cfg, deps);
+    if (outcome.action.kind !== "reupload") {
+      if (outcome.action.kind === "pull-first") {
+        await backoff(attempt);
+        await pull(root, cfg, deps);
+      } else {
+        await refreshWriteContext(cfg, deps);
+      }
       currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored); // disk changed under us
       currentForce = NO_GIT_FORCE;
-    } else if (outcome.action.kind === "epoch-stale") {
-      await refreshWriteContext(cfg, deps);
-      currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored);
-      currentForce = NO_GIT_FORCE;
+      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
+      recoverAccum.clear();
+      recoverFullAudit = false;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
+      recoverFullAudit = accumulateRecoveryPage(recoverAccum, recoverFullAudit, outcome.action.unsatisfiedBlobs);
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
     }
@@ -556,7 +578,9 @@ async function runPushAttempt(
   deps: SyncDeps,
   backoff: (attempt: number) => Promise<void>,
   purgeIgnored: boolean,
-  forceGitRecapture: ReadonlySet<string>
+  forceGitRecapture: ReadonlySet<string>,
+  recoverAddresses: ReadonlySet<string>,
+  forceFullAudit: boolean
 ): Promise<AttemptOutcome> {
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
@@ -673,6 +697,8 @@ async function runPushAttempt(
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
+    recoverAddresses,
+    forceFullAudit,
   });
 
   // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
@@ -736,7 +762,13 @@ async function runPushAttempt(
     const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
     return {
       done: false,
-      action: { kind: "reupload", forceGitRecapture: gitForce, localForRetry: committed, unsatisfiedTotal: res.unsatisfiedTotal },
+      action: {
+        kind: "reupload",
+        forceGitRecapture: gitForce,
+        localForRetry: committed,
+        unsatisfiedTotal: res.unsatisfiedTotal,
+        unsatisfiedBlobs: res.unsatisfiedBlobs ?? [],
+      },
       exhaustedError: "push: server keeps reporting missing blobs after re-upload",
     };
   }

@@ -5,7 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
+import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
+import { missingBlobsChunked } from "./sync-recovery.js";
 import type { WorkspaceConfig } from "./config.js";
 import { loadState, saveState, syncStreamId } from "./config.js";
 import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
@@ -92,6 +93,7 @@ class FakeRemote implements SyncRemote {
   forceUnsatisfiedOnce = false;
   forceUnsatisfiedTotals: number[] = [];
   forceUnsatisfiedPageSize = 1;
+  missingBlobCalls: string[][] = [];
   beforeCommit?: () => Promise<void>;
   // Live-folder TOCTOU simulation: reject a given encSha's PUT with a 400 sha_mismatch
   // (as R2 does when the streamed ciphertext no longer hashes to the declared encSha).
@@ -122,12 +124,17 @@ class FakeRemote implements SyncRemote {
   hasBlob(encSha: string): boolean {
     return this.blobs.has(encSha);
   }
+  deleteBlob(encSha: string): void {
+    this.blobs.delete(encSha);
+  }
 
   async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
     options?.onLatestTimings?.({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4 });
     return { sequence: this.head, manifest: this.log.get(this.head) ?? { generatedAt: "", files: [] } };
   }
   async missingBlobs(shas: string[]): Promise<string[]> {
+    if (shas.length === 0) return [];
+    this.missingBlobCalls.push([...shas]);
     return shas.filter((s) => !this.blobs.has(s));
   }
   async putBlobFile(sha256: string, absPath: string): Promise<void> {
@@ -156,7 +163,9 @@ class FakeRemote implements SyncRemote {
     }
     if (this.forceUnsatisfiedOnce) {
       this.forceUnsatisfiedOnce = false;
-      return { unsatisfiedBlobs: manifest.files.filter((f) => f.type === "file").map(addr) };
+      const unsatisfiedBlobs = manifest.files.filter((f) => f.type === "file").map(addr);
+      for (const sha of unsatisfiedBlobs) this.blobs.delete(sha);
+      return { unsatisfiedBlobs };
     }
     options?.onCommitTimings?.({
       refreshMs: 1,
@@ -200,10 +209,14 @@ class FakeRemote implements SyncRemote {
 
 let root: string;
 let cfg: WorkspaceConfig;
+let savedPreflightDelta: string | undefined;
+let savedPreflightFull: string | undefined;
 const noBackoff = async () => {};
 const deps = (remote: SyncRemote): SyncDeps => ({ remote, backoff: noBackoff });
 
 beforeEach(async () => {
+  savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
+  savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   // E2EE is the only mode (D6): a workspace always has an encryption key.
@@ -222,6 +235,10 @@ beforeEach(async () => {
   };
 });
 afterEach(async () => {
+  if (savedPreflightDelta === undefined) delete process.env.RBOX_PREFLIGHT_DELTA;
+  else process.env.RBOX_PREFLIGHT_DELTA = savedPreflightDelta;
+  if (savedPreflightFull === undefined) delete process.env.RBOX_PREFLIGHT_FULL;
+  else process.env.RBOX_PREFLIGHT_FULL = savedPreflightFull;
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -594,6 +611,265 @@ test("422 unsatisfied blobs: client re-uploads and retries to success", async ()
   const { sequence: seq } = await push(root, cfg, deps(remote));
   expect(seq).toBe(1);
   expect(remote.commitCalls).toBe(2); // 422 then success
+});
+
+test("delta preflight threads the unsatisfied address through a 422 retry", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const address = (await enc("payload\n")).encSha;
+  remote.forceUnsatisfiedOnce = true;
+
+  const { sequence } = await push(root, cfg, deps(remote));
+
+  expect(sequence).toBe(1);
+  expect(remote.commitCalls).toBe(2);
+  expect(remote.missingBlobCalls.filter((call) => call.includes(address))).toHaveLength(2);
+});
+
+test("delta preflight recovers a lost carried ref reported by full commit admission", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("carried.txt", "base\n");
+  await push(root, cfg, deps(remote));
+  const carriedAddress = (await enc("base\n")).encSha;
+  remote.deleteBlob(carriedAddress);
+  remote.missingBlobCalls.length = 0;
+  await write("changed.txt", "new\n");
+
+  const { sequence } = await push(root, cfg, deps(remote));
+
+  expect(sequence).toBe(2);
+  expect(remote.missingBlobCalls[0]).not.toContain(carriedAddress);
+  expect(remote.missingBlobCalls.slice(1).some((call) => call.includes(carriedAddress))).toBe(true);
+  expect(remote.hasBlob(carriedAddress)).toBe(true);
+});
+
+test("delta preflight sends only the unique introduced address", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("carried.txt", "base\n");
+  await push(root, cfg, deps(remote));
+  remote.missingBlobCalls.length = 0;
+  await write("changed.txt", "new\n");
+
+  await push(root, cfg, deps(remote));
+
+  expect(remote.missingBlobCalls).toEqual([[(await enc("new\n")).encSha]]);
+});
+
+test("delta git-identity-only commit sends no blob-preflight request", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  cfg = { ...cfg, syncGit: true };
+  await exec("git", ["init", "-q", "-b", "main"], { cwd: root });
+  await exec("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+  await exec("git", ["config", "user.name", "Test"], { cwd: root });
+  await write("tracked.txt", "unchanged\n");
+  await exec("git", ["add", "tracked.txt"], { cwd: root });
+  await exec("git", ["commit", "-qm", "base"], { cwd: root });
+  await push(root, cfg, deps(remote));
+  remote.missingBlobCalls.length = 0;
+  await exec("git", ["commit", "--allow-empty", "-qm", "identity only"], { cwd: root });
+
+  const result = await push(root, cfg, deps(remote));
+
+  expect(result.committed).toBe(true);
+  expect(result.sequence).toBe(2);
+  expect(remote.missingBlobCalls).toEqual([]);
+});
+
+test("flag-off preflight preserves manifest order and duplicate addresses", async () => {
+  delete process.env.RBOX_PREFLIGHT_DELTA;
+  delete process.env.RBOX_PREFLIGHT_FULL;
+  const remote = new FakeRemote();
+  await write("a.txt", "same\n");
+  await write("b.txt", "same\n");
+  await write("c.txt", "different\n");
+  const local = await scanManifest(root);
+
+  await pushManifest(root, cfg, local, deps(remote));
+
+  expect(remote.missingBlobCalls[0]).toEqual(local.files.filter((f) => f.type === "file").map((f) => f.encSha!));
+  expect(remote.missingBlobCalls[0]).toEqual([(await enc("same\n")).encSha, (await enc("same\n")).encSha, (await enc("different\n")).encSha]);
+});
+
+test("full preflight without delta checks the full deduped address set", async () => {
+  delete process.env.RBOX_PREFLIGHT_DELTA;
+  process.env.RBOX_PREFLIGHT_FULL = "1";
+  const remote = new FakeRemote();
+  await write("a.txt", "same\n");
+  await write("b.txt", "same\n");
+  await write("c.txt", "different\n");
+
+  const { committed } = await push(root, cfg, deps(remote));
+
+  expect(committed).toBe(true);
+  expect(remote.missingBlobCalls).toEqual([[(await enc("same\n")).encSha, (await enc("different\n")).encSha]]);
+});
+
+test("full preflight wins when both full and delta flags are enabled", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  process.env.RBOX_PREFLIGHT_FULL = "1";
+  const remote = new FakeRemote();
+  await write("carried.txt", "base\n");
+  await push(root, cfg, deps(remote));
+  remote.missingBlobCalls.length = 0;
+  await write("changed.txt", "new\n");
+
+  await push(root, cfg, deps(remote));
+
+  expect(remote.missingBlobCalls).toEqual([[(await enc("base\n")).encSha, (await enc("new\n")).encSha]]);
+});
+
+test("delta recovery clears accumulated 422 pages after a conflict pull", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const synthetic = [sha("discarded-conflict-a"), sha("discarded-conflict-b")];
+  const originalCommit = remote.commit.bind(remote);
+  let commit = 0;
+  let callsBeforeConflict = -1;
+  remote.commit = async (...args) => {
+    commit++;
+    if (commit === 1) return { unsatisfiedBlobs: synthetic, unsatisfiedTotal: synthetic.length };
+    if (commit === 2) {
+      remote.injectCommit([await remote.seedEntry("theirs.txt", "theirs\n")]);
+      callsBeforeConflict = remote.missingBlobCalls.length;
+      return originalCommit(...args);
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(committed).toBe(true);
+  expect(sequence).toBe(2);
+  expect(remote.missingBlobCalls[callsBeforeConflict]).not.toContain(synthetic[0]);
+  expect(remote.missingBlobCalls[callsBeforeConflict]).not.toContain(synthetic[1]);
+});
+
+test("delta recovery clears accumulated 422 pages after an epoch refresh", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote() as FakeRemote & {
+    currentKek: () => Promise<{ kek: Uint8Array; accountId: string; accountEpoch: number; keyEpoch: number }>;
+  };
+  remote.currentKek = async () => ({ kek: KEK, accountId: cfg.accountId!, accountEpoch: cfg.accountEpoch!, keyEpoch: cfg.keyEpoch! });
+  await write("x.txt", "payload\n");
+  const synthetic = [sha("discarded-epoch-a"), sha("discarded-epoch-b")];
+  const originalCommit = remote.commit.bind(remote);
+  let commit = 0;
+  let callsBeforeEpochRefresh = -1;
+  remote.commit = async (...args) => {
+    commit++;
+    if (commit === 1) return { unsatisfiedBlobs: synthetic, unsatisfiedTotal: synthetic.length };
+    if (commit === 2) {
+      callsBeforeEpochRefresh = remote.missingBlobCalls.length;
+      return { epochStale: cfg.accountEpoch! + 1 };
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(committed).toBe(true);
+  expect(sequence).toBe(1);
+  expect(remote.missingBlobCalls[callsBeforeEpochRefresh]).not.toContain(synthetic[0]);
+  expect(remote.missingBlobCalls[callsBeforeEpochRefresh]).not.toContain(synthetic[1]);
+});
+
+test("delta recovery retries with the distinct union of sequential 422 pages", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const address = (await enc("payload\n")).encSha;
+  const page1 = [sha("page-1-a"), sha("page-1-b")];
+  const page2 = [sha("page-2-a"), sha("page-2-b")];
+  const originalCommit = remote.commit.bind(remote);
+  let page = 0;
+  remote.commit = async (...args) => {
+    if (page === 0) {
+      page++;
+      return { unsatisfiedBlobs: page1, unsatisfiedTotal: 4 };
+    }
+    if (page === 1) {
+      page++;
+      return { unsatisfiedBlobs: page2, unsatisfiedTotal: 2 };
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(sequence).toBe(1);
+  expect(committed).toBe(true);
+  const expected = new Set([address, ...page1, ...page2]);
+  expect(remote.missingBlobCalls.some((call) => call.length === expected.size && call.every((sha) => expected.has(sha)))).toBe(true);
+});
+
+test("delta recovery accumulator overflow switches the retry to a full audit", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  const remote = new FakeRemote();
+  await write("carried.txt", "base\n");
+  await push(root, cfg, deps(remote));
+  const carriedAddress = (await enc("base\n")).encSha;
+  remote.missingBlobCalls.length = 0;
+  await write("changed.txt", "new\n");
+  const originalCommit = remote.commit.bind(remote);
+  const overflowPages = Array.from({ length: 11 }, (_, page) =>
+    Array.from({ length: 10_000 }, (_, index) => `recovery-p${page}-i${index}`)
+  );
+  const postOverflowPage = ["post-overflow-a", "post-overflow-b"];
+  const pages = [...overflowPages, postOverflowPage];
+  let nextPage = 0;
+  remote.commit = async (...args) => {
+    if (nextPage < pages.length) {
+      const unsatisfiedBlobs = pages[nextPage];
+      const unsatisfiedTotal = 130_000 - nextPage * 10_000;
+      nextPage++;
+      return { unsatisfiedBlobs, unsatisfiedTotal };
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(sequence).toBe(2);
+  expect(committed).toBe(true);
+  const postOverflowPreflight = remote.missingBlobCalls.at(-1)!;
+  expect(postOverflowPreflight).toContain(carriedAddress);
+  expect(pages.flat().some((synthetic) => postOverflowPreflight.includes(synthetic))).toBe(false);
+});
+
+test("accumulateRecoveryPage clears on overflow and stays empty while latched", () => {
+  const accum = new Set<string>();
+
+  expect(accumulateRecoveryPage(accum, false, ["a", "b"])).toBe(false);
+  expect(accum).toEqual(new Set(["a", "b"]));
+
+  const overflowPage = Array.from({ length: 100_001 }, (_, index) => `recovery-${index}`);
+  expect(accumulateRecoveryPage(accum, false, overflowPage)).toBe(true);
+  expect(accum.size).toBe(0);
+
+  expect(accumulateRecoveryPage(accum, true, ["post-overflow"])).toBe(true);
+  expect(accum.size).toBe(0);
+});
+
+test("missingBlobsChunked splits checks at 50,000 and unions missing results", async () => {
+  const shas = Array.from({ length: 50_001 }, (_, i) => `chunk-${i}`);
+  const calls: string[][] = [];
+  const expected = [shas[0], shas[49_999], shas[50_000]];
+  const api = {
+    async missingBlobs(batch: string[]) {
+      calls.push([...batch]);
+      return batch.filter((address) => expected.includes(address));
+    },
+  } as Pick<SyncRemote, "missingBlobs"> as SyncRemote;
+
+  const missing = await missingBlobsChunked(api, shas);
+
+  expect(calls.map((call) => call.length)).toEqual([50_000, 1]);
+  expect(new Set(missing)).toEqual(new Set(expected));
 });
 
 test("422 decreasing missingTotal pages can progress beyond the fixed retry budget", async () => {
