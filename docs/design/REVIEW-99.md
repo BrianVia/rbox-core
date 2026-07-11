@@ -25,3 +25,19 @@ codex (gpt-5.6-sol, read-only). Summary of items and disposition:
 16. Determinism coverage incomplete. → **FIXED**: property/mutation-schedule matrix; eligibility revalidated from bytes actually read (§7.1).
 17. Refactor claimed untouched but reroutes inline path. → **FIXED**: `encryptFileToTempInline` kept intact as ORACLE; fused helper is separate, validated byte-for-byte against it (§6.2, §7.1).
 18. Shipped work partially re-touched. → **FIXED**: explicit unchanged-vs-touched inventory (§1.1).
+
+## Round 2 — VERDICT: REVISE (7 items)
+
+codex (gpt-5.6-sol). Narrower/deeper holes in the v2 revision:
+
+1. Budget contradiction: releasing on frame-copy hides the framed body's memory; "combined ≈ prior peak" false. → **FIXED**: one lease held dispatch→**HTTP settlement**; uploader frames by **reference** (no copy); single combined budget, gated by measured peak not "≈ prior" (§4.1, §8 gate 3).
+2. Reservation/bounds rely on stale scan sizes; files can grow yet stay individually eligible → aggregate overrun. → **FIXED**: fixed per-job reservation = job cap (independent of scan sizes); worker enforces aggregate at read time, over-cap files returned `requeue` (§4.1, §6.1, §6.3).
+3. Retry accounting unbounded/lifecycle-incomplete; reservation ownership across splits undefined; release-vs-retry contradiction. → **FIXED**: explicit retry-tree state machine, per-file attempt cap K=3, parent releases before children re-reserve (§6.3).
+4. 98 interface lacks ownership/settlement protocol; per-file promise insufficient. → **FIXED**: `CiphertextLease` with `release()`/`cancel()`; budget freed exactly on framed/spilled/rejected/deduped/abandoned; early-stop reclaims leases (§10, §4.1).
+5. §6.4 doesn't prove streaming per-file readiness (not input-order/after-map). → **FIXED**: two concrete producer APIs — legacy per-file promise (poolMap) and 98's `onReady(lease)` stream with backpressure+cancel (§6.4, §10).
+6. Gates 3/6/7 still soft ("materially closer", "measurement noise", no CI). → **FIXED**: numeric overlap-efficiency ≥0.5, ru_maxrss hard-peak bound + absolute slack, bootstrap 95% CI / Mann–Whitney (§8).
+7. Mutation correctness claim too broad when `expected` absent. → **FIXED**: `expected` MANDATORY in batch protocol (production call sites already pass it, `sync-recovery.ts:225,294`); snapshot-equivalence claim scoped to the with-expected case (§4, §6.1, §7.1).
+
+## Round 3
+
+Status: pending (codex running).

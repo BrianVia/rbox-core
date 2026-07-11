@@ -1,6 +1,6 @@
 # 99 — Fused byte-bounded crypto worker jobs + fewer encrypt temp passes
 
-Status: Design draft v2 (revised after REVIEW-99 round 1). Measurement-first
+Status: Design draft v3 (revised after REVIEW-99 rounds 1–2). Measurement-first
 (Phase 0 gate precedes any behaviour change). Client-only. Owns the crypto
 worker pool's job granularity and the first-publish encrypt temp-file lifecycle.
 Interfaces with **design 98** (first-publish overlapping encrypt→upload
@@ -154,16 +154,21 @@ Phasing:
 
 Per fuse-eligible file the worker does, entirely in memory:
 
-1. `read(srcPath)` **once** into a bounded buffer `src`. **This single read IS
-   the immutable snapshot** — hashing and encrypting both read `src`, the exact
-   self-consistent-image guarantee `copyFile`→snapshot gives today
-   (`crypto.ts:164–173`), no snapshot temp. Eligibility (`size ≤
-   FUSE_MAX_FILE_BYTES`) is **re-validated from `src.length` after the read**,
-   not from the pre-read stat — a file that grew past the cap between scan and
-   read is failed as source-changed (Round-1 item 16).
-2. `plaintextSha = sha256(src)`; if `opts.expected` set and sha or size differ →
-   `sourceChangedError` (identical to `crypto.ts:199–201`), a per-file
-   deferrable failure (§7.4).
+1. `read(srcPath)` **once** into a bounded buffer `src`. Hashing and encrypting
+   both read `src` (one image, no snapshot temp). Two revalidations from the
+   bytes actually read (Round-1 item 16, Round-2 item 2): per-file `src.length ≤
+   FUSE_MAX_FILE_BYTES`, and the running job aggregate ≤ `FUSE_MAX_JOB_BYTES` —
+   a file that grew past either bound is not encrypted in this job (per-file →
+   source-changed failure; aggregate overflow → `requeue`, §6.1).
+2. `plaintextSha = sha256(src)`. **`opts.expected` is MANDATORY for fused jobs**
+   (§6.1); if `plaintextSha` or `src.length` differ from `expected` →
+   `sourceChangedError` (identical to `crypto.ts:199–201`), a per-file deferrable
+   failure (§7.4). Because every production fused call carries `expected`
+   (`sync-recovery.ts:225–227, 294–296`), an accepted image ALWAYS matches the
+   scanned manifest tuple — the same integrity guarantee the snapshot path gives
+   today. (Round-2 item 7: the weaker no-`expected` semantics are simply not
+   reachable on the fused path; the untouched oracle retains them for its
+   large/Git callers.)
 3. Compress in memory exactly as the ≤4 MiB buffered branch
    (`crypto.ts:207–216`): zstd level 3, keep iff `< plaintext × 0.95`.
 4. `deriveKeyNonce(kek, payloadSha)` → AES-256-GCM over the payload buffer →
@@ -175,31 +180,44 @@ Per fuse-eligible file the worker does, entirely in memory:
 
 Net for eligible files: **≥5 disk passes → 1 source read + 0 temp writes**.
 
-### 4.1 The ciphertext memory budget (one global byte-semaphore)
+### 4.1 The ciphertext memory budget (one lease, dispatch → HTTP settlement)
 
-Addresses Round-1 items 1, 2. The reread-elimination moves ciphertext into
-main-isolate memory until the uploader owns it. A **single global byte-semaphore
-`CiphertextBudget`** governs *all* live ciphertext bytes from worker output
-through HTTP settlement — worker `results` retention, transfer-limbo, main-side
-result objects, and the uploader's framed body all draw on it:
+Addresses Round-1 items 1, 2 and Round-2 items 1, 2. The reread-elimination
+moves ciphertext into main-isolate memory until the upload settles. A **single
+combined byte-semaphore `CiphertextBudget`** governs *all* concurrently-live
+in-memory ciphertext — worker `results` retention, transfer-limbo, the main-side
+`CiphertextLease` buffer, and the framed request body — through the whole
+lifecycle. The framed body does **not** get its own separate budget; the
+uploader frames the in-memory path **by reference to the leased buffer** (no
+copy), so the one reservation covers it (Round-2 item 1).
 
-- **Reserve before dispatch.** Before a fused job is posted, the coalescer
-  reserves a conservative upper bound `reserve = Σ plaintextSize + files×16 +
-  CLONE_SLACK` (ciphertext ≤ plaintext+tag because compression only shrinks;
-  `CLONE_SLACK` covers framing/serialization). If the budget cannot grant the
-  reservation, **dispatch blocks** (backpressure onto the encrypt lane) — so a
-  worker never returns bytes the main isolate has not already accounted for
-  (fixes "backpressure too late").
+- **Fixed per-job reservation, independent of stale scan sizes.** Each fused job
+  reserves a **constant** `JOB_RESERVE = FUSE_MAX_JOB_BYTES + FUSE_MAX_JOB_FILES
+  × 16 + CLONE_SLACK` (≈ 4 MiB + 8 KiB + slack) **before** it is posted —
+  regardless of the coalesced files' scan sizes. Because the reservation is the
+  job *cap*, files that grew between scan and read cannot make actual output
+  exceed the reserved amount (Round-2 item 2); the worker separately enforces
+  the aggregate at read time (§6.1). If the budget cannot grant `JOB_RESERVE`,
+  **dispatch blocks** — a worker never returns bytes the main isolate has not
+  already reserved (fixes "backpressure too late").
 - **Transfer, don't clone.** Ciphertext buffers move via `postMessage` transfer
-  lists (mandatory, §7.2); the worker's copy is neutered on send, so no
-  double-count. If a runtime lacks transfer support the pool refuses to enable
-  fusion (falls back to the oracle path) rather than silently doubling memory.
-- **Release on ownership transfer only.** A reservation is released when the
-  uploader has copied the bytes into its framed body (owns them) **or** spill
-  (§4.2) has written them to disk. Not before.
-- **Budget size** `CIPHERTEXT_BUDGET_BYTES` = **96 MiB** (§5.2), strictly below
-  the uploader's already-tolerated in-flight ceiling so the two budgets do not
-  jointly exceed prior peak (§8 gate 3 measures it).
+  lists (mandatory, §7.2); the worker's copy is neutered on send. A runtime
+  without transfer support disables fusion (falls back to the oracle path)
+  rather than silently double-counting.
+- **Release exactly once, at settlement — via the lease.** The reservation is
+  held until the file's `CiphertextLease.release()` fires (§10), which the
+  owning consumer calls **after HTTP settlement** (bytes are on the wire and
+  acknowledged) **or** after it spills/rejects/dedups/abandons the bytes. For
+  the legacy in-process consumer (design 98 off) the coalescer owns the lease
+  and releases after its own `putBytesBatched`/`putBytes` settles. Because the
+  framed body references the leased buffer, there is no window where the bytes
+  are counted twice or released while still live.
+- **Budget size** `CIPHERTEXT_BUDGET_BYTES` = **96 MiB** (§5.2). This is the
+  in-memory-path budget; large/spilled/file-sourced uploads use the existing
+  uploader path and its own file reads (not this budget). §8 gate 3 measures and
+  gates the **combined** peak RSS directly — the design does **not** claim
+  "combined ≈ prior peak" (Round-2 item 1); it states a budget and gates the
+  measured peak against control + budget + a stated slack.
 
 ### 4.2 Spill (the real trigger, fully specified)
 
@@ -215,11 +233,12 @@ would stall the encrypt lane.
   files in the shared `tmpDir` (owner-only, as today), flips their
   `ciphertextLocation` to `{ kind: "file", path }`, and **releases their budget
   reservation**. Encryption keeps flowing.
-- **Promise settlement:** each spilled file's per-file promise still resolves
-  normally with the file-backed location; the uploader takes the `putBlobFile`
-  path for those (§7.5). A spill *write* failure settles only that file's
-  promise as a retry-later deferral (§7.4) and releases its bytes; siblings are
-  unaffected.
+- **Promise/lease settlement:** each spilled file's per-file promise/lease
+  resolves normally with the file-backed location; the uploader takes the
+  `putBlobFile` path for those (§7.5), and the spill write is exactly the event
+  that fires `release()` on that file's budget reservation. A spill *write*
+  failure settles only that file's promise as a retry-later deferral (§7.4) and
+  releases its bytes; siblings are unaffected.
 - Spill is a measured escape hatch (metric: spilled bytes/files, §8 gate 3), not
   the hot path; a healthy pipeline (98 draining) never spills.
 
@@ -305,16 +324,25 @@ serialized, control retained for A/B).
 ### 6.1 Protocol (`crypto-worker-protocol.ts`) + completeness rules
 
 ```ts
+type FusedJobEntry = {
+  index: number;
+  srcPath: string;
+  // MANDATORY for fused jobs (Round-2 item 7): the scanned manifest tuple.
+  expected: { sha256: string; size: number };
+  opts?: Omit<EncryptFileOptions, "expected">;
+};
 type CryptoWorkerEncryptBatchMessage = {
   id: number;
   kind: "encryptBatch";
-  jobs: Array<{ index: number; srcPath: string; opts?: EncryptFileOptions }>;
+  jobs: FusedJobEntry[];
+  jobPlaintextCap: number;   // = FUSE_MAX_JOB_BYTES; worker enforces the aggregate
 };
 type CryptoWorkerEncryptBatchResult = {
   id: number; ok: true;
   results: Array<
     | { index: number; ok: true; blob: InMemoryEncryptedBlob }
-    | { index: number; ok: false; error: SerializedError }   // allowlisted (§7.4)
+    | { index: number; ok: false; error: SerializedError }         // allowlisted (§7.4)
+    | { index: number; ok: false; requeue: true }                  // aggregate overflow
   >;
 };
 ```
@@ -322,13 +350,22 @@ type CryptoWorkerEncryptBatchResult = {
 `InMemoryEncryptedBlob` = `EncryptedBlob` with `ciphertextPath` replaced by
 `ciphertext: ArrayBuffer` (**always** in the transfer list, §7.2).
 
+**Aggregate enforcement (Round-2 item 2):** the worker reads entries in order,
+tracking cumulative plaintext bytes; if including a file would exceed
+`jobPlaintextCap`, that file (and any later ones) is returned `{ ok:false,
+requeue:true }` — NOT encrypted — so the job's real output never exceeds the
+fixed `JOB_RESERVE` (§4.1). The coalescer re-submits requeued files (as a fresh
+group or, if a single file now exceeds the per-file cap, as a large single-file
+job). This keeps worker output inside its reservation even when files grew after
+scan.
+
 **Completeness validation (Round-1 item 8):** on receipt the pool asserts
-`results` contains **exactly one** entry per requested `index`, indices unique
-and within the request set. Any violation (missing, duplicate, extra, malformed,
+`results` has **exactly one** entry per requested `index`, indices unique and
+within the request set. Any violation (missing, duplicate, extra, malformed,
 non-`ok` envelope) **rejects every still-unresolved slot of that job promptly**
-with a crash-class error → bounded whole-job retry (§6.3); a caller is never
-resolved with another file's ciphertext, and no promise hangs. Health/decrypt
-messages are unchanged.
+with a crash-class error → bounded split retry (§6.3); a caller is never resolved
+with another file's ciphertext, and no promise hangs. Health/decrypt messages
+are unchanged.
 
 ### 6.2 Worker (`crypto-worker.ts`) — separate helper, not a reroute
 
@@ -350,25 +387,56 @@ envelope. Buffers accumulate in `results` until one post (retention modelled in
   `FUSE_MAX_JOB_FILES`, the 10 ms timer, the primed-first-batch rule (§5.2), or
   pool drain/close. Reserve `CiphertextBudget` **before** posting (§4.1). Each
   buffered file gets a deferred promise resolved from its `results` slot.
-- **Crash retry decomposes (Round-1 item 7).** The shipped machinery re-queues a
-  crashed job once (`crypto-pool.ts:342–364`); for a fused job the retry
-  **splits the batch in half** and re-queues the halves, recursing to singleton
-  jobs. A deterministic crash on one pathological input therefore isolates to a
-  single-file job that fails only that file (§7.4) after its own bounded retry;
-  the ≤511 innocent siblings succeed on the sibling half. Split depth is bounded
-  by ⌈log2(512)⌉ = 9. Readiness for siblings is delayed only by their (smaller)
-  half's re-run, not by the poisoned file.
+- **Crash retry — explicit retry-tree state machine (Round-1 item 7, Round-2
+  item 3).** A fused job holds exactly one `JOB_RESERVE` (§4.1) and each of its
+  files carries a per-file attempt counter (initialized from the caller,
+  capped at `K = 3` re-encrypts across the whole tree). On a worker crash /
+  malformed-envelope (§6.1) for a job with >1 file:
+  1. the crashed job **releases its `JOB_RESERVE` first** (single release; the
+     cleanup matrix's "crash releases the job's reservation" and this are the
+     *same* release, not two — Round-2 item 3 contradiction resolved);
+  2. its unresolved files are partitioned into two halves; each half is enqueued
+     as a **new** fused job that makes its **own** `JOB_RESERVE` at dispatch via
+     the normal blocking semaphore. Because the parent already released, capacity
+     exists → no reacquisition deadlock;
+  3. each file's attempt counter increments on each re-encrypt; a file that
+     reaches `K` is failed as a per-file error (§7.4), never retried again;
+  4. recursion bottoms out at singleton jobs: a deterministic crash on one
+     pathological input isolates to a single-file job that, after `K` attempts,
+     fails only that file — its ≤511 siblings already succeeded on sibling
+     halves. Split depth ≤ ⌈log2(512)⌉ = 9; total re-encrypts per file ≤ `K`.
+  Readiness for a sibling is delayed only by its (smaller) half's re-run, never
+  by the poisoned file. Transport-level upload failures do **not** enter this
+  tree — they reuse retained bytes (§7.5), not re-encryption.
 
-### 6.4 Caller (`sync-recovery.ts`) — one guarded swap
+### 6.4 Two concrete producer APIs (Round-2 items 4, 5)
 
-`runCryptoAndUpload`'s `poolMap` loop (`:200–249`) calls `pool.encryptCoalesced`
-when `RBOX_CRYPTO_FUSE` is on and a pool exists, else the shipped
-`encryptFileToTemp`. Each call still returns one per-file result, so the
-address-cache record (`:244`), `ctByEnc` bookkeeping, and upload/retry logic
-(`:282–373`) are structurally unchanged. A `{ kind:"memory" }` result routes to
-`putBytesBatched`/`putBytes` (§7.5); `{ kind:"file" }` (large or spilled) to
-today's `putBlobFile`. No new same-isolate promise per file beyond the one the
-loop already awaits.
+The pool exposes streaming readiness two ways; the central pipeline-compat claim
+rests on the second, specified concretely — not on "structurally unchanged".
+
+- **Legacy per-file promise (design 98 OFF — the path that ships in Phase 1).**
+  `runCryptoAndUpload`'s `poolMap` loop (`:200–249`) calls
+  `pool.encryptCoalesced(srcPath, size, opts)` when `RBOX_CRYPTO_FUSE` is on,
+  else the shipped `encryptFileToTemp`. Each call returns one per-file promise
+  that **resolves the instant that file's fused job completes** — decoupled from
+  input order and from the map's completion (a fused job resolves up to
+  `FUSE_MAX_JOB_FILES` sibling promises at once, so `poolMap`'s per-file slots
+  proceed as bursts). The address-cache record (`:244`), `ctByEnc` bookkeeping,
+  and upload/retry (`:282–373`) are unchanged; the coalescer owns each file's
+  `CiphertextLease` and calls `release()` after its `putBytesBatched`/`putBytes`
+  settles (§7.5). This adds no new same-isolate promise beyond the one the loop
+  already awaits.
+- **Streaming `onReady` (design 98 ON).** For the overlapping pipeline the pool
+  exposes `pool.encryptStream(files, { onReady }): { cancel(): void }`, where
+  `onReady(lease: CiphertextLease)` fires **per file as each fused job
+  completes**, in completion order, NOT after the batch. Backpressure is the
+  §4.1 budget (the producer blocks dispatch when the consumer holds leases);
+  cancellation is `cancel()`, which stops further dispatch and reclaims all
+  outstanding leases' reservations (design 98 stopping early cannot leak budget).
+  §10 defines the lease. This is the exact async interface 98 consumes — an
+  event stream with explicit lease/release and cancel, not a completed array.
+
+Both share one coalescer + budget; only the delivery surface differs.
 
 ## 7. Correctness requirements
 
@@ -426,7 +494,9 @@ Only an **allowlist of expected, serializable per-file errors** becomes a
 - `SOURCE_CHANGED` (`crypto.ts:139–142`, survives serialization);
 - source-vanished / unreadable filesystem errors classified `isDeferrableChurn`
   (ENOENT/EACCES/…), matching `sync-recovery.ts:228–239`;
-- post-read eligibility-revalidation failure (§4 step 1).
+- post-read per-file eligibility-revalidation failure (§4 step 1);
+- `requeue` (aggregate overflow, §6.1) — not a failure at all: the coalescer
+  re-submits the file, its lease/reservation was never taken.
 
 **Everything else** — programmer errors, invariant violations, cancellation,
 pool closure, OOM, resource exhaustion — MUST fail the **whole job envelope**
@@ -459,35 +529,42 @@ normally.
 
 ## 8. Gates (falsify, not promise) — with tolerances and method
 
-All on the §5.4 pinned control; p50/p95 over ≥5 cold + ≥10 warm; aggregated
-**per host and per filesystem** (APFS + ext4); a gate passes only if it holds on
-**both** filesystems.
+All on the §5.4 pinned control; ≥5 cold + ≥10 warm runs; distributions compared
+with a bootstrap 95% CI on the p50 delta (and Mann–Whitney U for the latency
+distributions in gates 5, 7); aggregated **per host and per filesystem** (APFS +
+ext4); a gate passes only if it holds on **both** filesystems. "Peak RSS"
+throughout means the hard peak from `getrusage` `ru_maxrss` (worker and main
+processes reported separately), not a sampled estimate — it cannot miss a
+short-lived allocation peak (Round-2 item 6).
 
 1. **Encrypt phase ≥30% faster.** Fused vs control encrypt-phase critical-path
-   wall (first-start → last-ready), p50 ≥30% below control, 95% CI excluding 0.
+   wall (first-start → last-ready), p50 ≥30% below control, bootstrap 95% CI of
+   the delta entirely below −30%.
 2. **Determinism green.** §7.1 differential + boundary/property matrix
    byte-identical; named suites pass unchanged.
-3. **Memory + FDs bounded, attributed.** Peak **worker** RSS and peak **main**
-   RSS sampled ≥100 Hz; main live-ciphertext never exceeds
-   `CIPHERTEXT_BUDGET_BYTES`; combined peak RSS ≤ control + 96 MiB (± measurement
-   noise stated); FD count ≤ control; spilled bytes/files reported (0 expected
-   with 98 draining). Host-minimum memory named; gate re-checked there.
+3. **Memory + FDs bounded, attributed.** `ru_maxrss` for the main isolate ≤
+   control_main + `CIPHERTEXT_BUDGET_BYTES` + `RSS_SLACK` where `RSS_SLACK` =
+   **32 MiB** (a stated absolute allocator/GC-headroom allowance, not vague
+   "noise"); `ru_maxrss` for each worker ≤ control_worker + 8 MiB; the
+   instrumented in-memory live-ciphertext high-water never exceeds
+   `CIPHERTEXT_BUDGET_BYTES`; FD count ≤ control; spilled bytes/files reported (0
+   expected with 98 draining). Host-minimum-memory host named and gate re-checked
+   there.
 4. **No upload regression.** Batch-PUT record/body occupancy and wire bytes
-   within ±2% of control (in-memory framing must not change what goes on the
-   wire).
-5. **No small-push regression (numeric, not "guaranteed").** Workload A
-   one-file change (audit 1227–1234), p50 wall within +1% of control, measured
-   in **both** pool-off (<`minJobs`) and pool-on partial-batch cases; the swap,
-   helper extraction, and flag plumbing must add no measurable cost.
-6. **Full-publish critical path improves (Finding 6, Round-1 item 13).** With
-   design 98 enabled, full first-publish wall p50 materially closer to
-   `max(encrypt, upload)` than to their sum, and no worse than control; fusion
-   must not shave the encrypt phase while inflating upload buffering or
-   time-to-first-upload.
-7. **Readiness not coarsened (Round-1 item 14).** Measured per-file
-   readiness-delay p50/p99 (enqueue → `ready`) and **time-to-first-upload** both
-   ≤ control; the primed first batch (§5.2) must keep first-upload no later than
-   control.
+   within ±2% of control.
+5. **No small-push regression (numeric).** Workload A one-file change (audit
+   1227–1234): p50 wall ≤ control × 1.01 AND Mann–Whitney U shows no significant
+   slowdown (α = 0.05), measured in **both** pool-off (<`minJobs`) and pool-on
+   partial-batch cases.
+6. **Full-publish overlap efficiency (Finding 6, Round-1 item 13).** With design
+   98 enabled: full first-publish wall p50 ≤ control, AND overlap efficiency
+   `η = (encrypt_wall + upload_wall − full_wall) / min(encrypt_wall, upload_wall)
+   ≥ 0.5` (i.e. at least half of the smaller phase is hidden) — a numeric
+   threshold replacing "materially closer".
+7. **Readiness not coarsened (Round-1 item 14, Round-2 item 6).** Per-file
+   readiness-delay (enqueue → `ready`): p50 ≤ control × 1.05 and p99 ≤ control ×
+   1.10, bootstrap 95% CI; **time-to-first-upload** ≤ control × 1.05. The primed
+   first batch (§5.2) must keep first-upload no later than control.
 8. **Full-corpus receiver diff clean** after a fused first publish (audit 658):
    a fresh join reproduces every file byte-for-byte.
 
@@ -505,18 +582,41 @@ All on the §5.4 pinned control; p50/p95 over ≥5 cold + ≥10 warm; aggregated
 
 ## 10. Interface contract with design 98 (per-file readiness)
 
-98 overlaps encrypt with upload and needs `ready(encSha, size,
-ciphertextLocation)` per file, where:
+98 overlaps encrypt with upload and consumes a **lease** per file, delivered by
+the `onReady` stream of §6.4:
 
 ```ts
 type CiphertextLocation =
   | { kind: "memory"; bytes: Uint8Array }   // fused, budget-held (§4.1)
   | { kind: "file"; path: string };         // large / streaming / spilled (§4.2)
+
+interface CiphertextLease {
+  readonly encSha: string;
+  readonly size: number;
+  readonly location: CiphertextLocation;
+  /** Consumer MUST call exactly once after it has taken ownership of the bytes:
+   *  after HTTP settlement (uploaded), or after it spills/rejects/dedups/
+   *  abandons them. Frees the §4.1 budget reservation. Idempotent guard: a
+   *  second call throws in dev, is ignored in prod. */
+  release(): void;
+}
 ```
 
+**Ownership/settlement protocol (Round-2 item 4).** The per-file promise is not
+enough for an async consumer, so the budget is governed by explicit leases: the
+producer holds each file's `JOB_RESERVE` share until `release()`. 98 calls
+`release()` at exactly the events budget correctness depends on — framed and
+acknowledged on the wire, spilled, rejected, deduped, or abandoned. The uploader
+frames the `memory` variant **by reference** to `lease.location.bytes` (no copy,
+§4.1), so `release()` at HTTP settlement is the single point the bytes leave
+memory. If 98 stops early, it drops its stream, and `cancel()` (§6.4) reclaims
+every outstanding lease's reservation — early-stop cannot leak the budget. The
+`file` variant carries no memory reservation; its `release()` is a no-op that
+still lets the producer delete a spilled temp once uploaded.
+
 **Granularity — decided: readiness fires per file at fused-job completion, not
-incrementally within a job.** A fused job posts one `results` message; its files
-become `ready` together. Incremental within-job signalling would need multiple
+incrementally within a job.** A fused job posts one `results` message; its files'
+leases emit together. Incremental within-job signalling would need multiple
 `postMessage`s per job, reintroducing the per-message overhead fusion exists to
 amortize (§2.1).
 
