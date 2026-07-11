@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
-import { emit as emitMetric, startOp, type MetricEvent } from "./metrics.js";
+import { emit as emitMetric, emitDelta, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
   commitAccounting,
@@ -9,9 +9,11 @@ import {
   MAX_REFS_PER_COMMIT,
   type RefWithSize,
 } from "./commit-accounting.js";
-import { resolveSidecarBytes, loadSidecarShaSet } from "./sidecar.js";
+import { loadSidecarRaw, resolveSidecarRaw, loadSidecarShaSet } from "./sidecar.js";
+import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeAddedShas, mergeSortedUnique, type DeltaResult, type ShadowFlags } from "./commit-delta.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
+import { refsetShas } from "../../../src/engine/refset.js";
 import { verifyReceipt } from "./receipts.js";
 import {
   MAX_COMMIT_BODY,
@@ -32,6 +34,8 @@ const FOLD_MAX_REFS = 250_000;
 const FOLD_CHUNK = 5_000;
 const SWEEP_CHUNK = 500;
 let isolateFoldActive = false;
+// Design 102 §3.5B page-class fallback reasons.
+const HIGH_SEVERITY_FALLBACKS = new Set(["parent_unreadable", "fence_violation", "delta_error"]);
 
 type IndexState = "building" | "ready" | "lagging";
 type FoldCursor = { phase: "removed" | "added"; lastSha: string };
@@ -239,6 +243,86 @@ export class WorkspaceSync {
 
   // ---- commit (the atomic sequencer) ----
 
+  private async computeCommitDelta(
+    db: D1Database,
+    accountId: string,
+    parent: number,
+    commitEpoch: number,
+    childBuf: Uint8Array,
+    childCount: number,
+  ): Promise<{ fallback?: string; delta?: DeltaResult; admitData: string[] }> {
+    const phase = (outcome: string, started: number): void => emitDelta(this.env, outcome, { count: Date.now() - started });
+    try {
+      if (parent === 0) return { fallback: "first_commit", admitData: [] };
+      if (childCount > DELTA_MAX_REFS) return { fallback: "refset_too_large", admitData: [] };
+      const deleting = await db.prepare("SELECT 1 FROM account_deletions WHERE account_id = ? AND status IN ('pending','purging') LIMIT 1").bind(accountId).first();
+      if (deleting) return { fallback: "account_deleting", admitData: [] };
+
+      let parentBuf: Uint8Array;
+      try {
+        const fetchStarted = Date.now();
+        const rawParent = this.ctx.storage.kv.get(`seq:${parent}`) as string | undefined;
+        phase("parentFetchMs", fetchStarted);
+        if (!rawParent) return { fallback: "parent_unreadable", admitData: [] };
+        const parseStarted = Date.now();
+        const parentCommit = JSON.parse(rawParent) as SignedCommit;
+        const parentBody = JSON.parse(parentCommit.body) as CommitBodyView;
+        const parentMode = readRefMode(parentBody);
+        phase("parentParseMs", parseStarted);
+        if (!parentMode) return { fallback: "parent_unreadable", admitData: [] };
+        if (parentBody.accountEpoch !== commitEpoch) return { fallback: "epoch_rotation", admitData: [] };
+        if (parentMode.kind === "inline") return { fallback: "parent_not_sidecar", admitData: [] };
+        if (parentMode.count > DELTA_MAX_REFS) return { fallback: "refset_too_large", admitData: [] };
+        const loaded = await loadSidecarRaw(this.env, parentMode.sidecarSha, parentMode.count);
+        if (!loaded.ok || loaded.totalBytes !== parentMode.totalBytes) return { fallback: "parent_unreadable", admitData: [] };
+        parentBuf = loaded.buf;
+      } catch {
+        return { fallback: "parent_unreadable", admitData: [] };
+      }
+
+      const fenceStarted = Date.now();
+      const [markedRows, intentRows] = await Promise.all([
+        db.prepare("SELECT sha256 FROM blob_ref_candidates WHERE account_id = ? LIMIT ?").bind(accountId, FENCE_SET_MAX + 1).all<{ sha256: string }>(),
+        db.prepare("SELECT sha256 FROM gc_candidates WHERE deleting_at IS NOT NULL LIMIT ?").bind(FENCE_SET_MAX + 1).all<{ sha256: string }>(),
+      ]);
+      phase("fenceQueryMs", fenceStarted);
+      if (markedRows.results.length > FENCE_SET_MAX || intentRows.results.length > FENCE_SET_MAX) return { fallback: "fence_over_cap", admitData: [] };
+      const diffStarted = Date.now();
+      const delta = mergeAddedShas(parentBuf, childBuf, new Set(markedRows.results.map((r) => r.sha256)), new Set(intentRows.results.map((r) => r.sha256)));
+      phase("diffMs", diffStarted);
+      if (delta.intentCarriedHit) return { fallback: "fence_violation", admitData: [] };
+      emitDelta(this.env, "sizes", { count: delta.addedCount, ratio: delta.carriedCount, bytes: delta.removedCount });
+      emitDelta(this.env, "carried_fenced", { count: delta.markedCarried.length });
+      return { delta, admitData: mergeSortedUnique(delta.added, delta.markedCarried) };
+    } catch {
+      return { fallback: "delta_error", admitData: [] };
+    }
+  }
+
+  private async readShadowFlags(db: D1Database, accountId: string, shas: string[]): Promise<Map<string, ShadowFlags>> {
+    const flags = new Map<string, ShadowFlags>();
+    await batchedInLookup<{ sha256: string; present: number; entitled: number; marked: number; active_intent: number }>(
+      db,
+      shas,
+      (chunk) => {
+        const values = chunk.map(() => "(?)").join(",");
+        return db.prepare(`WITH x(sha256) AS (VALUES ${values})
+          SELECT x.sha256, CASE WHEN b.present=1 THEN 1 ELSE 0 END present,
+            CASE WHEN r.sha256 IS NOT NULL THEN 1 ELSE 0 END entitled,
+            CASE WHEN c.sha256 IS NOT NULL THEN 1 ELSE 0 END marked,
+            CASE WHEN g.sha256 IS NOT NULL THEN 1 ELSE 0 END active_intent
+          FROM x LEFT JOIN blobs b ON b.sha256=x.sha256
+          LEFT JOIN blob_refs r ON r.sha256=x.sha256 AND r.account_id=?
+          LEFT JOIN blob_ref_candidates c ON c.sha256=x.sha256 AND c.account_id=?
+          LEFT JOIN gc_candidates g ON g.sha256=x.sha256 AND g.deleting_at IS NOT NULL`).bind(...chunk, accountId, accountId);
+      },
+      (rows) => {
+        for (const row of rows) flags.set(row.sha256, { present: !!row.present, entitled: !!row.entitled, marked: !!row.marked, activeIntent: !!row.active_intent });
+      },
+    );
+    return flags;
+  }
+
   private async commit(req: Request, ws: string, proj: string): Promise<Response> {
     const startedAt = Date.now();
     const serverTimings: ServerTimings = {
@@ -345,7 +429,7 @@ export class WorkspaceSync {
     // future pull breaks. 422 → client uploads. For a sidecar commit the data refs come from
     // the resolved sidecar (below); the existence set always includes encManifestSha and,
     // for sidecar commits, sidecarSha itself (so the published head's sidecar is durable).
-    let shas: string[];
+    let shas!: string[];
     const emit = (count: number) => (outcome: string, extra: Partial<MetricEvent> = {}) => op.done(outcome, {
       bytes: bodyBytes,
       count,
@@ -394,6 +478,38 @@ export class WorkspaceSync {
       // +grant, all BEFORE the head advance (account-then-publish). On head 409 the accounting
       // is already durable (benign: refs entitled+present; retry charges 0).
       const nowMs = Date.now();
+      const db = dbFor(op.env, accountId);
+      const configuredDeltaMode = this.env.RBOX_COMMIT_DELTA_ADMISSION;
+      const deltaMode = configuredDeltaMode === "shadow" || configuredDeltaMode === "enforce" ? configuredDeltaMode : "off";
+      const runFullAdmission = async (fullShas: string[]): Promise<Response | null> => {
+        shas = fullShas;
+        const accountingStartedAt = Date.now();
+        const beforeCalls = op.span.dbCalls;
+        const v = await validateCommitRefs(this.env, db, accountId, shas, receipts, nowMs);
+        serverTimings.accountingMs = Date.now() - accountingStartedAt;
+        const emitDeltaAdmission = deltaMode !== "off" && mode.kind === "sidecar";
+        if (!v.ok) {
+          if (emitDeltaAdmission) emitDelta(this.env, "admit_stmts", { dbCalls: op.span.dbCalls - beforeCalls });
+          emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
+          return json(unsatisfiedBlobsBody(v.needsUpload), 422);
+        }
+        const acct = await commitAccounting(db, accountId, v.newRefs, nowMs);
+        serverTimings.accountingMs = Date.now() - accountingStartedAt;
+        if (emitDeltaAdmission) {
+          emitDelta(this.env, "admit_stmts", { dbCalls: op.span.dbCalls - beforeCalls });
+          emitDelta(this.env, "admitAccountMs", { count: serverTimings.accountingMs });
+        }
+        if ("needsUpload" in acct) {
+          emit(shas.length)("unsatisfied_blobs", { ratio: acct.needsUpload.length / shas.length });
+          return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
+        }
+        if ("overCap" in acct) {
+          emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
+          return json(await quotaExceededBody(db, accountId, acct.overCap), 402);
+        }
+        return null;
+      };
+
       if (mode.kind === "sidecar") {
         // §30: cap the DATA-ref count directly (the 2 carriers — encManifest + sidecar — ride
         // within the multi-batch accounting, no separate budget). Same bound readRefMode applies
@@ -404,18 +520,66 @@ export class WorkspaceSync {
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
         { const early = earlyStaleReject(mode.count); if (early) return early; }
+        const descriptor = { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes };
         const sidecarStartedAt = Date.now();
-        const sc = await resolveSidecarBytes(this.env, dbFor(op.env, accountId), accountId, { sidecarSha: mode.sidecarSha, count: mode.count, totalBytes: mode.totalBytes }, receipts, nowMs);
+        const child = await resolveSidecarRaw(this.env, db, accountId, descriptor, receipts, nowMs);
         serverTimings.sidecarMs = Date.now() - sidecarStartedAt;
-        if (!sc.ok) {
-          if ("needsUpload" in sc) {
+        if (!child.ok) {
+          if ("needsUpload" in child) {
             emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
-            return json(unsatisfiedBlobsBody(sc.needsUpload), 422);
+            return json(unsatisfiedBlobsBody(child.needsUpload), 422);
           }
           emit(mode.count)("bad_sidecar");
-          return json({ error: "bad_sidecar", message: sc.badSidecar }, 400);
+          return json({ error: "bad_sidecar", message: child.badSidecar }, 400);
         }
-        shas = [...new Set([cb.encManifestSha as string, mode.sidecarSha, ...sc.refShas])];
+        const carriers = [cb.encManifestSha as string, mode.sidecarSha];
+        if (deltaMode === "off") {
+          const response = await runFullAdmission([...new Set([...carriers, ...refsetShas(child.buf)])]);
+          if (response) return response;
+        } else {
+          const { fallback, delta, admitData } = await this.computeCommitDelta(db, accountId, parent, commitEpoch, child.buf, child.count);
+          let childShas: string[] | undefined;
+          const fullChildShas = (): string[] => {
+            if (!childShas) {
+              const childParseStarted = Date.now();
+              childShas = refsetShas(child.buf);
+              emitDelta(this.env, "childParseMs", { count: Date.now() - childParseStarted });
+            }
+            return childShas;
+          };
+          if (fallback || deltaMode === "shadow") fullChildShas();
+          if (fallback) {
+            emitDelta(this.env, "fallback", { reason: fallback });
+            if (HIGH_SEVERITY_FALLBACKS.has(fallback)) emitDelta(this.env, fallback, { reason: fallback });
+          } else if (delta && deltaMode === "shadow") {
+            try {
+              // §6 four-flag read is bounded in chunked batches, not one transactional pre-state;
+              // soak owners should treat harmful-under-concurrent-GC as possible chunk-boundary noise.
+              const dataShas = fullChildShas();
+              const compareReadStarted = Date.now();
+              const flags = await this.readShadowFlags(db, accountId, [...new Set([...carriers, ...dataShas])]);
+              emitDelta(this.env, "compareReadMs", { count: Date.now() - compareReadStarted });
+              const cmp = classifyShadow({ childShas: dataShas, carriers, addedSet: new Set(delta.added), markedCarriedSet: new Set(delta.markedCarried), flags, receiptKeys: new Set(Object.keys(receipts)) });
+              if (cmp.divergent) {
+                const d = divergenceDigest(cmp.harmful);
+                emitDelta(this.env, "divergence", { count: cmp.harmful.length, digest: d.digest, sample: d.sample });
+              }
+              if (cmp.benign.length) {
+                const d = divergenceDigest(cmp.benign);
+                emitDelta(this.env, "benign_marker_divergence", { count: cmp.benign.length, digest: d.digest, sample: d.sample });
+              }
+            } catch {
+              // Shadow comparison failed (telemetry only — the authoritative full path below
+              // still responds). Surface high-severity so a broken soak read is not silent.
+              emitDelta(this.env, "fallback", { reason: "delta_error" });
+              emitDelta(this.env, "delta_error", { reason: "shadow_compare" });
+            }
+          }
+          // design 102 enforce — flag-gated, not enabled in this PR.
+          const dataShas = deltaMode === "enforce" && delta && !fallback ? admitData : fullChildShas();
+          const response = await runFullAdmission([...new Set([...carriers, ...dataShas])]);
+          if (response) return response;
+        }
       } else {
         shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
         // Defensive backstop: inline can't actually reach this — >MAX_REFS_PER_COMMIT 64-hex
@@ -427,23 +591,8 @@ export class WorkspaceSync {
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
         }
         { const early = earlyStaleReject(mode.refShas.length); if (early) return early; }
-      }
-      const accountingStartedAt = Date.now();
-      const v = await validateCommitRefs(this.env, dbFor(op.env, accountId), accountId, shas, receipts, nowMs);
-      serverTimings.accountingMs = Date.now() - accountingStartedAt;
-      if (!v.ok) {
-        emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
-        return json(unsatisfiedBlobsBody(v.needsUpload), 422);
-      }
-      const acct = await commitAccounting(dbFor(op.env, accountId), accountId, v.newRefs, nowMs);
-      serverTimings.accountingMs = Date.now() - accountingStartedAt;
-      if ("needsUpload" in acct) {
-        emit(shas.length)("unsatisfied_blobs", { ratio: acct.needsUpload.length / shas.length });
-        return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
-      }
-      if ("overCap" in acct) {
-        emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
-        return json(await quotaExceededBody(dbFor(op.env, accountId), accountId, acct.overCap), 402);
+        const response = await runFullAdmission(shas);
+        if (response) return response;
       }
     } else {
       // Legacy (M7): inline only — a sidecar commit was rejected above (requires receipts),

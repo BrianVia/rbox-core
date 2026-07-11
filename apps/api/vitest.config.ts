@@ -62,6 +62,7 @@ export default defineWorkersConfig(async () => {
               RBOX_GRANT_KEY: "test-grant-key-at-least-32-bytes-long-xxxxx",
               // Design 103: allow the full Workers suite to exercise early rejection.
               ...(process.env.RBOX_COMMIT_EARLY_REJECT ? { RBOX_COMMIT_EARLY_REJECT: process.env.RBOX_COMMIT_EARLY_REJECT } : {}),
+              ...(process.env.RBOX_COMMIT_DELTA_ADMISSION ? { RBOX_COMMIT_DELTA_ADMISSION: process.env.RBOX_COMMIT_DELTA_ADMISSION } : {}),
               TEST_MIGRATIONS: migrations,
             },
           },

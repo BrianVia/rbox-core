@@ -1,7 +1,7 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
-import { resolveSidecarBytes } from "../src/sidecar.js";
+import { resolveSidecarBytes, resolveSidecarRaw } from "../src/sidecar.js";
 import { mintReceipt } from "../src/receipts.js";
 import { blobKey } from "../src/util.js";
 import { serializeRefset } from "../../../src/engine/refset.js";
@@ -61,6 +61,19 @@ describe("resolveSidecarBytes (§24.3) — direct-write, fail-closed", () => {
     // returns the data refs in canonical order; sidecarSha itself is NOT in the list (caller adds it).
     expect(new Set(r.refShas)).toEqual(new Set(refs.map((x) => x.encSha)));
     expect(r.refShas).not.toContain(scSha);
+  });
+
+  test("raw resolver shares the entitlement/validation gate and preserves verified bytes", async () => {
+    const a = await bootstrap("sc-raw-ok");
+    const refs = refSet(5);
+    const bytes = serializeRefset(refs);
+    const scSha = sha(bytes);
+    const receipt = await putBytes(a.token, bytes);
+    const r = await resolveSidecarRaw(env, env.rbox_dev_db, a.accountId, descriptor(refs, scSha), { [scSha]: receipt }, Date.now());
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.count).toBe(refs.length);
+    expect([...r.buf]).toEqual([...bytes]);
   });
 
   test("no receipt + not entitled → needsUpload (never probes R2)", async () => {

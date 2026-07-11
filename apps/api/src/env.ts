@@ -54,6 +54,10 @@ export interface Env {
    *  409 the final CAS would. Unset/"0" → today's behavior (no early return).
    *  Rollback = flip the flag; no schema, no migration. */
   RBOX_COMMIT_EARLY_REJECT?: string;
+  /** Design 102. O(change) commit delta admission. Off/unset preserves full
+   * validation; shadow compares read-only and returns the full result; enforce is
+   * explicitly flag-gated and is not enabled by this change. */
+  RBOX_COMMIT_DELTA_ADMISSION?: "off" | "shadow" | "enforce";
   /** Producer binding for the new-device email queue (design 16 §2.4). Optional: absent
    *  in local bun tests and until the queue is provisioned — enqueue then no-ops and the
    *  cron backstop drives delivery off the durable outbox instead. */
