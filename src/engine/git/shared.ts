@@ -11,6 +11,28 @@ import type { GitArtifactRef, GitPackLink, GitSection } from "../types.js";
  *  checkout (`.git` gitfile whose state lives in the main clone's gitdir). */
 export type GitRepoKind = "dir" | "pointer";
 
+export interface GitChainTimings {
+  chainLength: number;
+  fetchDecryptMs: number;
+  bundleVerifyMs: number;
+  gitImportMs: number;
+  indexOpStateMs: number;
+}
+
+export function zeroGitChainTimings(): GitChainTimings {
+  return { chainLength: 0, fetchDecryptMs: 0, bundleVerifyMs: 0, gitImportMs: 0, indexOpStateMs: 0 };
+}
+
+export async function addTimedMs<T>(timings: GitChainTimings | undefined, field: keyof GitChainTimings, fn: () => Promise<T>): Promise<T> {
+  if (!timings) return fn();
+  const t0 = performance.now();
+  try {
+    return await fn();
+  } finally {
+    timings[field] += performance.now() - t0;
+  }
+}
+
 const exec = promisify(execFile);
 
 let gitSpawnObserver: ((root: string, args: readonly string[]) => void) | undefined;
@@ -280,22 +302,31 @@ export async function importGitPackChain(
   store: BlobStore,
   kek: Buffer,
   tmpDir: string,
-  incomingNs: string
+  incomingNs: string,
+  timings?: GitChainTimings
 ): Promise<{ imported: number; skipped: number }> {
   let imported = 0;
   let skipped = 0;
 
   const importLink = async (link: GitPackLink, i: number): Promise<void> => {
     const bundlePath = path.join(tmpDir, `chain-${i}.bundle`);
-    await getGitArtifact(store, kek, link, bundlePath, tmpDir);
-    if (!(await gitOk(repoDir, ["bundle", "verify", bundlePath]))) {
+    await addTimedMs(timings, "fetchDecryptMs", async () => {
+      await getGitArtifact(store, kek, link, bundlePath, tmpDir);
+    });
+    const verified = await addTimedMs(timings, "bundleVerifyMs", () =>
+      gitOk(repoDir, ["bundle", "verify", bundlePath])
+    );
+    if (!verified) {
       throw new Error(`bundle verify failed for git pack link ${i}`);
     }
-    await git(repoDir, ["fetch", "--no-tags", bundlePath, `+refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    await addTimedMs(timings, "gitImportMs", async () => {
+      await git(repoDir, ["fetch", "--no-tags", bundlePath, `+refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+    });
     imported++;
   };
 
   const links = gitSectionPackLinks(section);
+  if (timings) timings.chainLength = links.length;
   const hasHistoricalLinks = (section.packChain?.length ?? 0) > 0;
   for (let i = 0; i < links.length; i++) {
     const link = links[i]!;

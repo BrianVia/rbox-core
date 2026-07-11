@@ -15,6 +15,10 @@ import {
   type Manifest,
   type ScanStats,
   laneTimingSummary,
+  applyStatsDelta,
+  setApplyStatsEnabled,
+  snapshotApplyStats,
+  type ApplyStats,
 } from "../engine/index.js";
 import {
   applyGitSections,
@@ -108,6 +112,10 @@ const scanDetailsOf = (s: ScanStats, wallMs: number, midwriteDeferred: number): 
 });
 const formatScanStats = (s: ScanDetails): string =>
   `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred}`;
+/** mk=mkdir/cr=created, walk=dir components, uniq=dirs, ls=lstat, rn=rename,
+ * stg=stages, pre=preflight, pool=write pool, sm/lg=count and bytes. */
+export const formatApplyStats = (s: ApplyStats): string =>
+  `mk${s.mkdirCalls}/cr${s.mkdirCreated} walk${s.dirComponentWalks} uniq${s.uniqueDirs} ls${s.lstatCalls} rn${s.renameCalls} stg${s.stageCalls} pre${fmtDetailSeconds(s.preflightMs)}s pool${fmtDetailSeconds(s.writePoolMs)}s sm${s.smallCount}n/${fmtDetailBytes(s.smallBytes)} lg${s.largeCount}n/${fmtDetailBytes(s.largeBytes)}`;
 
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
   const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
@@ -324,14 +332,24 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   let actions: Action[] = [];
   let finalMatcher = matcher; // the post-pull rules — also gates git materialization below
   try {
-    await report.phase("apply", async () => {
-      if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
-      const fresh = ruleActions.length > 0 ? matcherForState(root, cfg, state) : matcher;
-      finalMatcher = fresh;
-      const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
-      await applyActions(root, rest, api.blobStore(), applyOpts);
-      actions = [...ruleActions, ...rest];
-    });
+    if (report.enabled) setApplyStatsEnabled(true);
+    const applyStatsBefore = report.enabled ? snapshotApplyStats() : undefined;
+    try {
+      await report.phase("apply", async () => {
+        if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
+        const fresh = ruleActions.length > 0 ? matcherForState(root, cfg, state) : matcher;
+        finalMatcher = fresh;
+        const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+        await applyActions(root, rest, api.blobStore(), applyOpts);
+        actions = [...ruleActions, ...rest];
+      });
+    } finally {
+      if (report.enabled) setApplyStatsEnabled(false);
+    }
+    if (applyStatsBefore) {
+      const d = applyStatsDelta(applyStatsBefore);
+      report.recordDetails("apply", { applyStats: d }, formatApplyStats(d));
+    }
   } finally {
     if (batch) await batch.finish();
   }

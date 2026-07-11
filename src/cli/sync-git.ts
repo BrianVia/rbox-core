@@ -26,6 +26,7 @@ import {
   writeFileAtomic,
   type DiscoveredGitRepo,
   type GitIdentity,
+  type GitChainTimings,
   type GitPackLink,
   type GitPreflightResult,
   type GitRepoKind,
@@ -35,6 +36,7 @@ import {
   type Manifest,
   type BlobStore,
   type RepoCtx,
+  zeroGitChainTimings,
 } from "../engine/index.js";
 import { repoCtx } from "../engine/git/shared.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../engine/manifest-validate.js";
@@ -1747,6 +1749,7 @@ export interface GitApplyRepoTiming {
   wallMs: number;
   result: GitApplyRepoResult;
   commonDirGroup?: number;
+  chain?: GitChainTimings;
 }
 
 export interface GitApplyMetrics {
@@ -1784,7 +1787,10 @@ function finishGitApplyMetrics(
     ...metrics,
     commonDirGroups: commonDirGroups?.size ?? 0,
     results: { ...metrics.results },
-    repoTimings: metrics.repoTimings.map((timing) => ({ ...timing })),
+    repoTimings: metrics.repoTimings.map((timing) => ({
+      ...timing,
+      ...(timing.chain ? { chain: { ...timing.chain } } : {}),
+    })),
   };
 }
 
@@ -1796,7 +1802,10 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
   const repoBits = metrics.repoTimings
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
-      return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}`;
+      const chain = t.chain && t.chain.chainLength > 0
+        ? ` L${t.chain.chainLength}fd${Math.round(t.chain.fetchDecryptMs)}bv${Math.round(t.chain.bundleVerifyMs)}gi${Math.round(t.chain.gitImportMs)}io${Math.round(t.chain.indexOpStateMs)}`
+        : "";
+      return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
     .join(",");
   return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} results=${resultBits || "none"} repoMs=${repoBits || "none"}`;
@@ -1969,7 +1978,7 @@ opts: {
     });
   };
 
-  const processRepo = async (rel: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
+  const processRepo = async (rel: string, chainTimings?: GitChainTimings): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     let remoteSec = wireRemoteSec;
     if (wireRemoteSec?.config !== undefined) {
@@ -2220,6 +2229,7 @@ opts: {
           }
           : {}),
         ...(configAfterGit ? { afterGitMutate: configAfterGit } : {}),
+        ...(chainTimings ? { chainTimings } : {}),
       }
     );
     if (res.applied) {
@@ -2249,11 +2259,12 @@ opts: {
     let startedAt = Date.now();
     let result: GitApplyRepoResult = "deferred";
     let commonDirGroup: number | undefined;
+    const chainTimings = metrics ? zeroGitChainTimings() : undefined;
     try {
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async () => {
         startedAt = Date.now();
-        const processed = await processRepo(rel);
+        const processed = await processRepo(rel, chainTimings);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });
@@ -2274,6 +2285,7 @@ opts: {
           wallMs: Date.now() - startedAt,
           result,
           commonDirGroup,
+          chain: chainTimings,
         });
       }
       opts.onProgress?.(++progressDone, keys.length);

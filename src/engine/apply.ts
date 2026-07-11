@@ -10,6 +10,10 @@ import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
 import type { TrashBatch } from "./trash.js";
 import type { FileEntry, Manifest } from "./types.js";
+import {
+  addDirComponentWalks, addPreflightMs, addUniqueDirs, addWritePoolMs,
+  applyStatsEnabled, countLstat, countMkdir, countRename, countStage, mkdirCounted,
+} from "./apply-stats.js";
 
 /**
  * Push a tree's content into the blob store (the Phase-1 stand-in for "upload
@@ -69,6 +73,9 @@ export async function applyActions(
   store: BlobStore,
   opts: ApplyOptions = {}
 ): Promise<void> {
+  const measured = applyStatsEnabled();
+  const preT0 = measured ? performance.now() : 0;
+  let poolStarted = false;
   const device = opts.device ?? "local";
   const now = opts.now ?? new Date().toISOString();
 
@@ -83,14 +90,20 @@ export async function applyActions(
   // race the same move. These go to a VISIBLE conflict copy (files are cheap; the
   // design deliberately does NOT trash them).
   const needDirs = new Set<string>();
+  let dirComponentWalks = 0;
   for (const a of rest) {
     const p = a.kind === "write" ? a.entry.path : a.path;
     const parts = p.split("/");
+    if (measured) dirComponentWalks += parts.length - 1;
     let acc = "";
     for (let i = 0; i < parts.length - 1; i++) {
       acc = acc ? `${acc}/${parts[i]!}` : parts[i]!;
       needDirs.add(acc);
     }
+  }
+  if (measured) {
+    addDirComponentWalks(dirComponentWalks);
+    addUniqueDirs(needDirs.size);
   }
   const shallowFirst = [...needDirs].sort((a, b) => a.split("/").length - b.split("/").length);
 
@@ -124,6 +137,7 @@ export async function applyActions(
       const obstructed = new Set<string>();
       for (const comp of shallowFirst) {
         try {
+          countLstat();
           const st = await fs.lstat(path.join(destRoot, comp));
           if (st.isFile() || st.isSymbolicLink()) obstructed.add(comp);
         } catch (error) {
@@ -158,22 +172,33 @@ export async function applyActions(
         await moveAside(destRoot, comp, conflictName(comp, device, now));
       }
 
-      await poolMap(rest, dlConc, async (a) => {
-        if (a.kind === "write") {
-          await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
-            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a),
-          });
-        } else if (a.kind === "conflict") {
-          // Reconcile already decided both sides diverged. Stage and verify the
-          // remote first; only then preserve the local at its chosen conflict name.
-          await writeEntry(destRoot, a.entry, undefined, store, device, now, {
-            kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
-          });
-        }
-        opts.onProgress?.(++done, rest.length);
-      });
+      if (measured) addPreflightMs(performance.now() - preT0);
+      poolStarted = true;
+      const poolT0 = measured ? performance.now() : 0;
+      try {
+        await poolMap(rest, dlConc, async (a) => {
+          if (a.kind === "write") {
+            await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a),
+            });
+          } else if (a.kind === "conflict") {
+            // Reconcile already decided both sides diverged. Stage and verify the
+            // remote first; only then preserve the local at its chosen conflict name.
+            await writeEntry(destRoot, a.entry, undefined, store, device, now, {
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
+            });
+          }
+          opts.onProgress?.(++done, rest.length);
+        });
+      } finally {
+        if (measured) addWritePoolMs(performance.now() - poolT0);
+      }
     });
   } finally {
+    // Deletes (after the pool) and prepared-temp cleanup deliberately stay outside
+    // both intervals. They are ~0 on a fresh join; apply wall is the denominator,
+    // so this split is evidence rather than an identity.
+    if (measured && !poolStarted) addPreflightMs(performance.now() - preT0);
     await Promise.all([...prepared.values()].map((tmp) => fs.rm(tmp, { force: true }).catch(() => {})));
   }
   for (const a of deletes) {
@@ -204,11 +229,14 @@ async function writeEntry(
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
-  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await mkdirCounted(path.dirname(abs));
 
   const tmp = tmpName(abs);
   try {
-    if (preparedTmp) await fs.rename(preparedTmp, tmp);
+    if (preparedTmp) {
+      countRename();
+      await fs.rename(preparedTmp, tmp);
+    }
     else {
       try {
         await stageEntryToTemp(tmp, entry, store, kek);
@@ -232,12 +260,14 @@ async function writeEntry(
     // rename (else `rename(tmp, dir)` is EISDIR — the flat-meadow outage). It goes
     // to trash when present (a visible in-workspace conflict copy would re-push the
     // entire subtree as new adds — a churn bomb), else to a visible conflict copy.
+    countLstat();
     const obstruction = await fs.lstat(abs).catch(() => undefined);
     if (obstruction?.isDirectory()) {
       onTypeFlip?.(entry.path);
       if (trash) await trash.put(entry.path);
       else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
     }
+    countRename();
     await fs.rename(tmp, abs);
   } catch (e) {
     await fs.rm(tmp, { force: true }).catch(() => {});
@@ -262,36 +292,42 @@ export function laneTimingSummary(): string | undefined {
 }
 
 async function stageEntryToTemp(tmp: string, entry: FileEntry, store: BlobStore, kek?: Buffer): Promise<void> {
-  if (entry.type === "symlink") {
-    await fs.symlink(entry.symlinkTarget ?? "", tmp);
-    return;
-  }
-  if (entry.encSha && kek) {
-    // Encrypted (M5/E2EE): fetch ciphertext by encSha, decrypt+verify into tmp.
-    const ctTmp = `${tmp}.ct`;
-    try {
-      const t0 = LANE_TIMING ? performance.now() : 0;
-      const ciphertextSizeHint = entry.comp ? (entry.cipherSize ?? entry.size + BLOB_CIPHERTEXT_TAG_BYTES) : entry.size + BLOB_CIPHERTEXT_TAG_BYTES;
-      if (store.getToFile) await store.getToFile(entry.encSha, ctTmp, ciphertextSizeHint);
-      else await fs.writeFile(ctTmp, await store.get(entry.encSha));
-      const t1 = LANE_TIMING ? performance.now() : 0;
-      await decryptFileToPath(ctTmp, kek, entry.sha256, tmp, { comp: entry.comp, payloadSha: entry.payloadSha, maxPlaintextBytes: entry.size });
-      if (LANE_TIMING) {
-        laneTiming.fetchMs += t1 - t0;
-        laneTiming.decryptWriteMs += performance.now() - t1;
-        laneTiming.blobs++;
-      }
-    } finally {
-      await fs.rm(ctTmp, { force: true }).catch(() => {});
+  const measured = applyStatsEnabled();
+  const t0 = measured ? performance.now() : 0;
+  try {
+    if (entry.type === "symlink") {
+      await fs.symlink(entry.symlinkTarget ?? "", tmp);
+      return;
     }
+    if (entry.encSha && kek) {
+      // Encrypted (M5/E2EE): fetch ciphertext by encSha, decrypt+verify into tmp.
+      const ctTmp = `${tmp}.ct`;
+      try {
+        const laneT0 = LANE_TIMING ? performance.now() : 0;
+        const ciphertextSizeHint = entry.comp ? (entry.cipherSize ?? entry.size + BLOB_CIPHERTEXT_TAG_BYTES) : entry.size + BLOB_CIPHERTEXT_TAG_BYTES;
+        if (store.getToFile) await store.getToFile(entry.encSha, ctTmp, ciphertextSizeHint);
+        else await fs.writeFile(ctTmp, await store.get(entry.encSha));
+        const t1 = LANE_TIMING ? performance.now() : 0;
+        await decryptFileToPath(ctTmp, kek, entry.sha256, tmp, { comp: entry.comp, payloadSha: entry.payloadSha, maxPlaintextBytes: entry.size });
+        if (LANE_TIMING) {
+          laneTiming.fetchMs += t1 - laneT0;
+          laneTiming.decryptWriteMs += performance.now() - t1;
+          laneTiming.blobs++;
+        }
+      } finally {
+        await fs.rm(ctTmp, { force: true }).catch(() => {});
+      }
+      await fs.chmod(tmp, entry.mode);
+      return;
+    }
+    // Stream large blobs straight to the temp file (no whole-file buffer); the
+    // streaming download verifies the sha. Fall back to buffered get otherwise.
+    if (store.getToFile) await store.getToFile(entry.sha256, tmp);
+    else await fs.writeFile(tmp, await store.get(entry.sha256));
     await fs.chmod(tmp, entry.mode);
-    return;
+  } finally {
+    if (measured) countStage(entry.size, performance.now() - t0);
   }
-  // Stream large blobs straight to the temp file (no whole-file buffer); the
-  // streaming download verifies the sha. Fall back to buffered get otherwise.
-  if (store.getToFile) await store.getToFile(entry.sha256, tmp);
-  else await fs.writeFile(tmp, await store.get(entry.sha256));
-  await fs.chmod(tmp, entry.mode);
 }
 
 /** Staging failures name the entry and retain the original typed error as `cause`. */
@@ -386,6 +422,7 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   const abs = path.join(destRoot, rel);
   let st;
   try {
+    countLstat();
     st = await fs.lstat(abs);
   } catch (e) {
     // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
@@ -408,9 +445,10 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
  *  (same device) collide — probe and suffix `~2`, `~3`… (design-50 review). */
 async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
   const from = path.join(destRoot, fromRel);
+  countLstat();
   const st = await fs.lstat(from);
   let to = path.join(destRoot, toRel);
-  await fs.mkdir(path.dirname(to), { recursive: true });
+  await mkdirCounted(path.dirname(to));
   for (let i = 2; ; i++) {
     if (await moveNoClobber(from, to, st)) return;
     to = path.join(destRoot, `${toRel}~${i}`);
@@ -422,8 +460,15 @@ async function moveAside(destRoot: string, fromRel: string, toRel: string): Prom
 async function moveNoClobber(from: string, to: string, st: { isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
   try {
     if (st.isDirectory()) {
-      await fs.mkdir(to);
+      let ok = false;
+      try {
+        await fs.mkdir(to);
+        ok = true;
+      } finally {
+        countMkdir(ok);
+      }
       await fs.rename(from, to);
+      countRename();
     } else if (st.isSymbolicLink()) {
       await fs.symlink(await fs.readlink(from), to);
       await fs.unlink(from);

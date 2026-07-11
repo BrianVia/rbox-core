@@ -8,8 +8,8 @@
 // validates gitRepos values, and manifest-validate must stay node:*-free for the Worker).
 export { isSyncableRef, validateGitSection } from "./manifest-validate.js";
 
-export type { GitRepoKind, RepoCtx } from "./git/shared.js";
-export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver } from "./git/shared.js";
+export type { GitChainTimings, GitRepoKind, RepoCtx } from "./git/shared.js";
+export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver, zeroGitChainTimings } from "./git/shared.js";
 export { gitPreflight, isGitBusy, type GitPreflightResult } from "./git/preflight.js";
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
 export {

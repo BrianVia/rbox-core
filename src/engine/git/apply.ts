@@ -6,6 +6,8 @@ import { writeFileAtomic } from "../fsutil.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitSection } from "../types.js";
 import {
+  addTimedMs,
+  type GitChainTimings,
   type RepoCtx,
   clearIndexResolveUndo,
   detectGitKind,
@@ -129,6 +131,7 @@ export async function applyGitState(
     /** Final mutation in the rollback boundary. Design 93 uses this for config:
      * its rename is the combined git+config commit point. */
     afterGitMutate?: () => Promise<void>;
+    chainTimings?: GitChainTimings;
   } = {}
 ): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
@@ -219,7 +222,7 @@ export async function applyGitState(
     await pruneStaleScratchRefs(repoDir, "refs/rbox-incoming");
     incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     try {
-      await importGitPackChain(repoDir, section, store, kek, tmpDir, incomingNs);
+      await importGitPackChain(repoDir, section, store, kek, tmpDir, incomingNs, opts.chainTimings);
       return { ok: true };
     } catch (e) {
       await cleanupIncoming();
@@ -238,22 +241,26 @@ export async function applyGitState(
     const opTmp: Array<{ rel: string; tmp: string }> = [];
     try {
       if (indexTmp) {
-        await getGitArtifact(
-          store,
-          kek,
-          {
-            sha: section.indexSha!,
-            encSha: section.indexEncSha!,
-            cipherSize: section.indexCipherSize!,
-            ...(section.indexComp ? { comp: section.indexComp, payloadSha: section.indexPayloadSha } : {}),
-          },
-          indexTmp,
-          tmpDir
-        );
+        await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
+          await getGitArtifact(
+            store,
+            kek,
+            {
+              sha: section.indexSha!,
+              encSha: section.indexEncSha!,
+              cipherSize: section.indexCipherSize!,
+              ...(section.indexComp ? { comp: section.indexComp, payloadSha: section.indexPayloadSha } : {}),
+            },
+            indexTmp,
+            tmpDir
+          );
+        });
       }
       for (const [rel, ref] of Object.entries(section.opState ?? {})) {
         const tmp = path.join(tmpDir, "op", rel);
-        await getGitArtifact(store, kek, ref, tmp, tmpDir);
+        await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
+          await getGitArtifact(store, kek, ref, tmp, tmpDir);
+        });
         opTmp.push({ rel, tmp });
       }
     } catch (e) {
