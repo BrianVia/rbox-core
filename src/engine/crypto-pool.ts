@@ -986,6 +986,14 @@ export async function withCryptoPool<T>(
   return poolScope.run(pool, () => fn(pool));
 }
 
+/** Terminate the process-wide crypto worker pool if one is active. Idempotent and
+ *  safe when no pool exists. One-shot commands call this before exit; the daemon
+ *  keeps its pool for the life of the process. */
+export async function shutdownCryptoPool(): Promise<void> {
+  if (activePool) await activePool.close().catch(() => {});
+  activePool = undefined;
+}
+
 export function currentCryptoPoolForKek(kek: Buffer): CryptoPool | undefined {
   const pool = poolScope.getStore();
   if (!pool || pool.closed) return undefined;
@@ -1015,8 +1023,7 @@ export function cryptoPoolStatus(): CryptoPoolStatus {
 
 export const __cryptoPoolTestHooks = {
   async reset(): Promise<void> {
-    if (activePool) await activePool.close().catch(() => {});
-    activePool = undefined;
+    await shutdownCryptoPool();
     disabledReason = undefined;
     jobsRunTotal = 0;
     workerExecutionsTotal = 0;

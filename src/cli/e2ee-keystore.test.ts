@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { forgetRecoveryKey, hasDevice, loadDevice, loadRecoveryKey, loadWsKek, saveDevice, saveMasterKey, saveRecoveryKey, saveWsKek } from "./e2ee-keystore.js";
+import { enrolledDeviceId, forgetRecoveryKey, hasDevice, loadDevice, loadRecoveryKey, loadWsKek, saveDevice, saveMasterKey, saveRecoveryKey, saveWsKek } from "./e2ee-keystore.js";
 import { bootstrapAccount, generateWorkspaceKek, toB64url } from "../engine/e2ee/index.js";
 
 let tmp: string;
@@ -47,6 +47,14 @@ describe("e2ee keystore", () => {
   test("missing account → undefined", async () => {
     expect(await loadDevice("nope")).toBeUndefined();
     expect(await hasDevice("nope")).toBe(false);
+  });
+
+  test("enrolled device id reads the authoritative identity", async () => {
+    const boot = await bootstrapAccount("acct_identity", "dev_identity", 1_900_000_000_000);
+    expect(await enrolledDeviceId(undefined)).toBeUndefined();
+    expect(await enrolledDeviceId("acct_absent")).toBeUndefined();
+    await saveDevice(boot.secrets);
+    expect(await enrolledDeviceId("acct_identity")).toBe("dev_identity");
   });
 
   test("workspace KEK cache is per-epoch", async () => {

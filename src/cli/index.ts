@@ -9,7 +9,15 @@ async function run(): Promise<void> {
   }
 
   const { main } = await import("./main-dispatch.js");
-  await main();
+  try {
+    await main();
+  } finally {
+    // The daemon keeps its crypto pool for the life of the process.
+    if (cmd !== "__daemon-run") {
+      const { shutdownCryptoPool } = await import("../engine/index.js");
+      await shutdownCryptoPool();
+    }
+  }
 }
 
 run().catch(async (e) => {

@@ -8,6 +8,7 @@
  * decision surface is unit-testable without a TTY or a server. A future OpenTUI
  * front-end drives the same function.
  */
+import crypto from "node:crypto";
 import path from "node:path";
 
 /** The per-machine credential shape we care about (subset of credentials.ts). */
@@ -71,10 +72,6 @@ export function interpretWorkspaceNameAnswer(raw: string): string | undefined {
   return trimmed && trimmed !== "-" ? trimmed : undefined;
 }
 
-/** `from-credentials` = resolve from the credential saved by the login the
- *  executor will run (auth was "need-interactive-login"). */
-export type ResolvedDeviceId = { kind: "fixed"; id: string } | { kind: "from-credentials" };
-
 export interface InitPlan {
   /** have = creds already present; bootstrap-login = `--bootstrap <secret>` (works
    *  headless, e.g. first device in CI); need-interactive-login = TTY device-code flow. */
@@ -82,7 +79,6 @@ export interface InitPlan {
   workspace: WorkspaceChoice;
   root: string;
   remoteUrl: string;
-  deviceId: ResolvedDeviceId;
   /** new→push, join→sync, keyed agent join→pull, --no-sync→none. */
   firstSync: "push" | "sync" | "pull" | "none";
   /** §28: git-sync defaults ON (git artifacts are E2EE-encrypted); --git false opts out. */
@@ -104,14 +100,27 @@ export function isInitError(x: InitPlan | InitError): x is InitError {
 
 const TRUE = "true";
 
-/**
- * The auth device id is the sync identity (design 07c §6). The `"env"`
- * placeholder is what credentials.ts assigns when RBOX_TOKEN is set without
- * RBOX_DEVICE_ID — not a real per-device id, so fall back to a generated one.
- */
-export function unifyDeviceId(creds: CredsView | undefined): ResolvedDeviceId {
-  if (!creds || creds.deviceId === "env") return { kind: "from-credentials" };
-  return { kind: "fixed", id: creds.deviceId };
+/** Resolve the device id to write into a workspace binding. Precedence:
+ *  force-new, explicit override, enrolled identity, previous binding, real
+ *  credential id, then a freshly minted id. The default `mint` is this module's
+ *  only nondeterminism (crypto.randomUUID) — tests inject `mint` to pin it. */
+export function resolveWorkspaceDeviceId(opts: {
+  forceNew?: boolean;
+  override?: string;
+  prevDeviceId?: string;
+  enrolledDeviceId?: string;
+  credsDeviceId?: string;
+  mint?: () => string;
+}): string {
+  const mint = opts.mint ?? (() => `dev_${crypto.randomUUID().slice(0, 8)}`);
+  if (opts.forceNew) return mint();
+  return (
+    opts.override ??
+    opts.enrolledDeviceId ??
+    opts.prevDeviceId ??
+    (opts.credsDeviceId && opts.credsDeviceId !== "env" ? opts.credsDeviceId : undefined) ??
+    mint()
+  );
 }
 
 export function resolveInitPlan(input: InitInput): InitPlan | InitError {
@@ -171,7 +180,6 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
     workspace,
     root,
     remoteUrl,
-    deviceId: unifyDeviceId(creds),
     firstSync,
     syncGit: flags.git !== "false",
     respectGitignore: flags["respect-gitignore"] === "true",
