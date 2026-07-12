@@ -16,7 +16,8 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { decodeEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
@@ -204,6 +205,56 @@ async function tmp(): Promise<string> {
 }
 afterAll(async () => {
   for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
+});
+
+async function withManifestEncodingFlags<T>(snapshot: string | undefined, delta: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const oldSnapshot = process.env.RBOX_MDE_SNAPSHOT;
+  const oldDelta = process.env.RBOX_MDE_DELTA;
+  if (snapshot === undefined) delete process.env.RBOX_MDE_SNAPSHOT; else process.env.RBOX_MDE_SNAPSHOT = snapshot;
+  if (delta === undefined) delete process.env.RBOX_MDE_DELTA; else process.env.RBOX_MDE_DELTA = delta;
+  try { return await fn(); } finally {
+    if (oldSnapshot === undefined) delete process.env.RBOX_MDE_SNAPSHOT; else process.env.RBOX_MDE_SNAPSHOT = oldSnapshot;
+    if (oldDelta === undefined) delete process.env.RBOX_MDE_DELTA; else process.env.RBOX_MDE_DELTA = oldDelta;
+  }
+}
+
+test("C2 commit emits a chained delta and a cold peer folds it with propagated meta", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-mde-delta", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base: Manifest = {
+      generatedAt: "base",
+      files: Array.from({ length: 300 }, (_, i) => ({
+        path: `links/${i.toString(16).padStart(4, "0")}-${hex(i * 7919 + 17)}`,
+        type: "symlink" as const,
+        symlinkTarget: `../targets/${hex(i * 104729 + 3)}`,
+        sha256: hex(i * 65537 + 11), size: 70, mode: 0o777, mtimeMs: i,
+      })),
+    };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    expect(first.manifestMeta).toBeDefined();
+    const target: Manifest = { ...base, generatedAt: "next", files: base.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const body = parseSignedCommit(server.commits[1]!);
+    expect(body.manifestChain).toEqual([first.manifestMeta!.encManifestSha]);
+    expect(second.manifestMeta?.chain).toEqual(body.manifestChain);
+    expect(second.manifestMeta?.chainBytes).toBeGreaterThan(0);
+    expect(second.manifestMeta?.snapshotBytes).toBe(first.manifestMeta?.snapshotBytes);
+    const plaintext = await openManifestChainBlob({
+      bytes: server.store.blobs.get(body.encManifestSha)!,
+      expectedEncSha: body.encManifestSha,
+      workspaceId: WS,
+      accountId: ACCT,
+      keyEpoch: body.keyEpoch,
+      kek: new Uint8Array((await writer.currentKek()).kek),
+    });
+    expect((await decodeEnvelope(plaintext)).kind).toBe("delta");
+    const pulled = await peer.latest();
+    expect(pulled.manifest).toEqual(target);
+    expect(pulled.manifestMeta).toEqual(second.manifestMeta);
+  });
 });
 
 async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {

@@ -24,6 +24,7 @@ import { hashBytes } from "../engine/hash.js";
 import {
   canonicalManifestHash,
   decodeEnvelope,
+  encodeDeltaEnvelope,
   encodeSnapshotEnvelope,
   foldDelta,
   gitSectionBlobRefs,
@@ -201,7 +202,8 @@ export class E2eeRemote implements SyncRemote {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, process.env.RBOX_MDE_SNAPSHOT === "1");
+    const collectMeta = process.env.RBOX_MDE_SNAPSHOT === "1" || process.env.RBOX_MDE_DELTA === "1";
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
 
@@ -593,16 +595,9 @@ export class E2eeRemote implements SyncRemote {
     let encodeMs = 0;
     let encryptMs = 0;
     let uploadMs = 0;
-    let manifestJson: Uint8Array;
-    const snapshotEnabled = process.env.RBOX_MDE_SNAPSHOT === "1";
-    if (onCommitTimings) {
-      const t0 = Date.now();
-      manifestJson = snapshotEnabled ? await encodeSnapshotEnvelope(manifest, { compress: true }) : new TextEncoder().encode(JSON.stringify(manifest));
-      encodeMs = Date.now() - t0;
-    } else {
-      manifestJson = snapshotEnabled ? await encodeSnapshotEnvelope(manifest, { compress: true }) : new TextEncoder().encode(JSON.stringify(manifest));
-    }
-    const buildArgs: Parameters<typeof buildCommit>[0] = {
+    const deltaEnabled = process.env.RBOX_MDE_DELTA === "1";
+    const snapshotEnabled = process.env.RBOX_MDE_SNAPSHOT === "1" || deltaEnabled;
+    const baseBuildArgs = {
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
       kek,
@@ -612,12 +607,53 @@ export class E2eeRemote implements SyncRemote {
       seq: parentSequence + 1,
       parentSeq: parentSequence,
       parentCommitHash,
-      manifestJson,
       blobRefs,
       blobRefset,
     };
-    if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs = ms);
-    const built = await buildCommit(buildArgs);
+    const buildEncoded = async (manifestJson: Uint8Array, manifestChain?: string[]) => {
+      const buildArgs: Parameters<typeof buildCommit>[0] = {
+        ...baseBuildArgs,
+        manifestJson,
+        ...(manifestChain?.length ? { manifestChain } : {}),
+      };
+      if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs += ms);
+      return buildCommit(buildArgs);
+    };
+    const encodeSnapshot = async () => buildEncoded(await encodeSnapshotEnvelope(manifest, { compress: true }));
+    const t0 = onCommitTimings ? Date.now() : 0;
+    let built: Awaited<ReturnType<typeof buildCommit>>;
+    let resultManifestHash: string | undefined;
+    let emittedChain: string[] | undefined;
+    let emittedDelta = false;
+    const deltaBase = deltaEnabled ? options?.deltaBase : undefined;
+    if (
+      deltaBase &&
+      deltaBase.meta.keyEpoch === epoch &&
+      deltaBase.meta.accountEpoch === account.currentEpoch &&
+      deltaBase.meta.chain.length + 1 <= MAX_MANIFEST_DELTA_CHAIN
+    ) {
+      const chain = [...deltaBase.meta.chain, deltaBase.meta.encManifestSha];
+      const candidate = await encodeDeltaEnvelope(deltaBase.manifest, manifest, {
+        baseEncSha: deltaBase.meta.encManifestSha,
+        baseManifestHash: deltaBase.meta.manifestHash,
+        compress: true,
+      });
+      const candidateBuilt = await buildEncoded(candidate.bytes, chain);
+      if (deltaBase.meta.chainBytes + candidateBuilt.encManifest.byteLength < deltaBase.meta.snapshotBytes) {
+        built = candidateBuilt;
+        resultManifestHash = candidate.resultHash;
+        emittedChain = chain;
+        emittedDelta = true;
+      } else {
+        built = await encodeSnapshot();
+      }
+    } else if (snapshotEnabled) {
+      // NOTE(84): C2 implies C1; rollout flags are sequential capabilities, not independent axes.
+      built = await encodeSnapshot();
+    } else {
+      built = await buildEncoded(new TextEncoder().encode(JSON.stringify(manifest)));
+    }
+    if (onCommitTimings) encodeMs = Math.max(0, Date.now() - t0 - encryptMs);
     if (onCommitTimings) {
       const t0 = Date.now();
       await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
@@ -651,7 +687,11 @@ export class E2eeRemote implements SyncRemote {
       ...(res.serverTimings ? { serverTimings: res.serverTimings } : {}),
     });
     if (res.conflict) return { conflict: true, head: res.head };
-    if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
+    if (res.unsatisfiedBlobs) return {
+      unsatisfiedBlobs: res.unsatisfiedBlobs,
+      unsatisfiedTotal: res.unsatisfiedTotal,
+      ...(emittedChain ? { attemptedManifestChain: emittedChain } : {}),
+    };
     if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry
     // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
@@ -661,12 +701,12 @@ export class E2eeRemote implements SyncRemote {
       sequence: res.sequence,
       ...(snapshotEnabled ? { manifestMeta: {
         encManifestSha: built.encManifestSha,
-        manifestHash: await canonicalManifestHash(manifest),
+        manifestHash: resultManifestHash ?? await canonicalManifestHash(manifest),
         accountEpoch: account.currentEpoch,
         keyEpoch: epoch,
-        chain: [],
-        chainBytes: 0,
-        snapshotBytes: built.encManifest.byteLength,
+        chain: emittedChain ?? [],
+        chainBytes: emittedDelta ? deltaBase!.meta.chainBytes + built.encManifest.byteLength : 0,
+        snapshotBytes: emittedDelta ? deltaBase!.meta.snapshotBytes : built.encManifest.byteLength,
       } } : {}),
     };
   }

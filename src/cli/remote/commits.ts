@@ -25,6 +25,8 @@ export class CommitRejectedError extends Error {
 export interface CommitOptions {
   blockedFingerprint?: string;
   onCommitTimings?: (timings: CommitTimings) => void;
+  /** Applied manifest + its verified wire identity; only sync.ts may select this base. */
+  deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
 }
 
 export interface CommitTimings {
@@ -95,6 +97,8 @@ export interface CommitResult {
    *  Distinct from a parent conflict — a different recovery (upload, not pull). */
   unsatisfiedBlobs?: string[];
   unsatisfiedTotal?: number;
+  /** Signed chain on the bounced attempt, used to partition data misses from chain misses. */
+  attemptedManifestChain?: string[];
   /** The signed commit used a stale account epoch; refresh E2EE write context and retry. */
   epochStale?: number;
   serverTimings?: ServerTimings;

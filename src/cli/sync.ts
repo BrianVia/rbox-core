@@ -39,7 +39,7 @@ import {
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
+import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
@@ -484,7 +484,7 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; r
 type RecoveryAction =
   | { kind: "pull-first" }
   | { kind: "epoch-stale" }
-  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[] };
+  | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[]; forceSnapshot?: boolean };
 
 const RECOVER_ACCUM_MAX = 100_000;
 
@@ -545,9 +545,10 @@ export async function pushManifest(
   let previousUnsatisfiedTotal: number | undefined;
   const recoverAccum = new Set<string>();
   let recoverFullAudit = false;
+  let forceSnapshot = false;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit);
+    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit, forceSnapshot);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) process.stderr.write(`${lane}\n`);
@@ -574,11 +575,15 @@ export async function pushManifest(
       // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
       recoverAccum.clear();
       recoverFullAudit = false;
+      forceSnapshot = false;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
       recoverFullAudit = accumulateRecoveryPage(recoverAccum, recoverFullAudit, outcome.action.unsatisfiedBlobs);
       currentLocal = outcome.action.localForRetry;
       currentForce = outcome.action.forceGitRecapture;
+      // Once a missing/truncated chain selects repair, every retry stays a snapshot:
+      // a later data-only page must not revive the known-broken historical base.
+      forceSnapshot ||= outcome.action.forceSnapshot === true;
     }
     if (consumesAttempt) attempt++;
   }
@@ -599,7 +604,8 @@ async function runPushAttempt(
   purgeIgnored: boolean,
   forceGitRecapture: ReadonlySet<string>,
   recoverAddresses: ReadonlySet<string>,
-  forceFullAudit: boolean
+  forceFullAudit: boolean,
+  forceSnapshot: boolean
 ): Promise<AttemptOutcome> {
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
@@ -756,10 +762,15 @@ async function runPushAttempt(
 
   let commitTimings: CommitTimings | undefined;
   let commitOptions: CommitOptions | undefined;
-  if (deps.blockedFingerprint !== undefined || report.enabled) {
+  const manifestMeta = validManifestMeta(state.manifestMeta);
+  const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && state.lastSyncedSequence === appliedSequence
+    ? { manifest: state.lastSyncedManifest, meta: manifestMeta }
+    : undefined;
+  if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase) {
     commitOptions = {
       ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
       ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
+      ...(deltaBase ? { deltaBase } : {}),
     };
   }
   const res = await report.phase("commit", () => api.commit(appliedSequence, cfg.deviceId, committed, commitOptions));
@@ -779,6 +790,10 @@ async function runPushAttempt(
     // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
     // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
     const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
+    const attemptedChain = res.attemptedManifestChain ?? [];
+    const missing = new Set(res.unsatisfiedBlobs);
+    const forceSnapshotRetry = attemptedChain.some((sha) => missing.has(sha)) ||
+      (attemptedChain.length > 0 && res.unsatisfiedTotal !== undefined && res.unsatisfiedTotal > res.unsatisfiedBlobs.length);
     return {
       done: false,
       action: {
@@ -787,6 +802,7 @@ async function runPushAttempt(
         localForRetry: committed,
         unsatisfiedTotal: res.unsatisfiedTotal,
         unsatisfiedBlobs: res.unsatisfiedBlobs ?? [],
+        ...(forceSnapshotRetry ? { forceSnapshot: true } : {}),
       },
       exhaustedError: "push: server keeps reporting missing blobs after re-upload",
     };
