@@ -16,13 +16,14 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { decodeEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { decodeEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type GitSection, type Manifest } from "../engine/index.js";
 import { openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
 import { pull, push } from "./sync.js";
+import { repairChain } from "./chain-repair.js";
 import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 
 const exec = promisify(execFile);
@@ -217,6 +218,87 @@ async function withManifestEncodingFlags<T>(snapshot: string | undefined, delta:
     if (oldDelta === undefined) delete process.env.RBOX_MDE_DELTA; else process.env.RBOX_MDE_DELTA = oldDelta;
   }
 }
+
+async function wireKind(server: FakeServer, remote: E2eeRemote, index = server.commits.length - 1): Promise<string> {
+  const body = parseSignedCommit(server.commits[index]!);
+  const plaintext = await openManifestChainBlob({
+    bytes: server.store.blobs.get(body.encManifestSha)!, expectedEncSha: body.encManifestSha,
+    workspaceId: WS, accountId: ACCT, keyEpoch: body.keyEpoch, kek: new Uint8Array((await remote.currentKek()).kek),
+  });
+  return (await decodeEnvelope(plaintext)).kind;
+}
+
+test("wire snapshot triggers: absent meta, epoch mismatch, chain cap, and byte bound", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-snapshot-triggers", NOW);
+    const remote = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: [] };
+    const first = await remote.commit(0, secrets.deviceId, base);
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    const changed: Manifest = { generatedAt: "changed", files: [] };
+    const meta = first.manifestMeta!;
+    await remote.commit(1, secrets.deviceId, changed, { deltaBase: { manifest: base, meta: { ...meta, keyEpoch: meta.keyEpoch + 1 } } });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    await remote.commit(2, secrets.deviceId, { ...changed, generatedAt: "cap" }, {
+      deltaBase: { manifest: changed, meta: { ...meta, chain: Array(MAX_MANIFEST_DELTA_CHAIN).fill(meta.encManifestSha) } },
+    });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    await remote.commit(3, secrets.deviceId, { ...changed, generatedAt: "bytes" }, {
+      deltaBase: { manifest: changed, meta: { ...meta, chainBytes: meta.snapshotBytes, snapshotBytes: meta.snapshotBytes } },
+    });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+  });
+});
+
+test("chainDiagnostic skips the manifest blob for a chain-free head", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-doctor-cheap", NOW);
+  const remote = await remoteFor(server, secrets);
+  await remote.commit(0, secrets.deviceId, { generatedAt: "head", files: [] });
+  const body = parseSignedCommit(server.commits[0]!);
+  server.store.blobs.delete(body.encManifestSha);
+  await expect(remote.chainDiagnostic()).resolves.toEqual({ sequence: 1, links: 0, chainBytes: 0, snapshotBytes: 0, snapshotFetched: false });
+});
+
+test("broken delta head repairs with an unconditional snapshot and a cold peer converges", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-repair", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairRemote = await remoteFor(server, secrets);
+    const coldRemote = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairRemote);
+    const base: Manifest = {
+      generatedAt: "base",
+      files: Array.from({ length: 300 }, (_, i) => ({
+        path: `repair/${i}-${hex(i + 1)}`, type: "symlink" as const, symlinkTarget: `../${hex(i + 2)}`,
+        sha256: hex(i + 3), size: 64, mode: 0o777, mtimeMs: i,
+      })),
+    };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairRemote });
+    const brokenManifest: Manifest = { ...base, generatedAt: "broken-head", files: base.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+    await writer.commit(1, secrets.deviceId, brokenManifest, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const brokenBody = parseSignedCommit(server.commits[1]!);
+    server.store.blobs.delete(brokenBody.encManifestSha);
+    let failure: ManifestChainError | undefined;
+    try { await pull(root, cfg, { remote: repairRemote }); } catch (error) {
+      expect(error).toBeInstanceOf(ManifestChainError);
+      failure = error as ManifestChainError;
+    }
+    if (!failure) throw new Error("expected broken chain");
+    const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, { confirmSupersede: async () => true });
+    expect(outcome.kind).toBe("repaired");
+    expect(outcome.kind === "repaired" && outcome.sequence).toBe(3);
+    expect(parseSignedCommit(server.commits[2]!).manifestChain ?? []).toEqual([]);
+    expect(await wireKind(server, repairRemote, 2)).toBe("snapshot");
+    const converged = await coldRemote.latest();
+    expect(converged.sequence).toBe(3);
+    expect(converged.manifest.files).toHaveLength(base.files.length);
+  });
+});
 
 test("C2 commit emits a chained delta and a cold peer folds it with propagated meta", async () => {
   await withManifestEncodingFlags(undefined, "1", async () => {

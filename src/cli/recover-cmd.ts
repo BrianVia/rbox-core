@@ -33,6 +33,7 @@ export interface RecoverDeps {
   latestCommit?: typeof latestCommitHead;
   log?: (line: string) => void;
   repair?: typeof repairChain;
+  chainProbe?: (remote: Awaited<ReturnType<typeof buildAuthedRemote>>["remote"]) => Promise<void>;
 }
 
 function count(actions: Action[], kind: Action["kind"]): number {
@@ -66,10 +67,6 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
         throw new Error(`recover refused: server head sequence ${sequence} is below the local verified pin ${pin.commitSeq} (rollback evident)`);
       }
     }
-    // NOTE(84): §4.3 retained-pin ceremony still owes removal of this cleared
-    // window. The chain-error branch below preserves the newly verified head pin.
-    await pins.clear();
-
     const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
     built.deps.syncMutex = syncMutex;
     built.deps.allowMassDelete = opts.allowMassDelete === true;
@@ -77,6 +74,12 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     built.deps.report = report;
     let pulled: Action[];
     try {
+      // Retain the verified pin while proving the current head is chain-readable.
+      // A chain failure must enter repair with that broken-head pin intact.
+      await (deps.chainProbe ?? (async (remote) => { await remote.latest(); }))(built.remote);
+      // NOTE(84): §4.3 the successful legacy recovery ceremony still clears the
+      // pin before its re-baseline pull; full retained-pin re-verification remains.
+      await pins.clear();
       pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
     } catch (error) {
       if (!(error instanceof ManifestChainError)) throw error;

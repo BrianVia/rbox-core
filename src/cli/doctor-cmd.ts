@@ -209,7 +209,7 @@ export async function checkManifestChain(remote: Pick<E2eeRemote, "chainDiagnost
     return {
       ok: true,
       label: "manifest chain",
-      message: `head ${d.sequence}; links ${d.links}/${MAX_MANIFEST_DELTA_CHAIN}; chainBytes ${d.chainBytes}; snapshotBytes ${d.snapshotBytes}`,
+      message: `head ${d.sequence}; links ${d.links}/${MAX_MANIFEST_DELTA_CHAIN}; chainBytes ${d.chainBytes}; snapshotBytes ${d.snapshotBytes}${d.snapshotFetched === false ? " (not fetched)" : ""}`,
     };
   } catch (error) {
     if (error instanceof ManifestChainError) {

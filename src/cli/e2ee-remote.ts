@@ -214,9 +214,13 @@ export class E2eeRemote implements SyncRemote {
 
   /** Doctor's authenticated chain report; decoding here is the same reader path as
    * latest(), with metadata collection forced on for reporting. */
-  async chainDiagnostic(): Promise<{ sequence: number; links: number; chainBytes: number; snapshotBytes: number }> {
+  async chainDiagnostic(): Promise<{ sequence: number; links: number; chainBytes: number; snapshotBytes: number; snapshotFetched?: boolean }> {
     const vh = await this.verifiedHead();
     if (!vh) return { sequence: 0, links: 0, chainBytes: 0, snapshotBytes: 0 };
+    const body = parseCommit(vh.commit);
+    if ((body.manifestChain?.length ?? 0) === 0) {
+      return { sequence: vh.sequence, links: 0, chainBytes: 0, snapshotBytes: 0, snapshotFetched: false };
+    }
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, undefined, true);
     const meta = decoded.manifestMeta!;
     return { sequence: vh.sequence, links: meta.chain.length, chainBytes: meta.chainBytes, snapshotBytes: meta.snapshotBytes };

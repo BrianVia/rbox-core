@@ -25,6 +25,7 @@ import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { deferManifest } from "./sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { E2eeRemote } from "./e2ee-remote.js";
 import { beginReport, loadMetrics, metricsEnabled, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { createScanProbe, loadScanProbe, saveScanProbe } from "./scan-probe.js";
 import {
@@ -232,6 +233,10 @@ export class RboxDaemon {
   private errRepeat = 0;
   private pushTerminalBlocked = false;
   private lastTerminalBlockFingerprint = "";
+  /** Foreign-device chain HALTs are terminal for a verified head. Avoid repeatedly
+   * attempting repair (and repeating the same HALT) until the authenticated pin moves. */
+  private chainTerminalHeadFingerprint = "";
+  private chainTerminalHaltMessage = "";
   private lastLoggedSeq?: number;
   /** While quota-blocked, only a safety full-scan arms one upload probe. */
   private outOfStorageProbeArmed = false;
@@ -840,6 +845,11 @@ export class RboxDaemon {
   }
 
   private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
+    if (this.chainTerminalHeadFingerprint && this.e2ee.remote instanceof E2eeRemote) {
+      const pin = await this.e2ee.remote.loadVerifiedPin();
+      const fingerprint = pin ? `${pin.commitSeq}:${pin.commitHash}` : "";
+      if (fingerprint === this.chainTerminalHeadFingerprint) throw new Error(this.chainTerminalHaltMessage);
+    }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
@@ -872,12 +882,19 @@ export class RboxDaemon {
       if (outcome.kind === "declined") {
         const suffix = refusal ?? outcome.suffix;
         const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
-        throw new Error(`MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`);
+        const message = `MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`;
+        if (error.head) {
+          this.chainTerminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
+          this.chainTerminalHaltMessage = message;
+        }
+        throw new Error(message);
       }
       actions = outcome.kind === "converged"
         ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
         : outcome.actions;
     }
+    this.chainTerminalHeadFingerprint = "";
+    this.chainTerminalHaltMessage = "";
     report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {

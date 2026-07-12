@@ -574,6 +574,9 @@ export async function pushManifest(
       return outcome.result;
     }
     if (outcome.action.kind === "repair-conflict") {
+      // Repair conflicts deliberately escape this inner budget immediately. The
+      // outer repairChain budget owns 409 races; this loop only spends retries on
+      // bounded 422 reuploads and epoch refreshes while in repair mode.
       return { sequence: repair!.parentSequence, manifest: currentLocal, committed: false, repairConflict: true };
     }
     const consumesAttempt =

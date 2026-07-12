@@ -56,13 +56,15 @@ export async function repairChain(
   let suffix = await describeSuffix(remote, applied, error);
   if (!(await opts.confirmSupersede(suffix))) return { kind: "declined", suffix, actions };
 
-  for (let attempt = 0; attempt <= REPAIR_MAX_ATTEMPTS; attempt++) {
+  // Each publication has its own bounded 422/epoch retry budget in pushManifest;
+  // repair 409s return immediately, so this outer budget is the sole 409-race bound.
+  for (let attempt = 0; attempt < REPAIR_MAX_ATTEMPTS; attempt++) {
     const pin = await remote.loadVerifiedPin();
     if (!pin) throw new Error("chain repair has no verified head pin");
     const local: Manifest = await scanManifestForPush(root, cfg, deps);
     const pushed = await pushManifest(root, cfg, local, deps, 0, false, undefined, { kind: "repair", parentSequence: pin.commitSeq });
     if (!pushed.repairConflict) return { kind: "repaired", sequence: pushed.sequence, suffix, actions };
-    if (attempt >= REPAIR_MAX_ATTEMPTS) throw new Error("repair: remote head kept advancing during publication");
+    if (attempt + 1 >= REPAIR_MAX_ATTEMPTS) throw new Error("repair: remote head kept advancing during publication");
     try {
       const latest = await remote.latest();
       return { kind: "converged", sequence: latest.sequence, suffix, actions };

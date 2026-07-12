@@ -42,11 +42,9 @@ describe("recover workspace command", () => {
         clear: async () => { currentPin = undefined; },
       }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      chainProbe: async () => { currentPin = pin(6, "b".repeat(64)); throw broken; },
       beginReport: () => ({ logSummaryTo: () => {} } as never),
-      pull: async () => {
-        currentPin = pin(6, "b".repeat(64));
-        throw broken;
-      },
+      pull: async () => { throw new Error("pull must not run after a failed retained-pin probe"); },
       confirm: async () => { confirmations++; return true; },
       repair: async (_root, _cfg, _deps, _error, opts) => {
         repaired++;
@@ -70,8 +68,9 @@ describe("recover workspace command", () => {
       latestCommit: async () => ({ sequence: 3 }),
       pinStore: () => ({ load: async () => currentPin, save: async (next) => { currentPin = next; }, clear: async () => { currentPin = undefined; } }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      chainProbe: async () => { currentPin = pin(3, "d".repeat(64)); throw broken; },
       beginReport: () => ({ logSummaryTo: () => {} } as never),
-      pull: async () => { currentPin = pin(3, "d".repeat(64)); throw broken; },
+      pull: async () => { throw new Error("pull must not run after a failed retained-pin probe"); },
       confirm: async () => true,
       repair: async (_root, _cfg, _deps, _error, opts) => {
         expect(await opts.confirmSupersede([{ seq: 3, deviceId: "dev_1", reason: "missing link" }])).toBe(true);
@@ -97,6 +96,7 @@ describe("recover workspace command", () => {
         clear: async () => calls.push(`clear:${accountId}:${workspaceId}`),
       }),
       buildAuthedRemote: async () => ({ cfg, deps: depsObj, remote: {} as never }),
+      chainProbe: async () => calls.push("probe"),
       beginReport: () => ({ logSummaryTo: () => {} } as never),
       summarize: () => calls.push("summarize"),
       postSyncNudge: async () => calls.push("nudge"),
@@ -111,7 +111,7 @@ describe("recover workspace command", () => {
       log: (line) => logs.push(line),
     });
 
-    expect(calls).toEqual(["clear:acct_1:ws_1", "pull", "summarize", "nudge", "push"]);
+    expect(calls).toEqual(["probe", "clear:acct_1:ws_1", "pull", "summarize", "nudge", "push"]);
     expect(depsObj.allowMassDelete).toBe(false);
     expect(logs.join("\n")).toContain("pin cleared");
     expect(logs.join("\n")).toContain("1 pulled");
@@ -138,6 +138,7 @@ describe("recover workspace command", () => {
         },
       }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      chainProbe: async () => calls.push("probe"),
       beginReport: () => ({ logSummaryTo: () => {} } as never),
       summarize: () => calls.push("summarize"),
       postSyncNudge: async () => calls.push("nudge"),
@@ -152,7 +153,7 @@ describe("recover workspace command", () => {
       log: () => {},
     });
 
-    expect(calls).toEqual(["clear", "pull", "summarize", "nudge", "push"]);
+    expect(calls).toEqual(["probe", "clear", "pull", "summarize", "nudge", "push"]);
     expect(currentPin).toBeUndefined();
   });
 
@@ -197,6 +198,7 @@ describe("recover workspace command", () => {
       loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
       pinStore: () => ({ load: async () => undefined, save: async () => {}, clear: async () => {} }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      chainProbe: async () => {},
       beginReport: () => ({ logSummaryTo: () => {} } as never),
       summarize: (label, actions) => {
         expect(label).toBe("pulled");
