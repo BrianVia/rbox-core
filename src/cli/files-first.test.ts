@@ -197,7 +197,7 @@ test("flag ON but stream-mismatch (rebind, even nonzero persisted seq): git capt
     stream: "http://x::ws_OTHER::root",
     lastSyncedSequence: 5,
     lastSyncedManifest: { generatedAt: "", files: [] },
-  } as any);
+  });
   expect(syncStreamId(cfg)).toBe(STREAM); // sanity: our stream differs from the persisted one
 
   const r = await push(root, cfg, deps);

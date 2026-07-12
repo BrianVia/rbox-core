@@ -695,6 +695,16 @@ export async function pushManifest(
     ...(repair ? { repair } : {}),
   };
   let previousUnsatisfiedTotal: number | undefined;
+  // Shared "discard the attempt, rebuild from disk truth" reset — used by the
+  // pull-first/epoch-stale arm AND the files-first fallback arm below.
+  const rescanReset = async (): Promise<void> => {
+    state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored);
+    state.forceGitRecapture = NO_GIT_FORCE;
+    // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
+    state.recoverAddresses.clear();
+    state.forceFullAudit = false;
+    state.forceSnapshot = repair !== undefined;
+  };
 
   for (;;) {
     const outcome = await runPushAttempt(root, cfg, deps, backoff, state);
@@ -717,11 +727,7 @@ export async function pushManifest(
       if (state.filesFirstFallbackUsed) throw new Error(outcome.exhaustedError);
       state.filesFirstFallbackUsed = true;
       state.filesFirstAborted = true; // disables files-first defer on the re-run
-      state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored); // rebuild from disk truth
-      state.forceGitRecapture = NO_GIT_FORCE;
-      state.recoverAddresses.clear();
-      state.forceFullAudit = false;
-      state.forceSnapshot = repair !== undefined;
+      await rescanReset(); // rebuild from disk truth
       continue; // does NOT increment attempt
     }
     const consumesAttempt =
@@ -745,12 +751,7 @@ export async function pushManifest(
       } else {
         await refreshWriteContext(cfg, deps);
       }
-      state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored); // disk changed under us
-      state.forceGitRecapture = NO_GIT_FORCE;
-      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
-      state.recoverAddresses.clear();
-      state.forceFullAudit = false;
-      state.forceSnapshot = repair !== undefined;
+      await rescanReset(); // disk changed under us
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
       state.forceFullAudit = accumulateRecoveryPage(state.recoverAddresses, state.forceFullAudit, outcome.action.unsatisfiedBlobs);
@@ -871,8 +872,9 @@ async function runPushAttempt(
   // here too would be a second copy of the rule.
   local = { ...local, gitRepos: gitPlan.gitRepos };
 
-  // The file plane is unchanged by git-plan, so the hoisted filesDiff above is authoritative.
-  const filesUnchanged = filesDiff.added.length === 0 && filesDiff.changed.length === 0 && filesDiff.deleted.length === 0;
+  // The file plane is unchanged by git-plan, so the hoisted filesDiff above is
+  // authoritative — filesUnchanged is exactly its negation (single source, can't drift).
+  const filesUnchanged = !fileDiffNonEmpty;
   const gitUnchanged = !gitPlan.changed;
   if (!repair && filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
@@ -941,10 +943,10 @@ async function runPushAttempt(
 
   // Design 108 §3.6 (round-4 MAJOR 2): everything from encryptAndUpload (which ARMS the
   // module-global firstPublishTiming singleton) onward runs inside this try. Its finally
-  // disables the singleton on EVERY exit that did not transfer ownership to finalized
-  // stats — a reupload / no-advance return, an epoch/409/422 return, or a thrown
-  // encrypt/commit/state-save error — so later unrelated work can never accrue into it.
-  let firstPublishFinalized = false;
+  // disables the singleton on EVERY exit that did not finalize it — a reupload /
+  // no-advance return, an epoch/409/422 return, or a thrown encrypt/commit/state-save
+  // error. The success path needs no flag: finishFirstPublishStats itself disables the
+  // singleton, so `enabled` in the finally means exactly "exited without finalizing".
   try {
     // Missing or scan-mismatched sources defer immediately; ciphertext upload
     // mismatches retry within a bounded per-file budget. Only the stable subset is
@@ -1069,15 +1071,14 @@ async function runPushAttempt(
 
     // Finalize AFTER the fully-persisted commit — a failed attempt never appends a
     // success KPI, and a retry never double-appends. finishFirstPublishStats disables
-    // the singleton (even when it returns no stats), transferring ownership away.
+    // the singleton (even when it returns no stats), so the finally below no-ops here.
     const firstPublish = finishFirstPublishStats();
-    firstPublishFinalized = true;
     if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
     if (deferred.size > 0) reportDeferred(deferred);
     return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}) } };
   } finally {
-    if (!firstPublishFinalized && firstPublishTiming.enabled) beginFirstPublishTiming(false);
+    if (firstPublishTiming.enabled) beginFirstPublishTiming(false);
   }
 }
 
