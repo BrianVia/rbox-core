@@ -30,6 +30,14 @@ const DEFAULT_BATCH_SLOTS = 48;
 // so one batch PUT settles in ~910ms regardless of records; slots scale linearly
 // (8 slots = 83s publish, 24 slots = 39s on the A/B corpus; AE avg_ms constant at both).
 const DEFAULT_BATCH_PUT_SLOTS = 24;
+// Client slot ceilings (concurrency knobs). Raised well above the historical
+// defaults so RBOX_UPLOAD_SLOTS / RBOX_DOWNLOAD_SLOTS can sweep; defaults unchanged.
+// Peak transient framing scales as slots × bodyBytes (8 MiB), so the ceiling caps
+// worst-case RSS at ~2 GiB; real small-file batches fill `records` (32) long before
+// the 8 MiB cap, so typical per-slot bodies are far smaller. Only explicitly-set
+// values above the historical 32/64 caps reach here.
+const MAX_UPLOAD_SLOTS = 256;
+const MAX_DOWNLOAD_SLOTS = 256;
 const FLUSH_DELAY_MS = 10;
 const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
 const SINGLE_FALLBACK_CONCURRENCY = 128;
@@ -217,7 +225,7 @@ export class BlobBatchDownloader {
 
   constructor(private readonly ctx: RemoteContext) {
     // Download can accept record bytes up to the response body cap; upload cannot.
-    this.config = readBatchConfig("RBOX_BATCH_SLOTS", DEFAULT_BATCH_SLOTS, 64, DEFAULT_BATCH_BODY_BYTES);
+    this.config = downloadBatchConfig();
   }
 
   getToFile(sha: string, expectedSize: number | undefined, destPath: string): Promise<void> {
@@ -577,7 +585,7 @@ export class BlobBatchUploader {
 
   constructor(private readonly ctx: RemoteContext) {
     // Upload record bytes stay capped to the server's accepted per-record maximum.
-    this.config = readBatchConfig("RBOX_BATCH_PUT_SLOTS", DEFAULT_BATCH_PUT_SLOTS, 32, DEFAULT_BATCH_RECORD_BYTES);
+    this.config = uploadBatchConfig();
   }
 
   private canBatch(size: number): boolean {
@@ -912,13 +920,32 @@ export class BlobBatchUploader {
   }
 }
 
-function readBatchConfig(slotsEnv: string, slotsDefault: number, slotsMax: number, recordBytesMax: number): BatchConfig {
+export function uploadBatchConfig(): BatchConfig {
+  return readBatchConfig(["RBOX_UPLOAD_SLOTS", "RBOX_BATCH_PUT_SLOTS"], DEFAULT_BATCH_PUT_SLOTS, MAX_UPLOAD_SLOTS, DEFAULT_BATCH_RECORD_BYTES);
+}
+
+export function downloadBatchConfig(): BatchConfig {
+  return readBatchConfig(["RBOX_DOWNLOAD_SLOTS", "RBOX_BATCH_SLOTS"], DEFAULT_BATCH_SLOTS, MAX_DOWNLOAD_SLOTS, DEFAULT_BATCH_BODY_BYTES);
+}
+
+function envIntFirst(names: string[], fallback: number, min: number, max: number): number {
+  for (const name of names) {
+    if (process.env[name]?.trim()) return envInt(name, fallback, min, max);
+  }
+  return fallback;
+}
+
+function readBatchConfig(slotsEnvs: string[], slotsDefault: number, slotsMax: number, recordBytesMax: number): BatchConfig {
   return {
     enabled: process.env.RBOX_BATCH_BLOBS !== "0",
+    // Wire twin: apps/api MAX_BATCH_RECORDS (=32). The server rejects any batch with
+    // more records (400 "too many records"), so RBOX_BATCH_RECORDS is clamped to the
+    // wire cap, never raised independently. Raising the records axis is a coordinated
+    // client+server wire-cap change, not a client-only knob.
     records: envInt("RBOX_BATCH_RECORDS", DEFAULT_BATCH_RECORDS, 1, DEFAULT_BATCH_RECORDS),
     recordBytes: envInt("RBOX_BATCH_RECORD_BYTES", DEFAULT_BATCH_RECORD_BYTES, 1, recordBytesMax),
     bodyBytes: envInt("RBOX_BATCH_BODY_BYTES", DEFAULT_BATCH_BODY_BYTES, 1, DEFAULT_BATCH_BODY_BYTES),
-    slots: envInt(slotsEnv, slotsDefault, 1, slotsMax),
+    slots: envIntFirst(slotsEnvs, slotsDefault, 1, slotsMax),
   };
 }
 

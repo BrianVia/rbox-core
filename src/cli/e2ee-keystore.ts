@@ -56,6 +56,16 @@ export async function hasDevice(accountId: string): Promise<boolean> {
   return (await readMaybe(path.join(root(accountId), "device.json"))) !== undefined;
 }
 
+/** The enrolled device identity for this account (device.json's deviceId), or
+ *  undefined if this machine has no device identity for the account yet. This is the
+ *  authoritative per-machine/per-account device id — the one that signs commits. */
+export async function enrolledDeviceId(accountId: string | undefined): Promise<string | undefined> {
+  if (!accountId) return undefined;
+  const loaded = await loadDevice(accountId);
+  if (!loaded) return undefined;
+  return "secrets" in loaded ? loaded.secrets.deviceId : loaded.device.deviceId;
+}
+
 /**
  * Load the full device secrets, or report a partial state. Returns:
  *  - `{ secrets }` when both device.json and mk.key are present;

@@ -5,12 +5,15 @@ import path from "node:path";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import {
   buildDiagnosticsBundle,
+  checkDeviceIdentity,
   doctorCmd,
   presentDiagnosticsPreview,
   type DiagnosticsBundle,
   type DoctorChecks,
   type DoctorContext,
 } from "./doctor-cmd.js";
+import { saveDevice } from "./e2ee-keystore.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
 
 let home: string;
 let logs: string[];
@@ -22,6 +25,7 @@ const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: s
 const checks: DoctorChecks = {
   credentials: { ok: true, label: "credentials", message: "authenticated" },
   enrollment: { ok: true, label: "encryption", message: "present" },
+  device: { ok: true, label: "device", message: "device dev_1" },
   daemon: { ok: false, label: "background sync", message: "stale", status: "stale" },
   remote: { ok: true, label: "remote", message: "reachable", latencyMs: 10 },
   version: { ok: true, label: "version", message: "up to date", current: "0.6.8", latest: "0.6.8" },
@@ -94,6 +98,26 @@ function recordFetches(): string[] {
   }) as typeof fetch;
   return calls;
 }
+
+test("device identity check reports match, mismatch, and no enrollment", async () => {
+  const enrolled = await bootstrapAccount("acct_doctor_device", "dev_enrolled", 1_900_000_000_000);
+  await saveDevice(enrolled.secrets);
+  const creds = { token: "tok", deviceId: "env", accountId: "acct_doctor_device", remoteUrl: "https://api.test" };
+  const cfg = {
+    schema: "e2ee/v1" as const,
+    remoteWorkspaceId: "ws_device",
+    projectId: "root",
+    rootPath: "/tmp/device",
+    remoteUrl: "https://api.test",
+    token: "",
+    deviceId: "dev_enrolled",
+  };
+  expect(await checkDeviceIdentity(creds, cfg)).toEqual({ ok: true, label: "device", message: "device dev_enrolled" });
+  const mismatch = await checkDeviceIdentity(creds, { ...cfg, deviceId: "dev_dangling" });
+  expect(mismatch.ok).toBe(false);
+  expect(mismatch.message).toContain("dev_dangling");
+  expect((await checkDeviceIdentity(undefined, cfg)).ok).toBe(true);
+});
 
 async function expectReportReachesConsent(opts: { diagnostics?: boolean; env?: boolean }): Promise<void> {
   const root = await makeWorkspace();

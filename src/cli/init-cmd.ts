@@ -6,18 +6,17 @@
  * existing primitives (login, createRemoteWorkspace, config write, first sync).
  * All decision logic lives in init-plan.ts; this file is presentation + I/O.
  */
-import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
 import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { hasDevice } from "./e2ee-keystore.js";
+import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { filesFirstFlagEnabled, pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
-import { resolveInitPlan, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
+import { resolveInitPlan, resolveWorkspaceDeviceId, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
@@ -124,13 +123,17 @@ export async function runInit(
     process.exitCode = 1;
     return undefined;
   }
-  return executeInitPlan(plan, gathered.bootstrap, { summary: opts.summary !== false, recoveryKit: recoveryKitOptionsFromFlags(gathered) });
+  return executeInitPlan(plan, gathered.bootstrap, {
+    summary: opts.summary !== false,
+    recoveryKit: recoveryKitOptionsFromFlags(gathered),
+    newDevice: gathered["new-device"] === "true",
+  });
 }
 
 async function executeInitPlan(
   plan: InitPlan,
   bootstrapSecret: string | undefined,
-  opts: { summary: boolean; recoveryKit: RecoveryKitOptions }
+  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean }
 ): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
@@ -144,13 +147,6 @@ async function executeInitPlan(
     fail("login did not produce a credential — aborting init.");
     return undefined;
   }
-  const deviceId =
-    plan.deviceId.kind === "fixed"
-      ? plan.deviceId.id
-      : creds.deviceId !== "env"
-        ? creds.deviceId
-        : `dev_${crypto.randomUUID().slice(0, 8)}`;
-
   // 2. Workspace: create (new) or adopt the id (join — first sync validates access).
   let workspaceId: string;
   const ws = spinner(plan.workspace.kind === "new" ? "creating workspace" : "joining workspace");
@@ -168,6 +164,7 @@ async function executeInitPlan(
   // Init/setup owns one mutex across the complete rebind/reset + first-sync
   // decision, mutation, and state-save interval. Nested pull/push calls inherit it.
   const syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
+  let deviceId!: string;
   try {
     // 3. Write the per-device binding (token injected at runtime, never persisted).
     //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
@@ -176,6 +173,12 @@ async function executeInitPlan(
     //    incident). Reset the baseline explicitly (loadState also guards via the
     //    stream stamp; this keeps the on-disk state truthful) and say so.
     const prev = await loadConfig(plan.root).catch(() => undefined);
+    deviceId = resolveWorkspaceDeviceId({
+      forceNew: opts.newDevice,
+      prevDeviceId: prev?.deviceId,
+      enrolledDeviceId: await enrolledDeviceId(creds.accountId),
+      credsDeviceId: creds.deviceId,
+    });
     const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
     if (prev && syncStreamId(prev) !== nextStream) {
       await resetSyncState(plan.root, nextStream, syncMutex);

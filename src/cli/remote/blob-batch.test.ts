@@ -12,8 +12,10 @@ import {
   BATCH_FRAME_HEADER_BYTES,
   BATCH_STATUS_BIT,
   DEFAULT_BATCH_RECORD_BYTES,
+  downloadBatchConfig,
   resetBatchBlobStateForTests,
   resetUploaderDispatchCountForTests,
+  uploadBatchConfig,
   uploaderDispatchCount,
 } from "./blob-batch.js";
 
@@ -28,6 +30,8 @@ const ENV_KEYS = [
   "RBOX_BATCH_BODY_BYTES",
   "RBOX_BATCH_SLOTS",
   "RBOX_BATCH_PUT_SLOTS",
+  "RBOX_UPLOAD_SLOTS",
+  "RBOX_DOWNLOAD_SLOTS",
   "RBOX_UPLOAD_CONCURRENCY",
   "RBOX_LANE_TIMING",
   "RBOX_PULL_JOIN_WATCHDOG_MS",
@@ -108,6 +112,71 @@ afterEach(async () => {
     else process.env[k] = v;
   }
   await fs.rm(tmpDir, { recursive: true, force: true });
+});
+
+describe("batch config knobs", () => {
+  test("defaults are byte-identical when knobs unset", () => {
+    expect(uploadBatchConfig()).toEqual({ enabled: true, records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
+    expect(downloadBatchConfig()).toEqual({ enabled: true, records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 48 });
+  });
+
+  test("RBOX_UPLOAD_SLOTS overrides upload slots and clamps", () => {
+    process.env.RBOX_UPLOAD_SLOTS = "96";
+    expect(uploadBatchConfig().slots).toBe(96);
+    process.env.RBOX_UPLOAD_SLOTS = "500";
+    expect(uploadBatchConfig().slots).toBe(256);
+    process.env.RBOX_UPLOAD_SLOTS = "0";
+    expect(uploadBatchConfig().slots).toBe(1);
+    process.env.RBOX_UPLOAD_SLOTS = "abc";
+    expect(uploadBatchConfig().slots).toBe(24);
+  });
+
+  test("RBOX_DOWNLOAD_SLOTS overrides download slots and clamps", () => {
+    process.env.RBOX_DOWNLOAD_SLOTS = "192";
+    expect(downloadBatchConfig().slots).toBe(192);
+    process.env.RBOX_DOWNLOAD_SLOTS = "999";
+    expect(downloadBatchConfig().slots).toBe(256);
+    process.env.RBOX_DOWNLOAD_SLOTS = "0";
+    expect(downloadBatchConfig().slots).toBe(1);
+  });
+
+  test("primary slot knob wins over legacy alias", () => {
+    process.env.RBOX_BATCH_PUT_SLOTS = "40";
+    expect(uploadBatchConfig().slots).toBe(40);
+    process.env.RBOX_UPLOAD_SLOTS = "96";
+    expect(uploadBatchConfig().slots).toBe(96);
+
+    process.env.RBOX_BATCH_SLOTS = "50";
+    expect(downloadBatchConfig().slots).toBe(50);
+    process.env.RBOX_DOWNLOAD_SLOTS = "192";
+    expect(downloadBatchConfig().slots).toBe(192);
+  });
+
+  test("garbage primary suppresses the alias; empty primary falls through to it", () => {
+    // A present-but-non-integer primary resolves to the default (envInt fallback)
+    // and does NOT defer to a valid legacy alias — "primary set wins".
+    process.env.RBOX_UPLOAD_SLOTS = "abc";
+    process.env.RBOX_BATCH_PUT_SLOTS = "40";
+    expect(uploadBatchConfig().slots).toBe(24);
+    // An empty/whitespace primary is treated as unset, so the alias is honored.
+    process.env.RBOX_UPLOAD_SLOTS = "   ";
+    expect(uploadBatchConfig().slots).toBe(40);
+  });
+
+  test("RBOX_BATCH_RECORDS clamps to the wire cap", () => {
+    process.env.RBOX_BATCH_RECORDS = "8";
+    expect(uploadBatchConfig().records).toBe(8);
+    process.env.RBOX_BATCH_RECORDS = "128";
+    expect(uploadBatchConfig().records).toBe(32);
+    process.env.RBOX_BATCH_RECORDS = "0";
+    expect(uploadBatchConfig().records).toBe(1);
+  });
+
+  test("RBOX_BATCH_BLOBS=0 disables batching", () => {
+    process.env.RBOX_BATCH_BLOBS = "0";
+    expect(uploadBatchConfig().enabled).toBe(false);
+    expect(downloadBatchConfig().enabled).toBe(false);
+  });
 });
 
 describe("BlobBatchDownloader queueing", () => {
