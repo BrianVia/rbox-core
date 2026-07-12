@@ -252,7 +252,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
   let latestTimings: LatestTimings | undefined;
-  const { sequence, manifest: remote } = await report.phase("latest", () =>
+  const { sequence, manifest: remote, manifestMeta } = await report.phase("latest", () =>
     api.latest(report.enabled ? { onLatestTimings: (t) => (latestTimings = t) } : undefined)
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
@@ -394,6 +394,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
     globalManifest: remote,
+    ...(manifestMeta ? { manifestMeta } : {}),
     observedRepos: observedRepoKeys(state, remote.gitRepos, {
       bases: gitOutcome.gitRepos,
       pending: gitOutcome.gitPendingRemote,
@@ -805,6 +806,7 @@ async function runPushAttempt(
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: res.sequence!,
     globalManifest: committed,
+    ...(res.manifestMeta ? { manifestMeta: res.manifestMeta } : {}),
     observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
     values: ackValues,
     authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,

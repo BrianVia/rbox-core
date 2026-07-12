@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { GitSection, Manifest } from "../engine/index.js";
+import { MAX_MANIFEST_DELTA_CHAIN, type GitSection, type Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
@@ -102,6 +102,7 @@ export interface SyncState {
   stream: string;
   lastSyncedSequence: number;
   lastSyncedManifest: Manifest;
+  manifestMeta?: GlobalManifestMeta;
   /** Removal memories (design 43 §9 [v2, B4]): relPath → the LOCAL identity key at the
    *  moment the remote deleted the repo. A leftover local repo whose identity still
    *  equals the memory is not re-added by push (it's the untouched leftover) and is
@@ -126,6 +127,44 @@ export interface SyncState {
   /** Generation-CAS records. These are authoritative for gitRepos and all local
    * per-repo sidecars once present; legacy physical maps are folded in on read. */
   repoRecords?: Record<string, RepoRecord>;
+}
+
+export interface GlobalManifestMeta {
+  /** encManifestSha of the blob whose fold equals the described manifest. */
+  encManifestSha: string;
+  /** Canonical hash (§3.2) of that folded manifest. */
+  manifestHash: string;
+  /** The base commit's SIGNED epochs (from its parsed body) — the §3.3.2 /
+   *  I4 trigger inputs. Without these, a rotation between base and next
+   *  commit is undetectable from persisted state and the writer would emit
+   *  a cross-epoch delta (unreadable by construction). */
+  accountEpoch: number;
+  keyEpoch: number;
+  /** The base's EXACT verified chain, base-first — the base blob's signed
+   *  `manifestChain` as list-verified at apply time (§3.6.1). `chain[0]` is
+   *  the terminal snapshot; a snapshot base ⇒ []. Bounded by
+   *  MAX_MANIFEST_DELTA_CHAIN. */
+  chain: string[];
+  /** Cumulative delta ciphertext bytes since chain[0] — §3.3.4's input. */
+  chainBytes: number;
+  /** The terminal snapshot's ciphertext byte length (chain[0]'s — or, for a
+   *  snapshot base, this blob's own) — §3.3.4's threshold. Recorded from an
+   *  OBSERVED length and PROPAGATED UNCHANGED across deltas. */
+  snapshotBytes: number;
+}
+
+export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const meta = v as Record<string, unknown>;
+  const hex = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const counter = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return undefined;
+  if (!counter(meta.accountEpoch) || !counter(meta.keyEpoch) || !counter(meta.chainBytes)) return undefined;
+  if (!Number.isSafeInteger(meta.snapshotBytes) || (meta.snapshotBytes as number) <= 0) return undefined;
+  if (!Array.isArray(meta.chain) || meta.chain.length > MAX_MANIFEST_DELTA_CHAIN) return undefined;
+  if (!meta.chain.every(hex) || new Set(meta.chain).size !== meta.chain.length || meta.chain.includes(meta.encManifestSha)) return undefined;
+  if ((meta.chainBytes === 0) !== (meta.chain.length === 0)) return undefined;
+  return meta as unknown as GlobalManifestMeta;
 }
 
 export interface ConfigShapeIdentity {
@@ -160,7 +199,7 @@ export interface StateSavePacket {
   expectedStream: string;
   expectedNonce: string;
   sourceGlobalSeq: number;
-  global?: { manifest: FileOnlyManifest };
+  global?: { manifest: FileOnlyManifest; manifestMeta?: GlobalManifestMeta };
   repos: RepoTransition[];
 }
 
@@ -317,6 +356,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
 
     const records = repoRecordsForState(current);
+    const priorBases = Object.fromEntries(packet.repos.map(({ relPath }) => [relPath, records[relPath]?.base ?? null]));
     for (const transition of packet.repos) {
       if ((records[transition.relPath]?.repoGen ?? 0) !== transition.expectedRepoGen) {
         return { status: "rejected", reason: "repo-generation", state: current };
@@ -327,13 +367,17 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
 
     const global = packet.global?.manifest;
+    const repoOnlyBaseChanged = !packet.global && packet.repos.some(({ relPath, newRecord }) =>
+      JSON.stringify(priorBases[relPath]) !== JSON.stringify(newRecord.base ?? null)
+    );
     const base: SyncState = global
       ? {
           ...current,
           lastSyncedSequence: packet.sourceGlobalSeq,
           lastSyncedManifest: { ...global, gitRepos: undefined },
+          manifestMeta: packet.global?.manifestMeta,
         }
-      : current;
+      : repoOnlyBaseChanged ? { ...current, manifestMeta: undefined } : current;
     const next = stateFromRepoRecords({
       ...base,
       stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),

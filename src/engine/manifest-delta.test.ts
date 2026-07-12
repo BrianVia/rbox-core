@@ -40,7 +40,7 @@ describe("manifest delta envelope", () => {
     const raw = utf8.encode(JSON.stringify(m));
     expect(await decodeEnvelope(raw)).toEqual({ kind: "raw", manifest: m });
     for (const compress of [false, true]) {
-      expect(await decodeEnvelope(await encodeSnapshotEnvelope(m, { compress }))).toEqual({ kind: "snapshot", manifest: m });
+      expect(await decodeEnvelope(await encodeSnapshotEnvelope(m, { compress }))).toMatchObject({ kind: "snapshot", manifest: m });
     }
   });
 
@@ -71,6 +71,16 @@ describe("manifest delta envelope", () => {
     const header = JSON.stringify({ kind: "delta", bodyBytes: 2, baseEncSha: SHA_A, baseManifestHash: SHA_B, generatedAt: "x", manifestSchema: KNOWN_MANIFEST_SCHEMA + 1, resultHash: SHA_C });
     await expect(decodeEnvelope(utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${header}\n[]`))).rejects.toThrow("upgrade rbox");
   });
+});
+
+test("20k-entry snapshots compress below 25% of raw JSON", async () => {
+  const files = Array.from({ length: 20_000 }, (_, i) => entry(`packages/pkg-${i % 137}/src/generated/file-${i.toString().padStart(5, "0")}.ts`, i + 1));
+  const m = manifest("2026-07-12T00:00:00.000Z", files);
+  const rawBytes = utf8.encode(JSON.stringify(m)).byteLength;
+  const envelopeBytes = (await encodeSnapshotEnvelope(m, { compress: true })).byteLength;
+  const ratio = envelopeBytes / rawBytes;
+  console.log(`design 84 snapshot compression ratio: ${(ratio * 100).toFixed(2)}% (${envelopeBytes}/${rawBytes})`);
+  expect(ratio).toBeLessThan(0.25);
 });
 
 describe("canonical form and pure folding", () => {

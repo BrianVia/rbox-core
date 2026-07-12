@@ -71,7 +71,7 @@ export interface ManifestDeltaHeader {
   resultHash: string;
 }
 
-interface ManifestSnapshotHeader {
+export interface ManifestSnapshotHeader {
   kind: "snapshot";
   comp?: "zstd";
   bodyBytes: number;
@@ -79,7 +79,8 @@ interface ManifestSnapshotHeader {
 }
 
 export type DecodedManifestEnvelope =
-  | { kind: "raw" | "snapshot"; manifest: Manifest }
+  | { kind: "raw"; manifest: Manifest }
+  | { kind: "snapshot"; manifest: Manifest; header: ManifestSnapshotHeader }
   | { kind: "delta"; header: ManifestDeltaHeader; ops: ManifestDeltaOp[] };
 
 export class ManifestChainError extends Error {
@@ -311,7 +312,7 @@ export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedMani
   if (header.kind === "snapshot") {
     const manifest = parseManifest(body);
     if ((await canonicalManifestHash(manifest)) !== header.manifestHash) throw new Error("snapshot manifestHash mismatch");
-    return { kind: "snapshot", manifest };
+    return { kind: "snapshot", manifest, header };
   }
   return { kind: "delta", header, ops: parseOps(body) };
 }

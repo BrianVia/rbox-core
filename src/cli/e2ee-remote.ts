@@ -22,7 +22,9 @@ import {
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
 import {
+  canonicalManifestHash,
   decodeEnvelope,
+  encodeSnapshotEnvelope,
   foldDelta,
   gitSectionBlobRefs,
   MANIFEST_ENVELOPE_PREFIX,
@@ -33,6 +35,7 @@ import {
   type DecodedManifestEnvelope,
   type Manifest,
 } from "../engine/index.js";
+import type { GlobalManifestMeta } from "./config.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
@@ -194,12 +197,12 @@ export class E2eeRemote implements SyncRemote {
 
   // ---- SyncRemote ----------------------------------------------------------
 
-  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
+  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }> {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const { manifest } = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings);
-    return { sequence: vh.sequence, manifest };
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, process.env.RBOX_MDE_SNAPSHOT === "1");
+    return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
 
   /** Fetch + decrypt ONE commit's manifest, returning it plus the per-epoch KEK (so
@@ -211,8 +214,9 @@ export class E2eeRemote implements SyncRemote {
     commit: SignedCommit,
     account: VerifiedAccount,
     historical: boolean,
-    onLatestTimings?: LatestOptions["onLatestTimings"]
-  ): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+    onLatestTimings?: LatestOptions["onLatestTimings"],
+    collectMeta = false
+  ): Promise<{ manifest: Manifest; kek: Uint8Array; manifestMeta?: GlobalManifestMeta }> {
     const body = parseCommit(commit);
     const signedChain = body.manifestChain ?? [];
     const kek = await this.kekFor(body.keyEpoch, account, false);
@@ -283,7 +287,29 @@ export class E2eeRemote implements SyncRemote {
     const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
     const parseMs = onLatestTimings ? Date.now() - parseStart : 0;
     onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
-    return { manifest, kek };
+    let manifestMeta: GlobalManifestMeta | undefined;
+    if (collectMeta) {
+      const manifestHash = headEnvelope.kind === "delta"
+        ? headEnvelope.header.resultHash
+        : headEnvelope.kind === "snapshot"
+          ? headEnvelope.header.manifestHash
+          : await canonicalManifestHash(manifest);
+      manifestMeta = {
+        encManifestSha: body.encManifestSha,
+        manifestHash,
+        accountEpoch: body.accountEpoch,
+        keyEpoch: body.keyEpoch,
+        chain: [...signedChain],
+        // §3.3.4 accumulator: cumulative DELTA ciphertext bytes since chain[0] —
+        // the intermediate delta links (chain[1..]) plus the delta head itself,
+        // NEVER the terminal snapshot (chain[0]); a snapshot/raw head resets to 0.
+        // (A non-empty chain implies a delta head — foldManifestChain rejects a
+        // snapshot head with a non-empty signed chain.)
+        chainBytes: signedChain.length === 0 ? 0 : chainBlobBytes.slice(1).reduce((sum, bytes) => sum + bytes.byteLength, 0) + encManifest.byteLength,
+        snapshotBytes: signedChain.length === 0 ? encManifest.byteLength : chainBlobBytes[0]!.byteLength,
+      };
+    }
+    return { manifest, kek, ...(manifestMeta ? { manifestMeta } : {}) };
   }
 
   private foldManifestChain(
@@ -568,12 +594,13 @@ export class E2eeRemote implements SyncRemote {
     let encryptMs = 0;
     let uploadMs = 0;
     let manifestJson: Uint8Array;
+    const snapshotEnabled = process.env.RBOX_MDE_SNAPSHOT === "1";
     if (onCommitTimings) {
       const t0 = Date.now();
-      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
+      manifestJson = snapshotEnabled ? await encodeSnapshotEnvelope(manifest, { compress: true }) : new TextEncoder().encode(JSON.stringify(manifest));
       encodeMs = Date.now() - t0;
     } else {
-      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
+      manifestJson = snapshotEnabled ? await encodeSnapshotEnvelope(manifest, { compress: true }) : new TextEncoder().encode(JSON.stringify(manifest));
     }
     const buildArgs: Parameters<typeof buildCommit>[0] = {
       secrets: this.ctx.secrets,
@@ -630,7 +657,18 @@ export class E2eeRemote implements SyncRemote {
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
     if (res.sequence !== parentSequence + 1) throw new Error("server returned a sequence that does not match the signed commit seq — refusing to pin");
     await this.pinFrom(built.commit, account);
-    return { sequence: res.sequence };
+    return {
+      sequence: res.sequence,
+      ...(snapshotEnabled ? { manifestMeta: {
+        encManifestSha: built.encManifestSha,
+        manifestHash: await canonicalManifestHash(manifest),
+        accountEpoch: account.currentEpoch,
+        keyEpoch: epoch,
+        chain: [],
+        chainBytes: 0,
+        snapshotBytes: built.encManifest.byteLength,
+      } } : {}),
+    };
   }
 
   missingBlobs(shas: string[]): Promise<string[]> {

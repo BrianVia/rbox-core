@@ -2,6 +2,7 @@ import type { BlobStore, Manifest } from "../../engine/index.js";
 import type { ByteProgressCallback } from "../../engine/blobstore.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { AccountKeysDTO, CommitChainResult } from "../e2ee-remote.js";
+import type { GlobalManifestMeta } from "../config.js";
 import { RemoteContext } from "./context.js";
 import { getBlob, getBlobToFile, putBlob } from "./blobs.js";
 import { BlobBatchDownloader, BlobBatchUploader } from "./blob-batch.js";
@@ -31,7 +32,7 @@ import {
  * simulator. Keep it minimal: only what pull/push actually call.
  */
 export interface SyncRemote {
-  latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }>;
+  latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }>;
   missingBlobs(shas: string[]): Promise<string[]>;
   putBlobFile(
     sha256: string,

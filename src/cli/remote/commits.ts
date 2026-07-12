@@ -1,6 +1,7 @@
 import type { Manifest } from "../../engine/index.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
+import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 
@@ -97,6 +98,7 @@ export interface CommitResult {
   /** The signed commit used a stale account epoch; refresh E2EE write context and retry. */
   epochStale?: number;
   serverTimings?: ServerTimings;
+  manifestMeta?: GlobalManifestMeta;
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {
