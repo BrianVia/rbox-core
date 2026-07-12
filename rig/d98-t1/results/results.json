@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "configuration": {
+    "files": 2000,
+    "runs": 3,
+    "putLatencyMs": 20,
+    "missingLatencyMs": 30,
+    "receiptLatencyMs": 5,
+    "cryptoPoolEnabled": false
+  },
+  "corpus": {
+    "fileCount": 2000,
+    "plaintextBytes": 12538611,
+    "minFileBytes": 256,
+    "maxFileBytes": 65177
+  },
+  "arms": {
+    "A": {
+      "samples": 3,
+      "wallMs": {
+        "p50": 1492.3545459999996,
+        "min": 1412.4187780000002,
+        "max": 1597.699736
+      },
+      "putCount": {
+        "p50": 2000,
+        "min": 2000,
+        "max": 2000
+      },
+      "checkCalls": {
+        "p50": 1,
+        "min": 1,
+        "max": 1
+      },
+      "maxConcurrentPuts": {
+        "p50": 40,
+        "min": 40,
+        "max": 40
+      },
+      "storedCount": {
+        "p50": 2000
+      },
+      "storedBytes": {
+        "p50": 5156941
+      }
+    },
+    "B": {
+      "samples": 3,
+      "wallMs": {
+        "p50": 1339.7091580000001,
+        "min": 1206.3856860000014,
+        "max": 1354.276694
+      },
+      "putCount": {
+        "p50": 2000,
+        "min": 2000,
+        "max": 2000
+      },
+      "checkCalls": {
+        "p50": 7,
+        "min": 6,
+        "max": 9
+      },
+      "maxConcurrentPuts": {
+        "p50": 40,
+        "min": 40,
+        "max": 40
+      },
+      "storedCount": {
+        "p50": 2000
+      },
+      "storedBytes": {
+        "p50": 5156941
+      }
+    }
+  },
+  "overlap": {
+    "factor": 1.1139391987346552,
+    "headroomMs": 152.64538799999946
+  },
+  "samples": [
+    {
+      "arm": "A",
+      "run": 1,
+      "wallMs": 1597.699736,
+      "putCount": 2000,
+      "checkCalls": 1,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    },
+    {
+      "arm": "B",
+      "run": 1,
+      "wallMs": 1354.276694,
+      "putCount": 2000,
+      "checkCalls": 7,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    },
+    {
+      "arm": "B",
+      "run": 2,
+      "wallMs": 1339.7091580000001,
+      "putCount": 2000,
+      "checkCalls": 6,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    },
+    {
+      "arm": "A",
+      "run": 2,
+      "wallMs": 1492.3545459999996,
+      "putCount": 2000,
+      "checkCalls": 1,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    },
+    {
+      "arm": "A",
+      "run": 3,
+      "wallMs": 1412.4187780000002,
+      "putCount": 2000,
+      "checkCalls": 1,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    },
+    {
+      "arm": "B",
+      "run": 3,
+      "wallMs": 1206.3856860000014,
+      "putCount": 2000,
+      "checkCalls": 9,
+      "maxConcurrentPuts": 40,
+      "storedCount": 2000,
+      "storedBytes": 5156941
+    }
+  ]
+}

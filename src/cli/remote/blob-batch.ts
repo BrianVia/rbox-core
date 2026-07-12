@@ -8,7 +8,7 @@ import type { RemoteContext } from "./context.js";
 import { getBlobToFile, putBlobFile } from "./blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater, translateRemoteError } from "./errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, envInt } from "./resilient.js";
-import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 
 // Wire twin: apps/api/src/blob-batch.ts — the framing constants and codec are
 // duplicated per build target (house pattern, like UPLOAD_RECEIPTS_V1). Change
@@ -94,6 +94,10 @@ type BatchPutResponseRecord =
 
 let downloadDisabledForProcess = false;
 let uploadDisabledForProcess = false;
+let dispatchCount = 0;
+
+export function uploaderDispatchCount(): number { return dispatchCount; }
+export function resetUploaderDispatchCountForTests(): void { dispatchCount = 0; }
 
 class SingleGate {
   private active = 0;
@@ -566,6 +570,10 @@ export class BlobBatchUploader {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private active = 0;
   private readonly singleGate = new SingleGate(SINGLE_UPLOAD_FALLBACK_CONCURRENCY);
+  private closed = false;
+  private closeError: Error | undefined;
+  private closePromise: Promise<void> | undefined;
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(private readonly ctx: RemoteContext) {
     // Upload record bytes stay capped to the server's accepted per-record maximum.
@@ -587,6 +595,7 @@ export class BlobBatchUploader {
     uploadsDir?: string,
     onBytes?: ByteProgressCallback
   ): Promise<void> {
+    if (this.closed) return Promise.reject(this.closeError!);
     if (!this.canBatch(size)) return this.gatedPutFile(sha, srcPath, size, uploadsDir, onBytes);
     if (uploadDisabledForProcess) return this.timedGatedPutFile(sha, srcPath, size, uploadsDir, onBytes, 0);
     return new Promise<void>((resolve, reject) => {
@@ -595,6 +604,10 @@ export class BlobBatchUploader {
   }
 
   private enqueue(sha: string, waiter: BatchPutWaiter): void {
+    if (this.closed) {
+      waiter.reject(this.closeError!);
+      return;
+    }
     const existing = this.bySha.get(sha);
     if (existing) {
       existing.waiters.push(waiter);
@@ -620,21 +633,31 @@ export class BlobBatchUploader {
   }
 
   private dispatchFull(): void {
+    if (this.closed) return;
     while (this.active < this.config.slots && (this.queue.length >= this.config.records || this.queuedBytes >= this.config.bodyBytes)) {
       this.launch(this.carve());
     }
   }
 
   private dispatchPartial(): void {
+    if (this.closed) return;
     this.dispatchFull();
     while (this.active < this.config.slots && this.queue.length > 0) this.launch(this.carve());
   }
 
   private launch(batch: BatchPutGroup[]): void {
     if (batch.length === 0) return;
+    if (this.closed) {
+      for (const group of batch) this.rejectGroup(group, this.closeError!);
+      return;
+    }
     this.active++;
-    void this.dispatchBatch(batch).finally(() => {
+    const dispatch = this.dispatchBatch(batch);
+    this.inFlight.add(dispatch);
+    void dispatch.finally(() => {
+      this.inFlight.delete(dispatch);
       this.active--;
+      if (this.closed) return;
       this.dispatchFull();
       if (this.active === 0 && this.queue.length > 0) this.dispatchPartial();
     });
@@ -658,6 +681,10 @@ export class BlobBatchUploader {
 
   private async dispatchBatch(batch: BatchPutGroup[]): Promise<void> {
     const pending = new Map(batch.map((group) => [group.sha, group]));
+    if (this.closed) {
+      for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
+      return;
+    }
     if (uploadDisabledForProcess) {
       await this.fallbackAll(pending);
       return;
@@ -672,10 +699,21 @@ export class BlobBatchUploader {
 
     try {
       const body = await this.encodeBatchBody(batch, pending);
-      if (!body) return;
+      if (!body) {
+        if (this.closed) for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
+        return;
+      }
+      if (this.closed) {
+        for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
+        return;
+      }
       armIdle();
       const queueCutoffMs = LANE_TIMING ? performance.now() : 0;
-      const res = await this.ctx.fetch(
+      dispatchCount++;
+      firstPublishUploadStart();
+      firstPublishAuthStart();
+      let res: Response;
+      try { res = await this.ctx.fetch(
         `${this.ctx.baseUrl}/v1/blob-batch/put`,
         {
           method: "POST",
@@ -683,7 +721,7 @@ export class BlobBatchUploader {
           body: body.bytes,
         },
         { op: "uploading data", timeoutMs: SMALL_CONTROL_TIMEOUT_MS, retries: 0, signal: ctrl.signal },
-      );
+      ); } finally { firstPublishAuthEnd(); firstPublishUploadEnd(); }
       if (res.status === 404 || res.status === 405) {
         uploadDisabledForProcess = true;
         this.drainQueuedAsSingles();
@@ -718,14 +756,20 @@ export class BlobBatchUploader {
       }
       await this.fallbackAll(pending);
     } catch {
-      await this.fallbackAll(pending);
+      if (this.closed) {
+        for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
+      } else await this.fallbackAll(pending);
     } finally {
       if (idle) clearTimeout(idle);
     }
   }
 
   private async encodeBatchBody(batch: BatchPutGroup[], pending: Map<string, BatchPutGroup>): Promise<{ bytes: Uint8Array; groups: BatchPutGroup[] } | null> {
+    if (this.closed) return null;
     const payloads = await Promise.all(batch.map((group) => fs.readFile(group.srcPath)));
+    const allPayloadBytes = payloads.reduce((n, payload) => n + payload.byteLength, 0);
+    if (firstPublishTiming.enabled) firstPublishTiming.stats.peakUploaderFramingBytes = Math.max(firstPublishTiming.stats.peakUploaderFramingBytes, allPayloadBytes);
+    if (this.closed) return null;
     const accepted: Array<{ group: BatchPutGroup; payload: Uint8Array }> = [];
     const fallbacks: BatchPutGroup[] = [];
     let total = 0;
@@ -744,6 +788,9 @@ export class BlobBatchUploader {
     for (const group of fallbacks) await this.dispatchSingleGroup(group);
     if (accepted.length === 0) return null;
     const out = new Uint8Array(total);
+    if (firstPublishTiming.enabled) {
+      firstPublishTiming.stats.peakUploaderFramingBytes = Math.max(firstPublishTiming.stats.peakUploaderFramingBytes, allPayloadBytes + out.byteLength);
+    }
     let off = 0;
     for (const { group, payload } of accepted) {
       out.set(fromHex(group.sha), off);
@@ -756,6 +803,7 @@ export class BlobBatchUploader {
   }
 
   private drainQueuedAsSingles(): void {
+    if (this.closed) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const queued = this.queue;
@@ -765,12 +813,21 @@ export class BlobBatchUploader {
   }
 
   private async fallbackAll(pending: Map<string, BatchPutGroup>): Promise<void> {
+    if (this.closed) {
+      for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
+      pending.clear();
+      return;
+    }
     const groups = [...pending.values()];
     pending.clear();
     await Promise.all(groups.map((group) => this.dispatchSingleGroup(group)));
   }
 
   private async dispatchSingleGroup(group: BatchPutGroup): Promise<void> {
+    if (this.closed) {
+      this.rejectGroup(group, this.closeError!);
+      return;
+    }
     const first = group.waiters[0]!;
     const queueMs = LANE_TIMING && group.enqueuedAtMs > 0 ? Math.max(0, performance.now() - group.enqueuedAtMs) : 0;
     try {
@@ -826,7 +883,32 @@ export class BlobBatchUploader {
   }
 
   private async gatedPutFile(sha: string, srcPath: string, size: number, uploadsDir?: string, onBytes?: ByteProgressCallback): Promise<void> {
-    await this.singleGate.run(() => putBlobFile(this.ctx, sha, srcPath, size, uploadsDir, onBytes));
+    const dispatch = this.singleGate.run(() => {
+      if (this.closed) throw this.closeError!;
+      dispatchCount++;
+      return putBlobFile(this.ctx, sha, srcPath, size, uploadsDir, onBytes);
+    });
+    this.inFlight.add(dispatch);
+    try {
+      await dispatch;
+    } finally {
+      this.inFlight.delete(dispatch);
+    }
+  }
+
+  close(err: Error): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    this.closeError = err;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    const queued = this.queue;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.bySha.clear();
+    for (const group of queued) for (const waiter of group.waiters) waiter.reject(err);
+    this.closePromise = Promise.allSettled([...this.inFlight]).then(() => {});
+    return this.closePromise;
   }
 }
 

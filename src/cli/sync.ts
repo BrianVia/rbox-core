@@ -38,6 +38,7 @@ import {
   uploadLaneTimingSummary,
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
+import { finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
@@ -535,6 +536,29 @@ type AttemptOutcome =
   | { done: true; result: PushResult }
   | { done: false; action: RecoveryAction; exhaustedError: string };
 
+function reuploadOutcome(committed: Manifest, blobs: readonly string[], total?: number, attemptedChain: readonly string[] = []): AttemptOutcome {
+  const unsatisfiedBlobs = [...blobs];
+  // §3.3.5/§3.5.4 (design 84): a bounced manifest-chain link can never be
+  // re-uploaded (the client does not retain historical link ciphertext), and a
+  // TRUNCATED response under a non-empty attempted chain may be hiding one —
+  // either way the retry must be a snapshot.
+  const missing = new Set(unsatisfiedBlobs);
+  const forceSnapshot = attemptedChain.some((sha) => missing.has(sha)) ||
+    (attemptedChain.length > 0 && total !== undefined && total > unsatisfiedBlobs.length);
+  return {
+    done: false,
+    action: {
+      kind: "reupload",
+      forceGitRecapture: gitForceForMissingBlobs(committed.gitRepos, new Set(unsatisfiedBlobs)),
+      localForRetry: committed,
+      unsatisfiedTotal: total,
+      unsatisfiedBlobs,
+      ...(forceSnapshot ? { forceSnapshot: true } : {}),
+    },
+    exhaustedError: "push: server keeps reporting missing blobs after re-upload",
+  };
+}
+
 /**
  * Push a pre-computed manifest: upload missing blobs, commit. Short-circuits to a
  * no-op (no upload, no commit) when nothing changed vs the last-synced manifest —
@@ -771,7 +795,7 @@ async function runPushAttempt(
   // Missing or scan-mismatched sources defer immediately; ciphertext upload
   // mismatches retry within a bounded per-file budget. Only the stable subset is
   // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred, retryLater } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+  const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
     encryptFileToTemp: deps.encryptFileToTemp,
     encryptCacheFlushMs: deps.encryptCacheFlushMs,
     pruneLivePaths: scannedFilePaths,
@@ -786,6 +810,10 @@ async function runPushAttempt(
   // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
   // ref, no phantom deletion.
   const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+
+  if (needsUpload && needsUpload.size > 0) {
+    return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
+  }
 
   // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
   // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
@@ -828,8 +856,16 @@ async function runPushAttempt(
     };
   }
   const parentSequence = repair?.parentSequence ?? appliedSequence;
+  const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
+  const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
   const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
+  if (firstPublishTiming.enabled) {
+    const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
+    firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
+  }
   if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
+  const firstPublish = finishFirstPublishStats();
+  if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
   if (res.epochStale !== undefined) {
     return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
@@ -846,23 +882,7 @@ async function runPushAttempt(
     // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
     // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
     // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
-    const gitForce = gitForceForMissingBlobs(committed.gitRepos, new Set(res.unsatisfiedBlobs));
-    const attemptedChain = res.attemptedManifestChain ?? [];
-    const missing = new Set(res.unsatisfiedBlobs);
-    const forceSnapshotRetry = attemptedChain.some((sha) => missing.has(sha)) ||
-      (attemptedChain.length > 0 && res.unsatisfiedTotal !== undefined && res.unsatisfiedTotal > res.unsatisfiedBlobs.length);
-    return {
-      done: false,
-      action: {
-        kind: "reupload",
-        forceGitRecapture: gitForce,
-        localForRetry: committed,
-        unsatisfiedTotal: res.unsatisfiedTotal,
-        unsatisfiedBlobs: res.unsatisfiedBlobs ?? [],
-        ...(forceSnapshotRetry ? { forceSnapshot: true } : {}),
-      },
-      exhaustedError: "push: server keeps reporting missing blobs after re-upload",
-    };
+    return reuploadOutcome(committed, res.unsatisfiedBlobs, res.unsatisfiedTotal, res.attemptedManifestChain);
   }
 
   // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the

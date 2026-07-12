@@ -3,7 +3,9 @@ import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
 import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
+import { firstPublishTiming } from "../upload-lane-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
+import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
 
@@ -55,13 +57,7 @@ export interface ServerTimings {
 const SERVER_TIMING_KEYS = ["totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs"] as const;
 
 function readServerTimings(value: unknown): ServerTimings | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Record<string, unknown>;
-  for (const key of SERVER_TIMING_KEYS) {
-    const n = candidate[key];
-    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;
-  }
-  return Object.fromEntries(SERVER_TIMING_KEYS.map((key) => [key, candidate[key]])) as unknown as ServerTimings;
+  return readNumericFields(value, SERVER_TIMING_KEYS);
 }
 
 export interface LatestTimings {
@@ -83,6 +79,8 @@ export interface ReceiptRedeemResult {
   rejected: number;
   /** A fence aborted this whole redeem batch. These addresses need fresh staging. */
   needsUpload?: string[];
+  /** Addresses whose current receipts were cleanly redeemed and removed. */
+  settled?: string[];
 }
 
 function commitRejectedMessage(reason: CommitRejectReason, count?: number, max?: number): string {
@@ -158,8 +156,10 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
 }
 
 export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
+  const timingT0 = firstPublishTiming.enabled ? performance.now() : 0;
+  const overlappedAtStart = firstPublishTiming.enabled && firstPublishTiming.uploadActive > 0;
   const results: ReceiptRedeemResult[] = [];
-  while (ctx.receipts.size > 0) {
+  try { while (ctx.receipts.size > 0) {
     const batch = [...ctx.receipts.entries()].slice(0, RECEIPT_REDEEM_BATCH_MAX);
     // SAFE TO RETRY — receipt redemption is idempotent: duplicate calls find refs already
     // entitled and grant 0, while a socket-close-before-response can be replayed safely.
@@ -187,12 +187,27 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
       throw new Error(translateRemoteError(r.status, "receipt redeem failed", text, "workspace not found — check you're in the right directory"));
     }
     const body = (await r.json()) as ReceiptRedeemResult;
-    results.push(body);
+    const settled: string[] = [];
     for (const [sha, receipt] of batch) {
-      if (ctx.receipts.get(sha) === receipt) ctx.receipts.delete(sha);
+      if (ctx.receipts.get(sha) === receipt) {
+        ctx.receipts.delete(sha);
+        settled.push(sha);
+      }
+    }
+    results.push({ ...body, settled });
+  } return results;
+  } finally {
+    if (firstPublishTiming.enabled) {
+      const end = performance.now();
+      firstPublishTiming.stats.receiptRedemptionWallMs += Math.max(0, Math.round(end - timingT0));
+      if (overlappedAtStart) {
+        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(end - timingT0));
+      } else if (firstPublishTiming.uploadStartedAt) {
+        const uploadEnd = firstPublishTiming.uploadEndedAt || end;
+        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(Math.min(end, uploadEnd) - Math.max(timingT0, firstPublishTiming.uploadStartedAt)));
+      }
     }
   }
-  return results;
 }
 
 /** Post a signed commit envelope. Maps the server's 409 variants: a parent

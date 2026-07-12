@@ -1,19 +1,16 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   encryptFileToTemp as defaultEncryptFileToTemp,
-  isSourceChangedError,
   poolMap,
   withCryptoPool,
   type EncryptedBlob,
   type EncryptAddressCacheContext,
   type EncryptFileOptions,
   type CryptoPool,
-  type CoalescedBlob,
   type FileEntry,
   type Manifest,
   type PhaseReport,
@@ -22,7 +19,25 @@ import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "./re
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
-import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { metricsEnabled } from "./metrics.js";
+import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
+import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
+import {
+  FUSED_ENCRYPT_CONCURRENCY_CAP,
+  MAX_SHAS_PER_CHECK,
+  PER_FILE_UPLOAD_ATTEMPTS,
+  applyCipherDescriptor,
+  classifyCacheHit,
+  descriptorFromEncryptedBlob,
+  descriptorFromEntry,
+  encryptConcurrency,
+  fuseEnabled,
+  isDeferrableChurn,
+  materializeLease,
+  uploadConcurrency,
+  type CipherDescriptor,
+} from "./publish-pipeline/shared.js";
 
 // ---- churning-file recovery: encrypt + upload with bounded per-file retry ------------
 //
@@ -36,35 +51,6 @@ import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload
  *  deferred out of this commit (design: partial progress — commit the stable subset,
  *  defer the file that won't settle). Bounded so a perpetually-churning file can never
  *  hot-loop the push; the daemon's watcher/safety scans re-queue it once it settles. */
-export const PER_FILE_UPLOAD_ATTEMPTS = 3;
-
-// Concurrency knobs (read at call-time so the bench harness + power users can tune
-// via env). Upload is the dominant cost on a first push (latency-bound), so it's
-// the highest. Bench sweeps RBOX_UPLOAD_CONCURRENCY to find the real optimum.
-const clampConc = (v: string | undefined, dflt: number, max = 512): number => {
-  const n = Number(v);
-  return Number.isInteger(n) && n >= 1 && n <= max ? n : dflt;
-};
-const encryptConcurrency = (poolWorkers?: number) => clampConc(process.env.RBOX_ENCRYPT_CONCURRENCY, poolWorkers ? poolWorkers * 2 : 8); // CPU/disk bound
-const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
-const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
-
-async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<EncryptedBlob> {
-  // Phase 1's legacy consumer materializes a memory lease into the existing encup
-  // temp flow and releases its charge there; the disk temp becomes the source of
-  // truth, like a producer spill. Design 98 activates Tier-2 by-reference framing
-  // and release at HTTP settlement (Design 99 §7.5/§10).
-  let ciphertextPath: string;
-  if (blob.lease.location.kind === "file") {
-    ciphertextPath = blob.lease.location.path;
-    blob.lease.release();
-  } else {
-    ciphertextPath = path.join(tmpDir, `${blob.plaintextSha}.${randomBytes(8).toString("hex")}.ct`);
-    try { await fs.writeFile(ciphertextPath, blob.lease.location.bytes); }
-    finally { blob.lease.release(); }
-  }
-  return { plaintextSha: blob.plaintextSha, encSha: blob.encSha, ciphertextPath, cipherSize: blob.cipherSize, comp: blob.comp, payloadSha: blob.payloadSha };
-}
 // 64 is the post-§23 knee. The old default (32) was the knee BEFORE §23, when each PUT did
 // ~7 D1 round-trips and concurrency past 32 just multiplied D1 contention. §23 moved D1 off
 // the PUT (the hot path is now a pure R2 write), so the upload scales further: a measured
@@ -72,10 +58,12 @@ async function materializeLease(blob: CoalescedBlob, tmpDir: string): Promise<En
 // (R2/connection limits). This — not the §26 batch endpoint — is where the small-blob upload
 // win lived before design 80. With upload batching enabled, this pool becomes supply for the
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
-const uploadConcurrency = () => clampConc(process.env.RBOX_UPLOAD_CONCURRENCY, process.env.RBOX_BATCH_BLOBS !== "0" ? 512 : 64); // network/latency bound
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
+const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
+const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
+export { fuseEnabled, materializeLease, PER_FILE_UPLOAD_ATTEMPTS };
 
 type EncryptFileToTempForSync = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
 let defaultEncryptObserverForTest: (() => void) | undefined;
@@ -85,34 +73,6 @@ export function setDefaultEncryptObserverForTest(observer: (() => void) | undefi
   defaultEncryptObserverForTest = observer;
 }
 
-type CipherDescriptor = {
-  encSha: string;
-  cipherSize?: number;
-  comp?: "zstd";
-  payloadSha?: string;
-};
-
-function descriptorFromEntry(f: FileEntry): CipherDescriptor | undefined {
-  if (!f.encSha) return undefined;
-  return f.comp ? { encSha: f.encSha, comp: f.comp, payloadSha: f.payloadSha, cipherSize: f.cipherSize } : { encSha: f.encSha };
-}
-
-function descriptorFromEncryptedBlob(e: EncryptedBlob): CipherDescriptor {
-  return e.comp ? { encSha: e.encSha, comp: e.comp, payloadSha: e.payloadSha, cipherSize: e.cipherSize } : { encSha: e.encSha };
-}
-
-function applyCipherDescriptor(f: FileEntry, descriptor: CipherDescriptor): void {
-  f.encSha = descriptor.encSha;
-  if (descriptor.comp) {
-    f.comp = descriptor.comp;
-    f.payloadSha = descriptor.payloadSha;
-    f.cipherSize = descriptor.cipherSize;
-  } else {
-    delete f.comp;
-    delete f.payloadSha;
-    delete f.cipherSize;
-  }
-}
 
 export interface EncryptAndUploadOptions {
   encryptFileToTemp?: EncryptFileToTempForSync;
@@ -125,7 +85,6 @@ export interface EncryptAndUploadOptions {
 }
 
 const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
-const MAX_SHAS_PER_CHECK = 50_000;
 const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 export async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
@@ -148,31 +107,6 @@ function encryptAddressCacheContext(cfg: WorkspaceConfig): EncryptAddressCacheCo
   };
 }
 
-type CacheHitStatus = "accept" | "defer";
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
-async function classifyCacheHit(root: string, f: FileEntry): Promise<CacheHitStatus> {
-  try {
-    const st = await fs.lstat(path.join(root, f.path));
-    if (!st.isFile()) return "defer";
-    return st.size === f.size && st.mtimeMs === f.mtimeMs ? "accept" : "defer";
-  } catch (err) {
-    if (hasErrorCode(err, "ENOENT") || hasErrorCode(err, "ENOTDIR")) return "defer";
-    throw err;
-  }
-}
-
-/** Missing sources and snapshots that no longer match the scanned tuple are
- *  deferred; source changes are logged once per attempted cycle. */
-function isDeferrableChurn(err: unknown, relPath: string): boolean {
-  if (hasErrorCode(err, "ENOENT")) return true;
-  if (!isSourceChangedError(err)) return false;
-  console.error(`rbox: ${relPath} changed during encryption — deferred`);
-  return true;
-}
 
 export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfig, livePaths: ReadonlySet<string>): Promise<void> {
   const cache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
@@ -198,11 +132,12 @@ export async function encryptAndUpload(
   onProgress: TransferProgress | undefined,
   backoff: (attempt: number) => Promise<void>,
   options: EncryptAndUploadOptions = {}
-): Promise<{ deferred: Set<string>; retryLater: Set<string> }> {
+): Promise<{ deferred: Set<string>; retryLater: Set<string>; needsUpload?: Set<string> }> {
   // §28 lifted the old "encryption + git-state aren't supported together" refusal: git artifacts
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
+  beginFirstPublishTiming(report.enabled && metricsEnabled());
   const encryptFileToTemp = options.encryptFileToTemp ?? ((...args: Parameters<EncryptFileToTempForSync>) => {
     defaultEncryptObserverForTest?.();
     return defaultEncryptFileToTemp(...args);
@@ -211,11 +146,12 @@ export async function encryptAndUpload(
   const encryptCache = await EncryptAddressCache.load(root, encryptAddressCacheContext(cfg));
   const cacheWriter = new EncryptAddressCacheWriter(root, encryptCache, options.encryptCacheFlushMs ?? DEFAULT_ENCRYPT_CACHE_FLUSH_MS);
   const baseEnc = new Map(base.files.map((f) => [f.sha256, descriptorFromEntry(f)]).filter((x): x is [string, CipherDescriptor] => x[1] !== undefined));
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
+  let tmpDir = "";
   const ctByEnc = new Map<string, string>();
   const ctSizeByEnc = new Map<string, number>();
   const deferred = new Set<string>();
   const retryLater = new Set<string>();
+  let needsUpload: Set<string> | undefined;
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
     const toEncrypt: FileEntry[] = [];
@@ -234,6 +170,38 @@ export async function encryptAndUpload(
       }
     });
     report.record("address", { count: carried });
+    const usePipeline = pipelineEnabled() && options.encryptFileToTemp === undefined && toEncrypt.length >= PIPELINE_MIN_FILES;
+    tmpDir = usePipeline
+      ? await createRunTempDir(root)
+      : await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
+
+    if (usePipeline) {
+      const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
+      const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+      const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({
+        api,
+        root,
+        kek,
+        tmpDir,
+        toEncrypt,
+        local,
+        encryptCache,
+        cacheWriter,
+        encryptOpts,
+        encryptFileToTemp,
+        report,
+        onProgress,
+        backoff,
+        pool,
+        preflightDelta,
+        fullAudit,
+        recoverAddresses: options.recoverAddresses,
+        deferred,
+        retryLater,
+        uploadsDir: path.join(root, ".rbox", "state", "uploads"),
+      }));
+      needsUpload = result.needsUpload;
+    } else {
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
       const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
@@ -242,6 +210,8 @@ export async function encryptAndUpload(
       let cacheHits = 0;
       let cacheMisses = 0;
       await report.phase("encrypt", async () => {
+        const wallT0 = firstPublishTiming.enabled ? performance.now() : 0;
+        const cpuT0 = firstPublishTiming.enabled ? process.cpuUsage() : undefined;
         // The budget and fused dispatch bound provide real backpressure; this wide
         // caller window only lets the coalescer fill byte/count-bounded groups.
         const encConc = fuse ? Math.min(toEncrypt.length, FUSED_ENCRYPT_CONCURRENCY_CAP) : encryptConcurrency(pool?.workers.length);
@@ -287,6 +257,7 @@ export async function encryptAndUpload(
           throw err;
         }
         applyCipherDescriptor(f, descriptorFromEncryptedBlob(e));
+        firstPublishReady(e.cipherSize, e.encSha);
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
         encryptCache.record(e.plaintextSha, { ...descriptorFromEncryptedBlob(e), cipherSize: e.cipherSize, path: f.path });
@@ -295,6 +266,12 @@ export async function encryptAndUpload(
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
         onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
         });
+        if (firstPublishTiming.enabled) {
+          const wall = performance.now() - wallT0;
+          const cpu = process.cpuUsage(cpuT0);
+          firstPublishTiming.stats.encryptWallMs = Math.max(0, Math.round(wall));
+          firstPublishTiming.stats.producerCpuSaturationPct = wall > 0 ? Math.max(0, Math.round((cpu.user + cpu.system) / (wall * 10))) : 0;
+        }
       });
       report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
       // Design 82 §4: address-cache effectiveness travels with the address phase
@@ -323,9 +300,16 @@ export async function encryptAndUpload(
       encShas = [...candidate];
     }
     const missingT0 = LANE_TIMING ? performance.now() : 0;
+    const statsMissingT0 = firstPublishTiming.enabled ? performance.now() : 0;
     const missing = new Set(await report.phase("missing", () =>
       fullAudit ? missingBlobsChunked(api, encShas) : api.missingBlobs(encShas)
     ));
+    if (firstPublishTiming.enabled) {
+      const uniqueChecked = new Set(encShas);
+      firstPublishTiming.stats.missingCheckWallMs = Math.max(0, Math.round(performance.now() - statsMissingT0));
+      firstPublishTiming.stats.serverUnsatisfiedTotal = missing.size;
+      firstPublishTiming.stats.serverSatisfiedSkipped = Math.max(0, uniqueChecked.size - missing.size);
+    }
     if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
     report.record("missing", { count: encShas.length });
     if (preflightDelta || fullAudit) {
@@ -371,6 +355,8 @@ export async function encryptAndUpload(
               ...encryptOpts,
               expected: { sha256: f.sha256, size: f.size },
             });
+            if (firstPublishTiming.enabled) firstPublishTiming.stats.reEncryptedOnResume++;
+            firstPublishReady(re.cipherSize, re.encSha);
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
             // Source churn defers instead of mutating the scanned manifest tuple.
@@ -414,11 +400,13 @@ export async function encryptAndUpload(
           byteTracker.reviseTotal(uploadEncSha, size);
           emitUploadProgress(f.path);
           const callerOwnsLaneTiming = LANE_TIMING && api.ownsUploadLaneTiming?.(size) !== true;
+          firstPublishUploadStart();
           const t0 = callerOwnsLaneTiming ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
             emitUploadProgress(f.path);
           });
+          firstPublishUploadEnd();
           if (callerOwnsLaneTiming) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
             uploadLaneTiming.blobs++;
@@ -472,6 +460,7 @@ export async function encryptAndUpload(
     } else {
       await runCryptoAndUpload(undefined);
     }
+    }
   } finally {
     try {
       const livePaths = new Set(options.pruneLivePaths ?? local.files.filter((f) => f.type === "file").map((f) => f.path));
@@ -480,10 +469,10 @@ export async function encryptAndUpload(
       cacheWriter.schedule();
       await cacheWriter.flush();
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
     }
   }
-  return { deferred, retryLater };
+  return { deferred, retryLater, ...(needsUpload ? { needsUpload } : {}) };
 }
 
 /** Build the manifest to COMMIT when some files were deferred (never settled under a

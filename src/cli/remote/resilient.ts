@@ -167,6 +167,8 @@ export interface ResilientOpts {
   rerunHint?: string;
   /** Injectable sleep for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Called only when a transient failure will actually be retried. */
+  onRetry?: (attempt: number) => void;
 }
 
 const DEFAULT_BACKOFF_MS = [1000, 4000];
@@ -212,6 +214,7 @@ export async function retryTransient<T>(fn: () => Promise<T>, opts: ResilientOpt
       lastError = e;
       if (!isTransientNetworkError(e)) throw e; // typed/HTTP errors and real bugs pass straight through
       if (attempt === retries) break;
+      opts.onRetry?.(attempt + 1);
       const wait = backoff[Math.min(attempt, backoff.length - 1)] ?? DEFAULT_BACKOFF_MS[DEFAULT_BACKOFF_MS.length - 1]!;
       await backoffSleep(wait, sleep, opts.signal);
     }

@@ -6,6 +6,53 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-07-12 — performance program checkpoint: instant preflights, fused crypto, full sync telemetry
+
+The first checkpoint of the sync-performance program (designs 97–103). Two
+improvements are live by default or via fleet flags; the rest ship dark
+(flag-gated, default off) pending their measurement gates.
+
+### Improved
+- **Change-only blob preflight (design 103 Part B, #218).** With
+  `RBOX_PREFLIGHT_DELTA=1`, a push checks only the blobs it introduced (plus
+  any 422-recovery residue) instead of the whole workspace — measured
+  **2.8–4.0s → 0.1s** on a 114k-file workspace. Includes the fix that threads
+  the server's unsatisfied-blob list through retry (previously dropped), a
+  capped recovery accumulator with a chunked full-audit fallback, and
+  `RBOX_PREFLIGHT_FULL=1` to force the full audit.
+- **Instant rejection of stale commits (design 103 Part A, #218/#219).** The
+  server now 409s an already-stale commit in ~0.1s instead of ~6s of admission
+  work, cutting conflict-retry storms (previously 12–42s of added wall).
+- **CLI usability fixes (#203).** `rbox restore` is now trash-tier-backed
+  (undoable); uninstall warns about the keystore; assorted audit fixes.
+- **Torn-scan hardening (#205).** Same-size edits with restored mtimes are
+  re-hashed (ctime joins the fingerprint); mid-hash instability defers a file
+  instead of publishing a torn read.
+
+### Added (flag-gated, default off — awaiting measurement gates)
+- **Fused crypto worker jobs (design 99, #224).** `RBOX_CRYPTO_FUSE=1` batches
+  small-file encryption into byte-bounded in-memory jobs under a budget with a
+  contention-bounding dispatch cap — **79.7% encrypt-wall reduction** on the
+  production path in rig A/B (95% CI [77.2%, 86.5%]), byte-identical
+  ciphertext. Fleet first-publish gates pending.
+- **Overlapped first-publish pipeline (design 98 Tier 1, #225).**
+  `RBOX_PUBLISH_PIPELINE=1` overlaps encrypt → upload → receipt redemption
+  with reservation-based disk backpressure, an error-latched receipt drainer,
+  and a two-barrier abort protocol. Serialized remains the default until the
+  Workload-B gates hold.
+
+### Telemetry (numbers-only; no file names or paths, ever)
+- **Server commit decomposition rendered in push lines (#207/#213):**
+  `srv/env/acct/ssc/cm/mir/rsp` tokens — this measurement attributed ~87% of
+  commit-POST time to D1 ref admission and now feeds the design-102 shadow
+  soak.
+- **Join/apply decomposition (design 100 Phase 0, #223)** and **first-publish
+  stage decomposition (design 98 §5.1, #226)** — gate evidence is emitted by
+  the binary, not hand-timed.
+- **Scan-site stats, per-dir probe, deep-scan drift audit (design 85 P0,
+  #208)**, with `RBOX_METRICS` now **default-on** (opt out: `RBOX_METRICS=0`;
+  measured worst-case scan overhead ≤3%).
+
 ## [1.0.0] — 2026-07-10 — the correctness milestone
 
 rbox reaches 1.0. The three correctness pillars are now field-proven fleet-wide:

@@ -1,0 +1,115 @@
+/**
+ * Budgeted producer→consumer channel of ready ciphertexts (design 98 §3.1).
+ * `push` blocks under the items axis — that IS the encrypt-lane backpressure.
+ * The queue releases its own axes at pull; the temp + disk charge on each
+ * ReadyBlob are the pipeline's, released only at disposition settlement.
+ */
+import type { FileEntry } from "../../engine/index.js";
+import { ResourceBudget } from "./budget.js";
+
+export type Disposition = "uploaded" | "satisfied-skip" | "duplicate-skip" | "abandoned";
+
+export interface ReadyBlob {
+  file: FileEntry;
+  encSha: string;
+  cipherSize: number;
+  path: string;
+  diskCharge: number;
+  check?: Promise<boolean>;
+  release(disposition: Disposition): void;
+}
+
+export const EOF = Symbol("ready-queue-eof");
+export type EOF = typeof EOF;
+
+type PullWaiter = { resolve: (item: ReadyBlob | EOF) => void; reject: (error: Error) => void };
+
+export interface ReadyQueueOptions {
+  maxItems?: number;
+  items?: ResourceBudget;
+  heap?: ResourceBudget;
+}
+
+export class ReadyQueue {
+  private readonly items: ResourceBudget;
+  private readonly heap: ResourceBudget | undefined;
+  private readonly queued: ReadyBlob[] = [];
+  private readonly pulls: PullWaiter[] = [];
+  private writingClosed = false;
+  private aborted: Error | undefined;
+
+  constructor(options: ReadyQueueOptions = {}) {
+    this.items = options.items ?? new ResourceBudget(options.maxItems ?? 2_048);
+    this.heap = options.heap;
+  }
+
+  private closedError(): Error {
+    return new Error("ready queue is closed for writing");
+  }
+
+  private resolveEofIfDrained(): void {
+    if (this.writingClosed && this.queued.length === 0) {
+      for (const pull of this.pulls.splice(0)) pull.resolve(EOF);
+    }
+  }
+
+  async push(item: ReadyBlob): Promise<void> {
+    if (this.aborted) throw this.aborted;
+    if (this.writingClosed) throw this.closedError();
+    await this.items.reserve(1);
+    try {
+      await this.heap?.reserve(item.cipherSize);
+    } catch (error) {
+      this.items.release(1);
+      throw error;
+    }
+    if (this.aborted || this.writingClosed) {
+      this.items.release(1);
+      this.heap?.release(item.cipherSize);
+      throw this.aborted ?? this.closedError();
+    }
+    const pull = this.pulls.shift();
+    if (pull) {
+      this.releaseAxes(item);
+      pull.resolve(item);
+    } else {
+      this.queued.push(item);
+    }
+  }
+
+  pull(): Promise<ReadyBlob | EOF> {
+    if (this.aborted) return Promise.reject(this.aborted);
+    const item = this.queued.shift();
+    if (item) {
+      this.releaseAxes(item);
+      return Promise.resolve(item);
+    }
+    if (this.writingClosed) return Promise.resolve(EOF);
+    return new Promise<ReadyBlob | EOF>((resolve, reject) => this.pulls.push({ resolve, reject }));
+  }
+
+  closeForWriting(): void {
+    if (this.writingClosed || this.aborted) return;
+    this.writingClosed = true;
+    const error = this.closedError();
+    this.items.close(error);
+    this.heap?.close(error);
+    this.resolveEofIfDrained();
+  }
+
+  abort(err: Error): void {
+    if (this.aborted) return;
+    this.aborted = err;
+    this.writingClosed = true;
+    this.items.close(err);
+    this.heap?.close(err);
+    for (const pull of this.pulls.splice(0)) pull.reject(err);
+    for (const item of this.queued.splice(0)) this.releaseAxes(item);
+  }
+
+  private releaseAxes(item: ReadyBlob): void {
+    this.items.release(1);
+    this.heap?.release(item.cipherSize);
+    this.resolveEofIfDrained();
+  }
+}

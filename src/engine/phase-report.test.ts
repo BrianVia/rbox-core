@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { PhaseReport } from "./phase-report.js";
+import {
+  beginFirstPublishTiming,
+  finishFirstPublishStats,
+  firstPublishAuthEnd,
+  firstPublishAuthStart,
+  firstPublishReady,
+  firstPublishTiming,
+  firstPublishUploadEnd,
+  firstPublishUploadStart,
+  formatFirstPublishStats,
+} from "../cli/upload-lane-timing.js";
 
 describe("PhaseReport", () => {
   test("accumulates ms + bytes + count per phase across repeated hits", async () => {
@@ -108,5 +119,42 @@ describe("PhaseReport", () => {
     r.record("download", { count: 1 });
     r.record("decrypt", { count: 1 });
     expect(Object.keys(r.toJSON().phases)).toEqual(["download", "decrypt", "apply", "git-apply"]);
+  });
+});
+
+describe("FirstPublishStats", () => {
+  test("has a complete integer-only schema and a privacy-safe token", () => {
+    beginFirstPublishTiming(true);
+    firstPublishReady(123, "a".repeat(64));
+    firstPublishUploadStart();
+    firstPublishAuthStart();
+    firstPublishAuthEnd();
+    firstPublishUploadEnd();
+    firstPublishTiming.stats.encryptWallMs = 2;
+    firstPublishTiming.stats.missingCheckWallMs = 3;
+    firstPublishTiming.stats.receiptRedemptionWallMs = 4;
+    firstPublishTiming.stats.commitWallMs = 5;
+    const stats = finishFirstPublishStats()!;
+    expect(Object.keys(stats).sort()).toEqual([
+      "authCallCount", "authCriticalPathMs", "commitWallMs", "duplicateEncryptions",
+      "encryptWallMs", "firstReadyToFirstUploadStartMs", "missingCheckWallMs",
+      "peakQueueHeapBytes", "peakTempDiskBytes", "peakUploaderFramingBytes",
+      "producerCpuSaturationPct", "reEncryptedOnResume", "receiptRedemptionOverlapMs",
+      "receiptRedemptionWallMs", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",
+      "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
+    ]);
+    expect(Object.values(stats).every((n) => Number.isInteger(n) && n >= 0)).toBe(true);
+    expect(stats.encryptWallMs + stats.missingCheckWallMs + stats.receiptRedemptionWallMs + stats.commitWallMs).toBe(14);
+    const token = formatFirstPublishStats(stats);
+    expect(token).not.toContain("/");
+    expect(token).not.toMatch(/[a-f0-9]{64}/i);
+  });
+
+  test("disabled measurement emits nothing", () => {
+    beginFirstPublishTiming(false);
+    firstPublishReady(123, "b".repeat(64));
+    firstPublishUploadStart();
+    firstPublishUploadEnd();
+    expect(finishFirstPublishStats()).toBeUndefined();
   });
 });
