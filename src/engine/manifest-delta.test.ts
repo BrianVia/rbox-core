@@ -164,9 +164,9 @@ describe("signed manifestChain compatibility", () => {
   test("chain-bearing Phase-B body parses and malformed chains fail", async () => {
     const key = generateSignKeyPair();
     expect(parseCommit(await buildSignedCommit({ ...fields, manifestChain: [SHA_B, SHA_C] }, key)).manifestChain).toEqual([SHA_B, SHA_C]);
-    await expect(buildSignedCommit({ ...fields, manifestChain: [SHA_B, SHA_B] }, key)).rejects.toThrow("duplicate");
-    await expect(buildSignedCommit({ ...fields, manifestChain: [SHA_A] }, key)).rejects.toThrow("encManifestSha");
-    await expect(buildSignedCommit({ ...fields, manifestChain: ["x"] }, key)).rejects.toThrow("malformed");
-    await expect(buildSignedCommit({ ...fields, manifestChain: Array.from({ length: MAX_MANIFEST_DELTA_CHAIN + 1 }, (_, i) => i.toString(16).padStart(64, "0")) }, key)).rejects.toThrow("maximum");
+    await expect(buildSignedCommit({ ...fields, manifestChain: [SHA_B, SHA_B] }, key)).rejects.toThrow("manifestChain malformed");
+    await expect(buildSignedCommit({ ...fields, manifestChain: [SHA_A] }, key)).rejects.toThrow("manifestChain malformed");
+    await expect(buildSignedCommit({ ...fields, manifestChain: ["x"] }, key)).rejects.toThrow("manifestChain malformed");
+    await expect(buildSignedCommit({ ...fields, manifestChain: Array.from({ length: MAX_MANIFEST_DELTA_CHAIN + 1 }, (_, i) => i.toString(16).padStart(64, "0")) }, key)).rejects.toThrow("manifestChain malformed");
   });
 });

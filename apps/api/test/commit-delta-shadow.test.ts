@@ -67,6 +67,17 @@ function requestFor(f: Awaited<ReturnType<typeof fixture>>, seq: number, parentS
   });
 }
 
+function requestWithBody(f: Awaited<ReturnType<typeof fixture>>, commitBody: Record<string, unknown>, receipts = true): Request {
+  return new Request("https://api.test/v1/ws/ws/proj/root/manifests", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json", "x-rbox-account": f.accountId, "x-rbox-account-epoch": "0",
+      ...(receipts ? { "x-rbox-protocol": "upload-receipts-v1" } : {}),
+    },
+    body: JSON.stringify({ parentSequence: commitBody.parentSeq, commit: { body: JSON.stringify(commitBody), commitHash: hash(`custom-${crypto.randomUUID()}`), sig: "sig" }, receipts: {} }),
+  });
+}
+
 describe("design 102 shadow admission with real D1/R2", () => {
   test("shadow response is authoritative-full equivalent to off", async () => {
     const f = await fixture(`delta-eq-${crypto.randomUUID()}`);
@@ -149,4 +160,52 @@ describe("design 102 shadow admission with real D1/R2", () => {
     expect(hasDeltaPoint(points, "parent_unreadable")).toBe(true);
   });
 
+});
+
+describe("design 84 server manifestChain admission", () => {
+  test.each([
+    ["over cap", Array.from({ length: 17 }, (_, i) => i.toString(16).padStart(64, "0"))],
+    ["non-hex", ["not-a-sha"]],
+    ["duplicate", ["a".repeat(64), "a".repeat(64)]],
+  ])("rejects %s chains at the shape gate", async (_label, manifestChain) => {
+    const f = await fixture(`chain-shape-${crypto.randomUUID()}`);
+    const result = await responseBody(f, "off", [], { request: requestWithBody(f, { ...f.body(2), manifestChain }) });
+    expect(result).toEqual({ status: 400, body: { error: "bad_request", message: "bad manifestChain" } });
+  });
+
+  test("rejects a chain containing its own manifest", async () => {
+    const f = await fixture(`chain-self-${crypto.randomUUID()}`);
+    const result = await responseBody(f, "off", [], { request: requestWithBody(f, { ...f.body(2), manifestChain: [f.manifestSha] }) });
+    expect(result).toEqual({ status: 400, body: { error: "bad_request", message: "bad manifestChain" } });
+  });
+
+  test("missing chain sha is reported on receipts and legacy paths", async () => {
+    const f = await fixture(`chain-missing-${crypto.randomUUID()}`);
+    const chainSha = hash("missing-chain-link");
+    const receiptResult = await responseBody(f, "off", [], { request: requestWithBody(f, { ...f.body(2), manifestChain: [chainSha] }) });
+    expect(receiptResult.status).toBe(422);
+    expect(receiptResult.body).toMatchObject({ error: "unsatisfied_blobs", missing: [chainSha], missingTotal: 1 });
+
+    const inline = { ...f.body(2), blobRefset: undefined, blobRefs: [{ encSha: f.refSha, size: 7 }], manifestChain: [chainSha] };
+    const legacyResult = await responseBody(f, "off", [], { request: requestWithBody(f, inline, false) });
+    expect(legacyResult.status).toBe(422);
+    expect(legacyResult.body).toMatchObject({ error: "unsatisfied_blobs", missing: [chainSha], missingTotal: 1 });
+  });
+
+  test("marked chain link is unsatisfied while an honest entitled link is free", async () => {
+    const f = await fixture(`chain-entitled-${crypto.randomUUID()}`);
+    const chainSha = hash("prior-manifest-link");
+    await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blobs(sha256,size_bytes,present) VALUES (?,13,1)").bind(chainSha).run();
+    await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blob_refs(account_id,sha256,granted_at) VALUES (?,?,?)").bind(f.accountId, chainSha, Date.now()).run();
+    const before = Number((await env.rbox_dev_db.prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(f.accountId).first())!.used_bytes);
+    const ok = await responseBody(f, "off", [], { request: requestWithBody(f, { ...f.body(2), manifestChain: [chainSha] }) });
+    expect(ok.status).toBe(200);
+    const after = Number((await env.rbox_dev_db.prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(f.accountId).first())!.used_bytes);
+    expect(after).toBe(before);
+
+    await env.rbox_dev_db.prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES (?,?,?)").bind(f.accountId, chainSha, Date.now()).run();
+    const marked = await responseBody(f, "off", [], { request: requestWithBody(f, { ...f.body(2), manifestChain: [chainSha] }) });
+    expect(marked.status).toBe(422);
+    expect(marked.body).toMatchObject({ missing: [chainSha] });
+  });
 });

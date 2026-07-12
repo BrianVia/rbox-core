@@ -43,7 +43,7 @@ function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: 
   } as unknown as DurableObjectState;
 }
 
-function signed(seq: number, refs: { inline: string[] } | { sidecarSha: string; count: number }) {
+function signed(seq: number, refs: { inline: string[] } | { sidecarSha: string; count: number }, manifestChain?: string[]) {
   const carrier = "inline" in refs
     ? { blobRefs: refs.inline.map((encSha) => ({ encSha, size: 1 })) }
     : { blobRefset: { sidecarSha: refs.sidecarSha, count: refs.count, totalBytes: refs.count } };
@@ -52,6 +52,7 @@ function signed(seq: number, refs: { inline: string[] } | { sidecarSha: string; 
       type: "rbox/commit/v1",
       seq,
       encManifestSha: sha(String(seq)),
+      ...(manifestChain ? { manifestChain } : {}),
       ...carrier,
     }),
     commitHash: sha("c"),
@@ -70,7 +71,7 @@ describe("WorkspaceSync retained-roots index", () => {
       ["index_synced_seq", 1],
       ["index_generation", 7],
       ["seq:1", signed(1, { inline: [sha("a")] })],
-      ["seq:2", signed(2, { inline: [sha("b"), sha("d")] })],
+      ["seq:2", signed(2, { inline: [sha("b"), sha("d")] }, [sha("7"), sha("8")])],
     ]);
     const sql = fakeDoSql({
       dropped: [{ sha256: sha("e"), last_seq: 1 }, { sha256: sha("f"), last_seq: 1 }],
@@ -91,7 +92,7 @@ describe("WorkspaceSync retained-roots index", () => {
       indexSyncedSeq: 1,
       gap: [
         { seq: 1, manifestSha: sha("1"), inlineRefs: [sha("a")] },
-        { seq: 2, manifestSha: sha("2"), inlineRefs: [sha("b"), sha("d")] },
+        { seq: 2, manifestSha: sha("2"), inlineRefs: [sha("b"), sha("d")], chainRefs: [sha("7"), sha("8")] },
       ],
       droppedPage: [sha("e")],
       nextSha: sha("e"),
@@ -107,6 +108,18 @@ describe("WorkspaceSync retained-roots index", () => {
     });
     expect(secondBody).not.toHaveProperty("nextSha");
     expect(secondBody).not.toHaveProperty("nextSeq");
+  });
+
+  test("fails roots closed on a malformed manifest chain", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("c") }], ["pruneFloor", 0],
+      ["index_state", "ready"], ["index_synced_seq", 1], ["index_generation", 1],
+      ["seq:1", signed(1, { inline: [] }, [sha("1")])],
+    ]);
+    const sync = new WorkspaceSync(fakeCtx(kv), {} as never);
+    const res = await sync.fetch(rootsRequest);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "roots_incomplete" });
   });
 
   test("returns fail-closed index lifecycle errors", async () => {
@@ -231,7 +244,7 @@ describe("WorkspaceSync retained-roots index", () => {
       ["index_generation", 1],
       ["backfill_cursor", 1],
       ["fold_subcursor", { phase: "removed", lastSha: sha("a") }],
-      ["seq:1", signed(1, { inline: [sha("a"), sha("b")] })],
+      ["seq:1", signed(1, { inline: [sha("a"), sha("b")] }, [sha("e")])], // chain ref must sort after the resume cursor sha("a") or the resumed removal diff correctly skips it
       ["seq:2", signed(2, { inline: [sha("b"), sha("d")] })],
       ["seq:3", signed(3, { inline: [sha("a"), sha("d")] })],
     ]);
@@ -244,6 +257,7 @@ describe("WorkspaceSync retained-roots index", () => {
     await sync.alarm(); // resumes seq 2 after the already-committed removal
     expect(kv.get("index_synced_seq")).toBe(2);
     expect(sql.__dropped.get(sha("a"))?.last_seq).toBe(1);
+    expect(sql.__dropped.get(sha("e"))?.last_seq).toBe(1);
     expect(kv.has("fold_subcursor")).toBe(false);
 
     await sync.alarm(); // seq 3 re-adds a and drops b
@@ -251,6 +265,7 @@ describe("WorkspaceSync retained-roots index", () => {
     expect(kv.get("index_state")).toBe("ready");
     expect(sql.__dropped.has(sha("a"))).toBe(false);
     expect(sql.__dropped.get(sha("b"))?.last_seq).toBe(2);
+    expect(sql.__dropped.get(sha("e"))?.last_seq).toBe(1);
     expect([...sql.__seqRoots.keys()]).toEqual([1, 2, 3]);
   });
 

@@ -11,7 +11,8 @@
 import { sign, verify, type SignKeyPair } from "./asym.js";
 import { canonicalString, verifyRoundTrip } from "./jcs.js";
 import { fromB64url, fromHex, sha256Hex, toB64url, utf8 } from "./primitives.js";
-import { MAX_MANIFEST_DELTA_CHAIN } from "../manifest-delta.js";
+import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain } from "../manifest-chain.js";
+export { MAX_MANIFEST_DELTA_CHAIN } from "../manifest-chain.js";
 
 export const GENESIS_PARENT_HASH = "0".repeat(64);
 
@@ -68,17 +69,9 @@ export interface SignedCommit {
 const SHA_RE = /^[0-9a-f]{64}$/;
 
 export function validateManifestChain(v: unknown, encManifestSha?: string): string[] {
-  if (v === undefined) return [];
-  if (!Array.isArray(v)) throw new Error("manifestChain must be an array");
-  if (v.length > MAX_MANIFEST_DELTA_CHAIN) throw new Error("manifestChain exceeds maximum length");
-  const seen = new Set<string>();
-  return v.map((entry) => {
-    if (typeof entry !== "string" || !SHA_RE.test(entry)) throw new Error("manifestChain entry malformed");
-    if (seen.has(entry)) throw new Error("manifestChain contains a duplicate entry");
-    if (entry === encManifestSha) throw new Error("manifestChain must not contain encManifestSha");
-    seen.add(entry);
-    return entry;
-  });
+  const chain = readManifestChain(v, encManifestSha ?? "");
+  if (chain === null) throw new Error("manifestChain malformed");
+  return chain;
 }
 
 /** Normalize blobRefs to the V4-7 invariant: unique by encSha, sorted by encSha.

@@ -37,6 +37,7 @@ interface RootsPage {
     manifestSha: string;
     carrierSha?: string;
     inlineRefs?: string[];
+    chainRefs?: string[];
     sidecar?: { sha: string; count: number; size: number };
   }>;
   droppedPage: string[];
@@ -96,6 +97,7 @@ export async function reachableFromWorkspaces(env: Env, rows: Array<{ workspace_
               addRoot(env, reachable, local, gap.manifestSha);
               if (gap.carrierSha) addRoot(env, reachable, local, gap.carrierSha);
               for (const sha of gap.inlineRefs ?? []) addRoot(env, reachable, local, sha);
+              for (const sha of gap.chainRefs ?? []) addRoot(env, reachable, local, sha);
               if (gap.sidecar) {
                 addRoot(env, reachable, local, gap.sidecar.sha);
                 const loaded = await loadSidecarRefs(env, gap.sidecar.sha, gap.sidecar.count);

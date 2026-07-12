@@ -3,12 +3,12 @@ import { KNOWN_MANIFEST_SCHEMA, validateManifest } from "./manifest-validate.js"
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import { sha256Hex, utf8 } from "./e2ee/primitives.js";
 import { hashBytes } from "./hash.js";
+export { MAX_MANIFEST_DELTA_CHAIN } from "./manifest-chain.js";
 
 export const MANIFEST_ENVELOPE_MAGIC = "rbox-mde1\n";
 export const MANIFEST_ENVELOPE_PREFIX = "rbox-mde";
 export const MAX_ENVELOPE_HEADER = 64 * 1024;
 export const MAX_MANIFEST_PLAINTEXT = 512 * 1024 * 1024;
-export const MAX_MANIFEST_DELTA_CHAIN = 16;
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const decoder = new TextDecoder("utf-8", { fatal: true });
