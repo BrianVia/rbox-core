@@ -102,7 +102,7 @@ describe("websocket session cap", () => {
   });
 
   test("fails closed for missing, malformed, and future connectedAt", () => {
-    const sockets = [socket(), socket("old"), socket(now + 60 * 60_000)];
+    const sockets = [socket(), socket("old"), socket(now + 60 * 60_000), socket(NaN), socket(Infinity)];
     broadcast(fakeCtx(sockets), "committed", { maxSessionMs: sixHours, now });
     for (const ws of sockets) {
       expect(ws.send).not.toHaveBeenCalled();
@@ -110,8 +110,17 @@ describe("websocket session cap", () => {
     }
   });
 
+  test("fails closed when attachment deserialization throws", () => {
+    const ws = socket(now);
+    ws.deserializeAttachment = () => { throw new Error("poison"); };
+    broadcast(fakeCtx([ws]), "committed", { maxSessionMs: sixHours, now });
+    expect(ws.send).not.toHaveBeenCalled();
+    expect(ws.close).toHaveBeenCalledWith(1000, "session-max");
+  });
+
   test("cap off sends without consulting attachment age", () => {
     const ws = socket(now - sevenHours());
+    ws.deserializeAttachment = () => { throw new Error("must not be called"); };
     broadcast(fakeCtx([ws]), "committed", { maxSessionMs: 0, now });
     expect(ws.send).toHaveBeenCalledWith("committed");
     expect(ws.close).not.toHaveBeenCalled();

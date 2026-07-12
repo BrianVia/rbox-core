@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { HashCache, scanManifest, type BlobStore, type Manifest } from "../engine/index.js";
 import type { SyncState, WorkspaceConfig } from "./config.js";
-import { RboxDaemon } from "./daemon.js";
+import { reconnectDelayMs, RboxDaemon } from "./daemon.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
 
 const ENV_KEYS = [
@@ -29,6 +29,7 @@ interface DaemonInternals {
   pumpRun: Promise<void>;
   cache: HashCache;
   manifest: Manifest;
+  activity: { ws?: { connected: boolean } };
   armPongDeadline(ws: WebSocket): void;
   clearPongDeadline(): void;
   onPongDeadline(ws: WebSocket): void;
@@ -36,14 +37,20 @@ interface DaemonInternals {
   scheduleNextBackstop(): void;
   clearBackstop(): void;
   markWsOpen(ws: WebSocket): number;
-  handleWsMessageData(data: string): void;
+  markWsDisconnected(ws: WebSocket, reason: "close" | "error" | "timeout"): boolean;
+  handleWsMessageData(data: string, from?: WebSocket): void;
+  connect(): void;
+  maybeConnect(): void;
+  scheduleReconnect(): void;
   pump(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
   stop(): Promise<void>;
 }
 
 class MiniRemote implements SyncRemote {
+  latestCalls = 0;
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+    this.latestCalls++;
     return { sequence: 0, manifest: { generatedAt: "", files: [] } };
   }
   async missingBlobs(): Promise<string[]> { return []; }
@@ -78,13 +85,13 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-async function makeDaemon(): Promise<DaemonInternals> {
+async function makeDaemon(remote: MiniRemote = new MiniRemote()): Promise<DaemonInternals> {
   const cfg: WorkspaceConfig = {
     schema: "e2ee/v1", remoteWorkspaceId: "ws_test", projectId: "root", deviceId: "dev_test",
     rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: Buffer.alloc(32, 7),
     accountId: "acct_test", accountEpoch: 0, keyEpoch: 0,
   };
-  const daemon = new RboxDaemon(root, cfg, { remote: new MiniRemote(), backoff: async () => {} }, {
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
     bootId: "boot-test",
   }) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
@@ -105,25 +112,46 @@ test("pong deadline closes a silent socket and counts the half-open", async () =
   let closes = 0;
   const ws = fakeWs(() => closes++);
   daemon.ws = ws;
+  daemon.scheduleReconnect = () => {};
   daemon.markWsOpen(ws);
-  await sleep(55);
+  await sleep(100);
   expect(closes).toBe(1);
   expect(daemon.wsHalfOpenDetected).toBe(1);
 });
 
 test("every inbound frame re-arms the pong deadline", async () => {
-  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "50";
+  const daemon = await makeDaemon();
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  const originalTimer = daemon.wsPongDeadlineTimer;
+  daemon.handleWsMessageData("pong");
+  expect(daemon.wsPongDeadlineTimer).toBeDefined();
+  expect(daemon.wsPongDeadlineTimer).not.toBe(originalTimer);
+});
+
+test("pong deadline disconnects immediately and schedules recovery", async () => {
   const daemon = await makeDaemon();
   let closes = 0;
+  let reconnects = 0;
   const ws = fakeWs(() => closes++);
   daemon.ws = ws;
   daemon.markWsOpen(ws);
-  await sleep(30);
-  daemon.handleWsMessageData("pong");
-  await sleep(30);
-  expect(closes).toBe(0);
-  await sleep(35);
+  daemon.scheduleReconnect = () => { reconnects++; };
+  daemon.onPongDeadline(ws);
+  expect(daemon.ws).toBeUndefined();
+  expect(daemon.activity.ws?.connected).toBe(false);
+  expect(reconnects).toBe(1);
   expect(closes).toBe(1);
+  expect(daemon.wsHalfOpenDetected).toBe(1);
+});
+
+test("reconnect delay spreads the first attempt and preserves capped jitter", () => {
+  expect(reconnectDelayMs(0, () => 0)).toBe(0);
+  expect(reconnectDelayMs(0, () => 0.999999)).toBeLessThan(3000);
+  expect(reconnectDelayMs(1, () => 0)).toBe(750);
+  expect(reconnectDelayMs(1, () => 1)).toBe(1250);
+  expect(reconnectDelayMs(10, () => 1)).toBe(37500);
 });
 
 test("a stale socket deadline cannot close the replacement", async () => {
@@ -168,6 +196,16 @@ test("committed notification resets the backstop and records a latency token", a
   expect(lines.some((line) => line.includes("notify_latency_ms="))).toBe(true);
 });
 
+test("a stale socket message cannot trigger a pull or notify token", async () => {
+  const daemon = await makeDaemon();
+  const wsA = fakeWs();
+  const wsB = fakeWs();
+  daemon.ws = wsA;
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 5, deviceId: "d" }), wsB);
+  expect(daemon.notifyPullPendingAt).toBeUndefined();
+  expect(daemon.want.pull).toBe(false);
+});
+
 test("reliability master switch disables deadline, backstop, and notify token", async () => {
   process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = "1";
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "20";
@@ -189,9 +227,22 @@ test("reliability master switch disables deadline, backstop, and notify token", 
 test("WS-disabled plus zero backstop is the pure-polling falsification config", async () => {
   process.env.RBOX_DAEMON_WS_DISABLED = "1";
   process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "0";
-  const daemon = await makeDaemon();
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  let connectCalls = 0;
+  daemon.connect = () => { connectCalls++; };
+  daemon.maybeConnect();
+  expect(connectCalls).toBe(0);
   daemon.startBackstop();
+  await sleep(50);
   expect(daemon.wsDisabled).toBe(true);
   expect(daemon.backstopMs).toBe(0);
   expect(daemon.backstopTimer).toBeUndefined();
+  expect(remote.latestCalls).toBe(0);
+
+  delete process.env.RBOX_DAEMON_WS_DISABLED;
+  const enabled = await makeDaemon();
+  enabled.connect = () => { connectCalls++; };
+  enabled.maybeConnect();
+  expect(connectCalls).toBe(1);
 });

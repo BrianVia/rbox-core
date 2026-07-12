@@ -91,6 +91,7 @@ const GC_FENCE_RETRY_MS = 6 * 60 * 60_000; // open purge intents live 24–48h; 
 const DEEP_SCAN_MS = UNPRUNED_DEADLINE_MS;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_SPREAD_MS = 3_000;
 const WS_PING_MS = 25_000;
 const WS_KEEPALIVE_PERSIST_MS = 20_000;
 const WS_PONG_DEADLINE_DEFAULT_MS = 60_000; // 2 ping intervals (50s) + 10s grace
@@ -418,7 +419,7 @@ export class RboxDaemon {
     await this.pump();
 
     if (!this.pullOnly) await this.startLiveWatch();
-    if (!this.wsDisabled) this.connect();
+    this.maybeConnect();
     this.startBackstop();
     this.startUpdateChecks();
 
@@ -588,7 +589,6 @@ export class RboxDaemon {
     this.deferredRetryPaths.clear();
     this.gcFenceRetryPaths.clear();
     this.stopWsKeepalive();
-    this.clearPongDeadline();
     this.clearBackstop();
     try {
       this.ws?.close();
@@ -670,6 +670,7 @@ export class RboxDaemon {
           }
           const opWatcherGeneration = this.watcherUnsettledGeneration;
           const opWatcherErrorGeneration = this.watcherErrorGeneration;
+          let notifyPendingAtForRestore: number | undefined;
           try {
             let pushedToRemote = false;
             this.pushTerminalBlocked = false;
@@ -688,7 +689,8 @@ export class RboxDaemon {
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush();
               } else if (op === "pull") {
-                const notifyLatencyMs = this.notifyPullPendingAt !== undefined ? Date.now() - this.notifyPullPendingAt : undefined;
+                notifyPendingAtForRestore = this.notifyPullPendingAt;
+                const notifyLatencyMs = notifyPendingAtForRestore !== undefined ? Date.now() - notifyPendingAtForRestore : undefined;
                 this.notifyPullPendingAt = undefined;
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
@@ -738,6 +740,10 @@ export class RboxDaemon {
             }
             if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
           } catch (e) {
+            // A failed pull did not serve its notify: restore the pending receipt timestamp so
+            // the eventual healing pull reports the true notify→pull-start latency (??= keeps
+            // an EARLIER re-notify that arrived mid-failure).
+            if (op === "pull" && notifyPendingAtForRestore !== undefined) this.notifyPullPendingAt ??= notifyPendingAtForRestore;
             // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
             // first hit and every 10th after, with the running count — so the log stays
             // readable while still showing exactly how long the failure has persisted.
@@ -1729,11 +1735,10 @@ export class RboxDaemon {
     return generation;
   }
 
-  private markWsDisconnected(ws: WebSocket, reason: "close" | "error"): boolean {
+  private markWsDisconnected(ws: WebSocket, reason: "close" | "error" | "timeout"): boolean {
     if (this.ws !== ws) return false;
     this.ws = undefined;
     this.stopWsKeepalive();
-    this.clearPongDeadline();
     this.wsGeneration++;
     this.pendingCatchUpGeneration = undefined;
     this.activity.ws = {
@@ -1783,7 +1788,8 @@ export class RboxDaemon {
     this.writeWsActivity();
   }
 
-  private handleWsMessageData(data: string): void {
+  private handleWsMessageData(data: string, from?: WebSocket): void {
+    if (from !== undefined && this.ws !== from) return;
     if (this.ws) this.armPongDeadline(this.ws);
     if (data === "pong") {
       this.refreshWsAtThrottled();
@@ -1830,9 +1836,11 @@ export class RboxDaemon {
     }, WS_PING_MS);
   }
 
+  /** Tear down the whole WebSocket liveness apparatus (keepalive interval + pong deadline). */
   private stopWsKeepalive(): void {
     if (this.wsKeepaliveTimer) clearInterval(this.wsKeepaliveTimer);
     this.wsKeepaliveTimer = undefined;
+    this.clearPongDeadline();
   }
 
   private armPongDeadline(ws: WebSocket): void {
@@ -1851,11 +1859,13 @@ export class RboxDaemon {
     if (this.stopped || this.ws !== ws) return;
     this.wsHalfOpenDetected++;
     log(`ws half-open detected — no frame in ${Math.round(this.pongDeadlineMs / 1000)}s; cycling socket (ws_half_open_detected=${this.wsHalfOpenDetected})`);
+    if (!this.markWsDisconnected(ws, "timeout")) return;
     try {
       ws.close();
     } catch {
-      /* close/error listener drives reconnect */
+      /* half-open close is best-effort; reconnect is already scheduled */
     }
+    this.scheduleReconnect();
   }
 
   private startBackstop(): void {
@@ -1886,6 +1896,10 @@ export class RboxDaemon {
     this.backstopTimer = undefined;
   }
 
+  private maybeConnect(): void {
+    if (!this.wsDisabled) this.connect();
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const url = `${this.api.wsConnectUrl()}?device=${encodeURIComponent(this.cfg.deviceId)}`;
@@ -1905,6 +1919,7 @@ export class RboxDaemon {
     this.ws = ws;
 
     ws.addEventListener("open", () => {
+      if (this.ws !== ws) return;
       this.reconnectAttempt = 0;
       log("ws connected");
       const generation = this.markWsOpen(ws);
@@ -1913,7 +1928,7 @@ export class RboxDaemon {
       this.scheduleNextBackstop();
     });
     ws.addEventListener("message", (ev: MessageEvent) => {
-      this.handleWsMessageData(String(ev.data));
+      this.handleWsMessageData(String(ev.data), ws);
     });
     ws.addEventListener("pong", () => {
       this.armPongDeadline(ws);
@@ -1928,7 +1943,7 @@ export class RboxDaemon {
 
   private scheduleReconnect(): void {
     if (this.stopped) return;
-    const delay = jitter(Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.reconnectAttempt));
+    const delay = reconnectDelayMs(this.reconnectAttempt);
     this.reconnectAttempt++;
     setTimeout(() => this.connect(), delay);
   }
@@ -1952,6 +1967,17 @@ export async function runDaemon(root: string): Promise<void> {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** ± up to 50% jitter so a fleet of daemons never aligns its ticks/reconnects. */
 const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
+
+/** Reconnect delay (design 105 §5): the FIRST post-close attempt is spread
+ *  uniform(0, RECONNECT_SPREAD_MS) so a deploy's fleet-wide socket close never
+ *  re-handshakes in lockstep; subsequent attempts keep the existing 500ms→30s
+ *  exponential backoff with ±25% jitter. Pure — `random` injected for tests. */
+export function reconnectDelayMs(attempt: number, random: () => number = Math.random): number {
+  if (attempt === 0) return Math.floor(random() * RECONNECT_SPREAD_MS);
+  return Math.round(
+    Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt) * (0.75 + random() * 0.5),
+  );
+}
 
 /**
  * Next safety-scan delay (design 49), decided when a tick fires. Quiet interval
