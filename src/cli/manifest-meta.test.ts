@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { GitSection } from "../engine/index.js";
+import { canonicalManifestHashStreaming, type GitSection } from "../engine/index.js";
 import type { LockIdentitySource } from "../engine/git/lockfile.js";
 import {
   applyStateSavePacket,
   loadState,
+  manifestFromMeta,
   saveState,
   validManifestMeta,
   type GlobalManifestMeta,
@@ -17,7 +18,7 @@ import { composeStateSavePacket, saveStateSource } from "./sync-state.js";
 const stream = "https://api.test::ws_84::root";
 const nonce = "8".repeat(32);
 const sha = (c: string) => c.repeat(64);
-const meta: GlobalManifestMeta = { encManifestSha: sha("a"), manifestHash: sha("b"), accountEpoch: 1, keyEpoch: 2, chain: [], chainBytes: 0, snapshotBytes: 123 };
+const meta: GlobalManifestMeta = { encManifestSha: sha("a"), manifestHash: sha("b"), accountEpoch: 1, keyEpoch: 2, chain: [], chainBytes: 0, snapshotBytes: 123, gitRepos: {} };
 const section = (c: string): GitSection => ({ bundleSha: sha(c), bundleEncSha: sha(c === "c" ? "d" : "c"), bundleCipherSize: 1, head: "ref: refs/heads/main", refs: {}, refScope: "all", generatedAt: "" });
 const state = (): SyncState => ({ stream, stateNonce: nonce, stateRevision: 0, lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "one", files: [] }, manifestMeta: meta });
 const identity: LockIdentitySource = { current: async () => ({ hostId: "84", bootId: "84", pid: 84, startTime: "1" }), probe: async () => ({ status: "alive", startTime: "1" }) };
@@ -36,6 +37,7 @@ describe("validManifestMeta", () => {
       { ...meta, chain: [sha("c"), sha("c")], chainBytes: 1 }, { ...meta, chain: [sha("a")], chainBytes: 1 },
       { ...meta, accountEpoch: -1 }, { ...meta, keyEpoch: Number.NaN }, { ...meta, snapshotBytes: 1.5 },
       { ...meta, chainBytes: 1 }, { ...meta, chain: [sha("c")], chainBytes: 0 },
+      { ...meta, gitRepos: undefined }, { ...meta, gitRepos: [] }, { ...meta, gitRepos: { "../bad": section("c") } },
     ];
     for (const value of bad) expect(validManifestMeta(value)).toBeUndefined();
   });
@@ -69,13 +71,13 @@ describe("manifest metadata packet semantics", () => {
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
   });
 
-  test("repo-only base changes clear metadata while retained newer records preserve it", async () => {
+  test("repo-only base changes and retained newer records preserve metadata", async () => {
     const initial = state();
     initial.repoRecords = { r: { repoGen: 0, sourceSeq: 1, base: section("c") } };
     await saveState(root, initial);
     const changed = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: ["r"], values: { bases: { r: section("e") } } });
     await applyStateSavePacket(root, changed, { lock: lock() });
-    expect((await loadState(root, stream)).manifestMeta).toBeUndefined();
+    expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
 
     const newer = state();
     newer.repoRecords = { r: { repoGen: 0, sourceSeq: 5, base: section("c") } };
@@ -85,12 +87,26 @@ describe("manifest metadata packet semantics", () => {
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
   });
 
-  test("projection equality carries metadata; pending suppresses it; legacy drops it", async () => {
+  test("metadata rides the global despite pending projection; legacy drops it", async () => {
     const clean = composeStateSavePacket(state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [], manifestSchema: 2, gitRepos: { r: section("c") } }, manifestMeta: meta, observedRepos: ["r"], values: { bases: { r: section("c") } } });
     expect(clean.global?.manifestMeta).toEqual(meta);
     const pending = composeStateSavePacket(state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [], manifestSchema: 2, gitRepos: { r: section("c") } }, manifestMeta: meta, observedRepos: ["r"], values: { bases: { r: section("c") }, pending: { r: section("e") } } });
-    expect(pending.global?.manifestMeta).toBeUndefined();
+    expect(pending.global?.manifestMeta).toEqual(meta);
     const legacy = await saveStateSource(root, state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [] }, manifestMeta: meta, observedRepos: [], values: {} }, { forceLegacy: true });
     expect(legacy.manifestMeta).toBeUndefined();
+  });
+
+  test("reconstruction replaces projected gitRepos and omits an empty evidence map", () => {
+    const described = { generatedAt: "head", files: [], manifestSchema: 2 as const, gitRepos: { r: section("c") } };
+    const describedMeta = { ...meta, manifestHash: canonicalManifestHashStreaming(described), gitRepos: described.gitRepos };
+    const reconstructed = manifestFromMeta({ ...described, gitRepos: { lagging: section("e") } }, describedMeta);
+    expect(reconstructed).toEqual(described);
+    expect(canonicalManifestHashStreaming(reconstructed)).toBe(describedMeta.manifestHash);
+    expect(manifestFromMeta(described, { ...describedMeta, gitRepos: {} })).not.toHaveProperty("gitRepos");
+  });
+
+  test("pre-round-3 metadata without gitRepos normalizes away", () => {
+    const { gitRepos: _gitRepos, ...preR3 } = meta;
+    expect(validManifestMeta(preR3)).toBeUndefined();
   });
 });

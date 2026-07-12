@@ -40,6 +40,36 @@ export function isSafeRelPath(p: unknown): p is string {
 
 export type ValidationResult = { ok: true } | { ok: false; error: string };
 
+/** Validate the standalone gitRepos map using the same rules as a manifest.
+ * `schema` and `filePaths` let validateManifest additionally enforce its schema
+ * gates and file/repo collision rule; persisted fold evidence uses the newest
+ * understood schema because the described manifest was already validated. */
+export function validateGitRepos(
+  gitRepos: unknown,
+  schema: number = KNOWN_MANIFEST_SCHEMA,
+  filePaths: ReadonlySet<string> = new Set(),
+): ValidationResult {
+  if (gitRepos === null || typeof gitRepos !== "object" || Array.isArray(gitRepos)) return { ok: false, error: "manifest.gitRepos is not an object" };
+  if (schema < 2) return { ok: false, error: "gitRepos requires manifestSchema >= 2" };
+  const keys = Object.keys(gitRepos);
+  if (keys.length > MAX_GIT_REPOS) return { ok: false, error: `too many git repos (${keys.length} > ${MAX_GIT_REPOS})` };
+  const seenGitLower = new Set<string>();
+  for (const key of keys) {
+    if (!(key === "." || isSafeRelPath(key))) return { ok: false, error: `unsafe gitRepos key: ${JSON.stringify(key)}` };
+    const lower = key.toLowerCase();
+    if (seenGitLower.has(lower)) return { ok: false, error: `case-insensitive duplicate gitRepos key: ${key}` };
+    seenGitLower.add(lower);
+    if (filePaths.has(key)) return { ok: false, error: `gitRepos key collides with a file entry: ${key}` };
+    const section = (gitRepos as Record<string, unknown>)[key];
+    if (section === null || typeof section !== "object") return { ok: false, error: `gitRepos[${key}] is not an object` };
+    if (gitSectionRequiresSchema4(section) && schema < 4) return { ok: false, error: "compressed entries require manifestSchema >= 4" };
+    const gv = validateGitSection(section);
+    if (!gv.ok) return { ok: false, error: `gitRepos[${key}]: ${gv.reason}` };
+    if (packChainRequiresSchema3(section) && schema < 3) return { ok: false, error: `gitRepos[${key}]: packChain requires manifestSchema >= 3` };
+  }
+  return { ok: true };
+}
+
 /**
  * Validate a parsed manifest object. Returns the first problem found, or ok.
  * Enforces: safe relative paths, no duplicate or file/descendant paths (incl.
@@ -126,29 +156,8 @@ export function validateManifest(m: unknown): ValidationResult {
       return { ok: false, error: "manifest.gitRepos is not an object" };
     }
     if (typeof schema !== "number" || schema < 2) return { ok: false, error: "gitRepos requires manifestSchema >= 2" };
-    const keys = Object.keys(gitRepos);
-    if (keys.length > MAX_GIT_REPOS) return { ok: false, error: `too many git repos (${keys.length} > ${MAX_GIT_REPOS})` };
-    const seenGitLower = new Set<string>();
-    for (const key of keys) {
-      // isSafeRelPath rejects "." itself, hence the explicit disjunct (design 43 §2 [v2]).
-      if (!(key === "." || isSafeRelPath(key))) return { ok: false, error: `unsafe gitRepos key: ${JSON.stringify(key)}` };
-      const lower = key.toLowerCase();
-      if (seenGitLower.has(lower)) return { ok: false, error: `case-insensitive duplicate gitRepos key: ${key}` };
-      seenGitLower.add(lower);
-      // A repo key must not equal any FILE/symlink entry's path [v2, B5] — a colliding entry
-      // could redirect the repo materialization through a synced symlink.
-      if (seen.has(key)) return { ok: false, error: `gitRepos key collides with a file entry: ${key}` };
-      const section = (gitRepos as Record<string, unknown>)[key];
-      if (section === null || typeof section !== "object") return { ok: false, error: `gitRepos[${key}] is not an object` };
-      if (gitSectionRequiresSchema4(section) && (typeof schema !== "number" || schema < 4)) {
-        return { ok: false, error: "compressed entries require manifestSchema >= 4" };
-      }
-      const gv = validateGitSection(section);
-      if (!gv.ok) return { ok: false, error: `gitRepos[${key}]: ${gv.reason}` };
-      if (packChainRequiresSchema3(section) && (typeof schema !== "number" || schema < 3)) {
-        return { ok: false, error: `gitRepos[${key}]: packChain requires manifestSchema >= 3` };
-      }
-    }
+    const reposValidation = validateGitRepos(gitRepos, schema as number, seen);
+    if (!reposValidation.ok) return reposValidation;
   }
   return { ok: true };
 }

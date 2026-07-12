@@ -332,7 +332,7 @@ export class E2eeRemote implements SyncRemote {
         foldLinks,
       });
     };
-    const makeMeta = (manifestHash: string, chainBytes: number, snapshotBytes: number): GlobalManifestMeta => ({
+    const makeMeta = (manifestHash: string, chainBytes: number, snapshotBytes: number, manifest: Manifest): GlobalManifestMeta => ({
       encManifestSha: body.encManifestSha,
       manifestHash,
       accountEpoch: body.accountEpoch,
@@ -340,6 +340,7 @@ export class E2eeRemote implements SyncRemote {
       chain: [...signedChain],
       chainBytes,
       snapshotBytes,
+      gitRepos: manifest.gitRepos ?? {},
     });
     const evidenceChainLength = fastFoldBase?.meta.chain.length ?? -1;
     if (headEnvelope.kind === "delta" && fastFoldBase &&
@@ -379,7 +380,7 @@ export class E2eeRemote implements SyncRemote {
         kek,
         // Fast path never refetches the terminal snapshot: propagate its bytes
         // and accumulate only the fetched suffix + head ciphertexts (§3.4).
-        manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + suffixWalk.deltaCipherBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes),
+        manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + suffixWalk.deltaCipherBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes, manifest),
       };
     }
 
@@ -419,7 +420,8 @@ export class E2eeRemote implements SyncRemote {
       manifestMeta = makeMeta(
         manifestHash,
         signedChain.length === 0 ? 0 : chainWalk.deltaCipherBytes + encManifest.byteLength,
-        signedChain.length === 0 ? encManifest.byteLength : chainWalk.snapshotCipherBytes
+        signedChain.length === 0 ? encManifest.byteLength : chainWalk.snapshotCipherBytes,
+        manifest!,
       );
     }
     return { manifest: manifest!, kek, ...(manifestMeta ? { manifestMeta } : {}) };
@@ -926,6 +928,7 @@ export class E2eeRemote implements SyncRemote {
         chain: emittedChain ?? [],
         chainBytes: emittedDelta ? deltaBase!.meta.chainBytes + built.encManifest.byteLength : 0,
         snapshotBytes: emittedDelta ? deltaBase!.meta.snapshotBytes : built.encManifest.byteLength,
+        gitRepos: manifest.gitRepos ?? {},
       } } : {}),
     };
   }

@@ -117,6 +117,7 @@ export {
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
 export {
   validateManifest,
+  validateGitRepos,
   manifestRequiresSchema4,
   isSafeRelPath,
   type ValidationResult,

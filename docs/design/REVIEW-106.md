@@ -83,3 +83,47 @@ Verdict: **ALIGNED** — the placement/cost regression is removed without
 weakening the evidence trust anchor or round-1 current-head roster gates.
 `bun run typecheck` and the three mandated test files passed: 60 tests and 478
 expectations.
+
+## Round 3 evidence-carriage follow-up — GPT adversarial review (2026-07-12)
+
+The review attacked packet atomicity, reconstruction identity, contextual git
+section validation, chronic pending behavior, pre-upgrade state, and writer
+delta eligibility. It agreed that verbatim `gitRepos` makes evidence independent
+of repo projection while preserving the global CAS. The revision uses one
+explicit reconstruction helper for both consumers, reuses the manifest
+git-section validator, and retains fail-closed F1/F2/result-hash checks. The
+contextual-validator limitation is recorded conservatively: legitimate producer
+data is fully validated, while corrupt reconstructed state still demotes or
+fails closed. R5 uses real busy-repo pull deferral; R6 uses a repo-record pending
+transition through real push. Final simplify/anti-slop review required a writer
+regression for structurally valid but context-invalid evidence; the real-push
+test proves full-manifest validation demotes it to a snapshot without throwing.
+Verdict: **ALIGN**.
+
+## Round 3 uncommitted-change adversarial review (2026-07-12)
+
+The review compared the extracted validator against its former inline body,
+traced every evidence producer, consumer, and state writer, checked deferred
+writer target identity and peer folding, and exercised upgrade and benchmark
+behavior. No implementation defect landed. Two coverage gaps did: malformed
+metadata now explicitly pins rejection of an Array `gitRepos`, and R6 pins the
+peer-folded target's `gitRepos` after both deferred delta commits. Round 3 also
+records the sanctioned evidence-drop channels in design 106 for field triage.
+
+Refutations: `validateManifest` preserves every prior rule, error, schema gate,
+and first-error order by passing its file-path set and validated schema into the
+shared helper; standalone evidence validation may use schema 4 and no file set
+because producers describe already-validated manifests, F1/F2 verify hashes,
+and both apply and writer paths run full reconstructed-manifest validation before
+trusting contextual collisions. Packet CAS and one atomic state write keep the
+file layer and meta paired; repo-only transitions alter only projection. Delta
+and snapshot encode the identical committed target from the git plan, while
+`resultHash` makes a successful peer fold canonical-target exact. The new map is
+referenced in memory and serialized only by the existing state write, so the
+engine benchmark path is unchanged. Pre-R3 metadata demotes to one cold walk.
+
+Validation: `bun run typecheck`; mandated targeted suites plus the adjusted
+validator suites (`engine-m1.test.ts` and `git-nested.test.ts`, because the
+requested `manifest-validate.test.ts` does not exist) passed: 109 tests, 672
+expectations, zero failures. Benchmark: 625.9 ms, +44,872 KB isolated peak RSS
+against a 90,790 KB allowance. Final verdict: **ALIGNED — no open findings**.
