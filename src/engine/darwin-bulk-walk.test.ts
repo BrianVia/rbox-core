@@ -21,6 +21,12 @@ darwinTest("getattrlistbulk inventory and file metadata exactly match Bun lstat"
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-bulk-"));
   roots.push(root);
   await fs.mkdir(path.join(root, "nested/empty"), { recursive: true });
+  // Short-named subdir + symlink: dir/symlink records omit the file-only
+  // ATTR_FILE_DATALENGTH word, so a 1-char name yields a record shorter than a
+  // file's fixed size. Guards the record-length floor against rejecting them
+  // (which pre-fix fell the WHOLE parent directory back to readdir).
+  await fs.mkdir(path.join(root, "d"));
+  await fs.symlink("d", path.join(root, "s"));
   const files: Array<[string, string]> = [
     ["zero", ""], ["small.txt", "abc"], ["name with spaces.and.dots", "dots"],
     ["é", "accent"], ["日本語", "nihongo"], ["emoji-😀", "emoji"], ["nested/file", "nested"],

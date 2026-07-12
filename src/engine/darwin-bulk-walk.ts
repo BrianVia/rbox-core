@@ -16,7 +16,15 @@ const COMMON_PAYLOAD = ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE |
 const COMMON_REQUEST = (ATTR_CMN_RETURNED_ATTRS | COMMON_PAYLOAD) >>> 0;
 const FSOPT_PACK_INVAL_ATTRS = 0x8;
 const BUFFER_SIZE = 256 * 1024;
-const FIXED_SIZE = 92;
+// Bytes of packed fixed attributes before the variable-length name data, by
+// object type. The common group (through ATTR_CMN_FILEID at 76) is 84 bytes and
+// present for EVERY object; ATTR_FILE_DATALENGTH is a file-group attr that the
+// kernel packs ONLY for regular files (not dirs/symlinks) even under
+// FSOPT_PACK_INVAL_ATTRS — so a directory record is a full 8 bytes shorter. The
+// record-length floor must therefore be the common size, not the file size, or
+// every dir/symlink entry is wrongly rejected and the whole directory falls back.
+const COMMON_FIXED_SIZE = 84;
+const FILE_FIXED_SIZE = 92;
 
 type ChildType = BulkChild["type"];
 type BulkFn = (fd: number, attrs: number, buffer: number, size: number, options: bigint) => number | bigint;
@@ -130,7 +138,10 @@ function parseRecord(view: DataView, start: number, length: number, absDir: stri
   const type = objectType(view.getUint32(start + 36, true));
   if (!type) return undefined;
   const returnedFile = view.getUint32(start + 16, true);
-  if (type === "file" && (returnedFile & ATTR_FILE_DATALENGTH) === 0) return childFromLstat(absDir, name);
+  // Files carry the extra ATTR_FILE_DATALENGTH word (read at offset 84). If it
+  // wasn't packed for this file, or the record is too short to hold it, take the
+  // exact lstat rather than reading a neighboring record's bytes.
+  if (type === "file" && ((returnedFile & ATTR_FILE_DATALENGTH) === 0 || length < FILE_FIXED_SIZE)) return childFromLstat(absDir, name);
   if (type !== "file") return { name, type };
 
   const inoRaw = view.getBigUint64(start + 76, true);
@@ -186,7 +197,7 @@ export function bulkWalkDir(absDir: string): BulkChild[] | null {
       for (let i = 0; i < count; i++) {
         if (offset + 4 > buffer.byteLength) throw new Error("short record");
         const length = view.getUint32(offset, true);
-        if (length < FIXED_SIZE || length > buffer.byteLength - offset) throw new Error("bad record length");
+        if (length < COMMON_FIXED_SIZE || length > buffer.byteLength - offset) throw new Error("bad record length");
         const child = parseRecord(view, offset, length, absDir);
         if (child) result!.push(child);
         offset += length;
