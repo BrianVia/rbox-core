@@ -9,7 +9,21 @@ _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** 
 
 ## 2026-07-12 midday — gate-compression sprint (founder: "resolve the gates ASAP"; update STATUS continuously)
 
-- **Gate 1 (84 fold) — round 2 required.** #233's per-fold perf fix WORKS
+- **Gate 1 (84 fold) — round 2 PROVEN on Ubuntu; round 3 for the Mac.**
+  #234 merged: the r1 fast path only matched +1-link head advances; daemon
+  pulls are same-head or multi-link, so it never fired. Now evidence-as-
+  prefix: same-head = ZERO fetches. **Ubuntu field-verified: `fold=evidence
+  f0`, latest 0.9–1.0s (gate ≤2s PASSED; was 4.5s legacy / 8.5s broken).**
+  Mac still coldwalks: its two chronically-deferred git repos (worktree
+  branches — legitimate permanent state) suppress meta carriage via §3.4
+  fail-to-snapshot, so evidence never forms there — round 3 running
+  (decouple evidence from repo deferral). Flags currently ON fleet-wide on
+  `1.1.0-dev+0a6e717`; Ubuntu healthy, Mac degraded-but-bounded (p≈5–6s,
+  chain capped by snapshots).
+- **Gate 3 shipped dark:** 85 Layer A merged (#236, `RBOX_SCAN_PRUNE` off) —
+  honest bench: ~24% scan cut (readdir share only; stat floor remains; Layer
+  B is the real O(actions) receiver win, future cycle).
+- (superseded) **Gate 1 (84 fold) — round 2 required.** #233's per-fold perf fix WORKS
   (~600–800ms/fold, RSS bounded) but field validation failed AGAIN: the
   daemon pull path never engages evidence — `fold=coldwalk` on every pull on
   BOTH hosts, p growing with chain length (5.7→10.9s as ambient commits
