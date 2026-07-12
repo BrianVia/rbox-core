@@ -58,7 +58,22 @@ export const firstPublishTiming = {
   checkedAddresses: new Set<string>(),
 };
 
+/** Arm (or disarm) the per-push first-publish measurement.
+ *
+ *  OWNERSHIP INVARIANT (design 108, codex round-6 MAJOR 2): the accumulator is a
+ *  process-global singleton, so at most ONE measurement may be in flight per process.
+ *  That holds today because every push author is sequential — the CLI runs one command,
+ *  the daemon's tick loop awaits each push, and `runPushAttempt`'s finally disarms
+ *  before the next attempt (the design-93 workspace sync mutex additionally serializes
+ *  same-workspace pushes across processes). If a second measurement is ever requested
+ *  while one is armed (a future concurrent multi-workspace embedder), BOTH are voided
+ *  rather than cross-attributed: disarm and record nothing — mis-attributed timing is
+ *  worse than no timing. */
 export function beginFirstPublishTiming(enabled: boolean): void {
+  if (enabled && firstPublishTiming.enabled) {
+    firstPublishTiming.enabled = false; // concurrent measurement detected: void both, never mix
+    return;
+  }
   firstPublishTiming.enabled = enabled;
   if (!enabled) return;
   firstPublishTiming.stats = zeroFirstPublishStats();

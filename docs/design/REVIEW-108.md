@@ -164,3 +164,43 @@ start-timestamp definition — was applied verbatim from the reviewer's prescrip
 document carries no open BLOCKER/MAJOR correctness item. Effective state: CORRECTNESS-ALIGNED at
 the cap, with the founder decisions in §8 (publisher-loss git semantics, joiner pending signal,
 incremental-attach value) explicitly deferred to the founder rather than the review.
+
+---
+
+## Implementation reviews (PR #247, `impl/108-files-first`)
+
+### Impl round A (fable-5, 2026-07-12) — VERDICT: NOT ALIGNED (1 BLOCKER, 3 MAJOR, 3 MINOR) → fixed
+
+1. BLOCKER — chain-repair pushes could satisfy the genesis predicate (`repair.parentSequence ≠
+   appliedSequence`; a fresh-state repair supersede would publish a head with ALL git sections
+   dropped — fleet-wide repo-removal echo). **FIXED: `repair === undefined` added to the defer
+   predicate.**
+2. MAJOR — `firstPublishTiming` singleton stayed armed on reupload/no-advance returns and on
+   thrown encrypt/commit/state-save errors. **FIXED: the try/finally now wraps from
+   `encryptAndUpload` onward.**
+3. MAJOR — a 409-then-success genesis rendered ZERO FirstPublishStats (per-attempt reset left
+   `firstUploadAt` 0 on the retry), silencing the headline KPI. **FIXED: `timeToFilesSyncedMs`
+   is command-scoped (survives retries) and forces the render.**
+4. MINOR ×3 — no-repo workspaces scheduled a pointless commit 2 (fixed: capture-free discovery
+   gates `filesFirstDeferred`); commit-2 spinner lied on no-ops (fixed: "up to date" wording);
+   `sync()` drops the driver signal (accepted: the `firstSync === "sync"` init path leans on the
+   §4.6 daemon backstop). Bounded deviation accepted: init's `resetSyncState` rebind flavor is
+   not stream-mismatch-flagged, so it can files-first — safe (live remote caught by the 409
+   belt; empty remote is genesis-appropriate).
+
+### Impl round B (gpt-5.6-sol via codex, 2026-07-12) — VERDICT: CHANGES-REQUIRED (2 MAJOR) → fixed
+
+All other vectors (repair gate, gap-window resume, 409 latch, genesis gating, supersede git
+preservation, KPI stamping order) reviewed CLEAN.
+
+1. MAJOR — flag-off NOT byte-identical: init installed `filesFirstStartedAt` + an enabled
+   PhaseReport + summary logging unconditionally, so a flag-off `rbox init` emitted a new
+   stdout summary line and took the report-enabled commit-options path. **FIXED: all of it is
+   gated on `filesFirstFlagEnabled()`; the FirstPublishStats-on-init gap fix ships under the
+   flag and can be promoted to flag-off as a separate, deliberately-named change after 108
+   validates.**
+2. MAJOR — the first-publish accumulator is a process-global singleton; two overlapping
+   in-process pushes could reset/finalize each other's measurement. **FIXED: the sequential-
+   push invariant is now explicit in `beginFirstPublishTiming` (CLI one-command / daemon
+   awaited tick / attempt-finally disarm, design-93 mutex across processes), and a detected
+   overlap VOIDS both measurements rather than cross-attributing (unit-tested).**

@@ -15,7 +15,7 @@ import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceCon
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
-import { pull, push, sync } from "./sync.js";
+import { filesFirstFlagEnabled, pull, push, sync } from "./sync.js";
 import { beginReport } from "./metrics.js";
 import { resolveInitPlan, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
@@ -220,12 +220,17 @@ async function executeInitPlan(
       const sp = spinner("publishing initial snapshot — scanning files");
       try {
         deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-        // Design 108 §3.6: command-level "files synced" milestone, captured BEFORE scan so
-        // timeToFilesSyncedMs includes the scan wall. A fresh enabled report renders
-        // FirstPublishStats — the one run it was built to measure (the folded-in gap fix).
-        deps.filesFirstStartedAt = performance.now();
-        const report1 = beginReport("push");
-        deps.report = report1;
+        // Design 108 §3.6: the milestone + report wiring is FLAG-GATED (codex round-6
+        // MAJOR 1) — a flag-off init must emit exactly the pre-108 output (no summary
+        // line, no report-enabled commit path). Under the flag: the command-level
+        // "files synced" milestone is captured BEFORE scan so timeToFilesSyncedMs
+        // includes the scan wall, and a fresh enabled report renders FirstPublishStats.
+        const filesFirst = filesFirstFlagEnabled();
+        const report1 = filesFirst ? beginReport("push") : undefined;
+        if (filesFirst) {
+          deps.filesFirstStartedAt = performance.now();
+          deps.report = report1;
+        }
         // Commit 1 — files (git deferred under RBOX_FILES_FIRST on a genuine genesis;
         // otherwise an ordinary single git-first commit).
         const r1 = await push(plan.root, authed, deps);
