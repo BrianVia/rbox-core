@@ -341,9 +341,10 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "recover",
     group: "DEVICES & ACCOUNT",
     summary: "clear the local head pin and re-baseline a halted workspace",
-    usage: "rbox recover [path] [--yes] [--allow-mass-delete]",
+    usage: "rbox recover [path] [--yes] [--repair-chain] [--allow-mass-delete]",
     flags: [
       { flag: "--yes", desc: "skip the confirmation prompt (alias: -y)" },
+      { flag: "--repair-chain", desc: "confirm superseding an authenticated unreadable manifest suffix" },
       { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
     ],
   },

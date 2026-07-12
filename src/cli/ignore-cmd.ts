@@ -89,7 +89,7 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     }
     deps.syncMutex = syncMutex;
     deps.allowMassDeletePush = opts.allowMassDelete === true;
-    const res = await pushManifest(root, cfg, final.local, deps, 0, true);
+    const res = await pushManifest(root, cfg, final.local, deps, { purgeIgnored: true });
     console.log(
       res.committed
         ? `purged ${final.purged.length} ignored path${final.purged.length === 1 ? "" : "s"} -> sequence ${res.sequence}`

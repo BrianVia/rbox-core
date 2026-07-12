@@ -41,9 +41,31 @@ export {
   encryptFileToTemp,
   decryptFileToPath,
   isSourceChangedError,
+  zstdCompress,
+  zstdDecompressCapped,
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "./crypto.js";
+export { readManifestChain } from "./manifest-chain.js";
+export {
+  MANIFEST_ENVELOPE_MAGIC,
+  MANIFEST_ENVELOPE_PREFIX,
+  MAX_ENVELOPE_HEADER,
+  MAX_MANIFEST_PLAINTEXT,
+  MAX_MANIFEST_DELTA_CHAIN,
+  ManifestChainError,
+  canonicalManifestBytes,
+  canonicalManifestHash,
+  encodeSnapshotEnvelope,
+  diffToOps,
+  encodeDeltaEnvelope,
+  decodeEnvelope,
+  hasEnvelopePrefix,
+  foldDelta,
+  type ManifestDeltaHeader,
+  type ManifestDeltaOp,
+  type DecodedManifestEnvelope,
+} from "./manifest-delta.js";
 export { cryptoPoolStatus, withCryptoPool, type CryptoPoolStatus, type CryptoPool, type CoalescedBlob } from "./crypto-pool.js";
 export { hashFile, hashBytes } from "./hash.js";
 export {

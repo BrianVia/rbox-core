@@ -14,6 +14,7 @@ import {
   type IgnoreMatcher,
   type Manifest,
   type WatchEvent,
+  ManifestChainError,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
@@ -24,6 +25,7 @@ import { pull, pushManifest, type SyncDeps } from "./sync.js";
 import { deferManifest } from "./sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { E2eeRemote } from "./e2ee-remote.js";
 import { beginReport, loadMetrics, metricsEnabled, saveMetrics, type SyncMetrics } from "./metrics.js";
 import { createScanProbe, loadScanProbe, saveScanProbe } from "./scan-probe.js";
 import {
@@ -60,6 +62,7 @@ import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "./version.js";
 import { daemonBindingMatches } from "./sync-state.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import { repairChain, type SuffixInfo } from "./chain-repair.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -84,6 +87,42 @@ const WS_PING_MS = 25_000;
 const WS_KEEPALIVE_PERSIST_MS = 20_000;
 export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
+
+/** Stateful daemon policy for automatic chain repair. Exported as a narrow test
+ * seam: the recovery mechanics live in repairChain; this owns only authorship
+ * consent and terminal-head suppression. */
+export class DaemonChainRepairPolicy {
+  private terminalHeadFingerprint = "";
+  private terminalHaltMessage = "";
+
+  constructor(private readonly deviceId: string) {}
+
+  confirmSupersede(suffix: SuffixInfo[]): boolean {
+    return suffix.every((item) => item.deviceId === this.deviceId);
+  }
+
+  assertHeadAllowed(pin: { commitSeq: number; commitHash: string } | undefined): void {
+    if (!pin || !this.terminalHeadFingerprint) return;
+    if (`${pin.commitSeq}:${pin.commitHash}` === this.terminalHeadFingerprint) {
+      throw new Error(this.terminalHaltMessage);
+    }
+  }
+
+  halt(error: ManifestChainError, suffix: SuffixInfo[]): Error {
+    const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
+    const message = `MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`;
+    if (error.head) {
+      this.terminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
+      this.terminalHaltMessage = message;
+    }
+    return new Error(message);
+  }
+
+  clear(): void {
+    this.terminalHeadFingerprint = "";
+    this.terminalHaltMessage = "";
+  }
+}
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
 
@@ -258,6 +297,9 @@ export class RboxDaemon {
   private errRepeat = 0;
   private pushTerminalBlocked = false;
   private lastTerminalBlockFingerprint = "";
+  /** Foreign-device chain HALTs are terminal for a verified head. Avoid repeatedly
+   * attempting repair (and repeating the same HALT) until the authenticated pin moves. */
+  private readonly chainRepairPolicy: DaemonChainRepairPolicy;
   private lastLoggedSeq?: number;
   /** While quota-blocked, only a safety full-scan arms one upload probe. */
   private outOfStorageProbeArmed = false;
@@ -303,6 +345,7 @@ export class RboxDaemon {
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
+    this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
     this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
   }
@@ -919,13 +962,17 @@ export class RboxDaemon {
   }
 
   private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
+    if (this.e2ee.remote instanceof E2eeRemote) {
+      const pin = await this.e2ee.remote.loadVerifiedPin();
+      this.chainRepairPolicy.assertHeadAllowed(pin);
+    }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
     // here and in doPush's deps so the pull inside push's 409 recovery is recorded
     // identically (codex R2: its actions are discarded by the retry loop).
-    const actions = await pull(this.root, this.cfg, {
+    const pullDeps: SyncDeps = {
       ...this.e2ee,
       cache: this.cache,
       syncMutex,
@@ -934,7 +981,29 @@ export class RboxDaemon {
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
       onPullApplied: (a) => this.recordPullApplied(a),
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
-    });
+    };
+    let actions: Action[];
+    try {
+      actions = await pull(this.root, this.cfg, pullDeps);
+    } catch (error) {
+      if (!(error instanceof ManifestChainError)) throw error;
+      let refusal: SuffixInfo[] | undefined;
+      const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
+        confirmSupersede: async (suffix) => {
+          const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
+          if (!selfOnly) refusal = suffix;
+          return selfOnly;
+        },
+      });
+      if (outcome.kind === "declined") {
+        const suffix = refusal ?? outcome.suffix;
+        throw this.chainRepairPolicy.halt(error, suffix);
+      }
+      actions = outcome.kind === "converged"
+        ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
+        : outcome.actions;
+    }
+    this.chainRepairPolicy.clear();
     report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {

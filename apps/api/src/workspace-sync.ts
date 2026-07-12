@@ -14,12 +14,14 @@ import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeA
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { refsetShas } from "../../../src/engine/refset.js";
+import { readManifestChain } from "../../../src/engine/manifest-chain.js";
 import { verifyReceipt } from "./receipts.js";
 import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
   MAX_REQUEST_BODY,
   readBodyCapped,
+  orderChainFirst,
   readRefMode,
   unsatisfiedBlobsBody,
   type CommitBodyView,
@@ -420,6 +422,8 @@ export class WorkspaceSync {
     // A sidecar commit needs the receipts protocol (its refs come from a receipt-authenticated
     // R2 object resolved at accounting time) — an old/legacy-protocol sidecar can't be charged.
     if (mode.kind === "sidecar" && !useReceipts) return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
+    const chainShas = readManifestChain(cb.manifestChain, cb.encManifestSha as string);
+    if (chainShas === null) return json({ error: "bad_request", message: "bad manifestChain" }, 400);
     const deviceId = typeof cb.deviceId === "string" ? cb.deviceId : null;
     const bodyBytes = commit.body.length;
     serverTimings.envelopeMs = Date.now() - startedAt;
@@ -491,7 +495,7 @@ export class WorkspaceSync {
         if (!v.ok) {
           if (emitDeltaAdmission) emitDelta(this.env, "admit_stmts", { dbCalls: op.span.dbCalls - beforeCalls });
           emit(shas.length)("unsatisfied_blobs", { ratio: v.needsUpload.length / shas.length });
-          return json(unsatisfiedBlobsBody(v.needsUpload), 422);
+          return json(unsatisfiedBlobsBody(orderChainFirst(v.needsUpload, chainShas)), 422);
         }
         const acct = await commitAccounting(db, accountId, v.newRefs, nowMs);
         serverTimings.accountingMs = Date.now() - accountingStartedAt;
@@ -501,7 +505,7 @@ export class WorkspaceSync {
         }
         if ("needsUpload" in acct) {
           emit(shas.length)("unsatisfied_blobs", { ratio: acct.needsUpload.length / shas.length });
-          return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
+          return json(unsatisfiedBlobsBody(orderChainFirst(acct.needsUpload, chainShas)), 422);
         }
         if ("overCap" in acct) {
           emit(shas.length)("quota_exceeded", { bytes: bodyBytes });
@@ -514,7 +518,7 @@ export class WorkspaceSync {
         // §30: cap the DATA-ref count directly (the 2 carriers — encManifest + sidecar — ride
         // within the multi-batch accounting, no separate budget). Same bound readRefMode applies
         // to count, so no dead band. Cheap reject BEFORE the R2 fetch.
-        const accountedCount = mode.count + CARRIER_REFS;
+        const accountedCount = mode.count + CARRIER_REFS + chainShas.length;
         if (accountedCount > MAX_REFS_PER_COMMIT) {
           emit(accountedCount)("too_many_refs");
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
@@ -527,14 +531,14 @@ export class WorkspaceSync {
         if (!child.ok) {
           if ("needsUpload" in child) {
             emit(mode.count)("unsatisfied_blobs", { ratio: 1 });
-            return json(unsatisfiedBlobsBody(child.needsUpload), 422);
+            return json(unsatisfiedBlobsBody(orderChainFirst(child.needsUpload, chainShas)), 422);
           }
           emit(mode.count)("bad_sidecar");
           return json({ error: "bad_sidecar", message: child.badSidecar }, 400);
         }
         const carriers = [cb.encManifestSha as string, mode.sidecarSha];
         if (deltaMode === "off") {
-          const response = await runFullAdmission([...new Set([...carriers, ...refsetShas(child.buf)])]);
+          const response = await runFullAdmission([...new Set([...carriers, ...chainShas, ...refsetShas(child.buf)])]);
           if (response) return response;
         } else {
           const { fallback, delta, admitData } = await this.computeCommitDelta(db, accountId, parent, commitEpoch, child.buf, child.count);
@@ -577,15 +581,15 @@ export class WorkspaceSync {
           }
           // design 102 enforce — flag-gated, not enabled in this PR.
           const dataShas = deltaMode === "enforce" && delta && !fallback ? admitData : fullChildShas();
-          const response = await runFullAdmission([...new Set([...carriers, ...dataShas])]);
+          const response = await runFullAdmission([...new Set([...carriers, ...chainShas, ...dataShas])]);
           if (response) return response;
         }
       } else {
-        shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+        shas = [...new Set([cb.encManifestSha as string, ...chainShas, ...mode.refShas])];
         // Defensive backstop: inline can't actually reach this — >MAX_REFS_PER_COMMIT 64-hex
         // shas blow the 1MB MAX_COMMIT_BODY first (→ 400). The §24 client uses the sidecar
         // long before then; the real large-ref ceiling is enforced on the sidecar `count` above.
-        const accountedCount = mode.refShas.length + CARRIER_REFS;
+        const accountedCount = mode.refShas.length + CARRIER_REFS + chainShas.length;
         if (accountedCount > MAX_REFS_PER_COMMIT) {
           emit(accountedCount)("too_many_refs");
           return json({ error: "too_many_refs", count: accountedCount, max: MAX_REFS_PER_COMMIT }, 413);
@@ -598,7 +602,7 @@ export class WorkspaceSync {
       // Legacy (M7): inline only — a sidecar commit was rejected above (requires receipts),
       // so `mode` here is always inline; the guard narrows the type and is defensive.
       if (mode.kind !== "inline") return json({ error: "bad_request", message: "blobRefset requires the upload-receipts protocol" }, 400);
-      shas = [...new Set([cb.encManifestSha as string, ...mode.refShas])];
+      shas = [...new Set([cb.encManifestSha as string, ...chainShas, ...mode.refShas])];
       { const early = earlyStaleReject(mode.refShas.length); if (early) return early; }
       const accountingStartedAt = Date.now();
       const missing = await this.missingBlobs(dbFor(op.env, accountId), shas, accountId);
@@ -606,7 +610,7 @@ export class WorkspaceSync {
       if (missing.length > 0) {
         // missingBlobs ratio drives 422→upload round-trips — a key "why is push slow" signal.
         emit(shas.length)("unsatisfied_blobs", { ratio: missing.length / shas.length });
-        return json(unsatisfiedBlobsBody(missing), 422);
+        return json(unsatisfiedBlobsBody(orderChainFirst(missing, chainShas)), 422);
       }
     }
     const emitCommit = emit(shas.length);
@@ -779,10 +783,16 @@ export class WorkspaceSync {
     const cb = JSON.parse(sc.body) as CommitBodyView;
     const mode = readRefMode(cb);
     if (!mode || typeof cb.encManifestSha !== "string") return null;
-    if (mode.kind === "inline") return { refs: new Set([...mode.refShas].sort()), manifestSha: cb.encManifestSha, carrierSha: null };
+    const chainShas = readManifestChain(cb.manifestChain, cb.encManifestSha);
+    if (chainShas === null) return null;
+    if (mode.kind === "inline") return { refs: new Set([...mode.refShas, ...chainShas].sort()), manifestSha: cb.encManifestSha, carrierSha: null };
     const loaded = await loadSidecarShaSet(this.env, mode.sidecarSha, mode.count);
     if (!loaded.ok) return null;
-    return { refs: loaded.refs, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha };
+    // Sorted insertion order is load-bearing: diffChunk paginates the fold by
+    // iterating this Set in order with a `> lastSha` cursor — an out-of-order
+    // chain sha appended after the sorted sidecar refs would be skipped on a
+    // chunk resume and its dropped_index entry silently lost (GC stranding).
+    return { refs: new Set([...loaded.refs, ...chainShas].sort()), manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha };
   }
 
   private sweepIndex(floor: number): void {
@@ -913,13 +923,17 @@ export class WorkspaceSync {
       const cb = JSON.parse(sc.body) as CommitBodyView;
       const mode = readRefMode(cb);
       if (!mode) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+      if (typeof cb.encManifestSha !== "string") return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+      const chainRefs = readManifestChain(cb.manifestChain, cb.encManifestSha);
+      if (chainRefs === null) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+      gapRefs += chainRefs.length;
       if (mode.kind === "inline") {
         gapRefs += mode.refShas.length;
-        gap.push({ seq: s, manifestSha: cb.encManifestSha, inlineRefs: mode.refShas });
+        gap.push({ seq: s, manifestSha: cb.encManifestSha, inlineRefs: mode.refShas, ...(chainRefs.length ? { chainRefs } : {}) });
         continue;
       }
       gapRefs += mode.count;
-      gap.push({ seq: s, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha, sidecar: { sha: mode.sidecarSha, count: mode.count, size: mode.totalBytes } });
+      gap.push({ seq: s, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha, sidecar: { sha: mode.sidecarSha, count: mode.count, size: mode.totalBytes }, ...(chainRefs.length ? { chainRefs } : {}) });
     }
     if (gapRefs > ROOTS_OUTER_MAX_REFS) return json({ error: "roots_too_large" }, 503);
     return json({

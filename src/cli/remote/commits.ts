@@ -1,6 +1,7 @@
 import type { Manifest } from "../../engine/index.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
+import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
 import { firstPublishTiming } from "../upload-lane-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
@@ -26,6 +27,10 @@ export class CommitRejectedError extends Error {
 export interface CommitOptions {
   blockedFingerprint?: string;
   onCommitTimings?: (timings: CommitTimings) => void;
+  /** Applied manifest + its verified wire identity; only sync.ts may select this base. */
+  deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
+  /** Design 84 repair: encode a chain-free snapshot regardless of rollout flags. */
+  forceSnapshot?: boolean;
 }
 
 export interface CommitTimings {
@@ -64,6 +69,8 @@ export interface LatestTimings {
 
 export interface LatestOptions {
   onLatestTimings?: (timings: LatestTimings) => void;
+  /** Applied manifest plus persisted, verified wire evidence for the Phase-D head fold shortcut. */
+  fastFoldBase?: { manifest: Manifest; meta: GlobalManifestMeta };
 }
 
 export interface ReceiptRedeemResult {
@@ -92,9 +99,12 @@ export interface CommitResult {
    *  Distinct from a parent conflict — a different recovery (upload, not pull). */
   unsatisfiedBlobs?: string[];
   unsatisfiedTotal?: number;
+  /** Signed chain on the bounced attempt, used to partition data misses from chain misses. */
+  attemptedManifestChain?: string[];
   /** The signed commit used a stale account epoch; refresh E2EE write context and retry. */
   epochStale?: number;
   serverTimings?: ServerTimings;
+  manifestMeta?: GlobalManifestMeta;
 }
 
 export async function commit(ctx: RemoteContext, parentSequence: number, deviceId: string, manifest: Manifest): Promise<CommitResult> {

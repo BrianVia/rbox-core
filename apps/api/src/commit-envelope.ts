@@ -35,6 +35,12 @@ export function unsatisfiedBlobsBody(missing: string[]): { error: "unsatisfied_b
   };
 }
 
+export function orderChainFirst(missing: string[], chain: readonly string[]): string[] {
+  if (chain.length === 0) return missing;
+  const chainSet = new Set(chain);
+  return [...missing.filter((sha) => chainSet.has(sha)), ...missing.filter((sha) => !chainSet.has(sha))];
+}
+
 // Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
 // Content-Length). Returns raw bytes, an empty Uint8Array for an empty body, or null if it exceeds
 // the cap.
@@ -91,6 +97,7 @@ export interface CommitBodyView {
   deviceId?: unknown;
   blobRefs?: unknown;
   blobRefset?: unknown; // §24 sidecar descriptor {sidecarSha,count,totalBytes}
+  manifestChain?: unknown;
 }
 
 /** §24 strict discriminator: a commit body carries EXACTLY ONE ref carrier — inline

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import {
   buildKeyState,
   buildPairing,
+  buildSignedCommit,
   parseCommit,
   redeemPairing,
   serializeRefset,
@@ -16,13 +17,15 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, type GitSection, type Manifest } from "../engine/index.js";
+import { decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
-import { pull, push } from "./sync.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { pull, push, pushManifest } from "./sync.js";
+import { repairChain } from "./chain-repair.js";
+import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -204,6 +207,645 @@ async function tmp(): Promise<string> {
 }
 afterAll(async () => {
   for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
+});
+
+const repairFixtureManifest = (label: string, count = 300): Manifest => ({
+  generatedAt: label,
+  files: Array.from({ length: count }, (_, i) => ({
+    path: `repair-matrix/${i.toString().padStart(4, "0")}`,
+    type: "symlink" as const,
+    symlinkTarget: `../target-${i}`,
+    sha256: hex(i + 1),
+    size: 8,
+    mode: 0o777,
+    mtimeMs: i,
+  })),
+});
+
+async function expectBrokenPull(root: string, cfg: WorkspaceConfig, remote: E2eeRemote): Promise<ManifestChainError> {
+  try {
+    await pull(root, cfg, { remote });
+  } catch (error) {
+    expect(error).toBeInstanceOf(ManifestChainError);
+    return error as ManifestChainError;
+  }
+  throw new Error("expected broken manifest chain");
+}
+
+async function withManifestEncodingFlags<T>(snapshot: string | undefined, delta: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const oldSnapshot = process.env.RBOX_MDE_SNAPSHOT;
+  const oldDelta = process.env.RBOX_MDE_DELTA;
+  if (snapshot === undefined) delete process.env.RBOX_MDE_SNAPSHOT; else process.env.RBOX_MDE_SNAPSHOT = snapshot;
+  if (delta === undefined) delete process.env.RBOX_MDE_DELTA; else process.env.RBOX_MDE_DELTA = delta;
+  try { return await fn(); } finally {
+    if (oldSnapshot === undefined) delete process.env.RBOX_MDE_SNAPSHOT; else process.env.RBOX_MDE_SNAPSHOT = oldSnapshot;
+    if (oldDelta === undefined) delete process.env.RBOX_MDE_DELTA; else process.env.RBOX_MDE_DELTA = oldDelta;
+  }
+}
+
+async function withFastPullFlag<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const old = process.env.RBOX_MDE_FAST_PULL;
+  if (value === undefined) delete process.env.RBOX_MDE_FAST_PULL; else process.env.RBOX_MDE_FAST_PULL = value;
+  try { return await fn(); } finally {
+    if (old === undefined) delete process.env.RBOX_MDE_FAST_PULL; else process.env.RBOX_MDE_FAST_PULL = old;
+  }
+}
+
+async function wireKind(server: FakeServer, remote: E2eeRemote, index = server.commits.length - 1): Promise<string> {
+  const body = parseSignedCommit(server.commits[index]!);
+  const plaintext = await openManifestChainBlob({
+    bytes: server.store.blobs.get(body.encManifestSha)!, expectedEncSha: body.encManifestSha,
+    workspaceId: WS, accountId: ACCT, keyEpoch: body.keyEpoch, kek: new Uint8Array((await remote.currentKek()).kek),
+  });
+  return (await decodeEnvelope(plaintext)).kind;
+}
+
+const deltaSizedManifest = (label: string): Manifest => ({
+  generatedAt: label,
+  files: Array.from({ length: 300 }, (_, i) => ({
+    path: `partition/${i.toString().padStart(4, "0")}`,
+    type: "symlink" as const,
+    symlinkTarget: `../target/${hex(i + 1)}`,
+    sha256: hex(i + 10_000),
+    size: 70,
+    mode: 0o777,
+    mtimeMs: i,
+  })),
+});
+
+async function partitionPushFixture(deviceId: string) {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, deviceId, NOW);
+  const remote = await remoteFor(server, secrets);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, remote);
+  const base = deltaSizedManifest("base");
+  const first = await remote.commit(0, secrets.deviceId, base);
+  await pull(root, cfg, { remote });
+  const target: Manifest = { ...base, generatedAt: "target", files: base.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+  return { server, secrets, remote, root, cfg, first, target };
+}
+
+test("422 partition snapshots when the missing page names an attempted chain link", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const { server, remote, root, cfg, first, target } = await partitionPushFixture("devA-422-chain");
+    const attempted: string[] = [];
+    const baseCommit = server.commitSigned;
+    let bounced = false;
+    server.commitSigned = async (parent, commit) => {
+      attempted.push(commit);
+      if (!bounced) { bounced = true; return { unsatisfiedBlobs: [first.manifestMeta!.encManifestSha], unsatisfiedTotal: 1 }; }
+      return baseCommit(parent, commit);
+    };
+    await pushManifest(root, cfg, target, { remote });
+    expect(attempted).toHaveLength(2);
+    expect(parseSignedCommit(attempted[0]!).manifestChain).toContain(first.manifestMeta!.encManifestSha);
+    expect(await wireKind(server, remote)).toBe("snapshot");
+  });
+});
+
+test("422 partition keeps a data-only retry eligible for delta encoding", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const { server, remote, root, cfg, first, target } = await partitionPushFixture("devA-422-data");
+    const dataRef = hex(800_001);
+    server.store.blobs.set(dataRef, new Uint8Array([1]));
+    const attempted: string[] = [];
+    const baseCommit = server.commitSigned;
+    let bounced = false;
+    server.commitSigned = async (parent, commit) => {
+      attempted.push(commit);
+      if (!bounced) { bounced = true; return { unsatisfiedBlobs: [dataRef], unsatisfiedTotal: 1 }; }
+      return baseCommit(parent, commit);
+    };
+    await pushManifest(root, cfg, target, { remote });
+    expect(attempted).toHaveLength(2);
+    expect(parseSignedCommit(attempted[1]!).manifestChain).toEqual([first.manifestMeta!.encManifestSha]);
+    expect(await wireKind(server, remote)).toBe("delta");
+  });
+});
+
+test("422 partition snapshots on a truncated page when a chain was attempted", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const { server, remote, root, cfg, target } = await partitionPushFixture("devA-422-truncated");
+    const baseCommit = server.commitSigned;
+    let bounced = false;
+    server.commitSigned = async (parent, commit) => {
+      if (!bounced) { bounced = true; return { unsatisfiedBlobs: [hex(800_002)], unsatisfiedTotal: 2 }; }
+      return baseCommit(parent, commit);
+    };
+    await pushManifest(root, cfg, target, { remote });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+  });
+});
+
+test("a chain link encrypted under another epoch fails closed with its sha named", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-cross-epoch-link", NOW);
+    const writer = await remoteFor(server, secrets);
+    const base = deltaSizedManifest("base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const target: Manifest = { ...base, generatedAt: "target", files: base.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const linkSha = first.manifestMeta!.encManifestSha;
+    const wrongEpoch = await encryptManifest(new Uint8Array((await writer.currentKek()).kek), ACCT, WS, first.manifestMeta!.keyEpoch + 1, new TextEncoder().encode("wrong epoch"));
+    server.store.blobs.set(linkSha, wrongEpoch.ciphertext);
+    const peer = await remoteFor(server, secrets);
+    try {
+      await peer.latest();
+      throw new Error("expected cross-epoch chain failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ManifestChainError);
+      expect((error as ManifestChainError).failingLink).toBe(linkSha);
+    }
+  });
+});
+
+test("a push carrying a pending repo suppresses meta so the following push snapshots", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-pending-snapshot", NOW);
+    const root = await tmp();
+    for (let i = 0; i < 300; i++) await fs.symlink(`../target/${hex(i + 1)}`, path.join(root, `link-${i.toString().padStart(4, "0")}`));
+    const repo = path.join(root, "repo");
+    await fs.mkdir(repo);
+    await git(repo, "init", "-qb", "main");
+    await fs.writeFile(path.join(repo, "tracked.txt"), "base\n");
+    await git(repo, "add", "tracked.txt");
+    await git(repo, "-c", "user.name=Pending Test", "-c", "user.email=pending@example.invalid", "commit", "-qm", "base");
+    const remote = await remoteFor(server, secrets);
+    const cfg: WorkspaceConfig = { ...(await cfgFor(root, secrets, remote)), syncGit: true };
+    await push(root, cfg, { remote });
+    const state = await loadState(root, syncStreamId(cfg));
+    const section = state.lastSyncedManifest.gitRepos!.repo!;
+    state.gitPendingRemote = { repo: section };
+    state.repoRecords = { ...(state.repoRecords ?? {}), repo: { ...(state.repoRecords?.repo ?? { repoGen: 0, sourceSeq: 1 }), pending: section } };
+    await saveState(root, state);
+
+    await fs.unlink(path.join(root, "link-0299"));
+    await fs.symlink(`../changed/${hex(299)}`, path.join(root, "link-0299"));
+    await push(root, cfg, { remote });
+    expect(await wireKind(server, remote)).toBe("delta");
+    expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toBeUndefined();
+
+    await fs.unlink(path.join(root, "link-0298"));
+    await fs.symlink(`../changed/${hex(298)}`, path.join(root, "link-0298"));
+    await push(root, cfg, { remote });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+  });
+});
+
+test("wire snapshot triggers: absent meta, epoch mismatch, chain cap, and byte bound", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-snapshot-triggers", NOW);
+    const remote = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: [] };
+    const first = await remote.commit(0, secrets.deviceId, base);
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    const changed: Manifest = { generatedAt: "changed", files: [] };
+    const meta = first.manifestMeta!;
+    await remote.commit(1, secrets.deviceId, changed, { deltaBase: { manifest: base, meta: { ...meta, keyEpoch: meta.keyEpoch + 1 } } });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    await remote.commit(2, secrets.deviceId, { ...changed, generatedAt: "cap" }, {
+      deltaBase: { manifest: changed, meta: { ...meta, chain: Array(MAX_MANIFEST_DELTA_CHAIN).fill(meta.encManifestSha) } },
+    });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+    await remote.commit(3, secrets.deviceId, { ...changed, generatedAt: "bytes" }, {
+      deltaBase: { manifest: changed, meta: { ...meta, chainBytes: meta.snapshotBytes, snapshotBytes: meta.snapshotBytes } },
+    });
+    expect(await wireKind(server, remote)).toBe("snapshot");
+  });
+});
+
+test("chainDiagnostic skips the manifest blob for a chain-free head", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-doctor-cheap", NOW);
+  const remote = await remoteFor(server, secrets);
+  await remote.commit(0, secrets.deviceId, { generatedAt: "head", files: [] });
+  const body = parseSignedCommit(server.commits[0]!);
+  server.store.blobs.delete(body.encManifestSha);
+  await expect(remote.chainDiagnostic()).resolves.toEqual({ sequence: 1, links: 0, chainBytes: 0, snapshotBytes: 0, snapshotFetched: false });
+});
+
+test("broken delta head repairs with an unconditional snapshot and a cold peer converges", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-repair", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairRemote = await remoteFor(server, secrets);
+    const coldRemote = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairRemote);
+    const base: Manifest = {
+      generatedAt: "base",
+      files: Array.from({ length: 300 }, (_, i) => ({
+        path: `repair/${i}-${hex(i + 1)}`, type: "symlink" as const, symlinkTarget: `../${hex(i + 2)}`,
+        sha256: hex(i + 3), size: 64, mode: 0o777, mtimeMs: i,
+      })),
+    };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairRemote });
+    const brokenManifest: Manifest = { ...base, generatedAt: "broken-head", files: base.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+    await writer.commit(1, secrets.deviceId, brokenManifest, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const brokenBody = parseSignedCommit(server.commits[1]!);
+    server.store.blobs.delete(brokenBody.encManifestSha);
+    let failure: ManifestChainError | undefined;
+    try { await pull(root, cfg, { remote: repairRemote }); } catch (error) {
+      expect(error).toBeInstanceOf(ManifestChainError);
+      failure = error as ManifestChainError;
+    }
+    if (!failure) throw new Error("expected broken chain");
+    const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, { confirmSupersede: async () => true });
+    expect(outcome.kind).toBe("repaired");
+    expect(outcome.kind === "repaired" && outcome.sequence).toBe(3);
+    expect(parseSignedCommit(server.commits[2]!).manifestChain ?? []).toEqual([]);
+    expect(await wireKind(server, repairRemote, 2)).toBe("snapshot");
+    const converged = await coldRemote.latest();
+    expect(converged.sequence).toBe(3);
+    expect(converged.manifest.files).toHaveLength(base.files.length);
+  });
+});
+
+test("repairChain applies the newest foldable ancestor before publishing at broken head plus one", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-best-ancestor", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairRemote = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairRemote);
+    const base = repairFixtureManifest("base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairRemote });
+    const ancestor: Manifest = { ...base, generatedAt: "ancestor", files: base.files.map((f, i) => i === 10 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, ancestor, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const broken: Manifest = { ...ancestor, generatedAt: "broken", files: ancestor.files.map((f, i) => i === 20 ? { ...f, mode: 0o700 } : f) };
+    await writer.commit(2, secrets.deviceId, broken, { deltaBase: { manifest: ancestor, meta: second.manifestMeta! } });
+    const brokenBody = parseSignedCommit(server.commits[2]!);
+    server.store.blobs.delete(brokenBody.encManifestSha);
+    const failure = await expectBrokenPull(root, cfg, repairRemote);
+
+    let stateAtRepairCommit: number | undefined;
+    server.beforeCommitSigned = async () => {
+      stateAtRepairCommit = (await loadState(root, syncStreamId(cfg))).lastSyncedSequence;
+    };
+    const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, { confirmSupersede: async () => true });
+
+    expect(stateAtRepairCommit).toBe(2);
+    expect(outcome.kind).toBe("repaired");
+    expect(outcome.kind === "repaired" && outcome.sequence).toBe(4);
+    expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(4);
+    expect(await wireKind(server, repairRemote, 3)).toBe("snapshot");
+  });
+});
+
+test("repairChain converges on a readable racing head and re-confirms an unreadable racing suffix", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    for (const raceKind of ["readable", "unreadable"] as const) {
+      const server = new FakeServer();
+      const secrets = await bootstrapOnto(server, ACCT, `devA-race-${raceKind}`, NOW);
+      const writer = await remoteFor(server, secrets);
+      const repairRemote = await remoteFor(server, secrets);
+      const root = await tmp();
+      const cfg = await cfgFor(root, secrets, repairRemote);
+      const base = repairFixtureManifest(`base-${raceKind}`);
+      const first = await writer.commit(0, secrets.deviceId, base);
+      await pull(root, cfg, { remote: repairRemote });
+      await writer.commit(1, secrets.deviceId, { ...base, generatedAt: `broken-${raceKind}` }, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+      server.store.blobs.delete(parseSignedCommit(server.commits[1]!).encManifestSha);
+      const failure = await expectBrokenPull(root, cfg, repairRemote);
+      let injected = false;
+      server.beforeCommitSigned = async () => {
+        if (injected) return;
+        injected = true;
+        server.beforeCommitSigned = undefined;
+        await writer.commit(
+          2,
+          secrets.deviceId,
+          { ...base, generatedAt: `racer-${raceKind}` },
+          raceKind === "unreadable" ? { deltaBase: { manifest: base, meta: first.manifestMeta! } } : undefined
+        );
+        if (raceKind === "unreadable") {
+          server.store.blobs.delete(parseSignedCommit(server.commits[2]!).encManifestSha);
+        }
+      };
+      const confirmations: Array<Array<{ seq: number; deviceId: string }>> = [];
+      const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, {
+        confirmSupersede: async (suffix) => {
+          confirmations.push(suffix.map(({ seq, deviceId }) => ({ seq, deviceId })));
+          return true;
+        },
+      });
+
+      if (raceKind === "readable") {
+        expect(outcome.kind).toBe("converged");
+        expect(outcome.kind === "converged" && outcome.sequence).toBe(3);
+        expect(server.commits).toHaveLength(3);
+        expect(confirmations).toHaveLength(1);
+      } else {
+        expect(outcome.kind).toBe("repaired");
+        expect(outcome.kind === "repaired" && outcome.sequence).toBe(4);
+        expect(server.commits).toHaveLength(4);
+        expect(confirmations).toHaveLength(2);
+        expect(confirmations[1]!.map((entry) => entry.seq)).toEqual([2, 3]);
+        expect(await wireKind(server, repairRemote, 3)).toBe("snapshot");
+      }
+    }
+  });
+});
+
+test("repair mode preserves the mass-delete guard and proceeds only with push consent", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-repair-mass-delete", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairRemote = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairRemote);
+    const base = repairFixtureManifest("mass-base", 200);
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairRemote });
+    await writer.commit(1, secrets.deviceId, { ...base, generatedAt: "mass-broken" }, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.blobs.delete(parseSignedCommit(server.commits[1]!).encManifestSha);
+    const failure = await expectBrokenPull(root, cfg, repairRemote);
+    for (let i = 0; i < 120; i++) await fs.unlink(path.join(root, base.files[i]!.path));
+
+    await expect(repairChain(root, cfg, { remote: repairRemote }, failure, { confirmSupersede: async () => true }))
+      .rejects.toThrow(/push would delete 120 of 200 tracked files.*mass-delete guard/);
+    expect(server.commits).toHaveLength(2);
+
+    const outcome = await repairChain(root, cfg, { remote: repairRemote, allowMassDeletePush: true }, failure, { confirmSupersede: async () => true });
+    expect(outcome.kind).toBe("repaired");
+    expect(outcome.kind === "repaired" && outcome.sequence).toBe(3);
+    expect(server.commits).toHaveLength(3);
+    expect((await repairRemote.latest()).manifest.files).toHaveLength(80);
+  });
+});
+
+test("C2 commit emits a chained delta and a cold peer folds it with propagated meta", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-mde-delta", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base: Manifest = {
+      generatedAt: "base",
+      files: Array.from({ length: 300 }, (_, i) => ({
+        path: `links/${i.toString(16).padStart(4, "0")}-${hex(i * 7919 + 17)}`,
+        type: "symlink" as const,
+        symlinkTarget: `../targets/${hex(i * 104729 + 3)}`,
+        sha256: hex(i * 65537 + 11), size: 70, mode: 0o777, mtimeMs: i,
+      })),
+    };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    expect(first.manifestMeta).toBeDefined();
+    const target: Manifest = { ...base, generatedAt: "next", files: base.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const body = parseSignedCommit(server.commits[1]!);
+    expect(body.manifestChain).toEqual([first.manifestMeta!.encManifestSha]);
+    expect(second.manifestMeta?.chain).toEqual(body.manifestChain);
+    expect(second.manifestMeta?.chainBytes).toBeGreaterThan(0);
+    expect(second.manifestMeta?.snapshotBytes).toBe(first.manifestMeta?.snapshotBytes);
+    const plaintext = await openManifestChainBlob({
+      bytes: server.store.blobs.get(body.encManifestSha)!,
+      expectedEncSha: body.encManifestSha,
+      workspaceId: WS,
+      accountId: ACCT,
+      keyEpoch: body.keyEpoch,
+      kek: new Uint8Array((await writer.currentKek()).kek),
+    });
+    expect((await decodeEnvelope(plaintext)).kind).toBe("delta");
+    const pulled = await peer.latest();
+    expect(pulled.manifest).toEqual(target);
+    expect(pulled.manifestMeta).toEqual(second.manifestMeta);
+  });
+});
+
+test("mixed fleet reads snapshot/delta history with flags off, restores it, then writes raw-v0 without manifest meta", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-mixed-fleet", NOW);
+  const writer = await remoteFor(server, secrets);
+  const base = deltaSizedManifest("mixed-snapshot");
+  const target: Manifest = {
+    ...base,
+    generatedAt: "mixed-delta",
+    files: base.files.map((entry, index) => index === 42
+      ? { ...entry, symlinkTarget: "../target/mixed-fleet-v2", sha256: hex(999_042) }
+      : entry),
+  };
+
+  await withManifestEncodingFlags("1", "1", async () => {
+    const snapshot = await writer.commit(0, secrets.deviceId, base);
+    expect(await wireKind(server, writer, 0)).toBe("snapshot");
+    const delta = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: snapshot.manifestMeta! } });
+    expect(delta.manifestMeta?.chain).toEqual([snapshot.manifestMeta!.encManifestSha]);
+    expect(await wireKind(server, writer, 1)).toBe("delta");
+  });
+
+  await withManifestEncodingFlags(undefined, undefined, async () => {
+    const peer = await remoteFor(server, secrets);
+    const latest = await peer.latest();
+    expect(latest).toEqual({ sequence: 2, manifest: target });
+
+    expect((await peer.manifestAtSeq(1)).manifest).toEqual(base);
+    expect((await peer.manifestAtSeq(2)).manifest).toEqual(target);
+    expect((await peer.history(10)).map((version) => version.seq)).toEqual([2, 1]);
+    const changes = await peer.pathHistory(base.files[42]!.path, 10);
+    expect(changes.map((change) => change.seq)).toEqual([2, 1]);
+
+    const restoreRoot = await tmp();
+    const historical = await peer.manifestAtSeq(1);
+    await restoreEntryToPath(restoreRoot, historical.manifest.files[42]!, peer.blobStore(), Buffer.from(historical.kek));
+    expect(await fs.readlink(path.join(restoreRoot, historical.manifest.files[42]!.path))).toBe(base.files[42]!.symlinkTarget);
+
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, peer);
+    await pull(root, cfg, { remote: peer });
+    expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toBeUndefined();
+    await fs.symlink("../target/raw-v0", path.join(root, "mixed-legacy-write"));
+    expect((await push(root, cfg, { remote: peer })).sequence).toBe(3);
+
+    const rawBody = parseSignedCommit(server.commits[2]!);
+    expect(rawBody.manifestChain).toEqual([]);
+    const rawPlaintext = await openManifestChainBlob({
+      bytes: server.store.blobs.get(rawBody.encManifestSha)!, expectedEncSha: rawBody.encManifestSha,
+      workspaceId: WS, accountId: ACCT, keyEpoch: rawBody.keyEpoch, kek: new Uint8Array((await peer.currentKek()).kek),
+    });
+    const rawLatest = await peer.latest();
+    expect(new TextDecoder().decode(rawPlaintext)).toBe(JSON.stringify(rawLatest.manifest));
+    expect(rawLatest.manifestMeta).toBeUndefined();
+    expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toBeUndefined();
+  });
+});
+
+test("D fast pull folds one delta from persisted evidence with a head-only fetch", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `fast/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `../${i}`, sha256: hex(i + 1), size: 8, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const target: Manifest = { ...base, generatedAt: "target", files: base.files.map((f, i) => i === 42 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+
+    const pulled = await peer.latest({ fastFoldBase: { manifest: base, meta: first.manifestMeta! } });
+
+    expect(pulled.manifest).toEqual(target);
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha]);
+    expect(pulled.manifestMeta?.snapshotBytes).toBe(first.manifestMeta!.snapshotBytes);
+    expect(pulled.manifestMeta?.chainBytes).toBe(first.manifestMeta!.chainBytes + server.store.blobs.get(second.manifestMeta!.encManifestSha)!.byteLength);
+    expect(pulled.manifestMeta?.chain).toEqual([...first.manifestMeta!.chain, first.manifestMeta!.encManifestSha]);
+  });
+});
+
+test("D fast pull evidence mismatches fall back to the exact cold chain walk", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-fallback", NOW);
+    const writer = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `fallback/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `${i}`, sha256: hex(i + 1), size: 4, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const middle: Manifest = { ...base, generatedAt: "middle", files: base.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const target: Manifest = { ...middle, generatedAt: "target", files: middle.files.map((f, i) => i === 2 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
+    const cases = [
+      { ...second.manifestMeta!, encManifestSha: hex(900_001) },
+      { ...second.manifestMeta!, manifestHash: hex(900_002) },
+      { ...second.manifestMeta!, chain: [hex(900_003)] },
+    ];
+    for (const meta of cases) {
+      const peer = await remoteFor(server, secrets);
+      server.store.getCalls = [];
+      await expect(peer.latest({ fastFoldBase: { manifest: middle, meta } })).resolves.toMatchObject({ manifest: target });
+      expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
+    }
+  });
+});
+
+test("cold chain walk fails closed on hostile signed lists, links, and delta hashes without applying", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const cases = ["omission", "extension", "reorder", "head-in-list", "missing", "corrupt", "base-hash", "result-hash"] as const;
+    for (const hostile of cases) {
+      const server = new FakeServer();
+      const secrets = await bootstrapOnto(server, ACCT, `devA-hostile-${hostile}`, NOW);
+      const writer = await remoteFor(server, secrets);
+      const peer = await remoteFor(server, secrets);
+      const base = deltaSizedManifest(`hostile-base-${hostile}`);
+      const first = await writer.commit(0, secrets.deviceId, base);
+      const middle: Manifest = { ...base, generatedAt: `hostile-middle-${hostile}`, files: base.files.map((f, i) => i === 0 ? { ...f, mode: 0o755 } : f) };
+      const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+      const target: Manifest = { ...middle, generatedAt: `hostile-target-${hostile}`, files: middle.files.map((f, i) => i === 1 ? { ...f, mode: 0o700 } : f) };
+      const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
+      const original = parseSignedCommit(server.commits[2]!);
+      let headEncSha = original.encManifestSha;
+      const firstSha = first.manifestMeta!.encManifestSha;
+      const secondSha = second.manifestMeta!.encManifestSha;
+      let chain: string[] = [firstSha, secondSha];
+      if (hostile === "omission") chain = [secondSha];
+      if (hostile === "reorder") chain = [secondSha, firstSha];
+      if (hostile === "head-in-list") chain = [firstSha, secondSha, original.encManifestSha];
+      if (hostile === "missing") chain = [hex(987_654), secondSha];
+      if (hostile === "extension") {
+        const alternate = await encryptManifest(
+          new Uint8Array((await writer.currentKek()).kek), ACCT, WS, original.keyEpoch,
+          new TextEncoder().encode(JSON.stringify({ generatedAt: "unrelated", files: [] }))
+        );
+        server.store.blobs.set(alternate.encManifestSha, alternate.bytes);
+        chain = [firstSha, secondSha, alternate.encManifestSha];
+      }
+      if (hostile === "corrupt") {
+        const corrupt = new Uint8Array(server.store.blobs.get(firstSha)!);
+        corrupt[Math.floor(corrupt.byteLength / 2)]! ^= 1;
+        server.store.blobs.set(firstSha, corrupt);
+      }
+      if (hostile === "base-hash" || hostile === "result-hash") {
+        const encoded = await encodeDeltaEnvelope(middle, target, {
+          baseEncSha: secondSha,
+          baseManifestHash: hostile === "base-hash" ? hex(555_001) : second.manifestMeta!.manifestHash,
+          compress: false,
+        });
+        let bytes = encoded.bytes;
+        if (hostile === "result-hash") {
+          bytes = new TextEncoder().encode(new TextDecoder().decode(bytes).replace(encoded.resultHash, hex(555_002)));
+        }
+        const encrypted = await encryptManifest(new Uint8Array((await writer.currentKek()).kek), ACCT, WS, original.keyEpoch, bytes);
+        server.store.blobs.set(encrypted.encManifestSha, encrypted.bytes);
+        headEncSha = encrypted.encManifestSha;
+      }
+      const hostileBody = {
+        accountId: original.accountId, accountEpoch: original.accountEpoch, workspaceId: original.workspaceId,
+        seq: original.seq, parentSeq: original.parentSeq, parentCommitHash: original.parentCommitHash,
+        rosterVersion: original.rosterVersion, keyEpoch: original.keyEpoch, deviceId: original.deviceId,
+        encManifestSha: headEncSha, blobRefs: "blobRefs" in original ? original.blobRefs : [], manifestChain: chain,
+      };
+      const signingKey = { publicKey: secrets.sigPubKey, privateKey: signPrivateFromPkcs8(secrets.sigPrivPkcs8) };
+      if (hostile === "head-in-list") {
+        await expect(buildSignedCommit(hostileBody, signingKey)).rejects.toThrow(/manifestChain malformed/);
+        continue;
+      }
+      server.commits[2] = await buildSignedCommit(hostileBody, signingKey);
+
+      const root = await tmp();
+      const cfg = await cfgFor(root, secrets, peer);
+      await fs.writeFile(path.join(root, "must-survive.txt"), "local bytes");
+      const before = await loadState(root, syncStreamId(cfg));
+      before.manifestMeta = {
+        encManifestSha: hex(700_001), manifestHash: hex(700_002), accountEpoch: 0, keyEpoch: 0,
+        chain: [], chainBytes: 0, snapshotBytes: 123,
+      };
+      await saveState(root, before);
+      await expect(pull(root, cfg, { remote: peer })).rejects.toBeInstanceOf(ManifestChainError);
+      expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toEqual(before.manifestMeta);
+      expect(await fs.readFile(path.join(root, "must-survive.txt"), "utf8")).toBe("local bytes");
+      expect(third.manifestMeta).toBeDefined();
+    }
+  });
+});
+
+test("D history fold LRU avoids refetching the same authenticated manifest blob", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-fold-lru", NOW);
+  const remote = await remoteFor(server, secrets);
+  await remote.commit(0, secrets.deviceId, { generatedAt: "one", files: [] });
+  server.store.getCalls = [];
+  await remote.manifestAtSeq(1);
+  await remote.manifestAtSeq(1);
+  expect(server.store.getCalls).toHaveLength(1);
+});
+
+test("D pull flag is off by default and enables the persisted-state fast base only at exactly 1", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull-flag", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, puller);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `flag/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `${i}`, sha256: hex(i + 1), size: 4, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: puller });
+    const middle: Manifest = { ...base, generatedAt: "middle", files: base.files.map((f, i) => i === 10 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+    await withFastPullFlag(undefined, () => pull(root, cfg, { remote: puller }));
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
+
+    const target: Manifest = { ...middle, generatedAt: "target", files: middle.files.map((f, i) => i === 11 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
+    server.store.getCalls = [];
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha]);
+  });
 });
 
 async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
@@ -577,4 +1219,79 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       await expect(git(path.join(rootB, r), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
     }
   }, 30_000);
+});
+
+test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapshot/length/immediate base) and the cold walk fails closed", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-substitution", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base = deltaSizedManifest("fast-sub-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const m2: Manifest = { ...base, generatedAt: "fast-sub-2", files: base.files.map((f, i) => (i === 0 ? { ...f, mode: 0o755 } : f)) };
+    const second = await writer.commit(1, secrets.deviceId, m2, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const m3: Manifest = { ...m2, generatedAt: "fast-sub-3", files: m2.files.map((f, i) => (i === 1 ? { ...f, mode: 0o700 } : f)) };
+    const third = await writer.commit(2, secrets.deviceId, m3, { deltaBase: { manifest: m2, meta: second.manifestMeta! } });
+    const m4: Manifest = { ...m3, generatedAt: "fast-sub-4", files: m3.files.map((f, i) => (i === 2 ? { ...f, mode: 0o600 } : f)) };
+    await writer.commit(3, secrets.deviceId, m4, { deltaBase: { manifest: m3, meta: third.manifestMeta! } });
+
+    // Substitute the MIDDLE signed-chain element with a VALID, present encrypted
+    // blob — snapshot (chain[0]), length, and immediate base (last element) all
+    // preserved, exactly the §7.4 case an aggregate/endpoints-only compare passes.
+    const original = parseSignedCommit(server.commits[3]!);
+    const substitute = await encryptManifest(
+      new Uint8Array((await writer.currentKek()).kek), ACCT, WS, original.keyEpoch,
+      new TextEncoder().encode(JSON.stringify({ generatedAt: "substituted", files: [] }))
+    );
+    server.store.blobs.set(substitute.encManifestSha, substitute.bytes);
+    const signedChain = [first.manifestMeta!.encManifestSha, substitute.encManifestSha, third.manifestMeta!.encManifestSha];
+    const hostileBody = {
+      accountId: original.accountId, accountEpoch: original.accountEpoch, workspaceId: original.workspaceId,
+      seq: original.seq, parentSeq: original.parentSeq, parentCommitHash: original.parentCommitHash,
+      rosterVersion: original.rosterVersion, keyEpoch: original.keyEpoch, deviceId: original.deviceId,
+      encManifestSha: original.encManifestSha, blobRefs: "blobRefs" in original ? original.blobRefs : [], manifestChain: signedChain,
+    };
+    server.commits[3] = await buildSignedCommit(hostileBody, { publicKey: secrets.sigPubKey, privateKey: signPrivateFromPkcs8(secrets.sigPrivPkcs8) });
+
+    // Fast base = the applied third commit: baseEncSha/baseManifestHash MATCH the
+    // head's delta header, and the hostile chain matches meta.chain + [meta sha]
+    // everywhere EXCEPT the substituted middle element — only the element-wise
+    // compare catches it. The demoted cold walk then fails closed on linkage.
+    server.store.getCalls = [];
+    const error = await peer
+      .latest({ fastFoldBase: { manifest: m3, meta: third.manifestMeta! } })
+      .then(() => { throw new Error("expected chain failure"); }, (e: unknown) => e);
+    expect(error).toBeInstanceOf(ManifestChainError);
+    // The cold walk ran (chain blobs fetched) — the fast path did not accept.
+    expect(server.store.getCalls).toContain(substitute.encManifestSha);
+  });
+});
+
+test("repairChain converges on a readable head that raced in BEFORE the repair started (never supersedes readable data)", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-race-pre", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairer = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairer);
+    const base = repairFixtureManifest("base-pre-race");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairer });
+    await writer.commit(1, secrets.deviceId, { ...base, generatedAt: "broken-pre-race" }, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.blobs.delete(parseSignedCommit(server.commits[1]!).encManifestSha);
+    const failure = await expectBrokenPull(root, cfg, repairer);
+    // The peer repairs FIRST — a readable snapshot child exists before repairChain runs.
+    await writer.commit(2, secrets.deviceId, { ...base, generatedAt: "peer-repaired" });
+
+    const outcome = await repairChain(root, cfg, { remote: repairer, allowMassDeletePush: true }, failure, {
+      confirmSupersede: async () => {
+        throw new Error("must not ask consent to supersede a readable head");
+      },
+    });
+    expect(outcome.kind).toBe("converged");
+    expect(outcome.kind === "converged" && outcome.sequence).toBe(3);
+    expect(server.commits).toHaveLength(3); // no repair commit published
+  });
 });

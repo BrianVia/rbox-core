@@ -25,12 +25,12 @@ describe("design 96 roots caller", () => {
       const url = new URL(raw);
       urls.push(url);
       if (url.searchParams.get("fromSha") === "") {
-        return Response.json(page({ droppedPage: ["drop-a"], nextSha: "drop-a", seqRootsPage: [{ manifestSha: "manifest-a" }] }));
+        return Response.json(page({ gap: [{ manifestSha: "gap-manifest", chainRefs: ["chain-a", "chain-b"] }], droppedPage: ["drop-a"], nextSha: "drop-a", seqRootsPage: [{ manifestSha: "manifest-a" }] }));
       }
       return Response.json(page({ droppedPage: ["drop-b"], seqRootsPage: [] }));
     });
     const roots = await reachableFromWorkspaces(env, [{ workspace_id: "w", project_id: "p" }]);
-    expect([...roots].sort()).toEqual(["drop-a", "drop-b", "manifest-a"]);
+    expect([...roots].sort()).toEqual(["chain-a", "chain-b", "drop-a", "drop-b", "gap-manifest", "manifest-a"]);
     expect(urls).toHaveLength(2);
     expect(urls[1]!.searchParams.get("fromSeq")).toBe("done");
     expect(urls[1]!.searchParams.get("pinHead")).toBe("4");

@@ -4,10 +4,12 @@ import {
   GENESIS_PARENT_HASH,
   openCommit,
   openCommitHistorical,
+  openManifestChainBlob,
   openWorkspaceKey,
   parseCommit,
   serializeRefset,
   verifyAccount,
+  verifyCommitSig,
   verifyCommitChain,
   verifyHistorySegment,
   type BlobRefset,
@@ -18,9 +20,25 @@ import {
   type VerifiedAccount,
   type Wrap,
 } from "../engine/e2ee/index.js";
+import { activeSigners } from "../engine/e2ee/roster.js";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
-import { gitSectionBlobRefs, poolMap, validateManifest, type BlobStore, type Manifest } from "../engine/index.js";
+import {
+  canonicalManifestHash,
+  decodeEnvelope,
+  encodeDeltaEnvelope,
+  encodeSnapshotEnvelope,
+  foldDelta,
+  gitSectionBlobRefs,
+  hasEnvelopePrefix,
+  ManifestChainError,
+  MAX_MANIFEST_DELTA_CHAIN,
+  poolMap,
+  type BlobStore,
+  type DecodedManifestEnvelope,
+  type Manifest,
+} from "../engine/index.js";
+import type { GlobalManifestMeta } from "./config.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
@@ -48,6 +66,15 @@ export const SIDECAR_THRESHOLD = 4000;
  */
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+
+/** Design 84's rollout flags form a capability LATTICE, not independent axes:
+ *  C2 (delta) implies C1 (snapshot envelopes) implies meta collection. Encoded
+ *  once here — flag reads stay point-of-use per repo convention, the derived
+ *  implication does not. */
+function mdeWriteCaps(): { delta: boolean; snapshot: boolean } {
+  const delta = process.env.RBOX_MDE_DELTA === "1";
+  return { delta, snapshot: delta || process.env.RBOX_MDE_SNAPSHOT === "1" };
+}
 
 export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
   const refByEnc = new Map<string, { encSha: string; size: number }>();
@@ -119,6 +146,11 @@ export interface VersionInfo {
   keyEpoch: number;
 }
 
+export interface VerifiedSuffixEntry {
+  seq: number;
+  deviceId: string;
+}
+
 export interface HeadPin {
   commitSeq: number;
   commitHash: string;
@@ -153,6 +185,9 @@ export interface CurrentWriteKek {
 
 export class E2eeRemote implements SyncRemote {
   private readonly kekByEpoch = new Map<number, Uint8Array>();
+  /** Tiny process-local history fold cache. Entries are authenticated by their
+   * signed content address before insertion; newest entry is last. */
+  private readonly manifestFoldLru: Array<{ encManifestSha: string; keyEpoch: number; signedChain: string[]; manifest: Manifest }> = [];
   /** The keyEpoch the KEK handed to `currentKek()` belongs to — blobs are
    *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
   private writeEpoch?: number;
@@ -175,12 +210,27 @@ export class E2eeRemote implements SyncRemote {
 
   // ---- SyncRemote ----------------------------------------------------------
 
-  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
+  async latest(options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta }> {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const { manifest } = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings);
-    return { sequence: vh.sequence, manifest };
+    const collectMeta = mdeWriteCaps().snapshot || options?.fastFoldBase !== undefined;
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
+    return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
+  }
+
+  /** Doctor's authenticated chain report; decoding here is the same reader path as
+   * latest(), with metadata collection forced on for reporting. */
+  async chainDiagnostic(): Promise<{ sequence: number; links: number; chainBytes: number; snapshotBytes: number; snapshotFetched?: boolean }> {
+    const vh = await this.verifiedHead();
+    if (!vh) return { sequence: 0, links: 0, chainBytes: 0, snapshotBytes: 0 };
+    const body = parseCommit(vh.commit);
+    if ((body.manifestChain?.length ?? 0) === 0) {
+      return { sequence: vh.sequence, links: 0, chainBytes: 0, snapshotBytes: 0, snapshotFetched: false };
+    }
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, undefined, true);
+    const meta = decoded.manifestMeta!;
+    return { sequence: vh.sequence, links: meta.chain.length, chainBytes: meta.chainBytes, snapshotBytes: meta.snapshotBytes };
   }
 
   /** Fetch + decrypt ONE commit's manifest, returning it plus the per-epoch KEK (so
@@ -192,27 +242,199 @@ export class E2eeRemote implements SyncRemote {
     commit: SignedCommit,
     account: VerifiedAccount,
     historical: boolean,
-    onLatestTimings?: LatestOptions["onLatestTimings"]
-  ): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+    onLatestTimings?: LatestOptions["onLatestTimings"],
+    collectMeta = false,
+    fastFoldBase?: LatestOptions["fastFoldBase"]
+  ): Promise<{ manifest: Manifest; kek: Uint8Array; manifestMeta?: GlobalManifestMeta }> {
     const body = parseCommit(commit);
+    const signedChain = body.manifestChain ?? [];
     const kek = await this.kekFor(body.keyEpoch, account, false);
-    const timed = async <T>(fn: () => Promise<T>): Promise<[T, number]> => {
-      if (!onLatestTimings) return [await fn(), 0];
-      const t0 = Date.now();
-      const result = await fn();
-      return [result, Date.now() - t0];
-    };
-    const [encManifest, downloadMs] = await timed(() => this.api.blobStore().get(body.encManifestSha));
+    const head = { seq: body.seq, hash: commit.commitHash };
+    // Error classification (§3.6.2): chain-walk failures — a missing/corrupt LINK,
+    // a linkage/list mismatch, a bad fold — are ManifestChainError (the §3.6.3
+    // repair trigger). The chain-free head path (every pre-84 commit) keeps
+    // today's plain error surface: a raw-v0 manifest that fails JSON.parse or
+    // validateManifest throws exactly what it threw before this design.
+    if (signedChain.length > MAX_MANIFEST_DELTA_CHAIN) {
+      throw new ManifestChainError("signed chain exceeds maximum length", { head });
+    }
+    // Only authenticated historical reads may return before opening the blob.
+    // A current-head read must always run openCommit's current account/signer gate;
+    // persisted fast-fold evidence is the sole latest() shortcut.
+    const cached = historical ? this.getCachedManifest(body.encManifestSha, body.keyEpoch, signedChain) : undefined;
+    if (cached && !collectMeta) return { manifest: cached, kek };
+    const downloadStart = Date.now();
+    const encManifest = await this.api.blobStore().get(body.encManifestSha).catch((cause: unknown) => {
+        // The head blob is not a chain link; with no chain in play this is
+        // today's plain fetch failure. Under a chain it wedges the same walk.
+        if (signedChain.length === 0) throw cause;
+        throw new ManifestChainError("head manifest blob is missing", { head, failingLink: body.encManifestSha, cause });
+      });
+    const headDownloadMs = Date.now() - downloadStart;
+
+    const decryptStart = Date.now();
     const open = historical ? openCommitHistorical : openCommit;
-    const [json, decryptMs] = await timed(() => open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId }));
-    const [manifest, parseMs] = await timed(async () => {
-      const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
-      const validation = validateManifest(manifest);
-      if (!validation.ok) throw new Error(validation.error);
-      return manifest;
+    const plaintext = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
+    const headDecryptMs = Date.now() - decryptStart;
+    const headParseStart = Date.now();
+    // Head envelope: raw-v0 decode failures propagate plain (today's surface);
+    // an envelope-v1 head that fails to decode is a chain-class failure the
+    // §3.6.3 repair must see, chain or no chain.
+    const headEnvelope = await decodeEnvelope(plaintext).catch((cause: unknown) => {
+      if (!hasEnvelopePrefix(plaintext) && signedChain.length === 0) throw cause;
+      throw new ManifestChainError("head manifest envelope failed to decode", { head, failingLink: body.encManifestSha, cause });
     });
-    onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
-    return { manifest, kek };
+    const headParseMs = Date.now() - headParseStart;
+    const parseStart = Date.now();
+    // Shared exit plumbing for the fast-fold and cold-walk returns: the timings
+    // report differs only by the chain download/decrypt terms, and the meta
+    // differs only by hash + the two §3.3.4 byte fields.
+    const emitLatestTimings = (chainDownloadMs: number, chainDecryptMs: number): void => {
+      if (!onLatestTimings) return;
+      onLatestTimings({
+        downloadMs: headDownloadMs + chainDownloadMs,
+        decryptMs: headDecryptMs + chainDecryptMs,
+        parseMs: headParseMs + Date.now() - parseStart,
+        encBytes: encManifest.byteLength,
+      });
+    };
+    const makeMeta = (manifestHash: string, chainBytes: number, snapshotBytes: number): GlobalManifestMeta => ({
+      encManifestSha: body.encManifestSha,
+      manifestHash,
+      accountEpoch: body.accountEpoch,
+      keyEpoch: body.keyEpoch,
+      chain: [...signedChain],
+      chainBytes,
+      snapshotBytes,
+    });
+    if (headEnvelope.kind === "delta" && fastFoldBase &&
+      headEnvelope.header.baseEncSha === fastFoldBase.meta.encManifestSha &&
+      headEnvelope.header.baseManifestHash === fastFoldBase.meta.manifestHash &&
+      signedChain.length === fastFoldBase.meta.chain.length + 1 &&
+      fastFoldBase.meta.chain.every((sha, index) => signedChain[index] === sha) &&
+      signedChain[signedChain.length - 1] === fastFoldBase.meta.encManifestSha) {
+      let manifest: Manifest;
+      try {
+        manifest = foldDelta(fastFoldBase.manifest, headEnvelope.ops, headEnvelope.header);
+      } catch (cause) {
+        throw new ManifestChainError("manifest delta fold failed", { head, failingLink: body.encManifestSha, cause });
+      }
+      this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
+      emitLatestTimings(0, 0);
+      return {
+        manifest,
+        kek,
+        // Fast path cannot re-observe snapshotBytes (no chain fetch): propagate
+        // the base's, accumulate the head's cipher bytes (§3.4).
+        manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes),
+      };
+    }
+
+    const chainDownloadStart = Date.now();
+    const chainBlobBytes = await Promise.all(
+      signedChain.map((sha) => this.api.blobStore().get(sha).catch((cause: unknown) => {
+        throw new ManifestChainError("manifest chain link is missing", { head, failingLink: sha, cause });
+      }))
+    );
+    const chainDownloadMs = Date.now() - chainDownloadStart;
+    const chainDecryptStart = Date.now();
+    const chainPlaintexts = await Promise.all(chainBlobBytes.map(async (bytes, index) => {
+      const sha = signedChain[index]!;
+      try {
+        return await openManifestChainBlob({ kek, accountId: this.ctx.accountId, workspaceId: this.ctx.workspaceId, keyEpoch: body.keyEpoch, expectedEncSha: sha, bytes });
+      } catch (cause) {
+        throw new ManifestChainError("manifest chain link failed address or epoch authentication", { head, failingLink: sha, cause });
+      }
+    }));
+    const chainDecryptMs = Date.now() - chainDecryptStart;
+    const chainEnvelopes = await Promise.all(
+      chainPlaintexts.map((bytes, index) =>
+        decodeEnvelope(bytes).catch((cause: unknown) => {
+          throw new ManifestChainError("manifest chain link envelope failed to decode", { head, failingLink: signedChain[index], cause });
+        })
+      )
+    );
+    const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
+    this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
+    emitLatestTimings(chainDownloadMs, chainDecryptMs);
+    let manifestMeta: GlobalManifestMeta | undefined;
+    if (collectMeta) {
+      const manifestHash = headEnvelope.kind === "delta"
+        ? headEnvelope.header.resultHash
+        : headEnvelope.kind === "snapshot"
+          ? headEnvelope.header.manifestHash
+          : await canonicalManifestHash(manifest);
+      // §3.3.4 accumulator: cumulative DELTA ciphertext bytes since chain[0] —
+      // the intermediate delta links (chain[1..]) plus the delta head itself,
+      // NEVER the terminal snapshot (chain[0]); a snapshot/raw head resets to 0.
+      // (A non-empty chain implies a delta head — foldManifestChain rejects a
+      // snapshot head with a non-empty signed chain.)
+      manifestMeta = makeMeta(
+        manifestHash,
+        signedChain.length === 0 ? 0 : chainBlobBytes.slice(1).reduce((sum, bytes) => sum + bytes.byteLength, 0) + encManifest.byteLength,
+        signedChain.length === 0 ? encManifest.byteLength : chainBlobBytes[0]!.byteLength
+      );
+    }
+    return { manifest, kek, ...(manifestMeta ? { manifestMeta } : {}) };
+  }
+
+  private getCachedManifest(encManifestSha: string, keyEpoch: number, signedChain: readonly string[]): Manifest | undefined {
+    const index = this.manifestFoldLru.findIndex((entry) => entry.encManifestSha === encManifestSha && entry.keyEpoch === keyEpoch &&
+      entry.signedChain.length === signedChain.length && entry.signedChain.every((sha, i) => sha === signedChain[i]));
+    if (index < 0) return undefined;
+    const [entry] = this.manifestFoldLru.splice(index, 1);
+    this.manifestFoldLru.push(entry!);
+    return entry!.manifest;
+  }
+
+  private cacheManifest(encManifestSha: string, keyEpoch: number, signedChain: readonly string[], manifest: Manifest): void {
+    const index = this.manifestFoldLru.findIndex((entry) => entry.encManifestSha === encManifestSha);
+    if (index >= 0) this.manifestFoldLru.splice(index, 1);
+    this.manifestFoldLru.push({ encManifestSha, keyEpoch, signedChain: [...signedChain], manifest });
+    if (this.manifestFoldLru.length > 2) this.manifestFoldLru.shift();
+  }
+
+  private foldManifestChain(
+    headEncSha: string,
+    signedChain: readonly string[],
+    headEnvelope: DecodedManifestEnvelope,
+    chainEnvelopes: readonly DecodedManifestEnvelope[],
+    head: { seq: number; hash: string }
+  ): Manifest {
+    if (signedChain.includes(headEncSha)) throw new ManifestChainError("signed chain includes its head", { head, failingLink: headEncSha });
+    if (headEnvelope.kind !== "delta") {
+      if (signedChain.length !== 0) throw new ManifestChainError("snapshot/raw head has a non-empty signed chain", { head });
+      return headEnvelope.manifest;
+    }
+    if (signedChain.length === 0 || chainEnvelopes.length !== signedChain.length) throw new ManifestChainError("signed and walked chain lengths differ", { head });
+    if (chainEnvelopes[0]!.kind === "delta") throw new ManifestChainError("terminal chain link is not a snapshot", { head, failingLink: signedChain[0] });
+    for (let index = 1; index < chainEnvelopes.length; index++) {
+      const envelope = chainEnvelopes[index]!;
+      if (envelope.kind !== "delta") throw new ManifestChainError("non-terminal chain link is not a delta", { head, failingLink: signedChain[index] });
+      if (envelope.header.baseEncSha !== signedChain[index - 1]) throw new ManifestChainError("walked linkage does not match signed chain order", { head, failingLink: signedChain[index] });
+    }
+    if (headEnvelope.header.baseEncSha !== signedChain[signedChain.length - 1]) {
+      throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: headEncSha });
+    }
+
+    let manifest = chainEnvelopes[0]!.manifest;
+    const deltas = [...chainEnvelopes.slice(1), headEnvelope];
+    for (let index = 0; index < deltas.length; index++) {
+      const envelope = deltas[index]!;
+      if (envelope.kind !== "delta") throw new ManifestChainError("chain shape changed during fold", { head });
+      const failingLink = index < chainEnvelopes.length - 1 ? signedChain[index + 1] : headEncSha;
+      try {
+        manifest = foldDelta(manifest, envelope.ops, envelope.header);
+      } catch (cause) {
+        const reason = cause instanceof Error && cause.message.includes("baseManifestHash")
+          ? "baseManifestHash mismatch"
+          : cause instanceof Error && cause.message.includes("resultHash")
+            ? "resultHash mismatch"
+            : "manifest delta fold failed";
+        throw new ManifestChainError(reason, { head, failingLink, cause });
+      }
+    }
+    return manifest;
   }
 
   /**
@@ -295,7 +517,7 @@ export class E2eeRemote implements SyncRemote {
    * seq, a tampered/non-terminating chain, or a `seq` pruned past retention
    * (`NeedsRebaselineError` from `commitsSince`).
    */
-  async manifestAtSeq(seq: number): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+  async manifestAtSeq(seq: number): Promise<{ manifest: Manifest; kek: Uint8Array; keyEpoch: number }> {
     const vh = await this.verifiedHead();
     if (!vh) throw new Error("this workspace has no version history yet");
     const { account, sequence: head, commit: headCommit } = vh;
@@ -308,7 +530,61 @@ export class E2eeRemote implements SyncRemote {
       const chain = await this.api.commitsSince(seq - 1); // (seq-1, head] = seq..head
       target = await verifyHistorySegment(chain, seq, headCommit.commitHash, account);
     }
-    return this.decodeManifestAt(target, account, true);
+    const decoded = await this.decodeManifestAt(target, account, true);
+    return { manifest: decoded.manifest, kek: decoded.kek, keyEpoch: parseCommit(target).keyEpoch };
+  }
+
+  /** Authenticated signed-commit metadata for the complete suffix `(fromSeq, head]`.
+   * This is a consent/reporting surface only; it reuses the normal verified-head and
+   * history-segment checks and exposes no manifest paths or unverified server data. */
+  async verifiedSuffix(fromSeq: number): Promise<VerifiedSuffixEntry[]> {
+    const vh = await this.verifiedHead();
+    if (!vh) return [];
+    if (!Number.isInteger(fromSeq) || fromSeq < 0 || fromSeq > vh.sequence) {
+      throw new Error(`invalid verified suffix start: ${fromSeq}`);
+    }
+    if (fromSeq === vh.sequence) return [];
+    const segment = await this.api.commitsSince(fromSeq);
+    await verifyHistorySegment(segment, fromSeq + 1, vh.commit.commitHash, vh.account);
+    return segment.map((commit) => {
+      const body = parseCommit(commit);
+      return { seq: body.seq, deviceId: body.deviceId };
+    });
+  }
+
+  /** Return the current anti-rollback pin. Repair uses this verified authority as
+   * its ordinary commit parent; the commit layer still enforces parent == pin. */
+  loadVerifiedPin(): Promise<HeadPin | undefined> {
+    return this.pins.load();
+  }
+
+  /** Explicit recover ceremony for a workspace whose commit prefix was pruned.
+   * The previous pin remains installed throughout verification. Only the longest
+   * retained, signature-verified segment ending at /latest may replace it, and the
+   * replacement must satisfy the anti-rollback/equivocation floor. */
+  async rebaselinePinToRetainedHead(): Promise<{ sequence: number }> {
+    const priorPin = await this.pins.load();
+    const account = await this.refreshAccount();
+    const { sequence, commit } = await this.api.latestCommit();
+    if (!commit || sequence === 0) throw new Error("recover refused: pruned workspace has no replacement head");
+
+    const body = parseCommit(commit);
+    if (body.seq !== sequence) throw new Error("recover refused: server head sequence does not match its signed commit");
+    const roster = account.rosters[body.rosterVersion];
+    const signer = roster && activeSigners(roster).get(body.deviceId);
+    if (!signer || !(await verifyCommitSig(commit, signer))) {
+      throw new Error("recover refused: replacement head is not signed by an active member of its own verified roster");
+    }
+
+    await this.retainedSegmentEndingAtHead(0, sequence, commit.commitHash, account);
+    if (priorPin && (sequence < priorPin.commitSeq ||
+      (sequence === priorPin.commitSeq && commit.commitHash !== priorPin.commitHash))) {
+      throw new Error(sequence === priorPin.commitSeq
+        ? "recover refused: replacement head differs at the pinned sequence (fork/equivocation)"
+        : `recover refused: server head sequence ${sequence} is below the local verified pin ${priorPin.commitSeq} (rollback evident)`);
+    }
+    await this.pinFrom(commit, account);
+    return { sequence };
   }
 
   /**
@@ -453,15 +729,8 @@ export class E2eeRemote implements SyncRemote {
     let encodeMs = 0;
     let encryptMs = 0;
     let uploadMs = 0;
-    let manifestJson: Uint8Array;
-    if (onCommitTimings) {
-      const t0 = Date.now();
-      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
-      encodeMs = Date.now() - t0;
-    } else {
-      manifestJson = new TextEncoder().encode(JSON.stringify(manifest));
-    }
-    const buildArgs: Parameters<typeof buildCommit>[0] = {
+    const { delta: deltaEnabled, snapshot: snapshotEnabled } = mdeWriteCaps();
+    const baseBuildArgs = {
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
       kek,
@@ -471,12 +740,60 @@ export class E2eeRemote implements SyncRemote {
       seq: parentSequence + 1,
       parentSeq: parentSequence,
       parentCommitHash,
-      manifestJson,
       blobRefs,
       blobRefset,
     };
-    if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs = ms);
-    const built = await buildCommit(buildArgs);
+    const buildEncoded = async (manifestJson: Uint8Array, manifestChain?: string[]) => {
+      const buildArgs: Parameters<typeof buildCommit>[0] = {
+        ...baseBuildArgs,
+        manifestJson,
+        ...(manifestChain?.length ? { manifestChain } : {}),
+      };
+      if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs += ms);
+      return buildCommit(buildArgs);
+    };
+    // encodeSnapshotEnvelope returns the canonical hash it already computed —
+    // reusing it for the meta below avoids a second O(N) canonicalize+hash of
+    // the full manifest per snapshot commit (the commit's dominant CPU).
+    const encodeSnapshot = async () => {
+      const snapshot = await encodeSnapshotEnvelope(manifest, { compress: true });
+      resultManifestHash = snapshot.manifestHash;
+      return buildEncoded(snapshot.bytes);
+    };
+    const t0 = onCommitTimings ? Date.now() : 0;
+    let built: Awaited<ReturnType<typeof buildCommit>>;
+    let resultManifestHash: string | undefined;
+    let emittedChain: string[] | undefined;
+    let emittedDelta = false;
+    const deltaBase = deltaEnabled ? options?.deltaBase : undefined;
+    if (!options?.forceSnapshot &&
+      deltaBase &&
+      deltaBase.meta.keyEpoch === epoch &&
+      deltaBase.meta.accountEpoch === account.currentEpoch &&
+      deltaBase.meta.chain.length + 1 <= MAX_MANIFEST_DELTA_CHAIN
+    ) {
+      const chain = [...deltaBase.meta.chain, deltaBase.meta.encManifestSha];
+      const candidate = await encodeDeltaEnvelope(deltaBase.manifest, manifest, {
+        baseEncSha: deltaBase.meta.encManifestSha,
+        baseManifestHash: deltaBase.meta.manifestHash,
+        compress: true,
+      });
+      const candidateBuilt = await buildEncoded(candidate.bytes, chain);
+      if (deltaBase.meta.chainBytes + candidateBuilt.encManifest.byteLength < deltaBase.meta.snapshotBytes) {
+        built = candidateBuilt;
+        resultManifestHash = candidate.resultHash;
+        emittedChain = chain;
+        emittedDelta = true;
+      } else {
+        built = await encodeSnapshot(); // §3.3.4: candidate discarded, re-emit as snapshot
+      }
+    } else if (snapshotEnabled || options?.forceSnapshot) {
+      // NOTE(84): C2 implies C1; rollout flags are sequential capabilities, not independent axes.
+      built = await encodeSnapshot();
+    } else {
+      built = await buildEncoded(new TextEncoder().encode(JSON.stringify(manifest)));
+    }
+    if (onCommitTimings) encodeMs = Math.max(0, Date.now() - t0 - encryptMs);
     if (onCommitTimings) {
       const t0 = Date.now();
       await this.api.putBlobBytes(built.encManifestSha, built.encManifest);
@@ -510,13 +827,28 @@ export class E2eeRemote implements SyncRemote {
       ...(res.serverTimings ? { serverTimings: res.serverTimings } : {}),
     });
     if (res.conflict) return { conflict: true, head: res.head };
-    if (res.unsatisfiedBlobs) return { unsatisfiedBlobs: res.unsatisfiedBlobs, unsatisfiedTotal: res.unsatisfiedTotal };
+    if (res.unsatisfiedBlobs) return {
+      unsatisfiedBlobs: res.unsatisfiedBlobs,
+      unsatisfiedTotal: res.unsatisfiedTotal,
+      ...(emittedChain ? { attemptedManifestChain: emittedChain } : {}),
+    };
     if (res.epochStale !== undefined) return { epochStale: res.epochStale }; // rotated under us -> refresh write context + retry
     // The server's returned sequence MUST equal the seq we signed (parentSequence+1) —
     // otherwise it's labelling our commit with a different number (equivocation). Fail closed.
     if (res.sequence !== parentSequence + 1) throw new Error("server returned a sequence that does not match the signed commit seq — refusing to pin");
     await this.pinFrom(built.commit, account);
-    return { sequence: res.sequence };
+    return {
+      sequence: res.sequence,
+      ...(snapshotEnabled ? { manifestMeta: {
+        encManifestSha: built.encManifestSha,
+        manifestHash: resultManifestHash ?? await canonicalManifestHash(manifest),
+        accountEpoch: account.currentEpoch,
+        keyEpoch: epoch,
+        chain: emittedChain ?? [],
+        chainBytes: emittedDelta ? deltaBase!.meta.chainBytes + built.encManifest.byteLength : 0,
+        snapshotBytes: emittedDelta ? deltaBase!.meta.snapshotBytes : built.encManifest.byteLength,
+      } } : {}),
+    };
   }
 
   missingBlobs(shas: string[]): Promise<string[]> {

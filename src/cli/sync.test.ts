@@ -1157,7 +1157,7 @@ test("design 72: purge push refuses if a known repo becomes unevaluable after th
   await fs.rm(path.join(repo, ".git", "index"), { force: true });
 
   const before = remote.commitCalls;
-  await expect(pushManifest(root, cfg, dryRunLocal, deps(remote), 0, true)).rejects.toThrow(/refusing purge: cannot evaluate tracked files/);
+  await expect(pushManifest(root, cfg, dryRunLocal, deps(remote), { purgeIgnored: true })).rejects.toThrow(/refusing purge: cannot evaluate tracked files/);
   expect(remote.commitCalls).toBe(before);
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(0);
 });

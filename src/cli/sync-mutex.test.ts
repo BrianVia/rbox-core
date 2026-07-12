@@ -131,6 +131,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       ) importers.push(name);
     }
     expect(importers.sort()).toEqual([
+      "chain-repair.ts",
       "daemon.ts",
       "export-cmd.ts",
       "ignore-cmd.ts",
@@ -140,7 +141,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       "sync-cmd.ts",
     ]);
 
-    for (const owner of ["daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "main-dispatch.ts", "recover-cmd.ts", "sync-cmd.ts"]) {
+    for (const owner of ["chain-repair.ts", "daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "main-dispatch.ts", "recover-cmd.ts", "sync-cmd.ts"]) {
       expect(contents.get(owner), owner).toMatch(/syncMutex|WorkspaceSyncMutex/);
     }
     expect(contents.get("export-cmd.ts")).toMatch(/explicit mutex exemption/);

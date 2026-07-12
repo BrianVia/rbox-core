@@ -8,6 +8,7 @@ import {
   saveState,
   stateFromRepoRecords,
   type FileOnlyManifest,
+  type GlobalManifestMeta,
   type RepoRecord,
   type RepoRecordInput,
   type StateSavePacket,
@@ -41,6 +42,7 @@ export interface StateSource {
   sourceGlobalSeq: number;
   /** File-only global truth. gitRepos is deliberately removed by fileOnlyManifest. */
   globalManifest?: Manifest;
+  manifestMeta?: GlobalManifestMeta;
   /** Every repo observed by the source, including equal and absent outcomes. */
   observedRepos: Iterable<string>;
   values: RepoStateValues;
@@ -99,7 +101,8 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
   const records = repoRecordsForState(snapshot);
-  const repos = [...new Set(source.observedRepos)].sort().map((relPath) => {
+  const observedRepos = [...new Set(source.observedRepos)].sort();
+  const repos = observedRepos.map((relPath) => {
     const current = records[relPath] ?? { repoGen: 0, sourceSeq: 0 };
     return {
       relPath,
@@ -107,6 +110,13 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
       newRecord: sourceRecord(source, relPath, current),
     };
   });
+  const projected = { ...records };
+  for (const transition of repos) projected[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
+  const projectedGit = stateFromRepoRecords(snapshot, projected).lastSyncedManifest.gitRepos ?? {};
+  const describedGit = source.globalManifest?.gitRepos ?? {};
+  const hasPending = observedRepos.some((relPath) => projected[relPath]?.pending !== undefined);
+  const sortedJson = (value: Record<string, GitSection>): string => JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))));
+  const carriesMeta = !hasPending && sortedJson(projectedGit) === sortedJson(describedGit);
   return {
     expectedStream: source.expectedStream,
     expectedNonce: expectedStateNonce(snapshot),
@@ -115,7 +125,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
     // Repo transitions above likewise retain records with a newer sourceSeq.
     ...(source.globalManifest === undefined || source.sourceGlobalSeq < snapshot.lastSyncedSequence
       ? {}
-      : { global: { manifest: fileOnlyManifest(source.globalManifest) } }),
+      : { global: { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: carriesMeta ? source.manifestMeta : undefined } }),
     repos,
   };
 }
@@ -128,6 +138,7 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
   return {
     ...stateFromRepoRecords({
       ...snapshot,
+      manifestMeta: undefined,
       lastSyncedSequence: packet.global ? source.sourceGlobalSeq : snapshot.lastSyncedSequence,
       lastSyncedManifest: manifest,
     }, records),
