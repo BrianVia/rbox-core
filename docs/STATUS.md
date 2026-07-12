@@ -7,6 +7,33 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 morning — v1.1.0 shipped; design 84 fold FAILED its gate on the fleet (rolled back by flag); fix cycle running
+
+- **v1.1.0 released + fleet upgraded** (both hosts, installer). Contents: design
+  84 (#231, 15 commits, 5 review rounds), design 104 watcher re-trust (#229,
+  dark; `RBOX_WATCHER_RETRUST=1` soaking on the Mac), GC cron enabled (#228),
+  design 101 Phase 0 (#230), design 105 doc (#227), FirstPublishStats (#226).
+- **Staged MDE rollout — measured live:** snapshot commit 40.5MB→7.1MB; the
+  first delta commit shipped **605 BYTES** (seq 2102; u3.7s→0.2s). Writer side
+  proven. BUT the receiver FAILED design 84's §7.3 gate: `latest` p-phase =
+  **7.1–8.5s chain fold** (vs 0.3s legacy parse, gate ≤2s), FAST_PULL's
+  persisted-evidence fast path did not engage on consecutive pulls, and the
+  Mac daemon RSS hit **8.1GB** (baseline ~2GB). Net propagation benchmark:
+  41.5s → 39.6s only. **MDE flags rolled OFF fleet-wide** (flag-off verified
+  byte-identical; legacy latest back to 4.0s/p0.3). Fix cycle dispatched
+  (`impl/84-fold-fix`): fast-path engagement bug, fold hot path ≤2s on a
+  synthetic 124k bench, fold memory bound. Re-flip + re-benchmark after it
+  lands.
+- **Propagation baseline updated:** founder's Brian.md experiment = 41.5s
+  (25.0s origin detect+push, 16.4s receiver); v1.1.0 warm run = 39.6s
+  (18.3s origin, 21.4s receiver-with-broken-fold). Origin side is now
+  gated on 102-enforce (acct 7.5–9.1s while shadow double-pays) + the fold
+  fix; receiver on the fold fix + design 85.
+- **Watch items:** commit `acct` elevated under shadow (expected until
+  enforce); FirstPublishStats tokens live (`fp ready… redeem…`); Mac RSS
+  after fold rollback (restart clears); log-forensics rule — never read
+  daemon-log tokens without their timestamps (two false alarms this morning).
+
 ## v1.1.0 checklist (founder-directed: cut at the logic point, roll to fleet)
 
 1. Gate-review + merge the overnight PRs as they land: design 84 impl
