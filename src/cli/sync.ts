@@ -38,6 +38,7 @@ import {
   uploadLaneTimingSummary,
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
+import { finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
@@ -780,8 +781,16 @@ async function runPushAttempt(
       ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
     };
   }
+  const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
+  const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
   const res = await report.phase("commit", () => api.commit(appliedSequence, cfg.deviceId, committed, commitOptions));
+  if (firstPublishTiming.enabled) {
+    const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
+    firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
+  }
   if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
+  const firstPublish = finishFirstPublishStats();
+  if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
   if (res.epochStale !== undefined) {
     return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };

@@ -2,6 +2,7 @@ import type { Manifest } from "../../engine/index.js";
 import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
 import type { RemoteContext } from "./context.js";
+import { firstPublishTiming } from "../upload-lane-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
@@ -150,8 +151,10 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
 }
 
 export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
+  const timingT0 = firstPublishTiming.enabled ? performance.now() : 0;
+  const overlappedAtStart = firstPublishTiming.enabled && firstPublishTiming.uploadActive > 0;
   const results: ReceiptRedeemResult[] = [];
-  while (ctx.receipts.size > 0) {
+  try { while (ctx.receipts.size > 0) {
     const batch = [...ctx.receipts.entries()].slice(0, RECEIPT_REDEEM_BATCH_MAX);
     // SAFE TO RETRY — receipt redemption is idempotent: duplicate calls find refs already
     // entitled and grant 0, while a socket-close-before-response can be replayed safely.
@@ -187,8 +190,19 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
       }
     }
     results.push({ ...body, settled });
+  } return results;
+  } finally {
+    if (firstPublishTiming.enabled) {
+      const end = performance.now();
+      firstPublishTiming.stats.receiptRedemptionWallMs += Math.max(0, Math.round(end - timingT0));
+      if (overlappedAtStart) {
+        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(end - timingT0));
+      } else if (firstPublishTiming.uploadStartedAt) {
+        const uploadEnd = firstPublishTiming.uploadEndedAt || end;
+        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(Math.min(end, uploadEnd) - Math.max(timingT0, firstPublishTiming.uploadStartedAt)));
+      }
+    }
   }
-  return results;
 }
 
 /** Post a signed commit envelope. Maps the server's 409 variants: a parent
