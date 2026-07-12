@@ -37,6 +37,9 @@ export default defineWorkersConfig(async () => {
   return {
     cacheDir: "../../.cache/vitest/apps-api",
     test: {
+      // Shared self-hosted CI runners contend heavily; vitest's 5s default flakes
+      // healthy tests under that load. 15s still catches real hangs.
+      testTimeout: 15_000,
       poolOptions: {
         workers: {
           // Tests bootstrap unique accounts, so per-test storage isolation isn't
