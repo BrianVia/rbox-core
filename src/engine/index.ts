@@ -94,6 +94,20 @@ export { poolMap } from "./pool.js";
 export { PhaseReport, type PhaseName, type PhaseTotals, type PhaseBytes, type PhaseReportJson } from "./phase-report.js";
 export { HashCache, type HashCacheEntry } from "./hashcache.js";
 export {
+  DirCache,
+  RACY_MARGIN_MS,
+  UNPRUNED_DEADLINE_MS,
+  coverageOf,
+  dirListingReusable,
+  scanPruneEnabled,
+  type ChildType,
+  type DirCacheChild,
+  type DirCacheEntry,
+  type DirCacheFile,
+  type DircacheOutcome,
+  type RuleFileRecord,
+} from "./dircache.js";
+export {
   EncryptAddressCache,
   EncryptAddressCacheWriter,
   ENCRYPT_ADDRESS_CACHE_REL,

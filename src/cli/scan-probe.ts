@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic, type DirProbeSample, type DirProbeSink } from "../engine/index.js";
+import { RACY_MARGIN_MS, dirListingReusable, writeFileAtomic, type DirProbeSample, type DirProbeSink } from "../engine/index.js";
 import { RBOX_DIR } from "./config.js";
 
-export const RACY_MARGIN_MS = 2_000;
+export { RACY_MARGIN_MS };
 
 export interface ScanProbeState {
   version: 1;
@@ -24,9 +24,8 @@ const statePath = (root: string) => path.join(root, RBOX_DIR, "state", "scan-pro
 
 export function probeEligible(sample: Pick<DirProbeSample, "key" | "mtimeMs" | "ctimeMs">, prior?: ScanProbeState): boolean {
   const old = prior?.dirs[sample.key];
-  if (!old || old.mtimeMs !== sample.mtimeMs || old.ctimeMs !== sample.ctimeMs) return false;
-  const cutoff = prior!.lastScanStartMs - RACY_MARGIN_MS;
-  return sample.mtimeMs < cutoff && sample.ctimeMs < cutoff;
+  if (!old) return false;
+  return dirListingReusable(sample.mtimeMs, sample.ctimeMs, old.mtimeMs, old.ctimeMs, prior!.lastScanStartMs);
 }
 
 export async function loadScanProbe(root: string): Promise<ScanProbeState | undefined> {
