@@ -6,6 +6,52 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-12 — the Mac gets fast: bulk scans, working fold evidence, field-proven trust recovery
+
+Same-day follow-through on v1.1.0: everything that shipped dark yesterday is
+now field-verified and on, plus the macOS performance sprint.
+
+### Improved (measured on the live fleet)
+- **macOS scans: per-file stat eliminated (design 107, #241).**
+  `RBOX_SCAN_BULK=1` (darwin-only) walks directories with one
+  `getattrlistbulk` syscall instead of ~118k `lstat`s — warm full scan
+  **5.5s → 3.1s bench, 3.9s pull-scan / 2.0–3.2s safety-scan live**, with
+  value-identical attributes (0 parity mismatches across the full corpus)
+  and per-directory fallback on any FFI failure.
+- **Manifest fold evidence works everywhere (design 84 r2+r3, #234/#238).**
+  Same-head pulls fetch ZERO blobs; multi-link pulls fetch only the new
+  suffix; chronic git-repo deferral (linked-worktree branches) no longer
+  suppresses evidence — receiver manifest reads are **0.4–1.5s fleet-wide**
+  (were 4.5s legacy / up to 21s broken-fold), and delta writes work on every
+  host. Fold hot path: streaming canonical hash, each manifest verified
+  exactly once per walk, memory bounded.
+- **Watcher trust recovery field-confirmed (design 104).** The Mac's
+  transient FSEvents drops now cycle suspect → re-trusted-behind-unpruned-
+  scan instead of pinning full rescans at a 60s floor for the daemon's
+  lifetime.
+- **Pruned safety scans (design 85 Layer A, #236).** `RBOX_SCAN_PRUNE=1`
+  reuses ctime-keyed directory listings (~24% scan cut; readdir share);
+  deep scans stay unpruned as the drift backstop; pruned scans can never
+  testify for watcher re-trust.
+
+### Fixed
+- **GC Phase-1 lifecycle (#235/#237/#239):** mark/purge are now cursored and
+  fit D1's subrequest budget (previously: marks accumulated unboundedly —
+  230k stale rows — and purge threw mid-page while misreporting success);
+  the fence probe is robust to any mark-table size (enforce falls back to
+  full validation whenever the probe is skipped — never silently unfenced);
+  operator drain tooling gained grace parity with the cron and honest
+  failure reporting. Backlog drained: 228,962 stale marks, 35.3GB of
+  accounting released.
+
+### Added
+- **Machine-readable design-102 soak gate** (#232): `GET /v1/admin/delta-soak`
+  (platform secret) exposes divergence/fallback/admission AE aggregates.
+- **Cross-host propagation analyzer** (#240):
+  `bun scripts/propagation-report.ts <originLog> <receiverLog>` — first fleet
+  numbers: publish→apply p50 16.7s over 233 events, zero staleness
+  incidents.
+
 ## [1.1.0] — 2026-07-12 — manifest deltas, watcher trust recovery, self-draining GC
 
 The performance program's second checkpoint, hours after v1.0.1.
