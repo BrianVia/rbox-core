@@ -20,18 +20,26 @@ if (mode === "drain") {
   let purged = 0;
   let resurrected = 0;
   let released = 0;
+  let consecutiveZeroProgressFailures = 0;
   while (true) {
     const res = await fetch(`${api}/v1/admin/gc?phase=phase1&graceMs=${graceMs}`, { method: "POST", headers });
     const text = await res.text();
     if (!res.ok) throw new Error(`drain failed (${res.status}): ${text}`);
-    const pass = JSON.parse(text) as { marked: number; purged: number; resurrected: number; released: number };
+    const pass = JSON.parse(text) as { marked: number; purged: number; resurrected: number; released: number; failed: number };
     passes++;
     marked += pass.marked;
     purged += pass.purged;
     resurrected += pass.resurrected;
     released += pass.released;
-    console.error(`pass ${passes}: marked=${pass.marked} purged=${pass.purged} resurrected=${pass.resurrected} released=${pass.released}`);
-    if (pass.marked === 0 && pass.purged === 0 && pass.resurrected === 0) break;
+    console.error(`pass ${passes}: marked=${pass.marked} purged=${pass.purged} resurrected=${pass.resurrected} released=${pass.released} failed=${pass.failed}`);
+    const zeroProgress = pass.marked === 0 && pass.purged === 0 && pass.resurrected === 0;
+    if (zeroProgress && pass.failed === 0) break;
+    if (zeroProgress && pass.failed > 0) {
+      consecutiveZeroProgressFailures++;
+      if (consecutiveZeroProgressFailures >= 3) throw new Error("drain aborted after 3 consecutive zero-progress passes with account failures");
+    } else {
+      consecutiveZeroProgressFailures = 0;
+    }
     await sleep(5_000);
   }
   console.log(JSON.stringify({ passes, marked, purged, resurrected, released }));

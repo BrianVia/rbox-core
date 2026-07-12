@@ -17,6 +17,36 @@ const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const EMPTY = new Set<string>();
 
+function countingDb(d1: D1Database): { db: D1Database; calls: () => number } {
+  let count = 0;
+  const wrapStmt = (statement: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, prop, receiver) {
+        if (prop === "bind") return (...args: unknown[]) => wrapStmt((target.bind as (...xs: unknown[]) => D1PreparedStatement)(...args));
+        if (prop === "run" || prop === "first" || prop === "all" || prop === "raw") {
+          return (...args: unknown[]) => {
+            count++;
+            return (target[prop as "run"] as (...xs: unknown[]) => Promise<unknown>)(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  return {
+    db: new Proxy(d1, {
+      get(target, prop, receiver) {
+        if (prop === "prepare") return (sql: string) => wrapStmt(target.prepare(sql));
+        if (prop === "batch") return (statements: D1PreparedStatement[]) => {
+          count++;
+          return target.batch(statements);
+        };
+        return Reflect.get(target, prop, receiver);
+      },
+    }),
+    calls: () => count,
+  };
+}
+
 async function mkAccount(id: string, capBytes = 1_000_000_000) {
   await db()
     .prepare(`INSERT INTO accounts(id, plan, created_at, used_bytes, extra_storage_bytes, cap_bytes) VALUES (?, 'pro', ?, 0, 0, ?)`)
@@ -56,6 +86,64 @@ beforeEach(async () => {
 });
 
 describe("§33 mark → grace → purge (the leak fix)", () => {
+  it("chunks 200 unreachable candidates within the phase-1 D1 subrequest budget", async () => {
+    await mkAccount("a");
+    for (let i = 0; i < 200; i++) {
+      const sha = `budget-dead-${String(i).padStart(3, "0")}`;
+      await addRef("a", sha, 1, NOW - 4 * HOUR);
+      await mark("a", sha, NOW - 2 * HOUR);
+    }
+    const counted = countingDb(db());
+    const result = await phase1Purge(counted.db, "a", EMPTY, HOUR, NOW);
+    expect(result.purged).toBe(200);
+    expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(0);
+    // cursor read + page + 7 purge batches + 3 condemn probes + 7 inserts + cursor write = 20.
+    expect(counted.calls()).toBeLessThanOrEqual(25);
+  });
+
+  it("chunks 200 reachable candidates within the phase-1 D1 subrequest budget", async () => {
+    await mkAccount("a");
+    const reachable = new Set<string>();
+    for (let i = 0; i < 200; i++) {
+      const sha = `budget-live-${String(i).padStart(3, "0")}`;
+      reachable.add(sha);
+      await addRef("a", sha, 1, NOW - 4 * HOUR);
+      await mark("a", sha, NOW - 2 * HOUR);
+    }
+    const counted = countingDb(db());
+    const result = await phase1Purge(counted.db, "a", reachable, HOUR, NOW);
+    expect(result).toMatchObject({ purged: 0, resurrected: 200 });
+    expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(0);
+    // cursor read + page + 7 resurrection batches + cursor write = 10.
+    expect(counted.calls()).toBeLessThanOrEqual(25);
+  });
+
+  it("keeps route-level phase-1 dry-run and live grace handling in parity", async () => {
+    const platform = { "x-rbox-platform": "test-platform-secret" };
+    const realNow = Date.now();
+    await mkAccount("route-grace");
+    await addRef("route-grace", "route-expired", 7, realNow - 2 * 24 * HOUR);
+    await mark("route-grace", "route-expired", realNow - 2 * 24 * HOUR);
+
+    const shortAudit = await SELF.fetch("https://example.com/v1/admin/gc?phase=phase1&dryRun=1&graceMs=86400000", { method: "POST", headers: platform });
+    expect(shortAudit.status).toBe(200);
+    expect(await shortAudit.json()).toMatchObject({ wouldPurge: 1 });
+    const shortLive = await SELF.fetch("https://example.com/v1/admin/gc?phase=phase1&graceMs=86400000", { method: "POST", headers: platform });
+    expect(shortLive.status).toBe(200);
+    expect(await shortLive.json()).toMatchObject({ purged: 1, failed: 0 });
+    expect(await refExists("route-grace", "route-expired")).toBe(false);
+
+    await addRef("route-grace", "route-default", 7, realNow - 2 * 24 * HOUR);
+    await mark("route-grace", "route-default", realNow - 2 * 24 * HOUR);
+    const defaultAudit = await SELF.fetch("https://example.com/v1/admin/gc?phase=phase1&dryRun=1", { method: "POST", headers: platform });
+    expect(defaultAudit.status).toBe(200);
+    expect(await defaultAudit.json()).toMatchObject({ wouldPurge: 0 });
+    const defaultLive = await SELF.fetch("https://example.com/v1/admin/gc?phase=phase1", { method: "POST", headers: platform });
+    expect(defaultLive.status).toBe(200);
+    expect(await defaultLive.json()).toMatchObject({ purged: 0, failed: 0 });
+    expect(await refExists("route-grace", "route-default")).toBe(true);
+  });
+
   it("bounds and advances phase-1 mark cursor across pages", async () => {
     await mkAccount("a");
     for (let i = 0; i < PHASE1_MAX_ROWS + 1; i += 100) {
