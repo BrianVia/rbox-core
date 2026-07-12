@@ -23,12 +23,8 @@ export interface FakeMultipartServerOptions {
 }
 
 export interface FakeMultipartServerStats {
-  initRequests: number;
-  statusRequests: number;
-  partRequests: number;
   completeRequests: number;
   completedParts: number;
-  bytesReceived: number;
   transientFailures: number;
 }
 
@@ -67,15 +63,7 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
   const blobs = new Set<string>();
   const failedParts = new Set<number>();
   let nextUpload = 1;
-  const stats: FakeMultipartServerStats = {
-    initRequests: 0,
-    statusRequests: 0,
-    partRequests: 0,
-    completeRequests: 0,
-    completedParts: 0,
-    bytesReceived: 0,
-    transientFailures: 0,
-  };
+  const stats: FakeMultipartServerStats = { completeRequests: 0, completedParts: 0, transientFailures: 0 };
 
   const server = createServer(async (req, res) => {
     try {
@@ -86,7 +74,6 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
       const complete = url.pathname.match(/^\/v1\/blobs\/([0-9a-f]{64})\/multipart\/([^/]+)\/complete$/);
 
       if (req.method === "POST" && init) {
-        stats.initRequests++;
         const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { size?: unknown };
         const size = typeof parsed.size === "number" && Number.isFinite(parsed.size) && parsed.size >= 0 ? parsed.size : -1;
         if (size < 0) return json(res, 400, { error: "invalid_size" });
@@ -99,14 +86,12 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
       }
 
       if (req.method === "GET" && status) {
-        stats.statusRequests++;
         const upload = uploads.get(status[2]!);
         if (!upload || upload.sha !== status[1]) return json(res, 404, { error: "unknown_upload" });
         return json(res, 200, { partSize: upload.partSize, completedParts: [...upload.parts.keys()].sort((a, b) => a - b) });
       }
 
       if (req.method === "PUT" && part) {
-        stats.partRequests++;
         const n = Number(part[3]);
         const upload = uploads.get(part[2]!);
         if (!upload || upload.sha !== part[1]) return json(res, 404, { error: "unknown_upload" });
@@ -121,9 +106,7 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
         const expected = n < upload.totalParts ? upload.partSize : upload.size - (upload.totalParts - 1) * upload.partSize;
         if (body.byteLength !== expected) return json(res, 400, { error: "invalid_part_size" });
         if (opts.partLatencyMs && opts.partLatencyMs > 0) await new Promise((resolve) => setTimeout(resolve, opts.partLatencyMs));
-        const previous = upload.parts.get(n);
         upload.parts.set(n, body);
-        stats.bytesReceived += body.byteLength - (previous?.byteLength ?? 0);
         return json(res, 200, { ok: true, partNumber: n });
       }
 
