@@ -141,7 +141,7 @@ describe("FirstPublishStats", () => {
       "peakQueueHeapBytes", "peakTempDiskBytes", "peakUploaderFramingBytes",
       "producerCpuSaturationPct", "reEncryptedOnResume", "receiptRedemptionOverlapMs",
       "receiptRedemptionWallMs", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",
-      "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
+      "timeToFilesSyncedMs", "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
     ]);
     expect(Object.values(stats).every((n) => Number.isInteger(n) && n >= 0)).toBe(true);
     expect(stats.encryptWallMs + stats.missingCheckWallMs + stats.receiptRedemptionWallMs + stats.commitWallMs).toBe(14);

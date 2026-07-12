@@ -250,7 +250,11 @@ async function executeInitPlan(
           deps.report = report2;
           try {
             const r2 = await push(plan.root, authed, deps);
-            sp2.succeed(`git history attached ${style.sym.arrow} sequence ${style.cyan(String(r2.sequence))}`);
+            sp2.succeed(
+              r2.committed
+                ? `git history attached ${style.sym.arrow} sequence ${style.cyan(String(r2.sequence))}`
+                : `git history up to date ${style.dim(`(sequence ${r2.sequence})`)}`
+            );
             report2?.logSummaryTo((l) => console.log(style.dim(l)));
           } catch {
             // Commit 1's files are durable; git resumes via the daemon or the next push.

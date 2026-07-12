@@ -363,6 +363,10 @@ function localDivergedFromBase(localId: GitIdentity | undefined, base: GitSectio
 export interface GitPushPlan {
   gitRepos?: Record<string, GitSection>;
   changed: boolean;
+  /** Design 108 §3.1: this plan deferred git capture (files-first genesis) AND at least
+   *  one repo actually exists to attach — so the driver should run commit 2. Absent when
+   *  files-first was inactive or the workspace has no git repos (commit 1 is terminal). */
+  filesFirstDeferred?: boolean;
   gitReposRemoved?: Record<string, string>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
@@ -497,11 +501,17 @@ export async function planGitSections(
       gitPlanStats: { ...stats, carried: carried.length, captured: captured.length },
     };
   };
-  // Design 108 §3.2: genesis files-first defer — attach nothing this commit. On a
+  // Design 108 §3.2/§3.1: genesis files-first defer — attach nothing this commit. On a
   // genuine genesis (parentSequence 0, fresh state) base/pending/needsRes/removed are
-  // empty, so plan() yields gitRepos=undefined, changed=false, sidecars absent — git
-  // is re-derived as owed by the next ordinary push. No capture, no discovery.
-  if (options.filesFirstDefer) return plan();
+  // empty, so plan() yields gitRepos=undefined, changed=false, sidecars absent — git is
+  // re-derived as owed by the next ordinary push. A cheap discovery (NO capture) decides
+  // whether commit 2 is warranted: with ≥1 repo, flag `filesFirstDeferred` so the driver
+  // attaches; with zero repos there is nothing owed and commit 1 is terminal (no wasted
+  // second push, no "history attached" lie).
+  if (options.filesFirstDefer && cfg.syncGit) {
+    const discovered = await discoverGitRepos(root, matcher);
+    return { ...plan(), ...(discovered.length > 0 ? { filesFirstDeferred: true } : {}) };
+  }
   if (!cfg.syncGit) {
     // Opt-out: out stays empty → any base entries read as removal (the opt-out
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving

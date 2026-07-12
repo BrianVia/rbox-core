@@ -115,10 +115,12 @@ export function firstPublishAuthEnd(): void {
 export function finishFirstPublishStats(): FirstPublishStats | undefined {
   if (!firstPublishTiming.enabled) return undefined;
   // Design 108 §3.6 (round-4 MAJOR 2): finalization ALWAYS disables the singleton —
-  // even when it yields no stats (nothing uploaded) — so a no-upload push can't leak
-  // timing into later unrelated work.
+  // even when it yields no stats — so a no-upload push can't leak timing into later work.
   firstPublishTiming.enabled = false;
-  if (!firstPublishTiming.firstUploadAt) return undefined;
+  // Render when there was a real upload critical path OR a command-level files-synced
+  // milestone (design 108 §3.6): a 409/422-retry success re-uploads nothing yet must still
+  // emit the headline timeToFilesSyncedMs — the files DID sync, on the earlier attempt.
+  if (!firstPublishTiming.firstUploadAt && !firstPublishTiming.stats.timeToFilesSyncedMs) return undefined;
   const s = firstPublishTiming.stats;
   s.uploadCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.uploadEndedAt - firstPublishTiming.uploadStartedAt));
   s.authCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.authEndedAt - firstPublishTiming.authStartedAt));

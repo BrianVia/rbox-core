@@ -163,6 +163,16 @@ test("flag ON genesis: commit 1 files-only, gitDeferred, commit 2 attaches git",
   expect(remote.gitPutCalls).toBeGreaterThan(0);
 });
 
+// ── 2b. syncGit workspace with NO repos: files-first does not signal a wasted commit 2 ─
+test("flag ON genesis, files but NO git repo: commit 1 is terminal (gitDeferred falsy)", async () => {
+  process.env.RBOX_FILES_FIRST = "1";
+  await fs.writeFile(path.join(root, "plain.txt"), "just a file, no repo");
+  const r = await push(root, cfg, deps);
+  expect(r.committed).toBe(true);
+  expect(r.gitDeferred).toBeFalsy(); // nothing owed → no commit 2
+  expect(r.sequence).toBe(1);
+});
+
 // ── 3. files-must-diff guard: git-only workspace bypasses files-first ───────
 test("flag ON but NO file diff (git-only): files-first bypassed, git-first single commit advances", async () => {
   process.env.RBOX_FILES_FIRST = "1";
@@ -251,26 +261,27 @@ test("a no-op push renders NO FirstPublishStats", async () => {
   expect(lines.join(" ")).not.toContain("filesSynced");
 });
 
-// ── 8. metric leak: a 409-failing attempt renders no premature FirstPublishStats ─
-// (round-3 fix: finalization must happen AFTER admission+state-save, not before the
-// conflict check.) Here attempt 1 (files-first) uploads the file blob then 409s; the
-// successful retry re-uploads nothing, so a correct implementation renders ZERO
-// FirstPublishStats (no upload critical path) — and crucially the FAILED attempt renders
-// none. Under the pre-108 bug (finalize before the conflict check) the failed attempt
-// would have rendered one. Timing must also be left disabled (no singleton leak).
-test("409-failing files-first attempt renders no premature FirstPublishStats; timing disabled", async () => {
+// ── 8. metric honesty: 409-then-success emits EXACTLY ONE FirstPublishStats ──
+// (round-3/round-4 fixes: finalize only after admission+state-save, and render the
+// headline timeToFilesSyncedMs on the successful attempt even though its retry
+// re-uploaded nothing — the files DID sync, on the earlier 409'd attempt.) The FAILED
+// attempt must render none (pre-108 bug rendered before the conflict check) and must not
+// leak the timing singleton.
+test("409-then-success emits exactly ONE FirstPublishStats (headline KPI) and leaves timing disabled", async () => {
   process.env.RBOX_FILES_FIRST = "1";
   await repoWithFile();
   remote.injectCommit([await remote.seedEntry("seed.txt", "seeded")]); // forces a 409 on attempt 1
   const report = PhaseReport.push();
   deps.report = report;
-  deps.filesFirstStartedAt = performance.now();
+  deps.filesFirstStartedAt = performance.now() - 1234; // command milestone survives the retry
   const r = await push(root, cfg, deps);
   expect(r.committed).toBe(true); // retry succeeds, git inline
   const lines: string[] = [];
   report.logSummaryTo((l) => lines.push(l));
-  const occurrences = (lines.join(" ").match(/filesSynced/g) ?? []).length;
-  expect(occurrences).toBe(0); // failed attempt renders none; retry uploaded nothing
+  const summary = lines.join(" ");
+  const matches = summary.match(/filesSynced(\d+)/g) ?? [];
+  expect(matches.length).toBe(1); // exactly one, on the successful attempt
+  expect(Number(matches[0]!.replace("filesSynced", ""))).toBeGreaterThanOrEqual(1234); // milestone honored
   expect(firstPublishTiming.enabled).toBe(false);
 });
 

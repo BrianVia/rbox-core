@@ -842,6 +842,9 @@ async function runPushAttempt(
   // planning (byte-identical to today when the flag is off).
   const filesFirstDefer =
     filesFirstFlagEnabled() &&
+    repair === undefined &&                // NEVER defer under chain-repair: a repair supersede
+                                           // posts repair.parentSequence (≠ appliedSequence) and
+                                           // must republish git verbatim, never drop it (BLOCKER).
     cfg.syncGit === true &&                // no git to attach ⇒ nothing to defer (no wasted commit 2)
     !filesFirstAborted &&
     appliedSequence === 0 &&
@@ -936,74 +939,75 @@ async function runPushAttempt(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
-  // Missing or scan-mismatched sources defer immediately; ciphertext upload
-  // mismatches retry within a bounded per-file budget. Only the stable subset is
-  // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
-    encryptFileToTemp: deps.encryptFileToTemp,
-    encryptCacheFlushMs: deps.encryptCacheFlushMs,
-    pruneLivePaths: scannedFilePaths,
-    recoverAddresses,
-    forceFullAudit,
-  });
-
-  // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
-  // if it was previously synced we carry its base entry forward (mirrors the forward-only
-  // ignore carry above) so it NEVER reads as a deletion on other machines, and a never-synced
-  // deferred file is simply omitted. Invariant: every blob the committed manifest references
-  // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
-  // ref, no phantom deletion.
-  const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
-
-  if (needsUpload && needsUpload.size > 0) {
-    return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
-  }
-
-  // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
-  // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
-  // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
-  // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
-  // that the artifact blobs were missing.
-  if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
-    const dd = diffManifests(appliedBase, committed);
-    if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
-      if (filesFirstDefer) {
-        // Design 108 §3.2 anti-starvation: files-first committed nothing (every file
-        // deferred). A terminal committed:false here would leave the sequence at 0 and
-        // re-fire genesis every push, STARVING git. Return the nonterminal fallback so
-        // the loop re-plans with ordinary git-inclusive planning (best-effort, never a
-        // block). The uncommitted, idempotent ciphertext this attempt uploaded is safe;
-        // the re-run reconstructs disk truth.
-        return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
-      }
-      reportDeferred(deferred);
-      return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
-    }
-  }
-
-  let commitTimings: CommitTimings | undefined;
-  let commitOptions: CommitOptions | undefined;
-  const manifestMeta = validManifestMeta(state.manifestMeta);
-  const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
-  const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
-    validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
-    ? { manifest: reconstructedBase, meta: manifestMeta }
-    : undefined;
-  if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
-    commitOptions = {
-      ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
-      ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
-      ...(deltaBase ? { deltaBase } : {}),
-      ...(repair ? { forceSnapshot: true } : {}),
-    };
-  }
-  const parentSequence = repair?.parentSequence ?? appliedSequence;
-  // Design 108 §3.6: FirstPublishStats is finalized ONLY after a fully-persisted commit,
-  // and the module-global `firstPublishTiming` singleton is disabled on every other exit
-  // (409/422/epoch return, or a thrown commit/state-save error) so later unrelated work
-  // never accrues into it (round-4 MAJOR 2).
+  // Design 108 §3.6 (round-4 MAJOR 2): everything from encryptAndUpload (which ARMS the
+  // module-global firstPublishTiming singleton) onward runs inside this try. Its finally
+  // disables the singleton on EVERY exit that did not transfer ownership to finalized
+  // stats — a reupload / no-advance return, an epoch/409/422 return, or a thrown
+  // encrypt/commit/state-save error — so later unrelated work can never accrue into it.
   let firstPublishFinalized = false;
   try {
+    // Missing or scan-mismatched sources defer immediately; ciphertext upload
+    // mismatches retry within a bounded per-file budget. Only the stable subset is
+    // committed, and watcher/safety scans re-queue deferred paths once they settle.
+    const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+      encryptFileToTemp: deps.encryptFileToTemp,
+      encryptCacheFlushMs: deps.encryptCacheFlushMs,
+      pruneLivePaths: scannedFilePaths,
+      recoverAddresses,
+      forceFullAudit,
+    });
+
+    // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
+    // if it was previously synced we carry its base entry forward (mirrors the forward-only
+    // ignore carry above) so it NEVER reads as a deletion on other machines, and a never-synced
+    // deferred file is simply omitted. Invariant: every blob the committed manifest references
+    // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
+    // ref, no phantom deletion.
+    const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+
+    if (needsUpload && needsUpload.size > 0) {
+      return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
+    }
+
+    // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
+    // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
+    // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
+    // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
+    // that the artifact blobs were missing.
+    if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
+      const dd = diffManifests(appliedBase, committed);
+      if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
+        if (gitPlan.filesFirstDeferred) {
+          // Design 108 §3.2 anti-starvation: files-first committed nothing (every file
+          // deferred) yet real repos were deferred. A terminal committed:false here would
+          // leave the sequence at 0 and re-fire genesis every push, STARVING git. Return the
+          // nonterminal fallback so the loop re-plans with ordinary git-inclusive planning
+          // (best-effort, never a block). The uncommitted, idempotent ciphertext this attempt
+          // uploaded is safe; the re-run reconstructs disk truth.
+          return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
+        }
+        reportDeferred(deferred);
+        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
+      }
+    }
+
+    let commitTimings: CommitTimings | undefined;
+    let commitOptions: CommitOptions | undefined;
+    const manifestMeta = validManifestMeta(state.manifestMeta);
+    const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
+    const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
+      validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
+      ? { manifest: reconstructedBase, meta: manifestMeta }
+      : undefined;
+    if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
+      commitOptions = {
+        ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
+        ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
+        ...(deltaBase ? { deltaBase } : {}),
+        ...(repair ? { forceSnapshot: true } : {}),
+      };
+    }
+    const parentSequence = repair?.parentSequence ?? appliedSequence;
     const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
     const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
     const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
@@ -1032,11 +1036,12 @@ async function runPushAttempt(
     }
 
     // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
-    // this accepted commit response; the START is init's command milestone (before scan)
-    // when provided, else the timing's own start (daemon/direct push).
-    if (firstPublishTiming.enabled) {
-      const startAt = deps.filesFirstStartedAt ?? firstPublishTiming.startedAt;
-      firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - startAt));
+    // this accepted commit response; the START is init's command milestone (before scan).
+    // Scoped to init (which sets filesFirstStartedAt) — a daemon/CLI push without it leaves
+    // the KPI 0 so it never forces a FirstPublishStats render on a non-init push, and the
+    // value survives across a 409/422 retry (it is the command wall, not a per-attempt one).
+    if (firstPublishTiming.enabled && deps.filesFirstStartedAt !== undefined) {
+      firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
     }
 
     // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
@@ -1070,7 +1075,7 @@ async function runPushAttempt(
     if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
     if (deferred.size > 0) reportDeferred(deferred);
-    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(filesFirstDefer ? { gitDeferred: true } : {}) } };
+    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}) } };
   } finally {
     if (!firstPublishFinalized && firstPublishTiming.enabled) beginFirstPublishTiming(false);
   }
