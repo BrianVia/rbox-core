@@ -30,6 +30,10 @@ SLOTS=${SLOTS:-"24 48 96 192"}
 RECORDS=${RECORDS:-32}
 MAIN_ROOT=${MAIN_ROOT:-$HOME/Development}
 BACKUP=${BACKUP:-/tmp/rbox-id-backup}
+# The host's real daemon must stop/start via the INSTALLED binary, never the
+# bench build — `$RBOX start` would leave production running branch code.
+INSTALLED_RBOX=${INSTALLED_RBOX:-$HOME/.rbox/bin/rbox}
+[ -x "$INSTALLED_RBOX" ] || INSTALLED_RBOX="$RBOX"
 WS="$ROOT/ws"
 DATA="$WS/data"
 BASE="$ROOT/corpus-base"
@@ -54,34 +58,33 @@ restore_identity() {
 build_corpus() {
   log "building subset corpus from $SRC (<= $MAX_FILE B/file, target $TARGET_BYTES B, skip .git)"
   rm -rf "$BASE"; mkdir -p "$BASE"
-  local total=0 count=0
-  # find in walk order; skip any .git dir; regular files only, within size cap.
-  while IFS= read -r -d '' f; do
-    local sz; sz=$(stat -c %s "$f" 2>/dev/null) || continue
-    [ "$sz" -gt 0 ] && [ "$sz" -le "$MAX_FILE" ] || continue
-    local rel="${f#$SRC/}"
-    mkdir -p "$BASE/$(dirname "$rel")"
-    cp -- "$f" "$BASE/$rel" 2>/dev/null || continue
-    total=$((total + sz)); count=$((count + 1))
-    [ "$total" -ge "$TARGET_BYTES" ] && break
-  done < <(find "$SRC" -type d -name .git -prune -o -type f -print0 2>/dev/null)
+  # Walk order + size cap + byte budget in one pass: find's own stat (-printf),
+  # one awk cutoff, one bulk cpio copy — O(1) process spawns instead of the
+  # 3-forks-per-file loop this replaces (~3 min for 36k files on the bench host).
+  # Newline-separated paths are fine for a code corpus (no newline filenames).
+  ( cd "$SRC" && find . -type d -name .git -prune -o -type f -printf '%s\t%P\n' 2>/dev/null \
+      | awk -F'\t' -v max="$MAX_FILE" -v target="$TARGET_BYTES" \
+          '$1 > 0 && $1 <= max { print $2; total += $1; if (total >= target) exit }' \
+      | cpio -pdm --quiet "$BASE" )
+  local count total
+  count=$(find "$BASE" -type f | wc -l); total=$(du -sb --apparent-size "$BASE" | cut -f1)
   echo "corpus: $count files, $total bytes" | tee "$OUT/corpus.txt"
 }
 
 salt_corpus() {
-  # point index $1: overwrite DATA from BASE, then append a unique nonce to every
-  # file so all content hashes are fresh and the whole set re-uploads.
+  # point index $1: overwrite DATA from BASE, then append a per-point nonce to
+  # every file so all content hashes are fresh and the whole set re-uploads.
+  # One nonce per point suffices (files already differ from each other).
   local point="$1"
+  local nonce; nonce=$(date +%s%N)
   rm -rf "$DATA"; cp -a "$BASE" "$DATA"
   find "$DATA" -type f -print0 | xargs -0 -P16 -I{} \
-    bash -c 'printf "\n# rbox-sweep point %s %s\n" "$0" "$(date +%s%N)" >> "$1"' "$point" {}
+    bash -c 'printf "\n# rbox-sweep point %s %s\n" "$0" "$1" >> "$2"' "$point" "$nonce" {}
 }
-
-parse_num() { grep -oE "$2" "$1" | head -1 | grep -oE '[0-9]+' | head -1 || true; }
 
 init_workspace() {
   log "init bench workspace (single clobber; main daemon stopped)"
-  "$RBOX" stop "$MAIN_ROOT" >/dev/null 2>&1 || true
+  "$INSTALLED_RBOX" stop "$MAIN_ROOT" >/dev/null 2>&1 || true
   rm -rf "$WS"; mkdir -p "$WS"
   ( cd "$WS" && setsid env RBOX_METRICS=1 "$RBOX" init --new --no-interactive --git false \
       > "$ROOT/init.log" 2>&1 < /dev/null & echo $! > "$ROOT/init.pid" )
@@ -109,17 +112,27 @@ run_point() {
       RBOX_LANE_TIMING=1 RBOX_METRICS=1 "$RBOX" sync > "$plog" 2>&1 ) || echo "WARN: sync exit $?" >&2
   t1=$(date +%s.%N)
   local wall; wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-  local blobs; blobs=$(grep -oE 'lane timing \(push\): [0-9]+ blobs' "$plog" | grep -oE '[0-9]+' | head -1 || echo 0)
-  [ -z "$blobs" ] && blobs=0
-  local mbps blobps upms
-  mbps=$(awk -v b="$bytes" -v w="$wall" 'BEGIN{ if(w>0) printf "%.1f", (b*8)/(w*1e6); else print "0" }')
-  blobps=$(awk -v n="$blobs" -v w="$wall" 'BEGIN{ if(w>0) printf "%.0f", n/w; else print "0" }')
-  # per-blob upload ms from the lane-timing line (proxy: x RECORDS ~= per-batch round trip)
-  upms=$(grep -oE 'upload [0-9.]+ms' "$plog" | grep -oE '[0-9.]+' | tail -1 || echo "")
   local laneline; laneline=$(grep -oE 'lane timing \(push\):.*' "$plog" | head -1 || echo "")
   local fpline; fpline=$(grep -oE 'fp ready.*' "$plog" | head -1 || echo "")
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$slots" "$RECORDS" "$bytes" "$blobs" "$wall" "$mbps" "$blobps" "${upms:-NA}" >> "$CSV"
-  echo "  wall=${wall}s bytes=${bytes} blobs=${blobs} => ${mbps} Mbps, ${blobps} blobs/s (per-blob upload ${upms:-NA}ms)"
+  local blobs; blobs=$(echo "$laneline" | grep -oE '[0-9]+ blobs' | grep -oE '[0-9]+' | head -1 || echo 0)
+  [ -z "$blobs" ] && blobs=0
+  # upload critical path (elapsed upload-phase wall) and encrypt wall, from FirstPublishStats.
+  local up_ms enc_ms; up_ms=$(echo "$fpline" | grep -oE ' up[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "")
+  enc_ms=$(echo "$fpline" | grep -oE ' enc[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "")
+  # per-blob upload ms from the lane-timing line (x RECORDS ~= per-batch round trip proxy)
+  local upms; upms=$(echo "$laneline" | grep -oE 'upload [0-9.]+ms' | grep -oE '[0-9.]+' | tail -1 || echo "")
+  # ciphertext wire bytes (the sync summary's wire= token) — compression makes this
+  # much smaller than plaintext, and it's the honest basis for link-utilization Mbps.
+  local wire_mb; wire_mb=$(grep -oE 'wire=[0-9.]+MB' "$plog" | head -1 | grep -oE '[0-9.]+' | head -1 || echo "")
+  local wall_mbps up_mbps wire_mbps up_blobps
+  wall_mbps=$(awk -v b="$bytes" -v w="$wall" 'BEGIN{ if(w>0) printf "%.1f", (b*8)/(w*1e6); else print "0" }')
+  up_mbps=$(awk -v b="$bytes" -v u="${up_ms:-0}" 'BEGIN{ if(u>0) printf "%.1f", (b*8)/(u*1000); else print "NA" }')
+  wire_mbps=$(awk -v w="${wire_mb:-0}" -v u="${up_ms:-0}" 'BEGIN{ if(u>0 && w>0) printf "%.1f", (w*8*1000)/u; else print "NA" }')
+  up_blobps=$(awk -v n="$blobs" -v u="${up_ms:-0}" 'BEGIN{ if(u>0) printf "%.0f", n/(u/1000); else print "NA" }')
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$slots" "$RECORDS" "$bytes" "$blobs" "$wall" "${up_ms:-NA}" "${enc_ms:-NA}" "$wall_mbps" "${up_mbps}" "${wire_mb:-NA}" "${wire_mbps}" "${up_blobps}" "${upms:-NA}" >> "$CSV"
+  echo "  wall=${wall}s up_crit=${up_ms:-NA}ms enc=${enc_ms:-NA}ms blobs=${blobs} wire=${wire_mb:-NA}MB"
+  echo "  => UPLOAD-LANE ${up_mbps} Mbps plaintext / ${wire_mbps} Mbps wire / ${up_blobps} blobs-s   |   wall ${wall_mbps} Mbps"
   echo "  lane: $laneline"
   echo "  fp:   $fpline"
 }
@@ -131,11 +144,15 @@ emit_markdown() {
     echo "Corpus: $(cat "$OUT/corpus.txt"). Bench workspace: \`${WSID:-unknown}\` (junk — delete server-side)."
     echo "Records pinned at $RECORDS (server wire cap). Slots axis only."
     echo
-    echo "| slots | records | plaintext MB | blobs | wall s | Mbps | blobs/s | per-blob up ms |"
-    echo "|---:|---:|---:|---:|---:|---:|---:|---:|"
-    while IFS=, read -r s r b n w m bp u; do
+    echo "| slots | records | MB | blobs | wall s | up-crit s | enc s | UPLOAD Mbps | wire MB | wire Mbps | up blobs/s | wall Mbps | per-blob up ms |"
+    echo "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    while IFS=, read -r s r b n w upms encms wm um wmb wmbps ubp pbu; do
       [ "$s" = "slots" ] && continue
-      printf '| %s | %s | %.0f | %s | %s | %s | %s | %s |\n' "$s" "$r" "$(awk -v x="$b" 'BEGIN{print x/1048576}')" "$n" "$w" "$m" "$bp" "$u"
+      printf '| %s | %s | %.0f | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+        "$s" "$r" "$(awk -v x="$b" 'BEGIN{print x/1048576}')" "$n" "$w" \
+        "$(awk -v x="$upms" 'BEGIN{if(x=="NA")print "NA"; else printf "%.1f", x/1000}')" \
+        "$(awk -v x="$encms" 'BEGIN{if(x=="NA")print "NA"; else printf "%.1f", x/1000}')" \
+        "$um" "$wmb" "$wmbps" "$ubp" "$wm" "$pbu"
     done < "$CSV"
   } > "$MD"
   echo; cat "$MD"
@@ -143,14 +160,14 @@ emit_markdown() {
 
 main() {
   mkdir -p "$OUT"
-  echo "slots,records,bytes,blobs,wall_s,mbps,blobs_per_s,per_blob_up_ms" > "$CSV"
+  echo "slots,records,bytes,blobs,wall_s,up_crit_ms,enc_ms,wall_mbps,upload_mbps,wire_mb,wire_mbps,upload_blobs_per_s,per_blob_up_ms" > "$CSV"
   build_corpus
   init_workspace
   local idx=0
   for s in $SLOTS; do idx=$((idx + 1)); run_point "$s" "$idx"; done
   log "teardown: restore identity + restart main daemon"
   restore_identity
-  "$RBOX" start "$MAIN_ROOT" >/dev/null 2>&1 || echo "WARN: could not restart main daemon — start it manually" >&2
+  "$INSTALLED_RBOX" start "$MAIN_ROOT" >/dev/null 2>&1 || echo "WARN: could not restart main daemon — start it manually" >&2
   emit_markdown
   echo; echo "DONE. Results: $CSV / $MD"
 }

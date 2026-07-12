@@ -36,7 +36,8 @@ RBOX=/tmp/rbox-sweep-build/rbox rig/upload-sweep/sweep.sh
 
 Env overrides: `SRC` (default `~/code`), `ROOT` (`/tmp/rbox-sweep`), `TARGET_BYTES`
 (400 MiB), `MAX_FILE` (256 KiB), `SLOTS`, `RECORDS`, `MAIN_ROOT` (`~/Development`),
-`BACKUP` (`/tmp/rbox-id-backup`).
+`BACKUP` (`/tmp/rbox-id-backup`), `INSTALLED_RBOX` (`~/.rbox/bin/rbox` — the host's
+real daemon is stopped/restarted with THIS binary, never the bench build).
 
 Outputs `results/sweep.csv` and `results/sweep.md` under `ROOT`. Each point creates
 junk blobs in one bench workspace whose `ws_…` id is printed and recorded in the
