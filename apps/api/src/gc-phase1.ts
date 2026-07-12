@@ -8,7 +8,8 @@ import { dbFor } from "./db.js";
 // (≤3 params/row → 33 rows = 99). Shared by the batched mark + condemn inserts below.
 const INSERT_CHUNK = 33;
 // Keep a cron tick's D1 subrequests bounded: mark is ~cap/33 insert batches and
-// purge is at most cap atomic db.batch calls, never O(account refs) (§102 Q3).
+// purge is ~cap/33 transaction batches (plus condemnation), never O(account refs)
+// (§102 Q3). At cap, purge + condemn + cursors/probes is ~150 D1 subrequests.
 export const PHASE1_MAX_ROWS = 2_000;
 
 async function readCursor(db: D1Database, key: string): Promise<string> {
@@ -124,75 +125,94 @@ export async function phase1Purge(
     .prepare("SELECT c.sha256, c.marked_at, b.size_bytes FROM blob_ref_candidates c LEFT JOIN blobs b ON b.sha256 = c.sha256 WHERE c.account_id = ? AND c.sha256 > ? ORDER BY c.sha256 LIMIT ?")
     .bind(accountId, cursor, PHASE1_MAX_ROWS)
     .all<{ sha256: string; marked_at: number; size_bytes: number | null }>();
+  const scanned = cands.results ?? [];
   let purged = 0;
   let released = 0;
   let resurrected = 0;
   const dropped: string[] = []; // shas this purge removed this account's ref for (condemn-eligible)
-  for (const cand of cands.results ?? []) {
-    const sha = cand.sha256;
-    if (reachable.has(sha)) {
-      // Re-referenced since the mark (a deduped commit re-entered roots) → un-mark.
-      await db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha).run();
-      resurrected++;
-      continue;
-    }
-    if (nowMs - Number(cand.marked_at) < graceMs) continue; // not past grace yet
-    const size = Number(cand.size_bytes ?? 0);
-
-    // ATOMIC re-confirm + delete + conditional release + marker-clear (one db.batch = one
-    // transaction). The release/delete statements re-read `blob_ref_candidates` INSIDE the
-    // transaction (spec §3.3: "re-read inside the delete transaction, never from the stale
-    // mark-pass list"). This closes the race where a concurrent (re-)grant CLEARS the marker
-    // (un-condemns the ref) between this purge's candidate snapshot and its delete: if the marker
-    // is gone the batch no-ops, so we never drop a ref the commit path just re-established. The
-    // release requires the ref to still EXIST and runs BEFORE the delete, so a crash can't drop
-    // the row without the decrement, and two concurrent purges can't double-release (D1 serializes
-    // the batch; the second sees the marker/ref already gone). The marker-clear is the 3rd
-    // statement — folded into the same transaction so it's atomic with the drop (and the guard
-    // statements above read the marker before it's deleted, in order).
-    const guard = "EXISTS (SELECT 1 FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?)";
-    const batchRes = await db.batch([
-      db
-        .prepare(
-          `UPDATE accounts SET used_bytes = MAX(0, used_bytes - ?) WHERE id = ? AND EXISTS (SELECT 1 FROM blob_refs WHERE account_id = ? AND sha256 = ?) AND ${guard}`,
-        )
-        .bind(size, accountId, accountId, sha, accountId, sha),
-      db.prepare(`DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ? AND ${guard}`).bind(accountId, sha, accountId, sha),
-      db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha),
-    ]);
-    if ((batchRes[1]?.meta.changes ?? 0) === 1) {
-      purged++;
-      released += size;
-      dropped.push(sha);
-    }
-  }
-
-  // Condemn (for the MANUAL Phase 2 R2 sweep — Phase 1 never deletes an R2 object) every dropped
-  // sha now GLOBALLY unreferenced. `encSha` is account-unique (no cross-account sharing), so once
-  // this account's last ref drops the blob is orphaned — but the COUNT guard holds regardless.
-  // ONE chunked existence probe + ONE batched INSERT, instead of per-candidate round-trips.
   let condemned = 0;
-  const orphaned: string[] = [];
-  for (let i = 0; i < dropped.length; i += 80) {
-    const chunk = dropped.slice(i, i + 80);
-    if (chunk.length === 0) break;
-    const ph = chunk.map(() => "?").join(",");
-    const stillRef = await db.prepare(`SELECT DISTINCT sha256 FROM blob_refs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
-    const referenced = new Set((stillRef.results ?? []).map((r) => r.sha256));
-    for (const sha of chunk) if (!referenced.has(sha)) orphaned.push(sha);
+  let lastProcessedSha = cursor;
+  let completed = false;
+  try {
+    for (let i = 0; i < scanned.length; i += INSERT_CHUNK) {
+      const pageChunk = scanned.slice(i, i + INSERT_CHUNK);
+      const eligible = pageChunk.filter((cand) => !reachable.has(cand.sha256) && nowMs - Number(cand.marked_at) >= graceMs);
+      const reentered = pageChunk.filter((cand) => reachable.has(cand.sha256));
+      const statements: D1PreparedStatement[] = [];
+      const guard = "EXISTS (SELECT 1 FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?)";
+
+      // ATOMIC re-confirm + delete + conditional release + marker-clear. A chunk is one
+      // coarser transaction (<=33 rows / 99 guarded statements) with the SAME per-row
+      // guards and ordering as the old one-row transactions. Each release/delete re-reads
+      // `blob_ref_candidates` INSIDE the transaction (§33 §3.3), so a concurrent regrant
+      // that clears the marker makes that row's triple no-op. UPDATE precedes ref DELETE,
+      // and marker-clear remains third, preventing missed or double releases.
+      for (const cand of eligible) {
+        const sha = cand.sha256;
+        const size = Number(cand.size_bytes ?? 0);
+        statements.push(
+          db
+            .prepare(
+              `UPDATE accounts SET used_bytes = MAX(0, used_bytes - ?) WHERE id = ? AND EXISTS (SELECT 1 FROM blob_refs WHERE account_id = ? AND sha256 = ?) AND ${guard}`,
+            )
+            .bind(size, accountId, accountId, sha, accountId, sha),
+          db.prepare(`DELETE FROM blob_refs WHERE account_id = ? AND sha256 = ? AND ${guard}`).bind(accountId, sha, accountId, sha),
+          db.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?").bind(accountId, sha),
+        );
+      }
+      // Re-referenced since mark (a deduped commit re-entered roots) → bulk un-mark.
+      // This statement shares the page chunk's transaction, keeping mixed pages at one
+      // D1 subrequest per 33 scanned candidates while counting only actual deletions.
+      if (reentered.length > 0) {
+        statements.push(
+          db
+            .prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${reentered.map(() => "?").join(",")})`)
+            .bind(accountId, ...reentered.map((cand) => cand.sha256)),
+        );
+      }
+      if (statements.length > 0) {
+        const batchRes = await db.batch(statements);
+        for (let k = 0; k < eligible.length; k++) {
+          if ((batchRes[3 * k + 1]?.meta.changes ?? 0) !== 1) continue;
+          const cand = eligible[k]!;
+          purged++;
+          released += Number(cand.size_bytes ?? 0);
+          dropped.push(cand.sha256);
+        }
+        if (reentered.length > 0) resurrected += batchRes.at(-1)?.meta.changes ?? 0;
+      }
+      // A cursor advances only after every action in this SHA-ordered slice committed.
+      // Thus finally can persist a safe contiguous prefix after any later failure.
+      lastProcessedSha = pageChunk.at(-1)!.sha256;
+    }
+
+    // Condemn (for the MANUAL Phase 2 R2 sweep — Phase 1 never deletes an R2 object) every dropped
+    // sha now GLOBALLY unreferenced. `encSha` is account-unique (no cross-account sharing), so once
+    // this account's last ref drops the blob is orphaned — but the COUNT guard holds regardless.
+    // ONE chunked existence probe + ONE batched INSERT, instead of per-candidate round-trips.
+    const orphaned: string[] = [];
+    for (let i = 0; i < dropped.length; i += 80) {
+      const chunk = dropped.slice(i, i + 80);
+      if (chunk.length === 0) break;
+      const ph = chunk.map(() => "?").join(",");
+      const stillRef = await db.prepare(`SELECT DISTINCT sha256 FROM blob_refs WHERE sha256 IN (${ph})`).bind(...chunk).all<{ sha256: string }>();
+      const referenced = new Set((stillRef.results ?? []).map((r) => r.sha256));
+      for (const sha of chunk) if (!referenced.has(sha)) orphaned.push(sha);
+    }
+    for (let i = 0; i < orphaned.length; i += INSERT_CHUNK) {
+      const chunk = orphaned.slice(i, i + INSERT_CHUNK);
+      if (chunk.length === 0) break;
+      const c = await db.batch([
+        db
+          .prepare(`INSERT OR IGNORE INTO gc_candidates (sha256, kind, marked_at) VALUES ${chunk.map(() => "(?, 'blob', ?)").join(", ")}`)
+          .bind(...chunk.flatMap((sha) => [sha, nowMs])),
+      ]);
+      condemned += c[0]?.meta.changes ?? 0;
+    }
+    completed = true;
+  } finally {
+    await writeCursor(db, cursorKey, completed && scanned.length < PHASE1_MAX_ROWS ? "" : lastProcessedSha);
   }
-  for (let i = 0; i < orphaned.length; i += INSERT_CHUNK) {
-    const chunk = orphaned.slice(i, i + INSERT_CHUNK);
-    if (chunk.length === 0) break;
-    const c = await db.batch([
-      db
-        .prepare(`INSERT OR IGNORE INTO gc_candidates (sha256, kind, marked_at) VALUES ${chunk.map(() => "(?, 'blob', ?)").join(", ")}`)
-        .bind(...chunk.flatMap((sha) => [sha, nowMs])),
-    ]);
-    condemned += c[0]?.meta.changes ?? 0;
-  }
-  const scanned = cands.results ?? [];
-  await writeCursor(db, cursorKey, scanned.length < PHASE1_MAX_ROWS ? "" : scanned.at(-1)!.sha256);
   return { purged, released, resurrected, condemned };
 }
 
