@@ -53,6 +53,27 @@ interface ServerTimings {
   responseMs: number;
 }
 
+export async function loadFenceProbe(db: D1Database, accountId: string): Promise<{
+  markedSet: Set<string>; intentSet: Set<string>; markedProbeSkipped: boolean; intentOverCap: boolean; observedMarks: number;
+}> {
+  const [markedRows, intentRows] = await Promise.all([
+    db.prepare("SELECT sha256 FROM blob_ref_candidates WHERE account_id = ? LIMIT ?").bind(accountId, FENCE_SET_MAX + 1).all<{ sha256: string }>(),
+    db.prepare("SELECT sha256 FROM gc_candidates WHERE deleting_at IS NOT NULL LIMIT ?").bind(FENCE_SET_MAX + 1).all<{ sha256: string }>(),
+  ]);
+  const markedProbeSkipped = markedRows.results.length > FENCE_SET_MAX;
+  return {
+    markedSet: markedProbeSkipped ? new Set() : new Set(markedRows.results.map((r) => r.sha256)),
+    intentSet: new Set(intentRows.results.map((r) => r.sha256)),
+    markedProbeSkipped,
+    intentOverCap: intentRows.results.length > FENCE_SET_MAX,
+    observedMarks: markedRows.results.length,
+  };
+}
+
+export function shouldUseDeltaAdmission(deltaMode: string, delta: DeltaResult | undefined, fallback: string | undefined): boolean {
+  return deltaMode === "enforce" && !!delta && !fallback && !delta.markedProbeSkipped;
+}
+
 async function quotaExceededBody(db: D1Database, accountId: string, overCap: { used: number; cap: number; reason?: "no_plan" }) {
   if (overCap.reason === "no_plan") return { error: "quota_exceeded", used: overCap.used, cap: overCap.cap, reason: "no_plan" as const };
   const row = await db.prepare("SELECT plan FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string }>();
@@ -283,14 +304,14 @@ export class WorkspaceSync {
       }
 
       const fenceStarted = Date.now();
-      const [markedRows, intentRows] = await Promise.all([
-        db.prepare("SELECT sha256 FROM blob_ref_candidates WHERE account_id = ? LIMIT ?").bind(accountId, FENCE_SET_MAX + 1).all<{ sha256: string }>(),
-        db.prepare("SELECT sha256 FROM gc_candidates WHERE deleting_at IS NOT NULL LIMIT ?").bind(FENCE_SET_MAX + 1).all<{ sha256: string }>(),
-      ]);
+      const probe = await loadFenceProbe(db, accountId);
       phase("fenceQueryMs", fenceStarted);
-      if (markedRows.results.length > FENCE_SET_MAX || intentRows.results.length > FENCE_SET_MAX) return { fallback: "fence_over_cap", admitData: [] };
+      if (probe.intentOverCap) return { fallback: "fence_over_cap", admitData: [] };
+      const markedProbeSkipped = probe.markedProbeSkipped;
+      if (markedProbeSkipped) emitDelta(this.env, "marks_over_cap", { count: probe.observedMarks });
       const diffStarted = Date.now();
-      const delta = mergeAddedShas(parentBuf, childBuf, new Set(markedRows.results.map((r) => r.sha256)), new Set(intentRows.results.map((r) => r.sha256)));
+      const delta = mergeAddedShas(parentBuf, childBuf, probe.markedSet, probe.intentSet);
+      delta.markedProbeSkipped = markedProbeSkipped;
       phase("diffMs", diffStarted);
       if (delta.intentCarriedHit) return { fallback: "fence_violation", admitData: [] };
       emitDelta(this.env, "sizes", { count: delta.addedCount, ratio: delta.carriedCount, bytes: delta.removedCount });
@@ -563,7 +584,7 @@ export class WorkspaceSync {
               const compareReadStarted = Date.now();
               const flags = await this.readShadowFlags(db, accountId, [...new Set([...carriers, ...dataShas])]);
               emitDelta(this.env, "compareReadMs", { count: Date.now() - compareReadStarted });
-              const cmp = classifyShadow({ childShas: dataShas, carriers, addedSet: new Set(delta.added), markedCarriedSet: new Set(delta.markedCarried), flags, receiptKeys: new Set(Object.keys(receipts)) });
+              const cmp = classifyShadow({ childShas: dataShas, carriers, addedSet: new Set(delta.added), markedCarriedSet: new Set(delta.markedCarried), markedProbeSkipped: delta.markedProbeSkipped ?? false, flags, receiptKeys: new Set(Object.keys(receipts)) });
               if (cmp.divergent) {
                 const d = divergenceDigest(cmp.harmful);
                 emitDelta(this.env, "divergence", { count: cmp.harmful.length, digest: d.digest, sample: d.sample });
@@ -580,7 +601,11 @@ export class WorkspaceSync {
             }
           }
           // design 102 enforce — flag-gated, not enabled in this PR.
-          const dataShas = deltaMode === "enforce" && delta && !fallback ? admitData : fullChildShas();
+          if (deltaMode === "enforce" && delta && !fallback && delta.markedProbeSkipped) {
+            emitDelta(this.env, "fallback", { reason: "marks_over_cap" });
+          }
+          const useDelta = shouldUseDeltaAdmission(deltaMode, delta, fallback);
+          const dataShas = useDelta ? admitData : fullChildShas();
           const response = await runFullAdmission([...new Set([...carriers, ...chainShas, ...dataShas])]);
           if (response) return response;
         }

@@ -11,6 +11,7 @@ export interface DeltaResult {
   addedCount: number;
   removedCount: number;
   carriedCount: number;
+  markedProbeSkipped: boolean;
 }
 
 /** Merge two ascending SHA lists into one ascending list without duplicates. */
@@ -45,20 +46,21 @@ export function mergeAddedShas(parentBuf: Uint8Array, childBuf: Uint8Array, mark
   let addedCount = 0;
   let removedCount = 0;
   let carriedCount = 0;
-  let prevAddedHex = "";
-  let prevChildHex = "";
+  let prevAddedOff = -1;
   let i = 0;
   let j = 0;
-  const readChild = (off: number): string => {
-    const sha = bytes32ToHex(childBuf, off);
-    if (j > 0 && sha <= prevChildHex) throw new Error("delta: child not strictly ascending");
-    prevChildHex = sha;
-    return sha;
+  const validateChild = (off: number): void => {
+    if (j > 0 && compare32(childBuf, off - REFSET_REC, childBuf, off) >= 0) {
+      throw new Error("delta: child not strictly ascending");
+    }
   };
   const pushAdded = (off: number): void => {
-    const sha = readChild(off);
-    if (addedCount > 0 && sha <= prevAddedHex) throw new Error("delta: child not strictly ascending");
-    prevAddedHex = sha;
+    validateChild(off);
+    if (prevAddedOff >= 0 && compare32(childBuf, prevAddedOff, childBuf, off) >= 0) {
+      throw new Error("delta: child not strictly ascending");
+    }
+    const sha = bytes32ToHex(childBuf, off);
+    prevAddedOff = off;
     added.push(sha);
     addedCount++;
   };
@@ -67,10 +69,13 @@ export function mergeAddedShas(parentBuf: Uint8Array, childBuf: Uint8Array, mark
     const cOff = REFSET_HEADER + REFSET_REC * j;
     const cmp = compare32(parentBuf, pOff, childBuf, cOff);
     if (cmp === 0) {
+      validateChild(cOff);
       carriedCount++;
-      const sha = readChild(cOff);
-      if (intentSet.has(sha)) intentCarriedHit = true;
-      if (markedSet.has(sha)) markedCarried.push(sha);
+      if (markedSet.size > 0 || intentSet.size > 0) {
+        const sha = bytes32ToHex(childBuf, cOff);
+        if (intentSet.has(sha)) intentCarriedHit = true;
+        if (markedSet.has(sha)) markedCarried.push(sha);
+      }
       i++;
       j++;
     } else if (cmp < 0) {
@@ -86,7 +91,7 @@ export function mergeAddedShas(parentBuf: Uint8Array, childBuf: Uint8Array, mark
     pushAdded(REFSET_HEADER + REFSET_REC * j);
     j++;
   }
-  return { added, markedCarried, intentCarriedHit, addedCount, removedCount, carriedCount };
+  return { added, markedCarried, intentCarriedHit, addedCount, removedCount, carriedCount, markedProbeSkipped: false };
 }
 
 export interface ShadowFlags {
@@ -103,6 +108,7 @@ export interface ShadowInput {
   markedCarriedSet: Set<string>;
   flags: Map<string, ShadowFlags>;
   receiptKeys: Set<string>;
+  markedProbeSkipped: boolean;
 }
 
 export interface ShadowResult {
@@ -126,9 +132,13 @@ export function classifyShadow(input: ShadowInput): ShadowResult {
   for (const sha of input.childShas) {
     if (input.addedSet.has(sha) || haveFull(sha)) continue;
     const f = input.flags.get(sha) ?? { present: false, entitled: false, marked: false, activeIntent: false };
-    if (f.present && f.entitled && f.marked && !f.activeIntent) benign.push(sha);
-    else harmful.push(sha);
-    if (!input.markedCarriedSet.has(sha)) assertionFailed = true;
+    if (f.present && f.entitled && f.marked && !f.activeIntent) {
+      benign.push(sha);
+      if (!input.markedProbeSkipped && !input.markedCarriedSet.has(sha)) assertionFailed = true;
+    } else {
+      harmful.push(sha);
+      if (!input.markedCarriedSet.has(sha)) assertionFailed = true;
+    }
   }
   return { harmful, benign, divergent: harmful.length > 0 || assertionFailed };
 }

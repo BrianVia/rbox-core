@@ -1,7 +1,7 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { phase1Mark, phase1Purge, reconcileUsage, perAccountReachable, runPhase1 } from "../src/gc-phase1.js";
+import { PHASE1_MAX_ROWS, phase1Audit, phase1Mark, phase1Purge, reconcileUsage, perAccountReachable, runPhase1 } from "../src/gc-phase1.js";
 import { validateCommitRefs, commitAccounting } from "../src/commit-accounting.js";
 import { grantEntitlementWithQuota } from "../src/billing.js";
 import { mintReceipt } from "../src/receipts.js";
@@ -51,10 +51,81 @@ beforeEach(async () => {
     db().prepare("DELETE FROM blobs"),
     db().prepare("DELETE FROM accounts"),
     db().prepare("DELETE FROM workspaces"),
+    db().prepare("DELETE FROM gc_state"),
   ]);
 });
 
 describe("§33 mark → grace → purge (the leak fix)", () => {
+  it("bounds and advances phase-1 mark cursor across pages", async () => {
+    await mkAccount("a");
+    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i += 100) {
+      const values = Array.from({ length: Math.min(100, PHASE1_MAX_ROWS + 1 - i) }, (_, j) => `m${String(i + j).padStart(4, "0")}`);
+      for (const sha of values) await addRef("a", sha, 1, NOW - 2 * HOUR);
+    }
+    expect((await phase1Mark(db(), "a", EMPTY, HOUR, NOW)).marked).toBe(PHASE1_MAX_ROWS);
+    expect((await phase1Mark(db(), "a", EMPTY, HOUR, NOW)).marked).toBe(1);
+  });
+
+  it("bounds and drains phase-1 purge cursor across pages", async () => {
+    await mkAccount("a");
+    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i++) {
+      const sha = `p${String(i).padStart(4, "0")}`;
+      await addRef("a", sha, 1, NOW - 4 * HOUR);
+      await mark("a", sha, NOW - 2 * HOUR);
+    }
+    const first = await phase1Purge(db(), "a", EMPTY, HOUR, NOW);
+    expect(first.purged).toBe(PHASE1_MAX_ROWS);
+    const second = await phase1Purge(db(), "a", EMPTY, HOUR, NOW);
+    expect(second.purged).toBe(1);
+    expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(0);
+  });
+
+  it("isolates phase-1 purge cursors per account", async () => {
+    await mkAccount("small");
+    await mkAccount("large");
+    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i++) {
+      const sha = `large-${String(i).padStart(4, "0")}`;
+      await addRef("large", sha, 1, NOW - 4 * HOUR);
+      await mark("large", sha, NOW - 2 * HOUR);
+    }
+    for (let i = 0; i < 3; i++) {
+      const sha = `small-${i}`;
+      await addRef("small", sha, 1, NOW - 4 * HOUR);
+      await mark("small", sha, NOW - 2 * HOUR);
+    }
+
+    expect((await phase1Purge(db(), "small", EMPTY, HOUR, NOW)).purged).toBe(3);
+    expect((await phase1Purge(db(), "large", EMPTY, HOUR, NOW)).purged).toBe(PHASE1_MAX_ROWS);
+
+    const cursors = await db()
+      .prepare("SELECT k, v FROM gc_state WHERE k IN (?, ?) ORDER BY k")
+      .bind("p1_purge_cursor:large", "p1_purge_cursor:small")
+      .all<{ k: string; v: string }>();
+    expect(cursors.results).toEqual([
+      { k: "p1_purge_cursor:large", v: JSON.stringify(`large-${String(PHASE1_MAX_ROWS - 1).padStart(4, "0")}`) },
+      { k: "p1_purge_cursor:small", v: JSON.stringify("") },
+    ]);
+
+    expect((await phase1Purge(db(), "large", EMPTY, HOUR, NOW)).purged).toBe(1);
+    expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(0);
+  });
+
+  it("audits phase-1 candidates read-only with resurrection, purge, and release totals", async () => {
+    await mkAccount("a");
+    await addRef("a", "live", 5, NOW - 3 * HOUR);
+    await addRef("a", "dead", 7, NOW - 3 * HOUR);
+    await mark("a", "live", NOW - 2 * HOUR);
+    await mark("a", "dead", NOW - 2 * HOUR);
+    const before = Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n);
+    const fakeEnv = { ...env, WORKSPACE_SYNC: { ...env.WORKSPACE_SYNC } };
+    // No workspaces means per-account reachability is empty; add a focused roots fixture for live.
+    await db().prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES ('w','p','a',?)").bind(NOW).run();
+    fakeEnv.WORKSPACE_SYNC = { idFromName: (n: string) => env.WORKSPACE_SYNC.idFromName(n), get: () => ({ fetch: async () => Response.json({ head: 1, pruneFloor: 0, indexGeneration: 1, indexSyncedSeq: 1, gap: [{ seq: 1, manifestSha: "live", chainRefs: [] }], droppedPage: [], seqRootsPage: [] }) }) } as unknown as DurableObjectNamespace;
+    const audit = await phase1Audit(fakeEnv, HOUR, null, 10, NOW).then((r) => r.json()) as Record<string, number>;
+    expect(audit).toMatchObject({ examined: 2, wouldResurrect: 1, wouldPurge: 1, wouldRelease: 7 });
+    expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_ref_candidates").first())!.n)).toBe(before);
+    expect(await refExists("a", "dead")).toBe(true);
+  });
   it("keeps every chain link returned by a live retained head out of phase-1 condemnation", async () => {
     await mkAccount("chain-live");
     const chain = ["chain-live-a", "chain-live-b"];

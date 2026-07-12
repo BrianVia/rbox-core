@@ -2,7 +2,7 @@ import { eq, type RouteCtx } from "./shared.js";
 import { json } from "../util.js";
 import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
-import { runPhase1 } from "../gc-phase1.js";
+import { phase1Audit, runPhase1 } from "../gc-phase1.js";
 import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcMark, gcPurge } from "../versions.js";
 import { adminOverview, fetchDeltaSoak } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
@@ -42,6 +42,9 @@ export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Res
     // §33 Phase 1 (per-account entitlement prune; D1-only, cron-safe). Same handler that
     // runs on cron, exposed for on-demand runs/tests. Phase 2's same executor is also
     // exposed below as the kill-switch-immune supervised escape hatch.
+    if (phase === "phase1" && url.searchParams.get("dryRun") === "1") {
+      return phase1Audit(env, graceMs, url.searchParams.get("cursor"), Number(url.searchParams.get("limit") ?? "100"));
+    }
     if (phase === "phase1") return runPhase1(env, graceMs);
     if (phase === "purge" && url.searchParams.get("dryRun") === "1") {
       return gcAudit(env, graceMs, url.searchParams.get("cursor"), Number(url.searchParams.get("limit") ?? "100"));

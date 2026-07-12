@@ -706,6 +706,15 @@ begins** (§11); thereafter they are fixed:
 | `FENCE_SET_MAX` | 50,000 | §3.5A.4 |
 | `DIVERGENCE_SAMPLE` | 16 SHAs | §5 |
 
+**Q3 decision (prod-soak evidence).** Keep `FENCE_SET_MAX` for the
+safety-critical active-intent probe: over-cap still falls back. An over-cap
+`blob_ref_candidates` probe instead skips the optional carried-ref regrant; this
+is benign marker divergence, never a full fallback. The delta path therefore
+runs independently of mark-table size while memory remains bounded to
+`FENCE_SET_MAX + 1` rows. Prod exposed 230,033 marks (80% of one account's refs),
+all past the 24h grace, because unbounded Phase-1 mark work threw before purge;
+Phase-1 mark and purge are now capped and cursored like `openIntents`.
+
 ---
 
 ## 8. Out of scope
@@ -771,6 +780,9 @@ and rollback is a var flip, not a redeploy.
    commit atop an unreadable retained head (refusing would wedge the workspace,
    GC/prune already fail-closed). Acceptable, or should a corrupt retained head
    hard-reject new commits with a retryable integrity error until repaired?
-3. **`FENCE_SET_MAX` / `FOLD_MAX_REFS` interplay.** Fence-probe cap vs a paginated
-   probe; and whether the 250k `MAX_REFS_PER_COMMIT` cap should drop if the §7 gate
-   4 heap budget is not met.
+3. **`FENCE_SET_MAX` / `FOLD_MAX_REFS` interplay — DECIDED.** The 50k cap remains
+   fail-safe for active deletion intents (over-cap → full fallback). Mark-probe
+   over-cap skips regrant and stays on the delta path; the missed marker clear is
+   benign because Phase-1 resurrects a head-reachable ref. Both probes materialize
+   at most `FENCE_SET_MAX + 1` rows. Revisit the separate 250k commit cap only if
+   the §7 gate 4 heap budget is not met.
