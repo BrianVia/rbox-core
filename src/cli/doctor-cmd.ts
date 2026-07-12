@@ -6,7 +6,7 @@ import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, daemonLogPaths, readDaemonBindingRecord } from "./daemon-control.js";
-import { loadDevice } from "./e2ee-keystore.js";
+import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
 import { verifyAndParseManifest } from "./upgrade-cmd.js";
@@ -26,7 +26,7 @@ const NOTICE =
   "this includes your daemon log tail, which contains file and folder names/paths from this workspace, your device id, and raw error messages; it is stored UNENCRYPTED for support for 30 days.";
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
 
-type CheckName = "credentials" | "enrollment" | "daemon" | "remote" | "version" | "state" | "crypto";
+type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" | "version" | "state" | "crypto";
 
 export interface DoctorCheck {
   ok: boolean;
@@ -133,6 +133,21 @@ async function checkEnrollment(creds: Credentials | undefined): Promise<DoctorCh
   } catch {
     return { ok: false, label: "encryption", message: "could not read local key material", hint: "check `~/.rbox/e2ee` permissions" };
   }
+}
+
+export async function checkDeviceIdentity(creds: Credentials | undefined, cfg: WorkspaceConfig): Promise<DoctorCheck> {
+  // Intentionally stricter than the resolver: a workspace deliberately bound with --new-device/--device should surface as a dangling identity mismatch.
+  const enrolled = await enrolledDeviceId(creds?.accountId);
+  if (!enrolled) return { ok: true, label: "device", message: "no enrolled device identity" };
+  if (cfg.deviceId !== enrolled) {
+    return {
+      ok: false,
+      label: "device",
+      message: `workspace uses ${cfg.deviceId}; this machine is ${enrolled}`,
+      hint: "re-run `rbox init` / `rbox track` to rebind to this machine's device, or `rbox doctor` for details",
+    };
+  }
+  return { ok: true, label: "device", message: `device ${enrolled}` };
 }
 
 function checkDaemon(root: string, cfg: WorkspaceConfig): { check: DoctorCheck; stale: boolean } {
@@ -284,9 +299,10 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
   const creds = await loadCredentials();
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, remote, version, state, shape, chain] = await Promise.all([
+  const [credentials, enrollment, device, remote, version, state, shape, chain] = await Promise.all([
     checkCredentials(creds),
     checkEnrollment(creds),
+    checkDeviceIdentity(creds, cfg),
     checkRemote(creds, cfg),
     checkVersion(creds, cfg),
     checkState(root, cfg),
@@ -301,7 +317,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     creds,
     daemonStale: daemon.stale,
     workspaceShape: shape,
-    checks: { credentials, enrollment, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), chain },
+    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), chain },
   };
 }
 
@@ -406,7 +422,7 @@ function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
 
 export function renderDoctor(checks: DoctorChecks): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "daemon", "remote", "version", "state", "crypto", "chain"] as const) {
+  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "chain"] as const) {
     const c = checks[key];
     if (!c) continue;
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);

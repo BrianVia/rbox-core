@@ -13,7 +13,7 @@ import {
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "./crypto.js";
-import { __cryptoPoolTestHooks, cryptoPoolStatus, withCryptoPool } from "./crypto-pool.js";
+import { __cryptoPoolTestHooks, cryptoPoolStatus, shutdownCryptoPool, withCryptoPool } from "./crypto-pool.js";
 
 const ENV_KEYS = ["RBOX_CRYPTO_WORKERS", "RBOX_CRYPTO_POOL_MIN_JOBS", "RBOX_CRYPTO_WORKER_TEST_DELAY_MS"] as const;
 let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string>>;
@@ -65,6 +65,25 @@ async function compareInlineAndWorker(content: Buffer, opts: EncryptFileOptions)
 }
 
 describe("crypto worker pool", () => {
+  test("shutdown terminates an active worker pool", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-shutdown-"));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-shutdown-ct-"));
+    try {
+      const src = path.join(root, "file.txt");
+      await fs.writeFile(src, "shutdown regression");
+      const kek = generateKek();
+      await withCryptoPool(kek, 1, 1, async () => {
+        await encryptFileToTemp(src, kek, tmpDir, { compress: false });
+      });
+      expect(cryptoPoolStatus().workers).toBeGreaterThan(0);
+      await shutdownCryptoPool();
+      expect(cryptoPoolStatus().workers).toBe(0);
+      expect(cryptoPoolStatus().state).toBe("idle");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
   test("worker encryption is byte-identical to inline for raw, buffered compressed, and streaming compressed blobs", async () => {
     await compareInlineAndWorker(randomBytes(16 * 1024), { compress: false });
     await compareInlineAndWorker(Buffer.from("buffered compression\n".repeat(20_000)), { compress: true });
