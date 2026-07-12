@@ -7,6 +7,19 @@ import { dbFor } from "./db.js";
 // Max rows per multi-row INSERT so bound params stay within D1's ≤100/statement limit
 // (≤3 params/row → 33 rows = 99). Shared by the batched mark + condemn inserts below.
 const INSERT_CHUNK = 33;
+// Keep a cron tick's D1 subrequests bounded: mark is ~cap/33 insert batches and
+// purge is at most cap atomic db.batch calls, never O(account refs) (§102 Q3).
+export const PHASE1_MAX_ROWS = 2_000;
+
+async function readCursor(db: D1Database, key: string): Promise<string> {
+  const row = await db.prepare("SELECT v FROM gc_state WHERE k = ?").bind(key).first<{ v: string }>();
+  if (!row) return "";
+  try { return String(JSON.parse(row.v) ?? ""); } catch { return ""; }
+}
+
+async function writeCursor(db: D1Database, key: string, value: string): Promise<void> {
+  await db.prepare("INSERT INTO gc_state (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(key, JSON.stringify(value)).run();
+}
 
 // §33 Phase 1 — per-account reachability GC (the leak-closing, shardable, cron-safe
 // phase). PURE D1: it reclaims a `blob_refs` row + its `used_bytes` charge for refs
@@ -51,9 +64,11 @@ export async function phase1Mark(
   graceMs: number,
   nowMs: number,
 ): Promise<{ marked: number }> {
+  const cursorKey = `p1_mark_cursor:${accountId}`;
+  const cursor = await readCursor(db, cursorKey);
   const refs = await db
-    .prepare("SELECT sha256, granted_at FROM blob_refs WHERE account_id = ?")
-    .bind(accountId)
+    .prepare("SELECT sha256, granted_at FROM blob_refs WHERE account_id = ? AND sha256 > ? ORDER BY sha256 LIMIT ?")
+    .bind(accountId, cursor, PHASE1_MAX_ROWS)
     .all<{ sha256: string; granted_at: number }>();
   const toMark: string[] = [];
   for (const ref of refs.results ?? []) {
@@ -74,6 +89,8 @@ export async function phase1Mark(
     ]);
     marked += r[0]?.meta.changes ?? 0;
   }
+  const scanned = refs.results ?? [];
+  await writeCursor(db, cursorKey, scanned.length < PHASE1_MAX_ROWS ? "" : scanned.at(-1)!.sha256);
   return { marked };
 }
 
@@ -98,12 +115,14 @@ export async function phase1Purge(
   graceMs: number,
   nowMs: number,
 ): Promise<{ purged: number; released: number; resurrected: number; condemned: number }> {
+  const cursorKey = `p1_purge_cursor:${accountId}`;
+  const cursor = await readCursor(db, cursorKey);
   // Hoist each candidate's blob size into the candidates query (LEFT JOIN) — no per-candidate
   // `SELECT size_bytes`. LEFT JOIN: an orphan marker with no `blobs` row yields NULL → 0 (the
   // EXISTS(blob_refs) guard already makes its release a no-op).
   const cands = await db
-    .prepare("SELECT c.sha256, c.marked_at, b.size_bytes FROM blob_ref_candidates c LEFT JOIN blobs b ON b.sha256 = c.sha256 WHERE c.account_id = ?")
-    .bind(accountId)
+    .prepare("SELECT c.sha256, c.marked_at, b.size_bytes FROM blob_ref_candidates c LEFT JOIN blobs b ON b.sha256 = c.sha256 WHERE c.account_id = ? AND c.sha256 > ? ORDER BY c.sha256 LIMIT ?")
+    .bind(accountId, cursor, PHASE1_MAX_ROWS)
     .all<{ sha256: string; marked_at: number; size_bytes: number | null }>();
   let purged = 0;
   let released = 0;
@@ -172,7 +191,47 @@ export async function phase1Purge(
     ]);
     condemned += c[0]?.meta.changes ?? 0;
   }
+  const scanned = cands.results ?? [];
+  await writeCursor(db, cursorKey, scanned.length < PHASE1_MAX_ROWS ? "" : scanned.at(-1)!.sha256);
   return { purged, released, resurrected, condemned };
+}
+
+interface Phase1AuditCandidate { account_id: string; sha256: string; marked_at: number; size_bytes: number | null; entitled: number }
+
+/** Read-only operator audit of Phase-1 marks; no durable cursor or candidate writes. */
+export async function phase1Audit(env: Env, graceMs: number, cursor: string | null, requestedLimit: number, nowMs: number = Date.now()): Promise<Response> {
+  const limit = Math.max(1, Math.min(PHASE1_MAX_ROWS, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 100));
+  const split = cursor?.indexOf("\n") ?? -1;
+  const cursorAccount = split >= 0 ? cursor!.slice(0, split) : "";
+  const cursorSha = split >= 0 ? cursor!.slice(split + 1) : "";
+  const rows = await dbFor(env, "")
+    .prepare(`SELECT c.account_id, c.sha256, c.marked_at, b.size_bytes,
+        EXISTS (SELECT 1 FROM blob_refs r WHERE r.account_id=c.account_id AND r.sha256=c.sha256) entitled
+      FROM blob_ref_candidates c LEFT JOIN blobs b ON b.sha256=c.sha256
+      WHERE c.account_id > ? OR (c.account_id = ? AND c.sha256 > ?)
+      ORDER BY c.account_id, c.sha256 LIMIT ?`)
+    .bind(cursorAccount, cursorAccount, cursorSha, limit + 1)
+    .all<Phase1AuditCandidate>();
+  const page = (rows.results ?? []).slice(0, limit);
+  const reachableByAccount = new Map<string, Set<string>>();
+  let wouldResurrect = 0;
+  let wouldPurge = 0;
+  let wouldRelease = 0;
+  for (const candidate of page) {
+    let reachable = reachableByAccount.get(candidate.account_id);
+    if (!reachable) {
+      reachable = await perAccountReachable(env, candidate.account_id);
+      reachableByAccount.set(candidate.account_id, reachable);
+    }
+    if (reachable.has(candidate.sha256)) wouldResurrect++;
+    else if (Number(candidate.marked_at) < nowMs - graceMs) {
+      wouldPurge++;
+      if (candidate.entitled) wouldRelease += Number(candidate.size_bytes ?? 0);
+    }
+  }
+  const hasMore = (rows.results?.length ?? 0) > limit;
+  const last = page.at(-1);
+  return json({ examined: page.length, wouldResurrect, wouldPurge, wouldRelease, cursor: hasMore && last ? `${last.account_id}\n${last.sha256}` : null, limit });
 }
 
 /**
