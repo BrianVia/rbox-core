@@ -5,9 +5,62 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-12 (night) — **v1.2.0 RELEASED + fleet upgraded** ("the Mac gets fast"): APFS bulk scans (−43%, stat=0 live), fold evidence working fleet-wide (0.4–1.5s reads), 104 field-confirmed, 85 Layer A, GC Phase-1 lifecycle fixed + 229k marks drained (35.3GB released), soak endpoint + propagation analyzer (p50 16.7s publish→apply, 0 staleness). Fleet flags: Ubuntu PREFLIGHT+FUSE+MDE×3; Mac +RETRUST+SCAN_BULK. In flight: scan fault isolation + mass-delete breaker PR; 102 soak accumulating (accelerator running); Mac fresh-publish benchmark queued; CI-runner workspace hygiene queued._
+_Last updated: 2026-07-12 (night) — **v1.2.0 RELEASED + fleet upgraded** ("the Mac gets fast"): APFS bulk scans (−43%, stat=0 live), fold evidence fleet-wide (0.4–1.5s reads), 104 field-confirmed, 85 Layer A, GC Phase-1 fixed + 229k marks drained (35.3GB released), soak endpoint + propagation analyzer (p50 16.7s publish→apply, 0 staleness). Then: greenfield benchmark 578s (84% of bytes = git history) → design 108; WS reliability #242 live; init device-identity bug found+contained (INCIDENT #3 below)._
 
 _Prior header: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
+
+## 2026-07-12 night — greenfield 578s (84% git history) → design 108; WS reliability live; device-identity bug (INCIDENT #3)
+
+- **Greenfield benchmark** (Mac APFS clone, new workspace, full stack):
+  **578s**, 88k files / 114,787 blobs / **2.5 GiB up, 2.1 GiB of it git
+  packs** (four 118–640MB packs; #230 multipart instrumentation decomposed
+  them, zero retries). Encryption no longer the pole; uplink × git-pack
+  volume is. Cross-workspace dedup impossible BY DESIGN (per-workspace keys).
+  **Design 108 (files-first publish) cycle running**: files (~0.4 GiB ≈
+  60–90s) commit first, history streams after; time-to-files-synced ≤120s =
+  the greenfield KPI.
+- **Design 105 reliability MERGED (#242) + fleet-live** (pong deadline 60s,
+  5-min jittered backstop, session cap off until env set, notify_latency_ms
+  token — first live sample 4726ms).
+- **INCIDENT #3 (contained; product bug found):** bench `rbox init --new`
+  **clobbered the Mac's machine-global device identity** — the main daemon
+  pushed as the bench device (dev_932d7c02…) → ~200 probe conflicts, stale
+  re-push of a deleted worktree, one git-sync conflict (local kept; bundle at
+  .rbox/git-conflicts/remote-1783881771569.bundle), and a silent STATUS.md
+  working-tree revert that briefly regressed main's copy (repaired). No
+  tracked-file damage. **BUG (next cycle): multi-workspace init must scope
+  device identity, not overwrite global.** OPEN: Mac daemon still runs as
+  dev_932d7c02 (same account/keys; cosmetics) — adopt-and-revoke-orphans or
+  restore: founder's call. Bench workspaces ws_79529b0d/ws_67eb29f6 (+2.5GiB
+  R2) need server-side deletion. Dogfooding hazard noted: rbox syncing this
+  repo can overwrite uncommitted working files during churn — commit docs
+  promptly.
+- **Gaps filed:** init publish doesn't render FirstPublishStats (folded into
+  108); scan-stats accumulator double-count observed once (benign).
+
+## 2026-07-12 evening — macOS perf sprint (founder: "sorted TODAY"); CI runners ate the disk (fixed)
+
+- **APFS bulk-scan SHIPPED same-day (#241, design 107):** `getattrlistbulk`
+  via bun:ffi behind `RBOX_SCAN_BULK=1` (darwin-only, per-dir readdir
+  fallback on any FFI failure, flag-off byte-identical). Real-corpus Mac
+  bench: warm full scan **5466ms → 3137ms p50 (−43%)**, per-file stat phase
+  eliminated; parity 0 mismatches across 117k files + 20k-assert unit suite;
+  independent fable-5 review no-blockers. LIVE on the Mac now (verification
+  pass pending). Pre-default-on gate documented in design 107 (iCloud
+  dataless + non-APFS mounts unverified; ATTR_CMN_FLAGS hardening spec'd);
+  dircache composition = follow-up.
+- **Design 104 CONFIRMED working in the field:** Mac log shows transient
+  drop → suspect → "re-trusted after clean full-tree scan" → trusted. The
+  ~11% idle I/O duty fix is real.
+- **INCIDENT #2 (fixed in minutes):** the 8 self-hosted CI runner containers
+  accumulated **~760GB** of writable layers from today's merge volume and
+  filled the host disk to 100%. `docker compose up -d --force-recreate
+  --scale rbox-core=8` reclaimed 732GB; 8/8 runners back online. FOLLOW-UP
+  REQUIRED: runner job-workspace cleanup (ephemeral mode or work-dir tmpfs in
+  ~/gh-runners/docker-compose.yml) so merge-heavy days can't refill it.
+- **Commit accelerator running** (probe write/45s) to feed the design-102
+  soak toward its sample gate; soak counters need a clean post-fence-fix
+  window read before the enforce decision.
 
 ## 2026-07-12 evening — mark backlog DRAINED; soak collecting at full fidelity
 
