@@ -1217,6 +1217,8 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   // encrypt, wire on upload — each strictly positive for a real one-file push.
   expect(j.phases.scan!.plaintextBytes).toBe(Buffer.byteLength(content));
   expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "dircacheOutcome",
+    "dirsReusedFromCache",
     "dirsWalked",
     "filesHashed",
     "filesSkippedCacheHit",
@@ -1249,6 +1251,7 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   expect(lines.length).toBe(1);
   expect(lines[0]).not.toContain("x.txt");
   expect(lines[0]).toContain("scan");
+  expect(lines[0]).toContain("reuse0 dc:off");
   expect(lines[0]).toContain("commit");
   expect(lines[0]).toContain("r0.0 sc0.0 e0.0 c0.0 u0.0 p0.0 7B");
 });
@@ -1266,6 +1269,8 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   expect(j.blobs).toBe(1); // one write action applied
   expect(Object.keys(j.phases.latest!.details ?? {}).sort()).toEqual(["decryptMs", "downloadMs", "encBytes", "parseMs"]);
   expect(Object.keys(j.phases.scan!.details ?? {}).sort()).toEqual([
+    "dircacheOutcome",
+    "dirsReusedFromCache",
     "dirsWalked",
     "filesHashed",
     "filesSkippedCacheHit",
@@ -1283,6 +1288,7 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   const lines: string[] = [];
   report.logSummaryTo((l) => lines.push(l));
   expect(lines[0]).toContain("latest");
+  expect(lines[0]).toContain("reuse0 dc:off");
   expect(lines[0]).toContain("d0.0 x0.0 p0.0 4B");
 });
 

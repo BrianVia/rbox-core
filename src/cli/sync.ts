@@ -3,11 +3,13 @@ import {
   buildIgnoreMatcher,
   diffManifests,
   isIgnoreRuleFile,
+  DirCache,
   HashCache,
   PhaseReport,
   createScanStats,
   reconcile,
   scanManifest,
+  scanPruneEnabled,
   validateManifest,
   manifestRequiresSchema4,
   type Action,
@@ -112,7 +114,7 @@ const scanDetailsOf = (s: ScanStats, wallMs: number, midwriteDeferred: number): 
   midwriteDeferred,
 });
 const formatScanStats = (s: ScanDetails): string =>
-  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred}`;
+  `rd${fmtDetailSeconds(s.readdirMs)} st${fmtDetailSeconds(s.statMs)} mt${fmtDetailSeconds(s.matcherMs)} h${fmtDetailSeconds(s.hashMs)} srt${fmtDetailSeconds(s.sortMs)} res${fmtDetailSeconds(s.residualMs)} d${s.dirsWalked} f${s.filesStatted} hit${s.filesSkippedCacheHit} defer${s.midwriteDeferred} reuse${s.dirsReusedFromCache} dc:${s.dircacheOutcome}`;
 /** mk=mkdir/cr=created, walk=dir components, uniq=dirs, ls=lstat, rn=rename,
  * stg=stages, pre=preflight, pool=write pool, sm/lg=count and bytes. */
 export const formatApplyStats = (s: ApplyStats): string =>
@@ -138,6 +140,9 @@ export interface SyncDeps {
    * inherit this exact handle and must never reacquire the workspace mutex. */
   syncMutex?: WorkspaceSyncMutex;
   cache?: HashCache;
+  /** Optional caller-owned directory cache. Foreground scans load their own only
+   * when Layer A is explicitly enabled. */
+  dircache?: DirCache;
   remote?: SyncRemote;
   backoff?: (attempt: number) => Promise<void>;
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
@@ -209,6 +214,18 @@ async function withCache(
   return { cache, save: () => cache.save(root) };
 }
 
+/** Either use the caller's dircache, load+save one when Layer A is enabled, or
+ * stay entirely inert on the default-off path. */
+async function withDircache(
+  root: string,
+  provided: DirCache | undefined
+): Promise<{ dircache: DirCache | undefined; save: () => Promise<void> }> {
+  if (!scanPruneEnabled()) return { dircache: undefined, save: async () => {} };
+  if (provided) return { dircache: provided, save: async () => {} };
+  const dircache = await DirCache.load(root);
+  return { dircache, save: () => dircache.save(root) };
+}
+
 async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promise<void> {
   const remote = deps.remote as WriteContextProvider | undefined;
   if (typeof remote?.currentKek !== "function") {
@@ -226,18 +243,19 @@ async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promis
 export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<Manifest> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
+  const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   if (scanStats) {
     const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
     report.recordDetails("scan", { ...details }, formatScanStats(details));
   }
-  await save();
+  await Promise.all([save(), dircacheSave()]);
   return local;
 }
 
@@ -287,6 +305,7 @@ export async function applyPulledManifest(
 
   const state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const { cache, save } = await withCache(root, deps.cache);
+  const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
   const matcher = matcherForState(root, cfg, state);
   const scanStats = report.enabled ? deps.scanStats : undefined;
   // Counting-only deferral sink: pull intentionally acts on no deferred set
@@ -294,7 +313,7 @@ export async function applyPulledManifest(
   // but the §6.1 details still report how many paths the P-1 guard dropped.
   const scanDeferred = new Set<string>();
   const scanT0 = Date.now();
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
   const scanWallMs = Date.now() - scanT0;
   if (report.enabled) {
     report.files = fileCountOf(local);
@@ -398,7 +417,7 @@ export async function applyPulledManifest(
       cache.invalidate(a.keepLocalAs);
     }
   }
-  await report.phase("cache-save", save);
+  await report.phase("cache-save", () => Promise.all([save(), dircacheSave()]).then(() => undefined));
 
   // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
   // scope-projected identity, per-repo base advance (one busy repo never blocks the
@@ -463,15 +482,16 @@ export async function push(
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
+  const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred));
+  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
-  await save();
+  await Promise.all([save(), dircacheSave()]);
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });

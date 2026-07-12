@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
-import type { Dirent, Stats } from "node:fs";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import { indexByPath } from "./diff.js";
 import type { DiscoveredGitRepo } from "./git-discover.js";
 import { hashBytes, hashFile } from "./hash.js";
 import type { HashCache } from "./hashcache.js";
-import { buildIgnoreMatcher, type IgnoreMatcher } from "./ignore.js";
+import { DirCache, UNPRUNED_DEADLINE_MS, type DirCacheChild, type DircacheOutcome, type RuleFileRecord } from "./dircache.js";
+import { buildIgnoreMatcher, isIgnoreRuleFile, type IgnoreMatcher } from "./ignore.js";
 import type { FileEntry, Manifest } from "./types.js";
 
 export type WatchEventKind = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
@@ -39,6 +40,8 @@ export interface ScanStats {
   matcherMs: number;
   hashMs: number;
   sortMs: number;
+  dirsReusedFromCache: number;
+  dircacheOutcome: DircacheOutcome;
 }
 
 export interface DirProbeSample {
@@ -66,6 +69,8 @@ export function createScanStats(): ScanStats {
     matcherMs: 0,
     hashMs: 0,
     sortMs: 0,
+    dirsReusedFromCache: 0,
+    dircacheOutcome: "off",
   };
 }
 
@@ -88,24 +93,128 @@ export async function scanManifest(
   scanStats?: ScanStats,
   /** Out-param: files that changed between discovery and their deferred hash. */
   deferred?: Set<string>,
-  dirProbe?: DirProbeSink
+  dirProbe?: DirProbeSink,
+  dircache?: DirCache,
+  mode: "pruned" | "unpruned" = "unpruned"
 ): Promise<Manifest> {
-  const files: FileEntry[] = [];
+  const scanStartMs = Date.now();
+  if (!dircache) {
+    const files: FileEntry[] = [];
+    if (scanStats) { scanStats.dircacheOutcome = "off"; scanStats.dirsReusedFromCache = 0; }
+    const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs, scanStats, deferred, dirProbe, onProgress, onGitRepo });
+    await runWalk(ctx, "", files);
+    sortManifestFiles(files, scanStats);
+    return { generatedAt: new Date().toISOString(), files };
+  }
+
+  const priorRuleFiles = new Set(dircache.ruleFiles.map((record) => record.relPath));
+  let effectiveMode: "pruned" | "unpruned" = mode;
+  let outcome: DircacheOutcome = mode === "unpruned" ? "unpruned" : "cold";
+  if (mode === "pruned") {
+    // Self-demotion classification only — the walk loop drops the table for ANY
+    // unpruned effective mode (`if (effectiveMode === "unpruned") dircache.dropTable()`),
+    // so an extra drop here would be redundant.
+    if (dircache.lastScanStartMs > scanStartMs || dircache.lastUnprunedScanAtMs > scanStartMs ||
+        dircache.lastUnprunedScanAtMs === 0 || scanStartMs - dircache.lastUnprunedScanAtMs > UNPRUNED_DEADLINE_MS) {
+      effectiveMode = "unpruned"; outcome = "deadline";
+    } else if (!(await dircache.validateRuleInventory(root))) {
+      effectiveMode = "unpruned"; outcome = "rules-dropped";
+    }
+  }
+
+  let winningStats = createScanStats();
+  let winningCtx: WalkCtx;
+  let files: FileEntry[];
+  for (let attempt = 0; ; attempt++) {
+    files = [];
+    winningStats = createScanStats();
+    winningCtx = makeWalkCtx({ root, matcher, cache, dircache, mode: effectiveMode, scanStartMs, scanStats: winningStats, deferred, dirProbe, onProgress, onGitRepo, priorRuleFiles });
+    if (effectiveMode === "unpruned") dircache.dropTable();
+    try {
+      await runWalk(winningCtx, "", files);
+      // Post-walk rule re-validation (§3.1 fix 1): pre-walk validation only proves
+      // the inventory was intact when the walk STARTED. A rule file EDITED (or
+      // removed) mid-walk — after its dir was already traversed/reused — would
+      // otherwise be silently absorbed into the new inventory and never flagged,
+      // masking the change on the NEXT scan (which would then validate the new
+      // metadata and keep pruning under the changed rules). Re-validate the SAME
+      // prior inventory (still loaded until we restamp below); any disagreement
+      // forces the bounded unpruned restart. Appearance is already caught mid-walk;
+      // disappearance/edit is caught here (and pre-walk).
+      if (effectiveMode === "pruned" && !(await dircache.validateRuleInventory(root))) throw new RulesChangedDuringPrune();
+      break;
+    } catch (error) {
+      if (!(error instanceof RulesChangedDuringPrune) || attempt > 0) throw error;
+      effectiveMode = "unpruned";
+      outcome = "rules-dropped";
+      dircache.dropTable();
+    }
+  }
+
+  sortManifestFiles(files, winningStats);
+  const ruleFiles = await buildRuleFiles(root, winningCtx!.observedRuleFiles);
+  if (effectiveMode === "unpruned") dircache.stampUnprunedRebuild(scanStartMs, ruleFiles);
+  else {
+    dircache.stampPrunedScan(scanStartMs, ruleFiles);
+    outcome = winningStats.dirsReusedFromCache > 0 ? "hit" : "cold";
+  }
+  winningStats.dircacheOutcome = outcome;
+  // Record coverage-bearing outcome on the dircache itself (the thing that made the
+  // pruning decision) so callers derive watcher-re-trust coverage from a first-class
+  // source, never from the OPTIONAL metrics struct.
+  dircache.lastOutcome = outcome;
+  if (scanStats) mergeWinningStats(scanStats, winningStats);
+  return { generatedAt: new Date().toISOString(), files };
+}
+
+function sortManifestFiles(files: FileEntry[], scanStats?: ScanStats): void {
+  const t0 = scanStats ? Date.now() : 0;
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  if (scanStats) scanStats.sortMs += Date.now() - t0;
+}
+
+function mergeWinningStats(target: ScanStats, source: ScanStats): void {
+  for (const key of ["dirsWalked", "filesStatted", "filesSkippedCacheHit", "filesHashed", "readdirMs", "statMs", "matcherMs", "hashMs", "sortMs"] as const) target[key] += source[key];
+  target.dirsReusedFromCache = source.dirsReusedFromCache;
+  target.dircacheOutcome = source.dircacheOutcome;
+}
+
+async function buildRuleFiles(root: string, observed: Set<string>): Promise<RuleFileRecord[]> {
+  observed.add(".gitignore");
+  observed.add(".rboxignore");
+  return Promise.all([...observed].sort().map((relPath) => DirCache.statRuleFile(root, relPath)));
+}
+
+/** Per-scan inputs to {@link makeWalkCtx}; a named object so the many optional
+ *  same-typed args cannot be transposed at a call site. */
+interface WalkCtxOptions {
+  root: string;
+  matcher: IgnoreMatcher;
+  cache?: HashCache;
+  dircache?: DirCache;
+  mode: WalkCtx["mode"];
+  scanStartMs: number;
+  scanStats?: ScanStats;
+  deferred?: Set<string>;
+  dirProbe?: DirProbeSink;
+  onProgress?: (discovered: number) => void;
+  onGitRepo?: (repo: DiscoveredGitRepo) => void;
+  priorRuleFiles?: Set<string>;
+}
+
+function makeWalkCtx(o: WalkCtxOptions): WalkCtx {
   let discovered = 0;
+  const onProgress = o.onProgress;
   const onDiscover = onProgress
     ? () => {
         if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
       }
     : undefined;
-  await walk(root, "", matcher, files, cache, undefined, onDiscover, onGitRepo, false, scanStats, deferred, dirProbe);
-  if (scanStats) {
-    const t0 = Date.now();
-    files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    scanStats.sortMs += Date.now() - t0;
-  } else {
-    files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  }
-  return { generatedAt: new Date().toISOString(), files };
+  return {
+    root: o.root, matcher: o.matcher, cache: o.cache, dircache: o.dircache, mode: o.mode,
+    scanStartMs: o.scanStartMs, scanStats: o.scanStats, deferred: o.deferred, dirProbe: o.dirProbe,
+    onDiscover, onGitRepo: o.onGitRepo, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
+  };
 }
 
 /**
@@ -167,7 +276,8 @@ export async function applyWatchEvents(
         // because it's UNSTABLE, not gone — keep its prior entry out of the
         // authoritative-subtree cleanup, and surface it for the caller's retry.
         const subDeferred = new Set<string>();
-        await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false, undefined, subDeferred);
+        const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs: Date.now(), deferred: subDeferred });
+        await runWalk(ctx, rel, sub);
         const fresh = new Set(sub.map((e) => e.path));
         for (const k of [...map.keys()]) {
           if ((k === rel || k.startsWith(prefix)) && !fresh.has(k) && !subDeferred.has(k)) {
@@ -200,7 +310,8 @@ export async function applyWatchEvents(
     } else if (ev.kind === "addDir") {
       if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
       const sub: FileEntry[] = [];
-      await walk(root, rel, matcher, sub, cache, undefined, undefined, undefined, false, undefined, deferred);
+      const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs: Date.now(), deferred });
+      await runWalk(ctx, rel, sub);
       for (const e of sub) map.set(e.path, e);
     } else {
       // add | change
@@ -275,71 +386,109 @@ interface PendingHash {
 
 const HASH_CONCURRENCY = 16; // bound on parallel hashing — saturates disk without fd storms
 
-async function walk(
-  root: string,
-  rel: string,
-  matcher: IgnoreMatcher,
-  out: FileEntry[],
-  cache?: HashCache,
-  pending?: PendingHash[],
-  onDiscover?: () => void,
-  onGitRepo?: (repo: DiscoveredGitRepo) => void,
-  discoveryPruned = false,
-  scanStats?: ScanStats,
-  deferred?: Set<string>,
-  dirProbe?: DirProbeSink
-): Promise<void> {
-  // Top-level call owns the pending list + drains it in parallel at the end;
-  // recursive calls share the same list.
-  const isRoot = pending === undefined;
-  const toHash = pending ?? [];
+interface WalkCtx {
+  root: string;
+  matcher: IgnoreMatcher;
+  cache?: HashCache;
+  dircache?: DirCache;
+  mode: "pruned" | "unpruned" | "off";
+  scanStartMs: number;
+  scanStats?: ScanStats;
+  deferred?: Set<string>;
+  dirProbe?: DirProbeSink;
+  onDiscover?: () => void;
+  onGitRepo?: (repo: DiscoveredGitRepo) => void;
+  priorRuleFiles: Set<string>;
+  observedRuleFiles: Set<string>;
+}
 
-  let entries: Dirent[];
-  const readdirStart = dirProbe ? Date.now() : 0;
-  if (scanStats) {
-    const t0 = Date.now();
-    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
-    scanStats.readdirMs += Date.now() - t0;
-    scanStats.dirsWalked += 1;
-  } else {
-    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+class RulesChangedDuringPrune extends Error {}
+
+async function walk(
+  ctx: WalkCtx,
+  rel: string,
+  out: FileEntry[],
+  toHash: PendingHash[],
+  discoveryPruned: boolean
+): Promise<void> {
+  const absDir = path.join(ctx.root, rel);
+  let dirStat: Stats | undefined;
+  let children: DirCacheChild[] | undefined;
+  if (ctx.mode !== "off" && ctx.dircache) {
+    dirStat = await fs.lstat(absDir);
+    if (ctx.mode === "pruned") children = ctx.dircache.reuse(rel, dirStat);
   }
-  if (dirProbe) {
+  const reused = children !== undefined;
+  let rawEntryCount = children?.length ?? 0;
+  // Probe projection is INDEPENDENT of the traversal listing: the P0.2 sidecar
+  // (RBOX_SCAN_PROBE, separate from Layer A) counts every readdir entry — including
+  // fifos/sockets/devices, mapped to "file" — exactly as before Layer A, so its
+  // projectedBytes stays byte-identical. The dircache stores only file/dir/symlink.
+  let probeProjectedBytes = 0;
+  const readdirStart = ctx.dirProbe && !reused ? Date.now() : 0;
+  if (reused) {
+    if (ctx.scanStats) ctx.scanStats.dirsReusedFromCache += 1;
+  } else {
+    const t0 = ctx.scanStats ? Date.now() : 0;
+    const entries = await fs.readdir(absDir, { withFileTypes: true });
+    if (ctx.scanStats) {
+      ctx.scanStats.readdirMs += Date.now() - t0;
+      ctx.scanStats.dirsWalked += 1;
+    }
+    rawEntryCount = entries.length;
+    children = entries.flatMap((entry): DirCacheChild[] => entry.isDirectory()
+      ? [{ name: entry.name, type: "dir" }]
+      : entry.isSymbolicLink() ? [{ name: entry.name, type: "symlink" }]
+      : entry.isFile() ? [{ name: entry.name, type: "file" }] : []);
+    if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
+    if (ctx.dirProbe) probeProjectedBytes = Buffer.byteLength(JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }))));
+  }
+  if (ctx.dirProbe && !reused) {
     const readdirMs = Date.now() - readdirStart;
     const overheadStart = Date.now();
-    const st = await fs.lstat(path.join(root, rel));
-    const children = entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }));
-    dirProbe.record({
+    const st = dirStat ?? await fs.lstat(absDir);
+    ctx.dirProbe.record({
       key: hashBytes(Buffer.from(rel)).slice(0, 16),
       mtimeMs: st.mtimeMs,
       ctimeMs: st.ctimeMs,
       readdirMs,
-      childCount: entries.length,
-      projectedBytes: Buffer.byteLength(JSON.stringify(children)),
+      childCount: rawEntryCount,
+      projectedBytes: probeProjectedBytes,
     });
-    dirProbe.probeOverheadMs += Date.now() - overheadStart;
+    ctx.dirProbe.probeOverheadMs += Date.now() - overheadStart;
   }
-  for (const entry of entries) {
-    const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-    const abs = path.join(root, childRel);
-    if (entry.name === ".git") {
+  for (const child of children!) {
+    const childRel = rel ? `${rel}/${child.name}` : child.name;
+    const abs = path.join(ctx.root, childRel);
+    // Rule-file inventory tracking is dircache-only; skip the per-child string work
+    // entirely on the "off" (no-dircache) path so it stays zero-new-work.
+    if (ctx.mode !== "off" && isIgnoreRuleFile(childRel)) {
+      ctx.observedRuleFiles.add(childRel);
+      if (!reused && ctx.mode === "pruned" && !ctx.priorRuleFiles.has(childRel)) throw new RulesChangedDuringPrune();
+    }
+    if (child.name === ".git") {
       const relPath = rel === "" ? "." : rel;
-      if (!discoveryPruned && entry.isDirectory()) onGitRepo?.({ relPath, kind: "dir" });
-      else if (!discoveryPruned && entry.isFile()) onGitRepo?.({ relPath, kind: "pointer" });
+      if (!discoveryPruned && child.type === "dir") ctx.onGitRepo?.({ relPath, kind: "dir" });
+      else if (!discoveryPruned && child.type === "file") ctx.onGitRepo?.({ relPath, kind: "pointer" });
     }
 
-    if (entry.isDirectory()) {
+    if (child.type === "dir") {
       const childDir = `${childRel}/`;
       const childDiscoveryPruned =
         discoveryPruned ||
-        (scanStats
-          ? timedMatcher(scanStats, () => matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir))
-          : matcher.prunesForGitDiscovery?.(childDir) ?? matcher.ignores(childDir));
-      if (scanStats ? timedMatcher(scanStats, () => matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) : matcher.prunes?.(childDir) ?? matcher.ignores(childDir)) continue;
-      await walk(root, childRel, matcher, out, cache, toHash, onDiscover, onGitRepo, childDiscoveryPruned, scanStats, deferred, dirProbe);
-    } else if (entry.isSymbolicLink()) {
-      if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
-      onDiscover?.();
+        (ctx.scanStats
+          ? timedMatcher(ctx.scanStats, () => ctx.matcher.prunesForGitDiscovery?.(childDir) ?? ctx.matcher.ignores(childDir))
+          : ctx.matcher.prunesForGitDiscovery?.(childDir) ?? ctx.matcher.ignores(childDir));
+      if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.prunes?.(childDir) ?? ctx.matcher.ignores(childDir)) : ctx.matcher.prunes?.(childDir) ?? ctx.matcher.ignores(childDir)) continue;
+      try {
+        await walk(ctx, childRel, out, toHash, childDiscoveryPruned);
+      } catch (error) {
+        if (reused && ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR")) continue;
+        throw error;
+      }
+    } else if (child.type === "symlink") {
+      if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
+      ctx.onDiscover?.();
       const target = await fs.readlink(abs);
       out.push({
         path: childRel,
@@ -350,24 +499,31 @@ async function walk(
         mode: 0o777,
         mtimeMs: 0,
       });
-    } else if (entry.isFile()) {
-      if (scanStats ? timedMatcher(scanStats, () => matcher.ignores(childRel)) : matcher.ignores(childRel)) continue;
-      onDiscover?.();
+    } else {
+      if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
+      ctx.onDiscover?.();
       let st: Stats;
-      if (scanStats) {
+      if (ctx.scanStats) {
         const t0 = Date.now();
         try {
           st = await fs.stat(abs);
+        } catch (error) {
+          if (reused && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
         } finally {
-          scanStats.statMs += Date.now() - t0;
+          ctx.scanStats.statMs += Date.now() - t0;
         }
-        scanStats.filesStatted += 1;
+        ctx.scanStats.filesStatted += 1;
       } else {
-        st = await fs.stat(abs);
+        try { st = await fs.stat(abs); }
+        catch (error) {
+          if (reused && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
       }
-      const cached = cache?.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs);
+      const cached = ctx.cache?.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs);
       if (cached) {
-        if (scanStats) scanStats.filesSkippedCacheHit += 1;
+        if (ctx.scanStats) ctx.scanStats.filesSkippedCacheHit += 1;
         out.push({ path: childRel, type: "file", sha256: cached, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
       } else {
         // Defer the hash — sequential per-file hashing dominates a cold scan.
@@ -375,17 +531,24 @@ async function walk(
       }
     }
   }
+}
 
-  if (isRoot && toHash.length > 0) {
-    if (scanStats) {
-      scanStats.filesHashed += toHash.length;
-      const t0 = Date.now();
-      await drainHashes(toHash, out, cache, deferred);
-      scanStats.hashMs += Date.now() - t0;
-    } else {
-      await drainHashes(toHash, out, cache, deferred);
-    }
-  }
+async function finishHashes(ctx: WalkCtx, pending: PendingHash[], out: FileEntry[]): Promise<void> {
+  if (pending.length === 0) return;
+  if (ctx.scanStats) {
+    ctx.scanStats.filesHashed += pending.length;
+    const t0 = Date.now();
+    await drainHashes(pending, out, ctx.cache, ctx.deferred);
+    ctx.scanStats.hashMs += Date.now() - t0;
+  } else await drainHashes(pending, out, ctx.cache, ctx.deferred);
+}
+
+/** The "make a pending list, walk from `rel`, drain the deferred hashes" sequence
+ *  every top-level walk shares. `discoveryPruned` starts false at the top level. */
+async function runWalk(ctx: WalkCtx, rel: string, out: FileEntry[]): Promise<void> {
+  const toHash: PendingHash[] = [];
+  await walk(ctx, rel, out, toHash, false);
+  await finishHashes(ctx, toHash, out);
 }
 
 function timedMatcher(scanStats: ScanStats, fn: () => boolean): boolean {

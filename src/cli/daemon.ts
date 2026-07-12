@@ -8,8 +8,12 @@ import {
   diffManifests,
   isIgnoreRuleFile,
   HashCache,
+  DirCache,
+  coverageOf,
   createScanStats,
+  scanPruneEnabled,
   scanManifest,
+  UNPRUNED_DEADLINE_MS,
   type ScanStats,
   type IgnoreMatcher,
   type Manifest,
@@ -80,7 +84,11 @@ const RETRUST_FUSE_DROPS = envInt("RBOX_WATCHER_RETRUST_M", 6, 1, Number.MAX_SAF
 const RETRUST_HOLD_MAX_MS = SAFETY_SYNC_MAX_MS;
 const RETRUST_MIN_QUIET_TICKS = envInt("RBOX_WATCHER_RETRUST_K", 3, 1, Number.MAX_SAFE_INTEGER);
 const GC_FENCE_RETRY_MS = 6 * 60 * 60_000; // open purge intents live 24–48h; never hot-reupload
-const DEEP_SCAN_MS = 30 * 60_000; // infrequent cache-bypassing re-hash (heals mtime+size-stable drift)
+// Infrequent cache-bypassing re-hash (heals mtime+size-stable drift). Intentionally
+// THE SAME constant as the dircache's unpruned deadline (design 85 §3.1 decision 8):
+// the daemon's scheduled unpruned deep scan is exactly the periodic unpruned rebuild
+// the dircache staleness bound relies on, so one knob governs both by design.
+const DEEP_SCAN_MS = UNPRUNED_DEADLINE_MS;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 const WS_PING_MS = 25_000;
@@ -146,7 +154,7 @@ const errCode = (e: unknown): string =>
 
 export function scanStatsLine(kind: "safety scan" | "deep scan", stats: ScanStats, wallMs: number, deferred: number): string {
   const accounted = stats.readdirMs + stats.statMs + stats.matcherMs + stats.hashMs + stats.sortMs;
-  return `${kind}: files=${stats.filesStatted} dirs=${stats.dirsWalked} wall=${wallMs}ms readdir=${stats.readdirMs} stat=${stats.statMs} matcher=${stats.matcherMs} hash=${stats.hashMs} sort=${stats.sortMs} residual=${wallMs - accounted} cacheHits=${stats.filesSkippedCacheHit} hashed=${stats.filesHashed} deferred=${deferred}`;
+  return `${kind}: files=${stats.filesStatted} dirs=${stats.dirsWalked} wall=${wallMs}ms readdir=${stats.readdirMs} stat=${stats.statMs} matcher=${stats.matcherMs} hash=${stats.hashMs} sort=${stats.sortMs} residual=${wallMs - accounted} cacheHits=${stats.filesSkippedCacheHit} hashed=${stats.filesHashed} deferred=${deferred} reuse=${stats.dirsReusedFromCache} dc=${stats.dircacheOutcome}`;
 }
 
 interface OpenDriftAudit {
@@ -378,7 +386,7 @@ export class RboxDaemon {
     this.rebuildMatcher(initialState);
 
     // Initial convergence: full scan, then a real pull+push cycle.
-    await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest);
+    await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, "pruned");
     this.pruneCache();
     await this.cache.save(this.root);
     this.want.pull = true;
@@ -889,7 +897,7 @@ export class RboxDaemon {
       if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
         this.rebuildMatcher(await this.loadSyncBase());
         this.rulesChangedSinceDeepScan = true;
-        const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest);
+        const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, "pruned");
         await this.resolveDriftFromAppliedEvents(events, deferred);
       } else {
         const deferred = new Set<string>();
@@ -1026,7 +1034,7 @@ export class RboxDaemon {
     // Deferred paths carry the POST-pull base entry, never the pre-pull manifest —
     // carrying pre-pull truth would let the follow-up push publish a stale entry
     // over the version this pull just applied.
-    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest);
+    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, "pruned");
   }
 
   private bumpConflict(_kind: "commit"): void {
@@ -1410,7 +1418,7 @@ export class RboxDaemon {
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
-    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan");
+    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan", "pruned");
     if (metricsEnabled()) log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
@@ -1438,7 +1446,7 @@ export class RboxDaemon {
     const fresh = new HashCache();
     let scanResult: { freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" };
     try {
-      scanResult = await this.replaceManifestFromScan(fresh, this.manifest, stats, "deep scan");
+      scanResult = await this.replaceManifestFromScan(fresh, this.manifest, stats, "deep scan", "unpruned");
     } catch (error) {
       this.openDriftAudits.delete(audit);
       throw error;
@@ -1475,13 +1483,15 @@ export class RboxDaemon {
   /** Install a coherent full-scan result. A path that changed under its deferred
    *  hash carries `previous`'s entry (never a torn tuple, never a deletion) and
    *  enters the existing write-finish retry loop. */
-  private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats?: ScanStats, scanKind?: "safety scan" | "deep scan"): Promise<{ freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" }> {
+  private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats: ScanStats | undefined, scanKind: "safety scan" | "deep scan" | undefined, mode: "pruned" | "unpruned"): Promise<{ freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" }> {
     const deferred = new Set<string>();
     const probeOn = process.env.RBOX_SCAN_PROBE === "1" && scanKind !== undefined;
     const scanStartMs = Date.now();
     const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
     const probe = probeOn ? createScanProbe(priorProbe) : undefined;
-    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe);
+    const dircache = scanPruneEnabled() ? await DirCache.load(this.root) : undefined;
+    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe, dircache, mode);
+    await dircache?.save(this.root);
     this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
     if (probe) {
@@ -1490,13 +1500,12 @@ export class RboxDaemon {
       // Measurement only — a probe sidecar write failure must never fail the scan op.
       await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${errCode(e)}`));
     }
-    // Coverage originates HERE — the function that invokes the tree walker
-    // (`scanManifest`). Today every scan is a full unpruned walk ⇒ "full-tree".
-    // When design 85 Layer A lands, the pruning decision lives at this layer and
-    // MUST return "pruned" so a pruned scan can heal but never testify to
-    // re-trust (design 104 R1 F8 / codex impl-review M2). Callers forward this
-    // value unchanged — they never manufacture it.
-    return { freshManifest: fresh, deferred, coverage: "full-tree" };
+    // Coverage originates HERE — the function that invokes the tree walker. It is
+    // read from the DIRCACHE (the component that made the pruning decision), never
+    // from the optional metrics struct: a pruned scan can heal but must never
+    // testify to watcher re-trust (design 104 R1 F8). No dircache ⇒ unpruned walk ⇒
+    // "full-tree". Callers forward this value unchanged.
+    return { freshManifest: fresh, deferred, coverage: coverageOf(dircache?.lastOutcome ?? "off") };
   }
 
   /** Serialized sidecar transaction. `fn` returning false means "unchanged" and
