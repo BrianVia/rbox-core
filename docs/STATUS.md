@@ -5,7 +5,9 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-11 (evening) — design 103 IMPLEMENTED + ROLLED OUT (#218 code, #219 flags): missing preflight 2.8–4.0s → **0.1s measured on the live fleet**; both daemons on `1.0.0-dev+2cb1ac5` with `RBOX_PREFLIGHT_DELTA=1`; prod worker early-reject flag ON. Design-99 Phase-0: **GO — 86.8% encrypt cut [CI 84.1–87.7%]** (#220 merged; budget=96 MiB; determinism byte-identical; DOMINANT cost = concurrent streaming-zstd contention, not per-job overhead — Phase 1 gains a global fused-dispatch bound ~4–6; sync-zstd is 18× faster but address-breaking → parked as a separate founder decision). GC drain matures ~20:01Z._
+_Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
+
+_Prior entry (2026-07-11 evening): design 103 IMPLEMENTED + ROLLED OUT (#218 code, #219 flags): missing preflight 2.8–4.0s → **0.1s measured on the live fleet**; prod worker early-reject flag ON. Design-99 Phase-0: **GO — 86.8% encrypt cut [CI 84.1–87.7%]** (#220 merged; budget=96 MiB; determinism byte-identical; DOMINANT cost = concurrent streaming-zstd contention, not per-job overhead — Phase 1 gains a global fused-dispatch bound ~4–6; sync-zstd is 18× faster but address-breaking → parked as a separate founder decision). GC drain matures ~20:01Z._
 
 ## 2026-07-11 evening — design 103 built, validated, rolled out (same day as its design)
 
