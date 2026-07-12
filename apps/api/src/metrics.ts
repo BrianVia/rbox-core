@@ -46,6 +46,11 @@ import { DIVERGENCE_SAMPLE } from "./commit-delta.js";
  *    double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
  *    double9..15 = commit server total/envelope/accounting/sidecar/CAS/mirror/response ms
  *    double16 = earlyReject   (1 only when design-103's commit preflight rejects)
+ *
+ *  The multipart-complete phase decomposition (design 101 P0.2) is a SEPARATE
+ *  data point (`emitCompletePhases`, indexes ["multipart.complete.phases"]) —
+ *  the shared positional array above is near the AE 20-doubles cap, and per-op
+ *  decompositions follow the design-102 `emitDelta` precedent instead.
  */
 export interface MetricEvent {
   /** Low-cardinality op name, e.g. "request" | "commit" | "blob.put". */
@@ -130,6 +135,29 @@ export function emitDelta(env: Env, outcome: string, fields: DeltaMetricFields =
     if (fields.sample?.length) console.error(JSON.stringify({ event: "commit.delta.divergence", outcome, digest: fields.digest, sample: fields.sample.slice(0, DIVERGENCE_SAMPLE) }));
   } catch {
     // telemetry must never break commit admission
+  }
+}
+
+export interface CompletePhaseTimings {
+  totalMs: number;
+  assembleMs: number;
+  rereadPutMs: number;
+  cleanupMs: number;
+}
+
+/** Design 101 P0.2 — the multipart-complete phase decomposition as its own AE
+ * point (like `emitDelta`): blobs are [op,outcome], doubles are
+ * [totalMs, assembleMs, rereadPutMs, cleanupMs]. Numbers only; the frozen
+ * positional layout of the shared MetricEvent is untouched. */
+export function emitCompletePhases(env: Env, outcome: string, t: CompletePhaseTimings): void {
+  try {
+    env.rbox_metrics?.writeDataPoint({
+      indexes: ["multipart.complete.phases"],
+      blobs: ["multipart.complete.phases", outcome],
+      doubles: [t.totalMs, t.assembleMs, t.rereadPutMs, t.cleanupMs],
+    });
+  } catch {
+    // telemetry must never break the request path
   }
 }
 

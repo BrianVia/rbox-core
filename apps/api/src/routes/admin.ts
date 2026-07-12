@@ -6,14 +6,19 @@ import { runPhase1 } from "../gc-phase1.js";
 import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcMark, gcPurge } from "../versions.js";
 import { adminOverview } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
+import { multipartInventory } from "../multipart-inventory.js";
 
 /**
- * Platform-admin surfaces. `gc` and `account/:id/plan` require the PLATFORM secret
- * (isPlatform); `overview` is gated by a Cloudflare Access JWT + email allow-list
- * INSIDE adminOverview (defense in depth; NOT the rbox bearer) — so all three sit
- * BEFORE authenticate().
+ * Platform-admin surfaces. `gc`, `account/:id/plan`, and the read-only
+ * `multipart-inventory` require the PLATFORM secret (isPlatform); `overview` is
+ * gated by a Cloudflare Access JWT + email allow-list INSIDE adminOverview
+ * (defense in depth; NOT the rbox bearer) — so all four sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "GET" && eq(seg, ["v1", "admin", "multipart-inventory"])) {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    return multipartInventory(env, Date.now());
+  }
   // Platform-only internal op (M7): GC requires the PLATFORM secret, NOT a tenant
   // device token. roots/prune are not exposed by the public router (GC calls the DO directly).
   if (req.method === "POST" && eq(seg, ["v1", "admin", "gc"])) {
