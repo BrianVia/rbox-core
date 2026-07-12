@@ -17,7 +17,7 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
@@ -59,7 +59,8 @@ const sidecarShaOf = (manifest: Manifest): string => {
 };
 
 test("latest timing formatter appends the non-sensitive fold token", () => {
-  expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4, fold: "evidence" })).toEndWith("4B fold=evidence");
+  expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4, fold: "evidence", foldLinks: 2 })).toEndWith("4B fold=evidence f2");
+  expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 0, fold: "evidence", foldLinks: 0 })).toEndWith("0B fold=evidence f0");
   expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4 })).toBe("d0.0 x0.0 p0.0 4B");
 });
 
@@ -918,6 +919,143 @@ test("D FAST_PULL-only receiver bootstraps evidence through real pull persistenc
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest).toEqual(target);
 });
 
+test("R2 same-head real pull reuses persisted evidence with zero blob fetches", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r2-same-head", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, puller);
+    const base = deltaSizedManifest("r2-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const target = { ...base, generatedAt: "r2-target", files: base.files.map((f, i) => i === 3 ? { ...f, mode: 0o755 } : f) };
+    await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    const before = await loadState(root, syncStreamId(cfg));
+    server.store.getCalls = [];
+    const report = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller, report }));
+    expect(server.store.getCalls).toEqual([]);
+    expect((report.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number }).fold).toBe("evidence");
+    expect((report.toJSON().phases.latest!.details as { foldLinks?: number }).foldLinks).toBe(0);
+    const after = await loadState(root, syncStreamId(cfg));
+    expect(after.lastSyncedManifest).toEqual(before.lastSyncedManifest);
+    expect(after.manifestMeta).toEqual(before.manifestMeta);
+  });
+});
+
+test("R3 same-head evidence lazily self-heals corruption and then reuses the verified fold", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r3-same-head", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const base = deltaSizedManifest("r3-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const target = { ...base, generatedAt: "r3-target", files: base.files.map((f, i) => i === 3 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const corrupted = { ...target, generatedAt: "corrupted-local-state" };
+
+    server.store.getCalls = [];
+    let firstFold: string | undefined;
+    const healed = await puller.latest({
+      fastFoldBase: { manifest: corrupted, meta: second.manifestMeta! },
+      onLatestTimings: (timings) => { firstFold = timings.fold; },
+    });
+    expect(healed.manifest).toEqual(target);
+    expect(firstFold).toBe("coldwalk");
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
+
+    server.store.getCalls = [];
+    let secondFold: string | undefined;
+    const reused = await puller.latest({
+      fastFoldBase: { manifest: corrupted, meta: second.manifestMeta! },
+      onLatestTimings: (timings) => { secondFold = timings.fold; },
+    });
+    expect(reused.manifest).toEqual(target);
+    expect(secondFold).toBe("evidence");
+    expect(server.store.getCalls).toEqual([]);
+  });
+});
+
+test("R3 consecutive valid same-head pulls are both zero-fetch", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r3-zero-fetch", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const manifest = deltaSizedManifest("r3-zero-fetch");
+    const committed = await writer.commit(0, secrets.deviceId, manifest);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      server.store.getCalls = [];
+      await expect(puller.latest({ fastFoldBase: { manifest, meta: committed.manifestMeta! } }))
+        .resolves.toMatchObject({ manifest });
+      expect(server.store.getCalls).toEqual([]);
+    }
+  });
+});
+
+test("R1 daemon pull-push-pull cadence retains evidence for a head-only fold", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r1-daemon", NOW);
+    const writer = await remoteFor(server, secrets);
+    const receiver = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, receiver);
+    const c0 = deltaSizedManifest("r1-c0");
+    const first = await writer.commit(0, secrets.deviceId, c0);
+    const c1 = { ...c0, generatedAt: "r1-c1", files: c0.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    await writer.commit(1, secrets.deviceId, c1, { deltaBase: { manifest: c0, meta: first.manifestMeta! } });
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver }));
+    await fs.writeFile(path.join(root, "receiver-local.txt"), "local divergence\n");
+    await withFastPullFlag("1", () => push(root, cfg, { remote: receiver }));
+    const pushed = await writer.latest({ recordEvidence: true });
+    const target = { ...pushed.manifest, generatedAt: "r1-ambient", files: pushed.manifest.files.map((f, i) => i === 2 ? { ...f, mode: 0o700 } : f) };
+    const ambient = await writer.commit(pushed.sequence, secrets.deviceId, target, { deltaBase: { manifest: pushed.manifest, meta: pushed.manifestMeta! } });
+    server.store.getCalls = [];
+    const report = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report }));
+    expect(server.store.getCalls).toEqual([ambient.manifestMeta!.encManifestSha]);
+    expect((report.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number })).toMatchObject({ fold: "evidence", foldLinks: 1 });
+    expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest).toEqual(target);
+  });
+});
+
+test("R3 multi-link real pull fetches only the new suffix and head", async () => {
+  for (const advance of [2, 3]) await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, `devA-r3-suffix-${advance}`, NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, puller);
+    let manifest = deltaSizedManifest(`r3-base-${advance}`);
+    const snapshot = await writer.commit(0, secrets.deviceId, manifest);
+    manifest = { ...manifest, generatedAt: "r3-c1", files: manifest.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    let current = await writer.commit(1, secrets.deviceId, manifest, { deltaBase: { manifest: deltaSizedManifest(`r3-base-${advance}`), meta: snapshot.manifestMeta! } });
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    const expectedFetches: string[] = [];
+    for (let n = 0; n < advance; n++) {
+      const previous = manifest;
+      manifest = { ...previous, generatedAt: `r3-c${n + 2}`, files: previous.files.map((f, i) => i === n + 2 ? { ...f, mode: 0o700 - n } : f) };
+      current = await writer.commit(n + 2, secrets.deviceId, manifest, { deltaBase: { manifest: previous, meta: current.manifestMeta! } });
+      expectedFetches.push(current.manifestMeta!.encManifestSha);
+    }
+    server.store.getCalls = [];
+    const report = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller, report }));
+    expect([...server.store.getCalls].sort()).toEqual([...expectedFetches].sort());
+    expect(server.store.getCalls).not.toContain(snapshot.manifestMeta!.encManifestSha);
+    const after = await loadState(root, syncStreamId(cfg));
+    expect(after.lastSyncedManifest).toEqual(manifest);
+    expect(after.manifestMeta?.chain).toEqual(parseSignedCommit(server.commits.at(-1)!).manifestChain);
+    expect((report.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number })).toMatchObject({ fold: "evidence", foldLinks: advance });
+  });
+});
+
 async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
   const prev = process.env.RBOX_COMPRESS;
   if (value === undefined) delete process.env.RBOX_COMPRESS;
@@ -1335,6 +1473,29 @@ test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapsh
     expect(error).toBeInstanceOf(ManifestChainError);
     // The cold walk ran (chain blobs fetched) — the fast path did not accept.
     expect(server.store.getCalls).toContain(substitute.encManifestSha);
+  });
+});
+
+test("R4 evidence suffix rejects bytes substituted under a signed link address without refetching the prefix", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r4-suffix-address", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base = deltaSizedManifest("r4-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const m1 = { ...base, generatedAt: "r4-m1", files: base.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, m1, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const m2 = { ...m1, generatedAt: "r4-m2", files: m1.files.map((f, i) => i === 2 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, m2, { deltaBase: { manifest: m1, meta: second.manifestMeta! } });
+    const m3 = { ...m2, generatedAt: "r4-m3", files: m2.files.map((f, i) => i === 3 ? { ...f, mode: 0o600 } : f) };
+    const fourth = await writer.commit(3, secrets.deviceId, m3, { deltaBase: { manifest: m2, meta: third.manifestMeta! } });
+    server.store.blobs.set(third.manifestMeta!.encManifestSha, new Uint8Array(server.store.blobs.get(first.manifestMeta!.encManifestSha)!));
+    server.store.getCalls = [];
+    await expect(peer.latest({ fastFoldBase: { manifest: m1, meta: second.manifestMeta! } })).rejects.toBeInstanceOf(ManifestChainError);
+    expect(server.store.getCalls).toEqual([fourth.manifestMeta!.encManifestSha, third.manifestMeta!.encManifestSha]);
+    expect(server.store.getCalls).not.toContain(first.manifestMeta!.encManifestSha);
+    expect(server.store.getCalls).not.toContain(second.manifestMeta!.encManifestSha);
   });
 });
 

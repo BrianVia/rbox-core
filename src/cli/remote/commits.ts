@@ -66,6 +66,8 @@ export interface LatestTimings {
   parseMs: number;
   encBytes: number;
   fold?: "evidence" | "coldwalk" | "snapshot" | "raw";
+  /** Number of foldDelta calls executed while decoding this manifest. */
+  foldLinks?: number;
 }
 
 export interface LatestOptions {

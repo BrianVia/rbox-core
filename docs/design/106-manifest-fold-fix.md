@@ -108,3 +108,52 @@ String tokens are escaped incrementally with JSON.stringify-identical control,
 quote, and backslash spellings. The 64 KiB emitter never splits a valid UTF-16
 surrogate pair across hash updates, so even an unbounded scalar cannot create a
 document-sized temporary.
+
+## Round 2 — same-head and evidence-prefix folds
+
+The 2026-07-12 daemon soak confirmed that round 1's evidence guard only covered
+an advance of exactly one link. Real daemon pulls are dominated by an unchanged
+head, while ambient fleet churn commonly advances the head by two or more links;
+both cases therefore demoted to a full cold walk. Pull/push persistence itself
+was confirmed sound. A separate residual risk remains out of scope: a
+chronically pending or diverging git repository can suppress evidence carriage.
+
+For a current-head read, after `verifiedHead()` has signature-, chain-, pin-,
+account-, and roster-verified the signed commit, an exact match between its
+`encManifestSha` plus element-wise `manifestChain` and persisted evidence returns
+the applied evidence manifest and metadata directly. No blob exists to fetch or
+bind, so this path performs zero fetches and folds and reports
+`fold=evidence f0`. Historical reads cannot use this shortcut.
+Both evidence guards also require exact key and account epoch equality. F1
+evaluates those cheap identity conjuncts before any O(N) work. On an exact
+same-head match, a verified fold-LRU hit returns the previously authenticated
+manifest with zero fetch and zero hash; otherwise the carried manifest is
+streaming-hashed once against persisted `manifestHash`, cached on success, and
+returned. A mismatch demotes to a self-healing cold walk. This LRU reuse is safe
+despite round 1's ban on generic current-head cache returns: `verifiedHead()` has
+already re-run the account/roster gates, the complete signed identity equals
+§3.4 evidence, and no fetched bytes remain for `openCommit` to bind.
+
+For an advanced head, evidence is accepted only as an exact prefix: its chain
+must equal the signed-chain prefix and the next signed address must be the
+evidence head address. Only later signed links and the head are fetched. Each
+suffix link is address-authenticated against the signed list, required to be a
+delta, linkage-checked, and folded serially from the evidence manifest. F2 does
+no evidence pre-hash. The first fold uses the persisted verified manifest hash;
+every later fold uses the predecessor's newly verified result hash, and every
+result hash is recomputed. Corrupted carried state therefore fails closed via
+the fold's `resultHash` authority without adding a redundant O(N) pass.
+The head undergoes the same linkage and result verification. Guard mismatch
+alone demotes to the unchanged cold walk; any failure after guard acceptance is
+a `ManifestChainError` without a retry. Snapshot bytes propagate, chain bytes
+add only the fetched suffix and head ciphertexts, and the verified head is
+cached. `foldLinks` is exactly the number of `foldDelta` calls: zero for
+same-head/snapshot/raw, the new-link count for evidence folds, and the signed
+chain length for a cold walk.
+
+Suffix and cold paths use one link-walk helper. It fetches all requested signed
+addresses in parallel, releases ciphertext slots as it serially authenticates,
+decodes, linkage-checks, and folds them, and keeps snapshot/delta byte counters
+and download/decrypt timings distinct. Cold walking selects its terminal
+snapshot as the starting base; suffix walking supplies persisted evidence as
+the starting base.
