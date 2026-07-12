@@ -7,6 +7,41 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 midday — gate-compression sprint (founder: "resolve the gates ASAP"; update STATUS continuously)
+
+- **Gate 1 (84 fold) — FIXED + re-deployed.** #233 merged: root cause was a
+  bootstrap chicken-and-egg (fold evidence only persisted when WRITER caps
+  were on → a FAST_PULL receiver cold-walked forever) + foldDelta
+  canonicalizing the ~45MB manifest twice per fold (2k+1 materializations per
+  walk = the 7–8.5s and the 8GB RSS). Now: evidence persists under FAST_PULL,
+  streaming canonical hash (fuzz-proven byte-identical), trustedBaseHash
+  threading (each manifest hashed exactly once; resultHash always
+  recomputed), parallel prefetch + per-link buffer release. Bench (124k
+  entries, CI-gated): fold 603–713ms (gate <2s), RSS +216MB → +18–80MB.
+  New `fold=evidence|coldwalk|snapshot|raw` token on latest lines. Record:
+  docs/design/106-manifest-fold-fix.md + REVIEW-106. **Fleet re-flipped**: both
+  hosts on `1.1.0-dev+3628f0d` with full MDE flags; propagation re-benchmark
+  in flight (baseline 41.5s; v1.1.0-broken-fold run was 39.6s).
+- **Gate 2 (102 enforce) — soak was VACUOUS; unblock in progress.** New
+  machine-readable soak endpoint `/v1/admin/delta-soak` (#232, platform
+  secret; local AE SQL also works via CLOUDFLARE_ANALYTICS_TOKEN in repo-root
+  `.env` + account id via API). First query revealed: **fallback
+  fence_over_cap on 407/410 commits in 24h** — `blob_ref_candidates` has
+  230,033 rows vs FENCE_SET_MAX 50k, so shadow compares never ran; zero
+  divergence data is vacuous. Investigate+fix cycle running
+  (`impl/102-fence-probe`): mark-lifecycle diagnosis (is 230k a hygiene bug?)
+  + bounded/paginated probe per design §Q3. **Founder authorized removing
+  stale prod marks if needed** (sole user) — any cleanup ships dry-run-first
+  via a reviewed tool, main session executes. After the fix: soak accumulates
+  for real; ~410 commits/day ambient → use a commit accelerator (cheap at
+  605B/commit) then bring the founder the 72h-wall decision with data.
+- **Gate 3 (85 Layer A) — dev cycle running** (`impl/85-layer-a`):
+  ctime-keyed dircache pruned scans vs the ~10s/pull rescan; pruned scans
+  return coverage:"pruned" via #229's plumbing (can never testify for watcher
+  re-trust); ≥50k-file benchmark gate.
+- Watchdog process runs whenever agents are active (5-min stall detection) —
+  founder feedback 2026-07-12: supervision is the main session's job.
+
 ## 2026-07-12 morning — v1.1.0 shipped; design 84 fold FAILED its gate on the fleet (rolled back by flag); fix cycle running
 
 - **v1.1.0 released + fleet upgraded** (both hosts, installer). Contents: design
