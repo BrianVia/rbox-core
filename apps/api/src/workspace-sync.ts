@@ -36,6 +36,13 @@ const FOLD_MAX_REFS = 250_000;
 const FOLD_CHUNK = 5_000;
 const SWEEP_CHUNK = 500;
 let isolateFoldActive = false;
+
+function wsMaxSessionMs(env: Env): number {
+  const raw = env.RBOX_WS_MAX_SESSION_MS;
+  if (raw === undefined) return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 // Design 102 §3.5B page-class fallback reasons.
 const HIGH_SEVERITY_FALLBACKS = new Set(["parent_unreadable", "fence_violation", "delta_error"]);
 
@@ -694,7 +701,10 @@ export class WorkspaceSync {
     const mirrorStartedAt = Date.now();
     await this.armAlarm(Date.now());
 
-    wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }));
+    wsBroadcast(this.ctx, JSON.stringify({ type: "committed", sequence, deviceId }), {
+      maxSessionMs: wsMaxSessionMs(this.env),
+      now: Date.now(),
+    });
 
     // Best-effort D1 commit mirror (not authoritative). Fanout runs first so
     // `/latest` and WS evidence advance in the same order.

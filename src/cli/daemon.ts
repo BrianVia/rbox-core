@@ -93,6 +93,8 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 const WS_PING_MS = 25_000;
 const WS_KEEPALIVE_PERSIST_MS = 20_000;
+const WS_PONG_DEADLINE_DEFAULT_MS = 60_000; // 2 ping intervals (50s) + 10s grace
+const POLL_BACKSTOP_DEFAULT_MS = 300_000; // 5 min = safety-scan idle cap
 export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
@@ -251,6 +253,12 @@ export class RboxDaemon {
   private watcher?: Watcher;
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
+  private wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
+  private backstopTimer?: ReturnType<typeof setTimeout>;
+  private notifyPullPendingAt?: number;
+  private wsReconnects = 0;
+  private wsBackstopPulls = 0;
+  private wsHalfOpenDetected = 0;
   private activityHeartbeatTimer?: ReturnType<typeof setInterval>;
   private ambientStatusHeartbeatTimer?: ReturnType<typeof setInterval>;
   private wsGeneration = 0;
@@ -335,6 +343,14 @@ export class RboxDaemon {
   private readonly pullOnly: boolean;
   private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
   private readonly syncMutexBackoff: () => Promise<void>;
+  private readonly wsDisabled: boolean;
+  private readonly wsReliabilityDisabled: boolean;
+  private readonly pongDeadlineMs: number;
+  private readonly backstopMs: number;
+
+  private get wsReliabilityEnabled(): boolean {
+    return !this.wsReliabilityDisabled;
+  }
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
@@ -356,6 +372,14 @@ export class RboxDaemon {
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
     this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
+    this.wsDisabled = process.env.RBOX_DAEMON_WS_DISABLED === "1";
+    this.wsReliabilityDisabled = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED === "1";
+    this.pongDeadlineMs = this.wsReliabilityDisabled
+      ? 0
+      : envInt("RBOX_DAEMON_WS_PONG_DEADLINE_MS", WS_PONG_DEADLINE_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
+    this.backstopMs = this.wsReliabilityDisabled
+      ? 0
+      : envInt("RBOX_DAEMON_POLL_BACKSTOP_MS", POLL_BACKSTOP_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
   }
 
   async start(): Promise<void> {
@@ -394,7 +418,8 @@ export class RboxDaemon {
     await this.pump();
 
     if (!this.pullOnly) await this.startLiveWatch();
-    this.connect();
+    if (!this.wsDisabled) this.connect();
+    this.startBackstop();
     this.startUpdateChecks();
 
     log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
@@ -563,6 +588,8 @@ export class RboxDaemon {
     this.deferredRetryPaths.clear();
     this.gcFenceRetryPaths.clear();
     this.stopWsKeepalive();
+    this.clearPongDeadline();
+    this.clearBackstop();
     try {
       this.ws?.close();
     } catch {
@@ -661,9 +688,11 @@ export class RboxDaemon {
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush();
               } else if (op === "pull") {
+                const notifyLatencyMs = this.notifyPullPendingAt !== undefined ? Date.now() - this.notifyPullPendingAt : undefined;
+                this.notifyPullPendingAt = undefined;
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
-                await this.doPull(syncMutex);
+                await this.doPull(syncMutex, notifyLatencyMs);
                 if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
                 this.requestPush(); // publish any local divergence after taking remote
               } else {
@@ -969,7 +998,7 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
-  private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
+  private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number): Promise<void> {
     if (this.e2ee.remote instanceof E2eeRemote) {
       const pin = await this.e2ee.remote.loadVerifiedPin();
       this.chainRepairPolicy.assertHeadAllowed(pin);
@@ -1012,7 +1041,9 @@ export class RboxDaemon {
         : outcome.actions;
     }
     this.chainRepairPolicy.clear();
-    report?.logSummaryTo(log);
+    report?.logSummaryTo((line) =>
+      log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
+    );
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
       this.metrics.fileConflicts += fileConflicts;
@@ -1694,6 +1725,7 @@ export class RboxDaemon {
     };
     this.writeWsActivity();
     this.startWsKeepalive(ws);
+    this.armPongDeadline(ws);
     return generation;
   }
 
@@ -1701,6 +1733,7 @@ export class RboxDaemon {
     if (this.ws !== ws) return false;
     this.ws = undefined;
     this.stopWsKeepalive();
+    this.clearPongDeadline();
     this.wsGeneration++;
     this.pendingCatchUpGeneration = undefined;
     this.activity.ws = {
@@ -1710,6 +1743,8 @@ export class RboxDaemon {
       at: new Date().toISOString(),
     };
     this.writeWsActivity();
+    this.wsReconnects++;
+    log(`ws_reconnect reason=${reason} count=${this.wsReconnects}`);
     if (reason === "error") log("ws error");
     return true;
   }
@@ -1749,6 +1784,7 @@ export class RboxDaemon {
   }
 
   private handleWsMessageData(data: string): void {
+    if (this.ws) this.armPongDeadline(this.ws);
     if (data === "pong") {
       this.refreshWsAtThrottled();
       return;
@@ -1757,7 +1793,9 @@ export class RboxDaemon {
       const m = JSON.parse(data) as { type?: string; sequence?: unknown };
       if (m.type === "committed") {
         this.recordCommittedFrame(typeof m.sequence === "number" ? m.sequence : -1);
+        if (this.wsReliabilityEnabled) this.notifyPullPendingAt ??= Date.now();
         this.request("pull");
+        this.scheduleNextBackstop();
       } else {
         this.refreshWsAtThrottled();
       }
@@ -1797,6 +1835,57 @@ export class RboxDaemon {
     this.wsKeepaliveTimer = undefined;
   }
 
+  private armPongDeadline(ws: WebSocket): void {
+    if (this.pongDeadlineMs <= 0) return;
+    if (this.wsPongDeadlineTimer) clearTimeout(this.wsPongDeadlineTimer);
+    this.wsPongDeadlineTimer = setTimeout(() => this.onPongDeadline(ws), this.pongDeadlineMs);
+    this.wsPongDeadlineTimer.unref?.();
+  }
+
+  private clearPongDeadline(): void {
+    if (this.wsPongDeadlineTimer) clearTimeout(this.wsPongDeadlineTimer);
+    this.wsPongDeadlineTimer = undefined;
+  }
+
+  private onPongDeadline(ws: WebSocket): void {
+    if (this.stopped || this.ws !== ws) return;
+    this.wsHalfOpenDetected++;
+    log(`ws half-open detected — no frame in ${Math.round(this.pongDeadlineMs / 1000)}s; cycling socket (ws_half_open_detected=${this.wsHalfOpenDetected})`);
+    try {
+      ws.close();
+    } catch {
+      /* close/error listener drives reconnect */
+    }
+  }
+
+  private startBackstop(): void {
+    if (this.backstopMs <= 0) return;
+    if (this.backstopTimer) clearTimeout(this.backstopTimer);
+    const first = Math.floor(Math.random() * this.backstopMs);
+    this.backstopTimer = setTimeout(() => this.onBackstopTick(), first);
+    this.backstopTimer.unref?.();
+  }
+
+  private scheduleNextBackstop(): void {
+    if (this.backstopMs <= 0) return;
+    if (this.backstopTimer) clearTimeout(this.backstopTimer);
+    this.backstopTimer = setTimeout(() => this.onBackstopTick(), jitter(this.backstopMs));
+    this.backstopTimer.unref?.();
+  }
+
+  private onBackstopTick(): void {
+    if (this.stopped || this.backstopMs <= 0) return;
+    this.wsBackstopPulls++;
+    log(`ws backstop pull (ws_backstop_pull=${this.wsBackstopPulls})`);
+    this.request("pull");
+    this.scheduleNextBackstop();
+  }
+
+  private clearBackstop(): void {
+    if (this.backstopTimer) clearTimeout(this.backstopTimer);
+    this.backstopTimer = undefined;
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const url = `${this.api.wsConnectUrl()}?device=${encodeURIComponent(this.cfg.deviceId)}`;
@@ -1821,9 +1910,13 @@ export class RboxDaemon {
       const generation = this.markWsOpen(ws);
       this.pendingCatchUpGeneration = generation;
       this.request("pull"); // catch up on anything missed while disconnected
+      this.scheduleNextBackstop();
     });
     ws.addEventListener("message", (ev: MessageEvent) => {
       this.handleWsMessageData(String(ev.data));
+    });
+    ws.addEventListener("pong", () => {
+      this.armPongDeadline(ws);
     });
     ws.addEventListener("close", () => {
       this.handleWsClose(ws);

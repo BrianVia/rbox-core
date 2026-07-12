@@ -54,6 +54,12 @@ export interface Env {
    *  409 the final CAS would. Unset/"0" → today's behavior (no early return).
    *  Rollback = flip the flag; no schema, no migration. */
   RBOX_COMMIT_EARLY_REJECT?: string;
+  /** Design 105 §3.4 socket-lifetime cap (ms). Unset/"0"/non-numeric ⇒ cap OFF
+   *  (broadcast byte-identical to pre-105: send to every OPEN socket). A positive
+   *  int caps delivery: broadcast closes any socket older than this (checked BEFORE
+   *  each send, fail-closed on a missing/malformed connectedAt) instead of sending.
+   *  Recommended production value 21600000 (6h). Rollback = unset. */
+  RBOX_WS_MAX_SESSION_MS?: string;
   /** Design 102. O(change) commit delta admission. Off/unset preserves full
    * validation; shadow compares read-only and returns the full result; enforce is
    * explicitly flag-gated and is not enabled by this change. */
