@@ -57,7 +57,7 @@ export interface BulkChild {
 
 let support: Binding | null | undefined;
 let libraryHandle: ReturnType<typeof dlopen> | undefined;
-let loggedErrno = false;
+const loggedErrnos = new Set<number>();
 
 function binding(): Binding | null {
   if (support !== undefined) return support;
@@ -82,8 +82,10 @@ export function bulkWalkSupported(): boolean {
 }
 
 function logErrno(errno: number): void {
-  if (loggedErrno) return;
-  loggedErrno = true;
+  // Once per DISTINCT errno: a single boring EACCES on one protected dir must not
+  // permanently mask a later, different failure this feature would need to debug.
+  if (loggedErrnos.has(errno)) return;
+  loggedErrnos.add(errno);
   console.warn(`getattrlistbulk errno=${errno}`);
 }
 
@@ -146,14 +148,21 @@ function parseRecord(view: DataView, start: number, length: number, absDir: stri
 
   const inoRaw = view.getBigUint64(start + 76, true);
   if (inoRaw > BigInt(Number.MAX_SAFE_INTEGER)) return childFromLstat(absDir, name);
+  // dev_t is int32 on darwin; libuv widens st_dev into a u64, so a negative
+  // dev_t sign-extends to a large positive Number in fs.lstat. Rather than model
+  // that widening, defer any negative dev to the exact lstat (vanishingly rare).
+  const dev = view.getInt32(start + 32, true);
+  if (dev < 0) return childFromLstat(absDir, name);
+  const sizeRaw = view.getBigInt64(start + 84, true);
+  if (sizeRaw < 0n || sizeRaw > BigInt(Number.MAX_SAFE_INTEGER)) return childFromLstat(absDir, name);
   const mtimeSec = view.getBigInt64(start + 40, true);
   const mtimeNsec = view.getBigInt64(start + 48, true);
   const ctimeSec = view.getBigInt64(start + 56, true);
   const ctimeNsec = view.getBigInt64(start + 64, true);
   const stat: BulkStat = {
     ino: Number(inoRaw),
-    dev: view.getInt32(start + 32, true),
-    size: Number(view.getBigInt64(start + 84, true)),
+    dev,
+    size: Number(sizeRaw),
     mtimeMs: Number(mtimeSec) * 1000 + Number(mtimeNsec) / 1e6,
     ctimeMs: Number(ctimeSec) * 1000 + Number(ctimeNsec) / 1e6,
     mode: modeFor(type, view.getUint32(start + 72, true)),
@@ -179,11 +188,13 @@ export function bulkWalkDir(absDir: string): BulkChild[] | null {
   let result: BulkChild[] | null = [];
   try {
     const attrs = attrsBuffer();
-    const attrBacking = attrs.buffer;
     const buffer = new Uint8Array(BUFFER_SIZE);
-    const bufferBacking = buffer.buffer;
-    // Both backing ArrayBuffers and views remain strongly referenced across every native call.
-    void attrBacking; void bufferBacking;
+    // `attrs` and `buffer` MUST stay reachable across every blocking getattrlistbulk
+    // call so JSC cannot collect the storage `ptr()` handed to native code. Liveness
+    // is guaranteed by real uses on each loop iteration (`ptr(attrs)`, `ptr(buffer)`,
+    // `new DataView(buffer.buffer …)`) plus the post-loop read below — do NOT hoist
+    // the `ptr()` calls out of the loop, which would make `attrs` dead after the
+    // first iteration and open a use-after-free window during the blocking syscall.
     for (;;) {
       const count = Number(native.bulk(fd, ptr(attrs), ptr(buffer), buffer.byteLength, BigInt(FSOPT_PACK_INVAL_ATTRS)));
       if (count === 0) break;
@@ -203,6 +214,9 @@ export function bulkWalkDir(absDir: string): BulkChild[] | null {
         offset += length;
       }
     }
+    // Durable post-loop read: anchors both buffers' liveness to the end of the try
+    // so their `ptr()` storage cannot be reclaimed mid-syscall (see loop comment).
+    if (attrs.byteLength === 0 || buffer.byteLength === 0) result = null;
   } catch {
     result = null;
   } finally {

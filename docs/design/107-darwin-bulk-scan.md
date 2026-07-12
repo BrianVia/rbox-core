@@ -105,3 +105,49 @@ name-less failure semantics, narrow stat typing, raw-time diagnostics, signed
 device parsing, inode precision fallback, special-mode coverage, and immediate
 errno capture with suppression. Packed offsets, access-mask parity, and Bun's
 u64 call representation remain explicit Mac-harness assumptions.
+
+## Mac-validated results (2026-07-12)
+
+Reference host: MacBook Pro (arm64), `~/Development` = 118,384 files / 23,924
+dirs on APFS, Bun 1.3.14.
+
+- **Parity, unit:** `darwin-bulk-walk.test.ts` — 20,046 asserts, 0 fail. Bulk
+  `{name,type,size,mtimeMs,ctimeMs,mode,ino,dev}` deep-equal `fs.lstat`;
+  `statsStableAcrossHash(bulk, lstat)` true; mid-write false.
+- **Parity, real corpus:** `scripts/bulk-parity.ts ~/Development` — recursive,
+  every supported entry cross-checked against `lstat`, **0 mismatches** (~110s).
+  Packed offsets, access-mask reconstruction, signed `dev_t`, and the confirmed
+  Bun timestamp formula (`sec*1000 + nsec/1e6`) are thus empirically correct on
+  real APFS — the FSOPT_PACK_INVAL_ATTRS record layout (dirs/symlinks omit the
+  file-only DATALENGTH word) is proven by short-named subdir/symlink coverage.
+- **Benchmark (warm full scan, cache primed, p50 of 5):** stock **5484 ms**
+  (stat 1512 + readdir 1930) → bulk **3206 ms** (stat phase eliminated, one bulk
+  syscall/dir at 1447 ms). **≈42 % faster**, −2278 ms. All 118,384 files hit the
+  cache with 0 re-hashes in both modes (no cache invalidation).
+
+## Known scoping / pre-default-on gate
+
+- **Opt-in only.** `RBOX_SCAN_BULK=1`, darwin-only. Flag-off is byte-identical
+  (no `dlopen`, no syscall). This PR does not flip the default.
+- **Failure mode is deferral, never corruption.** Any FFI/parse failure falls the
+  whole directory back to readdir atomically. Even a bulk attr that were to differ
+  from `lstat` cannot poison the cache: `HashCache.record` always stores
+  post-hash `fs.lstat` values, so a divergent field only re-defers (re-hashes)
+  that file each scan — bounded, self-correcting, not fleet-wide corruption.
+- **Residual parity risk to close before default-on:** attrs returned *valid but
+  divergent* escape the returned-bit safety net. HFS-compressed files were tested
+  and are parity-clean (DATALENGTH returns the logical size, matching `st_size`).
+  Still unverified: iCloud-**dataless** (`SF_DATALESS`) placeholders and
+  **non-APFS** mounts (SMB/exFAT synthesized inodes). Non-APFS that lacks
+  getattrlistbulk returns `-1`→readdir fallback (safe); a mount that supports it
+  but synthesizes differently is the open case. Cheap hardening if needed: request
+  `ATTR_CMN_FLAGS` and route `UF_COMPRESSED`/`SF_DATALESS` records through
+  `childFromLstat` (shifts fileid→80, datalength→88; re-validate offsets on Mac).
+- **ScanStats semantics under the flag:** bulk-statted files count in
+  `filesStatted` but with ~0 `statMs` — their cost lands in `readdirMs` (the bulk
+  syscall subsumes both readdir and stat). Dashboards reading these fields on a
+  bulk scan should read `readdirMs` as the combined discovery cost.
+- **Dircache (Layer A) composition:** the bulk path does not call
+  `dircache.record`, so with `RBOX_SCAN_PRUNE` also on, bulk-walked dirs are not
+  seeded into / reused from the dircache. The two optimizations target the same
+  cost; composing them (record bulk children) is a follow-up.
