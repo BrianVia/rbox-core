@@ -46,6 +46,7 @@ export {
   type EncryptedBlob,
   type EncryptFileOptions,
 } from "./crypto.js";
+export { readManifestChain } from "./manifest-chain.js";
 export {
   MANIFEST_ENVELOPE_MAGIC,
   MANIFEST_ENVELOPE_PREFIX,
@@ -59,6 +60,7 @@ export {
   diffToOps,
   encodeDeltaEnvelope,
   decodeEnvelope,
+  hasEnvelopePrefix,
   foldDelta,
   type ManifestDeltaHeader,
   type ManifestDeltaOp,

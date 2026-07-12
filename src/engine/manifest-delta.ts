@@ -71,6 +71,19 @@ function canonicalJson(value: unknown): string {
   }
 }
 
+const PREFIX_BYTES = utf8(MANIFEST_ENVELOPE_PREFIX);
+const MAGIC_BYTES = utf8(MANIFEST_ENVELOPE_MAGIC);
+
+const startsWithBytes = (haystack: Uint8Array, needle: Uint8Array): boolean =>
+  haystack.length >= needle.length && needle.every((byte, index) => haystack[index] === byte);
+
+/** Does this decrypted plaintext claim the rbox-mde envelope FAMILY (any
+ *  version), vs raw-v0 JSON? The codec's own discrimination step 1-2; exported
+ *  so error-classification at the read boundary shares the same notion. */
+export function hasEnvelopePrefix(plaintext: Uint8Array): boolean {
+  return startsWithBytes(plaintext, PREFIX_BYTES);
+}
+
 export function canonicalManifestBytes(manifest: Manifest): Uint8Array {
   return utf8(canonicalJson(manifest));
 }
@@ -143,12 +156,26 @@ function compareOps(a: ManifestDeltaOp, b: ManifestDeltaOp): number {
   return ak < bk ? -1 : ak > bk ? 1 : 0;
 }
 
+/** The full FileEntry key set. A structural compare over these flat fields is
+ *  the delta-encode hot path (runs per entry per commit); entries carrying any
+ *  OTHER key (a future schema) fall back to the canonical deep compare so a
+ *  new field can never be silently dropped from a delta. */
+const FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
+const FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(FILE_ENTRY_KEYS);
+
+function fileEntryEqual(a: FileEntry | undefined, b: FileEntry): boolean {
+  if (a === undefined) return false;
+  const known = (e: FileEntry): boolean => Object.keys(e).every((k) => FILE_ENTRY_KEY_SET.has(k));
+  if (!known(a) || !known(b)) return deepEqual(a, b);
+  return FILE_ENTRY_KEYS.every((k) => a[k] === b[k]);
+}
+
 export function diffToOps(base: Manifest, target: Manifest): ManifestDeltaOp[] {
   const ops: ManifestDeltaOp[] = [];
   const baseFiles = new Map(base.files.map((entry) => [entry.path, entry]));
   const targetFiles = new Map(target.files.map((entry) => [entry.path, entry]));
   for (const [path, entry] of targetFiles) {
-    if (!deepEqual(baseFiles.get(path), entry)) ops.push({ op: "set", entry });
+    if (!fileEntryEqual(baseFiles.get(path), entry)) ops.push({ op: "set", entry });
   }
   for (const path of baseFiles.keys()) {
     if (!targetFiles.has(path)) ops.push({ op: "del", path });
@@ -186,17 +213,22 @@ async function frameEnvelope(header: ManifestSnapshotHeader | ManifestDeltaHeade
   return out;
 }
 
-export async function encodeSnapshotEnvelope(manifest: Manifest, options: { compress: boolean }): Promise<Uint8Array> {
+/** Returns the envelope bytes AND the canonical hash it stamped — the O(N)
+ *  canonicalize+hash over a large manifest is the dominant CPU of a snapshot
+ *  commit, so callers building GlobalManifestMeta reuse it instead of
+ *  recomputing (mirrors encodeDeltaEnvelope's resultHash). */
+export async function encodeSnapshotEnvelope(manifest: Manifest, options: { compress: boolean }): Promise<{ bytes: Uint8Array; manifestHash: string }> {
   assertManifest(manifest);
   const plaintext = utf8(JSON.stringify(manifest));
   assertBodyBound(plaintext);
+  const manifestHash = await canonicalManifestHash(manifest);
   const header: ManifestSnapshotHeader = {
     kind: "snapshot",
     ...(options.compress ? { comp: "zstd" as const } : {}),
     bodyBytes: plaintext.byteLength,
-    manifestHash: await canonicalManifestHash(manifest),
+    manifestHash,
   };
-  return frameEnvelope(header, options.compress ? await zstdCompress(plaintext) : plaintext);
+  return { bytes: await frameEnvelope(header, options.compress ? await zstdCompress(plaintext) : plaintext), manifestHash };
 }
 
 export async function encodeDeltaEnvelope(
@@ -313,14 +345,11 @@ function parseOps(bytes: Uint8Array): ManifestDeltaOp[] {
 }
 
 export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedManifestEnvelope> {
-  const prefix = utf8(MANIFEST_ENVELOPE_PREFIX);
-  const magic = utf8(MANIFEST_ENVELOPE_MAGIC);
-  const startsWith = (needle: Uint8Array): boolean => plaintext.length >= needle.length && needle.every((byte, index) => plaintext[index] === byte);
-  if (!startsWith(magic)) {
-    if (startsWith(prefix)) throw new Error("manifest envelope version not supported — upgrade rbox");
+  if (!startsWithBytes(plaintext, MAGIC_BYTES)) {
+    if (hasEnvelopePrefix(plaintext)) throw new Error("manifest envelope version not supported — upgrade rbox");
     return { kind: "raw", manifest: parseManifest(plaintext) };
   }
-  const headerStart = magic.byteLength;
+  const headerStart = MAGIC_BYTES.byteLength;
   const maxEnd = Math.min(plaintext.byteLength, headerStart + MAX_ENVELOPE_HEADER + 1);
   let newline = -1;
   for (let i = headerStart; i < maxEnd; i++) {

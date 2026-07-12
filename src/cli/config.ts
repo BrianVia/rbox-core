@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAX_MANIFEST_DELTA_CHAIN, type GitSection, type Manifest } from "../engine/index.js";
+import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain, type GitSection, type Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
@@ -161,8 +161,12 @@ export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
   if (!hex(meta.encManifestSha) || !hex(meta.manifestHash)) return undefined;
   if (!counter(meta.accountEpoch) || !counter(meta.keyEpoch) || !counter(meta.chainBytes)) return undefined;
   if (!Number.isSafeInteger(meta.snapshotBytes) || (meta.snapshotBytes as number) <= 0) return undefined;
-  if (!Array.isArray(meta.chain) || meta.chain.length > MAX_MANIFEST_DELTA_CHAIN) return undefined;
-  if (!meta.chain.every(hex) || new Set(meta.chain).size !== meta.chain.length || meta.chain.includes(meta.encManifestSha)) return undefined;
+  // The chain shape rule (cap, hex, dedup, self-exclusion) is the SAME invariant
+  // the wire parser enforces — one definition, or persisted metas could drift
+  // from what the commit codec/server accept. Explicit Array check first: the
+  // wire parser normalizes an ABSENT field to [], but a partial meta missing
+  // `chain` must reject wholesale (§3.4 fail-to-snapshot).
+  if (!Array.isArray(meta.chain) || readManifestChain(meta.chain, meta.encManifestSha) === null) return undefined;
   if ((meta.chainBytes === 0) !== (meta.chain.length === 0)) return undefined;
   return meta as unknown as GlobalManifestMeta;
 }

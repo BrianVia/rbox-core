@@ -479,7 +479,7 @@ export async function push(
       report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
   }
-  const { sequence, committed } = await pushManifest(root, cfg, local, deps, 0, purgeIgnored);
+  const { sequence, committed } = await pushManifest(root, cfg, local, deps, { purgeIgnored });
   return { sequence, committed };
 }
 
@@ -553,29 +553,40 @@ type AttemptOutcome =
  * MAX_ATTEMPTS budget, backing off only before a 409 pull (never a 422 re-upload), and
  * preserving the exact interleaving of the original recursive form.
  */
+export interface PushManifestOptions {
+  purgeIgnored?: boolean;
+  forceGitRecapture?: ReadonlySet<string>;
+  /** §3.6.3: publish as the PIN's child, snapshot-only, short-circuits bypassed. */
+  repair?: RepairPushMode;
+}
+
 export async function pushManifest(
   root: string,
   cfg: WorkspaceConfig,
   local: Manifest,
   deps: SyncDeps = {},
-  attempt = 0,
-  purgeIgnored = false,
-  forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE,
-  repair?: RepairPushMode
+  options: PushManifestOptions = {}
 ): Promise<PushResult> {
+  const { purgeIgnored = false, repair } = options;
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
   const backoff = deps.backoff ?? defaultBackoff;
-  let currentLocal = local;
-  let currentForce = forceGitRecapture;
+  let attempt = 0;
+  // Loop-carried attempt state, mutated by the RecoveryAction transitions below.
+  const state: PushAttemptState = {
+    local,
+    purgeIgnored,
+    forceGitRecapture: options.forceGitRecapture ?? NO_GIT_FORCE,
+    recoverAddresses: new Set<string>(),
+    forceFullAudit: false,
+    forceSnapshot: repair !== undefined,
+    ...(repair ? { repair } : {}),
+  };
   let previousUnsatisfiedTotal: number | undefined;
-  const recoverAccum = new Set<string>();
-  let recoverFullAudit = false;
-  let forceSnapshot = repair !== undefined;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit, forceSnapshot, repair);
+    const outcome = await runPushAttempt(root, cfg, deps, backoff, state);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) process.stderr.write(`${lane}\n`);
@@ -585,7 +596,7 @@ export async function pushManifest(
       // Repair conflicts deliberately escape this inner budget immediately. The
       // outer repairChain budget owns 409 races; this loop only spends retries on
       // bounded 422 reuploads and epoch refreshes while in repair mode.
-      return { sequence: repair!.parentSequence, manifest: currentLocal, committed: false, repairConflict: true };
+      return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true };
     }
     const consumesAttempt =
       outcome.action.kind !== "reupload" ||
@@ -603,20 +614,20 @@ export async function pushManifest(
       } else {
         await refreshWriteContext(cfg, deps);
       }
-      currentLocal = await scanManifestForPush(root, cfg, deps, purgeIgnored); // disk changed under us
-      currentForce = NO_GIT_FORCE;
+      state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored); // disk changed under us
+      state.forceGitRecapture = NO_GIT_FORCE;
       // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
-      recoverAccum.clear();
-      recoverFullAudit = false;
-      forceSnapshot = repair !== undefined;
+      state.recoverAddresses.clear();
+      state.forceFullAudit = false;
+      state.forceSnapshot = repair !== undefined;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
-      recoverFullAudit = accumulateRecoveryPage(recoverAccum, recoverFullAudit, outcome.action.unsatisfiedBlobs);
-      currentLocal = outcome.action.localForRetry;
-      currentForce = outcome.action.forceGitRecapture;
+      state.forceFullAudit = accumulateRecoveryPage(state.recoverAddresses, state.forceFullAudit, outcome.action.unsatisfiedBlobs);
+      state.local = outcome.action.localForRetry;
+      state.forceGitRecapture = outcome.action.forceGitRecapture;
       // Once a missing/truncated chain selects repair, every retry stays a snapshot:
       // a later data-only page must not revive the known-broken historical base.
-      forceSnapshot ||= outcome.action.forceSnapshot === true;
+      state.forceSnapshot ||= outcome.action.forceSnapshot === true;
     }
     if (consumesAttempt) attempt++;
   }
@@ -628,19 +639,27 @@ export async function pushManifest(
  * a done result or a {@link RecoveryAction} for the loop to apply. Attempt-agnostic: the
  * MAX_ATTEMPTS budget and backoff live in {@link pushManifest}'s loop.
  */
+/** The loop-carried state of {@link pushManifest}'s bounded retry loop — one
+ *  object instead of seven positionals, mutated by the RecoveryAction arms. */
+interface PushAttemptState {
+  local: Manifest;
+  purgeIgnored: boolean;
+  forceGitRecapture: ReadonlySet<string>;
+  recoverAddresses: Set<string>;
+  forceFullAudit: boolean;
+  forceSnapshot: boolean;
+  repair?: RepairPushMode;
+}
+
 async function runPushAttempt(
   root: string,
   cfg: WorkspaceConfig,
-  local: Manifest,
   deps: SyncDeps,
   backoff: (attempt: number) => Promise<void>,
-  purgeIgnored: boolean,
-  forceGitRecapture: ReadonlySet<string>,
-  recoverAddresses: ReadonlySet<string>,
-  forceFullAudit: boolean,
-  forceSnapshot: boolean,
-  repair?: RepairPushMode
+  attemptState: PushAttemptState
 ): Promise<AttemptOutcome> {
+  const { purgeIgnored, forceGitRecapture, recoverAddresses, forceFullAudit, forceSnapshot, repair } = attemptState;
+  let local = attemptState.local;
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
   // prior recursive form did (each recursive call re-ran `deps.remote ?? apiFor(cfg)`).

@@ -30,7 +30,7 @@ import {
   encodeSnapshotEnvelope,
   foldDelta,
   gitSectionBlobRefs,
-  MANIFEST_ENVELOPE_PREFIX,
+  hasEnvelopePrefix,
   ManifestChainError,
   MAX_MANIFEST_DELTA_CHAIN,
   poolMap,
@@ -67,11 +67,13 @@ export const SIDECAR_THRESHOLD = 4000;
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 
-const ENVELOPE_PREFIX_BYTES = new TextEncoder().encode(MANIFEST_ENVELOPE_PREFIX);
-
-/** Does this decrypted plaintext claim the envelope-v1 family (vs raw-v0 JSON)? */
-function isEnvelopeV1(plaintext: Uint8Array): boolean {
-  return plaintext.length >= ENVELOPE_PREFIX_BYTES.length && ENVELOPE_PREFIX_BYTES.every((byte, index) => plaintext[index] === byte);
+/** Design 84's rollout flags form a capability LATTICE, not independent axes:
+ *  C2 (delta) implies C1 (snapshot envelopes) implies meta collection. Encoded
+ *  once here — flag reads stay point-of-use per repo convention, the derived
+ *  implication does not. */
+function mdeWriteCaps(): { delta: boolean; snapshot: boolean } {
+  const delta = process.env.RBOX_MDE_DELTA === "1";
+  return { delta, snapshot: delta || process.env.RBOX_MDE_SNAPSHOT === "1" };
 }
 
 export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
@@ -212,7 +214,7 @@ export class E2eeRemote implements SyncRemote {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const collectMeta = process.env.RBOX_MDE_SNAPSHOT === "1" || process.env.RBOX_MDE_DELTA === "1" || options?.fastFoldBase !== undefined;
+    const collectMeta = mdeWriteCaps().snapshot || options?.fastFoldBase !== undefined;
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
@@ -279,11 +281,32 @@ export class E2eeRemote implements SyncRemote {
     // an envelope-v1 head that fails to decode is a chain-class failure the
     // §3.6.3 repair must see, chain or no chain.
     const headEnvelope = await decodeEnvelope(plaintext).catch((cause: unknown) => {
-      if (!isEnvelopeV1(plaintext) && signedChain.length === 0) throw cause;
+      if (!hasEnvelopePrefix(plaintext) && signedChain.length === 0) throw cause;
       throw new ManifestChainError("head manifest envelope failed to decode", { head, failingLink: body.encManifestSha, cause });
     });
     const headParseMs = Date.now() - headParseStart;
     const parseStart = Date.now();
+    // Shared exit plumbing for the fast-fold and cold-walk returns: the timings
+    // report differs only by the chain download/decrypt terms, and the meta
+    // differs only by hash + the two §3.3.4 byte fields.
+    const emitLatestTimings = (chainDownloadMs: number, chainDecryptMs: number): void => {
+      if (!onLatestTimings) return;
+      onLatestTimings({
+        downloadMs: headDownloadMs + chainDownloadMs,
+        decryptMs: headDecryptMs + chainDecryptMs,
+        parseMs: headParseMs + Date.now() - parseStart,
+        encBytes: encManifest.byteLength,
+      });
+    };
+    const makeMeta = (manifestHash: string, chainBytes: number, snapshotBytes: number): GlobalManifestMeta => ({
+      encManifestSha: body.encManifestSha,
+      manifestHash,
+      accountEpoch: body.accountEpoch,
+      keyEpoch: body.keyEpoch,
+      chain: [...signedChain],
+      chainBytes,
+      snapshotBytes,
+    });
     if (headEnvelope.kind === "delta" && fastFoldBase &&
       headEnvelope.header.baseEncSha === fastFoldBase.meta.encManifestSha &&
       headEnvelope.header.baseManifestHash === fastFoldBase.meta.manifestHash &&
@@ -297,22 +320,13 @@ export class E2eeRemote implements SyncRemote {
         throw new ManifestChainError("manifest delta fold failed", { head, failingLink: body.encManifestSha, cause });
       }
       this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
-      const downloadMs = onLatestTimings ? headDownloadMs : 0;
-      const decryptMs = onLatestTimings ? headDecryptMs : 0;
-      const parseMs = onLatestTimings ? headParseMs + Date.now() - parseStart : 0;
-      onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
+      emitLatestTimings(0, 0);
       return {
         manifest,
         kek,
-        manifestMeta: {
-          encManifestSha: body.encManifestSha,
-          manifestHash: headEnvelope.header.resultHash,
-          accountEpoch: body.accountEpoch,
-          keyEpoch: body.keyEpoch,
-          chain: [...signedChain],
-          chainBytes: fastFoldBase.meta.chainBytes + encManifest.byteLength,
-          snapshotBytes: fastFoldBase.meta.snapshotBytes,
-        },
+        // Fast path cannot re-observe snapshotBytes (no chain fetch): propagate
+        // the base's, accumulate the head's cipher bytes (§3.4).
+        manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes),
       };
     }
 
@@ -342,10 +356,7 @@ export class E2eeRemote implements SyncRemote {
     );
     const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
     this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
-    const downloadMs = onLatestTimings ? headDownloadMs + chainDownloadMs : 0;
-    const decryptMs = onLatestTimings ? headDecryptMs + chainDecryptMs : 0;
-    const parseMs = onLatestTimings ? headParseMs + Date.now() - parseStart : 0;
-    onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
+    emitLatestTimings(chainDownloadMs, chainDecryptMs);
     let manifestMeta: GlobalManifestMeta | undefined;
     if (collectMeta) {
       const manifestHash = headEnvelope.kind === "delta"
@@ -353,20 +364,16 @@ export class E2eeRemote implements SyncRemote {
         : headEnvelope.kind === "snapshot"
           ? headEnvelope.header.manifestHash
           : await canonicalManifestHash(manifest);
-      manifestMeta = {
-        encManifestSha: body.encManifestSha,
+      // §3.3.4 accumulator: cumulative DELTA ciphertext bytes since chain[0] —
+      // the intermediate delta links (chain[1..]) plus the delta head itself,
+      // NEVER the terminal snapshot (chain[0]); a snapshot/raw head resets to 0.
+      // (A non-empty chain implies a delta head — foldManifestChain rejects a
+      // snapshot head with a non-empty signed chain.)
+      manifestMeta = makeMeta(
         manifestHash,
-        accountEpoch: body.accountEpoch,
-        keyEpoch: body.keyEpoch,
-        chain: [...signedChain],
-        // §3.3.4 accumulator: cumulative DELTA ciphertext bytes since chain[0] —
-        // the intermediate delta links (chain[1..]) plus the delta head itself,
-        // NEVER the terminal snapshot (chain[0]); a snapshot/raw head resets to 0.
-        // (A non-empty chain implies a delta head — foldManifestChain rejects a
-        // snapshot head with a non-empty signed chain.)
-        chainBytes: signedChain.length === 0 ? 0 : chainBlobBytes.slice(1).reduce((sum, bytes) => sum + bytes.byteLength, 0) + encManifest.byteLength,
-        snapshotBytes: signedChain.length === 0 ? encManifest.byteLength : chainBlobBytes[0]!.byteLength,
-      };
+        signedChain.length === 0 ? 0 : chainBlobBytes.slice(1).reduce((sum, bytes) => sum + bytes.byteLength, 0) + encManifest.byteLength,
+        signedChain.length === 0 ? encManifest.byteLength : chainBlobBytes[0]!.byteLength
+      );
     }
     return { manifest, kek, ...(manifestMeta ? { manifestMeta } : {}) };
   }
@@ -722,8 +729,7 @@ export class E2eeRemote implements SyncRemote {
     let encodeMs = 0;
     let encryptMs = 0;
     let uploadMs = 0;
-    const deltaEnabled = process.env.RBOX_MDE_DELTA === "1";
-    const snapshotEnabled = process.env.RBOX_MDE_SNAPSHOT === "1" || deltaEnabled;
+    const { delta: deltaEnabled, snapshot: snapshotEnabled } = mdeWriteCaps();
     const baseBuildArgs = {
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
@@ -746,7 +752,14 @@ export class E2eeRemote implements SyncRemote {
       if (onCommitTimings) buildArgs.onEncryptMs = (ms: number) => (encryptMs += ms);
       return buildCommit(buildArgs);
     };
-    const encodeSnapshot = async () => buildEncoded(await encodeSnapshotEnvelope(manifest, { compress: true }));
+    // encodeSnapshotEnvelope returns the canonical hash it already computed —
+    // reusing it for the meta below avoids a second O(N) canonicalize+hash of
+    // the full manifest per snapshot commit (the commit's dominant CPU).
+    const encodeSnapshot = async () => {
+      const snapshot = await encodeSnapshotEnvelope(manifest, { compress: true });
+      resultManifestHash = snapshot.manifestHash;
+      return buildEncoded(snapshot.bytes);
+    };
     const t0 = onCommitTimings ? Date.now() : 0;
     let built: Awaited<ReturnType<typeof buildCommit>>;
     let resultManifestHash: string | undefined;
@@ -772,7 +785,7 @@ export class E2eeRemote implements SyncRemote {
         emittedChain = chain;
         emittedDelta = true;
       } else {
-        built = await encodeSnapshot();
+        built = await encodeSnapshot(); // §3.3.4: candidate discarded, re-emit as snapshot
       }
     } else if (snapshotEnabled || options?.forceSnapshot) {
       // NOTE(84): C2 implies C1; rollout flags are sequential capabilities, not independent axes.

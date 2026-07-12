@@ -41,7 +41,7 @@ describe("manifest delta envelope", () => {
     const raw = utf8.encode(JSON.stringify(m));
     expect(await decodeEnvelope(raw)).toEqual({ kind: "raw", manifest: m });
     for (const compress of [false, true]) {
-      expect(await decodeEnvelope(await encodeSnapshotEnvelope(m, { compress }))).toMatchObject({ kind: "snapshot", manifest: m });
+      expect(await decodeEnvelope((await encodeSnapshotEnvelope(m, { compress })).bytes)).toMatchObject({ kind: "snapshot", manifest: m });
     }
   });
 
@@ -64,7 +64,7 @@ describe("manifest delta envelope", () => {
     await expect(decodeEnvelope(utf8.encode("rbox-mde2\n{}\n"))).rejects.toThrow("manifest envelope version not supported — upgrade rbox");
     await expect(decodeEnvelope(utf8.encode(MANIFEST_ENVELOPE_MAGIC))).rejects.toThrow();
     const m = manifest("now", []);
-    const encoded = await encodeSnapshotEnvelope(m, { compress: false });
+    const { bytes: encoded } = await encodeSnapshotEnvelope(m, { compress: false });
     await expect(decodeEnvelope(encoded.subarray(0, encoded.length - 1))).rejects.toThrow("body length");
   });
 
@@ -76,7 +76,7 @@ describe("manifest delta envelope", () => {
   });
 
   test("zstd expansion must equal bodyBytes, including either one-byte mismatch", async () => {
-    const encoded = await encodeSnapshotEnvelope(manifest("zstd", [entry("a")]), { compress: true });
+    const { bytes: encoded } = await encodeSnapshotEnvelope(manifest("zstd", [entry("a")]), { compress: true });
     const newline = encoded.indexOf(0x0a, utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength);
     const headerStart = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
     const header = JSON.parse(new TextDecoder().decode(encoded.subarray(headerStart, newline))) as Record<string, unknown>;
@@ -103,7 +103,7 @@ test("20k-entry snapshots compress below 25% of raw JSON", async () => {
   const files = Array.from({ length: 20_000 }, (_, i) => entry(`packages/pkg-${i % 137}/src/generated/file-${i.toString().padStart(5, "0")}.ts`, i + 1));
   const m = manifest("2026-07-12T00:00:00.000Z", files);
   const rawBytes = utf8.encode(JSON.stringify(m)).byteLength;
-  const envelopeBytes = (await encodeSnapshotEnvelope(m, { compress: true })).byteLength;
+  const envelopeBytes = (await encodeSnapshotEnvelope(m, { compress: true })).bytes.byteLength;
   const ratio = envelopeBytes / rawBytes;
   console.log(`design 84 snapshot compression ratio: ${(ratio * 100).toFixed(2)}% (${envelopeBytes}/${rawBytes})`);
   expect(ratio).toBeLessThan(0.25);
@@ -210,7 +210,7 @@ describe("review round-2 protocol boundary hardening", () => {
 
   test("duplicate envelope-header members are rejected, including __proto__", async () => {
     const m = manifest("dup", [entry("a")]);
-    const encoded = await encodeSnapshotEnvelope(m, { compress: false });
+    const { bytes: encoded } = await encodeSnapshotEnvelope(m, { compress: false });
     const magicLen = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
     const newline = encoded.indexOf(0x0a, magicLen);
     const header = new TextDecoder().decode(encoded.subarray(magicLen, newline));
@@ -232,7 +232,7 @@ describe("review round-2 protocol boundary hardening", () => {
 
   test("escaped-equivalent duplicate header members and non-canonical encodings are rejected", async () => {
     const m = manifest("esc", [entry("a")]);
-    const encoded = await encodeSnapshotEnvelope(m, { compress: false });
+    const { bytes: encoded } = await encodeSnapshotEnvelope(m, { compress: false });
     const magicLen = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
     const newline = encoded.indexOf(0x0a, magicLen);
     const header = new TextDecoder().decode(encoded.subarray(magicLen, newline));

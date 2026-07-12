@@ -74,7 +74,7 @@ export async function repairChain(
     const pin = await remote.loadVerifiedPin();
     if (!pin) throw new Error("chain repair has no verified head pin");
     const local: Manifest = await scanManifestForPush(root, cfg, deps);
-    const pushed = await pushManifest(root, cfg, local, deps, 0, false, undefined, { kind: "repair", parentSequence: pin.commitSeq });
+    const pushed = await pushManifest(root, cfg, local, deps, { repair: { kind: "repair", parentSequence: pin.commitSeq } });
     if (!pushed.repairConflict) return { kind: "repaired", sequence: pushed.sequence, suffix, actions };
     if (attempt + 1 >= REPAIR_MAX_ATTEMPTS) throw new Error("repair: remote head kept advancing during publication");
     try {
