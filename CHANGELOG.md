@@ -6,6 +6,42 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-12 — manifest deltas, watcher trust recovery, self-draining GC
+
+The performance program's second checkpoint, hours after v1.0.1.
+
+### Added (flag-gated, default off — staged per-host rollout with measurement)
+- **Manifest delta encoding (design 84, #231).** The end of the constant
+  39–41MB manifest transfer: zstd snapshot envelopes (`RBOX_MDE_SNAPSHOT`,
+  measured **24×** smaller), O(change) delta commits (`RBOX_MDE_DELTA` — a
+  one-file change ships ~KB), and head-blob-only fast pulls
+  (`RBOX_MDE_FAST_PULL`). Chain-verified reads with exact-list matching, a
+  pin-as-parent repair transaction (`rbox recover --repair-chain` + doctor
+  check), fail-to-snapshot semantics on every delta trigger. Server chain
+  acceptance is unconditional and additive — old clients are unaffected.
+- **Watcher trust recovery (design 104, #229).** With `RBOX_WATCHER_RETRUST=1`,
+  a transient macOS FSEvents overflow no longer permanently distrusts the
+  watcher (which pinned full 116k-file rescans to a 60s floor — measured ~11%
+  continuous I/O duty on the Mac). Transient drops now enter a suspect state
+  that re-earns trust behind an unpruned safety scan, with a drop fuse
+  preserving today's behavior under sustained failure.
+
+### Changed
+- **Scheduled GC purge enabled (#228).** The founder-supervised drain
+  completed (5,410 blobs / 4.29GB reclaimed); the daily fenced cron now
+  drains the remaining candidates as they age past the 7-day grace.
+
+### Telemetry
+- **Multipart transfer decomposition (design 101 Phase 0, #230)**: per-part
+  walls/gaps/completion (client) + additive `serverTimings` with the
+  whole-object verification reread isolated (server), plus a read-only
+  multipart/staging orphan inventory for the platform operator.
+- **First-publish stage decomposition (design 98 §5.1, #226)** emitted on
+  both the serialized and pipeline paths with one schema.
+- **Design 105 (merged design):** the existing WebSocket notify channel is
+  formalized; its reliability fixes (pong deadline, jittered backstop pull,
+  session cap) are specified and sequenced for implementation next.
+
 ## [1.0.1] — 2026-07-12 — performance program checkpoint: instant preflights, fused crypto, full sync telemetry
 
 The first checkpoint of the sync-performance program (designs 97–103). Two
