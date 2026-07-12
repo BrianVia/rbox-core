@@ -41,7 +41,7 @@ function wsMaxSessionMs(env: Env): number {
   const raw = env.RBOX_WS_MAX_SESSION_MS;
   if (raw === undefined) return 0;
   const n = Number(raw);
-  return Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : 0;
+  return Number.isInteger(n) && n > 0 ? n : 0;
 }
 // Design 102 §3.5B page-class fallback reasons.
 const HIGH_SEVERITY_FALLBACKS = new Set(["parent_unreadable", "fence_violation", "delta_error"]);

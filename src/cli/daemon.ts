@@ -349,10 +349,6 @@ export class RboxDaemon {
   private readonly pongDeadlineMs: number;
   private readonly backstopMs: number;
 
-  private get wsReliabilityEnabled(): boolean {
-    return !this.wsReliabilityDisabled;
-  }
-
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
   constructor(
@@ -670,7 +666,6 @@ export class RboxDaemon {
           }
           const opWatcherGeneration = this.watcherUnsettledGeneration;
           const opWatcherErrorGeneration = this.watcherErrorGeneration;
-          let catchUpGenerationForRestore: number | undefined;
           try {
             let pushedToRemote = false;
             this.pushTerminalBlocked = false;
@@ -694,10 +689,17 @@ export class RboxDaemon {
                 // §6: the standalone metric event fires at dequeue — measured latency is recorded
                 // even if the pull below fails (the pull-line token then simply never prints).
                 if (notifyLatencyMs !== undefined) log(`notify_latency_ms=${notifyLatencyMs}`);
-                catchUpGenerationForRestore = this.pendingCatchUpGeneration;
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
-                await this.doPull(syncMutex, notifyLatencyMs);
+                try {
+                  await this.doPull(syncMutex, notifyLatencyMs);
+                } catch (e) {
+                  // A failed catch-up pull must not orphan its generation: restore it so the eventual
+                  // healing pull (backstop / next frame) can still mark the socket caught up.
+                  // markWsCaughtUp discards stale generations, so restoring a superseded one is harmless.
+                  if (catchUpGeneration !== undefined) this.pendingCatchUpGeneration ??= catchUpGeneration;
+                  throw e;
+                }
                 if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
                 this.requestPush(); // publish any local divergence after taking remote
               } else {
@@ -743,10 +745,6 @@ export class RboxDaemon {
             }
             if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
           } catch (e) {
-            // A failed catch-up pull must not orphan its generation: restore it so the eventual
-            // healing pull (backstop / next frame) can still mark the socket caught up.
-            // markWsCaughtUp discards stale generations, so restoring a superseded one is harmless.
-            if (op === "pull" && catchUpGenerationForRestore !== undefined) this.pendingCatchUpGeneration ??= catchUpGenerationForRestore;
             // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
             // first hit and every 10th after, with the running count — so the log stays
             // readable while still showing exactly how long the failure has persisted.
@@ -1802,7 +1800,7 @@ export class RboxDaemon {
       const m = JSON.parse(data) as { type?: string; sequence?: unknown };
       if (m.type === "committed") {
         this.recordCommittedFrame(typeof m.sequence === "number" ? m.sequence : -1);
-        if (this.wsReliabilityEnabled) this.notifyPullPendingAt ??= Date.now();
+        if (!this.wsReliabilityDisabled) this.notifyPullPendingAt ??= Date.now();
         this.request("pull");
         this.scheduleNextBackstop();
       } else {
@@ -1872,17 +1870,17 @@ export class RboxDaemon {
   }
 
   private startBackstop(): void {
-    if (this.backstopMs <= 0) return;
-    if (this.backstopTimer) clearTimeout(this.backstopTimer);
-    const first = Math.floor(Math.random() * this.backstopMs);
-    this.backstopTimer = setTimeout(() => this.onBackstopTick(), first);
-    this.backstopTimer.unref?.();
+    this.armBackstop(Math.floor(Math.random() * this.backstopMs)); // first tick: uniform(0, interval)
   }
 
   private scheduleNextBackstop(): void {
+    this.armBackstop(jitter(this.backstopMs)); // subsequent ticks: interval ±25%
+  }
+
+  private armBackstop(delayMs: number): void {
     if (this.backstopMs <= 0) return;
     if (this.backstopTimer) clearTimeout(this.backstopTimer);
-    this.backstopTimer = setTimeout(() => this.onBackstopTick(), jitter(this.backstopMs));
+    this.backstopTimer = setTimeout(() => this.onBackstopTick(), delayMs);
     this.backstopTimer.unref?.();
   }
 
@@ -1969,8 +1967,9 @@ export async function runDaemon(root: string): Promise<void> {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-/** ± up to 50% jitter so a fleet of daemons never aligns its ticks/reconnects. */
-const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
+/** ± up to 25% jitter (multiplier 0.75–1.25) so a fleet of daemons never aligns its
+ *  ticks/reconnects. `random` injected for deterministic tests. */
+const jitter = (ms: number, random: () => number = Math.random) => Math.round(ms * (0.75 + random() * 0.5));
 
 /** Reconnect delay (design 105 §5): the FIRST post-close attempt is spread
  *  uniform(0, RECONNECT_SPREAD_MS) so a deploy's fleet-wide socket close never
@@ -1978,9 +1977,7 @@ const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
  *  exponential backoff with ±25% jitter. Pure — `random` injected for tests. */
 export function reconnectDelayMs(attempt: number, random: () => number = Math.random): number {
   if (attempt === 0) return Math.floor(random() * RECONNECT_SPREAD_MS);
-  return Math.round(
-    Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt) * (0.75 + random() * 0.5),
-  );
+  return jitter(Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt), random);
 }
 
 /**
