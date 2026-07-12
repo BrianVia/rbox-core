@@ -23,6 +23,7 @@ const UPLOAD_RECEIPTS_V1 = "upload-receipts-v1";
 /** In-memory content-addressed blob store (stands in for R2). */
 export class MemBlobStore implements BlobStore {
   blobs = new Map<string, Uint8Array>();
+  getCalls: string[] = [];
   async has(sha: string) {
     return this.blobs.has(sha);
   }
@@ -30,6 +31,7 @@ export class MemBlobStore implements BlobStore {
     this.blobs.set(sha, new Uint8Array(bytes));
   }
   async get(sha: string): Promise<Buffer> {
+    this.getCalls.push(sha);
     const b = this.blobs.get(sha);
     if (!b) throw new Error(`blob ${sha} missing`);
     return Buffer.from(b);

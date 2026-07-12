@@ -39,7 +39,7 @@ import {
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type WorkspaceConfig } from "./config.js";
+import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
@@ -251,13 +251,21 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const validatedMeta = validManifestMeta(state.manifestMeta);
+  const fastFoldBase = process.env.RBOX_MDE_FAST_PULL === "1" && validatedMeta
+    ? { manifest: state.lastSyncedManifest, meta: validatedMeta }
+    : undefined;
   let latestTimings: LatestTimings | undefined;
   const { sequence, manifest: remote, manifestMeta } = await report.phase("latest", () =>
-    api.latest(report.enabled ? { onLatestTimings: (t) => (latestTimings = t) } : undefined)
+    api.latest(report.enabled || fastFoldBase ? {
+      ...(report.enabled ? { onLatestTimings: (t: LatestTimings) => (latestTimings = t) } : {}),
+      ...(fastFoldBase ? { fastFoldBase } : {}),
+    } : undefined)
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
-  return applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta });
+  return applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state });
 }
 
 /** Apply an already authenticated remote manifest through the exact normal pull
@@ -267,7 +275,7 @@ export async function applyPulledManifest(
   cfg: WorkspaceConfig,
   deps: SyncDeps,
   api: SyncRemote,
-  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number }
+  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState }
 ): Promise<Action[]> {
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
@@ -276,7 +284,7 @@ export async function applyPulledManifest(
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const { cache, save } = await withCache(root, deps.cache);
   const matcher = matcherForState(root, cfg, state);
   const scanStats = report.enabled ? deps.scanStats : undefined;

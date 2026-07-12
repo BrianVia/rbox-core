@@ -73,6 +73,8 @@ export interface LatestTimings {
 
 export interface LatestOptions {
   onLatestTimings?: (timings: LatestTimings) => void;
+  /** Applied manifest plus persisted, verified wire evidence for the Phase-D head fold shortcut. */
+  fastFoldBase?: { manifest: Manifest; meta: GlobalManifestMeta };
 }
 
 export interface ReceiptRedeemResult {

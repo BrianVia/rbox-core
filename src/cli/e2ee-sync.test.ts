@@ -219,6 +219,14 @@ async function withManifestEncodingFlags<T>(snapshot: string | undefined, delta:
   }
 }
 
+async function withFastPullFlag<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const old = process.env.RBOX_MDE_FAST_PULL;
+  if (value === undefined) delete process.env.RBOX_MDE_FAST_PULL; else process.env.RBOX_MDE_FAST_PULL = value;
+  try { return await fn(); } finally {
+    if (old === undefined) delete process.env.RBOX_MDE_FAST_PULL; else process.env.RBOX_MDE_FAST_PULL = old;
+  }
+}
+
 async function wireKind(server: FakeServer, remote: E2eeRemote, index = server.commits.length - 1): Promise<string> {
   const body = parseSignedCommit(server.commits[index]!);
   const plaintext = await openManifestChainBlob({
@@ -336,6 +344,95 @@ test("C2 commit emits a chained delta and a cold peer folds it with propagated m
     const pulled = await peer.latest();
     expect(pulled.manifest).toEqual(target);
     expect(pulled.manifestMeta).toEqual(second.manifestMeta);
+  });
+});
+
+test("D fast pull folds one delta from persisted evidence with a head-only fetch", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `fast/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `../${i}`, sha256: hex(i + 1), size: 8, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const target: Manifest = { ...base, generatedAt: "target", files: base.files.map((f, i) => i === 42 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+
+    const pulled = await peer.latest({ fastFoldBase: { manifest: base, meta: first.manifestMeta! } });
+
+    expect(pulled.manifest).toEqual(target);
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha]);
+    expect(pulled.manifestMeta?.snapshotBytes).toBe(first.manifestMeta!.snapshotBytes);
+    expect(pulled.manifestMeta?.chainBytes).toBe(first.manifestMeta!.chainBytes + server.store.blobs.get(second.manifestMeta!.encManifestSha)!.byteLength);
+    expect(pulled.manifestMeta?.chain).toEqual([...first.manifestMeta!.chain, first.manifestMeta!.encManifestSha]);
+  });
+});
+
+test("D fast pull evidence mismatches fall back to the exact cold chain walk", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-fallback", NOW);
+    const writer = await remoteFor(server, secrets);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `fallback/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `${i}`, sha256: hex(i + 1), size: 4, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const middle: Manifest = { ...base, generatedAt: "middle", files: base.files.map((f, i) => i === 1 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const target: Manifest = { ...middle, generatedAt: "target", files: middle.files.map((f, i) => i === 2 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
+    const cases = [
+      { ...second.manifestMeta!, encManifestSha: hex(900_001) },
+      { ...second.manifestMeta!, manifestHash: hex(900_002) },
+      { ...second.manifestMeta!, chain: [hex(900_003)] },
+    ];
+    for (const meta of cases) {
+      const peer = await remoteFor(server, secrets);
+      server.store.getCalls = [];
+      await expect(peer.latest({ fastFoldBase: { manifest: middle, meta } })).resolves.toMatchObject({ manifest: target });
+      expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
+    }
+  });
+});
+
+test("D history fold LRU avoids refetching the same authenticated manifest blob", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-fold-lru", NOW);
+  const remote = await remoteFor(server, secrets);
+  await remote.commit(0, secrets.deviceId, { generatedAt: "one", files: [] });
+  server.store.getCalls = [];
+  await remote.manifestAtSeq(1);
+  await remote.manifestAtSeq(1);
+  expect(server.store.getCalls).toHaveLength(1);
+});
+
+test("D pull flag is off by default and enables the persisted-state fast base only at exactly 1", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull-flag", NOW);
+    const writer = await remoteFor(server, secrets);
+    const puller = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, puller);
+    const base: Manifest = { generatedAt: "base", files: Array.from({ length: 300 }, (_, i) => ({
+      path: `flag/${i.toString().padStart(4, "0")}`, type: "symlink" as const, symlinkTarget: `${i}`, sha256: hex(i + 1), size: 4, mode: 0o777, mtimeMs: i,
+    })) };
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: puller });
+    const middle: Manifest = { ...base, generatedAt: "middle", files: base.files.map((f, i) => i === 10 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+    await withFastPullFlag(undefined, () => pull(root, cfg, { remote: puller }));
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
+
+    const target: Manifest = { ...middle, generatedAt: "target", files: middle.files.map((f, i) => i === 11 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
+    server.store.getCalls = [];
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha]);
   });
 });
 

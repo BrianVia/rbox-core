@@ -181,6 +181,9 @@ export interface CurrentWriteKek {
 
 export class E2eeRemote implements SyncRemote {
   private readonly kekByEpoch = new Map<number, Uint8Array>();
+  /** Tiny process-local history fold cache. Entries are authenticated by their
+   * signed content address before insertion; newest entry is last. */
+  private readonly manifestFoldLru: Array<{ encManifestSha: string; keyEpoch: number; signedChain: string[]; manifest: Manifest }> = [];
   /** The keyEpoch the KEK handed to `currentKek()` belongs to — blobs are
    *  encrypted under it, so a commit MUST be signed under the same epoch (D1). */
   private writeEpoch?: number;
@@ -207,8 +210,8 @@ export class E2eeRemote implements SyncRemote {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const collectMeta = process.env.RBOX_MDE_SNAPSHOT === "1" || process.env.RBOX_MDE_DELTA === "1";
-    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta);
+    const collectMeta = process.env.RBOX_MDE_SNAPSHOT === "1" || process.env.RBOX_MDE_DELTA === "1" || options?.fastFoldBase !== undefined;
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
 
@@ -236,7 +239,8 @@ export class E2eeRemote implements SyncRemote {
     account: VerifiedAccount,
     historical: boolean,
     onLatestTimings?: LatestOptions["onLatestTimings"],
-    collectMeta = false
+    collectMeta = false,
+    fastFoldBase?: LatestOptions["fastFoldBase"]
   ): Promise<{ manifest: Manifest; kek: Uint8Array; manifestMeta?: GlobalManifestMeta }> {
     const body = parseCommit(commit);
     const signedChain = body.manifestChain ?? [];
@@ -250,47 +254,25 @@ export class E2eeRemote implements SyncRemote {
     if (signedChain.length > MAX_MANIFEST_DELTA_CHAIN) {
       throw new ManifestChainError("signed chain exceeds maximum length", { head });
     }
+    // Only authenticated historical reads may return before opening the blob.
+    // A current-head read must always run openCommit's current account/signer gate;
+    // persisted fast-fold evidence is the sole latest() shortcut.
+    const cached = historical ? this.getCachedManifest(body.encManifestSha, body.keyEpoch, signedChain) : undefined;
+    if (cached && !collectMeta) return { manifest: cached, kek };
     const downloadStart = Date.now();
-    const [encManifest, chainBlobBytes] = await Promise.all([
-      this.api.blobStore().get(body.encManifestSha).catch((cause: unknown) => {
+    const encManifest = await this.api.blobStore().get(body.encManifestSha).catch((cause: unknown) => {
         // The head blob is not a chain link; with no chain in play this is
         // today's plain fetch failure. Under a chain it wedges the same walk.
         if (signedChain.length === 0) throw cause;
         throw new ManifestChainError("head manifest blob is missing", { head, failingLink: body.encManifestSha, cause });
-      }),
-      Promise.all(
-        signedChain.map((sha) =>
-          this.api.blobStore().get(sha).catch((cause: unknown) => {
-            throw new ManifestChainError("manifest chain link is missing", { head, failingLink: sha, cause });
-          })
-        )
-      ),
-    ]);
-    const downloadMs = onLatestTimings ? Date.now() - downloadStart : 0;
+      });
+    const headDownloadMs = Date.now() - downloadStart;
 
     const decryptStart = Date.now();
     const open = historical ? openCommitHistorical : openCommit;
     const plaintext = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
-    const chainPlaintexts = await Promise.all(
-      chainBlobBytes.map(async (bytes, index) => {
-        const sha = signedChain[index]!;
-        try {
-          return await openManifestChainBlob({
-            kek,
-            accountId: this.ctx.accountId,
-            workspaceId: this.ctx.workspaceId,
-            keyEpoch: body.keyEpoch,
-            expectedEncSha: sha,
-            bytes,
-          });
-        } catch (cause) {
-          throw new ManifestChainError("manifest chain link failed address or epoch authentication", { head, failingLink: sha, cause });
-        }
-      })
-    );
-    const decryptMs = onLatestTimings ? Date.now() - decryptStart : 0;
-
-    const parseStart = Date.now();
+    const headDecryptMs = Date.now() - decryptStart;
+    const headParseStart = Date.now();
     // Head envelope: raw-v0 decode failures propagate plain (today's surface);
     // an envelope-v1 head that fails to decode is a chain-class failure the
     // §3.6.3 repair must see, chain or no chain.
@@ -298,6 +280,57 @@ export class E2eeRemote implements SyncRemote {
       if (!isEnvelopeV1(plaintext) && signedChain.length === 0) throw cause;
       throw new ManifestChainError("head manifest envelope failed to decode", { head, failingLink: body.encManifestSha, cause });
     });
+    const headParseMs = Date.now() - headParseStart;
+    const parseStart = Date.now();
+    if (headEnvelope.kind === "delta" && fastFoldBase &&
+      headEnvelope.header.baseEncSha === fastFoldBase.meta.encManifestSha &&
+      headEnvelope.header.baseManifestHash === fastFoldBase.meta.manifestHash &&
+      signedChain.length === fastFoldBase.meta.chain.length + 1 &&
+      fastFoldBase.meta.chain.every((sha, index) => signedChain[index] === sha) &&
+      signedChain[signedChain.length - 1] === fastFoldBase.meta.encManifestSha) {
+      let manifest: Manifest;
+      try {
+        manifest = foldDelta(fastFoldBase.manifest, headEnvelope.ops, headEnvelope.header);
+      } catch (cause) {
+        throw new ManifestChainError("manifest delta fold failed", { head, failingLink: body.encManifestSha, cause });
+      }
+      this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
+      const downloadMs = onLatestTimings ? headDownloadMs : 0;
+      const decryptMs = onLatestTimings ? headDecryptMs : 0;
+      const parseMs = onLatestTimings ? headParseMs + Date.now() - parseStart : 0;
+      onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
+      return {
+        manifest,
+        kek,
+        manifestMeta: {
+          encManifestSha: body.encManifestSha,
+          manifestHash: headEnvelope.header.resultHash,
+          accountEpoch: body.accountEpoch,
+          keyEpoch: body.keyEpoch,
+          chain: [...signedChain],
+          chainBytes: fastFoldBase.meta.chainBytes + encManifest.byteLength,
+          snapshotBytes: fastFoldBase.meta.snapshotBytes,
+        },
+      };
+    }
+
+    const chainDownloadStart = Date.now();
+    const chainBlobBytes = await Promise.all(
+      signedChain.map((sha) => this.api.blobStore().get(sha).catch((cause: unknown) => {
+        throw new ManifestChainError("manifest chain link is missing", { head, failingLink: sha, cause });
+      }))
+    );
+    const chainDownloadMs = Date.now() - chainDownloadStart;
+    const chainDecryptStart = Date.now();
+    const chainPlaintexts = await Promise.all(chainBlobBytes.map(async (bytes, index) => {
+      const sha = signedChain[index]!;
+      try {
+        return await openManifestChainBlob({ kek, accountId: this.ctx.accountId, workspaceId: this.ctx.workspaceId, keyEpoch: body.keyEpoch, expectedEncSha: sha, bytes });
+      } catch (cause) {
+        throw new ManifestChainError("manifest chain link failed address or epoch authentication", { head, failingLink: sha, cause });
+      }
+    }));
+    const chainDecryptMs = Date.now() - chainDecryptStart;
     const chainEnvelopes = await Promise.all(
       chainPlaintexts.map((bytes, index) =>
         decodeEnvelope(bytes).catch((cause: unknown) => {
@@ -306,7 +339,10 @@ export class E2eeRemote implements SyncRemote {
       )
     );
     const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
-    const parseMs = onLatestTimings ? Date.now() - parseStart : 0;
+    this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
+    const downloadMs = onLatestTimings ? headDownloadMs + chainDownloadMs : 0;
+    const decryptMs = onLatestTimings ? headDecryptMs + chainDecryptMs : 0;
+    const parseMs = onLatestTimings ? headParseMs + Date.now() - parseStart : 0;
     onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
     let manifestMeta: GlobalManifestMeta | undefined;
     if (collectMeta) {
@@ -331,6 +367,22 @@ export class E2eeRemote implements SyncRemote {
       };
     }
     return { manifest, kek, ...(manifestMeta ? { manifestMeta } : {}) };
+  }
+
+  private getCachedManifest(encManifestSha: string, keyEpoch: number, signedChain: readonly string[]): Manifest | undefined {
+    const index = this.manifestFoldLru.findIndex((entry) => entry.encManifestSha === encManifestSha && entry.keyEpoch === keyEpoch &&
+      entry.signedChain.length === signedChain.length && entry.signedChain.every((sha, i) => sha === signedChain[i]));
+    if (index < 0) return undefined;
+    const [entry] = this.manifestFoldLru.splice(index, 1);
+    this.manifestFoldLru.push(entry!);
+    return entry!.manifest;
+  }
+
+  private cacheManifest(encManifestSha: string, keyEpoch: number, signedChain: readonly string[], manifest: Manifest): void {
+    const index = this.manifestFoldLru.findIndex((entry) => entry.encManifestSha === encManifestSha);
+    if (index >= 0) this.manifestFoldLru.splice(index, 1);
+    this.manifestFoldLru.push({ encManifestSha, keyEpoch, signedChain: [...signedChain], manifest });
+    if (this.manifestFoldLru.length > 2) this.manifestFoldLru.shift();
   }
 
   private foldManifestChain(

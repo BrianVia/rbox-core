@@ -173,3 +173,21 @@ opaque POST round trip.
 No remaining findings.
 
 Verdict: ALIGNED
+
+## Phase D implementation review — codex
+
+1. **CRITICAL — fold-cache hits could bypass chain/epoch authentication.** The
+   first implementation keyed only by ciphertext address and returned before
+   opening the blob. Remediated by binding historical cache entries to the
+   exact signed chain and key epoch.
+2. **HIGH — current-head cache hits could bypass C4 after an account/roster
+   advance without key rotation.** Remediated by limiting early cache returns
+   to authenticated historical reads. `latest()` always runs `openCommit`;
+   persisted exact-match evidence remains its sole shortcut.
+3. The review also requested explicit integration coverage for the §7.4
+   intermediate-substitution and valid-alternate-ancestry cases. Exact-list,
+   base-hash/address fallback, cold-walk success, flag gating, and history LRU
+   behavior are covered in this layer; the remaining adversarial fixtures are
+   noted for follow-up.
+
+Verdict after security remediation: no cache authorization bypass remains.
