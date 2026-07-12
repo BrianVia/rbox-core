@@ -39,7 +39,7 @@ import {
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type WorkspaceConfig } from "./config.js";
+import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
@@ -222,7 +222,7 @@ async function refreshWriteContext(cfg: WorkspaceConfig, deps: SyncDeps): Promis
   });
 }
 
-async function rescanForRetry(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored: boolean): Promise<Manifest> {
+export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<Manifest> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
@@ -257,6 +257,22 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
+  return applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta });
+}
+
+/** Apply an already authenticated remote manifest through the exact normal pull
+ * pipeline. Historical chain repair supplies the target commit's KEK/epoch here. */
+export async function applyPulledManifest(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps,
+  api: SyncRemote,
+  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number }
+): Promise<Action[]> {
+  const report = deps.report ?? PhaseReport.disabled("pull");
+  deps = withReportScanStats(deps, report);
+  const { sequence, manifest: remote, manifestMeta } = input;
+
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
@@ -282,7 +298,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
 
   // E2EE is the only mode (D6): the KEK is injected by buildAuthedRemote. A remote
   // manifest with encrypted entries but no key on this device → fail closed.
-  const kek = cfg.kek;
+  const kek = input.kek ? Buffer.from(input.kek) : cfg.kek;
   if (!kek && remote.files.some((f) => f.encSha)) {
     throw new Error("E2EE required: this workspace is encrypted but no key on this device — run `rbox pair` or `rbox key recover`.");
   }
@@ -324,7 +340,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const applyOpts = {
     device: cfg.deviceId,
     kek,
-    keyEpoch: cfg.keyEpoch,
+    keyEpoch: input.keyEpoch ?? cfg.keyEpoch,
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
     onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
@@ -464,7 +480,8 @@ export async function push(
  *  the no-op and everything-deferred short-circuits, so callers can say "already in
  *  sync" instead of reporting a publish that never happened (design 44: the setup
  *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
-type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean };
+export type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean; repairConflict?: boolean };
+export interface RepairPushMode { kind: "repair"; parentSequence: number }
 
 /**
  * The one typed recovery structure behind pushManifest's bounded retry loop. A failed
@@ -483,6 +500,7 @@ type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; r
  */
 type RecoveryAction =
   | { kind: "pull-first" }
+  | { kind: "repair-conflict" }
   | { kind: "epoch-stale" }
   | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[]; forceSnapshot?: boolean };
 
@@ -534,7 +552,8 @@ export async function pushManifest(
   deps: SyncDeps = {},
   attempt = 0,
   purgeIgnored = false,
-  forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE
+  forceGitRecapture: ReadonlySet<string> = NO_GIT_FORCE,
+  repair?: RepairPushMode
 ): Promise<PushResult> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
@@ -545,14 +564,17 @@ export async function pushManifest(
   let previousUnsatisfiedTotal: number | undefined;
   const recoverAccum = new Set<string>();
   let recoverFullAudit = false;
-  let forceSnapshot = false;
+  let forceSnapshot = repair !== undefined;
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit, forceSnapshot);
+    const outcome = await runPushAttempt(root, cfg, currentLocal, deps, backoff, purgeIgnored, currentForce, recoverAccum, recoverFullAudit, forceSnapshot, repair);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) process.stderr.write(`${lane}\n`);
       return outcome.result;
+    }
+    if (outcome.action.kind === "repair-conflict") {
+      return { sequence: repair!.parentSequence, manifest: currentLocal, committed: false, repairConflict: true };
     }
     const consumesAttempt =
       outcome.action.kind !== "reupload" ||
@@ -570,12 +592,12 @@ export async function pushManifest(
       } else {
         await refreshWriteContext(cfg, deps);
       }
-      currentLocal = await rescanForRetry(root, cfg, deps, purgeIgnored); // disk changed under us
+      currentLocal = await scanManifestForPush(root, cfg, deps, purgeIgnored); // disk changed under us
       currentForce = NO_GIT_FORCE;
       // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
       recoverAccum.clear();
       recoverFullAudit = false;
-      forceSnapshot = false;
+      forceSnapshot = repair !== undefined;
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
       recoverFullAudit = accumulateRecoveryPage(recoverAccum, recoverFullAudit, outcome.action.unsatisfiedBlobs);
@@ -605,7 +627,8 @@ async function runPushAttempt(
   forceGitRecapture: ReadonlySet<string>,
   recoverAddresses: ReadonlySet<string>,
   forceFullAudit: boolean,
-  forceSnapshot: boolean
+  forceSnapshot: boolean,
+  repair?: RepairPushMode
 ): Promise<AttemptOutcome> {
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
@@ -665,7 +688,7 @@ async function runPushAttempt(
     return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
   })();
   const gitUnchanged = !gitPlan.changed;
-  if (filesUnchanged && gitUnchanged) {
+  if (!repair && filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
     // (the 422 recovery): reaching here needs local == base, but to have hit the 422 at all
     // attempt-0 must have passed its own no-op — i.e. a real file or git-identity change. The
@@ -739,7 +762,7 @@ async function runPushAttempt(
   // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
   // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
   // that the artifact blobs were missing.
-  if (deferred.size > 0 && forceGitRecapture.size === 0) {
+  if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
     const dd = diffManifests(appliedBase, committed);
     if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
       reportDeferred(deferred);
@@ -766,14 +789,16 @@ async function runPushAttempt(
   const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && state.lastSyncedSequence === appliedSequence
     ? { manifest: state.lastSyncedManifest, meta: manifestMeta }
     : undefined;
-  if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase) {
+  if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
     commitOptions = {
       ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
       ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
       ...(deltaBase ? { deltaBase } : {}),
+      ...(repair ? { forceSnapshot: true } : {}),
     };
   }
-  const res = await report.phase("commit", () => api.commit(appliedSequence, cfg.deviceId, committed, commitOptions));
+  const parentSequence = repair?.parentSequence ?? appliedSequence;
+  const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
   if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
 
   if (res.epochStale !== undefined) {
@@ -781,7 +806,9 @@ async function runPushAttempt(
   }
   if (res.conflict) {
     deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
-    return { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };
+    return repair
+      ? { done: false, action: { kind: "repair-conflict" }, exhaustedError: "repair: verified head advanced during publication" }
+      : { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };
   }
   if (res.unsatisfiedBlobs) {
     // A missing GIT artifact can't be satisfied by a file re-upload, and an identity-carry

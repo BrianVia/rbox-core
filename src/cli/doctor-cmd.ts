@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, cryptoPoolStatus, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
@@ -14,6 +14,8 @@ import { RBOX_VERSION } from "./version.js";
 import { semverGt } from "./semver.js";
 import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
+import { buildAuthedRemote } from "./e2ee-client.js";
+import type { E2eeRemote } from "./e2ee-remote.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -38,7 +40,7 @@ export interface DoctorCheck {
   pid?: number;
 }
 
-export type DoctorChecks = Record<CheckName, DoctorCheck>;
+export type DoctorChecks = Record<CheckName, DoctorCheck> & { chain?: DoctorCheck };
 
 export interface WorkspaceShape {
   fileCount: number;
@@ -201,6 +203,27 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
   }
 }
 
+export async function checkManifestChain(remote: Pick<E2eeRemote, "chainDiagnostic">): Promise<DoctorCheck> {
+  try {
+    const d = await remote.chainDiagnostic();
+    return {
+      ok: true,
+      label: "manifest chain",
+      message: `head ${d.sequence}; links ${d.links}/${MAX_MANIFEST_DELTA_CHAIN}; chainBytes ${d.chainBytes}; snapshotBytes ${d.snapshotBytes}`,
+    };
+  } catch (error) {
+    if (error instanceof ManifestChainError) {
+      return {
+        ok: false,
+        label: "manifest chain",
+        message: `head ${error.head?.seq ?? "unknown"}: ${error.reason}; failing encrypted link ${error.failingLink ?? "head-level"}`,
+        hint: "run `rbox recover` to inspect and repair the unreadable suffix",
+      };
+    }
+    return { ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function checkCryptoWorkers(): DoctorCheck {
   const status = cryptoPoolStatus();
   if (status.state === "disabled") {
@@ -261,13 +284,16 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
   const creds = await loadCredentials();
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, remote, version, state, shape] = await Promise.all([
+  const [credentials, enrollment, remote, version, state, shape, chain] = await Promise.all([
     checkCredentials(creds),
     checkEnrollment(creds),
     checkRemote(creds, cfg),
     checkVersion(creds, cfg),
     checkState(root, cfg),
     workspaceShape(root, cfg),
+    buildAuthedRemote(root).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
+      ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
+    })),
   ]);
   return {
     root,
@@ -275,7 +301,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     creds,
     daemonStale: daemon.stale,
     workspaceShape: shape,
-    checks: { credentials, enrollment, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers() },
+    checks: { credentials, enrollment, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), chain },
   };
 }
 
@@ -380,8 +406,9 @@ function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
 
 export function renderDoctor(checks: DoctorChecks): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "daemon", "remote", "version", "state", "crypto"] as const) {
+  for (const key of ["credentials", "enrollment", "daemon", "remote", "version", "state", "crypto", "chain"] as const) {
     const c = checks[key];
+    if (!c) continue;
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);
     if (!c.ok && c.hint) lines.push(`      ${style.dim("fix:")} ${c.hint}`);
   }

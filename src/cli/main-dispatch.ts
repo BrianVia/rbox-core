@@ -361,7 +361,11 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     }
     case "recover": {
       const { recoverWorkspaceCmd } = await import("./recover-cmd.js");
-      await recoverWorkspaceCmd(positional[0], { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
+      await recoverWorkspaceCmd(positional[0], {
+        yes: flags.yes === "true",
+        repairChain: flags["repair-chain"] === "true",
+        allowMassDelete: flags["allow-mass-delete"] === "true",
+      });
       break;
     }
     case "versions": {

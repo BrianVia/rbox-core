@@ -3,6 +3,7 @@ import { recoverWorkspaceCmd } from "./recover-cmd.js";
 import type { WorkspaceConfig } from "./config.js";
 import type { SyncDeps } from "./sync.js";
 import type { HeadPin } from "./e2ee-keystore.js";
+import { ManifestChainError } from "../engine/index.js";
 
 const cfg: WorkspaceConfig = {
   schema: "e2ee/v1",
@@ -25,6 +26,62 @@ const pin = (seq: number, hash = `${seq}`.padStart(64, "0")): HeadPin => ({
 });
 
 describe("recover workspace command", () => {
+  test("chain failure retains the newly verified head and requires suffix consent", async () => {
+    let currentPin: HeadPin | undefined = pin(4);
+    let confirmations = 0;
+    let repaired = 0;
+    const broken = new ManifestChainError("corrupt delta", { head: { seq: 6, hash: "b".repeat(64) }, failingLink: "c".repeat(64) });
+    await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
+      findRoot: async () => "/tmp/ws",
+      loadConfig: async () => cfg,
+      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      latestCommit: async () => ({ sequence: 6 }),
+      pinStore: () => ({
+        load: async () => currentPin,
+        save: async (next) => { currentPin = next; },
+        clear: async () => { currentPin = undefined; },
+      }),
+      buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      beginReport: () => ({ logSummaryTo: () => {} } as never),
+      pull: async () => {
+        currentPin = pin(6, "b".repeat(64));
+        throw broken;
+      },
+      confirm: async () => { confirmations++; return true; },
+      repair: async (_root, _cfg, _deps, _error, opts) => {
+        repaired++;
+        await opts.confirmSupersede([{ seq: 5, deviceId: "dev_peer", reason: "corrupt delta" }, { seq: 6, deviceId: "dev_1", reason: "corrupt delta" }]);
+        return { kind: "repaired", sequence: 7, suffix: [], actions: [] };
+      },
+      log: () => {},
+    });
+    expect(repaired).toBe(1);
+    expect(confirmations).toBe(0); // --yes authorizes the suffix ceremony
+    expect(currentPin?.commitSeq).toBe(6);
+  });
+
+  test("--repair-chain bypasses only the chain suffix prompt", async () => {
+    let currentPin: HeadPin | undefined = pin(2);
+    const broken = new ManifestChainError("missing link", { head: { seq: 3, hash: "d".repeat(64) } });
+    await recoverWorkspaceCmd("/tmp/ws", { repairChain: true }, {
+      findRoot: async () => "/tmp/ws",
+      loadConfig: async () => cfg,
+      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      latestCommit: async () => ({ sequence: 3 }),
+      pinStore: () => ({ load: async () => currentPin, save: async (next) => { currentPin = next; }, clear: async () => { currentPin = undefined; } }),
+      buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
+      beginReport: () => ({ logSummaryTo: () => {} } as never),
+      pull: async () => { currentPin = pin(3, "d".repeat(64)); throw broken; },
+      confirm: async () => true,
+      repair: async (_root, _cfg, _deps, _error, opts) => {
+        expect(await opts.confirmSupersede([{ seq: 3, deviceId: "dev_1", reason: "missing link" }])).toBe(true);
+        return { kind: "repaired", sequence: 4, suffix: [], actions: [] };
+      },
+      log: () => {},
+    });
+    expect(currentPin?.commitSeq).toBe(3);
+  });
+
   test("clears the keystore pin, pulls/reconciles, then pushes local diffs", async () => {
     const calls: string[] = [];
     const logs: string[] = [];

@@ -14,6 +14,7 @@ import {
   type IgnoreMatcher,
   type Manifest,
   type WatchEvent,
+  ManifestChainError,
 } from "../engine/index.js";
 import type { Action } from "../engine/reconcile.js";
 import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type DaemonActivity } from "./activity.js";
@@ -59,6 +60,7 @@ import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "./version.js";
 import { daemonBindingMatches } from "./sync-state.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import { repairChain, type SuffixInfo } from "./chain-repair.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -844,7 +846,7 @@ export class RboxDaemon {
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
     // here and in doPush's deps so the pull inside push's 409 recovery is recorded
     // identically (codex R2: its actions are discarded by the retry loop).
-    const actions = await pull(this.root, this.cfg, {
+    const pullDeps: SyncDeps = {
       ...this.e2ee,
       cache: this.cache,
       syncMutex,
@@ -853,7 +855,29 @@ export class RboxDaemon {
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
       onPullApplied: (a) => this.recordPullApplied(a),
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
-    });
+    };
+    let actions: Action[];
+    try {
+      actions = await pull(this.root, this.cfg, pullDeps);
+    } catch (error) {
+      if (!(error instanceof ManifestChainError)) throw error;
+      let refusal: SuffixInfo[] | undefined;
+      const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
+        confirmSupersede: async (suffix) => {
+          const selfOnly = suffix.every((item) => item.deviceId === this.cfg.deviceId);
+          if (!selfOnly) refusal = suffix;
+          return selfOnly;
+        },
+      });
+      if (outcome.kind === "declined") {
+        const suffix = refusal ?? outcome.suffix;
+        const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
+        throw new Error(`MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`);
+      }
+      actions = outcome.kind === "converged"
+        ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
+        : outcome.actions;
+    }
     report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {

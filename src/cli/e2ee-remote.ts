@@ -142,6 +142,11 @@ export interface VersionInfo {
   keyEpoch: number;
 }
 
+export interface VerifiedSuffixEntry {
+  seq: number;
+  deviceId: string;
+}
+
 export interface HeadPin {
   commitSeq: number;
   commitHash: string;
@@ -205,6 +210,16 @@ export class E2eeRemote implements SyncRemote {
     const collectMeta = process.env.RBOX_MDE_SNAPSHOT === "1" || process.env.RBOX_MDE_DELTA === "1";
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
+  }
+
+  /** Doctor's authenticated chain report; decoding here is the same reader path as
+   * latest(), with metadata collection forced on for reporting. */
+  async chainDiagnostic(): Promise<{ sequence: number; links: number; chainBytes: number; snapshotBytes: number }> {
+    const vh = await this.verifiedHead();
+    if (!vh) return { sequence: 0, links: 0, chainBytes: 0, snapshotBytes: 0 };
+    const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, undefined, true);
+    const meta = decoded.manifestMeta!;
+    return { sequence: vh.sequence, links: meta.chain.length, chainBytes: meta.chainBytes, snapshotBytes: meta.snapshotBytes };
   }
 
   /** Fetch + decrypt ONE commit's manifest, returning it plus the per-epoch KEK (so
@@ -437,7 +452,7 @@ export class E2eeRemote implements SyncRemote {
    * seq, a tampered/non-terminating chain, or a `seq` pruned past retention
    * (`NeedsRebaselineError` from `commitsSince`).
    */
-  async manifestAtSeq(seq: number): Promise<{ manifest: Manifest; kek: Uint8Array }> {
+  async manifestAtSeq(seq: number): Promise<{ manifest: Manifest; kek: Uint8Array; keyEpoch: number }> {
     const vh = await this.verifiedHead();
     if (!vh) throw new Error("this workspace has no version history yet");
     const { account, sequence: head, commit: headCommit } = vh;
@@ -450,7 +465,32 @@ export class E2eeRemote implements SyncRemote {
       const chain = await this.api.commitsSince(seq - 1); // (seq-1, head] = seq..head
       target = await verifyHistorySegment(chain, seq, headCommit.commitHash, account);
     }
-    return this.decodeManifestAt(target, account, true);
+    const decoded = await this.decodeManifestAt(target, account, true);
+    return { manifest: decoded.manifest, kek: decoded.kek, keyEpoch: parseCommit(target).keyEpoch };
+  }
+
+  /** Authenticated signed-commit metadata for the complete suffix `(fromSeq, head]`.
+   * This is a consent/reporting surface only; it reuses the normal verified-head and
+   * history-segment checks and exposes no manifest paths or unverified server data. */
+  async verifiedSuffix(fromSeq: number): Promise<VerifiedSuffixEntry[]> {
+    const vh = await this.verifiedHead();
+    if (!vh) return [];
+    if (!Number.isInteger(fromSeq) || fromSeq < 0 || fromSeq > vh.sequence) {
+      throw new Error(`invalid verified suffix start: ${fromSeq}`);
+    }
+    if (fromSeq === vh.sequence) return [];
+    const segment = await this.api.commitsSince(fromSeq);
+    await verifyHistorySegment(segment, fromSeq + 1, vh.commit.commitHash, vh.account);
+    return segment.map((commit) => {
+      const body = parseCommit(commit);
+      return { seq: body.seq, deviceId: body.deviceId };
+    });
+  }
+
+  /** Return the current anti-rollback pin. Repair uses this verified authority as
+   * its ordinary commit parent; the commit layer still enforces parent == pin. */
+  loadVerifiedPin(): Promise<HeadPin | undefined> {
+    return this.pins.load();
   }
 
   /**
@@ -626,7 +666,7 @@ export class E2eeRemote implements SyncRemote {
     let emittedChain: string[] | undefined;
     let emittedDelta = false;
     const deltaBase = deltaEnabled ? options?.deltaBase : undefined;
-    if (
+    if (!options?.forceSnapshot &&
       deltaBase &&
       deltaBase.meta.keyEpoch === epoch &&
       deltaBase.meta.accountEpoch === account.currentEpoch &&
@@ -647,7 +687,7 @@ export class E2eeRemote implements SyncRemote {
       } else {
         built = await encodeSnapshot();
       }
-    } else if (snapshotEnabled) {
+    } else if (snapshotEnabled || options?.forceSnapshot) {
       // NOTE(84): C2 implies C1; rollout flags are sequential capabilities, not independent axes.
       built = await encodeSnapshot();
     } else {

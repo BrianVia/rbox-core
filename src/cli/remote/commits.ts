@@ -27,6 +27,8 @@ export interface CommitOptions {
   onCommitTimings?: (timings: CommitTimings) => void;
   /** Applied manifest + its verified wire identity; only sync.ts may select this base. */
   deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
+  /** Design 84 repair: encode a chain-free snapshot regardless of rollout flags. */
+  forceSnapshot?: boolean;
 }
 
 export interface CommitTimings {

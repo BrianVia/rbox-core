@@ -1,4 +1,4 @@
-import { type Action } from "../engine/index.js";
+import { ManifestChainError, type Action } from "../engine/index.js";
 import { findRoot, loadConfig } from "./config.js";
 import { loadCredentials } from "./credentials.js";
 import { keystorePinStore } from "./e2ee-keystore.js";
@@ -10,10 +10,12 @@ import { pull, push } from "./sync.js";
 import { postSyncNudge, summarize } from "./sync-cmd.js";
 import { style } from "./style.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
+import { repairChain, type SuffixInfo } from "./chain-repair.js";
 
 export interface RecoverOptions {
   yes?: boolean;
   allowMassDelete?: boolean;
+  repairChain?: boolean;
 }
 
 export interface RecoverDeps {
@@ -30,6 +32,7 @@ export interface RecoverDeps {
   postSyncNudge?: typeof postSyncNudge;
   latestCommit?: typeof latestCommitHead;
   log?: (line: string) => void;
+  repair?: typeof repairChain;
 }
 
 function count(actions: Action[], kind: Action["kind"]): number {
@@ -63,6 +66,8 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
         throw new Error(`recover refused: server head sequence ${sequence} is below the local verified pin ${pin.commitSeq} (rollback evident)`);
       }
     }
+    // NOTE(84): §4.3 retained-pin ceremony still owes removal of this cleared
+    // window. The chain-error branch below preserves the newly verified head pin.
     await pins.clear();
 
     const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
@@ -70,7 +75,37 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     built.deps.allowMassDelete = opts.allowMassDelete === true;
     const report = (deps.beginReport ?? beginReport)("sync");
     built.deps.report = report;
-    const pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+    let pulled: Action[];
+    try {
+      pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+    } catch (error) {
+      if (!(error instanceof ManifestChainError)) throw error;
+      const repairPin = await pins.load();
+      if (!error.head || !repairPin || repairPin.commitSeq !== error.head.seq || repairPin.commitHash !== error.head.hash) {
+        throw new Error("recover refused chain repair: verified broken-head pin is missing or inconsistent");
+      }
+      const confirmSupersede = async (suffix: SuffixInfo[]): Promise<boolean> => {
+        const describe = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(", ");
+        (deps.log ?? console.log)(`chain repair would supersede verified suffix ${describe} — ${suffix[0]?.reason ?? error.reason}`);
+        if (opts.yes || opts.repairChain) return true;
+        return (deps.confirm ?? promptConfirm)({
+          message: `Repair the manifest chain by superseding ${suffix.length} unreadable commit(s)?`,
+          default: false,
+        });
+      };
+      const outcome = await (deps.repair ?? repairChain)(root, built.cfg, built.deps, error, { confirmSupersede });
+      if (outcome.kind === "declined") {
+        (deps.log ?? console.log)("recover cancelled");
+        return;
+      }
+      if (outcome.kind === "repaired") {
+        (deps.log ?? console.log)(`${style.bold("recover")}: manifest chain repaired at sequence ${style.cyan(String(outcome.sequence))}`);
+        return;
+      }
+      // A peer published a readable head during our repair attempt. Apply it
+      // normally before the ceremony's ordinary push continuation.
+      pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+    }
     (deps.summarize ?? summarize)("pulled", pulled, root);
     await (deps.postSyncNudge ?? postSyncNudge)(root, pulled, built.cfg);
 
