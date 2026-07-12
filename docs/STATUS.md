@@ -7,6 +7,30 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 evening — macOS perf sprint (founder: "sorted TODAY"); CI runners ate the disk (fixed)
+
+- **APFS bulk-scan SHIPPED same-day (#241, design 107):** `getattrlistbulk`
+  via bun:ffi behind `RBOX_SCAN_BULK=1` (darwin-only, per-dir readdir
+  fallback on any FFI failure, flag-off byte-identical). Real-corpus Mac
+  bench: warm full scan **5466ms → 3137ms p50 (−43%)**, per-file stat phase
+  eliminated; parity 0 mismatches across 117k files + 20k-assert unit suite;
+  independent fable-5 review no-blockers. LIVE on the Mac now (verification
+  pass pending). Pre-default-on gate documented in design 107 (iCloud
+  dataless + non-APFS mounts unverified; ATTR_CMN_FLAGS hardening spec'd);
+  dircache composition = follow-up.
+- **Design 104 CONFIRMED working in the field:** Mac log shows transient
+  drop → suspect → "re-trusted after clean full-tree scan" → trusted. The
+  ~11% idle I/O duty fix is real.
+- **INCIDENT #2 (fixed in minutes):** the 8 self-hosted CI runner containers
+  accumulated **~760GB** of writable layers from today's merge volume and
+  filled the host disk to 100%. `docker compose up -d --force-recreate
+  --scale rbox-core=8` reclaimed 732GB; 8/8 runners back online. FOLLOW-UP
+  REQUIRED: runner job-workspace cleanup (ephemeral mode or work-dir tmpfs in
+  ~/gh-runners/docker-compose.yml) so merge-heavy days can't refill it.
+- **Commit accelerator running** (probe write/45s) to feed the design-102
+  soak toward its sample gate; soak counters need a clean post-fence-fix
+  window read before the enforce decision.
+
 ## 2026-07-12 evening — mark backlog DRAINED; soak collecting at full fidelity
 
 - **Phase-1 drain complete (post-#239):** 228,962 marks purged / 117 passes /
