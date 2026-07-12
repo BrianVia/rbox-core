@@ -1220,3 +1220,50 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     }
   }, 30_000);
 });
+
+test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapshot/length/immediate base) and the cold walk fails closed", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-fast-substitution", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const base = deltaSizedManifest("fast-sub-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    const m2: Manifest = { ...base, generatedAt: "fast-sub-2", files: base.files.map((f, i) => (i === 0 ? { ...f, mode: 0o755 } : f)) };
+    const second = await writer.commit(1, secrets.deviceId, m2, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    const m3: Manifest = { ...m2, generatedAt: "fast-sub-3", files: m2.files.map((f, i) => (i === 1 ? { ...f, mode: 0o700 } : f)) };
+    const third = await writer.commit(2, secrets.deviceId, m3, { deltaBase: { manifest: m2, meta: second.manifestMeta! } });
+    const m4: Manifest = { ...m3, generatedAt: "fast-sub-4", files: m3.files.map((f, i) => (i === 2 ? { ...f, mode: 0o600 } : f)) };
+    await writer.commit(3, secrets.deviceId, m4, { deltaBase: { manifest: m3, meta: third.manifestMeta! } });
+
+    // Substitute the MIDDLE signed-chain element with a VALID, present encrypted
+    // blob — snapshot (chain[0]), length, and immediate base (last element) all
+    // preserved, exactly the §7.4 case an aggregate/endpoints-only compare passes.
+    const original = parseSignedCommit(server.commits[3]!);
+    const substitute = await encryptManifest(
+      new Uint8Array((await writer.currentKek()).kek), ACCT, WS, original.keyEpoch,
+      new TextEncoder().encode(JSON.stringify({ generatedAt: "substituted", files: [] }))
+    );
+    server.store.blobs.set(substitute.encManifestSha, substitute.bytes);
+    const signedChain = [first.manifestMeta!.encManifestSha, substitute.encManifestSha, third.manifestMeta!.encManifestSha];
+    const hostileBody = {
+      accountId: original.accountId, accountEpoch: original.accountEpoch, workspaceId: original.workspaceId,
+      seq: original.seq, parentSeq: original.parentSeq, parentCommitHash: original.parentCommitHash,
+      rosterVersion: original.rosterVersion, keyEpoch: original.keyEpoch, deviceId: original.deviceId,
+      encManifestSha: original.encManifestSha, blobRefs: "blobRefs" in original ? original.blobRefs : [], manifestChain: signedChain,
+    };
+    server.commits[3] = await buildSignedCommit(hostileBody, { publicKey: secrets.sigPubKey, privateKey: signPrivateFromPkcs8(secrets.sigPrivPkcs8) });
+
+    // Fast base = the applied third commit: baseEncSha/baseManifestHash MATCH the
+    // head's delta header, and the hostile chain matches meta.chain + [meta sha]
+    // everywhere EXCEPT the substituted middle element — only the element-wise
+    // compare catches it. The demoted cold walk then fails closed on linkage.
+    server.store.getCalls = [];
+    const error = await peer
+      .latest({ fastFoldBase: { manifest: m3, meta: third.manifestMeta! } })
+      .then(() => { throw new Error("expected chain failure"); }, (e: unknown) => e);
+    expect(error).toBeInstanceOf(ManifestChainError);
+    // The cold walk ran (chain blobs fetched) — the fast path did not accept.
+    expect(server.store.getCalls).toContain(substitute.encManifestSha);
+  });
+});

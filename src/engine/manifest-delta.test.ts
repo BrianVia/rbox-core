@@ -93,7 +93,8 @@ describe("manifest delta envelope", () => {
   });
 
   test("rejects a newer manifest schema in the header before folding", async () => {
-    const header = JSON.stringify({ kind: "delta", bodyBytes: 2, baseEncSha: SHA_A, baseManifestHash: SHA_B, generatedAt: "x", manifestSchema: KNOWN_MANIFEST_SCHEMA + 1, resultHash: SHA_C });
+    // keys inserted in canonical (sorted) order — the header must pass the round-trip gate to reach the schema check
+    const header = JSON.stringify({ baseEncSha: SHA_A, baseManifestHash: SHA_B, bodyBytes: 2, generatedAt: "x", kind: "delta", manifestSchema: KNOWN_MANIFEST_SCHEMA + 1, resultHash: SHA_C });
     await expect(decodeEnvelope(utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${header}\n[]`))).rejects.toThrow("upgrade rbox");
   });
 });
@@ -128,7 +129,7 @@ describe("canonical form and pure folding", () => {
     const target = manifest("new", [entry("b")]);
     const header = deltaHeader(await canonicalManifestHash(base), await canonicalManifestHash(target), target.generatedAt);
     const envelope = (body: string): Uint8Array =>
-      utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${JSON.stringify({ ...header, bodyBytes: utf8.encode(body).byteLength })}\n${body}`);
+      utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${JSON.stringify(Object.fromEntries(Object.entries({ ...header, bodyBytes: utf8.encode(body).byteLength }).sort(([a], [b]) => (a < b ? -1 : 1))))}\n${body}`);
     const setA = JSON.stringify({ entry: entry("a"), op: "set" });
     await expect(decodeEnvelope(envelope(`[${setA},${setA}]`))).rejects.toThrow("duplicate");
     const setB = JSON.stringify({ entry: entry("b"), op: "set" });
@@ -227,5 +228,32 @@ describe("review round-2 protocol boundary hardening", () => {
     // __proto__ smuggling: rejected as an unknown header member
     const protoHeader = header.replace("{", `{"__proto__":{"comp":"zstd"},`);
     await expect(decodeEnvelope(reframe(protoHeader))).rejects.toThrow();
+  });
+
+  test("escaped-equivalent duplicate header members and non-canonical encodings are rejected", async () => {
+    const m = manifest("esc", [entry("a")]);
+    const encoded = await encodeSnapshotEnvelope(m, { compress: false });
+    const magicLen = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
+    const newline = encoded.indexOf(0x0a, magicLen);
+    const header = new TextDecoder().decode(encoded.subarray(magicLen, newline));
+    const body = encoded.subarray(newline + 1);
+    const reframe = (headerText: string): Uint8Array => {
+      const prefix = utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${headerText}\n`);
+      const out = new Uint8Array(prefix.byteLength + body.byteLength);
+      out.set(prefix);
+      out.set(body, prefix.byteLength);
+      return out;
+    };
+    // "\u0062odyBytes" decodes to "bodyBytes": raw-token duplicate scan can't see
+    // it, but the canonical round-trip rejects the non-canonical escape spelling.
+    const escapedDup = header.replace("{", `{"\\u0062odyBytes":1,`);
+    await expect(decodeEnvelope(reframe(escapedDup))).rejects.toThrow(/canonically encoded|duplicate/);
+    // whitespace / key-order deviations are equally non-canonical
+    await expect(decodeEnvelope(reframe(` ${header}`))).rejects.toThrow("canonically encoded");
+  });
+
+  test("lone surrogate in an object member NAME fails canonicalization closed", () => {
+    const m = { generatedAt: "now", files: [], gitRepos: { "repo-\ud800": {} } } as unknown as Manifest;
+    expect(() => canonicalManifestBytes(m)).toThrow("well-formed Unicode");
   });
 });

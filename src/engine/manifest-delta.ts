@@ -58,6 +58,10 @@ function canonicalJson(value: unknown): string {
       const object = value as Record<string, unknown>;
       const members: string[] = [];
       for (const key of Object.keys(object).sort()) {
+        // Member NAMES need the same RFC 8785 well-formedness gate as values —
+        // a lone-surrogate gitRepos key would otherwise hash here while a
+        // conforming implementation rejects it.
+        if (!isWellFormedUtf16(key)) throw new Error("manifest canonicalization requires well-formed Unicode strings");
         if (object[key] !== undefined) members.push(`${JSON.stringify(key)}:${canonicalJson(object[key])}`);
       }
       return `{${members.join(",")}}`;
@@ -326,11 +330,16 @@ export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedMani
     }
   }
   if (newline < 0 || newline - headerStart > MAX_ENVELOPE_HEADER) throw new Error("manifest envelope header exceeds maximum size or is unterminated");
-  // parseStrict (not JSON.parse): the strict-header contract rejects duplicate
-  // members (incl. __proto__ smuggling) instead of silently keeping the last;
-  // header values are strings and non-negative safe integers, so the signed-
-  // object scanner's number rules apply cleanly here.
-  const header = parseHeader(parseStrict(decoder.decode(plaintext.subarray(headerStart, newline))));
+  // Strict-header contract: parseStrict rejects duplicate raw member names and
+  // out-of-range numbers, and the canonical round-trip closes what a raw-token
+  // scan cannot see — escaped-equivalent duplicates ("bodyBytes" beside
+  // "bodyBytes" collapse under JSON.parse) and any non-canonical encoding.
+  // Exactly one wire encoding of any header exists (I6's ethos applied to the
+  // frame itself); writers emit canonicalJson, so honest envelopes pass.
+  const headerText = decoder.decode(plaintext.subarray(headerStart, newline));
+  const parsedHeader = parseStrict(headerText);
+  if (canonicalJson(parsedHeader) !== headerText) throw new Error("manifest envelope header is not canonically encoded");
+  const header = parseHeader(parsedHeader);
   const encodedBody = plaintext.subarray(newline + 1);
   const body = header.comp === "zstd" ? await zstdDecompressCapped(encodedBody, header.bodyBytes) : encodedBody;
   if (body.byteLength !== header.bodyBytes) throw new Error("manifest envelope body length does not match bodyBytes");
