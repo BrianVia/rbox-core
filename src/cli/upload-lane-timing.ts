@@ -4,6 +4,9 @@ export const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
 export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, queueMs: 0, blobs: 0, bytes: 0 };
 
 export interface FirstPublishStats {
+  /** Design 108 §3.6: command-level time from init's first-push milestone (before scan)
+   *  to the accepted files-only commit ACK — the headline greenfield onboarding KPI. */
+  timeToFilesSyncedMs: number;
   timeToFirstReadyCiphertextMs: number;
   firstReadyToFirstUploadStartMs: number;
   encryptWallMs: number;
@@ -26,6 +29,7 @@ export interface FirstPublishStats {
 }
 
 const zeroFirstPublishStats = (): FirstPublishStats => ({
+  timeToFilesSyncedMs: 0,
   timeToFirstReadyCiphertextMs: 0, firstReadyToFirstUploadStartMs: 0,
   encryptWallMs: 0, missingCheckWallMs: 0, uploadCriticalPathMs: 0,
   receiptRedemptionWallMs: 0, commitWallMs: 0, receiptRedemptionOverlapMs: 0,
@@ -109,16 +113,20 @@ export function firstPublishAuthEnd(): void {
   if (firstPublishTiming.enabled) firstPublishTiming.authEndedAt = performance.now();
 }
 export function finishFirstPublishStats(): FirstPublishStats | undefined {
-  if (!firstPublishTiming.enabled || !firstPublishTiming.firstUploadAt) return undefined;
+  if (!firstPublishTiming.enabled) return undefined;
+  // Design 108 §3.6 (round-4 MAJOR 2): finalization ALWAYS disables the singleton —
+  // even when it yields no stats (nothing uploaded) — so a no-upload push can't leak
+  // timing into later unrelated work.
+  firstPublishTiming.enabled = false;
+  if (!firstPublishTiming.firstUploadAt) return undefined;
   const s = firstPublishTiming.stats;
   s.uploadCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.uploadEndedAt - firstPublishTiming.uploadStartedAt));
   s.authCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.authEndedAt - firstPublishTiming.authStartedAt));
-  firstPublishTiming.enabled = false;
   return { ...s };
 }
 
 export function formatFirstPublishStats(s: FirstPublishStats): string {
-  return `fp ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} commit${s.commitWallMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
+  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} commit${s.commitWallMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
 }
 
 export function uploadLaneTimingSummary(): string | undefined {

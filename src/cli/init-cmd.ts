@@ -16,6 +16,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { pull, push, sync } from "./sync.js";
+import { beginReport } from "./metrics.js";
 import { resolveInitPlan, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
@@ -219,14 +220,44 @@ async function executeInitPlan(
       const sp = spinner("publishing initial snapshot — scanning files");
       try {
         deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-        const { sequence: seq, committed } = await push(plan.root, authed, deps);
+        // Design 108 §3.6: command-level "files synced" milestone, captured BEFORE scan so
+        // timeToFilesSyncedMs includes the scan wall. A fresh enabled report renders
+        // FirstPublishStats — the one run it was built to measure (the folded-in gap fix).
+        deps.filesFirstStartedAt = performance.now();
+        const report1 = beginReport("push");
+        deps.report = report1;
+        // Commit 1 — files (git deferred under RBOX_FILES_FIRST on a genuine genesis;
+        // otherwise an ordinary single git-first commit).
+        const r1 = await push(plan.root, authed, deps);
         // Never report a publish that didn't happen (design 44): the incident setup
         // printed "published → sequence 75" for a push that uploaded zero bytes.
         sp.succeed(
-          committed
-            ? `published ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
-            : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
+          r1.committed
+            ? `published ${style.sym.arrow} sequence ${style.cyan(String(r1.sequence))}`
+            : `already in sync — nothing to upload ${style.dim(`(sequence ${r1.sequence})`)}`
         );
+        report1?.logSummaryTo((l) => console.log(style.dim(l)));
+
+        // Commit 2 — attach git history (design 108 §3.1). CONDITIONAL: only when commit 1
+        // was a files-only, sequence-advancing genesis commit with git still owed. A bypass
+        // (no file diff) or starvation fallback already captured git → no second push. The
+        // SAME held first-sync mutex (deps.syncMutex is unchanged) means no other process
+        // interleaves; commit 1's "files synced ✓" stays true regardless of commit 2.
+        if (r1.gitDeferred) {
+          const sp2 = spinner("attaching git history");
+          deps.filesFirstStartedAt = undefined; // commit 2 is not the files-synced milestone
+          const report2 = beginReport("push");
+          deps.report = report2;
+          try {
+            const r2 = await push(plan.root, authed, deps);
+            sp2.succeed(`git history attached ${style.sym.arrow} sequence ${style.cyan(String(r2.sequence))}`);
+            report2?.logSummaryTo((l) => console.log(style.dim(l)));
+          } catch {
+            // Commit 1's files are durable; git resumes via the daemon or the next push.
+            sp2.fail("git history still uploading — will resume");
+            process.stderr.write(`${stderrStyle.yellow("!")} git history did not finish attaching — the daemon (or \`rbox push\`) will resume it.\n`);
+          }
+        }
       } catch (e) {
         sp.fail("initial push failed");
         throw e;

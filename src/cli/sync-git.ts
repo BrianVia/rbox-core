@@ -400,6 +400,12 @@ export interface GitPlanOptions {
   /** Workspace lock identity/link support is unavailable. Preserve Git syncing,
    * but neither read nor author config-lane updates. */
   disableConfigLane?: boolean;
+  /** Design 108 §3.2: files-first genesis defer. When true, planGitSections returns an
+   *  empty/absent git section with changed=false WITHOUT discovering/capturing any repo
+   *  and WITHOUT touching any local-only sidecar (base/pending/needsRes/removed are all
+   *  empty on a genuine genesis, so they pass through untouched). Git is re-derived as
+   *  owed by the next ordinary push. */
+  filesFirstDefer?: boolean;
 }
 
 /**
@@ -491,6 +497,11 @@ export async function planGitSections(
       gitPlanStats: { ...stats, carried: carried.length, captured: captured.length },
     };
   };
+  // Design 108 §3.2: genesis files-first defer — attach nothing this commit. On a
+  // genuine genesis (parentSequence 0, fresh state) base/pending/needsRes/removed are
+  // empty, so plan() yields gitRepos=undefined, changed=false, sidecars absent — git
+  // is re-derived as owed by the next ordinary push. No capture, no discovery.
+  if (options.filesFirstDefer) return plan();
   if (!cfg.syncGit) {
     // Opt-out: out stays empty → any base entries read as removal (the opt-out
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving
