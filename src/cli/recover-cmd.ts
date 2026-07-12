@@ -5,7 +5,7 @@ import { keystorePinStore } from "./e2ee-keystore.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
-import { RboxApi } from "./remote.js";
+import { NeedsRebaselineError } from "./remote.js";
 import { pull, push } from "./sync.js";
 import { postSyncNudge, summarize } from "./sync-cmd.js";
 import { style } from "./style.js";
@@ -30,10 +30,8 @@ export interface RecoverDeps {
   beginReport?: typeof beginReport;
   summarize?: typeof summarize;
   postSyncNudge?: typeof postSyncNudge;
-  latestCommit?: typeof latestCommitHead;
   log?: (line: string) => void;
   repair?: typeof repairChain;
-  chainProbe?: (remote: Awaited<ReturnType<typeof buildAuthedRemote>>["remote"]) => Promise<void>;
 }
 
 function count(actions: Action[], kind: Action["kind"]): number {
@@ -45,7 +43,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
   if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
   if (!opts.yes) {
     const ok = await (deps.confirm ?? promptConfirm)({
-      message: `Recover ${root}? This clears the local verified-head pin, pulls the server head, reconciles files, then pushes remaining local diffs.`,
+      message: `Recover ${root}? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.`,
       default: false,
     });
     if (!ok) {
@@ -59,14 +57,6 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     const creds = await (deps.loadCredentials ?? loadCredentials)();
     if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
     const pins = (deps.pinStore ?? keystorePinStore)(creds.accountId, cfg0.remoteWorkspaceId);
-    const pin = await pins.load();
-    if (pin) {
-      const remoteUrl = creds.remoteUrl ?? cfg0.remoteUrl;
-      const { sequence } = await (deps.latestCommit ?? latestCommitHead)(remoteUrl, creds.token, cfg0.remoteWorkspaceId, cfg0.projectId);
-      if (sequence < pin.commitSeq) {
-        throw new Error(`recover refused: server head sequence ${sequence} is below the local verified pin ${pin.commitSeq} (rollback evident)`);
-      }
-    }
     const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
     built.deps.syncMutex = syncMutex;
     built.deps.allowMassDelete = opts.allowMassDelete === true;
@@ -74,13 +64,18 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     built.deps.report = report;
     let pulled: Action[];
     try {
-      // Retain the verified pin while proving the current head is chain-readable.
-      // A chain failure must enter repair with that broken-head pin intact.
-      await (deps.chainProbe ?? (async (remote) => { await remote.latest(); }))(built.remote);
-      // NOTE(84): §4.3 the successful legacy recovery ceremony still clears the
-      // pin before its re-baseline pull; full retained-pin re-verification remains.
-      await pins.clear();
-      pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+      try {
+        // The normal path verifies forward from the retained pin. A successful
+        // pull needs no ceremony and must not manipulate the pin separately.
+        pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+      } catch (error) {
+        if (!(error instanceof NeedsRebaselineError)) throw error;
+        // Pruning is the sole continuity-skipping ceremony: E2eeRemote verifies
+        // /latest plus the longest retained segment and atomically overwrites the
+        // still-present prior pin only after its floor/equivocation check passes.
+        await built.remote.rebaselinePinToRetainedHead();
+        pulled = await (deps.pull ?? pull)(root, built.cfg, built.deps);
+      }
     } catch (error) {
       if (!(error instanceof ManifestChainError)) throw error;
       const repairPin = await pins.load();
@@ -120,11 +115,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     );
     report?.logSummaryTo((l) => (deps.log ?? console.log)(style.dim(l)));
     (deps.log ?? console.log)(
-      `${style.bold("recover")}: pin cleared, ${count(pulled, "write")} pulled, ${count(pulled, "delete")} trashed/deleted, ${count(pulled, "conflict")} keep-both conflict(s)`
+      `${style.bold("recover")}: head re-verified, ${count(pulled, "write")} pulled, ${count(pulled, "delete")} trashed/deleted, ${count(pulled, "conflict")} keep-both conflict(s)`
     );
   });
-}
-
-async function latestCommitHead(remoteUrl: string, token: string, workspaceId: string, projectId: string): Promise<{ sequence: number }> {
-  return new RboxApi(remoteUrl, token, workspaceId, projectId).latestCommit();
 }

@@ -9,6 +9,7 @@ import {
   parseCommit,
   serializeRefset,
   verifyAccount,
+  verifyCommitSig,
   verifyCommitChain,
   verifyHistorySegment,
   type BlobRefset,
@@ -19,6 +20,7 @@ import {
   type VerifiedAccount,
   type Wrap,
 } from "../engine/e2ee/index.js";
+import { activeSigners } from "../engine/e2ee/roster.js";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
 import {
@@ -547,6 +549,35 @@ export class E2eeRemote implements SyncRemote {
    * its ordinary commit parent; the commit layer still enforces parent == pin. */
   loadVerifiedPin(): Promise<HeadPin | undefined> {
     return this.pins.load();
+  }
+
+  /** Explicit recover ceremony for a workspace whose commit prefix was pruned.
+   * The previous pin remains installed throughout verification. Only the longest
+   * retained, signature-verified segment ending at /latest may replace it, and the
+   * replacement must satisfy the anti-rollback/equivocation floor. */
+  async rebaselinePinToRetainedHead(): Promise<{ sequence: number }> {
+    const priorPin = await this.pins.load();
+    const account = await this.refreshAccount();
+    const { sequence, commit } = await this.api.latestCommit();
+    if (!commit || sequence === 0) throw new Error("recover refused: pruned workspace has no replacement head");
+
+    const body = parseCommit(commit);
+    if (body.seq !== sequence) throw new Error("recover refused: server head sequence does not match its signed commit");
+    const roster = account.rosters[body.rosterVersion];
+    const signer = roster && activeSigners(roster).get(body.deviceId);
+    if (!signer || !(await verifyCommitSig(commit, signer))) {
+      throw new Error("recover refused: replacement head is not signed by an active member of its own verified roster");
+    }
+
+    await this.retainedSegmentEndingAtHead(0, sequence, commit.commitHash, account);
+    if (priorPin && (sequence < priorPin.commitSeq ||
+      (sequence === priorPin.commitSeq && commit.commitHash !== priorPin.commitHash))) {
+      throw new Error(sequence === priorPin.commitSeq
+        ? "recover refused: replacement head differs at the pinned sequence (fork/equivocation)"
+        : `recover refused: server head sequence ${sequence} is below the local verified pin ${priorPin.commitSeq} (rollback evident)`);
+    }
+    await this.pinFrom(commit, account);
+    return { sequence };
   }
 
   /**

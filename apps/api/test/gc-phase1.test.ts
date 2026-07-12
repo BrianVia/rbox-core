@@ -55,6 +55,26 @@ beforeEach(async () => {
 });
 
 describe("§33 mark → grace → purge (the leak fix)", () => {
+  it("keeps every chain link returned by a live retained head out of phase-1 condemnation", async () => {
+    await mkAccount("chain-live");
+    const chain = ["chain-live-a", "chain-live-b"];
+    for (const link of chain) await addRef("chain-live", link, 10, NOW - 2 * HOUR);
+    await db().prepare("INSERT INTO workspaces(workspace_id, project_id, account_id, created_at) VALUES ('ws_chain', 'root', 'chain-live', ?)").bind(NOW).run();
+    const rootsDO = {
+      idFromName: (name: string) => env.WORKSPACE_SYNC.idFromName(name),
+      get: () => ({ fetch: async () => Response.json({
+        head: 1, pruneFloor: 0, indexGeneration: 1, indexSyncedSeq: 1,
+        gap: [{ seq: 1, manifestSha: "manifest-live", chainRefs: chain }],
+        droppedPage: [], seqRootsPage: [],
+      }) }),
+    } as unknown as DurableObjectNamespace;
+    const reachable = await perAccountReachable({ ...env, WORKSPACE_SYNC: rootsDO }, "chain-live");
+
+    expect([...reachable]).toEqual(expect.arrayContaining(["manifest-live", ...chain]));
+    expect((await phase1Mark(db(), "chain-live", reachable, HOUR, NOW)).marked).toBe(0);
+    for (const link of chain) expect(await candExists("chain-live", link)).toBe(false);
+  });
+
   it("marks an unreachable ref, sweeps it after grace, releases exactly its bytes, condemns the last ref", async () => {
     await mkAccount("a");
     await addRef("a", "x", 100, NOW - 2 * HOUR); // stale (granted_at past grace)

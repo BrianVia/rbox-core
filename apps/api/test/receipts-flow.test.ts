@@ -18,6 +18,7 @@ import { MAX_MISSING_SHAS_RESPONSE, orderChainFirst, unsatisfiedBlobsBody } from
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { blobKey } from "../src/util.js";
 import { multipartComplete } from "../src/blobs.js";
+import { serializeRefset } from "../../../src/engine/refset.js";
 
 // §23.2 (staging PUT) + §23.4 (commit accounting) against real D1 + R2 (workerd).
 // The DO head-advance (transactionSync) isn't available in this runtime, so we drive
@@ -39,7 +40,7 @@ async function bootstrap(name: string) {
     body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: name, plan: "pro" }),
   });
   expect(res.status).toBe(200);
-  return (await res.json()) as { token: string; accountId: string };
+  return (await res.json()) as { token: string; accountId: string; deviceId: string };
 }
 const authed = (t: string, x: Record<string, string> = {}) => ({ authorization: `Bearer ${t}`, ...x });
 const db = () => env.rbox_dev_db;
@@ -110,6 +111,17 @@ async function putStaged(token: string, content: string): Promise<{ sha: string;
   const body = (await res.json()) as { sha256: string; sizeBytes: number; receipt: string };
   expect(body.receipt).toBeTruthy();
   return { sha: s, receipt: body.receipt };
+}
+
+async function putStagedBytes(token: string, bytes: Uint8Array): Promise<{ sha: string; receipt: string }> {
+  const s = createHash("sha256").update(bytes).digest("hex");
+  const res = await SELF.fetch(`${BASE}/v1/blobs/${s}`, {
+    method: "PUT",
+    headers: authed(token, { "content-length": String(bytes.length), ...RCPT }),
+    body: bytes,
+  });
+  expect(res.status).toBe(200);
+  return { sha: s, receipt: ((await res.json()) as { receipt: string }).receipt };
 }
 
 describe("§23.2 PUT → canonical + receipt (direct-write, zero D1 on the hot path)", () => {
@@ -261,11 +273,17 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
     expect(v).toEqual({ ok: false, needsUpload: [orphan] });
   });
 
-  test("one fenced sha aborts a multi-sha accounting batch atomically and returns the whole batch", async () => {
+  test("one fenced chain sha aborts a multi-sha accounting batch and chain-first handler formatting keeps it first", async () => {
     const a = await bootstrap("rcpt-fence-atomic");
-    const refs = [{ sha: sha("fence-a"), size: 7 }, { sha: sha("fence-b"), size: 9 }];
-    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(refs[1]!.sha).run();
-    expect(await commitAccounting(db(), a.accountId, refs, Date.now())).toEqual({ needsUpload: refs.map((r) => r.sha) });
+    const refs = [{ sha: sha("fence-data"), size: 7 }, { sha: sha("fence-chain"), size: 9 }];
+    const chainShas = [refs[1]!.sha];
+    await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(chainShas[0]).run();
+    const acct = await commitAccounting(db(), a.accountId, refs, Date.now());
+    expect(acct).toEqual({ needsUpload: refs.map((r) => r.sha) });
+    if (!("needsUpload" in acct)) throw new Error("expected delete-fence abort");
+    expect(unsatisfiedBlobsBody(orderChainFirst(acct.needsUpload, chainShas))).toEqual({
+      error: "unsatisfied_blobs", missing: [chainShas[0], refs[0]!.sha], missingTotal: 2,
+    });
     expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256 IN (?,?)").bind(...refs.map((r) => r.sha)).first()).toBeNull();
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=?").bind(a.accountId).first()).toBeNull();
     expect(await used(a.accountId)).toBe(0);
@@ -454,5 +472,74 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     expect(body.missing[0]).toBe(chainSha);
     expect(body.missing).toHaveLength(MAX_MISSING_SHAS_RESPONSE);
     expect(body.missingTotal).toBe(missing.length);
+  });
+
+  test("real commit handler keeps a missing chain link ahead of a truncated 10k+ data miss set", async () => {
+    const a = await bootstrap(`chain-truncation-${crypto.randomUUID()}`);
+    const refs = Array.from({ length: MAX_MISSING_SHAS_RESPONSE + 1 }, (_, i) => ({
+      encSha: sha(`handler-data-missing-${i}`),
+      size: 1,
+    }));
+    const sidecarBytes = serializeRefset(refs);
+    const sidecar = await putStagedBytes(a.token, sidecarBytes);
+    const chainSha = sha("handler-chain-missing");
+    const manifestSha = sha("handler-manifest-missing");
+    const commit = signedSidecarCommit({
+      accountId: a.accountId,
+      workspaceId: "ws",
+      deviceId: a.deviceId,
+      count: refs.length,
+      manifestChain: [chainSha],
+    });
+    const parsed = JSON.parse(commit.body) as Record<string, unknown>;
+    parsed.encManifestSha = manifestSha;
+    parsed.blobRefset = {
+      sidecarSha: sidecar.sha,
+      count: refs.length,
+      totalBytes: refs.length,
+    };
+    commit.body = JSON.stringify(parsed);
+
+    const sync = new WorkspaceSync(fakeState(), env);
+    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+      new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1", "x-rbox-account": a.accountId },
+        body: JSON.stringify({ parentSequence: 0, commit, receipts: { [sidecar.sha]: sidecar.receipt } }),
+      }), "ws", "root",
+    );
+
+    expect(res.status).toBe(422);
+    const body = await res.json() as { missing: string[]; missingTotal: number };
+    expect(body.missing).toHaveLength(MAX_MISSING_SHAS_RESPONSE);
+    expect(body.missing[0]).toBe(chainSha);
+    expect(body.missingTotal).toBe(refs.length + 2); // data refs + manifest carrier + chain link
+  }, 30_000);
+
+  test("legacy commit reports a prune-marked chain link as the first missing ref", async () => {
+    const a = await bootstrap(`legacy-marked-chain-${crypto.randomUUID()}`);
+    const chain = await putStaged(a.token, "legacy-marked-chain-bytes");
+    await db().prepare("INSERT OR IGNORE INTO blobs(sha256,size_bytes,present) VALUES (?,?,1)").bind(chain.sha, 25).run();
+    await db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES (?,?,?)").bind(a.accountId, chain.sha, Date.now()).run();
+    await db().prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES (?,?,?)").bind(a.accountId, chain.sha, Date.now()).run();
+
+    const commit = signedSidecarCommit({ accountId: a.accountId, workspaceId: "ws", deviceId: a.deviceId, count: 0, manifestChain: [chain.sha] });
+    const parsed = JSON.parse(commit.body) as Record<string, unknown>;
+    delete parsed.blobRefset;
+    parsed.blobRefs = [];
+    commit.body = JSON.stringify(parsed);
+    const sync = new WorkspaceSync(fakeState(), env);
+    const res = await (sync as unknown as { commit(req: Request, ws: string, proj: string): Promise<Response> }).commit(
+      new Request(`${BASE}/v1/ws/ws/proj/root/manifests`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-rbox-account": a.accountId },
+        body: JSON.stringify({ parentSequence: 0, commit }),
+      }), "ws", "root",
+    );
+
+    expect(res.status).toBe(422);
+    const body = await res.json() as { missing: string[] };
+    expect(body.missing[0]).toBe(chain.sha);
+    expect(body.missing).toContain(chain.sha);
   });
 });

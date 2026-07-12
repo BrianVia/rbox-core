@@ -269,6 +269,31 @@ describe("WorkspaceSync retained-roots index", () => {
     expect([...sql.__seqRoots.keys()]).toEqual([1, 2, 3]);
   });
 
+  test("snapshot reset retains dropped chain links until prune passes their last sequence", async () => {
+    const chain = [sha("7"), sha("8")];
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 2, commitHash: sha("c") }], ["pruneFloor", 0],
+      ["index_state", "building"], ["index_synced_seq", 0], ["index_generation", 0], ["backfill_cursor", 1],
+      ["seq:1", signed(1, { inline: [] }, chain)],
+      ["seq:2", signed(2, { inline: [] })],
+    ]);
+    const sql = fakeDoSql();
+    const sync = new WorkspaceSync(fakeCtx(kv, sql), {} as never);
+
+    await sync.alarm(); // seed chain-bearing seq 1
+    await sync.alarm(); // snapshot reset at seq 2 drops both links into retained index
+    expect([...sql.__dropped.values()]).toEqual(chain.map((sha256) => ({ sha256, last_seq: 1 })));
+    const retained = await sync.fetch(rootsRequest);
+    expect(await retained.json()).toMatchObject({ droppedPage: chain });
+
+    const pruned = await sync.fetch(new Request("https://do/prune?ws=ws_1&proj=root", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ floor: 1 }),
+    }));
+    expect(pruned.status).toBe(200);
+    await sync.alarm();
+    expect(sql.__dropped.size).toBe(0);
+  });
+
   test("server clamps oversized page limits", async () => {
     const kv = new Map<string, unknown>([
       ["head", { sequence: 0, commitHash: "0".repeat(64) }],

@@ -6,6 +6,7 @@ import { KNOWN_MANIFEST_SCHEMA } from "./manifest-validate.js";
 import type { FileEntry, Manifest } from "./types.js";
 import {
   MANIFEST_ENVELOPE_MAGIC,
+  MAX_ENVELOPE_HEADER,
   MAX_MANIFEST_DELTA_CHAIN,
   canonicalManifestBytes,
   canonicalManifestHash,
@@ -67,6 +68,30 @@ describe("manifest delta envelope", () => {
     await expect(decodeEnvelope(encoded.subarray(0, encoded.length - 1))).rejects.toThrow("body length");
   });
 
+  test("enforces the envelope-header boundary exactly", async () => {
+    const atLimit = utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${" ".repeat(MAX_ENVELOPE_HEADER)}\n`);
+    await expect(decodeEnvelope(atLimit)).rejects.toThrow(/JSON|header/);
+    await expect(decodeEnvelope(utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${" ".repeat(MAX_ENVELOPE_HEADER + 1)}\n`)))
+      .rejects.toThrow("manifest envelope header exceeds maximum size");
+  });
+
+  test("zstd expansion must equal bodyBytes, including either one-byte mismatch", async () => {
+    const encoded = await encodeSnapshotEnvelope(manifest("zstd", [entry("a")]), { compress: true });
+    const newline = encoded.indexOf(0x0a, utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength);
+    const headerStart = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
+    const header = JSON.parse(new TextDecoder().decode(encoded.subarray(headerStart, newline))) as Record<string, unknown>;
+    const body = encoded.subarray(newline + 1);
+    const assemble = (bodyBytes: number): Uint8Array => {
+      const prefix = utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${JSON.stringify({ ...header, bodyBytes })}\n`);
+      const out = new Uint8Array(prefix.byteLength + body.byteLength);
+      out.set(prefix);
+      out.set(body, prefix.byteLength);
+      return out;
+    };
+    await expect(decodeEnvelope(assemble((header.bodyBytes as number) - 1))).rejects.toThrow();
+    await expect(decodeEnvelope(assemble((header.bodyBytes as number) + 1))).rejects.toThrow("body length does not match bodyBytes");
+  });
+
   test("rejects a newer manifest schema in the header before folding", async () => {
     const header = JSON.stringify({ kind: "delta", bodyBytes: 2, baseEncSha: SHA_A, baseManifestHash: SHA_B, generatedAt: "x", manifestSchema: KNOWN_MANIFEST_SCHEMA + 1, resultHash: SHA_C });
     await expect(decodeEnvelope(utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${header}\n[]`))).rejects.toThrow("upgrade rbox");
@@ -109,6 +134,8 @@ describe("canonical form and pure folding", () => {
     const setB = JSON.stringify({ entry: entry("b"), op: "set" });
     await expect(decodeEnvelope(envelope(`[${setB},${setA}]`))).rejects.toThrow("sorted");
     await expect(decodeEnvelope(envelope(`[ ${setB}]`))).rejects.toThrow("canonically serialized");
+    const duplicateMember = `[{"entry":${JSON.stringify(entry("b"))},"op":"set","op":"set"}]`;
+    await expect(decodeEnvelope(envelope(duplicateMember))).rejects.toThrow();
     expect(() => foldDelta(base, [{ op: "set", entry: entry("a") }], header)).toThrow("no-op");
     expect(() => foldDelta(base, [{ op: "git-del", repo: "missing" }], header)).toThrow("absent");
   });
