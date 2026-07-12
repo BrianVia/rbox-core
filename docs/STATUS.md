@@ -9,7 +9,15 @@ _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** 
 
 ## 2026-07-12 midday — gate-compression sprint (founder: "resolve the gates ASAP"; update STATUS continuously)
 
-- **Gate 1 (84 fold) — FIXED + re-deployed.** #233 merged: root cause was a
+- **Gate 1 (84 fold) — round 2 required.** #233's per-fold perf fix WORKS
+  (~600–800ms/fold, RSS bounded) but field validation failed AGAIN: the
+  daemon pull path never engages evidence — `fold=coldwalk` on every pull on
+  BOTH hosts, p growing with chain length (5.7→10.9s as ambient commits
+  extend it). The #233 repro covered CLI pull(); the daemon loop differs.
+  MDE flags rolled OFF fleet-wide a second time; fix round 2 running in the
+  same cycle (daemon-loop repro is mandatory this time; multi-link
+  evidence-forward folding too).
+- **(superseded) Gate 1 (84 fold) — FIXED + re-deployed.** #233 merged: root cause was a
   bootstrap chicken-and-egg (fold evidence only persisted when WRITER caps
   were on → a FAST_PULL receiver cold-walked forever) + foldDelta
   canonicalizing the ~45MB manifest twice per fold (2k+1 materializations per
