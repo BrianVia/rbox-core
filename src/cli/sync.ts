@@ -101,7 +101,7 @@ const formatCommitTimings = (t: CommitTimings): string =>
  *  Rendered only when the server sent it (older workers omit the field). */
 const formatServerTimings = (t: CommitTimings["serverTimings"]): string =>
   t ? ` srv${fmtDetailSeconds(t.totalMs)} env${fmtDetailSeconds(t.envelopeMs)} acct${fmtDetailSeconds(t.accountingMs)} ssc${fmtDetailSeconds(t.sidecarMs)} cm${fmtDetailSeconds(t.commitMs)} mir${fmtDetailSeconds(t.mirrorMs)} rsp${fmtDetailSeconds(t.responseMs)}` : "";
-const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}`;
+export const formatLatestTimings = (t: LatestTimings): string => `d${fmtDetailSeconds(t.downloadMs)} x${fmtDetailSeconds(t.decryptMs)} p${fmtDetailSeconds(t.parseMs)} ${fmtDetailBytes(t.encBytes)}${t.fold ? ` fold=${t.fold}` : ""}`;
 /** Design 85 §6.1: the scan details carry an explicit residual (wall minus the
  *  five timed components — allocation, path construction, readlink, cache lookup,
  *  loop overhead) and the mid-write deferral count from the P-1 guard. */
@@ -254,14 +254,16 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const api = deps.remote ?? apiFor(cfg);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const validatedMeta = validManifestMeta(state.manifestMeta);
-  const fastFoldBase = process.env.RBOX_MDE_FAST_PULL === "1" && validatedMeta
+  const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL === "1";
+  const fastFoldBase = fastPullEnabled && validatedMeta
     ? { manifest: state.lastSyncedManifest, meta: validatedMeta }
     : undefined;
   let latestTimings: LatestTimings | undefined;
   const { sequence, manifest: remote, manifestMeta } = await report.phase("latest", () =>
-    api.latest(report.enabled || fastFoldBase ? {
+    api.latest(report.enabled || fastPullEnabled ? {
       ...(report.enabled ? { onLatestTimings: (t: LatestTimings) => (latestTimings = t) } : {}),
       ...(fastFoldBase ? { fastFoldBase } : {}),
+      ...(fastPullEnabled ? { recordEvidence: true } : {}),
     } : undefined)
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
