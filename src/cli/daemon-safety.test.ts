@@ -39,6 +39,11 @@ interface SafetyInternals {
   startLiveWatch(): Promise<void>;
   churnSinceSafety: boolean;
   watcherHealthy: boolean;
+  trustState: "trusted" | "suspect" | "fused";
+  watcherErrorGeneration: number;
+  lastTransientDropMs: number;
+  recoveryHoldMs: number;
+  maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
   safetyDelay: number;
   pumping: boolean;
   want: { push: boolean };
@@ -111,6 +116,8 @@ test("pull-only daemon watcher path never queues push", async () => {
 });
 
 test("a post-init watcher error revokes trust: backoff treats the watcher as dead (codex R1)", async () => {
+  const previous = process.env.RBOX_WATCHER_RETRUST;
+  delete process.env.RBOX_WATCHER_RETRUST;
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root);
   let onError: ((err: Error) => void) | undefined;
@@ -136,6 +143,38 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
     // only healer for anything the (possibly dead) watcher misses.
     expect(nextSafetyDelay(CAP, { watcherLive: daemon.watcher !== undefined && daemon.watcherHealthy, churned: false })).toBe(FLOOR);
   } finally {
+    if (previous === undefined) delete process.env.RBOX_WATCHER_RETRUST;
+    else process.env.RBOX_WATCHER_RETRUST = previous;
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a transient post-init watcher error is suspect and recoverable with the flag on", async () => {
+  const previous = process.env.RBOX_WATCHER_RETRUST;
+  process.env.RBOX_WATCHER_RETRUST = "1";
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
+  const daemon = makeDaemon(root);
+  let onError: ((err: Error) => void) | undefined;
+  daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
+    onError = opts?.onError;
+    return Promise.resolve({ close: async () => {} });
+  };
+  daemon.pumping = true;
+  try {
+    await daemon.startLiveWatch();
+    onError!(new Error("Events were dropped by the FSEvents client. File system must be re-scanned."));
+    expect(daemon.trustState).toBe("suspect");
+    expect(daemon.watcherHealthy).toBe(false);
+    daemon.lastTransientDropMs -= daemon.recoveryHoldMs;
+    daemon.maybeClearWatcherDegradedAfterScan(daemon.watcherErrorGeneration, { coverage: "full-tree", errorGenAtStart: daemon.watcherErrorGeneration });
+    expect(daemon.trustState).toBe("trusted");
+    expect(daemon.watcherHealthy).toBe(true);
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_WATCHER_RETRUST;
+    else process.env.RBOX_WATCHER_RETRUST = previous;
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     await daemon.watcher?.close();
