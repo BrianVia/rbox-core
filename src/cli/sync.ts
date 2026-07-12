@@ -47,6 +47,7 @@ import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./syn
 import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
 import { RboxApi, type CommitOptions, type CommitTimings, type LatestTimings, type SyncRemote } from "./remote.js";
+import { envInt } from "./remote/resilient.js";
 
 const apiFor = (cfg: WorkspaceConfig): SyncRemote =>
   new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
@@ -57,6 +58,40 @@ const MAX_ATTEMPTS = 5;
  *  server-side accident than a real edit, so it fails closed until a human says
  *  otherwise. Normal dev churn (deleting a subtree) stays far under half the tree. */
 const MASS_DELETE_MIN_FILES = 100;
+
+/** Push-side mass-delete breaker (design 108). Refuse a push that deletes
+ *  >= max(PCT% of the last-synced file count, MIN) files BEFORE any upload/commit —
+ *  a poisoned/empty scan or stray `rm -rf` must not propagate a fleet-wide wipe.
+ *  Env-overridable; the MIN floor exempts small workspaces (blast radius is small),
+ *  the PCT leg catches large ones before a full wipe. */
+const PUSH_MASS_DELETE_PCT_DEFAULT = 20;
+const PUSH_MASS_DELETE_MIN_DEFAULT = 1000;
+/** Pure predicate (exported for unit tests): trips when deletes reach BOTH the
+ *  absolute floor AND the percentage of the baseline. Integer-safe form of
+ *  `deletes >= max(min, pct% * baseCount)`. */
+export function pushMassDeleteTrips(
+  deletes: number,
+  baseCount: number,
+  opts: { pct?: number; min?: number } = {}
+): boolean {
+  const pct = opts.pct ?? envInt("RBOX_MASS_DELETE_PCT", PUSH_MASS_DELETE_PCT_DEFAULT, 0, Number.MAX_SAFE_INTEGER);
+  const min = opts.min ?? envInt("RBOX_MASS_DELETE_MIN", PUSH_MASS_DELETE_MIN_DEFAULT, 0, Number.MAX_SAFE_INTEGER);
+  return deletes >= min && deletes * 100 >= pct * baseCount;
+}
+
+export function makeDeferErrnoReporter(sink: (line: string) => void = (l) => console.error(`rbox: ${l}`)): { onErrno: (code: string) => void; flush: () => void } {
+  const counts = new Map<string, number>();
+  return {
+    onErrno: (code) => counts.set(code, (counts.get(code) ?? 0) + 1),
+    flush: () => {
+      if (counts.size === 0) return;
+      const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
+      const tally = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([code, count]) => `${code}×${count}`).join(", ");
+      const body = `scan deferred ${total} file(s) on IO fault (${tally})`;
+      sink(body);
+    },
+  };
+}
 /** The empty per-relPath 422 recapture set: the default force for a first attempt (design
  *  43 §6 [v2, M5]). Its `.size === 0` also marks "not a git-recapture retry" below. */
 const NO_GIT_FORCE: ReadonlySet<string> = new Set();
@@ -247,8 +282,10 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
+  const deferErrnos = makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
+  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   if (scanStats) {
@@ -312,10 +349,17 @@ export async function applyPulledManifest(
   const scanStats = report.enabled ? deps.scanStats : undefined;
   // Counting-only deferral sink: pull intentionally acts on no deferred set
   // (see sync-scan-defer.test.ts — apply's expectedLocal guard is the protection),
-  // but the §6.1 details still report how many paths the P-1 guard dropped.
+  // but the §6.1 details still report how many paths the P-1 guard dropped. A
+  // scan-faulted local path is omitted from `local`; if remote deleted that same
+  // path in the same window, reconcile no-ops and advances base. Once readable,
+  // the local file re-publishes (RESURRECTION, the safe direction: never a
+  // deletion). Feeding base-carried entries into reconcile would instead let a
+  // remote delete plan a disk delete against an unreadable path (design 108).
   const scanDeferred = new Set<string>();
+  const deferErrnos = makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (report.enabled) {
     report.files = fileCountOf(local);
@@ -489,8 +533,10 @@ export async function push(
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
+  const deferErrnos = makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned"));
+  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
   await Promise.all([save(), dircacheSave()]);
@@ -759,10 +805,8 @@ async function runPushAttempt(
   // here too would be a second copy of the rule.
   local = { ...local, gitRepos: gitPlan.gitRepos };
 
-  const filesUnchanged = (() => {
-    const d = diffManifests(appliedBase, local);
-    return d.added.length === 0 && d.changed.length === 0 && d.deleted.length === 0;
-  })();
+  const filesDiff = diffManifests(appliedBase, local);
+  const filesUnchanged = filesDiff.added.length === 0 && filesDiff.changed.length === 0 && filesDiff.deleted.length === 0;
   const gitUnchanged = !gitPlan.changed;
   if (!repair && filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
@@ -809,6 +853,21 @@ async function runPushAttempt(
     (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan));
   }
 
+  // Push-side mass-delete breaker (design 108): compute the intended deletions on the
+  // PRE-UPLOAD manifest and refuse before any encrypt/upload/commit work. Deferral only
+  // carries base entries forward, so pre-upload `local` and post-defer `committed` have an
+  // identical DELETE count (a churning file is a change, not a delete). Op-scoped consent
+  // only (allowMassDeletePush / RBOX_ALLOW_MASS_DELETE handled at the CLI boundary) — the
+  // daemon never consents, so a runaway wipe halts background push instead of publishing.
+  const pushDeletes = filesDiff.deleted.length;
+  if (!deps.allowMassDeletePush && pushMassDeleteTrips(pushDeletes, appliedBase.files.length)) {
+    throw new Error(
+      `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
+        `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` ` +
+        `(or set RBOX_ALLOW_MASS_DELETE=1) to publish it once.`
+    );
+  }
+
   // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
   // E2EE is the only mode (design 12 D6): a non-encrypted config reaching the sync
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
@@ -848,19 +907,6 @@ async function runPushAttempt(
       reportDeferred(deferred);
       return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
     }
-  }
-
-  // Push-side mass-delete guard (design 50 §4): symmetry with the pull guard. A push that
-  // would delete ≥half the baseline is far likelier a stray `rm -rf` on THIS machine than an
-  // intended cleanup — publishing it wedges every OTHER device (each halts ⚠ on its next pull).
-  // Refuse to COMMIT until a human consents. Counted on `committed` (post-defer) so the number
-  // is exact, and gated on the op-scoped consent field so the recovery pull can't inherit it.
-  const pushDeletes = diffManifests(appliedBase, committed).deleted.length;
-  if (!deps.allowMassDeletePush && pushDeletes >= MASS_DELETE_MIN_FILES && pushDeletes * 2 >= appliedBase.files.length) {
-    throw new Error(
-      `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
-        `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` to publish it once.`
-    );
   }
 
   let commitTimings: CommitTimings | undefined;

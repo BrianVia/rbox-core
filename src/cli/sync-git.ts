@@ -13,6 +13,7 @@ import {
   inTreeWorktreeParentRel,
   inTreeWorktreeParentRelFromCtx,
   isGitBusy,
+  isPresentButUnreadableError,
   gitSectionBlobRefs,
   gitSectionNewestLink,
   gitSectionTips,
@@ -818,7 +819,15 @@ export async function planGitSections(
       const dirPresent = await fs
         .lstat(repoDirOf(root, rel))
         .then((s) => s.isDirectory())
-        .catch(() => false);
+        .catch((e) => {
+          // Only genuine absence drops the section; a permission/IO fault carries the base
+          // (design 108 — a chmod-000 hiccup must not propagate a git-section removal).
+          return isPresentButUnreadableError(e) ? undefined : false;
+        });
+      if (dirPresent === undefined) {
+        deferOne(rel, "repo dir unreadable (permission/IO fault) — carrying base");
+        continue;
+      }
       if (!dirPresent) {
         // §9: repo dir GONE ENTIRELY → the pusher drops the section (receivers drop
         // their base entry but never touch local .git).

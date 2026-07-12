@@ -82,6 +82,8 @@ const deps = (remote: SyncRemote, extra: Partial<SyncDeps> = {}): SyncDeps => ({
 const N = 200; // baseline size; the guard needs ≥100 deletes AND ≥half the baseline
 
 beforeEach(async () => {
+  process.env.RBOX_MASS_DELETE_MIN = "100";
+  process.env.RBOX_MASS_DELETE_PCT = "50";
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-push-guard-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   cfg = {
@@ -99,6 +101,8 @@ beforeEach(async () => {
   };
 });
 afterEach(async () => {
+  delete process.env.RBOX_MASS_DELETE_MIN;
+  delete process.env.RBOX_MASS_DELETE_PCT;
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -136,6 +140,29 @@ test("push --allow-mass-delete (allowMassDeletePush) publishes the deletion once
   expect(res.committed).toBe(true);
   const committed = (await remote.latest()).manifest;
   expect(committed.files.length).toBe(N - 120); // the deletion was published
+});
+
+test("default thresholds do not nag a small workspace", async () => {
+  delete process.env.RBOX_MASS_DELETE_MIN;
+  delete process.env.RBOX_MASS_DELETE_PCT;
+  const remote = new FakeRemote();
+  await seedBaseline(remote);
+  await deleteLocal(120);
+
+  const res = await push(root, cfg, deps(remote));
+  expect(res.committed).toBe(true);
+  expect((await remote.latest()).manifest.files.length).toBe(N - 120);
+});
+
+test("CLI-boundary env consent maps to allowMassDeletePush and publishes", async () => {
+  const remote = new FakeRemote();
+  await seedBaseline(remote);
+  await deleteLocal(120);
+
+  // main-dispatch/sync-cmd translate RBOX_ALLOW_MASS_DELETE=1 into this op-scoped field.
+  const res = await push(root, cfg, deps(remote, { allowMassDeletePush: true }));
+  expect(res.committed).toBe(true);
+  expect((await remote.latest()).manifest.files.length).toBe(N - 120);
 });
 
 test("REGRESSION (B2): push consent does NOT satisfy the PULL guard — a mass-delete pull still refuses", async () => {

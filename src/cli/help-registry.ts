@@ -167,7 +167,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "SYNCING",
     summary: "upload local changes",
     usage: "rbox push [path] [--allow-mass-delete]",
-    flags: [{ flag: "--allow-mass-delete", desc: "consent to publishing a delete of half or more of the tracked files" }],
+    flags: [{ flag: "--allow-mass-delete", desc: "consent to the push-side mass-delete guard (or env RBOX_ALLOW_MASS_DELETE=1)" }],
   },
   {
     name: "pull",
@@ -345,7 +345,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [
       { flag: "--yes", desc: "skip the confirmation prompt (alias: -y)" },
       { flag: "--repair-chain", desc: "confirm superseding an authenticated unreadable manifest suffix" },
-      { flag: "--allow-mass-delete", desc: "consent to a pull that deletes half or more of the tracked files" },
+      { flag: "--allow-mass-delete", desc: "consent to both pull-side and push-side mass-delete guards" },
     ],
   },
   {

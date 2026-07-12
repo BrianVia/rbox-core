@@ -10,6 +10,23 @@ import { buildIgnoreMatcher, isIgnoreRuleFile, type IgnoreMatcher } from "./igno
 import type { FileEntry, Manifest } from "./types.js";
 import { bulkWalkDir, bulkWalkSupported, type BulkStat } from "./darwin-bulk-walk.js";
 
+/** errno codes for a per-file fault we DEFER (carry the last-synced entry forward,
+ *  retry next scan) rather than abort the whole scan on. A directory-level readdir
+ *  failure is deliberately NOT here — an unenumerable dir fails the scan loudly. */
+const DEFERRABLE_FILE_ERRNOS = new Set(["EACCES", "EPERM", "EIO", "ENOENT"]);
+function isDeferrableFileError(e: unknown): e is NodeJS.ErrnoException {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && DEFERRABLE_FILE_ERRNOS.has(code);
+}
+
+/** Present-but-unreadable: the path EXISTS but this process cannot read it. Never
+ *  absence — mapping these to "gone" is how an unreadable file becomes a deletion. */
+const PRESENT_BUT_UNREADABLE_ERRNOS = new Set(["EACCES", "EPERM", "EIO"]);
+export function isPresentButUnreadableError(e: unknown): e is NodeJS.ErrnoException {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && PRESENT_BUT_UNREADABLE_ERRNOS.has(code);
+}
+
 export type WatchEventKind = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
 export interface WatchEvent {
   /** POSIX-relative path from the sync root. */
@@ -25,6 +42,9 @@ export interface WatchEvent {
  * With a {@link HashCache}, unchanged files (same mtime+size+ctime) skip re-hashing —
  * turning a full scan into a stat-only pass for the common case. The cache is a
  * fast-path hint only; identity is still the content sha (see FileEntry).
+ * Per-file IO faults are deferred so callers can carry the last-synced entry
+ * forward; directory enumeration failures remain fatal because the scan cannot
+ * safely establish what exists below an unenumerable directory.
  */
 /** How often {@link scanManifest}'s optional discovery callback fires — every Nth
  *  entry, so the caller's spinner moves during a long walk without paying a callback
@@ -92,17 +112,21 @@ export async function scanManifest(
    *  level; stat and matcher timing stays at the checked-entry level because the
    *  current walk interleaves them with pruning and recursion. */
   scanStats?: ScanStats,
-  /** Out-param: files that changed between discovery and their deferred hash. */
+  /** Out-param: files that changed between discovery and their deferred hash, or
+   *  hit a per-file IO fault and must carry their last-synced entry forward. */
   deferred?: Set<string>,
   dirProbe?: DirProbeSink,
   dircache?: DirCache,
-  mode: "pruned" | "unpruned" = "unpruned"
+  mode: "pruned" | "unpruned" = "unpruned",
+  /** Optional privacy-safe reporter for deferred per-file IO faults. Receives only
+   *  the errno string, never a path. */
+  onDeferErrno?: (code: string) => void
 ): Promise<Manifest> {
   const scanStartMs = Date.now();
   if (!dircache) {
     const files: FileEntry[] = [];
     if (scanStats) { scanStats.dircacheOutcome = "off"; scanStats.dirsReusedFromCache = 0; }
-    const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs, scanStats, deferred, dirProbe, onProgress, onGitRepo });
+    const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs, scanStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno });
     await runWalk(ctx, "", files);
     sortManifestFiles(files, scanStats);
     return { generatedAt: new Date().toISOString(), files };
@@ -129,7 +153,7 @@ export async function scanManifest(
   for (let attempt = 0; ; attempt++) {
     files = [];
     winningStats = createScanStats();
-    winningCtx = makeWalkCtx({ root, matcher, cache, dircache, mode: effectiveMode, scanStartMs, scanStats: winningStats, deferred, dirProbe, onProgress, onGitRepo, priorRuleFiles });
+    winningCtx = makeWalkCtx({ root, matcher, cache, dircache, mode: effectiveMode, scanStartMs, scanStats: winningStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno, priorRuleFiles });
     if (effectiveMode === "unpruned") dircache.dropTable();
     try {
       await runWalk(winningCtx, "", files);
@@ -200,6 +224,7 @@ interface WalkCtxOptions {
   dirProbe?: DirProbeSink;
   onProgress?: (discovered: number) => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
+  onDeferErrno?: (code: string) => void;
   priorRuleFiles?: Set<string>;
 }
 
@@ -214,7 +239,7 @@ function makeWalkCtx(o: WalkCtxOptions): WalkCtx {
   return {
     root: o.root, matcher: o.matcher, cache: o.cache, dircache: o.dircache, mode: o.mode,
     scanStartMs: o.scanStartMs, scanStats: o.scanStats, deferred: o.deferred, dirProbe: o.dirProbe,
-    onDiscover, onGitRepo: o.onGitRepo, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
+    onDiscover, onGitRepo: o.onGitRepo, onDeferErrno: o.onDeferErrno, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
   };
 }
 
@@ -269,7 +294,17 @@ export async function applyWatchEvents(
       //    itself re-derives from disk exactly like a stale `unlink`;
       //  - genuinely gone → drop the exact path + `dir/**` prefix.
       const prefix = `${rel}/`;
-      const st = await fs.lstat(path.join(root, rel)).catch(() => undefined);
+      let st: Stats | undefined;
+      try { st = await fs.lstat(path.join(root, rel)); }
+      catch (e) {
+        if (isPresentButUnreadableError(e)) {
+          // Unreadable, not absent: keep every prior entry under rel untouched and let the
+          // caller retry — a permission fault must never convert a subtree into deletions.
+          deferred?.add(rel);
+          continue;
+        }
+        st = undefined;
+      }
       if (st?.isDirectory()) {
         if ((matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
         const sub: FileEntry[] = [];
@@ -363,11 +398,16 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
   let st1;
   try {
     st1 = await fs.lstat(abs);
-  } catch {
+  } catch (e) {
+    // ENOENT/ENOTDIR = genuinely absent. A permission/IO fault is NOT absence —
+    // treating it as gone converts an unreadable-but-present file into a deletion.
+    if (isPresentButUnreadableError(e)) return { kind: "midwrite" };
     return { kind: "gone" };
   }
   if (st1.isSymbolicLink()) {
-    const target = await fs.readlink(abs);
+    let target: string;
+    try { target = await fs.readlink(abs); }
+    catch (e) { if (isPresentButUnreadableError(e)) return { kind: "midwrite" }; return { kind: "gone" }; }
     return { kind: "entry", entry: { path: rel, type: "symlink", symlinkTarget: target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), mode: 0o777, mtimeMs: 0 } };
   }
   if (!st1.isFile()) return { kind: "gone" };
@@ -375,9 +415,15 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
   const cached = cache?.lookup(rel, st1.mtimeMs, st1.size, st1.ctimeMs);
   if (cached) return { kind: "entry", entry: { path: rel, type: "file", sha256: cached, size: st1.size, mode: st1.mode & 0o777, mtimeMs: st1.mtimeMs } };
 
-  const sha256 = await hashFile(abs, st1.size);
-  const st2 = await fs.lstat(abs).catch(() => undefined);
-  if (!st2) return { kind: "gone" };
+  let sha256: string;
+  try { sha256 = await hashFile(abs, st1.size); }
+  catch (e) { if (isDeferrableFileError(e)) return { kind: "midwrite" }; throw e; }
+  let st2: Stats | undefined;
+  try { st2 = await fs.lstat(abs); }
+  catch (e) {
+    if (isPresentButUnreadableError(e)) return { kind: "midwrite" };
+    return { kind: "gone" };
+  }
   if (!statsStableAcrossHash(st1, st2)) return { kind: "midwrite" };
   cache?.record(rel, { mtimeMs: st2.mtimeMs, size: st2.size, ctimeMs: st2.ctimeMs, sha256 });
   return { kind: "entry", entry: { path: rel, type: "file", sha256, size: st2.size, mode: st2.mode & 0o777, mtimeMs: st2.mtimeMs } };
@@ -404,8 +450,18 @@ interface WalkCtx {
   dirProbe?: DirProbeSink;
   onDiscover?: () => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
+  onDeferErrno?: (code: string) => void;
   priorRuleFiles: Set<string>;
   observedRuleFiles: Set<string>;
+}
+
+/** Defer a per-file fault (add to the deferred set, report errno-only) — returns
+ *  false for a non-deferrable error the caller must rethrow. */
+function deferWalkFault(ctx: WalkCtx, childRel: string, error: unknown): boolean {
+  if (!isDeferrableFileError(error)) return false;
+  ctx.deferred?.add(childRel);
+  ctx.onDeferErrno?.(error.code!);
+  return true;
 }
 
 class RulesChangedDuringPrune extends Error {}
@@ -455,6 +511,8 @@ async function walk(
     }
     if (children === undefined) {
       const t0 = ctx.scanStats ? Date.now() : 0;
+      // Deliberate fail-loud boundary (design 108): an unenumerable directory aborts
+      // the scan — per-file faults defer, but the walk cannot know what lives below.
       const entries = await fs.readdir(absDir, { withFileTypes: true });
       if (ctx.scanStats) {
         ctx.scanStats.readdirMs += Date.now() - t0;
@@ -515,7 +573,12 @@ async function walk(
     } else if (child.type === "symlink") {
       if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
       ctx.onDiscover?.();
-      const target = await fs.readlink(abs);
+      let target: string;
+      try { target = await fs.readlink(abs); }
+      catch (error) {
+        if (deferWalkFault(ctx, childRel, error)) continue;
+        throw error;
+      }
       out.push({
         path: childRel,
         type: "symlink",
@@ -534,7 +597,7 @@ async function walk(
         try {
           st = await fs.stat(abs);
         } catch (error) {
-          if (reused && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          if (deferWalkFault(ctx, childRel, error)) continue;
           throw error;
         } finally {
           ctx.scanStats.statMs += Date.now() - t0;
@@ -542,7 +605,7 @@ async function walk(
       } else if (!st) {
         try { st = await fs.stat(abs); }
         catch (error) {
-          if (reused && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          if (deferWalkFault(ctx, childRel, error)) continue;
           throw error;
         }
       }
@@ -564,9 +627,9 @@ async function finishHashes(ctx: WalkCtx, pending: PendingHash[], out: FileEntry
   if (ctx.scanStats) {
     ctx.scanStats.filesHashed += pending.length;
     const t0 = Date.now();
-    await drainHashes(pending, out, ctx.cache, ctx.deferred);
+    await drainHashes(pending, out, ctx.cache, ctx.deferred, ctx.onDeferErrno);
     ctx.scanStats.hashMs += Date.now() - t0;
-  } else await drainHashes(pending, out, ctx.cache, ctx.deferred);
+  } else await drainHashes(pending, out, ctx.cache, ctx.deferred, ctx.onDeferErrno);
 }
 
 /** The "make a pending list, walk from `rel`, drain the deferred hashes" sequence
@@ -587,12 +650,20 @@ function timedMatcher(scanStats: ScanStats, fn: () => boolean): boolean {
 }
 
 /** Hash the deferred cache-miss files with bounded concurrency. */
-async function drainHashes(pending: PendingHash[], out: FileEntry[], cache?: HashCache, deferred?: Set<string>): Promise<void> {
+async function drainHashes(pending: PendingHash[], out: FileEntry[], cache?: HashCache, deferred?: Set<string>, onDeferErrno?: (code: string) => void): Promise<void> {
   let i = 0;
   const worker = async () => {
     for (let idx = i++; idx < pending.length; idx = i++) {
       const p = pending[idx]!;
-      const sha256 = await hashFile(p.abs, p.st.size);
+      let sha256: string;
+      try {
+        sha256 = await hashFile(p.abs, p.st.size);
+      } catch (e) {
+        if (!isDeferrableFileError(e)) throw e;
+        deferred?.add(p.childRel);
+        onDeferErrno?.(e.code!);
+        continue;
+      }
       const post = await fs.lstat(p.abs).catch(() => undefined);
       if (!post || !statsStableAcrossHash(p.st, post)) {
         deferred?.add(p.childRel);

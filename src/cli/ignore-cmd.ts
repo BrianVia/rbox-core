@@ -4,7 +4,8 @@ import { buildIgnoreMatcher, effectiveIgnoreRules, HashCache, scanManifest } fro
 import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { promptConfirm } from "./prompt.js";
-import { pushManifest } from "./sync.js";
+import { makeDeferErrnoReporter, pushManifest } from "./sync.js";
+import { deferManifest } from "./sync-recovery.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { style } from "./style.js";
 
@@ -107,7 +108,12 @@ async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeo
     knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
   });
   const cache = await HashCache.load(root);
-  const local = await scanManifest(root, matcher, cache);
+  const deferred = new Set<string>();
+  const deferErrnos = makeDeferErrnoReporter();
+  let local = await scanManifest(root, matcher, cache, undefined, undefined, undefined, deferred, undefined, undefined, undefined, deferErrnos.onErrno);
+  deferErrnos.flush();
+  // Design 108: a scan-faulted path is carried from base, never purged as absent.
+  if (deferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, deferred);
   await cache.save(root);
   const present = new Set(local.files.map((f) => f.path));
   const deleted = state.lastSyncedManifest.files.filter((entry) => !present.has(entry.path)).map((entry) => entry.path);

@@ -60,6 +60,10 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
     built.deps.syncMutex = syncMutex;
     built.deps.allowMassDelete = opts.allowMassDelete === true;
+    // recover both pulls AND repair-publishes; one explicit flag covers both directions
+    // (same pattern as `rbox sync --allow-mass-delete`). Env consent maps push-side only,
+    // mirroring the other CLI entry points.
+    built.deps.allowMassDeletePush = opts.allowMassDelete === true || process.env.RBOX_ALLOW_MASS_DELETE === "1";
     const report = (deps.beginReport ?? beginReport)("sync");
     built.deps.report = report;
     let pulled: Action[];
