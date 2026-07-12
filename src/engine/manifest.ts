@@ -8,6 +8,7 @@ import type { HashCache } from "./hashcache.js";
 import { DirCache, UNPRUNED_DEADLINE_MS, type DirCacheChild, type DircacheOutcome, type RuleFileRecord } from "./dircache.js";
 import { buildIgnoreMatcher, isIgnoreRuleFile, type IgnoreMatcher } from "./ignore.js";
 import type { FileEntry, Manifest } from "./types.js";
+import { bulkWalkDir, bulkWalkSupported, type BulkStat } from "./darwin-bulk-walk.js";
 
 export type WatchEventKind = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
 export interface WatchEvent {
@@ -336,7 +337,12 @@ export async function applyWatchEvents(
 type StatHashResult = { kind: "entry"; entry: FileEntry } | { kind: "gone" } | { kind: "midwrite" };
 
 /** Exact identity and metadata contract for accepting a stat → hash → stat tuple. */
-export function statsStableAcrossHash(pre: Stats, post: Stats): boolean {
+interface FileStatLike {
+  ino: number; dev: number; size: number; mtimeMs: number; ctimeMs: number; mode: number;
+  isFile(): boolean;
+}
+
+export function statsStableAcrossHash(pre: FileStatLike, post: FileStatLike): boolean {
   return pre.isFile() &&
     post.isFile() &&
     pre.ino === post.ino &&
@@ -381,7 +387,7 @@ async function statHashEntry(root: string, rel: string, cache?: HashCache): Prom
 interface PendingHash {
   childRel: string;
   abs: string;
-  st: Stats;
+  st: FileStatLike;
 }
 
 const HASH_CONCURRENCY = 16; // bound on parallel hashing — saturates disk without fd storms
@@ -404,6 +410,10 @@ interface WalkCtx {
 
 class RulesChangedDuringPrune extends Error {}
 
+export function scanBulkEnabled(): boolean {
+  return process.env.RBOX_SCAN_BULK === "1";
+}
+
 async function walk(
   ctx: WalkCtx,
   rel: string,
@@ -414,6 +424,7 @@ async function walk(
   const absDir = path.join(ctx.root, rel);
   let dirStat: Stats | undefined;
   let children: DirCacheChild[] | undefined;
+  let bulkStats: Map<string, BulkStat> | undefined;
   if (ctx.mode !== "off" && ctx.dircache) {
     dirStat = await fs.lstat(absDir);
     if (ctx.mode === "pruned") children = ctx.dircache.reuse(rel, dirStat);
@@ -429,19 +440,34 @@ async function walk(
   if (reused) {
     if (ctx.scanStats) ctx.scanStats.dirsReusedFromCache += 1;
   } else {
-    const t0 = ctx.scanStats ? Date.now() : 0;
-    const entries = await fs.readdir(absDir, { withFileTypes: true });
-    if (ctx.scanStats) {
-      ctx.scanStats.readdirMs += Date.now() - t0;
-      ctx.scanStats.dirsWalked += 1;
+    if (scanBulkEnabled() && !ctx.dirProbe && bulkWalkSupported()) {
+      const t0 = ctx.scanStats ? Date.now() : 0;
+      const bulk = bulkWalkDir(absDir);
+      if (bulk !== null) {
+        children = bulk.map(({ name, type }) => ({ name, type }));
+        bulkStats = new Map(bulk.flatMap((child) => child.type === "file" && child.stat ? [[child.name, child.stat]] : []));
+        rawEntryCount = bulk.length;
+        if (ctx.scanStats) {
+          ctx.scanStats.readdirMs += Date.now() - t0;
+          ctx.scanStats.dirsWalked += 1;
+        }
+      }
     }
-    rawEntryCount = entries.length;
-    children = entries.flatMap((entry): DirCacheChild[] => entry.isDirectory()
-      ? [{ name: entry.name, type: "dir" }]
-      : entry.isSymbolicLink() ? [{ name: entry.name, type: "symlink" }]
-      : entry.isFile() ? [{ name: entry.name, type: "file" }] : []);
-    if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
-    if (ctx.dirProbe) probeProjectedBytes = Buffer.byteLength(JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }))));
+    if (children === undefined) {
+      const t0 = ctx.scanStats ? Date.now() : 0;
+      const entries = await fs.readdir(absDir, { withFileTypes: true });
+      if (ctx.scanStats) {
+        ctx.scanStats.readdirMs += Date.now() - t0;
+        ctx.scanStats.dirsWalked += 1;
+      }
+      rawEntryCount = entries.length;
+      children = entries.flatMap((entry): DirCacheChild[] => entry.isDirectory()
+        ? [{ name: entry.name, type: "dir" }]
+        : entry.isSymbolicLink() ? [{ name: entry.name, type: "symlink" }]
+        : entry.isFile() ? [{ name: entry.name, type: "file" }] : []);
+      if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
+      if (ctx.dirProbe) probeProjectedBytes = Buffer.byteLength(JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }))));
+    }
   }
   if (ctx.dirProbe && !reused) {
     const readdirMs = Date.now() - readdirStart;
@@ -502,8 +528,8 @@ async function walk(
     } else {
       if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
       ctx.onDiscover?.();
-      let st: Stats;
-      if (ctx.scanStats) {
+      let st: FileStatLike | undefined = bulkStats?.get(child.name);
+      if (!st && ctx.scanStats) {
         const t0 = Date.now();
         try {
           st = await fs.stat(abs);
@@ -513,14 +539,14 @@ async function walk(
         } finally {
           ctx.scanStats.statMs += Date.now() - t0;
         }
-        ctx.scanStats.filesStatted += 1;
-      } else {
+      } else if (!st) {
         try { st = await fs.stat(abs); }
         catch (error) {
           if (reused && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
           throw error;
         }
       }
+      if (ctx.scanStats) ctx.scanStats.filesStatted += 1;
       const cached = ctx.cache?.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs);
       if (cached) {
         if (ctx.scanStats) ctx.scanStats.filesSkippedCacheHit += 1;
