@@ -8,7 +8,7 @@ import type { RemoteContext } from "./context.js";
 import { getBlobToFile, putBlobFile } from "./blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater, translateRemoteError } from "./errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS, blobDownloadTimeoutMs, envInt } from "./resilient.js";
-import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 
 // Wire twin: apps/api/src/blob-batch.ts — the framing constants and codec are
 // duplicated per build target (house pattern, like UPLOAD_RECEIPTS_V1). Change
@@ -710,7 +710,10 @@ export class BlobBatchUploader {
       armIdle();
       const queueCutoffMs = LANE_TIMING ? performance.now() : 0;
       dispatchCount++;
-      const res = await this.ctx.fetch(
+      firstPublishUploadStart();
+      firstPublishAuthStart();
+      let res: Response;
+      try { res = await this.ctx.fetch(
         `${this.ctx.baseUrl}/v1/blob-batch/put`,
         {
           method: "POST",
@@ -718,7 +721,7 @@ export class BlobBatchUploader {
           body: body.bytes,
         },
         { op: "uploading data", timeoutMs: SMALL_CONTROL_TIMEOUT_MS, retries: 0, signal: ctrl.signal },
-      );
+      ); } finally { firstPublishAuthEnd(); firstPublishUploadEnd(); }
       if (res.status === 404 || res.status === 405) {
         uploadDisabledForProcess = true;
         this.drainQueuedAsSingles();
@@ -764,6 +767,8 @@ export class BlobBatchUploader {
   private async encodeBatchBody(batch: BatchPutGroup[], pending: Map<string, BatchPutGroup>): Promise<{ bytes: Uint8Array; groups: BatchPutGroup[] } | null> {
     if (this.closed) return null;
     const payloads = await Promise.all(batch.map((group) => fs.readFile(group.srcPath)));
+    const allPayloadBytes = payloads.reduce((n, payload) => n + payload.byteLength, 0);
+    if (firstPublishTiming.enabled) firstPublishTiming.stats.peakUploaderFramingBytes = Math.max(firstPublishTiming.stats.peakUploaderFramingBytes, allPayloadBytes);
     if (this.closed) return null;
     const accepted: Array<{ group: BatchPutGroup; payload: Uint8Array }> = [];
     const fallbacks: BatchPutGroup[] = [];
@@ -783,6 +788,9 @@ export class BlobBatchUploader {
     for (const group of fallbacks) await this.dispatchSingleGroup(group);
     if (accepted.length === 0) return null;
     const out = new Uint8Array(total);
+    if (firstPublishTiming.enabled) {
+      firstPublishTiming.stats.peakUploaderFramingBytes = Math.max(firstPublishTiming.stats.peakUploaderFramingBytes, allPayloadBytes + out.byteLength);
+    }
     let off = 0;
     for (const { group, payload } of accepted) {
       out.set(fromHex(group.sha), off);

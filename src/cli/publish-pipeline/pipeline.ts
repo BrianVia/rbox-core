@@ -27,7 +27,7 @@ import type {
 import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
-import { LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
 import { ReceiptDrainer } from "./receipt-drainer.js";
@@ -208,7 +208,17 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     try {
       const addresses = [...new Set(batch.map((item) => item.address))];
       const t0 = LANE_TIMING ? performance.now() : 0;
+      const statsT0 = firstPublishTiming.enabled ? performance.now() : 0;
       const missing = new Set(await args.api.missingBlobs(addresses));
+      if (firstPublishTiming.enabled) {
+        firstPublishTiming.stats.missingCheckWallMs += Math.max(0, Math.round(performance.now() - statsT0));
+        for (const address of addresses) {
+          if (firstPublishTiming.checkedAddresses.has(address)) continue;
+          firstPublishTiming.checkedAddresses.add(address);
+          if (missing.has(address)) firstPublishTiming.stats.serverUnsatisfiedTotal++;
+          else firstPublishTiming.stats.serverSatisfiedSkipped++;
+        }
+      }
       if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - t0;
       checked += addresses.length;
       for (const item of batch) {
@@ -283,6 +293,8 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       throw error;
     }
     disk.reconcile(reservation, encrypted.cipherSize);
+    firstPublishReady(encrypted.cipherSize, encrypted.encSha);
+    if (forceEncrypt && firstPublishTiming.enabled) firstPublishTiming.stats.reEncryptedOnResume++;
     recordEncrypted(file, encrypted);
     encCtBytes += encrypted.cipherSize;
     if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
@@ -347,11 +359,13 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       try {
         byteTracker.reviseTotal(current.encSha, current.cipherSize);
         const callerOwnsTiming = LANE_TIMING && args.api.ownsUploadLaneTiming?.(current.cipherSize) !== true;
+        firstPublishUploadStart();
         const t0 = callerOwnsTiming ? performance.now() : 0;
         await args.api.putBlobFile(current.encSha, current.path, current.cipherSize, args.uploadsDir, (absolute) => {
           byteTracker.setProgress(current.encSha, absolute);
           emitUpload(file);
         });
+        firstPublishUploadEnd();
         if (callerOwnsTiming) {
           uploadLaneTiming.uploadMs += performance.now() - t0;
           uploadLaneTiming.blobs++;
@@ -455,10 +469,18 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     const consumerCount = Math.max(1, Math.min(uploadConcurrency(), args.toEncrypt.length + (args.recoverAddresses?.size ?? 0)));
     consumers = Array.from({ length: consumerCount }, () => consumer());
     await flushChecks();
+    const encryptWallT0 = firstPublishTiming.enabled ? performance.now() : 0;
+    const encryptCpuT0 = firstPublishTiming.enabled ? process.cpuUsage() : undefined;
     await args.report.phase("upload", async () => {
       await Promise.all([Promise.all(producers), Promise.all(consumers)]);
       await flushChecks();
     });
+    if (firstPublishTiming.enabled) {
+      const wall = performance.now() - encryptWallT0;
+      const cpu = process.cpuUsage(encryptCpuT0);
+      firstPublishTiming.stats.encryptWallMs = Math.max(0, Math.round(wall));
+      firstPublishTiming.stats.producerCpuSaturationPct = wall > 0 ? Math.max(0, Math.round((cpu.user + cpu.system) / (wall * 10))) : 0;
+    }
     args.report.record("encrypt", { count: args.toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
     args.report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
     args.report.record("missing", { count: checked });
@@ -469,6 +491,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     args.report.record("upload", { count: up, wireBytes: upWireBytes });
     const result = drainer ? await drainer.flush() : { needsUpload: [] };
     await Promise.allSettled([...cleanupSettlements]);
+    if (firstPublishTiming.enabled) firstPublishTiming.stats.peakTempDiskBytes = Math.max(0, Math.round(disk.highWater));
     if (disk.used !== 0) throw new Error("publish pipeline disk budget did not drain");
     return { needsUpload: new Set(result.needsUpload) };
   } catch (error) {
@@ -484,6 +507,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     if (drainer?.error) await drainer.flush().catch(() => {});
     throw abortCause;
   } finally {
+    if (firstPublishTiming.enabled) firstPublishTiming.stats.peakTempDiskBytes = Math.max(0, Math.round(disk.highWater));
     if (checkTimer) clearTimeout(checkTimer);
     process.off("SIGINT", sigint);
   }

@@ -19,7 +19,8 @@ import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "./re
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
-import { LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { metricsEnabled } from "./metrics.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
 import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
 import {
@@ -136,6 +137,7 @@ export async function encryptAndUpload(
   // are now convergent-encrypted under the same KEK (planGitSections), so git-sync is E2EE-safe.
   if (!cfg.kek) throw new Error("encrypted workspace but no key loaded — run `rbox key import <recovery-phrase>`");
   const kek = cfg.kek;
+  beginFirstPublishTiming(report.enabled && metricsEnabled());
   const encryptFileToTemp = options.encryptFileToTemp ?? ((...args: Parameters<EncryptFileToTempForSync>) => {
     defaultEncryptObserverForTest?.();
     return defaultEncryptFileToTemp(...args);
@@ -208,6 +210,8 @@ export async function encryptAndUpload(
       let cacheHits = 0;
       let cacheMisses = 0;
       await report.phase("encrypt", async () => {
+        const wallT0 = firstPublishTiming.enabled ? performance.now() : 0;
+        const cpuT0 = firstPublishTiming.enabled ? process.cpuUsage() : undefined;
         // The budget and fused dispatch bound provide real backpressure; this wide
         // caller window only lets the coalescer fill byte/count-bounded groups.
         const encConc = fuse ? Math.min(toEncrypt.length, FUSED_ENCRYPT_CONCURRENCY_CAP) : encryptConcurrency(pool?.workers.length);
@@ -253,6 +257,7 @@ export async function encryptAndUpload(
           throw err;
         }
         applyCipherDescriptor(f, descriptorFromEncryptedBlob(e));
+        firstPublishReady(e.cipherSize, e.encSha);
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
         encryptCache.record(e.plaintextSha, { ...descriptorFromEncryptedBlob(e), cipherSize: e.cipherSize, path: f.path });
@@ -261,6 +266,12 @@ export async function encryptAndUpload(
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
         onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
         });
+        if (firstPublishTiming.enabled) {
+          const wall = performance.now() - wallT0;
+          const cpu = process.cpuUsage(cpuT0);
+          firstPublishTiming.stats.encryptWallMs = Math.max(0, Math.round(wall));
+          firstPublishTiming.stats.producerCpuSaturationPct = wall > 0 ? Math.max(0, Math.round((cpu.user + cpu.system) / (wall * 10))) : 0;
+        }
       });
       report.record("encrypt", { count: toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
       // Design 82 §4: address-cache effectiveness travels with the address phase
@@ -289,9 +300,16 @@ export async function encryptAndUpload(
       encShas = [...candidate];
     }
     const missingT0 = LANE_TIMING ? performance.now() : 0;
+    const statsMissingT0 = firstPublishTiming.enabled ? performance.now() : 0;
     const missing = new Set(await report.phase("missing", () =>
       fullAudit ? missingBlobsChunked(api, encShas) : api.missingBlobs(encShas)
     ));
+    if (firstPublishTiming.enabled) {
+      const uniqueChecked = new Set(encShas);
+      firstPublishTiming.stats.missingCheckWallMs = Math.max(0, Math.round(performance.now() - statsMissingT0));
+      firstPublishTiming.stats.serverUnsatisfiedTotal = missing.size;
+      firstPublishTiming.stats.serverSatisfiedSkipped = Math.max(0, uniqueChecked.size - missing.size);
+    }
     if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - missingT0;
     report.record("missing", { count: encShas.length });
     if (preflightDelta || fullAudit) {
@@ -337,6 +355,8 @@ export async function encryptAndUpload(
               ...encryptOpts,
               expected: { sha256: f.sha256, size: f.size },
             });
+            if (firstPublishTiming.enabled) firstPublishTiming.stats.reEncryptedOnResume++;
+            firstPublishReady(re.cipherSize, re.encSha);
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
             // Source churn defers instead of mutating the scanned manifest tuple.
@@ -380,11 +400,13 @@ export async function encryptAndUpload(
           byteTracker.reviseTotal(uploadEncSha, size);
           emitUploadProgress(f.path);
           const callerOwnsLaneTiming = LANE_TIMING && api.ownsUploadLaneTiming?.(size) !== true;
+          firstPublishUploadStart();
           const t0 = callerOwnsLaneTiming ? performance.now() : 0;
           await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
             byteTracker.setProgress(uploadEncSha, abs);
             emitUploadProgress(f.path);
           });
+          firstPublishUploadEnd();
           if (callerOwnsLaneTiming) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
             uploadLaneTiming.blobs++;
