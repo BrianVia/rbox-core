@@ -178,6 +178,7 @@ export async function buildCommit(args: {
   manifestJson: Uint8Array;
   blobRefs: BlobRef[];
   blobRefset?: BlobRefset;
+  manifestChain?: string[];
   onEncryptMs?: (ms: number) => void;
 }): Promise<BuiltCommit> {
   const t0 = args.onEncryptMs ? Date.now() : 0;
@@ -194,6 +195,7 @@ export async function buildCommit(args: {
     keyEpoch: args.keyEpoch,
     deviceId: args.secrets.deviceId,
     encManifestSha: enc.encManifestSha,
+    manifestChain: args.manifestChain,
   };
   const signKey = { publicKey: args.secrets.sigPubKey, privateKey: signPrivateFromPkcs8(args.secrets.sigPrivPkcs8) };
   const commit = await buildSignedCommit(args.blobRefset !== undefined ? { ...base, blobRefset: args.blobRefset } : { ...base, blobRefs: args.blobRefs }, signKey);
@@ -396,6 +398,23 @@ export async function openCommitHistorical(args: {
   await assertSignedByOwnRoster(args.commit, body, args.account);
   if ((await sha256Hex(args.encManifest)) !== body.encManifestSha) throw new Error("encManifest does not match the signed encManifestSha");
   return decryptManifest(args.kek, args.secrets.accountId, args.workspaceId, body.keyEpoch, args.encManifest);
+}
+
+/**
+ * Address-authenticate and AEAD-open one bounded manifest-chain link. The
+ * caller supplies the target commit's signed key epoch for every link; a link
+ * crossing an epoch boundary therefore fails authentication.
+ */
+export async function openManifestChainBlob(args: {
+  kek: Uint8Array;
+  accountId: string;
+  workspaceId: string;
+  keyEpoch: number;
+  expectedEncSha: string;
+  bytes: Uint8Array;
+}): Promise<Uint8Array> {
+  if ((await sha256Hex(args.bytes)) !== args.expectedEncSha) throw new Error("manifest chain blob does not match its expected address");
+  return decryptManifest(args.kek, args.accountId, args.workspaceId, args.keyEpoch, args.bytes);
 }
 
 // ---- pairing (key transfer to a new device, V4-1/R2) ----------------------

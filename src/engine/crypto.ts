@@ -63,6 +63,33 @@ async function collectZstd(source: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+/** Compress an in-memory protocol payload with the shared level-3 zstd codec. */
+export async function zstdCompress(bytes: Uint8Array): Promise<Uint8Array> {
+  return collectZstd(Readable.from([Buffer.from(bytes)]));
+}
+
+/**
+ * Decompress an in-memory protocol payload while enforcing the limit in the
+ * stream. The transform aborts as soon as byte maxBytes + 1 is observed, so a
+ * forged size declaration cannot cause an unbounded allocation.
+ */
+export async function zstdDecompressCapped(bytes: Uint8Array, maxBytes: number): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid decompression byte limit");
+  const chunks: Buffer[] = [];
+  await pipeline(
+    Readable.from([Buffer.from(bytes)]),
+    createZstdDecompress(),
+    maxPlaintextBytesTransform(maxBytes),
+    new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(Buffer.from(chunk));
+        callback();
+      },
+    })
+  );
+  return Buffer.concat(chunks);
+}
+
 const zstdCompressFileToBuffer = (srcPath: string): Promise<Buffer> => collectZstd(fsSync.createReadStream(srcPath));
 const zstdCompressBufferToBuffer = (src: Buffer): Promise<Buffer> => collectZstd(Readable.from([src]));
 

@@ -4,6 +4,7 @@ import {
   GENESIS_PARENT_HASH,
   openCommit,
   openCommitHistorical,
+  openManifestChainBlob,
   openWorkspaceKey,
   parseCommit,
   serializeRefset,
@@ -20,7 +21,18 @@ import {
 } from "../engine/e2ee/index.js";
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
-import { gitSectionBlobRefs, poolMap, validateManifest, type BlobStore, type Manifest } from "../engine/index.js";
+import {
+  decodeEnvelope,
+  foldDelta,
+  gitSectionBlobRefs,
+  MANIFEST_ENVELOPE_PREFIX,
+  ManifestChainError,
+  MAX_MANIFEST_DELTA_CHAIN,
+  poolMap,
+  type BlobStore,
+  type DecodedManifestEnvelope,
+  type Manifest,
+} from "../engine/index.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
@@ -48,6 +60,13 @@ export const SIDECAR_THRESHOLD = 4000;
  */
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+
+const ENVELOPE_PREFIX_BYTES = new TextEncoder().encode(MANIFEST_ENVELOPE_PREFIX);
+
+/** Does this decrypted plaintext claim the envelope-v1 family (vs raw-v0 JSON)? */
+function isEnvelopeV1(plaintext: Uint8Array): boolean {
+  return plaintext.length >= ENVELOPE_PREFIX_BYTES.length && ENVELOPE_PREFIX_BYTES.every((byte, index) => plaintext[index] === byte);
+}
 
 export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
   const refByEnc = new Map<string, { encSha: string; size: number }>();
@@ -195,24 +214,119 @@ export class E2eeRemote implements SyncRemote {
     onLatestTimings?: LatestOptions["onLatestTimings"]
   ): Promise<{ manifest: Manifest; kek: Uint8Array }> {
     const body = parseCommit(commit);
+    const signedChain = body.manifestChain ?? [];
     const kek = await this.kekFor(body.keyEpoch, account, false);
-    const timed = async <T>(fn: () => Promise<T>): Promise<[T, number]> => {
-      if (!onLatestTimings) return [await fn(), 0];
-      const t0 = Date.now();
-      const result = await fn();
-      return [result, Date.now() - t0];
-    };
-    const [encManifest, downloadMs] = await timed(() => this.api.blobStore().get(body.encManifestSha));
+    const head = { seq: body.seq, hash: commit.commitHash };
+    // Error classification (§3.6.2): chain-walk failures — a missing/corrupt LINK,
+    // a linkage/list mismatch, a bad fold — are ManifestChainError (the §3.6.3
+    // repair trigger). The chain-free head path (every pre-84 commit) keeps
+    // today's plain error surface: a raw-v0 manifest that fails JSON.parse or
+    // validateManifest throws exactly what it threw before this design.
+    if (signedChain.length > MAX_MANIFEST_DELTA_CHAIN) {
+      throw new ManifestChainError("signed chain exceeds maximum length", { head });
+    }
+    const downloadStart = Date.now();
+    const [encManifest, chainBlobBytes] = await Promise.all([
+      this.api.blobStore().get(body.encManifestSha).catch((cause: unknown) => {
+        // The head blob is not a chain link; with no chain in play this is
+        // today's plain fetch failure. Under a chain it wedges the same walk.
+        if (signedChain.length === 0) throw cause;
+        throw new ManifestChainError("head manifest blob is missing", { head, failingLink: body.encManifestSha, cause });
+      }),
+      Promise.all(
+        signedChain.map((sha) =>
+          this.api.blobStore().get(sha).catch((cause: unknown) => {
+            throw new ManifestChainError("manifest chain link is missing", { head, failingLink: sha, cause });
+          })
+        )
+      ),
+    ]);
+    const downloadMs = onLatestTimings ? Date.now() - downloadStart : 0;
+
+    const decryptStart = Date.now();
     const open = historical ? openCommitHistorical : openCommit;
-    const [json, decryptMs] = await timed(() => open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId }));
-    const [manifest, parseMs] = await timed(async () => {
-      const manifest = JSON.parse(new TextDecoder().decode(json)) as Manifest;
-      const validation = validateManifest(manifest);
-      if (!validation.ok) throw new Error(validation.error);
-      return manifest;
+    const plaintext = await open({ secrets: this.ctx.secrets, kek, account, commit, encManifest, workspaceId: this.ctx.workspaceId });
+    const chainPlaintexts = await Promise.all(
+      chainBlobBytes.map(async (bytes, index) => {
+        const sha = signedChain[index]!;
+        try {
+          return await openManifestChainBlob({
+            kek,
+            accountId: this.ctx.accountId,
+            workspaceId: this.ctx.workspaceId,
+            keyEpoch: body.keyEpoch,
+            expectedEncSha: sha,
+            bytes,
+          });
+        } catch (cause) {
+          throw new ManifestChainError("manifest chain link failed address or epoch authentication", { head, failingLink: sha, cause });
+        }
+      })
+    );
+    const decryptMs = onLatestTimings ? Date.now() - decryptStart : 0;
+
+    const parseStart = Date.now();
+    // Head envelope: raw-v0 decode failures propagate plain (today's surface);
+    // an envelope-v1 head that fails to decode is a chain-class failure the
+    // §3.6.3 repair must see, chain or no chain.
+    const headEnvelope = await decodeEnvelope(plaintext).catch((cause: unknown) => {
+      if (!isEnvelopeV1(plaintext) && signedChain.length === 0) throw cause;
+      throw new ManifestChainError("head manifest envelope failed to decode", { head, failingLink: body.encManifestSha, cause });
     });
+    const chainEnvelopes = await Promise.all(
+      chainPlaintexts.map((bytes, index) =>
+        decodeEnvelope(bytes).catch((cause: unknown) => {
+          throw new ManifestChainError("manifest chain link envelope failed to decode", { head, failingLink: signedChain[index], cause });
+        })
+      )
+    );
+    const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
+    const parseMs = onLatestTimings ? Date.now() - parseStart : 0;
     onLatestTimings?.({ downloadMs, decryptMs, parseMs, encBytes: encManifest.byteLength });
     return { manifest, kek };
+  }
+
+  private foldManifestChain(
+    headEncSha: string,
+    signedChain: readonly string[],
+    headEnvelope: DecodedManifestEnvelope,
+    chainEnvelopes: readonly DecodedManifestEnvelope[],
+    head: { seq: number; hash: string }
+  ): Manifest {
+    if (signedChain.includes(headEncSha)) throw new ManifestChainError("signed chain includes its head", { head, failingLink: headEncSha });
+    if (headEnvelope.kind !== "delta") {
+      if (signedChain.length !== 0) throw new ManifestChainError("snapshot/raw head has a non-empty signed chain", { head });
+      return headEnvelope.manifest;
+    }
+    if (signedChain.length === 0 || chainEnvelopes.length !== signedChain.length) throw new ManifestChainError("signed and walked chain lengths differ", { head });
+    if (chainEnvelopes[0]!.kind === "delta") throw new ManifestChainError("terminal chain link is not a snapshot", { head, failingLink: signedChain[0] });
+    for (let index = 1; index < chainEnvelopes.length; index++) {
+      const envelope = chainEnvelopes[index]!;
+      if (envelope.kind !== "delta") throw new ManifestChainError("non-terminal chain link is not a delta", { head, failingLink: signedChain[index] });
+      if (envelope.header.baseEncSha !== signedChain[index - 1]) throw new ManifestChainError("walked linkage does not match signed chain order", { head, failingLink: signedChain[index] });
+    }
+    if (headEnvelope.header.baseEncSha !== signedChain[signedChain.length - 1]) {
+      throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: headEncSha });
+    }
+
+    let manifest = chainEnvelopes[0]!.manifest;
+    const deltas = [...chainEnvelopes.slice(1), headEnvelope];
+    for (let index = 0; index < deltas.length; index++) {
+      const envelope = deltas[index]!;
+      if (envelope.kind !== "delta") throw new ManifestChainError("chain shape changed during fold", { head });
+      const failingLink = index < chainEnvelopes.length - 1 ? signedChain[index + 1] : headEncSha;
+      try {
+        manifest = foldDelta(manifest, envelope.ops, envelope.header);
+      } catch (cause) {
+        const reason = cause instanceof Error && cause.message.includes("baseManifestHash")
+          ? "baseManifestHash mismatch"
+          : cause instanceof Error && cause.message.includes("resultHash")
+            ? "resultHash mismatch"
+            : "manifest delta fold failed";
+        throw new ManifestChainError(reason, { head, failingLink, cause });
+      }
+    }
+    return manifest;
   }
 
   /**

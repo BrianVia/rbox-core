@@ -11,6 +11,7 @@
 import { sign, verify, type SignKeyPair } from "./asym.js";
 import { canonicalString, verifyRoundTrip } from "./jcs.js";
 import { fromB64url, fromHex, sha256Hex, toB64url, utf8 } from "./primitives.js";
+import { MAX_MANIFEST_DELTA_CHAIN } from "../manifest-delta.js";
 
 export const GENESIS_PARENT_HASH = "0".repeat(64);
 
@@ -42,6 +43,8 @@ interface CommitBodyBase {
   keyEpoch: number;
   deviceId: string;
   encManifestSha: string;
+  /** Base-first manifest blobs below this head. Empty chains are omitted on wire. */
+  manifestChain?: string[];
 }
 
 /** §24 dual-mode: a commit carries EITHER inline `blobRefs` (legacy / small repos) XOR a
@@ -63,6 +66,20 @@ export interface SignedCommit {
 }
 
 const SHA_RE = /^[0-9a-f]{64}$/;
+
+export function validateManifestChain(v: unknown, encManifestSha?: string): string[] {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) throw new Error("manifestChain must be an array");
+  if (v.length > MAX_MANIFEST_DELTA_CHAIN) throw new Error("manifestChain exceeds maximum length");
+  const seen = new Set<string>();
+  return v.map((entry) => {
+    if (typeof entry !== "string" || !SHA_RE.test(entry)) throw new Error("manifestChain entry malformed");
+    if (seen.has(entry)) throw new Error("manifestChain contains a duplicate entry");
+    if (entry === encManifestSha) throw new Error("manifestChain must not contain encManifestSha");
+    seen.add(entry);
+    return entry;
+  });
+}
 
 /** Normalize blobRefs to the V4-7 invariant: unique by encSha, sorted by encSha.
  *  Throws on a duplicate encSha (ambiguous) or a malformed encSha. */
@@ -99,6 +116,7 @@ interface CommitFieldsBase {
   keyEpoch: number;
   deviceId: string;
   encManifestSha: string;
+  manifestChain?: string[];
 }
 /** §24: the caller supplies EITHER inline refs OR a sidecar descriptor (it already
  *  uploaded the sidecar blob + has its sha). Exactly one — never both. */
@@ -121,6 +139,9 @@ export async function buildSignedCommit(fields: CommitFields, signKey: SignKeyPa
     keyEpoch: fields.keyEpoch,
     deviceId: fields.deviceId,
     encManifestSha: fields.encManifestSha,
+    ...(fields.manifestChain && fields.manifestChain.length > 0
+      ? { manifestChain: validateManifestChain(fields.manifestChain, fields.encManifestSha) }
+      : {}),
   };
   // EXACTLY ONE ref carrier — canonical JSON includes only the present field, so the
   // signature floats over the right ref set with no implied/default the other mode.
@@ -141,6 +162,7 @@ export function parseCommit(c: SignedCommit): CommitBody {
   if (body.type !== "rbox/commit/v1") throw new Error("not a commit/v1");
   if (body.seq !== (body.parentSeq as number) + 1) throw new Error("commit seq must be parentSeq+1");
   if (!SHA_RE.test(body.encManifestSha as string)) throw new Error("encManifestSha malformed");
+  const manifestChain = validateManifestChain(body.manifestChain, body.encManifestSha as string);
   const hasInline = Array.isArray(body.blobRefs);
   const hasSidecar = body.blobRefset !== undefined && typeof body.blobRefset === "object" && body.blobRefset !== null && !Array.isArray(body.blobRefset);
   if (hasInline === hasSidecar) throw new Error("commit must carry exactly one of blobRefs / blobRefset");
@@ -151,7 +173,8 @@ export function parseCommit(c: SignedCommit): CommitBody {
     if (body.blobRefs !== undefined) throw new Error("sidecar commit must not carry blobRefs");
     validateBlobRefset(body.blobRefset);
   }
-  return body as unknown as CommitBody;
+  // Absence is normalized for all pre-84 commits without changing their signed bytes.
+  return { ...body, manifestChain } as unknown as CommitBody;
 }
 
 /** Verify the hash binds the body and the signature binds the hash under
