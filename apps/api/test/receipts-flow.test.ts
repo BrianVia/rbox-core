@@ -273,6 +273,14 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
     expect(v).toEqual({ ok: false, needsUpload: [orphan] });
   });
 
+  // §3.5.4 truncation on the FENCE path is structurally vacuous: a delete-fence
+  // abort returns exactly the caught super-batch (≤ MAX_REFS_PER_TXN = 3,000
+  // entries, commit-accounting.ts), which can never exceed
+  // MAX_MISSING_SHAS_RESPONSE (10,000) — so `missing` cannot truncate there.
+  // The >10k truncation boundary is exercised end-to-end on the
+  // validateCommitRefs path (the only producer that can exceed the cap); this
+  // test pins the fence path's chain-first ordering through the exact
+  // production composition instead.
   test("one fenced chain sha aborts a multi-sha accounting batch and chain-first handler formatting keeps it first", async () => {
     const a = await bootstrap("rcpt-fence-atomic");
     const refs = [{ sha: sha("fence-data"), size: 7 }, { sha: sha("fence-chain"), size: 9 }];

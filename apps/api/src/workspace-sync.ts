@@ -788,7 +788,11 @@ export class WorkspaceSync {
     if (mode.kind === "inline") return { refs: new Set([...mode.refShas, ...chainShas].sort()), manifestSha: cb.encManifestSha, carrierSha: null };
     const loaded = await loadSidecarShaSet(this.env, mode.sidecarSha, mode.count);
     if (!loaded.ok) return null;
-    return { refs: new Set([...loaded.refs, ...chainShas]), manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha };
+    // Sorted insertion order is load-bearing: diffChunk paginates the fold by
+    // iterating this Set in order with a `> lastSha` cursor — an out-of-order
+    // chain sha appended after the sorted sidecar refs would be skipped on a
+    // chunk resume and its dropped_index entry silently lost (GC stranding).
+    return { refs: new Set([...loaded.refs, ...chainShas].sort()), manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha };
   }
 
   private sweepIndex(floor: number): void {

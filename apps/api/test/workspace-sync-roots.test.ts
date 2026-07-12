@@ -311,3 +311,48 @@ describe("WorkspaceSync retained-roots index", () => {
     expect(body.nextSha).toBe(body.droppedPage.at(-1));
   });
 });
+
+describe("design 84 — refSetAt ordering invariant", () => {
+  test("sidecar refs merged with a lower-sorting chain sha iterate in ascending order (diffChunk cursor safety)", async () => {
+    // diffChunk paginates fold diffs by iterating the Set in order with a
+    // `> lastSha` cursor; a chain sha appended AFTER sorted sidecar refs would
+    // be skipped on a chunk resume and its dropped_index entry silently lost.
+    const { serializeRefset } = await import("../../../src/engine/refset.js");
+    const { sha256Hex } = await import("../src/util.js").then(async (u) => {
+      // util may not export sha256Hex; fall back to webcrypto
+      return {
+        sha256Hex: async (bytes: Uint8Array) => {
+          const d = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+        },
+      };
+    });
+    const chainSha = sha("a"); // sorts below the sidecar refs; != the commit's own encManifestSha (sha("1"))
+    const sidecarRefs = [
+      { encSha: sha("c"), size: 1 },
+      { encSha: sha("e"), size: 2 },
+    ];
+    const bytes = serializeRefset(sidecarRefs);
+    const sidecarSha = await sha256Hex(bytes);
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 1, commitHash: sha("9") }],
+      ["pruneFloor", 0],
+      ["seq:1", signed(1, { sidecarSha, count: sidecarRefs.length }, [chainSha])],
+    ]);
+    const env = {
+      rbox_dev_blobs: {
+        get: async (key: string) =>
+          key.endsWith(sidecarSha)
+            ? { size: bytes.byteLength, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) }
+            : null,
+      },
+    } as never;
+    const sync = new WorkspaceSync(fakeCtx(kv), env);
+    const result = await (sync as unknown as { refSetAt(seq: number): Promise<{ refs: Set<string> } | null> }).refSetAt(1);
+    expect(result).not.toBeNull();
+    const iterated = [...result!.refs];
+    expect(iterated).toEqual([...iterated].sort());
+    expect(iterated).toContain(chainSha);
+    expect(iterated[0]).toBe(chainSha);
+  });
+});

@@ -197,3 +197,35 @@ describe("signed manifestChain compatibility", () => {
     await expect(buildSignedCommit({ ...fields, manifestChain: Array.from({ length: MAX_MANIFEST_DELTA_CHAIN + 1 }, (_, i) => i.toString(16).padStart(64, "0")) }, key)).rejects.toThrow("manifestChain malformed");
   });
 });
+
+describe("review round-2 protocol boundary hardening", () => {
+  test("lone UTF-16 surrogates fail canonicalization closed (RFC 8785 posture)", async () => {
+    const m = manifest("now", [{ ...entry("a"), path: "bad-\ud800-path" }]);
+    expect(() => canonicalManifestHash(m)).toThrow("well-formed Unicode");
+    await expect(encodeSnapshotEnvelope(m, { compress: false })).rejects.toThrow();
+    // well-formed astral-plane strings still hash fine
+    await expect(canonicalManifestHash(manifest("now", [{ ...entry("a"), path: "ok-\u{1F600}" }]))).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("duplicate envelope-header members are rejected, including __proto__", async () => {
+    const m = manifest("dup", [entry("a")]);
+    const encoded = await encodeSnapshotEnvelope(m, { compress: false });
+    const magicLen = utf8.encode(MANIFEST_ENVELOPE_MAGIC).byteLength;
+    const newline = encoded.indexOf(0x0a, magicLen);
+    const header = new TextDecoder().decode(encoded.subarray(magicLen, newline));
+    const body = encoded.subarray(newline + 1);
+    const reframe = (headerText: string): Uint8Array => {
+      const prefix = utf8.encode(`${MANIFEST_ENVELOPE_MAGIC}${headerText}\n`);
+      const out = new Uint8Array(prefix.byteLength + body.byteLength);
+      out.set(prefix);
+      out.set(body, prefix.byteLength);
+      return out;
+    };
+    // duplicate a real member (last-wins under JSON.parse would silently change bodyBytes)
+    const dupBody = header.replace("{", `{"bodyBytes":1,`);
+    await expect(decodeEnvelope(reframe(dupBody))).rejects.toThrow(/duplicate/);
+    // __proto__ smuggling: rejected as an unknown header member
+    const protoHeader = header.replace("{", `{"__proto__":{"comp":"zstd"},`);
+    await expect(decodeEnvelope(reframe(protoHeader))).rejects.toThrow();
+  });
+});

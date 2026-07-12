@@ -1,6 +1,7 @@
 import { zstdCompress, zstdDecompressCapped } from "./crypto.js";
 import { KNOWN_MANIFEST_SCHEMA, validateManifest } from "./manifest-validate.js";
 import type { FileEntry, GitSection, Manifest } from "./types.js";
+import { parseStrict } from "./e2ee/jcs.js";
 import { sha256Hex, utf8 } from "./e2ee/primitives.js";
 import { hashBytes } from "./hash.js";
 export { MAX_MANIFEST_DELTA_CHAIN } from "./manifest-chain.js";
@@ -22,11 +23,31 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
  * NOTE(84): §3.2 calls this JCS, while the Layer-1 build resolution and measured
  * fractional mtimes require this float-tolerant JCS-compatible variant.
  */
+/** True iff the string has no lone UTF-16 surrogate (String#isWellFormed semantics). */
+function isWellFormedUtf16(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0xd800 || c > 0xdfff) continue;
+    if (c > 0xdbff) return false; // low surrogate with no preceding high
+    const next = s.charCodeAt(i + 1);
+    if (!(next >= 0xdc00 && next <= 0xdfff)) return false; // high surrogate not followed by low
+    i++;
+  }
+  return true;
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null) return "null";
   switch (typeof value) {
     case "boolean":
+      return JSON.stringify(value);
     case "string":
+      // RFC 8785 requires canonicalization to FAIL on invalid Unicode; a lone
+      // surrogate would otherwise hash as its escaped form here while a
+      // conforming JCS implementation rejects it — a cross-implementation
+      // divergence at a protocol boundary. Fail closed instead. (Manual scan:
+      // String#isWellFormed needs lib es2024 and the repo pins ES2022.)
+      if (!isWellFormedUtf16(value)) throw new Error("manifest canonicalization requires well-formed Unicode strings");
       return JSON.stringify(value);
     case "number": {
       if (!Number.isFinite(value)) throw new Error("manifest canonicalization requires finite numbers");
@@ -305,7 +326,11 @@ export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedMani
     }
   }
   if (newline < 0 || newline - headerStart > MAX_ENVELOPE_HEADER) throw new Error("manifest envelope header exceeds maximum size or is unterminated");
-  const header = parseHeader(JSON.parse(decoder.decode(plaintext.subarray(headerStart, newline))) as unknown);
+  // parseStrict (not JSON.parse): the strict-header contract rejects duplicate
+  // members (incl. __proto__ smuggling) instead of silently keeping the last;
+  // header values are strings and non-negative safe integers, so the signed-
+  // object scanner's number rules apply cleanly here.
+  const header = parseHeader(parseStrict(decoder.decode(plaintext.subarray(headerStart, newline))));
   const encodedBody = plaintext.subarray(newline + 1);
   const body = header.comp === "zstd" ? await zstdDecompressCapped(encodedBody, header.bodyBytes) : encodedBody;
   if (body.byteLength !== header.bodyBytes) throw new Error("manifest envelope body length does not match bodyBytes");
