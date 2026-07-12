@@ -74,6 +74,11 @@ export class MultipartMetrics {
 
   constructor(private readonly enabled: boolean) {}
 
+  /** Callers use this to skip optional metric-only work (e.g. reading a response body). */
+  get isEnabled(): boolean {
+    return this.enabled;
+  }
+
   recordPartWall(ms: number): void { if (this.enabled) this.partWalls.push(ms); }
   recordGap(ms: number): void { if (this.enabled) this.gaps.push(ms); }
   addRetries(n: number): void { if (this.enabled) this.retries += n; }

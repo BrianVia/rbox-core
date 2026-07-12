@@ -83,6 +83,22 @@ describe("multipart client instrumentation", () => {
     }
   });
 
+  test("RBOX_METRICS=0 emits nothing and the upload still succeeds (pre-101 behavior)", async () => {
+    process.env.RBOX_METRICS = "0";
+    const blob = await makeBlob(32);
+    const server = await startFakeMultipartServer({ partSize: 16 });
+    const lines: string[] = [];
+    setMultipartMetricsSink((line) => lines.push(line));
+    try {
+      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project"), blob.sha, blob.file, 32);
+      expect(lines).toEqual([]);
+      expect(server.stats.completedParts).toBe(2);
+    } finally {
+      await server.close();
+      await fs.rm(blob.dir, { recursive: true, force: true });
+    }
+  });
+
   test("one transient part failure is counted and the upload succeeds", async () => {
     process.env.RBOX_METRICS = "1";
     const blob = await makeBlob(32);

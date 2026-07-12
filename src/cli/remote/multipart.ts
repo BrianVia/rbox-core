@@ -187,8 +187,28 @@ async function multipartAttempt(
     if (isShaMismatch(done.status, text)) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
     throw new Error(translateRemoteError(done.status, "multipart complete failed", text, "workspace not found — check you're in the right directory"));
   }
-  const completeBody = (await done.json().catch(() => ({}))) as { serverTimings?: unknown };
-  metrics.setServerTimings(readMultipartServerTimings(completeBody.serverTimings));
+  // Metric-only success-body read: skipped entirely when metrics are off (the pre-101
+  // client never read the success body — completion was done at response headers), and
+  // bounded by its own timer when on, so a 2xx-headers-then-stalled-body server can
+  // delay a published upload by at most SERVER_TIMINGS_READ_MS, never indefinitely.
+  if (metrics.isEnabled) {
+    metrics.setServerTimings(readMultipartServerTimings((await readBodyBounded(done)).serverTimings));
+  }
   if (tokenPath) await fsp.rm(tokenPath, { force: true });
   onBytes?.(size);
+}
+
+const SERVER_TIMINGS_READ_MS = 10_000;
+
+async function readBodyBounded(res: Response): Promise<{ serverTimings?: unknown }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const gaveUp = new Promise<Record<string, never>>((resolve) => {
+    timer = setTimeout(() => resolve({}), SERVER_TIMINGS_READ_MS);
+    timer.unref?.();
+  });
+  try {
+    return (await Promise.race([res.json().catch(() => ({})), gaveUp])) as { serverTimings?: unknown };
+  } finally {
+    clearTimeout(timer);
+  }
 }
