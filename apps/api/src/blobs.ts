@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { blobKey, json } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
-import { startOp } from "./metrics.js";
+import { emitCompletePhases, startOp } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
 import { verifyGrant } from "./grants.js";
 import { dbFor } from "./db.js";
@@ -492,7 +492,8 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch(() => {}));
     await cleanupUpload(op.env, accountId, uploadId);
     cleanupMs = Math.max(0, Math.round(Date.now() - cleanupStart));
-    op.done(outcome, { bytes, count, completeTotalMs: totalMs, assembleMs, rereadPutMs, cleanupMs });
+    op.done(outcome, { bytes, count });
+    emitCompletePhases(env, outcome, { totalMs, assembleMs, rereadPutMs, cleanupMs });
   }
 }
 

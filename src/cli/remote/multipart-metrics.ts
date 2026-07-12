@@ -1,4 +1,5 @@
 import { metricsEnabled } from "../metrics.js";
+import { readNumericFields } from "./timings.js";
 
 export const multipartMetricsEnabled = (): boolean => metricsEnabled();
 
@@ -12,13 +13,7 @@ export interface MultipartServerTimings {
 const SERVER_TIMING_KEYS = ["totalMs", "assembleMs", "rereadPutMs", "accountingMs"] as const;
 
 export function readMultipartServerTimings(value: unknown): MultipartServerTimings | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Record<string, unknown>;
-  for (const key of SERVER_TIMING_KEYS) {
-    const n = candidate[key];
-    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;
-  }
-  return Object.fromEntries(SERVER_TIMING_KEYS.map((key) => [key, candidate[key]])) as unknown as MultipartServerTimings;
+  return readNumericFields(value, SERVER_TIMING_KEYS);
 }
 
 interface Distribution {

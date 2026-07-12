@@ -9,10 +9,10 @@ import { adminSetPlan } from "../billing.js";
 import { multipartInventory } from "../multipart-inventory.js";
 
 /**
- * Platform-admin surfaces. `gc` and `account/:id/plan` require the PLATFORM secret
- * (isPlatform); `overview` is gated by a Cloudflare Access JWT + email allow-list
- * INSIDE adminOverview (defense in depth; NOT the rbox bearer) — so all three sit
- * BEFORE authenticate().
+ * Platform-admin surfaces. `gc`, `account/:id/plan`, and the read-only
+ * `multipart-inventory` require the PLATFORM secret (isPlatform); `overview` is
+ * gated by a Cloudflare Access JWT + email allow-list INSIDE adminOverview
+ * (defense in depth; NOT the rbox bearer) — so all four sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
   if (req.method === "GET" && eq(seg, ["v1", "admin", "multipart-inventory"])) {

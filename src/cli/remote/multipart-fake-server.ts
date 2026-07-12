@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 const MiB = 1024 * 1024;
+// Local copy of the server's part sizing (apps/api/src/blobs.ts partSizeFor /
+// MIN_PART / MAX_PARTS) — the tsconfig graphs don't allow importing across the
+// src/ ↔ apps/api boundary. Keep manually in sync with blobs.ts if it changes.
 const MIN_PART = 8 * MiB;
 const MAX_PARTS = 9000;
 
@@ -16,8 +19,6 @@ export interface FakeMultipartServerOptions {
   partLatencyMs?: number;
   /** Close this part's connection once, producing a retryable transport failure. */
   failPartOnce?: number;
-  /** Alias retained for convenient CLI wiring. */
-  failPart?: number;
   includeServerTimings?: boolean;
 }
 
@@ -110,8 +111,7 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
         const upload = uploads.get(part[2]!);
         if (!upload || upload.sha !== part[1]) return json(res, 404, { error: "unknown_upload" });
         if (!Number.isInteger(n) || n < 1 || n > upload.totalParts) return json(res, 400, { error: "invalid_part" });
-        const failPart = opts.failPartOnce ?? opts.failPart;
-        if (failPart === n && !failedParts.has(n)) {
+        if (opts.failPartOnce === n && !failedParts.has(n)) {
           failedParts.add(n);
           stats.transientFailures++;
           req.socket.destroy();
@@ -133,15 +133,23 @@ export async function startFakeMultipartServer(opts: FakeMultipartServerOptions 
         const upload = uploads.get(complete[2]!);
         if (!upload || upload.sha !== complete[1]) return json(res, 404, { error: "unknown_upload" });
         if (upload.parts.size !== upload.totalParts) return json(res, 409, { error: "missing_parts" });
+        // Stream each part into the digest in order (no Buffer.concat) so peak
+        // memory stays ~1x the artifact — a --gib run already holds all parts.
         const assembleStart = Date.now();
-        const assembled = Buffer.concat(Array.from({ length: upload.totalParts }, (_, i) => upload.parts.get(i + 1)!));
+        const hash = createHash("sha256");
+        let assembledBytes = 0;
+        for (let i = 1; i <= upload.totalParts; i++) {
+          const partBody = upload.parts.get(i)!;
+          hash.update(partBody);
+          assembledBytes += partBody.byteLength;
+        }
         const assembleMs = Date.now() - assembleStart;
-        const actual = createHash("sha256").update(assembled).digest("hex");
-        if (actual !== upload.sha || assembled.byteLength !== upload.size) return json(res, 422, { error: "sha_mismatch" });
+        const actual = hash.digest("hex");
+        if (actual !== upload.sha || assembledBytes !== upload.size) return json(res, 422, { error: "sha_mismatch" });
         uploads.delete(complete[2]!);
         blobs.add(actual);
         stats.completedParts += upload.totalParts;
-        const body: Record<string, unknown> = { ok: true, sha256: actual, sizeBytes: assembled.byteLength };
+        const body: Record<string, unknown> = { ok: true, sha256: actual, sizeBytes: assembledBytes };
         if (opts.includeServerTimings !== false) {
           body.serverTimings = { totalMs: Date.now() - t0, assembleMs, rereadPutMs: 0, accountingMs: 0 };
         }

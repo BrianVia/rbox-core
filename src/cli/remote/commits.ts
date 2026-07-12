@@ -4,6 +4,7 @@ import type { CommitChainResult } from "../e2ee-remote.js";
 import type { RemoteContext } from "./context.js";
 import { firstPublishTiming } from "../upload-lane-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
+import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
 
@@ -51,13 +52,7 @@ export interface ServerTimings {
 const SERVER_TIMING_KEYS = ["totalMs", "envelopeMs", "accountingMs", "sidecarMs", "commitMs", "mirrorMs", "responseMs"] as const;
 
 function readServerTimings(value: unknown): ServerTimings | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const candidate = value as Record<string, unknown>;
-  for (const key of SERVER_TIMING_KEYS) {
-    const n = candidate[key];
-    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;
-  }
-  return Object.fromEntries(SERVER_TIMING_KEYS.map((key) => [key, candidate[key]])) as unknown as ServerTimings;
+  return readNumericFields(value, SERVER_TIMING_KEYS);
 }
 
 export interface LatestTimings {

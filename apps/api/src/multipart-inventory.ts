@@ -17,30 +17,28 @@ function bucketIndex(ageMs: number): number {
 /** Read-only, cross-account inventory of incomplete multipart state. */
 export async function multipartInventory(env: Env, nowMs: number): Promise<Response> {
   const db = dbFor(env, "");
-  const uploads = await db
-    .prepare("SELECT upload_id, size, created_at FROM uploads LIMIT 100000")
-    .all<{ upload_id: string; size: number; created_at: number }>();
-  const parts = await db
-    .prepare("SELECT upload_id, SUM(size) AS staged FROM upload_parts GROUP BY upload_id")
-    .all<{ upload_id: string; staged: number }>();
+  // The two D1 reads are independent — issue them concurrently.
+  const [uploads, parts] = await Promise.all([
+    db.prepare("SELECT upload_id, size, created_at FROM uploads LIMIT 100000").all<{ upload_id: string; size: number; created_at: number }>(),
+    db.prepare("SELECT upload_id, SUM(size) AS staged FROM upload_parts GROUP BY upload_id").all<{ upload_id: string; staged: number }>(),
+  ]);
   const stagedByUpload = new Map((parts.results ?? []).map((row) => [row.upload_id, Number(row.staged) || 0]));
   const uploadBuckets = LABELS.map((label) => ({ label, count: 0, declaredBytes: 0, stagedBytes: 0 }));
+  const incompleteTotal = { count: 0, declaredBytes: 0, stagedBytes: 0 };
   for (const upload of uploads.results ?? []) {
     const bucket = uploadBuckets[bucketIndex(nowMs - Number(upload.created_at))]!;
+    const declared = Number(upload.size) || 0;
+    const staged = stagedByUpload.get(upload.upload_id) ?? 0;
     bucket.count++;
-    bucket.declaredBytes += Number(upload.size) || 0;
-    bucket.stagedBytes += stagedByUpload.get(upload.upload_id) ?? 0;
+    bucket.declaredBytes += declared;
+    bucket.stagedBytes += staged;
+    incompleteTotal.count++;
+    incompleteTotal.declaredBytes += declared;
+    incompleteTotal.stagedBytes += staged;
   }
-  const incompleteTotal = uploadBuckets.reduce(
-    (total, bucket) => ({
-      count: total.count + bucket.count,
-      declaredBytes: total.declaredBytes + bucket.declaredBytes,
-      stagedBytes: total.stagedBytes + bucket.stagedBytes,
-    }),
-    { count: 0, declaredBytes: 0, stagedBytes: 0 },
-  );
 
   const objectBuckets = LABELS.map((label) => ({ label, count: 0, bytes: 0 }));
+  const objectTotal = { count: 0, bytes: 0 };
   let cursor: string | undefined;
   let truncated = false;
   const maxPages = 50;
@@ -50,6 +48,8 @@ export async function multipartInventory(env: Env, nowMs: number): Promise<Respo
       const bucket = objectBuckets[bucketIndex(nowMs - object.uploaded.getTime())]!;
       bucket.count++;
       bucket.bytes += object.size;
+      objectTotal.count++;
+      objectTotal.bytes += object.size;
     }
     if (!listed.truncated) {
       cursor = undefined;
@@ -58,10 +58,6 @@ export async function multipartInventory(env: Env, nowMs: number): Promise<Respo
     cursor = listed.cursor;
     if (page === maxPages - 1) truncated = true;
   }
-  const objectTotal = objectBuckets.reduce(
-    (total, bucket) => ({ count: total.count + bucket.count, bytes: total.bytes + bucket.bytes }),
-    { count: 0, bytes: 0 },
-  );
 
   return json({
     nowMs,

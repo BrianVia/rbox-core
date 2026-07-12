@@ -102,7 +102,7 @@ describe("multipart client instrumentation", () => {
   test("one transient part failure is counted and the upload succeeds", async () => {
     process.env.RBOX_METRICS = "1";
     const blob = await makeBlob(32);
-    const server = await startFakeMultipartServer({ partSize: 16, failPart: 1 });
+    const server = await startFakeMultipartServer({ partSize: 16, failPartOnce: 1 });
     const lines: string[] = [];
     setMultipartMetricsSink((line) => lines.push(line));
     try {

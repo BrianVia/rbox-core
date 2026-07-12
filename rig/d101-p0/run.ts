@@ -13,27 +13,18 @@ const arg = (name: string): string | undefined => {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
 };
-const positive = (name: string, fallback: number): number => {
+const numberArg = (name: string, fallback: number, min: number): number => {
   const raw = arg(name);
   if (raw === undefined) return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number`);
-  return value;
-};
-const nonNegative = (name: string, fallback: number): number => {
-  const raw = arg(name);
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a non-negative number`);
+  if (!Number.isFinite(value) || value < min) throw new Error(`${name} must be a number >= ${min}`);
   return value;
 };
 
-const mib = arg("--gib") === undefined ? positive("--mib", 24) : positive("--gib", 2) * 1024;
+const mib = arg("--gib") === undefined ? numberArg("--mib", 24, 1) : numberArg("--gib", 2, 1) * 1024;
 const size = Math.round(mib * 1024 * 1024);
-const latencyMs = Math.round(nonNegative("--latency-ms", 0));
-const failPartRaw = arg("--fail-part");
-const failPart = failPartRaw === undefined ? undefined : Math.round(Number(failPartRaw));
-if (failPart !== undefined && (!Number.isInteger(failPart) || failPart < 1)) throw new Error("--fail-part must be a positive integer");
+const latencyMs = Math.round(numberArg("--latency-ms", 0, 0));
+const failPart = arg("--fail-part") === undefined ? undefined : Math.round(numberArg("--fail-part", 1, 1));
 
 async function writeSynthetic(file: string, bytes: number, random: boolean): Promise<void> {
   const handle = await fs.open(file, "w");

@@ -78,11 +78,15 @@ double13 = commitMs        (Durable Object head CAS)
 double14 = mirrorMs        (alarm scheduling, fanout, and D1 mirror)
 double15 = responseMs      (response payload assembly before final serialization)
 double16 = earlyReject     (commit preflight reject indicator)
-double17 = completeTotalMs (multipart-complete entry through success response assembly)
-double18 = assembleMs      (multipart assembly)
-double19 = rereadPutMs     (staging reread plus canonical put)
-double20 = cleanupMs       (staging delete plus upload-row cleanup)
 ```
+
+The multipart-complete phase decomposition (design 101 P0.2) is its own AE
+point (`emitDelta` precedent — the shared array stays frozen):
+indexes `["multipart.complete.phases"]`, blobs `[op, outcome]`, doubles
+`[totalMs, assembleMs, rereadPutMs, cleanupMs]` where `totalMs` is entry
+through success-response assembly (excludes `finally` cleanup), `assembleMs`
+is R2 MPU assembly, `rereadPutMs` is the staging reread plus verified
+canonical put, and `cleanupMs` is the staging delete plus upload-row cleanup.
 
 Query via the [AE SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
 Dataset: `rbox_dev_metrics` (dev) / `rbox_prod_metrics` (production).
