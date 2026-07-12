@@ -670,7 +670,7 @@ export class RboxDaemon {
           }
           const opWatcherGeneration = this.watcherUnsettledGeneration;
           const opWatcherErrorGeneration = this.watcherErrorGeneration;
-          let notifyPendingAtForRestore: number | undefined;
+          let catchUpGenerationForRestore: number | undefined;
           try {
             let pushedToRemote = false;
             this.pushTerminalBlocked = false;
@@ -689,9 +689,12 @@ export class RboxDaemon {
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush();
               } else if (op === "pull") {
-                notifyPendingAtForRestore = this.notifyPullPendingAt;
-                const notifyLatencyMs = notifyPendingAtForRestore !== undefined ? Date.now() - notifyPendingAtForRestore : undefined;
+                const notifyLatencyMs = this.notifyPullPendingAt !== undefined ? Date.now() - this.notifyPullPendingAt : undefined;
                 this.notifyPullPendingAt = undefined;
+                // §6: the standalone metric event fires at dequeue — measured latency is recorded
+                // even if the pull below fails (the pull-line token then simply never prints).
+                if (notifyLatencyMs !== undefined) log(`notify_latency_ms=${notifyLatencyMs}`);
+                catchUpGenerationForRestore = this.pendingCatchUpGeneration;
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
                 await this.doPull(syncMutex, notifyLatencyMs);
@@ -740,10 +743,10 @@ export class RboxDaemon {
             }
             if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
           } catch (e) {
-            // A failed pull did not serve its notify: restore the pending receipt timestamp so
-            // the eventual healing pull reports the true notify→pull-start latency (??= keeps
-            // an EARLIER re-notify that arrived mid-failure).
-            if (op === "pull" && notifyPendingAtForRestore !== undefined) this.notifyPullPendingAt ??= notifyPendingAtForRestore;
+            // A failed catch-up pull must not orphan its generation: restore it so the eventual
+            // healing pull (backstop / next frame) can still mark the socket caught up.
+            // markWsCaughtUp discards stale generations, so restoring a superseded one is harmless.
+            if (op === "pull" && catchUpGenerationForRestore !== undefined) this.pendingCatchUpGeneration ??= catchUpGenerationForRestore;
             // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
             // first hit and every 10th after, with the running count — so the log stays
             // readable while still showing exactly how long the failure has persisted.
@@ -1931,6 +1934,7 @@ export class RboxDaemon {
       this.handleWsMessageData(String(ev.data), ws);
     });
     ws.addEventListener("pong", () => {
+      if (this.ws !== ws) return;
       this.armPongDeadline(ws);
     });
     ws.addEventListener("close", () => {

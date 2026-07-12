@@ -22,14 +22,16 @@ interface DaemonInternals {
   wsDisabled: boolean;
   wsHalfOpenDetected: number;
   wsBackstopPulls: number;
+  reconnectAttempt: number;
   notifyPullPendingAt?: number;
+  pendingCatchUpGeneration?: number;
   wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
   backstopTimer?: ReturnType<typeof setTimeout>;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pumpRun: Promise<void>;
   cache: HashCache;
   manifest: Manifest;
-  activity: { ws?: { connected: boolean } };
+  activity: { ws?: { connected: boolean; caughtUp: boolean } };
   armPongDeadline(ws: WebSocket): void;
   clearPongDeadline(): void;
   onPongDeadline(ws: WebSocket): void;
@@ -49,8 +51,13 @@ interface DaemonInternals {
 
 class MiniRemote implements SyncRemote {
   latestCalls = 0;
+  throwNextLatest = false;
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     this.latestCalls++;
+    if (this.throwNextLatest) {
+      this.throwNextLatest = false;
+      throw new Error("latest failed");
+    }
     return { sequence: 0, manifest: { generatedAt: "", files: [] } };
   }
   async missingBlobs(): Promise<string[]> { return []; }
@@ -154,6 +161,15 @@ test("reconnect delay spreads the first attempt and preserves capped jitter", ()
   expect(reconnectDelayMs(10, () => 1)).toBe(37500);
 });
 
+test("scheduleReconnect advances the attempt sequence used by reconnectDelayMs", async () => {
+  const daemon = await makeDaemon();
+  daemon.connect = () => {};
+  expect(daemon.reconnectAttempt).toBe(0);
+  daemon.scheduleReconnect(); // consumes attempt 0 (the uniform 0–3s spread)
+  daemon.scheduleReconnect(); // consumes attempt 1 (the 1s ±25% step G5(b) expects)
+  expect(daemon.reconnectAttempt).toBe(2);
+});
+
 test("a stale socket deadline cannot close the replacement", async () => {
   const daemon = await makeDaemon();
   let closes = 0;
@@ -194,6 +210,41 @@ test("committed notification resets the backstop and records a latency token", a
   }
   expect(daemon.notifyPullPendingAt).toBeUndefined();
   expect(lines.some((line) => line.includes("notify_latency_ms="))).toBe(true);
+});
+
+test("failed notified pull logs latency at dequeue without restoring the timestamp", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  remote.throwNextLatest = true;
+
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => lines.push(args.join(" "));
+  try {
+    daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 5, deviceId: "d" }));
+    await daemon.pumpRun;
+  } finally {
+    console.log = originalLog;
+  }
+  expect(lines.some((line) => line.includes("notify_latency_ms="))).toBe(true);
+  expect(daemon.notifyPullPendingAt).toBeUndefined();
+});
+
+test("failed catch-up pull restores its generation until a healing pull", async () => {
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote);
+  const ws = fakeWs();
+  daemon.ws = ws;
+  const generation = daemon.markWsOpen(ws);
+  daemon.pendingCatchUpGeneration = generation;
+  remote.throwNextLatest = true;
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(daemon.pendingCatchUpGeneration).toBeDefined();
+
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(daemon.activity.ws?.caughtUp).toBe(true);
 });
 
 test("a stale socket message cannot trigger a pull or notify token", async () => {
