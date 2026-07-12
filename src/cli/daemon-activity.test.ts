@@ -93,7 +93,7 @@ interface DaemonInternals {
   watcherDegraded: boolean;
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
-  doFullScan(): Promise<void>;
+  doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
@@ -486,7 +486,7 @@ test("a second watcher error during the covering scan keeps status degraded", as
     daemon.doFullScan = async () => {
       scanEntered.resolve();
       await releaseScan.promise;
-      await realFullScan();
+      return realFullScan(); // forward ScanCoverage so the completion hook gets errorGenAtStart
     };
     await writeOwnedDaemonPid();
 

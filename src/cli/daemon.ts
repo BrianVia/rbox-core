@@ -46,6 +46,7 @@ import {
 } from "./drift-audit.js";
 import { lowerIoPriority } from "./io-priority.js";
 import { QuotaExceededError, RboxApi } from "./remote.js";
+import { envInt } from "./remote/resilient.js";
 import { CommitRejectedError } from "./remote.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 import { runUpdateCheckIfDue } from "./update-check.js";
@@ -69,6 +70,12 @@ type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
 
 const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
+const retrustEnabled = () => process.env.RBOX_WATCHER_RETRUST === "1";
+// Soak-tunable (design 104 §Constants): W / M / K, floored at 1 (envInt clamps).
+const RETRUST_DROP_WINDOW_MS = envInt("RBOX_WATCHER_RETRUST_W_MS", 10 * 60_000, 1, Number.MAX_SAFE_INTEGER);
+const RETRUST_FUSE_DROPS = envInt("RBOX_WATCHER_RETRUST_M", 6, 1, Number.MAX_SAFE_INTEGER);
+const RETRUST_HOLD_MAX_MS = SAFETY_SYNC_MAX_MS;
+const RETRUST_MIN_QUIET_TICKS = envInt("RBOX_WATCHER_RETRUST_K", 3, 1, Number.MAX_SAFE_INTEGER);
 const GC_FENCE_RETRY_MS = 6 * 60 * 60_000; // open purge intents live 24–48h; never hot-reupload
 const DEEP_SCAN_MS = 30 * 60_000; // infrequent cache-bypassing re-hash (heals mtime+size-stable drift)
 const RECONNECT_BASE_MS = 500;
@@ -79,6 +86,18 @@ export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
+
+type TrustState = "trusted" | "suspect" | "fused";
+interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
+const worseTrust = (a: TrustState, b: TrustState): TrustState => {
+  const rank: Record<TrustState, number> = { trusted: 0, suspect: 1, fused: 2 };
+  return rank[a] >= rank[b] ? a : b;
+};
+
+export function classifyWatcherError(message: string): "transient" | "fatal" {
+  const m = message.toLowerCase();
+  return m.includes("were dropped") || m.includes("must be re-scanned") ? "transient" : "fatal";
+}
 
 /** Sanitized error identifier for measurement-failure log lines. Node fs errors
  *  embed absolute paths in `message` — only the errno code may be emitted (the
@@ -109,6 +128,7 @@ interface OpenDriftAudit {
   appliedEvents: WatchEvent[];
   overflow: boolean;
   watcherHealthy: boolean;
+  trustState: TrustState;
   errorGen: number;
   sinceSafetyMs: number;
   rulesChanged: boolean;
@@ -200,6 +220,14 @@ export class RboxDaemon {
    *  errored once is no longer trusted to have delivered everything, so the safety
    *  scan never backs off again (fail-safe toward pre-design-49 behavior). */
   private watcherHealthy = true;
+  private trustState: TrustState = "trusted";
+  private lastTrustedErrorGeneration = 0;
+  private transientDropTimestamps: number[] = [];
+  private lastTransientDropMs = 0;
+  private recoveryHoldMs = 0;
+  private watcherLivenessSinceDrop = false;
+  private hasCleanUnprunedScanThisEpisode = false;
+  private consecutiveQuietSafetyTicks = 0;
   private watcherDegraded = false;
   /** Monotonic post-init watcher error generation. A successful full/deep scan may
    *  clear the visible degradation only if this did not advance after that scan began. */
@@ -350,16 +378,54 @@ export class RboxDaemon {
             }
           },
           onError: (err) => {
-            // One backend error and the watcher is no longer TRUSTED (codex R1): a
-            // dead FSEvents/inotify stream must not let the safety scan — now the
-            // only healer — sit backed off at 5m. Sync itself is unaffected. An
-            // already-armed backed-off timer is pulled forward too (codex R2) —
-            // the flag alone would wait out the remaining timeout.
-            if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
-            this.watcherHealthy = false;
-            for (const audit of this.openDriftAudits) audit.watcherHealthy = false;
+            if (!retrustEnabled()) {
+              // Design-104 flag OFF (default): today's body, verbatim — one backend
+              // error and the watcher is no longer TRUSTED (codex R1): a dead
+              // FSEvents/inotify stream must not let the safety scan — now the
+              // only healer — sit backed off at 5m. Sync itself is unaffected. An
+              // already-armed backed-off timer is pulled forward too (codex R2) —
+              // the flag alone would wait out the remaining timeout.
+              if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
+              this.watcherHealthy = false;
+              for (const audit of this.openDriftAudits) audit.watcherHealthy = false;
+              this.watcherDegraded = true;
+              this.watcherErrorGeneration++;
+              this.writeAmbientStatus();
+              this.pinSafetyFloor();
+              return;
+            }
+            // Design-104 flag ON: classify transient overflow vs fatal and run the
+            // trust state machine. errorGen bumps on EVERY drop (never on re-trust);
+            // all P2 episode evidence resets on every drop, incl. suspect→suspect.
             this.watcherDegraded = true;
             this.watcherErrorGeneration++;
+            this.resetSuspectEpisodeState();
+            if (this.trustState === "fused") {
+              // Fused is permanent — never re-enters suspect, but the drop still
+              // bumped errorGen and re-pins the floor (today's untrusted behavior).
+              this.writeAmbientStatus();
+              this.pinSafetyFloor();
+              return;
+            }
+            if (classifyWatcherError(err.message) === "fatal") {
+              log(`watcher error (fatal): ${err.message} — permanent un-trust`);
+              this.setTrustState("fused", "fatal error");
+            } else {
+              const now = Date.now();
+              this.transientDropTimestamps = this.transientDropTimestamps.filter((ts) => ts > now - RETRUST_DROP_WINDOW_MS);
+              this.transientDropTimestamps.push(now);
+              this.lastTransientDropMs = now;
+              const d = this.transientDropTimestamps.length;
+              if (d >= RETRUST_FUSE_DROPS) {
+                log(`watcher trust FUSED: ${d} transient drops within ${RETRUST_DROP_WINDOW_MS}ms — reverting to permanent un-trust (safety-scan-only)`);
+                this.setTrustState("fused", `fuse ${d}/${RETRUST_FUSE_DROPS}`);
+              } else {
+                this.recoveryHoldMs = Math.min(SAFETY_SYNC_MS * 2 ** (d - 1), RETRUST_HOLD_MAX_MS);
+                if (this.trustState === "trusted") log(`watcher error (transient overflow): ${err.message} — safety scan pinned; recovering`);
+                log(`retrust drop: window=${d}/${RETRUST_FUSE_DROPS} wouldFuse=n hold=${this.recoveryHoldMs}ms`);
+                this.setTrustState("suspect", `transient drop ${d}`);
+              }
+            }
             this.writeAmbientStatus();
             this.pinSafetyFloor();
           },
@@ -377,6 +443,7 @@ export class RboxDaemon {
    *  the flag alone would let a drop from THIS storm wait out an armed 5m timer —
    *  the scan must return to its 60s cadence the moment there is churn to protect. */
   private noteChurn(): void {
+    this.watcherLivenessSinceDrop = true;
     this.churnSinceSafety = true;
     this.pinSafetyFloor();
   }
@@ -405,14 +472,28 @@ export class RboxDaemon {
   private scheduleSafetyScan(): void {
     this.safetyTimer = setTimeout(() => {
       if (this.stopped) return;
-      this.safetyDelay = nextSafetyDelay(this.safetyDelay, {
-        watcherLive: this.watcher !== undefined && this.watcherHealthy,
-        churned: this.churnSinceSafety,
-      });
+      this.advanceSafetyCadenceForTick();
       this.churnSinceSafety = false;
       this.request("fullScan");
       this.scheduleSafetyScan();
     }, jitter(this.safetyDelay));
+  }
+
+  private advanceSafetyCadenceForTick(): void {
+    if (this.churnSinceSafety) this.consecutiveQuietSafetyTicks = 0;
+    else this.consecutiveQuietSafetyTicks++;
+    const degradedBackoffEligible = retrustEnabled()
+      && this.trustState === "suspect"
+      && this.watcherLivenessSinceDrop
+      && this.hasCleanUnprunedScanThisEpisode
+      && this.consecutiveQuietSafetyTicks >= RETRUST_MIN_QUIET_TICKS;
+    // degradedBackoffEligible already embeds the flag; false and absent are
+    // identical to nextSafetyDelay, so flag-off output is unchanged.
+    this.safetyDelay = nextSafetyDelay(this.safetyDelay, {
+      watcherLive: this.watcher !== undefined && this.watcherHealthy,
+      churned: this.churnSinceSafety,
+      degradedBackoffEligible,
+    });
   }
 
   async stop(): Promise<void> {
@@ -520,12 +601,12 @@ export class RboxDaemon {
             this.appliedPendingEventsInOp = false;
             try {
               if (op === "deepScan") {
-                await this.doDeepScan();
-                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
+                const cov = await this.doDeepScan();
+                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 this.requestPush();
               } else if (op === "fullScan") {
-                await this.doFullScan();
-                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration);
+                const cov = await this.doFullScan();
+                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush();
               } else if (op === "pull") {
@@ -963,10 +1044,45 @@ export class RboxDaemon {
   /** A completed full-tree scan covers the dropped-events window. Clear the ambient
    *  warning only for a live watcher that reported no further error during that scan;
    *  periodic-scan mode has no watcher to recover and therefore remains degraded. */
-  private maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number): void {
-    if (!this.watcher || !this.watcherDegraded || this.watcherErrorGeneration !== opWatcherErrorGeneration) return;
-    this.watcherDegraded = false;
-    this.writeAmbientStatus();
+  private maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: ScanCoverage): void {
+    // Visible-degraded clear: keyed on the PUMP-OP-START generation, byte-identical
+    // to pre-104 behavior — a second error DURING the covering scan (bumping errorGen
+    // after this capture) must keep status degraded (daemon-activity.test.ts).
+    const stable = this.watcher && this.watcherDegraded && this.watcherErrorGeneration === opWatcherErrorGeneration;
+    if (stable) { this.watcherDegraded = false; this.writeAmbientStatus(); }
+    if (!retrustEnabled()) return;
+    // Re-trust uses the scan's OWN inside-scan coverage evidence (design 85 R1 F8 /
+    // codex M3): coverage originates at the walker; a drop during config-reload OR
+    // the walk advances errorGen past errorGenAtStart and blocks re-trust.
+    const clean = this.watcher !== undefined && cov.coverage === "full-tree" && cov.errorGenAtStart === this.watcherErrorGeneration;
+    if (!clean) return;
+    if (this.trustState !== "suspect") return;
+    this.hasCleanUnprunedScanThisEpisode = true; // P2 episode evidence
+    if (this.watcherErrorGeneration > this.lastTrustedErrorGeneration
+      && Date.now() - this.lastTransientDropMs >= this.recoveryHoldMs) {
+      this.lastTrustedErrorGeneration = this.watcherErrorGeneration;
+      this.setTrustState("trusted", `re-trusted after clean full-tree scan (errorGen=${this.watcherErrorGeneration})`);
+      this.watcherDegraded = false;
+      this.resetSuspectEpisodeState();
+      this.writeAmbientStatus();
+    }
+  }
+
+  private setTrustState(next: TrustState, reason: string): void {
+    if (this.trustState === next) return;
+    this.trustState = next;
+    this.watcherHealthy = next === "trusted";
+    if (next !== "trusted") for (const audit of this.openDriftAudits) {
+      audit.watcherHealthy = false;
+      audit.trustState = worseTrust(audit.trustState, next);
+    }
+    log(`watcher trust ${this.trustState} (${reason})`);
+  }
+
+  private resetSuspectEpisodeState(): void {
+    this.watcherLivenessSinceDrop = false;
+    this.hasCleanUnprunedScanThisEpisode = false;
+    this.consecutiveQuietSafetyTicks = 0;
   }
 
   private localSnapshot(settled: boolean, now: number): DaemonActivity["local"] | undefined {
@@ -1220,19 +1336,22 @@ export class RboxDaemon {
     this.writeActivity();
   }
 
-  private async doFullScan(): Promise<void> {
+  private async doFullScan(): Promise<ScanCoverage> {
     await this.reloadWorkspaceConfigIfChanged();
+    const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
-    const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan");
+    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan");
     if (metricsEnabled()) log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
+    return { coverage, errorGenAtStart };
   }
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
-  private async doDeepScan(): Promise<void> {
+  private async doDeepScan(): Promise<ScanCoverage> {
     await this.reloadWorkspaceConfigIfChanged();
+    const errorGenAtStart = this.watcherErrorGeneration;
     const scanStartMs = Date.now();
     const priorManifest = this.manifest;
     const eventGenAtScan = this.watcherUnsettledGeneration;
@@ -1241,26 +1360,28 @@ export class RboxDaemon {
     const audit: OpenDriftAudit = {
       scanStartMs, candidates: [], horizonInputs: new Map(), rawEvents: [], appliedEvents: [], overflow: false,
       watcherHealthy: !!this.watcher && this.watcherHealthy,
+      trustState: retrustEnabled() ? this.trustState : "trusted",
       errorGen: this.watcherErrorGeneration,
       sinceSafetyMs: this.lastSafetyCompletedMs === undefined ? 0 : Math.max(0, scanStartMs - this.lastSafetyCompletedMs),
       rulesChanged,
     };
     this.openDriftAudits.add(audit);
     const fresh = new HashCache();
-    let scanResult: { freshManifest: Manifest; deferred: Set<string> };
+    let scanResult: { freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" };
     try {
       scanResult = await this.replaceManifestFromScan(fresh, this.manifest, stats, "deep scan");
     } catch (error) {
       this.openDriftAudits.delete(audit);
       throw error;
     }
-    const { freshManifest, deferred } = scanResult;
+    const { freshManifest, deferred, coverage } = scanResult;
     this.rulesChangedSinceDeepScan = false;
     if (metricsEnabled()) log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, deferred.size));
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
     audit.candidates = diffForDrift(priorManifest, freshManifest, {
       firstSeenAtMs: scanStartMs, eventGenAtScan, bootId: this.bootId,
       watcherSessionId: this.watcherSessionId, errorGenAtScan: this.watcherErrorGeneration,
+      originUntrusted: retrustEnabled() && audit.trustState !== "trusted",
     });
     // Stash the fresh-scan snapshot for each PENDING candidate now (the fresh
     // manifest is the horizon's disk truth) — but resolve nothing until the settle
@@ -1279,12 +1400,13 @@ export class RboxDaemon {
         if (r.removedBatches) log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
       })
       .catch(() => {});
+    return { coverage, errorGenAtStart };
   }
 
   /** Install a coherent full-scan result. A path that changed under its deferred
    *  hash carries `previous`'s entry (never a torn tuple, never a deletion) and
    *  enters the existing write-finish retry loop. */
-  private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats?: ScanStats, scanKind?: "safety scan" | "deep scan"): Promise<{ freshManifest: Manifest; deferred: Set<string> }> {
+  private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats?: ScanStats, scanKind?: "safety scan" | "deep scan"): Promise<{ freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" }> {
     const deferred = new Set<string>();
     const probeOn = process.env.RBOX_SCAN_PROBE === "1" && scanKind !== undefined;
     const scanStartMs = Date.now();
@@ -1299,7 +1421,13 @@ export class RboxDaemon {
       // Measurement only — a probe sidecar write failure must never fail the scan op.
       await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${errCode(e)}`));
     }
-    return { freshManifest: fresh, deferred };
+    // Coverage originates HERE — the function that invokes the tree walker
+    // (`scanManifest`). Today every scan is a full unpruned walk ⇒ "full-tree".
+    // When design 85 Layer A lands, the pruning decision lives at this layer and
+    // MUST return "pruned" so a pruned scan can heal but never testify to
+    // re-trust (design 104 R1 F8 / codex impl-review M2). Callers forward this
+    // value unchanged — they never manufacture it.
+    return { freshManifest: fresh, deferred, coverage: "full-tree" };
   }
 
   /** Serialized sidecar transaction. `fn` returning false means "unchanged" and
@@ -1371,18 +1499,24 @@ export class RboxDaemon {
         const pendingCoverage = [...audit.rawEvents, ...audit.appliedEvents, ...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
         quiescent = !audit.overflow && audit.rawEvents.length === 0;
         const survivors: DriftCandidate[] = [];
+        // Loop-invariant: the audit's trust stamp is monotonically downgraded and
+        // never changes mid-loop (the decision section is synchronous).
+        const auditContaminated = retrustEnabled() && audit.trustState !== "trusted";
         for (const candidate of audit.candidates) {
           if (audit.overflow || eventsCoverPath(pendingCoverage, candidate.path)) { racing++; continue; }
           const current = reverified.get(candidate.path);
           if (current === undefined) { racing++; continue; }
           // The same retained-expected mismatch must survive; healed scan churn is dropped.
-          if (candidateStillMismatch(candidate, current)) survivors.push({ ...candidate, quiescentAtScan: quiescent });
+          if (candidateStillMismatch(candidate, current)) {
+            const originUntrusted = candidate.originUntrusted || auditContaminated;
+            survivors.push({ ...candidate, quiescentAtScan: quiescent, ...(originUntrusted ? { originUntrusted: true } : {}) });
+          }
         }
         const held: DriftCandidate[] = [];
         const continuity = {
           bootId: this.bootId, watcherSessionId: this.watcherSessionId,
           errorGeneration: this.watcherErrorGeneration,
-          watcherUnhealthySince: !this.watcher || !this.watcherHealthy,
+          watcherUnhealthySince: !this.watcher || !this.watcherHealthy || !audit.watcherHealthy,
         };
         for (const candidate of state.pending) {
           // Event-time truth is binding: a candidate covered by ANY event seen
@@ -1407,7 +1541,7 @@ export class RboxDaemon {
         this.openDriftAudits.delete(audit); // window closed — atomically with the pending update
         return before !== 0 || state.pending.length !== 0 || resolved.lateCovered !== 0 || resolved.coveredAmbiguous !== 0;
       });
-      log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
+      log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"}${retrustEnabled() ? ` trustState=${audit.trustState}` : ""} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
     } catch (e) {
       this.openDriftAudits.delete(audit);
       log(`drift audit failed (measurement only, sync unaffected): ${errCode(e)}`);
@@ -1654,7 +1788,8 @@ const jitter = (ms: number) => Math.round(ms * (0.75 + Math.random() * 0.5));
  * scan is the sync mechanism there), → back to the 60s floor. Pure — the
  * doubling/cap/reset table is unit-tested without timers.
  */
-export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean }): number {
-  if (!opts.watcherLive || opts.churned) return SAFETY_SYNC_MS;
+export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean; degradedBackoffEligible?: boolean }): number {
+  if (opts.churned) return SAFETY_SYNC_MS;
+  if (!opts.watcherLive && !opts.degradedBackoffEligible) return SAFETY_SYNC_MS;
   return Math.min(current * 2, SAFETY_SYNC_MAX_MS);
 }

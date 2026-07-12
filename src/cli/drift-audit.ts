@@ -22,6 +22,7 @@ export interface DriftCandidate {
   bootId: string;
   watcherSessionId?: string;
   errorGenAtScan: number;
+  originUntrusted?: boolean;
   /** Origin scan's quiescence tag — only confirmed drops born in a QUIESCENT scan
    *  feed the design's drop-rate gate (§5 P0.3 filter c). */
   quiescentAtScan: boolean;
@@ -42,6 +43,7 @@ export function sameSnapshot(a: EntrySnapshot | null, b: EntrySnapshot | null): 
 export type DriftCandidateDraft = Omit<DriftCandidate, "quiescentAtScan">;
 
 export function diffForDrift(expected: Manifest, observed: Manifest, context: Omit<DriftCandidateDraft, "path" | "kind" | "expected" | "observed">): DriftCandidateDraft[] {
+  const { originUntrusted, ...baseContext } = context;
   const before = new Map(expected.files.map((x) => [x.path, x]));
   const after = new Map(observed.files.map((x) => [x.path, x]));
   const paths = new Set([...before.keys(), ...after.keys()]);
@@ -49,7 +51,7 @@ export function diffForDrift(expected: Manifest, observed: Manifest, context: Om
   for (const p of paths) {
     const a = snap(before.get(p)); const b = snap(after.get(p));
     if (sameSnapshot(a, b)) continue;
-    out.push({ path: p, kind: !a ? "added" : !b ? "deleted" : "modified", expected: a, observed: b, ...context });
+    out.push({ path: p, kind: !a ? "added" : !b ? "deleted" : "modified", expected: a, observed: b, ...baseContext, ...(originUntrusted ? { originUntrusted: true } : {}) });
   }
   return out;
 }
@@ -58,7 +60,7 @@ export function eventCoversPath(event: WatchEvent, candidatePath: string): boole
 }
 export function eventsCoverPath(events: WatchEvent[], candidatePath: string): boolean { return events.some((e) => eventCoversPath(e, candidatePath)); }
 export function continuityBroken(candidate: DriftCandidateDraft, now: ContinuityContext): boolean {
-  return candidate.bootId !== now.bootId || candidate.watcherSessionId !== now.watcherSessionId || candidate.errorGenAtScan !== now.errorGeneration || now.watcherUnhealthySince;
+  return candidate.bootId !== now.bootId || candidate.watcherSessionId !== now.watcherSessionId || candidate.errorGenAtScan !== now.errorGeneration || now.watcherUnhealthySince || !!candidate.originUntrusted;
 }
 export function horizonClass(candidate: DriftCandidateDraft, currentObserved: EntrySnapshot | null, continuity: ContinuityContext): "confirmed" | "reverted" | "unattributable" {
   if (continuityBroken(candidate, continuity)) return "unattributable";
@@ -99,11 +101,20 @@ export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEv
  *  the original drop evidence and true drift age — then cap. */
 export function dedupePending(candidates: DriftCandidate[]): DriftCandidate[] {
   const byPath = new Map<string, DriftCandidate>();
+  const contaminated = new Set<string>(); // any same-path duplicate stamped originUntrusted
   for (const c of candidates) {
+    if (c.originUntrusted) contaminated.add(c.path);
     const prev = byPath.get(c.path);
     if (!prev || c.firstSeenAtMs < prev.firstSeenAtMs) byPath.set(c.path, c);
   }
-  return [...byPath.values()].slice(0, PENDING_CAP);
+  // The oldest candidate wins its evidence/age, but `originUntrusted` is ORed
+  // monotonically across every duplicate: a clean-oldest + contaminated-newer
+  // same-path pair must NOT lose the contamination (codex impl-review M1). Kept
+  // omit-when-false so a flag-off run (never contaminated) is byte-identical —
+  // and skips the clone pass entirely.
+  const deduped = [...byPath.values()].slice(0, PENDING_CAP);
+  if (contaminated.size === 0) return deduped;
+  return deduped.map((c) => (contaminated.has(c.path) && !c.originUntrusted ? { ...c, originUntrusted: true } : c));
 }
 
 /** Held-back pending + this scan's survivors, oldest-per-path, capped. */
@@ -130,6 +141,7 @@ export async function loadDriftAudit(root: string): Promise<DriftAuditState> {
       Number.isFinite(candidate.firstSeenAtMs) && Number.isFinite(candidate.eventGenAtScan) &&
       Number.isFinite(candidate.errorGenAtScan) && typeof candidate.bootId === "string" &&
       (candidate.watcherSessionId === undefined || typeof candidate.watcherSessionId === "string") &&
+      (candidate.originUntrusted === undefined || candidate.originUntrusted === true) &&
       typeof candidate.quiescentAtScan === "boolean" &&
       validSnapshot(candidate.expected) && validSnapshot(candidate.observed)
     );
