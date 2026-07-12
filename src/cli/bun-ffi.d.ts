@@ -3,7 +3,9 @@
  * parcel-watcher.d.ts rather than pulling in all of bun-types. */
 declare module "bun:ffi" {
   export type FFITypeTag = number & { readonly __ffiType: unique symbol };
-  export const FFIType: Record<"i32" | "i64", FFITypeTag>;
+  export const FFIType: Record<"i32" | "i64" | "ptr" | "u64" | "usize", FFITypeTag>;
+  export function ptr(view: ArrayBufferView): number;
+  export const read: { i32(pointer: number, offset?: number): number };
   export function dlopen(
     path: string,
     symbols: Record<string, { args: FFITypeTag[]; returns: FFITypeTag }>
