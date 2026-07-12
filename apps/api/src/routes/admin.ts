@@ -4,7 +4,7 @@ import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
 import { runPhase1 } from "../gc-phase1.js";
 import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcMark, gcPurge } from "../versions.js";
-import { adminOverview } from "../admin.js";
+import { adminOverview, fetchDeltaSoak } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
 import { multipartInventory } from "../multipart-inventory.js";
 
@@ -15,6 +15,17 @@ import { multipartInventory } from "../multipart-inventory.js";
  * (defense in depth; NOT the rbox bearer) — so all four sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "GET" && eq(seg, ["v1", "admin", "delta-soak"])) {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    if (!env.CF_ANALYTICS_TOKEN || !env.CF_ACCOUNT_ID) return json({ error: "analytics_unavailable" }, 503);
+    const raw = Number(url.searchParams.get("sinceHours") ?? "72");
+    const sinceHours = Number.isFinite(raw) ? Math.min(168, Math.max(1, Math.trunc(raw))) : 72;
+    try {
+      return json(await fetchDeltaSoak(env, sinceHours));
+    } catch {
+      return json({ error: "analytics_unavailable" }, 503);
+    }
+  }
   if (req.method === "GET" && eq(seg, ["v1", "admin", "multipart-inventory"])) {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
     return multipartInventory(env, Date.now());

@@ -364,7 +364,7 @@ function num(v: unknown): number {
 
 /** Run one AE SQL statement, returning its `data` rows. Throws on any non-2xx / parse
  *  failure so the caller's single try/catch can degrade the whole block to null. */
-async function aeSql(env: Env, token: string, sql: string): Promise<Array<Record<string, unknown>>> {
+export async function aeSql(env: Env, token: string, sql: string): Promise<Array<Record<string, unknown>>> {
   const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
@@ -374,6 +374,105 @@ async function aeSql(env: Env, token: string, sql: string): Promise<Array<Record
   if (!res.ok) throw new Error(`ae_sql_${res.status}`);
   const body = (await res.json()) as { data?: Array<Record<string, unknown>> };
   return body.data ?? [];
+}
+
+// ── design-102 shadow-soak gate ──────────────────────────────────────────────
+
+export interface DeltaSoak {
+  sinceHours: number;
+  commitDelta: {
+    divergence: { events: number; harmfulTotal: number };
+    benignMarkerDivergence: { events: number; total: number };
+    fallback: { byReason: Record<string, number>; total: number };
+    highSeverity: { fence_violation: number; parent_unreadable: number; delta_error: number };
+    admitStmts: { count: number; p50: number; p95: number };
+    sizes: { count: number };
+  };
+  commits: { total: number };
+}
+
+type AeSql = typeof aeSql;
+
+/** Read the numeric-only design-102 soak counters from the real positional AE schema.
+ * Throws when AE rejects a query; the route converts that to analytics_unavailable. */
+export async function fetchDeltaSoak(env: Env, sinceHours: number, query: AeSql = aeSql): Promise<DeltaSoak> {
+  const token = env.CF_ANALYTICS_TOKEN!;
+  const dataset = env.CF_METRICS_DATASET ?? (env.RBOX_ENV === "dev" ? "rbox_dev_metrics" : "rbox_prod_metrics");
+  if (!/^[A-Za-z0-9_]+$/.test(dataset)) throw new Error("invalid_metrics_dataset");
+  const win = `timestamp > NOW() - INTERVAL '${sinceHours}' HOUR`;
+
+  const [summaryRows, admitRows, fallbackRows, severityRows, commitRows] = await Promise.all([
+    query(
+      env,
+      token,
+      `SELECT
+         sumIf(_sample_interval, blob2 = 'divergence') AS divergence_events,
+         sumIf(double2 * _sample_interval, blob2 = 'divergence') AS harmful_total,
+         sumIf(_sample_interval, blob2 = 'benign_marker_divergence') AS benign_events,
+         sumIf(double2 * _sample_interval, blob2 = 'benign_marker_divergence') AS benign_total,
+         sumIf(_sample_interval, blob2 = 'sizes') AS sizes_count
+       FROM ${dataset} WHERE index1 = 'commit.delta' AND ${win}`,
+    ),
+    query(
+      env,
+      token,
+      `SELECT sum(_sample_interval) AS n,
+         round(quantileExactWeighted(0.50)(double4, _sample_interval)) AS p50,
+         round(quantileExactWeighted(0.95)(double4, _sample_interval)) AS p95
+       FROM ${dataset} WHERE index1 = 'commit.delta' AND blob2 = 'admit_stmts' AND ${win}`,
+    ),
+    query(
+      env,
+      token,
+      `SELECT blob3 AS reason, sum(_sample_interval) AS n
+       FROM ${dataset} WHERE index1 = 'commit.delta' AND blob2 = 'fallback' AND ${win}
+       GROUP BY reason ORDER BY reason`,
+    ),
+    query(
+      env,
+      token,
+      `SELECT blob2 AS outcome, sum(_sample_interval) AS n
+       FROM ${dataset} WHERE index1 = 'commit.delta'
+         AND blob2 IN ('fence_violation', 'parent_unreadable', 'delta_error') AND ${win}
+       GROUP BY outcome`,
+    ),
+    query(
+      env,
+      token,
+      `SELECT sum(_sample_interval) AS total FROM ${dataset}
+       WHERE blob1 = 'commit' AND blob3 = 'ok' AND ${win}`,
+    ),
+  ]);
+
+  const summary = summaryRows[0] ?? {};
+  const admit = admitRows[0] ?? {};
+  const byReason: Record<string, number> = {};
+  let fallbackTotal = 0;
+  for (const row of fallbackRows) {
+    const reason = String(row.reason ?? "");
+    if (!reason) continue;
+    const n = num(row.n);
+    byReason[reason] = n;
+    fallbackTotal += n;
+  }
+  const highSeverity = { fence_violation: 0, parent_unreadable: 0, delta_error: 0 };
+  for (const row of severityRows) {
+    const outcome = String(row.outcome ?? "") as keyof typeof highSeverity;
+    if (outcome in highSeverity) highSeverity[outcome] = num(row.n);
+  }
+
+  return {
+    sinceHours,
+    commitDelta: {
+      divergence: { events: num(summary.divergence_events), harmfulTotal: num(summary.harmful_total) },
+      benignMarkerDivergence: { events: num(summary.benign_events), total: num(summary.benign_total) },
+      fallback: { byReason, total: fallbackTotal },
+      highSeverity,
+      admitStmts: { count: num(admit.n), p50: num(admit.p50), p95: num(admit.p95) },
+      sizes: { count: num(summary.sizes_count) },
+    },
+    commits: { total: num(commitRows[0]?.total) },
+  };
 }
 
 /**
