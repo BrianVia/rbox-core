@@ -65,12 +65,15 @@ export interface LatestTimings {
   decryptMs: number;
   parseMs: number;
   encBytes: number;
+  fold?: "evidence" | "coldwalk" | "snapshot" | "raw";
 }
 
 export interface LatestOptions {
   onLatestTimings?: (timings: LatestTimings) => void;
   /** Applied manifest plus persisted, verified wire evidence for the Phase-D head fold shortcut. */
   fastFoldBase?: { manifest: Manifest; meta: GlobalManifestMeta };
+  /** Collect verified fold evidence even when no prior fast-fold base exists. */
+  recordEvidence?: boolean;
 }
 
 export interface ReceiptRedeemResult {

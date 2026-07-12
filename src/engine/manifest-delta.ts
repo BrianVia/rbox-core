@@ -1,9 +1,9 @@
+import { createHash } from "node:crypto";
 import { zstdCompress, zstdDecompressCapped } from "./crypto.js";
 import { KNOWN_MANIFEST_SCHEMA, validateManifest } from "./manifest-validate.js";
 import type { FileEntry, GitSection, Manifest } from "./types.js";
 import { parseStrict } from "./e2ee/jcs.js";
-import { sha256Hex, utf8 } from "./e2ee/primitives.js";
-import { hashBytes } from "./hash.js";
+import { utf8 } from "./e2ee/primitives.js";
 export { MAX_MANIFEST_DELTA_CHAIN } from "./manifest-chain.js";
 
 export const MANIFEST_ENVELOPE_MAGIC = "rbox-mde1\n";
@@ -88,8 +88,112 @@ export function canonicalManifestBytes(manifest: Manifest): Uint8Array {
   return utf8(canonicalJson(manifest));
 }
 
+/** JSON.stringify's two-character escape spellings (the reference serializer
+ *  delegates to JSON.stringify; the streaming emitter must match them). */
+const STRING_ESCAPES: Record<number, string> = { 8: "\\b", 9: "\\t", 10: "\\n", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\" };
+
+/** SHA-256 the canonical manifest token stream without materializing it. */
+export function canonicalManifestHashStreaming(manifest: Manifest): string {
+  const hash = createHash("sha256");
+  const chunkChars = 64 * 1024;
+  let pending = "";
+  const flush = (): void => {
+    if (pending.length > 0) {
+      hash.update(pending, "utf8");
+      pending = "";
+    }
+  };
+  const write = (text: string): void => {
+    let offset = 0;
+    while (offset < text.length) {
+      let take = Math.min(chunkChars - pending.length, text.length - offset);
+      // Hash.update encodes each string independently. Never split a valid UTF-16
+      // surrogate pair across updates or UTF-8 replacement bytes would differ.
+      if (take > 0 && offset + take < text.length) {
+        const last = text.charCodeAt(offset + take - 1);
+        if (last >= 0xd800 && last <= 0xdbff) take--;
+      }
+      if (take === 0) {
+        flush();
+        continue;
+      }
+      pending += text.slice(offset, offset + take);
+      offset += take;
+      if (pending.length >= chunkChars) flush();
+    }
+  };
+  const writeJsonString = (value: string): void => {
+    if (!isWellFormedUtf16(value)) throw new Error("manifest canonicalization requires well-formed Unicode strings");
+    write('"');
+    let runStart = 0;
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      const escaped = STRING_ESCAPES[code] ?? (code < 0x20 ? `\\u${code.toString(16).padStart(4, "0")}` : undefined);
+      if (escaped === undefined) continue;
+      if (runStart < index) write(value.slice(runStart, index));
+      write(escaped);
+      runStart = index + 1;
+    }
+    if (runStart < value.length) write(value.slice(runStart));
+    write('"');
+  };
+  const emit = (value: unknown): void => {
+    if (value === null) return write("null");
+    switch (typeof value) {
+      case "boolean":
+        return write(JSON.stringify(value));
+      case "string":
+        return writeJsonString(value);
+      case "number":
+        if (!Number.isFinite(value)) throw new Error("manifest canonicalization requires finite numbers");
+        return write(JSON.stringify(value));
+      case "object": {
+        if (Array.isArray(value)) {
+          write("[");
+          value.forEach((item, index) => {
+            if (index > 0) write(",");
+            emit(item);
+          });
+          return write("]");
+        }
+        const object = value as Record<string, unknown>;
+        write("{");
+        let first = true;
+        for (const key of Object.keys(object).sort()) {
+          // The reference canonicalizer validates member names before omitting
+          // undefined values, so an invalid hidden key must still fail closed.
+          if (!isWellFormedUtf16(key)) throw new Error("manifest canonicalization requires well-formed Unicode strings");
+          if (object[key] === undefined) continue;
+          if (!first) write(",");
+          first = false;
+          writeJsonString(key);
+          write(":");
+          // The only unbounded member is the top-level `files` array; per-entry
+          // reference serialization keeps the streaming bound (each entry is
+          // small) while staying byte-identical for ANY entry shape —
+          // `canonicalJson` IS the reference, so this special case cannot drift.
+          if (value === manifest && key === "files" && Array.isArray(object[key])) {
+            write("[");
+            (object[key] as unknown[]).forEach((entry, index) => {
+              if (index > 0) write(",");
+              write(canonicalJson(entry));
+            });
+            write("]");
+          } else emit(object[key]);
+        }
+        return write("}");
+      }
+      default:
+        throw new Error(`manifest canonicalization does not support ${typeof value}`);
+    }
+  };
+  emit(manifest);
+  flush();
+  return hash.digest("hex");
+}
+
 export function canonicalManifestHash(manifest: Manifest): Promise<string> {
-  return sha256Hex(canonicalManifestBytes(manifest));
+  return Promise.resolve(canonicalManifestHashStreaming(manifest));
 }
 
 export type ManifestDeltaOp =
@@ -221,7 +325,7 @@ export async function encodeSnapshotEnvelope(manifest: Manifest, options: { comp
   assertManifest(manifest);
   const plaintext = utf8(JSON.stringify(manifest));
   assertBodyBound(plaintext);
-  const manifestHash = await canonicalManifestHash(manifest);
+  const manifestHash = canonicalManifestHashStreaming(manifest);
   const header: ManifestSnapshotHeader = {
     kind: "snapshot",
     ...(options.compress ? { comp: "zstd" as const } : {}),
@@ -242,7 +346,7 @@ export async function encodeDeltaEnvelope(
   const ops = diffToOps(base, target);
   const body = utf8(canonicalJson(ops));
   assertBodyBound(body);
-  const resultHash = await canonicalManifestHash(target);
+  const resultHash = canonicalManifestHashStreaming(target);
   const header: ManifestDeltaHeader = {
     kind: "delta",
     ...(options.compress ? { comp: "zstd" as const } : {}),
@@ -374,14 +478,16 @@ export async function decodeEnvelope(plaintext: Uint8Array): Promise<DecodedMani
   if (body.byteLength !== header.bodyBytes) throw new Error("manifest envelope body length does not match bodyBytes");
   if (header.kind === "snapshot") {
     const manifest = parseManifest(body);
-    if ((await canonicalManifestHash(manifest)) !== header.manifestHash) throw new Error("snapshot manifestHash mismatch");
+    if (canonicalManifestHashStreaming(manifest) !== header.manifestHash) throw new Error("snapshot manifestHash mismatch");
     return { kind: "snapshot", manifest, header };
   }
   return { kind: "delta", header, ops: parseOps(body) };
 }
 
-export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], header: ManifestDeltaHeader): Manifest {
-  if (hashBytes(canonicalManifestBytes(base)) !== header.baseManifestHash) throw new Error("manifest delta baseManifestHash mismatch");
+export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], header: ManifestDeltaHeader, trustedBaseHash?: string): Manifest {
+  if (trustedBaseHash !== header.baseManifestHash && canonicalManifestHashStreaming(base) !== header.baseManifestHash) {
+    throw new Error("manifest delta baseManifestHash mismatch");
+  }
   const files = new Map(base.files.map((entry) => [entry.path, entry]));
   const repos = new Map(Object.entries(base.gitRepos ?? {}));
   let previous: ManifestDeltaOp | undefined;
@@ -410,7 +516,7 @@ export function foldDelta(base: Manifest, ops: readonly ManifestDeltaOp[], heade
     ...(header.manifestSchema === undefined ? {} : { manifestSchema: header.manifestSchema }),
     ...(Object.keys(gitRepos).length === 0 ? {} : { gitRepos }),
   };
-  if (hashBytes(canonicalManifestBytes(result)) !== header.resultHash) throw new Error("manifest delta resultHash mismatch");
+  if (canonicalManifestHashStreaming(result) !== header.resultHash) throw new Error("manifest delta resultHash mismatch");
   assertManifest(result);
   return result;
 }

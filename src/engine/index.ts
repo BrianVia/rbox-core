@@ -56,6 +56,7 @@ export {
   ManifestChainError,
   canonicalManifestBytes,
   canonicalManifestHash,
+  canonicalManifestHashStreaming,
   encodeSnapshotEnvelope,
   diffToOps,
   encodeDeltaEnvelope,

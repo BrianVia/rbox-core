@@ -23,9 +23,9 @@ import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError } from "./remote.js";
-import { pull, push, pushManifest } from "./sync.js";
+import { formatLatestTimings, pull, push, pushManifest } from "./sync.js";
 import { repairChain } from "./chain-repair.js";
-import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadState, saveState, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -57,6 +57,24 @@ const sidecarShaOf = (manifest: Manifest): string => {
   });
   return shaBytes(serializeRefset(refs));
 };
+
+test("latest timing formatter appends the non-sensitive fold token", () => {
+  expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4, fold: "evidence" })).toEndWith("4B fold=evidence");
+  expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4 })).toBe("d0.0 x0.0 p0.0 4B");
+});
+
+test("latest timing fold token distinguishes chain-free raw and snapshot heads", async () => {
+  for (const snapshot of [undefined, "1"] as const) {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, `devA-fold-token-${snapshot ?? "raw"}`, NOW);
+    const writer = await remoteFor(server, secrets);
+    const reader = await remoteFor(server, secrets);
+    await withManifestEncodingFlags(snapshot, undefined, () => writer.commit(0, secrets.deviceId, { generatedAt: "token", files: [] }));
+    let fold: string | undefined;
+    await reader.latest({ onLatestTimings: (timings) => { fold = timings.fold; } });
+    expect(fold).toBe(snapshot ? "snapshot" : "raw");
+  }
+});
 
 async function appendKeyState(server: FakeServer, secrets: DeviceSecrets, keyEpoch: number): Promise<void> {
   const prev = JSON.parse(server.account.keyStates.at(-1)!) as SignedKeyState;
@@ -693,9 +711,11 @@ test("D fast pull folds one delta from persisted evidence with a head-only fetch
     const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
     server.store.getCalls = [];
 
-    const pulled = await peer.latest({ fastFoldBase: { manifest: base, meta: first.manifestMeta! } });
+    let fold: string | undefined;
+    const pulled = await peer.latest({ fastFoldBase: { manifest: base, meta: first.manifestMeta! }, onLatestTimings: (timings) => { fold = timings.fold; } });
 
     expect(pulled.manifest).toEqual(target);
+    expect(fold).toBe("evidence");
     expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha]);
     expect(pulled.manifestMeta?.snapshotBytes).toBe(first.manifestMeta!.snapshotBytes);
     expect(pulled.manifestMeta?.chainBytes).toBe(first.manifestMeta!.chainBytes + server.store.blobs.get(second.manifestMeta!.encManifestSha)!.byteLength);
@@ -721,11 +741,28 @@ test("D fast pull evidence mismatches fall back to the exact cold chain walk", a
       { ...second.manifestMeta!, manifestHash: hex(900_002) },
       { ...second.manifestMeta!, chain: [hex(900_003)] },
     ];
+    const originalGet = server.store.get.bind(server.store);
+    let inFlightGets = 0;
+    let peakInFlightGets = 0;
+    server.store.get = async (sha: string) => {
+      inFlightGets++;
+      peakInFlightGets = Math.max(peakInFlightGets, inFlightGets);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      try {
+        return await originalGet(sha);
+      } finally {
+        inFlightGets--;
+      }
+    };
     for (const meta of cases) {
       const peer = await remoteFor(server, secrets);
       server.store.getCalls = [];
-      await expect(peer.latest({ fastFoldBase: { manifest: middle, meta } })).resolves.toMatchObject({ manifest: target });
+      peakInFlightGets = 0;
+      let fold: string | undefined;
+      await expect(peer.latest({ fastFoldBase: { manifest: middle, meta }, onLatestTimings: (timings) => { fold = timings.fold; } })).resolves.toMatchObject({ manifest: target });
+      expect(fold).toBe("coldwalk");
       expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
+      expect(peakInFlightGets).toBe(third.manifestMeta!.chain.length);
     }
   });
 });
@@ -846,6 +883,39 @@ test("D pull flag is off by default and enables the persisted-state fast base on
     await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
     expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha]);
   });
+});
+
+test("D FAST_PULL-only receiver bootstraps evidence through real pull persistence", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull-bootstrap", NOW);
+  const writer = await remoteFor(server, secrets);
+  const puller = await remoteFor(server, secrets);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, puller);
+  const base: Manifest = { generatedAt: "bootstrap-base", files: Array.from({ length: 300 }, (_, i) => ({
+    path: `bootstrap/${i.toString().padStart(4, "0")}`, type: "symlink" as const,
+    symlinkTarget: `../${i}`, sha256: hex(i + 1), size: 8, mode: 0o777, mtimeMs: i + 0.25,
+  })) };
+  const first = await withManifestEncodingFlags(undefined, "1", () => writer.commit(0, secrets.deviceId, base));
+
+  await withManifestEncodingFlags(undefined, undefined, () =>
+    withFastPullFlag("1", () => pull(root, cfg, { remote: puller })));
+  const afterFirst = await loadState(root, syncStreamId(cfg));
+  expect(validManifestMeta(afterFirst.manifestMeta)).toEqual(afterFirst.manifestMeta);
+  expect(afterFirst.manifestMeta).toBeDefined();
+  expect(afterFirst.lastSyncedManifest).toEqual(base);
+
+  const target: Manifest = { ...base, generatedAt: "bootstrap-target", files: base.files.map((entry, index) =>
+    index === 42 ? { ...entry, mode: 0o755 } : entry) };
+  const second = await withManifestEncodingFlags(undefined, "1", () =>
+    writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } }));
+  const headEncSha = second.manifestMeta!.encManifestSha;
+  server.store.getCalls = [];
+
+  await withManifestEncodingFlags(undefined, undefined, () =>
+    withFastPullFlag("1", () => pull(root, cfg, { remote: puller })));
+  expect(server.store.getCalls).toEqual([headEncSha]);
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest).toEqual(target);
 });
 
 async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {

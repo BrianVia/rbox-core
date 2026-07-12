@@ -25,6 +25,7 @@ import type { ByteProgressCallback } from "../engine/blobstore.js";
 import { hashBytes } from "../engine/hash.js";
 import {
   canonicalManifestHash,
+  canonicalManifestHashStreaming,
   decodeEnvelope,
   encodeDeltaEnvelope,
   encodeSnapshotEnvelope,
@@ -35,11 +36,10 @@ import {
   MAX_MANIFEST_DELTA_CHAIN,
   poolMap,
   type BlobStore,
-  type DecodedManifestEnvelope,
   type Manifest,
 } from "../engine/index.js";
 import type { GlobalManifestMeta } from "./config.js";
-import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
+import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type LatestTimings, type SyncRemote } from "./remote.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */
@@ -214,7 +214,7 @@ export class E2eeRemote implements SyncRemote {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const collectMeta = mdeWriteCaps().snapshot || options?.fastFoldBase !== undefined;
+    const collectMeta = mdeWriteCaps().snapshot || options?.recordEvidence === true || options?.fastFoldBase !== undefined;
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
@@ -258,11 +258,18 @@ export class E2eeRemote implements SyncRemote {
     if (signedChain.length > MAX_MANIFEST_DELTA_CHAIN) {
       throw new ManifestChainError("signed chain exceeds maximum length", { head });
     }
+    if (signedChain.includes(body.encManifestSha)) {
+      throw new ManifestChainError("signed chain includes its head", { head, failingLink: body.encManifestSha });
+    }
     // Only authenticated historical reads may return before opening the blob.
     // A current-head read must always run openCommit's current account/signer gate;
     // persisted fast-fold evidence is the sole latest() shortcut.
     const cached = historical ? this.getCachedManifest(body.encManifestSha, body.keyEpoch, signedChain) : undefined;
     if (cached && !collectMeta) return { manifest: cached, kek };
+    // An uncached fold owns at most its input and output manifests. Drop stale
+    // history entries before fetching a new large manifest; the completed result
+    // is cached again below. A cached hit returned above remains unaffected.
+    this.manifestFoldLru.length = 0;
     const downloadStart = Date.now();
     const encManifest = await this.api.blobStore().get(body.encManifestSha).catch((cause: unknown) => {
         // The head blob is not a chain link; with no chain in play this is
@@ -289,13 +296,14 @@ export class E2eeRemote implements SyncRemote {
     // Shared exit plumbing for the fast-fold and cold-walk returns: the timings
     // report differs only by the chain download/decrypt terms, and the meta
     // differs only by hash + the two §3.3.4 byte fields.
-    const emitLatestTimings = (chainDownloadMs: number, chainDecryptMs: number): void => {
+    const emitLatestTimings = (chainDownloadMs: number, chainDecryptMs: number, fold: LatestTimings["fold"]): void => {
       if (!onLatestTimings) return;
       onLatestTimings({
         downloadMs: headDownloadMs + chainDownloadMs,
         decryptMs: headDecryptMs + chainDecryptMs,
         parseMs: headParseMs + Date.now() - parseStart,
         encBytes: encManifest.byteLength,
+        fold,
       });
     };
     const makeMeta = (manifestHash: string, chainBytes: number, snapshotBytes: number): GlobalManifestMeta => ({
@@ -315,12 +323,12 @@ export class E2eeRemote implements SyncRemote {
       signedChain[signedChain.length - 1] === fastFoldBase.meta.encManifestSha) {
       let manifest: Manifest;
       try {
-        manifest = foldDelta(fastFoldBase.manifest, headEnvelope.ops, headEnvelope.header);
+        manifest = foldDelta(fastFoldBase.manifest, headEnvelope.ops, headEnvelope.header, fastFoldBase.meta.manifestHash);
       } catch (cause) {
         throw new ManifestChainError("manifest delta fold failed", { head, failingLink: body.encManifestSha, cause });
       }
       this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
-      emitLatestTimings(0, 0);
+      emitLatestTimings(0, 0, "evidence");
       return {
         manifest,
         kek,
@@ -331,39 +339,83 @@ export class E2eeRemote implements SyncRemote {
     }
 
     const chainDownloadStart = Date.now();
-    const chainBlobBytes = await Promise.all(
-      signedChain.map((sha) => this.api.blobStore().get(sha).catch((cause: unknown) => {
+    const chainCiphertexts: Array<Uint8Array | null> = await Promise.all(signedChain.map(async (sha) =>
+      this.api.blobStore().get(sha).catch((cause: unknown) => {
         throw new ManifestChainError("manifest chain link is missing", { head, failingLink: sha, cause });
-      }))
-    );
+      })
+    ));
     const chainDownloadMs = Date.now() - chainDownloadStart;
-    const chainDecryptStart = Date.now();
-    const chainPlaintexts = await Promise.all(chainBlobBytes.map(async (bytes, index) => {
+    let chainDecryptMs = 0;
+    // §3.3.4 byte inputs, accumulated as scalars while the slots are consumed:
+    // chain[0]'s ciphertext length (the terminal snapshot) and the sum of the
+    // intermediate delta lengths (chain[1..]).
+    let snapshotCipherBytes = 0;
+    let deltaCipherBytes = 0;
+    let manifest: Manifest | undefined;
+    let trustedBaseHash: string | undefined;
+    // Fetch every signed address in parallel, then decrypt/decode/fold serially.
+    // Ciphertexts are small relative to the manifest; clearing each consumed slot
+    // ensures ciphertext and plaintext become unreachable as the fold advances.
+    for (let index = 0; index < signedChain.length; index++) {
       const sha = signedChain[index]!;
+      const bytes = chainCiphertexts[index]!;
+      chainCiphertexts[index] = null;
+      if (index === 0) snapshotCipherBytes = bytes.byteLength;
+      else deltaCipherBytes += bytes.byteLength;
+      const decryptStart = Date.now();
+      let chainPlaintext: Uint8Array;
       try {
-        return await openManifestChainBlob({ kek, accountId: this.ctx.accountId, workspaceId: this.ctx.workspaceId, keyEpoch: body.keyEpoch, expectedEncSha: sha, bytes });
+        chainPlaintext = await openManifestChainBlob({ kek, accountId: this.ctx.accountId, workspaceId: this.ctx.workspaceId, keyEpoch: body.keyEpoch, expectedEncSha: sha, bytes });
       } catch (cause) {
         throw new ManifestChainError("manifest chain link failed address or epoch authentication", { head, failingLink: sha, cause });
       }
-    }));
-    const chainDecryptMs = Date.now() - chainDecryptStart;
-    const chainEnvelopes = await Promise.all(
-      chainPlaintexts.map((bytes, index) =>
-        decodeEnvelope(bytes).catch((cause: unknown) => {
-          throw new ManifestChainError("manifest chain link envelope failed to decode", { head, failingLink: signedChain[index], cause });
-        })
-      )
-    );
-    const manifest = this.foldManifestChain(body.encManifestSha, signedChain, headEnvelope, chainEnvelopes, head);
-    this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
-    emitLatestTimings(chainDownloadMs, chainDecryptMs);
+      chainDecryptMs += Date.now() - decryptStart;
+      const envelope = await decodeEnvelope(chainPlaintext).catch((cause: unknown) => {
+        throw new ManifestChainError("manifest chain link envelope failed to decode", { head, failingLink: sha, cause });
+      });
+      if (index === 0) {
+        if (envelope.kind === "delta") throw new ManifestChainError("terminal chain link is not a snapshot", { head, failingLink: sha });
+        manifest = envelope.manifest;
+        trustedBaseHash = envelope.kind === "snapshot" ? envelope.header.manifestHash : canonicalManifestHashStreaming(envelope.manifest);
+        continue;
+      }
+      if (envelope.kind !== "delta") throw new ManifestChainError("non-terminal chain link is not a delta", { head, failingLink: sha });
+      if (envelope.header.baseEncSha !== signedChain[index - 1]) {
+        throw new ManifestChainError("walked linkage does not match signed chain order", { head, failingLink: sha });
+      }
+      try {
+        manifest = foldDelta(manifest!, envelope.ops, envelope.header, trustedBaseHash);
+        trustedBaseHash = envelope.header.resultHash;
+      } catch (cause) {
+        throw this.foldChainError(cause, head, sha);
+      }
+    }
+    let foldKind: LatestTimings["fold"];
+    if (signedChain.length === 0) {
+      if (headEnvelope.kind === "delta") throw new ManifestChainError("signed and walked chain lengths differ", { head });
+      manifest = headEnvelope.manifest;
+      foldKind = headEnvelope.kind === "snapshot" ? "snapshot" : "raw";
+    } else {
+      if (headEnvelope.kind !== "delta") throw new ManifestChainError("snapshot/raw head has a non-empty signed chain", { head });
+      if (headEnvelope.header.baseEncSha !== signedChain[signedChain.length - 1]) {
+        throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: body.encManifestSha });
+      }
+      try {
+        manifest = foldDelta(manifest!, headEnvelope.ops, headEnvelope.header, trustedBaseHash);
+      } catch (cause) {
+        throw this.foldChainError(cause, head, body.encManifestSha);
+      }
+      foldKind = "coldwalk";
+    }
+    this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest!);
+    emitLatestTimings(chainDownloadMs, chainDecryptMs, foldKind);
     let manifestMeta: GlobalManifestMeta | undefined;
     if (collectMeta) {
       const manifestHash = headEnvelope.kind === "delta"
         ? headEnvelope.header.resultHash
         : headEnvelope.kind === "snapshot"
           ? headEnvelope.header.manifestHash
-          : await canonicalManifestHash(manifest);
+          : await canonicalManifestHash(manifest!);
       // §3.3.4 accumulator: cumulative DELTA ciphertext bytes since chain[0] —
       // the intermediate delta links (chain[1..]) plus the delta head itself,
       // NEVER the terminal snapshot (chain[0]); a snapshot/raw head resets to 0.
@@ -371,11 +423,11 @@ export class E2eeRemote implements SyncRemote {
       // snapshot head with a non-empty signed chain.)
       manifestMeta = makeMeta(
         manifestHash,
-        signedChain.length === 0 ? 0 : chainBlobBytes.slice(1).reduce((sum, bytes) => sum + bytes.byteLength, 0) + encManifest.byteLength,
-        signedChain.length === 0 ? encManifest.byteLength : chainBlobBytes[0]!.byteLength
+        signedChain.length === 0 ? 0 : deltaCipherBytes + encManifest.byteLength,
+        signedChain.length === 0 ? encManifest.byteLength : snapshotCipherBytes
       );
     }
-    return { manifest, kek, ...(manifestMeta ? { manifestMeta } : {}) };
+    return { manifest: manifest!, kek, ...(manifestMeta ? { manifestMeta } : {}) };
   }
 
   private getCachedManifest(encManifestSha: string, keyEpoch: number, signedChain: readonly string[]): Manifest | undefined {
@@ -394,47 +446,17 @@ export class E2eeRemote implements SyncRemote {
     if (this.manifestFoldLru.length > 2) this.manifestFoldLru.shift();
   }
 
-  private foldManifestChain(
-    headEncSha: string,
-    signedChain: readonly string[],
-    headEnvelope: DecodedManifestEnvelope,
-    chainEnvelopes: readonly DecodedManifestEnvelope[],
-    head: { seq: number; hash: string }
-  ): Manifest {
-    if (signedChain.includes(headEncSha)) throw new ManifestChainError("signed chain includes its head", { head, failingLink: headEncSha });
-    if (headEnvelope.kind !== "delta") {
-      if (signedChain.length !== 0) throw new ManifestChainError("snapshot/raw head has a non-empty signed chain", { head });
-      return headEnvelope.manifest;
-    }
-    if (signedChain.length === 0 || chainEnvelopes.length !== signedChain.length) throw new ManifestChainError("signed and walked chain lengths differ", { head });
-    if (chainEnvelopes[0]!.kind === "delta") throw new ManifestChainError("terminal chain link is not a snapshot", { head, failingLink: signedChain[0] });
-    for (let index = 1; index < chainEnvelopes.length; index++) {
-      const envelope = chainEnvelopes[index]!;
-      if (envelope.kind !== "delta") throw new ManifestChainError("non-terminal chain link is not a delta", { head, failingLink: signedChain[index] });
-      if (envelope.header.baseEncSha !== signedChain[index - 1]) throw new ManifestChainError("walked linkage does not match signed chain order", { head, failingLink: signedChain[index] });
-    }
-    if (headEnvelope.header.baseEncSha !== signedChain[signedChain.length - 1]) {
-      throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: headEncSha });
-    }
-
-    let manifest = chainEnvelopes[0]!.manifest;
-    const deltas = [...chainEnvelopes.slice(1), headEnvelope];
-    for (let index = 0; index < deltas.length; index++) {
-      const envelope = deltas[index]!;
-      if (envelope.kind !== "delta") throw new ManifestChainError("chain shape changed during fold", { head });
-      const failingLink = index < chainEnvelopes.length - 1 ? signedChain[index + 1] : headEncSha;
-      try {
-        manifest = foldDelta(manifest, envelope.ops, envelope.header);
-      } catch (cause) {
-        const reason = cause instanceof Error && cause.message.includes("baseManifestHash")
-          ? "baseManifestHash mismatch"
-          : cause instanceof Error && cause.message.includes("resultHash")
-            ? "resultHash mismatch"
-            : "manifest delta fold failed";
-        throw new ManifestChainError(reason, { head, failingLink, cause });
-      }
-    }
-    return manifest;
+  private foldChainError(
+    cause: unknown,
+    head: { seq: number; hash: string },
+    failingLink: string
+  ): ManifestChainError {
+    const reason = cause instanceof Error && cause.message.includes("baseManifestHash")
+      ? "baseManifestHash mismatch"
+      : cause instanceof Error && cause.message.includes("resultHash")
+        ? "resultHash mismatch"
+        : "manifest delta fold failed";
+    return new ManifestChainError(reason, { head, failingLink, cause });
   }
 
   /**

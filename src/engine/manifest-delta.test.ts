@@ -3,13 +3,14 @@ import { canonicalString } from "./e2ee/jcs.js";
 import { buildSignedCommit, parseCommit } from "./e2ee/commit.js";
 import { generateSignKeyPair } from "./e2ee/asym.js";
 import { KNOWN_MANIFEST_SCHEMA } from "./manifest-validate.js";
-import type { FileEntry, Manifest } from "./types.js";
+import type { FileEntry, GitSection, Manifest } from "./types.js";
 import {
   MANIFEST_ENVELOPE_MAGIC,
   MAX_ENVELOPE_HEADER,
   MAX_MANIFEST_DELTA_CHAIN,
   canonicalManifestBytes,
   canonicalManifestHash,
+  canonicalManifestHashStreaming,
   decodeEnvelope,
   diffToOps,
   encodeDeltaEnvelope,
@@ -17,6 +18,7 @@ import {
   foldDelta,
   type ManifestDeltaHeader,
 } from "./manifest-delta.js";
+import { hashBytes } from "./hash.js";
 
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
@@ -110,6 +112,42 @@ test("20k-entry snapshots compress below 25% of raw JSON", async () => {
 });
 
 describe("canonical form and pure folding", () => {
+  test("streaming canonical hashes equal reference bytes across fuzzed manifests", () => {
+    let seed = 0x84d106;
+    const next = (): number => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+    for (let iteration = 0; iteration < 100; iteration++) {
+      const count = 1 + next() % 12;
+      const files = Array.from({ length: count }, (_, index): FileEntry => ({
+        ...entry(`unicode/${iteration}-${index}-${index % 3 === 0 ? "😀" : "é"}`, next()),
+        mtimeMs: 1_700_000_000_000 + (next() % 10_000) / 7,
+        ...(index % 4 === 0 ? { encSha: next().toString(16).padStart(64, "0"), comp: "zstd" as const,
+          payloadSha: (next() + 1).toString(16).padStart(64, "0"), cipherSize: 17 + next() % 1000 } : {}),
+      })).sort((a, b) => a.path.localeCompare(b.path));
+      const gitSection: GitSection = {
+        bundleSha: SHA_A, bundleEncSha: SHA_B, bundleCipherSize: 123,
+        packChain: [{ sha: SHA_B, encSha: SHA_C, cipherSize: 45, tips: ["1".repeat(40), "2".repeat(40)] }],
+        head: "ref: refs/heads/μ-main", refs: { "refs/heads/μ-main": "3".repeat(40) },
+        opState: { "rebase-merge/onto": { sha: SHA_C, encSha: SHA_A, cipherSize: 12 } },
+        config: { "remote.origin.fetch": ["+refs/heads/*:refs/remotes/origin/*"] },
+        refScope: "all", generatedAt: `git-${iteration}-😀`,
+      };
+      const m: Manifest = {
+        generatedAt: `fuzz-${iteration}-${iteration % 2 ? "λ" : "😀"}`,
+        files,
+        ...(iteration % 2 === 0 ? { manifestSchema: 4 } : {}),
+        ...(iteration % 3 === 0 ? { gitRepos: { [`repo-${iteration}-é`]: gitSection } } : {}),
+      };
+      expect(canonicalManifestHashStreaming(m)).toBe(hashBytes(canonicalManifestBytes(m)));
+    }
+    const badValue = { generatedAt: "bad-\ud800", files: [] } as Manifest;
+    const badKey = { generatedAt: "bad", files: [], gitRepos: { "bad-\udfff": {} } } as unknown as Manifest;
+    const hiddenBadKey = { generatedAt: "bad", files: [], ["bad-\ud800"]: undefined } as unknown as Manifest;
+    for (const bad of [badValue, badKey, hiddenBadKey]) {
+      expect(() => canonicalManifestBytes(bad)).toThrow("well-formed Unicode");
+      expect(() => canonicalManifestHashStreaming(bad)).toThrow("well-formed Unicode");
+    }
+  });
+
   test("fractional mtimes are stable and non-finite numbers fail closed", async () => {
     const m = manifest("now", [entry("fractional")]);
     expect(canonicalManifestBytes(JSON.parse(JSON.stringify(m)) as Manifest)).toEqual(canonicalManifestBytes(m));
@@ -147,6 +185,8 @@ describe("canonical form and pure folding", () => {
     const target = manifest("new", [entry("b")]);
     const header = deltaHeader(await canonicalManifestHash(base), await canonicalManifestHash(target), target.generatedAt);
     expect(foldDelta(base, diffToOps(base, target), header)).toEqual(target);
+    expect(foldDelta(base, diffToOps(base, target), header, header.baseManifestHash)).toEqual(target);
+    expect(foldDelta(base, diffToOps(base, target), header, SHA_C)).toEqual(target);
     expect(JSON.stringify(base)).toBe(before);
     expect(() => foldDelta(base, [{ op: "del", path: "absent" }], header)).toThrow("absent");
     expect(JSON.stringify(base)).toBe(before);
