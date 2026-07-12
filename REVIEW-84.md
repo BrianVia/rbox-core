@@ -191,3 +191,31 @@ Verdict: ALIGNED
    noted for follow-up.
 
 Verdict after security remediation: no cache authorization bypass remains.
+
+## Implementation review — branch impl/84-manifest-delta (Phases B/C1/C2/D), codex adversarial loop
+
+Round 1 (4 findings): BLOCKER — recover cleared the pin before verifying the
+replacement (equal-sequence fork window; §4.3); MAJOR — hostile signed-chain
+fixtures, mixed-fleet historical surfaces, and server truncation/GC lifecycle
+tests missing. All fixed (retained-pin rebaseline ceremony + test matrices).
+
+Round 2 (4): BLOCKER-class — refSetAt's sidecar branch appended chain shas
+unsorted, breaking diffChunk's ordered-cursor resume (GC could strand a live
+link); MAJOR — lone-surrogate hashing diverges from RFC 8785; duplicate
+envelope-header members accepted; fence-path >10k truncation test demanded
+(shown structurally vacuous: one super-batch ≤3,000 refs cannot exceed the
+10k cap — documented, validate-path tested end-to-end). All fixed.
+
+Round 3 (3): MAJOR — escaped-equivalent duplicate header keys evaded the raw
+token scan (closed by canonical round-trip: one wire encoding per header);
+member NAMES lacked the surrogate gate; the §7.4 Phase-D intermediate-
+substitution fixture was missing. All fixed.
+
+Round 4 (2): MAJOR — repair could supersede a readable head that raced in
+before the repair started (closed by an entry convergence probe; post-probe
+races were already closed by the 409 → re-verify branch); MAJOR — delete-
+fenced chain link through the real handler untested (receipts + legacy). Fixed.
+
+Round 5: both closures verified, no new findings.
+
+Verdict: ALIGNED
