@@ -36,6 +36,18 @@ export async function repairChain(
   const originalApplied = (await loadState(root, syncStreamId(cfg))).lastSyncedSequence;
   const detected = await describeSuffix(remote, originalApplied, error);
   const detectedHead = detected.at(-1)?.seq ?? error.head?.seq ?? originalApplied;
+  // §3.6.3 convergence probe: a peer may have published a READABLE head between
+  // detection and this call (repaired first, or advanced past the break with a
+  // decodable commit) — repair must never supersede readable data. If the
+  // current verified head decodes, report convergence (the caller re-pulls and
+  // resumes normal sync). Races AFTER this probe are closed by the 409 →
+  // re-verify branch below; a head that still fails to decode falls through.
+  try {
+    const readable = await remote.latest();
+    return { kind: "converged", sequence: readable.sequence, suffix: detected, actions: [] };
+  } catch (probeError) {
+    if (!(probeError instanceof ManifestChainError)) throw probeError;
+  }
   let actions: Action[] = [];
   for (let seq = detectedHead - 1; seq > originalApplied; seq--) {
     try {

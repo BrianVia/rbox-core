@@ -208,4 +208,27 @@ describe("design 84 server manifestChain admission", () => {
     expect(marked.status).toBe(422);
     expect(marked.body).toMatchObject({ missing: [chainSha] });
   });
+
+  test("chain link behind a DELETING gc fence 422s chain-first with full missingTotal on receipts and legacy paths", async () => {
+    // §3.5.2/§3.5.4: a fenced (gc_candidates.deleting_at NOT NULL) chain link is
+    // excluded from the have-set even though entitled+present, and every
+    // commit-path 422 places chain shas before data refs.
+    const f = await fixture(`chain-fenced-${crypto.randomUUID()}`);
+    const chainSha = hash("fenced-chain-link");
+    const missingData = hash("missing-data-ref");
+    await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blobs(sha256,size_bytes,present) VALUES (?,13,1)").bind(chainSha).run();
+    await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO blob_refs(account_id,sha256,granted_at) VALUES (?,?,?)").bind(f.accountId, chainSha, Date.now()).run();
+    await env.rbox_dev_db.prepare("INSERT OR REPLACE INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(chainSha).run();
+
+    // zz-prefixed sha would sort after; use an inline body listing the missing
+    // data ref FIRST so only the partition (not input order) can front the chain.
+    const inline = { ...f.body(2), blobRefset: undefined, blobRefs: [{ encSha: missingData, size: 7 }, { encSha: f.refSha, size: 7 }], manifestChain: [chainSha] };
+    const legacyResult = await responseBody(f, "off", [], { request: requestWithBody(f, inline, false) });
+    expect(legacyResult.status).toBe(422);
+    expect(legacyResult.body).toMatchObject({ error: "unsatisfied_blobs", missing: [chainSha, missingData], missingTotal: 2 });
+
+    const receiptsResult = await responseBody(f, "off", [], { request: requestWithBody(f, inline, true) });
+    expect(receiptsResult.status).toBe(422);
+    expect(receiptsResult.body).toMatchObject({ error: "unsatisfied_blobs", missing: [chainSha, missingData], missingTotal: 2 });
+  });
 });

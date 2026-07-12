@@ -1267,3 +1267,31 @@ test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapsh
     expect(server.store.getCalls).toContain(substitute.encManifestSha);
   });
 });
+
+test("repairChain converges on a readable head that raced in BEFORE the repair started (never supersedes readable data)", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-race-pre", NOW);
+    const writer = await remoteFor(server, secrets);
+    const repairer = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, repairer);
+    const base = repairFixtureManifest("base-pre-race");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await pull(root, cfg, { remote: repairer });
+    await writer.commit(1, secrets.deviceId, { ...base, generatedAt: "broken-pre-race" }, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.blobs.delete(parseSignedCommit(server.commits[1]!).encManifestSha);
+    const failure = await expectBrokenPull(root, cfg, repairer);
+    // The peer repairs FIRST — a readable snapshot child exists before repairChain runs.
+    await writer.commit(2, secrets.deviceId, { ...base, generatedAt: "peer-repaired" });
+
+    const outcome = await repairChain(root, cfg, { remote: repairer, allowMassDeletePush: true }, failure, {
+      confirmSupersede: async () => {
+        throw new Error("must not ask consent to supersede a readable head");
+      },
+    });
+    expect(outcome.kind).toBe("converged");
+    expect(outcome.kind === "converged" && outcome.sequence).toBe(3);
+    expect(server.commits).toHaveLength(3); // no repair commit published
+  });
+});
