@@ -46,6 +46,7 @@ import { DIVERGENCE_SAMPLE } from "./commit-delta.js";
  *    double8 = dbCalls      (# D1 statements/batches — the §23 success metric)
  *    double9..15 = commit server total/envelope/accounting/sidecar/CAS/mirror/response ms
  *    double16 = earlyReject   (1 only when design-103's commit preflight rejects)
+ *    double17..20 = multipart-complete total/assemble/reread/cleanup ms
  */
 export interface MetricEvent {
   /** Low-cardinality op name, e.g. "request" | "commit" | "blob.put". */
@@ -81,6 +82,10 @@ export interface MetricEvent {
   responseMs?: number;
   /** Design 103 Part A commit preflight fired. Numeric and low-cardinality. */
   earlyReject?: number;
+  completeTotalMs?: number;
+  assembleMs?: number;
+  rereadPutMs?: number;
+  cleanupMs?: number;
 }
 
 export function emit(env: Env, e: MetricEvent): void {
@@ -97,6 +102,7 @@ export function emit(env: Env, e: MetricEvent): void {
         e.serverTotalMs ?? 0, e.envelopeMs ?? 0, e.accountingMs ?? 0,
         e.sidecarMs ?? 0, e.commitMs ?? 0, e.mirrorMs ?? 0, e.responseMs ?? 0,
         e.earlyReject ?? 0,
+        e.completeTotalMs ?? 0, e.assembleMs ?? 0, e.rereadPutMs ?? 0, e.cleanupMs ?? 0,
       ],
     });
   } catch {

@@ -5,6 +5,7 @@ import type { RemoteContext } from "./context.js";
 import { BlobRetryLaterError, BlobShaMismatchError, QuotaExceededError, isRetryLater, isShaMismatch, readQuotaExceeded, readShaMismatch, translateRemoteError } from "./errors.js";
 import { fileStream, readJson } from "./stream.js";
 import { fetchWithDeadline, retryTransient, transferTimeoutMs } from "./resilient.js";
+import { MultipartMetrics, multipartMetricsEnabled, readMultipartServerTimings } from "./multipart-metrics.js";
 
 export function multipartCompletedBytes(completedParts: Iterable<number>, partSize: number, size: number): number {
   if (partSize <= 0 || size <= 0) return 0;
@@ -25,8 +26,9 @@ export async function putBlobMultipart(
   uploadsDir?: string,
   onBytes?: ByteProgressCallback
 ): Promise<void> {
+  const metrics = new MultipartMetrics(multipartMetricsEnabled());
   try {
-    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true, onBytes);
+    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true, onBytes, metrics);
   } catch (e) {
     // A sha_mismatch means the assembled/uploaded bytes do not match this content
     // address. Clear any resume token for that address before bubbling so caller-level
@@ -47,7 +49,10 @@ export async function putBlobMultipart(
       return; // someone else finished it
     }
     onBytes?.(0);
-    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, false, onBytes);
+    metrics.noteReInit();
+    await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, false, onBytes, metrics);
+  } finally {
+    metrics.emit();
   }
 }
 
@@ -58,7 +63,8 @@ async function multipartAttempt(
   size: number,
   uploadsDir: string | undefined,
   allowResume: boolean,
-  onBytes: ByteProgressCallback | undefined
+  onBytes: ByteProgressCallback | undefined,
+  metrics: MultipartMetrics
 ): Promise<void> {
   const tokenPath = uploadsDir ? path.join(uploadsDir, `${sha256}.json`) : undefined;
 
@@ -102,25 +108,36 @@ async function multipartAttempt(
   }
 
   const totalParts = Math.ceil(size / partSize);
+  metrics.setParts(totalParts);
+  metrics.setBytes(size);
   let completedBytes = multipartCompletedBytes(completed, partSize, size);
   if (completedBytes > 0) onBytes?.(completedBytes);
+  let previousPartEnd: number | undefined;
   for (let n = 1; n <= totalParts; n++) {
     if (completed.has(n)) continue; // resume: skip already-uploaded parts
     const start = (n - 1) * partSize;
     const end = Math.min(start + partSize, size); // exclusive
     const len = end - start;
+    const partStart = Date.now();
+    if (previousPartEnd !== undefined) metrics.recordGap(partStart - previousPartEnd);
     // Content-addressed part → idempotent (server does INSERT OR REPLACE upload_parts). The body
     // is a single-use file stream, so retry lives here and re-creates it per attempt.
-    const res = await retryTransient(
-      () =>
-        fetchWithDeadline(`${ctx.baseUrl}/v1/blobs/${sha256}/multipart/${uploadId}/part/${n}`, {
-          method: "PUT",
-          headers: { ...ctx.auth, "content-length": String(len) },
-          body: fileStream(absPath, start, end - 1), // createReadStream end is inclusive
-          duplex: "half",
-        } as RequestInit, transferTimeoutMs(len)),
-      { op: "uploading data" }
-    );
+    let res: Response;
+    try {
+      res = await retryTransient(
+        () =>
+          fetchWithDeadline(`${ctx.baseUrl}/v1/blobs/${sha256}/multipart/${uploadId}/part/${n}`, {
+            method: "PUT",
+            headers: { ...ctx.auth, "content-length": String(len) },
+            body: fileStream(absPath, start, end - 1), // createReadStream end is inclusive
+            duplex: "half",
+          } as RequestInit, transferTimeoutMs(len)),
+        { op: "uploading data", onRetry: () => metrics.addRetries(1) }
+      );
+    } finally {
+      previousPartEnd = Date.now();
+      metrics.recordPartWall(previousPartEnd - partStart);
+    }
     if (!res.ok) {
       const { mismatch, text } = await readShaMismatch(res);
       if (mismatch) throw new BlobShaMismatchError(sha256); // source changed mid-upload → push re-scans + retries
@@ -138,10 +155,16 @@ async function multipartAttempt(
   // `missingBlobs` present-check just below (blob published despite the drop → success), and
   // failing that, putBlobMultipart's outer catch re-checks + re-inits from a fresh upload. Cheap,
   // because the parts (the bulk of the bytes) are already staged and resume skips them.
-  const done = await ctx.fetch(`${ctx.baseUrl}/v1/blobs/${sha256}/multipart/${uploadId}/complete`, {
-    method: "POST",
-    headers: ctx.auth,
-  }, { op: "finalizing upload", retries: 0 });
+  const completionStart = Date.now();
+  let done: Response;
+  try {
+    done = await ctx.fetch(`${ctx.baseUrl}/v1/blobs/${sha256}/multipart/${uploadId}/complete`, {
+      method: "POST",
+      headers: ctx.auth,
+    }, { op: "finalizing upload", retries: 0 });
+  } finally {
+    metrics.recordCompletionWall(Date.now() - completionStart);
+  }
   if (!done.ok) {
     const retryText = done.status === 503 ? await done.clone().text() : undefined;
     if (isRetryLater(done.status, retryText)) {
@@ -164,6 +187,8 @@ async function multipartAttempt(
     if (isShaMismatch(done.status, text)) throw new BlobShaMismatchError(sha256); // assembled object failed R2's sha256 guard → re-scan + retry
     throw new Error(translateRemoteError(done.status, "multipart complete failed", text, "workspace not found — check you're in the right directory"));
   }
+  const completeBody = (await done.json().catch(() => ({}))) as { serverTimings?: unknown };
+  metrics.setServerTimings(readMultipartServerTimings(completeBody.serverTimings));
   if (tokenPath) await fsp.rm(tokenPath, { force: true });
   onBytes?.(size);
 }

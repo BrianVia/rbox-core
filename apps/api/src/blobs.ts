@@ -409,6 +409,7 @@ export async function multipartPart(req: Request, env: Env, sha: string, uploadI
 
 // POST /v1/blobs/:sha/multipart/:uploadId/complete
 export async function multipartComplete(env: Env, sha: string, uploadId: string, accountId: string): Promise<Response> {
+  const t0 = Date.now();
   // One data point, emitted in `finally` so `ms` covers the WHOLE op including the
   // always-run R2 delete + D1 cleanup (which run before the response is returned).
   // dbMs/storeMs accumulate across each phase so the dashboard's R2-vs-D1 split is real.
@@ -416,6 +417,11 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
   let outcome = "error"; // default ⇒ an UNEXPECTED throw is recorded as "error", not "ok"
   let bytes = 0;
   let count = 0;
+  let totalMs = 0;
+  let assembleMs = 0;
+  let rereadPutMs = 0;
+  let accountingMs = 0;
+  let cleanupMs = 0;
   const up = await loadUpload(op.env, sha, uploadId, accountId);
   if (!up) return json({ error: "unknown_upload" }, 404); // pre-op: not worth a metric
 
@@ -434,11 +440,12 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
 
   try {
     // From here the MPU is consumed: assemble staging, publish→canonical with R2 verify.
-    const staged = await op.span.r2(async () => {
-      const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
-      await mpu.complete(parts); // composite etag is NOT the content hash — only for assembly
-      return env.rbox_dev_blobs.get(up.staging_key);
-    });
+    const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
+    const assembleStart = Date.now();
+    await op.span.r2(() => mpu.complete(parts)); // composite etag is NOT the content hash — only for assembly
+    assembleMs = Math.max(0, Math.round(Date.now() - assembleStart));
+    const rereadPutStart = Date.now();
+    const staged = await op.span.r2(() => env.rbox_dev_blobs.get(up.staging_key));
     if (!staged || !staged.body) {
       outcome = "staged_missing";
       return json({ error: "staged_missing" }, 500);
@@ -447,10 +454,12 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     try {
       // Publish to canonical; R2 verifies the whole-object sha server-side.
       await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), staged.body!, { sha256: sha }));
+      rereadPutMs = Math.max(0, Math.round(Date.now() - rereadPutStart));
     } catch {
       outcome = "sha_mismatch";
       return json({ error: "sha_mismatch" }, 412); // no raw message (privacy)
     }
+    const accountingStart = Date.now();
     try {
       await dbFor(op.env, accountId).prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, bytes).run();
     } catch (e) {
@@ -474,12 +483,16 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
       outcome = "quota_exceeded";
       return json({ error: "quota_exceeded", used: grant.used, cap: grant.cap, ...(grant.reason ? { reason: grant.reason } : {}) }, 402);
     }
+    accountingMs = Math.max(0, Math.round(Date.now() - accountingStart));
     outcome = "ok";
-    return json({ ok: true, sha256: sha, sizeBytes: bytes });
+    totalMs = Math.max(0, Math.round(Date.now() - t0));
+    return json({ ok: true, sha256: sha, sizeBytes: bytes, serverTimings: { totalMs, assembleMs, rereadPutMs, accountingMs } });
   } finally {
+    const cleanupStart = Date.now();
     await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch(() => {}));
     await cleanupUpload(op.env, accountId, uploadId);
-    op.done(outcome, { bytes, count });
+    cleanupMs = Math.max(0, Math.round(Date.now() - cleanupStart));
+    op.done(outcome, { bytes, count, completeTotalMs: totalMs, assembleMs, rereadPutMs, cleanupMs });
   }
 }
 

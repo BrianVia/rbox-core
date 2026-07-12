@@ -17,7 +17,11 @@ request latency, never throws into the request path, no-op when the binding is a
 | `blob.put` | `blobs.ts` | R2 store time, D1 time, blob size |
 | `blob.get` | `blobs.ts` | D1 entitlement time, R2 open time, blob size |
 | `multipart.part` | `blobs.ts` | per-part R2 upload time, part size |
-| `multipart.complete` | `blobs.ts` | full op time (incl. cleanup), R2 + D1 split, final size, part count |
+| `multipart.complete` | `blobs.ts` | full op time (incl. cleanup), R2 + D1 split, final size, part count, completion total/assemble/reread/cleanup decomposition |
+
+Successful multipart-complete responses also carry a numbers-only `serverTimings`
+object with total/assemble/reread/accounting milliseconds for client reconciliation.
+Cleanup runs in `finally`, so it remains metric-only and is excluded from that response.
 
 **Latency caveat (important):** `request.ms` and `blob.get.storeMs` measure *handler*
 time — time to produce the `Response`, i.e. time-to-first-byte. They do **not** include
@@ -73,6 +77,11 @@ double12 = sidecarMs       (sidecar resolution, including its lookup and parse)
 double13 = commitMs        (Durable Object head CAS)
 double14 = mirrorMs        (alarm scheduling, fanout, and D1 mirror)
 double15 = responseMs      (response payload assembly before final serialization)
+double16 = earlyReject     (commit preflight reject indicator)
+double17 = completeTotalMs (multipart-complete entry through success response assembly)
+double18 = assembleMs      (multipart assembly)
+double19 = rereadPutMs     (staging reread plus canonical put)
+double20 = cleanupMs       (staging delete plus upload-row cleanup)
 ```
 
 Query via the [AE SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
