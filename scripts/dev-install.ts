@@ -94,9 +94,22 @@ function currentDevVersion(): string {
   return devVersion(packageVersion(), shortSha, dirty);
 }
 
-function runBuild(argv: string[]): void {
-  const r = Bun.spawnSync(argv, { cwd: ROOT, stdout: "inherit", stderr: "inherit" });
+function runBuild(argv: string[], cwd = ROOT): void {
+  const r = Bun.spawnSync(argv, { cwd, stdout: "inherit", stderr: "inherit" });
   if (r.exitCode !== 0) throw new Error(`command failed: ${argv.join(" ")}`);
+}
+
+/** Run `fn` with a fresh scratch dir OUTSIDE the workspace, removed afterward on BOTH
+ *  success and failure. `bun build --compile` drops its intermediate `.<hash>.bun-build`
+ *  in the process CWD and orphans it on failure/interrupt — running the compile here
+ *  keeps that temp out of the synced repo (the 2026-07-12 near-miss). */
+export function withBuildScratch<T>(fn: (scratchDir: string) => T): T {
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-dev-build-"));
+  try {
+    return fn(scratchDir);
+  } finally {
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+  }
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -108,7 +121,12 @@ export function main(argv = process.argv.slice(2)): void {
   fs.mkdirSync(outDir, { recursive: true });
   console.log(`[dev-install] build ${target} (embedding ${PARCEL_PKG[target]})`);
   buildCryptoWorkerBundle();
-  runBuild(assembleDevBuildArgv({ target, version, outfile }));
+  withBuildScratch((scratchDir) => {
+    runBuild(
+      assembleDevBuildArgv({ target, version, outfile, entry: path.join(ROOT, "src", "cli", "index.ts") }),
+      scratchDir
+    );
+  });
   fs.chmodSync(outfile, 0o755);
 
   console.log(`[dev-install] installed ${outfile}`);

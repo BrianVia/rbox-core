@@ -144,6 +144,29 @@ test("push commits the BASE entry for a scan-deferred path — never torn, never
   expect(committed.files.some((f) => f.path === "b.txt")).toBe(true); // stable subset committed
 });
 
+test("push carries a previously-synced file through an EACCES hash fault", async () => {
+  const remote = new FakeRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  await fs.writeFile(path.join(root, "keep.txt"), "stable");
+  await push(root, cfg, deps(remote));
+  const base = (await loadState(root, syncStreamId(cfg))).lastSyncedManifest;
+  const baseA = base.files.find((f) => f.path === "a.txt")!;
+
+  await fs.rm(path.join(root, ".rbox/state/hashcache.json"), { force: true });
+  await fs.writeFile(path.join(root, "b.txt"), "new");
+  mutations.set("a.txt", async () => { throw Object.assign(new Error("injected unreadable"), { code: "EACCES" }); });
+
+  const result = await push(root, cfg, deps(remote));
+  expect(result.committed).toBe(true);
+  const committed = (await remote.latest()).manifest;
+  const committedA = committed.files.find((f) => f.path === "a.txt")!;
+  expect(committedA.sha256).toBe(baseA.sha256);
+  expect(committedA.size).toBe(baseA.size);
+  expect(committed.files.some((f) => f.path === "b.txt")).toBe(true);
+  expect(base.files.filter((f) => !committed.files.some((entry) => entry.path === f.path)).map((f) => f.path)).not.toContain("a.txt");
+  expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest.files.some((f) => f.path === "a.txt")).toBe(true);
+});
+
 // Pull sites intentionally pass NO deferred set (impl review D1-R2): a path the
 // pre-apply scan dropped reaches reconcile as locally-absent, and every branch is
 // byte-preserving — remote-untouched takes the no-action arm; remote-changed plans

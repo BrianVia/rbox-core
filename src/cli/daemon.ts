@@ -25,7 +25,7 @@ import { renderShellLine, saveActivity, saveShellLine, shellLineStateOf, type Da
 import { expectedStateNonce, loadConfig, loadState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "./config.js";
 import { pruneTrash } from "../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
-import { pull, pushManifest, type SyncDeps } from "./sync.js";
+import { makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "./sync.js";
 import { deferManifest } from "./sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -403,6 +403,13 @@ export class RboxDaemon {
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
     const initialState = await this.loadSyncBase();
+    // Seed the in-memory manifest with the last-synced base BEFORE the first scan so a
+    // heartbeat firing during the scan window diffs base-vs-base (clean) — never
+    // empty-vs-base, which would report a phantom full-tree deletion in `rbox status`
+    // (the 2026-07-12 near-miss: an EACCES-aborted first scan left this.manifest empty
+    // and every heartbeat wrote "126,557 deleted"). Fix 1 stops the abort; this stops
+    // the phantom count even if a future scan-fatal throws here.
+    this.manifest = initialState.lastSyncedManifest;
     this.lastLoggedSeq = initialState.lastSyncedSequence;
     this.rebuildMatcher(initialState);
 
@@ -1528,7 +1535,10 @@ export class RboxDaemon {
     const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
     const probe = probeOn ? createScanProbe(priorProbe) : undefined;
     const dircache = scanPruneEnabled() ? await DirCache.load(this.root) : undefined;
-    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe, dircache, mode);
+    const deferErrnos = makeDeferErrnoReporter(log);
+    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe, dircache, mode,
+      deferErrnos.onErrno);
+    deferErrnos.flush();
     await dircache?.save(this.root);
     this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);

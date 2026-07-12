@@ -604,7 +604,11 @@ test("repairChain converges on a readable racing head and re-confirms an unreada
 });
 
 test("repair mode preserves the mass-delete guard and proceeds only with push consent", async () => {
-  await withManifestEncodingFlags("1", "1", async () => {
+  const priorPct = process.env.RBOX_MASS_DELETE_PCT;
+  const priorMin = process.env.RBOX_MASS_DELETE_MIN;
+  process.env.RBOX_MASS_DELETE_PCT = "50";
+  process.env.RBOX_MASS_DELETE_MIN = "100";
+  try { await withManifestEncodingFlags("1", "1", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA-repair-mass-delete", NOW);
     const writer = await remoteFor(server, secrets);
@@ -628,7 +632,10 @@ test("repair mode preserves the mass-delete guard and proceeds only with push co
     expect(outcome.kind === "repaired" && outcome.sequence).toBe(3);
     expect(server.commits).toHaveLength(3);
     expect((await repairRemote.latest()).manifest.files).toHaveLength(80);
-  });
+  }); } finally {
+    if (priorPct === undefined) delete process.env.RBOX_MASS_DELETE_PCT; else process.env.RBOX_MASS_DELETE_PCT = priorPct;
+    if (priorMin === undefined) delete process.env.RBOX_MASS_DELETE_MIN; else process.env.RBOX_MASS_DELETE_MIN = priorMin;
+  }
 });
 
 test("C2 commit emits a chained delta and a cold peer folds it with propagated meta", async () => {
