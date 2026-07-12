@@ -2,7 +2,7 @@ import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import type { Env } from "../src/env.js";
-import { adminPurgeWorkspace, type WsPurgeCounts } from "../src/ws-purge.js";
+import { adminPurgeWorkspace, WS_PURGE_PAIR_BATCH, type WsPurgeCounts } from "../src/ws-purge.js";
 
 const BASE = "https://example.com";
 const db = () => env.rbox_dev_db;
@@ -101,6 +101,45 @@ describe("adminPurgeWorkspace", () => {
     expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
     expect(new Set(purged)).toEqual(new Set([`${ws}/alpha`, `${ws}/beta`]));
     expect((await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async () => true })).status).toBe(404);
+  });
+
+  test("pages DO purges beyond WS_PURGE_PAIR_BATCH without stranding pairs", async () => {
+    const account = await bootstrap("ws-purge-pages");
+    const ws = "ws_purge_pages";
+    const projects = Array.from({ length: WS_PURGE_PAIR_BATCH + 1 }, (_, i) => `project-${String(i).padStart(3, "0")}`);
+    const now = Date.now();
+    const inserts = projects.flatMap((project, i) => [
+      db().prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at) VALUES (?, ?, ?, ?)").bind(ws, project, account.accountId, now),
+      db().prepare("INSERT INTO commits (workspace_id, project_id, sequence, commit_hash, body, sig) VALUES (?, ?, 1, ?, ?, ?)").bind(ws, project, `commit-${i}`, "opaque", "sig"),
+    ]);
+    for (let i = 0; i < inserts.length; i += 40) await db().batch(inserts.slice(i, i + 40));
+    const purged: string[] = [];
+    const dep = async (_env: Env, w: string, p: string) => (purged.push(`${w}/${p}`), true);
+
+    const first = await body<{ done: boolean }>(await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: dep }));
+    expect(first.done).toBe(false);
+    expect(purged).toHaveLength(WS_PURGE_PAIR_BATCH);
+    const last = projects.at(-1)!;
+    expect(await db().prepare("SELECT 1 FROM commits WHERE workspace_id = ? AND project_id = ?").bind(ws, last).first()).not.toBeNull();
+    expect(await db().prepare("SELECT 1 FROM workspaces WHERE workspace_id = ? AND project_id = ?").bind(ws, last).first()).not.toBeNull();
+
+    let result = first;
+    while (!result.done) result = await body(await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: dep }));
+    expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+    expect(new Set(purged)).toEqual(new Set(projects.map((project) => `${ws}/${project}`)));
+  });
+
+  test("a throwing purgeWorkspace dep fails closed", async () => {
+    const account = await bootstrap("ws-purge-throw");
+    const ws = "ws_purge_throw";
+    await seed(account.accountId, ws, "root", [sha("throw")]);
+    const before = await counts(ws);
+    const res = await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async () => { throw new Error("DO unavailable"); } });
+    expect(res.status).toBe(200);
+    const result = await body<{ deleted: WsPurgeCounts; done: boolean }>(res);
+    expect(result.done).toBe(false);
+    expect(result.deleted).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await counts(ws)).toEqual(before);
   });
 
   test("uses bounded deletes, retains registry until drained, and fails closed on DO failure", async () => {

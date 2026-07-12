@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { purgeWorkspaceDO } from "./account-delete.js";
 import { dbFor } from "./db.js";
-import { json } from "./util.js";
+import { json, logErr } from "./util.js";
 
 export const WS_PURGE_ROW_CAP = 2000;
 export const WS_PURGE_PAIR_BATCH = 100;
@@ -28,6 +28,11 @@ interface CountRow { n: number }
 
 const zeroCounts = (): WsPurgeCounts => ({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
 const allZero = (counts: WsPurgeCounts): boolean => Object.values(counts).every((n) => n === 0);
+const chunked = <T>(xs: T[], n: number): T[][] => {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
+};
 
 async function countWorkspaceRows(db: D1Database, workspaceId: string): Promise<WsPurgeCounts> {
   const results = await db.batch([
@@ -46,6 +51,20 @@ async function countWorkspaceRows(db: D1Database, workspaceId: string): Promise<
  * no workspace prefix. Removing the workspace registry makes Phase-1 reachability stop
  * seeing its DO roots; the existing GC pipeline then reclaims refs and condemns truly
  * orphaned blobs for Phase 2 without risking another account's shared content.
+ *
+ * Each pass is page-scoped: a pair's D1 rows are deleted only after that exact pair's DO
+ * purge succeeded in the same pass. Registry rows drop per pair, in the same transaction,
+ * only when in-transaction NOT EXISTS checks prove its commits and manifests are gone.
+ *
+ * PRECONDITION: the target workspace is assumed QUIESCED (an operator purge of junk
+ * workspaces). A concurrently-writing client can re-create rows/DO state mid-purge; the
+ * drain loop deletes stragglers on later passes, but a write landing after the final recount
+ * survives — rerun the drain. A write-fencing tombstone would need a migration plus every
+ * workspace write path and is deliberately out of scope.
+ *
+ * §32: orphan mirror rows whose registry row is gone route via `dbFor(env, "")`
+ * (plane-correct, account absent) — a no-op at N=1, and one of the documented sites a real
+ * sharding cutover must revisit (see db.ts NOTE).
  */
 export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: WsPurgeOpts = {}): Promise<Response> {
   // §32: discover the owning account before a shard is in scope, then route every
@@ -63,40 +82,52 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
     .prepare(`SELECT workspace_id, project_id FROM workspaces WHERE workspace_id = ?
       UNION SELECT workspace_id, project_id FROM commits WHERE workspace_id = ?
       UNION SELECT workspace_id, project_id FROM manifests WHERE workspace_id = ?
+      ORDER BY workspace_id, project_id
       LIMIT ?`)
-    .bind(workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH)
+    .bind(workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH + 1)
     .all<PairRow>();
+  const page = (pairs.results ?? []).slice(0, WS_PURGE_PAIR_BATCH);
+  const hasMorePairs = (pairs.results?.length ?? 0) > WS_PURGE_PAIR_BATCH;
+  void hasMorePairs; // Informational only; the recount determines completion.
   const purgeWorkspace = opts.purgeWorkspace ?? purgeWorkspaceDO;
-  for (const pair of pairs.results ?? []) {
-    if (!(await purgeWorkspace(env, pair.workspace_id, pair.project_id))) {
+  for (const pair of page) {
+    let purged = false;
+    try {
+      purged = await purgeWorkspace(env, pair.workspace_id, pair.project_id);
+    } catch (e) {
+      logErr("ws_purge_do_failed", e);
+    }
+    if (!purged) {
       return json({ ok: true, workspaceId, dryRun: false, deleted: zeroCounts(), remaining: counts, done: false });
     }
   }
 
-  const rowCap = opts.rowCap ?? WS_PURGE_ROW_CAP;
-  // gc-phase1's 33-row batches exist because multi-row INSERTs carry <=100 bound params.
-  // Each bounded DELETE below uses only two binds, so one statement/table is optimal for
-  // the subrequest budget. D1's ~1k subrequest cap (which bit us in design 102) stays far
-  // away: this handler uses <= ~10 D1 subrequests plus <=100 DO fetches per call. The
-  // delete is its own cursor; no durable cursor row is needed because the drain calls again.
-  const deletedRows = await db.batch([
-    db.prepare("DELETE FROM commits WHERE rowid IN (SELECT rowid FROM commits WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap),
-    db.prepare("DELETE FROM manifests WHERE rowid IN (SELECT rowid FROM manifests WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap),
-    db.prepare("DELETE FROM workspace_keys WHERE rowid IN (SELECT rowid FROM workspace_keys WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap),
-  ]);
-  const deleted: WsPurgeCounts = {
-    commits: deletedRows[0]?.meta.changes ?? 0,
-    manifests: deletedRows[1]?.meta.changes ?? 0,
-    workspace_keys: deletedRows[2]?.meta.changes ?? 0,
-    workspaces: 0,
-  };
-
-  // Registry rows go last so account routing and DO enumeration remain available throughout
-  // a multi-pass purge. A short delete proves each preceding table is fully drained.
-  if (deleted.commits < rowCap && deleted.manifests < rowCap && deleted.workspace_keys < rowCap) {
-    const registry = await db.prepare("DELETE FROM workspaces WHERE workspace_id = ?").bind(workspaceId).run();
-    deleted.workspaces = registry.meta.changes ?? 0;
+  const rowCap = Math.max(1, Math.floor(Number.isFinite(opts.rowCap ?? NaN) ? opts.rowCap! : WS_PURGE_ROW_CAP));
+  const pairChunks = chunked(page, 40);
+  const statements: D1PreparedStatement[] = [];
+  const kinds: (keyof WsPurgeCounts)[] = [];
+  for (const ck of pairChunks) {
+    const projects = ck.map((pair) => pair.project_id);
+    const ph = projects.map(() => "?").join(",");
+    statements.push(
+      db.prepare(`DELETE FROM commits WHERE rowid IN (SELECT rowid FROM commits WHERE workspace_id = ? AND project_id IN (${ph}) LIMIT ?)`).bind(workspaceId, ...projects, rowCap),
+      db.prepare(`DELETE FROM manifests WHERE rowid IN (SELECT rowid FROM manifests WHERE workspace_id = ? AND project_id IN (${ph}) LIMIT ?)`).bind(workspaceId, ...projects, rowCap),
+    );
+    kinds.push("commits", "manifests");
   }
+  statements.push(db.prepare("DELETE FROM workspace_keys WHERE rowid IN (SELECT rowid FROM workspace_keys WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap));
+  kinds.push("workspace_keys");
+  for (const ck of pairChunks) {
+    const projects = ck.map((pair) => pair.project_id);
+    const ph = projects.map(() => "?").join(",");
+    statements.push(db.prepare(`DELETE FROM workspaces WHERE workspace_id = ? AND project_id IN (${ph})
+      AND NOT EXISTS (SELECT 1 FROM commits c WHERE c.workspace_id = workspaces.workspace_id AND c.project_id = workspaces.project_id)
+      AND NOT EXISTS (SELECT 1 FROM manifests m WHERE m.workspace_id = workspaces.workspace_id AND m.project_id = workspaces.project_id)`).bind(workspaceId, ...projects));
+    kinds.push("workspaces");
+  }
+  const deleted = zeroCounts();
+  const deletedRows = await db.batch(statements);
+  for (let i = 0; i < deletedRows.length; i++) deleted[kinds[i]!] += deletedRows[i]?.meta.changes ?? 0;
 
   const remaining = await countWorkspaceRows(db, workspaceId);
   return json({ ok: true, workspaceId, dryRun: false, deleted, remaining, done: allZero(remaining) });
