@@ -8,6 +8,11 @@ const secret = process.env.RBOX_PLATFORM_SECRET ?? "";
 if (!api || !secret) throw new Error("RBOX_API_URL and RBOX_PLATFORM_SECRET are required");
 const headers = { "x-rbox-platform": secret };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Phase-1 grace. The admin route's query-param default is the PHASE-2 7-day
+ *  grace; the Phase-1 cron uses GRACE_1_MS = 24h — pass the cron's value so
+ *  audit/drain see the same eligibility the hourly tick does. Override with
+ *  RBOX_P1_GRACE_MS. */
+const graceMs = String(Number(process.env.RBOX_P1_GRACE_MS ?? 24 * 60 * 60 * 1000));
 
 if (mode === "drain") {
   let passes = 0;
@@ -16,7 +21,7 @@ if (mode === "drain") {
   let resurrected = 0;
   let released = 0;
   while (true) {
-    const res = await fetch(`${api}/v1/admin/gc?phase=phase1`, { method: "POST", headers });
+    const res = await fetch(`${api}/v1/admin/gc?phase=phase1&graceMs=${graceMs}`, { method: "POST", headers });
     const text = await res.text();
     if (!res.ok) throw new Error(`drain failed (${res.status}): ${text}`);
     const pass = JSON.parse(text) as { marked: number; purged: number; resurrected: number; released: number };
@@ -40,7 +45,7 @@ let wouldResurrect = 0;
 let wouldPurge = 0;
 let wouldRelease = 0;
 do {
-  const q = new URLSearchParams({ phase: "phase1", dryRun: "1", limit: "200" });
+  const q = new URLSearchParams({ phase: "phase1", dryRun: "1", limit: "200", graceMs });
   if (cursor) q.set("cursor", cursor);
   const res = await fetch(`${api}/v1/admin/gc?${q}`, { method: "POST", headers });
   if (!res.ok) throw new Error(`audit failed (${res.status}): ${await res.text()}`);
