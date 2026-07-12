@@ -12,7 +12,6 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const safeErrorBody = (text: string): string => text.replaceAll(secret, "[redacted]").slice(0, 200);
 
 interface Counts { commits: number; manifests: number; workspace_keys: number; workspaces: number }
-interface PurgeResponse { done: boolean; deleted: Counts }
 type DryResult = { workspaceId: string; counts: Counts } | { workspaceId: string; notFound: true };
 type PurgeResult = { workspaceId: string; passes: number; deleted: Counts } | { workspaceId: string; notFound: true };
 const zero = (): Counts => ({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
@@ -64,19 +63,18 @@ for (const workspaceId of workspaceIds) {
       break;
     }
     if (!res.ok) throw new Error(`purge failed (${res.status}): ${safeErrorBody(text)}`);
-    const parsed = parseResponse(text, res.status, "deleted");
-    const pass: PurgeResponse = { done: parsed.done, deleted: parsed.counts };
+    const { done, counts: passDeleted } = parseResponse(text, res.status, "deleted");
     passes++;
-    deleted.commits += pass.deleted.commits;
-    deleted.manifests += pass.deleted.manifests;
-    deleted.workspace_keys += pass.deleted.workspace_keys;
-    deleted.workspaces += pass.deleted.workspaces;
-    console.error(`${JSON.stringify(workspaceId)} pass ${passes}: commits=${pass.deleted.commits} manifests=${pass.deleted.manifests} keys=${pass.deleted.workspace_keys} workspaces=${pass.deleted.workspaces} done=${pass.done}`);
-    if (pass.done) {
+    deleted.commits += passDeleted.commits;
+    deleted.manifests += passDeleted.manifests;
+    deleted.workspace_keys += passDeleted.workspace_keys;
+    deleted.workspaces += passDeleted.workspaces;
+    console.error(`${JSON.stringify(workspaceId)} pass ${passes}: commits=${passDeleted.commits} manifests=${passDeleted.manifests} keys=${passDeleted.workspace_keys} workspaces=${passDeleted.workspaces} done=${done}`);
+    if (done) {
       workspaces.push({ workspaceId, passes, deleted });
       break;
     }
-    const noProgress = Object.values(pass.deleted).every((n) => n === 0);
+    const noProgress = Object.values(passDeleted).every((n) => n === 0);
     consecutiveZeroProgress = noProgress ? consecutiveZeroProgress + 1 : 0;
     if (consecutiveZeroProgress >= 5) throw new Error(`${workspaceId}: purge aborted after 5 consecutive zero-progress passes`);
     await sleep(1_000);

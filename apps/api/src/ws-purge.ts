@@ -1,10 +1,11 @@
 import type { Env } from "./env.js";
-import { purgeWorkspaceDO } from "./account-delete.js";
+import { chunked, purgeWorkspaceDO } from "./account-delete.js";
 import { dbFor } from "./db.js";
 import { json, logErr } from "./util.js";
 
 export const WS_PURGE_ROW_CAP = 2000;
 export const WS_PURGE_PAIR_BATCH = 100;
+const IN_CHUNK = 80; // SQLite bound-variable safety for `... IN (?,?,…)` (same bound as account-delete.ts)
 
 export interface WsPurgeCounts {
   commits: number;
@@ -28,21 +29,33 @@ interface CountRow { n: number }
 
 const zeroCounts = (): WsPurgeCounts => ({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
 const allZero = (counts: WsPurgeCounts): boolean => Object.values(counts).every((n) => n === 0);
-const chunked = <T>(xs: T[], n: number): T[][] => {
-  const out: T[][] = [];
-  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
-  return out;
-};
 
-async function countWorkspaceRows(db: D1Database, workspaceId: string): Promise<WsPurgeCounts> {
-  const results = await db.batch([
+/** The four per-table counts, plus (optionally, in the SAME one-subrequest batch) the
+ *  ORDER BY'd page of distinct (workspace, project) pairs the real purge processes. */
+async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs: boolean): Promise<{ counts: WsPurgeCounts; pairs: PairRow[] }> {
+  const statements = [
     db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM manifests WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM workspace_keys WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM workspaces WHERE workspace_id = ?").bind(workspaceId),
-  ]);
+  ];
+  if (withPairs) {
+    statements.push(
+      db
+        .prepare(`SELECT workspace_id, project_id FROM workspaces WHERE workspace_id = ?
+          UNION SELECT workspace_id, project_id FROM commits WHERE workspace_id = ?
+          UNION SELECT workspace_id, project_id FROM manifests WHERE workspace_id = ?
+          ORDER BY workspace_id, project_id
+          LIMIT ?`)
+        .bind(workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH),
+    );
+  }
+  const results = await db.batch(statements);
   const count = (index: number): number => Number((results[index]?.results?.[0] as CountRow | undefined)?.n ?? 0);
-  return { commits: count(0), manifests: count(1), workspace_keys: count(2), workspaces: count(3) };
+  return {
+    counts: { commits: count(0), manifests: count(1), workspace_keys: count(2), workspaces: count(3) },
+    pairs: withPairs ? ((results[4]?.results ?? []) as PairRow[]) : [],
+  };
 }
 
 /**
@@ -74,41 +87,31 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
     .bind(workspaceId)
     .first<OwnerRow>();
   const db = dbFor(env, owner?.account_id ?? "");
-  const counts = await countWorkspaceRows(db, workspaceId);
+  const { counts, pairs: page } = await readWorkspaceState(db, workspaceId, !opts.dryRun);
   if (allZero(counts)) return json({ error: "not_found" }, 404);
   if (opts.dryRun) return json({ ok: true, workspaceId, dryRun: true, counts, done: false });
 
-  const pairs = await db
-    .prepare(`SELECT workspace_id, project_id FROM workspaces WHERE workspace_id = ?
-      UNION SELECT workspace_id, project_id FROM commits WHERE workspace_id = ?
-      UNION SELECT workspace_id, project_id FROM manifests WHERE workspace_id = ?
-      ORDER BY workspace_id, project_id
-      LIMIT ?`)
-    .bind(workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH + 1)
-    .all<PairRow>();
-  const page = (pairs.results ?? []).slice(0, WS_PURGE_PAIR_BATCH);
-  const hasMorePairs = (pairs.results?.length ?? 0) > WS_PURGE_PAIR_BATCH;
-  void hasMorePairs; // Informational only; the recount determines completion.
+  // Fan the (idempotent) DO purges out in parallel — they hit distinct DOs, so there is
+  // no ordering to preserve; an exception is fail-closed like a false return (logged,
+  // no row deleted this pass; the drain retries).
   const purgeWorkspace = opts.purgeWorkspace ?? purgeWorkspaceDO;
-  for (const pair of page) {
-    let purged = false;
-    try {
-      purged = await purgeWorkspace(env, pair.workspace_id, pair.project_id);
-    } catch (e) {
-      logErr("ws_purge_do_failed", e);
-    }
-    if (!purged) {
-      return json({ ok: true, workspaceId, dryRun: false, deleted: zeroCounts(), remaining: counts, done: false });
-    }
+  const purgeResults = await Promise.all(
+    page.map((pair) =>
+      purgeWorkspace(env, pair.workspace_id, pair.project_id).catch((e: unknown) => (logErr("ws_purge_do_failed", e), false)),
+    ),
+  );
+  if (!purgeResults.every((purged) => purged)) {
+    return json({ ok: true, workspaceId, dryRun: false, deleted: zeroCounts(), remaining: counts, done: false });
   }
 
   const rowCap = Math.max(1, Math.floor(Number.isFinite(opts.rowCap ?? NaN) ? opts.rowCap! : WS_PURGE_ROW_CAP));
-  const pairChunks = chunked(page, 40);
+  const pairChunks = chunked(page, IN_CHUNK).map((ck) => {
+    const projects = ck.map((pair) => pair.project_id);
+    return { projects, ph: projects.map(() => "?").join(",") };
+  });
   const statements: D1PreparedStatement[] = [];
   const kinds: (keyof WsPurgeCounts)[] = [];
-  for (const ck of pairChunks) {
-    const projects = ck.map((pair) => pair.project_id);
-    const ph = projects.map(() => "?").join(",");
+  for (const { projects, ph } of pairChunks) {
     statements.push(
       db.prepare(`DELETE FROM commits WHERE rowid IN (SELECT rowid FROM commits WHERE workspace_id = ? AND project_id IN (${ph}) LIMIT ?)`).bind(workspaceId, ...projects, rowCap),
       db.prepare(`DELETE FROM manifests WHERE rowid IN (SELECT rowid FROM manifests WHERE workspace_id = ? AND project_id IN (${ph}) LIMIT ?)`).bind(workspaceId, ...projects, rowCap),
@@ -117,9 +120,7 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
   }
   statements.push(db.prepare("DELETE FROM workspace_keys WHERE rowid IN (SELECT rowid FROM workspace_keys WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap));
   kinds.push("workspace_keys");
-  for (const ck of pairChunks) {
-    const projects = ck.map((pair) => pair.project_id);
-    const ph = projects.map(() => "?").join(",");
+  for (const { projects, ph } of pairChunks) {
     statements.push(db.prepare(`DELETE FROM workspaces WHERE workspace_id = ? AND project_id IN (${ph})
       AND NOT EXISTS (SELECT 1 FROM commits c WHERE c.workspace_id = workspaces.workspace_id AND c.project_id = workspaces.project_id)
       AND NOT EXISTS (SELECT 1 FROM manifests m WHERE m.workspace_id = workspaces.workspace_id AND m.project_id = workspaces.project_id)`).bind(workspaceId, ...projects));
@@ -129,6 +130,6 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
   const deletedRows = await db.batch(statements);
   for (let i = 0; i < deletedRows.length; i++) deleted[kinds[i]!] += deletedRows[i]?.meta.changes ?? 0;
 
-  const remaining = await countWorkspaceRows(db, workspaceId);
+  const { counts: remaining } = await readWorkspaceState(db, workspaceId, false);
   return json({ ok: true, workspaceId, dryRun: false, deleted, remaining, done: allZero(remaining) });
 }

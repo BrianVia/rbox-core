@@ -111,7 +111,7 @@ export async function purgeWorkspaceDO(env: Env, ws: string, proj: string): Prom
 
 export const REAL_PURGE_DEPS: PurgeDeps = { purgeStripe: purgeStripeForAccount, deleteClerk: deleteClerkUser, purgeWorkspace: purgeWorkspaceDO, purgeUpload: purgeUploadR2, purgeDiagnostic: purgeDiagnosticR2 };
 
-const chunked = <T>(xs: T[], n: number): T[][] => {
+export const chunked = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];
   for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
   return out;
