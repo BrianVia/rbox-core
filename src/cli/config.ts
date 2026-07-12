@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain, type GitSection, type Manifest } from "../engine/index.js";
+import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
@@ -151,6 +151,8 @@ export interface GlobalManifestMeta {
    *  snapshot base, this blob's own) — §3.3.4's threshold. Recorded from an
    *  OBSERVED length and PROPAGATED UNCHANGED across deltas. */
   snapshotBytes: number;
+  /** The described manifest's git layer, verbatim. Empty when the key is absent. */
+  gitRepos: Record<string, GitSection>;
 }
 
 export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
@@ -168,7 +170,18 @@ export function validManifestMeta(v: unknown): GlobalManifestMeta | undefined {
   // `chain` must reject wholesale (§3.4 fail-to-snapshot).
   if (!Array.isArray(meta.chain) || readManifestChain(meta.chain, meta.encManifestSha) === null) return undefined;
   if ((meta.chainBytes === 0) !== (meta.chain.length === 0)) return undefined;
+  if (!validateGitRepos(meta.gitRepos).ok) return undefined;
   return meta as unknown as GlobalManifestMeta;
+}
+
+/** Reconstruct the exact described manifest independently of local repo apply progress. */
+export function manifestFromMeta(lastSyncedManifest: Manifest, meta: GlobalManifestMeta): Manifest {
+  return {
+    generatedAt: lastSyncedManifest.generatedAt,
+    files: lastSyncedManifest.files,
+    ...(lastSyncedManifest.manifestSchema === undefined ? {} : { manifestSchema: lastSyncedManifest.manifestSchema }),
+    ...(Object.keys(meta.gitRepos).length === 0 ? {} : { gitRepos: meta.gitRepos }),
+  };
 }
 
 export interface ConfigShapeIdentity {
@@ -360,7 +373,6 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
 
     const records = repoRecordsForState(current);
-    const priorBases = Object.fromEntries(packet.repos.map(({ relPath }) => [relPath, records[relPath]?.base ?? null]));
     for (const transition of packet.repos) {
       if ((records[transition.relPath]?.repoGen ?? 0) !== transition.expectedRepoGen) {
         return { status: "rejected", reason: "repo-generation", state: current };
@@ -371,9 +383,6 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
 
     const global = packet.global?.manifest;
-    const repoOnlyBaseChanged = !packet.global && packet.repos.some(({ relPath, newRecord }) =>
-      JSON.stringify(priorBases[relPath]) !== JSON.stringify(newRecord.base ?? null)
-    );
     const base: SyncState = global
       ? {
           ...current,
@@ -381,7 +390,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
           lastSyncedManifest: { ...global, gitRepos: undefined },
           manifestMeta: packet.global?.manifestMeta,
         }
-      : repoOnlyBaseChanged ? { ...current, manifestMeta: undefined } : current;
+      : current;
     const next = stateFromRepoRecords({
       ...base,
       stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),

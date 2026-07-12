@@ -110,13 +110,6 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
       newRecord: sourceRecord(source, relPath, current),
     };
   });
-  const projected = { ...records };
-  for (const transition of repos) projected[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
-  const projectedGit = stateFromRepoRecords(snapshot, projected).lastSyncedManifest.gitRepos ?? {};
-  const describedGit = source.globalManifest?.gitRepos ?? {};
-  const hasPending = observedRepos.some((relPath) => projected[relPath]?.pending !== undefined);
-  const sortedJson = (value: Record<string, GitSection>): string => JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))));
-  const carriesMeta = !hasPending && sortedJson(projectedGit) === sortedJson(describedGit);
   return {
     expectedStream: source.expectedStream,
     expectedNonce: expectedStateNonce(snapshot),
@@ -125,7 +118,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
     // Repo transitions above likewise retain records with a newer sourceSeq.
     ...(source.globalManifest === undefined || source.sourceGlobalSeq < snapshot.lastSyncedSequence
       ? {}
-      : { global: { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: carriesMeta ? source.manifestMeta : undefined } }),
+      : { global: { manifest: fileOnlyManifest(source.globalManifest), manifestMeta: source.manifestMeta } }),
     repos,
   };
 }

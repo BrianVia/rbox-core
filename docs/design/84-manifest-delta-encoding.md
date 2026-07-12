@@ -6,25 +6,26 @@ both sides (server fronts all chain misses in `missing` — they always fit —
 on every 422 producer incl. the fence-abort path; client conservatively
 snapshots on ANY truncated response with a non-empty attempted chain), and
 `validManifestMeta`'s chain/bytes consistency is bidirectional
-(`chainBytes === 0 ⇔ chain.length === 0`). v6 closed round 4's minor: `validManifestMeta` is a normative
+(`chainBytes === 0 ⇔ chain.length === 0`). **2026-07-12 round-3 fold-fix
+revision:** evidence now carries the described manifest's verbatim `gitRepos`;
+projection-divergence suppression and repo-only clearing are retired because
+git apply progress is orthogonal to fold correctness. v6 closed round 4's minor: `validManifestMeta` is a normative
 runtime validator gating every meta consumption point (base selection, epoch
 trigger, fast-fold match, byte arithmetic) — any partial/malformed persisted
 meta normalizes wholesale to `undefined` (fail-to-snapshot), so no JS
 coercion can fail a trigger open. v5 closed round 3: `GlobalManifestMeta.snapshotBytes` makes
 the byte-bound trigger implementable (encode-then-compare, threshold includes
-the proposed head, observed lengths propagated across deltas); repo-only
-packets clear a stale meta via a normative rule inside `applyStateSavePacket`
-(atomic with the accepted transitions — the packet shape has no global member
-to carry a clear); `MAX_MANIFEST_PLAINTEXT`/`MAX_ENVELOPE_HEADER` are
+the proposed head, observed lengths propagated across deltas); its former
+repo-only meta-clear rule is retired by the round-3 fold fix above;
+`MAX_MANIFEST_PLAINTEXT`/`MAX_ENVELOPE_HEADER` are
 normative protocol constants (only post-soak retuning stays open). v3 was the full round-1 rework against current main (designs
 91/92/93/95/96); v4 closes round 2: repair mode bypasses the no-op/defer
 short-circuits (an unchanged tree still publishes the healing snapshot);
 `manifestSchema` is carried verbatim in the delta header (both transition
 directions encodable); `GlobalManifestMeta` persists the base's signed
 epochs (I4 has a truthful input) and the base's EXACT verified chain (the
-fast path performs the full I3b list match, not an aggregate check); meta is
-suppressed whenever the design-93 repo-pending projection diverges from the
-described manifest; the recover ceremony retains the prior pin until the
+fast path performs the full I3b list match, not an aggregate check); the former
+repo-pending suppression is superseded by self-contained evidence; the recover ceremony retains the prior pin until the
 replacement head verifies (equal-seq/different-hash refused against the
 retained pin); `MAX_MANIFEST_DELTA_CHAIN = 16` is normative and the vacuous
 retention trigger is replaced by the rooting proof. Full-stack (client
@@ -181,8 +182,8 @@ state.
   exact verified chain)
   lives INSIDE `StateSavePacket.global` and lands only when the packet's
   stream/nonce/global-sequence preconditions accept (§3.4). It NEVER updates
-  on verify-only pin advancement, decode/fold failure, partial apply, a
-  rejected packet, or a repo-pending projection — the same applied-base rule
+  on verify-only pin advancement, decode/fold failure, or a rejected packet.
+  Repo apply progress changes only the projection, not this global CAS unit — the same applied-base rule
   design 92 established for push decisions.
 
 ### 3.2 Wire / storage format
@@ -433,6 +434,8 @@ export interface GlobalManifestMeta {
    *  fetch on a cold walk) and PROPAGATED UNCHANGED across deltas, so the
    *  steady-state fast path never refetches the snapshot just to size it. */
   snapshotBytes: number;
+  /** The described folded/committed manifest's gitRepos verbatim; {} when absent. */
+  gitRepos: Record<string, GitSection>;
 }
 export interface StateSavePacket {
   // ...unchanged...
@@ -455,38 +458,14 @@ Semantics (all inherited from the packet, stated to be testable):
   decode/fold/apply never reaches `saveStateSource` (`sync.ts:343-364`), so
   the base metadata cannot describe an unapplied head — the design-92
   applied-base rule (`sync.ts:530-536`) extends to the delta base for free.
-- **Suppressed whenever the projection diverges (the design-93 repo-pending
-  rule).** `applyStateSavePacket` stores the FILE-ONLY global verbatim and
-  reconstructs `lastSyncedManifest.gitRepos` from the per-repo generation
-  records (`config.ts:329-345`) — so when any repo apply is pending/lagging,
-  the persisted manifest is deliberately NOT the folded remote head. A meta
-  certifying the head beside a projected manifest would poison both the delta
-  writer (ops diffed from a base that isn't what `encManifestSha` folds to)
-  and the fast fold. Rule: the packet writer includes `manifestMeta` **iff
-  the post-application projection equals the described manifest** — and
-  since the file layer is stored verbatim, the ONLY divergence channel is
-  `gitRepos`, so the check is a deep-equal of the reconstructed `gitRepos`
-  projection against the source manifest's `gitRepos` (≤ ~100 repos — cheap;
-  concretely: no repo left `pending`, no repo transition retained by a newer
-  `sourceSeq`, `sync-state.ts:84-98`). On divergence the packet carries
-  `manifestMeta: undefined` — which CLEARS any prior meta (global writes
-  replace the global member wholesale) — and the next commit takes the
-  §3.3.1 snapshot path until a fully-applied pull re-establishes it.
-  **Repo-only packets clear meta INSIDE the applier, not via the packet
-  shape** (round-3 finding 2: `manifestMeta` lives only in `packet.global`,
-  and a repo-only packet has no global member — omission cannot mean both
-  "preserve" and "clear", and synthesizing a global would wrongly enter the
-  global-sequence CAS). Normative rule in `applyStateSavePacket`: after the
-  accepted repo transitions are folded (`config.ts:325-345`), if the packet
-  carried no `global` and any accepted transition CHANGED a record's
-  projected `base` (deep-unequal old vs new `base` for that relPath), the
-  persisted `manifestMeta` is cleared in the SAME atomic state write. A
-  rejected packet (stream/nonce/repo-generation/owner-lost) changes nothing,
-  including meta; a retained newer-`sourceSeq` transition re-writes the
-  current record (`sync-state.ts:84-98`) so its `base` is unchanged and meta
-  is preserved. The legacy/`forceLegacy` writers already drop meta
-  unconditionally (above), which subsumes this rule off the fenced path.
-  Fail-to-snapshot, never fail-to-wrong-base.
+- **Self-contained under projection divergence.** The file-only global is
+  stored verbatim and `manifestMeta.gitRepos` carries the described head's git
+  layer verbatim (`{}` when absent). `manifestFromMeta` combines those sources
+  for both fast-pull and writer bases, omitting an empty map for canonical hash
+  identity. Pending/deferred/needs-resolution and repo-only transitions therefore
+  preserve evidence. F1 hashes reconstructed same-head evidence on an LRU miss;
+  every fold verifies `resultHash`; invalid writer reconstructions fail to the
+  snapshot path. Git working-tree apply progress is orthogonal to fold truth.
 - **Writers of the packet:**
   - *Pull apply* (`sync.ts:343-364`): meta = the pulled head's
     `encManifestSha`, the verified fold's hash (= the checked
@@ -495,18 +474,15 @@ Semantics (all inherited from the packet, stated to be testable):
     already produced), the head's list-verified `manifestChain` + cumulative
     bytes (snapshot → `[]`/0), and `snapshotBytes` (fast path: propagated
     from the prior meta; cold walk: the terminal snapshot's fetched length;
-    snapshot head: its own fetched length) — subject to the suppression rule
-    above.
+    snapshot head: its own fetched length), and the folded manifest's verbatim
+    `gitRepos`.
   - *Push commit* (`sync.ts:715-725`): meta = the just-built envelope's
     `encManifestSha`, the writer's `resultHash` (computed anyway), the
     epochs it signed under (the D1-checked write context,
     `e2ee-remote.ts:406-410`), and the chain it emitted (snapshot → `[]`/0
     with `snapshotBytes` = its own uploaded ciphertext length; delta →
     `base.chain + [base.encManifestSha]`, bytes incremented, `snapshotBytes`
-    propagated) —
-    same suppression rule (a commit that carried a pending repo's section
-    keeps the OLD base in state, `gitBaseAfterCommit`, `sync.ts:708`, so the
-    projection diverges and the meta is suppressed).
+    propagated), and the committed manifest's verbatim `gitRepos`.
   - *409 recovery* is pull-then-retry (`sync.ts:489-493`) — both writers
     above run in order; no third path exists.
 - **Degraded/legacy paths fail to SNAPSHOT, not to corruption.** The
@@ -536,7 +512,8 @@ Semantics (all inherited from the packet, stated to be testable):
   field ⇒
   the WHOLE meta is treated as `undefined` (→ §3.3.1 snapshot path / cold
   walk) before any epoch check, list match, or byte arithmetic runs.
-- **Migration:** old state files load with `manifestMeta` undefined — and
+- **Migration:** pre-round-3 metas lack required `gitRepos` and normalize to
+  undefined. Old state files load with `manifestMeta` undefined — and
   partial/malformed persisted metas normalize to undefined per the validator
   above — → first post-upgrade commit is a snapshot (§3.3.1).
   Backward-tolerant, no migration step.
@@ -1345,13 +1322,9 @@ gate window; gate 3's `latest` ≤2s stands.*
    - state packet (I8/§3.4): `manifestMeta` lands only with an accepted
      global; rejected packets, verify-only pulls, decode failures, degraded/
      legacy writes, and `resetSyncState` leave/clear it per spec; undefined
-     meta forces the snapshot path. **Repo-pending suppression:** a pull with
-     one pending repo persists NO meta (and clears a prior one); the next
-     push snapshots; the next fast-path pull is skipped (cold walk); a
-     later fully-applied pull re-establishes the meta. **Repo-only clear:**
-     an accepted repo-only packet that changes a projected `base` clears a
-     present meta atomically; a repo-generation-rejected packet and a
-     retained newer-`sourceSeq` transition both preserve it.
+     meta forces the snapshot path. A pending repo persists self-contained
+     evidence, and accepted repo-only base transitions preserve it; the next
+     pull and push can reconstruct the exact head independently of projection.
    - byte-bound trigger (§3.3.4): `chainBytes + candidateDeltaBytes ≥
      snapshotBytes` re-emits as snapshot (threshold includes the proposed
      head); `snapshotBytes` propagates unchanged across fast-path applies

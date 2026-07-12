@@ -42,7 +42,7 @@ import {
 } from "./sync-recovery.js";
 import { finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
 import type { TransferProgress } from "./transfer-progress.js";
-import { loadState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import { openTrashBatch } from "../engine/trash.js";
@@ -274,7 +274,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const validatedMeta = validManifestMeta(state.manifestMeta);
   const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL === "1";
   const fastFoldBase = fastPullEnabled && validatedMeta
-    ? { manifest: state.lastSyncedManifest, meta: validatedMeta }
+    ? { manifest: manifestFromMeta(state.lastSyncedManifest, validatedMeta), meta: validatedMeta }
     : undefined;
   let latestTimings: LatestTimings | undefined;
   const { sequence, manifest: remote, manifestMeta } = await report.phase("latest", () =>
@@ -866,8 +866,10 @@ async function runPushAttempt(
   let commitTimings: CommitTimings | undefined;
   let commitOptions: CommitOptions | undefined;
   const manifestMeta = validManifestMeta(state.manifestMeta);
-  const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && state.lastSyncedSequence === appliedSequence
-    ? { manifest: state.lastSyncedManifest, meta: manifestMeta }
+  const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
+  const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
+    validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
+    ? { manifest: reconstructedBase, meta: manifestMeta }
     : undefined;
   if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
     commitOptions = {

@@ -157,3 +157,35 @@ decodes, linkage-checks, and folds them, and keeps snapshot/delta byte counters
 and download/decrypt timings distinct. Cold walking selects its terminal
 snapshot as the starting base; suffix walking supplies persisted evidence as
 the starting base.
+
+## Round 3 — self-contained evidence under chronic git deferral
+
+Fleet evidence split cleanly: Ubuntu reached `fold=evidence`, while the Mac
+cold-walked indefinitely with two legitimately permanent deferred linked-worktree
+repos. The cause was §84.3.4 coupling metadata persistence to projected per-repo
+apply state; the same coupling also deprived that host's writer of a delta base.
+
+`GlobalManifestMeta` now requires the described manifest's verbatim `gitRepos`
+map. Pull-fold and commit producers populate it, while pre-round-3 shapes
+normalize away for a one-walk self-healing upgrade. `manifestFromMeta` explicitly
+reconstructs the exact base from the verbatim file global/scalars plus this map,
+omitting the key when empty, and is the sole base builder for fast pull and delta
+write. Pending-projection suppression and repo-only clearing are retired;
+legacy drops, reset wiping, stale-global omission, and global packet CAS remain.
+
+Soundness stays fail-closed: shared manifest git-section rules validate the map,
+F1 streaming-hashes reconstructed same-head evidence on an LRU miss, F2 and cold
+folds recompute every `resultHash`, and the writer validates its base. Git
+working-tree apply progress cannot change the folded remote head.
+
+Evidence drop channels for field triage:
+
+- legacy/unfenced state writes (`forceLegacy`, unsupported state lock, or the
+  allowed legacy stream-replacement fallback) intentionally persist no meta;
+- a global save whose candidate became stale during packet recompute omits the
+  global and its meta together, preserving the already-newer persisted pair;
+- a global save with no produced meta (including rollout flags off or a raw
+  decode that did not collect evidence) replaces the prior meta with undefined;
+- `resetSyncState` removes the entire state incarnation, including evidence;
+- repo-only saves, pending/deferred repo transitions, and ordinary fenced global
+  saves are not drop channels in round 3.

@@ -17,7 +17,7 @@ import {
   type SignedKeyState,
   type SignedRoster,
 } from "../engine/e2ee/index.js";
-import { decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
+import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
@@ -25,7 +25,8 @@ import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRe
 import { CommitRejectedError } from "./remote.js";
 import { formatLatestTimings, pull, push, pushManifest } from "./sync.js";
 import { repairChain } from "./chain-repair.js";
-import { loadState, saveState, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
+import { loadState, manifestFromMeta, saveState, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
+import { saveStateSource } from "./sync-state.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -380,7 +381,7 @@ test("a chain link encrypted under another epoch fails closed with its sha named
   });
 });
 
-test("a push carrying a pending repo suppresses meta so the following push snapshots", async () => {
+test("R6 writer carrying a pending repo preserves evidence and emits consecutive deltas", async () => {
   await withManifestEncodingFlags(undefined, "1", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA-pending-snapshot", NOW);
@@ -405,12 +406,40 @@ test("a push carrying a pending repo suppresses meta so the following push snaps
     await fs.symlink(`../changed/${hex(299)}`, path.join(root, "link-0299"));
     await push(root, cfg, { remote });
     expect(await wireKind(server, remote)).toBe("delta");
-    expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toBeUndefined();
+    expect(parseSignedCommit(server.commits.at(-1)!).manifestChain.length).toBeGreaterThan(0);
+    const peer = await remoteFor(server, secrets);
+    const peerFold = await peer.latest();
+    expect(peerFold.manifest.files.find((f) => f.path === "link-0299")?.symlinkTarget).toBe(`../changed/${hex(299)}`);
+    expect(peerFold.manifest.gitRepos).toEqual({ repo: section });
+    expect((await loadState(root, syncStreamId(cfg))).manifestMeta?.gitRepos.repo).toEqual(section);
 
     await fs.unlink(path.join(root, "link-0298"));
     await fs.symlink(`../changed/${hex(298)}`, path.join(root, "link-0298"));
     await push(root, cfg, { remote });
+    expect(await wireKind(server, remote)).toBe("delta");
+    expect(parseSignedCommit(server.commits.at(-1)!).manifestChain.length).toBeGreaterThan(0);
+    expect((await peer.latest()).manifest.gitRepos).toEqual({ repo: section });
+  });
+});
+
+test("context-invalid reconstructed writer evidence fails to a snapshot without throwing", async () => {
+  await withManifestEncodingFlags("1", "1", async () => {
+    const { server, remote, root, cfg } = await partitionPushFixture("devA-invalid-reconstruction");
+    const state = await loadState(root, syncStreamId(cfg));
+    const collidingPath = state.lastSyncedManifest.files[0]!.path;
+    const section: GitSection = {
+      bundleSha: hex(920_001), bundleEncSha: hex(920_002), bundleCipherSize: 1,
+      head: "ref: refs/heads/main", refs: { "refs/heads/main": "2".repeat(40) }, refScope: "all", generatedAt: "invalid-context",
+    };
+    state.manifestMeta = { ...state.manifestMeta!, gitRepos: { [collidingPath]: section } };
+    expect(validManifestMeta(state.manifestMeta)).toBeDefined();
+    await saveState(root, state);
+    const changed = path.join(root, "partition", "0299");
+    await fs.unlink(changed);
+    await fs.symlink("../context-invalid-change", changed);
+    await expect(push(root, cfg, { remote })).resolves.toMatchObject({ committed: true });
     expect(await wireKind(server, remote)).toBe("snapshot");
+    expect(parseSignedCommit(server.commits.at(-1)!).manifestChain).toEqual([]);
   });
 });
 
@@ -838,6 +867,7 @@ test("cold chain walk fails closed on hostile signed lists, links, and delta has
       before.manifestMeta = {
         encManifestSha: hex(700_001), manifestHash: hex(700_002), accountEpoch: 0, keyEpoch: 0,
         chain: [], chainBytes: 0, snapshotBytes: 123,
+        gitRepos: {},
       };
       await saveState(root, before);
       await expect(pull(root, cfg, { remote: peer })).rejects.toBeInstanceOf(ManifestChainError);
@@ -917,6 +947,98 @@ test("D FAST_PULL-only receiver bootstraps evidence through real pull persistenc
     withFastPullFlag("1", () => pull(root, cfg, { remote: puller })));
   expect(server.store.getCalls).toEqual([headEncSha]);
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest).toEqual(target);
+});
+
+test("R5 chronic git deferral keeps fold evidence through advanced and same-head pulls", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r3-chronic-deferral", NOW);
+    const writer = await remoteFor(server, secrets);
+    const receiver = await remoteFor(server, secrets);
+    const root = await tmp();
+    const repo = path.join(root, "repo");
+    await fs.mkdir(repo);
+    await git(repo, "init", "-qb", "main");
+    await fs.writeFile(path.join(repo, ".git", "index.lock"), "busy");
+    const cfg: WorkspaceConfig = { ...(await cfgFor(root, secrets, receiver)), syncGit: true };
+    const section: GitSection = {
+      bundleSha: hex(910_001), bundleEncSha: hex(910_002), bundleCipherSize: 1,
+      head: "ref: refs/heads/main", refs: { "refs/heads/main": "1".repeat(40) },
+      refScope: "all", generatedAt: "chronic",
+    };
+    for (const ref of gitSectionBlobRefs(section)) server.store.blobs.set(ref.encSha, new Uint8Array([1]));
+    const c0: Manifest = { ...deltaSizedManifest("r5-c0"), manifestSchema: 2, gitRepos: { repo: section } };
+    const first = await writer.commit(0, secrets.deviceId, c0);
+
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver }));
+    let state = await loadState(root, syncStreamId(cfg));
+    expect(state.gitPendingRemote?.repo).toEqual(section);
+    expect(state.manifestMeta?.gitRepos.repo).toEqual(section);
+    expect(canonicalManifestHashStreaming(manifestFromMeta(state.lastSyncedManifest, state.manifestMeta!))).toBe(state.manifestMeta!.manifestHash);
+
+    const c1: Manifest = { ...c0, generatedAt: "r5-c1", files: c0.files.map((f, i) => i === 7 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, c1, { deltaBase: { manifest: c0, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+    const advancedReport = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report: advancedReport }));
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha]);
+    expect((advancedReport.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number })).toMatchObject({ fold: "evidence", foldLinks: 1 });
+    state = await loadState(root, syncStreamId(cfg));
+    expect(state.gitPendingRemote?.repo).toEqual(section);
+
+    server.store.getCalls = [];
+    const sameHeadReport = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report: sameHeadReport }));
+    expect(server.store.getCalls).toEqual([]);
+    expect((sameHeadReport.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number })).toMatchObject({ fold: "evidence", foldLinks: 0 });
+
+    const repoOnlySection = { ...section, generatedAt: "repo-only-transition" };
+    state = await saveStateSource(root, await loadState(root, syncStreamId(cfg)), {
+      expectedStream: syncStreamId(cfg), sourceGlobalSeq: 2, observedRepos: ["repo"], values: { bases: { repo: repoOnlySection } },
+    });
+    expect(state.manifestMeta).toEqual(second.manifestMeta);
+    const c2: Manifest = { ...c1, generatedAt: "r7-c2", files: c1.files.map((f, i) => i === 8 ? { ...f, mode: 0o700 } : f) };
+    const third = await writer.commit(2, secrets.deviceId, c2, { deltaBase: { manifest: c1, meta: second.manifestMeta! } });
+    server.store.getCalls = [];
+    const repoOnlyReport = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report: repoOnlyReport }));
+    expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha]);
+    expect((repoOnlyReport.toJSON().phases.latest!.details as { fold?: string }).fold).toBe("evidence");
+  });
+});
+
+test("R9 pre-round-3 metadata cold-walks once, upgrades, and re-engages evidence", async () => {
+  await withManifestEncodingFlags(undefined, "1", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-r3-upgrade", NOW);
+    const writer = await remoteFor(server, secrets);
+    const receiver = await remoteFor(server, secrets);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, receiver);
+    const base = deltaSizedManifest("r9-base");
+    const first = await writer.commit(0, secrets.deviceId, base);
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver }));
+    const preUpgrade = await loadState(root, syncStreamId(cfg));
+    const { gitRepos: _gitRepos, ...preR3Meta } = preUpgrade.manifestMeta!;
+    preUpgrade.manifestMeta = preR3Meta as typeof preUpgrade.manifestMeta;
+    await saveState(root, preUpgrade);
+    expect(validManifestMeta((await loadState(root, syncStreamId(cfg))).manifestMeta)).toBeUndefined();
+
+    const target: Manifest = { ...base, generatedAt: "r9-target", files: base.files.map((f, i) => i === 9 ? { ...f, mode: 0o755 } : f) };
+    const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+    server.store.getCalls = [];
+    const coldReport = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report: coldReport }));
+    expect((coldReport.toJSON().phases.latest!.details as { fold?: string }).fold).toBe("coldwalk");
+    expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
+    expect(validManifestMeta((await loadState(root, syncStreamId(cfg))).manifestMeta)).toBeDefined();
+
+    server.store.getCalls = [];
+    const evidenceReport = PhaseReport.pull();
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: receiver, report: evidenceReport }));
+    expect(server.store.getCalls).toEqual([]);
+    expect((evidenceReport.toJSON().phases.latest!.details as { fold?: string; foldLinks?: number })).toMatchObject({ fold: "evidence", foldLinks: 0 });
+  });
 });
 
 test("R2 same-head real pull reuses persisted evidence with zero blob fetches", async () => {
