@@ -630,3 +630,21 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
 - Fresh-join stress loops are the highest-yield test lane (3 P0 finds in 2
   days). Poison repros must use compressible data (the size cap only fires in
   the zstd counter).
+- **Fleet network speeds (measured 2026-07-13, raw R2 curl probes — know these
+  before blaming rbox for throughput):**
+  - **via-desktop-ubuntu**: Ethernet to a MESH NODE (wireless backhaul), NOT
+    wired-to-WAN — caps **~155 Mbps up** (single stream ~158, 4-parallel ~155
+    aggregate; parallelism buys nothing, the backhaul is the cap). Never use it
+    for bandwidth benchmarks.
+  - **flat-meadow-prod-main-01**: wired ~gigabit — single stream ~300 Mbps,
+    **4-parallel 632 Mbps aggregate**. THE bandwidth/perf benchmark host
+    (16T/32GB).
+  - **Mac (dfinitiv-macbook-pro)**: uplink only ~40 Mbps — network-bound for
+    uploads; fine for scan/watcher/propagation tests, useless for upload
+    ceilings.
+  - Rules: benchmarks run SERIAL, one host at a time (don't split one host's
+    pipe across concurrent runs); bench against `~/code` snapshot clones
+    (desktop + FM), never live workspaces; run a raw curl/R2 probe first so
+    network ceiling vs software ceiling is settled before interpreting rbox
+    numbers (that's how the universal ~35 Mbps uploader ceiling was isolated
+    as software, not ISP).
