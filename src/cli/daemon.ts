@@ -81,6 +81,42 @@ const WS_KEEPALIVE_PERSIST_MS = 20_000;
 export const ACTIVITY_HEARTBEAT_MS = 30_000;
 const UPDATE_CHECK_TICK_MS = 60 * 60_000;
 
+/** Stateful daemon policy for automatic chain repair. Exported as a narrow test
+ * seam: the recovery mechanics live in repairChain; this owns only authorship
+ * consent and terminal-head suppression. */
+export class DaemonChainRepairPolicy {
+  private terminalHeadFingerprint = "";
+  private terminalHaltMessage = "";
+
+  constructor(private readonly deviceId: string) {}
+
+  confirmSupersede(suffix: SuffixInfo[]): boolean {
+    return suffix.every((item) => item.deviceId === this.deviceId);
+  }
+
+  assertHeadAllowed(pin: { commitSeq: number; commitHash: string } | undefined): void {
+    if (!pin || !this.terminalHeadFingerprint) return;
+    if (`${pin.commitSeq}:${pin.commitHash}` === this.terminalHeadFingerprint) {
+      throw new Error(this.terminalHaltMessage);
+    }
+  }
+
+  halt(error: ManifestChainError, suffix: SuffixInfo[]): Error {
+    const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
+    const message = `MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`;
+    if (error.head) {
+      this.terminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
+      this.terminalHaltMessage = message;
+    }
+    return new Error(message);
+  }
+
+  clear(): void {
+    this.terminalHeadFingerprint = "";
+    this.terminalHaltMessage = "";
+  }
+}
+
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
 
 /** Sanitized error identifier for measurement-failure log lines. Node fs errors
@@ -235,8 +271,7 @@ export class RboxDaemon {
   private lastTerminalBlockFingerprint = "";
   /** Foreign-device chain HALTs are terminal for a verified head. Avoid repeatedly
    * attempting repair (and repeating the same HALT) until the authenticated pin moves. */
-  private chainTerminalHeadFingerprint = "";
-  private chainTerminalHaltMessage = "";
+  private readonly chainRepairPolicy: DaemonChainRepairPolicy;
   private lastLoggedSeq?: number;
   /** While quota-blocked, only a safety full-scan arms one upload probe. */
   private outOfStorageProbeArmed = false;
@@ -282,6 +317,7 @@ export class RboxDaemon {
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
+    this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
     this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
   }
@@ -845,10 +881,9 @@ export class RboxDaemon {
   }
 
   private async doPull(syncMutex: WorkspaceSyncMutex): Promise<void> {
-    if (this.chainTerminalHeadFingerprint && this.e2ee.remote instanceof E2eeRemote) {
+    if (this.e2ee.remote instanceof E2eeRemote) {
       const pin = await this.e2ee.remote.loadVerifiedPin();
-      const fingerprint = pin ? `${pin.commitSeq}:${pin.commitHash}` : "";
-      if (fingerprint === this.chainTerminalHeadFingerprint) throw new Error(this.chainTerminalHaltMessage);
+      this.chainRepairPolicy.assertHeadAllowed(pin);
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     const report = beginReport("pull");
@@ -874,27 +909,20 @@ export class RboxDaemon {
       let refusal: SuffixInfo[] | undefined;
       const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
         confirmSupersede: async (suffix) => {
-          const selfOnly = suffix.every((item) => item.deviceId === this.cfg.deviceId);
+          const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
           if (!selfOnly) refusal = suffix;
           return selfOnly;
         },
       });
       if (outcome.kind === "declined") {
         const suffix = refusal ?? outcome.suffix;
-        const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
-        const message = `MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`;
-        if (error.head) {
-          this.chainTerminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
-          this.chainTerminalHaltMessage = message;
-        }
-        throw new Error(message);
+        throw this.chainRepairPolicy.halt(error, suffix);
       }
       actions = outcome.kind === "converged"
         ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
         : outcome.actions;
     }
-    this.chainTerminalHeadFingerprint = "";
-    this.chainTerminalHaltMessage = "";
+    this.chainRepairPolicy.clear();
     report?.logSummaryTo(log);
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
