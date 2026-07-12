@@ -7,6 +7,34 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 late afternoon — design 84 LIVE fleet-wide; first propagation statistics
+
+- **Fold r3 (#238) verified on BOTH hosts:** Ubuntu `fold=evidence f0` 0.9s;
+  **Mac `fold=evidence f0/f1` 0.4–1.5s** (was 16–21s receiver reads). §7.3
+  gate (≤2s) PASSED fleet-wide. Mac writer resumed MDE (re-baseline snapshot
+  then deltas). Watch: Mac RSS ~4GB post-bootstrap; ~11s unattributed server
+  time on the Mac snapshot commit (delta-soak AE has the phase split).
+- **First fleet propagation statistics** (`scripts/propagation-report.ts`,
+  built via /tmp worktree — NOT yet committed to main; commit it): 233
+  publish events / 12h, **publish→apply p50 16.7s** (post-r3 hour: 18.3s,
+  n=30), 0 unmatched (zero staleness incidents — WS delivered every commit).
+  Receiver p50 decomposition: notify≈0 + latest 1.5s + **rescan ~8–10s
+  (Layer B target)** + apply/git + cycle luck. Origin ≈20s push (shadow tax
+  ~7s dies at 102-enforce) + up-to-a-cycle queueing. Hand benchmark single
+  samples (41.5s baseline / 60.2s collided run) are superseded by the
+  analyzer's population stats.
+- **Phase-1 mark drain root cause #2 (#239 merged):** purge blew the D1
+  ~1,000-subrequest budget (one batch per row), threw mid-page AFTER
+  committing ~707 deletions, and runPhase1 swallowed it as failed++ (which
+  the script didn't print). Fixed: 33-row chunked batches, cursor persisted
+  in finally, drain aborts loudly on repeated failures. Drain re-run in
+  flight (expect ~2,000/pass, ~115 passes, releases ~35.4GB accounting).
+- **In flight:** scan fault isolation + mass-delete circuit breaker +
+  dev-install hygiene (`impl/scan-fault-isolation`); Mac fresh-publish
+  benchmark via APFS-cloned `~/Development-bench` NEW workspace (founder
+  suggestion — validates 99's encrypt gate + FirstPublishStats end-to-end;
+  Mac has 160GB free, Ubuntu is 98% full so the clone lives on the Mac).
+
 ## 2026-07-12 afternoon — NEAR-MISS: phantom mass-delete caught pre-push; fold r3 merged
 
 - **INCIDENT (caught, zero damage):** dev-install left a 92MB mode-000
