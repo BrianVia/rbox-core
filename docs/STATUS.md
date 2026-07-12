@@ -7,6 +7,30 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 afternoon — NEAR-MISS: phantom mass-delete caught pre-push; fold r3 merged
+
+- **INCIDENT (caught, zero damage):** dev-install left a 92MB mode-000
+  `.bun-build` temp INSIDE the workspace; the daemon scan EACCES'd hashing it
+  and the failed scan surfaced as **"126,557 deleted"** — one push from a
+  fleet-wide mass-delete manifest. Daemon wedged before pushing; stopped
+  manually, temp removed, scan sane again. Fix cycle running
+  (`impl/scan-fault-isolation`): per-file scan faults DEFER (never delete),
+  scan-fatal fails the sync loudly, mass-delete circuit breaker
+  (>max(20%,1000) files ⇒ abort push, explicit override only), dev-install
+  builds outside the workspace. SCAN_PRUNE off fleet-wide meanwhile (Layer A
+  exonerated — unrelated — but variables minimized).
+- **Fold round 3 MERGED (#238):** evidence is now self-contained
+  (GlobalManifestMeta carries gitRepos verbatim) — chronic git-repo deferral
+  (the Mac's permanent worktree-branch state) no longer suppresses evidence;
+  restores Mac fast pulls AND Mac delta writes. Fleet rollout of ec0b11dd +
+  re-benchmark = next step.
+- **Mark drain blocked by a second tooling bug:** dryRun honors graceMs
+  (audit: 229,843 purgeable / 35.46GB releasable / 0 resurrect) but the LIVE
+  path purged 0 — route-side graceMs handling fix in flight. Cron continues
+  nibbling regardless; fence probe no longer cares about table size.
+- Reverse benchmark (Mac→Ubuntu) was invalidated by the incident (Ubuntu
+  daemon wedged mid-window).
+
 ## 2026-07-12 midday — gate-compression sprint (founder: "resolve the gates ASAP"; update STATUS continuously)
 
 - **Gate 1 (84 fold) — round 2 PROVEN on Ubuntu; round 3 for the Mac.**
