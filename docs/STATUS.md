@@ -7,6 +7,19 @@
 
 _Last updated: 2026-07-12 (late night) — **v1.0.1 RELEASED + fleet upgraded** (installer binaries, flags `RBOX_PREFLIGHT_DELTA=1 RBOX_CRYPTO_FUSE=1` on both daemons); wave-2/3 merges #221–#226 (102 shadow SOAKING on prod, 99 fused Phase 1, 98 Tier-1 pipeline dark, 100/98 instrumentation); GC drained 1,600/5,410 (~3.34GB) with the final sweep timer armed; telemetry sweep ALL CLEAR; **Mac watcher root-caused → design 104 placeholder** (FSEvents transient drops permanently un-trust the watcher ⇒ ~11% I/O duty cycle; fix = first dev-cycle item next session, pairs with v1.1.0 + design 84 which is still building)._
 
+## 2026-07-12 evening — mark backlog DRAINED; soak collecting at full fidelity
+
+- **Phase-1 drain complete (post-#239):** 228,962 marks purged / 117 passes /
+  0 resurrected / 0 failed; **35.33GB accounting released**; marks table now
+  191 rows; D1 shrank ~44MB. The freed refs cascaded into ~294k gc_candidates
+  aging through the 7-day grace — the daily cron reclaims the R2 bytes
+  automatically through ~07-19. Fence probe can never over-cap now → every
+  commit contributes a real design-102 shadow compare. Check
+  `/v1/admin/delta-soak` (or local AE SQL) for divergence before the enforce
+  decision.
+- **Propagation analyzer merged (#240)**: `bun scripts/propagation-report.ts
+  <originLog> <receiverLog> [--sinceHours N]`.
+
 ## 2026-07-12 late afternoon — design 84 LIVE fleet-wide; first propagation statistics
 
 - **Fold r3 (#238) verified on BOTH hosts:** Ubuntu `fold=evidence f0` 0.9s;
