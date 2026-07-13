@@ -100,7 +100,7 @@
     "RBOX_COMMIT_EARLY_REJECT": "1",
     // Design 102 soak: delta admission computed + compared; response stays on the
     // full path. Flip gate to "enforce": zero HARMFUL divergence over §7.1 soak.
-    "RBOX_COMMIT_DELTA_ADMISSION": "shadow"
+    "RBOX_COMMIT_DELTA_ADMISSION": "enforce"
   },
   // Production environment: separate worker (rbox-prod-api) + its own D1/R2/DO,
   // served at api.rbox.to. Binding NAMES are kept identical to dev so the code is
@@ -175,7 +175,7 @@
       // RBOX_ALLOW_BOOTSTRAP_PLAN is EXPLICITLY "0" in prod (the dev-only bootstrap plan
       // override, design 56 §7). Present-but-off because wrangler refuses env-targeted
       // commands (d1 migrations apply --env production) when a top-level var is absent here.
-      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod", "RBOX_ALLOW_BOOTSTRAP_PLAN": "0", "RBOX_GC_PURGE_DISABLED": "0", "RBOX_COMMIT_EARLY_REJECT": "1", "RBOX_COMMIT_DELTA_ADMISSION": "shadow" },
+      "vars": { "RBOX_NOTIFY_FROM": "security@mail.rbox.to", "RBOX_ENV": "prod", "RBOX_ALLOW_BOOTSTRAP_PLAN": "0", "RBOX_GC_PURGE_DISABLED": "0", "RBOX_COMMIT_EARLY_REJECT": "1", "RBOX_COMMIT_DELTA_ADMISSION": "enforce" },
       "routes": [{ "pattern": "api.rbox.to", "custom_domain": true }]
     }
   }
