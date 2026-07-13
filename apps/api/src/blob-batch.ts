@@ -67,7 +67,9 @@ export async function blobBatchGet(req: Request, env: Env, opts: { accountId: st
   return new Response(streamBatch(op, parsed.shas, opts), { headers: { "content-type": BATCH_BLOB_CONTENT_TYPE } });
 }
 
-type BatchPutAuthOutcome = "fast_path" | "fallback_missing" | "fallback_invalid" | "fallback_expired";
+export type BatchPutAuthOutcome = "fast_path" | "fallback_missing" | "fallback_invalid" | "fallback_expired";
+/** The bearer-path subset of §109 auth outcomes, computed pre-auth in worker.ts. */
+export type BatchPutAuthFallback = Exclude<BatchPutAuthOutcome, "fast_path">;
 
 export async function blobBatchPutWithVerifiedGrant(req: Request, env: Env, accountId: string): Promise<Response> {
   return blobBatchPut(req, env, accountId, "fast_path");

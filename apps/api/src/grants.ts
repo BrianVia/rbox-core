@@ -23,7 +23,7 @@ import { ctEqual } from "./util.js";
 // that a STOLEN grant is useful only briefly. An EXPIRED grant is not a failure:
 // worker routing falls back to the normal bearer-authenticated D1 entitlement path.
 export const GRANT_TTL_MS = 5 * 60_000;
-export const UPLOAD_GRANT_TTL_MS = 5 * 60_000;
+export const UPLOAD_GRANT_TTL_MS = GRANT_TTL_MS; // same value today; a separate name so the two can diverge deliberately
 const UPLOAD_GRANT_EXPIRY_GRACE_MS = 5_000;
 const CLOCK_SKEW_MS = 60_000; // tolerate ≤60s of client/server clock skew on `t` (matches receipts)
 const MIN_KEY_BYTES = 32;
@@ -139,7 +139,7 @@ async function verifyGrantPayload(
   env: Env,
   grant: string,
   nowMs: number,
-  opts: { domain: string; ttlMs: number; requireWorkspace: boolean } = { domain: DOMAIN, ttlMs: GRANT_TTL_MS, requireWorkspace: true },
+  opts: { domain: string; ttlMs: number; requireWorkspace: boolean; maxRemainingMs?: number } = { domain: DOMAIN, ttlMs: GRANT_TTL_MS, requireWorkspace: true },
 ): Promise<InternalGrantVerify> {
   const k = keys(env);
   if (!k) return { ok: false, reason: "no_key" };
@@ -180,10 +180,10 @@ async function verifyGrantPayload(
   if (!(payload.e - payload.t > 0 && payload.e - payload.t <= opts.ttlMs)) return { ok: false, reason: "bad_ttl" };
   if (payload.t > nowMs + CLOCK_SKEW_MS) return { ok: false, reason: "future" };
   if (payload.e <= nowMs) return { ok: false, reason: "expired" };
-  // Upload mint and verification both use Worker clocks, so the client-skew
-  // tolerance above must not extend the revocation-lag window. A small grace
-  // absorbs isolate drift while keeping usable upload grants effectively TTL-bound.
-  if (opts.domain === UPLOAD_DOMAIN && payload.e - nowMs > opts.ttlMs + UPLOAD_GRANT_EXPIRY_GRACE_MS) {
+  // Callers whose mint AND verification both run on Worker clocks (upload grants)
+  // cap remaining life so the client-skew tolerance above cannot extend a
+  // revocation-lag window; the caller-supplied bound keeps this body domain-agnostic.
+  if (opts.maxRemainingMs !== undefined && payload.e - nowMs > opts.maxRemainingMs) {
     return { ok: false, reason: "future" };
   }
 
@@ -241,6 +241,10 @@ export async function verifyUploadGrantCredential(env: Env, grant: string, claim
     domain: UPLOAD_DOMAIN,
     ttlMs: UPLOAD_GRANT_TTL_MS,
     requireWorkspace: false,
+    // Mint AND verify run on Worker clocks, so cap remaining life: the 60s
+    // client-skew tolerance must not extend the revocation-lag window (5s
+    // grace absorbs isolate drift; usable life stays effectively TTL-bound).
+    maxRemainingMs: UPLOAD_GRANT_TTL_MS + UPLOAD_GRANT_EXPIRY_GRACE_MS,
   });
   if (!verified.ok) return verified;
   return { ok: true, accountId: verified.payload.a };

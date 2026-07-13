@@ -128,6 +128,7 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
   // entitled-but-present=0 (an in-flight/crashed prior promote) is reported missing → the
   // client re-stages it. blob_refs is queried FIRST → no existence oracle.
   if (usesReceipts(req)) {
+    const uploadGrantMint = mintUploadGrant(op.env, { accountId, nowMs: Date.now() });
     const have = new Set<string>();
     // §30: batched dispatch — the per-80-sha IN-list SELECTs run grouped in db.batch()
     // calls (one D1 subrequest per group) instead of one serial round-trip per chunk, so
@@ -154,8 +155,9 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
     );
     const missing = uniq.filter((s) => !have.has(s));
     // Empty-shas requests intentionally take this branch: §109 uses them as the
-    // authenticated, dedicated upload-grant refresh transport.
-    const uploadGrant = await mintUploadGrant(op.env, { accountId, nowMs: Date.now() });
+    // authenticated, dedicated upload-grant refresh transport. The mint depends
+    // only on accountId, so it overlapped the D1 lookup above.
+    const uploadGrant = await uploadGrantMint;
     op.done("ok", { count: uniq.length, ratio: uniq.length ? missing.length / uniq.length : 0 });
     return json(uploadGrant ? { missing, uploadGrant } : { missing });
   }

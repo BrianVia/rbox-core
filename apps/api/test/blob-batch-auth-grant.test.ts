@@ -12,7 +12,7 @@ import {
   verifyUploadGrantCredential,
 } from "../src/grants.js";
 import { verifyReceipt } from "../src/receipts.js";
-import { blobKey } from "../src/util.js";
+import { blobKey, toHex } from "../src/util.js";
 
 const BASE = "https://example.com";
 const KEY = "u".repeat(40);
@@ -57,15 +57,14 @@ const b64url = (bytes: Uint8Array): string => {
   for (const byte of bytes) s += String.fromCharCode(byte);
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
-const hex = (buf: ArrayBuffer): string => [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 async function signedUploadPayload(key: string, payload: unknown): Promise<string> {
   const enc = new TextEncoder();
-  const kid = hex(await crypto.subtle.digest("SHA-256", enc.encode(key))).slice(0, 8);
+  const kid = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(key)))).slice(0, 8);
   const payloadB64 = b64url(enc.encode(JSON.stringify(payload)));
   const body = `${kid}.${payloadB64}`;
   const ck = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const mac = hex(await crypto.subtle.sign("HMAC", ck, enc.encode(`rbox.upload-grant.v1|${body}`)));
+  const mac = toHex(new Uint8Array(await crypto.subtle.sign("HMAC", ck, enc.encode(`rbox.upload-grant.v1|${body}`))));
   return `${body}.${b64url(enc.encode(mac))}`;
 }
 

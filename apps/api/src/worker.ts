@@ -20,7 +20,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { AccountDeleteMessage, DeviceNotifyMessage, Env, WorkerEntrypointExports } from "./env.js";
 import { authenticate } from "./auth.js";
-import { blobBatchGetWithVerifiedGrant, blobBatchPutWithVerifiedGrant } from "./blob-batch.js";
+import { blobBatchGetWithVerifiedGrant, blobBatchPutWithVerifiedGrant, type BatchPutAuthFallback } from "./blob-batch.js";
 import { blobGetWithVerifiedGrant, usesReceipts } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
@@ -262,14 +262,15 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   // ANY failure fall through to authenticate() (the bearer is on every request). The
   // route never parses an unverified account id and never leaks whether a kid/account
   // exists (silent fallback).
+  let batchPutAuthFallback: BatchPutAuthFallback | undefined;
   if (req.method === "POST" && eq(seg, ["v1", "blob-batch", "put"]) && uploadGrantsEnabled(env)) {
     const grant = req.headers.get("x-rbox-upload-grant");
     if (grant && usesReceipts(req)) {
       const verified = await verifyUploadGrantCredential(env, grant, { nowMs: Date.now() });
       if (verified.ok) return blobBatchPutWithVerifiedGrant(req, env, verified.accountId);
-      ctx.batchPutAuthFallback = verified.reason === "expired" ? "fallback_expired" : "fallback_invalid";
+      batchPutAuthFallback = verified.reason === "expired" ? "fallback_expired" : "fallback_invalid";
     } else {
-      ctx.batchPutAuthFallback = grant ? "fallback_invalid" : "fallback_missing";
+      batchPutAuthFallback = grant ? "fallback_invalid" : "fallback_missing";
     }
   }
 
@@ -299,7 +300,7 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
   if ((r = await billingRoutes(ctx, p))) return r;
   if ((r = await accountRoutes(ctx, p))) return r;
   if ((r = await keysRoutes(ctx, p))) return r;
-  if ((r = await blobBatchRoutes(ctx, p))) return r;
+  if ((r = await blobBatchRoutes(ctx, p, batchPutAuthFallback))) return r;
   if ((r = await blobsRoutes(ctx, p))) return r;
   if ((r = await diagnosticsRoutes(ctx, p))) return r;
   if ((r = await syncRoutes(ctx, p))) return r;
