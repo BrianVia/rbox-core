@@ -1,7 +1,8 @@
 # 110 — First-publish commit-tail latency
 
-Status: UNDER REVIEW, 2026-07-12 — codex rounds 1-3 adopted (see
-`docs/design/REVIEW-110.md`).
+Status: REVIEWED — ALIGNED, 2026-07-12, after 5 codex adversarial rounds
+(4 substantive + 1 confirmation; adjudication in `docs/design/REVIEW-110.md`).
+Pending the joint seam round with designs 109/111 before implementation.
 
 This design addresses the long synchronous tail of a greenfield first publish.
 It deliberately does not change manifest semantics, the signed commit format, or

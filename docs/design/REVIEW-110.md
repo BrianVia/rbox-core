@@ -81,7 +81,18 @@ fixes. Round-3 items 2-7 confirmed RESOLVED.
 
 ## Round 5 — 2026-07-12 (confirmation round for the round-4 prescribed fixes)
 
-<!-- filled after the confirmation run -->
+Verdict: **ALIGNED.** Both round-4 fixes confirmed RESOLVED: (1) the §3
+sequence returns A's 422 before accounting while 402/fence/200 occur only
+after exactly one accounting pass — admission-before-success preserved;
+(2) the two mark-timing fixtures assert the correct classes
+(`A == R != B` → `divergence`; `R != A` → `state_moved`). No unrelated
+sections disturbed.
+
+**Final state: ALIGNED after 5 rounds (4 substantive + 1 confirmation).**
+The design is a conditional pipeline — Phase 0 field attribution → Phase 0.5
+D1 limits/prototype with a fixed stop rule → shadow with a fail-closed
+three-read divergence protocol → enforce — every gate fail-closed, ordering
+dependency on design 111's commit-request shape recorded in the doc.
 
 ## Seam items (for the joint round with 109/111)
 
