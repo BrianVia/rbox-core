@@ -137,7 +137,7 @@ describe("FirstPublishStats", () => {
     const stats = finishFirstPublishStats()!;
     expect(Object.keys(stats).sort()).toEqual([
       "authCallCount", "authCriticalPathMs", "commitWallMs", "duplicateEncryptions",
-      "encryptWallMs", "firstReadyToFirstUploadStartMs", "missingCheckWallMs",
+      "encryptWallMs", "finalDrainMs", "firstReadyToFirstUploadStartMs", "missingCheckWallMs",
       "peakQueueHeapBytes", "peakTempDiskBytes", "peakUploaderFramingBytes",
       "producerCpuSaturationPct", "reEncryptedOnResume", "receiptRedemptionOverlapMs",
       "receiptRedemptionWallMs", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",

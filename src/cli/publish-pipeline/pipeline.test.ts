@@ -15,6 +15,7 @@ import {
 import type { WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { encryptAndUpload } from "../sync-recovery.js";
+import { beginFirstPublishTiming, firstPublishTiming } from "../upload-lane-timing.js";
 import { runPublishPipeline } from "./pipeline.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
@@ -312,6 +313,42 @@ test("encryptAndUpload routes flag-off and small pushes to legacy, large pushes 
       else expect(remote.checks.length).toBe(1);
       expect(sawRunTemp).toBe(pipeline);
     } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+  }
+});
+
+test("failed pipeline PUT closes first-publish upload activity", async () => {
+  const fx = await fixture(64);
+  try {
+    beginFirstPublishTiming(true);
+    const remote = new PipelineRemote();
+    const fatal = new Error("pipeline PUT failed");
+    remote.putHook = () => { throw fatal; };
+    await withEnv({ RBOX_PUBLISH_PIPELINE: "1", RBOX_CRYPTO_FUSE: "0" }, async () => {
+      await expect(encryptAndUpload(remote as unknown as SyncRemote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {})).rejects.toBe(fatal);
+    });
+    expect(firstPublishTiming.uploadActive).toBe(0);
+    expect(firstPublishTiming.uploadOpenAt).toBe(0);
+  } finally {
+    beginFirstPublishTiming(false);
+    await fs.rm(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("failed legacy PUT closes first-publish upload activity", async () => {
+  const fx = await fixture(1);
+  try {
+    beginFirstPublishTiming(true);
+    const remote = new PipelineRemote();
+    const fatal = new Error("legacy PUT failed");
+    remote.putHook = () => { throw fatal; };
+    await withEnv({ RBOX_PUBLISH_PIPELINE: undefined, RBOX_CRYPTO_FUSE: "0" }, async () => {
+      await expect(encryptAndUpload(remote as unknown as SyncRemote, fx.root, configFor(fx.root, generateKek()), fx.local, emptyManifest(), PhaseReport.disabled(), undefined, async () => {})).rejects.toBe(fatal);
+    });
+    expect(firstPublishTiming.uploadActive).toBe(0);
+    expect(firstPublishTiming.uploadOpenAt).toBe(0);
+  } finally {
+    beginFirstPublishTiming(false);
+    await fs.rm(fx.root, { recursive: true, force: true });
   }
 });
 

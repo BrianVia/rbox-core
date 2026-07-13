@@ -402,11 +402,12 @@ export async function encryptAndUpload(
           const callerOwnsLaneTiming = LANE_TIMING && api.ownsUploadLaneTiming?.(size) !== true;
           firstPublishUploadStart();
           const t0 = callerOwnsLaneTiming ? performance.now() : 0;
-          await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
-            byteTracker.setProgress(uploadEncSha, abs);
-            emitUploadProgress(f.path);
-          });
-          firstPublishUploadEnd();
+          try {
+            await api.putBlobFile(uploadEncSha, ct, size, uploadsDir, (abs) => {
+              byteTracker.setProgress(uploadEncSha, abs);
+              emitUploadProgress(f.path);
+            });
+          } finally { firstPublishUploadEnd(); }
           if (callerOwnsLaneTiming) {
             uploadLaneTiming.uploadMs += performance.now() - t0;
             uploadLaneTiming.blobs++;
