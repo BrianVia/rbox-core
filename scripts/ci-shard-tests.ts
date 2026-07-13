@@ -28,6 +28,8 @@ const HEAVY_WEIGHTS: Record<string, number> = {
   "src/cli/daemon-logs.test.ts": 5,
   "src/cli/daemon/daemon-watch-degrade.test.ts": 5,
   "src/engine/e2ee/e2ee-e2e.test.ts": 4,
+  // Compiles the pool-exit fixture into a ~100MB standalone binary and runs it.
+  "src/engine/crypto-pool-exit-compiled.test.ts": 3,
 };
 
 const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?: number[] }> = {

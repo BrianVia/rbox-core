@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dir, "..");
-export const CRYPTO_WORKER_BUNDLE = path.join(ROOT, "src", "engine", "generated", "crypto-worker.bundle.js");
+export const CRYPTO_WORKER_BUNDLE = path.join(ROOT, "src", "engine", "generated", "crypto-worker.bundle.txt");
 
 export function buildCryptoWorkerBundle(): void {
   fs.mkdirSync(path.dirname(CRYPTO_WORKER_BUNDLE), { recursive: true });

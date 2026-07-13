@@ -24,7 +24,10 @@ export async function cleanupEmbeddedWorker(): Promise<void> {
 
 async function embeddedWorkerFile(): Promise<string> {
   if (embeddedWorkerPath) return embeddedWorkerPath;
-  const mod = (await import("./generated/crypto-worker.bundle.js", { with: { type: "text" } })) as { default: string };
+  const mod = (await import("./generated/crypto-worker.bundle.txt", { with: { type: "text" } })) as { default: unknown };
+  if (typeof mod.default !== "string" || mod.default.length === 0) {
+    throw new Error("embedded crypto worker bundle missing or not text — compiled-binary build issue");
+  }
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-crypto-worker-"));
   await fs.chmod(dir, 0o700).catch(() => {});
   const file = path.join(dir, "crypto-worker.bundle.js");
