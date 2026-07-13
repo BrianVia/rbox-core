@@ -1,8 +1,11 @@
 # 116 — Checkout follows sync
 
-Status: **INITIAL DESIGN** (2026-07-13). Not yet through the adversarial
-alignment loop. Initial source/adversarial findings are folded here; ledger:
-[REVIEW-116](./REVIEW-116.md). This is an active correctness design, not a
+Status: **ALIGNED** (2026-07-13) — eight codex adversarial rounds (r1-r5
+finding rounds, r6-r8 confirmation chain on the final keep-mine closure
+seam); every finding adjudicated against code and folded, marked `(rN Fn)`
+inline. Ledger: [REVIEW-116](./REVIEW-116.md). Phase 0 (incident
+reproduction) is a mandatory pre-implementation gate and survived review
+strengthened, not weakened. This is an active correctness design, not a
 shelf note.
 
 **Founder-set principle:** the checkout follows you. rbox promises: close the

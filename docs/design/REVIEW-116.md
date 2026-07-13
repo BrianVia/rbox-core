@@ -2,8 +2,10 @@
 
 Design class: active Git correctness and no-clobber behavior.
 
-Status: initial-draft scrutiny complete; formal `/arbitrage` alignment loop has
-not run. The design remains **INITIAL**, not implementation-approved.
+Status: **ALIGNED** (2026-07-13) after eight codex rounds (five finding
+rounds r1-r5, confirmation chain r6-r8). Implementation may be dispatched;
+Phase 0 (incident reproduction, evidence-first) remains a mandatory gate
+before any predicate change lands.
 
 ## Initial source and adversarial pass — CHANGES-REQUIRED
 
@@ -334,13 +336,27 @@ otherwise); keep-mine's protect step verifies closure for legacy sections
 and packs missing-but-locally-present objects into a supplementary
 quarantine pack, refusing without closure.
 
-## Round 8 (codex, final confirmation)
+## Round 8 (codex, final confirmation) — ALIGNED
 
-- Confirm the Phase-0 incident reproduction and actual failing control-flow
-  seam.
-- Adversarially prove or reject the schema-5 common-store tracking convergence
-  rule; if rejected, ship config-only remote tracking and split actual
-  `refs/remotes/*` into a separate design.
-- Verify the checkout linearization contract against real Git lock behavior and
-  injected concurrent file/Git operations.
-- Run formal arbitrage rounds to alignment before implementation dispatch.
+"The fold closes the round-7 trace: schema-5 capture now guarantees every
+index-referenced object is included in the bundle chain or capture defers,
+while keep-mine repairs legacy sections with a supplementary quarantine pack
+and refuses before clearing when closure is impossible. No new BLOCKER or
+MAJOR is introduced."
+
+## Remaining work (implementation phase, not review blockers)
+
+- **Phase 0 stays mandatory**: daemon-stop + immutable raw snapshot first,
+  live current-code candidates (needsResolution identity freeze, busy-carry
+  incl. stale editor lockfile, pending suppression) checked before any
+  bisect; no predicate change lands on narrative alone.
+- The tracking-lane cross-shape convergence trace and two idle cycles remain
+  a shipping gate: if it oscillates, `tracking` does not ship and remote
+  tracking stays config-only (unchanged from the draft).
+- Rig gate: measured publish→bytes-on-disk propagation unchanged before
+  default-on (r2 F3).
+- Round-6/7 MINORs to carry into implementation review: keep-mine episode
+  record lifetime, shell.deferrals boundary matching + bounds fixtures,
+  supplementary-pack GC accounting.
+- Verify the `symref-update`-in-transaction capability floor against the
+  fleet's actual git versions during implementation (r1 F3 probe).
