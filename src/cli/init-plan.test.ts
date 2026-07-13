@@ -1,8 +1,8 @@
 import { test, expect } from "bun:test";
 import {
   resolveInitPlan,
+  resolveWorkspaceDeviceId,
   isInitError,
-  unifyDeviceId,
   collapseHome,
   sanitizeWorkspaceName,
   interpretWorkspaceNameAnswer,
@@ -179,11 +179,19 @@ test("collapseHome: collapses the home prefix to ~, leaves outside paths untouch
 
 // ── device-id unification (review #9) ──────────────────────────────────────
 
-test("device id unifies to the server-issued credential id", () => {
-  expect(unifyDeviceId(creds({ deviceId: "dev_server1" }))).toEqual({ kind: "fixed", id: "dev_server1" });
+test("workspace device id precedence", () => {
+  let mints = 0;
+  const mint = () => `dev_mint${++mints}`;
+  expect(resolveWorkspaceDeviceId({ forceNew: true, override: "dev_override", prevDeviceId: "dev_prev", enrolledDeviceId: "dev_enrolled", credsDeviceId: "dev_creds", mint })).toBe("dev_mint1");
+  expect(resolveWorkspaceDeviceId({ override: "dev_override", prevDeviceId: "dev_prev", enrolledDeviceId: "dev_enrolled", credsDeviceId: "dev_creds", mint })).toBe("dev_override");
+  expect(resolveWorkspaceDeviceId({ prevDeviceId: "dev_prev", enrolledDeviceId: "dev_enrolled", credsDeviceId: "dev_creds", mint })).toBe("dev_enrolled");
+  expect(resolveWorkspaceDeviceId({ prevDeviceId: "dev_prev", credsDeviceId: "dev_creds", mint })).toBe("dev_prev");
+  expect(resolveWorkspaceDeviceId({ credsDeviceId: "dev_creds", mint })).toBe("dev_creds");
+  expect(resolveWorkspaceDeviceId({ credsDeviceId: "env", mint })).toBe("dev_mint2");
 });
 
-test("RBOX_TOKEN env-placeholder ('env') and no creds → from-credentials (executor resolves)", () => {
-  expect(unifyDeviceId(creds({ deviceId: "env" }))).toEqual({ kind: "from-credentials" });
-  expect(unifyDeviceId(undefined)).toEqual({ kind: "from-credentials" });
+test("two workspaces reuse the same enrolled device with RBOX_TOKEN credentials", () => {
+  const resolve = () => resolveWorkspaceDeviceId({ enrolledDeviceId: "dev_machine", credsDeviceId: "env", mint: () => "dev_unused" });
+  expect(resolve()).toBe("dev_machine");
+  expect(resolve()).toBe("dev_machine");
 });

@@ -8,11 +8,12 @@
  * (create a new workspace, or pick an existing one by name) rather than silently
  * creating — `--no-interactive` (or a non-TTY) keeps the unattended create-new path.
  */
-import crypto from "node:crypto";
 import path from "node:path";
 import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
+import { enrolledDeviceId } from "./e2ee-keystore.js";
+import { resolveWorkspaceDeviceId } from "./init-plan.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -88,11 +89,13 @@ export async function track(
       schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
       remoteWorkspaceId: workspaceId,
       projectId,
-      deviceId:
-        flags.device ??
-        prev?.deviceId ??
-        (creds?.deviceId !== "env" ? creds?.deviceId : undefined) ??
-        `dev_${crypto.randomUUID().slice(0, 8)}`,
+      deviceId: resolveWorkspaceDeviceId({
+        forceNew: flags["new-device"] === "true",
+        override: flags.device,
+        prevDeviceId: prev?.deviceId,
+        enrolledDeviceId: await enrolledDeviceId(creds?.accountId),
+        credsDeviceId: creds?.deviceId,
+      }),
       rootPath: root,
       remoteUrl,
       token: "", // token comes from `rbox login` (per-machine credential), never config

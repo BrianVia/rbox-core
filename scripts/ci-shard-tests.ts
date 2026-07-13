@@ -256,9 +256,12 @@ for (const unit of splitUnits) {
   const file = unit.files[0]!;
   splitGroups.set(file, [...(splitGroups.get(file) ?? []), ...(unit.names ?? [])]);
 }
+// Shared self-hosted runners contend (8 runners/box + local dev load); bun's 5s
+// default per-test timeout flakes under that load. 15s still catches real hangs.
+const TEST_TIMEOUT = ["--timeout", "15000"];
 const commands = [
-  ...(fileUnits.length > 0 ? [["bun", "test", ...fileUnits.flatMap((unit) => unit.files)]] : []),
-  ...[...splitGroups.entries()].map(([file, names]) => ["bun", "test", "--test-name-pattern", patternFor(names), file]),
+  ...(fileUnits.length > 0 ? [["bun", "test", ...TEST_TIMEOUT, ...fileUnits.flatMap((unit) => unit.files)]] : []),
+  ...[...splitGroups.entries()].map(([file, names]) => ["bun", "test", ...TEST_TIMEOUT, "--test-name-pattern", patternFor(names), file]),
 ];
 const rendered = commands.map((argv) => argv.map(shellQuote).join(" ")).join("\n");
 
