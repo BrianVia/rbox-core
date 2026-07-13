@@ -80,10 +80,12 @@ a large wave forms full batches via `dispatchFull()` and only the residue is
 timer-drained. The timer hypothesis is the most probable mechanism consistent
 with the code paths, but its share is unproven. This design therefore treats
 fill-v2 as a **measurement-first experiment**: the implementation adds
-low-cardinality dispatch-reason counters (`full_records`, `full_bytes`,
-`quiet`, `absolute`, `idle_tail`) plus queued-record depth and oldest-record
-age at dispatch, and the fill-v1 baseline run must show timer/idle partials
-dominating before the causal claim is asserted in any report.
+low-cardinality dispatch-reason counters — per fill version, matching each
+version's actual dispatch paths: fill-v1 emits `full_records`, `full_bytes`,
+`fixed_timer`, `idle_tail`; fill-v2 emits `full_records`, `full_bytes`,
+`quiet`, `absolute`, `idle_tail` — plus queued-record depth and oldest-record
+age at dispatch. The fill-v1 baseline run must show `fixed_timer`/`idle_tail`
+partials dominating before the causal claim is asserted in any report.
 
 The producer is deliberately bounded: the publish pipeline uses
 `encryptConcurrency(...)` (normally eight workers) feeding up to 512 upload
@@ -326,7 +328,7 @@ Rollout order is binding:
 | 32 | 32 | Current compatible behavior; fill-v2 may improve occupancy. |
 | 64 | 32 | Backward-compatible; server capability is unused. |
 | 64 | 64 | Target behavior. |
-| 32 | 64 | Invalid rollout/rollback ordering. Without the latch below this would be UNBOUNDED degradation, not a one-off: today's client treats a 400 like any non-OK response — `fallbackAll` re-uploads that request as singles and keeps forming oversized batches forever (unlike 404/405, a 400 latches nothing). Mitigations below make it one-shot per process and alertable. |
+| 32 | 64 | Invalid rollout/rollback ordering. Without the latch below this would be UNBOUNDED degradation, not a one-off: today's client treats a 400 like any non-OK response — `fallbackAll` re-uploads that request as singles and keeps forming oversized batches forever (unlike 404/405, a 400 latches nothing). Mitigations below reduce it to one latch event plus a bounded in-flight burst (≤ slots), and make it alertable. |
 | old/no batch route | 64-cap client | Existing 404/405 process-wide single-PUT fallback. |
 
 The skewed-rollback path needs three concrete mechanisms, because a
@@ -344,8 +346,10 @@ new-client/old-server pair cannot rely on any new server contract:
    oversized requests in flight at latch time (≤ slots, 24 by default)
    degraded requests per process**, not exactly one. The latch prevents any
    NEW oversized batch from being carved: the session cap is a mutable field
-   read at carve time, so queued not-yet-carved groups automatically re-carve
-   at 32; only batches already carved and launching stay oversized.
+   that replaces `config.records` at BOTH read sites — `dispatchFull()`'s
+   fullness check and `carve()`'s take limit — so queued not-yet-carved
+   groups automatically re-carve at 32; only batches already carved and
+   launching stay oversized.
 2. **Server `too_many_records` outcome (ships with the server change).** The
    current handler collapses every parse failure into AE outcome
    `bad_request` with `count: 0` — an alert on the skew condition is not
@@ -415,14 +419,19 @@ is also a prerequisite, since older clients clamp `RBOX_BATCH_RECORDS` to 32):
   RSS + `peakUploaderFramingBytes`.
 
 Measurement sources are named because round 1 found gates that could not be
-evaluated from existing telemetry: per-batch fill distributions (mean/p50)
-come from per-event AE `blob.batchPut` `count`; the client dispatch-reason
-counters are reported **independently, one per reason** — only `idle_tail` is
-an observed idle-tail dispatch; `absolute` can equally mean a sustained slow
-trickle mid-publish, and a genuine end-of-producer tail can ship via `quiet`,
-so no reason combination is labeled "the tail" (a true logical
-end-of-producer marker would need a producer-closed signal this design does
-not add — that quantity is simply unavailable). Response size is bounded
+evaluated from existing telemetry: overall per-batch fill distributions
+(mean/p50) come from per-event AE `blob.batchPut` `count`. Per-reason fill is
+NOT derivable by joining server AE with independent client counters — so the
+client records, under lane timing/sweep mode only, a per-dispatch observation
+of `(reason, records, bytes)` (numbers and one enum; local sweep output, no
+identifiers), from which the sweep reports per-reason dispatch counts and
+record-count histograms. Reasons are reported **independently, one per
+reason** — only `idle_tail` is an observed idle-tail dispatch; `absolute` can
+equally mean a sustained slow trickle mid-publish, and a genuine
+end-of-producer tail can ship via `quiet`, so no reason combination is
+labeled "the tail" (a true logical end-of-producer marker would need a
+producer-closed signal this design does not add — that quantity is simply
+unavailable). Response size is bounded
 analytically (results array of ≤64 fixed-shape records, receipt string of
 measured size) and spot-checked in the boundary tests.
 
@@ -450,12 +459,14 @@ Promotion of client default 64 requires all of:
    not fall, keep fill-v2/32 and do not promote 64.
 5. **Resource gate:** zero Worker 1102/resource-limit errors across the sweep;
    p99 handler wall at 64 <10 s; client peak process RSS (aggregate memory)
-   and `peakUploaderFramingBytes` (per-request framing peak — see the
-   measurement-honesty note above) each within 10% of the 32-record cells
-   (framing is slots × body-cap bounded, so no growth is expected);
-   single-PUT fallback and retry counts non-inferior. The existing #245
-   result is respected: slots remain 24 and are not swept upward as part of
-   this design.
+   within 10% of the 32-record cells (the aggregate bound is slots × body
+   cap, unchanged by this design); `peakUploaderFramingBytes` (per-request
+   framing peak) checked against its **analytical ceiling** of ~2× (body cap
+   + frame headers) — it is EXPECTED to grow roughly with per-request fill
+   (a full 64-record FM batch frames ~2 × 547 KB vs ~2 × 274 KB at 32), so
+   it gets a ceiling, not a no-growth comparison; single-PUT fallback and
+   retry counts non-inferior. The existing #245 result is respected: slots
+   remain 24 and are not swept upward as part of this design.
 6. **Correctness gate:** identical committed ref set, all receipts redeemed,
    resume after injected mid-upload failure converges without double accounting,
    and all design-96/102 fence assertions pass.
