@@ -7,10 +7,8 @@ import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../erro
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
 import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../../upload-lane-timing.js";
 import { SingleGate, uploadDisabled, disableUploadForProcess, incrementDispatchCount } from "./gate.js";
-import { uploadBatchConfig, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY } from "./config.js";
-import type { BatchConfig } from "./config.js";
-import { framedBytes, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES } from "./wire.js";
-import type { BatchPutResponseRecord } from "./wire.js";
+import { uploadBatchConfig, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig } from "./config.js";
+import { framedBytes, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
 
 interface BatchPutWaiter {
   srcPath: string;

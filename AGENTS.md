@@ -20,6 +20,16 @@ Brian's preferred loop — follow it unless told otherwise:
 7. (Optional) release a new CLI build if the change warrants it
    (`docs/DEPLOYMENTS.md` has the release flow).
 
+## Module ownership map (docs/CODEMAP.md)
+
+`docs/CODEMAP.md` is the canonical ownership map of the sync engine
+(`src/cli/sync*`, `src/cli/daemon*`, `src/cli/e2ee-remote*`,
+`src/cli/remote/`, `src/cli/publish-pipeline/`, `src/engine/`): one line per
+module — what it owns, what it must never own. Specs cite CODEMAP lines
+instead of re-deriving structure from line numbers. **Any PR that adds a
+module under those trees, or changes what a module owns, updates its CODEMAP
+line in the same PR.**
+
 ## Deployment & local dev
 
 **How every surface ships (API worker / web dashboard / CLI binaries), the

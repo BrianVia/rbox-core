@@ -105,3 +105,70 @@ round.)
 remaining line ranges (daemon class 246–1963, sync pull/push, crypto
 resolver/pool/registry, E2EE class, blob decoder/downloader/uploader) as
 sound. Plan considered ALIGNED pending founder review of the revision.
+
+---
+
+## Wave completion record
+
+Per-wave adversarial reviews and gate results live in the wave PR bodies:
+
+| Wave | PR | Scope |
+|---|---|---|
+| 1a | #258 | blob-batch → `remote/blob-batch/` (wire/gate/config/downloader/uploader) |
+| 1b | #257 | crypto-pool → `engine/crypto-pool/` + `crypto-worker-files.ts` (compiled smoke passed) |
+| 1c | #256 | e2ee contracts → `e2ee-remote-types.ts` |
+| 2a | #259 | sync-git → `sync-git/` (shared/plan/config-lane/fingerprint/divergence-cache/apply/status) |
+| 2b | #260 | daemon satellites → `daemon/` (policy/render/daemon) |
+| 3 | #261 | sync → `sync/` (policy/format/deps/pull/push/sync) |
+| 4 | #262 | comment sweep (comments + ledger appends only) |
+| 5 | this PR | CODEMAP + AGENTS.md pointer + final adversarial pass |
+
+## Wave 5 — final adversarial pass over the CUMULATIVE restructure
+
+Codex (gpt-5.6-sol) reviewed `git diff f060b5f9..HEAD -- src/ scripts/`
+(the whole restructure, waves 1–4 merged) with the plan's §5 final brief —
+behavior deltas, dropped constraint comments, double-instantiated module
+state — plus barrel-surface drift vs the pre-split originals and new import
+cycles vs the 3-cycle baseline.
+
+**VERDICT: ALIGNED — zero findings.** Codex verified: no runtime behavior
+delta (including the four §8 risk-register carves: push try/finally arming,
+GIT_FINGERPRINT_VERSION adjacency, daemon dynamic import, crypto-pool
+MODULE_DIR depth); every piece of module-level mutable state has exactly one
+definition site; all six pre-split export surfaces match their barrels with
+no type/value drift; no constraint comment dropped by the wave-4 sweep is
+unpreserved; no internal module imports its own barrel; madge matches the
+3-cycle baseline exactly.
+
+### /simplify pass (4 review agents: reuse, simplification, efficiency, altitude)
+
+Applied (split artifacts, zero logic): merged the carve-emitted separate
+`import type` statements into their sibling value imports in
+`remote/blob-batch/downloader.ts` (config.js) and `uploader.ts` (config.js,
+wire.js). Everything else clean; pre-existing patterns recorded as post-113
+follow-ups (see the wave-5 PR body): the `envInt` copy in
+`sync-git/shared.ts` vs `remote/resilient.ts`, duplicate `sleep` helpers,
+zero-importer barrel exports faithfully preserved from the pre-split
+surfaces, and newly-possible deep imports (`status-cmd.ts` →
+`sync-git/status.js`) that would ripple call sites.
+
+### /antislop-codebase pass (structure hygiene, naming, barrel quality, test placement)
+
+All four angles clean. One RECORD-ONLY finding: `src/cli/sync/push.ts` is
+613 lines — over the <600 target and not on the §2.7 exception list (the §2
+estimate was ~590; content ownership verified correct, pure move
+arithmetic). Follow-up: trim or amend §2.7. CODEMAP verified line-by-line
+against actual module contents by two independent agents — no corrections
+needed.
+
+### Wave-5 gates
+
+`bun test ./src/` 1452 pass / 6 skip / 2 fail (exactly the two tolerated
+host flakes: shellStateOf status --json, same-SHA metadata heal — identical
+on clean main); typecheck clean (root + apps/api); ci-shard guard green
+(135 files / 149 units / 6 shards); madge = the 3 baseline cycles, zero
+new; files-first privacy + sync-mutex drift greps re-run green (26/26).
+
+**Workstream closed.** `docs/CODEMAP.md` is the §6 artifact; AGENTS.md
+carries the maintenance rule (any PR adding a module or changing ownership
+updates its CODEMAP line).
