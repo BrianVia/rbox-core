@@ -59,7 +59,7 @@ src/cli/daemon/render.ts     — daemon log-line rendering: log, scanStatsLine, 
 
 ```
 src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/release/withWorkspaceSyncMutex) + degraded lock-unsupported fallback, CLI vs daemon acquisition policy. Never: the lockfile primitive itself (engine/git/lockfile.ts).
-src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
+src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing, flag-gated serialized receipt-drainer wiring) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
 src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
 src/cli/daemon-control.ts     — daemon process lifecycle + on-disk records: binding/pid files, start/stop/liveness/PID-ownership, rbox logs tailing. Never: the daemon's sync loop (daemon/).
 src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming + dispatch-reason accumulators, overlap math, summary formatters. Never: network or file I/O.
@@ -103,7 +103,7 @@ src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, f
 src/cli/publish-pipeline/pipeline.ts        — runPublishPipeline: producer-consumer graph (dynamic encrypt lane, rolling missingBlobs batching, budgeted upload scheduler) under one abort scope; flag-gated alternative to the serialized path in sync-recovery.ts. Never: leaf helpers (shared.ts), transport.
 src/cli/publish-pipeline/budget.ts          — ResourceBudget: generic FIFO-fair reservation/release counter (items/bytes/heap axes). Pure concurrency primitive. Never: domain knowledge of blobs/uploads.
 src/cli/publish-pipeline/ready-queue.ts     — ReadyQueue: budgeted producer→consumer channel of ready ciphertexts (backpressure, EOF, disposition-gated release). Never: encryption or upload themselves.
-src/cli/publish-pipeline/receipt-drainer.ts — ReceiptDrainer: single-flight, generation-safe, error-latched mid-upload receipt redemption over a ReceiptPort abstraction. Never: the HTTP transport directly.
+src/cli/publish-pipeline/receipt-drainer.ts — ReceiptDrainer + its shared threshold default: single-flight, generation-safe, error-latched mid-upload receipt redemption and backpressure waiting over a ReceiptPort abstraction. Never: the HTTP transport directly.
 src/cli/publish-pipeline/shared.ts          — leaf helpers shared by the serialized path AND the pipeline (cipher-descriptor mapping, classifyCacheHit, churn/error helpers, concurrency clamps, lease materialization). Never: importing sync-recovery.ts (keeps the graph acyclic).
 src/cli/publish-pipeline/stale-temp.ts      — stale enc-* temp-dir reclamation at push start (reclaimStaleTemps, createRunTempDir) under the sync mutex. Best-effort. Never: correctness-bearing state.
 ```

@@ -161,6 +161,38 @@ export function emitCompletePhases(env: Env, outcome: string, t: CompletePhaseTi
   }
 }
 
+export interface RedeemPhaseTimings {
+  totalMs: number;
+  precheckMs: number;
+  verifyMs: number;
+  accountingMs: number;
+  count: number;
+  bytes: number;
+  granted: number;
+  alreadyEntitled: number;
+  rejected: number;
+}
+
+/** Design 111 Phase 0 — assigns the redemption wall to entitlement precheck vs
+ * receipt HMAC verification vs D1 accounting. Any design 110/111 measurement
+ * cell must record the design-112 rollout state (fill version + records cap) per
+ * the REVIEW-109-111-seam.md addendum. Numbers only; the frozen positional
+ * MetricEvent layout remains untouched. */
+export function emitRedeemPhases(env: Env, outcome: string, t: RedeemPhaseTimings): void {
+  try {
+    env.rbox_metrics?.writeDataPoint({
+      indexes: ["receipts.redeem.phases"],
+      blobs: ["receipts.redeem.phases", outcome],
+      doubles: [
+        t.totalMs, t.precheckMs, t.verifyMs, t.accountingMs, t.count,
+        t.bytes, t.granted, t.alreadyEntitled, t.rejected,
+      ],
+    });
+  } catch {
+    // telemetry must never break the request path
+  }
+}
+
 /**
  * Per-op span collector. Accumulates D1 / R2 / DO sub-timings (and D1 call count)
  * across nested or FAILING calls, so the one emitted metric attributes time

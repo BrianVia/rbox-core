@@ -137,10 +137,11 @@ describe("FirstPublishStats", () => {
     const stats = finishFirstPublishStats()!;
     expect(Object.keys(stats).sort()).toEqual([
       "authCallCount", "authCriticalPathMs", "commitWallMs", "duplicateEncryptions",
-      "encryptWallMs", "finalDrainMs", "firstReadyToFirstUploadStartMs", "missingCheckWallMs",
+      "encryptWallMs", "finalDrainMs", "finalFlushMs", "firstReadyToFirstUploadStartMs", "missingCheckWallMs",
       "peakQueueHeapBytes", "peakTempDiskBytes", "peakUploaderFramingBytes",
       "producerCpuSaturationPct", "reEncryptedOnResume", "receiptRedemptionOverlapMs",
-      "receiptRedemptionWallMs", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",
+      "receiptRedemptionWallMs", "redeemMaxEntryBytes", "redeemMaxRequestBytes",
+      "redeemReceiptCount", "redeemRequestCount", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",
       "timeToFilesSyncedMs", "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
     ]);
     expect(Object.values(stats).every((n) => Number.isInteger(n) && n >= 0)).toBe(true);

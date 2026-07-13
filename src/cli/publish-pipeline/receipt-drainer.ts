@@ -7,6 +7,9 @@
  */
 import type { ReceiptRedeemResult } from "../remote/commits.js";
 
+/** Shared by the design-98 pipeline and design-111 serialized upload drainer. */
+export const DEFAULT_REDEEM_THRESHOLD = 5_000;
+
 export interface ReceiptPort {
   receiptCount(): number;
   redeem(): Promise<ReceiptRedeemResult[]>;
@@ -23,7 +26,8 @@ export class ReceiptDrainer {
   private readonly threshold: number;
   private readonly onError: (error: Error) => void;
   private readonly needsUpload = new Set<string>();
-  private readonly drainCallbacks = new Set<() => void>();
+  private drainGeneration = 0;
+  private readonly drainWaiters = new Set<() => void>();
   private active: Promise<void> | undefined;
   private latchedError: Error | undefined;
 
@@ -43,10 +47,6 @@ export class ReceiptDrainer {
     if (!this.latchedError && !this.active && this.port.receiptCount() > 0) this.kick();
   }
 
-  onDrainComplete(cb: () => void): void {
-    this.drainCallbacks.add(cb);
-  }
-
   async flush(): Promise<{ needsUpload: string[] }> {
     for (;;) {
       if (this.latchedError) throw this.latchedError;
@@ -56,13 +56,47 @@ export class ReceiptDrainer {
     }
   }
 
+  /** Await the settlement of any in-flight drain generation(s) WITHOUT starting new
+   *  work beyond the drainer's own threshold re-kick chain. The auto re-kick chain
+   *  may run additional bounded generations while the backlog remains above threshold,
+   *  which shrinks monotonically once captures stop. Never throws. */
+  async settle(): Promise<void> {
+    while (this.active) await this.active.catch(() => {});
+  }
+
+  /** Block while the pending-receipt backlog exceeds backlogMax. Wakes on each drain
+   *  completion (success or error — the latched error is rethrown) and on an external
+   *  abort wake. `aborted` is polled at each loop head, mirroring the pipeline's
+   *  original scope-signal check; `abortWakeups` lets an abort scope wake a parked
+   *  waiter immediately. */
+  async waitForBacklog(opts: { aborted?: () => Error | undefined; abortWakeups?: Set<() => void> } = {}): Promise<void> {
+    while (this.port.receiptCount() > this.backlogMax) {
+      const abortError = opts.aborted?.();
+      if (abortError) throw abortError;
+      if (this.latchedError) throw this.latchedError;
+      this.maybeKick();
+      const before = this.drainGeneration;
+      await new Promise<void>((resolve) => {
+        const wake = () => { this.drainWaiters.delete(wake); opts.abortWakeups?.delete(wake); resolve(); };
+        this.drainWaiters.add(wake);
+        opts.abortWakeups?.add(wake);
+        // The active drain may have completed between maybeKick() and registration.
+        if (this.drainGeneration !== before || this.port.receiptCount() <= this.backlogMax) wake();
+      });
+      const post = opts.aborted?.();
+      if (post) throw post;
+    }
+  }
+
   private kick(): void {
     if (this.active || this.latchedError) return;
     const generation = this.drain();
     this.active = generation;
     void generation.finally(() => {
       if (this.active === generation) this.active = undefined;
-      for (const cb of this.drainCallbacks) cb();
+      this.drainGeneration++;
+      for (const wake of this.drainWaiters) wake();
+      this.drainWaiters.clear();
       if (!this.latchedError && this.port.receiptCount() >= this.threshold) this.kick();
     }).catch(() => {});
   }

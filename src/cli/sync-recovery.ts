@@ -19,9 +19,10 @@ import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "./re
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
-import { beginFirstPublishTiming, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 import { metricsEnabled } from "./metrics.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
+import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./publish-pipeline/receipt-drainer.js";
 import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
 import {
   FUSED_ENCRYPT_CONCURRENCY_CAP,
@@ -29,6 +30,7 @@ import {
   PER_FILE_UPLOAD_ATTEMPTS,
   applyCipherDescriptor,
   classifyCacheHit,
+  clampConc,
   descriptorFromEncryptedBlob,
   descriptorFromEntry,
   encryptConcurrency,
@@ -60,6 +62,7 @@ import {
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
+const redeemDrainUpload = () => process.env.RBOX_REDEEM_DRAIN?.trim() === "upload";
 const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
@@ -321,6 +324,22 @@ export async function encryptAndUpload(
     }
     if (report.enabled) report.blobs = encShas.length; // guarded: disabled reports are shared singletons
     const uploadsDir = path.join(root, ".rbox", "state", "uploads");
+    // Design 111: upload-time receipt draining (RBOX_REDEEM_DRAIN=upload; unset =
+    // post-upload drain only). Drain errors LATCH inside the drainer — the upload
+    // loop fails fast after each capture, and flush() below rethrows — so a drain
+    // failure can never degrade to an empty-receipt commit attempt.
+    const receiptPort = redeemDrainUpload() ? api.receiptPort?.() : undefined;
+    const redeemThreshold = clampConc(
+      process.env.RBOX_PIPELINE_REDEEM_THRESHOLD,
+      DEFAULT_REDEEM_THRESHOLD,
+      1_000_000,
+    );
+    const drainer = receiptPort ? new ReceiptDrainer(receiptPort, {
+      threshold: redeemThreshold,
+      backlogMax: redeemThreshold * 2,
+      onError() {},
+    }) : undefined;
+    drainer?.maybeKick();
 
     // The files whose blob still needs uploading (their post-encrypt address is missing
     // server-side). We iterate FILES, not addresses: each file re-encrypts ONLY its own
@@ -395,6 +414,7 @@ export async function encryptAndUpload(
           emitUploadProgress(f.path);
         }
         try {
+          if (drainer) await drainer.waitForBacklog();
           const size = (await fs.stat(ct)).size;
           const uploadEncSha = f.encSha!;
           byteTracker.reviseTotal(uploadEncSha, size);
@@ -415,6 +435,8 @@ export async function encryptAndUpload(
           }
           byteTracker.setProgress(uploadEncSha, size);
           uploaded.add(uploadEncSha);
+          drainer?.capture();
+          if (drainer?.error) throw drainer.error;
           return size; // settled — the committed manifest can safely reference f.encSha
         } catch (e) {
           if (e instanceof BlobRetryLaterError) {
@@ -441,18 +463,32 @@ export async function encryptAndUpload(
     // Upload missing blobs concurrently — THE dominant cost on a first push (each
     // putBlobFile is one round-trip; sequential meant ~3/sec, latency-bound).
     let upWireBytes = 0; // ciphertext bytes actually sent over the wire this run
-    await report.phase("upload", async () => {
-      await poolMap(toUpload, uploadConcurrency(), async (f) => {
-        const size = await uploadFileWithRetry(f);
-        if (size === null) {
-          deferred.add(f.path); // never settled → defer THIS file only
-          return;
-        }
-        upWireBytes += size;
-        up++;
-        emitUploadProgress(f.path);
+    try {
+      await report.phase("upload", async () => {
+        await poolMap(toUpload, uploadConcurrency(), async (f) => {
+          const size = await uploadFileWithRetry(f);
+          if (size === null) {
+            deferred.add(f.path); // never settled → defer THIS file only
+            return;
+          }
+          upWireBytes += size;
+          up++;
+          emitUploadProgress(f.path);
+        });
       });
-    });
+      if (drainer) {
+        const flushToken = firstPublishMeasurementToken();
+        const flushT0 = flushToken ? performance.now() : 0;
+        const flushed = await drainer.flush();
+        if (firstPublishMeasurementLive(flushToken)) {
+          firstPublishTiming.stats.finalFlushMs += Math.max(0, Math.round(performance.now() - flushT0));
+        }
+        if (flushed.needsUpload.length > 0) needsUpload = new Set(flushed.needsUpload);
+      }
+    } catch (error) {
+      if (drainer) await drainer.settle();
+      throw error;
+    }
     report.record("upload", { count: up, wireBytes: upWireBytes });
     };
 

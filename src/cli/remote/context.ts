@@ -21,6 +21,8 @@ export class RemoteContext {
   // hand the map to commit, which does the batched accounting + staging→canonical
   // promote. Cleared on a successful commit (so a daemon's RboxApi doesn't accrete).
   readonly receipts = new Map<string, string>();
+  receiptSendCap: number | undefined;
+  receiptSendCapShrinkCount = 0;
   private static readonly PROTO = "upload-receipts-v1";
 
   // §27 — short-lived download grant handed back on the pull handshake (`latest()` /

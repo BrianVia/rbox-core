@@ -44,6 +44,16 @@ export const CARRIER_REFS = 2; // encManifestSha + sidecarSha
 export const MAX_REFS_PER_COMMIT = 250_000;
 export const MAX_RECEIPTS_PER_REDEEM = 5_000;
 
+/** Design 111's flag-gated receipt-redeem cap. The commit path continues to use
+ * MAX_RECEIPTS_PER_REDEEM; this only raises the dedicated redemption endpoint. */
+export function receiptRedeemMax(env: Env): number {
+  const raw = env.RBOX_RECEIPT_REDEEM_MAX?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return MAX_RECEIPTS_PER_REDEEM;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return MAX_RECEIPTS_PER_REDEEM;
+  return Math.min(15_000, parsed);
+}
+
 const chunk = <T>(xs: T[], n: number): T[][] => {
   const out: T[][] = [];
   for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));

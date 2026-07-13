@@ -27,10 +27,10 @@ import type {
 import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
-import { firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
-import { ReceiptDrainer } from "./receipt-drainer.js";
+import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./receipt-drainer.js";
 import {
   MAX_SHAS_PER_CHECK,
   PER_FILE_UPLOAD_ATTEMPTS,
@@ -48,7 +48,6 @@ import {
 const ROLLING_CHECK_BATCH = Math.min(5_000, MAX_SHAS_PER_CHECK);
 const DEFAULT_QUEUE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_ITEMS = 2_048;
-const DEFAULT_REDEEM_THRESHOLD = 5_000;
 
 type EncryptFn = (srcPath: string, kek: Buffer, tmpDir?: string, opts?: EncryptFileOptions) => Promise<EncryptedBlob>;
 
@@ -108,13 +107,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   const port = args.api.receiptPort?.();
   const threshold = clampConc(process.env.RBOX_PIPELINE_REDEEM_THRESHOLD, DEFAULT_REDEEM_THRESHOLD, 1_000_000);
   const drainer = port ? new ReceiptDrainer(port, { threshold, backlogMax: threshold * 2, onError: abort }) : undefined;
-  let drainGeneration = 0;
-  const drainWaiters = new Set<() => void>();
-  drainer?.onDrainComplete(() => {
-    drainGeneration++;
-    for (const wake of drainWaiters) wake();
-    drainWaiters.clear();
-  });
   drainer?.maybeKick();
 
   const makeReady = (file: FileEntry, encrypted: EncryptedBlob): ReadyBlob => {
@@ -331,22 +323,6 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   let upTotal = 0;
   let upWireBytes = 0;
   const emitUpload = (file?: FileEntry) => args.onProgress?.(up, upTotal, "upload", file?.path, byteTracker.progress());
-  const waitForBacklog = async (): Promise<void> => {
-    if (!port || !drainer) return;
-    while (port.receiptCount() > drainer.backlogMax) {
-      if (scope.signal.aborted) throw abortCause;
-      drainer.maybeKick();
-      const before = drainGeneration;
-      await new Promise<void>((resolve) => {
-        const wake = () => { abortWakeups.delete(wake); resolve(); };
-        drainWaiters.add(wake);
-        abortWakeups.add(wake);
-        if (drainGeneration !== before || port.receiptCount() <= drainer.backlogMax) { drainWaiters.delete(wake); wake(); }
-      });
-      if (scope.signal.aborted) throw abortCause;
-    }
-  };
-
   const uploadReady = async (initial: ReadyBlob): Promise<number | null> => {
     let current = initial;
     for (let attempt = 0; attempt < PER_FILE_UPLOAD_ATTEMPTS; attempt++) {
@@ -354,7 +330,10 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       if (uploaded.has(current.encSha)) { current.release("duplicate-skip"); return 0; }
       byteTracker.migrate(file.path, current.encSha, current.cipherSize);
       emitUpload(file);
-      await waitForBacklog();
+      if (drainer) await drainer.waitForBacklog({
+        aborted: () => (scope.signal.aborted ? (abortCause ?? new Error("publish aborted")) : undefined),
+        abortWakeups,
+      });
       if (scope.signal.aborted) { current.release("abandoned"); throw abortCause; }
       try {
         byteTracker.reviseTotal(current.encSha, current.cipherSize);
@@ -490,7 +469,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     }
     if (args.report.enabled) args.report.blobs = checked;
     args.report.record("upload", { count: up, wireBytes: upWireBytes });
+    const flushToken = firstPublishMeasurementToken();
+    const flushT0 = flushToken ? performance.now() : 0;
     const result = drainer ? await drainer.flush() : { needsUpload: [] };
+    if (drainer && firstPublishMeasurementLive(flushToken)) {
+      firstPublishTiming.stats.finalFlushMs += Math.max(0, Math.round(performance.now() - flushT0));
+    }
     await Promise.allSettled([...cleanupSettlements]);
     if (firstPublishTiming.enabled) firstPublishTiming.stats.peakTempDiskBytes = Math.max(0, Math.round(disk.highWater));
     if (disk.used !== 0) throw new Error("publish pipeline disk budget did not drain");

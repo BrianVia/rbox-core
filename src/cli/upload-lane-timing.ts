@@ -72,6 +72,16 @@ export interface FirstPublishStats {
   /** Design 110 Phase 0: wall of the redeemReceipts call enclosed by commitSigned,
    *  the only drain inside the commit POST envelope (`p`). */
   finalDrainMs: number;
+  /** Design 111 Phase 0 receipt details. Measurement cells built from these
+   *  fields must record the design-112 rollout state (fill version + records
+   *  cap) alongside them (REVIEW-109-111-seam.md addendum). redeemRequestCount
+   *  counts logical redemption requests; transport-level retries inside
+   *  fetchResilient are not re-counted. */
+  redeemRequestCount: number;
+  redeemReceiptCount: number;
+  redeemMaxEntryBytes: number;
+  redeemMaxRequestBytes: number;
+  finalFlushMs: number;
   receiptRedemptionOverlapMs: number;
   authCallCount: number;
   authCriticalPathMs: number;
@@ -90,7 +100,9 @@ const zeroFirstPublishStats = (): FirstPublishStats => ({
   timeToFilesSyncedMs: 0,
   timeToFirstReadyCiphertextMs: 0, firstReadyToFirstUploadStartMs: 0,
   encryptWallMs: 0, missingCheckWallMs: 0, uploadCriticalPathMs: 0,
-  receiptRedemptionWallMs: 0, commitWallMs: 0, finalDrainMs: 0, receiptRedemptionOverlapMs: 0,
+  receiptRedemptionWallMs: 0, commitWallMs: 0, finalDrainMs: 0,
+  redeemRequestCount: 0, redeemReceiptCount: 0, redeemMaxEntryBytes: 0,
+  redeemMaxRequestBytes: 0, finalFlushMs: 0, receiptRedemptionOverlapMs: 0,
   authCallCount: 0, authCriticalPathMs: 0, peakTempDiskBytes: 0,
   peakQueueHeapBytes: 0, peakUploaderFramingBytes: 0,
   serverUnsatisfiedTotal: 0, serverSatisfiedSkipped: 0,
@@ -251,7 +263,7 @@ export function finishFirstPublishStats(): FirstPublishStats | undefined {
 }
 
 export function formatFirstPublishStats(s: FirstPublishStats): string {
-  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} redeemOverlap${s.receiptRedemptionOverlapMs} commit${s.commitWallMs} finalDrain${s.finalDrainMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
+  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} redeemOverlap${s.receiptRedemptionOverlapMs} commit${s.commitWallMs} finalDrain${s.finalDrainMs} rreq${s.redeemRequestCount} rcpt${s.redeemReceiptCount} rentB${s.redeemMaxEntryBytes} rreqB${s.redeemMaxRequestBytes} flush${s.finalFlushMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
 }
 
 export function uploadLaneTimingSummary(): string | undefined {
