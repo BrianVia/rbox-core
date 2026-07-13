@@ -17,33 +17,13 @@ permissions:
   contents: read
 
 jobs:
-  # Route to the self-hosted "home" box when it's online, else fall back to a
-  # GitHub-hosted runner. This job runs on ubuntu-latest so the decision is always
-  # available — even when the box is physically off. Needs a PAT with
-  # Administration:Read on this repo (secret RUNNER_ADMIN_PAT) to list runners.
-  pick-runner:
-    runs-on: ubuntu-latest
-    outputs:
-      runner: ${{ steps.choose.outputs.runner }}
-    steps:
-      - id: choose
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
-        run: |
-          online=$(gh api "repos/${{ github.repository }}/actions/runners" \
-            --jq '[.runners[] | select(.status=="online" and ([.labels[].name] | index("self-hosted-home")))] | length')
-          if [ "${online:-0}" -gt 0 ]; then
-            echo "self-hosted-home online ($online) -> using self-hosted"
-            echo "runner=self-hosted-home" >> "$GITHUB_OUTPUT"
-          else
-            echo "self-hosted-home offline -> falling back to ubuntu-latest"
-            echo "runner=ubuntu-latest" >> "$GITHUB_OUTPUT"
-          fi
-
+  # GitHub-hosted only (founder decision 2026-07-13): the self-hosted home box
+  # double-booked as the dev workstation — CPU-starved runners flaked heavyweight
+  # tests every busy run, and ephemeral job workspaces leaked ~13GB/day/container
+  # (filled a 916GB disk once). Not worth it.
   test:
-    needs: pick-runner
     name: ${{ matrix.name }}
-    runs-on: ${{ needs.pick-runner.outputs.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -89,15 +69,7 @@ jobs:
       # Cache Bun's global package store (setup-bun caches only the bun binary),
       # keyed on the lockfile hash + --frozen-lockfile so versions come solely from
       # bun.lock (sha512-integrity-verified).
-      #
-      # ONLY on the GitHub-hosted fallback. The self-hosted-home box mounts a
-      # persistent host dir at ~/.bun/install/cache (docker-compose), so bun's
-      # cache already survives between jobs on-disk. Running actions/cache there
-      # would ship the whole store to GitHub's cache storage and back over the
-      # home uplink every run (~40-60s), which is what made self-hosted SLOWER
-      # than ubuntu-latest. Skipping it lets the local NVMe cache win.
       - name: Cache bun install store
-        if: needs.pick-runner.outputs.runner == 'ubuntu-latest'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.bun/install/cache
