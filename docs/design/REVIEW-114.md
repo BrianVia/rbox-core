@@ -310,3 +310,21 @@ Cap policy: 5 rounds reached on prescribed-fix residuals → the sanctioned +1
 cheap confirmation round follows.
 
 Revision committed as DRAFT v6.
+
+### Confirmation round (5+1) — codex verdict: **ALIGNED**
+
+Scoped strictly to the three round-5 fixes (candidacy epoch binding, permanent
+tombstone deny records, atomic guarded terminal transition) plus gate 5b's
+matching history. No findings.
+
+## Outcome
+
+**ALIGNED at v6** after 5 full adversarial rounds + 1 confirmation round.
+Totals adjudicated: 4 BLOCKER, 21 MAJOR, 8 MINOR findings — all adopted
+(several with simpler mechanisms than proposed) except three recorded
+rejections with rationale: technical prevention of old-build selection
+(infeasible under Workers Builds; rollback floor + reader-first soak is the
+control), processing placement changes for already-entitled receipts
+(skip-if-entitled proven safe instead), and mid-invocation env-var GC recheck
+(env is fixed per invocation; boundary documented, exposure bounded by
+executor caps).

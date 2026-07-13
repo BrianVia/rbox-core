@@ -1,9 +1,10 @@
 # 114 — Pack small ciphertext blobs into bandwidth-sized R2 objects
 
-Status: **DRAFT v6** (2026-07-13) — rounds 1-5 of the adversarial review folded
-(`docs/design/REVIEW-114.md`). Not yet approved; implementation must not begin
-until the loop converges. This is a storage-format and GC-fence design. Field
-baseline: `flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
+Status: ✅ **REVIEWED — ALIGNED v6** (2026-07-13). Five codex adversarial
+rounds + one confirmation round (ledger: `docs/design/REVIEW-114.md`); the
+confirmation round returned no findings. Ready for founder review /
+implementation. This is a storage-format and GC-fence design. Field baseline:
+`flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
 
 ## Problem
 
