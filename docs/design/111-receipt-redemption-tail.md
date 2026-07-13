@@ -30,6 +30,20 @@ tail is approximately:
 redemption tail = receiptRedemptionWallMs - receiptRedemptionOverlapMs
 ```
 
+with one important caveat: the overlap field **as computed today overstates
+overlap** and is not yet gate-grade. `redeemReceipts` snapshots
+`overlappedAtStart` once; when any upload is active at drain start, the entire
+drain — every serial batch until the map empties, including batches issued
+after the last upload settled — is credited as overlap
+(`remote/commits.ts:165, 208–209`). The clamped-interval math only runs in the
+not-overlapped-at-start branch. Additionally, both upload schedules call
+`firstPublishUploadEnd()` only on PUT success, not in a `finally`
+(`sync-recovery.ts:403–409`; `publish-pipeline/pipeline.ts:362–368`), so a
+failed PUT leaks `uploadActive` and can keep the overlapped-at-start branch
+taken forever. Phase 0 (below) must repair this accounting — interval
+intersection of redemption-active and upload-active periods, `finally`-paired
+upload ends — before the subtraction above is used for any decision.
+
 The commit attribution is already disjoint: `sync.ts:1015–1022` subtracts
 redemption accumulated within `api.commit()` from `commitWallMs`.
 
@@ -161,21 +175,46 @@ receipt timing and avoids changing encryption, missing-check, or upload order.
 
 ### 2. Raise the bounded wire batch from 5,000 to 15,000
 
-After recording actual serialized sizes in Phase 0, raise both
-`RECEIPT_REDEEM_BATCH_MAX` and `MAX_RECEIPTS_PER_REDEEM` to 15,000. At the code's
-conservative ~375 B/ref estimate this is ~5.6 MB, leaving about 2.4 MB beneath
-the existing 8 MiB raw-body cap for JSON variance and headers are not in the
-body. The flat-meadow case falls from ten HTTP requests to four while preserving
-the body cap and the 3,000-ref internal accounting super-batch.
+Raise both `RECEIPT_REDEEM_BATCH_MAX` and `MAX_RECEIPTS_PER_REDEEM` to 15,000,
+**contingent on Phase 0 byte measurement**. The 15k number is a candidate, not
+a decision: the code's ~375 B/ref figure (`commit-envelope.ts:16–25`) is a
+comment estimate, and a real wire entry is the 64-hex sha key plus a receipt
+of the form `<kid>.<base64url JSON payload {v,a,s,n,t,e}>.<base64url MAC>`
+(`apps/api/src/receipts.ts:101–115`) — its size scales with the
+account-id length and numeric widths and can exceed 375 B. Phase 0 records the
+maximum measured per-entry and per-request serialized bytes on real accounts;
+15k ships only if `15,000 × max_entry_bytes ≤ 7 MiB`. Otherwise pick the
+largest N that fits.
 
-This is an `apps/api` wire-cap change. Deploy the server acceptance first, then
-the client. Older clients remain valid at 5,000. A new client must learn the
-server maximum safely: during the compatibility release keep its send cap at
-5,000 unless the response/handshake advertises `receiptRedeemMax >= 15000`, or
-ship only after the fleet is known upgraded and retain automatic fallback on
-`too_many_receipts`. The implementation design must choose and test one of these
-two compatibility mechanisms; silent reliance on deployment ordering is not
-sufficient for self-hosted/lagging servers.
+Client slicing becomes **count- and byte-bounded**: a batch closes at the count
+cap or at a 7 MiB serialized-byte ceiling, whichever first (measured on the
+exact `JSON.stringify` payload it will send). Count-only slicing cannot enforce
+the wire gate; a count-valid oversized request would only be caught by the
+server's 413.
+
+The flat-meadow case falls from ten HTTP requests to four while preserving the
+body cap and the 3,000-ref internal accounting super-batch.
+
+This is an `apps/api` wire-cap change with a **decided** compatibility
+mechanism: automatic fallback on `too_many_receipts`. The server already
+returns `400 {error: "too_many_receipts", max}` for an oversized batch
+(`workspace-sync.ts:867–870`); today's client throws a generic error on any
+non-422 failure (`remote/commits.ts:189–193`). The new client:
+
+1. starts each RemoteContext session with `sendCap = 15,000` (or the configured
+   value) and slices by `min(sendCap, byteCeiling)`;
+2. on `400 too_many_receipts`, parses `max`; if `max` is a positive integer
+   strictly below the batch size just sent, sets `sendCap = max` for the rest
+   of the session and re-slices the (untouched, generation-safe) receipt map —
+   the rejected request performed no server work, so replay is trivially safe;
+3. if `max` is absent, non-numeric, or does not shrink the batch, fails hard —
+   no unbounded retry loop; the drain error latches as today.
+
+This handles old servers (first oversized request costs one bounced round
+trip, then the session runs at 5,000), the `RECEIPT_REDEEM_15K` flag being
+rolled back mid-session (the next 400 clamps down), and self-hosted/lagging
+servers — with no new handshake field or capability endpoint. No advertised
+`receiptRedeemMax` is added.
 
 Do not raise `MAX_REQUEST_BODY`, do not accept a 49k batch, and do not increase
 `MAX_REFS_PER_TXN`. Server accounting and its atomic failure unit are unchanged.
@@ -224,10 +263,12 @@ Add a client kill switch `RBOX_RECEIPT_DRAIN_DURING_UPLOAD`:
 - `0`: current post-upload drain behavior.
 
 Keep the server's larger accepted count behind an environment flag
-`RECEIPT_REDEEM_15K`; flag off preserves the 5,000 limit. The client must never
-send above the server-advertised/known cap. These flags are independent: the
-overlap schedule can ship at 5,000, and the server cap can be rolled back without
-turning off safe pipelining.
+`RECEIPT_REDEEM_15K`; flag off preserves the 5,000 limit. The client discovers
+the effective cap via the `too_many_receipts` fallback above and never retries
+above a learned cap within a session. These flags are independent: the overlap
+schedule can ship at 5,000, and the server cap can be rolled back without
+turning off safe pipelining — a rollback just bounces one request per active
+session before the client clamps down.
 
 Rollout order:
 
@@ -244,14 +285,29 @@ fleet validation in `docs/DEPLOYMENTS.md`; merge to `main` ships production.
 
 ### Phase 0 — measurement before either flag
 
-Use the existing first-publish stats. Preserve compact `fp ... redeemN ...`
-output and add the already-collected `receiptRedemptionOverlapMs` to the compact
-tokens as `redeemOverlapN` (structured output already has it). Add low-cardinality
+First, **repair the overlap accounting** so the tail subtraction is
+trustworthy: compute `receiptRedemptionOverlapMs` as the true interval
+intersection of redemption-active and upload-active periods (clamp every batch
+against `[uploadStartedAt, uploadEndedAt]`, dropping the whole-drain
+`overlappedAtStart` credit), and pair every `firstPublishUploadStart()` with a
+`finally`-scoped `firstPublishUploadEnd()` in both upload schedules so a failed
+PUT cannot leak `uploadActive`. The pre-fix overlap field is not used for any
+gate.
+
+Then use the first-publish stats. Preserve compact `fp ... redeemN ...` output
+and add the corrected `receiptRedemptionOverlapMs` to the compact tokens as
+`redeemOverlapN` (structured output already has it). Add low-cardinality
 receipt details to the phase report: receipt count, redemption request count,
-maximum serialized request bytes, and final flush wall. On the server, use the
-existing `receipts.redeem` op and add numeric timing details for entitlement
-precheck, receipt verification, and accounting so the 37.4s can be assigned
-rather than inferred.
+maximum serialized per-entry and per-request bytes, and final flush wall
+(post-last-upload drain measured on its own, independent of the overlap
+field). On the server, use the existing `receipts.redeem` op and add numeric
+timing details for entitlement precheck, receipt verification, and accounting
+so the 37.4s can be assigned rather than inferred. Server resource telemetry
+is named, not implied: per-request CPU time from Workers observability
+(`cpuTime` in the invocation logs / Workers analytics for the
+`receipts.redeem` route) and the `op` wall breakdown; isolate memory has no
+per-request API, so the memory gate is expressed as the byte-cap bound plus
+absence of isolate OOM/eviction errors in the run logs.
 
 Capture at least five same-host greenfield runs at approximately 50k unique
 uploads for each configuration: current 5k/post-tail baseline, 5k/pipelined,
@@ -260,25 +316,37 @@ steady-sync cohort to detect regressions.
 
 ### Falsifiable gates
 
-- Primary: `redeem - redeemOverlap` p50 ≤ 5s and p95 ≤ 10s for ~50k-receipt
-  greenfield publishes; no regression in `filesSynced` p50 greater than 5%.
-- Scheduling: with upload-time draining enabled, at least 80% of redemption wall
-  overlaps upload on the 2.85 GB corpus, unless total redemption wall itself is
-  below 5s.
-- Wire: every request remains below 7 MiB measured serialized bytes and the API
-  returns no `body_too_large`; 15,001 is rejected when the 15k flag is on and
-  5,001 is rejected when it is off.
-- Resource: API isolate peak memory and CPU remain within the existing 5k
-  baseline plus 25%; no Worker CPU-limit or D1 subrequest failures in 20 cold
-  runs. If this fails, keep pipelining and revert the batch increase.
+- Primary: `redeem - redeemOverlap` (corrected interval-intersection overlap)
+  p50 ≤ 5s and p95 ≤ 10s for ~50k-receipt greenfield publishes; no regression
+  in `filesSynced` p50 greater than 5%.
+- Scheduling: with upload-time draining enabled, at least 80% of redemption
+  wall overlaps upload on the 2.85 GB corpus (corrected metric), unless total
+  redemption wall itself is below 5s. The final flush is inherently
+  non-overlapped; at threshold 5,000 the expected residue is under two batches,
+  which this budget accommodates — if it does not, the gate fails honestly and
+  the threshold is revisited.
+- Wire: every request remains below 7 MiB measured serialized bytes (the
+  client's byte ceiling, enforced in slicing) and the API returns no
+  `body_too_large`; 15,001 is rejected when the 15k flag is on and 5,001 is
+  rejected when it is off; a 15k-sliced client against a 5k server converges
+  via one `too_many_receipts` bounce and completes the drain.
+- Resource, split in two: (a) per-request safety — no `receipts.redeem`
+  invocation exceeds 50% of the platform CPU limit (Workers `cpuTime`) and no
+  Worker CPU-limit, isolate memory, or D1 subrequest-limit errors occur in 20
+  cold runs at 15k; (b) corpus totals — summed server redemption CPU and wall
+  across a full ~50k publish do not regress beyond 10% versus the 5k baseline
+  (per-request cost may triple; total cost must not grow). If either fails,
+  keep pipelining and revert the batch increase.
 - Correctness: total newly granted refs equals unique successful uploads; a
   second redemption grants zero; accepted commit refs all have live
   entitled+present rows; retained-root/GC rig results are identical flag-on/off.
 
 ### Tests and rig
 
-Extend `remote-commits.test.ts` for negotiated/fallback 15k slicing, exact
-generation deletion, retries, 422 whole-batch fallback, and body-cap errors.
+Extend `remote-commits.test.ts` for count+byte slicing at 15k, the
+`too_many_receipts` clamp-down (valid `max`, missing `max`, non-shrinking
+`max` → hard fail), exact generation deletion, retries, 422 whole-batch
+fallback, and body-cap errors.
 Extend receipt-drainer and ordinary sync-recovery tests to prove redemption
 starts before the last upload settles, backlog bounds hold, flush precedes
 commit, and a latched error starts no commit. API tests cover both count flags,
