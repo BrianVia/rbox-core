@@ -41,6 +41,7 @@ import { accountLinkPublicRoutes, accountRoutes } from "./routes/account.js";
 import { keysRoutes } from "./routes/keys.js";
 import { blobsRoutes } from "./routes/blobs.js";
 import { blobBatchRoutes } from "./routes/blob-batch.js";
+import { packGcEnabled, sweepUploadingPacks } from "./blob-pack.js";
 import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 export { WorkspaceSync } from "./workspace-sync.js";
@@ -173,6 +174,13 @@ export default {
       await sweepAccountDeletions(env);
     } catch (e) {
       logErr("scheduled_account_delete_sweep_failed", e); // no raw message (touches account metadata)
+    }
+    if (packGcEnabled(env)) {
+      try {
+        await sweepUploadingPacks(env);
+      } catch (e) {
+        logErr("scheduled_pack_uploading_sweep_failed", e);
+      }
     }
   },
 
@@ -328,7 +336,7 @@ const ROUTE_VOCAB = new Set([
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics",
   "keys", "api", "roster", "admit", "keystate", "workspace",
-  "blobs", "blob-batch", "check", "get", "put", "multipart", "part", "complete",
+  "blobs", "blob-batch", "blob-pack", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
 ]);
 export function routeTemplate(pathname: string): string {
@@ -401,7 +409,7 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
 function apiKeyAllowed(method: string, seg: string[]): boolean {
   if (method === "GET" && (eq(seg, ["v1", "account", "usage"]) || eq(seg, ["v1", "account", "workspaces"]))) return true;
   if (seg[0] === "v1" && seg[1] === "ws") return true;
-  if (seg[0] === "v1" && (seg[1] === "blobs" || seg[1] === "blob-batch")) return true;
+  if (seg[0] === "v1" && (seg[1] === "blobs" || seg[1] === "blob-batch" || seg[1] === "blob-pack")) return true;
   if (seg[0] === "v1" && seg[1] === "keys") {
     // POST admit is the key's one-time SELF-admission during `rbox key create-ci`
     // (admitAgentDevice runs under the new PAT bearer). The other mutating keys

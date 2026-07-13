@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { PLANS, planFor } from "./plans.js";
-import { audit, isEntitled, type Principal } from "./authz.js";
+import { audit, entitledSubset, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
 
@@ -31,6 +31,24 @@ export async function wouldExceedCap(env: Env, accountId: string, sha: string, i
   if (await isEntitled(env, accountId, sha)) return { over: false, used: a.used, cap };
   const over = cap !== Infinity && a.used + incomingSize > cap;
   return { over, used: a.used, cap, ...(over && a.plan === "none" ? { reason: "no_plan" as const } : {}) };
+}
+
+/** Design 114 pack-PUT fail-fast quota check. Already-entitled logical blobs
+ * cost zero; redemption's atomic cap guard remains the publication authority. */
+export async function wouldExceedCapAggregate(
+  env: Env,
+  accountId: string,
+  members: Array<{ sha: string; size: number }>,
+): Promise<{ over: boolean; used: number; cap: number; reason?: "no_plan" }> {
+  const a = await account(env, accountId);
+  const cap = planFor(a.plan).storageBytes + a.extra;
+  if (a.plan === "none") return { over: true, used: a.used, cap, reason: "no_plan" };
+  const entitled = await entitledSubset(env, accountId, members.map((member) => member.sha));
+  let incomingSize = 0;
+  for (const member of members) if (!entitled.has(member.sha)) incomingSize += member.size;
+  // Match wouldExceedCap's existing behavior: a wholly entitled retry costs
+  // exactly zero and remains admissible even when the account is already at/over cap.
+  return { over: incomingSize > 0 && cap !== Infinity && a.used + incomingSize > cap, used: a.used, cap };
 }
 
 /**
