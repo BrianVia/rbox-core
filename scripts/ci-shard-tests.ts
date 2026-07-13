@@ -35,7 +35,7 @@ const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?:
   // so a file-only partition cannot hit the <=30s target. Split by test names
   // discovered from the source at runtime; the guard verifies every discovered
   // test name in these files is covered exactly once.
-  "src/cli/git-sync.test.ts": { parts: 12, weight: 73, partWeights: [8.8, 8.8, 6, 5.3, 5.4, 4.5, 4.7, 3.9, 8, 3.9, 4.3, 3.3] },
+  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 73, partWeights: [8.8, 8.8, 6, 5.3, 5.4, 4.5, 4.7, 3.9, 8, 3.9, 4.3, 3.3] },
   "src/engine/git-nested.test.ts": { parts: 4, weight: 19, partWeights: [6, 3.7, 4, 5.2] },
 };
 const DEFAULT_WEIGHT = 0.5;

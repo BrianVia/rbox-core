@@ -4,11 +4,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../engine/index.js";
-import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../engine/git/config-sync.js";
-import { gitRaw } from "../engine/git/shared.js";
-import type { SyncState, WorkspaceConfig } from "./config.js";
-import type { SyncRemote } from "./remote.js";
+import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../../engine/index.js";
+import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-sync.js";
+import { gitRaw } from "../../engine/git/shared.js";
+import type { SyncState, WorkspaceConfig } from "../config.js";
+import type { SyncRemote } from "../remote.js";
 import {
   GIT_FINGERPRINT_VERSION,
   GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS,
@@ -16,7 +16,7 @@ import {
   gitDivergenceStatus,
   planGitSections,
   shouldPublishGitConfig,
-} from "./sync-git.js";
+} from "../sync-git.js";
 
 const exec = promisify(execFile);
 const runGit = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((result) => result.stdout.toString().trim());

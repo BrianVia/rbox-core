@@ -13,11 +13,11 @@ import {
   validateManifest,
   type GitSection,
   type Manifest,
-} from "../engine/index.js";
-import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../engine/git/config-sync.js";
-import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "./config.js";
-import { composeStateSavePacket, observedRepoKeys } from "./sync-state.js";
-import { applyGitSections, gitConfigHash } from "./sync-git.js";
+} from "../../engine/index.js";
+import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-sync.js";
+import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
+import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
+import { applyGitSections, gitConfigHash } from "../sync-git.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
