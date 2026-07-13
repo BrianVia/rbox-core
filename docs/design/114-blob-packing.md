@@ -1,9 +1,10 @@
 # 114 — Pack small ciphertext blobs into bandwidth-sized R2 objects
 
-Status: **INITIAL DESIGN DRAFT** (2026-07-13). Not reviewed or approved.
-This is a storage-format and GC-fence design; implementation must not begin until
-the adversarial review loop converges. Field baseline: `flat-meadow`, same host
-and corpus, 630 Mbps pipe, 2026-07-13.
+Status: ✅ **REVIEWED — ALIGNED v6** (2026-07-13). Five codex adversarial
+rounds + one confirmation round (ledger: `docs/design/REVIEW-114.md`); the
+confirmation round returned no findings. Ready for founder review /
+implementation. This is a storage-format and GC-fence design. Field baseline:
+`flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
 
 ## Problem
 
@@ -55,9 +56,11 @@ Mbps while the large-object lane reaches about 200 Mbps.
 
 The adjacent tuning ledgers rule out the cheaper explanations:
 
-- **Slots:** design 98 / `REVIEW-98.md` and the #245 sweep put the useful knee at
-  48; 64 and above collapse through higher RTT and resource contention. This
-  design does not add or sweep slots.
+- **Slots:** the #245 upload-slot sweep found 48 slots only +9% over the kept
+  default of 24 (`DEFAULT_BATCH_PUT_SLOTS`, `src/cli/remote/blob-batch/config.ts`
+  — the 48 default there is the *download* lane), and ≥64 collapses 3x through
+  per-batch RTT inflation. All projection arithmetic in this design uses 24, the
+  kept upload default. This design does not add or sweep slots.
 - **Records per batch:** design 112 / `REVIEW-112.md` raised and measured the
   32→64 axis. The 64-record candidate failed the cap gate by **7%** in the
   2026-07-13 sweep. Even a perfectly filled request still performs one R2 PUT
@@ -84,10 +87,21 @@ physical PUT reduction    = 40,828 / 46 ~= 888x
 The current batch route needed 2,360 HTTP requests for that sample, but still
 issued 40,828 R2 PUTs. Packing needs about 46 HTTP requests and 46 R2 PUTs. Even
 if a pack PUT paid the full measured 733 ms fixed settle cost, its idealized
-24-slot request envelope is `46 * 0.733 / 24 = 1.4 s`; the approximately 341
+24-slot request envelope is `46 * 0.733 / 24 = 1.4 s` (24 =
+`DEFAULT_BATCH_PUT_SLOTS`, the kept #245 default); the approximately 341
 MiB payload then dominates at 150–200 Mbps (about 18.2–13.6 s). These are
 projections, not a latency promise; the validation gate measures real R2 pack
 writes.
+
+One honesty caveat is binding (round 1): the 150–200 Mbps evidence comes from
+the *multipart* lane's streaming writes, and the 733 ms datum measures handlers
+doing small-object fan-out — neither measures the proposed primitive, a
+buffered, checksum-verified, non-multipart ~8 MiB `R2.put`. Phase 0 therefore
+measures a dev-API curve of verified single PUTs at 1 / 4 / 7.5 MiB bodies
+under the same 24-slot scheduler *before* implementation proceeds past the
+format work. If that curve shows the 7.5 MiB verified PUT is itself
+operation-bound below the gate, the design stops at the object-count win and
+the larger streaming-pack follow-up is designed instead.
 
 ## Root cause
 
@@ -168,10 +182,23 @@ logical GC may run while physical pack deletion remains disabled.
 1. **Logical identity is unchanged.** `encSha = SHA-256(ciphertext bytes)`;
    manifests, refsets, commits, entitlements, quota, receipts, and retained
    roots continue to name and account for each ciphertext independently.
-2. **E2EE is unchanged.** The pack contains opaque, complete per-blob
-   ciphertexts. There is no pack encryption key, cross-blob compression, or
-   server-visible plaintext. Existing per-blob keys, AEAD framing, and MAC
-   verification are untouched.
+2. **Cryptographic confidentiality is unchanged; the metadata surface shifts
+   and the delta is stated and accepted.** The pack contains opaque, complete
+   per-blob ciphertexts. There is no pack encryption key, cross-blob
+   compression, or server-visible plaintext. Existing per-blob keys, AEAD
+   framing, and MAC verification are untouched. What an R2-level observer
+   learns changes shape (round 1 finding f): **before** packing, key listing
+   exposes one object per `encSha` with its exact ciphertext size and upload
+   time; **after**, packed blobs no longer appear as individual keys (a
+   listing-only observer sees less), but an observer who can *read* pack
+   objects gains the plaintext directory — durable proof of exact
+   co-membership, ordering, and per-member lengths for the ~hundreds of
+   ciphertexts published together, plus range-read patterns correlating
+   intra-pack access. The `encSha` values themselves are already R2 key
+   material today. This co-membership/ordering metadata is a new, permanent
+   artifact and is explicitly accepted: it reveals grouping of an account's own
+   uploads within one publish window, which the same observer could already
+   approximate from upload timestamps.
 3. **One active placement per logical blob.** An entitled+present blob resolves
    either to the legacy canonical object or to exactly one immutable pack
    extent. Placement changes only through authenticated receipt accounting.
@@ -271,6 +298,7 @@ Add an additive endpoint:
 
 ```text
 POST /v1/blob-pack/put
+authorization: Bearer <token>            (identical contract to blob-batch PUT)
 content-type: application/x-rbox-pack
 x-rbox-protocol: upload-receipts-v1
 x-rbox-pack-id: <128-bit random lowercase hex>
@@ -280,13 +308,23 @@ body: rbox-pack-v1
 200 { packId, packSha256, results: [{ sha256, ok, sizeBytes, receipt }] }
 ```
 
+Authentication is stated explicitly because design 109 is being implemented in
+parallel against the same dispatch surface (round 2 + REVIEW-114 seam note):
+the route authenticates the **bearer token exactly as `/v1/blob-batch/put`
+does** — the client sends `ctx.protoAuth` unconditionally, the server derives
+`accountId` from `authenticate()`, and download grants are **never** an upload
+credential and never appear in the pack wire contract. If design 109 lands a
+server-side grant verification fast-path, it changes only how the bearer is
+verified, not this contract. An API test asserts an un-authenticated /
+grant-only pack PUT is rejected.
+
 `packId` is an opaque random physical identity, separate from content identity,
 and the R2 key is `packs/v1/<packId>`. The server rejects reuse of a `packId`
 with a different pack checksum. Same-id/same-checksum retry is idempotent while
-the object is not under a pack deletion intent. A client whose same-id retry is
-fenced generates a fresh `packId` and rebuilds only the outer header identity if
-the final format revision binds it; v1 as specified above does not embed the ID,
-so the body may be reused unchanged.
+no `pack_gc_candidates` row exists for the id (marked or opened — §7.3
+property 1). A client whose same-id retry is fenced generates a fresh `packId`
+and retries; v1 deliberately does not embed the ID in the body, so the built
+pack bytes are reused unchanged under the new identity.
 
 The Worker reads at most 8 MiB and performs the strict format validation above.
 It runs one aggregate, entitlement-aware quota precheck over the declared
@@ -301,15 +339,62 @@ collision (member inserts are parameter-bounded chunks within that D1 batch).
 It then issues **one** verified R2 PUT for the pack. It does not issue per-member
 R2 writes. Any structural,
 whole-pack checksum, or member hash failure rejects the whole request and mints
-no receipts. There is no partial physical success contract. A failed request may
-leave an `uploading` inventory row but never an active blob location; an orphan
-sweeper may remove that inventory only after confirming the R2 object absent or
-after the pack-orphan rules below safely delete it.
+no receipts. There is no partial physical success contract.
+
+A failed request may leave an `uploading` inventory row but never an active
+blob location. The `uploading`-orphan protocol is explicit because the sweeper
+and a same-id repair can race (rounds 2–3):
+
+- inventory carries a `touched_at` heartbeat; the original insert and every
+  same-id retry set it via a **conditional single-row UPDATE before the R2
+  write** (`changes = 1` required, else the request fails closed with
+  `retry_later` and no R2 write);
+- the `uploading -> ready` transition is a conditional single-row UPDATE
+  (`state='uploading'` predicate, `changes = 1` required). A same-id retry
+  that finds the pack already `ready` with the same checksum takes a distinct
+  idempotent branch (round 3): verify inventory + object, run the fence read,
+  and mint fresh receipts **without** requiring the transition — a crash
+  between `ready` and the response is therefore recoverable;
+- a handler that loses a race performs **no cleanup of the shared R2 key**
+  (round 4: two same-id retries can both hold `state='uploading'` heartbeats
+  and both PUT the same key; if the loser deleted "its" object after the
+  winner's ready transition, it would destroy published serving bytes — a
+  release-blocking same-id concurrent-PUT test pins this). It just returns
+  `retry_later`; inventoried orphan bytes belong to the sweeper and pack GC
+  exclusively;
+- the sweeper acts only on inventory whose `state='uploading'` and whose
+  `created_at` **and** `touched_at` are both past the §7.3 orphan grace, and
+  its **destructive statements embed those predicates** (round 3 — a JS
+  pre-select is not the guard). The exact atomic transition (round 4 — one
+  shape, not two): a single `db.batch` runs (i) `DELETE FROM pack_members`
+  correlated to a still-eligible parent, then (ii)
+  `UPDATE packs SET state='swept' WHERE pack_id=? AND state='uploading' AND
+  created_at<? AND touched_at<?`; the R2 delete runs only if that UPDATE
+  reports `changes = 1`. A repair heartbeat therefore either lands first and
+  falsifies eligibility, or lands after and fails closed (`changes = 0`);
+- because no platform bound is documented for how late an already-issued R2
+  PUT can land (round 3), the **`swept` tombstone is durable** (round 4: a
+  finite removal grace would contradict the unbounded-lateness premise it
+  exists for). Every later path — heartbeat, ready transition, ready-verify
+  branch, fence read — requires non-swept state and fails closed against a
+  tombstone; the sweeper re-HEADs tombstoned ids on subsequent ticks and
+  re-deletes any reappeared object. Tombstones are **permanent deny records**
+  (round 5: a HEAD-confirmed absence can never prove no already-issued PUT
+  will still land, so there is no sound removal condition — removing one would
+  reopen the id's namespace). Growth is bounded in practice by orphaned-pack
+  count (our own clients' crash residue, not attacker-controllable volume
+  beyond ordinary upload abuse controls) and is metered (§9). The only admin
+  surface over tombstones is non-destructive — audit listing and a forced
+  re-HEAD/re-delete sweep — authenticated with the platform secret exactly
+  like the existing admin GC endpoints.
 
 After R2 accepts, one fail-closed D1 fence query checks:
 
 - active logical `gc_candidates` for every member SHA; and
-- an active `pack_gc_candidates` intent for `packId`.
+- **any** `pack_gc_candidates` row for `packId` — marked or opened (§7.3
+  property 1: no fence read begun after a candidacy exists can authorize
+  minting, and every authorized receipt's signed `issuedAt` precedes the wall
+  time the candidacy's mark landed).
 
 If either query fails or finds a fence, return `503 retry_later` and mint no
 receipt. The unreferenced pack object is a safe inventoried orphan for later pack
@@ -329,6 +414,24 @@ the publish pipeline does not own wire framing.
 The pack uploader consumes permits from the existing upload slot budget. A
 record moved into a pack is removed from the ordinary batch uploader; a pack
 PUT occupies one of those same permits. No independent pack-slot pool exists.
+Because today's permit counter is `BlobBatchUploader`'s private `active` field
+(`uploader.ts`), this is a named implementation requirement, not an emergent
+property (round 1): extract one shared upload-permit arbiter (owned beside the
+existing process-wide state in `gate.ts`) that both the batch lane and the pack
+lane draw from, and add a mixed-lane test asserting combined in-flight
+batch+pack requests never exceed the configured slot count.
+
+Capability and disable signaling is machine-readable and distinct from
+transient fences (round 1): when `RBOX_BLOB_PACK_ACCEPT` is off, the route
+returns **`404 { error: "pack_disabled" }`** — the same latch class as a
+route-absent old server (404/405). `503 retry_later` remains reserved for the
+post-write fence case only, exactly as in the batch lane, and the client
+treats it as defer-and-retry, never as capability absence. The client-side
+pack-off latch is a **separate flag in `gate.ts`**; it must NOT reuse
+`disableUploadForProcess()`, which would wrongly collapse the established
+batch lane to single PUTs. Latching pack-off requeues all unsettled members
+into the ordinary batch/single uploader.
+
 Client pack construction uses temp files in the existing run temp directory,
 not 8 MiB multiplied by all active slots in heap. Temp files are deleted only
 after all member promises have settled or on scoped abort cleanup.
@@ -339,27 +442,51 @@ Per-blob receipts are mandatory. Extend the opaque receipt payload with a v2
 variant whose authenticated claim is:
 
 ```text
-{ accountId, encSha, logicalSize, storage:"pack",
-  packId, packSha256, offset, length, issuedAt, expiresAt }
+{ accountId, encSha, logicalSize, storage:"pack", packId, issuedAt, expiresAt }
 ```
+
+The receipt deliberately does **not** carry `offset`/`length`/`packSha256`
+(round 1): the authoritative extent lives in the server's immutable
+`pack_members` inventory, written before the receipt was minted. Redemption
+resolves placement by `(packId, encSha)` from `pack_members` joined against
+`packs.state = 'ready'`, so a receipt (or a bug in receipt handling) can never
+install an offset/length tuple that the physical inventory does not prove.
+This also keeps v2 receipt bytes close to v1: the only additions are the
+storage tag and the 32-hex `packId`, bounding the encoded entry growth under
+~90 bytes. Design 111's slicer is **byte-bounded** at 7 MiB
+(`sliceReceiptBatch`, `src/cli/remote/commits.ts`), so even the larger entries
+degrade only the per-request count, never the cap; a unit test pins the
+worst-case v2 entry byte size.
 
 Receipt v1 continues to mean `storage:"canonical"` at `blobKey(encSha)`.
 Clients treat both versions as opaque strings; `RemoteContext.receipts` and the
 design-111 generation-safe drainer remain `encSha -> receipt`. Count and byte
 slicing, exact-generation deletion, 422 handling, retry, and final-drain-before-
-commit semantics do not change. Larger v2 receipt bytes must remain inside
-design 111's 7 MiB request slicer and be measured.
+commit semantics do not change.
 
-`verifyReceipt` returns authenticated logical size plus placement. The dedicated
-redeem endpoint and commit fallback feed that into `commitAccounting`. In the
-same D1 accounting super-batch that catalogs `blobs.present=1`, charges quota,
-grants `blob_refs`, clears `blob_ref_candidates`, and un-condemns a non-active
-logical candidate, accounting also installs the active packed location. A v1
-receipt removes any stale packed active location and selects canonical storage;
-if that removal leaves its former pack with zero active locations, the same
-transaction inserts an unopened pack candidate. A v2 receipt upserts its exact
-immutable extent. The location update is guarded by new delete-fence triggers
-described in §7.
+`verifyReceipt` returns authenticated logical size plus placement intent. The
+dedicated redeem endpoint and commit fallback feed that into
+`commitAccounting`. In the same D1 accounting super-batch that catalogs
+`blobs.present=1`, charges quota, grants `blob_refs`, clears
+`blob_ref_candidates`, and un-condemns a non-active logical candidate,
+accounting also installs the active location: a v2 receipt inserts the
+`pack_members`-derived extent; a v1 receipt deletes any packed active location
+(selecting canonical storage). Former-pack candidacy on displacement is
+handled atomically by the schema trigger in §5, not by JS pre-reads. The
+location install is guarded by the pack delete-fence trigger described in §7.
+
+**Skip-if-entitled semantics are the deployed reality and are kept** (round
+1): both the redeem endpoint and commit admission skip receipts whose sha is
+already in the entitled+present `have` set (`workspace-sync.ts` redeem loop;
+`validateCommitRefs`). A skipped receipt therefore installs **no** placement
+change. This is safe by the following invariant, which the property rig
+asserts: *an entitled+present logical blob always retains a valid active
+placement* — its packed location (if any) cannot be under an active pack
+intent (an active location blocks intent-open, §7.3), and its canonical object
+cannot be deleted (logical Phase 2 requires zero refs). The skipped receipt's
+own pack simply never gains that location and, if it ends with zero locations,
+ages out as a safe orphan. Consequently `/v1/blobs/check`'s new
+usable-location clause (§6) is defense-in-depth, not a load-bearing filter.
 
 The critical ordering is:
 
@@ -403,8 +530,9 @@ CREATE TABLE packs (
   pack_sha256  TEXT NOT NULL,
   size_bytes   INTEGER NOT NULL,
   member_count INTEGER NOT NULL,
-  state         TEXT NOT NULL CHECK (state IN ('uploading', 'ready')),
-  created_at   INTEGER NOT NULL
+  state         TEXT NOT NULL CHECK (state IN ('uploading', 'ready', 'swept')),
+  created_at   INTEGER NOT NULL,
+  touched_at   INTEGER NOT NULL   -- §3 repair heartbeat; sweeper requires BOTH past grace
 );
 
 CREATE TABLE pack_members (
@@ -417,10 +545,56 @@ CREATE TABLE pack_members (
 
 CREATE TABLE pack_gc_candidates (
   pack_id     TEXT PRIMARY KEY,
+  epoch       TEXT NOT NULL,     -- random id per candidacy; every open/execute/terminal statement binds it (round 5)
   marked_at   INTEGER NOT NULL,
   deleting_at INTEGER
 );
 ```
+
+The `epoch` column exists because candidacies are replaceable (resurrect →
+displacement re-mark) while `pack_id` stays the primary key: a pass that
+observed candidacy C1 must never act on its replacement C2 with stale state
+(round 5 BLOCKER — a stale open UPDATE matching only `pack_id` could stamp C2
+with a clock older than C2's mark, breaking §7.3's `deleting_at > T_mark`).
+Every destructive or opening statement binds the observed `epoch`, so a
+replaced candidacy makes the stale statement a `changes = 0` no-op.
+
+Plus the indexes the executors actually scan (rounds 1–2), shaped for the
+keyset cursors exactly as migration 0024 shapes them for `gc_candidates`:
+`packs(created_at)` (with `touched_at` in the sweep predicate) for the
+orphan-grace scan, and composite partial indexes
+`pack_gc_candidates(marked_at, pack_id) WHERE deleting_at IS NULL` and
+`pack_gc_candidates(deleting_at, pack_id) WHERE deleting_at IS NOT NULL` for
+the cursored mark/execute passes in `versions.ts` style.
+
+Three triggers make the placement lifecycle D1-serialized rather than
+JS-read-then-hope (round 1 findings):
+
+1. **Install guard (`rbox_pack_delete_fence`, raised as
+   `rbox_delete_fence_pack`):** any INSERT/UPDATE of `blob_locations` whose
+   `pack_id` has `pack_gc_candidates.deleting_at IS NOT NULL` →
+   `RAISE(ABORT, 'rbox_delete_fence_pack')`. The message deliberately contains
+   the existing `rbox_delete_fence` substring so the deployed classifier
+   (`isDeleteFenceAbort`, `commit-accounting.ts`) — and any rollback binary
+   carrying it — already converts the abort into the caught-super-batch 422
+   `needsUpload` recovery. A test covers a mixed v1/v2 super-batch hitting
+   this trigger.
+2. **Inventory guard:** any INSERT/UPDATE of `blob_locations` must match an
+   existing `pack_members(pack_id, sha256)` row with identical
+   `offset`/`length` and a `packs.state = 'ready'` parent, else
+   `RAISE(ABORT)`. Combined with §4's pack_members-derived install, an
+   accounting bug cannot become durable serving state pointing at bytes the
+   immutable inventory does not prove.
+3. **Displacement candidacy:** AFTER DELETE on `blob_locations` (and AFTER
+   UPDATE of `pack_id`, if an upsert path ever rewrites one), when
+   `OLD.pack_id` has no remaining `blob_locations` rows, INSERT OR IGNORE an
+   unopened `pack_gc_candidates(OLD.pack_id, now)`. This closes the v1-
+   displacement and v2 A→B races without a post-delete JS lookup losing the
+   former pack identity.
+
+Because trigger 3 can fire on transient states, the pack-GC mark pass also
+**resurrects** (deletes) any unopened pack candidate whose pack has regained
+active locations, mirroring `openIntents`' resurrect arm.
 
 `pack_members` is immutable physical inventory retained until the pack object is
 deleted. `blob_locations` is the active serving map. Its absence means legacy
@@ -430,10 +604,18 @@ must never infer canonical presence from location absence alone: the existing
 physical fetch.
 
 The tables live in the same account-data D1 routing domain as `blobs`,
-`blob_refs`, and `gc_candidates`. Because current `encSha` is account-unique in
-the deployed model, the existing SHA primary-key convention remains valid. A
-future cross-account physical-dedup design must revisit these keys; design 114
-does not introduce that sharing.
+`blob_refs`, and `gc_candidates`. Keying stated precisely (round 1):
+`blobs.sha256` is already a **global** primary key (migration 0001) — only
+`blob_refs` is `(account_id, sha256)` — and the deployed model is effectively
+single-tenant per content address, so a global `blob_locations.sha256` key
+follows the existing `blobs` convention, not an account-uniqueness claim. A
+future cross-account physical-dedup design must revisit these keys together
+with the pack-wide zero-location predicates; design 114 does not introduce
+that sharing.
+
+The migration ships as the next free number — **0025 at time of writing,
+re-checked after any rebase** per `apps/api/migrations/README.md` (filenames
+are append-only; the vitest config guard fails on collisions).
 
 ### 6. Addressing and read path
 
@@ -443,26 +625,42 @@ After authorization:
 
 1. read `blob_locations` for `encSha`;
 2. if a row exists, issue `R2.get(packKey(packId), { range: { offset, length } })`;
-3. require the returned byte count to equal `length`; stream it as the ordinary
-   `application/octet-stream` blob body;
+3. require the returned byte count to equal `length` **and SHA-256 of the
+   returned extent to equal the requested `encSha`** (round 1: a corrupted
+   equal-length offset would otherwise serve wrong bytes with HTTP 200 — the
+   canonical path has no such failure mode because the key *is* the hash;
+   hashing a ≤256 KiB extent is negligible Worker CPU). Then buffer/stream it
+   as the ordinary `application/octet-stream` blob body;
 4. if no row exists, use the current `R2.get(blobKey(encSha))` path.
 
 The single GET URL, status behavior, grant behavior, content type, and returned
 ciphertext bytes are unchanged. The client still hashes/decrypts/verifies the
-per-blob ciphertext as today. A missing pack/range or size mismatch is a server
-storage error/not-found equivalent and is paged; it must never fall through to a
-canonical key because that could mask a torn location transition.
+per-blob ciphertext as today. A missing pack/range, size mismatch, or extent
+hash mismatch is a server storage error/not-found equivalent and is paged (an
+extent-hash mismatch is specifically an index-corruption signal); it must never
+fall through to a canonical key because that could mask a torn location
+transition.
 
 For `POST /v1/blob-batch/get`, entitlement/grant checks remain per requested
 SHA and result frames retain the existing `(sha, payload|status)` semantics.
 The server resolves all authorized SHAs in one D1 placement query, then groups
-packed members by `packId`. For each pack it coalesces requested extents into the
-smallest covering range only when that range plus other response data remains
-within the existing 8 MiB response cap; otherwise it issues separate ranges.
-It slices the returned range back into independent frames and verifies exact
-lengths. Unpacked members use the existing canonical GET fan-out. Response order
-may remain completion order as it is today. The client batch downloader and
-single fallback require no pack knowledge.
+packed members by `packId`. Coalescing is governed by **two independent
+budgets** (round 1 — the response cap alone does not bound Worker memory,
+because a covering range fetches gap bytes that never enter the response, and
+today's implementation pre-buffers all results concurrently,
+`blob-batch.ts::streamBatch`):
+
+- the existing 8 MiB **response** cap on emitted frame payloads, unchanged; and
+- an 8 MiB **fetch-byte** budget counting every fetched byte at full covering-
+  range size, across all packs and canonical objects in the request.
+
+For each pack the server coalesces requested extents into the smallest covering
+range only while both budgets hold; otherwise it issues exact per-extent ranges
+(no gap bytes). It slices the returned range back into independent frames and
+verifies exact lengths plus per-extent SHA-256 as in the single path. Unpacked
+members use the existing canonical GET fan-out. Response order may remain
+completion order as it is today. The client batch downloader and single
+fallback require no pack knowledge.
 
 This adds D1 placement lookup to the verified-download-grant preauth path,
 which is currently D1-zero. That cost is accepted for correctness in v1 and is
@@ -504,11 +702,16 @@ executor uses the existing purge lease, intent quiescence, fresh reachable set,
 and final zero-`blob_refs` check, but it **does not modify the R2 pack**. Under
 the same live lease and active logical intent it atomically:
 
-1. deletes that exact active `blob_locations(sha256, pack_id)` row;
+1. deletes that exact active `blob_locations(sha256, pack_id)` row — with the
+   zero-ref, open-intent, and live-lease predicates **embedded in the DELETE
+   statement itself** inside the same `db.batch`, exactly like
+   `versions.ts::cleanupCandidate` repeats its guards per destructive
+   statement (round 2: a prior JS readiness check is not the guard);
 2. deletes the logical `blobs` catalog row and logical `gc_candidates` row under
    the existing zero-ref/open-intent guards; and
-3. if the pack now has no active `blob_locations`, inserts an un-opened
-   `pack_gc_candidates(pack_id, marked_at)` row.
+3. relies on the §5 displacement trigger: the location DELETE itself atomically
+   inserts the un-opened `pack_gc_candidates(OLD.pack_id, now)` row when it was
+   the pack's last active location — no JS re-read of the pack id.
 
 The immutable `pack_members` row remains until physical pack deletion, so audit
 and retry can prove what the object contains. Retiring a member does not punch a
@@ -525,37 +728,110 @@ never points back into the old condemned pack.
 Pack GC is disabled initially and has its own kill switch. When enabled it is a
 two-pass lease/quiescence executor modeled on existing `gc_candidates`:
 
+- **scope:** pack candidacy, intent, and execution apply to
+  **`packs.state='ready'` only** (round 4). `uploading` remnants are owned
+  exclusively by the §3 sweeper's guarded `uploading→swept` transition — one
+  owner per state, so an uploading pack can never take a non-tombstone
+  deletion path and later receive the late PUT the tombstone exists to
+  contain. `swept` packs are terminal and only re-HEAD-swept;
 - **mark:** only after `NOT EXISTS (SELECT 1 FROM blob_locations WHERE
-  pack_id=?)` and an orphan grace of at least **13 hours** after `created_at`;
-  this exceeds the 12-hour receipt TTL plus clock-skew allowance, so no valid
-  unredeemed receipt can first install a location after a pack becomes eligible.
-  A live member pins the pack indefinitely. Both `uploading` crash remnants and
-  `ready` packs with no redeemed members use this same grace—there is no faster
-  unsafe orphan path;
+  pack_id=?)` and an orphan grace of at least **13 hours** after `created_at`.
+  A live member pins the pack indefinitely. There is no faster unsafe orphan
+  path. The grace exists so a mark cannot race the *original* upload's
+  redemption window; it is deliberately **not** the receipt-expiry argument
+  (round 1: same-id retries re-mint receipts with a fresh 12-hour TTL, so no
+  `created_at`-anchored window bounds the last valid receipt);
 - **open intent:** after pack grace, atomically set `deleting_at` only if the
-  same zero-active-location predicate still holds;
+  same zero-active-location predicate still holds — stamped from the post-read
+  live clock (property 3 below), unlike `versions.ts::openIntents`, and bound
+  to the observed candidacy `epoch` (round 5: a resurrected-then-replaced
+  candidacy must make the stale UPDATE a no-op, never open the new epoch with
+  an old clock);
 - **execute:** under an unexpired purge lease and intent quiescence, recompute
-  and require zero active locations again, then delete `packs/v1/<packId>`, HEAD
-  to confirm absence, and finally delete `pack_members`, `packs`, and the pack
-  candidate;
+  and require zero active locations again, then delete `packs/v1/<packId>` and
+  HEAD to confirm absence. The **terminal transition is one guarded atomic
+  `db.batch`** (round 5): correlated `pack_members` DELETE, `UPDATE packs SET
+  state='swept' WHERE pack_id=? AND state='ready'`, and the candidate DELETE
+  bound to `(pack_id, epoch, deleting_at IS NOT NULL)` — each statement
+  embedding the zero-location and live-lease guards, so no crash point leaves
+  the object deleted with the mint/install fence retired but the tombstone
+  absent (a crash before the batch leaves candidacy + fence intact for retry;
+  the batch itself is atomic). The durable `swept` tombstone is the uniform
+  terminal state (round 4) — a late same-id write reappearing after physical
+  deletion meets the same tombstone re-sweep as an uploading remnant;
 - **unwind:** any active location or failed delete/HEAD clears or leaves the
   physical intent safely for retry; it never guesses success.
 
-New D1 triggers provide the physical equivalent of
-`rbox_delete_fence`: inserting/updating `blob_locations` to a pack with
-`pack_gc_candidates.deleting_at IS NOT NULL` raises `rbox_pack_delete_fence`.
-Receipt minting for that pack also folds the active pack candidate into its
-fail-closed fence read. Thus no await-sized read/delete race can make an active
-location point into a deleted pack.
+The safety of the terminal step — deleting the `pack_gc_candidates` row, which
+retires the install trigger's fence — rests on three named, individually
+enforced properties (round 1 restated this from a hand-wave into an invariant):
 
-The deletion proof is conservative:
+1. **Mint fence covers every candidate state, with pre-read timestamp
+   anchoring.** Receipt minting (and same-id retry) for pack `P` fails closed
+   on **any** `pack_gc_candidates` row for `P` — marked *or* opened, not just
+   `deleting_at IS NOT NULL`. Because an HTTP invocation has no duration bound,
+   "minted before mark" cannot be a wall-clock claim about when the HMAC
+   completes (round 2); instead the signed `issuedAt` is **captured before the
+   fence read**, exactly as `mintFenceCheckedReceipts` already anchors
+   `checkTime` today (`blobs.ts`). What D1 order actually gives (round 3 —
+   `marked_at`/`deleting_at` are JS invocation clocks, NOT database-assigned
+   times, so no inequality against them follows from serialization): for every
+   receipt whose fence read found no candidacy,
+   `issuedAt < T_mark` where `T_mark` is the **wall time the mark INSERT
+   landed** — the read preceded the insert in database order and `issuedAt`
+   was captured before the read.
+2. **Install fence covers the open intent.** The §5 trigger aborts any
+   location install into a pack with an open intent, and a pre-intent install
+   makes the intent-open predicate false — either way an await-sized race
+   cannot thread between them.
+3. **Quiescence dominates receipt lifetime, per candidacy epoch —
+   `PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS` — anchored by a
+   post-read intent clock.** A candidacy can be resurrected away (the §5
+   resurrect arm removes an unopened candidate when the pack regains
+   locations), after which minting legitimately resumes — so "never minted
+   again after the first candidacy" is false and is not the invariant (round
+   2). The invariant is **per candidacy epoch**: the candidacy that reaches
+   delete existed continuously from its mark through the delete (intent-open
+   re-checks, and the executor retires the row only at the end), so by
+   property 1 every receipt whose fence read passed has `issuedAt < T_mark`,
+   the wall time this epoch's mark landed. The wall-clock chain must not lean
+   on invocation-start timestamps (round 3), and an invocation-start clock is
+   not even bounded by the executor deadline at intent-open time (round 4 —
+   `gcPurge` can await long R2 work between capturing `nowMs` and opening
+   intents). The pack open pass therefore differs from
+   `versions.ts::openIntents` in one deliberate way: it stamps `deleting_at`
+   from a **live clock read taken after it observed the candidate row**, not
+   from the invocation-start `nowMs`. That gives `deleting_at > T_mark`
+   directly — no staleness budget carries proof weight. The chain:
+   - `deleting_at > T_mark` (post-read stamp, above);
+   - the execute pass requires `nowMs_exec − deleting_at > quiescence` with
+     `nowMs_exec ≤ T_delete` (an invocation-start execute clock only *delays*
+     eligibility — the safe direction), hence `T_delete > T_mark + quiescence`;
+   - every valid receipt expires by `issuedAt + TTL + skew < T_mark + TTL +
+     skew`, so `quiescence ≥ TTL + skew` suffices: no unexpired receipt exists
+     at the delete or at the terminal tombstone transition.
+   With 24 h quiescence against 12 h + 60 s the margin is ≈ 12 h. As
+   defense-in-depth (not proof-bearing), the open pass also skips opening when
+   `clock() − nowMs` exceeds a staleness guard, and gate 5b includes an
+   over-deadline-await history. The constant relation is compile/test-asserted.
+
+The deletion proof is conservative, and case-complete over how a pack reaches
+zero active locations (round 1: the previous single-case proof omitted two
+legitimate histories):
 
 ```text
 pack delete
-=> active pack intent + live lease + quiescence
+=> active pack intent + live lease + quiescence ≥ receipt TTL + skew
 => zero active blob_locations at intent open and immediately before delete
-=> every former member was independently retired under its logical
-   gc_candidates intent + zero refs + fresh design-96 reachability
+=> every former or would-be member is in one of exactly three states:
+   (i)  logically retired — its location was removed under that blob's own
+        gc_candidates intent + zero refs + fresh design-96 reachability (§7.2);
+   (ii) relocated — an authenticated receipt redemption atomically replaced
+        the location with another verified placement (canonical via v1, or a
+        different ready pack via v2); the blob is live and served elsewhere;
+   (iii) never published — the member was uploaded but never redeemed (orphan
+        pack, fenced retry, abandoned client); its receipts are expired by
+        property 3 and its bytes were never a serving location.
 => no published/entitled logical blob resolves into the pack
 ```
 
@@ -564,6 +840,15 @@ regranted between a JS read and R2 delete. The active-location trigger and pack
 intent are the D1-serialized barrier. This is the same reason design 102 relies
 on a live D1 invariant rather than a read-then-hope fence snapshot.
 
+**Kill-switch boundary, stated honestly** (round 1): `RBOX_BLOB_PACK_GC` is a
+Worker env var, fixed per invocation — flipping it cannot recall an invocation
+already executing, exactly like the existing GC flags. The exposure is bounded
+by the executor's own limits (page-capped rows, wall deadline, single purge
+lease); the flag guarantees no *new* invocation marks, opens, or deletes. This
+is the same boundary the platform gives every env-var kill switch and is
+accepted; a mid-invocation abort mechanism would require a durable-state flag
+read per page and is not part of v1.
+
 There is no compaction in v1. A pack with 897 dead members and one live member
 keeps the full object. This knowingly sacrifices storage efficiency for fence
 correctness. Operators may disable physical pack GC without disabling uploads,
@@ -571,10 +856,21 @@ reads, logical GC, or accounting.
 
 ### 8. Failure, retry, and resume
 
-- Crash before pack PUT: no server state; queued member promises retry.
+- Client crash before the pack PUT request: no server state; queued member
+  promises retry.
+- Server crash after inventory insert but before the R2 PUT: an `uploading`
+  inventory row remains (this IS server state — round 2); the client retries
+  same-id (heartbeat + repair, §3) or fresh-id; an abandoned row ages past the
+  orphan grace and the sweeper removes inventory, then any object.
 - R2 PUT failure: no receipts; retry the whole pack.
 - Crash after R2 PUT but before response: retry same `packId` + checksum;
-  idempotent validation returns fresh per-blob receipt generations.
+  idempotent validation (conditional heartbeat + single-row ready transition,
+  or the ready-state verify branch when the transition already happened)
+  returns fresh per-blob receipt generations.
+- Same-id repair racing the orphan sweeper: the repair's conditional heartbeat
+  or ready transition affects zero rows → fail closed, no receipts, fresh
+  `packId`; the sweeper's inventory-first ordering leaves no
+  served-but-uninventoried object.
 - Fence after R2 PUT: no receipts; pack is an orphan. Client retries members in
   a fresh pack after `retry_later`; pack GC eventually removes the orphan.
 - Some receipts redeemed before client death: they are normal per-blob
@@ -588,9 +884,11 @@ reads, logical GC, or accounting.
 - Batch/single read of a mixed pack/canonical set: each frame resolves
   independently; one packed failure falls through only to the existing client
   single-GET retry, never to an alternate server placement.
-- Client packer failure or server 404/405/415 capability response: settle no
-  member twice; monotonically disable packing for the process and requeue every
-  unsettled member into the existing batch/single uploader.
+- Client packer failure or server 404/405/415 capability response (including
+  `404 pack_disabled`): settle no member twice; monotonically latch packing off
+  for the process via the pack-only gate (§3 — never
+  `disableUploadForProcess`) and requeue every unsettled member into the
+  existing batch/single uploader.
 
 ### 9. Metrics and privacy
 
@@ -603,7 +901,9 @@ Add only numeric and low-cardinality fields:
 - reads: canonical vs packed counts, R2 range count, requested vs covering-range
   bytes, outcome enum;
 - GC: logical packed locations retired, packs marked/opened/deleted/unwound,
-  pinned pack count and aggregate pinned bytes.
+  pinned pack count and aggregate pinned bytes, durable `swept` tombstone
+  count, and reappeared-object re-deletes (a nonzero value proves the late-PUT
+  containment fired).
 
 No raw paths, SHAs, pack IDs, account/workspace/device IDs, path hashes, or
 member-order fingerprints enter metrics or logs. Debug output follows the same
@@ -631,11 +931,13 @@ cutoff only against the dev API.
 
 1. Add schema, receipt-v2 verification/accounting, location-aware reads/check,
    and metrics. Keep pack acceptance and pack GC off. Deploy dev first per
-   `docs/DEPLOYMENTS.md`; D1 migrations auto-apply on the Workers build.
+   `docs/DEPLOYMENTS.md`; D1 migrations auto-apply on the Workers build. **This
+   release is the pack rollback floor** (version skew section below).
 2. Enable pack acceptance in dev. Upload/read/GC-shadow fixtures; keep physical
-   pack deletion off.
-3. Deploy server support to production with acceptance off, then enable
-   acceptance. Old clients remain canonical.
+   pack deletion off. Run the rollback drill against the floor build.
+3. Deploy server support to production with acceptance off; after the floor
+   has soaked one release cycle, enable acceptance. Old clients remain
+   canonical.
 4. Release a client with `RBOX_BLOB_PACK=0`; canary flag-on against dev and then
    internal production accounts.
 5. Promote client packing only after throughput, resource, and correctness
@@ -653,15 +955,43 @@ cutoff only against the dev API.
 | old | old | Canonical/batch behavior unchanged. |
 | new, pack off | old | Canonical uploads and all reads unchanged. |
 | new, pack on | old | Old client uploads canonical forever; server reads mixed estate. |
-| old/no route | new, pack flag on | First 404/405/415 latches packing off for the process; all unsettled members requeue to existing batch/single PUT. |
-| new, acceptance off | new, pack flag on | Machine-readable `pack_disabled` (404/503 policy finalized in review) latches client off; no retry loop. |
+| old/no route | new, pack flag on | First 404/405/415 latches packing off for the process (pack-only latch, §3 — never `disableUploadForProcess`); all unsettled members requeue to existing batch/single PUT. |
+| new, acceptance off | new, pack flag on | Machine-readable `404 pack_disabled` (decided, §3) latches client pack-off; no retry loop; batch lane unaffected. |
 | new, acceptance on | new, pack on | Target packed upload; per-blob receipts and unchanged commits. |
-| new server rolled back after packs exist | any | Pack reads and receipt-v2 verification remain mandatory compatibility code; only new pack PUTs stop. |
+| server ≥ rollback floor, rolled back after packs exist | any | Pack reads and receipt-v2 verification remain in the binary; only new pack PUTs stop. |
+| server **below** the rollback floor | any | **Packed data is unavailable and v2 receipts unverifiable. Not a rollback target once acceptance has ever been on in that environment.** |
 
 Receipt v2 and packed reads are storage compatibility, not removable feature
-flags. A server rollback binary that cannot read already-written packs is
-forbidden. Rollback means disable acceptance/GC or deploy a binary retaining the
-reader and receipt decoder.
+flags — and "forbidden" is made mechanical rather than aspirational (round 1
+BLOCKER):
+
+- **Rollback floor.** The release that first ships the pack reader, placement
+  read path, and receipt-v2 verification (rollout step 1) is the **pack
+  rollback floor**. Its deployed version is recorded in this design, in
+  `docs/STATUS.md`, and as a named constant beside the reader code.
+- **Reader-first soak.** Production pack **acceptance** (step 3+) may be
+  enabled only after the floor release has been the stable production build
+  through at least one subsequent release cycle, so every plausible rollback
+  target still reads packs and verifies v2 receipts.
+- **Rollback drill (gate), operationally pinned** (rounds 2–3). In dev, after
+  writing and redeeming real packs: from `apps/api` (the wrangler config
+  root), record the floor and active Worker version IDs
+  (`cd apps/api && npx wrangler versions list` against the dev worker),
+  redeploy the floor build at 100% via
+  `npx wrangler versions deploy <floor-version-id>@100%` (acceptance off),
+  assert packed single/batch GETs return byte-identical ciphertext,
+  outstanding v2 receipts redeem, and `/v1/blobs/check` is unchanged; then
+  restore the recorded active version the same way and re-verify. "One
+  release cycle" of soak is
+  defined measurably: the floor (or a later reader-capable build) has been the
+  deployed production Worker for **≥7 days and ≥1 subsequent production
+  deploy**, so every version in the plausible rollback window reads packs.
+  This drill is a promotion gate, not documentation.
+- **Inherent residual, stated plainly.** No mechanism can make a pre-floor
+  binary read a format it predates; that is true of every storage-format
+  addition. The control is that rollback below the floor is never required for
+  a 114-originated problem: every 114 behavior above the floor is
+  independently disableable by flag (acceptance, client packing, pack GC).
 
 ## Validation
 
@@ -677,10 +1007,17 @@ reader and receipt decoder.
 - Pack PUT performs exactly one R2 PUT and returns one ordered per-blob receipt;
   any member failure returns no receipts. Same-ID/same-checksum retry is
   idempotent; same-ID/different-checksum fails.
-- Receipt v1 selects canonical; v2 installs exact packed placement. Redeeming
-  twice grants/charges zero the second time. Mixed v1/v2 batches preserve design
-  111 count+byte slicing, exact-generation deletion, 422 whole-super-batch
-  recovery, and final flush before commit.
+- Receipt v1 selects canonical; v2 installs the `pack_members`-derived packed
+  placement (never receipt-carried offsets). Redeeming twice grants/charges
+  zero the second time; a receipt for an already-entitled sha is skipped and
+  installs no placement change (§4 skip-if-entitled), asserted directly. Mixed
+  v1/v2 batches preserve design 111 count+byte slicing, exact-generation
+  deletion, 422 whole-super-batch recovery, and final flush before commit; the
+  worst-case encoded v2 entry byte size is pinned by test against the 7 MiB
+  slicer.
+- A mixed v1/v2 accounting super-batch that trips `rbox_delete_fence_pack`
+  converts to the caught-super-batch 422 `needsUpload` via the existing
+  `isDeleteFenceAbort` classifier (substring compatibility asserted by test).
 - `/v1/blobs/check` response for the same logical D1 state is identical for
   canonical and packed storage, including old-client headers, Phase-1 marks,
   active logical intents, and active pack intents.
@@ -699,8 +1036,23 @@ canonical and packed locations. At every injected await/crash boundary assert:
 3. a Phase-1 stale snapshot can mark but cannot retire a head-reachable member;
 4. logical intent vs receipt redemption either aborts the accounting super-batch
    to `needsUpload` or leaves a live location—never partial publication;
-5. pack intent vs packed receipt/location install is D1-serialized by
-   `rbox_pack_delete_fence`;
+5. pack intent vs packed receipt/location install is D1-serialized by the
+   `rbox_delete_fence_pack` trigger;
+5b. no fence read begun after a candidacy exists authorizes minting (same-id
+   retry included); every authorized receipt's signed `issuedAt` precedes the
+   wall time the current candidacy's mark landed; `deleting_at` exceeds that
+   mark's landing time (post-read stamp); and every such receipt is expired
+   before that candidacy's delete step can run (`PACK_INTENT_QUIESCENCE ≥
+   RECEIPT_TTL_MS + CLOCK_SKEW_MS`, compile/test-asserted) — exercised with
+   clock-injected histories covering: mint-vs-mark interleavings at statement
+   granularity (a fence read that passed before the mark landed may complete
+   its HMAC after — must still satisfy the issuedAt bound); pre-mark
+   install→resurrect→retry-mint (must succeed)→last-location-delete→fresh
+   mark→delete with quiescence restarted from the NEW intent; an
+   **over-deadline await between invocation start and intent-open** (round 4);
+   a **stale open/execute statement racing a resurrect→re-mark candidacy
+   replacement** (round 5: the epoch-bound statement must be a `changes = 0`
+   no-op); and installs attempted at every await boundary;
 6. re-add before logical retirement preserves the old location; re-add after
    retirement installs a fresh canonical/new-pack location and cannot resurrect
    the condemned pack;
@@ -751,9 +1103,25 @@ Promotion requires all of:
    measured physical counts are reported side by side.
 4. **Server resource gate:** zero Worker 1102/OOM/subrequest-limit errors; p99
    pack handler wall <10 s; per-request CPU <50% of configured limit; body never
-   exceeds 8 MiB; aggregate error/retry rate non-inferior. Read p95 for single
-   packed GET and 32-record mixed batch GET regresses by no more than 20% versus
-   canonical, and join wall regresses by no more than 5%.
+   exceeds 8 MiB; aggregate error/retry rate non-inferior. Because the 128 MiB
+   limit is per **isolate**, not per request (round 2), and remote fan-out may
+   spread across isolates (round 3), the memory check is two-layered: (i) a
+   deterministic same-isolate harness in the existing workers vitest runtime
+   driving N concurrent pack-PUT + mixed batch-GET handler invocations with
+   full 8 MiB bodies in one isolate, and (ii) the remote dev stress cell (24
+   concurrent pack PUTs overlapped with batch GETs) for platform behavior —
+   the same transient-buffer class the existing 8 MiB batch lane already
+   carries (~16–24 MiB per in-flight request), made explicit rather than
+   assumed.
+4b. **Read gate — dedicated matched cells** (round 1: five cold publishes
+   cannot establish read percentiles). A separate read harness runs, on the
+   same host/API build, ≥200 single GETs and ≥50 32-record batch GETs per arm
+   against the *same logical corpus* stored packed vs canonical (cold client
+   cache; the two arms interleaved to share network weather). Gate: packed p95
+   regresses ≤20% vs the matched canonical p95 for both shapes, computed
+   nearest-rank; missing telemetry for any cell fails the gate rather than
+   passing silently. Join wall: ≥5 matched joins per arm, median regression
+   ≤5%.
 5. **Receipt/accounting gate:** newly granted logical refs and charged bytes equal
    unique successful ciphertext members and their ciphertext sizes, not pack
    count or physical bytes; repeat redemption charges zero; final drain obeys
