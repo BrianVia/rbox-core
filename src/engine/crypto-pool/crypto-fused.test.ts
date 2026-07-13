@@ -5,13 +5,13 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import * as zlib from "node:zlib";
-import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "./crypto.js";
-import { hashBytes } from "./hash.js";
-import { __cryptoPoolTestHooks, CryptoPool, withCryptoPool } from "./crypto-pool.js";
-import { PhaseReport, type Manifest } from "./index.js";
-import { encryptAndUpload, setDefaultEncryptObserverForTest } from "../cli/sync-recovery.js";
-import type { SyncRemote } from "../cli/remote.js";
-import type { WorkspaceConfig } from "../cli/config.js";
+import { encryptBytesInMemory, encryptFileToTempInline, generateKek } from "../crypto.js";
+import { hashBytes } from "../hash.js";
+import { __cryptoPoolTestHooks, CryptoPool, withCryptoPool } from "../crypto-pool.js";
+import { PhaseReport, type Manifest } from "../index.js";
+import { encryptAndUpload, setDefaultEncryptObserverForTest } from "../../cli/sync-recovery.js";
+import type { SyncRemote } from "../../cli/remote.js";
+import type { WorkspaceConfig } from "../../cli/config.js";
 
 function seeded(size: number, compressible: boolean): Buffer {
   const out = Buffer.alloc(size);
@@ -99,7 +99,7 @@ describe("fused crypto", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-split-"));
     const workerPath = path.join(root, "poison-worker.js");
     const attemptsPath = path.join(root, "attempts.log");
-    const cryptoUrl = new URL("./crypto.ts", import.meta.url).href;
+    const cryptoUrl = new URL("../crypto.ts", import.meta.url).href;
     await fs.writeFile(workerPath, [
       `import fs from "node:fs/promises"; import { encryptBytesInMemory } from ${JSON.stringify(cryptoUrl)};`,
       "let kek; self.onmessage = async ({data:m}) => {",
@@ -139,7 +139,7 @@ describe("fused crypto", () => {
   test("aggregate-overflow requeues resolve byte-identically without leaking charges", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-fused-requeue-"));
     const workerPath = path.join(root, "requeue-worker.js");
-    const cryptoUrl = new URL("./crypto.ts", import.meta.url).href;
+    const cryptoUrl = new URL("../crypto.ts", import.meta.url).href;
     await fs.writeFile(workerPath, [
       `import fs from "node:fs/promises"; import { encryptBytesInMemory } from ${JSON.stringify(cryptoUrl)};`,
       "let kek; let first=true; self.onmessage=async({data:m})=>{",
