@@ -1,6 +1,7 @@
 # 112 — Batch-fill and blob-PUT wire-cap raise
 
-Status: **INITIAL DRAFT — no adversarial review yet**, 2026-07-12.
+Status: **REVIEWED — ALIGNED** (4 codex rounds; ledger: `REVIEW-112.md`),
+2026-07-12.
 
 ## Problem
 
@@ -64,19 +65,35 @@ Cloudflare permits only six simultaneous outgoing connections per invocation.
 4. After a request settles, `launch().finally` launches full batches and, if
    every slot is idle, flushes a remaining tail partial.
 
-Thus the observed 17 is not the 32-record cap and is not a slot-completion
-race. It is principally the 10 ms fixed window racing the encrypt producer:
-the first item starts a clock, the producer supplies roughly 17 unique blobs
-before it expires, and the 24 mostly-free PUT slots let the timer drain that
-partial immediately. Slot availability enables the underfill but does not
-initiate it. The idle-tail path matters only when active requests fall to zero.
+Thus, from code, partial batches have exactly two origins: the 10 ms timer
+path and the idle-tail path (FIFO carving cannot underfill at ~8.55 KB
+records). The observed 17.3 is not the 32-record cap and is not a
+slot-completion race.
+
+**Attribution caveat (what the field data can and cannot prove).** The AE
+`blob.batchPut` fields are count/bytes/duration only; there are no enqueue
+timestamps or dispatch reasons, so the 17.3 mean cannot be decomposed into
+timer-drain versus idle-tail versus full batches diluted by small flushes.
+Supply is also not a smooth stream: the pipeline buffers missing-checks for
+50 ms (or `ROLLING_CHECK_BATCH`) and resolves an entire check batch in one
+synchronous loop (`pipeline.ts` `flushChecks`), releasing consumers in waves —
+a large wave forms full batches via `dispatchFull()` and only the residue is
+timer-drained. The timer hypothesis is the most probable mechanism consistent
+with the code paths, but its share is unproven. This design therefore treats
+fill-v2 as a **measurement-first experiment**: the implementation adds
+low-cardinality dispatch-reason counters — per fill version, matching each
+version's actual dispatch paths: fill-v1 emits `full_records`, `full_bytes`,
+`fixed_timer`, `idle_tail`; fill-v2 emits `full_records`, `full_bytes`,
+`quiet`, `absolute`, `idle_tail` — plus queued-record depth and oldest-record
+age at dispatch. The fill-v1 baseline run must show `fixed_timer`/`idle_tail`
+partials dominating before the causal claim is asserted in any report.
 
 The producer is deliberately bounded: the publish pipeline uses
-`encryptConcurrency(...)` (normally eight workers). Each queued `putFile()`
-promise remains occupied until its record settles. The original design-80
+`encryptConcurrency(...)` (normally eight workers) feeding up to 512 upload
+consumers that each await `putFile()` settlement. The original design-80
 intent was to keep supply ahead of dispatch, but the non-sliding 10 ms window
-can expire between encrypt completions even when the overall first-publish
-queue is deep.
+can expire between encrypt completions and between check waves even when the
+overall first-publish queue is deep.
 
 ### Server cost evidence
 
@@ -98,29 +115,50 @@ work and request/response materialization consume CPU and memory, while R2 PUTs
 complete in about `ceil(N/6)` waves. See the current [Cloudflare Workers
 limits](https://developers.cloudflare.com/workers/platform/limits/).
 
-## Root cause
+## Constraints and hypotheses
 
-There are two serially composed constraints:
+There are two serially composed constraints — the first a hypothesis to test,
+the second a hard fact of the wire:
 
-1. **The client closes a batch too early.** The 10 ms timer measures time since
-   the first queued record, not time since the last arrival and not whether the
-   upstream publish still has a deep encrypt backlog. With 24 free slots it
-   eagerly converts producer burstiness into half-full requests.
-2. **The wire rejects a useful sweep axis.** Both client and server pin the
-   record maximum to 32. `RBOX_BATCH_RECORDS` is clamped to 32 explicitly, so
-   `rig/upload-sweep` cannot test larger record batches without a coordinated
-   server release.
+1. **Hypothesis: the client closes batches too early.** The 10 ms timer
+   measures time since the first queued record, not time since the last
+   arrival and not whether the upstream publish still has a deep backlog; with
+   24 free slots it can convert producer burstiness into half-full requests.
+   This is the most probable underfill mechanism consistent with the code
+   paths, but per the attribution caveat above it is asserted as cause only if
+   the fill-v1 dispatch-reason baseline demonstrates it.
+2. **Fact: the wire rejects a useful sweep axis.** Both client and server pin
+   the record maximum to 32. `RBOX_BATCH_RECORDS` is clamped to 32 explicitly,
+   so `rig/upload-sweep` cannot test larger record batches without a
+   coordinated server release.
 
 The 8 MiB request cap is not the FM constraint. At 8.55 KB/record, 64 records
 are about 547 KB and even 128 are about 1.09 MiB. Raising body bytes or the
 256 KiB per-record limit would add memory risk without helping this corpus.
+Memory bounds after the raise are unchanged in the dimension that matters:
+the server's per-request payload stays capped at 8 MiB (a 64-record batch of
+max-size 256 KiB records cannot exist — FIFO carving and `readBytesCapped`
+bind at the body cap near 31 records, so the record raise only changes
+small-record batches). On the client, peak framing remains approximately two
+body buffers per active slot (payloads plus the contiguous output in
+`encodeBatchBody`), bounded by slots × body cap, not by the record count.
+Measurement honesty: `peakUploaderFramingBytes` is a **per-request** framing
+peak (it maxes each `encodeBatchBody` invocation's own bytes; it does not
+aggregate across the up-to-24 concurrent encodes), so aggregate client memory
+is assessed via process peak RSS, with `peakUploaderFramingBytes` as the
+per-request component. This design does not add an aggregate in-flight
+framing counter.
 
 ## Options
 
 ### A. Raise records only, leave the 10 ms timer
 
-This exposes a sweep axis but does not address measured underfill: a client
-that averages 17 under a cap of 32 will still average about 17 under 64. Reject.
+This exposes a sweep axis but provides no fill mechanism and no telemetry to
+interpret the result. Whether fill would improve depends on which underfill
+mechanism dominates — under a wave-residue pattern a larger cap can absorb a
+whole check wave into one partial, while under timer starvation it changes
+nothing — and without dispatch-reason instrumentation the sweep could not
+tell which happened. Option D strictly contains A. Reject as a standalone.
 
 ### B. Sliding quiet timer
 
@@ -170,18 +208,30 @@ the remaining time to the earlier condition and rearms; it does not blindly
 drain every partial on the first tick. The existing `active === 0` tail flush
 remains, because it is the deadlock guard when all active work finishes.
 
-“Queue deep” is defined locally and safely: queued unique records plus active
-batched records are supply evidence; this design does not reach into the
-encrypt scheduler or add a cross-layer queue API. While the queue can form a
-full batch, `dispatchFull()` wins. Otherwise the sliding quiet bound detects a
-real producer gap and the 50 ms absolute bound prevents starvation.
+**Known limitation, stated up front:** the uploader sees only `putFile()`
+arrivals; it has no producer-open or encrypt-backlog signal, and this design
+deliberately does not add a cross-layer queue API. Consequently the sliding
+quiet bound cannot distinguish a genuine producer end from a >10 ms supply gap
+(encrypt stall, filesystem variance, a missing-check wave boundary): any such
+gap ships the partial. Fill-v2 is therefore an **experiment with a falsifiable
+gate**, not a diagnosed cure — if supply gaps >10 ms dominate, fill-v2 will
+measure no better than fill-v1 and the fill gate below will fail. A fake-clock
+unit test pins this exact behavior (deep logical backlog, inter-arrival gaps
+>10 ms → partials ship on the quiet bound); it documents the limitation rather
+than gating on it. While the queue can form a full batch, `dispatchFull()`
+wins. The dispatch-reason counters above are what turn a fill-gate failure
+into a diagnosis (quiet-dominated → gaps; absolute-dominated → slow trickle).
 
 Latency trade: a small upload that does not fill a batch may wait up to 50 ms
 before its request starts, versus nominally 10 ms today: **at most +40 ms of
-intentional client queueing** on that tail. A greenfield publish should usually
-pay the bound only during ramp and final tail; full batches launch immediately.
-Record queue timing already exists under lane timing and must be reported in
-the sweep so this trade is measured rather than assumed.
+additional timer-induced client queueing while the uploader remains open**.
+Scope of that bound: the `active === 0` idle-tail flush may ship a partial
+sooner than either timer bound, and `close(err)` does not flush at all — it
+cancels the timer and rejects queued waiters, exactly as today. A greenfield
+publish should usually pay the bound only during ramp and final tail; full
+batches launch immediately. Record queue timing already exists under lane
+timing and must be reported in the sweep so this trade is measured rather
+than assumed.
 
 ### 2. Raise the accepted record cap from 32 to 64
 
@@ -232,6 +282,27 @@ bounce but cannot lose receipts, loop on a non-shrinking max, or commit before
 the required flush. If design 111 instead moves redemption into blob-PUT
 responses, that is a seam change requiring joint re-review before this ships.
 
+### 4. Seam with the 109/110/111 binding order
+
+`REVIEW-109-111-seam.md` fixes a binding implementation/evaluation order whose
+step 4 captures ONE fixed-corpus, flags-off baseline shared by 110 Phase 0 and
+111's control. Design 112 changes exactly the quantities that baseline
+measures: `blob.batchPut` count/duration (109's gate-0 decomposition and 110's
+upstream-of-DO context) and the cadence at which receipts reach 111's drainer
+(a 64-record PUT can hand the drainer 64 receipts at once). Binding rules:
+
+- 112's effective state (fill version, client record cap, server acceptance
+  cap) is **frozen and recorded in every cell** of any 110/111 baseline,
+  control, or candidate measurement; no 112 behavior or cap transition may
+  land inside such a window.
+- The seam ledger's order list must be amended when 112 enters
+  implementation, slotting 112's field evaluation outside the step-4 window
+  (before the baseline capture with its state recorded, or strictly after the
+  110/111 evaluations that consume it).
+- If design 109 is ever unparked, its gate-0 attribution must be rerun after
+  112 has changed batch cardinality — the 89 ms/request pre-handler share was
+  measured against 17.3-record batches and does not transfer.
+
 ## Flags and rollout
 
 Two independent kill switches are required:
@@ -258,14 +329,45 @@ Rollout order is binding:
 | 32 | 32 | Current compatible behavior; fill-v2 may improve occupancy. |
 | 64 | 32 | Backward-compatible; server capability is unused. |
 | 64 | 64 | Target behavior. |
-| 32 | 64 | Invalid rollout/rollback ordering: server returns 400 and current client falls back the entire request to singles. Safe but slow; alerts must catch any occurrence. |
+| 32 | 64 | Invalid rollout/rollback ordering. Without the latch below this would be UNBOUNDED degradation, not a one-off: today's client treats a 400 like any non-OK response — `fallbackAll` re-uploads that request as singles and keeps forming oversized batches forever (unlike 404/405, a 400 latches nothing). Mitigations below reduce it to one latch event plus a bounded in-flight burst (≤ slots), and make it alertable. |
 | old/no batch route | 64-cap client | Existing 404/405 process-wide single-PUT fallback. |
 
-Unlike design 111 redemption, the blob-PUT endpoint does not currently return a
-machine-readable `too_many_records` contract that the client safely clamps and
-re-slices. This design does not invent one for rollout safety; server-first is
-mandatory, and the server kill switch must not be lowered below the deployed
-client default until clients have first been rolled back to 32.
+The skewed-rollback path needs three concrete mechanisms, because a
+new-client/old-server pair cannot rely on any new server contract:
+
+1. **Client 400 latch (mandatory, ships with phase 3).** On any
+   `/v1/blob-batch/put` 400 while the effective record cap exceeds the
+   compiled floor of 32, the client latches its session record cap down to 32
+   (one-time, monotonic — analogous to `uploadDisabledForProcess`), falls the
+   current request back to singles as today, and continues batching at 32.
+   A 400 at cap ≤32 is a genuine bad request and behaves exactly as today.
+   Honest bound: with 24 slots, several oversized requests may already be in
+   flight when the first 400 lands, and each falls back to singles
+   independently — the guarantee is therefore **at most the number of
+   oversized requests in flight at latch time (≤ slots, 24 by default)
+   degraded requests per process**, not exactly one. The latch prevents any
+   NEW oversized batch from being carved: the session cap is a mutable field
+   that replaces `config.records` at BOTH read sites — `dispatchFull()`'s
+   fullness check and `carve()`'s take limit — so queued not-yet-carved
+   groups automatically re-carve at 32; only batches already carved and
+   launching stay oversized.
+2. **Server `too_many_records` outcome (ships with the server change).** The
+   current handler collapses every parse failure into AE outcome
+   `bad_request` with `count: 0` — an alert on the skew condition is not
+   implementable from existing telemetry. The new server emits a distinct
+   low-cardinality outcome (`too_many_records`) with the offending record
+   count, and the deployment checklist gains an alert on any nonzero rate.
+3. **Machine-readable `max` (new server only, forward-looking).** The new
+   server's over-cap 400 includes `max`, mirroring the existing batch-GET
+   "too many shas" response shape. Clients that see a valid shrinking `max`
+   clamp to it (same validation discipline as design 111: positive integer,
+   strictly below what was sent; otherwise use the latch in (1)). Old servers
+   never send it, which is why (1) does not depend on it.
+
+Server-first rollout remains mandatory, and the server kill switch must not
+be lowered below the deployed client default until clients have first been
+rolled back to 32 — mechanism (2) is what makes a violation of that rule
+visible within minutes rather than by anecdote.
 
 ## Validation
 
@@ -275,10 +377,21 @@ client default until clients have first been rolled back to 32.
   stream does not flush at the first record's +10 ms; quiet partials dispatch
   after 10 ms; continuous partial supply dispatches by oldest+50 ms; the
   `active === 0` tail cannot deadlock; close/retry/fallback settles every waiter
-  once; duplicate SHAs do not inflate fill counts.
+  once; duplicate SHAs do not inflate fill counts; and the documented
+  limitation is pinned: inter-arrival gaps >10 ms with a deep logical backlog
+  ship partials on the quiet bound (limitation-documenting, not a pass gate).
+- 400-latch tests: a `/v1/blob-batch/put` 400 at effective cap >32 latches the
+  session cap to 32, falls back that request to singles, and subsequent
+  batches carve at 32 with no further 400s; with 24 concurrent oversized
+  requests in flight against a 32-cap server, every waiter settles exactly
+  once, at most those in-flight requests degrade to singles, and queued
+  groups re-carve at 32; a 400 at cap ≤32 behaves exactly as today; a valid
+  shrinking `max` in the response clamps to `max` instead; absent/invalid/
+  non-shrinking `max` uses the 32 latch.
 - Boundary tests send 32, 33, 64, and 65 records under server max 32 and 64 and
   pin rejection precedence, response ordering, SHA mismatch, duplicate SHA,
-  8 MiB body, and 256 KiB record behavior.
+  8 MiB body, and 256 KiB record behavior, plus the new `too_many_records`
+  outcome and `max` field on the over-cap 400.
 - Receipt/fence suites from designs 96/102 run at 64 records, including an open
   delete intent after writes but before minting: no receipt in the request is
   minted and the response remains `503 retry_later`.
@@ -288,39 +401,83 @@ client default until clients have first been rolled back to 32.
 
 ### Sweep and corpus gates
 
-Once dev accepts 64, extend `rig/upload-sweep` so its records axis is no longer
-pinned to 32. Hold slots at **24** and body/per-record caps at 8 MiB/256 KiB.
-Run 32/48/64 for both fill-v1 and fill-v2, minimum three cold FM first publishes
-per cell, randomized order, same build/corpus/network placement. Capture AE
-`blob.batchPut` count/bytes/duration plus client wall and queue timing.
+The current harness cannot run this plan as-is: `sweep.sh` takes one scalar
+`RECORDS`, loops only over `SLOTS`, has no fill-policy selector, and — absent
+an explicit `RBOX_API` — the CLI targets **production**. The records sweep is
+therefore an explicit harness change shipped with phase 3 (whose client build
+is also a prerequisite, since older clients clamp `RBOX_BATCH_RECORDS` to 32):
+
+- `RECORDS_SET="32 48 64"` and `FILL_SET="v1 v2"` axes, cells randomized and
+  repeated (minimum three cold FM first publishes per cell), same
+  build/corpus/network placement;
+- `RBOX_API` mandatory, pointing at the dev worker; the script hard-refuses
+  to run any cell with records >32 or fill-v2 against the prod API base;
+- every output row records the effective settings (records, fill, slots,
+  API base, build sha) alongside the measurements;
+- slots held at **24**, body/per-record caps at 8 MiB/256 KiB;
+- capture AE `blob.batchPut` count/bytes/duration per cell window, the new
+  client dispatch-reason counters, lane queue timing, and client process peak
+  RSS + `peakUploaderFramingBytes`.
+
+Measurement sources are named because round 1 found gates that could not be
+evaluated from existing telemetry: overall per-batch fill distributions
+(mean/p50) come from per-event AE `blob.batchPut` `count`. Per-reason fill is
+NOT derivable by joining server AE with independent client counters — so the
+client records, under lane timing/sweep mode only, a per-dispatch observation
+of `(reason, records, bytes)` (numbers and one enum; local sweep output, no
+identifiers), from which the sweep reports per-reason dispatch counts and
+record-count histograms. Reasons are reported **independently, one per
+reason** — only `idle_tail` is an observed idle-tail dispatch; `absolute` can
+equally mean a sustained slow trickle mid-publish, and a genuine
+end-of-producer tail can ship via `quiet`, so no reason combination is
+labeled "the tail" (a true logical end-of-producer marker would need a
+producer-closed signal this design does not add — that quantity is simply
+unavailable). Response size is bounded
+analytically (results array of ≤64 fixed-shape records, receipt string of
+measured size) and spot-checked in the boundary tests.
 
 Promotion of client default 64 requires all of:
 
 1. **Batch-count gate:** successful attempted batch-PUT count falls by at least
    35% versus 32/fill-v1 on FM; single-PUT fallback count does not increase.
-2. **Fill gate:** mean records ≥48 at candidate 64, p50 ≥56, with tail batches
-   reported separately; mean accepted bytes ≥400 KB on FM. This is compatible
-   with the measured ~8.55 KB/blob and detects continued timer starvation.
+2. **Fill gate:** mean records ≥48 at candidate 64, p50 ≥56 (AE per-event
+   `count`), with the fill distribution also broken down per dispatch reason
+   (each reason reported independently — no combined "tail" bucket); mean
+   accepted bytes ≥400 KB on FM. This is compatible with the measured
+   ~8.55 KB/blob and detects continued timer starvation.
 3. **Wall-throughput gate:** median FM first-publish upload wall improves ≥15%
    and wall Mbps improves ≥15%; no run regresses >5%. Report total publish wall
    separately so commit/redemption work cannot be credited to this change.
-4. **Server-curve gate:** p95 handler wall at 64 <5 s, error/503/fallback rates
-   non-inferior, and `duration64 / duration32 < 1.8`. A ratio near 2 means R2
-   serialization erased the amortization thesis; keep fill-v2/32 and do not
-   promote 64.
-5. **Resource gate:** no Worker 1102/resource-limit errors, no material CPU or
-   memory regression, response serialization remains bounded, and the existing
-   #245 result is respected: slots remain 24 and are not swept upward as part of
-   this design.
+4. **Server slot-work gate:** compared on matched fill-v2 cells (fill-v2/64 vs
+   fill-v2/32 — never against the underfilled fill-v1 baseline, which would
+   confound fill policy with record count): total slot work (sum of handler
+   durations ≈ request count × mean duration) falls by ≥10%, p95 handler wall
+   at 64 <5 s, and error/503/fallback rates are non-inferior. A raw
+   duration ratio is deliberately NOT the falsifier: the design's own
+   six-wide wave model predicts an ideal full-batch ratio of 11/6 ≈ 1.83, so
+   a threshold near it cannot separate healthy scaling from erased
+   amortization; slot work measures the thesis directly. If slot work does
+   not fall, keep fill-v2/32 and do not promote 64.
+5. **Resource gate:** zero Worker 1102/resource-limit errors across the sweep;
+   p99 handler wall at 64 <10 s; client peak process RSS (aggregate memory)
+   within 10% of the 32-record cells (the aggregate bound is slots × body
+   cap, unchanged by this design); `peakUploaderFramingBytes` (per-request
+   framing peak) checked against its **analytical ceiling** of ~2× (body cap
+   + frame headers) — it is EXPECTED to grow roughly with per-request fill
+   (a full 64-record FM batch frames ~2 × 547 KB vs ~2 × 274 KB at 32), so
+   it gets a ceiling, not a no-growth comparison; single-PUT fallback and
+   retry counts non-inferior. The existing #245 result is respected: slots
+   remain 24 and are not swept upward as part of this design.
 6. **Correctness gate:** identical committed ref set, all receipts redeemed,
    resume after injected mid-upload failure converges without double accounting,
    and all design-96/102 fence assertions pass.
-7. **Privacy gate:** emitted metrics contain counts, bytes, durations, cap and
-   low-cardinality outcome only—no raw file paths, SHAs, workspace/account/device
-   identifiers, or path hashes.
+7. **Privacy gate:** emitted metrics (including the new dispatch-reason
+   counters and `too_many_records` outcome) contain counts, bytes, durations,
+   cap and low-cardinality outcome only—no raw file paths, SHAs,
+   workspace/account/device identifiers, or path hashes.
 
 Validation is the dev fleet or `bun run rig`/upload-sweep against the real dev
-Worker and R2, not unit tests alone. If 64 fails the server-curve or wall gate,
+Worker and R2, not unit tests alone. If 64 fails the slot-work or wall gate,
 the shippable result is fill-v2 at 32; the coordinated cap remains accepted
 server-side but is not made the client default.
 
