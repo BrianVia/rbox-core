@@ -73,7 +73,7 @@ src/cli/e2ee-client.ts        — E2EE account/device bootstrap + pairing client
 ```
 src/cli/remote.ts                — barrel: stable import surface for the remote/ control-plane client.
 src/cli/remote/api.ts            — RboxApi facade (implements SyncRemote) + the SyncRemote interface: wires RemoteContext + blobs/commits/keys/batch modules into the surface sync depends on. Never: HTTP/crypto details (sibling domain modules).
-src/cli/remote/context.ts        — shared transport core: RemoteContext (base URL, auth token, ws/project ids, auth headers, upload-receipts accumulator, download-grant cache, fetch/postJson/missingBlobs primitives). Never: domain-specific endpoints.
+src/cli/remote/context.ts        — shared transport core: RemoteContext (base URL, auth token, ws/project ids, auth headers, upload-receipts accumulator, download/upload-grant caches (§27/§109), fetch/postJson/missingBlobs primitives). Never: domain-specific endpoints.
 src/cli/remote/blobs.ts          — single-blob PUT/GET transport (putBlob, getBlob, getBlobToFile), single-vs-multipart threshold, download integrity re-fetch. Never: multipart mechanics (multipart.ts), batch scheduling (blob-batch/).
 src/cli/remote/commits.ts        — manifest/commit transport: commit/commitSigned/commitsSince/latest/commitTimes/redeemReceipts + CommitRejectedError/CommitOptions/CommitTimings. Never: blob transfer, key/roster crypto.
 src/cli/remote/keys.ts           — E2EE key/pairing/device-admission transport (bootstrapKeys, account/device/workspace key endpoints, roster append, API-key CRUD). Never: verifying or interpreting the crypto material (engine/e2ee + e2ee-client.ts).

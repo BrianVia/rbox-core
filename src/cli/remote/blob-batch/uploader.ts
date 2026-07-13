@@ -5,7 +5,7 @@ import type { RemoteContext } from "../context.js";
 import { putBlobFile } from "../blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
-import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
+import { firstPublishAuthDispatchStart, firstPublishAuthSettle, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
 import { SingleGate, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount } from "./gate.js";
 import { uploadBatchConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig } from "./config.js";
 import { framedBytes, parseBatchPutErrorMax, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
@@ -233,18 +233,26 @@ export class BlobBatchUploader {
       armIdle();
       const queueCutoffMs = LANE_TIMING ? performance.now() : 0;
       incrementDispatchCount();
+      this.ctx.maybeRefreshUploadGrant();
       firstPublishUploadStart();
-      firstPublishAuthStart();
+      const authT0 = firstPublishAuthDispatchStart();
+      let authPath: "grant" | "bearer" = "bearer";
       let res: Response;
-      try { res = await this.ctx.fetch(
-        `${this.ctx.baseUrl}/v1/blob-batch/put`,
-        {
-          method: "POST",
-          headers: { ...this.ctx.protoAuth, accept: "application/json", "content-type": BATCH_BLOB_CONTENT_TYPE, "content-length": String(body.bytes.byteLength) },
-          body: body.bytes,
-        },
-        { op: "uploading data", timeoutMs: SMALL_CONTROL_TIMEOUT_MS, retries: 0, signal: ctrl.signal },
-      ); } finally { firstPublishAuthEnd(); firstPublishUploadEnd(); }
+      try {
+        res = await this.ctx.fetch(
+          `${this.ctx.baseUrl}/v1/blob-batch/put`,
+          {
+            method: "POST",
+            headers: { ...this.ctx.batchPutAuth, accept: "application/json", "content-type": BATCH_BLOB_CONTENT_TYPE, "content-length": String(body.bytes.byteLength) },
+            body: body.bytes,
+          },
+          { op: "uploading data", timeoutMs: SMALL_CONTROL_TIMEOUT_MS, retries: 0, signal: ctrl.signal },
+        );
+        if (res.headers.get("x-rbox-auth-path") === "grant") authPath = "grant";
+      } finally {
+        firstPublishAuthSettle(authT0, authPath);
+        firstPublishUploadEnd();
+      }
       if (res.status === 404 || res.status === 405) {
         disableUploadForProcess();
         this.drainQueuedAsSingles();

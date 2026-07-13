@@ -8,6 +8,11 @@
 import { translateRemoteError } from "./errors.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 
+const authGrantEnabled = (): boolean => process.env.RBOX_AUTH_GRANT !== "0";
+export const UPLOAD_GRANT_ATTACH_WINDOW_MS = 270_000;
+export const UPLOAD_GRANT_REFRESH_AFTER_MS = 240_000;
+export const UPLOAD_GRANT_RETRY_INTERVAL_MS = 15_000;
+
 export class RemoteContext {
   constructor(
     readonly baseUrl: string,
@@ -33,6 +38,14 @@ export class RemoteContext {
   private downloadGrantCapturedAtMs = 0;
   private downloadGrantRefresh?: Promise<void>;
 
+  // §109 — upload grants are shared by every batch-upload lane. Refresh is a
+  // context-owned control call, deliberately outside the uploader's in-flight work.
+  private uploadGrant?: string;
+  private uploadGrantCapturedAtMs = 0;
+  private uploadGrantGeneration = 0;
+  private uploadGrantRefresh?: Promise<void>;
+  private uploadGrantRetryBlockedUntilMs = 0;
+
   get auth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}` };
   }
@@ -49,6 +62,48 @@ export class RemoteContext {
   }
   get protoAuth(): Record<string, string> {
     return { authorization: `Bearer ${this.token}`, "x-rbox-protocol": RemoteContext.PROTO };
+  }
+  /** Bearer is always present; the grant is only a server verification fast path. */
+  get batchPutAuth(): Record<string, string> {
+    // A grant expiring mid-flight is correctness-harmless because the server falls
+    // back to this bearer; the conservative attach margin only keeps that rare.
+    if (
+      authGrantEnabled()
+      && this.uploadGrant
+      && Date.now() - this.uploadGrantCapturedAtMs < UPLOAD_GRANT_ATTACH_WINDOW_MS
+    ) {
+      return { ...this.protoAuth, "x-rbox-upload-grant": this.uploadGrant };
+    }
+    return this.protoAuth;
+  }
+
+  captureUploadGrant(body: { uploadGrant?: unknown }): void {
+    if (authGrantEnabled() && typeof body.uploadGrant === "string") {
+      this.uploadGrant = body.uploadGrant;
+      this.uploadGrantCapturedAtMs = Date.now();
+      this.uploadGrantGeneration++;
+    }
+  }
+
+  private clearUploadGrant(): void {
+    this.uploadGrant = undefined;
+    this.uploadGrantCapturedAtMs = 0;
+    this.uploadGrantGeneration++;
+  }
+
+  /** Fire-and-forget: upload correctness never depends on grant refresh. */
+  maybeRefreshUploadGrant(): void {
+    if (!authGrantEnabled() || !this.uploadGrant) return;
+    const now = Date.now();
+    if (now - this.uploadGrantCapturedAtMs < UPLOAD_GRANT_REFRESH_AFTER_MS) return;
+    if (this.uploadGrantRefresh || now < this.uploadGrantRetryBlockedUntilMs) return;
+    this.uploadGrantRefresh = this.refreshUploadGrant().then(
+      () => { this.uploadGrantRefresh = undefined; },
+      () => {
+        this.uploadGrantRefresh = undefined;
+        this.uploadGrantRetryBlockedUntilMs = Date.now() + UPLOAD_GRANT_RETRY_INTERVAL_MS;
+      },
+    );
   }
 
   /** Record the receipt a §23 staging PUT returned (no-op for legacy responses). */
@@ -81,7 +136,9 @@ export class RemoteContext {
       body: JSON.stringify({ shas }),
     }, { op: "checking which blobs to upload" });
     if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
-    return ((await res.json()) as { missing: string[] }).missing;
+    const body = (await res.json()) as { missing: string[]; uploadGrant?: unknown };
+    this.captureUploadGrant(body);
+    return body.missing;
   }
 
   async ensureFreshDownloadGrant(maxAgeMs: number): Promise<void> {
@@ -103,6 +160,23 @@ export class RemoteContext {
     else {
       this.downloadGrant = undefined;
       this.downloadGrantCapturedAtMs = 0;
+    }
+  }
+
+  private async refreshUploadGrant(): Promise<void> {
+    const generation = this.uploadGrantGeneration;
+    const res = await this.fetch(`${this.baseUrl}/v1/blobs/check`, {
+      method: "POST",
+      headers: { ...this.protoAuth, "content-type": "application/json" },
+      body: JSON.stringify({ shas: [] }),
+    }, { op: "refreshing upload grant", retries: 0 });
+    if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
+    const body = (await res.json()) as { uploadGrant?: unknown };
+    if (this.uploadGrantGeneration !== generation) return;
+    if (typeof body.uploadGrant === "string") this.captureUploadGrant(body);
+    else {
+      // The server kill switch may have changed since the original check.
+      this.clearUploadGrant();
     }
   }
 }

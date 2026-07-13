@@ -23,9 +23,12 @@ import { ctEqual } from "./util.js";
 // that a STOLEN grant is useful only briefly. An EXPIRED grant is not a failure:
 // worker routing falls back to the normal bearer-authenticated D1 entitlement path.
 export const GRANT_TTL_MS = 5 * 60_000;
+export const UPLOAD_GRANT_TTL_MS = GRANT_TTL_MS; // same value today; a separate name so the two can diverge deliberately
+const UPLOAD_GRANT_EXPIRY_GRACE_MS = 5_000;
 const CLOCK_SKEW_MS = 60_000; // tolerate ≤60s of client/server clock skew on `t` (matches receipts)
 const MIN_KEY_BYTES = 32;
 const DOMAIN = "rbox.grant.v1|"; // domain-separates this MAC from the §23 receipt MAC and every other key use
+const UPLOAD_DOMAIN = "rbox.upload-grant.v1|";
 
 export interface GrantMintClaim {
   accountId: string;
@@ -51,7 +54,7 @@ export type GrantCredentialVerify =
   | { ok: true; accountId: string }
   | GrantVerifyFail;
 type InternalGrantVerify =
-  | { ok: true; payload: Payload }
+  | { ok: true; payload: Payload | UploadPayload }
   | {
       ok: false;
       reason: "no_key" | "malformed" | "bad_version" | "bad_kid" | "bad_mac" | "expired" | "future" | "bad_ttl" | "mismatch";
@@ -63,6 +66,13 @@ interface Payload {
   w: string; // workspaceId — issuance provenance / audit; NOT enforced at GET (blobGet has no ws context)
   t: number; // mint time (ms epoch)
   e: number; // expiry = t + GRANT_TTL_MS
+}
+
+interface UploadPayload {
+  v: 1;
+  a: string;
+  t: number;
+  e: number;
 }
 
 const enc = new TextEncoder();
@@ -125,7 +135,12 @@ export async function mintGrant(env: Env, claim: GrantMintClaim): Promise<string
   return `${body}.${b64url(enc.encode(mac))}`;
 }
 
-async function verifyGrantPayload(env: Env, grant: string, nowMs: number): Promise<InternalGrantVerify> {
+async function verifyGrantPayload(
+  env: Env,
+  grant: string,
+  nowMs: number,
+  opts: { domain: string; ttlMs: number; requireWorkspace: boolean; maxRemainingMs?: number } = { domain: DOMAIN, ttlMs: GRANT_TTL_MS, requireWorkspace: true },
+): Promise<InternalGrantVerify> {
   const k = keys(env);
   if (!k) return { ok: false, reason: "no_key" };
 
@@ -142,7 +157,7 @@ async function verifyGrantPayload(env: Env, grant: string, nowMs: number): Promi
   if (typeof rawPayload !== "object" || rawPayload === null) return { ok: false, reason: "malformed" };
   const payload = rawPayload as Partial<Payload>;
   if (payload.v !== 1) return { ok: false, reason: "bad_version" };
-  if (typeof payload.a !== "string" || typeof payload.w !== "string" || typeof payload.t !== "number" || typeof payload.e !== "number" || !Number.isFinite(payload.t) || !Number.isFinite(payload.e)) {
+  if (typeof payload.a !== "string" || (opts.requireWorkspace && typeof payload.w !== "string") || typeof payload.t !== "number" || typeof payload.e !== "number" || !Number.isFinite(payload.t) || !Number.isFinite(payload.e)) {
     return { ok: false, reason: "malformed" };
   }
 
@@ -158,15 +173,21 @@ async function verifyGrantPayload(env: Env, grant: string, nowMs: number): Promi
   } catch {
     return { ok: false, reason: "malformed" };
   }
-  const expected = await hmac(matchedKey, `${DOMAIN}${kid}.${payloadB64}`);
+  const expected = await hmac(matchedKey, `${opts.domain}${kid}.${payloadB64}`);
   if (!ctEqual(expected, presentedMac)) return { ok: false, reason: "bad_mac" };
 
   // Timestamp bounds: TTL not over-long, `t` not future (skew-tolerant), not expired.
-  if (!(payload.e - payload.t > 0 && payload.e - payload.t <= GRANT_TTL_MS)) return { ok: false, reason: "bad_ttl" };
+  if (!(payload.e - payload.t > 0 && payload.e - payload.t <= opts.ttlMs)) return { ok: false, reason: "bad_ttl" };
   if (payload.t > nowMs + CLOCK_SKEW_MS) return { ok: false, reason: "future" };
   if (payload.e <= nowMs) return { ok: false, reason: "expired" };
+  // Callers whose mint AND verification both run on Worker clocks (upload grants)
+  // cap remaining life so the client-skew tolerance above cannot extend a
+  // revocation-lag window; the caller-supplied bound keeps this body domain-agnostic.
+  if (opts.maxRemainingMs !== undefined && payload.e - nowMs > opts.maxRemainingMs) {
+    return { ok: false, reason: "future" };
+  }
 
-  return { ok: true, payload: payload as Payload };
+  return { ok: true, payload: payload as Payload | UploadPayload };
 }
 
 /** Verify a presented grant on the legacy authenticated path. Any failure (incl. an
@@ -187,6 +208,44 @@ export async function verifyGrant(env: Env, grant: string, claim: GrantVerifyCla
  *  succeeded; callers must not derive an account id from failed verification. */
 export async function verifyGrantCredential(env: Env, grant: string, claim: GrantCredentialClaim): Promise<GrantCredentialVerify> {
   const verified = await verifyGrantPayload(env, grant, claim.nowMs);
+  if (!verified.ok) return verified;
+  return { ok: true, accountId: verified.payload.a };
+}
+
+// §109 upload-grant primitive. Per REVIEW-109 §4.1, a stolen grant has only
+// TTL-bounded batch-PUT staging authority: its receipts are inert without a live
+// bearer because redemption and commit stay bearer-authenticated. The founder
+// constraint also sends the durable bearer beside every grant: any transport channel
+// that can steal the grant can steal the co-traveling bearer, so the credential-theft
+// model on this path is strictly stronger than grant-only theft and transport compromise
+// was always bearer-level. The TTL is the grant's marginal authority when it leaks alone
+// (for example through logs or timing).
+export function uploadGrantsEnabled(env: Env): boolean {
+  return env.RBOX_AUTH_GRANT !== "0";
+}
+
+export async function mintUploadGrant(env: Env, claim: { accountId: string; nowMs: number }): Promise<string | undefined> {
+  if (!uploadGrantsEnabled(env)) return undefined;
+  const k = keys(env);
+  if (!k) return undefined;
+  const payload: UploadPayload = { v: 1, a: claim.accountId, t: claim.nowMs, e: claim.nowMs + UPLOAD_GRANT_TTL_MS };
+  const kid = await kidOf(k.current);
+  const body = `${kid}.${b64url(enc.encode(JSON.stringify(payload)))}`;
+  const mac = await hmac(k.current, UPLOAD_DOMAIN + body);
+  return `${body}.${b64url(enc.encode(mac))}`;
+}
+
+export async function verifyUploadGrantCredential(env: Env, grant: string, claim: GrantCredentialClaim): Promise<GrantCredentialVerify> {
+  if (!uploadGrantsEnabled(env)) return { ok: false, reason: "no_key" };
+  const verified = await verifyGrantPayload(env, grant, claim.nowMs, {
+    domain: UPLOAD_DOMAIN,
+    ttlMs: UPLOAD_GRANT_TTL_MS,
+    requireWorkspace: false,
+    // Mint AND verify run on Worker clocks, so cap remaining life: the 60s
+    // client-skew tolerance must not extend the revocation-lag window (5s
+    // grace absorbs isolate drift; usable life stays effectively TTL-bound).
+    maxRemainingMs: UPLOAD_GRANT_TTL_MS + UPLOAD_GRANT_EXPIRY_GRACE_MS,
+  });
   if (!verified.ok) return verified;
   return { ok: true, accountId: verified.payload.a };
 }

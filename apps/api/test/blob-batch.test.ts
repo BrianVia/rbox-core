@@ -534,10 +534,13 @@ describe("POST /v1/blob-batch/put", () => {
     await batchPutDirect(new Uint8Array(0), fakePutEnv({ metrics }));
     await batchPutDirect(batchPutBody(batchPutRecords(33, "metric-over-cap")), fakePutEnv({ metrics }));
 
-    expect(metrics.map((m) => m.blobs[2])).toEqual(["ok", "partial", "bad_request", "too_many_records"]);
-    expect(metrics[0]?.doubles[4]).toBe(okPayload.byteLength);
-    expect(metrics[0]?.doubles[5]).toBe(1);
-    expect(metrics[3]?.doubles[4]).toBe(0);
-    expect(metrics[3]?.doubles[5]).toBe(33);
+    // §109 interleaves one blob.batchPut.auth event per request; the handler op's
+    // outcome vocabulary must be untouched by it (REVIEW-109 finding 9).
+    const handler = metrics.filter((m) => m.blobs[0] === "blob.batchPut");
+    expect(handler.map((m) => m.blobs[2])).toEqual(["ok", "partial", "bad_request", "too_many_records"]);
+    expect(handler[0]?.doubles[4]).toBe(okPayload.byteLength);
+    expect(handler[0]?.doubles[5]).toBe(1);
+    expect(handler[3]?.doubles[4]).toBe(0);
+    expect(handler[3]?.doubles[5]).toBe(33);
   });
 });

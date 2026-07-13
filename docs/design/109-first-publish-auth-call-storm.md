@@ -1,8 +1,13 @@
 # 109 — First-publish upload authentication call storm
 
-Status: REVIEWED — ALIGNED (codex adversarial loop, 4 rounds, 2026-07-13) —
-ledger in `docs/design/REVIEW-109.md`. Implementation is gated on §6.0 gate 0
-(attribution go/no-go) before any code.
+Status: IMPLEMENTED 2026-07-13 as an engineering-hygiene item after a founder
+call unparked it. Gate 0 measured ~89ms/request, making this a small PERF lever,
+but O(publish) credential verification replaces O(dispatch) as hygiene. The
+shipped flag is `RBOX_AUTH_GRANT` (default ON; `=0` kill switch), superseding
+§5's `RBOX_UPLOAD_GRANTS`/default-off rollout. The durable bearer rides every
+batch PUT; the grant is only a server-side verification fast-path. Gate 0/§6.2
+remeasurement is confirmation and must be rerun after design 112 changes batch
+cardinality, per `REVIEW-109-111-seam.md`'s addendum.
 
 ## 1. Problem and measured evidence
 
