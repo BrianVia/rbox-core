@@ -196,3 +196,11 @@ both `tsc` projects clean; antislop clean. Original plan:
    precedence, `unref`, clear-line `stop()`, stderr prompts (no stdout pollution).
    §4, §2.
 Plus #8 pure planner/executor (§1) and #9 device-id unification (§6).
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/init-plan.test.ts` (device-id unification): was "review #9" — rewritten as a neutral section heading.

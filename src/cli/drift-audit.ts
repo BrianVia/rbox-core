@@ -109,7 +109,7 @@ export function dedupePending(candidates: DriftCandidate[]): DriftCandidate[] {
   }
   // The oldest candidate wins its evidence/age, but `originUntrusted` is ORed
   // monotonically across every duplicate: a clean-oldest + contaminated-newer
-  // same-path pair must NOT lose the contamination (codex impl-review M1). Kept
+  // same-path pair must NOT lose the contamination. Kept
   // omit-when-false so a flag-off run (never contaminated) is byte-identical —
   // and skips the clone pass entirely.
   const deduped = [...byPath.values()].slice(0, PENDING_CAP);

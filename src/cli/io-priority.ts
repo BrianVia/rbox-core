@@ -18,7 +18,7 @@ import { dlopen, FFIType } from "bun:ffi";
  *  - linux: ioprio_set per EXISTING kernel task — io priority is per-thread,
  *    and WHO_PROCESS with who=0 targets only the CALLING thread (kernel
  *    block/ioprio.c), which would miss Bun's already-spawned IO worker threads,
- *    the ones doing the actual disk work (codex R1). So every tid in
+ *    the ones doing the actual disk work. So every tid in
  *    /proc/self/task is set; threads spawned later inherit from their spawner
  *    (the main thread, which is set here). Best-effort class level 7 (lowest),
  *    NOT the IDLE class — IDLE can starve indefinitely under sustained foreign

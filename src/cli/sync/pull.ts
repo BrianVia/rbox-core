@@ -261,7 +261,7 @@ export async function applyPulledManifest(
       deps.onPullApplied?.(actions);
     } catch {
       // Observability only: a hook failure must never fail a pull that has already
-      // applied and saved — the daemon would misread it as a pull halt (codex R3).
+      // applied and saved — the daemon would misread it as a pull halt.
     }
   }
   return actions;

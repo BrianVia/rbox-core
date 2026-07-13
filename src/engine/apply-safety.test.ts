@@ -277,7 +277,7 @@ test("unlinkDir removes children only when the directory is genuinely gone", asy
   expect(gone.files.some((f) => f.path.startsWith("d/"))).toBe(false);
 });
 
-// --- codex impl-round-1 regressions -----------------------------------------
+// --- review-regression guards ----------------------------------------------
 
 test("unlinkDir for a path that is NOW A FILE (the eviction-echo flip) re-derives the file, drops only dir children", async () => {
   // Base: foo/ is a directory with a child. Then the pull evicts foo/ and writes FILE foo.
@@ -288,7 +288,7 @@ test("unlinkDir for a path that is NOW A FILE (the eviction-echo flip) re-derive
   await write("foo", "now a file");
 
   // The stale queued `unlinkDir foo` must NOT delete the fresh `foo` entry
-  // (impl-review BLOCKER: this exact case pushed a sub-threshold delete).
+  // This exact case pushed a sub-threshold delete.
   const after = await applyWatchEvents(base, root, buildIgnoreMatcher(root), [{ relPath: "foo", kind: "unlinkDir" }]);
   expect(after.files.some((f) => f.path === "foo")).toBe(true);
   expect(after.files.some((f) => f.path === "foo/child.txt")).toBe(false); // children impossible under a file

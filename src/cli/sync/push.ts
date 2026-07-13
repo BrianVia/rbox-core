@@ -406,7 +406,7 @@ async function runPushAttempt(
     // committing — deleting a leftover .git is usually EXACTLY a no-op push (a .git
     // removal changes no synced files), yet §9 requires its removal memory to be
     // pruned then, or the stale memory suppresses a later legitimate re-add at that
-    // path (codex step-3 round-3 MAJOR). Persist the bookkeeping commit-free.
+    // path. Persist the bookkeeping commit-free.
     const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
     if (
       cfg.syncGit &&
@@ -458,7 +458,7 @@ async function runPushAttempt(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
-  // Design 108 §3.6 (round-4 MAJOR 2): everything from encryptAndUpload (which ARMS the
+  // (design 108): everything from encryptAndUpload (which ARMS the
   // module-global firstPublishTiming singleton) onward runs inside this try. Its finally
   // disables the singleton on EVERY exit that did not finalize it — a reupload /
   // no-advance return, an epoch/409/422 return, or a thrown encrypt/commit/state-save
@@ -548,7 +548,7 @@ async function runPushAttempt(
     }
     if (res.unsatisfiedBlobs) {
       // A missing GIT artifact can't be satisfied by a file re-upload, and an identity-carry
-      // would re-reference the absent bundle (§28, codex M3) — so force a RE-CAPTURE for
+      // would re-reference the absent bundle (§28) — so force a RE-CAPTURE for
       // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
       // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
       // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).

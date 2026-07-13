@@ -53,7 +53,7 @@ export async function restoreOpState(gitDir: string, opTmp: Array<{ rel: string;
     if (!want.has(rel)) await fs.rm(path.join(gitDir, rel), { force: true }).catch(() => {});
   }
   // Atomic-rename each PRE-DECRYPTED temp into place (decryption already happened + verified
-  // before any mutation, §28 codex M4) — never a torn or plaintext-less live file.
+  // before any mutation, §28) — never a torn or plaintext-less live file.
   for (const { rel, tmp } of opTmp) {
     const dest = path.join(gitDir, rel);
     await fs.mkdir(path.dirname(dest), { recursive: true });

@@ -47,7 +47,7 @@ export interface DaemonActivity {
     bootId: string;
     pid: number;
   };
-  /** Last push that COMMITTED. Separate slot from `lastPull` (codex R2): a single
+  /** Last push that COMMITTED. Separate slot from `lastPull`: a single
    *  most-recent-op slot let the commit that follows a 409-recovery pull mask the
    *  local-tree mutations that pull had just applied. */
   lastPush?: { at: string; files: number; sequence: number };
@@ -87,7 +87,7 @@ const shellLinePath = (root: string) => path.join(root, RBOX_DIR, "state", "shel
 
 /** Best-effort read: absent/corrupt → undefined, and each nested slot is SHAPE-
  *  VALIDATED individually — a malformed slot is dropped, never handed to a render
- *  helper (codex R3: `{"at":"…","lastPush":{}}` crashed `rbox status` on
+ *  helper (`{"at":"…","lastPush":{}}` crashed `rbox status` on
  *  `undefined.toLocaleString`). The file is daemon-written but user-editable. */
 export async function loadActivity(root: string): Promise<DaemonActivity | undefined> {
   try {
@@ -271,7 +271,7 @@ export function renderShellLine(
   }
 
   // Sequence 0 = never synced (the daemon seeds it from a fresh baseline) — that's
-  // "no sequence", not "(seq 0)" in the banner (codex R1).
+  // "no sequence", not "(seq 0)" in the banner.
   const sequence = opts.sequence !== undefined && opts.sequence > 0 ? opts.sequence : "-";
 
   let lastOpEpoch: string | number = "-";

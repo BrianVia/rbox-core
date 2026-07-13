@@ -457,7 +457,7 @@ async function getBlobToFile(store: BlobStore, sha: string, destPath: string): P
 
 /** §28: fetch a git artifact's CIPHERTEXT by encSha, then decrypt+verify (GCM tag + plaintext-sha)
  *  to `destPath`. Throws on any fetch/decrypt/verify failure — callers run this into temp files
- *  BEFORE mutating the gitdir (codex M4), so a bad/ swapped/ corrupt blob never half-applies. */
+ *  BEFORE mutating the gitdir, so a bad/ swapped/ corrupt blob never half-applies. */
 export async function getGitArtifact(store: BlobStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
   const ct = path.join(tmpDir, `ct-${ref.encSha}`);
   await getBlobToFile(store, ref.encSha, ct);

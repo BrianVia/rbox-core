@@ -68,7 +68,7 @@ export interface SyncDeps {
    *  runaway mass delete halts background sync instead of destroying the tree. */
   allowMassDelete?: boolean;
   /** Explicit human consent to a PUSH that deletes ≥half the baseline (design 50 §4).
-   *  Deliberately SEPARATE from {@link allowMassDelete} (design-review B2): pushManifest's
+   *  Deliberately SEPARATE from {@link allowMassDelete}: pushManifest's
    *  409-recovery reuses this same deps object to PULL, and pull-side consent must NOT be
    *  implied by push consent — a `rbox push --allow-mass-delete` must never let the recovery
    *  pull silently apply a mass delete. Set by `rbox push --allow-mass-delete`, or by
@@ -77,12 +77,12 @@ export interface SyncDeps {
   /** Command shown when either mass-delete guard refuses this operation. */
   massDeleteHint?: string;
   /** A pull evicted a local directory that the remote now flips to a file/symlink
-   *  (design 50 §3, review M2): the dir moved to trash. The CLI/daemon logs it and
+   *  (design 50 §3): the dir moved to trash. The CLI/daemon logs it and
    *  counts it into `lastPull.conflicts`. Threaded into applyActions via `onTypeFlip`. */
   onTypeFlip?: (relPath: string) => void;
   /** Fired by EVERY pull that applied actions to the local tree — including the pull
    *  inside pushManifest's 409 recovery, whose actions the retry loop discards
-   *  (design 45, codex R2: the daemon's forensic log and activity trail must record
+   *  (design 45: the daemon's forensic log and activity trail must record
    *  every local-tree mutation, whichever path performed it). */
   onPullApplied?: (actions: Action[]) => void;
   /** Daemon-only terminal-halt hint. Foreground `rbox push` / `rbox sync` leaves this

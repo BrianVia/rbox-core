@@ -3,7 +3,7 @@
  * the design-93 workspace sync mutex, so every pre-existing `enc-*` sibling is
  * stale by construction and swept unconditionally — process identity (the pid
  * embedded in the dir name) is diagnostic only and plays NO role, closing the
- * PID-reuse hole (design review rounds 5/6).
+ * PID-reuse hole.
  */
 import fs from "node:fs/promises";
 import path from "node:path";

@@ -11,7 +11,7 @@ import { conflictName } from "./reconcile.js";
  * same filesystem as the tree, so every move is one atomic rename (§28 EXDEV
  * lesson: never stage across mounts).
  *
- * Cross-process safety (design-review B3): a batch carries an `.active`
+ * Cross-process safety: a batch carries an `.active`
  * marker from its first rename until the owning pull's apply phase finishes.
  * The pruner skips marked batches unless the marker is >24h stale (a crashed
  * pull), and never touches any batch younger than 15 minutes — cap pressure
@@ -228,7 +228,7 @@ export interface RestoreResult {
 
 /**
  * Rename a trashed path (file, symlink, or directory) back into the tree.
- * NEVER overwrites (design-review M4): an existing target — including a
+ * NEVER overwrites: an existing target — including a
  * case-folded twin on case-insensitive filesystems, which lstat finds —
  * diverts the restore to a visible conflict name. Searches newest batch
  * first unless `batch` pins one.

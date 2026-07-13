@@ -127,3 +127,11 @@ validator suites (`engine-m1.test.ts` and `git-nested.test.ts`, because the
 requested `manifest-validate.test.ts` does not exist) passed: 109 tests, 672
 expectations, zero failures. Benchmark: 625.9 ms, +44,872 KB isolated peak RSS
 against a 90,790 KB allowance. Final verdict: **ALIGNED — no open findings**.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/e2ee-remote.ts` (git blob-ref sizing): was "codex M2" — ciphertext-size privacy/accounting invariant retained in code.

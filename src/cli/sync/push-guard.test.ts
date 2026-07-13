@@ -9,7 +9,7 @@ import { type CommitResult, type SyncRemote } from "../remote.js";
 import { type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
-// Design 50 §4 + review B2: the push-side mass-delete guard, and the critical
+// Design 50 §4: the push-side mass-delete guard, and the critical
 // non-leak regression — `--allow-mass-delete` on PUSH must never satisfy the
 // PULL-side guard (they are separate op-scoped consent fields).
 

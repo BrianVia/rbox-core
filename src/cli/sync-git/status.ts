@@ -8,7 +8,7 @@ import { gitFingerprintRun } from "./fingerprint.js";
 import { GIT_DIVERGENCE_CONCURRENCY, loadGitDivergenceCache, saveGitDivergenceCache, cachedDivergenceProbe, type CachedDivergenceProbe, type GitDivergenceRepoHint, type GitDivergenceRepoSource } from "./divergence-cache.js";
 /**
  * READ-ONLY advisory count of repos whose LOCAL git state a push would publish —
- * the `rbox status` verdict's git dimension (design 45, codex R1). Mirrors
+ * the `rbox status` verdict's git dimension (design 45). Mirrors
  * {@link planGitSections}'s per-repo capture decision (pending carry, removal
  * memories, needs-resolution suppression, preflight, the §7 shape×scope carry
  * matrix) without any of its work or side effects: no bundling, no state
@@ -143,9 +143,9 @@ export async function gitDivergenceStatus(
     }
     const probe = probes.get(rel);
     if (!probe || probe.busy) continue; // indeterminate this instant
-    // Suppressions FIRST, preflight second — planGitSections' exact order (codex R4:
+    // Suppressions FIRST, preflight second — planGitSections' exact order:
     // a needsResolution-suppressed repo that turns structurally unsyncable is CARRIED
-    // by push, so counting it here would drift the verdict from the planner).
+    // by push, so counting it here would drift the verdict from the planner.
     if (!baseSec && removedMem[rel] !== undefined) {
       if (probe.identityKey === "none" || probe.identityKey === removedMem[rel]) continue; // untouched removal residue
     }
@@ -154,8 +154,8 @@ export async function gitDivergenceStatus(
     }
     if (!probe.preflightOk) {
       // A STRUCTURAL refusal (shallow/bare/…) over a synced base is not a skip:
-      // planGitSections DROPS the section, and that drop is an unpublished change
-      // (codex R2). Transient failures defer-with-carry → genuinely nothing pending.
+      // planGitSections DROPS the section, and that drop is an unpublished change.
+      // Transient failures defer-with-carry → genuinely nothing pending.
       if (probe.preflightStructural && baseSec) n++;
       continue;
     }

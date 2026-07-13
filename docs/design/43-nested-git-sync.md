@@ -491,3 +491,22 @@ savvy-core/rome — recovery at …`). `rbox status` gains a `git-sync:` summary
   (B2/B3), removal memories (B4), realpath containment + key/file collision rejection (B5),
   superprojects explicitly unsupported (M1), `needsResolution` suppression (M2), raw-index
   identity fallback (M3), cap-never-drops-carry (M4), per-repo 422 recapture (M5).
+
+### Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync-git/apply.ts` (pending-removal carry): was "codex step-3 BLOCKER" — resurrection guard retained in code.
+- `src/cli/sync-git/apply.ts` (quarantine ordering): was "codex step-3 round-3 MAJOR" — crash-safety ordering retained in code.
+- `src/cli/sync-git/apply.ts` (pre-mutation hook): was "codex step-3 MAJOR" — defer-without-wipe invariant retained in code.
+- `src/cli/sync-git/plan.ts` (ignored-repo resurrection guard): was "codex step-3 MAJOR" — resurrection guard retained in code.
+- `src/cli/sync-git/plan.ts` (missing-bundle recapture): was "codex M3" — recapture invariant and §28 pointer retained in code.
+- `src/engine/git/apply.ts` (`beforeMutate` coverage): was "codex step-3 MAJOR" — hook coverage invariant retained in code.
+- `src/engine/git/apply.ts` (side-artifact ordering): was "codex M4" — decrypt-before-mutation invariant and §28 pointer retained in code.
+- `src/engine/git/quarantine.ts` (DIR-leftover clean materialization): was "codex round-4 BLOCKER" — the resurrection-through-the-side-door hazard (leftover refs re-entering a later all-scope capture) retained in code.
+- `src/engine/git/shared.ts` (blob validation ordering): was "codex M4" — validate-before-mutation invariant retained in code.
+- `src/engine/git/rollback.ts` (stash rollback isolation): was "codex step-3 MAJOR" — remote-entry isolation invariant retained in code.
+- `src/engine/git/refs.ts` (atomic ref-side-artifact publish): was "codex M4" — pre-mutation decrypt/atomicity invariant and §28 pointer retained in code.
+- `src/engine/git-nested.test.ts` (fail-closed section heading): was "codex round-1 fixes" — rewritten as a neutral guard heading.

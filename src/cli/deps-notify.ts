@@ -13,7 +13,7 @@
  *     since a repo could ship a `./rbox`), uses no `eval`, and spawns detached/async
  *     so the prompt is never blocked.
  *
- * The string generators are pure + exported so the (founder-reviewed) snippet and the
+ * The string generators are pure + exported so the snippet and the
  * idempotent install/uninstall are unit-tested without touching a real shell.
  */
 import { execFileSync } from "node:child_process";

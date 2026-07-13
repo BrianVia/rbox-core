@@ -115,7 +115,7 @@ async function worktreeCollision(ctx: RepoCtx, section: GitSection, deletesAbsen
  * artifact has been fetched+decrypted+verified/imported into scratch refs but BEFORE
  * publish/ref-wipe/index mutation. The caller's quarantine+ref-wipe of a removal-memory
  * leftover runs here, so a missing or corrupt remote artifact can never strand a wiped
- * repo (codex step-3 MAJOR). When the hook wipes syncable refs, callers must set
+ * repo. When the hook wipes syncable refs, callers must set
  * `beforeMutateWipesRefs` so the worktree collision pre-check can defer before the hook
  * strands a sibling checkout. A hook throw returns {applied:false} after scratch refs
  * are cleaned.
@@ -234,7 +234,7 @@ export async function applyGitState(
     }
   };
   try {
-    // §28 (codex M4): decrypt side artifacts before publish/index mutation. Bundle
+    // §28: decrypt side artifacts before publish/index mutation. Bundle
     // links are decrypted, git-verified, and imported into scratch refs below; failures
     // clean those refs and return {applied:false} before user-visible git state changes.
     const indexTmp = section.indexSha ? path.join(tmpDir, "index") : undefined;

@@ -52,7 +52,7 @@ export async function quarantineLocal(ctx: RepoCtx, qDir: string, ts: string): P
  * recovery, not refs-only), then DELETE its syncable refs + index + op-state (reset to
  * empty). A following {@link applyGitState} then lands on a clean target, so the
  * leftover's old refs can never re-enter a later all-scope capture (resurrection
- * through the side door — codex round-4 BLOCKER). DIR repos only: a pointer repo's
+ * through the side door). DIR repos only: a pointer repo's
  * refs live in the SHARED main-clone store and must never be wiped — pointer leftovers
  * go through the guarded update-only apply instead. Throws when the quarantine fails
  * (callers defer the apply — fail closed, never wipe unquarantined state).

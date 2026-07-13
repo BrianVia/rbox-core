@@ -67,7 +67,7 @@ export const firstPublishTiming = {
 
 /** Arm (or disarm) the per-push first-publish measurement.
  *
- *  OWNERSHIP INVARIANT (design 108, codex round-6 MAJOR 2): the accumulator is a
+ *  OWNERSHIP INVARIANT (design 108): the accumulator is a
  *  process-global singleton, so at most ONE measurement may be in flight per process.
  *  That holds today because every push author is sequential — the CLI runs one command,
  *  the daemon's tick loop awaits each push, and `runPushAttempt`'s finally disarms
@@ -182,7 +182,7 @@ export function firstPublishAuthEnd(): void {
 }
 export function finishFirstPublishStats(): FirstPublishStats | undefined {
   if (!firstPublishTiming.enabled) return undefined;
-  // Design 108 §3.6 (round-4 MAJOR 2): finalization ALWAYS disables the singleton —
+  // (design 108): finalization ALWAYS disables the singleton —
   // even when it yields no stats — so a no-upload push can't leak timing into later work.
   firstPublishTiming.enabled = false;
   // Render when there was a real upload critical path OR a command-level files-synced

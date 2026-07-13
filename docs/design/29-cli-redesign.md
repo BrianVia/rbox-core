@@ -660,3 +660,12 @@ records every rc it touched so `uninstall`/`status` cover all shells; (m4) globa
 > Round-2 also confirmed B1/B2/B3/B5/M2 substantively resolved and M3/M4/M5/M7 standing. The only
 > remaining items are normal implementation-time concerns (daemon PID-capture API for M7's exit-poll),
 > not design gaps.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/deps-notify.test.ts` (generated snippets): was "founder review" — security-sensitive section retained under a neutral heading.
+- `src/cli/deps-notify.ts` (snippet generator): was "founder-reviewed" — pure-generator testability rationale retained in code.

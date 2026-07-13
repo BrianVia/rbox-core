@@ -1090,3 +1090,12 @@ the codebase already has an interprocess ownership model (design 93's
 mutex), the protocol must be expressed in it — "both sides run and the
 server sorts it out" was a completeness proof in disguise, and it died the
 same way the sidecar did.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync/sync-scan-defer.test.ts` (pull deferred-set contract): was "impl review D1-R2" — byte-preserving pull invariant retained in code.
+- `src/cli/daemon/daemon-scan-defer.test.ts` (post-pull rescan carry): was "impl review D1-R1" — post-pull base-carry invariant and P-1 ID retained in code.

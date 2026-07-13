@@ -163,7 +163,7 @@ opts: {
     metrics = {
       // "fresh" = no useful local/base git state (design 74 §3) — NOT sequence 0:
       // a file-synced workspace receiving its first remote.gitRepos is fresh for
-      // git purposes even at a nonzero baseline (review finding: sequence-keyed
+      // git purposes even at a nonzero baseline (sequence-keyed
       // classification would poison the Phase-1 gate data).
       runKind: Object.keys(baseRepos).length === 0 && Object.keys(pending).length === 0 ? "fresh" : "steady",
       repos: keys.length,
@@ -314,7 +314,7 @@ opts: {
     }
     // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
     // and skipping it would leave gitPendingRemote/base carrying a section the remote
-    // deleted, which the next file-only push would resurrect (codex step-3 BLOCKER).
+    // deleted, which the next file-only push would resurrect.
     const localId = dotGit ? await gitIdentity(repoDir) : undefined;
 
     if (!remoteSec) {
@@ -322,7 +322,7 @@ opts: {
       // first (§13.5: never stamp a removal memory over unexamined local divergence),
       // then the pure state transitions apply UNCONDITIONALLY — absence is the newer
       // truth no matter what else succeeds — and only then the best-effort recovery
-      // preserve. Ordering is crash-safety (codex step-3 round-3 MAJOR): if the
+      // preserve. Ordering is crash-safety: if the
       // preserve throws (blob/fs failure), the per-repo catch must not leave a stale
       // pending/base entry for the next push to resurrect.
       const diverged = pend !== undefined && localDivergedFromBase(localId, baseSec);
@@ -501,7 +501,7 @@ opts: {
     // old refs can never re-enter a later all-scope capture. Runs as applyGitState's
     // beforeMutate hook — i.e. ONLY after every remote artifact has been fetched,
     // decrypted, and verified — so a missing/corrupt bundle can never strand a wiped
-    // repo (codex step-3 MAJOR). Hook/quarantine failure → defer, nothing wiped.
+    // repo. Hook/quarantine failure → defer, nothing wiped.
     // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
     // update-only apply is the whole treatment; the memory clears on success.
     const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();

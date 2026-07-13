@@ -98,7 +98,7 @@ export interface SyncState {
    *  deleted" — a mass local delete (the 2026-07-01 rebind incident). loadState
    *  treats a mismatch as NO baseline. The full identity matters: the server keys
    *  manifests by (workspace, project), and different remotes are different worlds —
-   *  workspace id alone would let a --project rebind poison the reconcile (codex R2). */
+   *  workspace id alone would let a --project rebind poison the reconcile. */
   stream: string;
   lastSyncedSequence: number;
   lastSyncedManifest: Manifest;
@@ -513,7 +513,7 @@ export async function saveState(root: string, state: SyncState): Promise<void> {
 /** Discard the local sync baseline (used when a root is REBOUND to a different
  *  workspace — the old baseline describes the old stream). Files on disk are
  *  untouched; the next pull writes without deleting and the next push publishes
- *  the full tree. Every per-binding sidecar goes with it (design 45, codex R4):
+ *  the full tree. Every per-binding sidecar goes with it (design 45):
  *  the activity record AND the design-46 `shell.line` prompt sidecar both describe
  *  the OLD binding's halt/trail and must not render under the new one.
  *  Missing files = already reset. */

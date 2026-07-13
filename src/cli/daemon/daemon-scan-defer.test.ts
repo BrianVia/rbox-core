@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
-// Design 85 P-1 regression (impl review D1-R1): a path that churns during the
+// Design 85 P-1 regression: a path that churns during the
 // POST-pull rescan must carry the post-pull BASE entry, never the pre-pull
 // manifest entry — carrying pre-pull truth lets the pump's follow-up push
 // publish stale content over the version the pull just applied.

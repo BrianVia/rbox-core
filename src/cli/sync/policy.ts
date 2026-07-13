@@ -56,7 +56,7 @@ export const NO_GIT_FORCE: ReadonlySet<string> = new Set();
  *  single-user fleet, and the path is genesis-only so it is inert for every existing
  *  workspace). `RBOX_FILES_FIRST=0` is the kill switch: it restores the byte-identical
  *  legacy path, including init's report/metrics wiring, which gates on this same flag
- *  so a flag-off `rbox init` emits exactly the pre-108 output (codex round-6 MAJOR 1). */
+ *  so a flag-off `rbox init` emits exactly the pre-108 output. */
 export const filesFirstFlagEnabled = (): boolean => process.env.RBOX_FILES_FIRST !== "0";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

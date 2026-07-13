@@ -1315,3 +1315,13 @@ old-format workspace refused to unwrap) — the correct behavior, not a regressi
    to avoid manifest dedup correlation?
 8. Anything that makes this NOT actually zero-knowledge, or a key-management
    footgun that locks users out / silently weakens to non-E2EE.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/engine/e2ee/session.ts` (workspace key separation): was "codex r2" — cross-workspace substitution prohibition retained in code.
+- `src/engine/e2ee/epoch.ts` (previous-roster verification): was "codex MAJOR" — e-1 roster invariant and §31 pointer retained in code.
+- `src/engine/e2ee/jcs.ts` (canonicalization scope): was "codex flagged" — cross-runtime ambiguity constraint retained in code.

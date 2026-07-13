@@ -155,7 +155,7 @@ test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unsta
   const { cfg: first } = await track(dir, { workspace: "ws_old" }, "https://api.test");
 
   // A LEGACY (pre-stamp) baseline from the old workspace: the ownership check can't
-  // tell it apart, so track itself must reset it on rebind (codex BLOCKER).
+  // tell it apart, so track itself must reset it on rebind.
   const statePath = path.join(dir, ".rbox", "state.json");
   await fs.writeFile(
     statePath,

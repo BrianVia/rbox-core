@@ -270,7 +270,7 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
   if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`");
 
   // ONE effective remote for both the network client and the returned cfg (design 44
-  // §2, codex R3): the sync-state stream stamp derives from cfg.remoteUrl, so the cfg
+  // §2): the sync-state stream stamp derives from cfg.remoteUrl, so the cfg
   // must name the remote actually being talked to — otherwise a baseline built against
   // prod could be accepted while syncing a same-id workspace on a different server,
   // and its divergent (or empty) head would reconcile as local deletes.

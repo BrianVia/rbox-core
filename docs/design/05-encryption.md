@@ -66,3 +66,12 @@ Plaintext workspaces are unchanged (no `encSha`; M3 path as-is). Encryption is a
 3. Passphrase escrow: Argon2id params; is storing a passphrase-wrapped KEK server-side an acceptable opt-in, or device-to-device only for M5?
 4. Key rotation: out of scope for M5 (rotating KEK = re-encrypt everything)? Note as follow-up?
 5. The `encSha` manifest addition vs a cleaner separate encryption-map — does adding `encSha` to FileEntry interact badly with M2 git bundles (which are also blobs — should `.git` artifacts be encrypted too when the workspace is encrypted)? (Likely yes: encrypt git bundle/index blobs the same way.)
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/engine/crypto.ts` (ciphertext derivation): was "review finding #1" — re-hash invariant retained in code.
+- `src/engine/crypto.ts` (ciphertext address availability): was "finding #3" — post-encryption address invariant retained in code.

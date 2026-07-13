@@ -103,3 +103,12 @@ without timers.
   `lowerIoPriority` + `verifyIoPriority` and exits 4 on failure, printing an
   `IOPRIO_SELFTEST` line. A darwin-arm64 symbol typo or a wrong arm64
   syscall number can no longer ship.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/watcher.ts` (watcher error trust): was "codex R1" — post-error distrust invariant retained in code.
+- `src/cli/io-priority.ts` (Linux per-thread priority): was "codex R1" — all-existing-task coverage invariant retained in code.

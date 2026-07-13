@@ -83,7 +83,7 @@ export async function applyActions(
   const rest = actions.filter((a) => a.kind !== "delete");
   const prepared = new Map<Action, string>();
 
-  // Ancestor preflight (§3, design-review M3): a FILE or SYMLINK squatting on a
+  // Ancestor preflight (§3): a FILE or SYMLINK squatting on a
   // path component a write needs as a directory makes mkdir throw ENOTDIR. Resolve
   // it once, serially, shallowest-first, BEFORE the parallel write pool — poolMap
   // runs writes concurrently, so two children under one obstruction must never
@@ -280,9 +280,9 @@ async function writeEntry(
  *  into `tmp`; plain file → stream by sha (download verifies it) + chmod. Shared by
  *  the pull writer (precondition-checked publish) and the version-restore writer
  *  (explicit overwrite). */
-/** RBOX_LANE_TIMING=1 — per-lane fetch vs decrypt+write attribution (design 74/76
- *  reviews: the pull's per-blob cost must be decomposable before transport work is
- *  justified). Zero cost when unset. Totals print once per apply via laneTimingSummary. */
+/** RBOX_LANE_TIMING=1 — per-lane fetch vs decrypt+write attribution (design 74/76):
+ *  the pull's per-blob cost must be decomposable before transport work is
+ *  justified. Zero cost when unset. Totals print once per apply via laneTimingSummary. */
 const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
 export const laneTiming = { fetchMs: 0, decryptWriteMs: 0, blobs: 0 };
 export function laneTimingSummary(): string | undefined {
@@ -426,7 +426,7 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
     st = await fs.lstat(abs);
   } catch (e) {
     // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
-    // can't exist, so it's already gone (design-review M1).
+    // can't exist, so it's already gone.
     if (hasErrorCode(e, "ENOENT") || hasErrorCode(e, "ENOTDIR")) return undefined;
     throw e;
   }
@@ -442,7 +442,7 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
 
 /** A conflict-copy destination must never clobber an EARLIER copy: conflictName
  *  has one-second precision, so two conflicts on the same path in the same second
- *  (same device) collide — probe and suffix `~2`, `~3`… (design-50 review). */
+ *  (same device) collide — probe and suffix `~2`, `~3`… (design 50). */
 async function moveAside(destRoot: string, fromRel: string, toRel: string): Promise<void> {
   const from = path.join(destRoot, fromRel);
   countLstat();

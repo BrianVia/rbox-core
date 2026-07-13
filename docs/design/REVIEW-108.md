@@ -204,3 +204,19 @@ preservation, KPI stamping order) reviewed CLEAN.
    push invariant is now explicit in `beginFirstPublishTiming` (CLI one-command / daemon
    awaited tick / attempt-finally disarm, design-93 mutex across processes), and a detected
    overlap VOIDS both measurements rather than cross-attributing (unit-tested).**
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync/push.ts` (commit-free git bookkeeping): was "codex step-3 round-3 MAJOR" — persistence invariant retained in code.
+- `src/cli/sync/push.ts` (timing finalization coverage): was "Design 108 §3.6 (round-4 MAJOR 2)" — compressed to `(design 108)`; post-arm try/finally invariant retained.
+- `src/cli/sync/push.ts` (missing-bundle recovery): was "codex M3" — recapture invariant and §28 pointer retained in code.
+- `src/cli/upload-lane-timing.ts` (singleton ownership): was "codex round-6 MAJOR 2" — process-global ownership invariant retained with bare design pointer.
+- `src/cli/upload-lane-timing.ts` (singleton finalization): was "Design 108 §3.6 (round-4 MAJOR 2)" — compressed to `(design 108)`; always-disable invariant retained.
+- `src/cli/sync/policy.ts` (flag-off output): was "codex round-6 MAJOR 1" — pre-108 output compatibility invariant retained in code.
+- `src/cli/init-cmd.ts` (flag-gated reporting): was "Design 108 §3.6" plus "codex round-6 MAJOR 1" — compressed to `(design 108)`; flag-off output invariant retained.
+- `src/cli/files-first.test.ts` (metric-honesty regression): was "round-3/round-4 fixes" — finalization/admission invariant retained in code.
+- `src/cli/files-first.test.ts` (failed-attempt narration): was "pre-108 bug rendered before the conflict check" — failed-attempt no-render/no-leak invariant retained in code.

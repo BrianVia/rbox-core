@@ -1584,7 +1584,7 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   await fs.rm(p, { recursive: true, force: true });
   await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p]);
 
-  // Design 45 (codex R2): the pending structural DROP is an unpublished change —
+  // Design 45: the pending structural DROP is an unpublished change —
   // status must not read "in sync" while the next push would commit a removal.
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), buildIgnoreMatcher(rootA))).toBe(1);
 
@@ -1614,7 +1614,7 @@ test("gitDivergenceCount mirrors push's capture decision (read-only, no state mu
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
 
   // A fresh local commit diverges the identity while the base stands → 1
-  // (codex R1: a clean file tree + unpushed git state must not read "in sync").
+  // A clean file tree + unpushed git state must not read "in sync".
   await commitFile(p1, "b.txt", "v2", "c2");
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
   await push(rootA, cfgA, depsA);

@@ -261,7 +261,7 @@ test("restore without a pin searches newest batch first", async () => {
   expect(await readTrash(root, "shared.txt")).toBe("from-newer");
 });
 
-// --- codex impl-round-1 regressions -----------------------------------------
+// --- review-regression guards ----------------------------------------------
 
 test("a user file literally named .active trashes, lists, and restores cleanly (marker is a sibling, not an inmate)", async () => {
   await write(".active", "user bytes");
@@ -311,7 +311,7 @@ test("restore divert never clobbers an existing same-second conflict copy", asyn
   expect(both.sort()).toEqual(["trashed-1", "trashed-2"]);
 });
 
-// --- codex impl-round-2 regressions -----------------------------------------
+// --- review-regression guards ----------------------------------------------
 
 test("restore refuses a destination whose real parent escapes the workspace (symlinked dir)", async () => {
   await write("out/pwn.txt", "payload");

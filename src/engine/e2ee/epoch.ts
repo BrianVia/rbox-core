@@ -118,7 +118,7 @@ export async function verifyKeyStateChain(chain: SignedKeyState[], rosters: Rost
 /** The roster that authorizes epoch e's key-state: for genesis, roster v0; for a
  *  rotation, the roster pinned by the PREVIOUS epoch's key-state (states[e-1]).
  *
- *  §31 (codex MAJOR): this MUST be e-1's roster, NOT the new state's own
+ *  §31: this MUST be e-1's roster, NOT the new state's own
  *  `rosterVersion`. Using the new state's roster lets a device that was only just
  *  admitted (e.g. a stale-grant no-MK rogue admin) sign the rotation that pins the
  *  very roster containing itself — self-authorizing a rotation to attacker-chosen MK

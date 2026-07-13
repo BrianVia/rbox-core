@@ -183,7 +183,7 @@ export async function planGitSections(
 
   // §9: removal memories are pruned ONLY when the local `.git` genuinely disappears —
   // never on mere discovery absence (an ignored-but-present leftover is undiscoverable
-  // yet must keep its resurrection guard for when it is unignored; codex step-3 MAJOR).
+  // yet must keep its resurrection guard for when it is unignored).
   for (const rel of Object.keys(removedMem)) {
     if (kindByPath.has(rel)) continue;
     const dotGit = await fs.lstat(path.join(repoDirOf(root, rel), ".git")).catch(() => undefined);
@@ -583,7 +583,7 @@ export async function planGitSections(
   // whose owning main clone is (a) an in-tree linked-worktree parent AND (b) itself authored
   // a section THIS cycle skips its own full-store capture: the shared history already rides
   // the main clone's `--single-worktree --all` bundle, so capturing the pointer would upload
-  // the same object store again. Skip is BASE-CARRY, never a drop (codex M4): an existing
+  // the same object store again. Skip is BASE-CARRY, never a drop: an existing
   // section is carried forward unchanged (the remote never observes an absence → no removal
   // memory is stamped, sync-git.ts:443/:231 untouched), and a repo with no base is simply
   // never authored. `sectioned` is snapshotted BEFORE mutating toCapture — parents are dir
@@ -727,7 +727,7 @@ export function gitBaseAfterCommit(
 /** The per-relPath 422 recapture set [v2, M5]: ONLY the repos whose sections reference a
  *  missing (unsatisfied) encSha are force-recaptured — a missing GIT artifact can't be
  *  satisfied by a file re-upload, and the identity-carry would re-reference the absent
- *  bundle (§28, codex M3). A naive "recapture everything" would drop exactly the repos the
+ *  bundle (§28). A naive "recapture everything" would drop exactly the repos the
  *  defer machinery is protecting. */
 export function gitForceForMissingBlobs(committedGit: Record<string, GitSection> | undefined, missing: Set<string>): Set<string> {
   const gitForce = new Set<string>();
