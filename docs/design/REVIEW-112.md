@@ -27,3 +27,17 @@ correct and the doc honest that the 64 win may be near zero; per-request
 skew fallback non-looping; old-client/new-server compatible;
 `/v1/blobs/check`, commit shape, ciphertext format untouched; no violation of
 111's 5,000-receipt cap or clamp contract; slots stay 24 (respects #245).
+
+## Round 2 — VERDICT: CHANGES-REQUIRED
+
+Codex verified round-1 fixes 2 (supply-gap limitation), 4 (harness spec), 6
+(seam section), 7 (latency/memory bounds — confirming `floor(8 MiB /
+(256 KiB + 36)) = 31`) as resolved; 1, 3, 5 partially, with the residuals
+below. No CRITICAL or MINOR findings.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | MAJOR | Measurement-first framing contradicted by residual categorical causality: "Root cause" still asserted the timer "closes a batch too early … eagerly converts producer burstiness into half-full requests", and Option A predicted fill "will still average about 17 under 64" — unsupported, since under a wave-residue mechanism a larger cap CAN absorb a whole check wave into one fuller partial. | **ADOPT** — section renamed "Constraints and hypotheses"; item 1 is now an explicitly conditional hypothesis asserted only if the fill-v1 dispatch-reason baseline demonstrates it; Option A rejection re-based (no fill mechanism + no telemetry to interpret the result; D strictly contains A) instead of the unsupported ~17 prediction. |
+| 2 | MAJOR | The 400 latch does not guarantee "one degraded request per process": with 24 slots, several oversized requests can be in flight when the first 400 lands, each independently falling back to singles; queued-batch re-carve after the cap drop was unspecified. | **ADOPT** (weaken-to-proven-bound option; the alternative >32 probation mechanism rejected as needless serialization of a rollback-only path) — bound restated as ≤ in-flight oversized requests at latch time (≤ slots), re-carve semantics specified (mutable session cap read at carve time; queued groups re-carve at 32), and a 24-concurrent-oversized test added with settle-exactly-once assertions. |
+| 3 | MAJOR | `idle_tail + absolute = tail` is internally false: the doc itself diagnoses `absolute` as slow trickle, and a genuine end-of-producer tail can ship via `quiet`; a combined "tail" bucket in the fill gate could misdiagnose the experiment. | **ADOPT** — dispatch reasons now reported independently; only `idle_tail` is called an observed idle-tail dispatch; the doc states a true end-of-producer marker is unavailable without a producer-closed signal this design does not add; fill gate uses per-reason breakdown, no combined bucket. |
+| 4 | MAJOR | `peakUploaderFramingBytes` is a per-invocation max (`blob-batch.ts:779,800`), not an aggregate across up-to-24 concurrent encodes, so the resource gate was not testing the stated slots × body bound and "already tracked" was wrong. | **ADOPT** (redefine option; aggregate in-flight counter rejected as instrumentation burden duplicating RSS signal) — metric explicitly redefined as per-request framing peak; aggregate client memory assessed via process peak RSS; gate 5 names both with their semantics. |

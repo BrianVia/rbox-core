@@ -112,18 +112,22 @@ work and request/response materialization consume CPU and memory, while R2 PUTs
 complete in about `ceil(N/6)` waves. See the current [Cloudflare Workers
 limits](https://developers.cloudflare.com/workers/platform/limits/).
 
-## Root cause
+## Constraints and hypotheses
 
-There are two serially composed constraints:
+There are two serially composed constraints — the first a hypothesis to test,
+the second a hard fact of the wire:
 
-1. **The client closes a batch too early.** The 10 ms timer measures time since
-   the first queued record, not time since the last arrival and not whether the
-   upstream publish still has a deep encrypt backlog. With 24 free slots it
-   eagerly converts producer burstiness into half-full requests.
-2. **The wire rejects a useful sweep axis.** Both client and server pin the
-   record maximum to 32. `RBOX_BATCH_RECORDS` is clamped to 32 explicitly, so
-   `rig/upload-sweep` cannot test larger record batches without a coordinated
-   server release.
+1. **Hypothesis: the client closes batches too early.** The 10 ms timer
+   measures time since the first queued record, not time since the last
+   arrival and not whether the upstream publish still has a deep backlog; with
+   24 free slots it can convert producer burstiness into half-full requests.
+   This is the most probable underfill mechanism consistent with the code
+   paths, but per the attribution caveat above it is asserted as cause only if
+   the fill-v1 dispatch-reason baseline demonstrates it.
+2. **Fact: the wire rejects a useful sweep axis.** Both client and server pin
+   the record maximum to 32. `RBOX_BATCH_RECORDS` is clamped to 32 explicitly,
+   so `rig/upload-sweep` cannot test larger record batches without a
+   coordinated server release.
 
 The 8 MiB request cap is not the FM constraint. At 8.55 KB/record, 64 records
 are about 547 KB and even 128 are about 1.09 MiB. Raising body bytes or the
@@ -134,15 +138,24 @@ max-size 256 KiB records cannot exist — FIFO carving and `readBytesCapped`
 bind at the body cap near 31 records, so the record raise only changes
 small-record batches). On the client, peak framing remains approximately two
 body buffers per active slot (payloads plus the contiguous output in
-`encodeBatchBody`), already tracked by `peakUploaderFramingBytes` and bounded
-by slots × body cap, not by the record count.
+`encodeBatchBody`), bounded by slots × body cap, not by the record count.
+Measurement honesty: `peakUploaderFramingBytes` is a **per-request** framing
+peak (it maxes each `encodeBatchBody` invocation's own bytes; it does not
+aggregate across the up-to-24 concurrent encodes), so aggregate client memory
+is assessed via process peak RSS, with `peakUploaderFramingBytes` as the
+per-request component. This design does not add an aggregate in-flight
+framing counter.
 
 ## Options
 
 ### A. Raise records only, leave the 10 ms timer
 
-This exposes a sweep axis but does not address measured underfill: a client
-that averages 17 under a cap of 32 will still average about 17 under 64. Reject.
+This exposes a sweep axis but provides no fill mechanism and no telemetry to
+interpret the result. Whether fill would improve depends on which underfill
+mechanism dominates — under a wave-residue pattern a larger cap can absorb a
+whole check wave into one partial, while under timer starvation it changes
+nothing — and without dispatch-reason instrumentation the sweep could not
+tell which happened. Option D strictly contains A. Reject as a standalone.
 
 ### B. Sliding quiet timer
 
@@ -325,8 +338,14 @@ new-client/old-server pair cannot rely on any new server contract:
    (one-time, monotonic — analogous to `uploadDisabledForProcess`), falls the
    current request back to singles as today, and continues batching at 32.
    A 400 at cap ≤32 is a genuine bad request and behaves exactly as today.
-   This converts sustained skew from "400 + up to 64 singles per batch,
-   forever" into one degraded request per process.
+   Honest bound: with 24 slots, several oversized requests may already be in
+   flight when the first 400 lands, and each falls back to singles
+   independently — the guarantee is therefore **at most the number of
+   oversized requests in flight at latch time (≤ slots, 24 by default)
+   degraded requests per process**, not exactly one. The latch prevents any
+   NEW oversized batch from being carved: the session cap is a mutable field
+   read at carve time, so queued not-yet-carved groups automatically re-carve
+   at 32; only batches already carved and launching stay oversized.
 2. **Server `too_many_records` outcome (ships with the server change).** The
    current handler collapses every parse failure into AE outcome
    `bad_request` with `count: 0` — an alert on the skew condition is not
@@ -357,10 +376,13 @@ visible within minutes rather than by anecdote.
   limitation is pinned: inter-arrival gaps >10 ms with a deep logical backlog
   ship partials on the quiet bound (limitation-documenting, not a pass gate).
 - 400-latch tests: a `/v1/blob-batch/put` 400 at effective cap >32 latches the
-  session cap to 32, falls back that one request to singles, and subsequent
-  batches carve at 32 with no further 400s; a 400 at cap ≤32 behaves exactly
-  as today; a valid shrinking `max` in the response clamps to `max` instead;
-  absent/invalid/non-shrinking `max` uses the 32 latch.
+  session cap to 32, falls back that request to singles, and subsequent
+  batches carve at 32 with no further 400s; with 24 concurrent oversized
+  requests in flight against a 32-cap server, every waiter settles exactly
+  once, at most those in-flight requests degrade to singles, and queued
+  groups re-carve at 32; a 400 at cap ≤32 behaves exactly as today; a valid
+  shrinking `max` in the response clamps to `max` instead; absent/invalid/
+  non-shrinking `max` uses the 32 latch.
 - Boundary tests send 32, 33, 64, and 65 records under server max 32 and 64 and
   pin rejection precedence, response ordering, SHA mismatch, duplicate SHA,
   8 MiB body, and 256 KiB record behavior, plus the new `too_many_records`
@@ -394,20 +416,25 @@ is also a prerequisite, since older clients clamp `RBOX_BATCH_RECORDS` to 32):
 
 Measurement sources are named because round 1 found gates that could not be
 evaluated from existing telemetry: per-batch fill distributions (mean/p50)
-come from per-event AE `blob.batchPut` `count`; tail identification comes from
-the client dispatch-reason counters (`idle_tail` + `absolute` = tail);
-response size is bounded analytically (results array of ≤64 fixed-shape
-records, receipt string of measured size) and spot-checked in the boundary
-tests.
+come from per-event AE `blob.batchPut` `count`; the client dispatch-reason
+counters are reported **independently, one per reason** — only `idle_tail` is
+an observed idle-tail dispatch; `absolute` can equally mean a sustained slow
+trickle mid-publish, and a genuine end-of-producer tail can ship via `quiet`,
+so no reason combination is labeled "the tail" (a true logical
+end-of-producer marker would need a producer-closed signal this design does
+not add — that quantity is simply unavailable). Response size is bounded
+analytically (results array of ≤64 fixed-shape records, receipt string of
+measured size) and spot-checked in the boundary tests.
 
 Promotion of client default 64 requires all of:
 
 1. **Batch-count gate:** successful attempted batch-PUT count falls by at least
    35% versus 32/fill-v1 on FM; single-PUT fallback count does not increase.
 2. **Fill gate:** mean records ≥48 at candidate 64, p50 ≥56 (AE per-event
-   `count`), with tail batches (dispatch-reason `idle_tail`/`absolute`)
-   reported separately; mean accepted bytes ≥400 KB on FM. This is compatible
-   with the measured ~8.55 KB/blob and detects continued timer starvation.
+   `count`), with the fill distribution also broken down per dispatch reason
+   (each reason reported independently — no combined "tail" bucket); mean
+   accepted bytes ≥400 KB on FM. This is compatible with the measured
+   ~8.55 KB/blob and detects continued timer starvation.
 3. **Wall-throughput gate:** median FM first-publish upload wall improves ≥15%
    and wall Mbps improves ≥15%; no run regresses >5%. Report total publish wall
    separately so commit/redemption work cannot be credited to this change.
@@ -422,11 +449,13 @@ Promotion of client default 64 requires all of:
    amortization; slot work measures the thesis directly. If slot work does
    not fall, keep fill-v2/32 and do not promote 64.
 5. **Resource gate:** zero Worker 1102/resource-limit errors across the sweep;
-   p99 handler wall at 64 <10 s; client peak RSS and
-   `peakUploaderFramingBytes` within 10% of the 32-record cells (framing is
-   slots × body-cap bounded, so no growth is expected); single-PUT fallback
-   and retry counts non-inferior. The existing #245 result is respected:
-   slots remain 24 and are not swept upward as part of this design.
+   p99 handler wall at 64 <10 s; client peak process RSS (aggregate memory)
+   and `peakUploaderFramingBytes` (per-request framing peak — see the
+   measurement-honesty note above) each within 10% of the 32-record cells
+   (framing is slots × body-cap bounded, so no growth is expected);
+   single-PUT fallback and retry counts non-inferior. The existing #245
+   result is respected: slots remain 24 and are not swept upward as part of
+   this design.
 6. **Correctness gate:** identical committed ref set, all receipts redeemed,
    resume after injected mid-upload failure converges without double accounting,
    and all design-96/102 fence assertions pass.
