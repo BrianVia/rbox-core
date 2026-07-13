@@ -153,6 +153,20 @@ per group under the common-dir lock, and gives every newly authored member the
 same `tracking` value and `sourceSequence`. Carried older members may retain an
 older value.
 
+**Tracking is capture dirt in its own right (r1 F4).** `gitIdentity` and the
+§43 carry matrix do not see `refs/remotes/*`, so without a dedicated
+predicate a tracking-only change (a fetch, a remote force-push) would carry
+the old section forever and the LWW convergence claim would be vacuous. The
+planner computes a canonical per-common-store `trackingKey` (hash of the
+normalized tracking map) per group and compares it with the newest tracking
+assertion carried by the group's base sections. A mismatch makes the group's
+authoring member re-author with a fresh snapshot and restamped
+`sourceSequence` even when Git identity is otherwise carry-clean. The
+fingerprint/divergence caches must either incorporate `trackingKey` into
+their trusted summaries or be bypassed for this decision, and
+`gitDivergenceStatus` mirrors the same predicate so `rbox status` cannot
+report "in sync" over unpublished tracking truth.
+
 Apply groups incoming sections by the receiver's resolved commonDir and chooses
 one tracking assertion for the group: greatest valid `tracking.sourceSequence`,
 then lexicographically smallest repo key as a deterministic tie-break. The
@@ -161,8 +175,11 @@ when that tracking snapshot is freshly authored; carried assertions retain
 their original sequence. A 409 rebuilds against the new parent before retry,
 and pull rejects an assertion whose source sequence exceeds its authenticated
 manifest commit sequence. This uses the sync stream's LWW order, never wall
-clocks. It
-applies that complete map once under the common-dir lock. Thus an older carried
+clocks. It commits that complete map once, transactionally, under the
+common-dir lock — transactional means all-or-none success, not atomic
+observability: a concurrent reader may see a subset mid-commit (documented
+`update-ref --stdin` behavior); rbox's own proofs run under its
+serialization and never read mid-transaction. Thus an older carried
 pointer section cannot regress a newer sibling assertion, and apply order is
 irrelevant. When pointer-origin sections materialize as independent standalone
 repos, each standalone common store receives its section's assertion; if those
@@ -222,7 +239,19 @@ metadata remains excluded by the built-in rules. This may conservatively block
 a parent when a child has human-local dirt, which is preferable to clobbering
 it.
 
-Unreadable paths, scan churn, hashing failure, ambiguous type changes, or an
+Path comparison is byte-exact first, with an explicit receiver-filesystem
+equivalence model (r1 F2): case-insensitive and Unicode-normalization-aliasing
+behavior (APFS in this fleet) is **probed** at runtime, never assumed. When a
+scan spelling and an oracle spelling differ only under the probed equivalence,
+equality must be proved through filesystem identity of the single underlying
+entry; two oracle-projected paths that collide under receiver equivalence, or
+an incoming Git index naming receiver-colliding paths, are unprovable. The
+oracle scan's own deferred-path set must be empty for the repo's projection —
+a path the scanner deferred (permission/IO churn) is missing from the proof,
+not proof of absence.
+
+Unreadable paths, scan-deferred paths, scan churn, hashing failure, ambiguous
+type changes, receiver path-equivalence collisions, or an
 unprovable projection produce `indeterminate`, which defers the checkout as
 human-local protection. Per-entry stat tokens are insufficient because they
 cannot detect a newly created path. The first scan retains directory inventory
@@ -313,6 +342,16 @@ proofs:
 The current checkout follows only when its tip passes incoming ownership. The
 same ownership + no-drop pair runs per ref before deletion/replacement.
 
+**Connectivity discipline (r1 F5).** Both proofs are complete-closure walks,
+not tip-presence checks. They run with lazy/promisor fetch disabled
+(`GIT_NO_LAZY_FETCH`/equivalent), peel tag roots explicitly, and treat every
+missing object, peel failure, or walk error as `indeterminate` — defer, never
+"unreachable". A shallow receiver store (shallow markers in the common dir)
+defers the checkout plane, matching capture's structural refusal. The
+incremental pack-chain import's link skip (advertised tip already present)
+proves tip presence only; the ownership/no-drop walks must independently
+verify closure over the roots they consult or defer.
+
 For dir repos, protection enumerates every receiver `refs/stash` reflog OID,
 not only the current stash tip. Older stash entries are often reachable only
 from that reflog. A receiver-only stash holds the user-visible stash ref/stack
@@ -385,6 +424,16 @@ head/tag/stash/tracking ref:
 5. for remote-tracking last-writer-wins replacement, transactionally pin a
    displaced unique tip at
    `refs/rbox-local/<episode>/<encoded-original-ref>` before advancing it.
+
+Deleting or force-replacing a ref also destroys its reflog, and reflog-only
+commits (a pre-force-push tracking tip, an amended head) can be reachable from
+nowhere else (r1 F6). The stash rule therefore generalizes: before ANY
+ref-plane deletion or non-fast-forward replacement, the engine enumerates that
+ref's reflog OIDs and pins every entry not reachable from the planned durable
+graph under the episode recovery namespace, in the same ref transaction as the
+displaced-tip pin. Recovery-pin creation is create-only (expected-absent): a
+name collision aborts to a fresh episode id rather than overwriting an earlier
+pin.
 
 The recovery namespace is excluded from capture and ordinary identity exactly
 like existing `refs/rbox-*`. It is surfaced with recovery instructions and
@@ -508,10 +557,51 @@ is intentionally after potentially slow ref/config work and immediately before
 the checkout commit. A crash after a
 safe ref update but before state save is recovered by comparing the exact
 incoming value on retry; the update is idempotent and the old ref was either
-not unique or was pinned first. A crash must never leave the current branch
-moved with old HEAD/index, or HEAD/index moved without the verified file oracle.
-The checkout subset therefore retains `applyGitState`'s snapshot/rollback
-transaction boundary.
+not unique or was pinned first.
+
+**Checkout journal (r1 F1).** `applyGitState`'s snapshot/rollback boundary is
+in-process only: refs, HEAD, index, and op-state are separate filesystem
+mutations, and a power failure between them cannot run `restoreLocal`. The
+checkout subset therefore adds a durable two-phase protocol. Before the first
+checkout-plane mutation, the engine persists a **checkout journal** in the
+repo's gitdir (`<gitdir>/rbox-checkout-journal`, written atomically): the
+exact old and new values of the current branch ref, HEAD form, index
+projection hash plus the staged candidate index path, and every op-state
+entry, keyed by `incomingKey`. The journal is removed only after the
+post-checkout fsck passes and the state save lands. On every apply (and on
+daemon start), a surviving journal is recovered FIRST, before any
+classification: live checkout-plane state is compared field by field against
+the journal's old/new values; an exact old-or-new mix is rolled forward to
+the journaled new state (artifacts re-verified from the still-pending
+incoming section) or rolled back to the journaled old state — deterministic,
+and never classified as human divergence. Any field matching neither
+journaled value means a human intervened mid-crash: the journal is retired to
+the recovery namespace and the repo takes the ordinary conflict path. A crash
+must never leave the current branch moved with old HEAD/index, or HEAD/index
+moved without the verified file oracle, without a journal that makes the next
+run repair it. Kill-injection tests cover every boundary: after safe refs,
+after journal write, after ref-transaction prepare/commit, after HEAD, after
+index rename, mid op-state restore, before journal clear, before state save.
+
+**Lock protocol and capability floor (r1 F3).** "Acquire the checkout locks"
+is pinned to this sequence: (1) normalize/stage the candidate index privately
+(the resolve-undo clear runs against the staged candidate via a private
+`GIT_INDEX_FILE`, never `git update-index` on the live index); (2) open one
+`git update-ref --stdin` transaction carrying expected-old values for every
+checkout-plane ref update, including HEAD via `symref-update` (verified
+old symbolic target); (3) `prepare` — this takes the ref locks; (4) create
+`index.lock` (and `HEAD.lock` only on a fallback path, see below) via
+O_CREAT|O_EXCL; (5) run the second oracle + metadata proof using **lock-free
+reads only** — direct file reads and plumbing that takes no locks; no Git
+command that acquires index/ref locks may run between prepare and commit;
+(6) `commit` the ref transaction, rename the staged index into place, restore
+op-state, fsck; (7) clear the journal in the state save. `symref-update`
+inside `--stdin` transactions requires a modern Git; the engine probes the
+capability once per binary+git-version and on an unsupported Git defers the
+checkout with a typed `unsupported` reason (legacy disposition) rather than
+running a weaker partial protocol. The ownership-aware busy probe (defined at
+the oracle's checkout boundary above) ignores exactly the lock tokens this
+sequence created and nothing else.
 
 ## Visibility
 
@@ -599,7 +689,14 @@ can therefore never be falsely acknowledged: its tracking lane applies (or is
 recorded partial), and checkout/base clear only according to the legacy gate.
 
 Schema-5 authorship is controlled by the reader-first release stage, not this
-runtime safety switch. Once the fleet crosses the schema-5 reader floor,
+runtime safety switch — through a concrete interlock (r1 F8): a checked-in
+build constant (`GIT_TRACKING_AUTHORSHIP`, alongside the release version
+gate), shipped `false` in the reader-stage release and flipped only in the
+follow-up release after the fleet crosses the schema-5 reader floor. It is
+not an env var and cannot be toggled at runtime. Every stamp site — capture,
+base/pending carry, 409 rebuild, 422 recapture, and versions restore — must
+consult it, pinned by a static test that enumerates the sites and by tests
+proving no path emits schema 5 while the constant is false. Once flipped,
 tracking authorship remains enabled in either flag arm; rollback is by feature
 behavior, not by emitting a lossy schema-4 rewrite. Readers remain schema-5
 capable permanently after rollout.
@@ -622,9 +719,25 @@ promise disabled.
 
 ### Phase 0 — prove the incident path
 
-Before implementation, archive privacy-scrubbed evidence from the affected
-repo and released binary, reproduce the chronic defer, and make the test fail
-for the same persisted reason/transition. Record the release commit and bisect
+Evidence first, scrubbing second (r1 F7): stop the daemon on the affected
+host, then take an immutable, permission-restricted RAW snapshot — state.json
+(repo records, pending, needs-resolution, removal memories, generations),
+daemon logs, the exact released binary/version, HEAD/refs/reflogs, index and
+op-state metadata, every lockfile, manifest meta, and the trash inventory.
+The OIDs, ref spellings, and identity keys inside it are exactly what
+distinguish the candidate mechanisms; the privacy-scrubbed archive is derived
+FROM that snapshot, never taken instead of it. A daemon retry, log rotation,
+or a cleared sidecar can silently destroy the chronic state and leave only a
+lookalike to reproduce.
+
+Before any historical bisect, check the live current-code candidates against
+the snapshot: a `gitNeedsResolution` checkpoint whose recorded identity still
+equals the live key (the unconditional early return in
+`applyGitSections`), the busy-probe defer loop (including an editor- or
+crash-created stale lockfile), and pending-carry capture suppression. Then
+reproduce the chronic defer with the incident release/state and make the test
+fail for the same persisted reason/transition. Record the release commit and
+bisect
 whether the refusal is in an older dirty-tree gate, identity/base state,
 pending/needs-resolution suppression, ownership, or another path. If current
 HEAD already follows the exact sync-dirt case, retain that passing regression
@@ -646,7 +759,18 @@ localCommits    ∈ {0,1}  // current tip absent from incoming-ownership roots
 localStash      ∈ {0,1}  // receiver-only stash work
 ```
 
-That is 48 principal cases. Checkout follows iff `humanDirt=0`,
+That is 48 principal cases, and the principal set is not the whole state
+space (r1 F9). `indexDiverged` and `opStateDiverged` join as crossed
+dimensions, and pairwise coverage is required across
+`{syncDirt, humanDirt, localCommits, localStash, indexDiverged,
+opStateDiverged, incomingStash, trackingOnly, configOnly, schemaMix,
+pointerShape, legacyBase}` × `{ff, switch, detached}` — the fully-crossed 48
+remain the core, the pairwise closure catches interaction cells. Every
+checkout mutation boundary additionally gets a crash-injection row (after
+safe refs, after journal write, after prepare, after ref commit, after HEAD,
+after index rename, mid op-state, before journal clear, before state save),
+plus receiver path-equivalence alias rows (case and Unicode-normalization)
+and a scan-deferred-path row. Checkout follows iff `humanDirt=0`,
 `localCommits=0`, `localStash=0`, index/op-state are base-or-incoming, and no
 operational guard blocks it. `syncDirt` never changes that answer. A
 receiver-only stash is local-only commit evidence: it holds the stash ref and
