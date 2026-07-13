@@ -141,7 +141,7 @@ describe("FirstPublishStats", () => {
       "peakQueueHeapBytes", "peakTempDiskBytes", "peakUploaderFramingBytes",
       "producerCpuSaturationPct", "reEncryptedOnResume", "receiptRedemptionOverlapMs",
       "receiptRedemptionWallMs", "serverSatisfiedSkipped", "serverUnsatisfiedTotal",
-      "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
+      "timeToFilesSyncedMs", "timeToFirstReadyCiphertextMs", "uniqueEncryptions", "uploadCriticalPathMs",
     ]);
     expect(Object.values(stats).every((n) => Number.isInteger(n) && n >= 0)).toBe(true);
     expect(stats.encryptWallMs + stats.missingCheckWallMs + stats.receiptRedemptionWallMs + stats.commitWallMs).toBe(14);
@@ -156,5 +156,17 @@ describe("FirstPublishStats", () => {
     firstPublishUploadStart();
     firstPublishUploadEnd();
     expect(finishFirstPublishStats()).toBeUndefined();
+  });
+
+  test("a second concurrent measurement voids BOTH (ownership invariant, design 108)", () => {
+    beginFirstPublishTiming(true);
+    expect(firstPublishTiming.enabled).toBe(true);
+    beginFirstPublishTiming(true); // overlap: never cross-attribute — void both
+    expect(firstPublishTiming.enabled).toBe(false);
+    expect(finishFirstPublishStats()).toBeUndefined();
+    // A fresh, non-overlapping measurement still arms normally afterwards.
+    beginFirstPublishTiming(true);
+    expect(firstPublishTiming.enabled).toBe(true);
+    beginFirstPublishTiming(false);
   });
 });

@@ -40,7 +40,7 @@ import {
   uploadLaneTimingSummary,
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
-import { finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
@@ -103,6 +103,12 @@ type CurrentWriteContext = {
   keyEpoch: number;
 };
 type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWriteContext> };
+
+/** Design 108: files-first first publish is flag-gated, default OFF. Exactly `=1`
+ *  activates it; any other value (or unset) keeps the byte-identical legacy path —
+ *  including init's report/metrics wiring, which gates on this same flag so a flag-off
+ *  `rbox init` emits exactly the pre-108 output (codex round-6 MAJOR 1). */
+export const filesFirstFlagEnabled = (): boolean => process.env.RBOX_FILES_FIRST === "1";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */
@@ -232,6 +238,11 @@ export interface SyncDeps {
   /** Daemon-only terminal-halt hint. Foreground `rbox push` / `rbox sync` leaves this
    *  unset so an explicit user sync always makes a real attempt. */
   blockedFingerprint?: string;
+  /** Design 108 §3.6: the command-level "files synced" start milestone (a
+   *  performance.now() reading) captured by init BEFORE scan, so timeToFilesSyncedMs
+   *  includes the scan wall. Absent on non-init pushes → falls back to the timing's own
+   *  start (which begins inside encryptAndUpload, after scan+git-plan). */
+  filesFirstStartedAt?: number;
 }
 
 function withReportScanStats(deps: SyncDeps, report: PhaseReport): SyncDeps {
@@ -523,7 +534,7 @@ export async function push(
   cfg: WorkspaceConfig,
   deps: SyncDeps = {},
   purgeIgnored = false
-): Promise<{ sequence: number; committed: boolean }> {
+): Promise<{ sequence: number; committed: boolean; gitDeferred?: boolean }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
@@ -548,8 +559,8 @@ export async function push(
       report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
   }
-  const { sequence, committed } = await pushManifest(root, cfg, local, deps, { purgeIgnored });
-  return { sequence, committed };
+  const { sequence, committed, gitDeferred } = await pushManifest(root, cfg, local, deps, { purgeIgnored });
+  return { sequence, committed, ...(gitDeferred ? { gitDeferred } : {}) };
 }
 
 /** What a push commit reports back to callers holding an in-memory manifest.
@@ -557,7 +568,10 @@ export async function push(
  *  the no-op and everything-deferred short-circuits, so callers can say "already in
  *  sync" instead of reporting a publish that never happened (design 44: the setup
  *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
-export type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean; repairConflict?: boolean };
+export type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean; repairConflict?: boolean;
+  /** Design 108 §3.1: set true only on a successful, sequence-advancing files-only
+   *  genesis commit (commit 1) with git still owed — signals init to run commit 2. */
+  gitDeferred?: boolean };
 export interface RepairPushMode { kind: "repair"; parentSequence: number }
 
 /**
@@ -579,6 +593,11 @@ type RecoveryAction =
   | { kind: "pull-first" }
   | { kind: "repair-conflict" }
   | { kind: "epoch-stale" }
+  // Design 108 §3.2: nonterminal anti-starvation fallback. A files-first attempt that
+  // committed nothing (every changed file deferred) returns this so the loop re-plans
+  // with ordinary git-inclusive planning — NO pull, NO epoch refresh, NO reupload, and
+  // it does not consume the MAX_ATTEMPTS 409 budget (independent cap of 1).
+  | { kind: "files-first-fallback" }
   | { kind: "reupload"; forceGitRecapture: ReadonlySet<string>; localForRetry: Manifest; unsatisfiedTotal?: number; unsatisfiedBlobs: string[]; forceSnapshot?: boolean };
 
 const RECOVER_ACCUM_MAX = 100_000;
@@ -673,9 +692,21 @@ export async function pushManifest(
     recoverAddresses: new Set<string>(),
     forceFullAudit: false,
     forceSnapshot: repair !== undefined,
+    filesFirstAborted: false,
+    filesFirstFallbackUsed: false,
     ...(repair ? { repair } : {}),
   };
   let previousUnsatisfiedTotal: number | undefined;
+  // Shared "discard the attempt, rebuild from disk truth" reset — used by the
+  // pull-first/epoch-stale arm AND the files-first fallback arm below.
+  const rescanReset = async (): Promise<void> => {
+    state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored);
+    state.forceGitRecapture = NO_GIT_FORCE;
+    // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
+    state.recoverAddresses.clear();
+    state.forceFullAudit = false;
+    state.forceSnapshot = repair !== undefined;
+  };
 
   for (;;) {
     const outcome = await runPushAttempt(root, cfg, deps, backoff, state);
@@ -690,6 +721,17 @@ export async function pushManifest(
       // bounded 422 reuploads and epoch refreshes while in repair mode.
       return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true };
     }
+    if (outcome.action.kind === "files-first-fallback") {
+      // Design 108 §3.2: a files-first attempt committed nothing (every file deferred).
+      // Re-plan with ordinary git-inclusive planning so git is not starved. This is a
+      // MODE SWITCH, not a conflict: no pull, no epoch refresh, no reupload, and it does
+      // NOT consume the MAX_ATTEMPTS 409 budget (independent cap of 1).
+      if (state.filesFirstFallbackUsed) throw new Error(outcome.exhaustedError);
+      state.filesFirstFallbackUsed = true;
+      state.filesFirstAborted = true; // disables files-first defer on the re-run
+      await rescanReset(); // rebuild from disk truth
+      continue; // does NOT increment attempt
+    }
     const consumesAttempt =
       outcome.action.kind !== "reupload" ||
       outcome.action.unsatisfiedTotal === undefined ||
@@ -700,18 +742,18 @@ export async function pushManifest(
     // `attempt`), matching the original recursion's throw-before-retry ordering.
     if (consumesAttempt && attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
     if (outcome.action.kind !== "reupload") {
+      // Design 108 §3.2/§3.4: a 409/pull-first or epoch-stale discovery latches
+      // files-first OFF for the rest of the run — the refreshed parentSequence will be
+      // ≥1 anyway, but the latch makes the "retry-after-409 captures git" guarantee
+      // independent of the sequence check.
+      state.filesFirstAborted = true;
       if (outcome.action.kind === "pull-first") {
         await backoff(attempt);
         await pull(root, cfg, deps);
       } else {
         await refreshWriteContext(cfg, deps);
       }
-      state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored); // disk changed under us
-      state.forceGitRecapture = NO_GIT_FORCE;
-      // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
-      state.recoverAddresses.clear();
-      state.forceFullAudit = false;
-      state.forceSnapshot = repair !== undefined;
+      await rescanReset(); // disk changed under us
     } else {
       // 422: same manifest, no backoff, no re-scan — force git recapture of the named repos.
       state.forceFullAudit = accumulateRecoveryPage(state.recoverAddresses, state.forceFullAudit, outcome.action.unsatisfiedBlobs);
@@ -740,6 +782,12 @@ interface PushAttemptState {
   recoverAddresses: Set<string>;
   forceFullAudit: boolean;
   forceSnapshot: boolean;
+  /** Design 108 §3.2: loop-carried latch. Set on any 409/pull-first or epoch-stale
+   *  branch, and on the no-advance files-first fallback. Once set, files-first defer is
+   *  OFF for the rest of the run (git captured on retry). */
+  filesFirstAborted: boolean;
+  /** Design 108 §3.2: independent cap (=1) for the files-first-fallback RecoveryAction. */
+  filesFirstFallbackUsed: boolean;
   repair?: RepairPushMode;
 }
 
@@ -750,7 +798,7 @@ async function runPushAttempt(
   backoff: (attempt: number) => Promise<void>,
   attemptState: PushAttemptState
 ): Promise<AttemptOutcome> {
-  const { purgeIgnored, forceGitRecapture, recoverAddresses, forceFullAudit, forceSnapshot, repair } = attemptState;
+  const { purgeIgnored, forceGitRecapture, recoverAddresses, forceFullAudit, forceSnapshot, filesFirstAborted, repair } = attemptState;
   let local = attemptState.local;
   // Created PER attempt (not once in the loop): when no remote is injected, a stateful
   // RboxApi must start each attempt with a clean upload-receipt slate — exactly as the
@@ -786,6 +834,26 @@ async function runPushAttempt(
     assertNoUnevaluatedPurgeDeletes(matcher, deleted);
   }
 
+  // Design 108 §3.2: the file-plane diff drives BOTH the files-must-diff guard and (later)
+  // the no-op / mass-delete checks. Computed once here — planGitSections does not touch the
+  // file plane — so the files-first decision precedes git capture.
+  const filesDiff = diffManifests(appliedBase, local);
+  const fileDiffNonEmpty = filesDiff.added.length > 0 || filesDiff.changed.length > 0 || filesDiff.deleted.length > 0;
+  // Files-first defers git capture ONLY on a genuine genesis first-init with a real file
+  // diff (§3.1/§3.4): flag on, no 409/epoch/starvation latch yet, parentSequence 0, NOT a
+  // rebind/stream-mismatch, and files actually differ. Any false leg ⇒ ordinary git-inclusive
+  // planning (byte-identical to today when the flag is off).
+  const filesFirstDefer =
+    filesFirstFlagEnabled() &&
+    repair === undefined &&                // NEVER defer under chain-repair: a repair supersede
+                                           // posts repair.parentSequence (≠ appliedSequence) and
+                                           // must republish git verbatim, never drop it (BLOCKER).
+    cfg.syncGit === true &&                // no git to attach ⇒ nothing to defer (no wasted commit 2)
+    !filesFirstAborted &&
+    appliedSequence === 0 &&
+    !stateWasStreamMismatch(state) &&
+    fileDiffNonEmpty;
+
   // Attach the git sections (design 43 §6): per-repo carry/capture/defer/remove map
   // orchestration. `forceGitRecapture` is the per-relPath 422 recapture set [v2, M5]:
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
@@ -795,6 +863,7 @@ async function runPushAttempt(
     planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
       onGitLog: deps.onGitLog,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+      filesFirstDefer,
     })
   );
   if (report.enabled) {
@@ -805,8 +874,9 @@ async function runPushAttempt(
   // here too would be a second copy of the rule.
   local = { ...local, gitRepos: gitPlan.gitRepos };
 
-  const filesDiff = diffManifests(appliedBase, local);
-  const filesUnchanged = filesDiff.added.length === 0 && filesDiff.changed.length === 0 && filesDiff.deleted.length === 0;
+  // The file plane is unchanged by git-plan, so the hoisted filesDiff above is
+  // authoritative — filesUnchanged is exactly its negation (single source, can't drift).
+  const filesUnchanged = !fileDiffNonEmpty;
   const gitUnchanged = !gitPlan.changed;
   if (!repair && filesUnchanged && gitUnchanged) {
     // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
@@ -873,112 +943,145 @@ async function runPushAttempt(
   // core is a fail-closed error, BEFORE any byte is uploaded — never plaintext.
   if (!cfg.encrypted || !cfg.kek) throw new Error("E2EE required: refusing to sync without an encryption key (run `rbox init`/`rbox pair`/`rbox key recover`)");
 
-  // Missing or scan-mismatched sources defer immediately; ciphertext upload
-  // mismatches retry within a bounded per-file budget. Only the stable subset is
-  // committed, and watcher/safety scans re-queue deferred paths once they settle.
-  const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
-    encryptFileToTemp: deps.encryptFileToTemp,
-    encryptCacheFlushMs: deps.encryptCacheFlushMs,
-    pruneLivePaths: scannedFilePaths,
-    recoverAddresses,
-    forceFullAudit,
-  });
+  // Design 108 §3.6 (round-4 MAJOR 2): everything from encryptAndUpload (which ARMS the
+  // module-global firstPublishTiming singleton) onward runs inside this try. Its finally
+  // disables the singleton on EVERY exit that did not finalize it — a reupload /
+  // no-advance return, an epoch/409/422 return, or a thrown encrypt/commit/state-save
+  // error. The success path needs no flag: finishFirstPublishStats itself disables the
+  // singleton, so `enabled` in the finally means exactly "exited without finalizing".
+  try {
+    // Missing or scan-mismatched sources defer immediately; ciphertext upload
+    // mismatches retry within a bounded per-file budget. Only the stable subset is
+    // committed, and watcher/safety scans re-queue deferred paths once they settle.
+    const { deferred, retryLater, needsUpload } = await encryptAndUpload(api, root, cfg, local, appliedBase, report, deps.onProgress, backoff, {
+      encryptFileToTemp: deps.encryptFileToTemp,
+      encryptCacheFlushMs: deps.encryptCacheFlushMs,
+      pruneLivePaths: scannedFilePaths,
+      recoverAddresses,
+      forceFullAudit,
+    });
 
-  // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
-  // if it was previously synced we carry its base entry forward (mirrors the forward-only
-  // ignore carry above) so it NEVER reads as a deletion on other machines, and a never-synced
-  // deferred file is simply omitted. Invariant: every blob the committed manifest references
-  // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
-  // ref, no phantom deletion.
-  const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+    // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
+    // if it was previously synced we carry its base entry forward (mirrors the forward-only
+    // ignore carry above) so it NEVER reads as a deletion on other machines, and a never-synced
+    // deferred file is simply omitted. Invariant: every blob the committed manifest references
+    // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
+    // ref, no phantom deletion.
+    const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
 
-  if (needsUpload && needsUpload.size > 0) {
-    return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
-  }
-
-  // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
-  // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
-  // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
-  // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
-  // that the artifact blobs were missing.
-  if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
-    const dd = diffManifests(appliedBase, committed);
-    if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
-      reportDeferred(deferred);
-      return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
+    if (needsUpload && needsUpload.size > 0) {
+      return reuploadOutcome(committed, [...needsUpload], needsUpload.size);
     }
-  }
 
-  let commitTimings: CommitTimings | undefined;
-  let commitOptions: CommitOptions | undefined;
-  const manifestMeta = validManifestMeta(state.manifestMeta);
-  const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
-  const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
-    validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
-    ? { manifest: reconstructedBase, meta: manifestMeta }
-    : undefined;
-  if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
-    commitOptions = {
-      ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
-      ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
-      ...(deltaBase ? { deltaBase } : {}),
-      ...(repair ? { forceSnapshot: true } : {}),
+    // If deferral left nothing to commit (every change deferred, git unchanged), don't burn a
+    // no-op commit — the deferred files stand alone for the daemon to re-queue later. NEVER
+    // short-circuit a forced git RE-CAPTURE (422 recovery): its whole point is to re-commit a
+    // manifest whose git artifacts were re-uploaded, and gitUnchanged (identity-only) can't see
+    // that the artifact blobs were missing.
+    if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
+      const dd = diffManifests(appliedBase, committed);
+      if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
+        if (gitPlan.filesFirstDeferred) {
+          // Design 108 §3.2 anti-starvation: files-first committed nothing (every file
+          // deferred) yet real repos were deferred. A terminal committed:false here would
+          // leave the sequence at 0 and re-fire genesis every push, STARVING git. Return the
+          // nonterminal fallback so the loop re-plans with ordinary git-inclusive planning
+          // (best-effort, never a block). The uncommitted, idempotent ciphertext this attempt
+          // uploaded is safe; the re-run reconstructs disk truth.
+          return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
+        }
+        reportDeferred(deferred);
+        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
+      }
+    }
+
+    let commitTimings: CommitTimings | undefined;
+    let commitOptions: CommitOptions | undefined;
+    const manifestMeta = validManifestMeta(state.manifestMeta);
+    const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
+    const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
+      validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
+      ? { manifest: reconstructedBase, meta: manifestMeta }
+      : undefined;
+    if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
+      commitOptions = {
+        ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
+        ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
+        ...(deltaBase ? { deltaBase } : {}),
+        ...(repair ? { forceSnapshot: true } : {}),
+      };
+    }
+    const parentSequence = repair?.parentSequence ?? appliedSequence;
+    const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
+    const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
+    const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
+    if (firstPublishTiming.enabled) {
+      const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
+      firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
+    }
+    if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
+
+    if (res.epochStale !== undefined) {
+      return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
+    }
+    if (res.conflict) {
+      deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
+      return repair
+        ? { done: false, action: { kind: "repair-conflict" }, exhaustedError: "repair: verified head advanced during publication" }
+        : { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };
+    }
+    if (res.unsatisfiedBlobs) {
+      // A missing GIT artifact can't be satisfied by a file re-upload, and an identity-carry
+      // would re-reference the absent bundle (§28, codex M3) — so force a RE-CAPTURE for
+      // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
+      // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
+      // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
+      return reuploadOutcome(committed, res.unsatisfiedBlobs, res.unsatisfiedTotal, res.attemptedManifestChain);
+    }
+
+    // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
+    // this accepted commit response; the START is init's command milestone (before scan).
+    // Scoped to init (which sets filesFirstStartedAt) — a daemon/CLI push without it leaves
+    // the KPI 0 so it never forces a FirstPublishStats render on a non-init push, and the
+    // value survives across a 409/422 retry (it is the command wall, not a per-attempt one).
+    if (firstPublishTiming.enabled && deps.filesFirstStartedAt !== undefined) {
+      firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
+    }
+
+    // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
+    // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
+    // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
+    const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
+    const ackValues = {
+      bases: stateGit,
+      pending: gitPlan.gitPendingRemote,
+      removed: gitPlan.gitReposRemoved,
+      resolutions: gitPlan.gitNeedsResolution,
     };
-  }
-  const parentSequence = repair?.parentSequence ?? appliedSequence;
-  const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
-  const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
-  const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
-  if (firstPublishTiming.enabled) {
-    const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
-    firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
-  }
-  if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
-  const firstPublish = finishFirstPublishStats();
-  if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
+    await report.phase("state-save", () => saveStateSource(root, state, {
+      expectedStream: syncStreamId(cfg),
+      sourceGlobalSeq: res.sequence!,
+      globalManifest: committed,
+      ...(res.manifestMeta ? { manifestMeta: res.manifestMeta } : {}),
+      observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
+      values: ackValues,
+      authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
+    }, {
+      allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+      forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+    }));
 
-  if (res.epochStale !== undefined) {
-    return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
-  }
-  if (res.conflict) {
-    deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
-    return repair
-      ? { done: false, action: { kind: "repair-conflict" }, exhaustedError: "repair: verified head advanced during publication" }
-      : { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };
-  }
-  if (res.unsatisfiedBlobs) {
-    // A missing GIT artifact can't be satisfied by a file re-upload, and an identity-carry
-    // would re-reference the absent bundle (§28, codex M3) — so force a RE-CAPTURE for
-    // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
-    // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
-    // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
-    return reuploadOutcome(committed, res.unsatisfiedBlobs, res.unsatisfiedTotal, res.attemptedManifestChain);
-  }
+    // Finalize AFTER the fully-persisted commit — a failed attempt never appends a
+    // success KPI, and a retry never double-appends. finishFirstPublishStats disables
+    // the singleton (even when it returns no stats), so the finally below no-ops here.
+    const firstPublish = finishFirstPublishStats();
+    if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
-  // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
-  // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
-  // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
-  const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
-  const ackValues = {
-    bases: stateGit,
-    pending: gitPlan.gitPendingRemote,
-    removed: gitPlan.gitReposRemoved,
-    resolutions: gitPlan.gitNeedsResolution,
-  };
-  await report.phase("state-save", () => saveStateSource(root, state, {
-    expectedStream: syncStreamId(cfg),
-    sourceGlobalSeq: res.sequence!,
-    globalManifest: committed,
-    ...(res.manifestMeta ? { manifestMeta: res.manifestMeta } : {}),
-    observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
-    values: ackValues,
-    authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
-  }, {
-    allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-    forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-  }));
-  if (deferred.size > 0) reportDeferred(deferred);
-  return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true } };
+    if (deferred.size > 0) reportDeferred(deferred);
+    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}) } };
+  } finally {
+    if (firstPublishTiming.enabled) beginFirstPublishTiming(false);
+  }
 }
 
 function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: string[]): void {

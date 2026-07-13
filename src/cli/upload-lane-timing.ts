@@ -4,6 +4,9 @@ export const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
 export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, queueMs: 0, blobs: 0, bytes: 0 };
 
 export interface FirstPublishStats {
+  /** Design 108 §3.6: command-level time from init's first-push milestone (before scan)
+   *  to the accepted files-only commit ACK — the headline greenfield onboarding KPI. */
+  timeToFilesSyncedMs: number;
   timeToFirstReadyCiphertextMs: number;
   firstReadyToFirstUploadStartMs: number;
   encryptWallMs: number;
@@ -26,6 +29,7 @@ export interface FirstPublishStats {
 }
 
 const zeroFirstPublishStats = (): FirstPublishStats => ({
+  timeToFilesSyncedMs: 0,
   timeToFirstReadyCiphertextMs: 0, firstReadyToFirstUploadStartMs: 0,
   encryptWallMs: 0, missingCheckWallMs: 0, uploadCriticalPathMs: 0,
   receiptRedemptionWallMs: 0, commitWallMs: 0, receiptRedemptionOverlapMs: 0,
@@ -54,7 +58,22 @@ export const firstPublishTiming = {
   checkedAddresses: new Set<string>(),
 };
 
+/** Arm (or disarm) the per-push first-publish measurement.
+ *
+ *  OWNERSHIP INVARIANT (design 108, codex round-6 MAJOR 2): the accumulator is a
+ *  process-global singleton, so at most ONE measurement may be in flight per process.
+ *  That holds today because every push author is sequential — the CLI runs one command,
+ *  the daemon's tick loop awaits each push, and `runPushAttempt`'s finally disarms
+ *  before the next attempt (the design-93 workspace sync mutex additionally serializes
+ *  same-workspace pushes across processes). If a second measurement is ever requested
+ *  while one is armed (a future concurrent multi-workspace embedder), BOTH are voided
+ *  rather than cross-attributed: disarm and record nothing — mis-attributed timing is
+ *  worse than no timing. */
 export function beginFirstPublishTiming(enabled: boolean): void {
+  if (enabled && firstPublishTiming.enabled) {
+    firstPublishTiming.enabled = false; // concurrent measurement detected: void both, never mix
+    return;
+  }
   firstPublishTiming.enabled = enabled;
   if (!enabled) return;
   firstPublishTiming.stats = zeroFirstPublishStats();
@@ -109,16 +128,22 @@ export function firstPublishAuthEnd(): void {
   if (firstPublishTiming.enabled) firstPublishTiming.authEndedAt = performance.now();
 }
 export function finishFirstPublishStats(): FirstPublishStats | undefined {
-  if (!firstPublishTiming.enabled || !firstPublishTiming.firstUploadAt) return undefined;
+  if (!firstPublishTiming.enabled) return undefined;
+  // Design 108 §3.6 (round-4 MAJOR 2): finalization ALWAYS disables the singleton —
+  // even when it yields no stats — so a no-upload push can't leak timing into later work.
+  firstPublishTiming.enabled = false;
+  // Render when there was a real upload critical path OR a command-level files-synced
+  // milestone (design 108 §3.6): a 409/422-retry success re-uploads nothing yet must still
+  // emit the headline timeToFilesSyncedMs — the files DID sync, on the earlier attempt.
+  if (!firstPublishTiming.firstUploadAt && !firstPublishTiming.stats.timeToFilesSyncedMs) return undefined;
   const s = firstPublishTiming.stats;
   s.uploadCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.uploadEndedAt - firstPublishTiming.uploadStartedAt));
   s.authCriticalPathMs = Math.max(0, Math.round(firstPublishTiming.authEndedAt - firstPublishTiming.authStartedAt));
-  firstPublishTiming.enabled = false;
   return { ...s };
 }
 
 export function formatFirstPublishStats(s: FirstPublishStats): string {
-  return `fp ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} commit${s.commitWallMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
+  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} commit${s.commitWallMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
 }
 
 export function uploadLaneTimingSummary(): string | undefined {
