@@ -6,6 +6,37 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-13 — files-first first publish ON by default; init fixed for scripting
+
+### Added
+- **Files-first first publish is the default (design 108, #244/#247, `f2403834`).**
+  A greenfield `rbox init` now publishes in two commits: files land first (the
+  workspace is usable the moment "published → sequence 1" prints), then git
+  history attaches as an ordinary second push. Genesis-only — existing
+  workspaces are untouched. Field-validated on flat-meadow: two-phase publish,
+  409 abort latch, starvation fallback, and flag-off byte-identity all
+  confirmed; `timeToFilesSynced` beat the full-publish wall by 107s even on a
+  file-heavy corpus. Kill switch: `RBOX_FILES_FIRST=0`.
+- **`FirstPublishStats` renders on init** — the `fp filesSynced… authn… commit…`
+  line that exposed the next round of perf levers (designs 109–111).
+- **Admin workspace purge (#248).** `DELETE /v1/admin/workspace/:id[?dryRun=1]`
+  (platform-secret gated) + `scripts/ws-purge.ts` drain — junk/bench workspaces
+  can finally be deleted server-side; blobs reclaim via the normal GC pipeline.
+  Field-proven on three bench workspaces.
+- **Upload/download concurrency knobs (#245).** `RBOX_UPLOAD_SLOTS` /
+  `RBOX_DOWNLOAD_SLOTS` (legacy aliases honored), clamp [1,256], defaults
+  byte-identical. The measured verdict: defaults stay 24/48 — the knee is at
+  48 slots and ≥64 collapses throughput 3x via per-batch RTT inflation.
+
+### Fixed
+- **`rbox init --new` no longer clobbers the machine device identity (#246).**
+  Device-id resolution now prefers the enrolled E2EE keystore identity
+  (`--new-device` escape hatch added); `rbox doctor` gained an O(1) check for
+  dangling/mismatched binding ids. Field-verified on flat-meadow.
+- **`rbox init` exits cleanly in headless/scripted runs (#246).** Ref'd crypto
+  worker threads kept the event loop alive after `main()` returned; one-shot
+  commands now tear the pool down on exit (the daemon keeps its pool).
+
 ## [1.2.0] — 2026-07-12 — the Mac gets fast: bulk scans, working fold evidence, field-proven trust recovery
 
 Same-day follow-through on v1.1.0: everything that shipped dark yesterday is
