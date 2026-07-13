@@ -654,3 +654,4 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
     network ceiling vs software ceiling is settled before interpreting rbox
     numbers (that's how the universal ~35 Mbps uploader ceiling was isolated
     as software, not ISP).
+- Cloudflare Flagship (blog.cloudflare.com/flagship) — founder-flagged for future exploration, NOT current work.

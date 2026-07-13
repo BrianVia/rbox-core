@@ -5,6 +5,13 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.5.1] — 2026-07-13 — release-gate test hygiene (v1.5.0 build never shipped)
+
+### Fixed
+- Bounded teardown in the upload-grant suite: an unresolved gated fetch could
+  hang the afterEach hook 10s in the single-process release build, poisoning
+  the next test and failing the v1.5.0 gate. Same #264 class; 2s close bound.
+
 ## [1.5.0] — 2026-07-13 — blob packing: small-file uploads scale with bandwidth
 
 ### Added
