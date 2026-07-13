@@ -189,6 +189,16 @@ cross-shape trace and two idle cycles; if it oscillates, `tracking` does not
 ship and remote-tracking remains config-only until a separate store lane is
 designed.
 
+Index closure joins the bundle contract (r7): `git stash create` fails on an
+unmerged index, so a partially resolved conflict's staged resolution blob can
+be reachable from no WIP root and absent from `AUTO_MERGE` — in no bundle
+link at all. Schema-5 capture therefore enumerates every OID in the staged
+index (all stages, plus resolve-undo and sparse entries) and pins any not
+already reachable into the capture-unique scratch namespace before bundling,
+using the existing scratch-ref discipline. A section must never ship an
+index artifact whose stage entries are not object-complete in its bundle
+chain; capture defers when it cannot prove that.
+
 Tracking refs never participate in `refScope` deletion semantics. A selected
 present map is complete and last-writer-wins, including deletions; a displaced
 unique tip is first retained under the local recovery namespace. Capture pins
@@ -936,7 +946,14 @@ end. Implementation may be phased; semantics are fixed:
   themselves** — the full bundle chain (self-contained closure by
   construction: capture pinned WIP/pseudo-ref roots into it) plus the index
   and op-state bytes — never relying on the repo object store to keep the
-  discarded section's objects alive. A staged conflict resolution or paused
+  discarded section's objects alive. Because legacy (pre-r7) sections may
+  predate the index-closure bundle contract, the protect step VERIFIES
+  closure — enumerating the retained index artifact's stage OIDs against the
+  retained chain — and packs any missing objects still present locally into
+  a supplementary quarantine pack; if closure cannot be completed, keep-mine
+  refuses (protect-then-clear holds: no clear without closure), leaving the
+  explicit loud override as the only path (r7). A staged conflict resolution
+  or paused
   operation that existed only in the discarded section survives keep-mine
   byte-exactly and object-complete. The episode record naming these
   quarantine artifacts is durable and survives the deferral/checkpoint clear

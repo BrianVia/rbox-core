@@ -319,7 +319,22 @@ store; durable episode record survives the clear. Three MINORs folded
 (episode-record lifetime, path-component-boundary/longest-match shell
 routing, sidecar bounds vs the 5 ms gate) and the shell.line wording NIT.
 
-## Round 7 (codex, final confirmation of the r6 fold)
+## Round 7 (codex, confirmation of the r6 fold) — one MAJOR, folded
+
+Confirmed: full `packChain` retention covers incremental basis closure;
+`AUTO_MERGE` tree pinning correct. One MAJOR remained: `git stash create`
+fails on an unmerged index, so a PARTIALLY resolved conflict's staged
+resolution blob can be in no bundle link at all — a latent capture-closure
+gap that keep-mine's guarantee exposes. Adopted codex's prescribed remedy
+verbatim (r7): schema-5 capture enumerates every staged-index OID (all
+stages + resolve-undo/sparse) and pins unreachable ones into the
+capture-unique scratch namespace before bundling (a section must never ship
+an index artifact that is not object-complete in its chain; capture defers
+otherwise); keep-mine's protect step verifies closure for legacy sections
+and packs missing-but-locally-present objects into a supplementary
+quarantine pack, refusing without closure.
+
+## Round 8 (codex, final confirmation)
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
   seam.
