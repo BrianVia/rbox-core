@@ -141,7 +141,7 @@ test("serialized upload drains before the final PUT settles and flushes before r
 test("serialized upload leaves redemption to commit when flag is off", async () => {
   const fx = await fixture(2);
   try {
-    delete process.env.RBOX_REDEEM_DRAIN;
+    process.env.RBOX_REDEEM_DRAIN = "off"; // kill switch (default is ON)
     const remote = new DrainRemote();
     await run(fx, remote);
     expect(remote.redeems).toBe(0);
@@ -149,14 +149,14 @@ test("serialized upload leaves redemption to commit when flag is off", async () 
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 
-test("serialized upload ignores non-upload redemption flag values", async () => {
+test("only 'off' disables draining; other values (and unset) stay ON", async () => {
   const fx = await fixture(1);
   try {
-    process.env.RBOX_REDEEM_DRAIN = "true";
+    process.env.RBOX_REDEEM_DRAIN = "true"; // not the kill switch — drain stays on
     const remote = new DrainRemote();
     await run(fx, remote);
-    expect(remote.redeems).toBe(0);
-    expect(remote.receipts.size).toBe(1);
+    expect(remote.redeems).toBeGreaterThan(0);
+    expect(remote.receipts.size).toBe(0);
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 
@@ -266,7 +266,7 @@ test("serialized upload backpressure waits for a pre-existing drain", async () =
 test("fresh receipts after a killed client are redeemed on resume", async () => {
   const fx = await fixture(2);
   try {
-    delete process.env.RBOX_REDEEM_DRAIN;
+    process.env.RBOX_REDEEM_DRAIN = "off"; // first run simulates a legacy/killed client
     process.env.RBOX_PIPELINE_REDEEM_THRESHOLD = "1";
     const remote = new DrainRemote();
     await run(fx, remote);

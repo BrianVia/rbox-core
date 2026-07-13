@@ -116,9 +116,14 @@ afterEach(async () => {
 });
 
 describe("batch config knobs", () => {
-  test("defaults are byte-identical when knobs unset", () => {
-    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
+  test("upload defaults ON to fill-v2/64 when knobs unset; download stays v1/32", () => {
+    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v2", records: 64, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
     expect(downloadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 48 });
+  });
+
+  test("RBOX_BATCH_FILL=v1 is the kill switch: legacy fill + 32-record cap", () => {
+    process.env.RBOX_BATCH_FILL = "v1";
+    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
   });
 
   test("RBOX_UPLOAD_SLOTS overrides upload slots and clamps", () => {
@@ -164,33 +169,38 @@ describe("batch config knobs", () => {
     expect(uploadBatchConfig().slots).toBe(40);
   });
 
-  test("RBOX_BATCH_RECORDS clamps to the wire cap", () => {
+  test("RBOX_BATCH_RECORDS clamps to the fill-derived wire cap", () => {
     process.env.RBOX_BATCH_RECORDS = "8";
     expect(uploadBatchConfig().records).toBe(8);
     process.env.RBOX_BATCH_RECORDS = "128";
-    expect(uploadBatchConfig().records).toBe(32);
+    expect(uploadBatchConfig().records).toBe(64); // v2 default cap
+    process.env.RBOX_BATCH_FILL = "v1";
+    expect(uploadBatchConfig().records).toBe(32); // kill switch restores legacy cap
+    delete process.env.RBOX_BATCH_FILL;
     process.env.RBOX_BATCH_RECORDS = "0";
     expect(uploadBatchConfig().records).toBe(1);
   });
 
-  test("fill-v2 gates the raised upload record cap", () => {
+  test("fill-v1 gates the record cap back to 32", () => {
     process.env.RBOX_BATCH_RECORDS = "64";
+    process.env.RBOX_BATCH_FILL = "v1";
     expect(uploadBatchConfig()).toMatchObject({ fill: "v1", records: 32 });
+    delete process.env.RBOX_BATCH_FILL;
 
     process.env.RBOX_BATCH_FILL = "v2";
     expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 64 });
 
     delete process.env.RBOX_BATCH_RECORDS;
-    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 32 });
+    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 64 }); // default records = fill cap
   });
 
-  test("download config ignores fill-v2 and invalid upload fill values use v1", () => {
+  test("download config ignores fill-v2; only exactly 'v1' engages the kill switch", () => {
     process.env.RBOX_BATCH_FILL = "v2";
     process.env.RBOX_BATCH_RECORDS = "64";
     expect(downloadBatchConfig()).toMatchObject({ fill: "v1", records: 32 });
 
     process.env.RBOX_BATCH_FILL = "garbage";
-    expect(uploadBatchConfig().fill).toBe("v1");
+    expect(uploadBatchConfig().fill).toBe("v2"); // default-on: only "v1" opts out
   });
 
   test("RBOX_BATCH_BLOBS=0 disables batching", () => {

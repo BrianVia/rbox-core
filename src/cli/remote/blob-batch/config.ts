@@ -40,7 +40,10 @@ export interface BatchConfig {
 }
 
 export function uploadBatchConfig(): BatchConfig {
-  const fill = process.env.RBOX_BATCH_FILL === "v2" ? "v2" : "v1";
+  // Default ON (founder call 2026-07-13, single-user fleet — same as files-first):
+  // fill-v2 + 64-record batches ship live; RBOX_BATCH_FILL=v1 is the kill switch
+  // (the server cap is already 64 on both envs, and the 400 latch guards skew).
+  const fill = process.env.RBOX_BATCH_FILL === "v1" ? "v1" : "v2";
   return readBatchConfig(
     ["RBOX_UPLOAD_SLOTS", "RBOX_BATCH_PUT_SLOTS"],
     DEFAULT_BATCH_PUT_SLOTS,
@@ -81,7 +84,7 @@ function readBatchConfig(
     // Wire twin: server RBOX_BLOB_BATCH_MAX_RECORDS defaults to 32, candidate 64.
     // The client may exceed 32 only under fill-v2 against a raised server; uploader's
     // 400 latch is the version-skew guard when rollout ordering is violated.
-    records: envInt("RBOX_BATCH_RECORDS", BATCH_RECORDS_FLOOR, 1, recordsMax),
+    records: envInt("RBOX_BATCH_RECORDS", recordsMax, 1, recordsMax),
     recordBytes: envInt("RBOX_BATCH_RECORD_BYTES", DEFAULT_BATCH_RECORD_BYTES, 1, recordBytesMax),
     bodyBytes: envInt("RBOX_BATCH_BODY_BYTES", DEFAULT_BATCH_BODY_BYTES, 1, DEFAULT_BATCH_BODY_BYTES),
     slots: envIntFirst(slotsEnvs, slotsDefault, 1, slotsMax),

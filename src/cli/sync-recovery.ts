@@ -62,7 +62,10 @@ import {
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
-const redeemDrainUpload = () => process.env.RBOX_REDEEM_DRAIN?.trim() === "upload";
+// Default ON (founder call 2026-07-13, single-user fleet): upload-time receipt
+// draining ships live; RBOX_REDEEM_DRAIN=off is the kill switch (commit-enclosed
+// final drain remains the catch-all either way).
+const redeemDrainUpload = () => process.env.RBOX_REDEEM_DRAIN?.trim() !== "off";
 const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;

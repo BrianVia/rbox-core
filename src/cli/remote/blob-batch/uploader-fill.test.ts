@@ -105,6 +105,7 @@ afterEach(async () => {
 
 describe("BlobBatchUploader fill policy", () => {
   test("v1 classifies full, fixed-timer, idle-tail, and byte-full dispatches", async () => {
+    process.env.RBOX_BATCH_FILL = "v1"; // kill switch: this test exercises the legacy policy
     process.env.RBOX_UPLOAD_SLOTS = "1";
     const clock = useClock();
     await uploadWave(api(), await files(32, "full"));
@@ -435,6 +436,7 @@ describe("BlobBatchUploader record-cap latch", () => {
   });
 
   test("400 at the 32 cap keeps existing single fallback behavior", async () => {
+    process.env.RBOX_BATCH_FILL = "v1"; // legacy 32-cap scenario
     useClock();
     batchPutHandler = () => json(400, { error: "bad_request" });
     const progress = await uploadWaveCounting(api(), await files(32, "floor400"));
