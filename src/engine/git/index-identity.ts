@@ -55,13 +55,15 @@ export async function indexIdentityV2(repoDir: string, indexFilePath: string): P
   const privateIndex = path.join(path.dirname(indexFilePath), `.rbox-index-projection-${process.pid}-${crypto.randomBytes(8).toString("hex")}`);
   try {
     await fs.copyFile(indexFilePath, privateIndex);
-    const [stagedRaw, flagsRaw, sparseRaw, undoRaw, debugRaw] = await Promise.all([
-      gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--stage"]),
-      gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "-v"]),
-      gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--stage", "--sparse"]),
-      gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--resolve-undo"]),
-      gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--debug"]),
-    ]);
+    // SEQUENTIAL on purpose: all five probes share ONE private index copy, and
+    // git may opportunistically refresh-write an index it reads (taking
+    // `<index>.lock`). Concurrent probes intermittently collide on that lock
+    // and a spurious throw would read as indeterminate — a flaky false defer.
+    const stagedRaw = await gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--stage"]);
+    const flagsRaw = await gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "-v"]);
+    const sparseRaw = await gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--stage", "--sparse"]);
+    const undoRaw = await gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--resolve-undo"]);
+    const debugRaw = await gitWithIndexFile(repoDir, privateIndex, ["ls-files", "-z", "--debug"]);
 
     // ls-files --stage supplies mode/OID/stage (including conflict stages and
     // zero-OID intent-to-add); -v supplies assume-unchanged/skip-worktree; and

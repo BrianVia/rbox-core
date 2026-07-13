@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +9,10 @@ import {
   LocalBlobStore,
   buildIgnoreMatcher,
   captureGitState,
+  hashBytes,
   indexIdentityV2,
+  oracleFromState,
+  resetCheckoutCapabilityProbeCacheForTests,
   type AppliedManifestOracle,
   type GitSection,
   type Manifest,
@@ -20,7 +24,7 @@ import { saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { checkoutJournalBinding, FollowCrashInjectedError, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
 import { planGitSections } from "./plan.js";
-import { gitFollowEnabled } from "./shared.js";
+import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled } from "./shared.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
@@ -32,8 +36,10 @@ let workspace: string;
 let receiver: string;
 let store: LocalBlobStore;
 let cfg: WorkspaceConfig;
+let priorGitFollow: string | undefined;
 
 beforeEach(async () => {
+  priorGitFollow = process.env.RBOX_GIT_FOLLOW;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-"));
   sender = path.join(tmp, "sender");
   workspace = path.join(tmp, "workspace");
@@ -61,7 +67,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.RBOX_GIT_FOLLOW;
+  if (priorGitFollow === undefined) delete process.env.RBOX_GIT_FOLLOW;
+  else process.env.RBOX_GIT_FOLLOW = priorGitFollow;
+  resetCheckoutCapabilityProbeCacheForTests();
+  configOwnershipSkipLogged.clear();
+  configInvalidSkipLogged.clear();
+  configCredentialSkipLogged.clear();
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -185,6 +196,17 @@ test("field incident follows a contained stale tip to detached incoming HEAD", a
   await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
 });
 
+test("design safety: detached receiver follows an incoming attached branch", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "HEAD"), `${c1}\n`);
+  const { outcome, logs } = await applyIncoming(state, incoming);
+  expect(logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.partial?.repo).toBeNull();
+});
+
 test("disposition: staged index changes defer local-index", async () => {
   const { state, incoming } = await baseAndIncoming();
   await fs.writeFile(path.join(receiver, "staged.txt"), "human\n");
@@ -194,11 +216,35 @@ test("disposition: staged index changes defer local-index", async () => {
   expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
 });
 
-test("disposition: local operation state defers local-operation", async () => {
+test("design safety: local merge state defers local-operation", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
   const { outcome } = await applyIncoming(state, incoming);
   expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+});
+
+for (const [label, rel] of [
+  ["rebase", "rebase-merge/head-name"],
+  ["cherry-pick", "CHERRY_PICK_HEAD"],
+] as const) {
+  test(`design safety: local ${label} state defers local-operation`, async () => {
+    const { c1, state, incoming } = await baseAndIncoming();
+    await fs.mkdir(path.dirname(path.join(receiver, ".git", rel)), { recursive: true });
+    await fs.writeFile(path.join(receiver, ".git", rel), `${c1}\n`);
+    const { outcome } = await applyIncoming(state, incoming);
+    expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+    expect(await fs.readFile(path.join(receiver, ".git", rel), "utf8")).toBe(`${c1}\n`);
+  });
+}
+
+test("design safety: mode-only index edit defers local-index with working bytes untouched", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const bytes = await fs.readFile(path.join(receiver, "tracked.txt"));
+  await git(receiver, "update-index", "--chmod=+x", "tracked.txt");
+  const { outcome } = await applyIncoming(state, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-index");
+  expect(await fs.readFile(path.join(receiver, "tracked.txt"))).toEqual(bytes);
+  expect(await git(receiver, "ls-files", "-s", "tracked.txt")).toStartWith("100755 ");
 });
 
 test("disposition: oracle mismatch wins display precedence as local-edits", async () => {
@@ -235,6 +281,44 @@ test("disposition: receiver-only non-current branch is held while checkout follo
   expect(outcome.partial?.repo?.checkoutPending).toBe(false);
   expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
   expect(await git(receiver, "rev-parse", "refs/heads/local-side")).toBe(local);
+});
+
+test("design safety: receiver-only tag is held and reachable while the safe checkout follows", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "tag-only commit"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/tags/receiver-only", local);
+  const { outcome, logs } = await applyIncoming(state, incoming);
+  expect(logs).toContain("git-sync followed repo");
+  expect(outcome.partial?.repo?.heldRefs["refs/tags/receiver-only"]).toBe("local-commits");
+  expect(outcome.partial?.repo?.checkoutPending).toBe(false);
+  expect(await git(receiver, "rev-parse", "refs/tags/receiver-only")).toBe(local);
+  await expect(git(receiver, "cat-file", "-e", `${local}^{commit}`)).resolves.toBe("");
+});
+
+test("design safety: ignored human file stays byte-identical and does not block metadata follow", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(workspace, ".rboxignore"), "repo/*.local\n");
+  await fs.writeFile(path.join(receiver, "human.local"), "precious ignored bytes\n");
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const expected = "three\n";
+  const oracle = oracleFromState({
+    root: workspace,
+    matcher: buildIgnoreMatcher(workspace),
+    base: {
+      generatedAt: "",
+      files: [{
+        path: "repo/tracked.txt", type: "file", sha256: hashBytes(Buffer.from(expected)),
+        size: Buffer.byteLength(expected), mode: 0o644, mtimeMs: 0,
+      }],
+    },
+  });
+  const { logs } = await applyIncoming(state, incoming, oracle);
+  expect(logs).toContain("git-sync followed repo");
+  expect(await fs.readFile(path.join(receiver, "human.local"), "utf8")).toBe("precious ignored bytes\n");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
 });
 
 test("deferredSince survives a partial follow followed by a new defer reason", async () => {
@@ -390,6 +474,93 @@ test("second-proof oracle mismatch aborts with local-edits", async () => {
   expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal")).catch(() => [])).toEqual([]);
 });
 
+type BoundaryMutation = "git-add" | "commit" | "checkout" | "stash" | "op-state";
+const boundaryMutations: Array<{ mutation: BoundaryMutation; reason: string }> = [
+  { mutation: "git-add", reason: "local-index" },
+  // These move the current ref after the first live snapshot, so the pinned
+  // transaction's exact-old-value CAS is the protecting guard.
+  { mutation: "commit", reason: "other" },
+  { mutation: "checkout", reason: "other" },
+  { mutation: "stash", reason: "local-stash" },
+  { mutation: "op-state", reason: "local-operation" },
+];
+
+for (const { mutation, reason } of boundaryMutations) {
+  test(`design safety linearization: ${mutation} before the boundary is protected`, async () => {
+    const { c1, state, incoming } = await baseAndIncoming();
+    const old = await git(receiver, "rev-parse", "refs/heads/main");
+    await git(receiver, "update-ref", "refs/heads/main", c1, old);
+    let mutated = false;
+    let protectedOid: string | undefined;
+    const mutate = async (): Promise<void> => {
+      if (mutated) return;
+      mutated = true;
+      if (mutation === "git-add") {
+        await fs.writeFile(path.join(receiver, "boundary-index.txt"), "boundary\n");
+        await git(receiver, "add", "boundary-index.txt");
+      } else if (mutation === "commit") {
+        await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "boundary commit");
+      } else if (mutation === "checkout") {
+        const tree = await git(receiver, "rev-parse", `${c1}^{tree}`);
+        protectedOid = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "boundary checkout commit"])
+          .then(({ stdout }) => stdout.toString().trim());
+        await git(receiver, "branch", "boundary-checkout", protectedOid);
+        await git(receiver, "checkout", "-q", "boundary-checkout");
+      } else if (mutation === "stash") {
+        await fs.writeFile(path.join(receiver, "boundary-stash.txt"), "boundary stash\n");
+        await git(receiver, "stash", "push", "-uqm", "boundary stash");
+        protectedOid = await git(receiver, "rev-parse", "refs/stash");
+      } else {
+        await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
+      }
+    };
+    const result = await applyIncoming(state, incoming, matchingOracle, { capabilityProbe: async () => { await mutate(); return true; } });
+    expect(result.outcome.deferrals?.repo?.apply?.reason).toBe(reason);
+    expect(result.outcome.gitPendingRemote?.repo).toEqual(incoming);
+    if (mutation === "checkout") {
+      expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/boundary-checkout");
+      expect(await git(receiver, "rev-parse", "HEAD")).toBe(protectedOid);
+    } else if (mutation === "stash") {
+      expect(await git(receiver, "rev-parse", "refs/stash")).toBe(protectedOid);
+      await expect(git(receiver, "cat-file", "-e", `${protectedOid}^{commit}`)).resolves.toBe("");
+    }
+  });
+}
+
+for (const { mutation } of boundaryMutations) {
+  test(`design safety linearization: ${mutation} after the boundary remains ordinary post-follow work`, async () => {
+    const { c1, state, incoming } = await baseAndIncoming();
+    const old = await git(receiver, "rev-parse", "refs/heads/main");
+    await git(receiver, "update-ref", "refs/heads/main", c1, old);
+    let mutated = false;
+    const postFollow = (point: FollowCrashPoint): void => {
+      if (point !== "after-published-flip" || mutated) return;
+      mutated = true;
+      if (mutation === "git-add") {
+        fsSync.writeFileSync(path.join(receiver, "post-index.txt"), "post\n");
+        execFileSync("git", ["-C", receiver, "add", "post-index.txt"]);
+      } else if (mutation === "commit") {
+        execFileSync("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "post-follow commit"]);
+      } else if (mutation === "checkout") {
+        execFileSync("git", ["-C", receiver, "checkout", "-qb", "post-follow-checkout"]);
+      } else if (mutation === "stash") {
+        fsSync.writeFileSync(path.join(receiver, "post-stash.txt"), "post stash\n");
+        execFileSync("git", ["-C", receiver, "stash", "push", "-uqm", "post-follow stash"]);
+      } else {
+        fsSync.writeFileSync(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
+      }
+    };
+    const result = await applyIncoming(state, incoming, matchingOracle, { crashAt: postFollow });
+    expect(result.logs).toContain("git-sync followed repo");
+    expect(mutated).toBe(true);
+    if (mutation === "git-add") expect(await git(receiver, "diff", "--cached", "--name-only")).toContain("post-index.txt");
+    else if (mutation === "commit") expect(await git(receiver, "log", "-1", "--format=%s")).toBe("post-follow commit");
+    else if (mutation === "checkout") expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/post-follow-checkout");
+    else if (mutation === "stash") expect(await git(receiver, "stash", "list")).toContain("post-follow stash");
+    else expect(await fs.readFile(path.join(receiver, ".git", "MERGE_HEAD"), "utf8")).toBe(`${c1}\n`);
+  });
+}
+
 for (const point of [
   "after-safe-refs",
   "after-journal-write",
@@ -492,6 +663,25 @@ test("crash after safe-ref publish is idempotent and retry does not duplicate mu
   expect(retry.logs).toContain("git-sync followed repo");
   expect(retry.outcome.gitPendingRemote?.repo).toBeUndefined();
   await withRevalidatedGitPartialApplies(workspace, retryState, retry.outcome, async () => undefined);
+});
+
+test("design safety: artifact failure after safe-ref progress preserves the published ref", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const withSafeRef = { ...incoming, refs: { ...incoming.refs, "refs/heads/artifact-safe": incoming.refs["refs/heads/main"]! } };
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await expect(applyIncoming(state, withSafeRef, matchingOracle, {
+    crashAt: (point) => { if (point === "after-safe-refs") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-safe-refs");
+  const safeTip = withSafeRef.refs["refs/heads/artifact-safe"]!;
+  expect(await git(receiver, "rev-parse", "refs/heads/artifact-safe")).toBe(safeTip);
+
+  const missing = withSafeRef.bundleEncSha;
+  await fs.rm(path.join(tmp, "blobs", "blobs", missing.slice(0, 2), missing));
+  const retry = await applyIncoming(state, withSafeRef);
+  expect(retry.outcome.deferrals?.repo?.apply?.reason).toBe("artifact");
+  expect(retry.outcome.gitPendingRemote?.repo).toEqual(withSafeRef);
+  expect(await git(receiver, "rev-parse", "refs/heads/artifact-safe")).toBe(safeTip);
 });
 
 test("non-current NFF publication pins the displaced live tip in the same episode", async () => {

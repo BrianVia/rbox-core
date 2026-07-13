@@ -1396,8 +1396,18 @@ test("pending: outbound pushes CARRY the pending section (never the stale base) 
   expect(await fs.readFile(path.join(b, "f.txt"), "utf8")).toBe("v2");
 }, 20_000);
 
-test("pending + remote deletion: absence supersedes pending [v6] — pending cleared, removal memory recorded, no outbound resurrection", async () => {
+test("remote absence while partial: absence supersedes pending+partial [v6] — state clears with no outbound resurrection", async () => {
   const { a, b, lock } = await makePending("r");
+  const partialState = await st(rootB);
+  const pending = partialState.gitPendingRemote!.r!;
+  partialState.repoRecords!.r!.partial = {
+    incomingKey: gitIncomingKey(pending),
+    checkoutPending: true,
+    appliedRefs: {},
+    heldRefs: {},
+    configApplied: true,
+  };
+  await saveState(rootB, partialState);
   await fs.rm(lock);
   await fs.rm(a, { recursive: true, force: true });
   await push(rootA, cfgA, depsA); // A deletes the repo

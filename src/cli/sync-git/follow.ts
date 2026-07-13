@@ -603,7 +603,9 @@ async function deriveBaseProjection(opts: FollowOptions, staged: StagedIncoming)
   try {
     await getGitArtifact(opts.store, opts.kek, artifact, raw, staged.tmpDir);
     await clearIndexResolveUndo(opts.ctx.repoDir, raw);
-    return indexIdentityV2(opts.ctx.repoDir, raw);
+    // `return await`, not `return`: the finally's rm would otherwise race the
+    // projection's own read of `raw` (observed as a flaky false-indeterminate).
+    return await indexIdentityV2(opts.ctx.repoDir, raw);
   } finally {
     await fs.rm(raw, { force: true });
   }
