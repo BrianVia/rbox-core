@@ -33,6 +33,9 @@ export interface ApplyGitResult {
   applied: boolean;
   reason?: string;
   conflictBundle?: string;
+  /** Dir-target refs held at their receiver values because a sibling worktree owns
+   *  them (design 116 phase-0). Non-empty on a successful PARTIAL apply. */
+  heldRefs?: Record<string, string>;
   /** Refs the pointer-target namespace/ownership filter refused to publish
    *  (design 43 §7 [v3/v4]) — surfaced so the caller can log them. */
   filteredRefs?: string[];
@@ -44,7 +47,7 @@ export interface ApplyGitResult {
  *  (`git branch -f` refuses; `update-ref` does not — codex repro, design 43 §7 [v4]).
  *  Prunable (stale) entries are ignored so they can't produce phantom collisions
  *  (design 68 V13). From `git worktree list --porcelain`. */
-async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Map<string, string>> {
+export async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Map<string, string>> {
   const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
   const owned = new Map<string, string>();
   for (const e of await listWorktrees(ctx.repoDir)) {
@@ -55,39 +58,47 @@ async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Map<string, st
   return owned;
 }
 
-/** Design 68 §3.2 — mandatory apply-side collision defer for a dir target (a main clone)
- *  with LIVE linked worktrees. rbox publishes via `git update-ref`, which SILENTLY moves a
- *  branch a sibling worktree has checked out (apply.ts hazard above) — git's porcelain
- *  refusal never fires on this path. So before ANY publish we intersect the destination's
- *  checked-out set (branches of OTHER, non-prunable worktrees) with the section's ref
- *  UPDATES, ref DELETIONS (only when this apply deletes absent refs), a ref-wiping
- *  pre-mutation hook (clean materialization), and HEAD move. ANY intersection defers the
- *  WHOLE section (no partial application). Returns the collision reason, or undefined
- *  when clear. Read-only. */
-async function worktreeCollision(ctx: RepoCtx, section: GitSection, deletesAbsent: boolean, beforeMutateWipesRefs: boolean): Promise<string | undefined> {
+/** Design 116 phase-0 supersedes design 68 §3.2's ANY-intersection defer: ordinary
+ *  sibling-owned ref updates/deletions are held per ref, while HEAD/index/op-state and
+ *  unrelated refs keep moving. HEAD ownership and clean-materialization wipes remain
+ *  whole-apply hazards. Current refs are read ONCE so an identical incoming OID is a
+ *  no-op, never a hold (the field-incident shape). Read-only. */
+async function classifyWorktreeOwnership(
+  ctx: RepoCtx,
+  section: GitSection,
+  deletesAbsent: boolean,
+  beforeMutateWipesRefs: boolean
+): Promise<{ heldRefs: Map<string, string>; deferReason?: string }> {
   const owned = await branchesCheckedOutElsewhere(ctx);
-  if (owned.size === 0) return undefined;
+  const heldRefs = new Map<string, string>();
+  if (owned.size === 0) return { heldRefs };
+  const localRefs = await readAllRefs(ctx.repoDir);
   const shortName = (ref: string) => ref.replace(/^refs\/heads\//, "");
-  const collision = (ref: string, suffix = "") => `branch ${shortName(ref)} checked out in linked worktree ${owned.get(ref)}${suffix}`;
-  // ref updates — every branch the section would publish
-  for (const ref of Object.keys(section.refs)) if (owned.has(ref)) return collision(ref);
-  // pre-mutation ref wipe — clean materialization deletes every local syncable ref before
-  // publishing even scoped sections, so every live sibling branch is at risk.
-  if (beforeMutateWipesRefs) {
-    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) {
-      if (owned.has(ref)) return collision(ref, " (would be wiped)");
-    }
-  }
-  // ref deletions — a checked-out branch absent from the section would be deleted
-  if (deletesAbsent) {
-    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) {
-      if (owned.has(ref) && !(ref in section.refs)) return collision(ref, " (would be deleted)");
-    }
-  }
-  // HEAD move — pointing the main checkout at a branch a sibling already holds
+  const collision = (ref: string, suffix = "") => `worktree-ownership: branch ${shortName(ref)} checked out in linked worktree ${owned.get(ref)}${suffix}`;
+  // HEAD move is a checkout-plane collision even when its ref OID is already equal:
+  // the primary checkout may not attach to a branch held by a sibling worktree.
   const headBranch = headBranchOf(section.head);
-  if (headBranch && owned.has(headBranch)) return collision(headBranch);
-  return undefined;
+  if (headBranch && owned.has(headBranch)) return { heldRefs, deferReason: collision(headBranch) };
+  // pre-mutation ref wipe — clean materialization deletes every local syncable ref before
+  // publishing even scoped sections; partial holding of a wipe is undefined in D1.
+  if (beforeMutateWipesRefs) {
+    for (const ref of Object.keys(localRefs)) {
+      if (owned.has(ref)) return { heldRefs, deferReason: collision(ref, " (would be wiped)") };
+    }
+  }
+  // Ref updates: equality is a true no-op, so only a different/absent local OID is held.
+  for (const [ref, incomingOid] of Object.entries(section.refs)) {
+    const worktree = owned.get(ref);
+    if (worktree && localRefs[ref] !== incomingOid) heldRefs.set(ref, worktree);
+  }
+  // Ref deletions: an owned local branch absent from an all-scope section survives.
+  if (deletesAbsent) {
+    for (const ref of Object.keys(localRefs)) {
+      const worktree = owned.get(ref);
+      if (worktree && !(ref in section.refs)) heldRefs.set(ref, worktree);
+    }
+  }
+  return { heldRefs };
 }
 
 /**
@@ -154,6 +165,7 @@ export async function applyGitState(
   // Scope-gated publish set (design 43 §7). A fresh target materializes as a dir repo.
   const publishRefs: Record<string, string> = { ...section.refs };
   const filteredRefs: string[] = [];
+  const heldRefs = new Map<string, string>();
   let deleteAbsent = false;
   if (!ctx || ctx.kind === "dir") {
     // superproject/alternates stores have undefined apply semantics (design 43 §4, v1) —
@@ -168,12 +180,15 @@ export async function applyGitState(
       }
     }
     deleteAbsent = section.refScope === "all";
-    // Design 68 §3.2: zero-cost path when `.git/worktrees` is absent (the common case) —
-    // only pay `git worktree list` when linked worktrees actually exist. Any collision
-    // defers the whole section this cycle with no mutation.
+    // Design 116 phase-0: retain the zero-cost no-worktrees path, then hold only
+    // sibling-owned refs whose OIDs would actually move (or whose deletion is requested).
     if (ctx && (await exists(path.join(ctx.commonDir, "worktrees")))) {
-      const reason = await worktreeCollision(ctx, section, deleteAbsent, opts.beforeMutateWipesRefs === true);
-      if (reason) return { applied: false, reason };
+      const ownership = await classifyWorktreeOwnership(ctx, section, deleteAbsent, opts.beforeMutateWipesRefs === true);
+      if (ownership.deferReason) return { applied: false, reason: ownership.deferReason };
+      for (const [ref, worktree] of ownership.heldRefs) {
+        heldRefs.set(ref, worktree);
+        delete publishRefs[ref];
+      }
     }
   } else {
     for (const ref of Object.keys(publishRefs)) {
@@ -185,8 +200,11 @@ export async function applyGitState(
       }
     }
     const owned = await branchesCheckedOutElsewhere(ctx);
+    const localRefs = owned.size > 0 ? await readAllRefs(ctx.repoDir) : {};
     for (const ref of Object.keys(publishRefs)) {
-      if (owned.has(ref)) {
+      // Design 116 phase-0: publishing the identical OID cannot disturb the sibling;
+      // keep it in the publish set as an explicit no-op, not a filtered ref.
+      if (owned.has(ref) && localRefs[ref] !== publishRefs[ref]) {
         filteredRefs.push(ref);
         delete publishRefs[ref];
       }
@@ -334,7 +352,7 @@ export async function applyGitState(
       }
       if (deleteAbsent) {
         for (const ref of Object.keys(await readAllRefs(repoDir))) {
-          if (!(ref in section.refs)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+          if (!(ref in section.refs) && !heldRefs.has(ref)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
         }
       }
       await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
@@ -366,7 +384,12 @@ export async function applyGitState(
     } finally {
       await cleanupIncoming();
     }
-    return { applied: true, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
+    return {
+      applied: true,
+      conflictBundle,
+      heldRefs: heldRefs.size ? Object.fromEntries(heldRefs) : undefined,
+      filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+    };
   } finally {
     await cleanupIncoming();
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});

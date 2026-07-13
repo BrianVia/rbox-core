@@ -3,6 +3,7 @@ import path from "node:path";
 import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
+import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, type ConfigLaneState } from "../sync-state.js";
 import { configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency } from "./shared.js";
@@ -17,6 +18,38 @@ function localDivergedFromBase(localId: GitIdentity | undefined, base: GitSectio
   if (!base) return true;
   const n = narrowerScope(localId.refScope, base.refScope);
   return projectedKey(localId, n) !== projectedKey(base, n);
+}
+
+/** D1's deliberately temporary partial-state oracle (design 116 phase-0). There is no
+ *  durable GitPartialApply record yet, so a pending retry may bypass the legacy conflict
+ *  gate only when local equals INCOMING after masking head refs whose receiver values are
+ *  either still live-owned or exactly the old base values left by the previous hold. The
+ *  base-equality arm is what lets `git worktree remove` unblock the next retry; any human
+ *  ref edit away from both base and incoming still conflicts. D2 replaces this inference. */
+async function isHeldRefMaskedPartial(
+  repoDir: string,
+  localId: GitIdentity | undefined,
+  base: GitSection | undefined,
+  incoming: GitSection
+): Promise<boolean> {
+  if (!localId || !base) return false;
+  const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+  if (!ctx || ctx.kind !== "dir") return false;
+  const owned = await branchesCheckedOutElsewhere(ctx);
+  const held = new Set<string>();
+  for (const ref of new Set([...Object.keys(localId.refs), ...Object.keys(incoming.refs)])) {
+    const localOid = localId.refs[ref];
+    if (!ref.startsWith("refs/heads/") || localOid === undefined || localOid === incoming.refs[ref]) continue;
+    if (owned.has(ref) || localOid === base.refs[ref]) held.add(ref);
+  }
+  if (held.size === 0) return false;
+  const mask = <T extends GitIdentity | GitSection>(identity: T): T => {
+    const refs = { ...identity.refs };
+    for (const ref of held) delete refs[ref];
+    return { ...identity, refs };
+  };
+  const n = narrowerScope(localId.refScope, incoming.refScope);
+  return projectedKey(mask(localId), n) === projectedKey(mask(incoming), n);
 }
 export interface GitPullOutcome {
   gitRepos?: Record<string, GitSection>;
@@ -472,7 +505,17 @@ opts: {
     }
 
     const kek = cfg.kek!; // guaranteed by the fail-closed gate above
-    if (!cleanMaterialize && localDivergedFromBase(localId, baseSec)) {
+    const localDiverged = !cleanMaterialize && localDivergedFromBase(localId, baseSec);
+    // A D1 partial apply intentionally keeps the old base + newest pending section. On
+    // retry, compare the recognizable partial shape before manufacturing a conflict;
+    // remote absence above deliberately retains the unmodified base-divergence rule.
+    const retryHeldPartial = localDiverged && pend !== undefined
+      // Prove against the section that produced the partial receiver, then apply the
+      // newest wire truth below. Comparing to remoteSec would false-conflict if v3
+      // arrived after a v2 partial (D1 pending-carry/newest-truth rule).
+      ? await isHeldRefMaskedPartial(repoDir, localId, baseSec, pend)
+      : false;
+    if (localDiverged && !retryHeldPartial) {
       // Per-repo conflict: never auto-clobber local. Preserve remote for manual merge,
       // checkpoint base to remote (stop pull-conflict-looping), and suppress capture
       // until the local identity changes from this recorded value [v2, M2].
@@ -534,10 +577,23 @@ opts: {
       } catch (e) {
         glog(`git-sync WARNING ${rel}: post-apply containment check failed: ${errMsg(e)}`);
       }
-      applied[rel] = remoteSec;
-      delete pending[rel];
+      const held = Object.entries(res.heldRefs ?? {}).sort(([a], [b]) => a.localeCompare(b));
+      if (held.length > 0) {
+        // Design 116 phase-0 D1: checkout/unrelated refs landed, but without a durable
+        // partial record the old base must stay put and pending carries newest truth.
+        pending[rel] = remoteSec;
+      } else {
+        applied[rel] = remoteSec;
+        delete pending[rel];
+      }
       delete removedMem[rel];
-      glog(`git-sync applied ${rel}${res.filteredRefs?.length ? ` (filtered refs: ${res.filteredRefs.join(" ")})` : ""}`);
+      glog(
+        `git-sync applied ${rel}${held.length
+          ? ` (held refs: ${held.map(([ref, worktree]) => `${ref}=${worktree}`).join(" ")})`
+          : res.filteredRefs?.length
+            ? ` (filtered refs: ${res.filteredRefs.join(" ")})`
+            : ""}`
+      );
       return { result: "applied", commonDirGroup };
     } else {
       defer(res.reason ?? "apply deferred");

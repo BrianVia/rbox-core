@@ -444,7 +444,7 @@ test("a repo APPEARING at a fresh target during artifact download defers — its
   expect(await fs.readFile(path.join(D, "user.txt"), "utf8")).toBe("user work");
 });
 
-test("design 68 §3.2: apply into a primary with linked worktrees DEFERS on a checked-out-branch collision, then applies once the worktree is removed (V10, V3)", async () => {
+test("design 116 phase-0 supersedes design 68 §3.2: absent sibling branch is held while unrelated refs apply, then deletes after removal", async () => {
   const A = path.join(tmp, "A");
   await initRepo(A);
   await commit(A, "f.txt", "x", "c1");
@@ -454,14 +454,14 @@ test("design 68 §3.2: apply into a primary with linked worktrees DEFERS on a ch
   const siblingSha = await git(M, "rev-parse", "sibling");
   const mMain = await git(M, "rev-parse", "main");
 
-  // The all-scope apply would DELETE `sibling` (absent from the section) — but prim-wt has it
-  // checked out, so `update-ref -d` would strand that worktree. Whole-section defer, no mutation.
+  // The all-scope apply would DELETE `sibling` (absent from the section), so D1 holds that
+  // ref in place while allowing the unrelated main/HEAD/index lanes to progress.
   const res = await applyGitState(M, section!, store, KEK);
-  expect(res.applied).toBe(false);
-  expect(res.reason).toContain("linked worktree");
-  expect(res.reason).toContain("sibling");
+  expect(res.applied).toBe(true);
+  expect(res.heldRefs).toEqual({ "refs/heads/sibling": "prim-wt" });
   expect(await git(M, "rev-parse", "sibling")).toBe(siblingSha); // untouched
-  expect(await git(M, "rev-parse", "main")).toBe(mMain); // no partial application
+  expect(await git(M, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  expect(await git(M, "rev-parse", "main")).not.toBe(mMain); // unrelated ref applied
 
   // Remove the worktree → the checked-out set clears → the section applies next cycle (V3).
   await git(M, "worktree", "remove", "--force", path.join(tmp, "prim-wt"));

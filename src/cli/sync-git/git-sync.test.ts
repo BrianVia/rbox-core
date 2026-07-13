@@ -1069,6 +1069,65 @@ test("repo dir GONE ENTIRELY → pusher drops the section (§9); receiver drops 
 
 // ── (c) design §13.5 pending tests ────────────────────────────────────────────────
 
+test("design 116 phase-0: linked-worktree partial apply stays pending, retries without conflict, then completes after removal", async () => {
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "base.txt", "base", "base");
+  await git(a, "branch", "side");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+
+  const b = path.join(rootB, "r");
+  const baseline = (await st(rootB)).lastSyncedManifest.gitRepos!["r"]!;
+  const heldSide = await git(b, "rev-parse", "side");
+  const worktree = path.join(tmp, "b-r-side");
+  await git(b, "worktree", "add", worktree, "side");
+
+  await git(a, "checkout", "-q", "side");
+  await commitFile(a, "side.txt", "incoming side", "advance side");
+  const incomingSide = await git(a, "rev-parse", "side");
+  await git(a, "checkout", "-q", "main");
+  await commitFile(a, "main.txt", "incoming main", "advance main");
+  const incomingMain = await git(a, "rev-parse", "main");
+  await push(rootA, cfgA, depsA);
+
+  await pull(rootB, cfgB, depsB);
+  let state = await st(rootB);
+  expect(await git(b, "rev-parse", "main")).toBe(incomingMain); // checkout/unrelated ref plane advanced
+  expect(await git(b, "rev-parse", "side")).toBe(heldSide);
+  expect(await git(worktree, "rev-parse", "HEAD")).toBe(heldSide);
+  expect(state.gitPendingRemote?.["r"]?.refs["refs/heads/side"]).toBe(incomingSide);
+  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs).toEqual(baseline.refs); // D1 never advances base on partial
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(logsB.some((line) => line.includes("git-sync applied r (held refs: refs/heads/side=b-r-side)"))).toBe(true);
+
+  // A newer wire section may arrive after the v2 partial. The proof is against persisted
+  // pending v2, then apply retries newest v3: unrelated main advances, side stays held.
+  await commitFile(a, "main-v3.txt", "newest main", "advance main again");
+  const newestMain = await git(a, "rev-parse", "main");
+  await push(rootA, cfgA, depsA);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+  state = await st(rootB);
+  expect(await git(b, "rev-parse", "main")).toBe(newestMain);
+  expect(state.gitPendingRemote?.["r"]).toBeDefined();
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
+  expect(logsB.some((line) => line.includes("held refs: refs/heads/side=b-r-side"))).toBe(true);
+
+  // Once ownership disappears, the same recognizable three-way partial shape retries
+  // into a full apply; pending clears and the base finally advances to incoming truth.
+  await git(b, "worktree", "remove", "--force", worktree);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+  state = await st(rootB);
+  expect(await git(b, "rev-parse", "side")).toBe(incomingSide);
+  expect(state.gitPendingRemote?.["r"]).toBeUndefined();
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs["refs/heads/side"]).toBe(incomingSide);
+  expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
+}, 20_000);
+
 /** Sync a repo to both machines, advance it on A, then make B's pull DEFER the apply
  *  (index.lock = receiver busy) so `gitPendingRemote` is recorded. Returns repo paths. */
 async function makePending(rel: string): Promise<{ a: string; b: string; lock: string }> {
@@ -1088,6 +1147,20 @@ async function makePending(rel: string): Promise<{ a: string; b: string; lock: s
   expect(logsB.some((l) => l.startsWith(`git-sync deferred ${rel}`))).toBe(true);
   return { a, b, lock };
 }
+
+test("design 116 phase-0: pending remote plus ordinary human divergence still conflicts", async () => {
+  const { b, lock } = await makePending("human-divergence");
+  await fs.rm(lock);
+  await commitFile(b, "local.txt", "human work", "local commit");
+  logsB.length = 0;
+
+  await pull(rootB, cfgB, depsB);
+
+  const state = await st(rootB);
+  expect(state.gitNeedsResolution?.["human-divergence"]).toBeDefined();
+  expect(state.gitPendingRemote?.["human-divergence"]).toBeUndefined();
+  expect(logsB.some((line) => line.includes("CONFLICT human-divergence"))).toBe(true);
+}, 20_000);
 
 test("pending: outbound pushes CARRY the pending section (never the stale base) and the base does not advance [v5]", async () => {
   const { b, lock } = await makePending("r");
