@@ -45,3 +45,16 @@ decisions were adjudicated in the individual loops and were off-limits here.
 
 111's behavioral rollout does not invalidate 110's admission baseline (commits
 still arrive pre-drained). 109 must precede the shared baseline of step 4.
+
+## Addendum — design 112 (added 2026-07-13, from REVIEW-112 seam items)
+
+112 (batch fill / wire-cap raise, reviewed ALIGNED in #254) slots into the
+binding order as follows:
+- 112's evaluation runs OUTSIDE the step-4 shared-baseline window, and the
+  112 rollout state (fill version + records cap) must be recorded in every
+  110/111 measurement cell.
+- If 109 ever unparks, its gate-0 attribution must be RERUN after 112 changes
+  batch cardinality (the 89ms/request pre-handler share moves with request
+  count).
+- Codex confirmed 112 violates none of: /v1/blobs/check, commit shape,
+  fence/receipt semantics, 111's too_many_receipts clamp contract.
