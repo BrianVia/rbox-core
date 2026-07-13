@@ -3,6 +3,61 @@ export const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
 
 export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, queueMs: 0, blobs: 0, bytes: 0 };
 
+const uploadDispatchReasons = [
+  "full_records", "full_bytes", "fixed_timer", "quiet", "absolute", "idle_tail",
+] as const;
+export type UploadDispatchReason = (typeof uploadDispatchReasons)[number];
+
+export interface UploadDispatchStat {
+  count: number;
+  records: number;
+  bytes: number;
+}
+
+export interface UploadDispatchObservation {
+  reason: UploadDispatchReason;
+  records: number;
+  bytes: number;
+  queueDepth: number;
+  oldestAgeMs: number;
+}
+
+const UPLOAD_DISPATCH_OBSERVATION_CAP = 20_000;
+const newUploadDispatchStats = (): Record<UploadDispatchReason, UploadDispatchStat> =>
+  Object.fromEntries(uploadDispatchReasons.map((reason) => [reason, { count: 0, records: 0, bytes: 0 }])) as Record<UploadDispatchReason, UploadDispatchStat>;
+let uploadDispatchStats = newUploadDispatchStats();
+// Design-112 sweep seam: per-dispatch reason/records/bytes/queueDepth/oldestAgeMs observations under RBOX_LANE_TIMING are consumed by the phase-3/4 sweep harness, not production code (docs/design/112-batch-fill-wire-cap.md §Sweep and corpus gates).
+let uploadDispatchObservations: UploadDispatchObservation[] = [];
+
+export function recordUploadDispatch(
+  reason: UploadDispatchReason,
+  records: number,
+  bytes: number,
+  queueDepth: number,
+  oldestAgeMs: number,
+): void {
+  const stat = uploadDispatchStats[reason];
+  stat.count++;
+  stat.records += records;
+  stat.bytes += bytes;
+  if (LANE_TIMING && uploadDispatchObservations.length < UPLOAD_DISPATCH_OBSERVATION_CAP) {
+    uploadDispatchObservations.push({ reason, records, bytes, queueDepth, oldestAgeMs });
+  }
+}
+
+export function getUploadDispatchStats(): Readonly<Record<UploadDispatchReason, Readonly<UploadDispatchStat>>> {
+  return Object.fromEntries(uploadDispatchReasons.map((reason) => [reason, { ...uploadDispatchStats[reason] }])) as Record<UploadDispatchReason, UploadDispatchStat>;
+}
+
+export function getUploadDispatchObservations(): ReadonlyArray<Readonly<UploadDispatchObservation>> {
+  return uploadDispatchObservations.map((observation) => ({ ...observation }));
+}
+
+export function resetUploadDispatchStatsForTests(): void {
+  uploadDispatchStats = newUploadDispatchStats();
+  uploadDispatchObservations = [];
+}
+
 export interface FirstPublishStats {
   /** Design 108 §3.6: command-level time from init's first-push milestone (before scan)
    *  to the accepted files-only commit ACK — the headline greenfield onboarding KPI. */
@@ -206,5 +261,10 @@ export function uploadLaneTimingSummary(): string | undefined {
   const encryptPct = active > 0 ? ((e / active) * 100).toFixed(0) : "0";
   const uploadPct = active > 0 ? ((u / active) * 100).toFixed(0) : "0";
   const queue = q > 0 ? ` · queue ${(q / 1000).toFixed(1)}s` : "";
-  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${encryptPct}%) · upload ${(u / 1000).toFixed(1)}s (${uploadPct}%)${queue} · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms`;
+  const dispatches = uploadDispatchReasons
+    .filter((reason) => uploadDispatchStats[reason].count > 0)
+    .map((reason) => `${reason}:${uploadDispatchStats[reason].count}(${uploadDispatchStats[reason].records}r)`)
+    .join(" ");
+  const dispatch = dispatches ? ` · dispatch ${dispatches}` : "";
+  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${encryptPct}%) · upload ${(u / 1000).toFixed(1)}s (${uploadPct}%)${queue} · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms${dispatch}`;
 }

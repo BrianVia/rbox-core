@@ -25,6 +25,7 @@ const corruptNextGets = new Map<string, number>();
 const origDateNow = Date.now;
 const ENV_KEYS = [
   "RBOX_BATCH_BLOBS",
+  "RBOX_BATCH_FILL",
   "RBOX_BATCH_RECORDS",
   "RBOX_BATCH_RECORD_BYTES",
   "RBOX_BATCH_BODY_BYTES",
@@ -116,8 +117,8 @@ afterEach(async () => {
 
 describe("batch config knobs", () => {
   test("defaults are byte-identical when knobs unset", () => {
-    expect(uploadBatchConfig()).toEqual({ enabled: true, records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
-    expect(downloadBatchConfig()).toEqual({ enabled: true, records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 48 });
+    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
+    expect(downloadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 48 });
   });
 
   test("RBOX_UPLOAD_SLOTS overrides upload slots and clamps", () => {
@@ -170,6 +171,26 @@ describe("batch config knobs", () => {
     expect(uploadBatchConfig().records).toBe(32);
     process.env.RBOX_BATCH_RECORDS = "0";
     expect(uploadBatchConfig().records).toBe(1);
+  });
+
+  test("fill-v2 gates the raised upload record cap", () => {
+    process.env.RBOX_BATCH_RECORDS = "64";
+    expect(uploadBatchConfig()).toMatchObject({ fill: "v1", records: 32 });
+
+    process.env.RBOX_BATCH_FILL = "v2";
+    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 64 });
+
+    delete process.env.RBOX_BATCH_RECORDS;
+    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 32 });
+  });
+
+  test("download config ignores fill-v2 and invalid upload fill values use v1", () => {
+    process.env.RBOX_BATCH_FILL = "v2";
+    process.env.RBOX_BATCH_RECORDS = "64";
+    expect(downloadBatchConfig()).toMatchObject({ fill: "v1", records: 32 });
+
+    process.env.RBOX_BATCH_FILL = "garbage";
+    expect(uploadBatchConfig().fill).toBe("v1");
   });
 
   test("RBOX_BATCH_BLOBS=0 disables batching", () => {

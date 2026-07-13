@@ -5,16 +5,19 @@ import { startOp, type Op } from "./metrics.js";
 import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
 import { blobKey, json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
-// Wire twin: src/cli/remote/blob-batch.ts — the framing constants and codec are
-// duplicated per build target (house pattern, like UPLOAD_RECEIPTS_V1). Change
-// them in lockstep; nothing fails to compile if they drift.
+// Wire twin: src/cli/remote/blob-batch/wire.ts — the framing constants, codec,
+// and over-cap { error: "too_many_records", max } response are duplicated per
+// build target (house pattern, like UPLOAD_RECEIPTS_V1). Change them in lockstep;
+// nothing fails to compile if they drift.
 
 export const BATCH_BLOB_CONTENT_TYPE = "application/x-rbox-blobs";
 export const BATCH_FRAME_HEADER_BYTES = 36;
 export const BATCH_STATUS_BIT = 0x80000000;
 export const MAX_BATCH_RECORD_BYTES = 256 * 1024;
 const BATCH_STATUS_MAX_BYTES = 4 * 1024;
-const MAX_BATCH_RECORDS = 32;
+const MAX_BATCH_GET_SHAS = 32;
+const BATCH_PUT_RECORDS_FLOOR = 32;
+const BATCH_PUT_RECORDS_MAX = 64;
 const MAX_BATCH_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_BATCH_REQUEST_BYTES = 4 * 1024;
 
@@ -70,8 +73,13 @@ export async function blobBatchPut(req: Request, env: Env, accountId: string): P
     return json({ error: "receipts_required" }, 400);
   }
 
-  const parsed = await readBatchPutRequest(req);
+  const maxRecords = batchPutMaxRecords(env);
+  const parsed = await readBatchPutRequest(req, maxRecords);
   if (!parsed.ok) {
+    if ("tooManyRecords" in parsed) {
+      op.done("too_many_records", { count: parsed.tooManyRecords, bytes: 0 });
+      return json({ error: "too_many_records", max: maxRecords }, 400);
+    }
     op.done("bad_request", { count: 0, bytes: 0 });
     return parsed.response;
   }
@@ -109,36 +117,55 @@ async function readBatchRequest(req: Request): Promise<{ ok: true; shas: string[
     }
   }
   if (shas.length === 0) return { ok: false, response: json({ error: "bad_request", message: "empty batch" }, 400) };
-  if (shas.length > MAX_BATCH_RECORDS) return { ok: false, response: json({ error: "bad_request", message: "too many shas", max: MAX_BATCH_RECORDS }, 400) };
+  if (shas.length > MAX_BATCH_GET_SHAS) return { ok: false, response: json({ error: "bad_request", message: "too many shas", max: MAX_BATCH_GET_SHAS }, 400) };
   return { ok: true, shas };
 }
 
-async function readBatchPutRequest(req: Request): Promise<{ ok: true; records: BatchPutRecord[]; acceptedPayloadBytes: number } | { ok: false; response: Response }> {
+function batchPutMaxRecords(env: Env): number {
+  const n = Number(env.RBOX_BLOB_BATCH_MAX_RECORDS);
+  if (!Number.isInteger(n) || n < 1) return BATCH_PUT_RECORDS_FLOOR;
+  return Math.min(BATCH_PUT_RECORDS_MAX, Math.max(BATCH_PUT_RECORDS_FLOOR, n));
+}
+
+async function readBatchPutRequest(req: Request, maxRecords: number): Promise<
+  | { ok: true; records: BatchPutRecord[]; acceptedPayloadBytes: number }
+  | { ok: false; response: Response }
+  | { ok: false; tooManyRecords: number }
+> {
   const raw = await readBytesCapped(req, MAX_BATCH_BODY_BYTES);
   if (raw === null) return { ok: false, response: json({ error: "bad_request", message: "request body too large" }, 400) };
-  const parsed = parseBatchPutFrames(raw);
-  if (!parsed.ok) return { ok: false, response: json({ error: "bad_request", message: parsed.message }, 400) };
+  const parsed = parseBatchPutFrames(raw, maxRecords);
+  if (!parsed.ok) {
+    if ("tooManyRecords" in parsed) return parsed;
+    return { ok: false, response: json({ error: "bad_request", message: parsed.message }, 400) };
+  }
   let acceptedPayloadBytes = 0;
   for (const r of parsed.records) if (r.payload.byteLength <= MAX_BATCH_RECORD_BYTES) acceptedPayloadBytes += r.payload.byteLength;
   return { ok: true, records: parsed.records, acceptedPayloadBytes };
 }
 
-function parseBatchPutFrames(raw: Uint8Array): { ok: true; records: BatchPutRecord[] } | { ok: false; message: string } {
+function parseBatchPutFrames(raw: Uint8Array, maxRecords: number):
+  | { ok: true; records: BatchPutRecord[] }
+  | { ok: false; message: string }
+  | { ok: false; tooManyRecords: number } {
   const records: BatchPutRecord[] = [];
+  let count = 0;
   for (let off = 0; off < raw.byteLength;) {
     if (raw.byteLength - off < BATCH_FRAME_HEADER_BYTES) return { ok: false, message: "truncated frame header" };
     const head = raw.subarray(off, off + BATCH_FRAME_HEADER_BYTES);
     off += BATCH_FRAME_HEADER_BYTES;
-    const sha = toHex(head.subarray(0, 32));
     const word = new DataView(head.buffer, head.byteOffset + 32, 4).getUint32(0, false);
     if ((word & BATCH_STATUS_BIT) !== 0) return { ok: false, message: "invalid frame length" };
     const len = word;
     if (raw.byteLength - off < len) return { ok: false, message: "truncated frame payload" };
-    records.push({ sha, payload: raw.subarray(off, off + len) });
+    count++;
+    if (count <= maxRecords) {
+      records.push({ sha: toHex(head.subarray(0, 32)), payload: raw.subarray(off, off + len) });
+    }
     off += len;
-    if (records.length > MAX_BATCH_RECORDS) return { ok: false, message: "too many records" };
   }
-  if (records.length === 0) return { ok: false, message: "empty batch" };
+  if (count === 0) return { ok: false, message: "empty batch" };
+  if (count > maxRecords) return { ok: false, tooManyRecords: count };
   return { ok: true, records };
 }
 

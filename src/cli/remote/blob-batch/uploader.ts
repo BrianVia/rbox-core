@@ -5,10 +5,27 @@ import type { RemoteContext } from "../context.js";
 import { putBlobFile } from "../blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
-import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../../upload-lane-timing.js";
-import { SingleGate, uploadDisabled, disableUploadForProcess, incrementDispatchCount } from "./gate.js";
-import { uploadBatchConfig, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig } from "./config.js";
-import { framedBytes, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
+import { firstPublishAuthEnd, firstPublishAuthStart, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
+import { SingleGate, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount } from "./gate.js";
+import { uploadBatchConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig } from "./config.js";
+import { framedBytes, parseBatchPutErrorMax, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
+
+interface UploaderClock {
+  now(): number;
+  setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(t: ReturnType<typeof setTimeout>): void;
+}
+
+const realUploaderClock: UploaderClock = {
+  now: () => performance.now(),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
+let uploaderClock = realUploaderClock;
+
+export function setUploaderClockForTests(clock?: UploaderClock): void {
+  uploaderClock = clock ?? realUploaderClock;
+}
 
 interface BatchPutWaiter {
   srcPath: string;
@@ -24,6 +41,7 @@ interface BatchPutGroup {
   size: number;
   srcPath: string;
   enqueuedAtMs: number;
+  policyEnqueuedAtMs: number;
   waiters: BatchPutWaiter[];
 }
 
@@ -39,10 +57,15 @@ export class BlobBatchUploader {
   private closeError: Error | undefined;
   private closePromise: Promise<void> | undefined;
   private readonly inFlight = new Set<Promise<unknown>>();
+  private lastUniqueEnqueueAtMs = 0;
 
   constructor(private readonly ctx: RemoteContext) {
     // Upload record bytes stay capped to the server's accepted per-record maximum.
     this.config = uploadBatchConfig();
+  }
+
+  private get effectiveRecords(): number {
+    return Math.min(this.config.records, batchRecordsCeiling());
   }
 
   private canBatch(size: number): boolean {
@@ -78,70 +101,105 @@ export class BlobBatchUploader {
       existing.waiters.push(waiter);
       return;
     }
+    const policyEnqueuedAtMs = uploaderClock.now();
     const group: BatchPutGroup = {
       sha,
       size: waiter.size,
       srcPath: waiter.srcPath,
       enqueuedAtMs: LANE_TIMING ? performance.now() : 0,
+      policyEnqueuedAtMs,
       waiters: [waiter],
     };
     this.bySha.set(group.sha, group);
     this.queue.push(group);
     this.queuedBytes += framedBytes(group.size);
+    this.lastUniqueEnqueueAtMs = policyEnqueuedAtMs;
     this.dispatchFull();
     if (this.queue.length > 0 && !this.timer) {
-      this.timer = setTimeout(() => {
+      if (this.config.fill === "v2") this.armFillV2Timer();
+      else this.timer = uploaderClock.setTimeout(() => {
         this.timer = undefined;
-        this.dispatchPartial();
+        this.dispatchPartial("fixed_timer");
       }, FLUSH_DELAY_MS);
     }
   }
 
   private dispatchFull(): void {
     if (this.closed) return;
-    while (this.active < this.config.slots && (this.queue.length >= this.config.records || this.queuedBytes >= this.config.bodyBytes)) {
-      this.launch(this.carve());
+    while (this.active < this.config.slots && (this.queue.length >= this.effectiveRecords || this.queuedBytes >= this.config.bodyBytes)) {
+      const reason: UploadDispatchReason = this.queue.length >= this.effectiveRecords ? "full_records" : "full_bytes";
+      this.launch(this.carve(), reason);
     }
   }
 
-  private dispatchPartial(): void {
+  private dispatchPartial(reason: UploadDispatchReason): void {
     if (this.closed) return;
     this.dispatchFull();
-    while (this.active < this.config.slots && this.queue.length > 0) this.launch(this.carve());
+    while (this.active < this.config.slots && this.queue.length > 0) this.launch(this.carve(), reason);
   }
 
-  private launch(batch: BatchPutGroup[]): void {
-    if (batch.length === 0) return;
+  private armFillV2Timer(): void {
+    // Arm only with dispatch capacity; saturation hands re-arming to the
+    // settle path because an in-flight request is guaranteed to settle.
+    if (this.closed || this.timer || this.queue.length === 0 || this.active >= this.config.slots) return;
+    const now = uploaderClock.now();
+    const quietRemaining = FILL_QUIET_MS - (now - this.lastUniqueEnqueueAtMs);
+    const absoluteRemaining = FILL_ABSOLUTE_MS - (now - this.queue[0]!.policyEnqueuedAtMs);
+    this.timer = uploaderClock.setTimeout(() => this.onFillV2Timer(), Math.max(1, Math.min(quietRemaining, absoluteRemaining)));
+  }
+
+  private onFillV2Timer(): void {
+    this.timer = undefined;
+    if (this.closed) return;
+    this.dispatchFull();
+    const now = uploaderClock.now();
+    if (now - this.lastUniqueEnqueueAtMs >= FILL_QUIET_MS) {
+      this.dispatchPartial("quiet");
+    } else {
+      // A valid partial queue fits one carve because dispatchFull and carve
+      // share caps; the loop guard is defensive for latch/byte-cap edges.
+      while (this.active < this.config.slots && this.queue.length > 0 && now - this.queue[0]!.policyEnqueuedAtMs >= FILL_ABSOLUTE_MS) {
+        this.launch(this.carve(), "absolute");
+      }
+    }
+    this.armFillV2Timer();
+  }
+
+  private launch(batch: { groups: BatchPutGroup[]; bytes: number }, reason: UploadDispatchReason): void {
+    if (batch.groups.length === 0) return;
     if (this.closed) {
-      for (const group of batch) this.rejectGroup(group, this.closeError!);
+      for (const group of batch.groups) this.rejectGroup(group, this.closeError!);
       return;
     }
+    const oldestAgeMs = Math.max(0, uploaderClock.now() - batch.groups[0]!.policyEnqueuedAtMs);
+    recordUploadDispatch(reason, batch.groups.length, batch.bytes, this.queue.length, oldestAgeMs);
     this.active++;
-    const dispatch = this.dispatchBatch(batch);
+    const dispatch = this.dispatchBatch(batch.groups);
     this.inFlight.add(dispatch);
     void dispatch.finally(() => {
       this.inFlight.delete(dispatch);
       this.active--;
       if (this.closed) return;
       this.dispatchFull();
-      if (this.active === 0 && this.queue.length > 0) this.dispatchPartial();
+      if (this.active === 0 && this.queue.length > 0) this.dispatchPartial("idle_tail");
+      if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
     });
   }
 
-  private carve(): BatchPutGroup[] {
+  private carve(): { groups: BatchPutGroup[]; bytes: number } {
     const taken: BatchPutGroup[] = [];
     let bytes = 0;
     let i = 0;
     for (; i < this.queue.length; i++) {
       const group = this.queue[i]!;
       const nextBytes = framedBytes(group.size);
-      if (taken.length >= this.config.records || (taken.length > 0 && bytes + nextBytes > this.config.bodyBytes)) break;
+      if (taken.length >= this.effectiveRecords || (taken.length > 0 && bytes + nextBytes > this.config.bodyBytes)) break;
       taken.push(group);
       bytes += nextBytes;
     }
     this.queue.splice(0, i);
     this.queuedBytes -= bytes;
-    return taken;
+    return { groups: taken, bytes };
   }
 
   private async dispatchBatch(batch: BatchPutGroup[]): Promise<void> {
@@ -158,8 +216,8 @@ export class BlobBatchUploader {
     let idle: ReturnType<typeof setTimeout> | undefined;
     const ctrl = new AbortController();
     const armIdle = () => {
-      if (idle) clearTimeout(idle);
-      idle = setTimeout(() => ctrl.abort(new DOMException("batch upload stalled", "TimeoutError")), DOWNLOAD_IDLE_MS);
+      if (idle) uploaderClock.clearTimeout(idle);
+      idle = uploaderClock.setTimeout(() => ctrl.abort(new DOMException("batch upload stalled", "TimeoutError")), DOWNLOAD_IDLE_MS);
     };
 
     try {
@@ -201,6 +259,24 @@ export class BlobBatchUploader {
         pending.clear();
         return;
       }
+      if (res.status === 400 && this.effectiveRecords > BATCH_RECORDS_FLOOR) {
+        // | Server max | Client send max | Result |
+        // | 32 | 32 | Current compatible behavior; fill-v2 may improve occupancy. |
+        // | 64 | 32 | Backward-compatible; server capability is unused. |
+        // | 64 | 64 | Target behavior. |
+        // | 32 | 64 | Invalid rollout/rollback ordering. Without the latch below this would be UNBOUNDED degradation, not a one-off: today's client treats a 400 like any non-OK response — `fallbackAll` re-uploads that request as singles and keeps forming oversized batches forever (unlike 404/405, a 400 latches nothing). Mitigations below reduce it to one latch event plus a bounded in-flight burst (≤ slots), and make it alertable. |
+        // | old/no batch route | 64-cap client | Existing 404/405 process-wide single-PUT fallback. |
+        // With 24 slots, up to `slots` oversized requests may already be in flight;
+        // each independently falls back to singles. The latch prevents NEW oversized carves.
+        const sent = body.groups.length;
+        const parsedMax = parseBatchPutErrorMax(await res.json().catch(() => null));
+        const target = parsedMax !== undefined && parsedMax < sent
+          ? Math.max(BATCH_RECORDS_FLOOR, parsedMax)
+          : BATCH_RECORDS_FLOOR;
+        latchBatchRecordsCeiling(target);
+        await this.fallbackAll(pending);
+        return;
+      }
       if (!res.ok) {
         await this.fallbackAll(pending);
         return;
@@ -225,7 +301,7 @@ export class BlobBatchUploader {
         for (const group of pending.values()) this.rejectGroup(group, this.closeError!);
       } else await this.fallbackAll(pending);
     } finally {
-      if (idle) clearTimeout(idle);
+      if (idle) uploaderClock.clearTimeout(idle);
     }
   }
 
@@ -269,7 +345,7 @@ export class BlobBatchUploader {
 
   private drainQueuedAsSingles(): void {
     if (this.closed) return;
-    if (this.timer) clearTimeout(this.timer);
+    if (this.timer) uploaderClock.clearTimeout(this.timer);
     this.timer = undefined;
     const queued = this.queue;
     this.queue = [];
@@ -365,7 +441,7 @@ export class BlobBatchUploader {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.closeError = err;
-    if (this.timer) clearTimeout(this.timer);
+    if (this.timer) uploaderClock.clearTimeout(this.timer);
     this.timer = undefined;
     const queued = this.queue;
     this.queue = [];
