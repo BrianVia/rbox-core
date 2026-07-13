@@ -44,6 +44,7 @@ import { blobBatchRoutes } from "./routes/blob-batch.js";
 import { packGcEnabled, sweepUploadingPacks } from "./blob-pack.js";
 import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
+import { runPackGc } from "./pack-gc.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export class CachedReleases extends WorkerEntrypoint<Env> {
@@ -126,6 +127,13 @@ export default {
           await gcPurge(env, GC_PHASE2_GRACE_MS);
         } catch (e) {
           logErr("scheduled_gc_purge_failed", e);
+        }
+      }
+      if (packGcEnabled(env)) {
+        try {
+          await runPackGc(env);
+        } catch (e) {
+          logErr("scheduled_pack_gc_failed", e);
         }
       }
       return;
@@ -334,7 +342,7 @@ const ROUTE_VOCAB = new Set([
   "v1", "health", "install.sh", "agent.sh", "version", "version.sig", "bin",
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
-  "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics",
+  "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics", "pack-tombstones", "resweep",
   "keys", "api", "roster", "admit", "keystate", "workspace",
   "blobs", "blob-batch", "blob-pack", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",

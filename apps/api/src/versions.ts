@@ -159,7 +159,7 @@ interface MarkCursor {
   prefix: string;
   cursor?: string;
 }
-interface PurgeLease {
+export interface PurgeLease {
   owner: string;
   acquired: number;
   expires: number;
@@ -244,13 +244,18 @@ export async function gcMark(env: Env, graceMs: number, nowMs: number = Date.now
   return json({ marked, cursor: next });
 }
 
-type LeaseAcquisition = { lease: PurgeLease; retryAfterMs: 0 } | { lease: null; retryAfterMs: number };
+export type LeaseAcquisition = { lease: PurgeLease; retryAfterMs: 0 } | { lease: null; retryAfterMs: number };
 
-async function acquireLease(db: D1Database, nowMs: number, owner = crypto.randomUUID()): Promise<LeaseAcquisition> {
+export async function acquireLease(
+  db: D1Database,
+  nowMs: number,
+  owner = crypto.randomUUID(),
+  stateKey = "purge_lease",
+): Promise<LeaseAcquisition> {
   const lease: PurgeLease = { owner, acquired: nowMs, expires: nowMs + PURGE_LEASE_TTL_MS };
-  const inserted = await db.prepare("INSERT OR IGNORE INTO gc_state (k, v) VALUES ('purge_lease', ?)").bind(JSON.stringify(lease)).run();
+  const inserted = await db.prepare(`INSERT OR IGNORE INTO gc_state (k, v) VALUES ('${leaseStateKey(stateKey)}', ?)`).bind(JSON.stringify(lease)).run();
   if ((inserted.meta.changes ?? 0) === 1) return { lease, retryAfterMs: 0 };
-  const prior = await db.prepare("SELECT v FROM gc_state WHERE k='purge_lease'").first<{ v: string }>();
+  const prior = await db.prepare(`SELECT v FROM gc_state WHERE k='${leaseStateKey(stateKey)}'`).first<{ v: string }>();
   if (!prior) return { lease: null, retryAfterMs: PURGE_LEASE_TTL_MS + TAKEOVER_QUIESCENCE_MS };
   let parsed: PurgeLease;
   try {
@@ -260,16 +265,16 @@ async function acquireLease(db: D1Database, nowMs: number, owner = crypto.random
   }
   const retryAfterMs = Math.max(1, Number(parsed.expires) + TAKEOVER_QUIESCENCE_MS - nowMs + 1);
   if (nowMs <= Number(parsed.expires) + TAKEOVER_QUIESCENCE_MS) return { lease: null, retryAfterMs };
-  const taken = await db.prepare("UPDATE gc_state SET v=? WHERE k='purge_lease' AND v=?").bind(JSON.stringify(lease), prior.v).run();
+  const taken = await db.prepare(`UPDATE gc_state SET v=? WHERE k='${leaseStateKey(stateKey)}' AND v=?`).bind(JSON.stringify(lease), prior.v).run();
   return (taken.meta.changes ?? 0) === 1
     ? { lease, retryAfterMs: 0 }
     : { lease: null, retryAfterMs: PURGE_LEASE_TTL_MS + TAKEOVER_QUIESCENCE_MS };
 }
 
-async function renewLease(db: D1Database, lease: PurgeLease, nowMs: number): Promise<boolean> {
+export async function renewLease(db: D1Database, lease: PurgeLease, nowMs: number, stateKey = "purge_lease"): Promise<boolean> {
   const renewed = { ...lease, expires: nowMs + PURGE_LEASE_TTL_MS };
   const r = await db
-    .prepare("UPDATE gc_state SET v=? WHERE k='purge_lease' AND json_extract(v, '$.owner')=?")
+    .prepare(`UPDATE gc_state SET v=? WHERE k='${leaseStateKey(stateKey)}' AND json_extract(v, '$.owner')=?`)
     .bind(JSON.stringify(renewed), lease.owner)
     .run();
   if ((r.meta.changes ?? 0) === 1) {
@@ -279,15 +284,15 @@ async function renewLease(db: D1Database, lease: PurgeLease, nowMs: number): Pro
   return false;
 }
 
-async function releaseLease(db: D1Database, owner: string): Promise<void> {
-  await db.prepare("DELETE FROM gc_state WHERE k='purge_lease' AND json_extract(v, '$.owner')=?").bind(owner).run();
+export async function releaseLease(db: D1Database, owner: string, stateKey = "purge_lease"): Promise<void> {
+  await db.prepare(`DELETE FROM gc_state WHERE k='${leaseStateKey(stateKey)}' AND json_extract(v, '$.owner')=?`).bind(owner).run();
 }
 
-async function releaseLeaseWithRetry(db: D1Database, owner: string): Promise<void> {
+export async function releaseLeaseWithRetry(db: D1Database, owner: string, stateKey = "purge_lease"): Promise<void> {
   const backoffs = [250, 1000];
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await releaseLease(db, owner);
+      await releaseLease(db, owner, stateKey);
       return;
     } catch {
       if (attempt < backoffs.length) await new Promise((resolve) => setTimeout(resolve, backoffs[attempt]));
@@ -295,24 +300,40 @@ async function releaseLeaseWithRetry(db: D1Database, owner: string): Promise<voi
   }
 }
 
-const leaseGuard =
-  "EXISTS (SELECT 1 FROM gc_state WHERE k='purge_lease' AND json_extract(v, '$.owner')=? AND CAST(json_extract(v, '$.expires') AS INTEGER)>=?)";
+function leaseStateKey(stateKey: string): string {
+  if (stateKey !== "purge_lease" && stateKey !== "pack_purge_lease") throw new Error("invalid purge lease state key");
+  return stateKey;
+}
+
+export function leaseGuard(stateKey = "purge_lease"): string {
+  return `EXISTS (SELECT 1 FROM gc_state WHERE k='${leaseStateKey(stateKey)}' AND json_extract(v, '$.owner')=? AND CAST(json_extract(v, '$.expires') AS INTEGER)>=?)`;
+}
 
 /** Remove candidacy only while this executor still owns the lease. */
 async function unwindCandidate(db: D1Database, sha: string, owner: string, nowMs: number): Promise<boolean> {
-  const r = await db.prepare(`DELETE FROM gc_candidates WHERE sha256=? AND deleting_at IS NOT NULL AND ${leaseGuard}`).bind(sha, owner, nowMs).run();
+  const r = await db.prepare(`DELETE FROM gc_candidates WHERE sha256=? AND deleting_at IS NOT NULL AND ${leaseGuard()}`).bind(sha, owner, nowMs).run();
   return (r.meta.changes ?? 0) === 1;
 }
 
-async function cleanupCandidate(db: D1Database, sha: string, owner: string, nowMs: number): Promise<boolean> {
+async function cleanupCandidate(db: D1Database, sha: string, owner: string, nowMs: number, packedIn?: string): Promise<boolean> {
   const zeroRefs = "NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.sha256=?)";
   const openIntent = "EXISTS (SELECT 1 FROM gc_candidates c WHERE c.sha256=? AND c.deleting_at IS NOT NULL)";
+  const logicalCleanup = [
+    db.prepare(`DELETE FROM blobs WHERE sha256=? AND ${zeroRefs} AND ${openIntent} AND ${leaseGuard()}`).bind(sha, sha, sha, owner, nowMs),
+    db.prepare(`DELETE FROM blob_refs WHERE sha256=? AND ${zeroRefs} AND ${openIntent} AND ${leaseGuard()}`).bind(sha, sha, sha, owner, nowMs),
+    db.prepare(`DELETE FROM gc_candidates WHERE sha256=? AND deleting_at IS NOT NULL AND ${zeroRefs} AND ${leaseGuard()}`).bind(sha, sha, owner, nowMs),
+  ];
+  if (packedIn === undefined) {
+    const res = await db.batch(logicalCleanup);
+    return (res[2]?.meta.changes ?? 0) === 1;
+  }
   const res = await db.batch([
-    db.prepare(`DELETE FROM blobs WHERE sha256=? AND ${zeroRefs} AND ${openIntent} AND ${leaseGuard}`).bind(sha, sha, sha, owner, nowMs),
-    db.prepare(`DELETE FROM blob_refs WHERE sha256=? AND ${zeroRefs} AND ${openIntent} AND ${leaseGuard}`).bind(sha, sha, sha, owner, nowMs),
-    db.prepare(`DELETE FROM gc_candidates WHERE sha256=? AND deleting_at IS NOT NULL AND ${zeroRefs} AND ${leaseGuard}`).bind(sha, sha, owner, nowMs),
+    db
+      .prepare(`DELETE FROM blob_locations WHERE sha256=? AND pack_id=? AND ${zeroRefs} AND ${openIntent} AND ${leaseGuard()}`)
+      .bind(sha, packedIn, sha, sha, owner, nowMs),
+    ...logicalCleanup,
   ]);
-  return (res[2]?.meta.changes ?? 0) === 1;
+  return (res[3]?.meta.changes ?? 0) === 1;
 }
 
 async function executePage(
@@ -324,7 +345,7 @@ async function executePage(
   limit: number,
   deadlineAt: number,
   clock: () => number,
-): Promise<{ purged: number; unwound: number; bytes: number; touched: Set<string>; cursor: ExecuteCursor | null }> {
+): Promise<{ purged: number; unwound: number; packedRetired: number; bytes: number; touched: Set<string>; cursor: ExecuteCursor | null }> {
   const prior = await readState<ExecuteCursor>(db, "execute_cursor");
   const cursorWhere = prior ? "AND (deleting_at > ? OR (deleting_at = ? AND sha256 > ?))" : "";
   const binds = prior ? [nowMs - INTENT_QUIESCENCE_MS, prior.deletingAt, prior.deletingAt, prior.sha256, limit] : [nowMs - INTENT_QUIESCENCE_MS, limit];
@@ -340,6 +361,7 @@ async function executePage(
   }
   let purged = 0;
   let unwound = 0;
+  let packedRetired = 0;
   let bytes = 0;
   const touched = new Set<string>();
   let cursor: ExecuteCursor | null = prior;
@@ -351,15 +373,16 @@ async function executePage(
     // Final D1 check: same unexpired lease, still-open intent, and zero refs.
     const ready = await db
       .prepare(
-        `SELECT b.size_bytes FROM gc_candidates c
+        `SELECT b.size_bytes, l.pack_id FROM gc_candidates c
          LEFT JOIN blobs b ON b.sha256=c.sha256
+         LEFT JOIN blob_locations l ON l.sha256=c.sha256
          WHERE c.sha256=? AND c.deleting_at IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.sha256=c.sha256)
            AND EXISTS (SELECT 1 FROM gc_state s WHERE s.k='purge_lease'
              AND json_extract(s.v, '$.owner')=? AND CAST(json_extract(s.v, '$.expires') AS INTEGER)>=?)`,
       )
       .bind(c.sha256, lease.owner, clock())
-      .first<{ size_bytes: number | null }>();
+      .first<{ size_bytes: number | null; pack_id: string | null }>();
     if (!ready) {
       // A failed readiness check may mean refs appeared, but it may instead mean
       // this holder expired/lost its lease or the intent disappeared. Only the
@@ -385,20 +408,23 @@ async function executePage(
     // lease can never authorize one.
     if (clock() >= deadlineAt || clock() > lease.expires) break;
 
-    const key = c.kind === "manifest" ? manifestKey(c.sha256) : blobKey(c.sha256);
-    await env.rbox_dev_blobs.delete(key);
-    const present = await env.rbox_dev_blobs.head(key);
-    if (present) {
-      if (await unwindCandidate(db, c.sha256, lease.owner, clock())) unwound++;
-      continue;
+    if (ready.pack_id === null) {
+      const key = c.kind === "manifest" ? manifestKey(c.sha256) : blobKey(c.sha256);
+      await env.rbox_dev_blobs.delete(key);
+      const present = await env.rbox_dev_blobs.head(key);
+      if (present) {
+        if (await unwindCandidate(db, c.sha256, lease.owner, clock())) unwound++;
+        continue;
+      }
     }
-    if (await cleanupCandidate(db, c.sha256, lease.owner, clock())) {
+    if (await cleanupCandidate(db, c.sha256, lease.owner, clock(), ready.pack_id ?? undefined)) {
       purged++;
+      if (ready.pack_id !== null) packedRetired++;
       bytes += Number(ready.size_bytes ?? 0);
     }
   }
   if (cursor) await writeState(db, "execute_cursor", cursor);
-  return { purged, unwound, bytes, touched, cursor };
+  return { purged, unwound, packedRetired, bytes, touched, cursor };
 }
 
 async function openIntents(
@@ -485,7 +511,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
     op.done("lease_busy");
     return json({ purged: 0, opened: 0, leaseBusy: true, retryAfterMs: acquired.retryAfterMs }, 409);
   }
-  let executed: Awaited<ReturnType<typeof executePage>> = { purged: 0, unwound: 0, bytes: 0, touched: new Set(), cursor: null };
+  let executed: Awaited<ReturnType<typeof executePage>> = { purged: 0, unwound: 0, packedRetired: 0, bytes: 0, touched: new Set(), cursor: null };
   let intents = { opened: 0, resurrected: 0, cursor: null as GcCursor | null };
   try {
     if (!(await renewLease(db, lease, clock()))) {
@@ -501,6 +527,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
     metric(env, "gc.intents.opened", intents.opened);
     metric(env, "gc.intents.unwound", executed.unwound);
     metric(env, "gc.objects.purged", executed.purged, executed.bytes);
+    metric(env, "gc.pack.locations_retired", executed.packedRetired);
     metric(env, "gc.intents.stale", Number(stale?.n ?? 0));
     metric(env, "gc.purge.cursor", 1);
     op.done("ok", { count: executed.purged, bytes: executed.bytes });

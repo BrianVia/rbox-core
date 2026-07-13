@@ -334,13 +334,80 @@ async function tombstoneCursor(db: D1Database): Promise<string> {
   }
 }
 
+export interface PackTombstone {
+  packId: string;
+  createdAt: number;
+  touchedAt: number;
+}
+
+/** Platform-admin audit data only. Pack ids never enter metrics or logs. */
+export async function packTombstones(env: Env): Promise<{ tombstones: PackTombstone[]; count: number }> {
+  const rows = await dbFor(env, "")
+    .prepare("SELECT pack_id,created_at,touched_at FROM packs WHERE state='swept' ORDER BY pack_id LIMIT ?")
+    .bind(TOMBSTONE_SWEEP_PAGE)
+    .all<{ pack_id: string; created_at: number; touched_at: number }>();
+  const tombstones = rows.results.map((row) => ({
+    packId: row.pack_id,
+    createdAt: Number(row.created_at),
+    touchedAt: Number(row.touched_at),
+  }));
+  return { tombstones, count: tombstones.length };
+}
+
+/** Bounded tombstone-only HEAD/delete pass; permanent deny rows are never removed. */
+export async function resweepPackTombstones(env: Env): Promise<{ observed: number; reDeleted: number }> {
+  const op = startOp(env, "pack.gc.resweep");
+  const db = dbFor(op.env, "");
+  let observed = 0;
+  let reDeleted = 0;
+  try {
+    const cursor = await tombstoneCursor(db);
+    const tombstones = await db
+      .prepare("SELECT pack_id FROM packs WHERE state='swept' AND pack_id > ? ORDER BY pack_id LIMIT ?")
+      .bind(cursor, TOMBSTONE_SWEEP_PAGE)
+      .all<{ pack_id: string }>();
+    observed = tombstones.results.length;
+    for (const { pack_id: packId } of tombstones.results) {
+      let present = false;
+      try {
+        present = (await op.span.r2(() => op.env.rbox_dev_blobs.head(packKey(packId)))) !== null;
+      } catch {
+        continue;
+      }
+      if (present) {
+        try {
+          await op.span.r2(() => op.env.rbox_dev_blobs.delete(packKey(packId)));
+          reDeleted++;
+        } catch {
+          // Keep the permanent tombstone and retry on a later pass.
+        }
+      }
+    }
+    if (tombstones.results.length === TOMBSTONE_SWEEP_PAGE) {
+      const last = tombstones.results.at(-1)!.pack_id;
+      await db
+        .prepare("INSERT INTO gc_state(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+        .bind(TOMBSTONE_CURSOR_KEY, JSON.stringify(last))
+        .run();
+    } else {
+      await db.prepare("DELETE FROM gc_state WHERE k = ?").bind(TOMBSTONE_CURSOR_KEY).run();
+    }
+    emit(env, { op: "pack.gc.tombstones", outcome: "ok", count: observed });
+    emit(env, { op: "pack.gc.resweep_deleted", outcome: "ok", count: reDeleted });
+    op.done("ok", { count: reDeleted });
+    return { observed, reDeleted };
+  } catch {
+    op.done("error", { count: reDeleted });
+    throw new Error("pack tombstone resweep failed");
+  }
+}
+
 /** Reclaims abandoned uploading inventories and permanently contains late PUTs. */
 export async function sweepUploadingPacks(env: Env, nowMs: number = Date.now()): Promise<void> {
   const op = startOp(env, "pack.gc.uploading");
   const db = dbFor(op.env, "");
   const cutoff = nowMs - PACK_ORPHAN_GRACE_MS;
   let swept = 0;
-  let reDeleted = 0;
   try {
     const stale = await db
       .prepare("SELECT pack_id FROM packs WHERE state = 'uploading' AND created_at < ? AND touched_at < ? ORDER BY pack_id LIMIT ?")
@@ -367,40 +434,9 @@ export async function sweepUploadingPacks(env: Env, nowMs: number = Date.now()):
       }
     }
 
-    const cursor = await tombstoneCursor(db);
-    const tombstones = await db
-      .prepare("SELECT pack_id FROM packs WHERE state = 'swept' AND pack_id > ? ORDER BY pack_id LIMIT ?")
-      .bind(cursor, TOMBSTONE_SWEEP_PAGE)
-      .all<{ pack_id: string }>();
-    for (const { pack_id: packId } of tombstones.results) {
-      let present = false;
-      try {
-        present = (await op.span.r2(() => op.env.rbox_dev_blobs.head(packKey(packId)))) !== null;
-      } catch {
-        continue;
-      }
-      if (present) {
-        try {
-          await op.span.r2(() => op.env.rbox_dev_blobs.delete(packKey(packId)));
-          reDeleted++;
-        } catch {
-          // Keep the tombstone and retry on a later maintenance tick.
-        }
-      }
-    }
-    if (tombstones.results.length === TOMBSTONE_SWEEP_PAGE) {
-      const last = tombstones.results.at(-1)!.pack_id;
-      await db
-        .prepare("INSERT INTO gc_state(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v")
-        .bind(TOMBSTONE_CURSOR_KEY, JSON.stringify(last))
-        .run();
-    } else {
-      await db.prepare("DELETE FROM gc_state WHERE k = ?").bind(TOMBSTONE_CURSOR_KEY).run();
-    }
+    await resweepPackTombstones(env);
 
     emit(env, { op: "pack.gc.swept", outcome: "ok", count: swept });
-    emit(env, { op: "pack.gc.tombstones", outcome: "ok", count: tombstones.results.length });
-    emit(env, { op: "pack.gc.resweep_deleted", outcome: "ok", count: reDeleted });
     op.done("ok", { count: swept });
   } catch {
     op.done("error", { count: swept, bytes: 0 });
