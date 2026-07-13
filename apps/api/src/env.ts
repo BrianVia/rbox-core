@@ -62,6 +62,12 @@ export interface Env {
   RBOX_WS_MAX_SESSION_MS?: string;
   /** Design 112 blob-batch PUT record cap: default 32, candidate 64; set 32 to kill-switch. */
   RBOX_BLOB_BATCH_MAX_RECORDS?: string;
+  /** Design 114 pack-PUT acceptance gate. Default off; only "1" enables
+   *  publication of new packed blobs. Packed reads are not gated by this flag. */
+  RBOX_BLOB_PACK_ACCEPT?: string;
+  /** Design 114 physical pack-GC and uploading-orphan sweeper gate. Default off;
+   *  only "1" enables destructive pack maintenance. */
+  RBOX_BLOB_PACK_GC?: string;
   /** Design 109 kill switch: unset/anything other than "0" mints and accepts
    *  upload grants (default on); "0" preserves the pure bearer path. */
   RBOX_AUTH_GRANT?: string;
