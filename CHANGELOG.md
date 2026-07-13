@@ -5,6 +5,16 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.5.4] — 2026-07-13 — receipt draining actually engages: −19%% push wall
+
+### Fixed
+- **Upload-time receipt draining now runs in production (#275).** E2eeRemote —
+  the wrapper every real publish uses — never forwarded the receiptPort
+  capability, so design 111 shipped default-on but inert (redeemOverlap=0 in
+  the field). Forwarded + compile-time parity guard so wrapper/transport
+  capability drift fails typecheck. Field-validated: commit-enclosed drain
+  8s→168ms, total push 39.2s→31.9s on an 8k-blob publish.
+
 ## [1.5.3] — 2026-07-13 — release unblocked: one release-env-only flaky grant test skipped (tracked)
 
 ## [1.5.2] — 2026-07-13 — the grant-suite fix actually ships this time (1.5.1 tagged without it — cwd slip)
