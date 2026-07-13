@@ -1,4 +1,4 @@
-export { gitReposManifestSchema } from "./sync-git/shared.js";
+export { gitReposManifestSchema, gitIncomingKey, nextDeferral } from "./sync-git/shared.js";
 export { gitConfigHash, shouldPublishGitConfig, type CachedLocalCfg } from "./sync-git/config-lane.js";
 export {
   planGitSections,
@@ -19,6 +19,8 @@ export {
 export { gitDivergenceFastRepoSource, classifyDivergenceCacheEntry, type GitDivergenceRepoHint } from "./sync-git/divergence-cache.js";
 export {
   applyGitSections,
+  revalidateGitPartialApplies,
+  withRevalidatedGitPartialApplies,
   formatGitApplyMetrics,
   type GitPullOutcome,
   type GitApplyRunKind,

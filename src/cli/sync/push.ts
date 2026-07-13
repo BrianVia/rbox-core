@@ -7,7 +7,7 @@ import {
   type IgnoreMatcher,
   type Manifest,
 } from "../../engine/index.js";
-import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, validManifestMeta, type WorkspaceConfig } from "../config.js";
+import { loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type WorkspaceConfig } from "../config.js";
 import { type CommitOptions, type CommitTimings } from "../remote.js";
 import {
   deferManifest,
@@ -23,9 +23,10 @@ import {
   gitForceForMissingBlobs,
   gitReposManifestSchema,
   planGitSections,
+  nextDeferral,
 } from "../sync-git.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "../sync-state.js";
+import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource, type GitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
@@ -323,7 +324,7 @@ async function runPushAttempt(
   // §4); §35's "a no-op tick allocates nothing" still holds — disabled() is a shared
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
@@ -381,6 +382,49 @@ async function runPushAttempt(
       filesFirstDefer,
     })
   );
+  // Visibility is durable as soon as planning settles. This sidecar-only packet carries
+  // the accepted sequence and therefore cannot claim a candidate commit that later fails.
+  const deferralUpdates: Record<string, GitDeferralUpdates | null> = {};
+  const repoRecords = repoRecordsForState(state);
+  const now = new Date().toISOString();
+  for (const rel of gitPlan.captureObserved) {
+    const current = repoRecords[rel]?.deferrals;
+    const lanes: GitDeferralUpdates = {};
+    const captureReason = gitPlan.captureDeferrals[rel];
+    if (captureReason) {
+      const next = nextDeferral(current?.capture, captureReason, now);
+      next.lane = "capture";
+      lanes.capture = next;
+    } else if (current?.capture) lanes.capture = null;
+    if (gitPlan.configObserved.includes(rel)) {
+      const configReason = gitPlan.configDeferrals[rel];
+      if (configReason) {
+        const next = nextDeferral(current?.config, configReason, now);
+        next.lane = "config";
+        lanes.config = next;
+      } else if (current?.config) lanes.config = null;
+    }
+    if (Object.keys(lanes).length > 0) deferralUpdates[rel] = lanes;
+  }
+  const deferralValues = {
+    bases: state.lastSyncedManifest.gitRepos,
+    pending: state.gitPendingRemote,
+    removed: state.gitReposRemoved,
+    resolutions: state.gitNeedsResolution,
+    deferrals: deferralUpdates,
+  };
+  const deferralRepos = changedSidecarRepoKeys(state, deferralValues);
+  if (deferralRepos.length > 0) {
+    state = await report.phase("state-save", () => saveStateSource(root, state, {
+      expectedStream: syncStreamId(cfg),
+      sourceGlobalSeq: state.lastSyncedSequence,
+      observedRepos: deferralRepos,
+      values: deferralValues,
+    }, {
+      allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+      forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+    }));
+  }
   if (report.enabled) {
     report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
     if (gitPlan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: gitPlan.gitPlanStats }, formatGitPlanStats(gitPlan.gitPlanStats));

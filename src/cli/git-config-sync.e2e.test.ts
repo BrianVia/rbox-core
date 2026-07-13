@@ -346,7 +346,7 @@ test("§11 E2E: old-writer strip and structural drop both recover through presen
   ]);
 });
 
-test("§11 E2E: config failure holds pending through both shortcuts; combined failure rolls Git back", async () => {
+test("§11 E2E: config failure retries independently while safe Git progress lands", async () => {
   const repoA = path.join(rootA, "repo");
   await initRepo(repoA);
   await commitFile(repoA, "tracked.txt", "one\n", "initial");
@@ -371,8 +371,9 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(first.gitRepos?.repo).toEqual(oldSection);
-  expect(first.gitPendingRemote?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(first.gitRepos?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(first.gitPendingRemote).toBeUndefined();
+  expect(first.partial?.repo?.configApplied).toBe(false);
 
   // Shortcut 2: retrying the same pending section must not clear it merely because
   // the local Git identity already equals the incoming identity.
@@ -387,11 +388,10 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(second.gitRepos?.repo).toEqual(oldSection);
-  expect(second.gitPendingRemote?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(second.gitRepos?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(second.gitPendingRemote).toBeUndefined();
 
-  // Combined Git+config mutation: Git lands first inside the boundary, then the
-  // injected config failure forces the ordinary-row snapshot rollback.
+  // Combined Git+config mutation: safe Git lands even though config remains deferred.
   await commitFile(repoA, "tracked.txt", "two\n", "git plus config");
   await runGit(repoA, "remote", "add", "backup", "https://example.test/backup.git");
   await push(rootA, cfgA, depsA);
@@ -407,10 +407,11 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(combined.gitRepos?.repo).toEqual(oldSection);
-  expect(combined.gitPendingRemote?.repo).toEqual(combinedHead.manifest.gitRepos!.repo);
-  expect(await runGit(repoB, "rev-parse", "HEAD")).toBe(oldGitHead);
+  expect(combined.gitRepos?.repo).toEqual(combinedHead.manifest.gitRepos!.repo);
+  expect(combined.gitPendingRemote).toBeUndefined();
+  expect(await runGit(repoB, "rev-parse", "HEAD")).not.toBe(oldGitHead);
   expect(await configValue(repoB, "remote.backup.url")).toBeUndefined();
+  expect(combined.partial?.repo?.configApplied).toBe(false);
 });
 
 test("§11 E2E: pointer historical all-base carry is verbatim; scoped→standalone→pointer skips config", async () => {

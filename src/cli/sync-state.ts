@@ -9,6 +9,9 @@ import {
   stateFromRepoRecords,
   type FileOnlyManifest,
   type GlobalManifestMeta,
+  type GitDeferral,
+  type GitDeferrals,
+  type GitPartialApply,
   type RepoRecord,
   type RepoRecordInput,
   type StateSavePacket,
@@ -16,6 +19,7 @@ import {
 } from "./config.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+export type GitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferral | null>>;
 
 export function configLaneState(record: ConfigLaneState): ConfigLaneState {
   return {
@@ -35,6 +39,9 @@ export interface RepoStateValues {
    * means preserve them. This rides the same generation-CAS transition as base and
    * pending; there is never a second config-only state write. */
   configLane?: Record<string, ConfigLaneState>;
+  /** Missing repo/lane preserves it; null repo clears all lanes; null lane clears it. */
+  deferrals?: Record<string, GitDeferralUpdates | null>;
+  partial?: Record<string, GitPartialApply | null>;
 }
 
 export interface StateSource {
@@ -83,20 +90,47 @@ const inputRecord = (record: RepoRecord): RepoRecordInput => {
   return input;
 };
 
+export function mergeDeferrals(
+  current: GitDeferrals | undefined,
+  incoming: GitDeferralUpdates | null | undefined,
+): GitDeferrals | undefined {
+  if (incoming === undefined) return current;
+  if (incoming === null) return undefined;
+  const merged: GitDeferrals = { ...(current ?? {}) };
+  for (const lane of ["apply", "capture", "config"] as const) {
+    const value = incoming[lane];
+    if (value === null) delete merged[lane];
+    else if (value !== undefined) merged[lane] = value;
+  }
+  return Object.keys(merged).length === 0 ? undefined : merged;
+}
+
 function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): RepoRecordInput {
   // A recompute from an older source retains the entire newer record. This is the
   // ordering half of the generation CAS: older pending/absence cannot regress a
   // newer success, while the transition still records that this path was observed.
-  if (current.sourceSeq > source.sourceGlobalSeq) return inputRecord(current);
+  const mergedDeferrals = mergeDeferrals(current.deferrals, source.values.deferrals?.[relPath]);
+  if (current.sourceSeq > source.sourceGlobalSeq) {
+    const retained = inputRecord(current);
+    if (mergedDeferrals === undefined) delete retained.deferrals;
+    else retained.deferrals = mergedDeferrals;
+    return retained;
+  }
   const lane = source.values.configLane?.[relPath] ?? current;
-  return stampConfigAck({
+  const next = stampConfigAck({
     sourceSeq: source.sourceGlobalSeq,
     ...(source.values.bases?.[relPath] === undefined ? {} : { base: source.values.bases[relPath] }),
     ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
     ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
     ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
     ...configLaneState(lane),
+    ...(mergedDeferrals === undefined ? {} : { deferrals: mergedDeferrals }),
+    ...(source.values.partial?.[relPath] === undefined
+      ? (current.partial === undefined ? {} : { partial: current.partial })
+      : source.values.partial[relPath] === null ? {} : { partial: source.values.partial[relPath] }),
+    ...(current.idxProj === undefined ? {} : { idxProj: current.idxProj }),
   }, source.authoredCfgHashByRepo?.[relPath]);
+  return next;
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
@@ -188,6 +222,8 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
     ...Object.keys(values.configLane ?? {}),
+    ...Object.keys(values.deferrals ?? {}),
+    ...Object.keys(values.partial ?? {}),
   ])].sort();
 }
 
@@ -200,13 +236,17 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     ...Object.keys(values.pending ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
+    ...Object.keys(values.deferrals ?? {}),
+    ...Object.keys(values.partial ?? {}),
   ]);
   const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   return [...keys].filter((relPath) => {
     const record = records[relPath];
     return !same(record?.pending, values.pending?.[relPath])
       || record?.removedKey !== values.removed?.[relPath]
-      || record?.resolutionKey !== values.resolutions?.[relPath];
+      || record?.resolutionKey !== values.resolutions?.[relPath]
+      || (values.deferrals?.[relPath] !== undefined && !same(mergeDeferrals(record?.deferrals, values.deferrals[relPath]), record?.deferrals))
+      || (values.partial?.[relPath] !== undefined && !same(values.partial[relPath], record?.partial));
   }).sort();
 }
 

@@ -189,6 +189,33 @@ export interface ConfigShapeIdentity {
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
+export type GitDeferralReason =
+  | "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash"
+  | "conflict" | "git-busy" | "worktree-ownership" | "ignored-target" | "unreadable"
+  | "artifact" | "config" | "containment" | "unsupported" | "other";
+
+export interface GitDeferral {
+  lane: "apply" | "capture" | "config";
+  deferredSince: string;
+  reasonSince: string;
+  lastSeen: string;
+  subjectKey?: string;
+  reason: GitDeferralReason;
+  checkout?: { kind: "branch" | "detached"; label?: string };
+  bytesChanged?: boolean;
+}
+
+export type GitDeferrals = Partial<Record<GitDeferral["lane"], GitDeferral>>;
+
+export interface GitPartialApply {
+  incomingKey: string;
+  checkoutPending: boolean;
+  appliedRefs: Record<string, { kind: "direct"; oid: string } | { kind: "symbolic"; target: string }>;
+  heldRefs: Record<string, "local-commits" | "local-stash" | "ownership">;
+  configApplied: boolean;
+  configBase?: Record<string, string[]>;
+}
+
 export interface RepoRecord {
   repoGen: number;
   sourceSeq: number;
@@ -200,6 +227,10 @@ export interface RepoRecord {
   cfgApplied?: string;
   cfgToken?: ConfigStatToken;
   cfgShape?: ConfigShapeIdentity;
+  deferrals?: GitDeferrals;
+  partial?: GitPartialApply;
+  /** D4's projected-index cache; stored here so RepoRecord's shape lands once. */
+  idxProj?: string;
 }
 
 export type RepoRecordInput = Omit<RepoRecord, "repoGen">;
@@ -566,9 +597,11 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
       path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
       path.join(root, RBOX_DIR, "state", "activity.json"),
       path.join(root, RBOX_DIR, "state", "shell.line"),
+      path.join(root, RBOX_DIR, "state", "git-journal"),
+      path.join(root, RBOX_DIR, "state", "shell.deferrals"),
     ]) {
       try {
-        await fs.rm(p);
+        await fs.rm(p, { recursive: true });
       } catch (e) {
         if (!isENOENT(e)) throw e;
       }

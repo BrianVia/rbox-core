@@ -189,16 +189,18 @@ describe("design 93 §6 transactional unit", () => {
   });
 
   test("repoGen prevents value ABA", async () => {
-    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("A") } });
+    const episode = { lane: "apply" as const, deferredSince: "2026-01-01T00:00:00.000Z", reasonSince: "2026-01-01T00:00:00.000Z", lastSeen: "2026-01-01T00:00:00.000Z", reason: "conflict" as const };
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("A"), deferrals: { apply: episode }, partial: { incomingKey: "a", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true } } });
     await saveState(root, initial);
     const delayed: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 1, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("delayed") } }] };
-    const toB = { ...delayed, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("B") } }] };
+    const toB = { ...delayed, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("B"), deferrals: { apply: episode }, partial: { incomingKey: "b", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true } } }] };
     expect((await applyStateSavePacket(root, toB, { lock: lock() })).status).toBe("accepted");
     const afterB = await loadState(root, stream);
     const backA = composeStateSavePacket(afterB, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: ["r"], values: { bases: { r: section("A") } } });
     expect((await applyStateSavePacket(root, backA, { lock: lock() })).status).toBe("accepted");
     const rejected = await applyStateSavePacket(root, delayed, { lock: lock() });
     expect(rejected).toMatchObject({ status: "rejected", reason: "repo-generation" });
+    expect(repoRecordsForState(await loadState(root, stream)).r).toMatchObject({ deferrals: { apply: episode }, partial: { incomingKey: "b" } });
   });
 
   test("UNSEEN-PATH ABSENCE: stale global rejects the whole packet", async () => {
@@ -333,5 +335,103 @@ describe("design 93 §6 transactional unit", () => {
       },
     })).rejects.toThrow(/3 recomputes exhausted/);
     expect(count).toBe(3);
+  });
+
+  test("deferral lanes merge across CAS recompute and stale sourceSeq without regressing repo truth", async () => {
+    const applyDeferral = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-02T00:00:00.000Z",
+      reason: "git-busy" as const,
+    };
+    const captureDeferral = {
+      lane: "capture" as const,
+      deferredSince: "2026-02-01T00:00:00.000Z",
+      reasonSince: "2026-02-01T00:00:00.000Z",
+      lastSeen: "2026-02-02T00:00:00.000Z",
+      reason: "artifact" as const,
+    };
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 5, base: section("five") } });
+    initial.lastSyncedSequence = 5;
+    initial.lastSyncedManifest = manifest("five", { r: section("five") });
+    const concurrent = baseState({ r: { repoGen: 1, sourceSeq: 7, base: section("seven"), deferrals: { apply: applyDeferral }, idxProj: "cached" } });
+    concurrent.lastSyncedSequence = 7;
+    concurrent.lastSyncedManifest = manifest("seven", { r: section("seven") });
+    const packets: StateSavePacket[] = [];
+    await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 5,
+      observedRepos: ["r"],
+      values: { deferrals: { r: { capture: captureDeferral } } },
+    }, {
+      apply: async (_root, packet) => {
+        packets.push(packet);
+        if (packets.length === 1) return { status: "rejected", reason: "repo-generation", state: concurrent };
+        return { status: "accepted", state: concurrent };
+      },
+    });
+    expect(packets[1]?.repos[0]?.newRecord).toMatchObject({
+      sourceSeq: 7,
+      base: section("seven"),
+      idxProj: "cached",
+      deferrals: { apply: applyDeferral, capture: captureDeferral },
+    });
+    const cleared = composeStateSavePacket(concurrent, {
+      expectedStream: stream,
+      sourceGlobalSeq: 5,
+      observedRepos: ["r"],
+      values: { deferrals: { r: { apply: null } } },
+    });
+    expect(cleared.repos[0]?.newRecord).toMatchObject({ sourceSeq: 7, base: section("seven"), idxProj: "cached" });
+    expect(cleared.repos[0]?.newRecord.deferrals).toBeUndefined();
+
+    const acceptedCommit = composeStateSavePacket(concurrent, {
+      expectedStream: stream,
+      sourceGlobalSeq: 8,
+      globalManifest: manifest("eight", { r: section("eight") }),
+      observedRepos: ["r"],
+      values: { bases: { r: section("eight") } },
+    });
+    expect(acceptedCommit.repos[0]?.newRecord.deferrals?.apply).toEqual(applyDeferral);
+  });
+
+  test("explicit lane and partial clears are distinct from omitted values", () => {
+    const apply = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "conflict" as const,
+    };
+    const partial = { incomingKey: "k", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true };
+    const state = baseState({ r: { repoGen: 2, sourceSeq: 4, base: section("base"), deferrals: { apply }, partial } });
+    expect(changedSidecarRepoKeys(state, {})).toEqual([]);
+    expect(changedSidecarRepoKeys(state, { deferrals: { r: { apply: null } } })).toEqual(["r"]);
+    expect(changedSidecarRepoKeys(state, { partial: { r: null } })).toEqual(["r"]);
+    expect(changedSidecarRepoKeys(baseState({ r: { repoGen: 0, sourceSeq: 0 } }), { deferrals: { r: { apply } } })).toEqual(["r"]);
+    expect(changedSidecarRepoKeys(baseState({ r: { repoGen: 0, sourceSeq: 0 } }), { partial: { r: partial } })).toEqual(["r"]);
+    const packet = composeStateSavePacket(state, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { bases: { r: section("base") }, deferrals: { r: { apply: null } }, partial: { r: null } },
+    });
+    expect(packet.repos[0]?.newRecord.deferrals).toBeUndefined();
+    expect(packet.repos[0]?.newRecord.partial).toBeUndefined();
+  });
+
+  test("reset disposes git journal directory and shell deferral sidecar", async () => {
+    await saveState(root, baseState());
+    const journal = path.join(root, ".rbox", "state", "git-journal");
+    const shell = path.join(root, ".rbox", "state", "shell.deferrals");
+    await fs.mkdir(journal, { recursive: true });
+    await fs.writeFile(path.join(journal, "entry"), "x");
+    await fs.writeFile(shell, "v1\n");
+    const mutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
+    await resetSyncState(root, stream, mutex);
+    await releaseWorkspaceSyncMutex(mutex);
+    expect(await fs.stat(journal).catch(() => undefined)).toBeUndefined();
+    expect(await fs.stat(shell).catch(() => undefined)).toBeUndefined();
   });
 });
