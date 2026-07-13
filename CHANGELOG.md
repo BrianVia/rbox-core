@@ -6,6 +6,39 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-07-13 — upload lane rebuilt: full batches, receipts drained in-flight; codebase modularized
+
+### Improved (live by default; founder ship-live call)
+- **Batches ship full (design 112).** Upload batching defaults to the fill-v2
+  dispatch policy with 64-record batches (server cap raised in lockstep):
+  dispatch-on-full with quiet/absolute deadlines replaces the fixed 10ms timer
+  that shipped half-empty batches (measured 17.3/32 records, 148KB of an 8MiB
+  cap, ~733ms server settle paid 2,360× on a greenfield publish). Kill switch:
+  `RBOX_BATCH_FILL=v1`. Version-skew guard: machine-readable `too_many_records`
+  400 + strictly-shrinking client latch.
+- **Receipts drain during upload (design 111).** Redemption receipts are
+  redeemed while blobs upload instead of accumulating into a post-upload tail
+  (37.4s measured on 49k receipts), with count+byte-bounded batches and a
+  session cap clamp. The commit-enclosed final drain remains the catch-all.
+  Kill switch: `RBOX_REDEEM_DRAIN=off`.
+- **First-publish observability**: dispatch-reason telemetry, receipt
+  request/byte stats, commit-enclosed `finalDrain` timing, repaired
+  redemption/upload overlap accounting (interval-union), server-side redeem
+  phase splits.
+
+### Changed
+- **Codebase modularized (design 113).** Six 1,000–2,500-line engine files →
+  ~24 owner-responsibility modules behind exact-surface barrels, with
+  `docs/CODEMAP.md` as the navigation contract. Behavior-identical (proven per
+  wave: rename/content-equivalence, single-instance state, cycle baseline,
+  compiled crypto smoke, token-stream-identical comment sweep). Review
+  archaeology moved from code comments to the design ledgers.
+- **O(change) commit admission enforced (design 102).** Prod validated 259/259
+  shadow agreements, then enforced: admission dropped 5,956ms → 213ms measured.
+- Design 109 (auth-call storm) evaluated and parked on gate-0 evidence
+  (~89ms/request pre-handler — batch fill was the real lever); design 110
+  (commit tail) pending its Phase-0 verdict from the evaluation sweep.
+
 ## [1.3.0] — 2026-07-13 — files-first first publish ON by default; init fixed for scripting
 
 ### Added
