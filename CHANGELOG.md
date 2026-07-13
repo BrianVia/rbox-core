@@ -5,6 +5,19 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.5.0] — 2026-07-13 — blob packing: small-file uploads scale with bandwidth
+
+### Added
+- **Blob packing (design 114, #268/#271).** Small ciphertext blobs pack into
+  bandwidth-sized R2 objects instead of one-object-per-blob: the small-file
+  lane stops being R2-operation-bound (~48.8 Mbps measured wall pre-packing)
+  and scales toward line rate like the multipart lane. Reader path +
+  server accounting ship ON (mixed packed/unpacked estates are permanent);
+  the pack WRITER is behind `RBOX_BLOB_PACK` pending field validation gates.
+  GC/fence correctness per the six-round adversarial review: epoch-bound
+  candidacy, live-clock deletion stamps, durable swept tombstones, the
+  `rbox_delete_fence_pack` trigger, rollback floor (pre-1.5 binaries cannot
+  read packs — reader-first rollout).
 
 ## [1.4.2] — 2026-07-13 — the crypto pool actually ships: Bun compile bug fixed, init exits clean
 
