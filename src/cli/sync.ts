@@ -104,11 +104,12 @@ type CurrentWriteContext = {
 };
 type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWriteContext> };
 
-/** Design 108: files-first first publish is flag-gated, default OFF. Exactly `=1`
- *  activates it; any other value (or unset) keeps the byte-identical legacy path —
- *  including init's report/metrics wiring, which gates on this same flag so a flag-off
- *  `rbox init` emits exactly the pre-108 output (codex round-6 MAJOR 1). */
-export const filesFirstFlagEnabled = (): boolean => process.env.RBOX_FILES_FIRST === "1";
+/** Design 108: files-first first publish. Default ON (founder call 2026-07-13 —
+ *  single-user fleet, and the path is genesis-only so it is inert for every existing
+ *  workspace). `RBOX_FILES_FIRST=0` is the kill switch: it restores the byte-identical
+ *  legacy path, including init's report/metrics wiring, which gates on this same flag
+ *  so a flag-off `rbox init` emits exactly the pre-108 output (codex round-6 MAJOR 1). */
+export const filesFirstFlagEnabled = (): boolean => process.env.RBOX_FILES_FIRST !== "0";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Exponential backoff with jitter, so two hot daemons don't livelock retrying. */

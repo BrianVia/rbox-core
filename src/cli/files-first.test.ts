@@ -10,7 +10,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { push, type SyncDeps } from "./sync.js";
+import { filesFirstFlagEnabled, push, type SyncDeps } from "./sync.js";
 import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { PhaseReport, gitSectionBlobRefs, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
@@ -97,7 +97,9 @@ const noBackoff = async () => {};
 
 beforeEach(async () => {
   savedFlag = process.env.RBOX_FILES_FIRST;
-  delete process.env.RBOX_FILES_FIRST;
+  // Explicit kill switch: tests that don't opt in with "1" exercise the legacy path.
+  // (The production default is ON — pinned by the dedicated default test below.)
+  process.env.RBOX_FILES_FIRST = "0";
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-ff-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   remote = new FakeRemote();
@@ -129,6 +131,14 @@ async function repoWithFile(rel = "repo", file = "a.txt", content = "hello world
 }
 const st = () => loadState(root, STREAM);
 const gitKeys = (m?: Manifest) => Object.keys(m?.gitRepos ?? {});
+
+// ── 0. production default is ON; "0" is the kill switch ─────────────────────
+test("files-first defaults ON with the env unset; =0 disables", () => {
+  delete process.env.RBOX_FILES_FIRST;
+  expect(filesFirstFlagEnabled()).toBe(true);
+  process.env.RBOX_FILES_FIRST = "0";
+  expect(filesFirstFlagEnabled()).toBe(false);
+});
 
 // ── 1. flag OFF: git captured inline (byte-identical legacy path) ───────────
 test("flag OFF: genesis captures git INLINE at commit 1 (no files-first)", async () => {
