@@ -24,7 +24,7 @@ export interface StatusSnapshot {
   deleted: number;
   /** Repos whose local git state a push would publish (`gitDivergenceCount`) —
    *  without it a clean file tree + a fresh local commit reads "in sync" while
-   *  push would commit a git section (codex R1). Optional: 0 when git-sync is off. */
+   *  push would commit a git section. Optional: 0 when git-sync is off. */
   gitChanged?: number;
   trackedFiles: number;
   daemonRunning: boolean;
@@ -238,7 +238,7 @@ export function healthLine(s: StatusSnapshot): string {
   }
 
   // 3. A transfer is live right now. Gated on BOTH daemon liveness and freshness
-  //    (codex R5): only the daemon writes `active`, so with the daemon stopped —
+  //    only the daemon writes `active`, so with the daemon stopped —
   //    even freshly killed mid-op — there is no live transfer to report; and a
   //    daemon that died with its pidfile intact must not show "syncing" forever.
   if (active) {
@@ -303,7 +303,7 @@ export function trashLine(stats: { files: number; bytes: number } | undefined): 
 }
 
 /** Human trail of what background sync last did (from the activity sidecar), most
- *  recent first. TWO slots on purpose (codex R2): a commit right after a
+ *  recent first. TWO slots on purpose: a commit right after a
  *  409-recovery pull must not mask the local-tree mutations that pull applied.
  *  Empty when there is no activity record (daemon never ran here). */
 export function lastSyncLines(activity: DaemonActivity | undefined, now: number): string[] {

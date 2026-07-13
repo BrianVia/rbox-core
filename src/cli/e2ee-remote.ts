@@ -183,7 +183,7 @@ export class E2eeRemote implements SyncRemote {
       body.encManifestSha === fastFoldBase.meta.encManifestSha &&
       signedChain.length === fastFoldBase.meta.chain.length &&
       fastFoldBase.meta.chain.every((sha, index) => signedChain[index] === sha)) {
-      // Round 1 banned current-head cache returns because they bypassed
+      // Current-head cache returns are banned when they would bypass
       // openCommit's account/roster gates. Here verifiedHead() has re-run those
       // gates this pull, the signed address/chain/epochs exactly equal
       // §3.4-verified persisted evidence, and no bytes exist for openCommit to
@@ -696,7 +696,7 @@ export class E2eeRemote implements SyncRemote {
     // manifest.files, so they must be added to blobRefs explicitly — else they're uploaded but
     // never granted/charged and GC could reclaim a live bundle. Union across repos (design 43
     // §6.5): two repos referencing the same convergent encSha contribute ONE ref. Use the
-    // CIPHERTEXT size (codex M2): the `size` is advisory (server bills measured R2 bytes) and
+    // CIPHERTEXT size: the `size` is advisory (server bills measured R2 bytes) and
     // the ciphertext size is what the server sees anyway, so no plaintext git size (≈ repo
     // size) enters a server-visible ref/sidecar.
     const blobRefs = blobRefsForManifest(manifest);

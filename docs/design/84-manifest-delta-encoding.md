@@ -1464,3 +1464,11 @@ self-review; (c) three designs (91/92/93) landed between draft and review,
 and every one of them invalidated a section written weeks earlier — designs
 that touch the sync core must be re-based on main before review, not after.
 Confirm or correct after Phase A.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/e2ee-remote.ts` (current-head cache): was "Round 1" — account/roster-gate trust invariant retained in code.

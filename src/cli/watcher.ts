@@ -23,7 +23,7 @@ export interface WatchOptions {
   /** Post-init backend error (FSEvents stream died, inotify overflow). Correctness
    *  is unaffected (the reconcile scans are the floor) but the daemon uses this to
    *  stop TRUSTING the watcher — a dead stream must not back the safety scan off
-   *  (design 49 / codex R1). Events may well keep flowing after a transient error;
+   *  (design 49). Events may well keep flowing after a transient error;
    *  the callback is a health signal, not a teardown. */
   onError?: (err: Error) => void;
   /** Fires after matcher filtering and before debounce coalescing. */

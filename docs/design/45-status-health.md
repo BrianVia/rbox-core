@@ -143,3 +143,32 @@ state.
 - `activity.test.ts` — round-trip, corrupt-file → undefined, best-effort writes.
 - `daemon.ts` integration (in `sync.test.ts` harness style): a push that commits
   writes `last`; a pump error writes `halt`; the next success clears it.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync-git/status.ts` (git status dimension): was "codex R1" — planner-mirroring invariant retained in code.
+- `src/cli/sync-git/status.ts` (suppression ordering): was "codex R4" — suppressions-before-preflight invariant retained in code.
+- `src/cli/sync-git/status.ts` (structural refusal): was "codex R2" — unpublished-drop counting invariant retained in code.
+- `src/cli/sync-git/git-sync.test.ts` (structural drop): was "codex R2" — unpublished-change regression guard retained in code.
+- `src/cli/sync-git/git-sync.test.ts` (clean files plus pending git): was "codex R1" — status-verdict guard retained in code.
+- `src/cli/activity.ts` (`lastPush` slot): was "codex R2" — recovery-pull visibility invariant retained in code.
+- `src/cli/activity.ts` (nested-slot validation): was "codex R3" — malformed-slot isolation invariant retained in code.
+- `src/cli/config.ts` (rebind sidecars): was "codex R4" — per-binding sidecar reset invariant retained in code.
+- `src/cli/daemon/daemon.ts` (same-kind halt healing): was "codex R1 BLOCKER" — halt persistence invariant retained in code.
+- `src/cli/daemon/daemon.ts` (settled shell sidecar): was "codex R4 P1" — idle-settle invariant retained in code.
+- `src/cli/daemon/daemon.ts` (`lastPush` slot): was "codex R2" — recovery-pull visibility invariant retained in code.
+- `src/cli/daemon/daemon.ts` (pull-inside-push hook): was "codex R2" — retry-loop activity recording invariant retained in code.
+- `src/cli/daemon/daemon.ts` (activity write latency): was "codex R1" — non-blocking sidecar persistence invariant retained in code.
+- `src/cli/daemon/daemon.ts` (pump-exit settle): was "codex R4 P1" — pending-to-ok transition invariant retained in code.
+- `src/cli/daemon/daemon-activity.test.ts` (same-kind heal guard): was "Codex R1 BLOCKER regression" — rewritten as a neutral regression guard.
+- `src/cli/daemon/daemon-activity.test.ts` (dedup episode guard): was "Codex R4 regression" — rewritten as a neutral regression guard.
+- `src/cli/status-view.ts` (git divergence field): was "codex R1" — pending-git visibility invariant retained in code.
+- `src/cli/status-view.ts` (stopped daemon rendering): was "codex R5" — daemon-ownership invariant retained in code.
+- `src/cli/status-view.ts` (two activity slots): was "codex R2" — recovery-pull visibility invariant retained in code.
+- `src/cli/status-view.test.ts` (409 recovery trail): was "codex R2 regression" — rewritten as a neutral regression guard.
+- `src/cli/sync/deps.ts` (`onPullApplied` trail): was "codex R2" — forensic-log/activity-trail invariant retained in code.
+- `src/cli/sync/pull.ts` (pull-applied hook): was "codex R3" — hook-after-save invariant retained in code.

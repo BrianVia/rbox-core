@@ -161,8 +161,8 @@ async function makeGitCaptureDir(workspaceRoot: string): Promise<string> {
  * - dir repo → refScope "all": bundle `--single-worktree --all` + refs/stash + enumerated
  *   pins. The `--single-worktree` restriction (design 68 §3.1) matters ONLY for a main clone
  *   with linked worktrees: plain `--all` runs rev-list over EVERY worktree's HEAD, so a
- *   detached linked-worktree HEAD would smuggle tier-2 state into the main bundle (codex M1;
- *   live-repro'd git 2.50.1). `--single-worktree` restricts rev-list to the main checkout's
+ *   detached linked-worktree HEAD would smuggle tier-2 state into the main bundle —
+ *   live-repro'd git 2.50.1. `--single-worktree` restricts rev-list to the main checkout's
  *   view; branches checked out in worktrees are ordinary `refs/heads/*` and still ride. It is
  *   a harmless no-op on a worktree-free repo. Ancient git without `--single-worktree`
  *   falls back to plain `--all` only when no live linked worktrees exist; with live

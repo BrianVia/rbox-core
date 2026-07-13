@@ -213,8 +213,8 @@ export function setCryptoPoolSelectorForProcess(selector: (kek: Buffer) => Crypt
 
 /**
  * Encrypt `srcPath` to a temp ciphertext file. Re-hashes the actual bytes for key
- * derivation (review finding #1) and returns the ciphertext content-address
- * (`encSha = sha256(ciphertext||tag)`), known only after encryption (finding #3).
+ * derivation and returns the ciphertext content-address
+ * (`encSha = sha256(ciphertext||tag)`), known only after encryption.
  *
  * Snapshot-first (concurrent-write safety): the source is copied to an IMMUTABLE
  * snapshot temp ONCE, and `plaintextSha`, the ciphertext, and `encSha` all derive

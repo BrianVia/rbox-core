@@ -107,3 +107,13 @@ starship users for the cost of a paragraph. Not shipped as code.
 - Completions: generated script contains every public command + a known flag;
   contains NO hidden/internal tokens; output is stable (snapshot).
 - shell-init: output embeds both hooks + completions; `zsh -n` parses it clean.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/shell-init.test.ts` (round-1 regression section): was "codex R1 regressions" — rewritten as a neutral guard heading; test-name strings remain unchanged.
+- `src/cli/shell-init.test.ts` (round-2 regression section): was "codex R2 regressions" — rewritten as a neutral guard heading; test-name strings remain unchanged.
+- `src/cli/activity.ts` (sequence-zero prompt rendering): was "codex R1" — never-synced rendering invariant retained in code.

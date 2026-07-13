@@ -194,3 +194,12 @@ responsible for the tail.
 6. Do not solve scan narrowing, size-aware file write scheduling, or decrypt
    parallelism here; those are follow-ups only if Phase 0/1 measurements show they are
    the remaining bottleneck.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync-git/apply.ts` (fresh-run classification): was "review finding" — non-sequence-keyed classification invariant retained in code.
+- `src/engine/apply.ts` (lane timing): was "design 74/76 reviews" — per-blob cost decomposition invariant retained with bare design pointers.

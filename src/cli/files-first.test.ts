@@ -272,10 +272,10 @@ test("a no-op push renders NO FirstPublishStats", async () => {
 });
 
 // ── 8. metric honesty: 409-then-success emits EXACTLY ONE FirstPublishStats ──
-// (round-3/round-4 fixes: finalize only after admission+state-save, and render the
+// (finalize only after admission+state-save, and render the
 // headline timeToFilesSyncedMs on the successful attempt even though its retry
 // re-uploaded nothing — the files DID sync, on the earlier 409'd attempt.) The FAILED
-// attempt must render none (pre-108 bug rendered before the conflict check) and must not
+// attempt must render none and must not
 // leak the timing singleton.
 test("409-then-success emits exactly ONE FirstPublishStats (headline KPI) and leaves timing disabled", async () => {
   process.env.RBOX_FILES_FIRST = "1";

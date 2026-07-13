@@ -62,7 +62,7 @@ function pairingWrapCtx(accountId: string, accountEpoch: number): WrapContext {
 }
 function kekWrapCtx(accountId: string, workspaceId: string, accountEpoch: number, keyEpoch: number): WrapContext {
   // workspaceId is bound into the wrap AAD so a same-account/same-epoch KEK wrap from
-  // ANOTHER workspace can't be substituted (per-workspace key separation, codex r2).
+  // ANOTHER workspace can't be substituted (per-workspace key separation).
   return { accountId, workspaceId, accountEpoch, keyEpoch, wrappedKeyKind: "KEK", purpose: "rbox/kek-wrap/v1" };
 }
 

@@ -223,8 +223,8 @@ async function executeInitPlan(
       const sp = spinner("publishing initial snapshot — scanning files");
       try {
         deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
-        // Design 108 §3.6: the milestone + report wiring is FLAG-GATED (codex round-6
-        // MAJOR 1) — a flag-off init must emit exactly the pre-108 output (no summary
+        // (design 108): the milestone + report wiring is FLAG-GATED — a flag-off init
+        // must emit exactly the pre-108 output (no summary
         // line, no report-enabled commit path). Under the flag: the command-level
         // "files synced" milestone is captured BEFORE scan so timeToFilesSyncedMs
         // includes the scan wall, and a fresh enabled report renders FirstPublishStats.

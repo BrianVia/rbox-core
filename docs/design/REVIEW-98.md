@@ -222,3 +222,12 @@ measured gate; file-variant framing coverage extended to producer-spilled
 Tier-2 leases with the abort settlement split (queued/undispatched → abandoned
 immediately; already-dispatched → release at HTTP settlement). J3: all
 verified, one wording echo in 99 §10 fixed as dictated. Seam ALIGNED.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/publish-pipeline/stale-temp.ts` (PID-reuse guard): was "design review rounds 5/6" — PID-reuse invariant retained in code.
+- `src/cli/publish-pipeline/receipt-drainer.ts` (replacement receipt): was "round-2 item 5" — redeem-before-forget invariant retained in code.

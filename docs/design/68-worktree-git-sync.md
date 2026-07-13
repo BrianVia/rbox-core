@@ -235,3 +235,12 @@ folded into the sections above. Recorded here per repo convention:
 - **M5 (matrix gaps):** V9–V14 added.
 - **m6/m7:** usage.md caveat reworded to "primary clones ineligible /
   pointer checkouts captured today"; backlog citation paths corrected.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/sync-git/plan.ts` (linked-worktree pointer skip): was "codex M4" — base-carry-never-drop invariant retained in code.
+- `src/engine/git/capture.ts` (detached linked-worktree HEAD): was "codex M1" — tier-2 exclusion and live-reproduction evidence retained in code.

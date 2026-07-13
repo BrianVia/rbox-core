@@ -158,7 +158,7 @@ test("a malformed / wrong-version sidecar degrades silently (no glyph, no banner
   expect(banner).toBe("");
 });
 
-// ── codex R1 regressions ─────────────────────────────────────────────────────
+// ── review-regression guards ─────────────────────────────────────────────────────
 
 test("a hostile workspace name NEVER executes: backticks / $() / prompt escapes are inert text (codex R1 BLOCKER)", () => {
   if (!ZSH) return;
@@ -208,7 +208,7 @@ test("RBOX_NO_RPROMPT=1 is retroactive: a re-eval removes the auto-appended segm
   expect(out.match(/SECOND:\[(.*)\]/)?.[1]).not.toContain("$RBOX_PROMPT");
 });
 
-// ── codex R2 regressions ─────────────────────────────────────────────────────
+// ── review-regression guards ─────────────────────────────────────────────────────
 
 test("hostile shell options (SH_WORD_SPLIT, GLOB_SUBST) cannot glob-expand a '*' name or split spacey roots (codex R2)", () => {
   if (!ZSH) return;

@@ -146,3 +146,17 @@ originates at `replaceManifestFromScan`; the drop-spanning test drives the real
 paths and would fail without `originUntrusted`). Fresh full sweep found no
 BLOCKER/MAJOR correctness or flag-off-identity hole. Implementation aligned in 2
 rounds. tsc clean; `bun test ./src/` 1297 pass / 2 tolerated host-only fails.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/daemon/daemon.ts` (flag-off watcher distrust): was "codex R1" — post-error distrust invariant retained in code.
+- `src/cli/daemon/daemon.ts` (armed safety timer): was "codex R2" — pull-forward invariant retained in code.
+- `src/cli/daemon/daemon.ts` (watcher churn): was "codex R1" — 60-second cadence restoration invariant retained in code.
+- `src/cli/daemon/daemon.ts` (safety-floor re-arm): was "codex R2" — no-wait-out invariant retained in code.
+- `src/cli/daemon/daemon.ts` (re-trust coverage evidence): was "codex M3" — inside-scan evidence invariant and design 85 R1 F8 ID retained in code.
+- `src/cli/drift-audit.ts` (duplicate contamination): was "codex impl-review M1" — monotonic contamination invariant retained in code.
+- `src/cli/daemon/daemon-safety.test.ts` (armed timer regression): was "codex R2" — pull-forward guard retained in code; the adjacent "codex R1 repro" evidence remains verbatim.

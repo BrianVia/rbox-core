@@ -8,8 +8,8 @@
  * non-negative safe integers, booleans, null, arrays, and plain objects — never
  * floats. We REJECT anything outside that (NaN, Infinity, non-integer, unsafe
  * integer, bigint, undefined, functions) rather than guess, because a silent
- * coercion across runtimes is exactly the canonicalization ambiguity codex
- * flagged. There is no float-formatting code here on purpose.
+ * coercion across runtimes is exactly the canonicalization ambiguity this
+ * codec exists to exclude. There is no float-formatting code here on purpose.
  */
 
 /** Serialize a value to RFC 8785 canonical JSON bytes (UTF-8). */

@@ -368,7 +368,7 @@ test("binding bootId does not affect attribution when pidfile and activity match
 // ── lastSyncLines ─────────────────────────────────────────────────────────────
 
 test("lastSyncLines: push and pull have separate slots, most recent first", () => {
-  // codex R2 regression: the commit after a 409-recovery pull must not mask the
+  // Regression guard: the commit after a 409-recovery pull must not mask the
   // local-tree mutations that pull applied — both render, newest on top.
   const activity: DaemonActivity = {
     at: iso(5),

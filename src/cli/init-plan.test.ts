@@ -177,7 +177,7 @@ test("collapseHome: collapses the home prefix to ~, leaves outside paths untouch
   expect(collapseHome("/any/path", "")).toBe("/any/path"); // no home known
 });
 
-// ── device-id unification (review #9) ──────────────────────────────────────
+// ── device-id unification ──────────────────────────────────────
 
 test("workspace device id precedence", () => {
   let mints = 0;

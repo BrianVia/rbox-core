@@ -373,7 +373,7 @@ test("apply into a POINTER repo filters stash/tags, ownership-guards sibling bra
   expect(res2.reason).toContain("ownership-deferred");
 });
 
-// ---- apply fail-closed + shape refusals (codex round-1 fixes) -------------------
+// ---- apply fail-closed + shape-refusal guards ----------------------------------
 
 test("wrong-KEK apply into a FRESH target leaves NO .git behind (decrypt before init)", async () => {
   const A = path.join(tmp, "A");

@@ -11,7 +11,7 @@ export interface LocalSnapshot {
   opState: Record<string, Buffer>;
   /** Bytes of the refs/stash REFLOG (logs/refs/stash), if present. Publishing
    *  refs/stash appends a reflog entry (--create-reflog) — a rolled-back apply must
-   *  not leak remote entries into `git stash list` (codex step-3 MAJOR). */
+   *  not leak remote entries into `git stash list`. */
   stashReflog?: Buffer;
 }
 export async function snapshotLocal(ctx: RepoCtx): Promise<LocalSnapshot> {

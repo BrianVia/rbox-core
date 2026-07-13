@@ -178,3 +178,24 @@ syncing trash between machines (explicitly never).
   clamped 0–1 TiB (default 2 GiB); anything invalid → defaults.
 - Eviction fallback: with trash disabled (`days: 0`) a dir eviction moves to
   a visible `conflictName` instead (something must receive the bytes).
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/daemon/daemon.ts` (type-flip tally): was "review M2" — apply-time accumulation invariant retained in code.
+- `src/cli/sync/deps.ts` (push consent separation): was "design-review B2" — pull/push consent separation retained in code.
+- `src/cli/sync/deps.ts` (type-flip callback): was "review M2" — trash/logging invariant retained in code.
+- `src/cli/main-dispatch.ts` (push consent wiring): was "review B2" — op-scoped consent invariant retained in code.
+- `src/cli/sync/push-guard.test.ts` (mass-delete consent guard): was "review B2" — non-leak regression invariant retained in code.
+- `src/engine/trash.ts` (active-batch safety): was "design-review B3" — cross-process ownership invariant retained in code.
+- `src/engine/trash.ts` (restore collision): was "design-review M4" — never-overwrite invariant retained in code.
+- `src/engine/apply.ts` (ancestor preflight): was "design-review M3" — ancestor obstruction guard retained in code.
+- `src/engine/apply.ts` (already-absent delete): was "design-review M1" — absence handling invariant retained in code.
+- `src/engine/apply.ts` (conflict-copy naming): was "design-50 review" — collision-free suffixing invariant retained with bare design pointer.
+- `src/engine/apply-safety.test.ts` (regression section): was "codex impl-round-1 regressions" — rewritten as a neutral guard heading.
+- `src/engine/apply-safety.test.ts` (sub-threshold delete): was "impl-review BLOCKER" — exact failure-case guard retained in code.
+- `src/engine/trash.test.ts` (first regression section): was "codex impl-round-1 regressions" — rewritten as a neutral guard heading.
+- `src/engine/trash.test.ts` (second regression section): was "codex impl-round-2 regressions" — rewritten as a neutral guard heading.

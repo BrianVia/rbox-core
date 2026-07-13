@@ -167,7 +167,7 @@ test("push carries a previously-synced file through an EACCES hash fault", async
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedManifest.files.some((f) => f.path === "a.txt")).toBe(true);
 });
 
-// Pull sites intentionally pass NO deferred set (impl review D1-R2): a path the
+// Pull sites intentionally pass NO deferred set: a path the
 // pre-apply scan dropped reaches reconcile as locally-absent, and every branch is
 // byte-preserving — remote-untouched takes the no-action arm; remote-changed plans
 // a write whose expectedLocal (absent) mismatches the on-disk churn, so apply

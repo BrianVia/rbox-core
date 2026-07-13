@@ -135,7 +135,7 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
     const armedBefore = daemon.safetyTimer;
     onError!(new Error("FSEvents stream died"));
     expect(daemon.watcherHealthy).toBe(false); // …and stays false: trust is not restored
-    // codex R2: the error must also pull the ARMED backed-off timer forward — the
+    // The error must also pull the ARMED backed-off timer forward — the
     // flag alone would wait out the remaining (up to 5m) timeout.
     expect(daemon.safetyDelay).toBe(FLOOR);
     expect(daemon.safetyTimer).not.toBe(armedBefore);

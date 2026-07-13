@@ -248,7 +248,7 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   expect(halted?.halt?.count).toBe(1);
   expect(halted?.halt?.op).toBe("pull");
 
-  // Codex R1 BLOCKER regression: a successful op of a DIFFERENT kind (the queued
+  // Regression guard: a successful op of a DIFFERENT kind (the queued
   // no-op push, every safety scan) must NOT heal a pull halt — the guard warning
   // would flap off within seconds of every trip.
   daemon.want.push = true;
@@ -264,7 +264,7 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   expect(healed?.halt).toBeUndefined();
   expect(healed?.at).toBeDefined();
 
-  // Codex R4 regression: a NEW failure with the SAME message after a heal is a new
+  // Regression guard: a NEW failure with the SAME message after a heal is a new
   // episode — it must persist a fresh halt (not silently count as dedup repeat 2..9
   // and leave activity.json healed).
   remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");

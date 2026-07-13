@@ -360,10 +360,10 @@ export class RboxDaemon {
           onError: (err) => {
             if (!retrustEnabled()) {
               // Design-104 flag OFF (default): today's body, verbatim — one backend
-              // error and the watcher is no longer TRUSTED (codex R1): a dead
+              // error and the watcher is no longer TRUSTED: a dead
               // FSEvents/inotify stream must not let the safety scan — now the
               // only healer — sit backed off at 5m. Sync itself is unaffected. An
-              // already-armed backed-off timer is pulled forward too (codex R2) —
+              // already-armed backed-off timer is pulled forward too —
               // the flag alone would wait out the remaining timeout.
               if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
               this.watcherHealthy = false;
@@ -419,7 +419,7 @@ export class RboxDaemon {
     }
   }
 
-  /** Record watcher churn AND pull a backed-off safety timer forward (codex R1):
+  /** Record watcher churn AND pull a backed-off safety timer forward:
    *  the flag alone would let a drop from THIS storm wait out an armed 5m timer —
    *  the scan must return to its 60s cadence the moment there is churn to protect. */
   private noteChurn(): void {
@@ -429,7 +429,7 @@ export class RboxDaemon {
   }
 
   /** Re-arm a backed-off safety timer at the 60s floor NOW. Shared by churn and
-   *  watcher-error (codex R2): both mean "the next scan matters — don't wait out
+   *  watcher-error: both mean "the next scan matters — don't wait out
    *  an armed 5m timeout". No-op at the floor, so it can never double-schedule. */
   private pinSafetyFloor(): void {
     if (this.safetyDelay > SAFETY_SYNC_MS && !this.stopped) {
@@ -627,8 +627,8 @@ export class RboxDaemon {
             }
             // Op completed: any live progress is over. A standing halt is healed ONLY by
             // a success of the op kind that recorded it — a mass-delete-guard halt from a
-            // pull must survive the queued push's no-op success and every safety scan
-            // (codex R1 BLOCKER: anything less flaps the warning off within seconds).
+            // pull must survive the queued push's no-op success and every safety scan.
+            // Anything less flaps the warning off within seconds.
             // Persist when something visible changed (or as a throttled heartbeat, so
             // `rbox status` can say "last checked: Ns ago" without idle disk churn).
             const terminalBlocked = op === "push" && this.pushTerminalBlocked;
@@ -701,7 +701,7 @@ export class RboxDaemon {
       }
       await this.cache.save(this.root);
       this.writeAmbientStatus();
-      // Settle the sidecar (codex R4 P1): all wants are drained here, so re-render if
+      // Settle the sidecar: all wants are drained here, so re-render if
       // the state CHANGED from the last write — the mid-pump write said `pending`
       // (push still queued) and the no-op push wrote nothing; an idle workspace must
       // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
@@ -758,7 +758,7 @@ export class RboxDaemon {
     this.lastLoggedSeq = res.sequence;
     if (res.committed) {
       // The status trail: "last push: 2m ago — N files → sequence S" (design 45).
-      // Its own slot — it must never mask what a recovery pull applied (codex R2).
+      // Its own slot — it must never mask what a recovery pull applied.
       this.activity.lastPush = { at: new Date().toISOString(), files: res.manifest.files.length, sequence: res.sequence };
       this.activityDirty = true;
     }
@@ -922,7 +922,7 @@ export class RboxDaemon {
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
     // here and in doPush's deps so the pull inside push's 409 recovery is recorded
-    // identically (codex R2: its actions are discarded by the retry loop).
+    // identically; its actions are discarded by the retry loop.
     const pullDeps: SyncDeps = {
       ...this.e2ee,
       cache: this.cache,
@@ -989,11 +989,11 @@ export class RboxDaemon {
 
   /** Pending activity persistence — writes CHAIN on this promise so overlapping
    *  saves can never land out of order (an older record must not win). NEVER awaited
-   *  on the sync path (a slow sidecar write must not delay a single op — codex R1);
+   *  on the sync path (a slow sidecar write must not delay a single op);
    *  drained only by stop() so graceful shutdown flushes the final record. */
   private activityWrite: Promise<void> = Promise.resolve();
   /** The shell.line state most recently WRITTEN — compared at pump exit so an idle
-   *  workspace settles back to `ok` (codex R4 P1: the last op's write can render
+   *  workspace settles back to `ok` (the last op's write can render
    *  `pending` because the follow-up push was still queued, and the no-op push
    *  never writes — without the settle pass the glyph reads pending forever). */
   private lastShellState?: string;
@@ -1073,8 +1073,8 @@ export class RboxDaemon {
     const stable = this.watcher && this.watcherDegraded && this.watcherErrorGeneration === opWatcherErrorGeneration;
     if (stable) { this.watcherDegraded = false; this.writeAmbientStatus(); }
     if (!retrustEnabled()) return;
-    // Re-trust uses the scan's OWN inside-scan coverage evidence (design 85 R1 F8 /
-    // codex M3): coverage originates at the walker; a drop during config-reload OR
+    // Re-trust uses the scan's OWN inside-scan coverage evidence (design 85 R1 F8):
+    // coverage originates at the walker; a drop during config-reload OR
     // the walk advances errorGen past errorGenAtStart and blocks re-trust.
     const clean = this.watcher !== undefined && cov.coverage === "full-tree" && cov.errorGenAtStart === this.watcherErrorGeneration;
     if (!clean) return;
@@ -1286,7 +1286,7 @@ export class RboxDaemon {
     setTimeout(() => void this.stop(), 0);
   }
 
-  /** Type-flip evictions seen since the last recorded pull (design 50 §3, review M2).
+  /** Type-flip evictions seen since the last recorded pull (design 50 §3).
    *  onTypeFlip fires DURING applyActions (before the pull's onPullApplied), so it
    *  accumulates here and recordPullApplied folds it into `lastPull.conflicts` and resets. */
   private typeFlipsSincePull = 0;

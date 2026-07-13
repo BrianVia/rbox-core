@@ -111,3 +111,13 @@ workspace — should never silently mint a second workspace.
 (rebind → pull deletes nothing → push publishes all), state ownership
 (mismatch/fresh, match/kept, legacy/adopted), guard trip + consent, guard
 non-trip at normal scale, and `committed=false` on no-op pushes.
+
+## Code-comment provenance (113 wave 4)
+
+Review citations relocated from code comments by design 113 wave 4 (comment
+sweep). The invariant prose remains at each cited site; the review round that
+produced it is recorded here.
+
+- `src/cli/e2ee-client.ts` (effective remote identity): was "codex R3" — stream-stamp/remote agreement invariant and §2 pointer retained in code.
+- `src/cli/track-untrack.test.ts` (rebind reset): was "codex BLOCKER" — baseline-reset invariant retained in code.
+- `src/cli/config.ts` (stream ownership): was "codex R2" — full remote/workspace/project identity invariant retained in code.

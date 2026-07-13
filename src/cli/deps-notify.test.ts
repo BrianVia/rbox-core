@@ -45,7 +45,7 @@ test("removeBlock strips the fenced block and is a no-op when absent", () => {
   expect(removeBlock(stripped)).toBe(stripped); // idempotent
 });
 
-// ── generated snippets (security-sensitive — founder review) ─────────────────
+// ── generated snippets (security-sensitive) ─────────────────
 
 const BIN = "/Users/me/.rbox/bin/rbox";
 
