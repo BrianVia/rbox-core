@@ -383,13 +383,21 @@ test("D2 capture deferral survives a post-plan push failure and clears on a late
   await fs.writeFile(path.join(rootA, "force-commit.txt"), "x");
   remote.failNextGitPut = true;
   const realCommit = remote.commit.bind(remote);
-  remote.commit = async () => { throw new Error("post-plan network failure"); };
+  let durableObserved = false;
+  depsA.onGitDeferralsSaved = (saved) => {
+    durableObserved = repoRecordsForState(saved)["capture-restart"]?.deferrals?.capture?.reason === "artifact";
+  };
+  remote.commit = async () => {
+    expect(durableObserved).toBe(true); // visibility hook ran immediately after the lane save
+    throw new Error("post-plan network failure");
+  };
   await expect(push(rootA, cfgA, depsA)).rejects.toThrow(/post-plan network failure/);
   let record = repoRecordsForState(await st(rootA))["capture-restart"]!;
   expect(record.deferrals?.capture?.reason).toBe("artifact");
   const since = record.deferrals?.capture?.deferredSince;
 
   remote.commit = realCommit;
+  delete depsA.onGitDeferralsSaved;
   const repoB = path.join(rootB, "capture-restart");
   await commitFile(repoB, "remote.txt", "newer", "newer remote truth");
   await push(rootB, cfgB, depsB);

@@ -116,6 +116,7 @@ src/cli/publish-pipeline/stale-temp.ts      — stale enc-* temp-dir reclamation
 src/engine/index.ts                 — barrel: the full public engine API for src/cli. Never: logic.
 src/engine/types.ts                 — core types only: FileEntry, FileType, Manifest, GitSection/GitArtifactRef/GitPackLink/GitRefScope. Never: logic, I/O.
 src/engine/manifest.ts              — the filesystem scan producer: scanManifest (ignore rules + dircache/hashcache reuse), applyWatchEvents, ScanStats, present-vs-absent error classification. Owns "what's on disk" → manifest. Never: diffing, wire encoding.
+src/engine/apply-receipt.ts         — applied-manifest oracle: lazy derived/persisted per-repo receipt proof, token-first re-proof, scoped inventory/hash widening, receiver path equivalence. Never: Git follow decisions or workspace-wide per-repo scans.
 src/engine/manifest-delta.ts        — manifest wire envelope codec: canonical (JCS float-tolerant) manifest hashing, snapshot/delta envelopes, delta ops diff/fold, ManifestChainError. Owns the on-wire manifest format. Never: scanning.
 src/engine/manifest-chain.ts        — pure validator: readManifestChain bounds/validates a manifest's delta chain. Never: I/O.
 src/engine/manifest-validate.ts     — dependency-free (no node:*) manifest/path/git-section validation shared by client AND Worker (isSafeRelPath, validateManifest, validateGitSection, schema/size constants). Pure string logic — must stay bundleable into the Worker.

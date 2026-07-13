@@ -519,10 +519,11 @@ async function walk(
         ctx.scanStats.dirsWalked += 1;
       }
       rawEntryCount = entries.length;
-      children = entries.flatMap((entry): DirCacheChild[] => entry.isDirectory()
-        ? [{ name: entry.name, type: "dir" }]
-        : entry.isSymbolicLink() ? [{ name: entry.name, type: "symlink" }]
-        : entry.isFile() ? [{ name: entry.name, type: "file" }] : []);
+      children = entries.map((entry): DirCacheChild => entry.isDirectory()
+        ? { name: entry.name, type: "dir" }
+        : entry.isSymbolicLink() ? { name: entry.name, type: "symlink" }
+        : entry.isFile() ? { name: entry.name, type: "file" }
+        : { name: entry.name, type: "other" });
       if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
       if (ctx.dirProbe) probeProjectedBytes = Buffer.byteLength(JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }))));
     }
@@ -588,7 +589,7 @@ async function walk(
         mode: 0o777,
         mtimeMs: 0,
       });
-    } else {
+    } else if (child.type === "file") {
       if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
       ctx.onDiscover?.();
       let st: FileStatLike | undefined = bulkStats?.get(child.name);
@@ -618,6 +619,11 @@ async function walk(
         // Defer the hash — sequential per-file hashing dominates a cold scan.
         toHash.push({ childRel, abs, st });
       }
+    } else {
+      // FIFOs/sockets/devices are not syncable manifest entries, but retaining
+      // them in the directory cache is load-bearing for consumers that must
+      // distinguish "absent" from "present but unrepresentable".
+      continue;
     }
   }
 }

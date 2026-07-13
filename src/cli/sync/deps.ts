@@ -7,7 +7,7 @@ import {
   type Action,
   type ScanStats,
 } from "../../engine/index.js";
-import type { WorkspaceConfig } from "../config.js";
+import type { SyncState, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { EncryptAndUploadOptions } from "../sync-recovery.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
@@ -59,6 +59,9 @@ export interface SyncDeps {
    *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
    *  injects its timestamped logger so the lines land in the daemon log. */
   onGitLog?: (line: string) => void;
+  /** Called immediately after a state save that may set/clear durable Git
+   * deferrals. Observability-only: callers must not throw or mutate the state. */
+  onGitDeferralsSaved?: (state: SyncState) => void;
   /** Per-repo progress during the pull-side git-apply loop (`done` advances once per
    *  repo examined, including no-op "unchanged" ones) — lets a CLI collapse the N
    *  per-repo `onGitLog` lines into a single updating "N/total" counter instead. */

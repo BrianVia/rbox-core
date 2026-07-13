@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
@@ -175,6 +175,8 @@ export async function applyGitSections(
   matcher: IgnoreMatcher,
   glog: (line: string) => void,
 opts: {
+    /** D3 typed passthrough; D4b owns all follow decisions that consume it. */
+    oracle?: AppliedManifestOracle;
     collectMetrics?: boolean;
     onProgress?: (done: number, total: number) => void;
     /** Workspace-wide legacy fallback: Git applies, config is left untouched. */

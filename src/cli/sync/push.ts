@@ -424,6 +424,11 @@ async function runPushAttempt(
       allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
       forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
     }));
+    try {
+      deps.onGitDeferralsSaved?.(state);
+    } catch {
+      // A local visibility hook cannot fail a save that is already durable.
+    }
   }
   if (report.enabled) {
     report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks

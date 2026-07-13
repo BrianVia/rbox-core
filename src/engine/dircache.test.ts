@@ -26,7 +26,7 @@ test("DirCache round-trips and safely discards missing, corrupt, old, or malform
   expect(loaded.reuse("", { mtimeMs: 1, ctimeMs: 2 } as never)?.[0]?.name).toBe("a");
 
   const file = path.join(root, ".rbox/state/dircache.json");
-  for (const text of ["{", JSON.stringify({ version: 2 }), JSON.stringify({ version: 1, lastScanStartMs: 1, lastUnprunedScanAtMs: 1, ruleFiles: [], entries: { "": { mtimeMs: 1, ctimeMs: 2, children: [{ name: "x", type: "wat" }] } } })]) {
+  for (const text of ["{", JSON.stringify({ version: 1 }), JSON.stringify({ version: 2, lastScanStartMs: 1, lastUnprunedScanAtMs: 1, ruleFiles: [], entries: { "": { mtimeMs: 1, ctimeMs: 2, children: [{ name: "x", type: "wat" }] } } })]) {
     await fs.writeFile(file, text);
     expect((await DirCache.load(root)).lastUnprunedScanAtMs).toBe(0);
   }
@@ -37,7 +37,7 @@ test("DirCache round-trips and safely discards missing, corrupt, old, or malform
 test("reuse requires the exact mtime+ctime pair outside the racy-clean margin", () => {
   // The cutoff is anchored on the PERSISTED lastScanStartMs (the caching scan),
   // not the current scan — matching probeEligible. Entry d has (mtime 100, ctime 200).
-  const cache = new DirCache({ version: 1, lastScanStartMs: 201 + RACY_MARGIN_MS, lastUnprunedScanAtMs: 0, ruleFiles: [], entries: { d: { mtimeMs: 100, ctimeMs: 200, children: [] } } });
+  const cache = new DirCache({ version: 2, lastScanStartMs: 201 + RACY_MARGIN_MS, lastUnprunedScanAtMs: 0, ruleFiles: [], entries: { d: { mtimeMs: 100, ctimeMs: 200, children: [] } } });
   const st = { mtimeMs: 100, ctimeMs: 200 } as never;
   expect(cache.reuse("d", st)).toEqual([]); // cutoff 201: both 100,200 strictly older → reuse
   expect(cache.reuse("d", { mtimeMs: 101, ctimeMs: 200 } as never)).toBeUndefined(); // mtime mismatch

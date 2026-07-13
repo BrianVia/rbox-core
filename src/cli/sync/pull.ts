@@ -3,6 +3,7 @@ import {
   isIgnoreRuleFile,
   PhaseReport,
   reconcile,
+  oracleFromPull,
   scanManifest,
   validateManifest,
   type Action,
@@ -219,6 +220,16 @@ export async function applyPulledManifest(
   }
   await report.phase("cache-save", () => Promise.all([save(), dircacheSave()]).then(() => undefined));
 
+  const oracle = oracleFromPull({
+    preScan: local,
+    actions,
+    oracle: remote,
+    matcher: finalMatcher,
+    dircache,
+    root,
+    scanDeferred,
+  });
+
   // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
   // scope-projected identity, per-repo base advance (one busy repo never blocks the
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
@@ -226,6 +237,7 @@ export async function applyPulledManifest(
   const gitOutcome = await report.phase("git-apply", () =>
     applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, {
       collectMetrics: report.enabled,
+      oracle,
       onProgress: deps.onGitProgress,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
     })
@@ -234,7 +246,7 @@ export async function applyPulledManifest(
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
-  await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
+  const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
     globalManifest: remote,
@@ -261,6 +273,11 @@ export async function applyPulledManifest(
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
   })));
+  try {
+    deps.onGitDeferralsSaved?.(savedState);
+  } catch {
+    // A local visibility hook cannot fail a save that is already durable.
+  }
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);

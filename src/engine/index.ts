@@ -84,6 +84,12 @@ export { scanManifest, createScanStats, applyWatchEvents, statsStableAcrossHash,
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
+export {
+  oracleFromPull,
+  oracleFromState,
+  type AppliedManifestOracle,
+  type OracleVerdict,
+} from "./apply-receipt.js";
 export { applyActions,
   laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
 export {
