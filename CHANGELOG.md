@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-07-13 — sweep verdict applied: fill-v2 stays, default records back to 32
+
+### Changed
+- **Default batch records: 32** (fill-v2 dispatch policy stays the default). The
+  flat-meadow matched-cell sweep passed fill-v2 at 32 records (−14.1% slot work)
+  but 64-record batches FAILED the cap gate (−7% — larger per-batch settles beat
+  the parallelism). `RBOX_BATCH_RECORDS=64` remains available; the server cap
+  stays 64 for re-evaluation.
+- Sweep harness: tolerate find SIGPIPE when the corpus exceeds the byte budget.
+
 ## [1.4.0] — 2026-07-13 — upload lane rebuilt: full batches, receipts drained in-flight; codebase modularized
 
 ### Improved (live by default; founder ship-live call)

@@ -1,0 +1,4 @@
+# Cloudflare Pages SPA fallback (SF2): every unmatched path — including "/" — serves
+# the app shell (index.html) with 200, so client routing owns /dashboard, /billing,
+# /billing/success. index.html avoids the /200.html → /200 clean-URL redirect loop.
+/*  /index.html  200

@@ -84,7 +84,11 @@ function readBatchConfig(
     // Wire twin: server RBOX_BLOB_BATCH_MAX_RECORDS defaults to 32, candidate 64.
     // The client may exceed 32 only under fill-v2 against a raised server; uploader's
     // 400 latch is the version-skew guard when rollout ordering is violated.
-    records: envInt("RBOX_BATCH_RECORDS", recordsMax, 1, recordsMax),
+    // Default 32 even under fill-v2: the FM matched-cell sweep (2026-07-13) PASSED
+    // fill-v2 at 32 records (−14.1% slot work) but FAILED the 64-record cap gate
+    // (−7% — bigger settles beat the parallelism, echoing the #245 knee). 64 stays
+    // reachable via RBOX_BATCH_RECORDS=64 for re-evaluation.
+    records: envInt("RBOX_BATCH_RECORDS", BATCH_RECORDS_FLOOR, 1, recordsMax),
     recordBytes: envInt("RBOX_BATCH_RECORD_BYTES", DEFAULT_BATCH_RECORD_BYTES, 1, recordBytesMax),
     bodyBytes: envInt("RBOX_BATCH_BODY_BYTES", DEFAULT_BATCH_BODY_BYTES, 1, DEFAULT_BATCH_BODY_BYTES),
     slots: envIntFirst(slotsEnvs, slotsDefault, 1, slotsMax),

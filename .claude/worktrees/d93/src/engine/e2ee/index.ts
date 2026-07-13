@@ -1,0 +1,118 @@
+/** Full E2EE (design 12, v4) — zero-knowledge crypto + signed protocol objects.
+ *  The server stores everything here as opaque blobs; only devices can read or
+ *  verify. All crypto is client-side (Bun); see each module for the wire spec. */
+export { canonicalize, canonicalString, parseStrict, verifyRoundTrip } from "./jcs.js";
+export {
+  aesGcmDecrypt,
+  aesGcmEncrypt,
+  ctEqual,
+  fromB64url,
+  fromHex,
+  hkdf,
+  randomBytes,
+  sha256,
+  sha256Hex,
+  toB64url,
+  toHex,
+  utf8,
+} from "./primitives.js";
+export {
+  generateSignKeyPair,
+  generateWrapKeyPair,
+  rsaUnwrap,
+  rsaWrap,
+  sign,
+  signKeyPairFromSeed,
+  signPrivateFromPkcs8,
+  signPrivateToPkcs8,
+  verify,
+  wrapPrivateFromPkcs8,
+  wrapPrivateToPkcs8,
+  type SignKeyPair,
+  type WrapKeyPair,
+} from "./asym.js";
+export {
+  generateRecoveryKey,
+  phraseToRk,
+  recoverySignKeyPair,
+  rkToPhrase,
+  rkWrapKey,
+} from "./recovery.js";
+export {
+  aesGcmUnwrap,
+  aesGcmWrap,
+  generateMasterKey,
+  generateWorkspaceKek,
+  recipientKeyHash,
+  rsaDeviceUnwrap,
+  rsaDeviceWrap,
+  wrapHash,
+  type AesGcmWrap,
+  type RsaWrap,
+  type Wrap,
+  type WrapContext,
+  type WrappedKeyKind,
+} from "./keys.js";
+export { decryptManifest, deriveManifestKey, encryptManifest, type EncryptedManifest } from "./manifest-crypto.js";
+export {
+  buildSignedCommit,
+  GENESIS_PARENT_HASH,
+  normalizeBlobRefs,
+  parseCommit,
+  validateBlobRefset,
+  verifyCommitSig,
+  type BlobRef,
+  type BlobRefset,
+  type CommitBody,
+  type CommitBodyInline,
+  type CommitBodySidecar,
+  type CommitFields,
+  type SignedCommit,
+} from "./commit.js";
+export { parseRefset, refsetByteLength, serializeRefset, REFSET_HEADER, REFSET_MAGIC, REFSET_REC, type Ref } from "../refset.js";
+export {
+  activeSigners,
+  admissionDelta,
+  buildAdmissionRoster,
+  buildAdminRoster,
+  buildGenesisRoster,
+  ENC_ALG,
+  SIG_ALG,
+  verifyRosterChain,
+  type AdmissionGrant,
+  type AdmissionProof,
+  type RosterBody,
+  type RosterEntry,
+  type SignedRoster,
+} from "./roster.js";
+export {
+  buildKeyState,
+  GENESIS_PREV_STATE_HASH,
+  verifyKeyStateChain,
+  type AccountKeyState,
+  type SignedKeyState,
+} from "./epoch.js";
+export {
+  assertMkWrapAuthorized,
+  bootstrapAccount,
+  buildCommit,
+  buildPairing,
+  buildRecoveryAdmission,
+  createWorkspaceKey,
+  openCommit,
+  openCommitHistorical,
+  openOwnMasterKey,
+  openWorkspaceKey,
+  recoverMasterKey,
+  redeemPairing,
+  verifyAccount,
+  verifyCommitChain,
+  verifyHistorySegment,
+  type BootstrapResult,
+  type BuiltCommit,
+  type DeviceSecrets,
+  type PairingMaterial,
+  type Pin,
+  type RedeemResult,
+  type VerifiedAccount,
+} from "./session.js";

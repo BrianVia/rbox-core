@@ -1,0 +1,39 @@
+{
+  "name": "@rbox/core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "rbox sync engine (Phase 1: locally-testable core)",
+  "scripts": {
+    "dev:install": "bun scripts/dev-install.ts",
+    "test": "bun test ./src/",
+    "test:api": "cd apps/api && vitest run",
+    "test:all": "bun test ./src/ && cd apps/api && vitest run",
+    "typecheck": "mkdir -p .cache/tsbuildinfo && tsc --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/root.tsbuildinfo && tsc -p apps/api --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/apps-api.tsbuildinfo",
+    "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
+    "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",
+    "rig": "bun scripts/rig/rig.ts",
+    "test:rig": "bun test ./scripts/rig/"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.5",
+    "@parcel/watcher": "^2.5.6",
+    "chokidar": "^5.0.0",
+    "ignore": "^5.3.2"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.12.21",
+    "@cloudflare/workers-types": "^4.20260626.1",
+    "@types/node": "^24.13.3",
+    "@vitest/runner": "2.0.5",
+    "@vitest/snapshot": "2.0.5",
+    "typescript": "^7.0.2",
+    "vitest": "2.0.5",
+    "wrangler": "^4.107.0"
+  },
+  "optionalDependencies": {
+    "@parcel/watcher-darwin-arm64": "^2.5.6",
+    "@parcel/watcher-linux-arm64-glibc": "^2.5.6",
+    "@parcel/watcher-linux-x64-glibc": "^2.5.6"
+  }
+}

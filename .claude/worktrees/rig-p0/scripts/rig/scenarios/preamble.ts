@@ -1,0 +1,184 @@
+/**
+ * `provisionPair` — the zero→onboarded handshake every scenario shares (design 56
+ * §9). Extracted verbatim from onboard-smoke's preamble so all six scenarios reach
+ * "two paired devices, one workspace, converged baseline" through ONE code path
+ * (onboard-smoke keeps its own convergence/teardown assertions — this only owns the
+ * provisioning steps + their step names, which stay byte-for-byte what P0 shipped).
+ *
+ * Secrets ride ENV EXPANSION, never argv (bootstrap secret, pairing token) — the same
+ * discipline as before; `rboxShell` masks them in transcripts.
+ */
+import { GUEST } from "../lib/config.js";
+import { deleteAccount, readCredentials } from "../lib/account.js";
+import { daemonWatcherMode, type Device } from "../lib/device.js";
+import { waitForPath } from "../lib/waiters.js";
+import type { Recorder } from "./harness.js";
+import type { RigCtx } from "./types.js";
+import { parsePairToken } from "./types.js";
+
+/** design-34 WAF rail — stay below the 64-wide fan-out on push/pull. */
+export const CONCURRENCY = "16";
+
+export interface ProvisionOpts {
+  /** Seed a deterministic corpus on A before init (shape name, e.g. "tiny"). */
+  seedShape?: string;
+  /** Corpus seed (content varies, shape fixed). Default 1. */
+  seedNum?: number;
+  /** Extra per-device seeding on A after the corpus, before init (e.g. a symlink). */
+  afterSeedA?: (a: Device) => Promise<void>;
+  /** Push from A after init. Default true. */
+  push?: boolean;
+  /** Pull on B after join. Default true. */
+  pull?: boolean;
+  /** Extra flags appended to BOTH `init --new` (A) and `init --workspace` (B) — e.g.
+   *  `["--git", "false"]` to disable git-sync for a pure plain-file workload. */
+  initFlags?: string[];
+}
+
+export interface ProvisionResult {
+  /** The remote workspace id A created (B joined it). */
+  workspaceId: string;
+}
+
+/**
+ * Run bootstrap→seed→init→push→pair→join→pull across A and B, recording each phase
+ * into `rec`. Returns the workspace id. Throws (via `rec.step`) on any hard failure so
+ * the caller's try/catch aborts the scenario — exactly as the inline version did.
+ */
+export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionOpts = {}): Promise<ProvisionResult> {
+  const doPush = opts.push !== false;
+  const doPull = opts.pull !== false;
+
+  // 1. A: bootstrap login (secret via env expansion, never argv).
+  await rec.step("[A] login --bootstrap", async () => {
+    await ctx.a.rboxShell(
+      `bun ${GUEST.cliEntry} login --bootstrap "$RIG_BOOT" --remote "$RBOX_API" --no-interactive`,
+      { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
+    );
+  });
+
+  // 2. A: seed corpus (optional) + any scenario-specific extra (symlink, …). The
+  //    workspace dir must exist before init even when nothing is seeded.
+  if (opts.seedShape) {
+    await rec.step("[A] seed corpus", async () => {
+      await ctx.a.seedCorpus(GUEST.workDir, opts.seedShape!, opts.seedNum ?? 1);
+      if (opts.afterSeedA) await opts.afterSeedA(ctx.a);
+    });
+  } else {
+    await rec.step("[A] mkdir workspace", async () => {
+      await ctx.a.mkdirp(GUEST.workDir);
+      if (opts.afterSeedA) await opts.afterSeedA(ctx.a);
+    });
+  }
+
+  // 3. A: create the workspace, read its id from the on-disk binding.
+  const workspaceId = await rec.step("[A] init --new", async () => {
+    await ctx.a.rbox(["init", "--new", "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])], { cwd: GUEST.workDir });
+    const cfg = JSON.parse(await ctx.a.readFile(`${GUEST.workDir}/.rbox/workspace.json`)) as { remoteWorkspaceId?: string };
+    if (!cfg.remoteWorkspaceId) throw new Error("workspace.json missing remoteWorkspaceId");
+    ctx.log(`  workspace ${cfg.remoteWorkspaceId}`);
+    return cfg.remoteWorkspaceId;
+  });
+
+  // 4. A: push (throttled).
+  if (doPush) {
+    await rec.step("[A] push", async () => {
+      await ctx.a.rbox(["push"], { cwd: GUEST.workDir, env: { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY } });
+    });
+  }
+
+  // 5. A: mint a pairing token.
+  const pairToken = await rec.step("[A] pair", async () => {
+    const res = await ctx.a.rbox(["pair"]);
+    return parsePairToken(res.stdout);
+  });
+
+  // 6. B: redeem the pairing token (token via env, never argv).
+  await rec.step("[B] login (redeem pair)", async () => {
+    await ctx.b.rboxShell(`bun ${GUEST.cliEntry} login --remote "$RBOX_API" --no-interactive`, {
+      env: { RBOX_PAIR_TOKEN: pairToken },
+      redact: [pairToken],
+    });
+  });
+
+  // 7. B: join the workspace + pull (throttled).
+  await rec.step(doPull ? "[B] init --workspace + pull" : "[B] init --workspace", async () => {
+    await ctx.b.mkdirp(GUEST.workDir);
+    await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])], { cwd: GUEST.workDir });
+    if (doPull) await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
+  });
+
+  return { workspaceId };
+}
+
+/** How long to wait for a freshly-started daemon to write its first activity.json
+ *  heartbeat (design 45: the daemon writes it after the initial convergence pump —
+ *  seconds, network-dependent; we poll rather than assume). */
+export const DAEMON_READY_TIMEOUT_MS = 30_000;
+
+export interface DaemonModes {
+  a: "native" | "polling" | "unknown";
+  b: "native" | "polling" | "unknown";
+}
+
+/** True once activity.json parses with a string `at` heartbeat. */
+function hasHeartbeat(contents: string | undefined): boolean {
+  if (contents === undefined) return false;
+  try {
+    return typeof (JSON.parse(contents) as { at?: unknown }).at === "string";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start the background-sync daemon on BOTH devices and wait until each has written
+ * its first activity.json heartbeat (design 45), then read + record the watcher mode
+ * from each daemon.log (native @parcel/watcher vs the polling fallback — both are
+ * acceptable; design 56 §9 wants the mode logged, not the mechanism asserted).
+ * Records a `[X] daemon heartbeat` step per device that FAILS if no heartbeat lands
+ * within {@link DAEMON_READY_TIMEOUT_MS}.
+ */
+export async function startDaemons(ctx: RigCtx, rec: Recorder): Promise<DaemonModes> {
+  await rec.step("[A] rbox start (daemon)", async () => {
+    await ctx.a.daemonStart(GUEST.workDir);
+  });
+  await rec.step("[B] rbox start (daemon)", async () => {
+    await ctx.b.daemonStart(GUEST.workDir);
+  });
+
+  const waitHeartbeat = async (label: "A" | "B", device: Device): Promise<void> => {
+    await rec.step(`[${label}] daemon heartbeat`, async () => {
+      const out = await waitForPath(device, `${GUEST.workDir}/.rbox/state/activity.json`, hasHeartbeat, DAEMON_READY_TIMEOUT_MS);
+      if (!out.ok) throw new Error(`no activity.json heartbeat within ${DAEMON_READY_TIMEOUT_MS}ms`);
+    });
+  };
+  await waitHeartbeat("A", ctx.a);
+  await waitHeartbeat("B", ctx.b);
+
+  const [logA, logB] = await Promise.all([ctx.a.readDaemonLogs(GUEST.rboxHome), ctx.b.readDaemonLogs(GUEST.rboxHome)]);
+  const modes: DaemonModes = { a: daemonWatcherMode(logA), b: daemonWatcherMode(logB) };
+  ctx.log(`  daemon watcher mode — A: ${modes.a}, B: ${modes.b}`);
+  return modes;
+}
+
+/**
+ * Host-side per-run teardown: `DELETE /v1/account` with A's own credentials (design
+ * 37 — doubles as a live exercise of the deletion cascade). No-op under
+ * `--keep-account`. Records the step + a `account delete 2xx` assertion; throws on a
+ * non-2xx so the scenario surfaces a broken teardown. Shared by every scenario so the
+ * cleanup path is identical everywhere.
+ */
+export async function teardownAccount(ctx: RigCtx, rec: Recorder): Promise<void> {
+  if (ctx.keepAccount) {
+    ctx.log("  (--keep-account) skipping teardown");
+    return;
+  }
+  await rec.step("teardown DELETE /v1/account", async () => {
+    const creds = readCredentials(await ctx.a.readFile(`${GUEST.rboxHome}/credentials.json`));
+    if (!creds.accountId) throw new Error("A credentials.json missing accountId");
+    const del = await deleteAccount(ctx.apiUrl, creds.token, creds.accountId);
+    rec.assert("account delete 2xx", del.ok, `${del.status}`);
+    if (!del.ok) throw new Error(`account delete ${del.status}: ${del.body.slice(0, 200)}`);
+  });
+}

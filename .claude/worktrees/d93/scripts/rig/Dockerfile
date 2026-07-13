@@ -1,0 +1,28 @@
+# rig device image (design 56 §5) — arm64-native Linux guest, built once and reused
+# (Apple `container` has no snapshot/clone verb, so the image IS the repeatability
+# primitive). Only deps are baked; the repo's src/ + scripts/ are bind-mounted
+# read-only at runtime so module resolution walks up to THIS image's linux
+# node_modules (native @parcel/watcher), never the host's macOS ones.
+FROM docker.io/library/ubuntu:24.04
+
+# Pin bun so the image is reproducible + staleness-hashable. `.bun-version` is empty
+# and package.json declares no engines.bun, so this pins to the version in use.
+ARG BUN_VERSION=1.3.5
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official installer, pinned. BUN_INSTALL=/usr/local → bun lands on PATH at /usr/local/bin.
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"
+
+WORKDIR /app
+
+# Bake linux-arm64 node_modules (incl. the @parcel/watcher native module) into the
+# image from the exact lockfile. src/ + scripts/ are NOT copied — they mount at runtime.
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# Long-lived guest; all real work happens via `container exec`.
+CMD ["sleep", "infinity"]

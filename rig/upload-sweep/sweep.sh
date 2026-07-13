@@ -104,7 +104,10 @@ build_corpus() {
   # one awk cutoff, one bulk cpio copy — O(1) process spawns instead of the
   # 3-forks-per-file loop this replaces (~3 min for 36k files on the bench host).
   # Newline-separated paths are fine for a code corpus (no newline filenames).
-  ( cd "$SRC" && find . -type d -name .git -prune -o -type f -printf '%s\t%P\n' 2>/dev/null \
+  # The awk byte-budget cutoff exits early when SRC exceeds TARGET_BYTES; find then
+  # dies of SIGPIPE (141), which pipefail would turn into a script abort — tolerate
+  # exactly that exit code (found the hard way on flat-meadow's 13G corpus).
+  ( cd "$SRC" && { find . -type d -name .git -prune -o -type f -printf '%s\t%P\n' 2>/dev/null || [ "$?" -eq 141 ]; } \
       | awk -F'\t' -v max="$MAX_FILE" -v target="$TARGET_BYTES" \
           '$1 > 0 && $1 <= max { print $2; total += $1; if (total >= target) exit }' \
       | cpio -pdm --quiet "$BASE" )

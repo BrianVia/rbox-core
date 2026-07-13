@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "providers": {
+    "clerk": {
+      "name": "Clerk"
+    }
+  },
+  "resources": {
+    "rbox": {
+      "name": "rbox",
+      "providerName": "Clerk",
+      "serviceId": "auth"
+    }
+  }
+}

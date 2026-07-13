@@ -1,0 +1,293 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { AccountWorkspace } from "./workspace-picker.js";
+import { runExportCore, type ExportSeams } from "./export-cmd.js";
+
+const ACCOUNT = "acct_0123456789abcdef";
+const DATE = new Date(2026, 6, 4, 10, 20, 30);
+const MARKER_NAME = "rbox-export.json";
+
+function ws(workspaceId: string, name: string | null, projectId = "root"): AccountWorkspace {
+  return { workspaceId, projectId, name, createdAt: 0 };
+}
+
+function fakePull(filesByWs: Record<string, Record<string, string>>): ExportSeams["pullWorkspace"] {
+  return async (stagingRoot, target) => {
+    const files = filesByWs[target.workspaceId] ?? { "README.md": "hello\n" };
+    for (const [rel, content] of Object.entries(files)) {
+      const p = path.join(stagingRoot, rel);
+      await fs.mkdir(path.dirname(p), { recursive: true });
+      await fs.writeFile(p, content);
+    }
+    await fs.mkdir(path.join(stagingRoot, ".rbox"), { recursive: true });
+    await fs.writeFile(path.join(stagingRoot, ".rbox", "state.json"), "{}");
+  };
+}
+
+function seamsFor(over: Partial<ExportSeams> & { list: AccountWorkspace[]; pull: ExportSeams["pullWorkspace"] }): ExportSeams {
+  return {
+    enrolled: true,
+    homeDir: over.homeDir ?? "/nonexistent-home",
+    now: () => DATE,
+    listWorkspaces: async () => over.list,
+    pullWorkspace: over.pull,
+    tarGzip: over.tarGzip ?? (async () => {}),
+    ...(over.onProgress ? { onProgress: over.onProgress } : {}),
+  };
+}
+
+let tmp: string;
+beforeEach(async () => {
+  tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-export-"));
+});
+afterEach(async () => {
+  await fs.rm(tmp, { recursive: true, force: true });
+});
+
+describe("default path selection", () => {
+  test("prefers ~/Downloads only when it exists, else $HOME", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-home-"));
+    try {
+      const seams = seamsFor({ homeDir: home, list: [ws("ws_alpha001", "Alpha")], pull: fakePull({}) });
+      const inHome = await runExportCore({}, ACCOUNT, seams);
+      expect(inHome.outPath).toBe(path.join(home, "rbox-export-0123456789abcdef-20260704"));
+
+      await fs.mkdir(path.join(home, "Downloads"));
+      const inDownloads = await runExportCore({}, ACCOUNT, seams);
+      expect(inDownloads.outPath).toBe(path.join(home, "Downloads", "rbox-export-0123456789abcdef-20260704"));
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runExportCore", () => {
+  test("exports every workspace to a clean tree with a completion marker; no .rbox leaks", async () => {
+    const out = path.join(tmp, "export");
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha"), ws("ws_beta0002", null)],
+      pull: fakePull({
+        ws_alpha001: { "a.txt": "aaaa", ".keep": "dot", "sub/b.txt": "bb" },
+        ws_beta0002: { "c.txt": "ccc" },
+      }),
+    });
+
+    const res = await runExportCore({ out }, ACCOUNT, seams);
+
+    expect(res.outPath).toBe(out);
+    const alphaDir = path.join(out, "Alpha-alpha001");
+    const betaDir = path.join(out, "beta0002");
+    expect(await fs.readFile(path.join(alphaDir, "a.txt"), "utf8")).toBe("aaaa");
+    expect(await fs.readFile(path.join(alphaDir, ".keep"), "utf8")).toBe("dot");
+    expect(await fs.readFile(path.join(alphaDir, "sub", "b.txt"), "utf8")).toBe("bb");
+    expect(await fs.readFile(path.join(betaDir, "c.txt"), "utf8")).toBe("ccc");
+
+    await expect(fs.stat(path.join(alphaDir, ".rbox"))).rejects.toThrow();
+    await expect(fs.stat(path.join(betaDir, ".rbox"))).rejects.toThrow();
+
+    const marker = JSON.parse(await fs.readFile(path.join(out, MARKER_NAME), "utf8"));
+    expect(marker.account).toBe(ACCOUNT);
+    expect(marker.workspaces).toHaveLength(2);
+    expect(marker.files).toBe(4);
+    expect(marker.bytes).toBe(12);
+    expect(typeof marker.finishedAt).toBe("string");
+    const siblings = await fs.readdir(tmp);
+    expect(siblings.filter((s) => s.startsWith(".rbox-export-staging"))).toHaveLength(0);
+  });
+
+  test("derives safe unique workspace directory names", async () => {
+    const out = path.join(tmp, "names");
+    const seams = seamsFor({
+      list: [
+        ws("ws_ab12cd34ef", "My App"),
+        ws("ws_deadbeef9", "../etc/passwd"),
+        ws("ws_ffff0000", "   "),
+      ],
+      pull: fakePull({}),
+    });
+
+    await runExportCore({ out }, ACCOUNT, seams);
+
+    expect(await fs.readdir(out)).toEqual(expect.arrayContaining(["My-App-ab12cd34", "etc-passwd-deadbeef", "ffff0000"]));
+  });
+
+  test("--workspace narrows to a single workspace", async () => {
+    const out = path.join(tmp, "one");
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha"), ws("ws_beta0002", "Beta")],
+      pull: fakePull({ ws_beta0002: { "c.txt": "ccc" } }),
+    });
+    const res = await runExportCore({ out, workspaceId: "ws_beta0002" }, ACCOUNT, seams);
+    expect(res.marker.workspaces).toHaveLength(1);
+    expect(await fs.readdir(out)).toEqual(expect.arrayContaining(["Beta-beta0002", MARKER_NAME]));
+    expect(await fs.readdir(out)).not.toContain("Alpha-alpha001");
+  });
+
+  test("--workspace with an unknown id fails clearly before staging or pull", async () => {
+    const out = path.join(tmp, "missing");
+    let pulled = false;
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: async () => {
+        pulled = true;
+      },
+    });
+    await expect(runExportCore({ out, workspaceId: "ws_missing999" }, ACCOUNT, seams)).rejects.toThrow(/no workspace `ws_missing999` on this account/);
+    expect(pulled).toBe(false);
+    await expect(fs.stat(out)).rejects.toThrow();
+  });
+
+  test("refuses instead of merging if two workspaces map to the same export subdir", async () => {
+    const out = path.join(tmp, "collision");
+    let pulled = false;
+    const seams = seamsFor({
+      list: [ws("ws_abcdef001", "app"), ws("ws_abcdef002", "app")],
+      pull: async () => {
+        pulled = true;
+      },
+    });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/subdir collision/);
+    expect(pulled).toBe(false);
+    await expect(fs.stat(out)).rejects.toThrow();
+  });
+
+  test("refuses to overwrite an existing export directory", async () => {
+    const out = path.join(tmp, "existing");
+    await fs.mkdir(out);
+    const seams = seamsFor({ list: [ws("ws_alpha001", "Alpha")], pull: fakePull({}) });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/overwrite/);
+  });
+
+  test("refuses to overwrite an existing tarball", async () => {
+    const out = path.join(tmp, "backup.tar.gz");
+    await fs.writeFile(out, "old");
+    const seams = seamsFor({ list: [ws("ws_alpha001", "Alpha")], pull: fakePull({}) });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/overwrite/);
+  });
+
+  test("tarball mode builds an archive and writes the marker beside it", async () => {
+    const out = path.join(tmp, "backup.tar.gz");
+    let stagedEntries: string[] = [];
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: fakePull({ ws_alpha001: { "a.txt": "aaaa" } }),
+      tarGzip: async (stageDir, tarball) => {
+        stagedEntries = await fs.readdir(stageDir);
+        await fs.writeFile(tarball, "TARBALL");
+      },
+    });
+    const res = await runExportCore({ out }, ACCOUNT, seams);
+    expect(res.outPath).toBe(out);
+    expect(await fs.readFile(out, "utf8")).toBe("TARBALL");
+    expect(res.markerPath).toBe(path.join(tmp, `backup.${MARKER_NAME}`));
+    const marker = JSON.parse(await fs.readFile(res.markerPath, "utf8"));
+    expect(marker.files).toBe(1);
+    expect(stagedEntries).toContain("Alpha-alpha001");
+  });
+
+  test("a workspace symlink is moved as a symlink, not followed out of staging", async () => {
+    const out = path.join(tmp, "symlink-export");
+    const outside = path.join(tmp, "outside");
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(outside, "secret.txt"), "secret");
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: async (stagingRoot) => {
+        await fs.symlink(outside, path.join(stagingRoot, "outside-link"));
+        await fs.mkdir(path.join(stagingRoot, ".rbox"), { recursive: true });
+      },
+    });
+    await runExportCore({ out }, ACCOUNT, seams);
+    const link = path.join(out, "Alpha-alpha001", "outside-link");
+    expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fs.readlink(link)).toBe(outside);
+  });
+
+  test("a half-finished export leaves no marker and no destination", async () => {
+    const out = path.join(tmp, "partial");
+    let calls = 0;
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha"), ws("ws_beta0002", "Beta")],
+      pull: async (stagingRoot, target, onProgress) => {
+        calls++;
+        if (target.workspaceId === "ws_beta0002") throw new Error("boom mid-pull");
+        return fakePull({ ws_alpha001: { "a.txt": "aaaa" } })(stagingRoot, target, onProgress);
+      },
+    });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/boom/);
+    expect(calls).toBe(2);
+    await expect(fs.stat(out)).rejects.toThrow();
+    const siblings = await fs.readdir(tmp);
+    expect(siblings.filter((s) => s.startsWith(".rbox-export-staging"))).toHaveLength(0);
+  });
+
+  test("refuses if the output path is inside an existing rbox workspace", async () => {
+    const workspaceRoot = path.join(tmp, "workspace");
+    await fs.mkdir(path.join(workspaceRoot, ".rbox"), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, ".rbox", "workspace.json"), "{}");
+    const out = path.join(workspaceRoot, "export");
+    let pulled = false;
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: async () => {
+        pulled = true;
+      },
+    });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/inside an rbox workspace/);
+    expect(pulled).toBe(false);
+    await expect(fs.stat(out)).rejects.toThrow();
+  });
+
+  test("a target created after the initial directory overwrite check is not replaced", async () => {
+    const out = path.join(tmp, "late-dir");
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: async (stagingRoot, target, onProgress) => {
+        await fakePull({ ws_alpha001: { "a.txt": "aaaa" } })(stagingRoot, target, onProgress);
+        await fs.mkdir(out);
+        await fs.writeFile(path.join(out, "intruder.txt"), "keep");
+      },
+    });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/overwrite/);
+    expect(await fs.readFile(path.join(out, "intruder.txt"), "utf8")).toBe("keep");
+  });
+
+  test("a tarball created after the initial overwrite check is not replaced", async () => {
+    const out = path.join(tmp, "late.tar.gz");
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: fakePull({ ws_alpha001: { "a.txt": "aaaa" } }),
+      tarGzip: async (_stageDir, tarball) => {
+        await fs.writeFile(out, "intruder");
+        await fs.writeFile(tarball, "TARBALL");
+      },
+    });
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/overwrite/);
+    expect(await fs.readFile(out, "utf8")).toBe("intruder");
+    await expect(fs.stat(path.join(tmp, `late.${MARKER_NAME}`))).rejects.toThrow();
+  });
+
+  test("not enrolled → refuses with the recover hint before network or directory creation", async () => {
+    const out = path.join(tmp, "missing-parent", "noenroll");
+    let listed = false;
+    let pulled = false;
+    const seams = seamsFor({
+      list: [ws("ws_alpha001", "Alpha")],
+      pull: async () => {
+        pulled = true;
+      },
+    });
+    seams.listWorkspaces = async () => {
+      listed = true;
+      return [ws("ws_alpha001", "Alpha")];
+    };
+    seams.enrolled = false;
+    await expect(runExportCore({ out }, ACCOUNT, seams)).rejects.toThrow(/enrolled.*rbox key recover|rbox key recover/);
+    expect(listed).toBe(false);
+    expect(pulled).toBe(false);
+    await expect(fs.stat(path.dirname(out))).rejects.toThrow();
+    await expect(fs.stat(out)).rejects.toThrow();
+  });
+});

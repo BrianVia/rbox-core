@@ -1,0 +1,74 @@
+import { expect, test } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { RELEASE_KEYS } from "./release-key.js";
+import { verifyReleaseArtifacts } from "./release-verify.js";
+
+// verifyReleaseArtifacts is the SINGLE gate BOTH publish paths go through — the single-shot
+// `release.ts` upload and the split `--upload-only` both call uploadRelease() → this. So
+// proving it refuses forged/missing/wrong-key/tampered manifests proves NEITHER path can
+// upload unverified bytes (design §41). We can't mint a VALID signature here (the release
+// private key lives only in the CI `release` env secret), so we assert the refusals — the
+// security boundary — which need no valid key.
+
+const VER = "1.2.3";
+const KNOWN_KEY = RELEASE_KEYS[0]!.keyId;
+
+/** Build a throwaway dist/ with the given manifest + sig bytes (+ optional binaries). */
+function mkdist(opts: { manifest?: string; sig?: string; bins?: Record<string, Buffer> }): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-relver-"));
+  if (opts.manifest !== undefined) fs.writeFileSync(path.join(dir, "version.json"), opts.manifest);
+  if (opts.sig !== undefined) fs.writeFileSync(path.join(dir, "version.json.sig"), opts.sig);
+  for (const [name, bytes] of Object.entries(opts.bins ?? {})) fs.writeFileSync(path.join(dir, name), bytes);
+  return dir;
+}
+const manifestJson = (over: Record<string, unknown> = {}) =>
+  JSON.stringify({ version: VER, keyId: KNOWN_KEY, artifacts: { "rbox-linux-x64": { sha256: "ab".repeat(32), path: `v${VER}/rbox-linux-x64` } }, ...over });
+
+const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });
+
+test("refuses when version.json is missing", () => {
+  const d = mkdist({ sig: "x" });
+  try {
+    expect(() => verifyReleaseArtifacts(d, VER)).toThrow(/version\.json.*missing|missing.*version\.json/i);
+  } finally {
+    cleanup(d);
+  }
+});
+
+test("refuses when version.json.sig is missing (unsigned release)", () => {
+  const d = mkdist({ manifest: manifestJson() });
+  try {
+    expect(() => verifyReleaseArtifacts(d, VER)).toThrow(/sig.*missing|unsigned/i);
+  } finally {
+    cleanup(d);
+  }
+});
+
+test("refuses a FORGED signature (bytes present, signature garbage)", () => {
+  const d = mkdist({ manifest: manifestJson(), sig: "not-a-real-signature" });
+  try {
+    expect(() => verifyReleaseArtifacts(d, VER)).toThrow(/did not verify|tampered/i);
+  } finally {
+    cleanup(d);
+  }
+});
+
+test("refuses a WRONG-KEY manifest (keyId not in the embedded keyring)", () => {
+  const d = mkdist({ manifest: manifestJson({ keyId: "deadbeefdeadbeef" }), sig: "AA" });
+  try {
+    expect(() => verifyReleaseArtifacts(d, VER)).toThrow(/unknown signing key/i);
+  } finally {
+    cleanup(d);
+  }
+});
+
+test("refuses a TAMPERED / malformed manifest (not valid JSON)", () => {
+  const d = mkdist({ manifest: "{ not json", sig: "AA" });
+  try {
+    expect(() => verifyReleaseArtifacts(d, VER)).toThrow(/not valid JSON|tampered/i);
+  } finally {
+    cleanup(d);
+  }
+});

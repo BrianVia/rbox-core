@@ -117,7 +117,7 @@ afterEach(async () => {
 
 describe("batch config knobs", () => {
   test("upload defaults ON to fill-v2/64 when knobs unset; download stays v1/32", () => {
-    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v2", records: 64, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
+    expect(uploadBatchConfig()).toEqual({ enabled: true, fill: "v2", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 24 });
     expect(downloadBatchConfig()).toEqual({ enabled: true, fill: "v1", records: 32, recordBytes: 262144, bodyBytes: 8388608, slots: 48 });
   });
 
@@ -191,7 +191,7 @@ describe("batch config knobs", () => {
     expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 64 });
 
     delete process.env.RBOX_BATCH_RECORDS;
-    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 64 }); // default records = fill cap
+    expect(uploadBatchConfig()).toMatchObject({ fill: "v2", records: 32 }); // sweep verdict: 32 default, 64 opt-in
   });
 
   test("download config ignores fill-v2; only exactly 'v1' engages the kill switch", () => {

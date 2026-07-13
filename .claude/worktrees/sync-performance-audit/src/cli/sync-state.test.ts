@@ -1,0 +1,337 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { GitSection, Manifest } from "../engine/index.js";
+import type { LockIdentitySource } from "../engine/git/lockfile.js";
+import {
+  applyStateSavePacket,
+  expectedStateNonce,
+  loadState,
+  repoRecordsForState,
+  resetSyncState,
+  saveState,
+  type RepoRecord,
+  type StateSavePacket,
+  type SyncState,
+} from "./config.js";
+import {
+  changedSidecarRepoKeys,
+  completeConfigApply,
+  composeStateSavePacket,
+  daemonBindingMatches,
+  observedRepoKeys,
+  saveStateSource,
+  stampConfigAck,
+  type StateSource,
+} from "./sync-state.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
+
+const stream = "https://api.test::ws_93::root";
+const nonce = "a".repeat(32);
+let root = "";
+let tokenCounter = 0;
+
+const identity: LockIdentitySource = {
+  current: async () => ({ hostId: "aa93", bootId: "bb93", pid: 9300, startTime: "1" }),
+  probe: async () => ({ status: "alive", startTime: "1" }),
+};
+const lock = () => ({ identity, token: () => (++tokenCounter).toString(16).padStart(32, "0") });
+
+const section = (id: string): GitSection => ({
+  bundleSha: id.padEnd(64, "0").slice(0, 64),
+  bundleEncSha: id.padEnd(64, "1").slice(0, 64),
+  bundleCipherSize: 1,
+  head: "ref: refs/heads/main",
+  refs: { "refs/heads/main": "1".repeat(40) },
+  refScope: "all",
+  generatedAt: "",
+});
+const manifest = (name: string, gitRepos?: Record<string, GitSection>): Manifest => ({
+  generatedAt: name,
+  files: [],
+  ...(gitRepos ? { manifestSchema: 2, gitRepos } : {}),
+});
+const baseState = (records: Record<string, RepoRecord> = {}): SyncState => ({
+  stream,
+  stateNonce: nonce,
+  stateRevision: 0,
+  lastSyncedSequence: 0,
+  lastSyncedManifest: { generatedAt: "zero", files: [] },
+  repoRecords: records,
+});
+
+beforeEach(async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-state93-"));
+  tokenCounter = 0;
+});
+afterEach(async () => fs.rm(root, { recursive: true, force: true }));
+
+describe("design 93 §6 sync-point truth table", () => {
+  const postToken = { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5" };
+
+  test("round-3 and round-4 pinned ownership traces", () => {
+    const rows = [
+      { name: "round-3: pre is our synced value", record: { sourceSeq: 1, cfgSynced: "ours" }, pre: "ours", basePre: "base", post: "merged", incoming: "remote", want: "merged" },
+      { name: "round-4: pre is the apply base", record: { sourceSeq: 1, cfgSynced: "other" }, pre: "base", basePre: "base", post: "merged", incoming: "remote", want: "merged" },
+      { name: "remote installed exactly", record: { sourceSeq: 1, cfgSynced: "other" }, pre: "local", basePre: "base", post: "remote", incoming: "remote", want: "remote" },
+      { name: "unowned merge leaves sync point", record: { sourceSeq: 1, cfgSynced: "other" }, pre: "local", basePre: "base", post: "merged", incoming: "remote", want: "other" },
+    ];
+    for (const row of rows) {
+      const got = completeConfigApply(row.record, { pre: row.pre, basePre: row.basePre, post: row.post, incoming: row.incoming, postToken });
+      expect(got.cfgSynced, row.name).toBe(row.want);
+      expect(got.cfgApplied, row.name).toBe(row.incoming);
+      expect(got.cfgToken, row.name).toEqual(postToken);
+    }
+  });
+
+  test("round-5 unrelated ACK stamps only an authored repo", () => {
+    expect(stampConfigAck({ sourceSeq: 1, cfgSynced: "b-old" }, undefined).cfgSynced).toBe("b-old");
+    expect(stampConfigAck({ sourceSeq: 1, cfgSynced: "a-old" }, "a-new").cfgSynced).toBe("a-new");
+  });
+});
+
+describe("design 93 §6 transactional unit", () => {
+  test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {
+    const unavailable: LockIdentitySource = {
+      current: async () => { throw new Error("no identity source"); },
+      probe: async () => ({ status: "unknown" }),
+    };
+    const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", {
+      lock: { identity: unavailable },
+      attempts: 1,
+      onDegraded: () => {},
+    });
+    expect(workspaceSyncMutexDegraded(syncMutex)).toBe(true);
+
+    const initial = baseState({
+      r: { repoGen: 3, sourceSeq: 1, base: section("base"), cfgSynced: "old", cfgApplied: "old" },
+    });
+    let lockedApplyCalled = false;
+    const saved = await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 2,
+      globalManifest: manifest("two", { r: section("next") }),
+      observedRepos: ["r"],
+      values: {
+        bases: { r: section("next") },
+        configLane: { r: { cfgSynced: "new", cfgApplied: "new" } },
+      },
+    }, {
+      forceLegacy: workspaceSyncMutexDegraded(syncMutex),
+      apply: async () => {
+        lockedApplyCalled = true;
+        throw new Error("must not acquire the transactional state lock");
+      },
+    });
+    expect(lockedApplyCalled).toBe(false);
+    expect(saved.stateNonce).toBeUndefined();
+    expect(saved.stateRevision).toBeUndefined();
+    expect(saved.repoRecords).toBeUndefined();
+    expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
+
+    await resetSyncState(root, "next-stream", syncMutex);
+    const reset = await loadState(root, "next-stream");
+    expect(reset.stateNonce).toBeUndefined();
+    expect(reset.repoRecords).toBeUndefined();
+    await releaseWorkspaceSyncMutex(syncMutex);
+  });
+
+  test("file-only global candidate rebuilds gitRepos solely from records", async () => {
+    await saveState(root, baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }));
+    const packet = composeStateSavePacket(baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }), {
+      expectedStream: stream,
+      sourceGlobalSeq: 1,
+      globalManifest: manifest("one", { stale: section("stale") }),
+      observedRepos: ["r"],
+      values: { bases: { r: section("new") } },
+    });
+    expect(packet.global?.manifest.gitRepos).toBeUndefined();
+    const result = await applyStateSavePacket(root, packet, { lock: lock() });
+    expect(result.status).toBe("accepted");
+    const saved = await loadState(root, stream);
+    expect(Object.keys(saved.lastSyncedManifest.gitRepos ?? {})).toEqual(["r"]);
+    expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("new"));
+  });
+
+  test("both pending-regression landing orders converge on the newer success", async () => {
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
+    const older: StateSource = { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: ["r"], values: { bases: { r: section("base") }, pending: { r: section("pending-old") } } };
+    const newer: StateSource = { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: manifest("two"), observedRepos: ["r"], values: { bases: { r: section("success") } } };
+
+    await saveState(root, initial);
+    await saveStateSource(root, initial, older);
+    await saveStateSource(root, initial, newer);
+    expect(repoRecordsForState(await loadState(root, stream)).r?.pending).toBeUndefined();
+    expect(repoRecordsForState(await loadState(root, stream)).r?.base).toEqual(section("success"));
+
+    await saveState(root, initial);
+    await saveStateSource(root, initial, newer);
+    await saveStateSource(root, initial, older);
+    const reverse = repoRecordsForState(await loadState(root, stream)).r!;
+    expect(reverse.pending).toBeUndefined();
+    expect(reverse.base).toEqual(section("success"));
+    expect(reverse.sourceSeq).toBe(2);
+  });
+
+  test("pending-after-newer-success wins in both landing orders", async () => {
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
+    const success: StateSource = { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: manifest("two"), observedRepos: ["r"], values: { bases: { r: section("success") } } };
+    const pending: StateSource = { expectedStream: stream, sourceGlobalSeq: 3, globalManifest: manifest("three"), observedRepos: ["r"], values: { bases: { r: section("success") }, pending: { r: section("pending-new") } } };
+    for (const order of [[success, pending], [pending, success]]) {
+      await saveState(root, initial);
+      await saveStateSource(root, initial, order[0]!);
+      await saveStateSource(root, initial, order[1]!);
+      const record = repoRecordsForState(await loadState(root, stream)).r!;
+      expect(record.pending).toEqual(section("pending-new"));
+      expect(record.sourceSeq).toBe(3);
+    }
+  });
+
+  test("repoGen prevents value ABA", async () => {
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("A") } });
+    await saveState(root, initial);
+    const delayed: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 1, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("delayed") } }] };
+    const toB = { ...delayed, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("B") } }] };
+    expect((await applyStateSavePacket(root, toB, { lock: lock() })).status).toBe("accepted");
+    const afterB = await loadState(root, stream);
+    const backA = composeStateSavePacket(afterB, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: ["r"], values: { bases: { r: section("A") } } });
+    expect((await applyStateSavePacket(root, backA, { lock: lock() })).status).toBe("accepted");
+    const rejected = await applyStateSavePacket(root, delayed, { lock: lock() });
+    expect(rejected).toMatchObject({ status: "rejected", reason: "repo-generation" });
+  });
+
+  test("UNSEEN-PATH ABSENCE: stale global rejects the whole packet", async () => {
+    const current = baseState({ x: { repoGen: 0, sourceSeq: 2, base: section("new-x") }, y: { repoGen: 0, sourceSeq: 0, base: section("y") } });
+    current.lastSyncedSequence = 2;
+    current.lastSyncedManifest = manifest("two", { x: section("new-x"), y: section("y") });
+    await saveState(root, current);
+    const stale: StateSavePacket = {
+      expectedStream: stream,
+      expectedNonce: nonce,
+      sourceGlobalSeq: 1,
+      global: { manifest: manifest("one") },
+      repos: [{ relPath: "y", expectedRepoGen: 0, newRecord: { sourceSeq: 1 } }],
+    };
+    const result = await applyStateSavePacket(root, stale, { lock: lock() });
+    expect(result).toMatchObject({ status: "rejected", reason: "global-sequence" });
+    const saved = await loadState(root, stream);
+    expect(saved.lastSyncedSequence).toBe(2);
+    expect(repoRecordsForState(saved).y?.base).toEqual(section("y"));
+  });
+
+  test("source atomicity rejects global when a repo CAS fails and repos when global is stale", async () => {
+    const initial = baseState({ r: { repoGen: 1, sourceSeq: 1, base: section("base") } });
+    initial.lastSyncedSequence = 1;
+    await saveState(root, initial);
+    const badRepo: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 2, global: { manifest: manifest("two") }, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 2, base: section("bad") } }] };
+    expect(await applyStateSavePacket(root, badRepo, { lock: lock() })).toMatchObject({ status: "rejected", reason: "repo-generation" });
+    expect((await loadState(root, stream)).lastSyncedSequence).toBe(1);
+
+    const staleGlobal: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 0, global: { manifest: manifest("zero") }, repos: [{ relPath: "r", expectedRepoGen: 1, newRecord: { sourceSeq: 0, base: section("bad") } }] };
+    expect(await applyStateSavePacket(root, staleGlobal, { lock: lock() })).toMatchObject({ status: "rejected", reason: "global-sequence" });
+    expect(repoRecordsForState(await loadState(root, stream)).r?.base).toEqual(section("base"));
+  });
+
+  test("equal-sequence no-op transitions isolate unrelated repo bases", async () => {
+    const initial = baseState({
+      a: { repoGen: 0, sourceSeq: 5, base: section("a"), removedKey: "old" },
+      b: { repoGen: 0, sourceSeq: 5, base: section("b") },
+    });
+    initial.lastSyncedSequence = 5;
+    await saveState(root, initial);
+    const values = { bases: { a: section("a"), b: section("b") }, removed: {} };
+    expect(changedSidecarRepoKeys(initial, values)).toEqual(["a"]);
+    await saveStateSource(root, initial, { expectedStream: stream, sourceGlobalSeq: 5, observedRepos: ["a"], values });
+    const saved = repoRecordsForState(await loadState(root, stream));
+    expect(saved.a?.removedKey).toBeUndefined();
+    expect(saved.b?.base).toEqual(section("b"));
+    expect(saved.b?.repoGen).toBe(0);
+  });
+
+  test("stream and nonce mismatches reject the whole packet", async () => {
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
+    await saveState(root, initial);
+    const packet = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: ["r"], values: { bases: { r: section("next") } } });
+    expect(await applyStateSavePacket(root, { ...packet, expectedStream: "other" }, { lock: lock() })).toMatchObject({ status: "rejected", reason: "stream" });
+    expect(await applyStateSavePacket(root, { ...packet, expectedNonce: "b".repeat(32) }, { lock: lock() })).toMatchObject({ status: "rejected", reason: "nonce" });
+    expect((await loadState(root, stream)).lastSyncedSequence).toBe(0);
+  });
+
+  test("legacy sentinel matches only nonce-less state and first save installs nonce", async () => {
+    const legacy = { ...baseState(), stateNonce: undefined };
+    await saveState(root, legacy);
+    const packet = composeStateSavePacket(legacy, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: [], values: {} });
+    expect(packet.expectedNonce).toBe("legacy");
+    expect((await applyStateSavePacket(root, packet, { lock: lock() })).status).toBe("accepted");
+    const installed = await loadState(root, stream);
+    expect(installed.stateNonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(await applyStateSavePacket(root, packet, { lock: lock() })).toMatchObject({ status: "rejected", reason: "nonce" });
+  });
+
+  test("same-binding reset regenerates nonce and delayed packet rejects", async () => {
+    const initial = baseState();
+    await saveState(root, initial);
+    const delayed = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: [], values: {} });
+    const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
+    await resetSyncState(root, stream, syncMutex);
+    await releaseWorkspaceSyncMutex(syncMutex);
+    const reset = await loadState(root, stream);
+    expect(reset.stateNonce).not.toBe(nonce);
+    expect(await applyStateSavePacket(root, delayed, { lock: lock() })).toMatchObject({ status: "rejected", reason: "nonce" });
+  });
+
+  test("A→B→A reset changes nonce and daemon iteration revalidation detects it", async () => {
+    await saveState(root, baseState());
+    const mutexA = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
+    await resetSyncState(root, "stream-B", mutexA);
+    await resetSyncState(root, stream, mutexA);
+    await releaseWorkspaceSyncMutex(mutexA);
+    expect(await daemonBindingMatches(root, stream, nonce)).toBe(false);
+    const rebound = await loadState(root, stream);
+    expect(await daemonBindingMatches(root, stream, expectedStateNonce(rebound))).toBe(true);
+  });
+
+  test("observedRepoKeys includes explicit observed absence", () => {
+    const state = baseState({ absentNow: { repoGen: 1, sourceSeq: 1, base: section("old") } });
+    expect(observedRepoKeys(state, {}, {})).toEqual(["absentNow"]);
+    const packet = composeStateSavePacket(state, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: observedRepoKeys(state, {}, {}), values: {} });
+    expect(packet.repos[0]?.newRecord.base).toBeUndefined();
+  });
+
+  test("a rejected packet recomputes in-operation, bounded to three attempts", async () => {
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
+    const fresh1 = { ...initial, repoRecords: { r: { repoGen: 1, sourceSeq: 1, base: section("one") } } };
+    const fresh2 = { ...initial, repoRecords: { r: { repoGen: 2, sourceSeq: 2, base: section("two") } } };
+    const attempts: StateSavePacket[] = [];
+    const accepted = await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 3,
+      observedRepos: ["r"],
+      values: { bases: { r: section("three") } },
+    }, {
+      apply: async (_root, packet) => {
+        attempts.push(packet);
+        if (attempts.length === 1) return { status: "rejected", reason: "repo-generation", state: fresh1 };
+        if (attempts.length === 2) return { status: "rejected", reason: "repo-generation", state: fresh2 };
+        return { status: "accepted", state: fresh2 };
+      },
+    });
+    expect(accepted).toBe(fresh2);
+    expect(attempts.map((packet) => packet.repos[0]?.expectedRepoGen)).toEqual([0, 1, 2]);
+
+    let count = 0;
+    await expect(saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 3,
+      observedRepos: ["r"],
+      values: { bases: { r: section("three") } },
+    }, {
+      apply: async () => {
+        count++;
+        return { status: "rejected", reason: "repo-generation", state: fresh1 };
+      },
+    })).rejects.toThrow(/3 recomputes exhausted/);
+    expect(count).toBe(3);
+  });
+});

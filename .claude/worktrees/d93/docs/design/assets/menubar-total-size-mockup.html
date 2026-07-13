@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RboxBar — total size instead of sequence number</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #1a1d24; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #2b3a55 0%, transparent 60%),
+      radial-gradient(1000px 500px at 95% 110%, #3d2b4e 0%, transparent 55%),
+      #1a1d24;
+    padding: 44px 40px 56px;
+    color: #e8eaed;
+  }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; margin-bottom: 4px; color: #f2f3f5; }
+  .sub { font-size: 12px; color: #9aa0aa; margin-bottom: 34px; }
+  .row { display: flex; gap: 40px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+  .variant { display: flex; flex-direction: column; align-items: center; }
+  .variant .label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase;
+    margin-bottom: 12px; padding: 3px 10px; border-radius: 20px;
+  }
+  .label.before { color: #9aa0aa; background: rgba(255,255,255,0.06); }
+  .label.after  { color: #4cd964; background: rgba(50,215,75,0.13); }
+
+  .panel {
+    width: 296px;
+    background: rgba(38, 39, 44, 0.94);
+    border: 1px solid rgba(255,255,255,0.11);
+    border-radius: 12px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55), 0 2px 10px rgba(0,0,0,0.35);
+    padding: 14px;
+    backdrop-filter: blur(30px);
+  }
+  .head { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+  .head .name { font-size: 13px; font-weight: 600; color: #f4f5f7; letter-spacing: -0.1px; }
+  .head .spacer { flex: 1; }
+  .path { font-size: 10px; color: #9aa0aa; margin-bottom: 12px; }
+  .pill {
+    font-size: 11px; font-weight: 500; letter-spacing: 0.1px;
+    padding: 3px 8px; border-radius: 20px;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .pill.synced { color: #4cd964; background: rgba(50, 215, 75, 0.13); border: 1px solid rgba(50,215,75,0.25); }
+  .pill.synced .dot { background: #32d74b; }
+
+  .primary { font-size: 12px; font-weight: 500; color: #f0f1f4; margin-bottom: 3px; }
+  .secondary { font-size: 10px; color: #9aa0aa; font-variant-numeric: tabular-nums; }
+  .secondary .highlight { color: #6fdb85; font-weight: 600; }
+  .secondary .old { color: #8b919c; }
+
+  .divider { height: 1px; background: rgba(255,255,255,0.09); margin: 11px 0; }
+
+  .item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5.5px 0;
+    font-size: 12px; color: #e8eaed;
+  }
+  .item .glyph { width: 16px; text-align: center; opacity: 0.8; font-size: 12px; }
+
+  .foot {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: #7d828c;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .caption { margin-top: 16px; font-size: 12px; color: #8b919c; text-align: center; max-width: 296px; }
+  .arrow { align-self: center; font-size: 22px; color: #565b64; margin-top: 130px; }
+</style>
+</head>
+<body>
+  <h1>RboxBar dropdown — "seq N" replaced with total synced size</h1>
+  <div class="sub">Same secondary status line, same position — the raw sequence counter is swapped for a human-readable byte total (via ByteCountFormatter), computed from the daemon's in-memory manifest.</div>
+
+  <div class="row">
+
+    <!-- BEFORE -->
+    <div class="variant">
+      <div class="label before">Before</div>
+      <div class="panel">
+        <div class="head">
+          <span class="name">Development</span>
+          <span class="spacer"></span>
+          <span class="pill synced"><span class="dot"></span>Synced</span>
+        </div>
+        <div class="path">~/Development</div>
+        <div class="primary">106,203 files · in sync</div>
+        <div class="secondary">Last synced 1 min ago · <span class="old">seq 786</span></div>
+        <div class="divider"></div>
+        <div class="item"><span class="glyph">⏸</span>Pause rbox</div>
+        <div class="item"><span class="glyph">↻</span>Restart rbox</div>
+        <div class="item"><span class="glyph">≡</span>Open logs</div>
+        <div class="divider"></div>
+        <div class="foot"><span>rbox 0.9.17</span><span>brians-macbook-pro-2</span></div>
+      </div>
+    </div>
+
+    <div class="arrow">→</div>
+
+    <!-- AFTER -->
+    <div class="variant">
+      <div class="label after">After</div>
+      <div class="panel">
+        <div class="head">
+          <span class="name">Development</span>
+          <span class="spacer"></span>
+          <span class="pill synced"><span class="dot"></span>Synced</span>
+        </div>
+        <div class="path">~/Development</div>
+        <div class="primary">106,203 files · in sync</div>
+        <div class="secondary">Last synced 1 min ago · <span class="highlight">15.2 GB</span></div>
+        <div class="divider"></div>
+        <div class="item"><span class="glyph">⏸</span>Pause rbox</div>
+        <div class="item"><span class="glyph">↻</span>Restart rbox</div>
+        <div class="item"><span class="glyph">≡</span>Open logs</div>
+        <div class="divider"></div>
+        <div class="foot"><span>rbox 0.9.17</span><span>brians-macbook-pro-2</span></div>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>
