@@ -32,6 +32,19 @@ every finding's cited file:line was confirmed accurate.
 No findings rejected this round — all fifteen were verified accurate against
 the code.
 
+## Round 4 — 2026-07-13 (final)
+
+Verdict: **ALIGNED** — no findings. Codex re-verified R3-1 against
+`worker.ts` (`request` op route dimension includes the templated
+`POST /v1/blob-batch/put`; outer span includes `authenticate()`),
+`blob-batch.ts` (handler op scope), and `metrics.ts` (no correlation id), and
+confirmed the exact-count-reconciliation gate-0 wording plus a full-doc skim
+with no regressions.
+
+Review closed: 4 rounds to ALIGNED. Rounds 1-3 findings: 17 total
+(2 BLOCKER, 11 MAJOR, 4 MINOR, 1 NIT counting the R2/R3 residuals), all
+adopted, none rejected.
+
 ## Round 3 — 2026-07-13
 
 Verdict: **CHANGES-REQUIRED** (1 MAJOR residual; R2-1 verified resolved).

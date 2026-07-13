@@ -1,7 +1,8 @@
 # 109 — First-publish upload authentication call storm
 
-Status: UNDER ADVERSARIAL REVIEW (round 1 revisions applied 2026-07-13) — see
-`docs/design/REVIEW-109.md`.
+Status: REVIEWED — ALIGNED (codex adversarial loop, 4 rounds, 2026-07-13) —
+ledger in `docs/design/REVIEW-109.md`. Implementation is gated on §6.0 gate 0
+(attribution go/no-go) before any code.
 
 ## 1. Problem and measured evidence
 
