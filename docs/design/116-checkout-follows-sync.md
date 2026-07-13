@@ -530,6 +530,9 @@ interface GitDeferral {
   subjectKey?: string;                 // incomingKey for apply; local probe for capture
   reason: GitDeferralReason;            // closed enum
   checkout?: { kind: "branch" | "detached"; label?: string };
+  /** r4 F9/r5 F2: working bytes changed while this deferral stood —
+   * sender-local, restart-surviving; blocks the clean aggregate. */
+  bytesChanged?: boolean;
 }
 
 // RepoRecord field: independent episodes can coexist.
@@ -750,7 +753,7 @@ Closed reason enum:
 
 ```text
 local-edits | local-index | local-operation | local-commits | local-stash
-git-busy | worktree-ownership | ignored-target | unreadable
+conflict | git-busy | worktree-ownership | ignored-target | unreadable
 artifact | config | containment | unsupported | other
 ```
 
@@ -759,8 +762,13 @@ probe values and reason changes for as long as that lane never reaches a fully
 non-deferred state. This is the chronic age displayed to the user: a busy
 workspace cannot reset “14d” to minutes by publishing another blocked section.
 `reasonSince` resets when the closed reason class changes; `lastSeen` advances
-on retry. Success, convergence, conflict checkpoint, or remote absence clears
-the apply age. Capture age clears only when that planner row captures/carries
+on retry. Success, convergence, or remote absence clears the apply age. A
+conflict checkpoint does NOT clear it (r5 F3): a new or re-proved-genuine
+`gitNeedsResolution` checkpoint is an unresolved condition, so it holds an
+apply-lane deferral with reason `conflict` and continuous age until actual
+resolution — a local identity change, a `rbox git resolve` verb, or remote
+absence. The checkpoint's early-return suppression never makes the repo
+ambiently invisible. Capture age clears only when that planner row captures/carries
 successfully or the repo is intentionally removed; config age clears on
 completion or permanent policy skip.
 
@@ -827,11 +835,16 @@ surfaces: the macOS menu bar (`RboxBarAmbientStatus` gains the deferred-repo
 count and oldest age, design 88), `rbox status` (the per-repo line already
 specified in Visibility), and shell integration (the design-46 `shell.line`
 state shows the deferral when the shell is cd'd into that repo's subtree).
-The v1 `shell.line` record is one workspace-wide line and cannot route by
-subtree (r4 F8), so the sidecar gains a versioned extension: a compact
-repo-routing table (rel-path → deferral summary) that old plugin versions
-ignore, with the plugin passing `$PWD` into the existing TypeScript-owned
-lookup that selects the enclosing repo's entry. All three surfaces read the
+The v1 `shell.line` record is one workspace-wide line, its parser accepts
+only `v1` and treats trailing fields as the workspace name, and its default
+path spawns no subprocess (r4 F8, r5 F4) — so `shell.line` itself is NOT
+extended. A **separate** sidecar, `shell.deferrals` (versioned `v1` of its
+own), carries one line per deferred repo: percent-encoded rel-path,
+reason class, age bucket, and the `bytesChanged` flag, tab-separated. Only
+new plugin versions read it, via pure-shell `$PWD` prefix matching against
+the decoded rel-paths — no per-prompt subprocess, preserving design 88's
+≤5 ms budget; old plugins never open the file and render exactly today's
+line. All three surfaces read the
 same authoritative repo-record deferral state; no fourth
 bookkeeping source. The same privacy boundary applies: repo/branch names
 render locally only.
@@ -847,18 +860,22 @@ every hour it waits for a human, making eventual resolution harder — the
 opposite of the founder principle. Working bytes on a deferred repo may
 therefore be newer than its checkout; the deferral line says so.
 
-The stale-porcelain hazard is named, classified, and surfaced (r4 F9): a
+The stale-porcelain hazard is named, classified, and surfaced (r4 F9;
+scoped honestly r5 F2): a
 user who runs `git reset --hard`/`git checkout -- .` against the deferred
 old HEAD restores old bytes, and the file plane publishes them as ordinary
 deliberate edits — LWW file semantics, working as specified; the displaced
-newer content stays recoverable in version history. What the system must
+newer content stays recoverable in version history. What the SENDER must
 never do is call that state fully in sync: a deferred repo whose working
-bytes CHANGE while the deferral stands gains a `bytes-changed-during-defer`
-marker on its deferral record, rendered on every surface, and the workspace
-aggregate cannot report clean while any repo carries the marker. The pushed
-manifest pairing those bytes with the carried newer pending Git section is
-cross-plane incoherent by construction; receivers surface the same marker
-when their oracle sees tree≠checkout after applying it. Design 50's conflict
+bytes change while the deferral stands sets `bytesChanged: true` on its
+persisted `GitDeferral` record (a schema field, restart-surviving), rendered
+on every local surface, and the workspace aggregate cannot report clean
+while any repo carries it. The marker is deliberately **sender-local, not
+transported**: on a receiver the resulting state — tree matching the applied
+manifest but dirty against the followed checkout — is indistinguishable from
+a legitimate unstaged sender edit and is treated identically (ordinary
+post-follow dirt); inventing wire semantics to distinguish them would add
+schema surface without a decidable receiver-side test. Design 50's conflict
 copies do not cover this path and are not claimed to.
 
 **3. One-command exit: `rbox git resolve <repo> [show-me|take-theirs|
@@ -903,10 +920,18 @@ end. Implementation may be phased; semantics are fixed:
 - `keep-mine`: make local the truth. Ordering is protect-then-clear
   (r4 F6): first fetch, decrypt, closure-verify, and import the discarded
   pending/incoming section's artifacts and pin its tips locally — incoming
-  heads, tags, checkout tips, and stash roots are **human-origin (permanent)
-  pins**: they are another human's work, and server-history retention is not
+  heads, tags, checkout tips, stash roots, AND every commit-bearing incoming
+  op-state root are **human-origin (permanent) pins**: they are another
+  human's work, and server-history retention is not
   a substitute (r4 F4); only the section's tracking entries take tracking
-  provenance. Only after those pins land does the verb clear the
+  provenance. Pins alone cannot hold the section's index and op-state — they
+  are artifacts, not refs (r5 F1) — so the protect step also retains
+  **quarantine-grade durable copies** of the decrypt-verified incoming index
+  and op-state bytes in the workspace quarantine area (the same discipline
+  `quarantineLocal` applies to local state), recorded in the episode so
+  `show-me` can direct recovery. A staged conflict resolution or paused
+  operation that existed only in the discarded section survives keep-mine
+  byte-exactly. Only after those pins land does the verb clear the
   deferral/checkpoint — and that clear rides the SAME accepted-commit state
   transition as the force-captured push, so a failed import, capture,
   network error, or rejected commit leaves the deferral (and its ambient

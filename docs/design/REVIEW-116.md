@@ -266,6 +266,37 @@ fixes. All eleven adjudicated and adopted, folded as `(r4 Fn)`:
   <repo> [verb]`, default show-me, `--json`, `--confirm <token>` using the
   printed snapshot identity.
 
+## Round 5 (codex, 2026-07-13) — CHANGES-REQUIRED
+
+1 BLOCKER + 3 MAJOR, all in the r3/r4 UX/visibility additions; the entire
+core follow machinery (journal phases, non-replay recovery, quarantine-rename
+fresh recovery, pin promotion ordering, take-theirs CAS, keep-mine ordering,
+kill-switch semantics, grammar) verified closed. All four adopted, folded as
+`(r5 Fn)`:
+
+- **F1 [BLOCKER] keep-mine could not preserve incoming index/op-state-only
+  human work** (they are artifacts, not refs — pins can't hold them; scratch
+  cleanup + server expiry could orphan a conflict-resolution index that
+  existed only in the discarded section). Adopted: protect step retains
+  quarantine-grade durable copies of the decrypt-verified incoming
+  index/op-state bytes and pins commit-bearing incoming op-state roots
+  human-origin, recorded in the episode.
+- **F2 [MAJOR] bytes-changed marker was neither persisted nor honestly
+  transportable** (receiver shape indistinguishable from a legitimate
+  unstaged sender edit). Adopted: `bytesChanged` persisted on the
+  `GitDeferral` schema, sender-local by design; receiver-transport claim
+  withdrawn with the rationale recorded.
+- **F3 [MAJOR] retained genuine checkpoints went ambiently invisible**
+  (checkpoint cleared the apply age while suppression early-returns).
+  Adopted: `conflict` joins the closed reason enum; new and re-proved
+  checkpoints hold an apply-lane deferral with continuous age until real
+  resolution.
+- **F4 [MAJOR] shell.line v1 parser cannot carry routing data** (trailing
+  fields become the workspace name; new versions are rejected; default path
+  may spawn no subprocess). Adopted: separate versioned `shell.deferrals`
+  sidecar, percent-encoded tab-separated rows, pure-shell `$PWD` prefix
+  matching, old plugins untouched, ≤5 ms budget preserved.
+
 ## Open review work
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
