@@ -111,9 +111,21 @@ export interface FollowOptions {
   crashAt?: (point: FollowCrashPoint) => void;
   /** A D2 applied-ref marker failed exact revalidation; human movement wins. */
   forcedHeldRefs?: GitPartialApply["heldRefs"];
+  /** D6's explicit, snapshot-confirmed authorization. Automatic follow keeps
+   * using the ordinary oracle gates; this narrow mode only waives the exact
+   * human divergences enumerated by show-me. Exact ref-plane progress authored
+   * by the normal pipeline is reported to the lock-bound snapshot verifier so
+   * it can normalize only those known changes and reject every other delta. */
+  manualResolution?: {
+    snapshotId: string;
+    waivedReasons: readonly Extract<GitDeferralReason,
+      "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash">[];
+    protectedOids: readonly string[];
+    secondProof: (authoredRefChanges: readonly { ref: string; before?: string; after?: string }[]) => Promise<boolean>;
+  };
 }
 
-interface StagedIncoming {
+export interface StagedIncoming {
   tmpDir: string;
   incomingNs: string;
   candidateIndex?: string;
@@ -122,6 +134,8 @@ interface StagedIncoming {
   opBytes: Record<string, Uint8Array>;
   cleanup(): Promise<void>;
 }
+
+export type StageIncomingOptions = Pick<FollowOptions, "ctx" | "incoming" | "store" | "kek" | "chainTimings">;
 
 interface LiveMetadata {
   headContent: string;
@@ -212,7 +226,7 @@ async function normalizedIndexProjection(repoDir: string, source: string, dest: 
   return indexIdentityV2(repoDir, dest);
 }
 
-async function stageIncoming(opts: FollowOptions): Promise<StagedIncoming> {
+export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedIncoming> {
   const { ctx, incoming, store, kek } = opts;
   await fs.mkdir(path.join(ctx.repoDir, ".rbox"), { recursive: true });
   const tmpDir = await fs.mkdtemp(path.join(ctx.repoDir, ".rbox", "git-follow-"));
@@ -289,6 +303,7 @@ async function classifyCheckout(args: {
   roots: readonly string[];
   boundary: boolean;
   checkoutRefReason?: GitDeferralReason;
+  checkoutRefDetail?: string;
 }): Promise<CheckoutClassification> {
   const reasons = new Set<GitDeferralReason>();
   const details: string[] = [];
@@ -356,8 +371,9 @@ async function classifyCheckout(args: {
   }
   if (args.checkoutRefReason) {
     reasons.add(args.checkoutRefReason);
-    details.push("incoming checkout ref could not be published safely");
+    details.push(args.checkoutRefDetail ?? "incoming checkout ref could not be published safely");
   }
+  for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
   const reason = firstReason(reasons);
   return reason ? { safe: false, reason, detail: details.join("; ") } : { safe: true };
 }
@@ -420,7 +436,11 @@ async function publishRefPlane(
   opts: FollowOptions,
   live: LiveMetadata,
   roots: readonly string[],
-): Promise<FollowProgress & { checkoutRefReason?: GitDeferralReason }> {
+): Promise<FollowProgress & {
+  checkoutRefReason?: GitDeferralReason;
+  checkoutRefDetail?: string;
+  authoredRefChanges: Array<{ ref: string; before?: string; after?: string }>;
+}> {
   const effective = effectiveRefs(opts.ctx, opts.incoming);
   const owned = await branchesCheckedOutElsewhere(opts.ctx);
   const appliedRefs: GitPartialApply["appliedRefs"] = {};
@@ -428,7 +448,14 @@ async function publishRefPlane(
   const plannedRoots = [...new Set(Object.values(effective.refs))];
   const forcedCurrent = live.currentRef ? opts.forcedHeldRefs?.[live.currentRef] : undefined;
   let checkoutRefReason: GitDeferralReason | undefined = forcedCurrent === "ownership" ? "worktree-ownership" : forcedCurrent;
+  let checkoutRefDetail: string | undefined;
+  const authoredRefChanges: Array<{ ref: string; before?: string; after?: string }> = [];
+  const manualProtected = new Set(opts.manualResolution?.protectedOids ?? []);
   const incomingHeadRef = headBranchOf(opts.incoming.head);
+  if (incomingHeadRef && owned.has(incomingHeadRef)) {
+    checkoutRefReason = "worktree-ownership";
+    checkoutRefDetail = `branch ${incomingHeadRef.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(incomingHeadRef)}`;
+  }
   const candidates = new Set(Object.keys(effective.refs));
   if (effective.deleteAbsent) for (const ref of Object.keys(live.refs)) candidates.add(ref);
 
@@ -440,7 +467,11 @@ async function publishRefPlane(
     const newOid = effective.refs[ref];
     if (oldOid === newOid) continue;
     let hold = opts.forcedHeldRefs?.[ref];
-    if (!hold && owned.has(ref)) hold = "ownership";
+    if (!hold && owned.has(ref)) {
+      hold = "ownership";
+      if (opts.manualResolution) checkoutRefReason ??= "worktree-ownership";
+      checkoutRefDetail ??= `branch ${ref.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(ref)}`;
+    }
     if (oldOid) {
       const protectedOids = ref === "refs/stash" && opts.ctx.kind === "dir"
         ? [...new Set([oldOid, ...await enumerateStashReflogOids(opts.ctx.repoDir)])]
@@ -448,7 +479,11 @@ async function publishRefPlane(
       protectedByRef.set(ref, protectedOids);
       if (!hold) for (const oid of protectedOids) {
         const proof = await tipOwnedByIncoming(opts.ctx.repoDir, oid, roots);
-        if (proof.status === "unowned") { hold = ref === "refs/stash" ? "local-stash" : "local-commits"; break; }
+        if (proof.status === "unowned") {
+          if (opts.manualResolution && manualProtected.has(oid)) continue;
+          hold = ref === "refs/stash" ? "local-stash" : "local-commits";
+          break;
+        }
         if (proof.status === "indeterminate") {
           hold = ref === "refs/stash" ? "local-stash" : "local-commits";
           checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
@@ -481,6 +516,7 @@ async function publishRefPlane(
       if (ref === live.currentRef || classifiedHolds.has(ref)) continue;
       const protectedOids = protectedByRef.get(ref);
       if (!protectedOids?.length) continue;
+      if (opts.manualResolution && protectedOids.every((oid) => manualProtected.has(oid))) continue;
       const proof = await noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids);
       if (proof.status === "proven") continue;
       classifiedHolds.set(ref, ref === "refs/stash" ? "local-stash" : "local-commits");
@@ -496,19 +532,22 @@ async function publishRefPlane(
     const newOid = effective.refs[ref];
     if (oldOid === newOid) {
       if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
-      if (ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
+      if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
       continue;
     }
     const hold = classifiedHolds.get(ref);
     if (hold) {
       heldRefs[ref] = hold;
+      if (opts.manualResolution) checkoutRefReason ??= hold === "ownership" ? "worktree-ownership" : hold;
       if (ref === incomingHeadRef) checkoutRefReason = hold === "ownership" ? "worktree-ownership" : hold;
       continue;
     }
     try {
       if ((await branchesCheckedOutElsewhere(opts.ctx)).has(ref)) {
         heldRefs[ref] = "ownership";
-        if (ref === incomingHeadRef) checkoutRefReason = "worktree-ownership";
+        const sibling = (await branchesCheckedOutElsewhere(opts.ctx)).get(ref);
+        checkoutRefDetail ??= `branch ${ref.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${sibling}`;
+        if (opts.manualResolution || ref === incomingHeadRef) checkoutRefReason = "worktree-ownership";
         continue;
       }
       if (!oldOid && !newOid) continue;
@@ -534,8 +573,9 @@ async function publishRefPlane(
       else if (newOid) lines.push(`create ${ref} ${newOid}`);
       else lines.push(`delete ${ref} ${oldOid}`);
       await runRefTransaction(opts.ctx.repoDir, lines);
+      if (opts.manualResolution) authoredRefChanges.push({ ref, ...(oldOid ? { before: oldOid } : {}), ...(newOid ? { after: newOid } : {}) });
       if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
-      if (ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
+      if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
     } catch (error) {
       const message = String((error as Error)?.message ?? error);
       checkoutRefReason ??= /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
@@ -543,7 +583,15 @@ async function publishRefPlane(
   }
 
   const configApplied = await opts.runConfig?.().catch(() => false) ?? true;
-  return { appliedRefs, heldRefs, filteredRefs: effective.filtered, configApplied, checkoutRefReason };
+  return {
+    appliedRefs,
+    heldRefs,
+    filteredRefs: effective.filtered,
+    configApplied,
+    checkoutRefReason,
+    checkoutRefDetail,
+    authoredRefChanges,
+  };
 }
 
 async function deriveBaseProjection(opts: FollowOptions, staged: StagedIncoming): Promise<string | undefined> {
@@ -597,7 +645,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
 
     // The design kill switch disables oracle-authorized checkout only. Safe
     // refs/config and their partial markers remain active in both flag arms.
-    if (!opts.followEnabled) return { status: "legacy", reason: "conflict", detail: "automatic checkout follow disabled", ...progress };
+    if (!opts.followEnabled && !opts.manualResolution) return { status: "legacy", reason: "conflict", detail: "automatic checkout follow disabled", ...progress };
     const capabilitySupported = opts.capabilityProbe
       ? await opts.capabilityProbe(await git(opts.ctx.repoDir, ["--version"]))
       : await checkoutTransactionSupported(opts.ctx.repoDir);
@@ -626,6 +674,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       roots: checkoutRoots,
       boundary: false,
       checkoutRefReason: refProgress.checkoutRefReason,
+      checkoutRefDetail: refProgress.checkoutRefDetail,
     });
     if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress };
 
@@ -715,6 +764,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       binding: opts.binding,
       createdFresh: false,
       intended,
+      ...(opts.manualResolution ? { episode: { verb: "take-theirs" as const, snapshotId: opts.manualResolution.snapshotId } } : {}),
     };
     await writeCheckoutJournal(opts.workspaceRoot, opts.relPath, journal, {
       indexPath: path.join(opts.ctx.gitDir, "index"),
@@ -750,6 +800,17 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           && freshBinding.worktreeId === opts.binding.worktreeId
           && freshCtx.kind === opts.ctx.kind;
         const live = sameIncarnation ? await readLive(freshCtx) : undefined;
+        if (opts.manualResolution) {
+          try {
+            if (!(await opts.manualResolution.secondProof(refProgress.authoredRefChanges))) {
+              noteBoundaryFailure("other", "confirmed snapshot changed at checkout boundary");
+              return false;
+            }
+          } catch {
+            noteBoundaryFailure("unreadable", "confirmed snapshot could not be revalidated at checkout boundary");
+            return false;
+          }
+        }
         const proof = await classifyCheckout({
           opts,
           live,
@@ -758,6 +819,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           roots: checkoutRoots,
           boundary: true,
           checkoutRefReason: refProgress.checkoutRefReason,
+          checkoutRefDetail: refProgress.checkoutRefDetail,
         });
         if (!proof.safe) boundaryFailure = proof;
         if (!sameIncarnation) { noteBoundaryFailure("unreadable", "repository incarnation changed at checkout boundary"); return false; }
@@ -808,6 +870,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       };
     }
     await markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath);
+    if (opts.manualResolution && effective.refs["refs/stash"]) await ensureStashReflog(opts.ctx.repoDir, effective.refs["refs/stash"]!);
     opts.crashAt?.("after-published-flip");
     return { status: "followed", journalPendingClear: true, ...postProgress };
   } finally {
