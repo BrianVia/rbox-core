@@ -34,17 +34,24 @@ itself attribute all 107.7s to D1 authentication CPU/wall time.
 
 ### 1.1 How big can the win actually be? (honest bound)
 
-The waste is real but bounded, and the bound must be stated before choosing a
-fix. At 24 slots, mean slot occupancy per dispatch is
-`107.7s × 24 / 2,426 ≈ 1.07s`. The client code itself records (comment at the
-`DEFAULT_BATCH_PUT_SLOTS` constant, measured 2026-07-08) that **one batch PUT
-settles in ~910ms regardless of record count**, attributed to the Worker's
-per-invocation subrequest serialization on the R2 writes. That leaves roughly
-~160ms of mean per-dispatch residual for *everything else* — network RTT,
-Worker queueing, routing, and bearer authentication combined. Even if
-authentication were the entire residual, removing it saves at most
-`≈ 0.16s × 2,426 / 24 ≈ 16s` of the 107.7s envelope (~15%) on this corpus —
-likely less.
+The waste is real but bounded, and the likely size must be stated before
+choosing a fix — with its assumptions visible. `107.7s × 24 / 2,426 ≈ 1.07s`
+is a **concurrency-envelope ceiling on mean request duration**: at most 24
+dispatches overlap at any instant, so total slot-seconds inside the envelope
+are ≤ `107.7 × 24`, and the true mean duration is ≤ 1.07s (lower whenever
+ramp-up, producer gaps, partial flushes, or the idle tail leave slots idle —
+which they do). Separately, the client code records (comment at the
+`DEFAULT_BATCH_PUT_SLOTS` constant, measured 2026-07-08 on a different
+corpus/window) ~910ms per batch PUT with AE average latency flat across 8 vs
+24 slots, attributed to the Worker's per-invocation subrequest serialization
+on the R2 writes. **If** that ~910ms floor transfers to the flat-meadow run,
+the mean removable residual is ≲160ms/dispatch and the projected wall saving
+is roughly `0.16s × 2,426 / 24 ≈ 16s` (~15%) — but this is a rough cross-run
+estimate, not an established upper bound: the ceiling is on *mean duration*,
+and the 910ms figure is from another measurement. The honest statement is:
+the win is plausibly in the low tens of seconds at best on this corpus, and
+gate 0 (§6.0) must establish the real number from matched server-side
+measurements before any implementation.
 
 Authentication itself is two D1 point reads plus a throttled `last_seen_at`
 write per request (`apps/api/src/auth/authenticate.ts`: `devices LEFT JOIN
@@ -54,15 +61,23 @@ the account DB). Every batch PUT carries the same durable bearer
 dispatching it, so the multiplicative defect is genuine — but it may not be
 the dominant term of the measured envelope.
 
-**Attribution prerequisite (gate 0, §6.0):** the server already measures this.
-The worker-level `request` op (`apps/api/src/worker.ts` `fetch()`) wraps
-`route()` *including* `authenticate()`, while the handler-level `blob.batchPut`
-op wraps only the handler; both emit `ms`/`dbMs`/`dbCalls` to Analytics Engine.
-`request − blob.batchPut` per matched `POST /v1/blob-batch/put` event bounds
-the pre-handler (auth + routing) cost per request using data we already
-collect. This design proceeds to implementation only if that decomposition
-shows a per-request pre-handler cost consistent with a material wall win
-(§6.0); otherwise it is parked in favor of the batch-fill/slot levers.
+**Attribution prerequisite (gate 0, §6.0):** the server already measures the
+right scopes. The worker-level `request` op (`apps/api/src/worker.ts`
+`fetch()`) wraps `route()` *including* `authenticate()` (whose `dirDb`/`dbFor`
+queries resolve to the span-proxied binding), while the handler-level
+`blob.batchPut` op wraps only the handler; both emit `ms`/`dbMs`/`dbCalls` to
+Analytics Engine. AE events carry **no correlation id**, so per-request
+subtraction is impossible with existing data — the decomposition is
+**aggregate**: over an isolated window in which `POST /v1/blob-batch/put`
+dominates traffic (a dedicated dev-worker publish, or the FM window after
+outcome/count reconciliation to exclude `request` rows with no handler
+event), compare the aggregate mean/sum of `request` vs `blob.batchPut`
+`ms`/`dbMs`. That bounds mean pre-handler (auth + routing) cost per request
+with stated uncertainty, using data we already collect. This design proceeds
+to implementation only if that aggregate decomposition shows a pre-handler
+cost consistent with a material wall win (§6.0); otherwise it is parked in
+favor of the batch-fill/slot levers. Per-request correlation instrumentation
+is explicitly NOT required for gate 0 and not added.
 
 ## 2. Root-cause analysis
 
@@ -362,18 +377,22 @@ data migration or cleanup is required.
 
 ### 6.0 Gate 0 — attribution before implementation (existing data only)
 
-Before any code is written, pull from Analytics Engine for the FM run window
-(or a fresh dev-worker publish):
+Before any code is written, pull from Analytics Engine for an isolated window
+(preferred: a fresh dedicated dev-worker publish; otherwise the FM window with
+outcome/count reconciliation, since AE events carry no correlation id and only
+aggregate comparison is possible — §1.1):
 
-- per-request `request` vs `blob.batchPut` decomposition for
-  `POST /v1/blob-batch/put` (`ms`, `dbMs`, `dbCalls`): the difference bounds
-  pre-handler auth + routing cost per request;
+- aggregate `request` vs `blob.batchPut` comparison for a window dominated by
+  `POST /v1/blob-batch/put` (`ms`, `dbMs`, `dbCalls` means/sums, after
+  excluding `request` rows with no matching handler outcome): the difference
+  bounds mean pre-handler auth + routing cost per request, with stated
+  uncertainty;
 - the batch-fill distribution from `blob.batchPut` `count`/`bytes`.
 
-Go/no-go: implement this design only if the measured pre-handler cost times
-request count, divided by slot width, is a wall-time win worth the new
+Go/no-go: implement this design only if the measured mean pre-handler cost
+times request count, divided by slot width, is a wall-time win worth the new
 credential surface (working threshold: ≥5s projected on the FM corpus — versus
-the §1.1 upper bound of ~16s). If fill is the larger lever, record that and
+the §1.1 rough estimate of ~16s). If fill is the larger lever, record that and
 park 109 in favor of the fill/slot work (option D).
 
 ### 6.1 Unit and integration gates

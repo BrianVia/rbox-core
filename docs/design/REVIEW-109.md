@@ -32,6 +32,22 @@ every finding's cited file:line was confirmed accurate.
 No findings rejected this round — all fifteen were verified accurate against
 the code.
 
+## Round 2 — 2026-07-13
+
+Verdict: **CHANGES-REQUIRED** (2 MAJOR residual on round-1 material; findings
+1–4, 6–8, 10–15 verified resolved; 5 and 9 partially resolved).
+
+| # | Sev | Finding (compressed) | Decision | Rationale / doc change |
+|---|-----|----------------------|----------|------------------------|
+| R2-1 | MAJOR | §1.1's "~16s upper bound" not mathematically established: `107.7×24/2,426` is a concurrency-envelope *ceiling on mean request duration* (slots are not fully occupied through ramp-up/gaps/idle tail), and the ~910ms figure is from a different corpus/window and shows slot-flatness, not record-count invariance — so subtracting it does not yield an upper bound on removable residual. | **ADOPT** | §1.1 rewritten: 1.07s labeled a concurrency-envelope ceiling on mean duration, ~910ms labeled a cross-run measurement with its transfer assumption explicit, ~16s downgraded to a rough estimate ("plausibly low tens of seconds at best"); gate 0 owns the real number. |
+| R2-2 | MAJOR | Gate 0 assumed per-request `request` − `blob.batchPut` subtraction, but AE events carry no correlation id (dimensions are op/route/outcome only), so pairing is impossible; `request` rows can exist with no handler event. | **ADOPT** | §1.1 and §6.0 now specify an *aggregate* decomposition over an isolated window (dedicated dev-worker publish preferred; otherwise FM window with outcome/count reconciliation), comparing means/sums with stated uncertainty; explicitly notes per-request correlation instrumentation is NOT required or added. |
+
+Codex additionally verified (no findings): auth-path echo header is
+enum-only/no-store/not CORS-exposed; settle-time classification coherent with
+`retries: 0`, watchdog abort, and 503 retry_later paths; refresh timing spec
+internally consistent; empty receipts-protocol check enters the receipts
+branch and can mint without D1 lookup work; §6 gates otherwise falsifiable.
+
 ### Seam items (for the joint 109/110/111 round — not folded into 109's scope)
 
 - **111 (redemption tail)**: 109 deliberately keeps receipt redemption
