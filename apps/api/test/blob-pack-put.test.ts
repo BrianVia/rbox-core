@@ -90,6 +90,34 @@ async function direct(pack: BuiltPack, handlerEnv: Env, accountId: string): Prom
   return blobPackPut(request(pack), handlerEnv, accountId);
 }
 
+interface R2Call { op: "put" | "delete" | "head"; key: string }
+
+function recordingEnv(calls: R2Call[], points?: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }>): Env {
+  const bucket = new Proxy(env.rbox_dev_blobs, {
+    get(target, property) {
+      if (property === "put") return (key: string, value: Uint8Array, options?: R2PutOptions) => {
+        calls.push({ op: "put", key });
+        return target.put(key, value, options);
+      };
+      if (property === "delete") return (key: string) => {
+        calls.push({ op: "delete", key });
+        return target.delete(key);
+      };
+      if (property === "head") return (key: string) => {
+        calls.push({ op: "head", key });
+        return target.head(key);
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    ...env,
+    rbox_dev_blobs: bucket,
+    ...(points ? { rbox_metrics: { writeDataPoint: (point: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) => points.push(point) } as AnalyticsEngineDataset } : {}),
+  } as Env;
+}
+
 async function packRow(id: string) {
   return db().prepare("SELECT * FROM packs WHERE pack_id = ?").bind(id).first<{
     pack_sha256: string;
@@ -182,12 +210,14 @@ describe("pack publication and idempotency", () => {
   test("publishes one pack, preserves directory order, and mints v2 receipts", async () => {
     const a = await bootstrap("pack-happy");
     const pack = smallPack();
+    const calls: R2Call[] = [];
+    const points: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
     const parsed = parsePack(pack.body);
     expect(parsed).toMatchObject({ ok: true, entries: pack.entries });
     if (!parsed.ok) throw new Error("test pack did not parse");
     for (const entry of parsed.entries) expect(hash(pack.body.subarray(entry.offset, entry.offset + entry.length))).toBe(entry.sha256);
 
-    const res = await SELF.fetch(request(pack, a.token));
+    const res = await direct(pack, recordingEnv(calls, points), a.accountId);
     expect(res.status).toBe(200);
     const body = await res.json() as { packId: string; packSha256: string; results: Array<{ sha256: string; sizeBytes: number; receipt: string }> };
     expect(body.packId).toBe(pack.id);
@@ -201,6 +231,20 @@ describe("pack publication and idempotency", () => {
     expect(new Uint8Array(await object!.arrayBuffer())).toEqual(pack.body);
     expect(await packRow(pack.id)).toMatchObject({ pack_sha256: pack.sha, size_bytes: pack.body.byteLength, member_count: pack.entries.length, state: "ready" });
     expect(await memberRows(pack.id)).toEqual(pack.entries);
+    expect(calls.filter((call) => call.op === "put")).toEqual([{ op: "put", key: packKey(pack.id) }]);
+    expect(calls.filter((call) => call.op === "put" && pack.entries.some((entry) => call.key === blobKey(entry.sha256)))).toEqual([]);
+
+    const generic = points.find((point) => point.blobs?.[0] === "blob.packPut");
+    expect(generic?.doubles?.[4]).toBe(pack.body.byteLength);
+    expect(generic?.doubles?.[5]).toBe(pack.entries.length);
+    const phasePoints = points.filter((point) => point.blobs?.[0] === "blob.packPut.phases");
+    expect(phasePoints).toHaveLength(1);
+    expect(phasePoints[0]?.blobs).toEqual(["blob.packPut.phases", "ok"]);
+    expect(phasePoints[0]?.doubles).toHaveLength(6);
+    expect(phasePoints[0]?.doubles?.every((value) => Number.isFinite(value) && value >= 0)).toBe(true);
+    expect(phasePoints[0]?.doubles?.[5]).toBe(pack.entries.reduce((sum, entry) => sum + entry.length, 0));
+    const serialized = JSON.stringify(points);
+    for (const forbidden of [pack.id, pack.sha, a.accountId, ...pack.entries.map((entry) => entry.sha256)]) expect(serialized).not.toContain(forbidden);
   });
 
   test("accepts an exactly-8-MiB valid pack", async () => {
@@ -238,6 +282,19 @@ describe("pack publication and idempotency", () => {
     expect(await db().prepare("SELECT COUNT(*) n FROM packs WHERE pack_id=?").bind(pack.id).first<{ n: number }>()).toMatchObject({ n: 1 });
   });
 
+  test("ready retry rejects equal-length object corruption and mints no receipts", async () => {
+    const a = await bootstrap("pack-ready-corrupt");
+    const pack = smallPack();
+    expect((await SELF.fetch(request(pack, a.token))).status).toBe(200);
+    const corrupt = pack.body.slice();
+    corrupt[pack.entries[0]!.offset] ^= 0xff;
+    expect(corrupt.byteLength).toBe(pack.body.byteLength);
+    await env.rbox_dev_blobs.put(packKey(pack.id), corrupt);
+    const retry = await SELF.fetch(request(pack, a.token));
+    expect(retry.status).toBe(503);
+    expect(await retry.json()).toEqual({ error: "retry_later" });
+  });
+
   test("same id with a different checksum conflicts without mixing inventory", async () => {
     const a = await bootstrap("pack-conflict");
     const id = nextId();
@@ -253,15 +310,19 @@ describe("pack publication and idempotency", () => {
 
   test("same-id concurrent PUT never deletes the winner's shared object", async () => {
     const a = await bootstrap("pack-concurrent");
-    const pack = smallPack();
-    const [left, right] = await Promise.all([direct(pack, env, a.accountId), direct(pack, env, a.accountId)]);
+    const pack = smallPack(nextId(), "concurrent-shared");
+    const calls: R2Call[] = [];
+    const handlerEnv = recordingEnv(calls);
+    const [left, right] = await Promise.all([direct(pack, handlerEnv, a.accountId), direct(pack, handlerEnv, a.accountId)]);
     expect([left.status, right.status].filter((status) => status === 200).length).toBeGreaterThanOrEqual(1);
     expect([200, 503]).toContain(left.status);
     expect([200, 503]).toContain(right.status);
+    expect(calls.filter((call) => call.op === "delete" && call.key === packKey(pack.id))).toEqual([]);
     const object = await env.rbox_dev_blobs.get(packKey(pack.id));
     expect(new Uint8Array(await object!.arrayBuffer())).toEqual(pack.body);
     expect(await packRow(pack.id)).toMatchObject({ state: "ready" });
     expect(await memberRows(pack.id)).toEqual(pack.entries);
+    expect(await db().prepare("SELECT COUNT(*) n FROM packs WHERE pack_id=? AND state='ready'").bind(pack.id).first()).toEqual({ n: 1 });
   });
 
   test("R2 failure leaves an inventoried uploading orphan and no receipts", async () => {
@@ -404,6 +465,44 @@ describe("uploading orphan sweeper", () => {
     expect(await env.rbox_dev_blobs.head(packKey(pack.id))).toBeNull();
 
     await env.rbox_dev_blobs.put(packKey(pack.id), pack.body);
+    await sweepUploadingPacks(env, now + 1);
+    expect(await env.rbox_dev_blobs.head(packKey(pack.id))).toBeNull();
+    expect(await packRow(pack.id)).toMatchObject({ state: "swept" });
+  });
+
+  test("repair racing a past-grace sweep converges through the swept tombstone", async () => {
+    const a = await bootstrap("pack-repair-sweep-race");
+    const pack = smallPack();
+    let signalPut!: () => void;
+    let releasePut!: () => void;
+    const putEntered = new Promise<void>((resolve) => { signalPut = resolve; });
+    const released = new Promise<void>((resolve) => { releasePut = resolve; });
+    const pausedBucket = new Proxy(env.rbox_dev_blobs, {
+      get(target, property) {
+        if (property === "put") return async (key: string, value: Uint8Array, options?: R2PutOptions) => {
+          if (key === packKey(pack.id)) {
+            signalPut();
+            await released;
+          }
+          return target.put(key, value, options);
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const pending = direct(pack, { ...env, rbox_dev_blobs: pausedBucket } as Env, a.accountId);
+    await putEntered;
+    const now = Date.now();
+    const old = now - PACK_ORPHAN_GRACE_MS - 1;
+    await db().prepare("UPDATE packs SET created_at=?,touched_at=? WHERE pack_id=? AND state='uploading'").bind(old, old, pack.id).run();
+    await sweepUploadingPacks(env, now);
+    expect(await packRow(pack.id)).toMatchObject({ state: "swept" });
+    releasePut();
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "retry_later" });
+    expect(await memberRows(pack.id)).toEqual([]);
+    expect(await env.rbox_dev_blobs.head(packKey(pack.id))).not.toBeNull();
     await sweepUploadingPacks(env, now + 1);
     expect(await env.rbox_dev_blobs.head(packKey(pack.id))).toBeNull();
     expect(await packRow(pack.id)).toMatchObject({ state: "swept" });

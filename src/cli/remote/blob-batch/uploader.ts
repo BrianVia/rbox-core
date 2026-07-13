@@ -64,6 +64,7 @@ export class BlobBatchUploader {
   private lastUniqueEnqueueAtMs = 0;
   private packUploader: BlobPackUploader | undefined;
   private pendingPartialReason: UploadDispatchReason | undefined;
+  private batchReleasePending = false;
 
   constructor(private readonly ctx: RemoteContext, arbiter?: UploadSlotArbiter) {
     // Upload record bytes stay capped to the server's accepted per-record maximum.
@@ -72,6 +73,16 @@ export class BlobBatchUploader {
     this.arbiter = arbiter ?? new UploadSlotArbiter(this.config.slots);
     this.arbiter.registerPump(() => {
       if (this.closed) return;
+      const batchReleased = this.batchReleasePending;
+      this.batchReleasePending = false;
+      if (batchReleased) {
+        this.dispatchFull();
+        if (this.batchActive === 0 && this.queue.length > 0) this.dispatchPartial("idle_tail");
+        if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
+      }
+      // Preserve the arbiter pump's pre-B1 second stage after the release-local
+      // full/idle-tail stage. An overdue partial can use a newly freed permit
+      // even while another batch request remains active.
       if (this.pendingPartialReason) this.dispatchPartial(this.pendingPartialReason);
       else this.dispatchFull();
       if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
@@ -211,11 +222,8 @@ export class BlobBatchUploader {
     void dispatch.finally(() => {
       this.inFlight.delete(dispatch);
       this.batchActive--;
+      this.batchReleasePending = true;
       this.arbiter.release();
-      if (this.closed) return;
-      this.dispatchFull();
-      if (this.batchActive === 0 && this.queue.length > 0) this.dispatchPartial("idle_tail");
-      if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
     });
   }
 

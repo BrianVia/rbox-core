@@ -146,6 +146,48 @@ describe("BlobBatchUploader fill policy", () => {
     expect(getUploadDispatchStats().full_bytes).toMatchObject({ count: 1, records: 1 });
   });
 
+  test("v1 dispatches an overdue partial when either of two active batches releases", async () => {
+    process.env.RBOX_BATCH_FILL = "v1";
+    process.env.RBOX_BATCH_RECORDS = "2";
+    process.env.RBOX_UPLOAD_SLOTS = "2";
+    const clock = useClock();
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let call = 0;
+    let secondSettled = false;
+    batchPutHandler = async (records) => {
+      const index = call++;
+      if (index === 0) await firstGate;
+      if (index === 1) {
+        await secondGate;
+        secondSettled = true;
+      }
+      return okBatch(records);
+    };
+    const a = api();
+    const pending = uploadWave(a, await files(5, "v1-overdue"));
+    pending.catch(() => {});
+    try {
+      await waitFor(() => batchSizes.length === 2);
+      expect(batchSizes).toEqual([2, 2]);
+      await clock.advance(10);
+      expect(batchSizes).toEqual([2, 2]);
+
+      releaseFirst();
+      await waitFor(() => batchSizes.length === 3);
+      expect(batchSizes).toEqual([2, 2, 1]);
+      expect(secondSettled).toBe(false);
+
+      releaseSecond();
+      await pending;
+    } finally {
+      releaseFirst();
+      releaseSecond();
+    }
+  });
+
   test("v2 dispatches a full 64-record batch immediately", async () => {
     v2();
     useClock();

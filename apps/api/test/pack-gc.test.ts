@@ -1,5 +1,5 @@
 import { applyD1Migrations, env, SELF } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import {
   PACK_CONTENT_TYPE,
@@ -10,7 +10,7 @@ import {
   type PackDirEntry,
 } from "../../../src/engine/blob-pack.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";
-import { blobPackPut, packKey, PACK_ORPHAN_GRACE_MS, resweepPackTombstones } from "../src/blob-pack.js";
+import { blobPackPut, packGcMode, packKey, PACK_ORPHAN_GRACE_MS, resweepPackTombstones, sweepUploadingPacks } from "../src/blob-pack.js";
 import {
   PACK_GC_CLOCK_STALENESS_MS,
   PACK_INTENT_QUIESCENCE_MS,
@@ -19,7 +19,8 @@ import {
 import { CLOCK_SKEW_MS, RECEIPT_TTL_MS } from "../src/receipts.js";
 import { gcPurge, INTENT_QUIESCENCE_MS, PURGE_LEASE_TTL_MS } from "../src/versions.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
-import { blobGet, blobsCheck } from "../src/blobs.js";
+import { blobGet, blobPut, blobsCheck } from "../src/blobs.js";
+import { phase1Purge } from "../src/gc-phase1.js";
 import { adminRoutes } from "../src/routes/admin.js";
 import worker, { GC_PURGE_UTC_HOUR } from "../src/worker.js";
 
@@ -189,6 +190,51 @@ async function receiptsFrom(response: Response): Promise<Record<string, string>>
   return Object.fromEntries(body.results.map((row) => [row.sha256, row.receipt]));
 }
 
+function receiptIssuedAt(receipt: string): number {
+  const encoded = receipt.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+  return Number((JSON.parse(atob(padded)) as { t: number }).t);
+}
+
+function fenceBarrierEnv(order: "before" | "after"): { handlerEnv: Env; reached: Promise<void>; release: () => void } {
+  const real = env.rbox_dev_db;
+  let fencePrepared = false;
+  let signalReached!: () => void;
+  let signalRelease!: () => void;
+  const reached = new Promise<void>((resolve) => { signalReached = resolve; });
+  const released = new Promise<void>((resolve) => { signalRelease = resolve; });
+  let fired = false;
+  const proxied = new Proxy(real, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.includes("pack_gc_candidates WHERE pack_id")) return statement;
+          fencePrepared = true;
+          return statement;
+        };
+      }
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          if (fired || !fencePrepared) return target.batch(statements);
+          fired = true;
+          if (order === "before") {
+            signalReached();
+            await released;
+            return target.batch(statements);
+          }
+          const result = await target.batch(statements);
+          signalReached();
+          await released;
+          return result;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  }) as D1Database;
+  return { handlerEnv: { ...env, rbox_dev_db: proxied } as Env, reached, release: signalRelease };
+}
+
 async function runAt(
   nowMs: number,
   options: Omit<NonNullable<Parameters<typeof runPackGc>[1]>, "nowMs" | "clock"> = {},
@@ -237,56 +283,167 @@ async function packRow(packId: string): Promise<{ state: string } | null> {
   return db().prepare("SELECT state FROM packs WHERE pack_id=?").bind(packId).first<{ state: string }>();
 }
 
+async function gcTableSnapshot(): Promise<Record<string, number>> {
+  const tables = ["packs", "pack_members", "blob_locations", "pack_gc_candidates", "gc_state"];
+  return Object.fromEntries(await Promise.all(tables.map(async (table) => {
+    const row = await db().prepare(`SELECT COUNT(*) n FROM ${table}`).first<{ n: number }>();
+    return [table, Number(row?.n ?? 0)] as const;
+  })));
+}
+
+describe("design 114 staged pack-GC modes", () => {
+  test("mode parser maps only the documented values", () => {
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: undefined } as Env)).toBe("off");
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: "0" } as Env)).toBe("off");
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: "shadow" } as Env)).toBe("shadow");
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: "mark" } as Env)).toBe("mark");
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: "1" } as Env)).toBe("execute");
+    expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: "execute" } as Env)).toBe("execute");
+  });
+
+  test("shadow returns projected phase counts with no durable or R2 changes", async () => {
+    const resurrect = onePack("shadow-resurrect");
+    await seedPack(resurrect);
+    await installLocation(resurrect);
+    await physicalCandidate(resurrect, nextId("shadow-resurrect-epoch"), NOW - DAY);
+
+    const mark = onePack("shadow-mark");
+    await seedPack(mark);
+    const open = onePack("shadow-open");
+    await seedPack(open);
+    await physicalCandidate(open, nextId("shadow-open-epoch"), NOW - DAY);
+    const execute = onePack("shadow-execute");
+    await seedPack(execute);
+    await physicalCandidate(execute, nextId("shadow-execute-epoch"), NOW - 2 * DAY, NOW - PACK_INTENT_QUIESCENCE_MS - 1);
+
+    const before = await gcTableSnapshot();
+    const r2Calls: string[] = [];
+    const noR2 = new Proxy(env.rbox_dev_blobs, {
+      get(target, property) {
+        if (["put", "get", "head", "delete"].includes(String(property))) {
+          return async () => { r2Calls.push(String(property)); throw new Error("shadow touched R2"); };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const response = await runPackGc(
+      { ...env, RBOX_BLOB_PACK_GC: "shadow", rbox_dev_blobs: noR2 } as Env,
+      { nowMs: NOW, clock: () => NOW, owner: nextId("shadow-owner") },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ wouldResurrect: 1, wouldMark: 1, wouldOpen: 1, wouldDelete: 1 });
+    expect(r2Calls).toEqual([]);
+    expect(await gcTableSnapshot()).toEqual(before);
+  });
+
+  test("shadow projects OPEN after the preceding resurrect page", async () => {
+    for (let index = 0; index < 50; index++) {
+      const pinned = onePack(`shadow-resurrect-page-${index}`);
+      await seedPack(pinned, { object: false });
+      await installLocation(pinned);
+      await physicalCandidate(pinned, nextId("shadow-resurrect-page-epoch"), NOW - 2 * DAY);
+    }
+    const open = onePack("shadow-open-after-resurrect-page");
+    await seedPack(open, { object: false });
+    await physicalCandidate(open, nextId("shadow-open-after-resurrect-epoch"), NOW - DAY);
+    const response = await runPackGc(
+      { ...env, RBOX_BLOB_PACK_GC: "shadow" } as Env,
+      { nowMs: NOW, clock: () => NOW, owner: nextId("shadow-page-owner") },
+    );
+    expect(await response.json()).toMatchObject({ wouldResurrect: 50, wouldOpen: 1 });
+  });
+
+  test("mark mode resurrects and marks but never opens, executes, or sweeps uploads", async () => {
+    const resurrect = onePack("mark-resurrect");
+    await seedPack(resurrect);
+    await installLocation(resurrect);
+    await physicalCandidate(resurrect, nextId("mark-resurrect-epoch"), NOW - DAY);
+    const marked = onePack("mark-new");
+    await seedPack(marked);
+    const mature = onePack("mark-mature");
+    await seedPack(mature);
+    await physicalCandidate(mature, nextId("mark-mature-epoch"), NOW - DAY);
+    const uploading = onePack("mark-uploading");
+    await seedPack(uploading, { state: "uploading", createdAt: NOW - PACK_ORPHAN_GRACE_MS - 1 });
+
+    const markEnv = { ...env, RBOX_BLOB_PACK_GC: "mark" } as Env;
+    const result = await runPackGc(markEnv, { nowMs: NOW, clock: () => NOW, owner: nextId("mark-owner") });
+    expect(await result.json()).toMatchObject({ unwound: 1, marked: 1, opened: 0, deleted: 0 });
+    expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(resurrect.id).first()).toBeNull();
+    expect(await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(marked.id).first()).toEqual({ deleting_at: null });
+    expect(await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(mature.id).first()).toEqual({ deleting_at: null });
+    expect(await env.rbox_dev_blobs.head(packKey(mature.id))).not.toBeNull();
+    await sweepUploadingPacks(markEnv, NOW);
+    expect(await packRow(uploading.id)).toEqual({ state: "uploading" });
+    expect(await env.rbox_dev_blobs.head(packKey(uploading.id))).not.toBeNull();
+  });
+});
+
 describe("design 114 §7.3 fence release gates", () => {
   // Gate P1: any candidacy state blocks same-id mint; resurrection restates the invariant per epoch.
-  test("P1 mint-fence-any-candidacy: marked-only blocks retry until RESURRECT", async () => {
-    const accountId = await account("p1-fence");
-    const pack = onePack("p1-fence");
+  test.each(["mark", "execute"] as const)("P1 mint-fence-any-candidacy: %s mode resurrects before retry", async (mode) => {
+    const accountId = await account(`p1-fence-${mode}`);
+    const pack = onePack(`p1-fence-${mode}`);
     await seedPack(pack);
     await physicalCandidate(pack, nextId("epoch"), NOW - 10);
     expect((await retryPack(pack, accountId)).status).toBe(503);
 
     await installLocation(pack);
-    expect(await runAt(NOW)).toMatchObject({ unwound: 1 });
+    const response = await runPackGc(
+      { ...env, RBOX_BLOB_PACK_GC: mode } as Env,
+      { nowMs: NOW, clock: () => NOW, owner: nextId(`p1-${mode}`) },
+    );
+    expect(await response.json()).toMatchObject({ unwound: 1 });
     expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(pack.id).first()).toBeNull();
     expect((await retryPack(pack, accountId)).status).toBe(200);
   });
 
-  // Gate P1: signed issuance is captured before the fence read; this sequential cell records T_mark explicitly.
-  test("P1 issuedAt anchoring: every signed t precedes the later mark landing", async () => {
+  // Gate P1: signed issuance is captured before the fence read; T_mark is the
+  // wall time bracketing the INSERT landing, never the row's marked_at value.
+  test("P1 issuedAt anchoring: every signed t precedes the later mark INSERT landing", async () => {
     const accountId = await account("p1-time");
     const pack = buildPack([new TextEncoder().encode("p1-a"), new TextEncoder().encode("p1-b")]);
     await seedPack(pack);
-    const beforeFence = 10_000;
-    const afterFence = 20_000;
-    let fencePrepared = false;
-    const realDb = env.rbox_dev_db;
-    const observedDb = new Proxy(realDb, {
-      get(target, property, receiver) {
-        if (property !== "prepare") return Reflect.get(target, property, receiver);
-        return (sql: string) => {
-          if (sql.startsWith("SELECT sha256 FROM gc_candidates WHERE deleting_at IS NOT NULL")) fencePrepared = true;
-          return target.prepare(sql);
-        };
-      },
-    }) as D1Database;
-    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => fencePrepared ? afterFence : beforeFence);
-    let receipts: Record<string, string>;
-    try {
-      receipts = await receiptsFrom(await retryPack(pack, accountId, { ...env, rbox_dev_db: observedDb } as Env));
-    } finally {
-      dateNow.mockRestore();
-    }
-    const issued = Object.values(receipts).map((receipt) => {
-      const encoded = receipt.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=");
-      return Number((JSON.parse(atob(padded)) as { t: number }).t);
-    });
-    expect(fencePrepared).toBe(true);
-    expect(issued).toEqual([beforeFence, beforeFence]);
-    expect(await runAt(NOW)).toMatchObject({ marked: 1 });
-    const mark = await db().prepare("SELECT marked_at FROM pack_gc_candidates WHERE pack_id=?").bind(pack.id).first<{ marked_at: number }>();
-    expect(issued.every((value) => value < mark!.marked_at)).toBe(true);
+    const receipts = await receiptsFrom(await retryPack(pack, accountId));
+    const issued = Object.values(receipts).map(receiptIssuedAt);
+    while (Date.now() <= Math.max(...issued)) await new Promise((resolve) => setTimeout(resolve, 1));
+    const tBefore = Date.now();
+    await physicalCandidate(pack, nextId("p1-time-epoch"), NOW - DAY);
+    expect(issued.every((value) => value < tBefore)).toBe(true);
+  });
+
+  test("P1 statement ordering: candidacy landing before fence read completion returns 503 without receipts", async () => {
+    const accountId = await account("p1-mark-first");
+    const pack = onePack("p1-mark-first");
+    await seedPack(pack);
+    const barrier = fenceBarrierEnv("before");
+    const pending = retryPack(pack, accountId, barrier.handlerEnv);
+    await barrier.reached;
+    await physicalCandidate(pack, nextId("p1-mark-first-epoch"), Date.now());
+    barrier.release();
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "retry_later" });
+  });
+
+  test("P1 statement ordering: completed fence read may mint, anchored before the later mark", async () => {
+    const accountId = await account("p1-read-first");
+    const pack = onePack("p1-read-first");
+    await seedPack(pack);
+    const barrier = fenceBarrierEnv("after");
+    const startedAt = Date.now();
+    const pending = retryPack(pack, accountId, barrier.handlerEnv);
+    await barrier.reached;
+    const readCompletedAt = Math.max(startedAt, Date.now());
+    while (Date.now() <= readCompletedAt) await new Promise((resolve) => setTimeout(resolve, 1));
+    const tBefore = Date.now();
+    await physicalCandidate(pack, nextId("p1-read-first-epoch"), NOW - DAY);
+    barrier.release();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    const receipts = await receiptsFrom(response);
+    expect(Object.values(receipts).map(receiptIssuedAt).every((issuedAt) => issuedAt < tBefore)).toBe(true);
   });
 
   // Gate P2 / gate 5: open intent blocks install; an install serialized first makes OPEN a no-op.
@@ -310,6 +467,23 @@ describe("design 114 §7.3 fence release gates", () => {
     expect(await runAt(NOW, {}, racedEnv)).toMatchObject({ opened: 0 });
     expect((await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(raced.id).first<{ deleting_at: number | null }>())?.deleting_at).toBeNull();
     expect(await db().prepare("SELECT 1 FROM blob_locations WHERE pack_id=?").bind(raced.id).first()).not.toBeNull();
+  });
+
+  test("Gate 4 logical intent vs v2 redemption never partially publishes", async () => {
+    const accountId = await account("logical-redemption-race");
+    const pack = onePack("logical-redemption-race");
+    await seedPack(pack);
+    const receipts = await receiptsFrom(await retryPack(pack, accountId));
+    const sha = pack.entries[0]!.sha256;
+    await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, NOW - DAY, NOW - 1).run();
+    const before = await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(accountId).first<{ used_bytes: number }>();
+    const response = await redeem(accountId, receipts);
+    expect(response.status).toBe(422);
+    expect(await response.json()).toEqual({ error: "unsatisfied_blobs", missing: [sha], missingTotal: 1 });
+    expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).toBeNull();
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(accountId, sha).first()).toBeNull();
+    expect(await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(accountId).first()).toEqual(before);
+    expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256=? AND present=1").bind(sha).first()).toBeNull();
   });
 
   // Round-5 BLOCKER: stale e1 opening and terminal statements cannot mutate replacement e2.
@@ -524,6 +698,34 @@ describe("design 114 §7.3 fence release gates", () => {
     expect(await env.rbox_dev_blobs.head(packKey(pack.id))).not.toBeNull();
   });
 
+  test("Gate 3 packed Phase-1 stale snapshot cannot retire a head-reachable member", async () => {
+    const pack = onePack("phase1-stale-packed");
+    await seedPack(pack);
+    await installLocation(pack);
+    const sha = pack.entries[0]!.sha256;
+    const accountId = await account("phase1-stale-packed");
+    await db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES(?,?,?)").bind(accountId, sha, NOW - DAY).run();
+    await db().prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES(?,?,?)").bind(accountId, sha, NOW - DAY).run();
+    await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, NOW - 2 * DAY, NOW - INTENT_QUIESCENCE_MS - 1).run();
+    const purge = await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("phase1-stale") });
+    expect(await purge.json()).toMatchObject({ purged: 0 });
+    expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).not.toBeNull();
+    expect(await env.rbox_dev_blobs.head(packKey(pack.id))).not.toBeNull();
+
+    expect(await phase1Purge(db(), accountId, new Set([sha]), 0, NOW)).toMatchObject({ purged: 0, resurrected: 1 });
+    const check = await blobsCheck(new Request(`${BASE}/v1/blobs/check`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1" },
+      body: JSON.stringify({ shas: [sha] }),
+    }), env, /^[0-9a-f]{64}$/, accountId);
+    // The receipts branch may also mint an uploadGrant (§109) — only the
+    // missing set is under test here.
+    expect(await check.json()).toMatchObject({ missing: [] });
+    const get = await blobGet(env, sha, accountId);
+    expect(get.status).toBe(200);
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(pack.payloads[0]);
+  });
+
   // Gate 8: an expired/lost holder cannot dispatch or clear the durable fence.
   test("Gate 8 lease/kill safety: expiry after readiness dispatches no delete and preserves intent", async () => {
     const pack = onePack("lease-expiry");
@@ -654,11 +856,12 @@ describe("design 114 §7.3 fence release gates", () => {
     await seedPack(pack);
     await physicalCandidate(pack, nextId("epoch"), NOW - 2 * DAY, NOW - PACK_INTENT_QUIESCENCE_MS - 1);
     const realDb = env.rbox_dev_db;
+    let terminalAttempts = 0;
     const crashingDb = new Proxy(realDb, {
       get(target, property, receiver) {
         if (property !== "batch") return Reflect.get(target, property, receiver);
         return async (statements: D1PreparedStatement[]) => {
-          if (statements.length === 3) throw new Error("crash before terminal batch");
+          if (statements.length === 3 && terminalAttempts++ === 0) throw new Error("crash before terminal batch");
           return target.batch(statements);
         };
       },
@@ -669,7 +872,11 @@ describe("design 114 §7.3 fence release gates", () => {
     expect(await packRow(pack.id)).toEqual({ state: "ready" });
     expect(Number((await db().prepare("SELECT COUNT(*) n FROM pack_members WHERE pack_id=?").bind(pack.id).first())!.n)).toBe(1);
     expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=? AND deleting_at IS NOT NULL").bind(pack.id).first()).not.toBeNull();
+    expect(await db().prepare("SELECT 1 FROM gc_state WHERE k='pack_execute_cursor'").first()).toBeNull();
     expect(await runAt(NOW + 1)).toMatchObject({ deleted: 1 });
+    expect(await packRow(pack.id)).toEqual({ state: "swept" });
+    expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(pack.id).first()).toBeNull();
+    expect(await runAt(NOW + 2)).toMatchObject({ deleted: 0 });
   });
 
   // Gates 1/6: randomized publish/redeem/retire/re-add history preserves every entitled placement.
@@ -712,38 +919,106 @@ describe("design 114 §7.3 fence release gates", () => {
       }
       const located = await db().prepare("SELECT DISTINCT pack_id FROM blob_locations").all<{ pack_id: string }>();
       for (const row of located.results) expect(await env.rbox_dev_blobs.head(packKey(row.pack_id))).not.toBeNull();
+      const usage = await db().prepare(
+        "SELECT a.used_bytes actual, COALESCE(SUM(b.size_bytes),0) expected FROM accounts a LEFT JOIN blob_refs r ON r.account_id=a.id LEFT JOIN blobs b ON b.sha256=r.sha256 WHERE a.id=? GROUP BY a.id",
+      ).bind(accountId).first<{ actual: number; expected: number }>();
+      expect(Number(usage?.actual ?? 0)).toBe(Number(usage?.expected ?? 0));
     };
 
     const payloads = ["history-a", "history-b", "history-c"].map((value) => new TextEncoder().encode(value));
     for (let index = 0; index < payloads.length; index++) await publish(payloads[index]!, `initial-${index}`);
+    const uploadingOrphan = onePack("history-uploading-orphan");
+    await seedPack(uploadingOrphan, { state: "uploading", createdAt: NOW - PACK_ORPHAN_GRACE_MS - 1 });
     await assertLive(); // disabled world: callers simply do not invoke physical GC.
 
-    let random = 0x114;
-    const pick = () => {
+    const seed = 0x114;
+    let random = seed;
+    const nextRandom = () => {
       random = (random * 1664525 + 1013904223) >>> 0;
-      return random % payloads.length;
+      return random;
     };
-    let tick = NOW;
-    for (let step = 0; step < 2; step++) {
-      const index = pick();
-      const payload = payloads[index]!;
-      const sha = hash(payload);
-      const former = active.get(sha)!;
-      await db().prepare("DELETE FROM blob_refs WHERE account_id=? AND sha256=?").bind(accountId, sha).run();
-      await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, tick - 2 * DAY, tick - INTENT_QUIESCENCE_MS - 1).run();
-      expect(await (await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: tick, clock: () => tick, owner: nextId("history-logical") })).json()).toMatchObject({ purged: 1 });
-      active.delete(sha);
-      await assertLive();
+    type HistoryAction = "pack_publish" | "redeem" | "v1_displacement" | "logical_retire" | "gc_mark" | "gc_open" | "gc_execute" | "sweeper" | "re_add";
+    const remaining: HistoryAction[] = ["pack_publish", "redeem", "v1_displacement", "logical_retire", "gc_mark", "gc_open", "gc_execute", "sweeper", "re_add"];
+    const cyclePayload = payloads[0]!;
+    const cycleSha = hash(cyclePayload);
+    const former = active.get(cycleSha)!;
+    const pendingPayload = new TextEncoder().encode("history-pending-publication");
+    let pending: { pack: BuiltPack; receipts: Record<string, string> } | null = null;
+    let pendingRedeemed = false;
+    let displaced = false;
+    let retired = false;
+    let marked = false;
+    let opened = false;
+    let deleted = false;
+    const tick = NOW;
+    try {
+      while (remaining.length) {
+        const valid = remaining.filter((action) => {
+          if (action === "redeem") return pending !== null;
+          if (action === "logical_retire") return displaced;
+          if (action === "gc_mark") return retired && pendingRedeemed;
+          if (action === "gc_open") return marked;
+          if (action === "gc_execute") return opened;
+          if (action === "re_add") return deleted;
+          return true;
+        });
+        const action = valid[nextRandom() % valid.length]!;
+        remaining.splice(remaining.indexOf(action), 1);
 
-      expect(await runAt(tick + 1)).toMatchObject({ deleted: 0 });
-      await assertLive();
-      expect(await runAt(tick + 1 + PACK_INTENT_QUIESCENCE_MS + 1)).toMatchObject({ deleted: 1 });
-      expect(await env.rbox_dev_blobs.head(packKey(former.id))).toBeNull();
-      await assertLive();
-
-      await publish(payload, `readd-${step}`);
-      await assertLive();
-      tick += PACK_INTENT_QUIESCENCE_MS + DAY;
+        if (action === "pack_publish") {
+          const pack = buildPack([pendingPayload], nextId("history-publish-only"));
+          const response = await retryPack(pack, accountId);
+          expect(response.status).toBe(200);
+          pending = { pack, receipts: await receiptsFrom(response) };
+        } else if (action === "redeem") {
+          expect((await redeem(accountId, pending!.receipts)).status).toBe(200);
+          payloadBySha.set(pending!.pack.entries[0]!.sha256, pendingPayload);
+          active.set(pending!.pack.entries[0]!.sha256, pending!.pack);
+          pending = null;
+          pendingRedeemed = true;
+        } else if (action === "v1_displacement") {
+          const canonical = await blobPut(new Request(`${BASE}/v1/blobs/${cycleSha}`, {
+            method: "PUT",
+            headers: { "content-length": String(cyclePayload.byteLength), "x-rbox-protocol": "upload-receipts-v1" },
+            body: cyclePayload,
+          }), env, cycleSha, accountId);
+          expect(canonical.status).toBe(200);
+          const v1 = await canonical.json() as { receipt: string };
+          await db().prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES(?,?,?)").bind(accountId, cycleSha, tick).run();
+          expect((await redeem(accountId, { [cycleSha]: v1.receipt })).status).toBe(200);
+          expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(cycleSha).first()).toBeNull();
+          displaced = true;
+        } else if (action === "logical_retire") {
+          await db().batch([
+            db().prepare("UPDATE accounts SET used_bytes=MAX(0,used_bytes-?) WHERE id=?").bind(cyclePayload.byteLength, accountId),
+            db().prepare("DELETE FROM blob_refs WHERE account_id=? AND sha256=?").bind(accountId, cycleSha),
+          ]);
+          await db().prepare("INSERT OR REPLACE INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(cycleSha, tick - 2 * DAY, tick - INTENT_QUIESCENCE_MS - 1).run();
+          expect(await (await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: tick, clock: () => tick, owner: nextId("history-logical") })).json()).toMatchObject({ purged: 1 });
+          active.delete(cycleSha);
+          retired = true;
+        } else if (action === "gc_mark") {
+          const markOnly = await runPackGc({ ...env, RBOX_BLOB_PACK_GC: "mark" } as Env, { nowMs: tick + 1, clock: () => tick + 1, owner: nextId("history-mark") });
+          expect(markOnly.status).toBe(200);
+          marked = true;
+        } else if (action === "gc_open") {
+          expect(await runAt(tick + 2)).toMatchObject({ deleted: 0 });
+          opened = true;
+        } else if (action === "gc_execute") {
+          expect(await runAt(tick + 2 + PACK_INTENT_QUIESCENCE_MS + 1)).toMatchObject({ deleted: 1 });
+          expect(await env.rbox_dev_blobs.head(packKey(former.id))).toBeNull();
+          deleted = true;
+        } else if (action === "sweeper") {
+          await sweepUploadingPacks(env, tick + 3 + PACK_INTENT_QUIESCENCE_MS);
+          expect(await packRow(uploadingOrphan.id)).toEqual({ state: "swept" });
+          expect(await env.rbox_dev_blobs.head(packKey(uploadingOrphan.id))).toBeNull();
+        } else if (action === "re_add") {
+          await publish(cyclePayload, "history-readd");
+        }
+        await assertLive();
+      }
+    } catch (error) {
+      throw new Error(`pack GC randomized history failed (seed=${seed})`, { cause: error });
     }
   });
 });
@@ -762,13 +1037,19 @@ describe("design 114 pack-GC admin surfaces", () => {
     };
   }
 
-  test("phase=packs and forced resweep require the pack-GC flag; audit remains available", async () => {
+  test("phase=packs honors every mode while destructive resweep remains execute-only", async () => {
     const disabled = { ...env, RBOX_BLOB_PACK_GC: "0" } as Env;
     const phase = await adminRoutes(routeContext(`${BASE}/v1/admin/gc?phase=packs`, "POST", disabled));
     expect(phase?.status).toBe(409);
     expect(await phase?.json()).toEqual({ error: "pack_gc_disabled" });
     const resweep = await adminRoutes(routeContext(`${BASE}/v1/admin/gc/pack-tombstones/resweep`, "POST", disabled));
     expect(resweep?.status).toBe(409);
+    for (const mode of ["shadow", "mark", "execute"] as const) {
+      const modeEnv = { ...env, RBOX_BLOB_PACK_GC: mode } as Env;
+      expect((await adminRoutes(routeContext(`${BASE}/v1/admin/gc?phase=packs`, "POST", modeEnv)))?.status).toBe(200);
+      const modeResweep = await adminRoutes(routeContext(`${BASE}/v1/admin/gc/pack-tombstones/resweep`, "POST", modeEnv));
+      expect(modeResweep?.status).toBe(mode === "execute" ? 200 : 409);
+    }
     const audit = await adminRoutes(routeContext(`${BASE}/v1/admin/gc/pack-tombstones`, "GET", disabled));
     expect(audit?.status).toBe(200);
   });

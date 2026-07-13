@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   PACK_CONTENT_TYPE,
   PACK_HEADER_BYTES,
+  PACK_MAX_BODY_BYTES,
   encodePackDirectory,
   encodePackFooter,
   encodePackHeader,
@@ -11,7 +12,7 @@ import {
 } from "../../../src/engine/blob-pack.js";
 import { BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT, blobBatchGet, planPackReads } from "../src/blob-batch.js";
 import { blobGet, blobGetWithVerifiedGrant } from "../src/blobs.js";
-import { packKey } from "../src/blob-pack.js";
+import { blobPackPut, packKey } from "../src/blob-pack.js";
 import { blobKey } from "../src/util.js";
 import { mintGrant } from "../src/grants.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
@@ -168,6 +169,114 @@ describe("design 114 packed reads", () => {
     expect(new TextDecoder().decode((await decodeFrames(denied))[0]!.payload)).toBe('{"status":"missing"}');
     expect(reads).toBe(0);
   });
+
+  test("read metrics distinguish placement and summarize covering-range bytes without identifiers", async () => {
+    const a = await bootstrap("pack-read-metrics");
+    const pack = buildPack([new TextEncoder().encode("metric-first"), new TextEncoder().encode("metric-gap"), new TextEncoder().encode("metric-last")]);
+    await publishAndRedeem(a, pack);
+    const canonical = new TextEncoder().encode("metric-canonical");
+    const canonicalSha = hash(canonical);
+    await db().batch([
+      db().prepare("INSERT OR IGNORE INTO blobs(sha256,size_bytes,present) VALUES(?,?,1)").bind(canonicalSha, canonical.byteLength),
+      db().prepare("INSERT OR IGNORE INTO blob_refs(account_id,sha256) VALUES(?,?)").bind(a.accountId, canonicalSha),
+    ]);
+    await env.rbox_dev_blobs.put(blobKey(canonicalSha), canonical);
+    const points: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+    const metricEnv = {
+      ...env,
+      rbox_metrics: { writeDataPoint: (point: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) => points.push(point) } as AnalyticsEngineDataset,
+    } as Env;
+
+    await (await blobGet(metricEnv, pack.entries[0]!.sha256, a.accountId)).arrayBuffer();
+    await (await blobGet(metricEnv, canonicalSha, a.accountId)).arrayBuffer();
+    const single = points.filter((point) => point.blobs?.[0] === "blob.get");
+    expect(single.map((point) => point.blobs?.[2])).toEqual(["ok_packed", "ok_canonical"]);
+    expect(single.map((point) => point.doubles?.[4])).toEqual([pack.entries[0]!.length, canonical.byteLength]);
+
+    const wanted = [pack.entries[0]!.sha256, pack.entries[2]!.sha256, canonicalSha];
+    const batch = await blobBatchGet(
+      new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify(wanted) }),
+      metricEnv,
+      { accountId: a.accountId, grantPreauth: true },
+    );
+    expect(await decodeFrames(batch)).toHaveLength(3);
+    const summaries = points.filter((point) => point.blobs?.[0] === "blob.batchGet.summary");
+    expect(summaries).toHaveLength(1);
+    const coveringBytes = pack.entries[2]!.offset + pack.entries[2]!.length - pack.entries[0]!.offset;
+    expect(summaries[0]?.blobs).toEqual(["blob.batchGet.summary", "ok_grant_preauth"]);
+    expect(summaries[0]?.doubles).toEqual([
+      1,
+      2,
+      1,
+      pack.entries[0]!.length + pack.entries[2]!.length + canonical.byteLength,
+      coveringBytes + canonical.byteLength,
+    ]);
+    const serialized = JSON.stringify(points);
+    for (const forbidden of [pack.id, pack.sha, canonicalSha, a.accountId, ...pack.entries.map((entry) => entry.sha256)]) expect(serialized).not.toContain(forbidden);
+
+    const malformedPoints: Array<{ blobs?: string[]; doubles?: number[] }> = [];
+    const malformed = await blobBatchGet(
+      new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: "not-json" }),
+      { ...env, rbox_metrics: { writeDataPoint: (point: { blobs?: string[]; doubles?: number[] }) => malformedPoints.push(point) } as AnalyticsEngineDataset } as Env,
+      { accountId: a.accountId },
+    );
+    expect(malformed.status).toBe(400);
+    expect(malformedPoints).toEqual([{ indexes: ["blob.batchGet.summary"], blobs: ["blob.batchGet.summary", "bad_request"], doubles: [0, 0, 0, 0, 0] }]);
+  });
+
+  test("same-isolate full-size pack PUTs overlap mixed 32-sha batch GETs", async () => {
+    const a = await bootstrap("pack-resource-cell");
+    const packedPayloads = Array.from({ length: 16 }, (_, index) => new TextEncoder().encode(`resource-packed-${index}`));
+    const readablePack = buildPack(packedPayloads);
+    await publishAndRedeem(a, readablePack);
+    const canonicalPayloads = Array.from({ length: 16 }, (_, index) => new TextEncoder().encode(`resource-canonical-${index}`));
+    const canonicalShas = canonicalPayloads.map(hash);
+    await db().batch(canonicalPayloads.flatMap((payload, index) => [
+      db().prepare("INSERT OR IGNORE INTO blobs(sha256,size_bytes,present) VALUES(?,?,1)").bind(canonicalShas[index]!, payload.byteLength),
+      db().prepare("INSERT OR IGNORE INTO blob_refs(account_id,sha256) VALUES(?,?)").bind(a.accountId, canonicalShas[index]!),
+    ]));
+    await Promise.all(canonicalPayloads.map((payload, index) => env.rbox_dev_blobs.put(blobKey(canonicalShas[index]!), payload)));
+    const wanted = [...readablePack.entries.map((entry) => entry.sha256), ...canonicalShas];
+    expect(wanted).toHaveLength(32);
+
+    const count = 33;
+    const overhead = PACK_HEADER_BYTES + count * 48 + 72;
+    let remaining = PACK_MAX_BODY_BYTES - overhead;
+    const fullPayloads = Array.from({ length: count }, (_, index) => {
+      const length = Math.min(256 * 1024, remaining - (count - index - 1));
+      remaining -= length;
+      const bytes = new Uint8Array(length);
+      bytes.fill(index + 1);
+      return bytes;
+    });
+    const full = buildPack(fullPayloads);
+    fullPayloads.length = 0;
+    full.payloads = [];
+    expect(full.body.byteLength).toBe(PACK_MAX_BODY_BYTES);
+    const putPromises = Array.from({ length: 6 }, () => {
+      const pack = { ...full, id: nextId() };
+      return blobPackPut(new Request(`${BASE}/v1/blob-pack/put`, {
+        method: "POST",
+        headers: {
+          "content-type": PACK_CONTENT_TYPE,
+          ...RCPT,
+          "x-rbox-pack-id": pack.id,
+          "x-rbox-pack-sha256": pack.sha,
+        },
+        body: pack.body.slice(),
+      }), env, a.accountId);
+    });
+    const getPromises = Array.from({ length: 4 }, () => blobBatchGet(
+      new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify(wanted) }),
+      env,
+      { accountId: a.accountId, grantPreauth: true },
+    ));
+    const [puts, gets] = await Promise.all([Promise.all(putPromises), Promise.all(getPromises)]);
+    expect(puts.map((response) => response.status)).toEqual([200, 200, 200, 200, 200, 200]);
+    const frames = await Promise.all(gets.map(decodeFrames));
+    expect(frames.map((records) => records.length)).toEqual([32, 32, 32, 32]);
+    expect(frames.every((records) => records.every((record) => !record.status))).toBe(true);
+  }, 30_000);
 
   test("corrupt and torn placements fail closed without canonical fallback", async () => {
     const a = await bootstrap("pack-read-corrupt");

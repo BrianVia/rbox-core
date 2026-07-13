@@ -11,8 +11,9 @@ import type { RemoteContext } from "../context.js";
 import { BlobRetryLaterError, isRetryLater } from "../errors.js";
 import { transferTimeoutMs } from "../resilient.js";
 import { fileStream } from "../stream.js";
+import { LANE_TIMING, recordPackBuilt, recordPackFallback, recordPackSent, uploadLaneTiming, type PackFallbackReason } from "../../upload-lane-timing.js";
 import { PACK_FILL_ABSOLUTE_MS, PACK_FILL_QUIET_MS, packUploadConfig, type PackConfig } from "./config.js";
-import { disablePackUploadForProcess, type UploadSlotArbiter } from "./gate.js";
+import { disablePackUploadForProcess, onPackUploadDisabled, packUploadDisabled, type UploadSlotArbiter } from "./gate.js";
 import { buildPack, type BuiltPack } from "./packer.js";
 import type { BatchPutWaiter } from "./uploader.js";
 
@@ -30,6 +31,8 @@ interface PackGroup {
   enqueuedAtMs: number;
   waiters: PackWaiter[];
   owner: GroupOwner;
+  dispatchStartedAtMs?: number;
+  uploadMs?: number;
   completion: Promise<void>;
   complete: () => void;
 }
@@ -69,14 +72,20 @@ export class BlobPackUploader {
   private closePromise: Promise<void> | undefined;
   private inFlight = new Set<Promise<void>>();
   private controllers = new Set<AbortController>();
+  private readonly unsubscribePackDisabled: () => void;
 
   constructor(
     private readonly ctx: RemoteContext,
     private readonly arbiter: UploadSlotArbiter,
     private readonly fallback: (sha: string, waiter: BatchPutWaiter) => void,
+    private readonly packBuilder: typeof buildPack = buildPack,
   ) {
     this.config = packUploadConfig();
-    this.arbiter.registerPump(() => this.pump());
+    this.unsubscribePackDisabled = onPackUploadDisabled(() => this.transferAllUnsettled("disabled_latch"));
+    this.arbiter.registerPump(() => {
+      this.pump();
+      this.armTimer();
+    });
   }
 
   putFile(
@@ -144,7 +153,12 @@ export class BlobPackUploader {
 
   private onTimer(): void {
     this.timer = undefined;
-    if (this.closed || this.queue.length === 0) return;
+    if (this.closed) return;
+    if (packUploadDisabled()) {
+      this.transferAllUnsettled("disabled_latch");
+      return;
+    }
+    if (this.queue.length === 0) return;
     const now = performance.now();
     if (
       now - this.lastUniqueEnqueueAtMs < PACK_FILL_QUIET_MS
@@ -154,7 +168,7 @@ export class BlobPackUploader {
       return;
     }
     if (!this.activated) {
-      this.transferPending();
+      this.transferPending("not_activated");
       return;
     }
     this.tailReady = true;
@@ -163,7 +177,12 @@ export class BlobPackUploader {
   }
 
   private pump(): void {
-    if (this.closed || !this.activated) return;
+    if (this.closed) return;
+    if (packUploadDisabled()) {
+      this.transferAllUnsettled("disabled_latch");
+      return;
+    }
+    if (!this.activated) return;
     while (
       this.activePuts < this.config.streams
       && this.queue.length > 0
@@ -210,56 +229,79 @@ export class BlobPackUploader {
   private async dispatch(groups: PackGroup[], controller: AbortController): Promise<void> {
     let built: BuiltPack | undefined;
     try {
-      built = await buildPack(groups.map((group) => ({
+      if (packUploadDisabled()) {
+        this.transferGroups(groups, "disabled_latch");
+        return;
+      }
+      const buildT0 = performance.now();
+      for (const group of groups) group.dispatchStartedAtMs = buildT0;
+      built = await this.packBuilder(groups.map((group) => ({
         sha: group.sha,
         size: group.size,
         srcPath: group.srcPath,
         uploadsDir: group.uploadsDir,
       })));
+      const payloadBytes = groups.reduce((sum, group) => sum + group.size, 0);
+      recordPackBuilt(groups.length, payloadBytes, built.totalBytes, performance.now() - buildT0);
       if (this.closed) {
         this.rejectGroups(groups, this.closeError!);
         return;
       }
+      if (packUploadDisabled()) {
+        this.transferGroups(groups, "disabled_latch");
+        return;
+      }
       const pack = built;
       const packId = randomBytes(16).toString("hex");
-      const res = await this.ctx.fetch(`${this.ctx.baseUrl}/v1/blob-pack/put`, () => ({
-        method: "POST",
-        headers: {
-          ...this.ctx.protoAuth,
-          "content-type": PACK_CONTENT_TYPE,
-          "x-rbox-pack-id": packId,
-          "x-rbox-pack-sha256": pack.packSha256,
-          "content-length": String(pack.totalBytes),
-        },
-        body: fileStream(pack.path),
-        duplex: "half",
-      } as RequestInit), {
-        op: "uploading data",
-        timeoutMs: transferTimeoutMs(pack.totalBytes),
-        signal: controller.signal,
-      });
+      const uploadT0 = performance.now();
+      let res: Response;
+      try {
+        res = await this.ctx.fetch(`${this.ctx.baseUrl}/v1/blob-pack/put`, () => ({
+          method: "POST",
+          headers: {
+            ...this.ctx.protoAuth,
+            "content-type": PACK_CONTENT_TYPE,
+            "x-rbox-pack-id": packId,
+            "x-rbox-pack-sha256": pack.packSha256,
+            "content-length": String(pack.totalBytes),
+          },
+          body: fileStream(pack.path),
+          duplex: "half",
+        } as RequestInit), {
+          op: "uploading data",
+          timeoutMs: transferTimeoutMs(pack.totalBytes),
+          signal: controller.signal,
+        });
+      } finally {
+        const uploadMs = performance.now() - uploadT0;
+        recordPackSent(uploadMs);
+        const uploadShareMs = uploadMs / Math.max(1, groups.length);
+        for (const group of groups) group.uploadMs = uploadShareMs;
+      }
 
       if (res.status === 404 || res.status === 405 || res.status === 415) {
         disablePackUploadForProcess();
-        this.transferAllUnsettled();
         return;
       }
       const text = await res.text();
       if (isRetryLater(res.status, text)) {
+        this.recordFallback("retry_later", groups);
         this.rejectGroups(groups, new BlobRetryLaterError());
         return;
       }
       if (!res.ok) {
-        this.transferGroups(groups);
+        this.transferGroups(groups, "http_error");
         return;
       }
       let parsed: PackResultRecord[] | undefined;
       try { parsed = packResults(JSON.parse(text)); } catch { parsed = undefined; }
       if (!parsed) {
-        this.transferGroups(groups);
+        this.transferGroups(groups, "parse_error");
         return;
       }
       const bySha = new Map(parsed.map((record) => [record.sha256, record]));
+      const hasMissingResult = groups.some((group) => group.owner === "pack" && !bySha.has(group.sha));
+      if (hasMissingResult) recordPackFallback("parse_error");
       for (const group of groups) {
         const result = bySha.get(group.sha);
         if (!result) this.transferGroup(group);
@@ -267,17 +309,13 @@ export class BlobPackUploader {
       }
     } catch (error) {
       if (this.closed) this.rejectGroups(groups, this.closeError!);
-      else this.transferGroups(groups);
+      else this.transferGroups(groups, packUploadDisabled() ? "disabled_latch" : "transport");
     } finally {
       // Capacity covers build + upload, not subsequent canonical settlement.
       // Release before waiting on transferred waiters so fallback cannot deadlock.
       this.controllers.delete(controller);
       this.activePuts--;
       this.arbiter.release();
-      if (!this.closed) {
-        this.pump();
-        this.armTimer();
-      }
       if (built) {
         await Promise.all(groups.map((group) => group.completion));
         await fs.rm(built.path, { force: true }).catch(() => {});
@@ -289,12 +327,21 @@ export class BlobPackUploader {
     if (group.owner !== "pack") return;
     group.owner = "settled";
     this.bySha.delete(group.sha);
-    this.ctx.captureReceipt(group.sha, { receipt });
-    for (const waiter of group.waiters) {
-      waiter.onBytes?.(waiter.size);
-      waiter.resolve();
+    try {
+      this.ctx.captureReceipt(group.sha, { receipt });
+      for (const waiter of group.waiters) {
+        try { waiter.onBytes?.(waiter.size); } catch {}
+        waiter.resolve();
+      }
+      if (LANE_TIMING) {
+        uploadLaneTiming.queueMs += Math.max(0, (group.dispatchStartedAtMs ?? group.enqueuedAtMs) - group.enqueuedAtMs);
+        uploadLaneTiming.uploadMs += group.uploadMs ?? 0;
+        uploadLaneTiming.blobs++;
+        uploadLaneTiming.bytes += group.size;
+      }
+    } finally {
+      group.complete();
     }
-    group.complete();
   }
 
   private rejectGroups(groups: Iterable<PackGroup>, error: unknown): void {
@@ -318,21 +365,23 @@ export class BlobPackUploader {
     void Promise.all(waiters.map((waiter) => waiter.done)).then(group.complete);
   }
 
-  private transferGroups(groups: Iterable<PackGroup>): void {
-    for (const group of groups) this.transferGroup(group);
+  private transferGroups(groups: Iterable<PackGroup>, reason?: PackFallbackReason): void {
+    const owned = [...groups].filter((group) => group.owner === "pack");
+    if (reason && owned.length > 0) recordPackFallback(reason);
+    for (const group of owned) this.transferGroup(group);
   }
 
-  private transferPending(): void {
+  private transferPending(reason: PackFallbackReason): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const pending = this.queue;
     this.queue = [];
     this.queuedPayloadBytes = 0;
     this.tailReady = false;
-    this.transferGroups(pending);
+    this.transferGroups(pending, reason);
   }
 
-  private transferAllUnsettled(): void {
+  private transferAllUnsettled(reason: PackFallbackReason): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.queue = [];
@@ -341,11 +390,20 @@ export class BlobPackUploader {
     // Stop redundant old-server requests. Their catch/finally paths observe
     // transferred ownership, release permits, and clean their own temp files.
     for (const controller of this.controllers) controller.abort(new DOMException("pack capability unavailable", "AbortError"));
-    this.transferGroups([...this.bySha.values()]);
+    this.transferGroups([...this.bySha.values()], reason);
+  }
+
+  private recordFallback(reason: PackFallbackReason, groups: Iterable<PackGroup>): void {
+    for (const group of groups) {
+      if (group.owner !== "pack") continue;
+      recordPackFallback(reason);
+      return;
+    }
   }
 
   close(error: Error): Promise<void> {
     if (this.closePromise) return this.closePromise;
+    this.unsubscribePackDisabled();
     this.closed = true;
     this.closeError = error;
     if (this.timer) clearTimeout(this.timer);

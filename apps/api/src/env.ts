@@ -65,9 +65,11 @@ export interface Env {
   /** Design 114 pack-PUT acceptance gate. Default off; only "1" enables
    *  publication of new packed blobs. Packed reads are not gated by this flag. */
   RBOX_BLOB_PACK_ACCEPT?: string;
-  /** Design 114 physical pack-GC and uploading-orphan sweeper gate. Default off;
-   *  only "1" enables destructive pack maintenance. */
-  RBOX_BLOB_PACK_GC?: string;
+  /** Design 114 staged physical pack-GC mode. Unset/"0" = off; "shadow" =
+   *  read-only would-change counts; "mark" = resurrect + mark only; "1" or
+   *  "execute" = full open/delete execution. The destructive uploading-orphan
+   *  and tombstone re-sweeps run only in execute mode. */
+  RBOX_BLOB_PACK_GC?: "0" | "shadow" | "mark" | "1" | "execute";
   /** Design 109 kill switch: unset/anything other than "0" mints and accepts
    *  upload grants (default on); "0" preserves the pure bearer path. */
   RBOX_AUTH_GRANT?: string;

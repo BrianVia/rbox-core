@@ -10,7 +10,7 @@ import { readBytesCapped } from "./commit-envelope.js";
 import { wouldExceedCapAggregate } from "./billing.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
-import { emit, startOp, type Op } from "./metrics.js";
+import { emit, emitPackPutPhases, startOp, type Op, type PackPutPhaseTimings } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
 import { usesReceipts } from "./blob-protocol.js";
 import { json, logErr, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
@@ -32,7 +32,13 @@ export const PACK_ROLLBACK_FLOOR = "unset — record the first deployed Workers 
 
 export const packKey = (packId: string): string => `packs/v1/${packId}`;
 export const packAcceptEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_ACCEPT === "1";
-export const packGcEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_GC === "1";
+export type PackGcMode = "off" | "shadow" | "mark" | "execute";
+export const packGcMode = (env: Env): PackGcMode => {
+  if (env.RBOX_BLOB_PACK_GC === "shadow") return "shadow";
+  if (env.RBOX_BLOB_PACK_GC === "mark") return "mark";
+  if (env.RBOX_BLOB_PACK_GC === "1" || env.RBOX_BLOB_PACK_GC === "execute") return "execute";
+  return "off";
+};
 
 export interface PackedLocation {
   pack_id: string;
@@ -236,13 +242,49 @@ async function mintPackResponse(
   return json({ packId, packSha256: packSha, results });
 }
 
+async function readyObjectMatches(
+  op: Op,
+  packId: string,
+  packSha: string,
+  bodyBytes: number,
+  hash: (bytes: Uint8Array) => Promise<string>,
+): Promise<boolean> {
+  let object: R2Object | null;
+  try {
+    object = await op.span.r2(() => op.env.rbox_dev_blobs.head(packKey(packId)));
+  } catch {
+    return false;
+  }
+  if (!object || object.size !== bodyBytes) return false;
+  const storedSha = object.checksums?.sha256;
+  if (storedSha) return toHex(new Uint8Array(storedSha)) === packSha;
+  try {
+    const fetched = await op.span.r2(() => op.env.rbox_dev_blobs.get(packKey(packId)));
+    if (!fetched || fetched.size !== bodyBytes) return false;
+    return (await hash(new Uint8Array(await fetched.arrayBuffer()))) === packSha;
+  } catch {
+    return false;
+  }
+}
+
 /** Design 114 pack publication. Validation and persistence order is safety-critical. */
 export async function blobPackPut(req: Request, env: Env, accountId: string): Promise<Response> {
   const op = startOp(env, "blob.packPut");
   let memberCount = 0;
   let bodyBytes = 0;
+  const phases: PackPutPhaseTimings = { parseMs: 0, hashMs: 0, r2Ms: 0, fenceMs: 0, receiptMs: 0, payloadBytes: 0 };
+  const timed = async <T>(field: "parseMs" | "hashMs" | "fenceMs" | "receiptMs", fn: () => Promise<T> | T): Promise<T> => {
+    const started = performance.now();
+    try {
+      return await fn();
+    } finally {
+      phases[field] += performance.now() - started;
+    }
+  };
   const done = (outcome: string, response: Response): Response => {
+    phases.r2Ms = op.span.storeMs;
     op.done(outcome, { count: memberCount, bytes: bodyBytes });
+    emitPackPutPhases(env, outcome, phases);
     return response;
   };
 
@@ -257,20 +299,21 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
   }
 
   try {
-    const body = await readBytesCapped(req, PACK_MAX_BODY_BYTES);
+    const body = await timed("parseMs", () => readBytesCapped(req, PACK_MAX_BODY_BYTES));
     if (body === null) return done("too_large", json({ error: "bad_request" }, 400));
     bodyBytes = body.byteLength;
-    if (await sha256Hex(body) !== packSha) return done("pack_sha_mismatch", json({ error: "pack_sha_mismatch" }, 400));
+    if (await timed("hashMs", () => sha256Hex(body)) !== packSha) return done("pack_sha_mismatch", json({ error: "pack_sha_mismatch" }, 400));
 
-    const parsed = parsePack(body);
+    const parsed = await timed("parseMs", () => parsePack(body));
     if (!parsed.ok) return done("bad_pack", json({ error: "bad_pack", reason: parsed.error }, 400));
     memberCount = parsed.entries.length;
-    if ((await sha256Hex(parsed.directory)) !== toHex(parsed.directorySha256)) {
+    phases.payloadBytes = parsed.entries.reduce((sum, entry) => sum + entry.length, 0);
+    if ((await timed("hashMs", () => sha256Hex(parsed.directory))) !== toHex(parsed.directorySha256)) {
       return done("bad_pack", json({ error: "bad_pack", reason: "directory_sha_mismatch" }, 400));
     }
-    const memberHashes = await Promise.all(
+    const memberHashes = await timed("hashMs", () => Promise.all(
       parsed.entries.map((entry) => sha256Hex(body.subarray(entry.offset, entry.offset + entry.length))),
-    );
+    ));
     if (memberHashes.some((actual, i) => actual !== parsed.entries[i]!.sha256)) {
       return done("member_sha_mismatch", json({ error: "member_sha_mismatch" }, 400));
     }
@@ -291,18 +334,14 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
     if (!(await inventoryMatches(db, row, bodyBytes, parsed.entries))) return done("retry_later", json({ error: "retry_later" }, 503));
 
     if (row.state === "ready") {
-      let object: R2Object | null;
-      try {
-        object = await op.span.r2(() => op.env.rbox_dev_blobs.head(packKey(packId)));
-      } catch {
-        object = null;
-      }
-      if (!object || object.size !== bodyBytes) return done("retry_later", json({ error: "retry_later" }, 503));
-      const checkTime = Date.now();
-      if (!(await fenceRead(op, accountId, packId, parsed.entries.map((entry) => entry.sha256)))) {
+      if (!(await readyObjectMatches(op, packId, packSha, bodyBytes, (bytes) => timed("hashMs", () => sha256Hex(bytes))))) {
         return done("retry_later", json({ error: "retry_later" }, 503));
       }
-      return done("ok", await mintPackResponse(op.env, accountId, packId, packSha, parsed.entries, checkTime));
+      const checkTime = Date.now();
+      if (!(await timed("fenceMs", () => fenceRead(op, accountId, packId, parsed.entries.map((entry) => entry.sha256))))) {
+        return done("retry_later", json({ error: "retry_later" }, 503));
+      }
+      return done("ok", await timed("receiptMs", () => mintPackResponse(op.env, accountId, packId, packSha, parsed.entries, checkTime)));
     }
 
     const heartbeat = await db
@@ -318,7 +357,7 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
     }
 
     const checkTime = Date.now();
-    if (!(await fenceRead(op, accountId, packId, parsed.entries.map((entry) => entry.sha256)))) {
+    if (!(await timed("fenceMs", () => fenceRead(op, accountId, packId, parsed.entries.map((entry) => entry.sha256))))) {
       return done("retry_later", json({ error: "retry_later" }, 503));
     }
     const ready = await db
@@ -326,7 +365,7 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
       .bind(Date.now(), packId, packSha)
       .run();
     if (ready.meta.changes !== 1) return done("retry_later", json({ error: "retry_later" }, 503));
-    return done("ok", await mintPackResponse(op.env, accountId, packId, packSha, parsed.entries, checkTime));
+    return done("ok", await timed("receiptMs", () => mintPackResponse(op.env, accountId, packId, packSha, parsed.entries, checkTime)));
   } catch {
     return done("error", json({ error: "internal_error" }, 500));
   }
@@ -365,6 +404,7 @@ export async function packTombstones(env: Env): Promise<{ tombstones: PackTombst
 
 /** Bounded tombstone-only HEAD/delete pass; permanent deny rows are never removed. */
 export async function resweepPackTombstones(env: Env): Promise<{ observed: number; reDeleted: number }> {
+  if (packGcMode(env) !== "execute") return { observed: 0, reDeleted: 0 };
   const op = startOp(env, "pack.gc.resweep");
   const db = dbFor(op.env, "");
   let observed = 0;
@@ -413,6 +453,7 @@ export async function resweepPackTombstones(env: Env): Promise<{ observed: numbe
 
 /** Reclaims abandoned uploading inventories and permanently contains late PUTs. */
 export async function sweepUploadingPacks(env: Env, nowMs: number = Date.now()): Promise<void> {
+  if (packGcMode(env) !== "execute") return;
   const op = startOp(env, "pack.gc.uploading");
   const db = dbFor(op.env, "");
   const cutoff = nowMs - PACK_ORPHAN_GRACE_MS;

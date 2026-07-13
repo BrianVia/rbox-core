@@ -297,8 +297,8 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 // grant: an invalid grant is treated exactly like no grant.
 export async function blobGet(env: Env, sha: string, accountId: string, grant?: string): Promise<Response> {
   const op = startOp(env, "blob.get");
-  const notFound = (outcome = "not_found") => {
-    op.done(outcome);
+  const notFound = (outcome = "not_found", requestedBytes?: number) => {
+    op.done(outcome, requestedBytes === undefined ? undefined : { bytes: requestedBytes });
     return json({ error: "not_found" }, 404);
   };
   const granted = grant ? (await verifyGrant(op.env, grant, { accountId, nowMs: Date.now() })).ok : false;
@@ -307,13 +307,13 @@ export async function blobGet(env: Env, sha: string, accountId: string, grant?: 
   const loc = await packedLocation(dbFor(op.env, accountId), sha);
   if (loc) {
     const bytes = await readPackedExtent(op, op.env, sha, loc);
-    if (!bytes) return notFound("pack_extent_error");
-    op.done("ok", { bytes: bytes.byteLength });
+    if (!bytes) return notFound("pack_extent_error", loc.length);
+    op.done("ok_packed", { bytes: bytes.byteLength });
     return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
   }
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
-  op.done("ok", { bytes: got.size });
+  op.done("ok_canonical", { bytes: got.size });
   return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
@@ -323,20 +323,20 @@ export async function blobGet(env: Env, sha: string, accountId: string, grant?: 
 // query. Design 114 deliberately adds the post-authorization placement lookup.
 export async function blobGetWithVerifiedGrant(env: Env, sha: string, accountId: string): Promise<Response> {
   const op = startOp(env, "blob.get");
-  const notFound = (outcome = "not_found_grant_preauth") => {
-    op.done(outcome);
+  const notFound = (outcome = "not_found_grant_preauth", requestedBytes?: number) => {
+    op.done(outcome, requestedBytes === undefined ? undefined : { bytes: requestedBytes });
     return json({ error: "not_found" }, 404);
   };
   const loc = await packedLocation(dbFor(op.env, accountId), sha);
   if (loc) {
     const bytes = await readPackedExtent(op, op.env, sha, loc);
-    if (!bytes) return notFound("pack_extent_error");
-    op.done("ok_grant_preauth", { bytes: bytes.byteLength });
+    if (!bytes) return notFound("pack_extent_error", loc.length);
+    op.done("ok_packed_grant_preauth", { bytes: bytes.byteLength });
     return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
   }
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
-  op.done("ok_grant_preauth", { bytes: got.size });
+  op.done("ok_canonical_grant_preauth", { bytes: got.size });
   return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 

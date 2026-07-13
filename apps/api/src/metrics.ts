@@ -193,6 +193,57 @@ export function emitRedeemPhases(env: Env, outcome: string, t: RedeemPhaseTiming
   }
 }
 
+export interface PackPutPhaseTimings {
+  parseMs: number;
+  hashMs: number;
+  r2Ms: number;
+  fenceMs: number;
+  receiptMs: number;
+  payloadBytes: number;
+}
+
+/** Design 114 pack upload phase decomposition. Numeric fields only; pack ids,
+ * member hashes, and member ordering never enter the point. */
+export function emitPackPutPhases(env: Env, outcome: string, t: PackPutPhaseTimings): void {
+  try {
+    env.rbox_metrics?.writeDataPoint({
+      indexes: ["blob.packPut.phases"],
+      blobs: ["blob.packPut.phases", outcome],
+      doubles: [t.parseMs, t.hashMs, t.r2Ms, t.fenceMs, t.receiptMs, t.payloadBytes],
+    });
+  } catch {
+    // telemetry must never break the request path
+  }
+}
+
+export interface BlobBatchGetSummary {
+  canonicalCount: number;
+  packedCount: number;
+  r2RangeCount: number;
+  requestedBytes: number;
+  fetchedBytes: number;
+}
+
+/** One design-114 read-shape point per batch GET. All fields are numeric and
+ * aggregate over the request; no hashes, pack ids, or ordering are recorded. */
+export function emitBlobBatchGetSummary(env: Env, outcome: string, summary: BlobBatchGetSummary): void {
+  try {
+    env.rbox_metrics?.writeDataPoint({
+      indexes: ["blob.batchGet.summary"],
+      blobs: ["blob.batchGet.summary", outcome],
+      doubles: [
+        summary.canonicalCount,
+        summary.packedCount,
+        summary.r2RangeCount,
+        summary.requestedBytes,
+        summary.fetchedBytes,
+      ],
+    });
+  } catch {
+    // telemetry must never break the request path
+  }
+}
+
 /**
  * Per-op span collector. Accumulates D1 / R2 / DO sub-timings (and D1 call count)
  * across nested or FAILING calls, so the one emitted metric attributes time

@@ -13,8 +13,10 @@ import {
 } from "../../../engine/blob-pack.js";
 import { RemoteContext } from "../context.js";
 import { BlobRetryLaterError } from "../errors.js";
+import { getPackUploadTiming, resetPackUploadTimingForTests } from "../../upload-lane-timing.js";
 import { packUploadConfig } from "./config.js";
-import { UploadSlotArbiter, packUploadDisabled, resetBatchBlobStateForTests, uploadDisabled } from "./gate.js";
+import { UploadSlotArbiter, onPackUploadDisabled, packUploadDisabled, resetBatchBlobStateForTests, uploadDisabled } from "./gate.js";
+import { BlobPackUploader } from "./pack-uploader.js";
 import { buildPack } from "./packer.js";
 import { BlobBatchUploader } from "./uploader.js";
 
@@ -45,6 +47,7 @@ beforeEach(async () => {
     delete process.env[key];
   }
   resetBatchBlobStateForTests();
+  resetPackUploadTimingForTests();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pack-upload-"));
   uploaders = [];
   packCalls = [];
@@ -240,6 +243,55 @@ describe("client pack writer", () => {
     await waitFor(() => arbiter.inFlight === 0);
   });
 
+  test.each(["batch", "pack"] as const)("limit-1 arbiter interleaves dual backlogs from a %s-first owner", async (initialLane) => {
+    enableImmediatePacks();
+    process.env.RBOX_PACK_STREAMS = "8";
+    process.env.RBOX_PACK_CUTOFF_BYTES = String(64 * 1024);
+    process.env.RBOX_BATCH_RECORDS = "1";
+    const arbiter = new UploadSlotArbiter(1);
+    const uploader = makeUploader("token", arbiter);
+    const packed = await makeFiles(5, 64 * 1024, `fair-${initialLane}-pack`);
+    const batched = await makeFiles(5, 64 * 1024 + 1, `fair-${initialLane}-batch`);
+    const starts: Array<"batch" | "pack"> = [];
+    const completions: Array<"batch" | "pack"> = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let first = true;
+    handler = async (url, init, body) => {
+      const lane = url.endsWith("/v1/blob-pack/put") ? "pack" : "batch";
+      starts.push(lane);
+      if (first) {
+        first = false;
+        await firstGate;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      completions.push(lane);
+      return defaultHandler(url, init, body);
+    };
+
+    const initial = initialLane === "pack" ? packed.shift()! : batched.shift()!;
+    const pending = [uploader.putFile(initial.sha, initial.path, initial.size, tmpDir)];
+    await waitFor(() => starts.length === 1);
+    pending.push(
+      ...batched.map((member) => uploader.putFile(member.sha, member.path, member.size, tmpDir)),
+      ...packed.map((member) => uploader.putFile(member.sha, member.path, member.size, tmpDir)),
+    );
+    releaseFirst();
+    await Promise.all(pending);
+
+    expect(starts[0]).toBe(initialLane);
+    expect(new Set(starts.slice(0, 3))).toEqual(new Set(["batch", "pack"]));
+    expect(completions).toEqual(starts);
+    let longestRun = 1;
+    let run = 1;
+    for (let i = 1; i < starts.length; i++) {
+      run = starts[i] === starts[i - 1] ? run + 1 : 1;
+      longestRun = Math.max(longestRun, run);
+    }
+    expect(longestRun).toBeLessThanOrEqual(2);
+    await waitFor(() => arbiter.inFlight === 0);
+  });
+
   test("RBOX_PACK_STREAMS=2 caps packs with 24 shared permits", async () => {
     enableImmediatePacks();
     process.env.RBOX_PACK_STREAMS = "2";
@@ -316,6 +368,40 @@ describe("client pack writer", () => {
     expect(batchCalls).toBeGreaterThan(0);
   });
 
+  test("a process latch transfers pending work across uploader instances", async () => {
+    enableImmediatePacks();
+    const arbiter = new UploadSlotArbiter(1);
+    const firstUploader = makeUploader("first", arbiter);
+    const secondUploader = makeUploader("second", arbiter);
+    let packRequests = 0;
+    let release404!: () => void;
+    const responseGate = new Promise<void>((resolve) => { release404 = resolve; });
+    let latchNotifications = 0;
+    const unsubscribe = onPackUploadDisabled(() => { latchNotifications++; });
+    handler = async (url, init, body) => {
+      if (!url.endsWith("/v1/blob-pack/put")) return defaultHandler(url, init, body);
+      packRequests++;
+      if (new Headers(init.headers).get("authorization") !== "Bearer first") {
+        throw new Error("second uploader issued a pack PUT after the process latch");
+      }
+      await responseGate;
+      return json(404, { error: "pack_disabled" });
+    };
+    const first = await makeFile("cross-instance-first", 64 * 1024);
+    const second = await makeFile("cross-instance-second", 64 * 1024);
+    const firstPending = firstUploader.putFile(first.sha, first.path, first.size, tmpDir);
+    await waitFor(() => packRequests === 1);
+    const secondPending = secondUploader.putFile(second.sha, second.path, second.size, tmpDir);
+    release404();
+    await Promise.all([firstPending, secondPending]);
+    unsubscribe();
+
+    expect(packRequests).toBe(1);
+    expect(latchNotifications).toBe(1);
+    expect(packUploadDisabled()).toBe(true);
+    expect(batchCalls).toBe(2);
+  });
+
   test("duplicate SHAs coalesce in the pack lane without double-settling", async () => {
     enableImmediatePacks();
     const uploader = makeUploader();
@@ -328,6 +414,41 @@ describe("client pack writer", () => {
     expect(packCalls).toHaveLength(1);
     expect(packCalls[0]!.parsed.entries).toHaveLength(1);
     expect(progress).toBe(2);
+  });
+
+  test("throwing progress callbacks cannot strand pack settlement or cleanup", async () => {
+    enableImmediatePacks();
+    const arbiter = new UploadSlotArbiter(1);
+    const uploader = makeUploader("token", arbiter);
+    const member = await makeFile("throwing-progress", 64 * 1024);
+    let laterProgress = 0;
+    await Promise.all([
+      uploader.putFile(member.sha, member.path, member.size, tmpDir, () => { throw new Error("progress failed"); }),
+      uploader.putFile(member.sha, member.path, member.size, tmpDir, () => { laterProgress++; }),
+    ]);
+    await uploader.close(new Error("done"));
+
+    expect(laterProgress).toBe(1);
+    expect(arbiter.inFlight).toBe(0);
+    expect((await fs.readdir(tmpDir)).filter((name) => name.startsWith("pack-"))).toHaveLength(0);
+  });
+
+  test("records numeric pack telemetry after a stubbed publish", async () => {
+    enableImmediatePacks();
+    const uploader = makeUploader();
+    const members = await makeFiles(2, 32 * 1024, "telemetry");
+    await Promise.all(members.map((member) => uploader.putFile(member.sha, member.path, member.size, tmpDir)));
+    const timing = getPackUploadTiming();
+
+    expect(timing.packsBuilt).toBe(1);
+    expect(timing.packsSent).toBe(1);
+    expect(timing.members).toBe(2);
+    expect(timing.payloadBytes).toBe(64 * 1024);
+    expect(timing.overheadBytes).toBe(packCalls[0]!.body.byteLength - 64 * 1024);
+    expect(timing.overheadBytes).toBeGreaterThan(0);
+    expect(timing.buildMs).toBeGreaterThanOrEqual(0);
+    expect(timing.uploadMs).toBeGreaterThanOrEqual(0);
+    expect(Object.values(timing.fallbacks).every((count) => count === 0)).toBe(true);
   });
 
   test("a malformed successful response falls back canonically without latching", async () => {
@@ -375,6 +496,44 @@ describe("client pack writer", () => {
     expect(batchCalls).toBeGreaterThan(0);
   });
 
+  test("acceptance rolling off mid-publish settles the first pack and requeues the rest", async () => {
+    enableImmediatePacks();
+    process.env.RBOX_PACK_STREAMS = "1";
+    const arbiter = new UploadSlotArbiter(1);
+    const uploader = makeUploader("token", arbiter);
+    const members = await makeFiles(3, 64 * 1024, "rolloff");
+    let packRequests = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let latchNotifications = 0;
+    const unsubscribe = onPackUploadDisabled(() => { latchNotifications++; });
+    handler = async (url, init, body) => {
+      if (!url.endsWith("/v1/blob-pack/put")) return defaultHandler(url, init, body);
+      packRequests++;
+      if (packRequests === 1) {
+        await firstGate;
+        return defaultHandler(url, init, body);
+      }
+      return json(404, { error: "pack_disabled" });
+    };
+    const progress = [0, 0, 0];
+    const pending = members.map((member, i) => uploader.putFile(
+      member.sha, member.path, member.size, tmpDir, () => { progress[i]++; },
+    ));
+    await waitFor(() => packRequests === 1);
+    releaseFirst();
+    await Promise.all(pending);
+    unsubscribe();
+
+    expect(packRequests).toBe(2);
+    expect(progress).toEqual([1, 1, 1]);
+    expect(contextOf(uploader).receipts.get(members[0]!.sha)).toBe(`pack:${members[0]!.sha}`);
+    expect(batchCalls).toBeGreaterThan(0);
+    expect(packUploadDisabled()).toBe(true);
+    expect(uploadDisabled()).toBe(false);
+    expect(latchNotifications).toBe(1);
+  });
+
   test("close aborts and awaits an in-flight pack, rejects once, and cleans temp files", async () => {
     enableImmediatePacks();
     const arbiter = new UploadSlotArbiter(1);
@@ -397,6 +556,44 @@ describe("client pack writer", () => {
     await expect(pending).rejects.toBe(closeError);
     expect(arbiter.inFlight).toBe(0);
     expect((await fs.readdir(tmpDir)).filter((name) => name.startsWith("pack-"))).toHaveLength(0);
+  });
+
+  test("close during pack construction rejects waiters, removes temp state, and never fetches", async () => {
+    enableImmediatePacks();
+    const arbiter = new UploadSlotArbiter(1);
+    const ctx = new RemoteContext("https://example.test", "token", "ws", "project");
+    const pausedPath = path.join(tmpDir, "pack-paused.tmp");
+    let buildStarted!: () => void;
+    const started = new Promise<void>((resolve) => { buildStarted = resolve; });
+    let releaseBuild!: () => void;
+    const buildGate = new Promise<void>((resolve) => { releaseBuild = resolve; });
+    const builder: typeof buildPack = async () => {
+      await fs.writeFile(pausedPath, "partial pack");
+      buildStarted();
+      await buildGate;
+      return { path: pausedPath, packSha256: "0".repeat(64), entries: [], totalBytes: 12 };
+    };
+    const packUploader = new BlobPackUploader(ctx, arbiter, () => {
+      throw new Error("closed work must not fall back");
+    }, builder);
+    let packFetches = 0;
+    handler = (url, init, body) => {
+      if (url.endsWith("/v1/blob-pack/put")) packFetches++;
+      return defaultHandler(url, init, body);
+    };
+    const member = await makeFile("close-during-build", 64 * 1024);
+    const pending = packUploader.putFile(member.sha, member.path, member.size, tmpDir);
+    pending.catch(() => {});
+    await started;
+    const closeError = new Error("closed while building");
+    const closing = packUploader.close(closeError);
+    await expect(pending).rejects.toBe(closeError);
+    releaseBuild();
+    await closing;
+
+    expect(packFetches).toBe(0);
+    expect(arbiter.inFlight).toBe(0);
+    expect(await fs.stat(pausedPath).then(() => true, () => false)).toBe(false);
   });
 });
 

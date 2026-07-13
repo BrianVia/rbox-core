@@ -1,5 +1,28 @@
 import { expect, test } from "bun:test";
 
+test("pack telemetry is rendered through the upload lane summary", () => {
+  const code = `
+    import {
+      recordPackBuilt, recordPackFallback, recordPackSent,
+      uploadLaneTiming, uploadLaneTimingSummary,
+    } from "./src/cli/upload-lane-timing.js";
+    uploadLaneTiming.blobs = 2;
+    uploadLaneTiming.bytes = 100;
+    recordPackBuilt(2, 100, 140, 3);
+    recordPackSent(4);
+    recordPackFallback("http_error");
+    console.log(uploadLaneTimingSummary());
+  `;
+  const res = Bun.spawnSync(["bun", "-e", code], {
+    cwd: process.cwd(),
+    env: { ...process.env, RBOX_LANE_TIMING: "1" },
+  });
+  expect(res.exitCode, res.stderr.toString()).toBe(0);
+  expect(res.stdout.toString().trim()).toContain(
+    "packs built 1 sent 1 members/pack 2.0 payload 100B overhead 40B build 3.0ms upload 4.0ms fallback http_error:1",
+  );
+});
+
 test("RBOX_LANE_TIMING=1 push reports upload lane timing for file blobs", () => {
   const code = `
     import fs from "node:fs/promises";

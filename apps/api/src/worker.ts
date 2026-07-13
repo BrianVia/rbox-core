@@ -41,7 +41,7 @@ import { accountLinkPublicRoutes, accountRoutes } from "./routes/account.js";
 import { keysRoutes } from "./routes/keys.js";
 import { blobsRoutes } from "./routes/blobs.js";
 import { blobBatchRoutes } from "./routes/blob-batch.js";
-import { packGcEnabled, sweepUploadingPacks } from "./blob-pack.js";
+import { packGcMode, sweepUploadingPacks } from "./blob-pack.js";
 import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 import { runPackGc } from "./pack-gc.js";
@@ -129,7 +129,7 @@ export default {
           logErr("scheduled_gc_purge_failed", e);
         }
       }
-      if (packGcEnabled(env)) {
+      if (packGcMode(env) !== "off") {
         try {
           await runPackGc(env);
         } catch (e) {
@@ -183,7 +183,7 @@ export default {
     } catch (e) {
       logErr("scheduled_account_delete_sweep_failed", e); // no raw message (touches account metadata)
     }
-    if (packGcEnabled(env)) {
+    if (packGcMode(env) === "execute") {
       try {
         await sweepUploadingPacks(env);
       } catch (e) {
