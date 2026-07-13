@@ -19,28 +19,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Route to the self-hosted "home" box when online, else fall back to GitHub-hosted.
-  # Runs on ubuntu-latest so the decision is available even when the box is off.
-  pick-runner:
-    runs-on: ubuntu-latest
-    outputs:
-      runner: ${{ steps.choose.outputs.runner }}
-    steps:
-      - id: choose
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
-        run: |
-          online=$(gh api "repos/${{ github.repository }}/actions/runners" \
-            --jq '[.runners[] | select(.status=="online" and ([.labels[].name] | index("self-hosted-home")))] | length')
-          if [ "${online:-0}" -gt 0 ]; then
-            echo "runner=self-hosted-home" >> "$GITHUB_OUTPUT"
-          else
-            echo "runner=ubuntu-latest" >> "$GITHUB_OUTPUT"
-          fi
-
+  # GitHub-hosted only (founder decision 2026-07-13; see ci.yml).
   deploy:
-    needs: pick-runner
-    runs-on: ${{ needs.pick-runner.outputs.runner }}
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: apps/web
