@@ -19,7 +19,7 @@ const HEAVY_WEIGHTS: Record<string, number> = {
   // These hints keep the runtime partition balanced without hardcoding complete
   // shard file lists. Every test is still discovered from src/**/*.test.ts.
   "src/cli/daemon/daemon-activity.test.ts": 24,
-  "src/cli/sync.test.ts": 13,
+  "src/cli/sync/sync.test.ts": 13,
   "src/cli/e2ee-sync.test.ts": 3,
   "src/cli/shell-init.test.ts": 3,
   "src/cli/daemon/daemon-binding.test.ts": 7,
