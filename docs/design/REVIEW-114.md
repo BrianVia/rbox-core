@@ -204,3 +204,41 @@ as ≥7 days AND ≥1 subsequent production deploy with the reader present.
 WHERE deleting_at IS NOT NULL`, mirroring migration 0024.
 
 Revision committed as DRAFT v3.
+
+### Round 3 — codex verdict: CHANGES-REQUIRED (1 BLOCKER, 4 MAJOR, 1 MINOR)
+
+**BLOCKER — D1 ordering does not order JS timestamps.** ADOPTED. Verified: GC
+passes bind an invocation-start `nowMs` (`versions.ts::gcPurge`), so
+`marked_at`/`deleting_at` lag their statements' landing; database serialization
+of the fence read vs the mark INSERT yields only `issuedAt < T_mark` (wall
+insert time), not `issuedAt < marked_at`. Property 1 restated against
+`T_mark`; property 3 rebuilt as a wall-clock chain with an explicit
+`GC_CLOCK_STALENESS_BUDGET` (S = 1 h, ≥4x the executor's 15-min deadline,
+compile-asserted): `quiescence ≥ TTL + skew + S`, margin ≈ 11 h at deployed
+constants. Gate 5b injects stale invocation clocks.
+
+**MAJOR — sweeper eligibility not embedded in destructive statements.**
+ADOPTED verbatim: one db.batch, `pack_members` then `packs`, both correlated
+to `state='uploading' ∧ created_at,touched_at past grace`; R2 delete only on
+`changes=1`.
+
+**MAJOR — heartbeat relies on a nonexistent HTTP-duration bound (late R2 PUT
+recreates an uninventoried object).** ADOPTED with two mechanisms: (a) a
+handler that fails its ready transition/fence best-effort deletes its own
+just-written object; (b) the sweeper's terminal action is a `state='swept'`
+tombstone (not row deletion) — all later paths require non-swept state, and
+the sweeper re-HEADs tombstoned ids, re-deleting reappeared objects, removing
+the tombstone only after confirmed absence past a further grace.
+
+**MAJOR — ready-state crash retry cannot satisfy the uploading→ready CAS.**
+ADOPTED: distinct idempotent ready/same-checksum branch (verify inventory +
+object, fence read, mint fresh receipts, no transition).
+
+**MAJOR — remote concurrency does not establish same-isolate memory safety.**
+ADOPTED: two-layer gate — deterministic same-isolate workers-vitest
+concurrency harness with full 8 MiB bodies, plus the remote stress cell.
+
+**MINOR — wrangler drill not pinned to apps/api.** ADOPTED: `cd apps/api`,
+dev worker, `versions deploy <id>@100%`, record/restore exact active version.
+
+Revision committed as DRAFT v4.

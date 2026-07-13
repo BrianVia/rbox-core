@@ -1,6 +1,6 @@
 # 114 — Pack small ciphertext blobs into bandwidth-sized R2 objects
 
-Status: **DRAFT v3** (2026-07-13) — rounds 1-2 of the adversarial review folded
+Status: **DRAFT v4** (2026-07-13) — rounds 1-3 of the adversarial review folded
 (`docs/design/REVIEW-114.md`). Not yet approved; implementation must not begin
 until the loop converges. This is a storage-format and GC-fence design. Field
 baseline: `flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
@@ -342,21 +342,38 @@ no receipts. There is no partial physical success contract.
 
 A failed request may leave an `uploading` inventory row but never an active
 blob location. The `uploading`-orphan protocol is explicit because the sweeper
-and a same-id repair can race (round 2):
+and a same-id repair can race (rounds 2–3):
 
 - inventory carries a `touched_at` heartbeat; the original insert and every
-  same-id repair set it via a **conditional single-row UPDATE before the R2
+  same-id retry set it via a **conditional single-row UPDATE before the R2
   write** (`changes = 1` required, else the request fails closed with
   `retry_later` and no R2 write);
-- the `uploading -> ready` transition is likewise a conditional single-row
-  UPDATE (`state='uploading'` predicate, `changes = 1` required, else no
-  receipts are minted);
-- the sweeper may remove `uploading` inventory only when `created_at` **and**
-  `touched_at` are both past the §7.3 orphan grace — hours, versus the
-  platform-bounded minutes an in-flight request can live — and it deletes the
-  **inventory rows first, then** any `packs/v1/<packId>` object, so a repair
-  that lost the race fails its conditional transition (no receipts, no
-  location) rather than leaving a served-but-uninventoried object.
+- the `uploading -> ready` transition is a conditional single-row UPDATE
+  (`state='uploading'` predicate, `changes = 1` required). A same-id retry
+  that finds the pack already `ready` with the same checksum takes a distinct
+  idempotent branch (round 3): verify inventory + object, run the fence read,
+  and mint fresh receipts **without** requiring the transition — a crash
+  between `ready` and the response is therefore recoverable;
+- if the ready transition (or the fence read after it) fails, the handler
+  best-effort deletes the R2 object it just wrote before returning
+  `retry_later`, so a request that lost a race does not strand bytes;
+- the sweeper acts only on inventory whose `state='uploading'` and whose
+  `created_at` **and** `touched_at` are both past the §7.3 orphan grace, and
+  its **destructive statements embed those predicates** (round 3 — a JS
+  pre-select is not the guard): one `db.batch` deletes `pack_members`
+  correlated to a still-eligible parent, then the `packs` row with the same
+  eligibility predicate; the R2 delete runs only if the `packs` DELETE
+  reports `changes = 1`. A repair heartbeat therefore either lands first and
+  falsifies eligibility, or lands after and fails closed (`changes = 0`);
+- because no platform bound is documented for how late an already-issued R2
+  PUT can land (round 3), the sweeper's `packs` DELETE is actually a
+  transition to a terminal **`state='swept'` tombstone** (members deleted,
+  row retained): a late PUT that recreates `packs/v1/<packId>` after the
+  sweep meets a tombstone on every later path (heartbeat, ready transition,
+  fence read all require non-swept state → fail closed), and the sweeper
+  re-HEADs tombstoned ids on subsequent ticks, re-deleting a reappeared
+  object; the tombstone itself is removed only after the object has been
+  confirmed absent on a later tick past a further grace.
 
 After R2 accepts, one fail-closed D1 fence query checks:
 
@@ -499,7 +516,7 @@ CREATE TABLE packs (
   pack_sha256  TEXT NOT NULL,
   size_bytes   INTEGER NOT NULL,
   member_count INTEGER NOT NULL,
-  state         TEXT NOT NULL CHECK (state IN ('uploading', 'ready')),
+  state         TEXT NOT NULL CHECK (state IN ('uploading', 'ready', 'swept')),
   created_at   INTEGER NOT NULL,
   touched_at   INTEGER NOT NULL   -- §3 repair heartbeat; sweeper requires BOTH past grace
 );
@@ -716,30 +733,44 @@ enforced properties (round 1 restated this from a hand-wave into an invariant):
    "minted before mark" cannot be a wall-clock claim about when the HMAC
    completes (round 2); instead the signed `issuedAt` is **captured before the
    fence read**, exactly as `mintFenceCheckedReceipts` already anchors
-   `checkTime` today (`blobs.ts`). D1 serializes the fence read against the
-   mark insert, so for every receipt whose fence read found no candidacy,
-   `issuedAt < marked_at` holds **in signed-timestamp terms** even if the mint
-   itself completes after the mark lands.
+   `checkTime` today (`blobs.ts`). What D1 order actually gives (round 3 —
+   `marked_at`/`deleting_at` are JS invocation clocks, NOT database-assigned
+   times, so no inequality against them follows from serialization): for every
+   receipt whose fence read found no candidacy,
+   `issuedAt < T_mark` where `T_mark` is the **wall time the mark INSERT
+   landed** — the read preceded the insert in database order and `issuedAt`
+   was captured before the read.
 2. **Install fence covers the open intent.** The §5 trigger aborts any
    location install into a pack with an open intent, and a pre-intent install
    makes the intent-open predicate false — either way an await-sized race
    cannot thread between them.
-3. **Quiescence dominates receipt lifetime, per candidacy epoch —
-   `PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS`.** A candidacy
-   can be resurrected away (the §5 resurrect arm removes an unopened candidate
-   when the pack regains locations), after which minting legitimately resumes
-   — so "never minted again after the first candidacy" is false and is not the
-   invariant (round 2). The invariant is **per candidacy epoch**: the candidacy
-   that reaches delete existed continuously from its `marked_at` through the
-   delete (intent-open re-checks, and the executor deletes the row only at the
-   end), so by property 1 every valid receipt for `P` has
-   `issuedAt < marked_at` of *this* epoch. Quiescence runs from *this* epoch's
-   intent-open (`deleting_at`), which the executor's
-   `deleting_at < now - quiescence` predicate restarts automatically on any
-   re-opened intent. Hence
-   `delete ≥ deleting_at + 24 h ≥ marked_at + 24 h > issuedAt + 12 h + skew`:
-   at delete time, and at the terminal candidate-row removal, no unexpired
-   receipt for `P` exists. The constant relation is compile/test-asserted.
+3. **Quiescence dominates receipt lifetime plus clock staleness, per candidacy
+   epoch — `PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS +
+   GC_CLOCK_STALENESS_BUDGET`.** A candidacy can be resurrected away (the §5
+   resurrect arm removes an unopened candidate when the pack regains
+   locations), after which minting legitimately resumes — so "never minted
+   again after the first candidacy" is false and is not the invariant (round
+   2). The invariant is **per candidacy epoch**: the candidacy that reaches
+   delete existed continuously from its mark through the delete (intent-open
+   re-checks, and the executor deletes the row only at the end), so by
+   property 1 every valid receipt for `P` has `issuedAt < T_mark`, the wall
+   time this epoch's mark landed. The wall-clock chain (round 3 — JS
+   timestamps are stale by up to their invocation's age, so staleness must be
+   budgeted, not assumed away):
+   - `deleting_at` is the open pass's invocation-start clock; the open pass
+     observed the mark row, so `deleting_at ≥ T_mark − S` where `S` bounds one
+     GC invocation's age (the executor runs under a hard wall deadline — 15
+     minutes today, `versions.ts::gcPurge` — so `S = 1 h` is a ≥4x-margin
+     budget, compile-asserted against the deadline constant);
+   - the execute pass requires `nowMs_exec − deleting_at > quiescence` and
+     `nowMs_exec ≤ T_delete`, hence
+     `T_delete > T_mark − S + quiescence`;
+   - every valid receipt expires by `issuedAt + TTL + skew < T_mark + TTL +
+     skew`, so with `quiescence ≥ TTL + skew + S` no unexpired receipt exists
+     at the delete or at the terminal candidate-row removal.
+   With 24 h quiescence, 12 h TTL, 60 s skew, and `S = 1 h` the margin is
+   ≈ 11 h. The constant relation is compile/test-asserted; gate 5b injects
+   stale invocation clocks to exercise it.
 
 The deletion proof is conservative, and case-complete over how a pack reaches
 zero active locations (round 1: the previous single-case proof omitted two
@@ -790,7 +821,8 @@ reads, logical GC, or accounting.
   orphan grace and the sweeper removes inventory, then any object.
 - R2 PUT failure: no receipts; retry the whole pack.
 - Crash after R2 PUT but before response: retry same `packId` + checksum;
-  idempotent validation (conditional heartbeat + single-row ready transition)
+  idempotent validation (conditional heartbeat + single-row ready transition,
+  or the ready-state verify branch when the transition already happened)
   returns fresh per-blob receipt generations.
 - Same-id repair racing the orphan sweeper: the repair's conditional heartbeat
   or ready transition affects zero rows → fail closed, no receipts, fresh
@@ -896,13 +928,16 @@ BLOCKER):
   enabled only after the floor release has been the stable production build
   through at least one subsequent release cycle, so every plausible rollback
   target still reads packs and verifies v2 receipts.
-- **Rollback drill (gate), operationally pinned** (round 2). In dev, after
-  writing and redeeming real packs: record the floor and current Worker
-  version IDs (`npx wrangler versions list`), redeploy the floor build via
-  `npx wrangler versions deploy <floor-version-id>` (acceptance off), assert
-  packed single/batch GETs return byte-identical ciphertext, outstanding v2
-  receipts redeem, and `/v1/blobs/check` is unchanged; then restore the
-  current version the same way and re-verify. "One release cycle" of soak is
+- **Rollback drill (gate), operationally pinned** (rounds 2–3). In dev, after
+  writing and redeeming real packs: from `apps/api` (the wrangler config
+  root), record the floor and active Worker version IDs
+  (`cd apps/api && npx wrangler versions list` against the dev worker),
+  redeploy the floor build at 100% via
+  `npx wrangler versions deploy <floor-version-id>@100%` (acceptance off),
+  assert packed single/batch GETs return byte-identical ciphertext,
+  outstanding v2 receipts redeem, and `/v1/blobs/check` is unchanged; then
+  restore the recorded active version the same way and re-verify. "One
+  release cycle" of soak is
   defined measurably: the floor (or a later reader-capable build) has been the
   deployed production Worker for **≥7 days and ≥1 subsequent production
   deploy**, so every version in the plausible rollback window reads packs.
@@ -959,15 +994,17 @@ canonical and packed locations. At every injected await/crash boundary assert:
 5. pack intent vs packed receipt/location install is D1-serialized by the
    `rbox_delete_fence_pack` trigger;
 5b. while any `pack_gc_candidates` row exists for a pack, no receipt for that
-   pack is minted (same-id retry included), every signed `issuedAt` anchored by
-   a passing fence read precedes the current candidacy's `marked_at`, and every
-   such receipt is expired before that candidacy's delete step can run
-   (`PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS`, asserted at
-   compile/test time) — exercised with clock-injected histories covering:
+   pack is minted (same-id retry included); every signed `issuedAt` anchored by
+   a passing fence read precedes the wall time the current candidacy's mark
+   landed; and every such receipt is expired before that candidacy's delete
+   step can run (`PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS +
+   GC_CLOCK_STALENESS_BUDGET`, asserted at compile/test time against the
+   executor deadline) — exercised with clock-injected histories covering:
    mint→mark→retry-mint (must fail); pre-mark install→resurrect→retry-mint
    (must succeed)→last-location-delete→fresh mark→delete with quiescence
-   restarted from the NEW intent; and installs attempted at every await
-   boundary;
+   restarted from the NEW intent; **stale invocation clocks** (mark/open passes
+   whose `nowMs` lags their statements' landing by up to the deadline); and
+   installs attempted at every await boundary;
 6. re-add before logical retirement preserves the old location; re-add after
    retirement installs a fresh canonical/new-pack location and cannot resurrect
    the condemned pack;
@@ -1019,12 +1056,15 @@ Promotion requires all of:
 4. **Server resource gate:** zero Worker 1102/OOM/subrequest-limit errors; p99
    pack handler wall <10 s; per-request CPU <50% of configured limit; body never
    exceeds 8 MiB; aggregate error/retry rate non-inferior. Because the 128 MiB
-   limit is per **isolate**, not per request (round 2), this gate includes a
-   targeted dev stress cell: 24 concurrent pack PUTs overlapped with concurrent
-   mixed batch GETs against the same worker, asserting zero memory/CPU-limit
-   errors — the same transient-buffer class the existing 8 MiB batch lane
-   already carries (~16–24 MiB per in-flight request), made explicit rather
-   than assumed.
+   limit is per **isolate**, not per request (round 2), and remote fan-out may
+   spread across isolates (round 3), the memory check is two-layered: (i) a
+   deterministic same-isolate harness in the existing workers vitest runtime
+   driving N concurrent pack-PUT + mixed batch-GET handler invocations with
+   full 8 MiB bodies in one isolate, and (ii) the remote dev stress cell (24
+   concurrent pack PUTs overlapped with batch GETs) for platform behavior —
+   the same transient-buffer class the existing 8 MiB batch lane already
+   carries (~16–24 MiB per in-flight request), made explicit rather than
+   assumed.
 4b. **Read gate — dedicated matched cells** (round 1: five cold publishes
    cannot establish read percentiles). A separate read harness runs, on the
    same host/API build, ≥200 single GETs and ≥50 32-record batch GETs per arm
