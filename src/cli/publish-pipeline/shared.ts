@@ -83,6 +83,12 @@ export const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
 
 export const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
 
+// Default ON (founder call 2026-07-13, single-user fleet): upload-time receipt
+// draining ships live; RBOX_REDEEM_DRAIN=off is the kill switch for both the
+// serialized and pipeline paths (commit-enclosed final drain remains the
+// catch-all either way).
+export const redeemDrainUpload = () => process.env.RBOX_REDEEM_DRAIN?.trim() !== "off";
+
 // Phase 1's legacy consumer materializes a memory lease into the existing encup
 // temp flow and releases its charge there; the disk temp becomes the source of
 // truth. Tier 2 activates by-reference framing and release at HTTP settlement.

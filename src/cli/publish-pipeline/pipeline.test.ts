@@ -189,7 +189,7 @@ test("drainer failure aborts with its cause and starts no post-latch PUT", async
   try {
     const remote = new PipelineRemote(20);
     remote.redeemImpl = async () => { latchedAt = performance.now(); throw quota; };
-    await withEnv({ RBOX_PIPELINE_REDEEM_THRESHOLD: "1", RBOX_UPLOAD_CONCURRENCY: "1" }, async () => {
+    await withEnv({ RBOX_REDEEM_DRAIN: undefined, RBOX_PIPELINE_REDEEM_THRESHOLD: "1", RBOX_UPLOAD_CONCURRENCY: "1" }, async () => {
       await expect(run(fx, remote)).rejects.toBe(quota);
     });
     expect(remote.putStarts.every((started) => started <= latchedAt)).toBe(true);
@@ -203,7 +203,7 @@ test("drainer returns durable needsUpload residue", async () => {
     const remote = new PipelineRemote();
     const residue = "needs-upload-address";
     remote.redeemImpl = async () => [{ granted: 0, alreadyEntitled: 0, rejected: 0, needsUpload: [residue] }];
-    await withEnv({ RBOX_PIPELINE_REDEEM_THRESHOLD: "1" }, async () => {
+    await withEnv({ RBOX_REDEEM_DRAIN: undefined, RBOX_PIPELINE_REDEEM_THRESHOLD: "1" }, async () => {
       expect((await run(fx, remote)).needsUpload).toEqual(new Set([residue]));
     });
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
@@ -217,11 +217,25 @@ test("pre-existing receipt backlog is drained before the first PUT", async () =>
     let redeems = 0;
     remote.redeemImpl = async () => { redeems++; return []; };
     remote.putHook = () => { expect(redeems).toBeGreaterThan(0); };
-    await withEnv({ RBOX_PIPELINE_REDEEM_THRESHOLD: "1", RBOX_UPLOAD_CONCURRENCY: "1" }, async () => {
+    await withEnv({ RBOX_REDEEM_DRAIN: undefined, RBOX_PIPELINE_REDEEM_THRESHOLD: "1", RBOX_UPLOAD_CONCURRENCY: "1" }, async () => {
       await run(fx, remote);
     });
     expect(redeems).toBeGreaterThan(0);
     expect(remote.blobs.size).toBe(3);
+  } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("RBOX_REDEEM_DRAIN=off disables pipeline upload-time draining (kill switch is global)", async () => {
+  const fx = await fixture(3);
+  try {
+    const remote = new PipelineRemote();
+    let redeems = 0;
+    remote.redeemImpl = async () => { redeems++; return []; };
+    await withEnv({ RBOX_REDEEM_DRAIN: "off", RBOX_PIPELINE_REDEEM_THRESHOLD: "1" }, async () => {
+      await run(fx, remote);
+    });
+    expect(redeems).toBe(0);
+    expect(remote.receipts).toBe(3);
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 

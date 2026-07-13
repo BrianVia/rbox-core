@@ -5,10 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { PhaseReport, encryptFileToTemp, generateKek, type FileEntry, type Manifest } from "../engine/index.js";
 import type { WorkspaceConfig } from "./config.js";
+import { E2eeRemote } from "./e2ee-remote.js";
+import type { E2eeApi, E2eeContext, PinStore } from "./e2ee-remote-types.js";
 import type { SyncRemote } from "./remote.js";
 import type { ReceiptRedeemResult } from "./remote/commits.js";
 import { encryptAndUpload } from "./sync-recovery.js";
-import { beginFirstPublishTiming, firstPublishTiming } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, firstPublishTiming, uploadActiveOverlapMs } from "./upload-lane-timing.js";
 
 const savedEnv = {
   RBOX_REDEEM_DRAIN: process.env.RBOX_REDEEM_DRAIN,
@@ -96,13 +98,20 @@ class DrainRemote {
   }
 }
 
+const wrap = (remote: DrainRemote) => new E2eeRemote(
+  remote as unknown as E2eeApi,
+  { accountId: "a", workspaceId: "w", secrets: {} as never, now: Date.now } as E2eeContext,
+  { load: async () => undefined, save: async () => {} } satisfies PinStore,
+);
+
 async function run(
   fx: Awaited<ReturnType<typeof fixture>>,
   remote: DrainRemote,
   report: PhaseReport = PhaseReport.disabled(),
+  syncRemote: SyncRemote = remote as unknown as SyncRemote,
 ) {
   return encryptAndUpload(
-    remote as unknown as SyncRemote,
+    syncRemote,
     fx.root,
     configFor(fx.root),
     fx.local,
@@ -130,6 +139,39 @@ test("serialized upload drains before the final PUT settles and flushes before r
     await waitFor(() => remote.redeems > 0, "redemption did not overlap upload");
     releaseLast();
     await pending;
+    expect(remote.receipts.size).toBe(0);
+  } finally {
+    releaseLast();
+    await pending?.catch(() => {});
+    await fs.rm(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("upload-time draining engages through the production E2eeRemote wrapper (field gap)", async () => {
+  const fx = await fixture(3);
+  let releaseLast!: () => void;
+  const last = new Promise<void>((resolve) => { releaseLast = resolve; });
+  let pending: ReturnType<typeof run> | undefined;
+  let overlap = 0;
+  try {
+    delete process.env.RBOX_REDEEM_DRAIN; // default-on path
+    delete process.env.RBOX_METRICS;
+    process.env.RBOX_PIPELINE_REDEEM_THRESHOLD = "1";
+    process.env.RBOX_UPLOAD_CONCURRENCY = "1";
+    const remote = new DrainRemote();
+    remote.putHook = async (call) => { if (call === 3) await last; };
+    remote.redeemHook = async (entries) => {
+      const t0 = performance.now();
+      await Bun.sleep(10);
+      overlap = Math.max(overlap, uploadActiveOverlapMs(t0, performance.now()));
+      return [{ granted: entries.length, alreadyEntitled: 0, rejected: 0, settled: entries.map(([sha]) => sha) }];
+    };
+    pending = run(fx, remote, PhaseReport.push(), wrap(remote));
+    await waitFor(() => remote.puts === 3, "last PUT did not start");
+    await waitFor(() => remote.redeems > 0, "drain never engaged through E2eeRemote");
+    releaseLast();
+    await pending;
+    expect(overlap).toBeGreaterThan(0);
     expect(remote.receipts.size).toBe(0);
   } finally {
     releaseLast();
