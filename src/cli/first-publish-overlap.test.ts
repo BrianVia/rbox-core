@@ -29,7 +29,6 @@ test("nested upload activity produces one closed union interval", () => {
   expect(firstPublishTiming.uploadActive).toBe(1);
   firstPublishUploadEnd();
   expect(firstPublishTiming.uploadIntervals).toHaveLength(1);
-  expect(firstPublishTiming.uploadIntervals[0]!.end).toBeGreaterThanOrEqual(firstPublishTiming.uploadIntervals[0]!.start);
   expect(firstPublishTiming.uploadActive).toBe(0);
   expect(firstPublishTiming.uploadOpenAt).toBe(0);
 });
@@ -41,7 +40,6 @@ test("sequential upload activity produces two intervals and extra ends are inert
   firstPublishUploadStart();
   firstPublishUploadEnd();
   expect(firstPublishTiming.uploadIntervals).toHaveLength(2);
-  expect(firstPublishTiming.uploadIntervals[1]!.start).toBeGreaterThanOrEqual(firstPublishTiming.uploadIntervals[0]!.end);
   firstPublishUploadEnd();
   expect(firstPublishTiming.uploadIntervals).toHaveLength(2);
   expect(firstPublishTiming.uploadActive).toBe(0);

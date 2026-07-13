@@ -147,6 +147,8 @@ export function firstPublishMeasurementLive(token: number): boolean {
   return token !== 0 && firstPublishTiming.enabled && firstPublishTiming.generation === token;
 }
 
+/** Intervals must be disjoint and sorted ascending by start (uploadIntervals is
+ *  append-ordered by construction) — the early break relies on it. */
 export function intervalUnionOverlapMs(
   start: number,
   end: number,
