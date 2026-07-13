@@ -7,12 +7,13 @@ import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcMark, gcPurge } from "../versions.j
 import { adminOverview, fetchDeltaSoak } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
 import { multipartInventory } from "../multipart-inventory.js";
+import { adminPurgeWorkspace } from "../ws-purge.js";
 
 /**
- * Platform-admin surfaces. `gc`, `account/:id/plan`, and the read-only
+ * Platform-admin surfaces. `gc`, `workspace/:id`, `account/:id/plan`, and the read-only
  * `multipart-inventory` require the PLATFORM secret (isPlatform); `overview` is
  * gated by a Cloudflare Access JWT + email allow-list INSIDE adminOverview
- * (defense in depth; NOT the rbox bearer) — so all four sit BEFORE authenticate().
+ * (defense in depth; NOT the rbox bearer) — so these routes sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
   if (req.method === "GET" && eq(seg, ["v1", "admin", "delta-soak"])) {
@@ -63,6 +64,13 @@ export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Res
   if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "plan") {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
     return adminSetPlan(env, seg[3]!, url.searchParams.get("plan") ?? "none", Number(url.searchParams.get("extraGB") ?? "0"));
+  }
+
+  // DELETE /v1/admin/workspace/:id[?dryRun=1] — platform secret. Purges ONE workspace's
+  // D1 rows + its WorkspaceSync DO log; blobs/R2 stay GC-owned; NEVER cascades to the account.
+  if (req.method === "DELETE" && seg.length === 4 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "workspace") {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    return adminPurgeWorkspace(env, seg[3]!, { dryRun: url.searchParams.get("dryRun") === "1" });
   }
 
   return null;
