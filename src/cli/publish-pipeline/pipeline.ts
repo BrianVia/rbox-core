@@ -361,11 +361,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         const callerOwnsTiming = LANE_TIMING && args.api.ownsUploadLaneTiming?.(current.cipherSize) !== true;
         firstPublishUploadStart();
         const t0 = callerOwnsTiming ? performance.now() : 0;
-        await args.api.putBlobFile(current.encSha, current.path, current.cipherSize, args.uploadsDir, (absolute) => {
-          byteTracker.setProgress(current.encSha, absolute);
-          emitUpload(file);
-        });
-        firstPublishUploadEnd();
+        try {
+          await args.api.putBlobFile(current.encSha, current.path, current.cipherSize, args.uploadsDir, (absolute) => {
+            byteTracker.setProgress(current.encSha, absolute);
+            emitUpload(file);
+          });
+        } finally { firstPublishUploadEnd(); }
         if (callerOwnsTiming) {
           uploadLaneTiming.uploadMs += performance.now() - t0;
           uploadLaneTiming.blobs++;

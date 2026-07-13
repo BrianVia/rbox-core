@@ -4,6 +4,7 @@ import type { SignedCommit } from "../engine/e2ee/index.js";
 import { CommitRejectedError } from "./remote.js";
 import { RemoteContext } from "./remote/context.js";
 import { commitSigned, RECEIPT_REDEEM_BATCH_MAX, redeemReceipts } from "./remote/commits.js";
+import { beginFirstPublishTiming, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart } from "./upload-lane-timing.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const commit: SignedCommit = { body: "{}", commitHash: "a".repeat(64), sig: "sig" };
@@ -138,4 +139,75 @@ test("commitSigned preserves bounded 422 missingTotal", async () => {
     unsatisfiedBlobs: [missing],
     unsatisfiedTotal: 12_345,
   });
+});
+
+test("finalDrainMs measures only commit-enclosed receipt drains and accumulates", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url) => {
+    if (url.endsWith("/receipts/redeem")) {
+      await Bun.sleep(15);
+      return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+    }
+    return json(200, { sequence: 1 });
+  };
+  try {
+    beginFirstPublishTiming(true);
+    ctx.receipts.set(sha("direct"), "receipt-direct");
+    await redeemReceipts(ctx);
+    expect(firstPublishTiming.stats.receiptRedemptionWallMs).toBeGreaterThan(0);
+    expect(firstPublishTiming.stats.finalDrainMs).toBe(0);
+
+    ctx.receipts.set(sha("commit-one"), "receipt-one");
+    const callT0 = performance.now();
+    await commitSigned(ctx, 0, commit);
+    const callWall = performance.now() - callT0;
+    const afterFirst = firstPublishTiming.stats.finalDrainMs;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(afterFirst).toBeLessThanOrEqual(Math.ceil(callWall));
+
+    ctx.receipts.set(sha("commit-two"), "receipt-two");
+    await commitSigned(ctx, 1, commit);
+    expect(firstPublishTiming.stats.finalDrainMs).toBeGreaterThan(afterFirst);
+  } finally { beginFirstPublishTiming(false); }
+});
+
+test("redeemReceipts credits only the upload-active parts of a drain", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  for (let i = 0; i <= RECEIPT_REDEEM_BATCH_MAX; i++) ctx.receipts.set(sha(`overlap-${i}`), `r-${i}`);
+  let calls = 0;
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+    calls++;
+    if (calls === 1) {
+      await Bun.sleep(10);
+      firstPublishUploadEnd();
+    } else {
+      await Bun.sleep(20);
+    }
+    return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+  };
+  try {
+    beginFirstPublishTiming(true);
+    firstPublishUploadStart();
+    await redeemReceipts(ctx);
+    expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBeGreaterThan(0);
+    expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBeLessThan(firstPublishTiming.stats.receiptRedemptionWallMs);
+  } finally {
+    firstPublishUploadEnd();
+    beginFirstPublishTiming(false);
+  }
+});
+
+test("redeemReceipts with no upload activity records no overlap", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(sha("no-overlap"), "receipt");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+    await Bun.sleep(5);
+    return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+  };
+  try {
+    beginFirstPublishTiming(true);
+    await redeemReceipts(ctx);
+    expect(firstPublishTiming.stats.receiptRedemptionWallMs).toBeGreaterThan(0);
+    expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
 });

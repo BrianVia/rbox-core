@@ -1,0 +1,64 @@
+import { expect, test } from "bun:test";
+import {
+  beginFirstPublishTiming,
+  firstPublishTiming,
+  firstPublishUploadEnd,
+  firstPublishUploadStart,
+  intervalUnionOverlapMs,
+  uploadActiveOverlapMs,
+} from "./upload-lane-timing.js";
+
+test("intervalUnionOverlapMs intersects a drain with the upload interval union", () => {
+  try {
+    const intervals = [{ start: 10, end: 20 }, { start: 30, end: 40 }];
+    expect(intervalUnionOverlapMs(12, 18, intervals)).toBe(6);
+    expect(intervalUnionOverlapMs(5, 15, intervals)).toBe(5);
+    expect(intervalUnionOverlapMs(21, 29, intervals)).toBe(0);
+    expect(intervalUnionOverlapMs(5, 35, intervals)).toBe(15);
+    expect(intervalUnionOverlapMs(5, 35, [])).toBe(0);
+    expect(intervalUnionOverlapMs(15, 15, intervals)).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
+});
+
+test("nested upload activity produces one closed union interval", () => {
+  try {
+    beginFirstPublishTiming(true);
+    firstPublishUploadStart();
+    firstPublishUploadStart();
+    firstPublishUploadEnd();
+    expect(firstPublishTiming.uploadIntervals).toEqual([]);
+    expect(firstPublishTiming.uploadActive).toBe(1);
+    firstPublishUploadEnd();
+    expect(firstPublishTiming.uploadIntervals).toHaveLength(1);
+    expect(firstPublishTiming.uploadIntervals[0]!.end).toBeGreaterThanOrEqual(firstPublishTiming.uploadIntervals[0]!.start);
+    expect(firstPublishTiming.uploadActive).toBe(0);
+    expect(firstPublishTiming.uploadOpenAt).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
+});
+
+test("sequential upload activity produces two intervals and extra ends are inert", () => {
+  try {
+    beginFirstPublishTiming(true);
+    firstPublishUploadStart();
+    firstPublishUploadEnd();
+    firstPublishUploadStart();
+    firstPublishUploadEnd();
+    expect(firstPublishTiming.uploadIntervals).toHaveLength(2);
+    expect(firstPublishTiming.uploadIntervals[1]!.start).toBeGreaterThanOrEqual(firstPublishTiming.uploadIntervals[0]!.end);
+    firstPublishUploadEnd();
+    expect(firstPublishTiming.uploadIntervals).toHaveLength(2);
+    expect(firstPublishTiming.uploadActive).toBe(0);
+    expect(firstPublishTiming.uploadOpenAt).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
+});
+
+test("uploadActiveOverlapMs includes the currently open upload interval", async () => {
+  try {
+    beginFirstPublishTiming(true);
+    firstPublishUploadStart();
+    const t0 = performance.now();
+    await Bun.sleep(5);
+    const t1 = performance.now();
+    expect(uploadActiveOverlapMs(t0, t1)).toBeCloseTo(t1 - t0, 5);
+  } finally { beginFirstPublishTiming(false); }
+});

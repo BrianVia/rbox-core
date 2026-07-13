@@ -14,6 +14,9 @@ export interface FirstPublishStats {
   uploadCriticalPathMs: number;
   receiptRedemptionWallMs: number;
   commitWallMs: number;
+  /** Design 110 Phase 0: wall of the redeemReceipts call enclosed by commitSigned,
+   *  the only drain inside the commit POST envelope (`p`). */
+  finalDrainMs: number;
   receiptRedemptionOverlapMs: number;
   authCallCount: number;
   authCriticalPathMs: number;
@@ -32,7 +35,7 @@ const zeroFirstPublishStats = (): FirstPublishStats => ({
   timeToFilesSyncedMs: 0,
   timeToFirstReadyCiphertextMs: 0, firstReadyToFirstUploadStartMs: 0,
   encryptWallMs: 0, missingCheckWallMs: 0, uploadCriticalPathMs: 0,
-  receiptRedemptionWallMs: 0, commitWallMs: 0, receiptRedemptionOverlapMs: 0,
+  receiptRedemptionWallMs: 0, commitWallMs: 0, finalDrainMs: 0, receiptRedemptionOverlapMs: 0,
   authCallCount: 0, authCriticalPathMs: 0, peakTempDiskBytes: 0,
   peakQueueHeapBytes: 0, peakUploaderFramingBytes: 0,
   serverUnsatisfiedTotal: 0, serverSatisfiedSkipped: 0,
@@ -51,6 +54,8 @@ export const firstPublishTiming = {
   uploadStartedAt: 0,
   uploadEndedAt: 0,
   uploadActive: 0,
+  uploadIntervals: [] as Array<{ start: number; end: number }>,
+  uploadOpenAt: 0,
   tempBytes: 0,
   authStartedAt: 0,
   authEndedAt: 0,
@@ -81,6 +86,8 @@ export function beginFirstPublishTiming(enabled: boolean): void {
   firstPublishTiming.firstReadyAt = firstPublishTiming.firstUploadAt = 0;
   firstPublishTiming.uploadStartedAt = firstPublishTiming.uploadEndedAt = 0;
   firstPublishTiming.uploadActive = 0;
+  firstPublishTiming.uploadIntervals = [];
+  firstPublishTiming.uploadOpenAt = 0;
   firstPublishTiming.tempBytes = 0;
   firstPublishTiming.authStartedAt = firstPublishTiming.authEndedAt = 0;
   firstPublishTiming.encryptedAddresses.clear();
@@ -108,14 +115,43 @@ export function firstPublishUploadStart(): number {
     firstPublishTiming.stats.firstReadyToFirstUploadStartMs = Math.max(0, Math.round(t - (firstPublishTiming.firstReadyAt || t)));
   }
   if (!firstPublishTiming.uploadStartedAt) firstPublishTiming.uploadStartedAt = t;
+  if (firstPublishTiming.uploadActive === 0) firstPublishTiming.uploadOpenAt = t;
   firstPublishTiming.uploadActive++;
   return t;
 }
 export function firstPublishUploadEnd(): void {
   if (firstPublishTiming.enabled) {
-    firstPublishTiming.uploadEndedAt = performance.now();
+    const now = performance.now();
+    firstPublishTiming.uploadEndedAt = now;
+    const wasActive = firstPublishTiming.uploadActive;
     firstPublishTiming.uploadActive = Math.max(0, firstPublishTiming.uploadActive - 1);
+    if (wasActive === 1 && firstPublishTiming.uploadOpenAt > 0) {
+      firstPublishTiming.uploadIntervals.push({ start: firstPublishTiming.uploadOpenAt, end: now });
+      firstPublishTiming.uploadOpenAt = 0;
+    }
   }
+}
+
+export function intervalUnionOverlapMs(
+  start: number,
+  end: number,
+  intervals: ReadonlyArray<{ start: number; end: number }>,
+): number {
+  if (end <= start) return 0;
+  let overlap = 0;
+  for (const interval of intervals) {
+    if (interval.start > end) break;
+    overlap += Math.max(0, Math.min(end, interval.end) - Math.max(start, interval.start));
+  }
+  return overlap;
+}
+
+export function uploadActiveOverlapMs(start: number, end: number): number {
+  const closed = intervalUnionOverlapMs(start, end, firstPublishTiming.uploadIntervals);
+  const open = firstPublishTiming.uploadOpenAt > 0
+    ? Math.max(0, end - Math.max(start, firstPublishTiming.uploadOpenAt))
+    : 0;
+  return closed + open;
 }
 export function firstPublishAuthStart(): number {
   if (!firstPublishTiming.enabled) return 0;
@@ -143,7 +179,7 @@ export function finishFirstPublishStats(): FirstPublishStats | undefined {
 }
 
 export function formatFirstPublishStats(s: FirstPublishStats): string {
-  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} commit${s.commitWallMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
+  return `fp filesSynced${s.timeToFilesSyncedMs} ready${s.timeToFirstReadyCiphertextMs} wait${s.firstReadyToFirstUploadStartMs} enc${s.encryptWallMs} miss${s.missingCheckWallMs} up${s.uploadCriticalPathMs} redeem${s.receiptRedemptionWallMs} redeemOverlap${s.receiptRedemptionOverlapMs} commit${s.commitWallMs} finalDrain${s.finalDrainMs} authn${s.authCallCount} authms${s.authCriticalPathMs} temp${s.peakTempDiskBytes} queue${s.peakQueueHeapBytes} frame${s.peakUploaderFramingBytes} unsat${s.serverUnsatisfiedTotal} skip${s.serverSatisfiedSkipped} uniq${s.uniqueEncryptions} dup${s.duplicateEncryptions} resume${s.reEncryptedOnResume} cpu${s.producerCpuSaturationPct}`;
 }
 
 export function uploadLaneTimingSummary(): string | undefined {

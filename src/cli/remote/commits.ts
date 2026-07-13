@@ -3,7 +3,7 @@ import type { SignedCommit } from "../../engine/e2ee/index.js";
 import type { CommitChainResult } from "../e2ee-remote.js";
 import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
-import { firstPublishTiming } from "../upload-lane-timing.js";
+import { firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { readNumericFields } from "./timings.js";
 
@@ -162,7 +162,6 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
 
 export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
   const timingT0 = firstPublishTiming.enabled ? performance.now() : 0;
-  const overlappedAtStart = firstPublishTiming.enabled && firstPublishTiming.uploadActive > 0;
   const results: ReceiptRedeemResult[] = [];
   try { while (ctx.receipts.size > 0) {
     const batch = [...ctx.receipts.entries()].slice(0, RECEIPT_REDEEM_BATCH_MAX);
@@ -205,12 +204,7 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
     if (firstPublishTiming.enabled) {
       const end = performance.now();
       firstPublishTiming.stats.receiptRedemptionWallMs += Math.max(0, Math.round(end - timingT0));
-      if (overlappedAtStart) {
-        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(end - timingT0));
-      } else if (firstPublishTiming.uploadStartedAt) {
-        const uploadEnd = firstPublishTiming.uploadEndedAt || end;
-        firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(Math.min(end, uploadEnd) - Math.max(timingT0, firstPublishTiming.uploadStartedAt)));
-      }
+      firstPublishTiming.stats.receiptRedemptionOverlapMs += Math.max(0, Math.round(uploadActiveOverlapMs(timingT0, end)));
     }
   }
 }
@@ -224,7 +218,14 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   // SAFE TO RETRY — same `parentSequence === head` CAS as commit() above; a duplicate after a
   // socket close 409s benignly (see the note there). Sending all still-valid receipts each attempt
   // is already idempotent (the server charges 0 for already-entitled refs).
-  const redeemed = await redeemReceipts(ctx);
+  // Design 110 Phase 0: account only the commit-enclosed drain inside `p`.
+  const drainT0 = firstPublishTiming.enabled ? performance.now() : 0;
+  let redeemed: ReceiptRedeemResult[];
+  try {
+    redeemed = await redeemReceipts(ctx);
+  } finally {
+    if (firstPublishTiming.enabled) firstPublishTiming.stats.finalDrainMs += Math.max(0, Math.round(performance.now() - drainT0));
+  }
   const redeemNeedsUpload = [...new Set(redeemed.flatMap((r) => r.needsUpload ?? []))];
   if (redeemNeedsUpload.length > 0) {
     return { unsatisfiedBlobs: redeemNeedsUpload, unsatisfiedTotal: redeemNeedsUpload.length };
