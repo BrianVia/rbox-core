@@ -464,17 +464,23 @@ displaced-tip pin. Pins are **content-addressed** (r2 F8):
 `refs/rbox-local/keep/<oid>` — one ref per OID, create-only (expected-absent;
 an existing identical pin is an idempotent no-op, so repeated NFF churn on
 the same displaced history never duplicates), with a sidecar record mapping
-oid → (original ref, episode, time) for recovery instructions. Because
-tracking refs are LWW remote mirrors whose force-replacement is routine,
-tracking-derived pins alone carry a bounded retention policy: pruned after a
+oid → a **multi-origin set** of (original ref, episode, time) entries
+(r3 F7). Origin classes are ordered: human (heads, tags, stash, current
+checkout) dominates tracking, and promotion is monotonic — a pin that ever
+acquires a human origin is permanent, even if it was first created by a
+tracking displacement. Because tracking refs are LWW remote mirrors whose
+force-replacement is routine, pins whose origin set is **tracking-only**
+carry a bounded retention policy: pruned after a
 fixed age (default 30 days, config-overridable) once unreferenced by any
-journal or deferral episode. Pins derived from heads, tags, stash, or the
-current checkout are human-work protection and are never age-pruned — the
-existing no-prune rule stands for them.
+journal or deferral episode. Pins with any human origin are never age-pruned
+— the existing no-prune rule stands for them, and the retention sweep must
+re-read the origin set under the common-dir lock at prune time.
 
 The recovery namespace is excluded from capture and ordinary identity exactly
-like existing `refs/rbox-*`. It is surfaced with recovery instructions and
-pruned only by an explicit future policy; design 116 does not age-delete it.
+like existing `refs/rbox-*`. It is surfaced with recovery instructions. The
+only pruning design 116 defines is the tracking-only-origin retention above;
+pins with any human origin are never age-deleted (r3 F7 — no contradiction:
+"no pruning" applies to human-work protection, not to LWW tracking debris).
 Creating a recovery ref is not a substitute for checkout protection. Current
 branch and local stash remain held in their user-visible locations when their
 human work blocks them.
@@ -585,8 +591,9 @@ file apply completes
   -> write checkout journal (old bytes + incoming section)
   -> pre-commit connectivity/fsck proof over the planned durable graph
   -> prepare ref transaction + index lock; repeat oracle + metadata proof
-  -> if still checkout-safe: publish index, commit refs+HEAD, restore op-state
-  -> clear journal; atomically save global file base + repo state/deferrals
+  -> if still checkout-safe: commit refs+HEAD, publish index, restore op-state
+  -> flip journal to published; save global file base + repo state/deferrals
+  -> clear journal
 ```
 
 The existing workspace mutex spans the operation. On filesystems where the
@@ -619,30 +626,61 @@ per-worktree-keyed so pointer repos sharing a common store cannot collide):
 - **byte-exact durable copies** of the old index and every old op-state file
   (a projection hash cannot reconstruct them), plus the old current-ref OID
   and HEAD form;
-- a created-fresh flag when this apply materializes a new `.git`.
+- **exact expected-NEW identities** (r3 F5): the hash of the transformed
+  candidate index bytes actually staged for publication (post-normalization,
+  post-resolve-undo-clear — NOT the wire `indexSha`), a per-op-state-file
+  new-hash/absence map, and the new ref/HEAD values, so old/new/third
+  arbitration is well defined per field;
+- **incarnation binding** (r3 F2): the sync stream id, state nonce, and the
+  resolved gitdir/commonDir realpaths plus worktree identity it was written
+  against. Recovery requires an exact binding match; any mismatch (reset,
+  rebind, a different repo now at that key) retires the journal to
+  quarantine WITHOUT touching the repo. `resetSyncState` disposes the journal
+  directory under the same lock that resets state;
+- a created-fresh flag when this apply materializes a new `.git`, and — on
+  the clean-materialization path — the **complete pre-wipe syncable ref map**
+  (r3 F3): `quarantineAndWipeGitState` deletes non-current refs the field
+  model above cannot see, so the wipe variant journals every deleted ref
+  (name → OID) and rollback restores them all; the quarantine bundle remains
+  defense in depth, not the recovery mechanism.
 
-The journal is removed only after the checkout publication completes and the
-state save lands. Recovery is **rollback-only** (r2 F2): on every apply and
-on daemon start, a surviving journal is recovered FIRST, before any
-classification — the engine restores the journaled old index/op-state bytes
-and, with expected-current semantics, moves the current ref/HEAD back to the
-journaled old values (a created-fresh journal instead removes the partial
-`.git` this apply created). It never rolls forward: working bytes are not
+The journal is **two-phase** (r3 F1). It is written in `intent` phase before
+the first checkout mutation; after the entire checkout publication (refs,
+HEAD, index, op-state) completes, an atomic marker flips it to `published`
+BEFORE the state save. Recovery of an `intent` journal is **rollback-only**
+(r2 F2): restore the journaled old index/op-state bytes (and, for the wipe
+variant, every journaled ref) and move the current ref/HEAD back with
+expected-current semantics; the ordinary retry then re-attempts follow with
+every proof from scratch. Recovery of a `published` journal keeps the new
+checkout — the Git mutation is complete and only the state save is owed — and
+re-runs that idempotent save before clearing the journal. This ordering makes
+the r3 F1 trace impossible: state can never claim an incoming section applied
+while recovery would still roll the checkout back, and a rolled-back checkout
+always leaves state that still owes the apply. Roll-forward of Git state
+never happens: working bytes are not
 journaled, so completing the move without re-running the full file oracle
-could bless a human edit made in the crash window as sync-authored. After
-rollback, the ordinary retry re-attempts follow with every proof from
-scratch. A live field matching neither journaled value means a human
+could bless a human edit made in the crash window as sync-authored.
+A live field matching neither journaled value means a human
 intervened mid-crash: that field is left untouched, the journal is retired to
-the recovery namespace, and the repo takes the ordinary conflict path. If the
-journaled old bytes are unreadable/corrupt, recovery defers with the journal
-intact and surfaces loudly — it never guesses. A crash
+the recovery namespace, and the repo takes the ordinary conflict path.
+A created-fresh `intent` journal removes the partial `.git` only after
+proving it is still exactly rbox-authored (r3 F4): no ref outside the
+journaled planned set, HEAD/index/op-state matching journaled new values or
+absent, no human config edit vs the recorded init shape. Any doubt →
+quarantine-defer with the `.git` left in place, never a recursive delete. If
+the journaled old bytes are unreadable/corrupt, recovery defers with the
+journal intact and surfaces loudly — it never guesses. Journal recovery runs
+under the repo's common-dir lock and the workspace mutex, like the mutation
+that wrote it. A crash
 must never leave the current branch moved with old HEAD/index, or HEAD/index
 moved without the verified file oracle, without a journal that makes the next
 run repair it. Kill-injection tests cover every boundary: after safe refs,
 after journal write, after the pre-commit connectivity proof, after prepare,
-after index publication, after the ref-transaction commit, mid op-state
-restore, before journal clear, before state save —
-plus a human edit and a human ref move injected inside the crash window.
+after the ref-transaction commit, after index publication, mid op-state
+restore, between the published-marker flip and state save, before journal
+clear — plus a human edit and a human ref move injected inside the crash
+window, a reset/rebind with a surviving journal, and a crash mid
+clean-materialization wipe.
 
 **Lock protocol and capability floor (r1 F3; hardened r2 F4).** "Acquire the
 checkout locks" is pinned to this sequence: (1) normalize/stage the candidate
@@ -659,12 +697,20 @@ using **lock-free reads only** — direct file reads and plumbing that takes no
 locks; no Git command that acquires index/ref locks may run between prepare
 and commit; (7) on proof failure: `abort` the transaction, remove the owned
 `index.lock`, remove the journal, defer — an explicit, tested path; (8) on
-success: write the candidate index bytes into the owned `index.lock` and
-publish by Git's own convention — rename `index.lock` → `index` — then
-`commit` the ref transaction, restore op-state, clear the journal in the
-state save. Publishing the index before the ref commit means a crash between
-them leaves new-index/old-refs, which journal rollback repairs; no
-post-commit fsck rollback exists anymore, so the r2 F4 clobber trace (user
+success: `commit` the ref transaction FIRST, while `index.lock` is still
+held; (9) write the candidate index bytes into the owned `index.lock` and
+publish by Git's own convention — rename `index.lock` → `index`; (10) restore
+op-state, flip the journal to `published`, save state. Holding `index.lock`
+across the ref commit is the writer reservation (r3 F6): no human `git add`
+can install a competing index anywhere inside the mutation window, so a
+crash there provably contains no human index write and journal rollback of
+the index bytes is safe. The new-refs/old-index interleaving a concurrent
+`git status`/IDE may observe between (8) and (9) is transient display dirt,
+not loss, and is pinned by a test. Op-state files have no native lock; a
+human racing operation-state creation inside this same held-lock window is
+the accepted design-43 local-attacker boundary, restated here explicitly. No
+post-commit fsck rollback exists anymore (the connectivity proof ran at (2)),
+so the r2 F4 clobber trace (user
 commits after lock release, unconditional restore discards their tip) is
 structurally gone. Any in-process failure after the ref commit repairs
 through the journal's expected-current arbitration — never through
@@ -751,6 +797,65 @@ log lines and upload only the aggregate typed projection.
 `rbox status --json` exposes a stable local `git.deferrals[]` shape with repo,
 reason, `deferredSince`, `reasonSince`, age seconds, and checkout kind/label; it
 omits OIDs and raw errors. This is local command output, not telemetry.
+
+## UX: irreconcilable divergence (founder-set direction)
+
+Post-follow-rule, the only deferral class left standing is true human
+divergence: local-only commits, or human dirt on both sides. Three normative
+decisions govern it; mechanics below are reviewable, the direction is not.
+
+**1. Surface it ambiently, everywhere the user already looks.** The typed
+deferral (reason + continuous age) renders on all three existing ambient
+surfaces: the macOS menu bar (`RboxBarAmbientStatus` gains the deferred-repo
+count and oldest age, design 88), `rbox status` (the per-repo line already
+specified in Visibility), and shell integration (the design-46 `shell.line`
+state shows the deferral when the shell is cd'd into that repo's subtree).
+All three read the same authoritative repo-record deferral state; no fourth
+bookkeeping source. The same privacy boundary applies: repo/branch names
+render locally only.
+
+**2. The file plane never freezes for a divergent repo.** Files keep
+converging while the Git plane defers, deliberately. The trade is explicit:
+`.git` is never file-synced, so the divergent human work — local commits,
+branches, stash, index — is structurally untouchable by file sync; colliding
+working-file edits are already protected by conflict copies (design 50);
+and freezing a repo's files would reintroduce compounding per-repo drift,
+which is the disease this design exists to cure. A frozen repo diverges more
+every hour it waits for a human, making eventual resolution harder — the
+opposite of the founder principle. Working bytes on a deferred repo may
+therefore be newer than its checkout; the deferral line says so.
+
+**3. One-command exit: `rbox git resolve <repo>`.** Deferral must never be a
+dead end. Three verbs; implementation may be phased, semantics are fixed:
+
+- `show-me` (default, read-only): summarizes the divergence — local-only
+  commits (tips absent from the incoming-ownership roots, with subjects),
+  incoming checkout target, oracle dirt classification, index/op-state/stash
+  divergence, and the deferral age. Never mutates; safe to run always.
+- `take-theirs`: follow the incoming checkout DESPITE local divergence.
+  Semantics: quarantine-first (capture-grade bundle + index/op-state copies,
+  exactly the §43 conflict discipline), pin every local-only tip and stash
+  reflog OID as human-origin recovery pins, then run the normal follow
+  pipeline with the human-divergence gates waived for exactly the divergence
+  snapshot the user was shown: the confirmation carries a snapshot identity
+  (CAS-style), and if live local state OR the incoming section changed since
+  `show-me`, the verb aborts and re-shows. Metadata-only like every follow:
+  working bytes are never rewritten; local edits survive as ordinary dirt
+  against the new HEAD.
+- `keep-mine`: make local the truth. Clears the repo's deferral/checkpoint,
+  force-captures local state, and pushes it as the newest section. Safety
+  against the cross-machine race (this verb must not clobber the OTHER
+  machine's unpushed work): (a) before capture, the discarded
+  pending/incoming section's tips are imported and pinned locally
+  (incoming-origin provenance, age-bounded like tracking pins — the remote
+  history also retains them); (b) the push is an ordinary sequenced commit —
+  a 409 means someone published meanwhile, and the verb re-fetches,
+  re-shows, and requires re-confirmation rather than retrying blindly;
+  (c) `keep-mine` weakens NOTHING on receivers: the other machine's apply
+  still runs its own follow/no-drop classification, so a ref that exists
+  only there is held and pinned there, never silently deleted by this
+  machine's `refScope:"all"` section. Codex must attack these verb semantics
+  like any other mutation path.
 
 ## Flag and rollout
 

@@ -163,6 +163,54 @@ as `(r2 Fn)`:
   dedup) + bounded age retention for tracking-derived pins only; human-work
   pins never age-pruned.
 
+## Round 3 (codex, 2026-07-13) — CHANGES-REQUIRED
+
+5 BLOCKER + 2 MAJOR, all against the r2 journal/lock/pin folds; r2 F3
+(derived receipt), F5, F6, F7 verified closed with no false-PASS trace found.
+All seven adjudicated and adopted, folded as `(r3 Fn)`:
+
+- **F1 [BLOCKER] journal clear vs state save had no safe crash order** (state
+  claiming "applied" while recovery still rolls back → unchanged-shortcut
+  suppression forever). Adopted: two-phase journal — `intent` (recovery =
+  rollback) atomically flips to `published` after full checkout publication
+  and before state save (recovery = keep checkout, re-run idempotent save).
+- **F2 [BLOCKER] journal unbound to incarnation** (`resetSyncState` ignores
+  it; a rebind can point the key at a different repo). Adopted: journal
+  records stream id + state nonce + resolved gitdir/commonDir realpaths +
+  worktree identity; mismatch retires without mutation; reset disposes the
+  journal dir under the same lock.
+- **F3 [BLOCKER] clean-materialization wipe outside the journal field model**
+  (non-current refs unrecoverable after crash-mid-wipe). Adopted: wipe
+  variant journals the complete pre-wipe syncable ref map; rollback restores
+  it; quarantine bundle stays defense-in-depth.
+- **F4 [BLOCKER] created-fresh rollback could rm-rf post-crash human work.**
+  Adopted: delete only after proving the gitdir is still exactly
+  rbox-authored; any doubt → quarantine-defer, `.git` left in place.
+- **F5 [MAJOR] arbitration lacked exact expected-new identities** (published
+  index is transformed; wire `indexSha` is the wrong comparand). Adopted:
+  journal records the staged candidate's exact hash + per-op-state new-hash/
+  absence map + new ref/HEAD values.
+- **F6 [MAJOR] index.lock rename released the writer reservation before ref
+  commit** (human `git add` in the window could be rolled back). Adopted:
+  reorder — ref commit while index.lock held, then publish index; the held
+  lock proves no human index write exists in any crash window; transient
+  new-refs/old-index visibility pinned by test; op-state races restated as
+  the accepted §43 local-attacker boundary.
+- **F7 [BLOCKER] content-addressed pins collapsed tracking and human
+  provenance** (30d tracking retention could prune an OID that later became
+  human-work protection; residual section contradicted retention). Adopted:
+  multi-origin sidecar with monotonic promotion (human dominates, permanent);
+  prune only tracking-only-origin pins, re-reading origins under the
+  common-dir lock; residual wording fixed.
+
+Also folded this round (founder guidance, normative direction): new
+**§UX: irreconcilable divergence** — ambient surfacing on menu bar
+(`RboxBarAmbientStatus`), `rbox status`, and design-46 `shell.line`; the
+file plane never freezes for a divergent repo (explicit `.git`-isolation
+trade); and `rbox git resolve <repo>` with `show-me`/`take-theirs`/
+`keep-mine` verb semantics (snapshot-CAS confirmation, quarantine-first,
+receiver-side no-drop unweakened). Round 4 must attack the verb semantics.
+
 ## Open review work
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
