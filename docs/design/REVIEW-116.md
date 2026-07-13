@@ -297,7 +297,29 @@ kill-switch semantics, grammar) verified closed. All four adopted, folded as
   sidecar, percent-encoded tab-separated rows, pure-shell `$PWD` prefix
   matching, old plugins untouched, ≤5 ms budget preserved.
 
-## Open review work
+## Round 6 (codex confirmation, 2026-07-13) — one fold reopened
+
+r5 F2 (bytesChanged: sender-local persistence implementable; receiver
+indistinguishability argued precisely — both planes ARE current on the
+receiver, porcelain dirt is post-follow dirt; founder principle intact),
+r5 F3 (conflict deferral coheres with §43: a checkpointed repo intentionally
+has no pending; `subjectKey` = checkpointed base's `incomingKey`), and
+r5 F4 (v1 parser untouched; pure-shell routing within design 88's budget)
+confirmed CLOSED. Whole-document coherence pass found no other
+BLOCKER/MAJOR contradiction.
+
+r5 F1 NOT closed: byte copies of incoming index/op-state without object
+closure are unusable after scratch cleanup + GC (staged resolution blob
+reachable only via the capture WIP root; `AUTO_MERGE` may name a tree — not
+covered by commit-root pins). Adopted codex's prescribed remedy verbatim
+(r6 F1): keep-mine's protect step retains the decrypt-verified incoming
+artifact FILES — full bundle chain (closure-complete by construction) +
+index/op-state bytes — in quarantine, never relying on the repo object
+store; durable episode record survives the clear. Three MINORs folded
+(episode-record lifetime, path-component-boundary/longest-match shell
+routing, sidecar bounds vs the 5 ms gate) and the shell.line wording NIT.
+
+## Round 7 (codex, final confirmation of the r6 fold)
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
   seam.

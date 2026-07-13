@@ -833,18 +833,21 @@ decisions govern it; mechanics below are reviewable, the direction is not.
 deferral (reason + continuous age) renders on all three existing ambient
 surfaces: the macOS menu bar (`RboxBarAmbientStatus` gains the deferred-repo
 count and oldest age, design 88), `rbox status` (the per-repo line already
-specified in Visibility), and shell integration (the design-46 `shell.line`
-state shows the deferral when the shell is cd'd into that repo's subtree).
+specified in Visibility), and shell integration (design 46: the prompt
+segment shows the deferral when the shell is cd'd into that repo's subtree).
 The v1 `shell.line` record is one workspace-wide line, its parser accepts
 only `v1` and treats trailing fields as the workspace name, and its default
 path spawns no subprocess (r4 F8, r5 F4) — so `shell.line` itself is NOT
 extended. A **separate** sidecar, `shell.deferrals` (versioned `v1` of its
 own), carries one line per deferred repo: percent-encoded rel-path,
 reason class, age bucket, and the `bytesChanged` flag, tab-separated. Only
-new plugin versions read it, via pure-shell `$PWD` prefix matching against
-the decoded rel-paths — no per-prompt subprocess, preserving design 88's
-≤5 ms budget; old plugins never open the file and render exactly today's
-line. All three surfaces read the
+new plugin versions read it, via pure-shell `$PWD` matching against the
+decoded rel-paths — on path-component boundaries only, selecting the
+longest enclosing repo (r6 minor: `repo` must not match `repository`, and
+nested repos resolve to the deepest) — no per-prompt subprocess, preserving
+design 88's ≤5 ms budget; the sidecar is row- and byte-bounded, with
+malformed/oversized fixtures validated against that p99 gate; old plugins
+never open the file and render exactly today's line. All three surfaces read the
 same authoritative repo-record deferral state; no fourth
 bookkeeping source. The same privacy boundary applies: repo/branch names
 render locally only.
@@ -925,13 +928,20 @@ end. Implementation may be phased; semantics are fixed:
   human's work, and server-history retention is not
   a substitute (r4 F4); only the section's tracking entries take tracking
   provenance. Pins alone cannot hold the section's index and op-state — they
-  are artifacts, not refs (r5 F1) — so the protect step also retains
-  **quarantine-grade durable copies** of the decrypt-verified incoming index
-  and op-state bytes in the workspace quarantine area (the same discipline
-  `quarantineLocal` applies to local state), recorded in the episode so
-  `show-me` can direct recovery. A staged conflict resolution or paused
+  are artifacts, not refs (r5 F1) — and byte copies alone are unusable once
+  their referenced objects are GC'd: a staged resolution blob may be
+  reachable only through the capture WIP root, and `AUTO_MERGE` can name a
+  tree, not a commit (r6 F1). The protect step therefore retains, in the
+  workspace quarantine area, the **decrypt-verified incoming artifact files
+  themselves** — the full bundle chain (self-contained closure by
+  construction: capture pinned WIP/pseudo-ref roots into it) plus the index
+  and op-state bytes — never relying on the repo object store to keep the
+  discarded section's objects alive. A staged conflict resolution or paused
   operation that existed only in the discarded section survives keep-mine
-  byte-exactly. Only after those pins land does the verb clear the
+  byte-exactly and object-complete. The episode record naming these
+  quarantine artifacts is durable and survives the deferral/checkpoint clear
+  (r6 minor): `show-me` and recovery instructions can locate them until the
+  operator explicitly discards the episode. Only after those pins land does the verb clear the
   deferral/checkpoint — and that clear rides the SAME accepted-commit state
   transition as the force-captured push, so a failed import, capture,
   network error, or rejected commit leaves the deferral (and its ambient
