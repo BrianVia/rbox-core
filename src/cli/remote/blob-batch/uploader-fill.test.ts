@@ -20,6 +20,7 @@ let tmpDir = "";
 let batchSizes: number[] = [];
 let singlePuts = 0;
 let batchPutHandler: (records: BatchRecord[]) => Response | Promise<Response>;
+let apiInstances: RboxApi[] = [];
 
 interface BatchRecord { sha: string; payload: Uint8Array }
 
@@ -68,6 +69,7 @@ beforeEach(async () => {
   resetUploadDispatchStatsForTests();
   batchSizes = [];
   singlePuts = 0;
+  apiInstances = [];
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-uploader-fill-"));
   batchPutHandler = (records) => okBatch(records);
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -88,6 +90,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  for (const instance of apiInstances) {
+    await instance.closeUploader(new Error("test teardown"));
+  }
   setUploaderClockForTests();
   globalThis.fetch = originalFetch;
   for (const key of ENV_KEYS) {
@@ -110,20 +115,30 @@ describe("BlobBatchUploader fill policy", () => {
     await timerUpload;
     expect(getUploadDispatchStats().fixed_timer).toMatchObject({ count: 1, records: 2 });
 
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let resolveGate!: () => void;
+    let released = false;
+    const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+    const release = () => {
+      if (released) return;
+      released = true;
+      resolveGate();
+    };
     let gated = true;
     batchPutHandler = async (records) => {
       if (gated) { gated = false; await gate; }
       return okBatch(records);
     };
-    const a = api();
-    const first = uploadWave(a, await files(32, "tail-head"));
-    await waitFor(() => batchSizes.length >= 3);
-    const tail = uploadWave(a, await files(3, "tail"));
-    release();
-    await Promise.all([first, tail]);
-    expect(getUploadDispatchStats().idle_tail).toMatchObject({ count: 1, records: 3 });
+    try {
+      const a = api();
+      const first = uploadWave(a, await files(32, "tail-head"));
+      await waitFor(() => batchSizes.length >= 3);
+      const tail = uploadWave(a, await files(3, "tail"));
+      release();
+      await Promise.all([first, tail]);
+      expect(getUploadDispatchStats().idle_tail).toMatchObject({ count: 1, records: 3 });
+    } finally {
+      release();
+    }
 
     process.env.RBOX_BATCH_BODY_BYTES = "80";
     await uploadWave(api(), await files(2, "byte", 40));
@@ -146,7 +161,9 @@ describe("BlobBatchUploader fill policy", () => {
     const step = FILL_QUIET_MS / 2;
     const almostQuiet = FILL_QUIET_MS - 1;
     for (let i = 0; i < 4; i++) {
-      pending.push(a.putBlobFile(...await fileArgs(`steady-${i}`)));
+      const upload = a.putBlobFile(...await fileArgs(`steady-${i}`));
+      upload.catch(() => {});
+      pending.push(upload);
       if (i < 3) await clock.advance(step);
     }
     expect(batchSizes).toHaveLength(0);
@@ -165,7 +182,9 @@ describe("BlobBatchUploader fill policy", () => {
     const pending: Promise<void>[] = [];
     const step = FILL_QUIET_MS - 2;
     for (let i = 0; i < 7; i++) {
-      pending.push(a.putBlobFile(...await fileArgs(`absolute-${i}`)));
+      const upload = a.putBlobFile(...await fileArgs(`absolute-${i}`));
+      upload.catch(() => {});
+      pending.push(upload);
       if (i < 6) await clock.advance(step);
     }
     expect(batchSizes).toHaveLength(0);
@@ -178,10 +197,12 @@ describe("BlobBatchUploader fill policy", () => {
     // A valid residual partial necessarily fits one carve: dispatchFull and carve
     // share the same record/body caps. Pin the reachable non-drain behavior by
     // proving arrivals after the absolute carve start a fresh coalescing window.
-    const younger = [
-      a.putBlobFile(...await fileArgs("absolute-younger-0")),
-      a.putBlobFile(...await fileArgs("absolute-younger-1")),
-    ];
+    const younger: Promise<void>[] = [];
+    for (const name of ["absolute-younger-0", "absolute-younger-1"]) {
+      const upload = a.putBlobFile(...await fileArgs(name));
+      upload.catch(() => {});
+      younger.push(upload);
+    }
     const almostQuiet = FILL_QUIET_MS - 1;
     await clock.advance(almostQuiet);
     expect(batchSizes).toEqual([7]);
@@ -198,6 +219,7 @@ describe("BlobBatchUploader fill policy", () => {
     const a = api();
     for (let i = 0; i < 3; i++) {
       const pending = a.putBlobFile(...await fileArgs(`gap-${i}`));
+      pending.catch(() => {});
       await clock.advance(FILL_QUIET_MS + 1);
       await pending;
     }
@@ -209,31 +231,53 @@ describe("BlobBatchUploader fill policy", () => {
     v2();
     useClock();
     process.env.RBOX_UPLOAD_SLOTS = "1";
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let resolveGate!: () => void;
+    let released = false;
+    const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+    const release = () => {
+      if (released) return;
+      released = true;
+      resolveGate();
+    };
     let first = true;
     batchPutHandler = async (records) => {
       if (first) { first = false; await gate; }
       return okBatch(records);
     };
-    const a = api();
-    const head = uploadWave(a, await files(64, "guard-head"));
-    await waitFor(() => batchSizes.length === 1);
-    const tail = uploadWave(a, await files(3, "guard-tail"));
-    release();
-    await Promise.all([head, tail]);
-    expect(batchSizes).toEqual([64, 3]);
-    expect(getUploadDispatchStats().idle_tail).toMatchObject({ count: 1, records: 3 });
+    try {
+      const a = api();
+      const head = uploadWave(a, await files(64, "guard-head"));
+      await waitFor(() => batchSizes.length === 1);
+      const tail = uploadWave(a, await files(3, "guard-tail"));
+      release();
+      await Promise.all([head, tail]);
+      expect(batchSizes).toEqual([64, 3]);
+      expect(getUploadDispatchStats().idle_tail).toMatchObject({ count: 1, records: 3 });
+    } finally {
+      release();
+    }
   });
 
   test("v2 saturation waits for settle before re-arming an overdue partial", async () => {
     v2();
     process.env.RBOX_UPLOAD_SLOTS = "2";
     const clock = useClock();
-    let releaseFirst!: () => void;
-    let releaseSecond!: () => void;
-    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+    let firstReleased = false;
+    let secondReleased = false;
+    const firstGate = new Promise<void>((resolve) => { resolveFirst = resolve; });
+    const secondGate = new Promise<void>((resolve) => { resolveSecond = resolve; });
+    const releaseFirst = () => {
+      if (firstReleased) return;
+      firstReleased = true;
+      resolveFirst();
+    };
+    const releaseSecond = () => {
+      if (secondReleased) return;
+      secondReleased = true;
+      resolveSecond();
+    };
     const a = api();
     const wave = await files(131, "saturated");
     const firstSha = wave[0]![0];
@@ -242,26 +286,36 @@ describe("BlobBatchUploader fill policy", () => {
       else await secondGate;
       return okBatch(records);
     };
-    const uploads = wave.map((args) => a.putBlobFile(...args));
+    const uploads = wave.map((args) => {
+      const upload = a.putBlobFile(...args);
+      upload.catch(() => {});
+      return upload;
+    });
     const pending = Promise.all(uploads);
-    await waitFor(() => batchSizes.length === 2);
-    expect(batchSizes).toEqual([64, 64]);
+    pending.catch(() => {});
+    try {
+      await waitFor(() => batchSizes.length === 2);
+      expect(batchSizes).toEqual([64, 64]);
 
-    await clock.advance(FILL_ABSOLUTE_MS * 10);
-    expect(clock.scheduledTimers).toBeLessThanOrEqual(3);
-    expect(batchSizes).toEqual([64, 64]);
+      await clock.advance(FILL_ABSOLUTE_MS * 10);
+      expect(clock.scheduledTimers).toBeLessThanOrEqual(3);
+      expect(batchSizes).toEqual([64, 64]);
 
-    releaseFirst();
-    await uploads[0];
-    await waitFor(() => clock.hasTimerWithin(FILL_QUIET_MS));
-    await clock.advance(FILL_QUIET_MS);
-    await waitFor(() => batchSizes.length === 3);
-    expect(batchSizes).toEqual([64, 64, 3]);
-    expect(getUploadDispatchStats().quiet).toMatchObject({ count: 1, records: 3 });
+      releaseFirst();
+      await uploads[0];
+      await waitFor(() => clock.hasTimerWithin(FILL_QUIET_MS));
+      await clock.advance(FILL_QUIET_MS);
+      await waitFor(() => batchSizes.length === 3);
+      expect(batchSizes).toEqual([64, 64, 3]);
+      expect(getUploadDispatchStats().quiet).toMatchObject({ count: 1, records: 3 });
 
-    releaseSecond();
-    await pending;
-    expect(batchSizes).toEqual([64, 64, 3]);
+      releaseSecond();
+      await pending;
+      expect(batchSizes).toEqual([64, 64, 3]);
+    } finally {
+      releaseFirst();
+      releaseSecond();
+    }
   });
 
   test("duplicate shas coalesce into one dispatched record and settle both waiters", async () => {
@@ -270,9 +324,13 @@ describe("BlobBatchUploader fill policy", () => {
     const a = api();
     const args = await fileArgs("duplicate");
     const progress = [0, 0];
-    const pending = progress.map((_, i) => a.putBlobFile(
-      args[0], args[1], args[2], undefined, () => { progress[i]++; },
-    ));
+    const pending = progress.map((_, i) => {
+      const upload = a.putBlobFile(
+        args[0], args[1], args[2], undefined, () => { progress[i]++; },
+      );
+      upload.catch(() => {});
+      return upload;
+    });
     await clock.advance(FILL_QUIET_MS);
     await Promise.all(pending);
     expect(batchSizes).toEqual([1]);
@@ -350,20 +408,30 @@ describe("BlobBatchUploader record-cap latch", () => {
     v2();
     useClock();
     process.env.RBOX_UPLOAD_SLOTS = "2";
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let resolveGate!: () => void;
+    let released = false;
+    const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+    const release = () => {
+      if (released) return;
+      released = true;
+      resolveGate();
+    };
     batchPutHandler = async (records) => {
       if (records.length > 32) { await gate; return json(400, { error: "bad_request" }); }
       return okBatch(records);
     };
-    const pending = uploadWaveCounting(api(), await files(160, "concurrent"));
-    await waitFor(() => batchSizes.length === 2);
-    expect(batchSizes).toEqual([64, 64]);
-    release();
-    const progress = await pending;
-    expect(batchSizes).toEqual([64, 64, 32]);
-    expect(singlePuts).toBe(128);
-    expect(progress.every((count) => count === 1)).toBe(true);
+    try {
+      const pending = uploadWaveCounting(api(), await files(160, "concurrent"));
+      await waitFor(() => batchSizes.length === 2);
+      expect(batchSizes).toEqual([64, 64]);
+      release();
+      const progress = await pending;
+      expect(batchSizes).toEqual([64, 64, 32]);
+      expect(singlePuts).toBe(128);
+      expect(progress.every((count) => count === 1)).toBe(true);
+    } finally {
+      release();
+    }
   });
 
   test("400 at the 32 cap keeps existing single fallback behavior", async () => {
@@ -388,7 +456,9 @@ function useClock(): FakeClock {
 }
 
 function api(): RboxApi {
-  return new RboxApi("https://api.test", "token", "ws_1", "proj_1");
+  const instance = new RboxApi("https://api.test", "token", "ws_1", "proj_1");
+  apiInstances.push(instance);
+  return instance;
 }
 
 async function files(count: number, prefix: string, size = 4): Promise<Array<[string, string, number]>> {
@@ -403,14 +473,22 @@ async function fileArgs(name: string, size = 4): Promise<[string, string, number
 }
 
 async function uploadWave(a: RboxApi, wave: Array<[string, string, number]>): Promise<void> {
-  await Promise.all(wave.map((args) => a.putBlobFile(...args)));
+  await Promise.all(wave.map((args) => {
+    const upload = a.putBlobFile(...args);
+    upload.catch(() => {});
+    return upload;
+  }));
 }
 
 async function uploadWaveCounting(a: RboxApi, wave: Array<[string, string, number]>): Promise<number[]> {
   const progress = wave.map(() => 0);
-  await Promise.all(wave.map((args, i) => a.putBlobFile(
-    args[0], args[1], args[2], undefined, () => { progress[i]++; },
-  )));
+  await Promise.all(wave.map((args, i) => {
+    const upload = a.putBlobFile(
+      args[0], args[1], args[2], undefined, () => { progress[i]++; },
+    );
+    upload.catch(() => {});
+    return upload;
+  }));
   return progress;
 }
 
@@ -420,7 +498,11 @@ async function settleMicrotasks(): Promise<void> {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let i = 0; i < 100 && !predicate(); i++) await settleMicrotasks();
+  const deadline = performance.now() + 5_000;
+  while (!predicate() && performance.now() < deadline) {
+    await settleMicrotasks();
+    await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 2));
+  }
   if (!predicate()) throw new Error("timed out waiting for uploader state");
 }
 
