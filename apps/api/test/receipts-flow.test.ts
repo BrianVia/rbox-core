@@ -10,6 +10,7 @@ import {
   MAX_RECEIPTS_PER_REDEEM,
   MAX_REFS_PER_COMMIT,
   MAX_REFS_PER_TXN,
+  receiptRedeemMax,
   SELECTS_PER_BATCH,
   VALIDATE_IN_LIST_CHUNK,
 } from "../src/commit-accounting.js";
@@ -66,8 +67,8 @@ const fakeState = () =>
     } as unknown as DurableObjectState;
   };
 
-async function redeem(accountId: string, receipts: Record<string, unknown>): Promise<Response> {
-  const sync = new WorkspaceSync(fakeState(), env);
+async function redeem(accountId: string, receipts: Record<string, unknown>, handlerEnv: Env = env): Promise<Response> {
+  const sync = new WorkspaceSync(fakeState(), handlerEnv);
   return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
@@ -406,10 +407,63 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
 
   test(">5k receipts are rejected before verification", async () => {
     const a = await bootstrap("rcpt-redeem-too-many");
+    const atCap = Object.fromEntries(Array.from({ length: MAX_RECEIPTS_PER_REDEEM }, (_, i) => [`invalid-${i}`, "receipt"]));
+    const accepted = await redeem(a.accountId, atCap);
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ granted: 0, alreadyEntitled: 0, rejected: MAX_RECEIPTS_PER_REDEEM });
+
     const receipts = Object.fromEntries(Array.from({ length: MAX_RECEIPTS_PER_REDEEM + 1 }, (_, i) => [sha(`too-many-${i}`), "receipt"]));
     const res = await redeem(a.accountId, receipts);
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "too_many_receipts", max: MAX_RECEIPTS_PER_REDEEM });
+  });
+
+  test("configured receipt-redeem cap accepts 15k and rejects 15,001", async () => {
+    const a = await bootstrap("rcpt-redeem-raised-cap");
+    const handlerEnv = { ...env, RBOX_RECEIPT_REDEEM_MAX: "15000" } as Env;
+    const atCap = Object.fromEntries(Array.from({ length: 15_000 }, (_, i) => [`invalid-${i}`, "receipt"]));
+    const accepted = await redeem(a.accountId, atCap, handlerEnv);
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ granted: 0, alreadyEntitled: 0, rejected: 15_000 });
+
+    atCap["one-too-many"] = "receipt";
+    const rejected = await redeem(a.accountId, atCap, handlerEnv);
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ error: "too_many_receipts", max: 15_000 });
+  });
+
+  test("receiptRedeemMax parses positive integers and clamps the rollout cap", () => {
+    const configured = (value: string | undefined) => receiptRedeemMax({ ...env, RBOX_RECEIPT_REDEEM_MAX: value } as Env);
+    expect(configured(undefined)).toBe(5_000);
+    expect(configured(" 1 ")).toBe(1);
+    expect(configured("15000")).toBe(15_000);
+    expect(configured("999999")).toBe(15_000);
+    expect(configured("abc")).toBe(5_000);
+    expect(configured("0")).toBe(5_000);
+    expect(configured("-5")).toBe(5_000);
+  });
+
+  test("redeem emits numeric phase splits without changing the shared metric layout", async () => {
+    const a = await bootstrap("rcpt-redeem-phase-metrics");
+    const staged = await putStaged(a.token, "phase-metric");
+    const points: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+    const handlerEnv = {
+      ...env,
+      rbox_metrics: { writeDataPoint: (point: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) => points.push(point) } as AnalyticsEngineDataset,
+    } as Env;
+    const res = await redeem(a.accountId, { [staged.sha]: staged.receipt }, handlerEnv);
+    expect(res.status).toBe(200);
+    const phase = points.find((point) => point.indexes?.[0] === "receipts.redeem.phases");
+    expect(phase?.blobs).toEqual(["receipts.redeem.phases", "ok"]);
+    expect(phase?.doubles).toHaveLength(9);
+    expect(phase?.doubles?.every((value) => typeof value === "number" && value >= 0)).toBe(true);
+    expect(phase?.doubles?.slice(4)).toEqual([
+      1,
+      JSON.stringify({ receipts: { [staged.sha]: staged.receipt } }).length,
+      1,
+      0,
+      0,
+    ]);
   });
 
   test("redeem propagates quota_exceeded with the commit-accounting body", async () => {

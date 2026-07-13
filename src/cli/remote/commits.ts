@@ -8,6 +8,36 @@ import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from ".
 import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
+export const RECEIPT_REDEEM_REQUEST_BYTES_MAX = 7 * 1024 * 1024;
+const RECEIPT_REDEEM_BODY_PREFIX_BYTES = Buffer.byteLength('{"receipts":{');
+const RECEIPT_REDEEM_BODY_SUFFIX_BYTES = Buffer.byteLength("}}");
+
+export function initialReceiptSendCap(): number {
+  const raw = process.env.RBOX_RECEIPT_SEND_CAP?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return RECEIPT_REDEEM_BATCH_MAX;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return RECEIPT_REDEEM_BATCH_MAX;
+  return Math.min(15_000, parsed);
+}
+
+function sliceReceiptBatch(
+  receipts: ReadonlyMap<string, string>,
+  sendCap: number,
+): { batch: Array<[string, string]>; maxEntryBytes: number } {
+  const batch: Array<[string, string]> = [];
+  let requestBytes = RECEIPT_REDEEM_BODY_PREFIX_BYTES + RECEIPT_REDEEM_BODY_SUFFIX_BYTES;
+  let maxEntryBytes = 0;
+  for (const [sha, receipt] of receipts) {
+    const entryBytes = Buffer.byteLength(JSON.stringify(sha)) + 1 + Buffer.byteLength(JSON.stringify(receipt));
+    const nextBytes = requestBytes + entryBytes + (batch.length > 0 ? 1 : 0);
+    if (batch.length > 0 && nextBytes > RECEIPT_REDEEM_REQUEST_BYTES_MAX) break;
+    batch.push([sha, receipt]);
+    requestBytes = nextBytes;
+    maxEntryBytes = Math.max(maxEntryBytes, entryBytes);
+    if (batch.length >= sendCap) break;
+  }
+  return { batch, maxEntryBytes };
+}
 
 export type CommitRejectReason = "too_many_refs" | "body_too_large";
 
@@ -161,18 +191,57 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
 }
 
 export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
+  ctx.receiptSendCap ??= initialReceiptSendCap();
   const timingToken = firstPublishMeasurementToken();
   const timingT0 = timingToken ? performance.now() : 0;
   const results: ReceiptRedeemResult[] = [];
   try { while (ctx.receipts.size > 0) {
-    const batch = [...ctx.receipts.entries()].slice(0, RECEIPT_REDEEM_BATCH_MAX);
+    const { batch, maxEntryBytes } = sliceReceiptBatch(ctx.receipts, ctx.receiptSendCap);
+    const requestBody = JSON.stringify({ receipts: Object.fromEntries(batch) });
+    const countSubmitted = () => {
+      if (firstPublishMeasurementLive(timingToken)) {
+        firstPublishTiming.stats.redeemReceiptCount += batch.length;
+      }
+    };
     // SAFE TO RETRY — receipt redemption is idempotent: duplicate calls find refs already
     // entitled and grant 0, while a socket-close-before-response can be replayed safely.
+    // A too_many_receipts bounce performed no server work, so re-slicing the untouched,
+    // generation-safe receipt map is also safe.
+    if (firstPublishMeasurementLive(timingToken)) {
+      firstPublishTiming.stats.redeemRequestCount++;
+      firstPublishTiming.stats.redeemMaxEntryBytes = Math.max(firstPublishTiming.stats.redeemMaxEntryBytes, maxEntryBytes);
+      firstPublishTiming.stats.redeemMaxRequestBytes = Math.max(
+        firstPublishTiming.stats.redeemMaxRequestBytes,
+        Buffer.byteLength(requestBody),
+      );
+    }
     const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/receipts/redeem`, {
       method: "POST",
       headers: { ...ctx.protoAuth, "content-type": "application/json" },
-      body: JSON.stringify({ receipts: Object.fromEntries(batch) }),
+      body: requestBody,
     }, { op: "redeeming upload receipts" });
+    if (r.status === 400) {
+      const text = await r.text();
+      let body: { error?: unknown; max?: unknown } = {};
+      try { body = JSON.parse(text) as typeof body; } catch { /* generic handling below */ }
+      if (body.error === "too_many_receipts") {
+        const max = body.max;
+        if (typeof max !== "number" || !Number.isInteger(max) || max <= 0 || max >= batch.length) {
+          throw new Error("receipt redeem failed: server returned an invalid non-shrinking too_many_receipts cap");
+        }
+        ctx.receiptSendCapShrinkCount++;
+        if (ctx.receiptSendCapShrinkCount > 8) {
+          throw new Error("receipt redeem failed: server changed its receipt cap more than 8 times in one session");
+        }
+        ctx.receiptSendCap = max as number;
+        continue;
+      }
+      countSubmitted();
+      const { quota } = await readQuotaExceeded(new Response(text, { status: r.status, headers: r.headers }));
+      if (quota) throw quota;
+      throw new Error(translateRemoteError(r.status, "receipt redeem failed", text, "workspace not found — check you're in the right directory"));
+    }
+    countSubmitted();
     if (r.status === 422) {
       const body = (await r.json()) as { missing?: string[] };
       // The server identifies the caught accounting super-batch as the safe failure
@@ -181,9 +250,14 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
       const needsUpload = body.missing?.length ? body.missing : batch.map(([sha]) => sha);
       results.push({ granted: 0, alreadyEntitled: 0, rejected: 0, needsUpload });
       const failed = new Set(needsUpload);
+      let deleted = false;
       for (const [sha, receipt] of batch) {
-        if (failed.has(sha) && ctx.receipts.get(sha) === receipt) ctx.receipts.delete(sha);
+        if (failed.has(sha) && ctx.receipts.get(sha) === receipt) {
+          ctx.receipts.delete(sha);
+          deleted = true;
+        }
       }
+      if (!deleted) throw new Error("receipt redeem failed: malformed 422 missing detail did not match the submitted batch");
       continue;
     }
     if (!r.ok) {

@@ -1,12 +1,12 @@
 import type { Env } from "./env.js";
 import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
-import { emit as emitMetric, emitDelta, startOp, type MetricEvent } from "./metrics.js";
+import { emit as emitMetric, emitDelta, emitRedeemPhases, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
   commitAccounting,
   CARRIER_REFS,
-  MAX_RECEIPTS_PER_REDEEM,
   MAX_REFS_PER_COMMIT,
+  receiptRedeemMax,
   type RefWithSize,
 } from "./commit-accounting.js";
 import { loadSidecarRaw, resolveSidecarRaw, loadSidecarShaSet } from "./sidecar.js";
@@ -845,6 +845,7 @@ export class WorkspaceSync {
   }
 
   private async redeemReceipts(req: Request): Promise<Response> {
+    const startedAt = performance.now();
     const ROUTE = "/v1/ws/:ws/proj/:proj/receipts/redeem";
     const op = startOp(this.env, "receipts.redeem", ROUTE);
     const raw = await readBodyCapped(req, MAX_REQUEST_BODY);
@@ -864,18 +865,22 @@ export class WorkspaceSync {
     }
 
     const entries = Object.entries(body.receipts as Record<string, unknown>);
-    if (entries.length > MAX_RECEIPTS_PER_REDEEM) {
+    const max = receiptRedeemMax(this.env);
+    if (entries.length > max) {
       op.done("too_many_receipts", { count: entries.length });
-      return json({ error: "too_many_receipts", max: MAX_RECEIPTS_PER_REDEEM }, 400);
+      return json({ error: "too_many_receipts", max }, 400);
     }
 
     const accountId = req.headers.get("x-rbox-account") ?? "";
     const nowMs = Date.now();
     const db = dbFor(op.env, accountId);
+    const precheckStartedAt = performance.now();
     const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
+    const precheckMs = performance.now() - precheckStartedAt;
     const newRefs: RefWithSize[] = [];
     let alreadyEntitled = 0;
     let rejected = 0;
+    const verifyStartedAt = performance.now();
     for (const [sha, receipt] of entries) {
       if (!SHA_RE.test(sha) || typeof receipt !== "string") {
         rejected++;
@@ -892,17 +897,36 @@ export class WorkspaceSync {
       }
       newRefs.push({ sha, size: v.size });
     }
+    const verifyMs = performance.now() - verifyStartedAt;
 
+    const accountingStartedAt = performance.now();
     const acct = await commitAccounting(db, accountId, newRefs, nowMs);
+    const accountingMs = performance.now() - accountingStartedAt;
+    // `granted` undercounts durable partial super-batches on failure paths: deliberate,
+    // since commitAccounting's shared return shape reports no partial count.
+    const phases = (granted: number) => ({
+      totalMs: performance.now() - startedAt,
+      precheckMs,
+      verifyMs,
+      accountingMs,
+      count: entries.length,
+      bytes: raw.length,
+      granted,
+      alreadyEntitled,
+      rejected,
+    });
     if ("needsUpload" in acct) {
       op.done("unsatisfied_blobs", { count: entries.length, ratio: entries.length ? acct.needsUpload.length / entries.length : 0 });
+      emitRedeemPhases(this.env, "unsatisfied_blobs", phases(0));
       return json(unsatisfiedBlobsBody(acct.needsUpload), 422);
     }
     if ("overCap" in acct) {
       op.done("quota_exceeded", { count: entries.length });
+      emitRedeemPhases(this.env, "quota_exceeded", phases(0));
       return json(await quotaExceededBody(db, accountId, acct.overCap), 402);
     }
     op.done("ok", { count: entries.length, ratio: entries.length ? rejected / entries.length : 0 });
+    emitRedeemPhases(this.env, "ok", phases(newRefs.length));
     return json({ granted: newRefs.length, alreadyEntitled, rejected });
   }
 

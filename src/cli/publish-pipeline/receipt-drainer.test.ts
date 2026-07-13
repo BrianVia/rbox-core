@@ -11,9 +11,11 @@ const port = (ctx: RemoteContext) => ({
   redeem: () => redeemReceipts(ctx),
 });
 
-test("ReceiptDrainer is single-flight and signals drain completion", async () => {
+test("ReceiptDrainer is single-flight and wakes backlog waiters on drain completion", async () => {
   const ctx = new RemoteContext("https://test", "t", "w", "p");
   ctx.receipts.set(sha("a"), "a");
+  ctx.receipts.set(sha("b"), "b");
+  ctx.receipts.set(sha("c"), "c");
   let release!: () => void;
   let calls = 0;
   (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
@@ -21,16 +23,16 @@ test("ReceiptDrainer is single-flight and signals drain completion", async () =>
     await new Promise<void>((resolve) => { release = resolve; });
     return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
   };
-  let completed = 0;
   const drainer = new ReceiptDrainer(port(ctx), { threshold: 1, backlogMax: 2, onError() {} });
-  drainer.onDrainComplete(() => { completed++; });
   drainer.capture();
   drainer.capture();
+  const backlog = drainer.waitForBacklog();
   await Promise.resolve();
   expect(calls).toBe(1);
   release();
+  await backlog;
   await drainer.flush();
-  expect([calls, completed, drainer.backlogMax]).toEqual([1, 1, 2]);
+  expect([calls, drainer.backlogMax]).toEqual([1, 2]);
 });
 
 test("ReceiptDrainer maybeKick drains below-threshold pre-existing receipts", async () => {
@@ -74,4 +76,40 @@ test("ReceiptDrainer accumulates 422 residue until replacement is settled", asyn
   ctx.receipts.set(address, "replacement");
   drainer.capture();
   expect(await drainer.flush()).toEqual({ needsUpload: [] });
+});
+
+test("ReceiptDrainer preserves a replacement receipt installed during an in-flight drain", async () => {
+  const address = sha("generation-safe");
+  const ctx = new RemoteContext("https://test", "t", "w", "p");
+  ctx.receipts.set(address, "old");
+  let releaseFirst!: () => void;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const sent: string[] = [];
+  let calls = 0;
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (_url: string, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { receipts: Record<string, string> };
+    sent.push(body.receipts[address]!);
+    calls++;
+    if (calls === 1) {
+      markFirstStarted();
+      await firstHeld;
+    }
+    return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+  };
+  const drainer = new ReceiptDrainer(port(ctx), { threshold: 1, backlogMax: 2, onError() {} });
+  drainer.capture();
+  const flushed = drainer.flush();
+  try {
+    await firstStarted;
+    ctx.receipts.set(address, "replacement");
+    releaseFirst();
+    expect(await flushed).toEqual({ needsUpload: [] });
+    expect(sent).toEqual(["old", "replacement"]);
+    expect(ctx.receipts.size).toBe(0);
+  } finally {
+    releaseFirst();
+    await flushed.catch(() => {});
+  }
 });
