@@ -1,6 +1,7 @@
 # 112 — Batch-fill and blob-PUT wire-cap raise
 
-Status: **UNDER ADVERSARIAL REVIEW** (ledger: `REVIEW-112.md`), 2026-07-12.
+Status: **REVIEWED — ALIGNED** (4 codex rounds; ledger: `REVIEW-112.md`),
+2026-07-12.
 
 ## Problem
 

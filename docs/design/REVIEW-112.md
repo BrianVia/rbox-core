@@ -3,6 +3,16 @@
 Adversarial codex review loop on `docs/design/112-batch-fill-wire-cap.md`.
 Judge: Claude (this worktree). Reviewer: gpt-5.6-sol via `codex exec`.
 
+**FINAL VERDICT: ALIGNED (round 4, 2026-07-12).** Rounds 1-3
+CHANGES-REQUIRED (7+2, 4+0, 3+1 findings); round 4 confirmation: no
+findings, all residuals verified resolved with code citations.
+
+Implementation-binding seam item carried forward: when 112 enters
+implementation, amend `REVIEW-109-111-seam.md`'s binding order list (112's
+field evaluation must sit outside the step-4 shared-baseline window; 112
+state frozen and recorded in every 110/111 measurement cell; 109 gate-0
+attribution reruns if 109 unparks after 112 changes batch cardinality).
+
 ## Round 1 — VERDICT: CHANGES-REQUIRED
 
 | # | Sev | Finding | Disposition |
@@ -55,3 +65,12 @@ reporting, and the per-request framing definition as otherwise resolved.
 | 2 | MAJOR | Per-reason fill distributions cannot be derived from server AE per-event `count` joined with independent client reason counters. | **ADOPT** — client records a per-dispatch `(reason, records, bytes)` observation under lane-timing/sweep mode (numbers + one enum, local output, no identifiers); the sweep reports per-reason counts and record-count histograms; AE remains the source for overall fill only. |
 | 3 | MAJOR | Resource-gate contradiction: `peakUploaderFramingBytes` (per-request) necessarily grows with fill (~2×547 KB at full 64 vs ~2×274 KB at 32), so "within 10% of 32-cells / no growth expected" was self-contradictory with the fill gate. | **ADOPT** — per-request framing now gets an analytical ceiling (~2× (body cap + headers)), with expected growth stated; only process peak RSS (aggregate, slots × body-cap bounded, unchanged) keeps the 10% comparison. |
 | 4 | MINOR | Rollout table still said the latch makes skew "one-shot per process", contradicting the corrected ≤in-flight bound. | **ADOPT** — table now says "one latch event plus a bounded in-flight burst (≤ slots)". Also tightened per codex's residual note: the mutable session cap is specified to replace `config.records` at both read sites (`dispatchFull()` fullness check and `carve()` take limit). |
+
+## Round 4 — VERDICT: ALIGNED
+
+Confirmation round: no findings. All four round-3 residuals verified resolved
+with code citations (per-version enums; client `(reason, records, bytes)`
+observations with AE limited to overall fill; analytic ~2× framing ceiling
+with RSS keeping the 10% aggregate comparison — matching the two-buffer
+instrumentation at `blob-batch.ts:775`; latch bound wording + both
+`config.records` read sites confirmed at `blob-batch.ts:643`/`674`).
