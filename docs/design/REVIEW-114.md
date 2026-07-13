@@ -328,3 +328,26 @@ control), processing placement changes for already-entitled receipts
 (skip-if-entitled proven safe instead), and mid-invocation env-var GC recheck
 (env is fixed per invocation; boundary documented, exposure bounded by
 executor caps).
+
+## Field validation — FM, v1.5.3, 2026-07-13 — DO NOT PROMOTE (writer stays off)
+
+Mechanics field-perfect: 91/91 packs accepted, 20,408→45 physical R2 PUTs
+(−99.78%), zero fallbacks/4xx/5xx/fence anomalies, overhead 1.18% (~48B/member).
+Throughput thesis DEAD on current binaries: pack median 109.6s vs control 94.3s
+(same-day A/B) — ~16% WORSE. Root causes, per the fp decomposition:
+(1) the premise expired — after enforce admission + fill-v2 + the restored
+crypto pool, upload ops were already off the critical path (~38s slot work in a
+~95s wall; producer+tail bound);
+(2) pack receipts DOUBLE the redemption tail (33.4/35.8s vs 18.3/14.6s for the
+same 5 redeem requests; rentB 421 vs 372) — pack-receipt redemption costs ~2x
+canonical server-side and flows straight into commit `p`;
+(3) packer starvation: encrypt producer (~1MB/s ct) + 1s absolute timer flush
+→ ~1.86MB packs, 453 members vs the ≥700 gate.
+DECISIONS: writer remains RBOX_BLOB_PACK opt-in (not promoted); server accept +
+pack-GC shadow STAY ON (91 real packs now soaking the shadow GC — free field
+data); no cap/slot changes. NEW TOP LEVERS named by the data: the redeem/commit
+tail in BOTH arms (design 111's ≤5s drain gate fails at this corpus — and
+redeemOverlap=0 in all four runs despite default-on upload draining: FIELD GAP,
+investigate why the drain didn't engage on this path), and pack-receipt
+redemption server cost if packing is ever revived. Also: sweep.sh fp grep is
+stale (`fp ready.*` vs `fp filesSynced...`) — one-line fix owed.
