@@ -1,0 +1,65 @@
+import { envInt } from "../resilient.js";
+
+export const DEFAULT_BATCH_RECORD_BYTES = 256 * 1024;
+const DEFAULT_BATCH_RECORDS = 32;
+const DEFAULT_BATCH_BODY_BYTES = 8 * 1024 * 1024;
+// measured 2026-07-08 (same subrequest-cap mechanism as PUT below): a batch GET's
+// 32 parallel R2 reads serialize ~6-wide inside one invocation (~1s/batch), so GET
+// slots scale linearly too — full-corpus wired join: 16 slots = 128s, 48 = 84s,
+// 64 = 82s (flat past the knee; the floor moves to git apply + local decrypt).
+const DEFAULT_BATCH_SLOTS = 48;
+// measured 2026-07-08 — Workers cap parallel subrequests per invocation (~6),
+// so one batch PUT settles in ~910ms regardless of records; slots scale linearly
+// (8 slots = 83s publish, 24 slots = 39s on the A/B corpus; AE avg_ms constant at both).
+const DEFAULT_BATCH_PUT_SLOTS = 24;
+// Client slot ceilings (concurrency knobs). Raised well above the historical
+// defaults so RBOX_UPLOAD_SLOTS / RBOX_DOWNLOAD_SLOTS can sweep; defaults unchanged.
+// Peak transient framing scales as slots × bodyBytes (8 MiB), so the ceiling caps
+// worst-case RSS at ~2 GiB; real small-file batches fill `records` (32) long before
+// the 8 MiB cap, so typical per-slot bodies are far smaller. Only explicitly-set
+// values above the historical 32/64 caps reach here.
+const MAX_UPLOAD_SLOTS = 256;
+const MAX_DOWNLOAD_SLOTS = 256;
+export const FLUSH_DELAY_MS = 10;
+export const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
+export const SINGLE_FALLBACK_CONCURRENCY = 128;
+export const SINGLE_UPLOAD_FALLBACK_CONCURRENCY = 64;
+export const DEFAULT_PULL_JOIN_WATCHDOG_MS = 90_000;
+export const DEFAULT_PULL_JOIN_WATCHDOG_MAX_FIRINGS = 3;
+
+export interface BatchConfig {
+  enabled: boolean;
+  records: number;
+  recordBytes: number;
+  bodyBytes: number;
+  slots: number;
+}
+
+export function uploadBatchConfig(): BatchConfig {
+  return readBatchConfig(["RBOX_UPLOAD_SLOTS", "RBOX_BATCH_PUT_SLOTS"], DEFAULT_BATCH_PUT_SLOTS, MAX_UPLOAD_SLOTS, DEFAULT_BATCH_RECORD_BYTES);
+}
+
+export function downloadBatchConfig(): BatchConfig {
+  return readBatchConfig(["RBOX_DOWNLOAD_SLOTS", "RBOX_BATCH_SLOTS"], DEFAULT_BATCH_SLOTS, MAX_DOWNLOAD_SLOTS, DEFAULT_BATCH_BODY_BYTES);
+}
+
+function envIntFirst(names: string[], fallback: number, min: number, max: number): number {
+  for (const name of names) {
+    if (process.env[name]?.trim()) return envInt(name, fallback, min, max);
+  }
+  return fallback;
+}
+
+function readBatchConfig(slotsEnvs: string[], slotsDefault: number, slotsMax: number, recordBytesMax: number): BatchConfig {
+  return {
+    enabled: process.env.RBOX_BATCH_BLOBS !== "0",
+    // Wire twin: apps/api MAX_BATCH_RECORDS (=32). The server rejects any batch with
+    // more records (400 "too many records"), so RBOX_BATCH_RECORDS is clamped to the
+    // wire cap, never raised independently. Raising the records axis is a coordinated
+    // client+server wire-cap change, not a client-only knob.
+    records: envInt("RBOX_BATCH_RECORDS", DEFAULT_BATCH_RECORDS, 1, DEFAULT_BATCH_RECORDS),
+    recordBytes: envInt("RBOX_BATCH_RECORD_BYTES", DEFAULT_BATCH_RECORD_BYTES, 1, recordBytesMax),
+    bodyBytes: envInt("RBOX_BATCH_BODY_BYTES", DEFAULT_BATCH_BODY_BYTES, 1, DEFAULT_BATCH_BODY_BYTES),
+    slots: envIntFirst(slotsEnvs, slotsDefault, 1, slotsMax),
+  };
+}
