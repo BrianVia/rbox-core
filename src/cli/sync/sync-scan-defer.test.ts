@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 type Mutation = (abs: string) => Promise<void>;
 const mutations = new Map<string, Mutation>(); // basename → one-shot mutation
 
-mock.module("../engine/hash.js", () => ({
+mock.module("../../engine/hash.js", () => ({
   hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
   hashFile: async (abs: string): Promise<string> => {
     const run = mutations.get(path.basename(abs));
@@ -23,16 +23,16 @@ mock.module("../engine/hash.js", () => ({
   },
 }));
 
-const { push, pull } = await import("./sync.js");
-const { loadState, syncStreamId } = await import("./config.js");
-const { encryptFileNameProbe } = await import("../engine/e2ee/e2ee-e2e.helpers.js");
-type SyncDeps = import("./sync.js").SyncDeps;
-type WorkspaceConfig = import("./config.js").WorkspaceConfig;
-type CommitResult = import("./remote.js").CommitResult;
-type SyncRemote = import("./remote.js").SyncRemote;
-type BlobStore = import("../engine/index.js").BlobStore;
-type FileEntry = import("../engine/index.js").FileEntry;
-type Manifest = import("../engine/index.js").Manifest;
+const { push, pull } = await import("../sync.js");
+const { loadState, syncStreamId } = await import("../config.js");
+const { encryptFileNameProbe } = await import("../../engine/e2ee/e2ee-e2e.helpers.js");
+type SyncDeps = import("../sync.js").SyncDeps;
+type WorkspaceConfig = import("../config.js").WorkspaceConfig;
+type CommitResult = import("../remote.js").CommitResult;
+type SyncRemote = import("../remote.js").SyncRemote;
+type BlobStore = import("../../engine/index.js").BlobStore;
+type FileEntry = import("../../engine/index.js").FileEntry;
+type Manifest = import("../../engine/index.js").Manifest;
 
 const shaHex = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 const KEK = Buffer.alloc(32, 7);

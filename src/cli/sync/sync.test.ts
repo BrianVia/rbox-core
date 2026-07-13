@@ -5,11 +5,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "./sync.js";
-import { missingBlobsChunked } from "./sync-recovery.js";
-import type { WorkspaceConfig } from "./config.js";
-import { loadState, saveState, syncStreamId } from "./config.js";
-import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "./remote.js";
+import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "../sync.js";
+import { missingBlobsChunked } from "../sync-recovery.js";
+import type { WorkspaceConfig } from "../config.js";
+import { loadState, saveState, syncStreamId } from "../config.js";
+import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "../remote.js";
 import {
   buildIgnoreMatcher,
   ENCRYPT_ADDRESS_CACHE_REL,
@@ -22,9 +22,9 @@ import {
   type FileEntry,
   type GitSection,
   type Manifest,
-} from "../engine/index.js";
-import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
-import { listTrash } from "../engine/trash.js";
+} from "../../engine/index.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
+import { listTrash } from "../../engine/trash.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");

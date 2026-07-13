@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { pushMassDeleteTrips } from "./sync.js";
+import { pushMassDeleteTrips } from "../sync.js";
 
 let priorPct: string | undefined;
 let priorMin: string | undefined;

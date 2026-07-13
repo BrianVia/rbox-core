@@ -149,11 +149,13 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
   });
 
   test("nested 409 recovery and sync pull→push pass the held handle without reacquiring", async () => {
-    const source = await fs.readFile(path.join(sourceRoot, "cli", "sync.ts"), "utf8");
-    expect(source).not.toContain("acquireWorkspaceSyncMutex");
-    expect(source).toContain("await pull(root, cfg, deps)");
-    expect(source).toContain("const pulled = await pull(root, cfg, deps)");
-    expect(source).toContain("await push(root, cfg, deps)");
+    const pushSource = await fs.readFile(path.join(sourceRoot, "cli", "sync", "push.ts"), "utf8");
+    const syncSource = await fs.readFile(path.join(sourceRoot, "cli", "sync", "sync.ts"), "utf8");
+    expect(pushSource).not.toContain("acquireWorkspaceSyncMutex");
+    expect(syncSource).not.toContain("acquireWorkspaceSyncMutex");
+    expect(pushSource).toContain("await pull(root, cfg, deps)");
+    expect(syncSource).toContain("const pulled = await pull(root, cfg, deps)");
+    expect(syncSource).toContain("await push(root, cfg, deps)");
   });
 
   test("daemon acquires before consuming want and revalidates stream+nonce", async () => {

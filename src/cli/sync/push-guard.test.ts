@@ -3,11 +3,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { pull, push, type SyncDeps } from "./sync.js";
-import { loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
-import { type CommitResult, type SyncRemote } from "./remote.js";
-import { type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
-import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
+import { pull, push, type SyncDeps } from "../sync.js";
+import { loadState, syncStreamId, type WorkspaceConfig } from "../config.js";
+import { type CommitResult, type SyncRemote } from "../remote.js";
+import { type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 // Design 50 §4 + review B2: the push-side mass-delete guard, and the critical
 // non-leak regression — `--allow-mass-delete` on PUSH must never satisfy the
