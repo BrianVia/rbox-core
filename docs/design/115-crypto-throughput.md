@@ -247,3 +247,14 @@ acceptance shape is:
 
 No implementation, CODEMAP change, deployment, or fleet experiment is proposed
 by this shelf document.
+
+## Addendum (founder food-for-thought, 2026-07-13)
+
+The fused-dispatch bound (`FUSE_DISPATCH_BOUND_DEFAULT = 4`) encodes a memory-
+BANDWIDTH knee, not a core-count one — tuned on dual-channel DDR4 x86 (both
+Ryzens, ~50GB/s shared). The M2 Max's unified memory (~400GB/s) almost
+certainly supports a much higher bound. Channel/DIMM topology is not portably
+queryable and predicts poorly anyway; if this design activates, prefer a ~1s
+startup calibration (measure 2/4/8 concurrent zstd jobs, keep the knee, cache
+per host) over per-arch constants. The fleet's three memory architectures
+(2× dual-channel x86, 1× unified ARM) are the natural validation matrix.
