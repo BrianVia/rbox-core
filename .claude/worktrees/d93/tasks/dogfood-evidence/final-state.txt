@@ -1,5 +1,0 @@
-{"workspace":{"id":"ws_2b6e15da5fb7471ca2ff6be082f4831f","name":null,"root":"/home/via/Development"},"health":"pending","daemon":{"running":false,"pid":null},"remote":null,"trash":null,"account":{"plan":null,"usedBytes":null,"capBytes":null},"crypto":{"state":"idle","workers":0,"jobsRun":0,"workerExecutions":0}}
----
-114821
-8899848878
-98
