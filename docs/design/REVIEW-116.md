@@ -118,6 +118,51 @@ stash-reflog enumeration, checkout/ref plane split, absence-supersedes-pending
 and partial-hint revalidation, `=0` arm semantics, and the second-scan TOCTOU
 closure.
 
+## Round 2 (codex, 2026-07-13) — CHANGES-REQUIRED
+
+3 BLOCKER + 5 MAJOR. r1 F2/F4-F10 verified genuinely closed; F1 and F3 folds
+re-opened and rebuilt. All eight adjudicated against code and adopted, folded
+as `(r2 Fn)`:
+
+- **F1 [BLOCKER] journal couldn't roll back or forward.** The r1 journal held
+  an index projection hash (cannot reconstruct old bytes; `restoreLocal`'s
+  bytes are in-memory only), assumed a durably pending section that on first
+  apply doesn't exist until state save, and had no home before `git init` on
+  fresh targets. Adopted: journal moves to `.rbox/state/git-journal/<key>/`,
+  stores byte-exact old index/op-state copies + the verbatim incoming section
+  + created-fresh flag.
+- **F2 [BLOCKER] roll-forward could bless a crash-window human edit.**
+  Working bytes aren't journaled; completing the move without re-running the
+  oracle violates the prime invariant. Adopted: recovery is rollback-only;
+  follow re-proves everything on ordinary retry.
+- **F3 [BLOCKER] two post-apply workspace scans vs the zero-cost constraint.**
+  Pull's existing scan is pre-apply; the draft added two more walks. Adopted:
+  derived receipt (pre-apply scan ⊕ applied actions, dircache-token verified,
+  re-hash only action-touched/token-moved entries, subtree-scoped widening);
+  boundary proof is per-repo token-first; rig gate must measure
+  publish→bytes-on-disk unchanged before default-on.
+- **F4 [MAJOR] no abort path; wrong index publication convention; post-commit
+  fsck rollback clobbers a fresh human commit** (existing `restoreLocal` uses
+  unconditional `update-ref`). Adopted: connectivity proof moved pre-commit;
+  explicit abort step; index published via `index.lock` rename; post-commit
+  failures repair only through journal expected-current arbitration.
+- **F5 [MAJOR] legacy `needsResolution` checkpoints bypass the oracle
+  forever** (unconditional early return in `applyGitSections`). Adopted:
+  one-time re-proof of persisted checkpoints under the new classifier,
+  idempotent per `incomingKey`; §13.5 remote-absence use of
+  `localDivergedFromBase` explicitly untouched.
+- **F6 [MAJOR] capture-deferral saves had no ordering key** (candidate-N+1
+  stamps would newer-wins-discard genuine N transitions). Adopted: lane-only
+  saves never stamp an unaccepted global sequence; per-lane merge algebra;
+  repoGen CAS unchanged.
+- **F7 [MAJOR] degraded workspace-mutex mode ran follow unserialized.**
+  Adopted: follow + independent ref publication disabled in degraded mode
+  (config-lane precedent); rollback-only journal recovery and visibility stay.
+- **F8 [MAJOR] unbounded recovery-ref growth on LWW tracking NFF churn.**
+  Adopted: content-addressed `refs/rbox-local/keep/<oid>` pins (idempotent
+  dedup) + bounded age retention for tracking-derived pins only; human-work
+  pins never age-pruned.
+
 ## Open review work
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
