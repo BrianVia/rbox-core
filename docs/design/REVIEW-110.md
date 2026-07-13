@@ -69,6 +69,20 @@ round).
 | 6 | MINOR | "Exactly two classification passes" conflicts with the diagnostic re-probe | **ADOPT** — "two full-set classification passes (plus the bounded diagnostic re-probe)" |
 | 7 | MINOR | `admit_stmts` emits `op.span.dbCalls` (calls), not statements, despite the design-102 name | **ADOPT** — verified `workspace-sync.ts:524,531`; Phase 0 notes the misnomer and adds a true statement counter or records it as calls |
 
+## Round 4 — 2026-07-12 (cap round)
+
+Verdict: **CHANGES-REQUIRED**, but reduced to two prescribed wording/fixture
+fixes. Round-3 items 2-7 confirmed RESOLVED.
+
+| # | Sev | Finding | Judgment |
+|---|---|---|---|
+| 1 | BLOCKER (residual of r3 #1) | §3 sequence wrote "materialize A's result (200/422/402)" before accounting, but 200/402 are decided BY accounting — as written it would violate admission-before-success | **ADOPT** — sequence corrected: compare/re-probe → A's 422 if missing → single accounting from A → 402/fence/200 exactly as today |
+| 2 | MAJOR | Matrix case 5 fixture contradicted §3: a mark between B and A yields `A == R != B` → `divergence`, not `state_moved`; `state_moved` needs the mark between A and R | **ADOPT** — case 5 split into both fixtures with their expected classes |
+
+## Round 5 — 2026-07-12 (confirmation round for the round-4 prescribed fixes)
+
+<!-- filled after the confirmation run -->
+
 ## Seam items (for the joint round with 109/111)
 
 - **111 (redemption tail):** Round-1 finding 5 establishes that at genesis the

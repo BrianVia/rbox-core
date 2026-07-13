@@ -455,9 +455,14 @@ single accounting pass:
 
 ```
 bulk read B → authoritative read A → compare → bounded re-probe R (if divergent)
-  → classify + emit telemetry → materialize A's result (200/422/402/…)
-  → exactly one accounting pass from A (success path only)
+  → classify + emit telemetry
+  → if A reports missing: return A's 422
+  → exactly one accounting pass from A → 402/fence/200 exactly as today
 ```
+
+(The 200/402/fence outcomes are decided by accounting, as today — the
+ordering's point is that comparison and re-probe precede **both** every
+response and the accounting mutation.)
 
 Two consequences are explicit. First, the re-probe always reads
 **pre-accounting** state — accounting grants entitlements and clears candidate
@@ -654,12 +659,13 @@ Run each with bulk `off`, `shadow`, and `enforce`, and with
    sidecar, descriptor count/bytes mismatch, and oversized refset.
 4. Account quota crossed in the first, middle, and last accounting super-batch
    (receipt-backed variant); retry proves idempotent charge/grant behavior.
-5. `blob_ref_candidates`, active delete intent, mark landing between bulk
-   classification and the authoritative read (asserting the `state_moved`
-   classification and that it blocks the gate), a divergence exceeding the
-   re-probe cap (asserting all of it counts as `divergence`), and in-progress
-   account deletion (asserting parity with the current genesis path's
-   behavior).
+5. `blob_ref_candidates`, active delete intent, a mark landing between `B` and
+   `A` (yielding `A == R != B` — asserting the `divergence` classification and
+   that it blocks), a mark landing between `A` and `R` (yielding `R != A` —
+   asserting the `state_moved` classification and that it blocks by default),
+   a divergence exceeding the re-probe cap (asserting all of it counts as
+   `divergence`), and in-progress account deletion (asserting parity with the
+   current genesis path's behavior).
 6. Parent race (two genesis writers), epoch rotation before admission and before
    CAS, lost success response, and exact retry.
 7. Manifest snapshot raw and zstd, plus a subsequent one-file delta commit, to
