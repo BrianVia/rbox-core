@@ -29,6 +29,30 @@ Verdict: **CHANGES-REQUIRED** (2 BLOCKER, 9 MAJOR, 4 MINOR, 1 NIT).
 
 Revision committed after this round rewrites the doc per the adopted findings.
 
+## Round 2 — 2026-07-12
+
+Verdict: **CHANGES-REQUIRED** (2 BLOCKER, 5 MAJOR, 6 MINOR, 2 NIT). Codex
+confirmed the round-1 finding-16 rejections were sound (its finding 14) and
+round-1 finding 14 resolved (its finding 15).
+
+| # | Sev | Finding (compressed) | Judgment |
+|---|---|---|---|
+| 1 | BLOCKER | Round-1 #2 unresolved: re-probe rule "R != B → noise" is inverted — it excuses a stably-wrong bulk query (B wrong, A==R correct → labeled noise); `A == R != B` must be gate-blocking | **ADOPT** — protocol rewritten: `A == R != B` → `divergence` (blocking); `R != A` → `state_moved` (blocking by default) |
+| 2 | BLOCKER | Round-1 #2 unresolved: re-probe unbounded/undefined at high cardinality; a systematic defect diverging on 250k refs must not be sampled into an excuse | **ADOPT** — cap = one validator batch (3,060); above the cap nothing is re-probed and all counts as `divergence` |
+| 3 | MAJOR | Change-and-change-back histories are unattributable by any read sequence; noise excusal needs external mutation evidence | **ADOPT** — automatic excusal removed entirely; `state_moved` excusable only in soak review with corroborating GC-tick/redemption-log evidence, recorded in the gate record |
+| 4 | MAJOR | Phase 0.5 circular: prototype projects its own gate; "material win"/"plausibly meet" undefined | **ADOPT** — fixed independent stop rule (projected reduction ≥50% of measured `acct` AND ≥3s absolute at 49k, set before the prototype runs); implementation gate = ≥80% of the projection |
+| 5 | MAJOR | Screening expression ambiguous (which statistic, tie policy, p50 attachment) | **ADOPT** — all clauses defined as median-of-three; explicit both-pass policy (lanes proceed independently) and env-first precedence |
+| 6 | MAJOR | Combined-path gate unverifiable: 85 not 84 accounting subrequests (plan lookup), limits unnamed, no measurement method, case 9 needs the all-receipt-backed variant | **ADOPT** — case 9 fixed (all-receipt-backed, 82+85+bulk arithmetic, op.span counters); limits named (~1,000 subrequests, 128MB isolate, CPU budget); Phase 0.5 must name methods or fall back to analytical 50%-of-limit bounds |
+| 7 | MAJOR | `first_commit` telemetry emission lost by routing genesis ahead of `computeCommitDelta`; must be normative + tested or design-102 dashboards silently change | **ADOPT** — synthetic emission normative in §2; matrix case 7 asserts count/tags |
+| 8 | MINOR | Doc should state genesis bulk shadow = exactly two classification passes and prohibit design-102 `readShadowFlags` at genesis | **ADOPT** — stated in §2 |
+| 9 | MINOR | Receipt-result sharing underspecified (cache keying, nowMs, union population, order-independence, deterministic output order) | **ADOPT** — cache keyed `(sha, receipt)` with request `nowMs`, lazy union population, classifiers consult only the cache; input-order contract for `new`/`missing` |
+| 10 | MINOR | Cardinality check insufficient: bulk relation must reject duplicate inputs and yield exactly one row per input under table multiplicity (no silent first/last-write-wins) | **ADOPT** — two-level guard in §1 |
+| 11 | MINOR | JSON caps need a margin below the measured failure boundary + boundary±1 tests | **ADOPT** — caps ≤50% of failure boundary, boundary±1 tested |
+| 12 | MINOR | Matrix case 2 "drain skipped/failed" wrong: a failed drain never POSTs; all-receipt-backed is a fixture variant | **ADOPT** — reworded; cross-linked to case 9 |
+| 13 | MINOR | `max(0, …)` residual formulas hide clock skew; record signed residuals | **ADOPT** — signed values recorded, clamp for display only |
+| 14 | NIT | Round-1 #16 rejections confirmed sound | no action |
+| 15 | NIT | Round-1 #14 confirmed resolved | no action |
+
 ## Seam items (for the joint round with 109/111)
 
 - **111 (redemption tail):** Round-1 finding 5 establishes that at genesis the

@@ -1,6 +1,6 @@
 # 110 — First-publish commit-tail latency
 
-Status: UNDER REVIEW, 2026-07-12 — codex round 1 adopted (see
+Status: UNDER REVIEW, 2026-07-12 — codex rounds 1-2 adopted (see
 `docs/design/REVIEW-110.md`).
 
 This design addresses the long synchronous tail of a greenfield first publish.
@@ -337,11 +337,15 @@ one normative **pure classification**:
 
 where `have` is the set satisfying the current predicate, `new` are non-have
 SHAs with a valid receipt (size from `verifyReceipt` only), and `missing` is
-the rest. `validateCommitRefs` computes exactly this today internally
-(`commit-accounting.ts:73-109`); exposing it is a pure refactor. Shadow
-compares this structure; receipt verification results are computed once and
-shared between the two classifiers within a request (verification is
-side-effect-free, but it must not be paid twice per SHA).
+the rest, both in **input order** (the current iteration order,
+`commit-accounting.ts:97-107`). `validateCommitRefs` computes exactly this
+today internally (`commit-accounting.ts:73-109`); exposing it is a pure
+refactor. Shadow compares this structure. Receipt verification is
+side-effect-free but must not be paid twice per SHA: a per-request cache keyed
+by `(sha, receipt)` and evaluated with the request's single `nowMs` is
+populated lazily for the union of both classifiers' non-have sets; neither
+classifier's execution order may affect the other's result — each consults
+only the cache, never the other's classification.
 
 Normative requirements:
 
@@ -369,12 +373,17 @@ Normative requirements:
    worst case (bulk chunks attempted + full validator + accounting) must be
    budgeted and tested; see the resource gates.
 
-The implementation must use a bounded JSON array per statement, validate that
-the returned classification cardinality equals the input cardinality, and
-reject duplicate/unknown returned rows. This guards against silent truncation,
-unsupported JSON behavior, or a query-plan mistake. Chunk-size and total JSON
-bytes get explicit caps derived from the Phase 0.5 limits benchmark, below the
-request/isolate memory limits.
+The implementation must use a bounded JSON array per statement, and the guard
+against silent truncation, unsupported JSON behavior, or a query-plan mistake
+operates at two levels: (a) the bulk relation itself rejects duplicate input
+values, and the query must yield exactly one classification row per input SHA
+even under unexpected table multiplicity (collapse via `GROUP BY` on the input
+SHA or detect and fail on duplicate joined rows — a duplicated row must never
+be silently first- or last-write-wins in the result map); (b) the returned
+classification cardinality must equal the input cardinality, with
+duplicate/unknown returned rows rejected. Chunk-size and total JSON bytes get
+explicit caps fixed at no more than 50% of the failure boundary measured in
+Phase 0.5, with boundary±1 behavior tested.
 
 ### 2. Invoke it only for genesis commits on the receipts+sidecar path
 
@@ -393,9 +402,25 @@ run the bulk validator over the full resolved child refset plus carriers and
 chain addresses — the same set `runFullAdmission` receives today on both the
 delta-off path (`workspace-sync.ts:569`) and the delta-mode `first_commit`
 fallback path (`:574-582,615-616`). This requires a small call-site refactor
-routing both branches through one genesis helper; the refactor changes control
-flow and telemetry plumbing but must be behaviorally unchanged for every
-non-genesis commit and for genesis with the flag `off`.
+routing both branches through one genesis helper, with two normative
+telemetry/shape rules:
+
+- **`first_commit` emission is preserved explicitly.** Today, delta
+  `shadow`/`enforce` genesis reaches `computeCommitDelta`, gets the
+  `first_commit` fallback, and emits `emitDelta("fallback",
+  {reason:"first_commit"})` (`workspace-sync.ts:583-585`). Routing genesis
+  ahead of that call must synthesize the same emission (same event, reason,
+  and count) whenever `deltaMode != off`, and the correctness matrix asserts
+  its count/tags — otherwise design-102 soak dashboards silently change.
+- **Exactly two classification passes at genesis under bulk shadow:** bulk
+  plus the authoritative validator, then one accounting pass. Design-102's
+  `readShadowFlags` comparison never runs at genesis today (the `first_commit`
+  fallback bypasses the `delta && deltaMode === "shadow"` branch,
+  `workspace-sync.ts:586`) and must not start running under the genesis
+  helper.
+
+The refactor must otherwise be behaviorally unchanged for every non-genesis
+commit and for genesis with the flag `off`.
 
 The final `transactionSync` parent/epoch/watermark CAS is untouched. Sidecar
 resolution remains before admission. Mirror and response semantics are
@@ -417,21 +442,34 @@ is fixed: the bulk classification read runs first, then the authoritative
 `validateCommitRefs` read, then (single) accounting on the authoritative
 result. Both reads are pre-accounting, but they are separate chunked D1 reads
 with no shared snapshot, so concurrent GC marking, redemption, or entitlement
-changes between and within them can produce divergence that is **noise, not a
-bug** — the same chunk-boundary caveat design 102 records at
-`workspace-sync.ts:588-590`. The shadow protocol therefore defines a
-concurrency-aware classification:
+changes between and within them can produce divergence that is noise rather
+than a bug — the same chunk-boundary caveat design 102 records at
+`workspace-sync.ts:588-590`. No sequence of separate reads can *prove* which
+earlier observation was correct, so the protocol is fail-closed: **ambiguity
+blocks the gate; only externally corroborated concurrency can be excused, and
+only in soak review, never automatically.**
 
-- On any harmful divergence, immediately re-probe just the divergent SHAs with
-  the current predicate (bounded: ≤ one IN-list batch). If the re-probe result
-  differs from the bulk-read flags for those SHAs, the divergence is recorded
-  as `concurrent_noise` (separate counter); otherwise it is recorded as
-  `divergence` and counts against the gate.
+For each request: bulk result `B`, authoritative result `A` (read after `B`),
+and — when harmful divergence is detected — a re-probe `R` of the divergent
+SHAs with the current predicate, taken after both:
+
+- The re-probe is capped at one validator batch (≤ 34 × 90 = 3,060 SHAs). If
+  more SHAs diverge, none are re-probed and **all** count as `divergence` —
+  a systematic bulk defect can diverge on the entire refset and must never be
+  sampled into an excuse.
+- `A == R != B`: recorded as `divergence`, gate-blocking. This is either a
+  stable bulk defect or unprovable concurrency; both block.
+- `R != A` (state moved after the authoritative read, including three-way
+  histories): recorded as `state_moved`, **also gate-blocking by default**. A
+  `state_moved` event may be excused only in soak review with independent
+  corroborating evidence — the divergent SHAs overlap a logged GC
+  mark/purge/deletion tick or redemption activity for that account in the
+  request window — and every excusal is written into the gate record with its
+  evidence.
 - Rig comparisons run with GC and redemption quiesced and require strict zero
-  divergence of any kind.
-- The production soak gate is zero non-noise harmful divergences; a nonzero
-  `concurrent_noise` rate is reported, bounded, and investigated but does not
-  by itself block enforcement.
+  events of every class.
+- The production soak enforcement gate is zero `divergence` and zero unexcused
+  `state_moved` events.
 
 Emit only counts, timings, and a bounded digest/sample under the same privacy
 rules as design 102; never paths or manifest plaintext.
@@ -474,7 +512,8 @@ Rollout order:
 2. Land instrumentation and the bulk classifier with the flag `off`.
 3. Deploy the API to dev first, per `docs/DEPLOYMENTS.md`.
 4. Run the D1/DO rig and dev fleet with `shadow` across the workload matrix
-   below. Do not enable enforcement with any non-noise harmful divergence.
+   below. Do not enable enforcement with any `divergence` or unexcused
+   `state_moved` event.
 5. Enable dev `enforce`; run forced conflict, epoch, quota, 422, deletion-fence,
    and response-loss retries.
 6. Deploy prod code with `off`, then `shadow`. Require the sample-count gate.
@@ -497,26 +536,36 @@ FirstPublishStats object. Add/confirm numbers-only fields for:
 - existing design-102 `admit_stmts`, `admitAccountMs`, `childParseMs`, fallback
   reason, and D1 call count.
 
-Derive:
+Derive, recording the **raw signed residuals** alongside any clamped
+presentation value (the client timers, the drain timer, and the server tokens
+use different clocks and rounded millisecond fields; repeated negative
+residuals are instrumentation evidence, not zero transport cost):
 
 ```
-upstream-of-DO = max(0, p - finalDrainMs - srv)
-server residual = max(0, srv - env - acct - ssc - cm - mir - rsp)
+upstream-of-DO = p - finalDrainMs - srv          (signed; clamp only for display)
+server residual = srv - env - acct - ssc - cm - mir - rsp   (likewise)
 ```
 
 `upstream-of-DO` includes Worker-side auth + epoch D1 lookups and DO dispatch
 as well as network; if it dominates, split it under design 109 (which already
 instruments the auth lane) before concluding anything about transport.
 
-Screening gate (three reproduced first publishes; a screening signal, not a
-distribution): proceed with genesis bulk admission only if `acct` is at least
-50% of `p` or at least 10s p50. If the final drain is instead at least 10s,
-hand the lane to design 111 (continuous eager redemption). If `env` is at
-least 10s, inspect Worker→DO request streaming/body buffering; the small
-request-byte measurement must agree before changing transport. Phase 0 also
-computes the **maximum possible speedup**: the end-to-end and `acct` shares
-that admission can even theoretically recover, which re-grounds the
-performance gates below.
+Screening gate — three reproduced first publishes; every statistic below is
+the **median of the three samples** (a screening signal, not a distribution):
+
+- Proceed with genesis bulk admission iff `median(acct) >= 0.5 * median(p)`
+  **or** `median(acct) >= 10s`.
+- Independently: if `median(finalDrainMs) >= 10s`, the redemption lane
+  proceeds under design 111. Both clauses may pass and both lanes then proceed
+  — they share no mechanism (but see the seam note in `REVIEW-110.md`:
+  commit-request-shape changes from 111 alter this design's premise).
+- If `median(env) >= 10s`, Worker→DO request streaming/body buffering must be
+  investigated and explained first (the small request-byte measurement must
+  agree), before either lane's implementation starts.
+
+Phase 0 also computes the **maximum possible speedup**: the end-to-end and
+`acct` shares that admission can even theoretically recover. From it, fix the
+Phase 0.5 go/no-go threshold **before** the prototype runs (see below).
 
 ### Phase 0.5 — D1 limits and prototype benchmark
 
@@ -531,9 +580,19 @@ Before the design is implementable, measure on a real D1 database:
   sidecar buffer, SHA strings, JSON encodings, and result maps simultaneously
   at 250k refs.
 
-Output: the chunk size, JSON byte cap, and a measured projected `acct`
-improvement. If the projected improvement cannot plausibly meet the gates,
-stop here and record that in this document.
+Output: the chunk size and JSON byte cap (each fixed at ≤ 50% of the measured
+failure boundary), the concrete measurement methods for CPU/heap (named
+Workers observability metrics or rig-harness heap snapshots; if peak heap
+cannot be measured reliably, the caps must instead be justified by an
+analytical worst-case sum of the named retained buffers kept under 50% of the
+128MB isolate limit), and a measured projected `acct` improvement.
+
+**Independent stop rule, fixed before the prototype runs:** the prototype must
+project an `acct` reduction of at least 50% of the Phase-0-measured `acct`
+wall **and** at least 3s absolute at the reproduced 49k workload. Anything
+less: stop, record the numbers in this document, and close the design as a
+measured no-op. The prototype cannot weaken its own gate — the implementation
+gate below is then expressed against this projection, not vice versa.
 
 ### Correctness matrix
 
@@ -542,30 +601,41 @@ Run each with bulk `off`, `shadow`, and `enforce`, and with
 
 1. Genesis at 0, 1, 49,382, approximately 118k, and the protocol maximum refs.
 2. All refs already entitled (the normal pre-drained genesis state); all refs
-   receipt-backed at commit time (drain skipped/failed); mixed; duplicate
-   content collapsing to one ref; missing receipt; bad/expired receipt.
+   receipt-backed at commit time — note this is a **direct-API/fixture
+   variant** with the client drain deliberately bypassed, since a failed
+   `commitSigned` drain never reaches the POST
+   (`src/cli/remote/commits.ts:220-236`); mixed; duplicate content collapsing
+   to one ref; missing receipt; bad/expired receipt.
 3. Missing manifest carrier, missing sidecar carrier, corrupt/truncated/unsorted
    sidecar, descriptor count/bytes mismatch, and oversized refset.
 4. Account quota crossed in the first, middle, and last accounting super-batch
    (receipt-backed variant); retry proves idempotent charge/grant behavior.
 5. `blob_ref_candidates`, active delete intent, mark landing between bulk
-   classification and the authoritative read (asserting the
-   `concurrent_noise` classification), and in-progress account deletion
-   (asserting parity with the current genesis path's behavior).
+   classification and the authoritative read (asserting the `state_moved`
+   classification and that it blocks the gate), a divergence exceeding the
+   re-probe cap (asserting all of it counts as `divergence`), and in-progress
+   account deletion (asserting parity with the current genesis path's
+   behavior).
 6. Parent race (two genesis writers), epoch rotation before admission and before
    CAS, lost success response, and exact retry.
 7. Manifest snapshot raw and zstd, plus a subsequent one-file delta commit, to
-   prove design-84 behavior and delta admission are unchanged.
+   prove design-84 behavior and delta admission are unchanged — including the
+   count and tags of the synthesized `first_commit` fallback emission under
+   delta `shadow`/`enforce`.
 8. Kill switch flipped while requests are in flight; each request uses its
    captured mode and returns an ordinary current-contract result.
-9. Injected bulk failure at the **last** chunk of a maximum-ref request in
-   enforce, proving the fail-closed fallback completes within the resource
-   budget (combined bulk-attempt + full-validator + accounting cost measured).
+9. Injected bulk failure at the **last** chunk of a maximum-ref,
+   **all-receipt-backed** request (the only variant that drives accounting to
+   its 84-super-batch worst case) in enforce, proving the fail-closed fallback
+   completes within the resource budget: combined bulk-attempt statements/
+   subrequests + 82 full-validator subrequests + 85 accounting subrequests
+   (1 plan lookup + 84 super-batches), measured via the existing op.span
+   counters.
 
-Shadow acceptance requires zero non-noise harmful classification divergence
-across every rig case (rig runs GC-quiesced: strict zero of any kind) and the
-production soak. Benign ordering differences are not accepted silently:
-missing lists and `new` sets are normalized to the current deterministic order
+Shadow acceptance requires zero `divergence` and zero unexcused `state_moved`
+events across every rig case (rig runs GC-quiesced: strict zero of every
+class) and the production soak. Benign ordering differences are not accepted
+silently: `missing` and `new` are normalized to the input-order contract
 before comparison.
 
 ### Performance and resource gates
@@ -582,19 +652,23 @@ subrequests at these scales, so improvement bounds cannot be assumed. The
 provisional targets below stand only until then and any revision must record
 its Phase-0/0.5 justification here:
 
-- 49k and ~118k genesis `acct` p50 reduced by at least the Phase-0.5 projected
-  factor, and in no case slower than flag-off;
+- 49k and ~118k genesis `acct` p50 reduced by at least 80% of the Phase-0.5
+  projected reduction (the projection itself already passed the fixed stop
+  rule: ≥50% of measured `acct` and ≥3s absolute at 49k), and in no case
+  slower than flag-off;
 - end-to-end commit-wall p50 improvement consistent with the Phase-0 maximum
   possible speedup (no fixed 2x claim — commit wall contains sidecar,
   manifest, refresh, and pin work this change cannot touch), with no
   regression above 10% in `ssc`, `cm`, or `mir`;
-- maximum-ref request stays within the Worker memory/CPU budget with at least
+- maximum-ref request stays within the named platform limits with at least
   20% headroom **including the injected-failure combined path** (matrix case
-  9); no bulk JSON chunk exceeds its Phase-0.5 cap; total subrequests for the
-  combined path stay under the platform cap with the same headroom;
+  9): the ~1,000-subrequest cap per invocation (the limit that bit gc-phase1,
+  `apps/api/src/gc-phase1.ts:10-12`), the 128MB isolate memory limit, and the
+  Workers CPU budget, each measured by the Phase-0.5-named method; no bulk
+  JSON chunk exceeds its Phase-0.5 cap;
 - subsequent one-file commit p50 changes by no more than 5%;
-- zero non-noise harmful shadow divergences, broken accepted heads, double
-  charges, or missed delete fences.
+- zero `divergence` / unexcused `state_moved` shadow events, broken accepted
+  heads, double charges, or missed delete fences.
 
 Validation is not complete with unit tests. Ship a dev build to the local fleet
 and reproduce a greenfield publish, or run the full `bun run rig` first-publish
