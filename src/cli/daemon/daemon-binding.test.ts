@@ -9,10 +9,10 @@ import {
   readDaemonBinding,
   readDaemonBindingRecord,
   recordDaemonBinding,
-} from "./daemon-control.js";
-import { summarizeActions } from "./daemon.js";
-import type { Action } from "../engine/reconcile.js";
-import type { FileEntry } from "../engine/types.js";
+} from "../daemon-control.js";
+import { summarizeActions } from "../daemon.js";
+import type { Action } from "../../engine/reconcile.js";
+import type { FileEntry } from "../../engine/types.js";
 
 // The stale-daemon incident (v0.5.6): a repeat `rbox setup` re-bound the root to a
 // NEW workspace, but the already-running daemon kept its startup binding and 404'd

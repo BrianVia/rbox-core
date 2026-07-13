@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RboxDaemon } from "./daemon.js";
+import { RboxDaemon } from "../daemon.js";
 
 // The load-bearing §41 invariant: if the live watcher can't start, the daemon must NOT go
 // silently dead — the 60s safety scan + 30m deep scan reconcile loops stay armed so sync

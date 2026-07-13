@@ -120,19 +120,20 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
   test("every production sync caller is a named owner or the sole staging exemption", async () => {
     const cliDir = path.join(sourceRoot, "cli");
     const names = (await fs.readdir(cliDir)).filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"));
+    names.push(path.join("daemon", "daemon.ts"));
     const importers: string[] = [];
     const contents = new Map<string, string>();
     for (const name of names) {
       const source = await fs.readFile(path.join(cliDir, name), "utf8");
       contents.set(name, source);
       if (
-        /from\s+["']\.\/sync\.js["']/.test(source)
+        /from\s+["']\.\.?\/sync\.js["']/.test(source)
         && (/\b(pull|pushManifest|push|sync)\s*\(/.test(source) || /\?\?\s*(pull|push)\)\s*\(/.test(source))
       ) importers.push(name);
     }
     expect(importers.sort()).toEqual([
       "chain-repair.ts",
-      "daemon.ts",
+      "daemon/daemon.ts",
       "export-cmd.ts",
       "ignore-cmd.ts",
       "init-cmd.ts",
@@ -141,7 +142,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       "sync-cmd.ts",
     ]);
 
-    for (const owner of ["chain-repair.ts", "daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "main-dispatch.ts", "recover-cmd.ts", "sync-cmd.ts"]) {
+    for (const owner of ["chain-repair.ts", "daemon/daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "main-dispatch.ts", "recover-cmd.ts", "sync-cmd.ts"]) {
       expect(contents.get(owner), owner).toMatch(/syncMutex|WorkspaceSyncMutex/);
     }
     expect(contents.get("export-cmd.ts")).toMatch(/explicit mutex exemption/);
@@ -156,7 +157,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
   });
 
   test("daemon acquires before consuming want and revalidates stream+nonce", async () => {
-    const source = await fs.readFile(path.join(sourceRoot, "cli", "daemon.ts"), "utf8");
+    const source = await fs.readFile(path.join(sourceRoot, "cli", "daemon", "daemon.ts"), "utf8");
     const acquire = source.indexOf("await this.acquireSyncMutexFn(this.root)");
     const revalidate = source.indexOf("await daemonBindingMatches", acquire);
     const consume = source.indexOf("this.want[op] = false", acquire);

@@ -2,18 +2,18 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../engine/index.js";
-import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
-import { loadActivity, renderShellLine, type DaemonActivity } from "./activity.js";
-import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
-import { RboxDaemon } from "./daemon.js";
-import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "./daemon-control.js";
-import { pull } from "./sync.js";
-import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "./remote.js";
-import { attributeDaemonForStatus, healthLine, progressLabel } from "./status-view.js";
-import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
-import type { WatchOptions, Watcher } from "./watcher.js";
-import { RBOX_VERSION } from "./version.js";
+import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
+import { loadActivity, renderShellLine, type DaemonActivity } from "../activity.js";
+import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { RboxDaemon } from "../daemon.js";
+import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
+import { pull } from "../sync.js";
+import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
+import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
+import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
+import type { WatchOptions, Watcher } from "../watcher.js";
+import { RBOX_VERSION } from "../version.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
 // sync. The load-bearing lifecycle: a pump error records a HALT (the mass-delete

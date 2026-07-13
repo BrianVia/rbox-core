@@ -1,0 +1,111 @@
+import { UNPRUNED_DEADLINE_MS, ManifestChainError } from "../../engine/index.js";
+import type { SuffixInfo } from "../chain-repair.js";
+import { envInt } from "../remote/resilient.js";
+import type { DaemonMutexResult } from "../sync-mutex.js";
+
+export const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
+const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
+export const retrustEnabled = () => process.env.RBOX_WATCHER_RETRUST === "1";
+// Soak-tunable (design 104 §Constants): W / M / K, floored at 1 (envInt clamps).
+export const RETRUST_DROP_WINDOW_MS = envInt("RBOX_WATCHER_RETRUST_W_MS", 10 * 60_000, 1, Number.MAX_SAFE_INTEGER);
+export const RETRUST_FUSE_DROPS = envInt("RBOX_WATCHER_RETRUST_M", 6, 1, Number.MAX_SAFE_INTEGER);
+export const RETRUST_HOLD_MAX_MS = SAFETY_SYNC_MAX_MS;
+export const RETRUST_MIN_QUIET_TICKS = envInt("RBOX_WATCHER_RETRUST_K", 3, 1, Number.MAX_SAFE_INTEGER);
+export const GC_FENCE_RETRY_MS = 6 * 60 * 60_000; // open purge intents live 24–48h; never hot-reupload
+// Infrequent cache-bypassing re-hash (heals mtime+size-stable drift). Intentionally
+// THE SAME constant as the dircache's unpruned deadline (design 85 §3.1 decision 8):
+// the daemon's scheduled unpruned deep scan is exactly the periodic unpruned rebuild
+// the dircache staleness bound relies on, so one knob governs both by design.
+export const DEEP_SCAN_MS = UNPRUNED_DEADLINE_MS;
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_SPREAD_MS = 3_000;
+export const WS_PING_MS = 25_000;
+export const WS_KEEPALIVE_PERSIST_MS = 20_000;
+export const WS_PONG_DEADLINE_DEFAULT_MS = 60_000; // 2 ping intervals (50s) + 10s grace
+export const POLL_BACKSTOP_DEFAULT_MS = 300_000; // 5 min = safety-scan idle cap
+export const ACTIVITY_HEARTBEAT_MS = 30_000;
+export const UPDATE_CHECK_TICK_MS = 60 * 60_000;
+
+/** Stateful daemon policy for automatic chain repair. Exported as a narrow test
+ * seam: the recovery mechanics live in repairChain; this owns only authorship
+ * consent and terminal-head suppression. */
+export class DaemonChainRepairPolicy {
+  private terminalHeadFingerprint = "";
+  private terminalHaltMessage = "";
+
+  constructor(private readonly deviceId: string) {}
+
+  confirmSupersede(suffix: SuffixInfo[]): boolean {
+    return suffix.every((item) => item.deviceId === this.deviceId);
+  }
+
+  assertHeadAllowed(pin: { commitSeq: number; commitHash: string } | undefined): void {
+    if (!pin || !this.terminalHeadFingerprint) return;
+    if (`${pin.commitSeq}:${pin.commitHash}` === this.terminalHeadFingerprint) {
+      throw new Error(this.terminalHaltMessage);
+    }
+  }
+
+  halt(error: ManifestChainError, suffix: SuffixInfo[]): Error {
+    const detail = suffix.map((item) => `${item.seq}:${item.deviceId}`).join(",");
+    const message = `MANIFEST CHAIN HALT [${detail}] ${suffix[0]?.reason ?? error.reason}; run rbox recover`;
+    if (error.head) {
+      this.terminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
+      this.terminalHaltMessage = message;
+    }
+    return new Error(message);
+  }
+
+  clear(): void {
+    this.terminalHeadFingerprint = "";
+    this.terminalHaltMessage = "";
+  }
+}
+
+export type TrustState = "trusted" | "suspect" | "fused";
+export const worseTrust = (a: TrustState, b: TrustState): TrustState => {
+  const rank: Record<TrustState, number> = { trusted: 0, suspect: 1, fused: 2 };
+  return rank[a] >= rank[b] ? a : b;
+};
+
+export function classifyWatcherError(message: string): "transient" | "fatal" {
+  const m = message.toLowerCase();
+  return m.includes("were dropped") || m.includes("must be re-scanned") ? "transient" : "fatal";
+}
+
+export interface Wants {
+  pull: boolean;
+  push: boolean;
+  fullScan: boolean;
+  deepScan: boolean;
+}
+
+/** Contention disposition pin: only a successful acquire authorizes consuming
+ * the queued daemon wakeup. */
+export const daemonConsumesWakeup = (result: DaemonMutexResult): boolean => result.status === "acquired";
+
+/** ± up to 25% jitter (multiplier 0.75–1.25) so a fleet of daemons never aligns its
+ *  ticks/reconnects. `random` injected for deterministic tests. */
+export const jitter = (ms: number, random: () => number = Math.random) => Math.round(ms * (0.75 + random() * 0.5));
+
+/** Reconnect delay (design 105 §5): the FIRST post-close attempt is spread
+ *  uniform(0, RECONNECT_SPREAD_MS) so a deploy's fleet-wide socket close never
+ *  re-handshakes in lockstep; subsequent attempts keep the existing 500ms→30s
+ *  exponential backoff with ±25% jitter. Pure — `random` injected for tests. */
+export function reconnectDelayMs(attempt: number, random: () => number = Math.random): number {
+  if (attempt === 0) return Math.floor(random() * RECONNECT_SPREAD_MS);
+  return jitter(Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt), random);
+}
+
+/**
+ * Next safety-scan delay (design 49), decided when a tick fires. Quiet interval
+ * with a live watcher → double, capped at 5m. Churn, or no live watcher (the
+ * scan is the sync mechanism there), → back to the 60s floor. Pure — the
+ * doubling/cap/reset table is unit-tested without timers.
+ */
+export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean; degradedBackoffEligible?: boolean }): number {
+  if (opts.churned) return SAFETY_SYNC_MS;
+  if (!opts.watcherLive && !opts.degradedBackoffEligible) return SAFETY_SYNC_MS;
+  return Math.min(current * 2, SAFETY_SYNC_MAX_MS);
+}
