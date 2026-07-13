@@ -242,3 +242,46 @@ concurrency harness with full 8 MiB bodies, plus the remote stress cell.
 dev worker, `versions deploy <id>@100%`, record/restore exact active version.
 
 Revision committed as DRAFT v4.
+
+### Round 4 — codex verdict: CHANGES-REQUIRED (2 BLOCKER, 3 MAJOR, 1 MINOR)
+
+Both BLOCKERs were against round-3 machinery and are genuine; both got
+*simpler* fixes than proposed:
+
+**BLOCKER — the 15-min deadline does not bound the open pass's clock age.**
+ADOPTED, with a stronger mechanism than a bigger budget: the pack intent-open
+pass stamps `deleting_at` from a **live clock read taken after observing the
+candidate row** (deliberately unlike `versions.ts::openIntents`' invocation
+`nowMs`), giving `deleting_at > T_mark` directly. The staleness budget is
+demoted to a non-proof-bearing open-skip guard; quiescence ≥ TTL + skew again
+suffices (margin ≈ 12 h). Gate 5b gains an over-deadline-await history.
+Codex's note that `nowMs_exec ≤ T_delete` is the safe direction was verified
+and kept.
+
+**BLOCKER — failed-path self-delete can destroy a concurrently published
+pack.** ADOPTED via codex's first option: the self-delete (a round-3 addition)
+is removed entirely; a losing handler performs no R2 cleanup — orphan bytes
+belong exclusively to the sweeper/pack GC, whose tombstone re-sweep already
+covers reappearance. Release-blocking same-id concurrent-PUT test added.
+
+**MAJOR — finite tombstone grace contradicts the unbounded-late-PUT premise.**
+ADOPTED (durable tombstones): `swept` rows are permanent, growth bounded by
+own-client crash residue, metered in §9, manual admin purge as escape hatch.
+
+**MAJOR — §7.3 executor could bypass the tombstone path for uploading packs.**
+ADOPTED: pack candidacy/intent/execute now scoped to `state='ready'` only;
+the §3 sweeper is the sole owner of `uploading` remnants; and the executor's
+terminal action is uniformly the durable `swept` transition (members +
+candidate deleted, tombstone retained).
+
+**MAJOR — sweeper destructive SQL specified two incompatible ways.** ADOPTED:
+one shape — correlated `pack_members` DELETE + guarded
+`UPDATE packs SET state='swept'` in one db.batch; R2 delete keyed on
+`changes=1` of that UPDATE.
+
+**MINOR — residual wall-clock "no mint while candidacy exists" phrasing.**
+ADOPTED: §3 and gate 5b restated as "no fence read begun after candidacy may
+authorize minting; every authorized receipt's issuedAt precedes T_mark", with
+statement-granularity interleaving tests.
+
+Revision committed as DRAFT v5.

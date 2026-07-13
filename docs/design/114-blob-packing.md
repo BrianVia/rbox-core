@@ -1,6 +1,6 @@
 # 114 — Pack small ciphertext blobs into bandwidth-sized R2 objects
 
-Status: **DRAFT v4** (2026-07-13) — rounds 1-3 of the adversarial review folded
+Status: **DRAFT v5** (2026-07-13) — rounds 1-4 of the adversarial review folded
 (`docs/design/REVIEW-114.md`). Not yet approved; implementation must not begin
 until the loop converges. This is a storage-format and GC-fence design. Field
 baseline: `flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
@@ -354,33 +354,42 @@ and a same-id repair can race (rounds 2–3):
   idempotent branch (round 3): verify inventory + object, run the fence read,
   and mint fresh receipts **without** requiring the transition — a crash
   between `ready` and the response is therefore recoverable;
-- if the ready transition (or the fence read after it) fails, the handler
-  best-effort deletes the R2 object it just wrote before returning
-  `retry_later`, so a request that lost a race does not strand bytes;
+- a handler that loses a race performs **no cleanup of the shared R2 key**
+  (round 4: two same-id retries can both hold `state='uploading'` heartbeats
+  and both PUT the same key; if the loser deleted "its" object after the
+  winner's ready transition, it would destroy published serving bytes — a
+  release-blocking same-id concurrent-PUT test pins this). It just returns
+  `retry_later`; inventoried orphan bytes belong to the sweeper and pack GC
+  exclusively;
 - the sweeper acts only on inventory whose `state='uploading'` and whose
   `created_at` **and** `touched_at` are both past the §7.3 orphan grace, and
   its **destructive statements embed those predicates** (round 3 — a JS
-  pre-select is not the guard): one `db.batch` deletes `pack_members`
-  correlated to a still-eligible parent, then the `packs` row with the same
-  eligibility predicate; the R2 delete runs only if the `packs` DELETE
+  pre-select is not the guard). The exact atomic transition (round 4 — one
+  shape, not two): a single `db.batch` runs (i) `DELETE FROM pack_members`
+  correlated to a still-eligible parent, then (ii)
+  `UPDATE packs SET state='swept' WHERE pack_id=? AND state='uploading' AND
+  created_at<? AND touched_at<?`; the R2 delete runs only if that UPDATE
   reports `changes = 1`. A repair heartbeat therefore either lands first and
   falsifies eligibility, or lands after and fails closed (`changes = 0`);
 - because no platform bound is documented for how late an already-issued R2
-  PUT can land (round 3), the sweeper's `packs` DELETE is actually a
-  transition to a terminal **`state='swept'` tombstone** (members deleted,
-  row retained): a late PUT that recreates `packs/v1/<packId>` after the
-  sweep meets a tombstone on every later path (heartbeat, ready transition,
-  fence read all require non-swept state → fail closed), and the sweeper
-  re-HEADs tombstoned ids on subsequent ticks, re-deleting a reappeared
-  object; the tombstone itself is removed only after the object has been
-  confirmed absent on a later tick past a further grace.
+  PUT can land (round 3), the **`swept` tombstone is durable** (round 4: a
+  finite removal grace would contradict the unbounded-lateness premise it
+  exists for). Every later path — heartbeat, ready transition, ready-verify
+  branch, fence read — requires non-swept state and fails closed against a
+  tombstone; the sweeper re-HEADs tombstoned ids on subsequent ticks and
+  re-deletes any reappeared object. Tombstone growth is bounded in practice
+  by orphaned-pack count (our own clients' crash residue, not
+  attacker-controllable volume beyond ordinary upload abuse controls), is
+  metered (§9), and has a manual admin purge as the operator escape hatch for
+  confirmed-absent ids.
 
 After R2 accepts, one fail-closed D1 fence query checks:
 
 - active logical `gc_candidates` for every member SHA; and
 - **any** `pack_gc_candidates` row for `packId` — marked or opened (§7.3
-  property 1: after the first candidacy, no receipt for this pack is ever
-  minted again).
+  property 1: no fence read begun after a candidacy exists can authorize
+  minting, and every authorized receipt's signed `issuedAt` precedes the wall
+  time the candidacy's mark landed).
 
 If either query fails or finds a fence, return `503 retry_later` and mint no
 receipt. The unreferenced pack object is a safe inventoried orphan for later pack
@@ -705,20 +714,28 @@ never points back into the old condemned pack.
 Pack GC is disabled initially and has its own kill switch. When enabled it is a
 two-pass lease/quiescence executor modeled on existing `gc_candidates`:
 
+- **scope:** pack candidacy, intent, and execution apply to
+  **`packs.state='ready'` only** (round 4). `uploading` remnants are owned
+  exclusively by the §3 sweeper's guarded `uploading→swept` transition — one
+  owner per state, so an uploading pack can never take a non-tombstone
+  deletion path and later receive the late PUT the tombstone exists to
+  contain. `swept` packs are terminal and only re-HEAD-swept;
 - **mark:** only after `NOT EXISTS (SELECT 1 FROM blob_locations WHERE
   pack_id=?)` and an orphan grace of at least **13 hours** after `created_at`.
-  A live member pins the pack indefinitely. Both `uploading` crash remnants and
-  `ready` packs with no redeemed members use this same grace—there is no faster
-  unsafe orphan path. The grace exists so a mark cannot race the *original*
-  upload's redemption window; it is deliberately **not** the receipt-expiry
-  argument (round 1: same-id retries re-mint receipts with a fresh 12-hour TTL,
-  so no `created_at`-anchored window bounds the last valid receipt);
+  A live member pins the pack indefinitely. There is no faster unsafe orphan
+  path. The grace exists so a mark cannot race the *original* upload's
+  redemption window; it is deliberately **not** the receipt-expiry argument
+  (round 1: same-id retries re-mint receipts with a fresh 12-hour TTL, so no
+  `created_at`-anchored window bounds the last valid receipt);
 - **open intent:** after pack grace, atomically set `deleting_at` only if the
-  same zero-active-location predicate still holds;
+  same zero-active-location predicate still holds — stamped from the post-read
+  live clock (property 3 below), unlike `versions.ts::openIntents`;
 - **execute:** under an unexpired purge lease and intent quiescence, recompute
-  and require zero active locations again, then delete `packs/v1/<packId>`, HEAD
-  to confirm absence, and finally delete `pack_members`, `packs`, and the pack
-  candidate;
+  and require zero active locations again, then delete `packs/v1/<packId>`,
+  HEAD to confirm absence, and finally delete `pack_members` and the pack
+  candidate and transition `packs` to the durable **`swept` tombstone** (round
+  4: uniform terminal state — a late same-id write reappearing after physical
+  deletion meets the same tombstone re-sweep as an uploading remnant);
 - **unwind:** any active location or failed delete/HEAD clears or leaves the
   physical intent safely for retry; it never guesses success.
 
@@ -744,33 +761,36 @@ enforced properties (round 1 restated this from a hand-wave into an invariant):
    location install into a pack with an open intent, and a pre-intent install
    makes the intent-open predicate false — either way an await-sized race
    cannot thread between them.
-3. **Quiescence dominates receipt lifetime plus clock staleness, per candidacy
-   epoch — `PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS +
-   GC_CLOCK_STALENESS_BUDGET`.** A candidacy can be resurrected away (the §5
+3. **Quiescence dominates receipt lifetime, per candidacy epoch —
+   `PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS` — anchored by a
+   post-read intent clock.** A candidacy can be resurrected away (the §5
    resurrect arm removes an unopened candidate when the pack regains
    locations), after which minting legitimately resumes — so "never minted
    again after the first candidacy" is false and is not the invariant (round
    2). The invariant is **per candidacy epoch**: the candidacy that reaches
    delete existed continuously from its mark through the delete (intent-open
-   re-checks, and the executor deletes the row only at the end), so by
-   property 1 every valid receipt for `P` has `issuedAt < T_mark`, the wall
-   time this epoch's mark landed. The wall-clock chain (round 3 — JS
-   timestamps are stale by up to their invocation's age, so staleness must be
-   budgeted, not assumed away):
-   - `deleting_at` is the open pass's invocation-start clock; the open pass
-     observed the mark row, so `deleting_at ≥ T_mark − S` where `S` bounds one
-     GC invocation's age (the executor runs under a hard wall deadline — 15
-     minutes today, `versions.ts::gcPurge` — so `S = 1 h` is a ≥4x-margin
-     budget, compile-asserted against the deadline constant);
-   - the execute pass requires `nowMs_exec − deleting_at > quiescence` and
-     `nowMs_exec ≤ T_delete`, hence
-     `T_delete > T_mark − S + quiescence`;
+   re-checks, and the executor retires the row only at the end), so by
+   property 1 every receipt whose fence read passed has `issuedAt < T_mark`,
+   the wall time this epoch's mark landed. The wall-clock chain must not lean
+   on invocation-start timestamps (round 3), and an invocation-start clock is
+   not even bounded by the executor deadline at intent-open time (round 4 —
+   `gcPurge` can await long R2 work between capturing `nowMs` and opening
+   intents). The pack open pass therefore differs from
+   `versions.ts::openIntents` in one deliberate way: it stamps `deleting_at`
+   from a **live clock read taken after it observed the candidate row**, not
+   from the invocation-start `nowMs`. That gives `deleting_at > T_mark`
+   directly — no staleness budget carries proof weight. The chain:
+   - `deleting_at > T_mark` (post-read stamp, above);
+   - the execute pass requires `nowMs_exec − deleting_at > quiescence` with
+     `nowMs_exec ≤ T_delete` (an invocation-start execute clock only *delays*
+     eligibility — the safe direction), hence `T_delete > T_mark + quiescence`;
    - every valid receipt expires by `issuedAt + TTL + skew < T_mark + TTL +
-     skew`, so with `quiescence ≥ TTL + skew + S` no unexpired receipt exists
-     at the delete or at the terminal candidate-row removal.
-   With 24 h quiescence, 12 h TTL, 60 s skew, and `S = 1 h` the margin is
-   ≈ 11 h. The constant relation is compile/test-asserted; gate 5b injects
-   stale invocation clocks to exercise it.
+     skew`, so `quiescence ≥ TTL + skew` suffices: no unexpired receipt exists
+     at the delete or at the terminal tombstone transition.
+   With 24 h quiescence against 12 h + 60 s the margin is ≈ 12 h. As
+   defense-in-depth (not proof-bearing), the open pass also skips opening when
+   `clock() − nowMs` exceeds a staleness guard, and gate 5b includes an
+   over-deadline-await history. The constant relation is compile/test-asserted.
 
 The deletion proof is conservative, and case-complete over how a pack reaches
 zero active locations (round 1: the previous single-case proof omitted two
@@ -858,7 +878,9 @@ Add only numeric and low-cardinality fields:
 - reads: canonical vs packed counts, R2 range count, requested vs covering-range
   bytes, outcome enum;
 - GC: logical packed locations retired, packs marked/opened/deleted/unwound,
-  pinned pack count and aggregate pinned bytes.
+  pinned pack count and aggregate pinned bytes, durable `swept` tombstone
+  count, and reappeared-object re-deletes (a nonzero value proves the late-PUT
+  containment fired).
 
 No raw paths, SHAs, pack IDs, account/workspace/device IDs, path hashes, or
 member-order fingerprints enter metrics or logs. Debug output follows the same
@@ -993,18 +1015,19 @@ canonical and packed locations. At every injected await/crash boundary assert:
    to `needsUpload` or leaves a live location—never partial publication;
 5. pack intent vs packed receipt/location install is D1-serialized by the
    `rbox_delete_fence_pack` trigger;
-5b. while any `pack_gc_candidates` row exists for a pack, no receipt for that
-   pack is minted (same-id retry included); every signed `issuedAt` anchored by
-   a passing fence read precedes the wall time the current candidacy's mark
-   landed; and every such receipt is expired before that candidacy's delete
-   step can run (`PACK_INTENT_QUIESCENCE ≥ RECEIPT_TTL_MS + CLOCK_SKEW_MS +
-   GC_CLOCK_STALENESS_BUDGET`, asserted at compile/test time against the
-   executor deadline) — exercised with clock-injected histories covering:
-   mint→mark→retry-mint (must fail); pre-mark install→resurrect→retry-mint
-   (must succeed)→last-location-delete→fresh mark→delete with quiescence
-   restarted from the NEW intent; **stale invocation clocks** (mark/open passes
-   whose `nowMs` lags their statements' landing by up to the deadline); and
-   installs attempted at every await boundary;
+5b. no fence read begun after a candidacy exists authorizes minting (same-id
+   retry included); every authorized receipt's signed `issuedAt` precedes the
+   wall time the current candidacy's mark landed; `deleting_at` exceeds that
+   mark's landing time (post-read stamp); and every such receipt is expired
+   before that candidacy's delete step can run (`PACK_INTENT_QUIESCENCE ≥
+   RECEIPT_TTL_MS + CLOCK_SKEW_MS`, compile/test-asserted) — exercised with
+   clock-injected histories covering: mint-vs-mark interleavings at statement
+   granularity (a fence read that passed before the mark landed may complete
+   its HMAC after — must still satisfy the issuedAt bound); pre-mark
+   install→resurrect→retry-mint (must succeed)→last-location-delete→fresh
+   mark→delete with quiescence restarted from the NEW intent; an
+   **over-deadline await between invocation start and intent-open** (round 4);
+   and installs attempted at every await boundary;
 6. re-add before logical retirement preserves the old location; re-add after
    retirement installs a fresh canonical/new-pack location and cannot resurrect
    the condemned pack;
