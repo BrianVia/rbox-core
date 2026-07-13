@@ -83,6 +83,11 @@ function r2Object(bytes: Uint8Array): R2ObjectBody {
   } as R2ObjectBody;
 }
 
+const emptyPlacementDb = () => {
+  const statement = { bind: () => statement };
+  return { prepare: () => statement, batch: async (stmts: unknown[]) => stmts.map(() => ({ results: [] })) } as unknown as D1Database;
+};
+
 function fakePutEnv(opts: {
   throwSha?: string;
   metrics?: Array<{ blobs: string[]; doubles: number[] }>;
@@ -257,7 +262,7 @@ describe("POST /v1/blob-batch/get", () => {
     const waits = new Map(shas.map((s) => [s, deferred<R2ObjectBody | null>()]));
     const started: string[] = [];
     const fakeEnv = {
-      rbox_dev_db: {},
+      rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
         get: (key: string) => {
           const s = key.slice(-64);
@@ -272,12 +277,15 @@ describe("POST /v1/blob-batch/get", () => {
       "acct_parallel",
     );
     const body = decodeFrames(res);
-    await Promise.resolve();
-    expect(started).toEqual(shas);
     // Yield between resolutions: once several results are settled at race time
     // the drain legitimately proceeds in array order, so completion order is
     // only observable when completions are actually spaced out.
     const settle = () => new Promise((r) => setTimeout(r, 0));
+    // A macrotask (not one microtask): the §114 placement lookup awaits D1
+    // before the fan-out starts; all R2 gets must still begin before ANY body
+    // resolves — the parallelism property under test is unchanged.
+    await settle();
+    expect(started).toEqual(shas);
     waits.get(shas[1]!)!.resolve(r2Object(new TextEncoder().encode("two")));
     await settle();
     waits.get(shas[2]!)!.resolve(null);
@@ -292,7 +300,7 @@ describe("POST /v1/blob-batch/get", () => {
     const s = sha("r2-error");
     let calls = 0;
     const fakeEnv = {
-      rbox_dev_db: {},
+      rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
         get: () => {
           calls++;
@@ -309,7 +317,7 @@ describe("POST /v1/blob-batch/get", () => {
   test("oversized objects emit too_large without reading the object body", async () => {
     const s = sha("too-large");
     const fakeEnv = {
-      rbox_dev_db: {},
+      rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
         get: () =>
           ({

@@ -11,6 +11,7 @@
 import type { Env } from "./env.js";
 import { verifyReceipt } from "./receipts.js";
 import { isOverCapAbort } from "./auth.js";
+import { resolvePackPlacements, type PackPlacement } from "./blob-pack.js";
 
 export function isDeleteFenceAbort(e: unknown): boolean {
   return e instanceof Error && e.message.includes("rbox_delete_fence");
@@ -19,6 +20,7 @@ export function isDeleteFenceAbort(e: unknown): boolean {
 export interface RefWithSize {
   sha: string;
   size: number;
+  pack?: PackPlacement;
 }
 
 // D1: ≤100 bound params / statement. The grant INSERT binds (account_id, sha256)
@@ -35,7 +37,9 @@ export const MAX_REFS_PER_TXN = 3_000;
 // Validate IN-list SELECTs (≤90 refs each) grouped per db.batch() — one subrequest per group.
 export const VALIDATE_IN_LIST_CHUNK = 90;
 export const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / VALIDATE_IN_LIST_CHUNK); // ~34
-export const ACCOUNTING_STATEMENTS_PER_CHUNK = 5;
+// Worst mixed chunk: 5 logical-accounting statements + 3 pack-location
+// subchunks (ceil(33/13)) + 1 canonical-location delete.
+export const ACCOUNTING_STATEMENTS_PER_CHUNK = 9;
 // §71: hard sanity reject on the ACCOUNTED ref set in one commit. For sidecar commits the
 // signed descriptor's data-ref count is not the full accounting set: encManifestSha and
 // sidecarSha are charged/granted too. Keep the carrier count named so a future carrier changes
@@ -102,7 +106,7 @@ export async function validateCommitRefs(
     for (const r of results) for (const row of r.results ?? []) have.add(row.sha256);
   }
 
-  const newRefs: RefWithSize[] = [];
+  const verified: Array<{ sha: string; size: number; packId?: string }> = [];
   const needsUpload: string[] = [];
   for (const sha of shas) {
     if (have.has(sha)) continue;
@@ -113,7 +117,19 @@ export async function validateCommitRefs(
     }
     const v = await verifyReceipt(env, r, { accountId, encSha: sha, nowMs });
     if (!v.ok) needsUpload.push(sha);
-    else newRefs.push({ sha, size: v.size });
+    else verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
+  }
+  const wanted = verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []);
+  const placements = await resolvePackPlacements(db, wanted);
+  const newRefs: RefWithSize[] = [];
+  for (const ref of verified) {
+    if (!ref.packId) {
+      newRefs.push({ sha: ref.sha, size: ref.size });
+      continue;
+    }
+    const pack = placements.get(ref.sha);
+    if (!pack || pack.packId !== ref.packId) needsUpload.push(ref.sha);
+    else newRefs.push({ sha: ref.sha, size: ref.size, pack });
   }
   if (needsUpload.length > 0) return { ok: false, needsUpload };
   return { ok: true, newRefs };
@@ -190,6 +206,29 @@ export async function commitAccounting(
       // purge (its candidate row is gone). The dedup path bumps `granted_at` here too via
       // the ON CONFLICT UPDATE above, but `granted_at` is NOT the barrier — the marker is.
       stmts.push(db.prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${inList})`).bind(accountId, ...shas));
+
+      const packed = c.filter((ref): ref is RefWithSize & { pack: PackPlacement } => ref.pack !== undefined);
+      for (const locations of chunk(packed, 13)) {
+        stmts.push(
+          db
+            .prepare(
+              `INSERT INTO blob_locations (sha256, storage, pack_id, offset, length, pack_sha256, installed_at)
+               VALUES ${locations.map(() => "(?,'pack',?,?,?,?,?)").join(",")}
+               ON CONFLICT(sha256) DO UPDATE SET
+                 pack_id=excluded.pack_id, offset=excluded.offset, length=excluded.length,
+                 pack_sha256=excluded.pack_sha256, installed_at=excluded.installed_at`,
+            )
+            .bind(...locations.flatMap((ref) => [ref.sha, ref.pack.packId, ref.pack.offset, ref.pack.length, ref.pack.packSha256, nowMs])),
+        );
+      }
+      const canonical = c.filter((ref) => ref.pack === undefined).map((ref) => ref.sha);
+      if (canonical.length > 0) {
+        stmts.push(
+          db
+            .prepare(`DELETE FROM blob_locations WHERE sha256 IN (${canonical.map(() => "?").join(",")})`)
+            .bind(...canonical),
+        );
+      }
     }
 
     try {

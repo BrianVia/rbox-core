@@ -4,7 +4,9 @@ import { readBodyCapped, readBytesCapped } from "./commit-envelope.js";
 import { emit, startOp, type Op } from "./metrics.js";
 import { uploadGrantsEnabled } from "./grants.js";
 import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
-import { blobKey, json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
+import { blobKey, json, logErr, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
+import { dbFor } from "./db.js";
+import { packedLocations, packKey, readPackedExtent, type PackedLocation } from "./blob-pack.js";
 
 // Wire twin: src/cli/remote/blob-batch/wire.ts — the framing constants, codec,
 // and over-cap { error: "too_many_records", max } response are duplicated per
@@ -26,6 +28,55 @@ type BatchStatus = "missing" | "too_large" | "error";
 type BatchResult =
   | { sha: string; kind: "object"; size: number; bytes: ArrayBuffer }
   | { sha: string; kind: "status"; status: BatchStatus; code?: string; size?: number };
+
+export interface PackReadExtent extends PackedLocation {
+  sha: string;
+}
+
+export interface PackReadPlan {
+  packId: string;
+  offset: number;
+  length: number;
+  extents: PackReadExtent[];
+  coalesced: boolean;
+}
+
+/** Pure global fetch-budget planner. Exact extents are always safe because the
+ * request admits at most 32 × 256 KiB of logical payload; only gap bytes need
+ * the separate budget decision. */
+export function planPackReads(
+  extents: PackReadExtent[],
+  budgets: { fetchBytes: number; maxFetchBytes: number },
+): PackReadPlan[] {
+  const groups = new Map<string, PackReadExtent[]>();
+  for (const extent of extents) {
+    const group = groups.get(extent.pack_id);
+    if (group) group.push(extent);
+    else groups.set(extent.pack_id, [extent]);
+  }
+  const plans: PackReadPlan[] = [];
+  // Reserve every exact member before spending budget on gap bytes. Without
+  // this baseline, an early coalesced pack can consume space required by a
+  // later pack's unavoidable exact reads.
+  let used = budgets.fetchBytes + extents.reduce((sum, extent) => sum + extent.length, 0);
+  for (const [packId, members] of groups) {
+    members.sort((a, b) => a.offset - b.offset || a.sha.localeCompare(b.sha));
+    const start = members[0]!.offset;
+    const end = Math.max(...members.map((member) => member.offset + member.length));
+    const coveringBytes = end - start;
+    const exactBytes = members.reduce((sum, member) => sum + member.length, 0);
+    const gapBytes = coveringBytes - exactBytes;
+    if (used + gapBytes <= budgets.maxFetchBytes) {
+      plans.push({ packId, offset: start, length: coveringBytes, extents: members, coalesced: true });
+      used += gapBytes;
+    } else {
+      for (const member of members) {
+        plans.push({ packId, offset: member.offset, length: member.length, extents: [member], coalesced: false });
+      }
+    }
+  }
+  return plans;
+}
 type BatchPutError = "sha_mismatch" | "too_large" | "r2_error";
 type BatchPutResult =
   | { sha256: string; ok: true; sizeBytes: number; receipt: string }
@@ -231,9 +282,10 @@ function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPre
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        const results = opts.grantPreauth ? shas.map((sha) => fetchObject(op, sha)) : await authenticatedResults(op, shas, opts.accountId);
+        const results = await authenticatedResults(op, shas, opts.accountId, opts.grantPreauth === true);
         const pending = [...results];
         let dataBytes = 0;
+        let packError = false;
         while (pending.length) {
           const indexed = pending.map((promise, index) => promise.then((result) => ({ index, result })));
           const { index, result } = await Promise.race(indexed);
@@ -248,10 +300,11 @@ function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPre
             dataBytes += result.size;
             payloadBytes += result.size;
           } else {
+            if (result.code === "pack") packError = true;
             payloadBytes += enqueueStatus(controller, result.sha, result.status, { code: result.code, size: result.size });
           }
         }
-        op.done(outcome, { count: shas.length, bytes: payloadBytes });
+        op.done(packError ? "pack_extent_error" : outcome, { count: shas.length, bytes: payloadBytes });
         controller.close();
       } catch (e) {
         op.done("error", { count: shas.length, bytes: payloadBytes });
@@ -261,9 +314,72 @@ function streamBatch(op: Op, shas: string[], opts: { accountId: string; grantPre
   });
 }
 
-async function authenticatedResults(op: Op, shas: string[], accountId: string): Promise<Array<Promise<BatchResult>>> {
-  const entitlements = await Promise.all(shas.map((sha) => isEntitled(op.env, accountId, sha).then((ok) => ({ sha, ok }))));
-  return entitlements.map(({ sha, ok }) => (ok ? fetchObject(op, sha) : Promise.resolve({ sha, kind: "status", status: "missing" })));
+async function authenticatedResults(op: Op, shas: string[], accountId: string, grantPreauth: boolean): Promise<Array<Promise<BatchResult>>> {
+  const authorized = grantPreauth
+    ? shas.map((sha) => ({ sha, ok: true }))
+    : await Promise.all(shas.map((sha) => isEntitled(op.env, accountId, sha).then((ok) => ({ sha, ok }))));
+  const authorizedShas = authorized.filter(({ ok }) => ok).map(({ sha }) => sha);
+  // Authorization is deliberately complete before this placement read.
+  const locations = await packedLocations(dbFor(op.env, accountId), authorizedShas);
+  const packed = authorizedShas.flatMap((sha) => {
+    const loc = locations.get(sha);
+    return loc ? [{ sha, ...loc }] : [];
+  });
+  const canonicalCount = authorizedShas.length - packed.length;
+  // Canonical object sizes are only known after R2 responds. Reserve their
+  // maximum admitted size when deciding whether gap-byte coalescing is safe;
+  // this is conservative and leaves the existing canonical fan-out unchanged.
+  const plans = planPackReads(packed, {
+    fetchBytes: canonicalCount * MAX_BATCH_RECORD_BYTES,
+    maxFetchBytes: MAX_BATCH_BODY_BYTES,
+  });
+  const packedResults = new Map<string, Promise<BatchResult>>();
+  for (const plan of plans) {
+    const read = fetchPackPlan(op, plan);
+    for (const extent of plan.extents) {
+      packedResults.set(extent.sha, read.then((results) => results.get(extent.sha)!));
+    }
+  }
+  return authorized.map(({ sha, ok }) => {
+    if (!ok) return Promise.resolve({ sha, kind: "status", status: "missing" });
+    return packedResults.get(sha) ?? fetchObject(op, sha);
+  });
+}
+
+async function fetchPackPlan(op: Op, plan: PackReadPlan): Promise<Map<string, BatchResult>> {
+  const out = new Map<string, BatchResult>();
+  if (!plan.coalesced) {
+    const extent = plan.extents[0]!;
+    const bytes = await readPackedExtent(op, op.env, extent.sha, extent);
+    out.set(extent.sha, bytes
+      ? { sha: extent.sha, kind: "object", size: bytes.byteLength, bytes: bytes.buffer as ArrayBuffer }
+      : { sha: extent.sha, kind: "status", status: "error", code: "pack" });
+    return out;
+  }
+  try {
+    const object = await op.span.r2(() =>
+      op.env.rbox_dev_blobs.get(packKey(plan.packId), { range: { offset: plan.offset, length: plan.length } }),
+    );
+    if (!object) throw new Error("missing pack range");
+    const covering = new Uint8Array(await object.arrayBuffer());
+    if (covering.byteLength !== plan.length) throw new Error("short pack range");
+    let invalid = false;
+    await Promise.all(plan.extents.map(async (extent) => {
+      const start = extent.offset - plan.offset;
+      const bytes = covering.slice(start, start + extent.length);
+      if (bytes.byteLength !== extent.length || (await sha256Hex(bytes)) !== extent.sha) {
+        invalid = true;
+        out.set(extent.sha, { sha: extent.sha, kind: "status", status: "error", code: "pack" });
+      } else {
+        out.set(extent.sha, { sha: extent.sha, kind: "object", size: bytes.byteLength, bytes: bytes.buffer as ArrayBuffer });
+      }
+    }));
+    if (invalid) logErr("pack_extent_error", new Error("invalid pack extent"));
+  } catch (e) {
+    logErr("pack_extent_error", e);
+    for (const extent of plan.extents) out.set(extent.sha, { sha: extent.sha, kind: "status", status: "error", code: "pack" });
+  }
+  return out;
 }
 
 async function fetchObject(op: Op, sha: string): Promise<BatchResult> {

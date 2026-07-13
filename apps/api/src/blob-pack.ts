@@ -9,10 +9,11 @@ import {
 import { readBytesCapped } from "./commit-envelope.js";
 import { wouldExceedCapAggregate } from "./billing.js";
 import { dbFor } from "./db.js";
+import { batchedInLookup } from "./d1-batch.js";
 import { emit, startOp, type Op } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
-import { usesReceipts } from "./blobs.js";
-import { json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
+import { usesReceipts } from "./blob-protocol.js";
+import { json, logErr, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
 export const PACK_ORPHAN_GRACE_MS = 13 * 3600_000;
 const INVENTORY_ROWS_PER_STATEMENT = 24; // 24*4 + 2 = 98 bound params, under D1's 100
@@ -23,6 +24,103 @@ const TOMBSTONE_CURSOR_KEY = "pack_tombstone_cursor";
 export const packKey = (packId: string): string => `packs/v1/${packId}`;
 export const packAcceptEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_ACCEPT === "1";
 export const packGcEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_GC === "1";
+
+export interface PackedLocation {
+  pack_id: string;
+  offset: number;
+  length: number;
+}
+
+export interface PackPlacement {
+  packId: string;
+  offset: number;
+  length: number;
+  packSha256: string;
+}
+
+export async function packedLocation(db: D1Database, sha: string): Promise<PackedLocation | null> {
+  return db
+    .prepare("SELECT pack_id, offset, length FROM blob_locations WHERE sha256 = ?")
+    .bind(sha)
+    .first<PackedLocation>();
+}
+
+export async function packedLocations(db: D1Database, shas: string[]): Promise<Map<string, PackedLocation>> {
+  const out = new Map<string, PackedLocation>();
+  await batchedInLookup<PackedLocation & { sha256: string }>(
+    db,
+    shas,
+    (chunk) =>
+      db
+        .prepare(`SELECT sha256, pack_id, offset, length FROM blob_locations WHERE sha256 IN (${chunk.map(() => "?").join(",")})`)
+        .bind(...chunk),
+    (rows) => {
+      for (const row of rows) out.set(row.sha256, { pack_id: row.pack_id, offset: Number(row.offset), length: Number(row.length) });
+    },
+  );
+  return out;
+}
+
+/** Resolve authenticated pack intent through immutable, ready inventory. */
+export async function resolvePackPlacements(
+  db: D1Database,
+  wanted: Array<{ sha: string; packId: string }>,
+): Promise<Map<string, PackPlacement>> {
+  const byPack = new Map<string, string[]>();
+  for (const { sha, packId } of wanted) {
+    const shas = byPack.get(packId);
+    if (shas) shas.push(sha);
+    else byPack.set(packId, [sha]);
+  }
+  const out = new Map<string, PackPlacement>();
+  const statements: D1PreparedStatement[] = [];
+  for (const [packId, shas] of byPack) {
+    for (let i = 0; i < shas.length; i += 80) {
+      const chunk = shas.slice(i, i + 80);
+      statements.push(
+        db
+          .prepare(
+            `SELECT m.sha256, m.offset, m.length, p.pack_sha256, m.pack_id
+             FROM pack_members m JOIN packs p ON p.pack_id = m.pack_id
+             WHERE m.pack_id = ? AND p.state = 'ready' AND m.sha256 IN (${chunk.map(() => "?").join(",")})`,
+          )
+          .bind(packId, ...chunk),
+      );
+    }
+  }
+  // Match d1-batch's bounded statement groups while allowing chunks for many
+  // different packs to share one D1 subrequest.
+  for (let i = 0; i < statements.length; i += 34) {
+    const results = await db.batch<{ sha256: string; offset: number; length: number; pack_sha256: string; pack_id: string }>(statements.slice(i, i + 34));
+    for (const result of results) {
+      for (const row of result.results ?? []) {
+          out.set(row.sha256, {
+            packId: row.pack_id,
+            offset: Number(row.offset),
+            length: Number(row.length),
+            packSha256: row.pack_sha256,
+          });
+      }
+    }
+  }
+  return out;
+}
+
+export async function readPackedExtent(op: Op, env: Env, sha: string, loc: PackedLocation): Promise<Uint8Array | null> {
+  try {
+    const object = await op.span.r2(() =>
+      env.rbox_dev_blobs.get(packKey(loc.pack_id), { range: { offset: loc.offset, length: loc.length } }),
+    );
+    if (!object) throw new Error("missing pack extent");
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    if (bytes.byteLength !== loc.length || (await sha256Hex(bytes)) !== sha) throw new Error("invalid pack extent");
+    return bytes;
+  } catch (e) {
+    logErr("pack_extent_error", e);
+    emit(env, { op: "blob.packExtent", outcome: "pack_extent_error" });
+    return null;
+  }
+}
 
 interface PackRow {
   pack_id: string;

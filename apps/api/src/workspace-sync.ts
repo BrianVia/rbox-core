@@ -16,6 +16,7 @@ import { batchedInLookup } from "./d1-batch.js";
 import { refsetShas } from "../../../src/engine/refset.js";
 import { readManifestChain } from "../../../src/engine/manifest-chain.js";
 import { verifyReceipt } from "./receipts.js";
+import { resolvePackPlacements } from "./blob-pack.js";
 import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
@@ -877,7 +878,7 @@ export class WorkspaceSync {
     const precheckStartedAt = performance.now();
     const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
     const precheckMs = performance.now() - precheckStartedAt;
-    const newRefs: RefWithSize[] = [];
+    const verified: Array<{ sha: string; size: number; packId?: string }> = [];
     let alreadyEntitled = 0;
     let rejected = 0;
     const verifyStartedAt = performance.now();
@@ -895,7 +896,21 @@ export class WorkspaceSync {
         rejected++;
         continue;
       }
-      newRefs.push({ sha, size: v.size });
+      verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
+    }
+    const placements = await resolvePackPlacements(
+      db,
+      verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []),
+    );
+    const newRefs: RefWithSize[] = [];
+    for (const ref of verified) {
+      if (!ref.packId) {
+        newRefs.push({ sha: ref.sha, size: ref.size });
+        continue;
+      }
+      const pack = placements.get(ref.sha);
+      if (!pack || pack.packId !== ref.packId) rejected++;
+      else newRefs.push({ sha: ref.sha, size: ref.size, pack });
     }
     const verifyMs = performance.now() - verifyStartedAt;
 
