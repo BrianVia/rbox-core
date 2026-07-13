@@ -338,7 +338,9 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
         body: JSON.stringify({ shas: [staged.sha] }),
       });
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ missing: [staged.sha] });
+      // §109: the receipts-mode response also carries an uploadGrant; the missing
+      // steering must be identical in both modes.
+      expect(((await res.json()) as { missing: string[] }).missing).toEqual([staged.sha]);
     }
   });
 });

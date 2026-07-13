@@ -16,6 +16,9 @@ export interface RouteCtx {
   exports: WorkerEntrypointExports;
   url: URL;
   seg: string[];
+  /** §109 grant verdict computed pre-auth in worker.ts and consumed by the
+   *  bearer-path batch PUT for its auth AE event and echo header. */
+  batchPutAuthFallback?: "fallback_missing" | "fallback_invalid" | "fallback_expired";
 }
 
 export function eq(a: string[], b: string[]): boolean {

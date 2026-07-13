@@ -62,6 +62,9 @@ export interface Env {
   RBOX_WS_MAX_SESSION_MS?: string;
   /** Design 112 blob-batch PUT record cap: default 32, candidate 64; set 32 to kill-switch. */
   RBOX_BLOB_BATCH_MAX_RECORDS?: string;
+  /** Design 109 kill switch: unset/anything other than "0" mints and accepts
+   *  upload grants (default on); "0" preserves the pure bearer path. */
+  RBOX_AUTH_GRANT?: string;
   /** Design 111 per-request receipt-redeem entry cap. Unset/invalid defaults to
    *  5,000; positive integers clamp to [1, 15,000]. The independent 8 MiB
    *  request-body cap is unchanged. Rollback = unset; clients clamp down after

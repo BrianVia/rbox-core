@@ -16,6 +16,7 @@ request latency, never throws into the request path, no-op when the binding is a
 | `commit` | `workspace-sync.ts` DO | latency, body size, blobs/commit, missingBlobs ratio |
 | `blob.put` | `blobs.ts` | R2 store time, D1 time, blob size |
 | `blob.get` | `blobs.ts` | D1 entitlement time, R2 open time, blob size |
+| `blob.batchPut.auth` | `blob-batch.ts` | upload authentication path outcome (`fast_path`, `fallback_missing`, `fallback_invalid`, or `fallback_expired`) |
 | `multipart.part` | `blobs.ts` | per-part R2 upload time, part size |
 | `multipart.complete` | `blobs.ts` | full op time (incl. cleanup), R2 + D1 split, final size, part count, completion total/assemble/reread/cleanup decomposition |
 

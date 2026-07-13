@@ -237,15 +237,19 @@ export function uploadActiveOverlapMs(start: number, end: number): number {
     : 0;
   return closed + open;
 }
-export function firstPublishAuthStart(): number {
-  if (!firstPublishTiming.enabled) return 0;
-  const t = performance.now();
-  firstPublishTiming.stats.authCallCount++;
-  if (!firstPublishTiming.authStartedAt) firstPublishTiming.authStartedAt = t;
-  return t;
+/** Start a batch-PUT timing span; auth classification is unknown until settle. */
+export function firstPublishAuthDispatchStart(): number {
+  return firstPublishTiming.enabled ? performance.now() : 0;
 }
-export function firstPublishAuthEnd(): void {
-  if (firstPublishTiming.enabled) firstPublishTiming.authEndedAt = performance.now();
+/** authn counts settle-classified bearer-path batch PUTs from the server echo.
+ *  A missing echo or thrown fetch is classified bearer by the caller. */
+export function firstPublishAuthSettle(startT: number, path: "grant" | "bearer"): void {
+  if (!firstPublishTiming.enabled || path === "grant") return;
+  firstPublishTiming.stats.authCallCount++;
+  firstPublishTiming.authStartedAt = firstPublishTiming.authStartedAt
+    ? Math.min(firstPublishTiming.authStartedAt, startT)
+    : startT;
+  firstPublishTiming.authEndedAt = Math.max(firstPublishTiming.authEndedAt, performance.now());
 }
 export function finishFirstPublishStats(): FirstPublishStats | undefined {
   if (!firstPublishTiming.enabled) return undefined;

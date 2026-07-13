@@ -3,8 +3,8 @@ import { PhaseReport } from "./phase-report.js";
 import {
   beginFirstPublishTiming,
   finishFirstPublishStats,
-  firstPublishAuthEnd,
-  firstPublishAuthStart,
+  firstPublishAuthDispatchStart,
+  firstPublishAuthSettle,
   firstPublishReady,
   firstPublishTiming,
   firstPublishUploadEnd,
@@ -127,8 +127,7 @@ describe("FirstPublishStats", () => {
     beginFirstPublishTiming(true);
     firstPublishReady(123, "a".repeat(64));
     firstPublishUploadStart();
-    firstPublishAuthStart();
-    firstPublishAuthEnd();
+    firstPublishAuthSettle(firstPublishAuthDispatchStart(), "bearer");
     firstPublishUploadEnd();
     firstPublishTiming.stats.encryptWallMs = 2;
     firstPublishTiming.stats.missingCheckWallMs = 3;

@@ -20,8 +20,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { AccountDeleteMessage, DeviceNotifyMessage, Env, WorkerEntrypointExports } from "./env.js";
 import { authenticate } from "./auth.js";
-import { blobBatchGetWithVerifiedGrant } from "./blob-batch.js";
-import { blobGetWithVerifiedGrant } from "./blobs.js";
+import { blobBatchGetWithVerifiedGrant, blobBatchPutWithVerifiedGrant } from "./blob-batch.js";
+import { blobGetWithVerifiedGrant, usesReceipts } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
 import { gcMark, gcPurge } from "./versions.js";
@@ -30,7 +30,7 @@ import { json, logErr, SHA256_HEX_RE } from "./util.js";
 import { startOp } from "./metrics.js";
 import { processNotification, sweepNotifications } from "./notify.js";
 import { driveAccountDeletion, sweepAccountDeletions } from "./account-delete.js";
-import { verifyGrantCredential } from "./grants.js";
+import { uploadGrantsEnabled, verifyGrantCredential, verifyUploadGrantCredential } from "./grants.js";
 import { eq, isDeviceRevoke, type RouteCtx } from "./routes/shared.js";
 import { cachedReleaseResponse, releaseRoutes } from "./routes/release.js";
 import { adminRoutes } from "./routes/admin.js";
@@ -254,6 +254,22 @@ async function route(req: Request, env: Env, exports: WorkerEntrypointExports): 
         if (isGrantBlobGet) return blobGetWithVerifiedGrant(env, seg[2]!, verified.accountId);
         return blobBatchGetWithVerifiedGrant(req, env, verified.accountId);
       }
+    }
+  }
+
+  // §109 — upload-grant fast path: exactly POST /v1/blob-batch/put with the receipts
+  // protocol. Verify MAC/TTL first; derive accountId only from the verified grant; on
+  // ANY failure fall through to authenticate() (the bearer is on every request). The
+  // route never parses an unverified account id and never leaks whether a kid/account
+  // exists (silent fallback).
+  if (req.method === "POST" && eq(seg, ["v1", "blob-batch", "put"]) && uploadGrantsEnabled(env)) {
+    const grant = req.headers.get("x-rbox-upload-grant");
+    if (grant && usesReceipts(req)) {
+      const verified = await verifyUploadGrantCredential(env, grant, { nowMs: Date.now() });
+      if (verified.ok) return blobBatchPutWithVerifiedGrant(req, env, verified.accountId);
+      ctx.batchPutAuthFallback = verified.reason === "expired" ? "fallback_expired" : "fallback_invalid";
+    } else {
+      ctx.batchPutAuthFallback = grant ? "fallback_invalid" : "fallback_missing";
     }
   }
 

@@ -1,7 +1,8 @@
 import type { Env } from "./env.js";
 import { isEntitled } from "./authz.js";
 import { readBodyCapped, readBytesCapped } from "./commit-envelope.js";
-import { startOp, type Op } from "./metrics.js";
+import { emit, startOp, type Op } from "./metrics.js";
+import { uploadGrantsEnabled } from "./grants.js";
 import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
 import { blobKey, json, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
@@ -66,11 +67,23 @@ export async function blobBatchGet(req: Request, env: Env, opts: { accountId: st
   return new Response(streamBatch(op, parsed.shas, opts), { headers: { "content-type": BATCH_BLOB_CONTENT_TYPE } });
 }
 
-export async function blobBatchPut(req: Request, env: Env, accountId: string): Promise<Response> {
+type BatchPutAuthOutcome = "fast_path" | "fallback_missing" | "fallback_invalid" | "fallback_expired";
+
+export async function blobBatchPutWithVerifiedGrant(req: Request, env: Env, accountId: string): Promise<Response> {
+  return blobBatchPut(req, env, accountId, "fast_path");
+}
+
+export async function blobBatchPut(req: Request, env: Env, accountId: string, authOutcome?: BatchPutAuthOutcome): Promise<Response> {
   const op = startOp(env, "blob.batchPut");
+  const auth = authOutcome ?? (uploadGrantsEnabled(env) ? "fallback_missing" : undefined);
+  if (auth) emit(env, { op: "blob.batchPut.auth", outcome: auth });
+  const finish = (response: Response): Response => {
+    if (auth) response.headers.set("x-rbox-auth-path", auth === "fast_path" ? "grant" : "bearer");
+    return response;
+  };
   if (!usesReceipts(req)) {
     op.done("bad_request", { count: 0, bytes: 0 });
-    return json({ error: "receipts_required" }, 400);
+    return finish(json({ error: "receipts_required" }, 400));
   }
 
   const maxRecords = batchPutMaxRecords(env);
@@ -78,10 +91,10 @@ export async function blobBatchPut(req: Request, env: Env, accountId: string): P
   if (!parsed.ok) {
     if ("tooManyRecords" in parsed) {
       op.done("too_many_records", { count: parsed.tooManyRecords, bytes: 0 });
-      return json({ error: "too_many_records", max: maxRecords }, 400);
+      return finish(json({ error: "too_many_records", max: maxRecords }, 400));
     }
     op.done("bad_request", { count: 0, bytes: 0 });
-    return parsed.response;
+    return finish(parsed.response);
   }
 
   let results: BatchPutResult[];
@@ -90,11 +103,11 @@ export async function blobBatchPut(req: Request, env: Env, accountId: string): P
   } catch (e) {
     if (!(e instanceof ReceiptFenceError)) throw e;
     op.done("retry_later", { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
-    return json({ error: "retry_later" }, 503);
+    return finish(json({ error: "retry_later" }, 503));
   }
-  const outcome = results.every((r) => r.ok) ? "ok" : "partial";
-  op.done(outcome, { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
-  return json({ results });
+  const resultOutcome = results.every((r) => r.ok) ? "ok" : "partial";
+  op.done(resultOutcome, { count: parsed.records.length, bytes: parsed.acceptedPayloadBytes });
+  return finish(json({ results }));
 }
 
 async function readBatchRequest(req: Request): Promise<{ ok: true; shas: string[] } | { ok: false; response: Response }> {
