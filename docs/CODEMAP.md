@@ -1,0 +1,192 @@
+# CODEMAP — sync-engine module ownership
+
+One line per module: what it OWNS, what it must NEVER own. This is the
+structure map design 113 (§6) exists to produce — specs cite these lines
+instead of re-deriving structure from line numbers.
+
+**Maintenance rule (AGENTS.md):** any PR that adds a module under these
+trees, or changes what a module owns, updates its line here in the same PR.
+
+Scope: the sync engine — `src/cli/sync*`, `src/cli/daemon*`,
+`src/cli/e2ee-remote*`, `src/cli/remote/`, `src/cli/publish-pipeline/`,
+`src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
+are deliberately not mapped.
+
+Barrels (`sync.ts`, `sync-git.ts`, `daemon.ts`, `crypto-pool.ts`,
+`blob-batch.ts`, `remote.ts`, `git-state.ts`, the `index.ts` files) preserve
+a stable public surface. Never: logic, state, or an export that isn't a
+plain re-export. Internal modules never import their own barrel.
+
+Files marked **§2.7** are named exceptions to the <600-line rule (single
+closure/class over shared mutable state); carving them is a phase-B design
+with its own review, never a move.
+
+## `src/cli/sync/` — sync drivers (pull-then-push cycle)
+
+```
+src/cli/sync.ts               — barrel: pre-113-split public surface of sync/.
+src/cli/sync/sync.ts          — sync(): one full cycle, pull then push, under the sync mutex. Never: per-phase logic.
+src/cli/sync/pull.ts          — pull driver: scanManifestForPush, pull, applyPulledManifest (reconcile, two-phase ignore, mass-delete/trash safety, git apply, atomic state advance). Never: push/commit logic, rendering.
+src/cli/sync/push.ts          — push retry orchestration (pushManifest) + single-attempt transaction (runPushAttempt) + recovery-page accumulation + stampManifestSchemaForCommit. Never: rendering, remote construction, pull-side reconcile.
+src/cli/sync/policy.ts        — sync policy & flags: filesFirstFlagEnabled, mass-delete trip predicates/constants, deferred-errno reporting, retry backoff, apiFor, scan/matcher adapters. Never: I/O drivers, rendering.
+src/cli/sync/deps.ts          — SyncDeps injectable contract + cache/scan-stats/write-context wiring (withCache, withDircache, withReportScanStats, refreshWriteContext, CurrentWriteContext). Never: sync decisions.
+src/cli/sync/format.ts        — compact stat/timing token rendering (formatCommitTimings, formatLatestTimings, formatApplyStats, formatScanStats). Format strings are load-bearing (privacy tests grep them). Never: state, I/O, policy.
+```
+
+## `src/cli/sync-git/` — git lane (capture, plan, apply, status)
+
+```
+src/cli/sync-git.ts                  — barrel: pre-113-split public surface of sync-git/.
+src/cli/sync-git/shared.ts           — cross-lane orchestration policy (capture/apply concurrency, repo cap/path helpers, scope projection/carry matrix, log-once sets) + capture/locking primitives (chainLock, gitApplyMutationKey, nestedRepoChains, capturePlannedGitSection). SINGLE owner of the module-level state shared by plan AND apply. Never: plan or apply decisions themselves.
+src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 — one closure unit, helper order is semantic), plan contracts, push formatters, gitBaseAfterCommit, gitForceForMissingBlobs. Never: apply-side mutation, status rendering.
+src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
+src/cli/sync-git/config-lane.ts      — config-lane capture model + receiver: CachedLocalCfg, gitConfigHash, shouldPublishGitConfig, readLocalGitConfig, configReceiver, sameConfigShape. Never: fingerprinting, apply transactions.
+src/cli/sync-git/fingerprint.ts      — divergence fingerprint construction: stat/tree/index tokenization, racy-clean trust, GIT_FINGERPRINT_VERSION derivation (version MUST stay adjacent to the token code it versions — design 113 §8). Never: cache persistence, probing.
+src/cli/sync-git/divergence-cache.ts — divergence cache schema/persistence + probe build/classify/write/refresh. Never: fingerprint token construction.
+src/cli/sync-git/status.ts           — read-only divergence status: gitDivergenceStatus, gitDivergenceCount (mirrors planner suppressions). Never: mutation of repos, cache, or state.
+```
+
+## `src/cli/daemon/` — background daemon
+
+```
+src/cli/daemon.ts            — barrel: pre-113-split public surface of daemon/ (main-dispatch's dynamic import("./daemon.js") lands here).
+src/cli/daemon/daemon.ts     — RboxDaemon (§2.7 — one state machine: pump single-flight, watcher trust/retrust, safety/deep scan cadence, push/pull drivers, retry fences, drift audits, activity/ambient-status persistence, WS channel, ownership wind-down) + runDaemon + class-coupled types. Never: reusable policy or rendering (those live in siblings).
+src/cli/daemon/policy.ts     — daemon policy, pure: DaemonChainRepairPolicy, classifyWatcherError, TrustState/worseTrust, daemonConsumesWakeup, Wants, cadence/retrust/WS constants, reconnectDelayMs/nextSafetyDelay/jitter. Never: class state, I/O.
+src/cli/daemon/render.ts     — daemon log-line rendering: log, scanStatsLine, summarizeActions, path cleaning. Format strings are load-bearing. Never: state, decisions.
+```
+
+## `src/cli/` — sync-adjacent singles
+
+```
+src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/release/withWorkspaceSyncMutex) + degraded lock-unsupported fallback, CLI vs daemon acquisition policy. Never: the lockfile primitive itself (engine/git/lockfile.ts).
+src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
+src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
+src/cli/daemon-control.ts     — daemon process lifecycle + on-disk records: binding/pid files, start/stop/liveness/PID-ownership, rbox logs tailing. Never: the daemon's sync loop (daemon/).
+src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming accumulator, overlap math, summary formatters. Never: network or file I/O.
+src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
+src/cli/e2ee-remote-types.ts  — pure shared contracts: E2eeApi, AccountKeysDTO, WsKeyDTO, CommitChainResult, VersionInfo, VerifiedSuffixEntry, HeadPin, PinStore, E2eeContext, CurrentWriteKek. Never: behavior, policy constants.
+src/cli/e2ee-client.ts        — E2EE account/device bootstrap + pairing client flows (bootstrap, redemption, admission, verifyAccount glue). Never: transport (RboxApi/E2eeRemote), key storage (e2ee-keystore.ts).
+```
+
+## `src/cli/remote/` — HTTP transport to the API worker
+
+```
+src/cli/remote.ts                — barrel: stable import surface for the remote/ control-plane client.
+src/cli/remote/api.ts            — RboxApi facade (implements SyncRemote) + the SyncRemote interface: wires RemoteContext + blobs/commits/keys/batch modules into the surface sync depends on. Never: HTTP/crypto details (sibling domain modules).
+src/cli/remote/context.ts        — shared transport core: RemoteContext (base URL, auth token, ws/project ids, auth headers, upload-receipts accumulator, download-grant cache, fetch/postJson/missingBlobs primitives). Never: domain-specific endpoints.
+src/cli/remote/blobs.ts          — single-blob PUT/GET transport (putBlob, getBlob, getBlobToFile), single-vs-multipart threshold, download integrity re-fetch. Never: multipart mechanics (multipart.ts), batch scheduling (blob-batch/).
+src/cli/remote/commits.ts        — manifest/commit transport: commit/commitSigned/commitsSince/latest/commitTimes/redeemReceipts + CommitRejectedError/CommitOptions/CommitTimings. Never: blob transfer, key/roster crypto.
+src/cli/remote/keys.ts           — E2EE key/pairing/device-admission transport (bootstrapKeys, account/device/workspace key endpoints, roster append, API-key CRUD). Never: verifying or interpreting the crypto material (engine/e2ee + e2ee-client.ts).
+src/cli/remote/multipart.ts      — resumable multipart blob upload: init/part/complete attempt loop, resume-token files, mismatch/retry-later/quota recovery. Never: streaming primitives (stream.ts), metrics (multipart-metrics.ts).
+src/cli/remote/multipart-metrics.ts — multipart upload metrics (MultipartMetrics distributions + summary formatting). Never: performing uploads.
+src/cli/remote/errors.ts         — typed remote-error classes + classification/translation (NetworkError, QuotaExceededError, BlobShaMismatchError, isRetryLater, translateRemoteError, …). Never: network calls.
+src/cli/remote/resilient.ts      — network-resilience mechanics: transient-fault classification, fetchResilient (abort deadline + bounded retry), transfer timeout sizing, envInt. Never: retrying HTTP 4xx/5xx responses (returned untouched for typed handling).
+src/cli/remote/stream.ts         — leaf I/O helpers: fileStream (ReadableStream over a file/range), readJson. Never: business logic.
+src/cli/remote/timings.ts        — defensive parser readNumericFields for numbers-only server-timing payloads. Pure. Never: I/O.
+src/cli/remote/multipart-fake-server.ts — test-only in-process fake of the server multipart protocol (mirrors apps/api/src/blobs.ts part sizing) with injectable latency/failure. Never: production use.
+```
+
+## `src/cli/remote/blob-batch/` — batched blob transfer
+
+```
+src/cli/remote/blob-batch.ts            — barrel: pre-113-split public surface of blob-batch/.
+src/cli/remote/blob-batch/wire.ts       — client half of the wire contract with apps/api/src/blob-batch.ts: framing constants, BatchFrame, parseBatchFrames, codecs (framedBytes, parseStatus, parseBatchPutResponse). Change in lockstep with the server twin. Never: tuning knobs, scheduling.
+src/cli/remote/blob-batch/gate.ts       — process-wide batch kill switches + dispatch counter + SingleGate. SINGLE definition site (a second instance breaks 404/405 degradation). Never: per-request logic.
+src/cli/remote/blob-batch/config.ts     — all tuning defaults/caps + BatchConfig + env readers (uploadBatchConfig/downloadBatchConfig). Never: wire constants, class logic.
+src/cli/remote/blob-batch/downloader.ts — BlobBatchDownloader: queue/scheduler, batch GET, watchdog, single-lane degradation, race-safe publication + its private models. Never: upload logic, wire codecs.
+src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, batch PUT, receipt accounting, degradation, close protocol + its private models. Never: download logic, wire codecs.
+```
+
+## `src/cli/publish-pipeline/` — overlapped first-publish (design 98)
+
+```
+src/cli/publish-pipeline/pipeline.ts        — runPublishPipeline: producer-consumer graph (dynamic encrypt lane, rolling missingBlobs batching, budgeted upload scheduler) under one abort scope; flag-gated alternative to the serialized path in sync-recovery.ts. Never: leaf helpers (shared.ts), transport.
+src/cli/publish-pipeline/budget.ts          — ResourceBudget: generic FIFO-fair reservation/release counter (items/bytes/heap axes). Pure concurrency primitive. Never: domain knowledge of blobs/uploads.
+src/cli/publish-pipeline/ready-queue.ts     — ReadyQueue: budgeted producer→consumer channel of ready ciphertexts (backpressure, EOF, disposition-gated release). Never: encryption or upload themselves.
+src/cli/publish-pipeline/receipt-drainer.ts — ReceiptDrainer: single-flight, generation-safe, error-latched mid-upload receipt redemption over a ReceiptPort abstraction. Never: the HTTP transport directly.
+src/cli/publish-pipeline/shared.ts          — leaf helpers shared by the serialized path AND the pipeline (cipher-descriptor mapping, classifyCacheHit, churn/error helpers, concurrency clamps, lease materialization). Never: importing sync-recovery.ts (keeps the graph acyclic).
+src/cli/publish-pipeline/stale-temp.ts      — stale enc-* temp-dir reclamation at push start (reclaimStaleTemps, createRunTempDir) under the sync mutex. Best-effort. Never: correctness-bearing state.
+```
+
+## `src/engine/` — workspace engine (scan/diff/reconcile/apply/crypto)
+
+```
+src/engine/index.ts                 — barrel: the full public engine API for src/cli. Never: logic.
+src/engine/types.ts                 — core types only: FileEntry, FileType, Manifest, GitSection/GitArtifactRef/GitPackLink/GitRefScope. Never: logic, I/O.
+src/engine/manifest.ts              — the filesystem scan producer: scanManifest (ignore rules + dircache/hashcache reuse), applyWatchEvents, ScanStats, present-vs-absent error classification. Owns "what's on disk" → manifest. Never: diffing, wire encoding.
+src/engine/manifest-delta.ts        — manifest wire envelope codec: canonical (JCS float-tolerant) manifest hashing, snapshot/delta envelopes, delta ops diff/fold, ManifestChainError. Owns the on-wire manifest format. Never: scanning.
+src/engine/manifest-chain.ts        — pure validator: readManifestChain bounds/validates a manifest's delta chain. Never: I/O.
+src/engine/manifest-validate.ts     — dependency-free (no node:*) manifest/path/git-section validation shared by client AND Worker (isSafeRelPath, validateManifest, validateGitSection, schema/size constants). Pure string logic — must stay bundleable into the Worker.
+src/engine/diff.ts                  — pure manifest diffing: diffManifests, sameContent (content identity: hash/type/symlink/mode; deliberately mtime-insensitive). Never: I/O.
+src/engine/reconcile.ts             — pure three-way reconcile (local/remote/base → Action[]), conflictName. Decides WHAT changes. Never: filesystem mutation (apply.ts).
+src/engine/apply.ts                 — applies Actions to the working tree (write/delete/conflict, blob upload/download orchestration): applyActions, restoreEntryToPath, uploadManifestBlobs. Never: content addressing, encryption itself (crypto/crypto-pool), stats accumulation (apply-stats.ts).
+src/engine/apply-stats.ts           — process-global apply syscall/timing counters (valid under the single sync mutex). Pure accumulator. Never: I/O decisions.
+src/engine/blobstore.ts             — BlobStore interface + LocalBlobStore (sha256 content-addressed local backend). Never: encryption, manifest logic.
+src/engine/hash.ts                  — sha256 of files/bytes via node:crypto (client-side hashing primitive). Never: caching (hashcache.ts).
+src/engine/sha256-stream.ts         — pure-JS streaming SHA-256 for the workerd runtime ONLY (client uses hash.ts). Never: node:crypto.
+src/engine/hashcache.ts             — persistent (mtime,size,ctime)→sha256 cache (.rbox/state/hashcache.json). Safe to discard. Never: authoritative identity.
+src/engine/dircache.ts              — persistent per-directory-listing cache driving scan pruning/racy-clean reuse. Owns its cache-correctness invariants. Never: the scan walk itself (manifest.ts).
+src/engine/encrypt-address-cache.ts — persistent plaintext→ciphertext-address cache scoped per account/workspace/epoch. Never: encryption itself.
+src/engine/ignore.ts                — ignore-rule engine: BUILTIN_IGNORE/HARD_PRUNE_DIRS, .rboxignore support, buildIgnoreMatcher. Owns what never syncs. Never: the walk.
+src/engine/crypto.ts                — convergent per-blob AES-256-GCM encrypt/decrypt (design 12), KEK generation/phrase encode, zstd, inline + temp-file encrypt/decrypt paths. Never: pool orchestration (crypto-pool/), key wrapping (e2ee/keys.ts).
+src/engine/fsutil.ts                — filesystem safety primitives: writeFileAtomic, fsyncDirectory, assertWithinRoot, RBOX_TMP_PREFIX. Never: domain logic.
+src/engine/pool.ts                  — generic bounded-concurrency poolMap (fail-fast). Never: crypto-pool specifics.
+src/engine/trash.ts                 — local trash tier: atomic rename soft-delete, prune/list/restore, cross-process .active marker. Owns "never destroy bytes on apply". Never: the decision to delete (reconcile.ts).
+src/engine/phase-report.ts          — pure per-run phase timing/byte accumulator, no PII by construction. Never: emission I/O (caller owns).
+src/engine/git-discover.ts          — ignore-pruned walk finding every nested git repo (dir or pointer). Never: repo-boundary stops, symlink following.
+src/engine/git-state.ts             — barrel: stable git-state API over git/* + validate helpers. Never: implementation.
+src/engine/detect.ts                — pure ecosystem/package-manager detection for hydration (fixed in-binary allowlist). Never: disk I/O, execution.
+src/engine/doctor.ts                — pure host-vs-project readiness judging for hydration. Never: tool probing/execution (caller's job).
+src/engine/darwin-bulk-walk.ts      — macOS-only bulk directory enumeration (bun:ffi getattrlistbulk) scan fast path. Never: fallback logic (caller falls back).
+src/engine/encoding.ts              — base64url encode/decode. Pure leaf. Never: dependencies.
+src/engine/pat-token.ts             — personal-access-token generate/validate (+CRC32). Self-contained. Never: transport.
+src/engine/refset.ts                — dependency-free binary codec for the rbox-refset-v1 sidecar (locked format; bundles into client + Worker). Never: hashing (caller hashes).
+```
+
+## `src/engine/crypto-pool/` — worker-based crypto pool
+
+```
+src/engine/crypto-pool.ts           — barrel: pre-113-split public surface of crypto-pool/ (serves engine/index.ts unchanged).
+src/engine/crypto-pool/pool.ts      — CryptoPool + CryptoWorkerSlot (§2.7 — bidirectionally coupled; a slot/pool file split is an import cycle by construction, REVIEW-113 HIGH 1) + process-wide registry/selection (selectCryptoPool, withCryptoPool, shutdownCryptoPool, cryptoPoolStatus, test hooks) + kekFingerprint. Never: worker artifact resolution (crypto-worker-files.ts), sizing config (config.ts), the algorithm (crypto.ts), the worker body (crypto-worker.ts).
+src/engine/crypto-pool/config.ts    — operating constants, env parsing, worker sizing (configuredWorkers + its cache, fileDescriptorWorkerCap, minJobs). Owns configuredWorkersCache (permitted test reset lives here). Never: pool state/scheduling, worker paths.
+src/engine/crypto-pool/budget.ts    — ciphertext contracts + CiphertextBudget (reserve/convert/release/wait) + fused-job record types. Never: worker spawning, I/O.
+src/engine/crypto-pool/errors.ts    — worker-boundary error (de)serialization: rehydrateError, workerCrashError, closeError, streamCancelledError. Pure. Never: state.
+src/engine/crypto-worker-files.ts   — worker artifact resolution (embeddedWorkerFile, workerSpecifier, cleanupEmbeddedWorker) + the embedded-worker mutable state it closes over. Lives at src/engine/ level ON PURPOSE: MODULE_DIR-relative lookup and the generated-bundle import are depth- and compiled-runtime ($bunfs) sensitive — never move into crypto-pool/. Never: pool logic, protocol.
+src/engine/crypto-worker-protocol.ts — types only: the pool↔worker postMessage wire protocol + SerializedError + FUSE_MAX_FILE_BYTES. Never: logic.
+src/engine/crypto-worker.ts         — the worker-thread entrypoint: receives protocol messages, calls crypto.ts inline paths, serializes errors back. Never: main-thread scheduling.
+```
+
+## `src/engine/e2ee/` — end-to-end-encryption primitives & session logic
+
+```
+src/engine/e2ee/index.ts          — barrel: the E2EE public surface for src/cli. Never: logic.
+src/engine/e2ee/primitives.ts     — WebCrypto-backed low-level primitives shared by Bun client and Workers (randomBytes, hex, sha256, hkdf, aesGcm, ctEqual). Pure, runtime-portable. Never: node:-only APIs.
+src/engine/e2ee/jcs.ts            — RFC 8785 canonical JSON (canonicalize, parseStrict). Consensus-critical byte-identical encoding for every signed object; rejects floats/NaN/bigint on purpose. Never: I/O.
+src/engine/e2ee/asym.ts           — asymmetric primitives on node:crypto: Ed25519 sign/verify (+from-seed), RSA-OAEP-3072 wrap/unwrap, PKCS8/SPKI codecs. Never: object formats (commit/roster/epoch).
+src/engine/e2ee/keys.ts           — key hierarchy + wrap wire formats: WrapContext, AES-GCM/RSA wraps, MK/KEK generation, wrapHash. Never: blob-level key derivation (crypto.ts), manifest keys (manifest-crypto.ts).
+src/engine/e2ee/manifest-crypto.ts — manifest-specific encryption (own HKDF domain, fresh nonce per commit): deriveManifestKey, encryptManifest, decryptManifest. Never: blob content encryption.
+src/engine/e2ee/commit.ts         — signed hash-chained commit codec: buildSignedCommit, parseCommit, verifyCommitSig, validateManifestChain, validateBlobRefset. Owns the signed-commit wire shape. Never: chain-walk verification (session.ts).
+src/engine/e2ee/roster.ts         — signed, versioned, hash-chained device roster (trust root for commit signatures): builders + verifyRosterChain + activeSigners. Never: transport.
+src/engine/e2ee/epoch.ts          — account key-state / epoch transitions: AccountKeyState, buildKeyState, verifyKeyStateChain (genesis trust root, revocation rotation). Never: roster internals.
+src/engine/e2ee/recovery.ts       — BIP39 recovery-phrase codec + recovery-key derivation (rkToPhrase/phraseToRk, rkWrapKey, recoverySignKeyPair). Never: the BIP39 PBKDF2 seed function.
+src/engine/e2ee/bip39-wordlist.ts — data only: the fixed 2048-word BIP39 list, index-is-value, never reorder. Never: logic.
+src/engine/e2ee/session.ts        — top-level E2EE orchestration composing all of the above (bootstrapAccount, buildCommit, verifyAccount, verifyCommitChain, pairing/admission/redeem, recoverMasterKey). Pure logic over data + secrets. Never: network or filesystem (src/cli wires those).
+```
+
+## `src/engine/git/` — git-native repo state capture/apply
+
+```
+src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
+src/engine/git/preflight.ts   — decides whether a repo's shape is syncable (dir vs pointer, worktrees, alternates, submodule superprojects, busy-check): gitPreflight, isGitBusy (structural vs transient refusal). Never: capture or apply.
+src/engine/git/identity.ts    — stable plaintext-only identity of a repo's git state for change detection (gitIdentity, projectIdentity, gitIdentityKey), scope-aware. Never: the stored GitSection shape (types.ts).
+src/engine/git/capture.ts     — git-native state capture (design 43): history bundles, index/HEAD/op-state snapshot, stable change identity, scratch-dir rooting/sweep, GitCaptureDeferredError. Owns "what to upload for a repo this cycle". Never: apply.
+src/engine/git/apply.ts       — mutating git-state apply (design 43): fetch/decrypt/import pack chain, move index/op-state into place, quarantine + rollback on failure. Never: capture, planning.
+src/engine/git/quarantine.ts  — pre-mutation quarantine (bundle + index/op-state copy) + post-failure conflict preservation (quarantineLocal, quarantineAndWipeGitState, preserveGitConflict). Never: the apply itself.
+src/engine/git/rollback.ts    — local pre-apply snapshot/restore of refs+HEAD+index+op-state+stash reflog (snapshotLocal, restoreLocal with onlyRefs scoping for pointer repos). Never: quarantine policy.
+src/engine/git/refs.ts        — low-level ref/op-state enumeration and restore (readAllRefs, listRefs, readOpState/restoreOpState). Pure plumbing wrappers. Never: policy.
+src/engine/git/pins.ts        — scratch-ref pinning under refs/rbox-wip/* so bundles can reference unreachable commits (createScratchPins, pruneStaleScratchRefs). Never: bundle creation.
+src/engine/git/containment.ts — single safety check: assertGitTargetWithinRoot (refuses targets escaping the workspace root, incl. via symlinks). Never: anything else.
+src/engine/git/lockfile.ts    — generic cross-process advisory lockfile with liveness probing (acquireLock, OwnedLock, inspectLock, stale detection). Never: what the lock protects.
+src/engine/git/config-sync.ts — pure (node-free, bundles into Worker) grammar/projection/canonicalization for git config sync (design 93): allowlisted keys, canonicalizeGitConfig, credential/value safety. Never: I/O.
+src/engine/git/config-txn.ts  — transactional on-disk git config read/write: lockfile-guarded atomic apply, fault classification, orphan sweep. The stateful counterpart to config-sync.ts. Never: the grammar.
+```

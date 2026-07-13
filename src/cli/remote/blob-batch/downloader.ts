@@ -7,8 +7,7 @@ import { getBlobToFile } from "../blobs.js";
 import { translateRemoteError } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, blobDownloadTimeoutMs, envInt } from "../resilient.js";
 import { SingleGate, downloadDisabled, disableDownloadForProcess } from "./gate.js";
-import { downloadBatchConfig, FLUSH_DELAY_MS, GRANT_REFRESH_AFTER_MS, SINGLE_FALLBACK_CONCURRENCY, DEFAULT_PULL_JOIN_WATCHDOG_MS, DEFAULT_PULL_JOIN_WATCHDOG_MAX_FIRINGS } from "./config.js";
-import type { BatchConfig } from "./config.js";
+import { downloadBatchConfig, FLUSH_DELAY_MS, GRANT_REFRESH_AFTER_MS, SINGLE_FALLBACK_CONCURRENCY, DEFAULT_PULL_JOIN_WATCHDOG_MS, DEFAULT_PULL_JOIN_WATCHDOG_MAX_FIRINGS, type BatchConfig } from "./config.js";
 import { parseBatchFrames, parseStatus, BATCH_BLOB_CONTENT_TYPE } from "./wire.js";
 
 const debug = (msg: string): void => {
