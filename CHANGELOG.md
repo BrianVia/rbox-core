@@ -6,6 +6,21 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-07-13 — the crypto pool actually ships: Bun compile bug fixed, init exits clean
+
+### Fixed
+- **Release binaries now really run the crypto worker pool (#270).** Bun 1.3.5
+  (the old release pin) ignored the text import attribute under `--compile`:
+  the embedded worker extracted as 0 bytes, silently disabling the pool
+  (inline-crypto fallback) in EVERY release binary to date — and leaving a
+  permanently ref'd handle that made one-shot commands (init, push) hang
+  after finishing their work. Fixed via a loader-proof `.txt` bundle + a loud
+  non-empty guard; release toolchain now pins Bun 1.3.14 (`engines ^1.3.14`).
+  Expect faster fleet encryption — pooled crypto in a release build for the
+  first time.
+- Compiled-binary regression test: a release-style binary must exit within a
+  deadline after real crypto work (negative-control verified against the bug).
+
 ## [1.4.1] — 2026-07-13 — sweep verdict applied: fill-v2 stays, default records back to 32
 
 ### Changed
