@@ -314,6 +314,38 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const resolvesWithin = async (promise: Promise<unknown>, ms: number): Promise<boolean> =>
   Promise.race([promise.then(() => true), delay(ms).then(() => false)]);
 
+test("design 116 FIELD INCIDENT: pull receipt authorizes sync-dirt-only stale branch follow", async () => {
+  const a = path.join(rootA, "field-incident");
+  await initRepo(a);
+  await commitFile(a, "tracked.txt", "one\n", "c1");
+  const c1 = await git(a, "rev-parse", "HEAD");
+  await commitFile(a, "tracked.txt", "two\n", "c2");
+  await syncCycle();
+
+  const b = path.join(rootB, "field-incident");
+  const baseTip = await git(b, "rev-parse", "refs/heads/main");
+  await commitFile(a, "tracked.txt", "three\n", "c3");
+  const incomingTip = await git(a, "rev-parse", "HEAD");
+  await sync(rootA, cfgA, depsA);
+
+  // Reproduce the incident: Git metadata is stale/contained while the pull's
+  // file phase will install the incoming tracked bytes before Git apply.
+  await git(b, "update-ref", "refs/heads/main", c1, baseTip);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+
+  expect(logsB).toContain("git-sync followed field-incident");
+  expect(await git(b, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(b, "rev-parse", "HEAD")).toBe(incomingTip);
+  await expect(git(b, "diff", "--cached", "--quiet")).resolves.toBe("");
+  await expect(git(b, "diff", "--quiet")).resolves.toBe("");
+  expect(await fs.readFile(path.join(b, "tracked.txt"), "utf8")).toBe("three\n");
+  const record = repoRecordsForState(await st(rootB))["field-incident"]!;
+  expect(record.pending).toBeUndefined();
+  expect(record.partial).toBeUndefined();
+  expect(record.deferrals?.apply).toBeUndefined();
+}, 20_000);
+
 function observingBlobStore(inner: BlobStore, onGetToFile: (sha: string) => Promise<void> | void): BlobStore {
   const wrapped: BlobStore = {
     has: (sha) => inner.has(sha),
@@ -911,7 +943,7 @@ test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK
   expect(fetches).toBe(6);
 }, 30_000);
 
-test("design 53: conflict preserve materializes a complete recovery bundle for chained sections", async () => {
+test("design 116: chained-section human edits defer with newest incoming carried", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
   const r = path.join(rootA, "r");
   await initRepo(r);
@@ -926,11 +958,10 @@ test("design 53: conflict preserve materializes a complete recovery bundle for c
   const b = path.join(rootB, "r");
   await commitFile(b, "local.txt", "local\n", "local");
   await pull(rootB, cfgB, depsB);
-  expect((await st(rootB)).gitNeedsResolution?.["r"]).toBeDefined();
-  const recDir = path.join(b, ".rbox", "git-conflicts");
-  const bundles = (await fs.readdir(recDir)).filter((f) => f.endsWith(".bundle"));
-  expect(bundles.length).toBeGreaterThan(0);
-  await expect(git(b, "bundle", "verify", path.join(recDir, bundles[0]!))).resolves.toBeDefined();
+  const deferred = repoRecordsForState(await st(rootB)).r!;
+  expect(deferred.deferrals?.apply?.reason).toBe("local-edits");
+  expect(deferred.pending?.packChain).toHaveLength(1);
+  expect(deferred.resolutionKey).toBeUndefined();
 }, 30_000);
 
 // ── design 68 §3.3: in-tree linked-worktree pointer skip (base-carry) ──────────────
@@ -1273,8 +1304,10 @@ test("D2 partial retry never overwrites a human-moved applied non-current ref", 
   logsB.length = 0;
   await pull(rootB, cfgB, depsB);
   expect(await git(b, "rev-parse", "other")).toBe(oldOther);
-  expect(repoRecordsForState(await st(rootB))["partial-human"]?.resolutionKey).toBeDefined();
-  expect(logsB.some((line) => line.includes("CONFLICT partial-human"))).toBe(true);
+  const held = repoRecordsForState(await st(rootB))["partial-human"]!;
+  expect(held.partial?.heldRefs["refs/heads/other"]).toBe("local-commits");
+  expect(held.deferrals?.apply?.reason).toBe("local-commits");
+  expect(logsB.some((line) => line.includes("CONFLICT partial-human"))).toBe(false);
 }, 20_000);
 
 /** Sync a repo to both machines, advance it on A, then make B's pull DEFER the apply
@@ -1314,7 +1347,7 @@ test("D2 apply deferral keeps chronic age across newer truth and resets reason a
   expect(artifact.subjectKey).not.toBe(busy.subjectKey);
 }, 20_000);
 
-test("design 116 phase-0: pending remote plus ordinary human divergence still conflicts", async () => {
+test("design 116: pending remote plus ordinary human divergence remains a typed deferral", async () => {
   const { b, lock } = await makePending("human-divergence");
   await fs.rm(lock);
   await commitFile(b, "local.txt", "human work", "local commit");
@@ -1323,14 +1356,14 @@ test("design 116 phase-0: pending remote plus ordinary human divergence still co
   await pull(rootB, cfgB, depsB);
 
   const state = await st(rootB);
-  expect(state.gitNeedsResolution?.["human-divergence"]).toBeDefined();
-  expect(state.gitPendingRemote?.["human-divergence"]).toBeUndefined();
+  expect(state.gitNeedsResolution?.["human-divergence"]).toBeUndefined();
+  expect(state.gitPendingRemote?.["human-divergence"]).toBeDefined();
   const first = repoRecordsForState(state)["human-divergence"]?.deferrals?.apply;
-  expect(first?.reason).toBe("conflict");
-  expect(logsB.some((line) => line.includes("CONFLICT human-divergence"))).toBe(true);
+  expect(first?.reason).toBe("local-edits");
+  expect(logsB.some((line) => line.startsWith("git-sync deferred human-divergence"))).toBe(true);
   await pull(rootB, cfgB, depsB);
   const held = repoRecordsForState(await st(rootB))["human-divergence"]?.deferrals?.apply;
-  expect(held?.reason).toBe("conflict");
+  expect(held?.reason).toBe("local-edits");
   expect(held?.deferredSince).toBe(first?.deferredSince);
 }, 20_000);
 
@@ -1746,7 +1779,7 @@ test("cap: new repos beyond the cap are deferred LOUDLY; base-carrying repos alw
 
 // ── needs-resolution conflict suppression [v2, M2] ─────────────────────────────────
 
-test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED until local identity changes", async () => {
+test("per-repo human divergence is pending-carried and capture-suppressed without a checkpoint", async () => {
   const a = path.join(rootA, "r");
   await initRepo(a);
   await commitFile(a, "f.txt", "v1", "c1");
@@ -1764,12 +1797,11 @@ test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED
 
   await pull(rootB, cfgB, depsB);
   expect(await git(b, "rev-parse", "HEAD")).toBe(bHead); // local never clobbered
-  expect(logsB.some((l) => l.includes("CONFLICT r"))).toBe(true);
+  expect(logsB.some((l) => l.startsWith("git-sync deferred r"))).toBe(true);
   const sB = await st(rootB);
-  expect(sB.gitNeedsResolution?.["r"]).toBeDefined();
-  expect(sB.lastSyncedManifest.gitRepos!["r"]!.bundleEncSha).toBe((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha); // checkpointed to remote
-  const refs = await git(b, "for-each-ref", "--format=%(refname)", "refs/rbox-conflict");
-  expect(refs.length).toBeGreaterThan(0); // remote preserved for manual merge
+  expect(sB.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(sB.gitPendingRemote?.["r"]?.bundleEncSha).toBe((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha);
+  expect(repoRecordsForState(sB).r?.deferrals?.apply?.reason).toBe("local-edits");
 
   // sync()'s immediate push-after-pull must NOT republish the conflicted local state:
   // the git section stays the checkpointed remote (files like g.txt may still sync)
@@ -1781,11 +1813,7 @@ test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED
   await push(rootB, cfgB, depsB);
   expect(remote.headSeq()).toBe(head);
 
-  // the user resolves (identity changes) → republishing becomes intentional
-  await commitFile(b, "f.txt", "merged", "b merge");
-  await push(rootB, cfgB, depsB);
-  expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).not.toBe(remoteSec.bundleEncSha);
-  expect((await st(rootB)).gitNeedsResolution?.["r"]).toBeUndefined();
+  expect((await st(rootB)).gitPendingRemote?.["r"]).toBeDefined();
 }, 20_000);
 
 // ── per-repo independence: one busy repo defers only itself ────────────────────────

@@ -1,0 +1,646 @@
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import {
+  LocalBlobStore,
+  buildIgnoreMatcher,
+  captureGitState,
+  indexIdentityV2,
+  type AppliedManifestOracle,
+  type GitSection,
+  type Manifest,
+} from "../../engine/index.js";
+import { repoCtx } from "../../engine/git/shared.js";
+import { loadState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import type { SyncRemote } from "../remote.js";
+import { saveStateSource } from "../sync-state.js";
+import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
+import { checkoutJournalBinding, FollowCrashInjectedError, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
+import { planGitSections } from "./plan.js";
+import { gitFollowEnabled } from "./shared.js";
+
+const exec = promisify(execFile);
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
+const KEK = Buffer.alloc(32, 19);
+
+let tmp: string;
+let sender: string;
+let workspace: string;
+let receiver: string;
+let store: LocalBlobStore;
+let cfg: WorkspaceConfig;
+
+beforeEach(async () => {
+  tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-"));
+  sender = path.join(tmp, "sender");
+  workspace = path.join(tmp, "workspace");
+  receiver = path.join(workspace, "repo");
+  await fs.mkdir(sender, { recursive: true });
+  await fs.mkdir(path.join(workspace, ".rbox", "state"), { recursive: true });
+  await git(sender, "init", "-qb", "main");
+  await git(sender, "config", "user.email", "follow@example.invalid");
+  await git(sender, "config", "user.name", "follow");
+  store = new LocalBlobStore(path.join(tmp, "blobs"));
+  cfg = {
+    remoteWorkspaceId: "ws_follow",
+    projectId: "root",
+    deviceId: "receiver",
+    rootPath: workspace,
+    remoteUrl: "https://example.invalid",
+    token: "",
+    syncGit: true,
+    encrypted: true,
+    kek: KEK,
+    accountId: "acct",
+    accountEpoch: 0,
+    keyEpoch: 0,
+  };
+});
+
+afterEach(async () => {
+  delete process.env.RBOX_GIT_FOLLOW;
+  await fs.rm(tmp, { recursive: true, force: true });
+});
+
+async function commit(content: string, message: string): Promise<string> {
+  await fs.writeFile(path.join(sender, "tracked.txt"), content);
+  await git(sender, "add", "tracked.txt");
+  await git(sender, "commit", "-qm", message);
+  return git(sender, "rev-parse", "HEAD");
+}
+
+const manifest = (section: GitSection): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: { repo: section } });
+const stateWith = (section?: GitSection): SyncState => ({
+  stream: "test-stream",
+  stateNonce: "n".repeat(32),
+  lastSyncedSequence: section ? 1 : 0,
+  lastSyncedManifest: section ? manifest(section) : { generatedAt: "", files: [] },
+  ...(section ? { repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section } } } : {}),
+});
+
+const matchingOracle: AppliedManifestOracle = {
+  proveRepo: async () => ({ kind: "match" }),
+  reproveRepo: async () => ({ kind: "match" }),
+  receiptHash: () => "receipt",
+};
+
+async function capture(): Promise<GitSection> {
+  const section = await captureGitState(sender, store, KEK);
+  if (!section) throw new Error("capture returned no section");
+  return section;
+}
+
+async function materialize(section: GitSection): Promise<void> {
+  const outcome = await applyGitSections(workspace, cfg, stateWith(), manifest(section), store, buildIgnoreMatcher(workspace), () => {});
+  expect(outcome.gitRepos?.repo).toEqual(section);
+}
+
+async function baseAndIncoming(mode: "same" | "switch" | "detached" = "same"): Promise<{ c1: string; base: GitSection; incoming: GitSection; state: SyncState }> {
+  const c1 = await commit("one\n", "c1");
+  await commit("two\n", "c2");
+  const base = await capture();
+  await materialize(base);
+  if (mode === "switch") await git(sender, "checkout", "-qb", "next");
+  else if (mode === "detached") await git(sender, "checkout", "-q", "--detach");
+  await commit("three\n", "c3");
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  return { c1, base, incoming, state: stateWith(base) };
+}
+
+async function applyIncoming(state: SyncState, incoming: GitSection, oracle: AppliedManifestOracle = matchingOracle, extra: Parameters<typeof applyGitSections>[7] = {}) {
+  const logs: string[] = [];
+  const outcome = await applyGitSections(workspace, cfg, state, manifest(incoming), store, buildIgnoreMatcher(workspace), (line) => logs.push(line), {
+    oracle,
+    sourceGlobalSeq: 2,
+    capabilityProbe: async () => true,
+    ...extra,
+  });
+  return { outcome, logs };
+}
+
+test("RBOX_GIT_FOLLOW parses only exact zero as disabled", () => {
+  expect(gitFollowEnabled({})).toBe(true);
+  expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "0" })).toBe(false);
+  expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "00" })).toBe(true);
+  expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "invalid" })).toBe(true);
+});
+
+test("field incident: stale contained attached tip follows HEAD, tip, and semantic index", async () => {
+  const setup = await baseAndIncoming();
+  const { c1, base, state } = setup;
+  await fs.writeFile(path.join(sender, ".git", "MERGE_HEAD"), `${c1}\n`);
+  const incoming = await capture();
+  const baseTip = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, baseTip);
+
+  const { outcome, logs } = await applyIncoming(state, incoming);
+
+  expect(logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+  expect(await fs.readFile(path.join(receiver, ".git", "HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
+  const liveProjection = await indexIdentityV2(receiver, path.join(receiver, ".git", "index"));
+  expect(liveProjection).toBe(outcome.idxProj?.repo);
+  expect(outcome.gitRepos?.repo).toEqual(incoming);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.partial?.repo).toBeNull();
+  expect(await fs.readFile(path.join(receiver, ".git", "MERGE_HEAD"), "utf8")).toBe(`${c1}\n`);
+
+  await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
+  expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal"))).toEqual([]);
+});
+
+test("field incident follows an incoming branch switch", async () => {
+  const { c1, state, incoming } = await baseAndIncoming("switch");
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const { outcome, logs } = await applyIncoming(state, incoming);
+  expect(logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/next");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/next"]);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(incoming.refs["refs/heads/main"]);
+  expect(outcome.gitRepos?.repo).toEqual(incoming);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.partial?.repo).toBeNull();
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+  await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
+});
+
+test("field incident follows a contained stale tip to detached incoming HEAD", async () => {
+  const { c1, state, incoming } = await baseAndIncoming("detached");
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const { outcome, logs } = await applyIncoming(state, incoming);
+  expect(logs).toContain("git-sync followed repo");
+  await expect(git(receiver, "symbolic-ref", "HEAD")).rejects.toThrow();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.head.trim());
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(incoming.refs["refs/heads/main"]);
+  expect(outcome.gitRepos?.repo).toEqual(incoming);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.partial?.repo).toBeNull();
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+  await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
+});
+
+test("disposition: staged index changes defer local-index", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, "staged.txt"), "human\n");
+  await git(receiver, "add", "staged.txt");
+  const { outcome } = await applyIncoming(state, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-index");
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+});
+
+test("disposition: local operation state defers local-operation", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
+  const { outcome } = await applyIncoming(state, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+});
+
+test("disposition: oracle mismatch wins display precedence as local-edits", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const oracle: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "mismatch", sample: ["tracked.txt"] }),
+    reproveRepo: async () => ({ kind: "mismatch", sample: ["tracked.txt"] }),
+    receiptHash: () => undefined,
+  };
+  const { outcome } = await applyIncoming(state, incoming, oracle);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+});
+
+test("disposition: receiver-only current commit defers local-commits", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const withSafeRef = { ...incoming, refs: { ...incoming.refs, "refs/heads/incoming-side": incoming.refs["refs/heads/main"]! } };
+  await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "receiver only");
+  const { outcome } = await applyIncoming(state, withSafeRef);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-commits");
+  expect(await git(receiver, "rev-parse", "refs/heads/incoming-side")).toBe(withSafeRef.refs["refs/heads/incoming-side"]);
+  expect(outcome.partial?.repo?.appliedRefs["refs/heads/incoming-side"]).toBeDefined();
+});
+
+test("disposition: receiver-only non-current branch is held while checkout follows", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  const { outcome, logs } = await applyIncoming(state, incoming);
+  expect(logs.some((line) => line.startsWith("git-sync followed repo"))).toBe(true);
+  expect(outcome.partial?.repo?.heldRefs["refs/heads/local-side"]).toBe("local-commits");
+  expect(outcome.partial?.repo?.checkoutPending).toBe(false);
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(await git(receiver, "rev-parse", "refs/heads/local-side")).toBe(local);
+});
+
+test("deferredSince survives a partial follow followed by a new defer reason", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  await saveState(workspace, state);
+  const first = await applyIncoming(state, incoming);
+  const since = first.outcome.deferrals?.repo?.apply?.deferredSince;
+  const saved = await saveStateSource(workspace, state, {
+    expectedStream: "test-stream", sourceGlobalSeq: 2, observedRepos: ["repo"],
+    values: {
+      bases: first.outcome.gitRepos,
+      pending: first.outcome.gitPendingRemote,
+      deferrals: first.outcome.deferrals,
+      partial: first.outcome.partial,
+      idxProj: first.outcome.idxProj,
+    },
+  });
+  const unreadable: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "indeterminate", why: "later read failure" }),
+    reproveRepo: async () => ({ kind: "indeterminate", why: "later read failure" }),
+    receiptHash: () => undefined,
+  };
+  await commit("four\n", "c4 after partial");
+  const newer = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "four\n");
+  const second = await applyIncoming(saved, newer, unreadable, { sourceGlobalSeq: 3 });
+  expect(second.outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+  expect(second.outcome.deferrals?.repo?.apply?.deferredSince).toBe(since);
+});
+
+test("disposition: receiver-only stash defers local-stash and preserves stash", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, "stash.txt"), "stash work\n");
+  await git(receiver, "add", "stash.txt");
+  await git(receiver, "stash", "push", "-qm", "receiver stash");
+  await fs.rm(path.join(receiver, ".git", "ORIG_HEAD"), { force: true });
+  const stash = await git(receiver, "rev-parse", "refs/stash");
+  const { outcome } = await applyIncoming(state, incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-stash");
+  expect(await git(receiver, "rev-parse", "refs/stash")).toBe(stash);
+});
+
+test("incoming stash publishes a usable receiver reflog entry", async () => {
+  const { c1, state } = await baseAndIncoming();
+  await fs.writeFile(path.join(sender, "stash.txt"), "incoming stash\n");
+  await git(sender, "add", "stash.txt");
+  await git(sender, "stash", "push", "-qm", "incoming stash row");
+  const incoming = await capture();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const result = await applyIncoming(state, incoming);
+  expect(result.logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "stash", "list")).toContain("incoming stash row");
+  await git(receiver, "stash", "pop", "-q");
+  expect(await fs.readFile(path.join(receiver, "stash.txt"), "utf8")).toBe("incoming stash\n");
+});
+
+test("oracle indeterminate defers unreadable", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const oracle: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "indeterminate", why: "test unreadable" }),
+    reproveRepo: async () => ({ kind: "indeterminate", why: "test unreadable" }),
+    receiptHash: () => undefined,
+  };
+  const { outcome } = await applyIncoming(state, incoming, oracle);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+});
+
+test("flag zero keeps the legacy conflict checkpoint; invalid values stay on", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  process.env.RBOX_GIT_FOLLOW = "0";
+  const flagged = { ...incoming, refs: { ...incoming.refs, "refs/heads/flag-safe": incoming.refs["refs/heads/main"]! } };
+  const off = await applyIncoming(state, flagged);
+  expect(off.outcome.gitNeedsResolution?.repo).toBeDefined();
+  expect(off.outcome.deferrals?.repo?.apply?.reason).toBe("conflict");
+  expect(await git(receiver, "rev-parse", "refs/heads/flag-safe")).toBe(flagged.refs["refs/heads/flag-safe"]);
+
+  process.env.RBOX_GIT_FOLLOW = "invalid";
+  const checkpoint: SyncState = {
+    stream: state.stream,
+    stateNonce: state.stateNonce,
+    lastSyncedSequence: 2,
+    lastSyncedManifest: manifest(flagged),
+    gitNeedsResolution: { repo: off.outcome.gitNeedsResolution!.repo },
+    repoRecords: {
+      repo: {
+        repoGen: 2,
+        sourceSeq: 2,
+        base: flagged,
+        idxProj: off.outcome.idxProj?.repo ?? undefined,
+        resolutionKey: off.outcome.gitNeedsResolution!.repo,
+        deferrals: { apply: off.outcome.deferrals!.repo!.apply! },
+      },
+    },
+  };
+  const on = await applyIncoming(checkpoint, flagged);
+  expect(on.logs).toContain("git-sync followed repo");
+  expect(on.outcome.gitNeedsResolution?.repo).toBeUndefined();
+});
+
+test("unsupported checkout capability keeps legacy disposition with typed visibility", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const unsupported = { ...incoming, refs: { ...incoming.refs, "refs/heads/unsupported-safe": incoming.refs["refs/heads/main"]! } };
+  const { outcome } = await applyIncoming(state, unsupported, matchingOracle, { capabilityProbe: async () => false });
+  expect(outcome.gitNeedsResolution?.repo).toBeDefined();
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("unsupported");
+  expect(await git(receiver, "rev-parse", "refs/heads/unsupported-safe")).toBe(unsupported.refs["refs/heads/unsupported-safe"]);
+});
+
+test("degraded mutex keeps legacy conflict and performs no independent follow", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const { outcome } = await applyIncoming(state, incoming, matchingOracle, { degradedMutex: true });
+  expect(outcome.gitNeedsResolution?.repo).toBeDefined();
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+});
+
+test("degraded retry performs intent rollback before taking the legacy path", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-ref-commit");
+  const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming, matchingOracle, { degradedMutex: true });
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+  expect(retry.outcome.gitNeedsResolution?.repo).toBeDefined();
+});
+
+test("second-proof oracle mismatch aborts with local-edits", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const oracle: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "match" }),
+    reproveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    receiptHash: () => undefined,
+  };
+  const result = await applyIncoming(state, incoming, oracle);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+  expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal")).catch(() => [])).toEqual([]);
+});
+
+for (const point of [
+  "after-safe-refs",
+  "after-journal-write",
+  "after-connectivity-proof",
+  "after-prepare",
+  "after-index-lock",
+  "after-head-commit",
+  "after-ref-commit",
+  "before-index-publish",
+  "after-index-publish",
+  "mid-op-state",
+  "after-published-flip",
+] as const satisfies readonly FollowCrashPoint[]) {
+  test(`crash recovery at ${point} is coherent and retry converges`, async () => {
+    const { c1, base, state, incoming: firstIncoming } = await baseAndIncoming(point === "after-head-commit" ? "switch" : "same");
+    let incoming = firstIncoming;
+    if (point === "mid-op-state") {
+      await fs.writeFile(path.join(sender, ".git", "MERGE_HEAD"), `${c1}\n`);
+      incoming = await capture();
+    }
+    const old = await git(receiver, "rev-parse", "refs/heads/main");
+    await git(receiver, "update-ref", "refs/heads/main", c1, old);
+    await saveState(workspace, state);
+    const crashAt = (seen: FollowCrashPoint) => { if (seen === point) throw new FollowCrashInjectedError(seen); };
+    await expect(applyIncoming(state, incoming, matchingOracle, { crashAt })).rejects.toThrow(`injected follow crash at ${point}`);
+
+    const retryState = await loadState(workspace, "test-stream");
+    const retry = await applyIncoming(retryState, incoming);
+    expect(retry.logs.some((line) => line === "git-sync followed repo" || line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
+    const incomingHeadRef = /^ref:\s*(refs\/\S+)/.exec(incoming.head)?.[1];
+    expect(await git(receiver, "rev-parse", "HEAD")).toBe(incomingHeadRef ? incoming.refs[incomingHeadRef] : incoming.head.trim());
+    const persistedAfterRetry = await loadState(workspace, "test-stream");
+    expect(await indexIdentityV2(receiver, path.join(receiver, ".git", "index"))).toBe(retry.outcome.idxProj?.repo ?? persistedAfterRetry.repoRecords?.repo?.idxProj);
+    await withRevalidatedGitPartialApplies(workspace, retryState, retry.outcome, async () => undefined);
+    const journalRoot = path.join(workspace, ".rbox", "state", "git-journal");
+    expect(await fs.readdir(journalRoot).catch(() => [])).toEqual([]);
+    if (point !== "after-head-commit") expect(base.refs["refs/heads/main"]).not.toBe(incoming.refs["refs/heads/main"]);
+  }, 20_000);
+}
+
+test("crash-window human ref move is preserved and takes conflict path", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-ref-commit");
+  const tree = await git(receiver, "rev-parse", `${incoming.refs["refs/heads/main"]}^{tree}`);
+  const human = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", incoming.refs["refs/heads/main"]!, "-m", "human crash-window move"]).then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/main", human, incoming.refs["refs/heads/main"]!);
+
+  const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(human);
+  expect(retry.outcome.gitNeedsResolution?.repo).toBeDefined();
+  expect(retry.logs.some((line) => line.includes("crash-window human changes preserved"))).toBe(true);
+});
+
+test("rebind with a surviving intent journal quarantines it without touching Git", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-ref-commit");
+  const crashTip = await git(receiver, "rev-parse", "HEAD");
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  const rebound = await recoverFollowJournal(workspace, "repo", await checkoutJournalBinding("new-stream", "new-nonce", ctx));
+  expect(rebound.status).toBe("binding-mismatch");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(crashTip);
+  if (rebound.status === "binding-mismatch") expect(await fs.stat(rebound.quarantinePath)).toBeDefined();
+});
+
+test("crash after safe-ref publish is idempotent and retry does not duplicate mutation", async () => {
+  const c1 = await commit("one\n", "c1");
+  await commit("two\n", "c2");
+  await git(sender, "branch", "side");
+  const base = await capture();
+  await materialize(base);
+  await git(sender, "checkout", "-q", "side");
+  await commit("side-three\n", "side c3");
+  const incomingSide = await git(sender, "rev-parse", "side");
+  await git(sender, "checkout", "-q", "main");
+  await commit("main-three\n", "main c3");
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "main-three\n");
+  await git(receiver, "update-ref", "refs/heads/main", c1, base.refs["refs/heads/main"]!);
+  const state = stateWith(base);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-safe-refs") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-safe-refs");
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingSide);
+
+  const retryState = await loadState(workspace, "test-stream");
+  const retry = await applyIncoming(retryState, incoming);
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingSide);
+  expect(retry.logs).toContain("git-sync followed repo");
+  expect(retry.outcome.gitPendingRemote?.repo).toBeUndefined();
+  await withRevalidatedGitPartialApplies(workspace, retryState, retry.outcome, async () => undefined);
+});
+
+test("non-current NFF publication pins the displaced live tip in the same episode", async () => {
+  const c1 = await commit("one\n", "c1");
+  await commit("two\n", "c2");
+  await git(sender, "branch", "side");
+  const base = await capture();
+  await materialize(base);
+  await commit("three\n", "c3");
+  const tree = await git(sender, "write-tree");
+  const replacement = await exec("git", ["-C", sender, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-m", "unrelated side replacement"]).then(({ stdout }) => stdout.toString().trim());
+  const displaced = base.refs["refs/heads/side"]!;
+  await git(sender, "update-ref", "refs/heads/side", replacement, displaced);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await git(receiver, "update-ref", "refs/heads/main", c1, base.refs["refs/heads/main"]!);
+  const result = await applyIncoming(stateWith(base), incoming);
+  expect(result.logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(replacement);
+  expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${displaced}`)).toBe(displaced);
+  const origins = JSON.parse(await fs.readFile(path.join(receiver, ".git", "rbox-keep-origins.json"), "utf8"));
+  expect(origins[displaced]?.some((origin: { ref: string; class: string }) => origin.ref === "refs/heads/side" && origin.class === "human")).toBe(true);
+});
+
+test("working edit made after an intent crash is untouched and retry defers local-edits", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-journal-write") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-journal-write");
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "human crash-window edit\n");
+  const mismatch: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    reproveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    receiptHash: () => undefined,
+  };
+  const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming, mismatch);
+  expect(await fs.readFile(path.join(receiver, "tracked.txt"), "utf8")).toBe("human crash-window edit\n");
+  expect(retry.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+});
+
+test("crash before journal clear leaves published state recoverable without duplicate mutation", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  const first = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "before-journal-clear") throw new FollowCrashInjectedError(point); },
+  });
+  await expect(withRevalidatedGitPartialApplies(workspace, state, first.outcome, async () => saveStateSource(workspace, state, {
+    expectedStream: "test-stream",
+    sourceGlobalSeq: 2,
+    observedRepos: ["repo"],
+    values: {
+      bases: first.outcome.gitRepos,
+      pending: first.outcome.gitPendingRemote,
+      resolutions: first.outcome.gitNeedsResolution,
+      deferrals: first.outcome.deferrals,
+      partial: first.outcome.partial,
+      idxProj: first.outcome.idxProj,
+    },
+  }))).rejects.toThrow("before-journal-clear");
+  const tip = await git(receiver, "rev-parse", "HEAD");
+  const landed = await loadState(workspace, "test-stream");
+  const landedGen = landed.repoRecords?.repo?.repoGen;
+  const retry = await applyIncoming(landed, incoming);
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(tip);
+  expect(retry.logs.some((line) => line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
+  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBe(landedGen);
+});
+
+test("push planning completes a published journal before capture without echo", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-published-flip") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-published-flip");
+  const logs: string[] = [];
+  const plan = await planGitSections(
+    workspace,
+    cfg,
+    await loadState(workspace, "test-stream"),
+    {} as SyncRemote,
+    new Set(),
+    buildIgnoreMatcher(workspace),
+    undefined,
+    undefined,
+    { onGitLog: (line) => logs.push(line) },
+  );
+  expect(logs.some((line) => line.includes("recovered published checkout repo before capture"))).toBe(true);
+  expect(plan.gitRepos?.repo).toEqual(incoming);
+  expect(plan.changed).toBe(false);
+  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.base).toEqual(incoming);
+  expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal")).catch(() => [])).toEqual([]);
+});
+
+test("published partial recovery is idempotent after a branch-switch hold", async () => {
+  const { c1, state, incoming } = await baseAndIncoming("switch");
+  const old = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  const tree = await git(receiver, "write-tree");
+  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "held local side"]).then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  await saveState(workspace, state);
+  const first = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "before-journal-clear") throw new FollowCrashInjectedError(point); },
+  });
+  expect(first.outcome.partial?.repo?.heldRefs["refs/heads/local-side"]).toBe("local-commits");
+  await expect(withRevalidatedGitPartialApplies(workspace, state, first.outcome, async () => saveStateSource(workspace, state, {
+    expectedStream: "test-stream",
+    sourceGlobalSeq: 2,
+    observedRepos: ["repo"],
+    values: {
+      bases: first.outcome.gitRepos,
+      pending: first.outcome.gitPendingRemote,
+      deferrals: first.outcome.deferrals,
+      partial: first.outcome.partial,
+      idxProj: first.outcome.idxProj,
+    },
+  }))).rejects.toThrow("before-journal-clear");
+  const landed = await loadState(workspace, "test-stream");
+  const landedGen = landed.repoRecords?.repo?.repoGen;
+  const retry = await applyIncoming(landed, incoming);
+  expect(retry.logs.some((line) => line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
+  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBe(landedGen);
+});
+
+test("clean apply clears a stale index cache before the next contained follow", async () => {
+  const { base, state, incoming } = await baseAndIncoming();
+  state.repoRecords!.repo!.idxProj = "v2:stale-cache";
+  await saveState(workspace, state);
+  const clean = await applyIncoming(state, incoming);
+  expect(clean.outcome.idxProj?.repo).toBeNull();
+  const saved = await saveStateSource(workspace, state, {
+    expectedStream: "test-stream",
+    sourceGlobalSeq: 2,
+    observedRepos: ["repo"],
+    values: { bases: clean.outcome.gitRepos, partial: clean.outcome.partial, idxProj: clean.outcome.idxProj },
+  });
+  await commit("four\n", "c4");
+  const newer = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "four\n");
+  const live = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", base.refs["refs/heads/main"]!, live);
+  const followed = await applyIncoming(saved, newer, matchingOracle, { sourceGlobalSeq: 3 });
+  expect(followed.logs).toContain("git-sync followed repo");
+  expect(followed.outcome.deferrals?.repo?.apply?.reason).not.toBe("local-index");
+});

@@ -40,6 +40,7 @@ src/cli/sync-git.ts                  — barrel: pre-113-split public surface of
 src/cli/sync-git/shared.ts           — cross-lane orchestration policy (capture/apply concurrency, repo cap/path helpers, scope projection/carry matrix, log-once sets) + capture/locking primitives (chainLock, gitApplyMutationKey, nestedRepoChains, capturePlannedGitSection). SINGLE owner of the module-level state shared by plan AND apply. Never: plan or apply decisions themselves.
 src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 — one closure unit, helper order is semantic), plan contracts, push formatters, gitBaseAfterCommit, gitForceForMissingBlobs. Never: apply-side mutation, status rendering.
 src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
+src/cli/sync-git/follow.ts           — design-116 diverged-checkout orchestration: artifact staging, all-guard classification, independent safe-ref publication, journaled checkout commit/recovery adapters. Never: D4a journal/reachability/index/pin mechanics or state-file persistence.
 src/cli/sync-git/config-lane.ts      — config-lane capture model + receiver: CachedLocalCfg, gitConfigHash, shouldPublishGitConfig, readLocalGitConfig, configReceiver, sameConfigShape. Never: fingerprinting, apply transactions.
 src/cli/sync-git/fingerprint.ts      — divergence fingerprint construction: stat/tree/index tokenization, racy-clean trust, GIT_FINGERPRINT_VERSION derivation (version MUST stay adjacent to the token code it versions — design 113 §8). Never: cache persistence, probing.
 src/cli/sync-git/divergence-cache.ts — divergence cache schema/persistence + probe build/classify/write/refresh. Never: fingerprint token construction.
@@ -193,4 +194,9 @@ src/engine/git/containment.ts — single safety check: assertGitTargetWithinRoot
 src/engine/git/lockfile.ts    — generic cross-process advisory lockfile with liveness probing (acquireLock, OwnedLock, inspectLock, stale detection). Never: what the lock protects.
 src/engine/git/config-sync.ts — pure (node-free, bundles into Worker) grammar/projection/canonicalization for git config sync (design 93): allowlisted keys, canonicalizeGitConfig, credential/value safety. Never: I/O.
 src/engine/git/config-txn.ts  — transactional on-disk git config read/write: lockfile-guarded atomic apply, fault classification, orphan sweep. The stateful counterpart to config-sync.ts. Never: the grammar.
+src/engine/git/index-identity.ts — semantic GitIndexIdentityV2 projection from a private index copy. Never: follow authorization or live-index mutation.
+src/engine/git/reachability.ts — fail-closed incoming-ownership/no-drop graph proofs plus full stash-reflog enumeration. Never: ref mutation or follow policy.
+src/engine/git/journal.ts      — durable two-phase checkout journal write/mark/clear and old/new/third-value recovery arbitration. Never: CLI state interpretation or checkout planning.
+src/engine/git/checkout-txn.ts — prepared expected-old ref transaction + index-lock checkout commit and capability/boundary proof protocol. Never: classifier policy or state saving.
+src/engine/git/keep-pins.ts    — content-addressed recovery pins, reflog-displacement discovery, and pre-displacement provenance sidecar. Never: retention policy or ref-plane classification.
 ```

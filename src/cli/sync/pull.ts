@@ -240,6 +240,8 @@ export async function applyPulledManifest(
       oracle,
       onProgress: deps.onGitProgress,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+      degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
+      sourceGlobalSeq: sequence,
     })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
@@ -259,6 +261,7 @@ export async function applyPulledManifest(
       configLane: gitOutcome.configLane,
       deferrals: gitOutcome.deferrals,
       partial: gitOutcome.partial,
+      idxProj: gitOutcome.idxProj,
     }),
     values: {
       bases: gitOutcome.gitRepos,
@@ -268,6 +271,7 @@ export async function applyPulledManifest(
       configLane: gitOutcome.configLane,
       deferrals: gitOutcome.deferrals,
       partial: gitOutcome.partial,
+      idxProj: gitOutcome.idxProj,
     },
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),

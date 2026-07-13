@@ -1,4 +1,5 @@
 import type { GitSection, Manifest } from "../engine/index.js";
+import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import {
   applyStateSavePacket,
@@ -42,6 +43,8 @@ export interface RepoStateValues {
   /** Missing repo/lane preserves it; null repo clears all lanes; null lane clears it. */
   deferrals?: Record<string, GitDeferralUpdates | null>;
   partial?: Record<string, GitPartialApply | null>;
+  /** Semantic projection of the last applied index; null clears a stale cache. */
+  idxProj?: Record<string, string | null>;
 }
 
 export interface StateSource {
@@ -128,7 +131,9 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     ...(source.values.partial?.[relPath] === undefined
       ? (current.partial === undefined ? {} : { partial: current.partial })
       : source.values.partial[relPath] === null ? {} : { partial: source.values.partial[relPath] }),
-    ...(current.idxProj === undefined ? {} : { idxProj: current.idxProj }),
+    ...(source.values.idxProj?.[relPath] === undefined
+      ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
+      : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
   }, source.authoredCfgHashByRepo?.[relPath]);
   return next;
 }
@@ -224,7 +229,96 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.configLane ?? {}),
     ...Object.keys(values.deferrals ?? {}),
     ...Object.keys(values.partial ?? {}),
+    ...Object.keys(values.idxProj ?? {}),
   ])].sort();
+}
+
+/** Complete a published checkout journal with a fresh generation-CAS merge.
+ * The opaque intended record supplies the checkout/config result, while current
+ * capture/config deferral lanes are retained and only the apply lane is replaced. */
+export async function savePublishedRepoIntent(
+  root: string,
+  snapshot: SyncState,
+  relPath: string,
+  intended: { record: RepoRecordInput; expectedRepoGen: number; relPath: string; previousRecord?: RepoRecordInput },
+  options: { forceLegacy?: boolean } = {},
+): Promise<SyncState> {
+  if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
+  const withoutGen = (value: RepoRecord): RepoRecordInput => {
+    const { repoGen: _repoGen, ...record } = value;
+    return record;
+  };
+  const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
+    Object.fromEntries(fields.map((field) => [field, record?.[field]]));
+  const applyFields = ["base", "pending", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
+  const configFields = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
+  const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
+    for (const field of fields) {
+      if (desired[field] === undefined) delete target[field];
+      else (target as Record<string, unknown>)[field] = desired[field];
+    }
+  };
+  const laneDeferral = (record: RepoRecordInput | undefined, lane: "apply" | "capture" | "config") => record?.deferrals?.[lane];
+  let currentSnapshot = snapshot;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = repoRecordsForState(currentSnapshot)[relPath] ?? { repoGen: 0, sourceSeq: 0 };
+    const currentInput = withoutGen(current);
+    const exactGeneration = current.repoGen === intended.expectedRepoGen;
+    const appAlready = isDeepStrictEqual(select(currentInput, applyFields), select(intended.record, applyFields))
+      && isDeepStrictEqual(laneDeferral(currentInput, "apply"), laneDeferral(intended.record, "apply"));
+    const configAlready = isDeepStrictEqual(select(currentInput, configFields), select(intended.record, configFields))
+      && isDeepStrictEqual(laneDeferral(currentInput, "config"), laneDeferral(intended.record, "config"));
+    const appUnchanged = exactGeneration || (intended.previousRecord !== undefined
+      && isDeepStrictEqual(select(currentInput, applyFields), select(intended.previousRecord, applyFields))
+      && isDeepStrictEqual(laneDeferral(currentInput, "apply"), laneDeferral(intended.previousRecord, "apply")));
+    const configUnchanged = exactGeneration || (intended.previousRecord !== undefined
+      && isDeepStrictEqual(select(currentInput, configFields), select(intended.previousRecord, configFields))
+      && isDeepStrictEqual(laneDeferral(currentInput, "config"), laneDeferral(intended.previousRecord, "config")));
+
+    // Generation drift means another save landed. Only install a journal lane
+    // if that lane is still byte-for-byte the pre-journal value; otherwise the
+    // newer lane wins. Capture is never journal-owned and is always preserved.
+    const merged: RepoRecordInput = { ...currentInput };
+    if (!appAlready && appUnchanged) {
+      replace(merged, intended.record, applyFields);
+      merged.sourceSeq = intended.record.sourceSeq;
+    }
+    if (!configAlready && configUnchanged) replace(merged, intended.record, configFields);
+    const deferrals = { ...(currentInput.deferrals ?? {}) };
+    if (!appAlready && appUnchanged) {
+      const value = intended.record.deferrals?.apply;
+      if (value) deferrals.apply = value; else delete deferrals.apply;
+    }
+    if (!configAlready && configUnchanged) {
+      const value = intended.record.deferrals?.config;
+      if (value) deferrals.config = value; else delete deferrals.config;
+    }
+    if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
+    if (isDeepStrictEqual(currentInput, merged)) return currentSnapshot;
+
+    if (options.forceLegacy) {
+      const records = repoRecordsForState(currentSnapshot);
+      records[relPath] = { ...merged, repoGen: current.repoGen + 1 };
+      const next = stateFromRepoRecords(currentSnapshot, records);
+      await saveState(root, next);
+      return next;
+    }
+    const result = await applyStateSavePacket(root, {
+      expectedStream: currentSnapshot.stream,
+      expectedNonce: expectedStateNonce(currentSnapshot),
+      sourceGlobalSeq: merged.sourceSeq,
+      repos: [{ relPath, expectedRepoGen: current.repoGen, newRecord: merged }],
+    });
+    if (result.status === "accepted") return result.state;
+    if (result.status === "rejected" && (result.reason === "repo-generation" || result.reason === "global-sequence")) {
+      currentSnapshot = result.state;
+      continue;
+    }
+    if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
+    if (result.status === "unsupported") throw new Error(`sync state transactional save unsupported (${String(result.error)})`);
+    throw new Error(`sync state changed during published recovery (${result.reason})`);
+  }
+  throw new Error("sync state kept changing during published recovery (3 recomputes exhausted)");
 }
 
 /** The no-op site is intentionally narrow: only records whose exact sidecar

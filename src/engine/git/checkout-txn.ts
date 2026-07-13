@@ -22,13 +22,24 @@ export type CheckoutHeadUpdate =
   | { kind: "detached"; newOid: string; oldOid: string };
 
 export interface CheckoutPlan {
-  candidateIndexPath: string;
+  /** Incoming index bytes. Undefined with removeIndex publishes index absence. */
+  candidateIndexPath?: string;
+  removeIndex?: boolean;
   refUpdates: CheckoutRefUpdate[];
+  /** Updates to HEAD's former referent during a branch switch/detach. Git
+   * rejects these in the same update-ref transaction as the HEAD change, so
+   * checkout-txn prepares both transactions before the boundary proof and
+   * commits them as one journal-arbitrated checkout publication. */
+  postHeadRefUpdates?: CheckoutRefUpdate[];
+  postHeadExtraTransactionLines?: string[];
   head: CheckoutHeadUpdate;
   /** create-only recovery-pin lines already provenance-persisted by keep-pins. */
   extraTransactionLines?: string[];
   plannedGraphRoots: string[];
   opState: Array<{ rel: string; tmp: string }>;
+  /** Refs read by HEAD but not mutated in this transaction. Their ordinary
+   * ref lock is held across the boundary proof and commit. */
+  refReservations?: Array<{ ref: string; expectedOid: string }>;
 }
 
 export interface OwnedGitLock {
@@ -46,12 +57,14 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
   connectivityProof?: (repoDir: string, roots: readonly string[]) => Promise<boolean>;
   secondProof: (context: SecondProofContext) => Promise<boolean>;
   journal?: { workspaceRoot: string; relPath: string; value: CheckoutJournal<TIntended> };
-  crashAt?: (point: "after-connectivity-proof" | "after-prepare" | "after-index-lock" | "after-ref-commit" | "before-index-publish" | "mid-op-state") => void;
+  crashAt?: (point: "after-connectivity-proof" | "after-prepare" | "after-index-lock" | "after-head-commit" | "after-ref-commit" | "before-index-publish" | "after-index-publish" | "mid-op-state") => void;
   capabilityProbe?: CheckoutCapabilityProbe;
+  /** Caller already ran the exact capability probe for this transaction. */
+  capabilitySupported?: boolean;
 }
 
 export type CommitCheckoutResult =
-  | { status: "committed"; indexHash: string }
+  | { status: "committed"; indexHash?: string }
   | { status: "defer"; reason: string }
   | { status: "unsupported"; reason: string };
 
@@ -257,10 +270,34 @@ function transactionLines(plan: CheckoutPlan): string[] {
   return lines;
 }
 
+
+function refUpdateLines(updates: readonly CheckoutRefUpdate[], extra: readonly string[] = []): string[] {
+  const lines = [...extra];
+  for (const update of updates) {
+    if (update.kind === "create") lines.push(`create ${update.ref} ${update.newOid}`);
+    else if (update.kind === "update") lines.push(`update ${update.ref} ${update.newOid} ${update.oldOid}`);
+    else lines.push(`delete ${update.ref} ${update.oldOid}`);
+  }
+  return lines;
+}
+
 function expectedTransactionLockPaths(ctx: RepoCtx, plan: CheckoutPlan): Set<string> {
-  const locks = new Set<string>([path.resolve(ctx.gitDir, "HEAD.lock"), path.resolve(ctx.commonDir, "packed-refs.lock")]);
+  // Only per-ref/HEAD paths named by this exact plan are eligible. A broad
+  // packed-refs.lock allow-list cannot prove which process created that lock;
+  // treating it as external may conservatively defer a packed-ref rewrite but
+  // can never bless a concurrent Git writer.
+  const locks = new Set<string>([path.resolve(ctx.gitDir, "HEAD.lock")]);
+  if (plan.head.kind === "symbolic") {
+    locks.add(path.resolve(ctx.commonDir, `${plan.head.newTarget}.lock`));
+    if (plan.head.oldTarget) locks.add(path.resolve(ctx.commonDir, `${plan.head.oldTarget}.lock`));
+  }
   for (const update of plan.refUpdates) locks.add(path.resolve(ctx.commonDir, `${update.ref}.lock`));
+  for (const update of plan.postHeadRefUpdates ?? []) locks.add(path.resolve(ctx.commonDir, `${update.ref}.lock`));
   for (const line of plan.extraTransactionLines ?? []) {
+    const match = /^(?:create|update|delete|verify) (refs\/\S+)/.exec(line);
+    if (match) locks.add(path.resolve(ctx.commonDir, `${match[1]}.lock`));
+  }
+  for (const line of plan.postHeadExtraTransactionLines ?? []) {
     const match = /^(?:create|update|delete|verify) (refs\/\S+)/.exec(line);
     if (match) locks.add(path.resolve(ctx.commonDir, `${match[1]}.lock`));
   }
@@ -286,33 +323,70 @@ async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: strin
 
 /** The pinned 10-step checkout commit from design 116 (r1 F3/r2 F4/r3 F6). */
 export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPlan, opts: CommitCheckoutOptions<T>): Promise<CommitCheckoutResult> {
-  if (!(await checkoutTransactionSupported(ctx.repoDir, opts.capabilityProbe))) return { status: "unsupported", reason: "git lacks prepared transactional symref-update" };
+  if (!(opts.capabilitySupported ?? await checkoutTransactionSupported(ctx.repoDir, opts.capabilityProbe))) return { status: "unsupported", reason: "git lacks prepared transactional symref-update" };
+
+  if ((plan.candidateIndexPath === undefined) === (plan.removeIndex !== true)) {
+    return { status: "defer", reason: "checkout plan must publish index bytes or explicit index absence" };
+  }
 
   const staged = path.join(ctx.gitDir, `.rbox-candidate-index-${process.pid}-${crypto.randomBytes(8).toString("hex")}`);
   let tx: RefTransaction | undefined;
+  let postHeadTx: RefTransaction | undefined;
   let indexHandle: fs.FileHandle | undefined;
   let indexToken: OwnedGitLock | undefined;
+  const reservationHandles: fs.FileHandle[] = [];
+  const reservationTokens: OwnedGitLock[] = [];
   let refsCommitted = false;
   const indexLock = path.join(ctx.gitDir, "index.lock");
   try {
-    await fs.copyFile(plan.candidateIndexPath, staged);
-    await clearIndexResolveUndo(ctx.repoDir, staged); // private GIT_INDEX_FILE, never live index.
-    const candidate = await fs.readFile(staged);
-    const indexHash = hashBytes(candidate);
+    let candidate: Buffer | undefined;
+    let indexHash: string | undefined;
+    if (plan.candidateIndexPath) {
+      await fs.copyFile(plan.candidateIndexPath, staged);
+      await clearIndexResolveUndo(ctx.repoDir, staged); // private GIT_INDEX_FILE, never live index.
+      candidate = await fs.readFile(staged);
+      indexHash = hashBytes(candidate);
+    }
     if (opts.journal) {
       opts.journal.value.expectedNew.indexHash = indexHash;
       await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
     }
 
     if (!(await (opts.connectivityProof ?? defaultConnectivityProof)(ctx.repoDir, plan.plannedGraphRoots))) return { status: "defer", reason: "planned graph connectivity proof failed" };
-    opts.crashAt?.("after-connectivity-proof");
+    try { opts.crashAt?.("after-connectivity-proof"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+
+    const locksBeforePrepare = new Map<string, string>();
+    for (const abs of await allGitLocks(ctx)) {
+      const token = await lockToken(abs);
+      if (token) locksBeforePrepare.set(token.path, `${token.dev}:${token.ino}`);
+    }
 
     tx = new RefTransaction(ctx.repoDir);
     await tx.start();
     await tx.write("option no-deref");
     for (const line of transactionLines(plan)) await tx.write(line);
     await tx.prepare();
-    opts.crashAt?.("after-prepare");
+    const postHeadLines = refUpdateLines(plan.postHeadRefUpdates ?? [], plan.postHeadExtraTransactionLines);
+    try { opts.crashAt?.("after-prepare"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+
+    for (const reservation of plan.refReservations ?? []) {
+      const lockPath = path.join(ctx.commonDir, `${reservation.ref}.lock`);
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+      const handle = await fs.open(lockPath, "wx");
+      reservationHandles.push(handle);
+      const token = await lockToken(lockPath);
+      if (!token) throw new Error(`could not identify owned ${reservation.ref}.lock`);
+      reservationTokens.push(token);
+      const { stdout } = await exec("git", ["-C", ctx.repoDir, "rev-parse", "--verify", reservation.ref], { env: cleanGitEnv() });
+      if (stdout.toString().trim() !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
+    }
+    if (opts.journal && reservationTokens.length) {
+      opts.journal.value.expectedNew.reservedLocks = Object.fromEntries((plan.refReservations ?? []).map((reservation, i) => [reservation.ref, {
+        dev: reservationTokens[i]!.dev,
+        ino: reservationTokens[i]!.ino,
+      }]));
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
 
     if (plan.head.kind === "symbolic" && plan.head.newTarget === plan.head.oldTarget) {
       // Git forbids putting HEAD and its unchanged referent in one transaction.
@@ -327,50 +401,98 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     indexHandle = await fs.open(indexLock, "wx");
     indexToken = await lockToken(indexLock);
     if (!indexToken) throw new Error("could not identify owned index.lock");
-    opts.crashAt?.("after-index-lock");
+    if (opts.journal) {
+      opts.journal.value.expectedNew.indexLock = { dev: indexToken.dev, ino: indexToken.ino };
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
+    try { opts.crashAt?.("after-index-lock"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
-    const owned: OwnedGitLock[] = [indexToken];
+    const owned: OwnedGitLock[] = [indexToken, ...reservationTokens];
     const expectedLocks = expectedTransactionLockPaths(ctx, plan);
     for (const abs of await allGitLocks(ctx)) {
       if (!expectedLocks.has(abs) || abs === indexToken.path) continue;
       const token = await lockToken(abs);
-      if (token) owned.push(token);
+      if (token && !locksBeforePrepare.has(token.path)) owned.push(token);
     }
     const proofContext: SecondProofContext = { ownedLocks: owned, busy: () => ownershipAwareGitBusy(ctx, owned) };
-    if (await proofContext.busy() || !(await opts.secondProof(proofContext))) {
+    const becameBusy = await proofContext.busy();
+    const secondProofPassed = !becameBusy && await opts.secondProof(proofContext);
+    if (becameBusy || !secondProofPassed) {
       await tx.abort();
       tx = undefined;
+      await postHeadTx?.abort();
+      postHeadTx = undefined;
       await indexHandle.close();
       indexHandle = undefined;
       await fs.rm(indexLock, { force: true });
-      return { status: "defer", reason: "checkout boundary proof changed or git became busy" };
+      for (const handle of reservationHandles) await handle.close().catch(() => {});
+      reservationHandles.length = 0;
+      for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+      reservationTokens.length = 0;
+      return { status: "defer", reason: becameBusy ? "git became busy at checkout boundary" : "checkout boundary proof changed" };
     }
 
     await tx.commit();
     tx = undefined;
     refsCommitted = true;
-    opts.crashAt?.("after-ref-commit");
-    opts.crashAt?.("before-index-publish");
-    await indexHandle.writeFile(candidate);
-    await indexHandle.sync();
+    try { opts.crashAt?.("after-head-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+    if (postHeadLines.length) {
+      // Git cannot prepare an update of HEAD's old referent while HEAD.lock is
+      // held by the symref transaction. Keep this second expected-old commit
+      // inside checkout-txn and under the same intent journal/index reservation.
+      postHeadTx = new RefTransaction(ctx.repoDir);
+      await postHeadTx.start();
+      await postHeadTx.write("option no-deref");
+      for (const line of postHeadLines) await postHeadTx.write(line);
+      await postHeadTx.prepare();
+      await postHeadTx.commit();
+      postHeadTx = undefined;
+    }
+    try { opts.crashAt?.("after-ref-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+    try { opts.crashAt?.("before-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+    if (candidate) {
+      await indexHandle.writeFile(candidate);
+      await indexHandle.sync();
+    }
     await indexHandle.close();
     indexHandle = undefined;
-    await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
+    if (candidate) await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
+    else {
+      await fs.rm(path.join(ctx.gitDir, "index"), { force: true });
+      await fs.rm(indexLock, { force: true });
+    }
+    try { opts.crashAt?.("after-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
     await restoreOpStateWithCrash(ctx, plan.opState, opts.crashAt);
-    return { status: "committed", indexHash };
+    for (const handle of reservationHandles) await handle.close();
+    reservationHandles.length = 0;
+    for (const token of reservationTokens) await fs.rm(token.path, { force: true });
+    reservationTokens.length = 0;
+    return { status: "committed", ...(indexHash === undefined ? {} : { indexHash }) };
   } catch (error) {
     if (!refsCommitted) {
       await tx?.abort().catch(() => {});
+      await postHeadTx?.abort().catch(() => {});
       await indexHandle?.close().catch(() => {});
-      await fs.rm(indexLock, { force: true }).catch(() => {});
+      if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+      for (const handle of reservationHandles) await handle.close().catch(() => {});
+      for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+      if (error instanceof InjectedCheckoutCrash) throw error.cause;
       return { status: "defer", reason: error instanceof Error ? error.message : "checkout transaction failed" };
     }
     // After ref commit, never call unconditional restoreLocal (r2 F4). The
     // durable journal's old/new arbitration is the only repair authority.
     await indexHandle?.close().catch(() => {});
-    await fs.rm(indexLock, { force: true }).catch(() => {});
+    await postHeadTx?.abort().catch(() => {});
+    if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+    for (const handle of reservationHandles) await handle.close().catch(() => {});
+    for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+    if (error instanceof InjectedCheckoutCrash) throw error.cause;
     throw error;
   } finally {
     await fs.rm(staged, { force: true }).catch(() => {});
   }
+}
+
+class InjectedCheckoutCrash extends Error {
+  constructor(readonly cause: unknown) { super("injected checkout crash"); }
 }

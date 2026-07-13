@@ -43,6 +43,11 @@ const envInt = (name: string, fallback: number, min: number, max: number): numbe
 
 export const gitApplyConcurrency = (): number => envInt("RBOX_GIT_APPLY_CONCURRENCY", GIT_APPLY_CONCURRENCY_DEFAULT, 1, 16);
 
+/** Design 116 rollout gate. Read on every decision so tests and long-lived
+ * daemons never retain a stale environment value. Only the exact string "0"
+ * disables automatic checkout follow; every other value is intentionally on. */
+export const gitFollowEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => env.RBOX_GIT_FOLLOW !== "0";
+
 /** The push-side new-repo admission cap (design 43 §3 [v2, M4]). Env-overridable for
  *  tests/tuning; the manifest-validation bound stays the hard MAX_GIT_REPOS. The cap
  *  bounds capture WORK for newly-discovered repos — base-carrying repos are ALWAYS
@@ -103,6 +108,7 @@ export function nextDeferral(
     reason,
     ...(checkout === undefined ? {} : { checkout }),
     ...(current?.bytesChanged === undefined ? {} : { bytesChanged: current.bytesChanged }),
+    ...(current?.reproof === undefined || current.subjectKey !== subjectKey ? {} : { reproof: current.reproof }),
   };
 }
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {

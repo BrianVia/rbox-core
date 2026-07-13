@@ -2,13 +2,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { GitCaptureDeferredError, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
-import { type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
+import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
+import { savePublishedRepoIntent } from "../sync-state.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection, gitIncomingKey } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
+import { checkoutJournalBinding, clearFollowJournal, quarantineUnboundFollowJournal, recoverFollowJournal } from "./follow.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -61,6 +63,8 @@ export interface GitPlanOptions {
   /** Workspace lock identity/link support is unavailable. Preserve Git syncing,
    * but neither read nor author config-lane updates. */
   disableConfigLane?: boolean;
+  /** Degraded workspace serialization permits rollback-only journal recovery. */
+  degradedMutex?: boolean;
   /** Design 108 §3.2: files-first genesis defer. When true, planGitSections returns an
    *  empty/absent git section with changed=false WITHOUT discovering/capturing any repo
    *  and WITHOUT touching any local-only sidecar (base/pending/needsRes/removed are all
@@ -93,7 +97,7 @@ export async function planGitSections(
   backoff?: (attempt: number) => Promise<void>,
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
-  const base = state.lastSyncedManifest.gitRepos ?? {};
+  const base = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
@@ -222,6 +226,45 @@ export async function planGitSections(
   }
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
+  const recoveryBlocked = new Map<string, string>();
+  for (const rel of keys) {
+    const repoDir = repoDirOf(root, rel);
+    const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!ctx) {
+      const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
+      if (recovery.status === "binding-mismatch") glog(`git-sync WARNING ${rel}: journal for an absent/unreadable repository quarantined at ${recovery.quarantinePath}`);
+      else if (recovery.status === "defer") recoveryBlocked.set(rel, recovery.reason);
+      continue;
+    }
+    const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
+    const recovery = await recoverFollowJournal(root, rel, binding);
+    if (recovery.status === "keep") {
+      if (options.degradedMutex) {
+        recoveryBlocked.set(rel, "published checkout journal awaits non-degraded state save");
+        continue;
+      }
+      const before = repoRecordsForState(state)[rel];
+      const alreadyApplied = before?.base !== undefined
+        && gitIncomingKey(before.base) === recovery.incomingKey
+        && before.pending === undefined;
+      if (!alreadyApplied) state = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+      const record = repoRecordsForState(state)[rel];
+      if (record?.base) base[rel] = record.base; else delete base[rel];
+      if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
+      if (record?.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
+      if (record?.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
+      await clearFollowJournal(root, rel);
+      glog(`git-sync recovered published checkout ${rel} before capture`);
+    } else if (recovery.status === "defer") {
+      recoveryBlocked.set(rel, recovery.reason);
+    } else if (recovery.status === "human-intervened") {
+      recoveryBlocked.set(rel, `crash-window human changes preserved; journal quarantined at ${recovery.quarantinePath}`);
+    } else if (recovery.status === "binding-mismatch") {
+      glog(`git-sync WARNING ${rel}: stale checkout journal quarantined at ${recovery.quarantinePath}`);
+    } else if (recovery.status === "fresh-quarantined") {
+      recoveryBlocked.set(rel, `partial fresh repository quarantined at ${recovery.quarantinePath}`);
+    }
+  }
   for (const rel of keys) captureObserved.add(rel);
   stats.repos = keys.length;
   // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
@@ -510,6 +553,20 @@ export async function planGitSections(
     const baseSec = base[rel];
     const pend = pending[rel];
     let fastLookup: FingerprintHitProbeResult | undefined;
+
+    const recoveryReason = recoveryBlocked.get(rel);
+    if (recoveryReason) {
+      if (pend) {
+        deferred.push({ relPath: rel, reason: recoveryReason });
+        if (!force.has(rel)) {
+          out[rel] = pend;
+          carried.push(rel);
+        }
+        continue;
+      }
+      deferOne(rel, recoveryReason);
+      continue;
+    }
 
     // Pending unapplied remote [v5]: carry THE PENDING SECTION (the newest known truth),
     // capture suppressed. 422-while-pending [v6] → M5 drop; the pending entry stays for

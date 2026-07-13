@@ -203,6 +203,8 @@ export interface GitDeferral {
   reason: GitDeferralReason;
   checkout?: { kind: "branch" | "detached"; label?: string };
   bytesChanged?: boolean;
+  /** D4 r2 F5: this checkpoint was classified once for subjectKey. */
+  reproof?: boolean;
 }
 
 export type GitDeferrals = Partial<Record<GitDeferral["lane"], GitDeferral>>;

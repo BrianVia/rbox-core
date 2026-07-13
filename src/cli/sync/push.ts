@@ -379,6 +379,7 @@ async function runPushAttempt(
     planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
       onGitLog: deps.onGitLog,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+      degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
       filesFirstDefer,
     })
   );

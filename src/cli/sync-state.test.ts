@@ -21,6 +21,7 @@ import {
   composeStateSavePacket,
   daemonBindingMatches,
   observedRepoKeys,
+  savePublishedRepoIntent,
   saveStateSource,
   stampConfigAck,
   type StateSource,
@@ -92,6 +93,39 @@ describe("design 93 §6 sync-point truth table", () => {
 });
 
 describe("design 93 §6 transactional unit", () => {
+  test("published checkout recovery merges fresh lanes and is idempotent", async () => {
+    const oldApply = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "conflict" as const,
+    };
+    const capture = { ...oldApply, lane: "capture" as const, reason: "git-busy" as const };
+    const previous = { sourceSeq: 1, base: section("old"), cfgApplied: "old", deferrals: { apply: oldApply } };
+    const intended = {
+      sourceSeq: 2,
+      base: section("next"),
+      cfgApplied: "journal-config",
+      idxProj: "next-index",
+    };
+    const initial = baseState({ r: { repoGen: 1, ...previous } });
+    const concurrent = baseState({ r: { repoGen: 2, ...previous, cfgApplied: "newer-config", deferrals: { apply: oldApply, capture } } });
+    await saveState(root, concurrent);
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r", expectedRepoGen: 1, previousRecord: previous, record: intended,
+    });
+    expect(recovered.repoRecords?.r).toMatchObject({
+      repoGen: 3, sourceSeq: 2, base: section("next"), cfgApplied: "newer-config", idxProj: "next-index",
+      deferrals: { capture },
+    });
+    const repeated = await savePublishedRepoIntent(root, recovered, "r", {
+      relPath: "r", expectedRepoGen: 1, previousRecord: previous, record: intended,
+    });
+    expect(repeated.repoRecords?.r?.repoGen).toBe(3);
+    expect(repeated.repoRecords?.r?.cfgApplied).toBe("newer-config");
+  });
+
   test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {
     const unavailable: LockIdentitySource = {
       current: async () => { throw new Error("no identity source"); },

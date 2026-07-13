@@ -21,6 +21,8 @@ export interface CheckoutJournal<TIntended = unknown> {
   old: {
     currentRefName?: string;
     currentRefOid?: string;
+    /** Additional checkout-plane refs (for example a branch-switch target). */
+    refs?: Record<string, string | null>;
     headContent: string;
     indexPresent: boolean;
     opState: Record<string, true>;
@@ -34,6 +36,10 @@ export interface CheckoutJournal<TIntended = unknown> {
     opState: Record<string, string | null>;
     refs: Record<string, string>;
     head: string;
+    /** Empty lockfiles owned by checkout-txn across a branch switch. */
+    reservedRefs?: Record<string, string>;
+    indexLock?: { dev: number; ino: number };
+    reservedLocks?: Record<string, { dev: number; ino: number }>;
   };
   binding: CheckoutJournalBinding;
   createdFresh: boolean;
@@ -196,6 +202,26 @@ export async function recoverJournal<T = unknown>(
   const human: string[] = [];
   const repoDir = relPath === "." ? workspaceRoot : path.join(workspaceRoot, ...relPath.split("/"));
   const indexPath = path.join(binding.gitDirReal, "index");
+  const indexLockPath = path.join(binding.gitDirReal, "index.lock");
+  const indexLock = await fs.readFile(indexLockPath).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+  if (indexLock !== undefined) {
+    const stat = await fs.lstat(indexLockPath);
+    const token = journal.expectedNew.indexLock;
+    const owned = token !== undefined && stat.dev === token.dev && stat.ino === token.ino;
+    if (owned) await fs.rm(indexLockPath, { force: true });
+    else human.push("index.lock");
+  }
+  for (const [ref, oid] of Object.entries(journal.expectedNew.reservedRefs ?? {})) {
+    const lockPath = path.join(binding.commonDirReal, `${ref}.lock`);
+    const bytes = await fs.readFile(lockPath).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+    if (bytes === undefined) continue;
+    const stat = await fs.lstat(lockPath);
+    const token = journal.expectedNew.reservedLocks?.[ref];
+    const live = await liveRef(repoDir, ref);
+    if (bytes.length === 0 && live === oid && token && stat.dev === token.dev && stat.ino === token.ino) await fs.rm(lockPath, { force: true });
+    else human.push(`lock:${ref}`);
+  }
+  if (human.length > 0) return { status: "human-intervened", quarantinePath: await retireJournal(workspaceRoot, relPath), fields: human };
   const liveIndex = await fs.readFile(indexPath).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error));
   const liveIndexHash = liveIndex ? hashBytes(liveIndex) : undefined;
   const oldIndexHash = journal.old.indexPresent ? journal.old.indexHash : undefined;
@@ -220,7 +246,7 @@ export async function recoverJournal<T = unknown>(
   }
   await pruneEmptyOpStateDirs(binding.gitDirReal, Object.keys(journal.old.opState));
 
-  const oldRefs: Record<string, string | null> = { ...(journal.old.preWipeRefs ?? {}) };
+  const oldRefs: Record<string, string | null> = { ...(journal.old.refs ?? {}), ...(journal.old.preWipeRefs ?? {}) };
   if (journal.old.currentRefName) oldRefs[journal.old.currentRefName] = journal.old.currentRefOid ?? null;
   const wipeLiveRefs = journal.old.preWipeRefs ? Object.keys(await readAllRefs(repoDir)) : [];
   for (const ref of new Set([...Object.keys(oldRefs), ...Object.keys(journal.expectedNew.refs), ...wipeLiveRefs])) {
