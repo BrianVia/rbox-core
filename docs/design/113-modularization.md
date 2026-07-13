@@ -220,7 +220,7 @@ stay (multi-subject).
 
 | New file | Owns | ~Lines |
 |---|---|---|
-| `src/engine/crypto-worker-files.ts` | 188–227 resolver (`isCompiledRuntime`, `embeddedWorkerFile`, `workerSpecifier`, `cleanupEmbeddedWorker`, `MODULE_DIR`) **plus the mutable state it closes over** (today's 72–75: `embeddedWorkerPath`, `embeddedWorkerDir`, `cleanupRegistered`, `workerPathOverrideForTests`). Stays at `src/engine/` level so `path.join(MODULE_DIR, "crypto-worker.ts")` and `import("./generated/crypto-worker.bundle.js")` keep their exact relative depth — zero path rewrites in the compiled-binary-sensitive code. **Permitted setter (rule 5):** `setWorkerPathOverrideForTests(path: string \| undefined)` — `__cryptoPoolTestHooks.setWorkerPath`/`reset` delegate to it and to the existing `cleanupEmbeddedWorker` | ~75 |
+| `src/engine/crypto-worker-files.ts` | 188–227 resolver (`isCompiledRuntime`, `embeddedWorkerFile`, `workerSpecifier`, `cleanupEmbeddedWorker`, `MODULE_DIR`) **plus the mutable state it closes over** (today's 72–75: `embeddedWorkerPath`, `embeddedWorkerDir`, `cleanupRegistered`, `workerPathOverrideForTests`). Stays at `src/engine/` level so `path.join(MODULE_DIR, "crypto-worker.ts")` and `import("./generated/crypto-worker.bundle.txt")` keep their exact relative depth — zero path rewrites in the compiled-binary-sensitive code. **Permitted setter (rule 5):** `setWorkerPathOverrideForTests(path: string \| undefined)` — `__cryptoPoolTestHooks.setWorkerPath`/`reset` delegate to it and to the existing `cleanupEmbeddedWorker` | ~75 |
 | `src/engine/crypto-pool/config.ts` | 29–50 constants (minus `MODULE_DIR`), 85–96 env parsing, 145–186 sizing **plus its cache** (`configuredWorkersCache`, today :71). **Permitted setter (rule 5):** `resetConfiguredWorkersCacheForTests()` — called by `__cryptoPoolTestHooks.reset` (today :1030) | ~100 |
 | `src/engine/crypto-pool/errors.ts` | 229–258: `rehydrateError`, `workerCrashError`, `closeError`, `streamCancelledError` | ~35 |
 | `src/engine/crypto-pool/budget.ts` | 98–143: ciphertext contracts, `CiphertextBudget`, fused-job record types | ~55 |
@@ -511,7 +511,7 @@ navigability payoff this whole design exists for.
 ## 8. Risk register (top movers)
 
 1. **crypto-pool worker artifact resolution** (wave 1b): `MODULE_DIR`-relative
-   `crypto-worker.ts` lookup and the `import("./generated/crypto-worker.bundle.js",
+   `crypto-worker.ts` lookup and the `import("./generated/crypto-worker.bundle.txt",
    { with: { type: "text" } })` embedded-bundle import are directory-depth
    sensitive and compiled-runtime (`$bunfs`) sensitive. Mitigation: keep
    `crypto-worker-files.ts` at `src/engine/` (zero depth change) + gate 6.
