@@ -474,7 +474,14 @@ carry a bounded retention policy: pruned after a
 fixed age (default 30 days, config-overridable) once unreferenced by any
 journal or deferral episode. Pins with any human origin are never age-pruned
 — the existing no-prune rule stands for them, and the retention sweep must
-re-read the origin set under the common-dir lock at prune time.
+re-read the origin set under the common-dir lock at prune time. Promotion is
+ordered for crash safety (r4 F3): the human origin is durably persisted
+(atomic sidecar write) BEFORE the ref transaction that displaces the human
+ref commits. A crash between the two leaves an orphan human-origin record —
+harmless over-protection: the sweep never prunes an OID with a human origin,
+and orphan records (no pin exists) are garbage-collected only when provably
+unreferenced. The reverse order would let retention prune the sole
+protection of a displaced human branch whose promotion never landed.
 
 The recovery namespace is excluded from capture and ordinary identity exactly
 like existing `refs/rbox-*`. It is surfaced with recovery instructions. The
@@ -652,8 +659,14 @@ BEFORE the state save. Recovery of an `intent` journal is **rollback-only**
 variant, every journaled ref) and move the current ref/HEAD back with
 expected-current semantics; the ordinary retry then re-attempts follow with
 every proof from scratch. Recovery of a `published` journal keeps the new
-checkout — the Git mutation is complete and only the state save is owed — and
-re-runs that idempotent save before clearing the journal. This ordering makes
+checkout — the Git mutation is complete and only the state save is owed. That
+save is NOT a replay (r4 F1): the `published` journal records the intended
+per-lane post-record and the expected `repoGen`; recovery first runs a
+semantic already-applied check (repo base advanced to this `incomingKey` →
+just clear the journal), and otherwise composes a FRESH generation-CAS packet
+from the current live records merged lane-wise with the journal's outcome —
+stale field values are never replayed over lane transitions that landed after
+the crash, and an already-landed save never advances `repoGen` again. This ordering makes
 the r3 F1 trace impossible: state can never claim an incoming section applied
 while recovery would still roll the checkout back, and a rolled-back checkout
 always leaves state that still owes the apply. Roll-forward of Git state
@@ -663,11 +676,15 @@ could bless a human edit made in the crash window as sync-authored.
 A live field matching neither journaled value means a human
 intervened mid-crash: that field is left untouched, the journal is retired to
 the recovery namespace, and the repo takes the ordinary conflict path.
-A created-fresh `intent` journal removes the partial `.git` only after
-proving it is still exactly rbox-authored (r3 F4): no ref outside the
-journaled planned set, HEAD/index/op-state matching journaled new values or
-absent, no human config edit vs the recorded init shape. Any doubt →
-quarantine-defer with the `.git` left in place, never a recursive delete. If
+A created-fresh `intent` journal never deletes (r4 F2 — "still exactly
+rbox-authored" is not decidable against hooks, loose objects, or arbitrary
+third-party gitdir writers, and any scan-then-delete has a race): recovery
+atomically RENAMES the entire partial `.git` into the workspace quarantine
+area, restoring the no-mutation contract while preserving whatever a human
+may have added in the crash window, and surfaces the quarantine path. The
+in-process `removeFreshGit` cleanup inside a single uncrashed apply call
+keeps its existing design-43 contract; the rename-to-quarantine rule governs
+post-crash recovery only. If
 the journaled old bytes are unreadable/corrupt, recovery defers with the
 journal intact and surfaces loudly — it never guesses. Journal recovery runs
 under the repo's common-dir lock and the workspace mutex, like the mutation
@@ -810,7 +827,12 @@ surfaces: the macOS menu bar (`RboxBarAmbientStatus` gains the deferred-repo
 count and oldest age, design 88), `rbox status` (the per-repo line already
 specified in Visibility), and shell integration (the design-46 `shell.line`
 state shows the deferral when the shell is cd'd into that repo's subtree).
-All three read the same authoritative repo-record deferral state; no fourth
+The v1 `shell.line` record is one workspace-wide line and cannot route by
+subtree (r4 F8), so the sidecar gains a versioned extension: a compact
+repo-routing table (rel-path → deferral summary) that old plugin versions
+ignore, with the plugin passing `$PWD` into the existing TypeScript-owned
+lookup that selects the enclosing repo's entry. All three surfaces read the
+same authoritative repo-record deferral state; no fourth
 bookkeeping source. The same privacy boundary applies: repo/branch names
 render locally only.
 
@@ -825,37 +847,81 @@ every hour it waits for a human, making eventual resolution harder — the
 opposite of the founder principle. Working bytes on a deferred repo may
 therefore be newer than its checkout; the deferral line says so.
 
-**3. One-command exit: `rbox git resolve <repo>`.** Deferral must never be a
-dead end. Three verbs; implementation may be phased, semantics are fixed:
+The stale-porcelain hazard is named, classified, and surfaced (r4 F9): a
+user who runs `git reset --hard`/`git checkout -- .` against the deferred
+old HEAD restores old bytes, and the file plane publishes them as ordinary
+deliberate edits — LWW file semantics, working as specified; the displaced
+newer content stays recoverable in version history. What the system must
+never do is call that state fully in sync: a deferred repo whose working
+bytes CHANGE while the deferral stands gains a `bytes-changed-during-defer`
+marker on its deferral record, rendered on every surface, and the workspace
+aggregate cannot report clean while any repo carries the marker. The pushed
+manifest pairing those bytes with the carried newer pending Git section is
+cross-plane incoherent by construction; receivers surface the same marker
+when their oracle sees tree≠checkout after applying it. Design 50's conflict
+copies do not cover this path and are not claimed to.
 
-- `show-me` (default, read-only): summarizes the divergence — local-only
+**3. One-command exit: `rbox git resolve <repo> [show-me|take-theirs|
+keep-mine]`** (verb positional, default `show-me`; `--json` output;
+non-interactive confirmation via `--confirm <token>` where the token is the
+snapshot identity `show-me` printed — r4 F11). Deferral must never be a dead
+end. Implementation may be phased; semantics are fixed:
+
+- `show-me` (default): summarizes the divergence — local-only
   commits (tips absent from the incoming-ownership roots, with subjects),
   incoming checkout target, oracle dirt classification, index/op-state/stash
-  divergence, and the deferral age. Never mutates; safe to run always.
+  divergence, and the deferral age — and prints the snapshot identity token.
+  "Read-only" means the `rbox status` footprint (r4 F10): no user-visible
+  refs/index/op-state/worktree mutation; identity probes may add unreferenced
+  objects (`git write-tree`), and ownership inspection may import into
+  scratch refs, exactly as status/apply preparation already do.
 - `take-theirs`: follow the incoming checkout DESPITE local divergence.
-  Semantics: quarantine-first (capture-grade bundle + index/op-state copies,
-  exactly the §43 conflict discipline), pin every local-only tip and stash
-  reflog OID as human-origin recovery pins, then run the normal follow
-  pipeline with the human-divergence gates waived for exactly the divergence
-  snapshot the user was shown: the confirmation carries a snapshot identity
-  (CAS-style), and if live local state OR the incoming section changed since
-  `show-me`, the verb aborts and re-shows. Metadata-only like every follow:
-  working bytes are never rewritten; local edits survive as ordinary dirt
-  against the new HEAD.
-- `keep-mine`: make local the truth. Clears the repo's deferral/checkpoint,
-  force-captures local state, and pushes it as the newest section. Safety
-  against the cross-machine race (this verb must not clobber the OTHER
-  machine's unpushed work): (a) before capture, the discarded
-  pending/incoming section's tips are imported and pinned locally
-  (incoming-origin provenance, age-bounded like tracking pins — the remote
-  history also retains them); (b) the push is an ordinary sequenced commit —
-  a 409 means someone published meanwhile, and the verb re-fetches,
-  re-shows, and requires re-confirmation rather than retrying blindly;
-  (c) `keep-mine` weakens NOTHING on receivers: the other machine's apply
-  still runs its own follow/no-drop classification, so a ref that exists
-  only there is held and pinned there, never silently deleted by this
-  machine's `refScope:"all"` section. Codex must attack these verb semantics
-  like any other mutation path.
+  The confirmation is a complete lock-bound CAS (r4 F5): the snapshot
+  identity covers the incarnation (stream + nonce), `incomingKey`, `repoGen`,
+  the full live ref map and reflog tips, HEAD, the semantic index
+  projection, op-state map, stash reflog OIDs, and the oracle receipt hash.
+  Execution quarantines first (capture-grade bundle + index/op-state copies,
+  the §43 conflict discipline), pins every local-only tip and stash reflog
+  OID as human-origin recovery pins, then runs the NORMAL follow pipeline —
+  journal, locks, second proof — with the human-divergence gates waived
+  only for divergences enumerated in the confirmed snapshot; the snapshot is
+  revalidated at the ordinary second-proof boundary under the checkout
+  locks, and ANY state not in the snapshot (new dirt, a new op-state, a
+  moved ref, a replaced incoming section) aborts and re-shows. The
+  resolution episode (verb + snapshot identity) rides the checkout journal,
+  so crash recovery attributes it correctly. Pointer/ownership rules are
+  design-43-strict (r4 F7): stash pinning applies only to owning dir repos —
+  a pointer repo never touches the shared stash namespace; a
+  sibling-worktree collision remains a refusal, and the verb reports it as
+  an actionable result naming the sibling (resolution happens there), not a
+  silent no-op. Under `RBOX_GIT_FOLLOW=0` the verb STILL WORKS: the kill
+  switch disables oracle-AUTHORIZED automatic movement, and an explicit
+  human-confirmed resolution is manual authorization through the same
+  machinery — stated in the flag section too. Metadata-only like every
+  follow: working bytes are never rewritten; local edits survive as ordinary
+  dirt against the new HEAD.
+- `keep-mine`: make local the truth. Ordering is protect-then-clear
+  (r4 F6): first fetch, decrypt, closure-verify, and import the discarded
+  pending/incoming section's artifacts and pin its tips locally — incoming
+  heads, tags, checkout tips, and stash roots are **human-origin (permanent)
+  pins**: they are another human's work, and server-history retention is not
+  a substitute (r4 F4); only the section's tracking entries take tracking
+  provenance. Only after those pins land does the verb clear the
+  deferral/checkpoint — and that clear rides the SAME accepted-commit state
+  transition as the force-captured push, so a failed import, capture,
+  network error, or rejected commit leaves the deferral (and its ambient
+  warning) fully intact. A 409 means someone published meanwhile: the verb
+  re-fetches, re-shows, and requires a fresh confirmation rather than
+  retrying blindly. If the pending artifacts are no longer fetchable, the
+  verb refuses keep-mine until a pull refreshes pending or the operator
+  passes an explicit, loudly-logged override acknowledging the incoming
+  section cannot be locally preserved. `keep-mine` weakens NOTHING on
+  receivers: the other machine's apply still runs its own follow/no-drop
+  classification, so a ref that exists only there is held and pinned there,
+  never silently deleted by this machine's `refScope:"all"` section — the
+  other machine then shows its own deferral until resolved there
+  (receiver-local resolution is inherent, not a livelock: no mutation
+  ping-pong occurs and both sides surface).
 
 ## Flag and rollout
 
@@ -865,6 +931,10 @@ dead end. Three verbs; implementation may be phased, semantics are fixed:
   authorize checkout follow;
 - exact `RBOX_GIT_FOLLOW=0`: checkout uses the legacy pre-116 identity-
   divergence disposition. It never treats the oracle as permission to move.
+  An explicit human-confirmed `rbox git resolve take-theirs` still works
+  under `=0` (r4 F7): the switch kills oracle-authorized AUTOMATIC movement;
+  manual, snapshot-confirmed resolution is human authorization through the
+  same journaled machinery.
 
 Safe ref-plane progress, tracking/config lanes, typed deferrals, and visibility
 are unconditional in both arms. This follows the requested flag boundary: the

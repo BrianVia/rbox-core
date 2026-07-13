@@ -211,6 +211,61 @@ trade); and `rbox git resolve <repo>` with `show-me`/`take-theirs`/
 `keep-mine` verb semantics (snapshot-CAS confirmation, quarantine-first,
 receiver-side no-drop unweakened). Round 4 must attack the verb semantics.
 
+## Round 4 (codex, 2026-07-13) — CHANGES-REQUIRED
+
+4 BLOCKER + 5 MAJOR + 2 MINOR; r3 F2/F3/F5/F6 verified closed (F6 with an
+empirical git-2.51 repro that `update-ref --stdin` commit succeeds while
+`index.lock` is held); r3 F1/F4/F7 reopened and rebuilt. keep-mine's
+receiver-side trace verified loss-free/livelock-free conditional on the pin
+fixes. All eleven adjudicated and adopted, folded as `(r4 Fn)`:
+
+- **F1 [BLOCKER] `published` recovery replayed a stale save packet** (could
+  overwrite newer same-sequence lane transitions; double-advance repoGen).
+  Adopted: journal stores intended post-record + expected repoGen; recovery
+  does a semantic already-applied check, else composes a fresh lane-wise
+  merged CAS packet — never a replay.
+- **F2 [BLOCKER] created-fresh "exactly rbox-authored" proof undecidable**
+  (hooks/loose objects/scan-to-delete race → rm -rf of human state).
+  Adopted: post-crash recovery never deletes — atomic rename of the whole
+  partial `.git` into quarantine; in-process same-call cleanup keeps its §43
+  contract.
+- **F3 [BLOCKER] human-origin pin promotion not crash-ordered vs the ref
+  transaction** (crash window left tracking-only provenance on the sole
+  protection of displaced human work). Adopted: durable sidecar promotion
+  BEFORE the destructive ref commit; orphan human-origin records are
+  harmless over-protection.
+- **F4 [BLOCKER] keep-mine pinned incoming human commits with age-bounded
+  provenance** (expiry could orphan another human's unique commit). Adopted:
+  incoming heads/tags/checkout tips/stash roots pin human-origin permanent;
+  only tracking entries take tracking provenance.
+- **F5 [MAJOR] take-theirs snapshot CAS underdefined.** Adopted: snapshot
+  identity enumerated (incarnation, incomingKey, repoGen, full refs + reflog
+  tips, HEAD, semantic index, op-state, stash, oracle receipt); revalidated
+  under checkout locks at the second-proof boundary; waiver limited to
+  snapshot-enumerated divergences; episode journaled.
+- **F6 [MAJOR] keep-mine cleared deferral before fallible import/capture/
+  push.** Adopted: protect-then-clear; clear rides the accepted-commit state
+  transition; 409 re-fetch/re-show/re-confirm; unfetchable pending refuses
+  (explicit loud override only).
+- **F7 [MAJOR] take-theirs pointer/kill-switch undefined.** Adopted: stash
+  pins scoped to owning dir repos; sibling-worktree collision is an
+  actionable named refusal; `=0` kills automatic follow only — confirmed
+  manual resolve works (stated in both sections).
+- **F8 [MAJOR] design-46 `shell.line` cannot route per-subtree.** Adopted:
+  versioned sidecar extension with a repo-routing table + `$PWD` lookup;
+  old plugins ignore unknown fields.
+- **F9 [MAJOR] stale-porcelain publish makes a cross-plane incoherent
+  manifest read as in-sync.** Adopted: `bytes-changed-during-defer` marker on
+  the deferral record, rendered everywhere, blocks the clean aggregate on
+  both sender and receivers; LWW bytes + version-history recovery stated
+  explicitly; design 50 non-coverage stated.
+- **F10 [MINOR] show-me not physically read-only.** Adopted: defined as the
+  `rbox status` footprint (no user-visible state mutation; write-tree
+  objects/scratch imports allowed).
+- **F11 [MINOR] command grammar unpinned.** Adopted: `rbox git resolve
+  <repo> [verb]`, default show-me, `--json`, `--confirm <token>` using the
+  printed snapshot identity.
+
 ## Open review work
 
 - Confirm the Phase-0 incident reproduction and actual failing control-flow
