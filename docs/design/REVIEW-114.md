@@ -285,3 +285,28 @@ authorize minting; every authorized receipt's issuedAt precedes T_mark", with
 statement-granularity interleaving tests.
 
 Revision committed as DRAFT v5.
+
+### Round 5 (cap) — codex verdict: CHANGES-REQUIRED (1 BLOCKER, 2 MAJOR — all
+narrow prescribed fixes against round-4 terminal machinery)
+
+**BLOCKER — a stale open UPDATE can stamp a replacement candidacy epoch.**
+ADOPTED. Verified: `pack_gc_candidates` is keyed by `pack_id`, so after
+resurrect→displacement-re-mark, a pass that observed C1 could open C2 with a
+clock older than C2's mark. Fix: a random `epoch` column per candidacy; every
+opening/destructive statement binds the observed epoch (`changes = 0` on
+replacement). Gate 5b gains the stale-statement-vs-replacement history.
+
+**MAJOR — manual tombstone purge contradicts the containment premise.**
+ADOPTED: tombstones are permanent deny records; the admin surface is
+non-destructive only (audit + forced re-sweep), platform-secret-authed like
+existing admin GC.
+
+**MAJOR — terminal fence retirement was not one guarded atomic transaction.**
+ADOPTED: terminal `db.batch` = correlated members DELETE + ready→swept UPDATE
++ epoch-bound candidate DELETE, each embedding zero-location and live-lease
+guards; no crash point retires the fence without the tombstone.
+
+Cap policy: 5 rounds reached on prescribed-fix residuals → the sanctioned +1
+cheap confirmation round follows.
+
+Revision committed as DRAFT v6.

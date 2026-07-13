@@ -1,6 +1,6 @@
 # 114 — Pack small ciphertext blobs into bandwidth-sized R2 objects
 
-Status: **DRAFT v5** (2026-07-13) — rounds 1-4 of the adversarial review folded
+Status: **DRAFT v6** (2026-07-13) — rounds 1-5 of the adversarial review folded
 (`docs/design/REVIEW-114.md`). Not yet approved; implementation must not begin
 until the loop converges. This is a storage-format and GC-fence design. Field
 baseline: `flat-meadow`, same host and corpus, 630 Mbps pipe, 2026-07-13.
@@ -377,11 +377,15 @@ and a same-id repair can race (rounds 2–3):
   exists for). Every later path — heartbeat, ready transition, ready-verify
   branch, fence read — requires non-swept state and fails closed against a
   tombstone; the sweeper re-HEADs tombstoned ids on subsequent ticks and
-  re-deletes any reappeared object. Tombstone growth is bounded in practice
-  by orphaned-pack count (our own clients' crash residue, not
-  attacker-controllable volume beyond ordinary upload abuse controls), is
-  metered (§9), and has a manual admin purge as the operator escape hatch for
-  confirmed-absent ids.
+  re-deletes any reappeared object. Tombstones are **permanent deny records**
+  (round 5: a HEAD-confirmed absence can never prove no already-issued PUT
+  will still land, so there is no sound removal condition — removing one would
+  reopen the id's namespace). Growth is bounded in practice by orphaned-pack
+  count (our own clients' crash residue, not attacker-controllable volume
+  beyond ordinary upload abuse controls) and is metered (§9). The only admin
+  surface over tombstones is non-destructive — audit listing and a forced
+  re-HEAD/re-delete sweep — authenticated with the platform secret exactly
+  like the existing admin GC endpoints.
 
 After R2 accepts, one fail-closed D1 fence query checks:
 
@@ -540,10 +544,19 @@ CREATE TABLE pack_members (
 
 CREATE TABLE pack_gc_candidates (
   pack_id     TEXT PRIMARY KEY,
+  epoch       TEXT NOT NULL,     -- random id per candidacy; every open/execute/terminal statement binds it (round 5)
   marked_at   INTEGER NOT NULL,
   deleting_at INTEGER
 );
 ```
+
+The `epoch` column exists because candidacies are replaceable (resurrect →
+displacement re-mark) while `pack_id` stays the primary key: a pass that
+observed candidacy C1 must never act on its replacement C2 with stale state
+(round 5 BLOCKER — a stale open UPDATE matching only `pack_id` could stamp C2
+with a clock older than C2's mark, breaking §7.3's `deleting_at > T_mark`).
+Every destructive or opening statement binds the observed `epoch`, so a
+replaced candidacy makes the stale statement a `changes = 0` no-op.
 
 Plus the indexes the executors actually scan (rounds 1–2), shaped for the
 keyset cursors exactly as migration 0024 shapes them for `gc_candidates`:
@@ -729,13 +742,22 @@ two-pass lease/quiescence executor modeled on existing `gc_candidates`:
   `created_at`-anchored window bounds the last valid receipt);
 - **open intent:** after pack grace, atomically set `deleting_at` only if the
   same zero-active-location predicate still holds — stamped from the post-read
-  live clock (property 3 below), unlike `versions.ts::openIntents`;
+  live clock (property 3 below), unlike `versions.ts::openIntents`, and bound
+  to the observed candidacy `epoch` (round 5: a resurrected-then-replaced
+  candidacy must make the stale UPDATE a no-op, never open the new epoch with
+  an old clock);
 - **execute:** under an unexpired purge lease and intent quiescence, recompute
-  and require zero active locations again, then delete `packs/v1/<packId>`,
-  HEAD to confirm absence, and finally delete `pack_members` and the pack
-  candidate and transition `packs` to the durable **`swept` tombstone** (round
-  4: uniform terminal state — a late same-id write reappearing after physical
-  deletion meets the same tombstone re-sweep as an uploading remnant);
+  and require zero active locations again, then delete `packs/v1/<packId>` and
+  HEAD to confirm absence. The **terminal transition is one guarded atomic
+  `db.batch`** (round 5): correlated `pack_members` DELETE, `UPDATE packs SET
+  state='swept' WHERE pack_id=? AND state='ready'`, and the candidate DELETE
+  bound to `(pack_id, epoch, deleting_at IS NOT NULL)` — each statement
+  embedding the zero-location and live-lease guards, so no crash point leaves
+  the object deleted with the mint/install fence retired but the tombstone
+  absent (a crash before the batch leaves candidacy + fence intact for retry;
+  the batch itself is atomic). The durable `swept` tombstone is the uniform
+  terminal state (round 4) — a late same-id write reappearing after physical
+  deletion meets the same tombstone re-sweep as an uploading remnant;
 - **unwind:** any active location or failed delete/HEAD clears or leaves the
   physical intent safely for retry; it never guesses success.
 
@@ -1027,7 +1049,9 @@ canonical and packed locations. At every injected await/crash boundary assert:
    install→resurrect→retry-mint (must succeed)→last-location-delete→fresh
    mark→delete with quiescence restarted from the NEW intent; an
    **over-deadline await between invocation start and intent-open** (round 4);
-   and installs attempted at every await boundary;
+   a **stale open/execute statement racing a resurrect→re-mark candidacy
+   replacement** (round 5: the epoch-bound statement must be a `changes = 0`
+   no-op); and installs attempted at every await boundary;
 6. re-add before logical retirement preserves the old location; re-add after
    retirement installs a fresh canonical/new-pack location and cannot resurrect
    the condemned pack;
