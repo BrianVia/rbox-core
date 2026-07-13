@@ -115,6 +115,53 @@ export {
   type EncryptAddressCacheEntry,
 } from "./encrypt-address-cache.js";
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
+export { indexIdentityV2 } from "./git/index-identity.js";
+export {
+  incomingOwnershipRoots,
+  tipOwnedByIncoming,
+  noDropProof,
+  enumerateStashReflogOids,
+  type ImportedScratchNamespace,
+  type OwnershipProof,
+  type NoDropProof,
+} from "./git/reachability.js";
+export {
+  prepareKeepPins,
+  pinDisplaced,
+  enumerateRefReflogOids,
+  prepareDisplacedRefPins,
+  type KeepPinOrigin,
+  type KeepPinOrigins,
+  type PreparedKeepPins,
+  type PrepareDisplacedPinsResult,
+} from "./git/keep-pins.js";
+export {
+  checkoutJournalDir,
+  writeCheckoutJournal,
+  updateCheckoutJournal,
+  markCheckoutJournalPublished,
+  clearCheckoutJournal,
+  recoverJournal,
+  type CheckoutJournalBinding,
+  type CheckoutJournal,
+  type WriteCheckoutJournalSources,
+  type JournalRecoveryResult,
+} from "./git/journal.js";
+export {
+  commitCheckout,
+  checkoutTransactionSupported,
+  ownershipAwareGitBusy,
+  setCheckoutCapabilityProbeForTests,
+  resetCheckoutCapabilityProbeCacheForTests,
+  type CheckoutRefUpdate,
+  type CheckoutHeadUpdate,
+  type CheckoutPlan,
+  type OwnedGitLock,
+  type SecondProofContext,
+  type CommitCheckoutOptions,
+  type CommitCheckoutResult,
+  type CheckoutCapabilityProbe,
+} from "./git/checkout-txn.js";
 export {
   validateManifest,
   validateGitRepos,
