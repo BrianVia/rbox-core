@@ -183,8 +183,10 @@ of the form `<kid>.<base64url JSON payload {v,a,s,n,t,e}>.<base64url MAC>`
 (`apps/api/src/receipts.ts:101–115`) — its size scales with the
 account-id length and numeric widths and can exceed 375 B. Phase 0 records the
 maximum measured per-entry and per-request serialized bytes on real accounts;
-15k ships only if `15,000 × max_entry_bytes ≤ 7 MiB`. Otherwise pick the
-largest N that fits.
+15k ships only if a maximally sized 15,000-entry request — the exact
+`JSON.stringify({receipts: …})` payload including the envelope and per-entry
+punctuation, not `15,000 × max_entry_bytes` alone — measures at or below
+7 MiB. Otherwise pick the largest N whose full serialized request fits.
 
 Client slicing becomes **count- and byte-bounded**: a batch closes at the count
 cap or at a 7 MiB serialized-byte ceiling, whichever first (measured on the
@@ -286,12 +288,17 @@ fleet validation in `docs/DEPLOYMENTS.md`; merge to `main` ships production.
 ### Phase 0 — measurement before either flag
 
 First, **repair the overlap accounting** so the tail subtraction is
-trustworthy: compute `receiptRedemptionOverlapMs` as the true interval
-intersection of redemption-active and upload-active periods (clamp every batch
-against `[uploadStartedAt, uploadEndedAt]`, dropping the whole-drain
-`overlappedAtStart` credit), and pair every `firstPublishUploadStart()` with a
-`finally`-scoped `firstPublishUploadEnd()` in both upload schedules so a failed
-PUT cannot leak `uploadActive`. The pre-fix overlap field is not used for any
+trustworthy: accumulate the **union of upload-active intervals** on
+`uploadActive` transitions (`0→1` opens an interval, `1→0` closes it — the
+outer `[uploadStartedAt, uploadEndedAt]` span is NOT sufficient, since
+encryption stalls, missing-check waits, or retry backoff can open upload-free
+gaps inside it), compute `receiptRedemptionOverlapMs` as the intersection of
+each redemption interval with that union, and drop the whole-drain
+`overlappedAtStart` credit. Pair every `firstPublishUploadStart()` with a
+`finally`-scoped `firstPublishUploadEnd()` in both upload schedules so a
+failed PUT cannot leak `uploadActive`. A unit test must cover two upload
+intervals separated by an idle gap that a redemption drain spans: only the
+in-interval portions count. The pre-fix overlap field is not used for any
 gate.
 
 Then use the first-publish stats. Preserve compact `fp ... redeemN ...` output
@@ -317,8 +324,11 @@ steady-sync cohort to detect regressions.
 ### Falsifiable gates
 
 - Primary: `redeem - redeemOverlap` (corrected interval-intersection overlap)
-  p50 ≤ 5s and p95 ≤ 10s for ~50k-receipt greenfield publishes; no regression
-  in `filesSynced` p50 greater than 5%.
+  median ≤ 5s and **maximum** ≤ 10s over the ≥5 fixed-corpus runs per
+  configuration — five runs cannot support a percentile-tail claim, so the
+  small-sample gate uses median/max; the p95 ≤ 10s form applies only to the
+  step-4 canary cohort once it reaches ≥20 greenfield publishes. No regression
+  in `filesSynced` median greater than 5%.
 - Scheduling: with upload-time draining enabled, at least 80% of redemption
   wall overlaps upload on the 2.85 GB corpus (corrected metric), unless total
   redemption wall itself is below 5s. The final flush is inherently
@@ -334,9 +344,13 @@ steady-sync cohort to detect regressions.
   invocation exceeds 50% of the platform CPU limit (Workers `cpuTime`) and no
   Worker CPU-limit, isolate memory, or D1 subrequest-limit errors occur in 20
   cold runs at 15k; (b) corpus totals — summed server redemption CPU and wall
-  across a full ~50k publish do not regress beyond 10% versus the 5k baseline
-  (per-request cost may triple; total cost must not grow). If either fails,
-  keep pipelining and revert the batch increase.
+  across a full ~50k publish for **15k/pipelined versus 5k/pipelined** do not
+  regress beyond 10% (per-request cost may triple; total cost must not grow).
+  The scheduling comparison (5k/post-tail versus 5k/pipelined) is evaluated
+  only by the primary and scheduling gates above — pipelining changes server
+  concurrency independently of batch size, so the batch-cap gate must hold
+  scheduling fixed. If either resource gate fails, keep pipelining and revert
+  the batch increase.
 - Correctness: total newly granted refs equals unique successful uploads; a
   second redemption grants zero; accepted commit refs all have live
   entitled+present rows; retained-root/GC rig results are identical flag-on/off.

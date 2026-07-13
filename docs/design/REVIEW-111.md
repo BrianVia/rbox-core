@@ -19,7 +19,20 @@ commit-derived), 422 fence whole-batch fallback, generation-safe deletion,
 retry idempotency, RBOX_COMMIT_DELTA_ADMISSION interaction, and the decision
 NOT to fold redemption into the commit envelope.
 
+## Round 2 — VERDICT: CHANGES-REQUIRED
+
+Round-1 fixes accepted as directionally right but imprecise in three places;
+no new correctness attacks on draining/kill-resume/idempotency/fence/GC or the
+fallback mechanism landed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | MAJOR | Round-1 prescribed overlap repair ("clamp against `[uploadStartedAt, uploadEndedAt]`") still overstates overlap: those fields are the OUTER span; `uploadActive === 0` gaps inside it (encryption stalls, missing-check waits, retry backoff) would be falsely credited. | **ADOPT** — Phase 0 now accumulates the union of upload-active intervals on `uploadActive` 0→1/1→0 transitions and intersects redemption intervals with that union; required unit test: two upload intervals with an idle gap spanned by a drain. |
+| 2 | MAJOR | Corpus-total resource gate compared "15k" against "the 5k baseline", confounding the batch-cap change with the scheduling change (Phase 0's baseline is 5k/post-tail; pipelining alters server concurrency independently). | **ADOPT** — batch-cap regression gate now explicitly 15k/pipelined vs 5k/pipelined; 5k/post-tail vs 5k/pipelined evaluates scheduling only. |
+| 3 | MAJOR | p95 ≤ 10s gate over "at least five" runs is statistically meaningless (p95 of n=5 interpolates against the max). | **ADOPT** — small-sample gate is now median ≤ 5s and max ≤ 10s over the ≥5 fixed-corpus runs; the p95 form is reserved for the step-4 canary cohort at ≥20 publishes. |
+| 4 | MINOR | 15k eligibility formula `15,000 × max_entry_bytes ≤ 7 MiB` omitted JSON framing (outer `{receipts:{}}` envelope, punctuation) — could approve 15k when a full request doesn't fit (client byte-slicing would then silently cap below 15k). | **ADOPT** — eligibility now measured on the exact maximally-sized `JSON.stringify({receipts: …})` request including framing; otherwise largest N whose full request fits. |
+
 ### Seam items (design 110 joint round)
 
-- None raised in round 1. Codex did not push toward folding redemption into
+- None raised in rounds 1–2. Codex did not push toward folding redemption into
   the commit envelope; option C's rejection stood unchallenged.
