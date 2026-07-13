@@ -6,8 +6,9 @@ import { putBlobFile } from "../blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
 import { firstPublishAuthDispatchStart, firstPublishAuthSettle, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
-import { SingleGate, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount } from "./gate.js";
-import { uploadBatchConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig } from "./config.js";
+import { SingleGate, UploadSlotArbiter, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount, packUploadDisabled } from "./gate.js";
+import { uploadBatchConfig, packUploadConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig, type PackConfig } from "./config.js";
+import { BlobPackUploader } from "./pack-uploader.js";
 import { framedBytes, parseBatchPutErrorMax, parseBatchPutResponse, BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, type BatchPutResponseRecord } from "./wire.js";
 
 interface UploaderClock {
@@ -27,7 +28,7 @@ export function setUploaderClockForTests(clock?: UploaderClock): void {
   uploaderClock = clock ?? realUploaderClock;
 }
 
-interface BatchPutWaiter {
+export interface BatchPutWaiter {
   srcPath: string;
   size: number;
   uploadsDir?: string;
@@ -47,21 +48,45 @@ interface BatchPutGroup {
 
 export class BlobBatchUploader {
   private readonly config: BatchConfig;
+  private readonly packConfig: PackConfig;
+  private readonly arbiter: UploadSlotArbiter;
   private queue: BatchPutGroup[] = [];
   private queuedBytes = 0;
   private bySha = new Map<string, BatchPutGroup>();
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private active = 0;
+  /** Lane-local only: preserves the legacy idle_tail transition; not capacity. */
+  private batchActive = 0;
   private readonly singleGate = new SingleGate(SINGLE_UPLOAD_FALLBACK_CONCURRENCY);
   private closed = false;
   private closeError: Error | undefined;
   private closePromise: Promise<void> | undefined;
   private readonly inFlight = new Set<Promise<unknown>>();
   private lastUniqueEnqueueAtMs = 0;
+  private packUploader: BlobPackUploader | undefined;
+  private pendingPartialReason: UploadDispatchReason | undefined;
+  private batchReleasePending = false;
 
-  constructor(private readonly ctx: RemoteContext) {
+  constructor(private readonly ctx: RemoteContext, arbiter?: UploadSlotArbiter) {
     // Upload record bytes stay capped to the server's accepted per-record maximum.
     this.config = uploadBatchConfig();
+    this.packConfig = packUploadConfig();
+    this.arbiter = arbiter ?? new UploadSlotArbiter(this.config.slots);
+    this.arbiter.registerPump(() => {
+      if (this.closed) return;
+      const batchReleased = this.batchReleasePending;
+      this.batchReleasePending = false;
+      if (batchReleased) {
+        this.dispatchFull();
+        if (this.batchActive === 0 && this.queue.length > 0) this.dispatchPartial("idle_tail");
+        if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
+      }
+      // Preserve the arbiter pump's pre-B1 second stage after the release-local
+      // full/idle-tail stage. An overdue partial can use a newly freed permit
+      // even while another batch request remains active.
+      if (this.pendingPartialReason) this.dispatchPartial(this.pendingPartialReason);
+      else this.dispatchFull();
+      if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
+    });
   }
 
   private get effectiveRecords(): number {
@@ -85,6 +110,10 @@ export class BlobBatchUploader {
   ): Promise<void> {
     if (this.closed) return Promise.reject(this.closeError!);
     if (!this.canBatch(size)) return this.gatedPutFile(sha, srcPath, size, uploadsDir, onBytes);
+    if (this.packConfig.enabled && !packUploadDisabled() && size <= this.packConfig.cutoffBytes) {
+      this.packUploader ??= new BlobPackUploader(this.ctx, this.arbiter, (fallbackSha, waiter) => this.requeueFromPack(fallbackSha, waiter));
+      return this.packUploader.putFile(sha, srcPath, size, uploadsDir, onBytes);
+    }
     if (uploadDisabled()) return this.timedGatedPutFile(sha, srcPath, size, uploadsDir, onBytes, 0);
     return new Promise<void>((resolve, reject) => {
       this.enqueue(sha, { size, srcPath, uploadsDir, onBytes, resolve, reject });
@@ -124,9 +153,15 @@ export class BlobBatchUploader {
     }
   }
 
+  /** Ownership-transfer target for pack fallback; deliberately bypasses pack routing. */
+  requeueFromPack(sha: string, waiter: BatchPutWaiter): void {
+    this.enqueue(sha, waiter);
+  }
+
   private dispatchFull(): void {
     if (this.closed) return;
-    while (this.active < this.config.slots && (this.queue.length >= this.effectiveRecords || this.queuedBytes >= this.config.bodyBytes)) {
+    while (this.queue.length >= this.effectiveRecords || this.queuedBytes >= this.config.bodyBytes) {
+      if (!this.arbiter.tryAcquire()) break;
       const reason: UploadDispatchReason = this.queue.length >= this.effectiveRecords ? "full_records" : "full_bytes";
       this.launch(this.carve(), reason);
     }
@@ -134,14 +169,19 @@ export class BlobBatchUploader {
 
   private dispatchPartial(reason: UploadDispatchReason): void {
     if (this.closed) return;
+    this.pendingPartialReason = reason;
     this.dispatchFull();
-    while (this.active < this.config.slots && this.queue.length > 0) this.launch(this.carve(), reason);
+    while (this.queue.length > 0) {
+      if (!this.arbiter.tryAcquire()) break;
+      this.launch(this.carve(), reason);
+    }
+    if (this.queue.length === 0) this.pendingPartialReason = undefined;
   }
 
   private armFillV2Timer(): void {
     // Arm only with dispatch capacity; saturation hands re-arming to the
     // settle path because an in-flight request is guaranteed to settle.
-    if (this.closed || this.timer || this.queue.length === 0 || this.active >= this.config.slots) return;
+    if (this.closed || this.timer || this.queue.length === 0 || this.arbiter.inFlight >= this.arbiter.limit) return;
     const now = uploaderClock.now();
     const quietRemaining = FILL_QUIET_MS - (now - this.lastUniqueEnqueueAtMs);
     const absoluteRemaining = FILL_ABSOLUTE_MS - (now - this.queue[0]!.policyEnqueuedAtMs);
@@ -150,6 +190,7 @@ export class BlobBatchUploader {
 
   private onFillV2Timer(): void {
     this.timer = undefined;
+    this.pendingPartialReason = undefined;
     if (this.closed) return;
     this.dispatchFull();
     const now = uploaderClock.now();
@@ -158,7 +199,8 @@ export class BlobBatchUploader {
     } else {
       // A valid partial queue fits one carve because dispatchFull and carve
       // share caps; the loop guard is defensive for latch/byte-cap edges.
-      while (this.active < this.config.slots && this.queue.length > 0 && now - this.queue[0]!.policyEnqueuedAtMs >= FILL_ABSOLUTE_MS) {
+      while (this.queue.length > 0 && now - this.queue[0]!.policyEnqueuedAtMs >= FILL_ABSOLUTE_MS) {
+        if (!this.arbiter.tryAcquire()) break;
         this.launch(this.carve(), "absolute");
       }
     }
@@ -169,20 +211,19 @@ export class BlobBatchUploader {
     if (batch.groups.length === 0) return;
     if (this.closed) {
       for (const group of batch.groups) this.rejectGroup(group, this.closeError!);
+      this.arbiter.release();
       return;
     }
     const oldestAgeMs = Math.max(0, uploaderClock.now() - batch.groups[0]!.policyEnqueuedAtMs);
     recordUploadDispatch(reason, batch.groups.length, batch.bytes, this.queue.length, oldestAgeMs);
-    this.active++;
+    this.batchActive++;
     const dispatch = this.dispatchBatch(batch.groups);
     this.inFlight.add(dispatch);
     void dispatch.finally(() => {
       this.inFlight.delete(dispatch);
-      this.active--;
-      if (this.closed) return;
-      this.dispatchFull();
-      if (this.active === 0 && this.queue.length > 0) this.dispatchPartial("idle_tail");
-      if (this.config.fill === "v2" && this.queue.length > 0) this.armFillV2Timer();
+      this.batchActive--;
+      this.batchReleasePending = true;
+      this.arbiter.release();
     });
   }
 
@@ -355,6 +396,7 @@ export class BlobBatchUploader {
     if (this.closed) return;
     if (this.timer) uploaderClock.clearTimeout(this.timer);
     this.timer = undefined;
+    this.pendingPartialReason = undefined;
     const queued = this.queue;
     this.queue = [];
     this.queuedBytes = 0;
@@ -447,6 +489,9 @@ export class BlobBatchUploader {
 
   close(err: Error): Promise<void> {
     if (this.closePromise) return this.closePromise;
+    // Pack shutdown claims/aborts pack-owned groups before the parent batch
+    // queue is closed; transferred groups are then rejected by that queue.
+    const packClose = this.packUploader?.close(err) ?? Promise.resolve();
     this.closed = true;
     this.closeError = err;
     if (this.timer) uploaderClock.clearTimeout(this.timer);
@@ -456,7 +501,7 @@ export class BlobBatchUploader {
     this.queuedBytes = 0;
     this.bySha.clear();
     for (const group of queued) for (const waiter of group.waiters) waiter.reject(err);
-    this.closePromise = Promise.allSettled([...this.inFlight]).then(() => {});
+    this.closePromise = Promise.allSettled([packClose, ...this.inFlight]).then(() => {});
     return this.closePromise;
   }
 }

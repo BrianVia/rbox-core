@@ -1,4 +1,12 @@
 import { envInt } from "../resilient.js";
+import {
+  PACK_MAX_BODY_BYTES,
+  PACK_MAX_MEMBER_BYTES,
+  PACK_MAX_MEMBERS,
+  PACK_MIN_ACTIVATION_BYTES,
+  PACK_MIN_ACTIVATION_COUNT,
+  PACK_TARGET_PAYLOAD_BYTES,
+} from "../../../engine/blob-pack.js";
 
 export const DEFAULT_BATCH_RECORD_BYTES = 256 * 1024;
 export const BATCH_RECORDS_FLOOR = 32;
@@ -24,6 +32,8 @@ const MAX_DOWNLOAD_SLOTS = 256;
 export const FLUSH_DELAY_MS = 10;
 export const FILL_QUIET_MS = 10;
 export const FILL_ABSOLUTE_MS = 50;
+export const PACK_FILL_QUIET_MS = 200;
+export const PACK_FILL_ABSOLUTE_MS = 1000;
 export const GRANT_REFRESH_AFTER_MS = 4 * 60 * 1000;
 export const SINGLE_FALLBACK_CONCURRENCY = 128;
 export const SINGLE_UPLOAD_FALLBACK_CONCURRENCY = 64;
@@ -37,6 +47,30 @@ export interface BatchConfig {
   recordBytes: number;
   bodyBytes: number;
   slots: number;
+}
+
+export interface PackConfig {
+  enabled: boolean;
+  streams: number;
+  cutoffBytes: number;
+  targetPayloadBytes: number;
+  minActivationCount: number;
+  minActivationBytes: number;
+}
+
+export function packUploadEnabled(): boolean {
+  return process.env.RBOX_BLOB_PACK === "1";
+}
+
+export function packUploadConfig(): PackConfig {
+  return {
+    enabled: packUploadEnabled(),
+    streams: envInt("RBOX_PACK_STREAMS", 4, 1, 64),
+    cutoffBytes: envInt("RBOX_PACK_CUTOFF_BYTES", PACK_MAX_MEMBER_BYTES, 1, PACK_MAX_MEMBER_BYTES),
+    targetPayloadBytes: envInt("RBOX_PACK_TARGET_BYTES", PACK_TARGET_PAYLOAD_BYTES, 64 * 1024, PACK_TARGET_PAYLOAD_BYTES),
+    minActivationCount: envInt("RBOX_PACK_MIN_BLOBS", PACK_MIN_ACTIVATION_COUNT, 1, PACK_MAX_MEMBERS),
+    minActivationBytes: envInt("RBOX_PACK_MIN_BYTES", PACK_MIN_ACTIVATION_BYTES, 1, PACK_MAX_BODY_BYTES),
+  };
 }
 
 export function uploadBatchConfig(): BatchConfig {

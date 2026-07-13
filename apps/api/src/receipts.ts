@@ -8,7 +8,7 @@ import type { Env } from "./env.js";
 import { ctEqual } from "./util.js";
 
 export const RECEIPT_TTL_MS = 12 * 3600_000; // 12h — a receipt proves a recent direct-write upload
-const CLOCK_SKEW_MS = 60_000; // tolerate ≤60s of client/server clock skew on `t`
+export const CLOCK_SKEW_MS = 60_000; // tolerate ≤60s of client/server clock skew on `t`
 const MIN_KEY_BYTES = 32;
 const DOMAIN = "rbox.receipt.v1|"; // domain-separates this MAC from every other key use
 
@@ -17,6 +17,7 @@ export interface MintClaim {
   encSha: string;
   size: number;
   nowMs: number;
+  packId?: string;
 }
 export interface ReceiptClaim {
   accountId: string;
@@ -27,13 +28,13 @@ export interface ReceiptClaim {
   nowMs: number;
 }
 export type VerifyResult =
-  | { ok: true; size: number }
+  | { ok: true; size: number; packId?: string }
   | {
       ok: false;
       reason: "malformed" | "bad_version" | "bad_kid" | "bad_mac" | "expired" | "future" | "bad_ttl" | "mismatch";
     };
 
-interface Payload {
+interface PayloadV1 {
   v: 1;
   a: string;
   s: string;
@@ -41,6 +42,18 @@ interface Payload {
   t: number;
   e: number;
 }
+interface PayloadV2 {
+  v: 2;
+  a: string;
+  s: string;
+  n: number;
+  t: number;
+  e: number;
+  p: string;
+}
+type Payload = PayloadV1 | PayloadV2;
+
+const PACK_ID_RE = /^[0-9a-f]{32}$/;
 
 const enc = new TextEncoder();
 const b64url = (b: ArrayBuffer | Uint8Array): string => {
@@ -100,14 +113,14 @@ function keys(env: Env): { current: string; all: string[] } {
 
 export async function mintReceipt(env: Env, claim: MintClaim): Promise<string> {
   const { current } = keys(env);
-  const payload: Payload = {
-    v: 1,
+  const common = {
     a: claim.accountId,
     s: claim.encSha,
     n: claim.size,
     t: claim.nowMs,
     e: claim.nowMs + RECEIPT_TTL_MS,
   };
+  const payload: Payload = claim.packId === undefined ? { v: 1, ...common } : { v: 2, ...common, p: claim.packId };
   const kid = await kidOf(current);
   const body = `${kid}.${b64url(enc.encode(JSON.stringify(payload)))}`;
   const mac = await hmac(current, DOMAIN + body);
@@ -125,7 +138,9 @@ export async function verifyReceipt(env: Env, receipt: string, claim: ReceiptCla
   } catch {
     return { ok: false, reason: "malformed" };
   }
-  if (payload.v !== 1) return { ok: false, reason: "bad_version" };
+  if (payload === null || typeof payload !== "object") return { ok: false, reason: "malformed" };
+  if (payload.v !== 1 && payload.v !== 2) return { ok: false, reason: "bad_version" };
+  if (payload.v === 2 && (typeof payload.p !== "string" || !PACK_ID_RE.test(payload.p))) return { ok: false, reason: "malformed" };
 
   // Find the key whose kid matches (current or prev), then constant-time MAC compare
   // over the domain-tagged body. No key matches the kid → bad_kid (don't leak which).
@@ -151,5 +166,5 @@ export async function verifyReceipt(env: Env, receipt: string, claim: ReceiptCla
   // Claim binding: account + content must match; size only when the caller asserts one.
   if (payload.a !== claim.accountId || payload.s !== claim.encSha) return { ok: false, reason: "mismatch" };
   if (claim.size !== undefined && payload.n !== claim.size) return { ok: false, reason: "mismatch" };
-  return { ok: true, size: payload.n };
+  return payload.v === 2 ? { ok: true, size: payload.n, packId: payload.p } : { ok: true, size: payload.n };
 }

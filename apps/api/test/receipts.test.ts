@@ -8,12 +8,49 @@ const PREV = "p".repeat(40);
 const envWith = (k?: string, prev?: string) => ({ RBOX_RECEIPT_KEY: k, RBOX_RECEIPT_KEY_PREV: prev }) as Env;
 const NOW = 1_700_000_000_000;
 const claim = { accountId: "acc_1", encSha: "a".repeat(64), size: 4096, nowMs: NOW };
+const PACK_ID = "b".repeat(32);
+const MAX_V2_RECEIPT_REDEEM_ENTRY_BYTES = 512;
 
 describe("§23.1 receipts: mint / verify", () => {
   it("round-trips a freshly minted receipt", async () => {
     const env = envWith(KEY);
     const r = await mintReceipt(env, claim);
     expect(await verifyReceipt(env, r, claim)).toEqual({ ok: true, size: claim.size });
+  });
+
+  it("round-trips a v2 pack receipt while leaving v1 unchanged", async () => {
+    const env = envWith(KEY);
+    const v1 = await mintReceipt(env, claim);
+    const v2 = await mintReceipt(env, { ...claim, packId: PACK_ID });
+    expect(await verifyReceipt(env, v1, claim)).toEqual({ ok: true, size: claim.size });
+    expect(await verifyReceipt(env, v2, claim)).toEqual({ ok: true, size: claim.size, packId: PACK_ID });
+  });
+
+  it("rejects a tampered or malformed v2 pack id", async () => {
+    const env = envWith(KEY);
+    const receipt = await mintReceipt(env, { ...claim, packId: PACK_ID });
+    const [kid, payloadB64, mac] = receipt.split(".") as [string, string, string];
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/"))) as Record<string, unknown>;
+    payload.p = "c".repeat(32);
+    const changedPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    expect(await verifyReceipt(env, `${kid}.${changedPayload}.${mac}`, claim)).toEqual({ ok: false, reason: "bad_mac" });
+
+    const signedMalformed = await mintReceipt(env, { ...claim, packId: "not-a-pack-id" });
+    expect(await verifyReceipt(env, signedMalformed, claim)).toEqual({ ok: false, reason: "malformed" });
+
+    const signedNonString = await mintReceipt(env, { ...claim, packId: [PACK_ID] } as unknown as typeof claim & { packId: string });
+    expect(await verifyReceipt(env, signedNonString, claim)).toEqual({ ok: false, reason: "malformed" });
+  });
+
+  it("pins the worst-case v2 receipt-redeem entry size and v2 growth", async () => {
+    const env = envWith(KEY);
+    const worstClaim = { ...claim, accountId: "a".repeat(64) };
+    const v1 = await mintReceipt(env, worstClaim);
+    const v2 = await mintReceipt(env, { ...worstClaim, packId: PACK_ID });
+    const entryBytes = (receipt: string) =>
+      new TextEncoder().encode(`${JSON.stringify(worstClaim.encSha)}:${JSON.stringify(receipt)}`).byteLength;
+    expect(entryBytes(v2)).toBeLessThan(MAX_V2_RECEIPT_REDEEM_ENTRY_BYTES);
+    expect(entryBytes(v2) - entryBytes(v1)).toBeLessThan(90);
   });
 
   it("rejects a tampered payload (bad_mac)", async () => {
@@ -61,6 +98,10 @@ describe("§23.1 receipts: mint / verify", () => {
     const env = envWith(KEY);
     expect((await verifyReceipt(env, "not-a-receipt", claim)).ok).toBe(false);
     expect((await verifyReceipt(env, "a.b", claim)).reason).toBe("malformed");
+    const r = await mintReceipt(env, claim);
+    const [kid, , mac] = r.split(".");
+    const nullPayload = btoa("null").replace(/=+$/, "");
+    expect(await verifyReceipt(env, `${kid}.${nullPayload}.${mac}`, claim)).toEqual({ ok: false, reason: "malformed" });
   });
 
   it("a receipt minted under PREV key still verifies; current-key mismatch → bad_kid", async () => {

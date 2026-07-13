@@ -3,11 +3,11 @@ import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { emit as emitMetric, emitDelta, emitRedeemPhases, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
+  resolveVerifiedRefs,
   commitAccounting,
   CARRIER_REFS,
   MAX_REFS_PER_COMMIT,
   receiptRedeemMax,
-  type RefWithSize,
 } from "./commit-accounting.js";
 import { loadSidecarRaw, resolveSidecarRaw, loadSidecarShaSet } from "./sidecar.js";
 import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeAddedShas, mergeSortedUnique, type DeltaResult, type ShadowFlags } from "./commit-delta.js";
@@ -877,7 +877,7 @@ export class WorkspaceSync {
     const precheckStartedAt = performance.now();
     const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
     const precheckMs = performance.now() - precheckStartedAt;
-    const newRefs: RefWithSize[] = [];
+    const verified: Array<{ sha: string; size: number; packId?: string }> = [];
     let alreadyEntitled = 0;
     let rejected = 0;
     const verifyStartedAt = performance.now();
@@ -895,8 +895,10 @@ export class WorkspaceSync {
         rejected++;
         continue;
       }
-      newRefs.push({ sha, size: v.size });
+      verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
     }
+    const { newRefs, unresolved } = await resolveVerifiedRefs(db, verified);
+    rejected += unresolved.length;
     const verifyMs = performance.now() - verifyStartedAt;
 
     const accountingStartedAt = performance.now();

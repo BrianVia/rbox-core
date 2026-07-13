@@ -271,7 +271,10 @@ export function fetchWithDeadline(url: string, init: RequestInit = {}, timeoutMs
  * fetch itself throws (no response arrived), so no successful commit/upload is ever re-driven
  * on the strength of a Response the caller hasn't seen.
  */
-export function fetchResilient(url: string, init: RequestInit = {}, opts: ResilientOpts = {}): Promise<Response> {
+export function fetchResilient(url: string, init: RequestInit | (() => RequestInit) = {}, opts: ResilientOpts = {}): Promise<Response> {
   const timeoutMs = opts.timeoutMs ?? SMALL_CONTROL_TIMEOUT_MS;
-  return retryTransient(() => fetch(url, withDeadline(init, timeoutMs, opts.signal)), opts);
+  return retryTransient(() => {
+    const attemptInit = typeof init === "function" ? init() : init;
+    return fetch(url, withDeadline(attemptInit, timeoutMs, opts.signal));
+  }, opts);
 }

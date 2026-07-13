@@ -33,7 +33,7 @@ const SHA_RE = /^[0-9a-f]{64}$/;
 const MAGIC_BYTES = new Uint8Array(REFSET_MAGIC.length);
 for (let i = 0; i < REFSET_MAGIC.length; i++) MAGIC_BYTES[i] = REFSET_MAGIC.charCodeAt(i);
 
-function hexToBytes32(hex: string, out: Uint8Array, off: number): void {
+export function hexToBytes32(hex: string, out: Uint8Array, off: number): void {
   for (let i = 0; i < 32; i++) out[off + i] = parseInt(hex.substr(i * 2, 2), 16);
 }
 export function bytes32ToHex(b: Uint8Array, off: number): string {

@@ -120,7 +120,7 @@ export class RemoteContext {
    * (size-aware) and non-idempotent minting calls override `retries: 0`. An HTTP Response of
    * any status is returned as-is — only a THROWN transport fault is retried/translated.
    */
-  fetch(url: string, init: RequestInit = {}, opts: ResilientOpts = {}): Promise<Response> {
+  fetch(url: string, init: RequestInit | (() => RequestInit) = {}, opts: ResilientOpts = {}): Promise<Response> {
     return fetchResilient(url, init, opts);
   }
 

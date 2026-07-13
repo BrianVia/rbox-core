@@ -358,7 +358,9 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const accountingSubrequests = Math.ceil(MAX_REFS_PER_COMMIT / MAX_REFS_PER_TXN);
     const commitPathSubrequestsAtMax = preflightSubrequests + validateSubrequests + accountingSubrequests + 1; // D1 mirror
 
-    expect(statementsPerAccountingTxn).toBe(455);
+    // Design 114 adds up to four placement statements per 33-ref chunk while
+    // preserving the existing whole-super-batch failure unit.
+    expect(statementsPerAccountingTxn).toBe(819);
     expect(maxParams).toBeLessThanOrEqual(99);
     expect(commitPathSubrequestsAtMax).toBeLessThanOrEqual(300);
     expect(MAX_RECEIPTS_PER_REDEEM).toBeLessThanOrEqual(5_000);

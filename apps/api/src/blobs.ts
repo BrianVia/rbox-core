@@ -8,13 +8,14 @@ import { mintUploadGrant, verifyGrant } from "./grants.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { isDeleteFenceAbort } from "./commit-accounting.js";
+import { packedLocation, readPackedExtent } from "./blob-pack.js";
+import { usesReceipts } from "./blob-protocol.js";
+
+export { UPLOAD_RECEIPTS_V1, usesReceipts } from "./blob-protocol.js";
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
  *  ~R2-only (staging write + receipt, ZERO D1). Absent → legacy per-PUT grant path
  *  (kept during the §23 rollout; removed before the atomic merge once the CLI moves). */
-export const UPLOAD_RECEIPTS_V1 = "upload-receipts-v1";
-export const usesReceipts = (req: Request): boolean => req.headers.get("x-rbox-protocol") === UPLOAD_RECEIPTS_V1;
-
 type DirectWriteBody = Parameters<Env["rbox_dev_blobs"]["put"]>[1];
 type R2Span = <T>(fn: () => Promise<T>) => Promise<T>;
 
@@ -146,7 +147,11 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
             `SELECT r.sha256 FROM blob_refs r JOIN blobs b ON b.sha256 = r.sha256
              WHERE r.account_id = ? AND b.present = 1 AND r.sha256 IN (${chunk.map(() => "?").join(",")})
                AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = r.account_id AND c.sha256 = r.sha256)
-               AND NOT EXISTS (SELECT 1 FROM gc_candidates g WHERE g.sha256 = r.sha256 AND g.deleting_at IS NOT NULL)`,
+               AND NOT EXISTS (SELECT 1 FROM gc_candidates g WHERE g.sha256 = r.sha256 AND g.deleting_at IS NOT NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM blob_locations l JOIN pack_gc_candidates pg ON pg.pack_id = l.pack_id AND pg.deleting_at IS NOT NULL
+                 WHERE l.sha256 = r.sha256
+               )`,
           )
           .bind(accountId, ...chunk),
       (rows) => {
@@ -176,7 +181,12 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
     shas,
     (chunk) =>
       db
-        .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")}) AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = ? AND c.sha256 = blobs.sha256)`)
+        .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")})
+          AND NOT EXISTS (SELECT 1 FROM blob_ref_candidates c WHERE c.account_id = ? AND c.sha256 = blobs.sha256)
+          AND NOT EXISTS (
+            SELECT 1 FROM blob_locations l JOIN pack_gc_candidates pg ON pg.pack_id = l.pack_id AND pg.deleting_at IS NOT NULL
+            WHERE l.sha256 = blobs.sha256
+          )`)
         .bind(...chunk, accountId),
     (rows) => {
       for (const r of rows) present.add(r.sha256);
@@ -285,34 +295,57 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 // valid-grant case before authenticate(); this function remains the legacy fallback for
 // absent/invalid/expired grants and for direct callers. `blobGet` never 500s on a bad
 // grant: an invalid grant is treated exactly like no grant.
+async function readPackedBlob(
+  op: ReturnType<typeof startOp>,
+  env: Env,
+  sha: string,
+  accountId: string,
+  okOutcome: string,
+  notFoundOutcome: string,
+): Promise<Response | undefined> {
+  const loc = await packedLocation(dbFor(op.env, accountId), sha);
+  if (!loc) return undefined;
+  const bytes = await readPackedExtent(op, env, sha, loc);
+  if (!bytes) {
+    op.done(notFoundOutcome, { bytes: loc.length });
+    return json({ error: "not_found" }, 404);
+  }
+  op.done(okOutcome, { bytes: bytes.byteLength });
+  return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
+}
+
 export async function blobGet(env: Env, sha: string, accountId: string, grant?: string): Promise<Response> {
   const op = startOp(env, "blob.get");
-  const notFound = () => {
-    op.done("not_found");
+  const notFound = (outcome = "not_found", requestedBytes?: number) => {
+    op.done(outcome, requestedBytes === undefined ? undefined : { bytes: requestedBytes });
     return json({ error: "not_found" }, 404);
   };
   const granted = grant ? (await verifyGrant(op.env, grant, { accountId, nowMs: Date.now() })).ok : false;
   // No valid grant → the legacy D1 entitlement gate (BEFORE R2, no existence oracle).
   if (!granted && !(await isEntitled(op.env, accountId, sha))) return notFound();
+  const packed = await readPackedBlob(op, op.env, sha, accountId, "ok_packed", "pack_extent_error");
+  if (packed) return packed;
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
-  op.done("ok", { bytes: got.size });
+  op.done("ok_canonical", { bytes: got.size });
   return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 
 // §27 Amendment A — grant-only pre-auth blob GET. The worker calls this only after
 // `verifyGrantCredential()` has authenticated the HMAC, TTL, and signed account id.
-// The account id is intentionally not used for a D1 lookup here: the verified grant is
-// the narrow read credential, and this path must stay D1-zero.
-export async function blobGetWithVerifiedGrant(env: Env, sha: string, _accountId: string): Promise<Response> {
+// The verified grant remains the narrow read credential and skips the entitlement
+// query. Design 114 deliberately adds the post-authorization placement lookup.
+export async function blobGetWithVerifiedGrant(env: Env, sha: string, accountId: string): Promise<Response> {
   const op = startOp(env, "blob.get");
-  const notFound = () => {
-    op.done("not_found_grant_preauth");
+  const notFound = (outcome = "not_found_grant_preauth", requestedBytes?: number) => {
+    op.done(outcome, requestedBytes === undefined ? undefined : { bytes: requestedBytes });
     return json({ error: "not_found" }, 404);
   };
+  const packed = await readPackedBlob(op, op.env, sha, accountId, "ok_packed_grant_preauth", "pack_extent_error");
+  if (packed) return packed;
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
-  op.done("ok_grant_preauth", { bytes: got.size });
+  op.done("ok_canonical_grant_preauth", { bytes: got.size });
   return new Response(got.body, { headers: { "content-type": "application/octet-stream" } });
 }
 

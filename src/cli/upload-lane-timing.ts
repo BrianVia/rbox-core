@@ -3,6 +3,68 @@ export const LANE_TIMING = process.env.RBOX_LANE_TIMING === "1";
 
 export const uploadLaneTiming = { encryptMs: 0, uploadMs: 0, queueMs: 0, blobs: 0, bytes: 0 };
 
+const packFallbackReasons = [
+  "disabled_latch", "retry_later", "http_error", "parse_error", "not_activated", "transport",
+] as const;
+export type PackFallbackReason = (typeof packFallbackReasons)[number];
+
+export interface PackUploadTiming {
+  packsBuilt: number;
+  packsSent: number;
+  members: number;
+  payloadBytes: number;
+  overheadBytes: number;
+  buildMs: number;
+  uploadMs: number;
+  fallbacks: Record<PackFallbackReason, number>;
+}
+
+const newPackFallbacks = (): Record<PackFallbackReason, number> =>
+  Object.fromEntries(packFallbackReasons.map((reason) => [reason, 0])) as Record<PackFallbackReason, number>;
+
+export const packUploadTiming: PackUploadTiming = {
+  packsBuilt: 0,
+  packsSent: 0,
+  members: 0,
+  payloadBytes: 0,
+  overheadBytes: 0,
+  buildMs: 0,
+  uploadMs: 0,
+  fallbacks: newPackFallbacks(),
+};
+
+export function recordPackBuilt(members: number, payloadBytes: number, totalBytes: number, buildMs: number): void {
+  packUploadTiming.packsBuilt++;
+  packUploadTiming.members += members;
+  packUploadTiming.payloadBytes += payloadBytes;
+  packUploadTiming.overheadBytes += Math.max(0, totalBytes - payloadBytes);
+  packUploadTiming.buildMs += buildMs;
+}
+
+export function recordPackSent(uploadMs: number): void {
+  packUploadTiming.packsSent++;
+  packUploadTiming.uploadMs += uploadMs;
+}
+
+export function recordPackFallback(reason: PackFallbackReason): void {
+  packUploadTiming.fallbacks[reason]++;
+}
+
+export function getPackUploadTiming(): Readonly<PackUploadTiming> {
+  return { ...packUploadTiming, fallbacks: { ...packUploadTiming.fallbacks } };
+}
+
+export function resetPackUploadTimingForTests(): void {
+  packUploadTiming.packsBuilt = 0;
+  packUploadTiming.packsSent = 0;
+  packUploadTiming.members = 0;
+  packUploadTiming.payloadBytes = 0;
+  packUploadTiming.overheadBytes = 0;
+  packUploadTiming.buildMs = 0;
+  packUploadTiming.uploadMs = 0;
+  packUploadTiming.fallbacks = newPackFallbacks();
+}
+
 const uploadDispatchReasons = [
   "full_records", "full_bytes", "fixed_timer", "quiet", "absolute", "idle_tail",
 ] as const;
@@ -274,7 +336,7 @@ export function formatFirstPublishStats(s: FirstPublishStats): string {
 }
 
 export function uploadLaneTimingSummary(): string | undefined {
-  if (!LANE_TIMING || uploadLaneTiming.blobs === 0) return undefined;
+  if (!LANE_TIMING || (uploadLaneTiming.blobs === 0 && packUploadTiming.packsBuilt === 0)) return undefined;
   const e = uploadLaneTiming.encryptMs, u = uploadLaneTiming.uploadMs, q = uploadLaneTiming.queueMs, n = uploadLaneTiming.blobs;
   const active = e + u;
   const encryptPct = active > 0 ? ((e / active) * 100).toFixed(0) : "0";
@@ -285,5 +347,18 @@ export function uploadLaneTimingSummary(): string | undefined {
     .map((reason) => `${reason}:${uploadDispatchStats[reason].count}(${uploadDispatchStats[reason].records}r)`)
     .join(" ");
   const dispatch = dispatches ? ` · dispatch ${dispatches}` : "";
-  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${encryptPct}%) · upload ${(u / 1000).toFixed(1)}s (${uploadPct}%)${queue} · per-blob encrypt ${(e / n).toFixed(1)}ms / upload ${(u / n).toFixed(1)}ms${dispatch}`;
+  const perBlobEncrypt = n > 0 ? (e / n).toFixed(1) : "0.0";
+  const perBlobUpload = n > 0 ? (u / n).toFixed(1) : "0.0";
+  const fallback = packFallbackReasons
+    .filter((reason) => packUploadTiming.fallbacks[reason] > 0)
+    .map((reason) => `${reason}:${packUploadTiming.fallbacks[reason]}`)
+    .join(" ");
+  const packs = packUploadTiming.packsBuilt > 0 || fallback
+    ? ` · packs built ${packUploadTiming.packsBuilt} sent ${packUploadTiming.packsSent}`
+      + ` members/pack ${(packUploadTiming.members / Math.max(1, packUploadTiming.packsBuilt)).toFixed(1)}`
+      + ` payload ${packUploadTiming.payloadBytes}B overhead ${packUploadTiming.overheadBytes}B`
+      + ` build ${packUploadTiming.buildMs.toFixed(1)}ms upload ${packUploadTiming.uploadMs.toFixed(1)}ms`
+      + (fallback ? ` fallback ${fallback}` : "")
+    : "";
+  return `lane timing (push): ${n} blobs · encrypt ${(e / 1000).toFixed(1)}s (${encryptPct}%) · upload ${(u / 1000).toFixed(1)}s (${uploadPct}%)${queue} · per-blob encrypt ${perBlobEncrypt}ms / upload ${perBlobUpload}ms${dispatch}${packs}`;
 }

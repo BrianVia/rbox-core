@@ -1999,6 +1999,8 @@ describe("routeTemplate privacy masking", () => {
     ["/v1/account/usage", "/v1/account/usage"],
     ["/v1/blobs/check", "/v1/blobs/check"],
     ["/v1/diagnostics", "/v1/diagnostics"],
+    ["/v1/admin/gc/pack-tombstones", "/v1/admin/gc/pack-tombstones"],
+    ["/v1/admin/gc/pack-tombstones/resweep", "/v1/admin/gc/pack-tombstones/resweep"],
     // Allowlist guarantee: an entirely unknown / user-supplied segment is masked,
     // never echoed — this is the case a blocklist would have leaked.
     ["/v1/totally-made-up/../etc/passwd", "/v1/:x/:x/:x/:x"],
