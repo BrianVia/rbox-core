@@ -147,3 +147,60 @@ rebase); `packs(created_at)` + `pack_gc_candidates(marked_at/deleting_at)`
 indexes added.
 
 Revision committed as DRAFT v2.
+
+### Round 2 — codex verdict: CHANGES-REQUIRED (6 MAJOR, 2 MINOR)
+
+Codex re-attacked the round-1 machinery; all findings adjudicated:
+
+**MAJOR — mint fence does not serialize receipt issuance (wall-clock).**
+ADOPTED, with the fix being the existing house pattern rather than a new
+authorization transaction: `mintFenceCheckedReceipts` already captures
+`checkTime` BEFORE the fence read and anchors receipt `issuedAt` to it
+(`blobs.ts:57`), so `issuedAt < marked_at` holds in signed-timestamp terms
+under D1 serialization of read-vs-mark, regardless of when the HMAC completes.
+§7.3 property 1 restated in those terms; the expiry proof now runs on signed
+timestamps only.
+
+**MAJOR — property 1 / gate 5b contradicted the §5 resurrect arm.** ADOPTED.
+Verified the contradiction (resurrect deletes the candidate → same-id retry
+may legitimately mint again). Properties restated **per candidacy epoch**: the
+epoch that reaches delete exists continuously from its `marked_at` to the
+delete, so every valid receipt has `issuedAt < marked_at` of that epoch;
+quiescence restarts from the re-opened intent's `deleting_at` (the executor's
+`deleting_at < now - quiescence` predicate does this automatically). Gate 5b
+now exercises resurrect→retry-mint→last-location-delete→fresh-mark→delete.
+
+**MAJOR — uploading sweeper had no race protocol; §8 "no server state" was
+false.** ADOPTED. §3 now specifies: a `touched_at` heartbeat set by a
+conditional single-row UPDATE before every R2 write (changes=1 or fail
+closed), a conditional single-row `uploading→ready` transition, sweeper
+eligibility only when `created_at` AND `touched_at` are past the orphan grace,
+and inventory-first-then-object deletion ordering so a losing repair fails
+closed instead of leaving an uninventoried object. Failure matrix rows
+corrected/added; `packs.touched_at` added to the schema.
+
+**MAJOR — §7.2 destructive location DELETE must embed the guards.** ADOPTED.
+Verified `cleanupCandidate` embeds zero-ref/open-intent/lease predicates per
+destructive statement; §7.2 step 1 now requires the same embedding.
+
+**MAJOR — auth contract unstated on the new route (design-109 seam).**
+ADOPTED. §3 wire block now shows the bearer header and states the
+batch-PUT-identical contract: `protoAuth` always sent, `accountId` from
+`authenticate()`, grants never an upload credential; API test asserting
+grant-only rejection.
+
+**MAJOR — per-request budgets do not bound per-isolate memory.** ADOPTED
+moderated: this exposure class is identical to the existing 8 MiB batch lane
+(24 concurrent buffered bodies today); rather than redesigning to streaming,
+the resource gate gains a targeted concurrent PUT+GET stress cell and states
+the per-isolate model explicitly.
+
+**MINOR — rollback drill underspecified.** ADOPTED: `wrangler versions
+list/deploy <version-id>` procedure, restore + re-verify, and the soak defined
+as ≥7 days AND ≥1 subsequent production deploy with the reader present.
+
+**MINOR — candidate indexes must be composite partials.** ADOPTED:
+`(marked_at, pack_id) WHERE deleting_at IS NULL` and `(deleting_at, pack_id)
+WHERE deleting_at IS NOT NULL`, mirroring migration 0024.
+
+Revision committed as DRAFT v3.
