@@ -41,7 +41,25 @@ fallback mechanism landed.
 No other findings; timing attribution, drainer-default kill/resume, batch-cap
 limits, idempotency, and delta-admission interaction raised nothing new.
 
+## Round 4 — VERDICT: ALIGNED
+
+No findings. Round-3 fix (gate scoped to rollout candidates) confirmed;
+overall internal consistency verified against the code.
+
 ### Seam items (design 110 joint round)
 
-- None raised in rounds 1–2. Codex did not push toward folding redemption into
-  the commit envelope; option C's rejection stood unchallenged.
+- None raised in any round. Codex never pushed toward folding redemption into
+  the commit envelope; option C's rejection stood unchallenged all four
+  rounds. The doc keeps the commit receipts map empty after standalone
+  redemption — if design 110's commit-tail work changes commit-envelope
+  admission timing or the `RBOX_COMMIT_DELTA_ADMISSION` path, the joint seam
+  round should re-check that `commitSigned`'s pre-POST `redeemReceipts` call
+  and the empty-map invariant still hold.
+
+## Outcome
+
+ALIGNED after 4 rounds (3 revision rounds + 1 clean confirmation). All nine
+findings adopted (0 rejected): rounds 1–3 attacked measurement validity,
+compatibility mechanics, and gate falsifiability; no round produced a
+correctness finding against upload-time draining, kill/resume receipt safety,
+idempotency, fence/GC semantics, or the batch-cap raise itself.

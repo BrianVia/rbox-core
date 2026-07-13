@@ -1,7 +1,7 @@
 # 111 — Receipt-redemption tail on greenfield publish
 
-Status: INITIAL DRAFT, 2026-07-12 — evidence and proposed design only; no
-adversarial review yet.
+Status: REVIEWED — ALIGNED, 2026-07-12. Four codex adversarial rounds
+(ledger: `docs/design/REVIEW-111.md`); round 4 returned no findings.
 
 Reduce the receipt-accounting tail exposed by the first large greenfield publish.
 The recommended change keeps redemption as a bounded, idempotent operation, but
