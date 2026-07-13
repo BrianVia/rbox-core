@@ -32,6 +32,15 @@ fallback mechanism landed.
 | 3 | MAJOR | p95 ≤ 10s gate over "at least five" runs is statistically meaningless (p95 of n=5 interpolates against the max). | **ADOPT** — small-sample gate is now median ≤ 5s and max ≤ 10s over the ≥5 fixed-corpus runs; the p95 form is reserved for the step-4 canary cohort at ≥20 publishes. |
 | 4 | MINOR | 15k eligibility formula `15,000 × max_entry_bytes ≤ 7 MiB` omitted JSON framing (outer `{receipts:{}}` envelope, punctuation) — could approve 15k when a full request doesn't fit (client byte-slicing would then silently cap below 15k). | **ADOPT** — eligibility now measured on the exact maximally-sized `JSON.stringify({receipts: …})` request including framing; otherwise largest N whose full request fits. |
 
+## Round 3 — VERDICT: CHANGES-REQUIRED
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | MAJOR | The round-2 primary gate said "per configuration", literally applying the median≤5s/max≤10s tail bound to the 5k/post-tail control — which is expected to fail by construction (it IS the 37.4s problem statement), making the gate unsatisfiable. | **ADOPT** — gate now scoped to the rollout candidates (5k/pipelined, 15k/pipelined); 5k/post-tail explicitly designated the non-blocking control that only quantifies the improvement. |
+
+No other findings; timing attribution, drainer-default kill/resume, batch-cap
+limits, idempotency, and delta-admission interaction raised nothing new.
+
 ### Seam items (design 110 joint round)
 
 - None raised in rounds 1–2. Codex did not push toward folding redemption into

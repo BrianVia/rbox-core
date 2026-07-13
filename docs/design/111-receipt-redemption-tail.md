@@ -324,11 +324,14 @@ steady-sync cohort to detect regressions.
 ### Falsifiable gates
 
 - Primary: `redeem - redeemOverlap` (corrected interval-intersection overlap)
-  median ≤ 5s and **maximum** ≤ 10s over the ≥5 fixed-corpus runs per
-  configuration — five runs cannot support a percentile-tail claim, so the
-  small-sample gate uses median/max; the p95 ≤ 10s form applies only to the
-  step-4 canary cohort once it reaches ≥20 greenfield publishes. No regression
-  in `filesSynced` median greater than 5%.
+  median ≤ 5s and **maximum** ≤ 10s over the ≥5 fixed-corpus runs of each
+  **rollout candidate** (5k/pipelined and 15k/pipelined) — the 5k/post-tail
+  configuration is the non-blocking control, expected to fail this bound by
+  construction (its measured tail is the 37.4s problem statement); it exists
+  only to quantify the improvement. Five runs cannot support a
+  percentile-tail claim, so the small-sample gate uses median/max; the
+  p95 ≤ 10s form applies only to the step-4 canary cohort once it reaches ≥20
+  greenfield publishes. No regression in `filesSynced` median greater than 5%.
 - Scheduling: with upload-time draining enabled, at least 80% of redemption
   wall overlaps upload on the 2.85 GB corpus (corrected metric), unless total
   redemption wall itself is below 5s. The final flush is inherently
