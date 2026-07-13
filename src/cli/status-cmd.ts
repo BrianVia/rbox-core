@@ -3,16 +3,18 @@ import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
-import { loadConfig, loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
 import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
 import {
   attributeDaemonForStatus,
+  gitDeferralReasonPrecedence,
   healthDetailLines,
   healthLine,
   lastSyncLines,
+  renderGitDeferralLine,
   trashLine,
   type StatusRemoteHead,
 } from "./status-view.js";
@@ -40,8 +42,35 @@ interface StatusLocalCountsBase {
   deleted: number;
   trackedFiles: number;
   gitChanged: number;
+  gitDeferrals: GitDivergenceStatus["deferrals"];
   gitConfigChecking?: string[];
   gitConfigDisabled?: GitDivergenceStatus["configDisabled"];
+}
+
+interface LocalGitDeferral extends GitDeferral {
+  repo: string;
+}
+
+const DEFERRAL_LANES: GitDeferral["lane"][] = ["apply", "capture", "config"];
+const compareText = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+
+function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
+  const out: LocalGitDeferral[] = [];
+  for (const [repo, record] of Object.entries(repoRecordsForState(state))) {
+    for (const lane of DEFERRAL_LANES) {
+      const deferral = record.deferrals?.[lane];
+      if (deferral) out.push({ repo, ...deferral });
+    }
+  }
+  return out.sort((a, b) => {
+    const aAt = Date.parse(a.deferredSince);
+    const bAt = Date.parse(b.deferredSince);
+    const ageOrder = (Number.isFinite(aAt) ? aAt : Number.POSITIVE_INFINITY) - (Number.isFinite(bAt) ? bAt : Number.POSITIVE_INFINITY);
+    return ageOrder
+      || gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
+      || compareText(a.repo, b.repo)
+      || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane);
+  });
 }
 
 type StatusLocalCounts =
@@ -163,13 +192,19 @@ function statusHealthJson(input: {
   populate?: { filesDone: number; filesTotal: number };
   localChanges: number;
   gitChanged: number;
+  gitDeferrals: number;
+  gitBytesChangedDeferrals: number;
   localSequence: number;
   remote: StatusRemoteHead | undefined;
   now: number;
 }): "halt" | "outofstorage" | "active" | "pending" | "ok" {
   if (input.populate) return "active";
   const behind = input.remote?.sequence !== undefined && input.remote.sequence > input.localSequence;
-  const settled = input.localChanges === 0 && input.gitChanged === 0 && !behind;
+  const settled = input.localChanges === 0
+    && input.gitChanged === 0
+    && input.gitDeferrals === 0
+    && input.gitBytesChangedDeferrals === 0
+    && !behind;
   return shellStateOf(input.activity ?? { at: new Date(input.now).toISOString() }, settled);
 }
 
@@ -274,20 +309,21 @@ export async function statusCmdWithDeps(
     source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
     includeBaseRepos = true
   ): Promise<GitDivergenceStatus> => {
-    if (!cfg.syncGit) return { count: 0, configChecking: [], configDisabled: [] };
+    if (!cfg.syncGit) return { count: 0, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [] };
     try {
       if (deps.gitDivergenceStatus) {
         return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
       }
       return {
         count: await deps.gitDivergenceCount(root, cfg, state, matcher, source, includeBaseRepos),
+        deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })),
         configChecking: [],
         configDisabled: [],
       };
     } catch {
       // Design 93 §6: an indeterminate config lane is conservatively divergent;
       // status must never collapse an evaluation failure to zero.
-      return { count: 1, configChecking: ["*"], configDisabled: [] };
+      return { count: 1, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [] };
     }
   };
 
@@ -305,6 +341,7 @@ export async function statusCmdWithDeps(
       deleted: trusted.local.deleted,
       trackedFiles: trusted.local.trackedFiles,
       gitChanged: gitStatus.count,
+      gitDeferrals: gitStatus.deferrals,
       gitConfigChecking: gitStatus.configChecking,
       gitConfigDisabled: gitStatus.configDisabled,
       source: "daemon",
@@ -317,6 +354,13 @@ export async function statusCmdWithDeps(
       deleted: 0,
       trackedFiles: populate.operation.filesDone,
       gitChanged: 0,
+      gitDeferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({
+        relPath: repo,
+        lane: d.lane,
+        reason: d.reason,
+        deferredSince: d.deferredSince,
+        ...(d.bytesChanged === undefined ? {} : { bytesChanged: d.bytesChanged }),
+      })),
       source: "computed",
     };
   } else {
@@ -346,6 +390,7 @@ export async function statusCmdWithDeps(
       deleted,
       trackedFiles: localManifest.files.length,
       gitChanged: gitStatus.count,
+      gitDeferrals: gitStatus.deferrals,
       gitConfigChecking: gitStatus.configChecking,
       gitConfigDisabled: gitStatus.configDisabled,
       source: "computed",
@@ -356,6 +401,18 @@ export async function statusCmdWithDeps(
   const localChanges = counts.added + counts.changed + counts.deleted;
   const now = deps.now();
   const crypto = cryptoPoolStatus();
+  const gitDeferrals = localGitDeferrals(state);
+  const projectedGitDeferrals = counts.gitDeferrals;
+  const gitDeferredRepos = new Set(projectedGitDeferrals.map((d) => d.relPath)).size;
+  const gitBytesChangedDeferrals = projectedGitDeferrals.filter((d) => d.bytesChanged === true).length;
+  const gitOldestDeferral = [...projectedGitDeferrals].sort((a, b) => {
+    const aAt = Date.parse(a.deferredSince);
+    const bAt = Date.parse(b.deferredSince);
+    return ((Number.isFinite(aAt) ? aAt : Number.POSITIVE_INFINITY) - (Number.isFinite(bAt) ? bAt : Number.POSITIVE_INFINITY))
+      || gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
+      || compareText(a.relPath, b.relPath)
+      || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane);
+  })[0];
 
   if (opts.json) {
     const statusJson = {
@@ -365,6 +422,8 @@ export async function statusCmdWithDeps(
         populate: populate?.operation,
         localChanges,
         gitChanged: counts.gitChanged,
+        gitDeferrals: gitDeferredRepos,
+        gitBytesChangedDeferrals,
         localSequence: state.lastSyncedSequence,
         remote,
         now,
@@ -386,6 +445,22 @@ export async function statusCmdWithDeps(
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
       crypto,
+      git: {
+        deferrals: gitDeferrals.map((deferral) => ({
+          repo: deferral.repo,
+          lane: deferral.lane,
+          reason: deferral.reason,
+          deferredSince: deferral.deferredSince,
+          reasonSince: deferral.reasonSince,
+          ageSeconds: Math.max(0, Math.floor((now - Date.parse(deferral.deferredSince)) / 1000)) || 0,
+          bytesChanged: deferral.bytesChanged === true,
+          ...(deferral.checkout?.kind === "branch"
+            ? { checkout: { kind: "branch" as const, ...(deferral.checkout.label === undefined ? {} : { label: deferral.checkout.label }) } }
+            : deferral.checkout?.kind === "detached"
+              ? { checkout: { kind: "detached" as const } }
+              : {}),
+        })),
+      },
       ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
         ? {
           gitConfig: {
@@ -409,6 +484,11 @@ export async function statusCmdWithDeps(
     changed: counts.changed,
     deleted: counts.deleted,
     gitChanged: counts.gitChanged,
+    gitDeferrals: gitDeferredRepos,
+    gitBytesChangedDeferrals,
+    gitOldestDeferral: gitOldestDeferral
+      ? { deferredSince: gitOldestDeferral.deferredSince, reason: gitOldestDeferral.reason }
+      : undefined,
     trackedFiles: counts.trackedFiles,
     daemonRunning: bg.running,
     localSequence: state.lastSyncedSequence,
@@ -441,7 +521,7 @@ export async function statusCmdWithDeps(
           : style.yellow("stopped")
     }`
   );
-  if (cfg.syncGit) {
+  if (cfg.syncGit || projectedGitDeferrals.length > 0) {
     const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
     const pending = Object.keys(state.gitPendingRemote ?? {}).length;
     const conflicts = Object.keys(state.gitNeedsResolution ?? {}).length;
@@ -463,6 +543,7 @@ export async function statusCmdWithDeps(
     }
     if (pending) parts.push(style.yellow(`${pending} pending`));
     if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
+    if (projectedGitDeferrals.length) parts.push(style.yellow(`${projectedGitDeferrals.length} deferred`));
     if (counts.gitConfigChecking?.length) {
       const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
       parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
@@ -471,6 +552,16 @@ export async function statusCmdWithDeps(
       parts.push(style.yellow(`config: disabled (${counts.gitConfigDisabled.map((issue) => `${issue.relPath}: ${issue.reason}`).join("; ")})`));
     }
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
+    for (const deferral of gitDeferrals) {
+      console.log(`    ${renderGitDeferralLine({
+        relPath: deferral.repo,
+        reason: deferral.reason,
+        deferredSince: deferral.deferredSince,
+        checkout: deferral.checkout,
+        bytesChanged: deferral.bytesChanged,
+        now,
+      })}`);
+    }
   }
   const m = await loadMetrics(root);
   if (m.syncs > 0 || m.commitConflicts409 > 0 || m.fileConflicts > 0) {

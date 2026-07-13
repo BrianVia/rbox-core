@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { discoverGitRepos, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
-import { type SyncState, type WorkspaceConfig } from "../config.js";
+import { repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";
 import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";
@@ -21,6 +21,14 @@ import { GIT_DIVERGENCE_CONCURRENCY, loadGitDivergenceCache, saveGitDivergenceCa
  */
 export interface GitDivergenceStatus {
   count: number;
+  /** Durable lane projection. Read-only and intentionally excludes opaque keys. */
+  deferrals: Array<{
+    relPath: string;
+    lane: GitDeferral["lane"];
+    reason: GitDeferral["reason"];
+    deferredSince: string;
+    bytesChanged?: boolean;
+  }>;
   /** Repos whose config snapshot could not be stabilized/read. These count as
    * divergent and render as the explicit indeterminate `config: checking` state. */
   configChecking: string[];
@@ -42,7 +50,22 @@ export async function gitDivergenceStatus(
   includeBaseRepos = true,
   options: GitDivergenceStatusOptions = {}
 ): Promise<GitDivergenceStatus> {
-  if (!cfg.syncGit) return { count: 0, configChecking: [], configDisabled: [] };
+  const deferrals: GitDivergenceStatus["deferrals"] = [];
+  for (const [relPath, record] of Object.entries(repoRecordsForState(state))) {
+    for (const lane of ["apply", "capture", "config"] as const) {
+      const deferral = record.deferrals?.[lane];
+      if (!deferral) continue;
+      deferrals.push({
+        relPath,
+        lane: deferral.lane,
+        reason: deferral.reason,
+        deferredSince: deferral.deferredSince,
+        ...(deferral.bytesChanged === undefined ? {} : { bytesChanged: deferral.bytesChanged }),
+      });
+    }
+  }
+  deferrals.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0) || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0));
+  if (!cfg.syncGit) return { count: 0, deferrals, configChecking: [], configDisabled: [] };
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const pending = state.gitPendingRemote ?? {};
   const needsRes = state.gitNeedsResolution ?? {};
@@ -177,7 +200,7 @@ export async function gitDivergenceStatus(
     if (!carry) n++;
     else await countConfigDisposition(rel, baseSec);
   }
-  return { count: n, configChecking, configDisabled };
+  return { count: n, deferrals, configChecking, configDisabled };
 }
 
 export async function gitDivergenceCount(

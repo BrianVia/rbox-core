@@ -13,7 +13,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
-import { RBOX_DIR } from "./config.js";
+import { RBOX_DIR, repoRecordsForState, type GitDeferralReason, type SyncState } from "./config.js";
 import type { TransferPhase } from "./transfer-progress.js";
 
 /** The transfer phases the activity sidecar accepts. The daemon only ever writes a
@@ -300,6 +300,75 @@ export async function saveShellLine(root: string, line: string): Promise<void> {
   try {
     await fs.mkdir(path.join(root, RBOX_DIR, "state"), { recursive: true });
     await writeFileAtomic(shellLinePath(root), line + "\n");
+  } catch {
+    /* best-effort by contract */
+  }
+}
+
+const SHELL_DEFERRALS_MAX_ROWS = 50;
+const SHELL_DEFERRALS_MAX_BYTES = 8 * 1024;
+const DEFERRAL_REASON_ORDER: readonly GitDeferralReason[] = [
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
+  "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable",
+  "artifact", "config", "containment", "unsupported", "other",
+];
+
+const shellDeferralsPath = (root: string): string => path.join(root, RBOX_DIR, "state", "shell.deferrals");
+
+/**
+ * Render design 116's repo-routed prompt sidecar. Rows are deliberately ASCII-only:
+ * encodeURIComponent protects tabs/newlines and makes the zsh reader's character
+ * bound equal the on-disk byte bound. One row represents one repo; coexisting lanes
+ * collapse to the display-precedence reason, oldest episode age, and an OR of the
+ * sender-local bytesChanged marker.
+ */
+export function renderShellDeferrals(
+  state: SyncState,
+  now: number,
+  ageBucket: (iso: string, now: number) => string,
+): string | undefined {
+  const rows = Object.entries(repoRecordsForState(state)).flatMap(([relPath, record]) => {
+    const deferrals = Object.values(record.deferrals ?? {}).filter((d) => d !== undefined);
+    if (deferrals.length === 0) return [];
+    const oldest = deferrals.reduce((a, b) => Date.parse(a.deferredSince) <= Date.parse(b.deferredSince) ? a : b);
+    const reason = deferrals.reduce((a, b) =>
+      DEFERRAL_REASON_ORDER.indexOf(a.reason) <= DEFERRAL_REASON_ORDER.indexOf(b.reason) ? a : b
+    ).reason;
+    return [{
+      deferredAt: Date.parse(oldest.deferredSince),
+      line: `${encodeURIComponent(relPath)}\t${reason}\t${ageBucket(oldest.deferredSince, now)}\t${deferrals.some((d) => d.bytesChanged) ? 1 : 0}`,
+    }];
+  }).sort((a, b) => a.deferredAt - b.deferredAt || a.line.localeCompare(b.line));
+
+  if (rows.length === 0) return undefined;
+  let rendered = "v1\n";
+  let count = 0;
+  for (const row of rows) {
+    if (count >= SHELL_DEFERRALS_MAX_ROWS) break;
+    const candidate = rendered + row.line + "\n";
+    if (Buffer.byteLength(candidate) > SHELL_DEFERRALS_MAX_BYTES) break;
+    rendered = candidate;
+    count++;
+  }
+  return rendered;
+}
+
+/** Best-effort atomic sidecar write; absence is the fast no-op signal to zsh. */
+export async function saveShellDeferrals(
+  root: string,
+  state: SyncState,
+  now: number,
+  ageBucket: (iso: string, now: number) => string,
+): Promise<void> {
+  const file = shellDeferralsPath(root);
+  try {
+    const rendered = renderShellDeferrals(state, now, ageBucket);
+    if (rendered === undefined) {
+      await fs.rm(file, { force: true });
+      return;
+    }
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await writeFileAtomic(file, rendered);
   } catch {
     /* best-effort by contract */
   }

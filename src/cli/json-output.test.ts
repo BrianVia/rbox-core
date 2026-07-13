@@ -158,6 +158,7 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
     crypto: { state: "idle", workers: 0, jobsRun: 0, workerExecutions: 0 },
+    git: { deferrals: [] },
   });
 });
 

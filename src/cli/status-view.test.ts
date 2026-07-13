@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
 import {
+  ageBucket,
   attributeDaemonForStatus,
   healthDetailLines,
   healthLine,
   lastSyncLines,
   progressLabel,
   relTime,
+  renderGitDeferralLine,
   type StatusSnapshot,
 } from "./status-view.js";
 
@@ -39,6 +41,35 @@ test("relTime buckets", () => {
   expect(relTime(iso(3 * 3600 + 30), NOW)).toBe("3h ago");
   expect(relTime(iso(2 * 86400), NOW)).toBe("2d ago");
   expect(relTime("not-a-date", NOW)).toBe("unknown");
+});
+
+test("ageBucket uses the D5 coarse boundaries", () => {
+  expect(ageBucket(iso(0), NOW)).toBe("0m");
+  expect(ageBucket(iso(59 * 60), NOW)).toBe("59m");
+  expect(ageBucket(iso(3600), NOW)).toBe("1h");
+  expect(ageBucket(iso(86400), NOW)).toBe("1d");
+  expect(ageBucket(iso(7 * 86400), NOW)).toBe("7d");
+  expect(ageBucket(iso(14 * 86400), NOW)).toBe("14d");
+  expect(ageBucket(iso(30 * 86400), NOW)).toBe("30d");
+  expect(ageBucket("bad", NOW)).toBe("--");
+});
+
+test("renderGitDeferralLine sanitizes branches, hides detached OIDs, and marks changed bytes", () => {
+  expect(renderGitDeferralLine({
+    relPath: "repo",
+    reason: "local-edits",
+    deferredSince: iso(14 * 86400),
+    checkout: { kind: "branch", label: "release/0.9\u001b[31m\n" },
+    bytesChanged: true,
+    now: NOW,
+  })).toBe("git deferred 14d: local edits on branch release/0.9 (repo) (working files changed since)");
+  expect(renderGitDeferralLine({
+    relPath: "repo",
+    reason: "local-commits",
+    deferredSince: iso(3600),
+    checkout: { kind: "detached", label: "deadbeef" },
+    now: NOW,
+  })).toBe("git deferred 1h: local commits on detached checkout (repo)");
 });
 
 // ── progressLabel ─────────────────────────────────────────────────────────────
@@ -255,6 +286,20 @@ test("git divergence: clean file tree with unpushed git state is NOT in sync", (
   const both = healthLine(base({ changed: 2, gitChanged: 3 }));
   expect(both).toContain("2 local changes to sync");
   expect(both).toContain("git changes in 3 repos");
+});
+
+test("durable git deferrals and bytes-changed markers gate the both-planes in-sync verdict", () => {
+  const deferred = base({
+    gitDeferrals: 1,
+    gitOldestDeferral: { deferredSince: iso(8 * 86400), reason: "local-index" },
+  });
+  expect(healthLine(deferred)).toContain("1 git repo deferred");
+  expect(healthLine(deferred)).not.toContain("in sync");
+  expect(healthDetailLines(deferred)).toEqual(["git deferral: oldest 7d · local index changes"]);
+
+  const markerOnly = healthLine(base({ gitBytesChangedDeferrals: 1 }));
+  expect(markerOnly).toContain("working files changed during deferral");
+  expect(markerOnly).not.toContain("in sync");
 });
 
 test("local divergence + behind remote are reported together", () => {

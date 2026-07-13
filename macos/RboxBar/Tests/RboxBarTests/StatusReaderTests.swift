@@ -60,13 +60,31 @@ final class StatusReaderTests: XCTestCase {
         """)
         write("daemon.status.json", """
         {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":"\(iso(120))",
-         "fileCount":128517,"daemonVersion":"0.9.16","workspaceRoot":"/tmp/current-root"}
+         "fileCount":128517,"daemonVersion":"0.9.16","workspaceRoot":"/tmp/current-root",
+         "deferredRepos":2,"oldestDeferralAgeSeconds":259200}
         """)
         let ws = only()
         XCTAssertEqual(ws.fileCount, 128_517)
         XCTAssertEqual(ws.daemonVersion, "0.9.16")
         XCTAssertEqual(ws.rootPath, "/tmp/current-root")
         XCTAssertEqual(ws.name, "current-root")
+        XCTAssertEqual(ws.deferredRepos, 2)
+        XCTAssertEqual(ws.oldestDeferralAgeSeconds, 259_200)
+        XCTAssertEqual(ws.severityTier, .degraded)
+    }
+
+    func testInvalidDeferralFieldsRejectStatus() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":null,
+         "deferredRepos":-1,"oldestDeferralAgeSeconds":10}
+        """)
+        XCTAssertEqual(only().state, .attention)
+
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":null,
+         "deferredRepos":null,"oldestDeferralAgeSeconds":null}
+        """)
+        XCTAssertEqual(only().state, .attention, "deferredRepos is optional but not nullable")
     }
 
     func testTotalBytesParses() {
@@ -206,6 +224,23 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.state, .syncing)
         XCTAssertEqual(ws.operation?.kind, .pull)
         XCTAssertEqual(ws.operation?.filesTotal, 100)
+    }
+
+    func testFreshPopulatePreservesDeferralProjectionFromValidDaemonStatus() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(30))","sequence":247,"lastSyncedAt":null,
+         "deferredRepos":3,"oldestDeferralAgeSeconds":604800}
+        """)
+        write("populate.status.json", """
+        {"schemaVersion":1,"kind":"initial-populate","workspaceId":"w","projectId":"p","stream":"s",
+         "pid":\(getpid()),"startedAt":"\(iso(10))","heartbeatAt":"\(iso(1))",
+         "operation":{"kind":"pull","phase":"download","filesDone":40,"filesTotal":100}}
+        """)
+        let ws = only()
+        XCTAssertEqual(ws.state, .syncing)
+        XCTAssertEqual(ws.deferredRepos, 3)
+        XCTAssertEqual(ws.oldestDeferralAgeSeconds, 604_800)
+        XCTAssertEqual(ws.severityTier, .degraded)
     }
 
     func testStalePopulateIsIgnored() {

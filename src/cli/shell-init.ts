@@ -128,6 +128,97 @@ _rbox_read() {
   _RBOX_OPKIND=\$opkind
 }
 
+# Decode the writer's encodeURIComponent rel-path using zsh builtins only. \$REPLY.
+_rbox_pct_decode() {
+  emulate -L zsh
+  local s="\$1" out="" hex byte ch
+  while [[ -n \$s ]]; do
+    ch=\$s[1]
+    if [[ \$ch == % ]]; then
+      (( \${#s} >= 3 )) || return 1
+      hex=\$s[2,3]
+      [[ \$hex == [0-9A-Fa-f][0-9A-Fa-f] && \$hex != 00 ]] || return 1
+      printf -v byte '%b' "\\\\x\$hex" || return 1
+      out+="\$byte"
+      s=\$s[4,-1]
+    else
+      [[ \$ch == [A-Za-z0-9_.\\!\\~\\*\\'\\(\\)-] ]] || return 1
+      out+="\$ch"
+      s=\$s[2,-1]
+    fi
+  done
+  REPLY=\$out
+}
+
+# Read the bounded repo-routing sidecar and select the deepest repo enclosing \$PWD.
+# Sets _RBOX_DEF_AGE/_RBOX_DEF_BYTES; malformed, >50-row, or >8KiB files fail closed.
+_rbox_deferrals() {
+  emulate -L zsh
+  setopt extended_glob
+  local LC_ALL=C # byte-count semantics for the hard 8KiB gate, including hostile UTF-8
+  local root="\$1" file="\$1/.rbox/state/shell.deferrals" header
+  local row="" enc reason age changed extra decoded repo best_age="" best_changed="" best_len=-1
+  local rows=0 bytes=3 fd cache_key
+  local -A file_stat
+  _RBOX_DEF_AGE=""
+  _RBOX_DEF_BYTES=""
+  [[ -r \$file ]] || return 0
+  # Exact raw-byte gate before parsing. zstat is an in-process zsh module, not a fork.
+  zmodload zsh/stat 2>/dev/null || return 0
+  zstat -H file_stat -- "\$file" 2>/dev/null || return 0
+  (( file_stat[size] <= 8192 )) || return 0
+  cache_key="\$file:\$file_stat[inode]:\$file_stat[size]:\$file_stat[mtime]:\$PWD"
+  if [[ \$cache_key == \${_RBOX_DEF_CACHE_KEY-} ]]; then
+    _RBOX_DEF_AGE=\${_RBOX_DEF_CACHE_AGE-}
+    _RBOX_DEF_BYTES=\${_RBOX_DEF_CACHE_BYTES-}
+    return 0
+  fi
+  exec {fd}<"\$file" || return 0
+  IFS= read -r header <&\$fd || { exec {fd}<&-; return 0; }
+  [[ \$header == v1 ]] || { exec {fd}<&-; return 0; }
+  while IFS= read -r row <&\$fd; do
+    (( rows++ ))
+    enc="" reason="" age="" changed="" extra=""
+    IFS=\$'\\t' read -r enc reason age changed extra <<< "\$row"
+    (( bytes += \${#enc} + \${#reason} + \${#age} + \${#changed} + 4 ))
+    if (( rows > 50 || bytes > 8192 )) || [[ -z \$enc || "\$row" != "\$enc"\$'\\t'"\$reason"\$'\\t'"\$age"\$'\\t'"\$changed" ]]; then
+      exec {fd}<&-
+      return 0
+    fi
+    case \$reason in
+      local-edits|local-index|local-operation|local-commits|local-stash|conflict|git-busy|worktree-ownership|ignored-target|unreadable|artifact|config|containment|unsupported|other) ;;
+      *) exec {fd}<&-; return 0 ;;
+    esac
+    [[ \$age == ([0-9]m|[1-5][0-9]m|1h|1d|7d|14d|30d) && \$changed == (0|1) ]] || {
+      exec {fd}<&-
+      return 0
+    }
+    _rbox_pct_decode "\$enc" || { exec {fd}<&-; return 0; }
+    decoded=\$REPLY
+    [[ \$decoded == . || ( \$decoded != /* && \$decoded != .. && \$decoded != ../* && \$decoded != */../* && \$decoded != */.. && \$decoded != *//* ) ]] || {
+      exec {fd}<&-
+      return 0
+    }
+    [[ \$decoded == . ]] && repo=\$root || repo="\$root/\$decoded"
+    if [[ "\$PWD" == "\$repo" || "\$PWD" == "\$repo"/* ]]; then
+      if (( \${#repo} > best_len )); then
+        best_len=\${#repo}
+        best_age=\$age
+        best_changed=\$changed
+      fi
+    fi
+  done
+  # An unterminated final row makes read fail while leaving its bytes in row.
+  # Accepting earlier rows would violate whole-file fail-closed parsing.
+  [[ -z \$row ]] || { exec {fd}<&-; return 0; }
+  exec {fd}<&-
+  _RBOX_DEF_AGE=\$best_age
+  _RBOX_DEF_BYTES=\$best_changed
+  typeset -g _RBOX_DEF_CACHE_KEY=\$cache_key
+  typeset -g _RBOX_DEF_CACHE_AGE=\$best_age
+  typeset -g _RBOX_DEF_CACHE_BYTES=\$best_changed
+}
+
 _rbox_prompt_status_enabled() {
   emulate -L zsh
   [[ \${RBOX_USE_PROMPT_STATUS:-\$_RBOX_PROMPT_STATUS_DEFAULT} == 1 ]]
@@ -162,6 +253,19 @@ _rbox_prompt_status_glyph() {
 # and even our own halt message's backticks would execute.
 _rbox_banner() {
   emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  _rbox_read "\$1"
+  case \$_RBOX_KIND in
+    halt|active|pending) ;;
+    *)
+      _rbox_deferrals "\$1"
+      if [[ -n \$_RBOX_DEF_AGE ]]; then
+        local changed=""
+        [[ \$_RBOX_DEF_BYTES == 1 ]] && changed=" · working files changed"
+        print -r -u2 -- "\${_RBOX_C_YELLOW}rbox: git deferred \${_RBOX_DEF_AGE}\${changed}\${_RBOX_C_OFF}"
+        return
+      fi
+      ;;
+  esac
   if _rbox_prompt_status_enabled && _rbox_prompt_status "\$1"; then
     local ps="\$REPLY" msg
     case \$ps in
@@ -174,7 +278,6 @@ _rbox_banner() {
     [[ -n \$msg ]] && print -r -u2 -- "\$msg"
     return
   fi
-  _rbox_read "\$1"
   local n="\$_RBOX_NAME"
   local msg
   case \$_RBOX_KIND in
@@ -206,10 +309,22 @@ _rbox_banner() {
 # value contains no \$-references of its own.
 _rbox_glyph() {
   emulate -L zsh   # user options (SH_WORD_SPLIT, GLOB_SUBST, ...) must not change our expansions
+  _rbox_read "\$1"
+  case \$_RBOX_KIND in
+    halt|active|pending) ;;
+    *)
+      _rbox_deferrals "\$1"
+      if [[ -n \$_RBOX_DEF_AGE ]]; then
+        local changed=""
+        [[ \$_RBOX_DEF_BYTES == 1 ]] && changed="+files"
+        RBOX_PROMPT="%F{yellow}⚠git:\${_RBOX_DEF_AGE}\${changed}%f"
+        return
+      fi
+      ;;
+  esac
   if _rbox_prompt_status_enabled && _rbox_prompt_status "\$1"; then
     _rbox_prompt_status_glyph "\$REPLY" && return
   fi
-  _rbox_read "\$1"
   case \$_RBOX_KIND in
     ok)            RBOX_PROMPT="%F{green}✓%f" ;;
     pending)       RBOX_PROMPT="%F{yellow}↑%f" ;;

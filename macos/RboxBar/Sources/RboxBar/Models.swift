@@ -70,12 +70,16 @@ struct WorkspaceStatus: Identifiable, Equatable {
     var lastSyncedAt: Date?
     var heartbeatAgeSeconds: Double?
     var desiredState: String?
+    var deferredRepos: Int? = nil
+    var oldestDeferralAgeSeconds: Int? = nil
 }
 
 extension WorkspaceStatus {
     var severityTier: SeverityTier {
-        guard state == .attention else { return .ok }
-        return attentionReason?.severityTier ?? .critical
+        if state == .attention {
+            return attentionReason?.severityTier ?? .critical
+        }
+        return (deferredRepos ?? 0) > 0 ? .degraded : .ok
     }
 
     static var empty: WorkspaceStatus {
@@ -93,7 +97,9 @@ extension WorkspaceStatus {
             daemonVersion: nil,
             lastSyncedAt: nil,
             heartbeatAgeSeconds: nil,
-            desiredState: nil
+            desiredState: nil,
+            deferredRepos: nil,
+            oldestDeferralAgeSeconds: nil
         )
     }
 }

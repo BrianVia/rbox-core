@@ -2,8 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ACTIVE_STALE_MS, loadActivity, renderShellLine, saveActivity, saveShellLine, type DaemonActivity } from "./activity.js";
+import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, type DaemonActivity } from "./activity.js";
 import { resetSyncState } from "./config.js";
+import type { SyncState } from "./config.js";
+import { ageBucket } from "./status-view.js";
 
 let root: string;
 beforeEach(async () => {
@@ -144,6 +146,48 @@ test("resetSyncState clears the sidecar too — a rebind must not inherit the ol
   await resetSyncState(root);
   expect(await loadActivity(root)).toBeUndefined();
   await expect(fs.access(shellLine)).rejects.toThrow(); // shell.line removed too
+});
+
+const deferralState = (records: SyncState["repoRecords"]): SyncState => ({
+  stream: "test", lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "", files: [] }, repoRecords: records,
+});
+
+test("shell.deferrals is stable, encoded, precedence-collapsed, oldest-first, and bounded", () => {
+  const now = Date.parse("2026-07-13T12:00:00Z");
+  const state = deferralState({
+    "nested repo": { repoGen: 1, sourceSeq: 1, deferrals: {
+      apply: { lane: "apply", reason: "git-busy", deferredSince: "2026-07-13T11:30:00Z", reasonSince: "2026-07-13T11:30:00Z", lastSeen: "2026-07-13T11:30:00Z" },
+      capture: { lane: "capture", reason: "local-edits", deferredSince: "2026-07-13T11:45:00Z", reasonSince: "2026-07-13T11:45:00Z", lastSeen: "2026-07-13T11:45:00Z", bytesChanged: true },
+    } },
+    "old\trepo": { repoGen: 1, sourceSeq: 1, deferrals: {
+      config: { lane: "config", reason: "config", deferredSince: "2026-07-12T12:00:00Z", reasonSince: "2026-07-12T12:00:00Z", lastSeen: "2026-07-12T12:00:00Z" },
+    } },
+  });
+  const rendered = renderShellDeferrals(state, now, ageBucket)!;
+  expect(rendered.split("\n").slice(0, 3)).toEqual([
+    "v1", "old%09repo\tconfig\t1d\t0", "nested%20repo\tlocal-edits\t30m\t1",
+  ]);
+
+  const many = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`repo-${i}-${"x".repeat(300)}`, {
+    repoGen: 1, sourceSeq: 1, deferrals: { apply: {
+      lane: "apply" as const, reason: "other" as const, deferredSince: "2026-07-13T11:00:00Z",
+      reasonSince: "2026-07-13T11:00:00Z", lastSeen: "2026-07-13T11:00:00Z",
+    } },
+  }]));
+  const bounded = renderShellDeferrals(deferralState(many), now, ageBucket)!;
+  expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(8192);
+  expect(bounded.trimEnd().split("\n").length - 1).toBeLessThanOrEqual(50);
+});
+
+test("saveShellDeferrals deletes the sidecar when no deferrals remain", async () => {
+  const file = path.join(root, ".rbox", "state", "shell.deferrals");
+  const now = Date.parse("2026-07-13T12:00:00Z");
+  await saveShellDeferrals(root, deferralState({ repo: { repoGen: 1, sourceSeq: 1, deferrals: {
+    apply: { lane: "apply", reason: "local-edits", deferredSince: new Date(now).toISOString(), reasonSince: new Date(now).toISOString(), lastSeen: new Date(now).toISOString() },
+  } } }), now, ageBucket);
+  expect(await fs.readFile(file, "utf8")).toContain("repo\tlocal-edits\t0m\t0");
+  await saveShellDeferrals(root, deferralState({}), now, ageBucket);
+  await expect(fs.access(file)).rejects.toThrow();
 });
 
 // --- design 46: the pure prompt-sidecar renderer ---------------------------

@@ -12,6 +12,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
+import type { GitDeferralReason } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
@@ -26,6 +27,12 @@ export interface StatusSnapshot {
    *  without it a clean file tree + a fresh local commit reads "in sync" while
    *  push would commit a git section. Optional: 0 when git-sync is off. */
   gitChanged?: number;
+  /** Durable Git lanes that cannot currently converge. */
+  gitDeferrals?: number;
+  /** Deferred lanes whose working bytes changed during the episode. */
+  gitBytesChangedDeferrals?: number;
+  /** Oldest durable lane, for concise context below the verdict. */
+  gitOldestDeferral?: { deferredSince: string; reason: GitDeferralReason };
   trackedFiles: number;
   daemonRunning: boolean;
   localSequence: number;
@@ -115,6 +122,71 @@ export function relTime(iso: string, now: number): string {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
+}
+
+/** Coarse chronic-age bucket shared by all deferral visibility surfaces. */
+export function ageBucket(iso: string, now: number): string {
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return "--";
+  const seconds = Math.max(0, Math.floor((now - parsed) / 1000));
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return "1h";
+  if (seconds < 7 * 86400) return "1d";
+  if (seconds < 14 * 86400) return "7d";
+  if (seconds < 30 * 86400) return "14d";
+  return "30d";
+}
+
+const DEFERRAL_REASON_TEXT: Record<GitDeferralReason, string> = {
+  "local-edits": "local edits",
+  "local-index": "local index changes",
+  "local-operation": "local git operation",
+  "local-commits": "local commits",
+  "local-stash": "local stash",
+  conflict: "conflict",
+  "git-busy": "git busy",
+  "worktree-ownership": "worktree ownership",
+  "ignored-target": "ignored target",
+  unreadable: "unreadable repository",
+  artifact: "git artifact",
+  config: "git config",
+  containment: "repository containment",
+  unsupported: "unsupported git state",
+  other: "other git issue",
+};
+
+export function gitDeferralReasonText(reason: GitDeferralReason): string {
+  return DEFERRAL_REASON_TEXT[reason];
+}
+
+/** Human-divergence reasons lead operational reasons when chronic ages tie. */
+export function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
+  switch (reason) {
+    case "local-edits": return 0;
+    case "local-index": return 1;
+    case "local-operation": return 2;
+    case "local-commits": return 3;
+    case "local-stash": return 4;
+    default: return 5;
+  }
+}
+
+/** Pure, terminal-safe local rendering. Detached checkouts never expose an OID. */
+export function renderGitDeferralLine(input: {
+  relPath: string;
+  reason: GitDeferralReason;
+  deferredSince: string;
+  checkout?: { kind: "branch" | "detached"; label?: string };
+  bytesChanged?: boolean;
+  now: number;
+}): string {
+  const checkout = input.checkout?.kind === "branch"
+    ? `branch ${input.checkout.label ? truncateDetail(input.checkout.label) : "(unknown)"}`
+    : input.checkout?.kind === "detached"
+      ? "detached checkout"
+      : "checkout unavailable";
+  const changed = input.bytesChanged ? " (working files changed since)" : "";
+  return `git deferred ${ageBucket(input.deferredSince, input.now)}: ${gitDeferralReasonText(input.reason)} on ${checkout} (${truncateDetail(input.relPath)})${changed}`;
 }
 
 const ageLabel = (ageMs: number | undefined): string => {
@@ -248,6 +320,8 @@ export function healthLine(s: StatusSnapshot): string {
 
   const localChanges = s.added + s.changed + s.deleted;
   const gitChanged = s.gitChanged ?? 0;
+  const gitDeferrals = s.gitDeferrals ?? 0;
+  const gitBytesChangedDeferrals = s.gitBytesChangedDeferrals ?? 0;
   const remoteSequence = s.remote?.sequence;
   const behind = remoteSequence !== undefined && remoteSequence > s.localSequence;
   const behindNote = `behind remote (sequence ${s.localSequence} vs ${remoteSequence})`;
@@ -255,18 +329,27 @@ export function healthLine(s: StatusSnapshot): string {
   // 4. Local divergence from the baseline — file and/or git changes waiting to
   //    upload. With the daemon running this is normally transient; stopped, it
   //    needs a nudge.
-  if (localChanges > 0 || gitChanged > 0) {
+  if (localChanges > 0 || gitChanged > 0 || gitDeferrals > 0 || gitBytesChangedDeferrals > 0) {
+    const deferralIsHead = localChanges === 0 && gitChanged === 0 && gitDeferrals > 0;
     const parts = [
       s.added ? `${n(s.added)} new` : "",
       s.changed ? `${n(s.changed)} changed` : "",
       s.deleted ? `${n(s.deleted)} deleted` : "",
       gitChanged ? `git changes in ${n(gitChanged)} repo${gitChanged === 1 ? "" : "s"}` : "",
+      gitDeferrals && !deferralIsHead ? `${n(gitDeferrals)} git repo${gitDeferrals === 1 ? "" : "s"} deferred` : "",
+      gitBytesChangedDeferrals ? `working files changed during ${n(gitBytesChangedDeferrals)} deferral${gitBytesChangedDeferrals === 1 ? "" : "s"}` : "",
     ].filter(Boolean);
-    const head =
-      localChanges > 0 ? `↑ ${n(localChanges)} local change${localChanges === 1 ? "" : "s"} to sync` : "↑ git changes to sync";
+    const head = localChanges > 0
+      ? `↑ ${n(localChanges)} local change${localChanges === 1 ? "" : "s"} to sync`
+      : gitChanged > 0
+        ? "↑ git changes to sync"
+        : gitDeferrals > 0
+          ? `⚠ ${n(gitDeferrals)} git repo${gitDeferrals === 1 ? "" : "s"} deferred`
+          : "⚠ git working files changed during deferral";
     const extra = behind ? ` · ${behindNote}` : "";
     const hint = s.daemonRunning ? "" : ` ${style.dim("— background sync stopped; run `rbox start`")}`;
-    return `${style.yellow(head)} ${style.dim(`(${parts.join(", ")})`)}${extra}${hint}`;
+    const detail = parts.length ? ` ${style.dim(`(${parts.join(", ")})`)}` : "";
+    return `${style.yellow(head)}${detail}${extra}${hint}`;
   }
 
   // 5. Clean locally but the remote has moved on.
@@ -284,8 +367,14 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   const halt = s.daemonRunning ? s.activity?.halt : undefined;
   const active = freshActive(s);
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
-  if (!halt || halt.terminal || !active || out) return [];
-  return [`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`];
+  const lines: string[] = [];
+  if (halt && !halt.terminal && active && !out) {
+    lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
+  }
+  if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {
+    lines.push(`${style.yellow("git deferral:")} oldest ${ageBucket(s.gitOldestDeferral.deferredSince, s.now)} · ${gitDeferralReasonText(s.gitOldestDeferral.reason)}`);
+  }
+  return lines;
 }
 
 /** Human byte size: `847 B` / `12.3 KB` / `312.4 MB` / `1.4 GB` (decimal units, one

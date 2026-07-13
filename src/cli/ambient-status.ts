@@ -3,7 +3,7 @@ import path from "node:path";
 import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
 import type { DaemonActivity } from "./activity.js";
 import type { TransferPhase } from "./transfer-progress.js";
-import { syncStreamId, type WorkspaceConfig } from "./config.js";
+import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "./config.js";
 import {
   AMBIENT_STATUS_STALE_MS,
   hasFreshPopulateHeartbeat,
@@ -34,6 +34,8 @@ export interface AmbientDaemonStatusV1 {
     currentPath?: string;
   };
   attentionReason?: AmbientAttentionReason;
+  deferredRepos?: number;
+  oldestDeferralAgeSeconds?: number | null;
 }
 
 export type PromptAttentionReason = "dead" | "halt" | "quota" | "watcher" | "owner" | "error";
@@ -73,6 +75,7 @@ export interface AmbientStatusProjectionInput {
   watcherDegraded?: boolean;
   ownershipLost?: boolean;
   currentPath?: string;
+  repoRecords?: Record<string, RepoRecord>;
 }
 
 const STATES = new Set<AmbientDaemonState>(["synced", "syncing", "attention", "paused"]);
@@ -149,6 +152,22 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
           currentPath: cleanLocalPath(input.currentPath),
         })
       : undefined;
+  let deferredRepos = 0;
+  let oldestDeferredSince = Number.POSITIVE_INFINITY;
+  for (const record of Object.values(input.repoRecords ?? {})) {
+    const deferrals = Object.values(record.deferrals ?? {}).filter((entry) => entry !== undefined);
+    if (deferrals.length === 0) continue;
+    deferredRepos++;
+    for (const deferral of deferrals) {
+      const deferredSince = Date.parse(deferral.deferredSince);
+      if (Number.isFinite(deferredSince)) oldestDeferredSince = Math.min(oldestDeferredSince, deferredSince);
+    }
+  }
+  const oldestDeferralAgeSeconds = deferredRepos === 0
+    ? null
+    : Number.isFinite(oldestDeferredSince)
+      ? Math.max(0, Math.floor((input.now - oldestDeferredSince) / 1_000))
+      : null;
 
   return stripUndefined({
     schemaVersion: 1,
@@ -158,16 +177,23 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
     lastSyncedAt: newestIso(input.activity.lastPush?.at, input.activity.lastPull?.at),
     operation: op,
     attentionReason: state === "attention" ? reason ?? "unknown-error" : undefined,
+    deferredRepos,
+    oldestDeferralAgeSeconds,
   }) as AmbientDaemonStatusV1;
 }
 
-export function pausedAmbientDaemonStatus(now = Date.now(), previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt">): AmbientDaemonStatusV1 {
+export function pausedAmbientDaemonStatus(
+  now = Date.now(),
+  previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "deferredRepos" | "oldestDeferralAgeSeconds">,
+): AmbientDaemonStatusV1 {
   return {
     schemaVersion: 1,
     state: "paused",
     heartbeatAt: new Date(now).toISOString(),
     sequence: previous?.sequence ?? null,
     lastSyncedAt: previous?.lastSyncedAt ?? null,
+    ...(previous?.deferredRepos === undefined ? {} : { deferredRepos: previous.deferredRepos }),
+    ...(previous?.oldestDeferralAgeSeconds === undefined ? {} : { oldestDeferralAgeSeconds: previous.oldestDeferralAgeSeconds }),
   };
 }
 
@@ -198,6 +224,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (!(j.sequence === null || uint(j.sequence))) return undefined;
     if (!(j.lastSyncedAt === null || typeof j.lastSyncedAt === "string")) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
+    if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
+    if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
     const out: AmbientDaemonStatusV1 = {
       schemaVersion: 1,
       state: j.state as AmbientDaemonState,
@@ -206,6 +234,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
       lastSyncedAt: j.lastSyncedAt,
     };
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
+    if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
+    if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
     const op = j.operation;
     if (op !== undefined) {
       if (op.kind !== "pull" && op.kind !== "push") return undefined;
