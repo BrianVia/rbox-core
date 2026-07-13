@@ -98,7 +98,14 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const release of pendingReleases.splice(0)) release();
-  await Promise.all(uploaders.map((value) => value.close(new Error("test cleanup"))));
+  // Bounded close: a test that leaves a gated fetch pending must not hang the
+  // hook (10s hook timeout → globals never restore → the NEXT test fails on
+  // leaked state — bit the v1.5.0 release build, same class as #264). 2s is
+  // real work's ceiling here; stragglers are abandoned, globals still restore.
+  await Promise.race([
+    Promise.all(uploaders.map((value) => value.close(new Error("test cleanup")).catch(() => {}))),
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
   // Reset the process-global measurement singleton even when an assertion failed.
   finishFirstPublishStats();
   globalThis.fetch = originalFetch;

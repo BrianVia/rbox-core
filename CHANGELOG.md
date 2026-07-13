@@ -5,6 +5,8 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.5.2] — 2026-07-13 — the grant-suite fix actually ships this time (1.5.1 tagged without it — cwd slip)
+
 ## [1.5.1] — 2026-07-13 — release-gate test hygiene (v1.5.0 build never shipped)
 
 ### Fixed
