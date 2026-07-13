@@ -1,9 +1,8 @@
 # rig/upload-sweep
 
-Sweeps upload-batch **slot** concurrency to re-measure the ~35 Mbps upload ceiling
-the fleet hits on every host (a slot×latency bound: ~364 blobs/s ⇒ ~2s per 32-blob
-batch at 24 slots). Pairs with the `RBOX_UPLOAD_SLOTS` / `RBOX_DOWNLOAD_SLOTS` /
-`RBOX_BATCH_RECORDS` knobs in `src/cli/remote/blob-batch.ts`.
+Sweeps upload-batch fill policy and wire-cap settings to measure the upload lane.
+Pairs with the `RBOX_UPLOAD_SLOTS`, `RBOX_BATCH_RECORDS`, and
+`RBOX_BATCH_FILL` client knobs.
 
 ## What it measures, and what it deliberately does not
 
@@ -11,11 +10,14 @@ batch at 24 slots). Pairs with the `RBOX_UPLOAD_SLOTS` / `RBOX_DOWNLOAD_SLOTS` /
   (≤256 KiB), non-`.git`** files, and git-sync is disabled (`--git false`). So
   multipart (large blobs) and git-pack traffic never enter the number — this is the
   batch uploader's throughput alone.
-- **Slots axis only** (`{24,48,96,192}`). The **records** axis is pinned at the
-  server wire cap (`apps/api` `MAX_BATCH_RECORDS = 32`): the server 400s any larger
-  batch, so records >32 cannot run against a live server. Sweeping records needs a
-  coordinated client+server wire-cap bump and a dev deploy — out of scope for a
-  client-only, prod-safe run.
+- **Three-axis repeated sweep.** The harness runs the full
+  `SLOTS × RECORDS_SET × FILL_SET` cross-product (defaults `24`, `32`, and
+  `v1`), repeats it `REPEATS` times, and randomizes the complete point list when
+  `shuf` is available. Slots are deliberately held at 24 by default per
+  [design 112](../../docs/design/112-batch-fill-wire-cap.md) (#245 says not to
+  sweep slots upward here). `v1 × records>32` cells are **skipped with a note**:
+  the client clamps fill-v1 records to 32, so running them would record a
+  mislabeled cell and poison the matched-cell gates.
 
 ## How it runs (safety model)
 
@@ -31,17 +33,57 @@ Teardown restores the host's real device identity from `/tmp/rbox-id-backup`
 
 ```sh
 # On the bench host, with a branch-built binary (NOT in a live workspace):
-RBOX=/tmp/rbox-sweep-build/rbox rig/upload-sweep/sweep.sh
+RBOX=... RBOX_API=https://rbox-dev-api.<acct>.workers.dev RECORDS_SET="32 64" FILL_SET="v1 v2" REPEATS=3 rig/upload-sweep/sweep.sh
 ```
 
+`RBOX_API` is mandatory and should name the dev worker. The harness refuses
+`api.rbox.to` (case-insensitive) by default because every run creates a junk
+workspace and thousands of junk blobs. `ALLOW_PROD=1` is the conscious operator
+override.
+
+`RBOX_API` only sets the client's *default* remote — stored credentials override
+it (`init-plan.ts`, `e2ee-client.ts`). After init the harness therefore asserts
+the effective remote in `~/.rbox/credentials.json` matches `RBOX_API` and aborts
+(with identity restore + daemon restart, via an EXIT trap) if it does not: log in
+against the dev worker first, or move the credentials file aside.
+
 Env overrides: `SRC` (default `~/code`), `ROOT` (`/tmp/rbox-sweep`), `TARGET_BYTES`
-(400 MiB), `MAX_FILE` (256 KiB), `SLOTS`, `RECORDS`, `MAIN_ROOT` (`~/Development`),
-`BACKUP` (`/tmp/rbox-id-backup`), `INSTALLED_RBOX` (`~/.rbox/bin/rbox` — the host's
-real daemon is stopped/restarted with THIS binary, never the bench build).
+(400 MiB), `MAX_FILE` (256 KiB), `SLOTS`, `RECORDS_SET`, `FILL_SET`, `REPEATS`,
+`MAIN_ROOT` (`~/Development`), `BACKUP` (`/tmp/rbox-id-backup`), and
+`INSTALLED_RBOX` (`~/.rbox/bin/rbox` — the host's real daemon is stopped/restarted
+with THIS binary, never the bench build). Legacy `RECORDS` supplies the
+`RECORDS_SET` default when `RECORDS_SET` is unset.
+
+Records greater than 32 require both a phase-3 client build and a dev server
+deployed with acceptance cap 64. Older clients clamp `RBOX_BATCH_RECORDS` to 32;
+an old server returns 400 for oversized batches. The harness cannot detect either
+prerequisite.
 
 Outputs `results/sweep.csv` and `results/sweep.md` under `ROOT`. Each point creates
 junk blobs in one bench workspace whose `ws_…` id is printed and recorded in the
 markdown — delete it server-side afterwards.
+
+Every CSV row records the effective `slots`, `records`, and `fill`, total client
+slot work (`slot_work_s` — the lane summary's total upload seconds, i.e. the sum
+of per-request HTTP durations), the six per-reason dispatch counts (`NA` when the
+lane line or dispatch segment is absent — never fabricated zeros), a compact raw
+dispatch list, and the `api` base + client `build` version, alongside the existing
+throughput and timing measurements. The markdown table includes fill, slot work,
+and dispatch.
+
+The markdown's **Gates (design 112)** section averages repeats per cell and reports:
+
+- the fill-v1 dominance baseline: whether `fixed_timer + idle_tail` exceeds 50%
+  of dispatches, the precondition for the timer/idle causal claim;
+- a matched `(slots, records)` fill gate: fill-v2 must reduce mean slot work by at
+  least 10% versus fill-v1;
+- a matched fill-v2 cap gate: each higher records cell must reduce mean slot work
+  by at least 10% versus that slots value's lowest records baseline. Fill versions
+  are never crossed for this cap comparison.
+
+These are informational harness gates from
+[design 112](../../docs/design/112-batch-fill-wire-cap.md); missing telemetry or
+cells are reported as `n/a` and do not change the script exit status.
 
 ## Known host bugs worked around
 
