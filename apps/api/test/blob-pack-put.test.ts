@@ -312,11 +312,45 @@ describe("pack publication and idempotency", () => {
     const a = await bootstrap("pack-concurrent");
     const pack = smallPack(nextId(), "concurrent-shared");
     const calls: R2Call[] = [];
-    const handlerEnv = recordingEnv(calls);
-    const [left, right] = await Promise.all([direct(pack, handlerEnv, a.accountId), direct(pack, handlerEnv, a.accountId)]);
-    expect([left.status, right.status].filter((status) => status === 200).length).toBeGreaterThanOrEqual(1);
-    expect([200, 503]).toContain(left.status);
-    expect([200, 503]).toContain(right.status);
+    const barrier = () => {
+      let signalReached!: () => void;
+      let signalRelease!: () => void;
+      const reached = new Promise<void>((resolve) => { signalReached = resolve; });
+      const released = new Promise<void>((resolve) => { signalRelease = resolve; });
+      const bucket = new Proxy(env.rbox_dev_blobs, {
+        get(target, property) {
+          if (property === "put") return async (key: string, value: Uint8Array, options?: R2PutOptions) => {
+            calls.push({ op: "put", key });
+            signalReached();
+            await released;
+            return target.put(key, value, options);
+          };
+          if (property === "delete") return (key: string) => {
+            calls.push({ op: "delete", key });
+            return target.delete(key);
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      return { handlerEnv: { ...env, rbox_dev_blobs: bucket } as Env, reached, release: signalRelease };
+    };
+    const leftBarrier = barrier();
+    const rightBarrier = barrier();
+    const leftPending = direct(pack, leftBarrier.handlerEnv, a.accountId);
+    const rightPending = direct(pack, rightBarrier.handlerEnv, a.accountId);
+    await Promise.all([leftBarrier.reached, rightBarrier.reached]);
+    leftBarrier.release();
+    let loser!: Response;
+    try {
+      const winner = await leftPending;
+      expect(winner.status).toBe(200);
+    } finally {
+      rightBarrier.release();
+      loser = await rightPending;
+    }
+    expect(loser.status).toBe(503);
+    expect(await loser.json()).toEqual({ error: "retry_later" });
     expect(calls.filter((call) => call.op === "delete" && call.key === packKey(pack.id))).toEqual([]);
     const object = await env.rbox_dev_blobs.get(packKey(pack.id));
     expect(new Uint8Array(await object!.arrayBuffer())).toEqual(pack.body);

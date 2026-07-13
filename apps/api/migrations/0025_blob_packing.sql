@@ -88,12 +88,12 @@ CREATE TRIGGER IF NOT EXISTS blob_locations_delete_pack_candidate
 AFTER DELETE ON blob_locations FOR EACH ROW
 WHEN NOT EXISTS (SELECT 1 FROM blob_locations l WHERE l.pack_id = OLD.pack_id)
 BEGIN
-  INSERT OR IGNORE INTO pack_gc_candidates (pack_id, epoch, marked_at)
+  INSERT INTO pack_gc_candidates (pack_id, epoch, marked_at)
   VALUES (
     OLD.pack_id,
     lower(hex(randomblob(16))),
     CAST(strftime('%s','now') AS INTEGER) * 1000
-  );
+  ) ON CONFLICT(pack_id) DO NOTHING;
 END;
 
 CREATE TRIGGER IF NOT EXISTS blob_locations_move_pack_candidate
@@ -101,10 +101,10 @@ AFTER UPDATE OF pack_id ON blob_locations FOR EACH ROW
 WHEN OLD.pack_id != NEW.pack_id
   AND NOT EXISTS (SELECT 1 FROM blob_locations l WHERE l.pack_id = OLD.pack_id)
 BEGIN
-  INSERT OR IGNORE INTO pack_gc_candidates (pack_id, epoch, marked_at)
+  INSERT INTO pack_gc_candidates (pack_id, epoch, marked_at)
   VALUES (
     OLD.pack_id,
     lower(hex(randomblob(16))),
     CAST(strftime('%s','now') AS INTEGER) * 1000
-  );
+  ) ON CONFLICT(pack_id) DO NOTHING;
 END;

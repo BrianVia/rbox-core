@@ -416,8 +416,19 @@ export async function runPackGc(env: Env, options: PackGcOptions = {}): Promise<
     return json({ error: "pack_gc_disabled" }, 409);
   }
   const db = dbFor(op.env, "");
-  const clock = options.clock ?? Date.now;
   const nowMs = options.nowMs ?? Date.now();
+  if (mode === "shadow") {
+    try {
+      const would = await shadowCounts(db, nowMs);
+      op.done("shadow", { count: would.wouldDelete });
+      return json(would);
+    } catch {
+      op.done("error");
+      return json({ error: "pack_gc_failed" }, 500);
+    }
+  }
+
+  const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const deadlineAt = startedAt + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
   const acquired = await acquireLease(db, startedAt, options.owner, PACK_PURGE_LEASE_KEY);
@@ -429,11 +440,6 @@ export async function runPackGc(env: Env, options: PackGcOptions = {}): Promise<
 
   const counts: PackGcCounts = { marked: 0, opened: 0, deleted: 0, unwound: 0 };
   try {
-    if (mode === "shadow") {
-      const would = await shadowCounts(db, nowMs);
-      op.done("shadow", { count: would.wouldDelete });
-      return json(would);
-    }
     if (!(await renewLease(db, lease, clock(), PACK_PURGE_LEASE_KEY))) {
       op.done("lease_lost");
       return json({ ...counts, leaseLost: true }, 409);

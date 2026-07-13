@@ -172,6 +172,35 @@ describe("design 114 receipt placement accounting", () => {
     expect(await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(packB.id).first()).toEqual({ deleting_at: null });
   });
 
+  test("real accounting relocation preserves an existing unopened candidate for the former pack", async () => {
+    const a = await bootstrap("pack-redeem-existing-candidate");
+    const bytes = new TextEncoder().encode("relocate-with-existing-candidate");
+    const packA = buildPack([bytes]);
+    const packB = buildPack([bytes]);
+    const receiptA = await publish(a, packA);
+    await publish(a, packB);
+    expect((await redeem(a.accountId, receiptA)).status).toBe(200);
+
+    const epoch = nextId();
+    const markedAt = 1_234_567_890;
+    await db()
+      .prepare("INSERT INTO pack_gc_candidates(pack_id,epoch,marked_at,deleting_at) VALUES (?,?,?,NULL)")
+      .bind(packA.id, epoch, markedAt)
+      .run();
+    const entry = packB.entries[0]!;
+    expect(await commitAccounting(db(), a.accountId, [{
+      sha: entry.sha256,
+      size: entry.length,
+      pack: { packId: packB.id, offset: entry.offset, length: entry.length, packSha256: packB.sha },
+    }], Date.now())).toEqual({ ok: true });
+
+    expect((await location(entry.sha256))?.pack_id).toBe(packB.id);
+    expect(await db()
+      .prepare("SELECT epoch,marked_at,deleting_at FROM pack_gc_candidates WHERE pack_id=?")
+      .bind(packA.id)
+      .first()).toEqual({ epoch, marked_at: markedAt, deleting_at: null });
+  });
+
   test("an open pack fence aborts the whole mixed v1/v2 super-batch", async () => {
     expect(isDeleteFenceAbort(new Error("D1: rbox_delete_fence_pack"))).toBe(true);
     const a = await bootstrap("pack-redeem-fence");

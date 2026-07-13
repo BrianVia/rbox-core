@@ -174,8 +174,8 @@ const fakeState = () => ({
   },
 }) as unknown as DurableObjectState;
 
-async function redeem(accountId: string, receipts: Record<string, string>): Promise<Response> {
-  const sync = new WorkspaceSync(fakeState(), env);
+async function redeem(accountId: string, receipts: Record<string, string>, handlerEnv: Env = env): Promise<Response> {
+  const sync = new WorkspaceSync(fakeState(), handlerEnv);
   return (sync as unknown as { redeemReceipts(req: Request): Promise<Response> }).redeemReceipts(
     new Request(`${BASE}/v1/ws/ws/proj/root/receipts/redeem`, {
       method: "POST",
@@ -183,6 +183,150 @@ async function redeem(accountId: string, receipts: Record<string, string>): Prom
       body: JSON.stringify({ receipts }),
     }),
   );
+}
+
+type PackBoundary = "pack_fence_read" | "mark_insert" | "open_update" | "r2_delete" | "r2_head" | "terminal_batch" | "sweeper_batch";
+
+interface BoundaryStats {
+  fenceReads: number;
+  fenceBlocked: boolean | null;
+  marks: number;
+  markChanges: number;
+  markLandedAt: number | null;
+  opens: number;
+  openChanges: number;
+  r2Deletes: number;
+  deleteSawLocation: boolean;
+  r2Heads: number;
+  headAbsent: boolean | null;
+  terminals: number;
+  sweeps: number;
+  sweepChanges: number;
+}
+
+function hookedBoundaryEnv(boundary: PackBoundary, packId: string, mode: "mark" | "execute") {
+  const realDb = env.rbox_dev_db;
+  let fenceBatchPrepared = false;
+  let terminalBatchPrepared = false;
+  let sweeperBatchPrepared = false;
+  const stats: BoundaryStats = {
+    fenceReads: 0,
+    fenceBlocked: null,
+    marks: 0,
+    markChanges: 0,
+    markLandedAt: null,
+    opens: 0,
+    openChanges: 0,
+    r2Deletes: 0,
+    deleteSawLocation: false,
+    r2Heads: 0,
+    headAbsent: null,
+    terminals: 0,
+    sweeps: 0,
+    sweepChanges: 0,
+  };
+  let signalReached!: () => void;
+  let signalRelease!: () => void;
+  const reached = new Promise<void>((resolve) => { signalReached = resolve; });
+  const released = new Promise<void>((resolve) => { signalRelease = resolve; });
+  let paused = false;
+  const pause = async (at: PackBoundary): Promise<void> => {
+    if (at !== boundary || paused) return;
+    paused = true;
+    signalReached();
+    await released;
+  };
+  const wrapRun = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => new Proxy(statement, {
+    get(target, property, receiver) {
+      if (property !== "run") return Reflect.get(target, property, receiver);
+      return async () => {
+        const result = await target.run();
+        if (sql.includes("INSERT OR IGNORE INTO pack_gc_candidates(pack_id,epoch,marked_at)")) {
+          stats.marks++;
+          stats.markChanges += Number(result.meta.changes ?? 0);
+          stats.markLandedAt = Date.now();
+          await pause("mark_insert");
+        } else if (sql.includes("UPDATE pack_gc_candidates SET deleting_at")) {
+          stats.opens++;
+          stats.openChanges += Number(result.meta.changes ?? 0);
+          await pause("open_update");
+        }
+        return result;
+      };
+    },
+  });
+  const proxiedDb = new Proxy(realDb, {
+    get(target, property, receiver) {
+      if (property === "prepare") return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (sql.includes("pack_gc_candidates WHERE pack_id = ? UNION ALL")) fenceBatchPrepared = true;
+        if (sql.includes("DELETE FROM pack_gc_candidates")) terminalBatchPrepared = true;
+        if (sql.includes("p.state = 'uploading'")) sweeperBatchPrepared = true;
+        return new Proxy(statement, {
+          get(stmt, stmtProperty, stmtReceiver) {
+            if (stmtProperty !== "bind") return Reflect.get(stmt, stmtProperty, stmtReceiver);
+            return (...args: unknown[]) => {
+              const bound = stmt.bind(...args);
+              return sql.includes("INSERT OR IGNORE INTO pack_gc_candidates(pack_id,epoch,marked_at)")
+                || sql.includes("UPDATE pack_gc_candidates SET deleting_at")
+                ? wrapRun(bound, sql)
+                : bound;
+            };
+          },
+        });
+      };
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const result = await target.batch(statements);
+        if (fenceBatchPrepared) {
+          fenceBatchPrepared = false;
+          stats.fenceReads++;
+          stats.fenceBlocked = (result[1]?.results?.length ?? 0) > 0;
+          await pause("pack_fence_read");
+        } else if (terminalBatchPrepared && statements.length === 3) {
+          terminalBatchPrepared = false;
+          stats.terminals++;
+          await pause("terminal_batch");
+        } else if (sweeperBatchPrepared && statements.length === 2) {
+          sweeperBatchPrepared = false;
+          stats.sweeps++;
+          stats.sweepChanges += Number(result[1]?.meta.changes ?? 0);
+          await pause("sweeper_batch");
+        }
+        return result;
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  }) as D1Database;
+  const bucket = new Proxy(env.rbox_dev_blobs, {
+    get(target, property) {
+      if (property === "delete") return async (key: string) => {
+        if (key === packKey(packId)) {
+          stats.r2Deletes++;
+          stats.deleteSawLocation ||= await realDb.prepare("SELECT 1 FROM blob_locations WHERE pack_id=?").bind(packId).first() !== null;
+        }
+        const result = await target.delete(key);
+        if (key === packKey(packId)) await pause("r2_delete");
+        return result;
+      };
+      if (property === "head") return async (key: string) => {
+        const result = await target.head(key);
+        if (key === packKey(packId)) {
+          stats.r2Heads++;
+          stats.headAbsent = result === null;
+          await pause("r2_head");
+        }
+        return result;
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    handlerEnv: { ...env, RBOX_BLOB_PACK_GC: mode, rbox_dev_db: proxiedDb, rbox_dev_blobs: bucket } as Env,
+    reached,
+    release: signalRelease,
+    stats,
+  };
 }
 
 async function receiptsFrom(response: Response): Promise<Record<string, string>> {
@@ -291,6 +435,50 @@ async function gcTableSnapshot(): Promise<Record<string, number>> {
   })));
 }
 
+async function clearBoundaryFixtures(): Promise<void> {
+  await db().batch([
+    db().prepare("DELETE FROM blob_locations"),
+    db().prepare("DELETE FROM pack_gc_candidates"),
+    db().prepare("DELETE FROM pack_members"),
+    db().prepare("DELETE FROM packs"),
+    db().prepare("DELETE FROM blob_ref_candidates"),
+    db().prepare("DELETE FROM blob_refs"),
+    db().prepare("DELETE FROM gc_candidates"),
+    db().prepare("DELETE FROM blobs"),
+    db().prepare("DELETE FROM gc_state"),
+  ]);
+}
+
+async function assertEntitledPackedRead(accountId: string, pack: BuiltPack): Promise<void> {
+  const sha = pack.entries[0]!.sha256;
+  const check = await blobsCheck(new Request(`${BASE}/v1/blobs/check`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1" },
+    body: JSON.stringify({ shas: [sha] }),
+  }), env, /^[0-9a-f]{64}$/, accountId);
+  expect(check.status).toBe(200);
+  expect(await check.json()).toMatchObject({ missing: [] });
+  const get = await blobGet(env, sha, accountId);
+  expect(get.status).toBe(200);
+  expect(new Uint8Array(await get.arrayBuffer())).toEqual(pack.payloads[0]);
+}
+
+async function assertPackGateInvariants(): Promise<void> {
+  const invalid = await db().prepare(
+    `SELECT COUNT(*) AS n FROM blob_locations l
+     LEFT JOIN pack_members m ON m.pack_id=l.pack_id AND m.sha256=l.sha256
+       AND m.offset=l.offset AND m.length=l.length
+     LEFT JOIN packs p ON p.pack_id=l.pack_id
+     WHERE m.sha256 IS NULL OR p.state!='ready' OR p.pack_sha256!=l.pack_sha256`,
+  ).first<{ n: number }>();
+  expect(Number(invalid?.n ?? 0)).toBe(0);
+  expect(await db().prepare(
+    "SELECT 1 FROM blob_locations l JOIN packs p ON p.pack_id=l.pack_id WHERE p.state='swept' LIMIT 1",
+  ).first()).toBeNull();
+  const located = await db().prepare("SELECT DISTINCT pack_id FROM blob_locations").all<{ pack_id: string }>();
+  for (const row of located.results) expect(await env.rbox_dev_blobs.head(packKey(row.pack_id))).not.toBeNull();
+}
+
 describe("design 114 staged pack-GC modes", () => {
   test("mode parser maps only the documented values", () => {
     expect(packGcMode({ ...env, RBOX_BLOB_PACK_GC: undefined } as Env)).toBe("off");
@@ -317,18 +505,36 @@ describe("design 114 staged pack-GC modes", () => {
     await physicalCandidate(execute, nextId("shadow-execute-epoch"), NOW - 2 * DAY, NOW - PACK_INTENT_QUIESCENCE_MS - 1);
 
     const before = await gcTableSnapshot();
-    const r2Calls: string[] = [];
-    const noR2 = new Proxy(env.rbox_dev_blobs, {
+    const rejectMutation = (sql: string): void => {
+      if (/\b(?:INSERT|UPDATE|DELETE)\b/i.test(sql)) throw new Error(`shadow attempted D1 mutation: ${sql}`);
+    };
+    const readOnlyDb = new Proxy(env.rbox_dev_db, {
       get(target, property) {
-        if (["put", "get", "head", "delete"].includes(String(property))) {
-          return async () => { r2Calls.push(String(property)); throw new Error("shadow touched R2"); };
-        }
+        if (property === "prepare") return (sql: string) => {
+          rejectMutation(sql);
+          return target.prepare(sql);
+        };
+        if (property === "exec") return (sql: string) => {
+          rejectMutation(sql);
+          return target.exec(sql);
+        };
+        if (property === "batch") return () => { throw new Error("shadow attempted D1 batch"); };
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;
       },
+    }) as D1Database;
+    const r2Calls: string[] = [];
+    const noR2 = new Proxy(env.rbox_dev_blobs, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (typeof value === "function") {
+          return async () => { r2Calls.push(String(property)); throw new Error("shadow touched R2"); };
+        }
+        return value;
+      },
     });
     const response = await runPackGc(
-      { ...env, RBOX_BLOB_PACK_GC: "shadow", rbox_dev_blobs: noR2 } as Env,
+      { ...env, RBOX_BLOB_PACK_GC: "shadow", rbox_dev_db: readOnlyDb, rbox_dev_blobs: noR2 } as Env,
       { nowMs: NOW, clock: () => NOW, owner: nextId("shadow-owner") },
     );
     expect(response.status).toBe(200);
@@ -877,6 +1083,239 @@ describe("design 114 §7.3 fence release gates", () => {
     expect(await packRow(pack.id)).toEqual({ state: "swept" });
     expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(pack.id).first()).toBeNull();
     expect(await runAt(NOW + 2)).toMatchObject({ deleted: 0 });
+  });
+
+  test.each(["mark", "execute"] as const)("hooked boundary histories preserve every pack gate in %s mode", async (mode) => {
+    const boundaries: PackBoundary[] = [
+      "pack_fence_read",
+      "mark_insert",
+      "open_update",
+      "r2_delete",
+      "r2_head",
+      "terminal_batch",
+      "sweeper_batch",
+    ];
+    const seeds = [0x114, 0x214, 0x314];
+    for (const seed of seeds) {
+      for (const boundary of boundaries) {
+        await clearBoundaryFixtures();
+        const accountId = await account(`boundary-${mode}-${boundary}-${seed}`);
+        const target = onePack(`boundary-target-${mode}-${boundary}-${seed}`);
+        const sentinel = onePack(`boundary-sentinel-${mode}-${boundary}-${seed}`);
+        await seedPack(target);
+        await seedPack(sentinel, { createdAt: NOW });
+        await installLocation(sentinel);
+        await db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES(?,?,?)")
+          .bind(accountId, sentinel.entries[0]!.sha256, NOW).run();
+
+        const targetReceipt = await receiptsFrom(await retryPack(target, accountId));
+        if (boundary === "open_update") {
+          await physicalCandidate(target, nextId("boundary-open"), NOW - DAY);
+        } else if (["r2_delete", "r2_head", "terminal_batch"].includes(boundary)) {
+          await physicalCandidate(target, nextId("boundary-execute"), NOW - 2 * DAY, NOW - PACK_INTENT_QUIESCENCE_MS - 1);
+        } else if (boundary === "sweeper_batch") {
+          const old = NOW - PACK_ORPHAN_GRACE_MS - 1;
+          await db().prepare("UPDATE packs SET state='uploading',created_at=?,touched_at=? WHERE pack_id=?")
+            .bind(old, old, target.id).run();
+        }
+
+        const hook = hookedBoundaryEnv(boundary, target.id, mode);
+        const isMarkReachable = boundary === "pack_fence_read" || boundary === "mark_insert";
+        if (mode === "mark" && !isMarkReachable) {
+          // Some boundaries SEED an already-open intent; mark mode must leave
+          // deleting_at exactly as seeded (never stamp, never retire).
+          const seededDeletingAt = (await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first<{ deleting_at: number | null }>())?.deleting_at ?? null;
+          if (boundary === "sweeper_batch") await sweepUploadingPacks(hook.handlerEnv, NOW);
+          else await runPackGc(hook.handlerEnv, { nowMs: NOW, clock: () => NOW, owner: nextId("boundary-mark-forbidden") });
+          expect(hook.stats.opens).toBe(0);
+          expect(hook.stats.r2Deletes).toBe(0);
+          expect(hook.stats.r2Heads).toBe(0);
+          expect(hook.stats.terminals).toBe(0);
+          expect(hook.stats.sweeps).toBe(0);
+          expect((await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first<{ deleting_at: number | null }>())?.deleting_at ?? null).toBe(seededDeletingAt);
+          expect(await env.rbox_dev_blobs.head(packKey(target.id))).not.toBeNull();
+          await assertEntitledPackedRead(accountId, sentinel);
+          await assertPackGateInvariants();
+          continue;
+        }
+
+        let pending: Promise<Response> | Promise<void>;
+        let mint: Response;
+        if (boundary === "pack_fence_read") {
+          const mintPending = retryPack(target, accountId, hook.handlerEnv);
+          await hook.reached;
+          let markLandingWall = 0;
+          try {
+            expect(hook.stats.fenceBlocked).toBe(false);
+            const issuedBeforeFence = Date.now();
+            while (Date.now() <= issuedBeforeFence) await new Promise((resolve) => setTimeout(resolve, 1));
+            markLandingWall = Date.now();
+            const gc = await runPackGc(
+              { ...env, RBOX_BLOB_PACK_GC: mode } as Env,
+              { nowMs: NOW, clock: () => NOW, owner: nextId("boundary-fence-mark") },
+            );
+            expect(gc.status).toBe(200);
+            expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first()).not.toBeNull();
+            const redeemed = await redeem(accountId, targetReceipt, hook.handlerEnv);
+            expect(redeemed.status).toBe(200);
+            expect(await redeemed.json()).toEqual({ granted: 1, alreadyEntitled: 0, rejected: 0 });
+            expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=? AND pack_id=?").bind(target.entries[0]!.sha256, target.id).first()).not.toBeNull();
+            await assertEntitledPackedRead(accountId, target);
+            await assertEntitledPackedRead(accountId, sentinel);
+          } finally {
+            hook.release();
+            mint = await mintPending;
+          }
+          expect(mint.status).toBe(200);
+          const minted = await receiptsFrom(mint);
+          expect(Object.values(minted).every((receipt) => receiptIssuedAt(receipt) < markLandingWall)).toBe(true);
+        } else {
+          pending = boundary === "sweeper_batch"
+            ? sweepUploadingPacks(hook.handlerEnv, NOW)
+            : runPackGc(hook.handlerEnv, { nowMs: NOW, clock: () => NOW, owner: nextId("boundary-run") });
+          await hook.reached;
+          try {
+            const candidateAtPause = await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?")
+              .bind(target.id).first() !== null;
+            const sweptAtPause = (await packRow(target.id))?.state === "swept";
+            if (boundary === "mark_insert") {
+              expect(hook.stats.markChanges).toBe(1);
+              expect(candidateAtPause).toBe(true);
+            } else if (boundary === "open_update") {
+              expect(hook.stats.openChanges).toBe(1);
+              expect((await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first<{ deleting_at: number | null }>())?.deleting_at).not.toBeNull();
+            } else if (boundary === "r2_delete") {
+              expect(await env.rbox_dev_blobs.head(packKey(target.id))).toBeNull();
+              expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=? AND deleting_at IS NOT NULL").bind(target.id).first()).not.toBeNull();
+              expect(await db().prepare("SELECT 1 FROM blob_locations WHERE pack_id=?").bind(target.id).first()).toBeNull();
+            } else if (boundary === "r2_head") {
+              expect(hook.stats.headAbsent).toBe(true);
+            } else if (boundary === "terminal_batch") {
+              expect(await packRow(target.id)).toEqual({ state: "swept" });
+              expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first()).toBeNull();
+              expect(await db().prepare("SELECT 1 FROM pack_members WHERE pack_id=?").bind(target.id).first()).toBeNull();
+            } else if (boundary === "sweeper_batch") {
+              expect(hook.stats.sweepChanges).toBe(1);
+              expect(await packRow(target.id)).toEqual({ state: "swept" });
+              expect(await db().prepare("SELECT 1 FROM pack_members WHERE pack_id=?").bind(target.id).first()).toBeNull();
+            }
+            mint = await retryPack(target, accountId, hook.handlerEnv);
+            const redeemed = await redeem(accountId, targetReceipt, hook.handlerEnv);
+            if (boundary === "mark_insert") {
+              expect(redeemed.status).toBe(200);
+              expect(await redeemed.json()).toEqual({ granted: 1, alreadyEntitled: 0, rejected: 0 });
+              expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=? AND pack_id=?").bind(target.entries[0]!.sha256, target.id).first()).not.toBeNull();
+              await assertEntitledPackedRead(accountId, target);
+            } else if (["open_update", "r2_delete", "r2_head"].includes(boundary)) {
+              expect(redeemed.status).toBe(422);
+              expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(target.entries[0]!.sha256).first()).toBeNull();
+            } else {
+              expect(redeemed.status).toBe(200);
+              expect(await redeemed.json()).toEqual({ granted: 0, alreadyEntitled: 0, rejected: 1 });
+              expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(target.entries[0]!.sha256).first()).toBeNull();
+            }
+            await assertEntitledPackedRead(accountId, sentinel);
+            if (hook.stats.fenceBlocked === true) expect(mint.status).toBe(503);
+            if (candidateAtPause || sweptAtPause) expect(mint.status).toBe(503);
+          } finally {
+            hook.release();
+            await pending;
+          }
+        }
+
+        const location = await db().prepare("SELECT 1 FROM blob_locations WHERE pack_id=?").bind(target.id).first();
+        if (location) {
+          await runPackGc(
+            { ...env, RBOX_BLOB_PACK_GC: mode } as Env,
+            { nowMs: NOW + 1, clock: () => NOW + 1, owner: nextId("boundary-unwind") },
+          );
+        } else if (mode === "execute" && (await packRow(target.id))?.state === "ready") {
+          let candidate = await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?")
+            .bind(target.id).first<{ deleting_at: number | null }>();
+          if (candidate?.deleting_at == null) {
+            await runAt(NOW + 1);
+            candidate = await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?")
+              .bind(target.id).first<{ deleting_at: number | null }>();
+          }
+          if (candidate?.deleting_at != null) await runAt(Number(candidate.deleting_at) + PACK_INTENT_QUIESCENCE_MS + 1);
+        }
+
+        expect(hook.stats.deleteSawLocation).toBe(false);
+        const row = await packRow(target.id);
+        if (row?.state === "swept") {
+          expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(target.id).first()).toBeNull();
+          expect(await db().prepare("SELECT 1 FROM pack_members WHERE pack_id=?").bind(target.id).first()).toBeNull();
+          expect(await env.rbox_dev_blobs.head(packKey(target.id))).toBeNull();
+        } else {
+          expect(row).toEqual({ state: "ready" });
+          expect(await env.rbox_dev_blobs.head(packKey(target.id))).not.toBeNull();
+        }
+        if (mode === "mark") {
+          expect(hook.stats.opens).toBe(0);
+          expect(hook.stats.r2Deletes).toBe(0);
+          expect(hook.stats.terminals).toBe(0);
+        }
+        await assertPackGateInvariants();
+      }
+    }
+  }, 30_000);
+
+  test("over-deadline open await uses its post-observation live clock", async () => {
+    const pack = onePack("over-deadline-open");
+    await seedPack(pack);
+    await physicalCandidate(pack, nextId("over-deadline-epoch"), Date.now() - 1);
+    const markLandingWall = Date.now();
+    const start = markLandingWall + 10;
+    let signalObserved!: () => void;
+    let signalRelease!: () => void;
+    const observed = new Promise<void>((resolve) => { signalObserved = resolve; });
+    const released = new Promise<void>((resolve) => { signalRelease = resolve; });
+    const realDb = env.rbox_dev_db;
+    let paused = false;
+    const observationDb = new Proxy(realDb, {
+      get(target, property, receiver) {
+        if (property !== "prepare") return Reflect.get(target, property, receiver);
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.includes("WHERE c.deleting_at IS NULL AND c.marked_at < ?")) return statement;
+          return new Proxy(statement, {
+            get(stmt, stmtProperty, stmtReceiver) {
+              if (stmtProperty !== "bind") return Reflect.get(stmt, stmtProperty, stmtReceiver);
+              return (...args: unknown[]) => {
+                const bound = stmt.bind(...args);
+                return new Proxy(bound, {
+                  get(boundStmt, boundProperty, boundReceiver) {
+                    if (boundProperty !== "all") return Reflect.get(boundStmt, boundProperty, boundReceiver);
+                    return async () => {
+                      const rows = await boundStmt.all();
+                      if (!paused) {
+                        paused = true;
+                        signalObserved();
+                        await released;
+                      }
+                      return rows;
+                    };
+                  },
+                });
+              };
+            },
+          });
+        };
+      },
+    }) as D1Database;
+    let live = start;
+    const pending = runPackGc(
+      { ...env, rbox_dev_db: observationDb } as Env,
+      { nowMs: start, clock: () => live, deadlineMs: 10, owner: nextId("over-deadline-owner") },
+    );
+    await observed;
+    live = start + 11;
+    signalRelease();
+    expect((await pending).status).toBe(200);
+    const candidate = await db().prepare("SELECT deleting_at FROM pack_gc_candidates WHERE pack_id=?")
+      .bind(pack.id).first<{ deleting_at: number }>();
+    expect(candidate?.deleting_at).toBe(live);
+    expect(Number(candidate?.deleting_at)).toBeGreaterThan(markLandingWall);
   });
 
   // Gates 1/6: randomized publish/redeem/retire/re-add history preserves every entitled placement.
