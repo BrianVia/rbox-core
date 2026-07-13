@@ -6,6 +6,8 @@
  * directory hash and each member's content address in its own runtime.
  */
 
+import { bytes32ToHex, hexToBytes32 } from "./refset.js";
+
 export const PACK_HEADER_MAGIC = "RBOXPK01";
 export const PACK_FOOTER_MAGIC = "RBOXEND1";
 export const PACK_HEADER_BYTES = 16;
@@ -67,16 +69,6 @@ function asciiBytes(value: string): Uint8Array {
 function matches(bytes: Uint8Array, offset: number, expected: Uint8Array): boolean {
   for (let i = 0; i < expected.length; i++) if (bytes[offset + i] !== expected[i]) return false;
   return true;
-}
-
-function hexToBytes32(hex: string, out: Uint8Array, offset: number): void {
-  for (let i = 0; i < 32; i++) out[offset + i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-}
-
-function bytes32ToHex(bytes: Uint8Array, offset: number): string {
-  let result = "";
-  for (let i = 0; i < 32; i++) result += bytes[offset + i]!.toString(16).padStart(2, "0");
-  return result;
 }
 
 function safeU64(dv: DataView, offset: number): number | undefined {

@@ -9,7 +9,7 @@ import {
 import { readBytesCapped } from "./commit-envelope.js";
 import { wouldExceedCapAggregate } from "./billing.js";
 import { dbFor } from "./db.js";
-import { batchedInLookup } from "./d1-batch.js";
+import { batchedInLookup, IN_LIST_CHUNK, STMTS_PER_BATCH } from "./d1-batch.js";
 import { emit, emitPackPutPhases, startOp, type Op, type PackPutPhaseTimings } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
 import { usesReceipts } from "./blob-protocol.js";
@@ -90,8 +90,8 @@ export async function resolvePackPlacements(
   const out = new Map<string, PackPlacement>();
   const statements: D1PreparedStatement[] = [];
   for (const [packId, shas] of byPack) {
-    for (let i = 0; i < shas.length; i += 80) {
-      const chunk = shas.slice(i, i + 80);
+    for (let i = 0; i < shas.length; i += IN_LIST_CHUNK) {
+      const chunk = shas.slice(i, i + IN_LIST_CHUNK);
       statements.push(
         db
           .prepare(
@@ -105,8 +105,8 @@ export async function resolvePackPlacements(
   }
   // Match d1-batch's bounded statement groups while allowing chunks for many
   // different packs to share one D1 subrequest.
-  for (let i = 0; i < statements.length; i += 34) {
-    const results = await db.batch<{ sha256: string; offset: number; length: number; pack_sha256: string; pack_id: string }>(statements.slice(i, i + 34));
+  for (let i = 0; i < statements.length; i += STMTS_PER_BATCH) {
+    const results = await db.batch<{ sha256: string; offset: number; length: number; pack_sha256: string; pack_id: string }>(statements.slice(i, i + STMTS_PER_BATCH));
     for (const result of results) {
       for (const row of result.results ?? []) {
           out.set(row.sha256, {
@@ -318,15 +318,18 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
       return done("member_sha_mismatch", json({ error: "member_sha_mismatch" }, 400));
     }
 
-    const quota = await wouldExceedCapAggregate(
-      op.env,
-      accountId,
-      parsed.entries.map((entry) => ({ sha: entry.sha256, size: entry.length })),
-    );
+    const db = dbFor(op.env, accountId);
+    const [quota, loadedPack] = await Promise.all([
+      wouldExceedCapAggregate(
+        op.env,
+        accountId,
+        parsed.entries.map((entry) => ({ sha: entry.sha256, size: entry.length })),
+      ),
+      loadPack(db, packId),
+    ]);
     if (quota.over) return done("quota_exceeded", json({ error: "quota_exceeded", used: quota.used, cap: quota.cap }, 402));
 
-    const db = dbFor(op.env, accountId);
-    let row = await loadPack(db, packId);
+    let row = loadedPack;
     if (!row) row = await createInventory(op, accountId, packId, packSha, bodyBytes, parsed.entries, Date.now());
     if (!row) return done("retry_later", json({ error: "retry_later" }, 503));
     if (row.pack_sha256 !== packSha) return done("conflict", json({ error: "pack_conflict" }, 409));

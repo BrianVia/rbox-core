@@ -3,11 +3,11 @@ import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { emit as emitMetric, emitDelta, emitRedeemPhases, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
+  resolveVerifiedRefs,
   commitAccounting,
   CARRIER_REFS,
   MAX_REFS_PER_COMMIT,
   receiptRedeemMax,
-  type RefWithSize,
 } from "./commit-accounting.js";
 import { loadSidecarRaw, resolveSidecarRaw, loadSidecarShaSet } from "./sidecar.js";
 import { classifyShadow, DELTA_MAX_REFS, divergenceDigest, FENCE_SET_MAX, mergeAddedShas, mergeSortedUnique, type DeltaResult, type ShadowFlags } from "./commit-delta.js";
@@ -16,7 +16,6 @@ import { batchedInLookup } from "./d1-batch.js";
 import { refsetShas } from "../../../src/engine/refset.js";
 import { readManifestChain } from "../../../src/engine/manifest-chain.js";
 import { verifyReceipt } from "./receipts.js";
-import { resolvePackPlacements } from "./blob-pack.js";
 import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
@@ -898,20 +897,8 @@ export class WorkspaceSync {
       }
       verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
     }
-    const placements = await resolvePackPlacements(
-      db,
-      verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []),
-    );
-    const newRefs: RefWithSize[] = [];
-    for (const ref of verified) {
-      if (!ref.packId) {
-        newRefs.push({ sha: ref.sha, size: ref.size });
-        continue;
-      }
-      const pack = placements.get(ref.sha);
-      if (!pack || pack.packId !== ref.packId) rejected++;
-      else newRefs.push({ sha: ref.sha, size: ref.size, pack });
-    }
+    const { newRefs, unresolved } = await resolveVerifiedRefs(db, verified);
+    rejected += unresolved.length;
     const verifyMs = performance.now() - verifyStartedAt;
 
     const accountingStartedAt = performance.now();

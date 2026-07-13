@@ -295,6 +295,25 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
 // valid-grant case before authenticate(); this function remains the legacy fallback for
 // absent/invalid/expired grants and for direct callers. `blobGet` never 500s on a bad
 // grant: an invalid grant is treated exactly like no grant.
+async function readPackedBlob(
+  op: ReturnType<typeof startOp>,
+  env: Env,
+  sha: string,
+  accountId: string,
+  okOutcome: string,
+  notFoundOutcome: string,
+): Promise<Response | undefined> {
+  const loc = await packedLocation(dbFor(op.env, accountId), sha);
+  if (!loc) return undefined;
+  const bytes = await readPackedExtent(op, env, sha, loc);
+  if (!bytes) {
+    op.done(notFoundOutcome, { bytes: loc.length });
+    return json({ error: "not_found" }, 404);
+  }
+  op.done(okOutcome, { bytes: bytes.byteLength });
+  return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
+}
+
 export async function blobGet(env: Env, sha: string, accountId: string, grant?: string): Promise<Response> {
   const op = startOp(env, "blob.get");
   const notFound = (outcome = "not_found", requestedBytes?: number) => {
@@ -304,13 +323,8 @@ export async function blobGet(env: Env, sha: string, accountId: string, grant?: 
   const granted = grant ? (await verifyGrant(op.env, grant, { accountId, nowMs: Date.now() })).ok : false;
   // No valid grant → the legacy D1 entitlement gate (BEFORE R2, no existence oracle).
   if (!granted && !(await isEntitled(op.env, accountId, sha))) return notFound();
-  const loc = await packedLocation(dbFor(op.env, accountId), sha);
-  if (loc) {
-    const bytes = await readPackedExtent(op, op.env, sha, loc);
-    if (!bytes) return notFound("pack_extent_error", loc.length);
-    op.done("ok_packed", { bytes: bytes.byteLength });
-    return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
-  }
+  const packed = await readPackedBlob(op, op.env, sha, accountId, "ok_packed", "pack_extent_error");
+  if (packed) return packed;
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
   op.done("ok_canonical", { bytes: got.size });
@@ -327,13 +341,8 @@ export async function blobGetWithVerifiedGrant(env: Env, sha: string, accountId:
     op.done(outcome, requestedBytes === undefined ? undefined : { bytes: requestedBytes });
     return json({ error: "not_found" }, 404);
   };
-  const loc = await packedLocation(dbFor(op.env, accountId), sha);
-  if (loc) {
-    const bytes = await readPackedExtent(op, op.env, sha, loc);
-    if (!bytes) return notFound("pack_extent_error", loc.length);
-    op.done("ok_packed_grant_preauth", { bytes: bytes.byteLength });
-    return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
-  }
+  const packed = await readPackedBlob(op, op.env, sha, accountId, "ok_packed_grant_preauth", "pack_extent_error");
+  if (packed) return packed;
   const got = await op.span.r2(() => env.rbox_dev_blobs.get(blobKey(sha)));
   if (!got) return notFound();
   op.done("ok_canonical_grant_preauth", { bytes: got.size });

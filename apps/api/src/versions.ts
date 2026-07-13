@@ -176,7 +176,7 @@ function metric(env: Env, name: string, count = 0, bytes = 0, outcome = "ok"): v
   op.done(outcome, { count, bytes });
 }
 
-async function readState<T>(db: D1Database, key: string): Promise<T | null> {
+export async function readState<T>(db: D1Database, key: string): Promise<T | null> {
   const row = await db.prepare("SELECT v FROM gc_state WHERE k = ?").bind(key).first<{ v: string }>();
   if (!row) return null;
   try {
@@ -186,7 +186,7 @@ async function readState<T>(db: D1Database, key: string): Promise<T | null> {
   }
 }
 
-async function writeState(db: D1Database, key: string, value: unknown): Promise<void> {
+export async function writeState(db: D1Database, key: string, value: unknown): Promise<void> {
   await db.prepare("INSERT INTO gc_state (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(key, JSON.stringify(value)).run();
 }
 

@@ -7,8 +7,10 @@ import { json } from "./util.js";
 import {
   acquireLease,
   leaseGuard,
+  readState,
   releaseLeaseWithRetry,
   renewLease,
+  writeState,
   type PurgeLease,
 } from "./versions.js";
 
@@ -77,9 +79,9 @@ async function shadowCounts(db: D1Database, nowMs: number): Promise<ShadowPackGc
   const orphanCutoff = nowMs - PACK_ORPHAN_GRACE_MS;
   const executeCutoff = nowMs - PACK_INTENT_QUIESCENCE_MS;
   const [markCursor, intentCursor, executeCursor] = await Promise.all([
-    readCursor<MarkCursor>(db, MARK_CURSOR_KEY),
-    readCursor<IntentCursor>(db, INTENT_CURSOR_KEY),
-    readCursor<ExecuteCursor>(db, EXECUTE_CURSOR_KEY),
+    readState<MarkCursor>(db, MARK_CURSOR_KEY),
+    readState<IntentCursor>(db, INTENT_CURSOR_KEY),
+    readState<ExecuteCursor>(db, EXECUTE_CURSOR_KEY),
   ]);
   const pageWithFallback = async <T>(cursor: unknown, query: (withCursor: boolean) => Promise<D1Result<T>>): Promise<D1Result<T>> => {
     let page = await query(cursor !== null);
@@ -147,23 +149,6 @@ async function shadowCounts(db: D1Database, nowMs: number): Promise<ShadowPackGc
   };
 }
 
-async function readCursor<T>(db: D1Database, key: string): Promise<T | null> {
-  const row = await db.prepare("SELECT v FROM gc_state WHERE k=?").bind(key).first<{ v: string }>();
-  if (!row) return null;
-  try {
-    return JSON.parse(row.v) as T;
-  } catch {
-    return null;
-  }
-}
-
-async function writeCursor(db: D1Database, key: string, value: unknown): Promise<void> {
-  await db
-    .prepare("INSERT INTO gc_state(k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")
-    .bind(key, JSON.stringify(value))
-    .run();
-}
-
 async function resurrectPage(db: D1Database, lease: PurgeLease, clock: () => number): Promise<number> {
   const selected = await db
     .prepare(
@@ -194,7 +179,7 @@ async function resurrectPage(db: D1Database, lease: PurgeLease, clock: () => num
 
 async function markPage(db: D1Database, lease: PurgeLease, nowMs: number, clock: () => number): Promise<number> {
   const cutoff = nowMs - PACK_ORPHAN_GRACE_MS;
-  const prior = await readCursor<MarkCursor>(db, MARK_CURSOR_KEY);
+  const prior = await readState<MarkCursor>(db, MARK_CURSOR_KEY);
   const page = async (cursor: MarkCursor | null) => {
     const cursorSql = cursor ? "AND (created_at > ? OR (created_at = ? AND pack_id > ?))" : "";
     const binds = cursor
@@ -227,7 +212,7 @@ async function markPage(db: D1Database, lease: PurgeLease, nowMs: number, clock:
     marked += Number(result.meta.changes ?? 0);
   }
   const last = selected.results.at(-1);
-  if (last) await writeCursor(db, MARK_CURSOR_KEY, { createdAt: Number(last.created_at), packId: last.pack_id } satisfies MarkCursor);
+  if (last) await writeState(db, MARK_CURSOR_KEY, { createdAt: Number(last.created_at), packId: last.pack_id } satisfies MarkCursor);
   return marked;
 }
 
@@ -237,7 +222,7 @@ async function openIntentPage(
   nowMs: number,
   clock: () => number,
 ): Promise<number> {
-  const prior = await readCursor<IntentCursor>(db, INTENT_CURSOR_KEY);
+  const prior = await readState<IntentCursor>(db, INTENT_CURSOR_KEY);
   const page = async (cursor: IntentCursor | null) => {
     const cursorSql = cursor ? "AND (c.marked_at > ? OR (c.marked_at = ? AND c.pack_id > ?))" : "";
     const binds = cursor
@@ -277,7 +262,7 @@ async function openIntentPage(
       .run();
     opened += Number(result.meta.changes ?? 0);
   }
-  if (last) await writeCursor(db, INTENT_CURSOR_KEY, { markedAt: Number(last.marked_at), packId: last.pack_id } satisfies IntentCursor);
+  if (last) await writeState(db, INTENT_CURSOR_KEY, { markedAt: Number(last.marked_at), packId: last.pack_id } satisfies IntentCursor);
   return opened;
 }
 
@@ -291,7 +276,7 @@ async function executePage(
 ): Promise<number> {
   const executeNow = clock();
   const cutoff = executeNow - PACK_INTENT_QUIESCENCE_MS;
-  const prior = await readCursor<ExecuteCursor>(db, EXECUTE_CURSOR_KEY);
+  const prior = await readState<ExecuteCursor>(db, EXECUTE_CURSOR_KEY);
   const page = async (cursor: ExecuteCursor | null) => {
     const cursorSql = cursor ? "AND (c.deleting_at > ? OR (c.deleting_at = ? AND c.pack_id > ?))" : "";
     const binds = cursor
@@ -328,11 +313,7 @@ async function executePage(
       .first();
     if (!ready) {
       const liveLease = await db
-        .prepare(
-          `SELECT 1 FROM gc_state
-           WHERE k='${PACK_PURGE_LEASE_KEY}' AND json_extract(v,'$.owner')=?
-             AND CAST(json_extract(v,'$.expires') AS INTEGER)>=?`,
-        )
+        .prepare(`SELECT 1 WHERE ${leaseGuard(PACK_PURGE_LEASE_KEY)}`)
         .bind(lease.owner, clock())
         .first();
       if (!liveLease) break;
@@ -384,7 +365,7 @@ async function executePage(
     if (Number(terminal[1]?.meta.changes ?? 0) === 1) deleted++;
   }
   if (last) {
-    await writeCursor(db, EXECUTE_CURSOR_KEY, {
+    await writeState(db, EXECUTE_CURSOR_KEY, {
       deletingAt: Number(last.deleting_at),
       packId: last.pack_id,
     } satisfies ExecuteCursor);

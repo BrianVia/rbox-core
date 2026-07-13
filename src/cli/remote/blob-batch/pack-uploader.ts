@@ -285,8 +285,9 @@ export class BlobPackUploader {
       }
       const text = await res.text();
       if (isRetryLater(res.status, text)) {
-        this.recordFallback("retry_later", groups);
-        this.rejectGroups(groups, new BlobRetryLaterError());
+        const owned = groups.filter((group) => group.owner === "pack");
+        if (owned.length > 0) recordPackFallback("retry_later");
+        this.rejectGroups(owned, new BlobRetryLaterError());
         return;
       }
       if (!res.ok) {
@@ -391,14 +392,6 @@ export class BlobPackUploader {
     // transferred ownership, release permits, and clean their own temp files.
     for (const controller of this.controllers) controller.abort(new DOMException("pack capability unavailable", "AbortError"));
     this.transferGroups([...this.bySha.values()], reason);
-  }
-
-  private recordFallback(reason: PackFallbackReason, groups: Iterable<PackGroup>): void {
-    for (const group of groups) {
-      if (group.owner !== "pack") continue;
-      recordPackFallback(reason);
-      return;
-    }
   }
 
   close(error: Error): Promise<void> {

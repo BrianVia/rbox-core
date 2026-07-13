@@ -68,6 +68,26 @@ export type ValidateResult =
   | { ok: true; newRefs: RefWithSize[] }
   | { ok: false; needsUpload: string[] };
 
+export async function resolveVerifiedRefs(
+  db: D1Database,
+  verified: Array<{ sha: string; size: number; packId?: string }>,
+): Promise<{ newRefs: RefWithSize[]; unresolved: string[] }> {
+  const wanted = verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []);
+  const placements = await resolvePackPlacements(db, wanted);
+  const newRefs: RefWithSize[] = [];
+  const unresolved: string[] = [];
+  for (const ref of verified) {
+    if (!ref.packId) {
+      newRefs.push({ sha: ref.sha, size: ref.size });
+      continue;
+    }
+    const pack = placements.get(ref.sha);
+    if (!pack || pack.packId !== ref.packId) unresolved.push(ref.sha);
+    else newRefs.push({ sha: ref.sha, size: ref.size, pack });
+  }
+  return { newRefs, unresolved };
+}
+
 /** Which referenced shas this account may use without a receipt (already entitled
  *  AND canonical-present), and verify a receipt for the rest. A ref that is entitled
  *  but present=0 (an in-flight/crashed prior promote) is NOT satisfied — it needs a
@@ -119,18 +139,8 @@ export async function validateCommitRefs(
     if (!v.ok) needsUpload.push(sha);
     else verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
   }
-  const wanted = verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []);
-  const placements = await resolvePackPlacements(db, wanted);
-  const newRefs: RefWithSize[] = [];
-  for (const ref of verified) {
-    if (!ref.packId) {
-      newRefs.push({ sha: ref.sha, size: ref.size });
-      continue;
-    }
-    const pack = placements.get(ref.sha);
-    if (!pack || pack.packId !== ref.packId) needsUpload.push(ref.sha);
-    else newRefs.push({ sha: ref.sha, size: ref.size, pack });
-  }
+  const { newRefs, unresolved } = await resolveVerifiedRefs(db, verified);
+  needsUpload.push(...unresolved);
   if (needsUpload.length > 0) return { ok: false, needsUpload };
   return { ok: true, newRefs };
 }

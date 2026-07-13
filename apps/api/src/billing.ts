@@ -40,10 +40,12 @@ export async function wouldExceedCapAggregate(
   accountId: string,
   members: Array<{ sha: string; size: number }>,
 ): Promise<{ over: boolean; used: number; cap: number; reason?: "no_plan" }> {
-  const a = await account(env, accountId);
+  const [a, entitled] = await Promise.all([
+    account(env, accountId),
+    entitledSubset(env, accountId, members.map((member) => member.sha)),
+  ]);
   const cap = planFor(a.plan).storageBytes + a.extra;
   if (a.plan === "none") return { over: true, used: a.used, cap, reason: "no_plan" };
-  const entitled = await entitledSubset(env, accountId, members.map((member) => member.sha));
   let incomingSize = 0;
   for (const member of members) if (!entitled.has(member.sha)) incomingSize += member.size;
   // Match wouldExceedCap's existing behavior: a wholly entitled retry costs
