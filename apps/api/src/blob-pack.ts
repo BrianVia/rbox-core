@@ -21,6 +21,15 @@ const UPLOADING_SWEEP_PAGE = 50;
 const TOMBSTONE_SWEEP_PAGE = 100;
 const TOMBSTONE_CURSOR_KEY = "pack_tombstone_cursor";
 
+/** Design 114 "version skew": the release that first ships this reader +
+ * receipt-v2 verification is the PACK ROLLBACK FLOOR. Record the deployed
+ * Workers version id here and in docs/STATUS.md after the first production
+ * deploy; once pack acceptance has ever been enabled in an environment,
+ * builds below the floor are not rollback targets (packed data unreadable,
+ * v2 receipts unverifiable). The pinned rollback drill lives in the PR body
+ * for this change and in the design doc's rollout section. */
+export const PACK_ROLLBACK_FLOOR = "unset — record the first deployed Workers version id containing this reader";
+
 export const packKey = (packId: string): string => `packs/v1/${packId}`;
 export const packAcceptEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_ACCEPT === "1";
 export const packGcEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_GC === "1";

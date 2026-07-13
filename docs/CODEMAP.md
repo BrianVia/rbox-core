@@ -91,10 +91,12 @@ src/cli/remote/multipart-fake-server.ts — test-only in-process fake of the ser
 ```
 src/cli/remote/blob-batch.ts            — barrel: pre-113-split public surface of blob-batch/.
 src/cli/remote/blob-batch/wire.ts       — client half of the wire contract with apps/api/src/blob-batch.ts: framing constants, BatchFrame, parseBatchFrames, codecs (framedBytes, parseStatus, parseBatchPutResponse). Change in lockstep with the server twin. Never: tuning knobs, scheduling.
-src/cli/remote/blob-batch/gate.ts       — process-wide batch kill switches + monotonic records ceiling + dispatch counter + SingleGate. SINGLE definition site for process-wide batch degradation (a second instance breaks degradation). Never: per-request logic.
+src/cli/remote/blob-batch/gate.ts       — process-wide batch/pack kill switches + monotonic records ceiling + dispatch counter + SingleGate + shared UploadSlotArbiter. SINGLE definition site for upload permit accounting and process-wide degradation (a second instance breaks concurrency/degradation). Never: per-request logic.
 src/cli/remote/blob-batch/config.ts     — all tuning defaults/caps + fill-policy selector + wire-cap constants + BatchConfig + env readers (uploadBatchConfig/downloadBatchConfig). Never: wire framing constants, class logic.
 src/cli/remote/blob-batch/downloader.ts — BlobBatchDownloader: queue/scheduler, batch GET, watchdog, single-lane degradation, race-safe publication + its private models. Never: upload logic, wire codecs.
-src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, fill-v1/v2 dispatch policy, batch PUT, 400 skew-latch trigger (ceiling lives in gate.ts), receipt accounting, degradation, close protocol + its private models. Never: download logic, wire codecs.
+src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, fill-v1/v2 dispatch policy, pack-vs-batch routing under one arbiter, batch PUT, 400 skew-latch trigger (ceiling lives in gate.ts), receipt accounting, degradation, close protocol + its private models. Never: pack framing, download logic, wire codecs.
+src/cli/remote/blob-batch/packer.ts     — streaming temp-file rbox-pack-v1 construction + whole-pack hashing and size assertions. Never: network dispatch, queue policy, server auth.
+src/cli/remote/blob-batch/pack-uploader.ts — BlobPackUploader: activation/fill/carving, pack PUT scheduling, pack-only degradation, waiter ownership transfer, receipt settlement + temp cleanup. Never: batch grant refresh/auth policy, pack binary encoding, download logic.
 ```
 
 ## `src/cli/publish-pipeline/` — overlapped first-publish (design 98)
@@ -122,6 +124,7 @@ src/engine/reconcile.ts             — pure three-way reconcile (local/remote/b
 src/engine/apply.ts                 — applies Actions to the working tree (write/delete/conflict, blob upload/download orchestration): applyActions, restoreEntryToPath, uploadManifestBlobs. Never: content addressing, encryption itself (crypto/crypto-pool), stats accumulation (apply-stats.ts).
 src/engine/apply-stats.ts           — process-global apply syscall/timing counters (valid under the single sync mutex). Pure accumulator. Never: I/O decisions.
 src/engine/blobstore.ts             — BlobStore interface + LocalBlobStore (sha256 content-addressed local backend). Never: encryption, manifest logic.
+src/engine/blob-pack.ts             — dependency-free locked rbox-pack-v1 structural codec shared by client + Worker. Never: hashing (callers hash directories, members, and whole packs).
 src/engine/hash.ts                  — sha256 of files/bytes via node:crypto (client-side hashing primitive). Never: caching (hashcache.ts).
 src/engine/sha256-stream.ts         — pure-JS streaming SHA-256 for the workerd runtime ONLY (client uses hash.ts). Never: node:crypto.
 src/engine/hashcache.ts             — persistent (mtime,size,ctime)→sha256 cache (.rbox/state/hashcache.json). Safe to discard. Never: authoritative identity.
