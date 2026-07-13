@@ -18,15 +18,15 @@ type TestUnit = {
 const HEAVY_WEIGHTS: Record<string, number> = {
   // These hints keep the runtime partition balanced without hardcoding complete
   // shard file lists. Every test is still discovered from src/**/*.test.ts.
-  "src/cli/daemon-activity.test.ts": 24,
+  "src/cli/daemon/daemon-activity.test.ts": 24,
   "src/cli/sync.test.ts": 13,
   "src/cli/e2ee-sync.test.ts": 3,
   "src/cli/shell-init.test.ts": 3,
-  "src/cli/daemon-binding.test.ts": 7,
+  "src/cli/daemon/daemon-binding.test.ts": 7,
   "src/cli/daemon-spawn.test.ts": 7,
-  "src/cli/daemon-safety.test.ts": 5,
+  "src/cli/daemon/daemon-safety.test.ts": 5,
   "src/cli/daemon-logs.test.ts": 5,
-  "src/cli/daemon-watch-degrade.test.ts": 5,
+  "src/cli/daemon/daemon-watch-degrade.test.ts": 5,
   "src/engine/e2ee/e2ee-e2e.test.ts": 4,
 };
 

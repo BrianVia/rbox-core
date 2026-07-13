@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { ManifestChainError } from "../engine/index.js";
-import { DaemonChainRepairPolicy } from "./daemon.js";
-import type { SuffixInfo } from "./chain-repair.js";
+import { ManifestChainError } from "../../engine/index.js";
+import { DaemonChainRepairPolicy } from "../daemon.js";
+import type { SuffixInfo } from "../chain-repair.js";
 
 const hash = (char: string): string => char.repeat(64);
 

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { nextSafetyDelay, RboxDaemon } from "./daemon.js";
+import { nextSafetyDelay, RboxDaemon } from "../daemon.js";
 
 // Design 49: the safety scan heals DROPPED watcher events, and drops happen under
 // churn — so quiet intervals back the scan off (60s → 5m cap) instead of

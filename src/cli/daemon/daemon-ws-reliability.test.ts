@@ -2,10 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type Manifest } from "../engine/index.js";
-import type { SyncState, WorkspaceConfig } from "./config.js";
-import { reconnectDelayMs, RboxDaemon } from "./daemon.js";
-import type { CommitResult, SyncRemote } from "./remote.js";
+import { HashCache, scanManifest, type BlobStore, type Manifest } from "../../engine/index.js";
+import type { SyncState, WorkspaceConfig } from "../config.js";
+import { reconnectDelayMs, RboxDaemon } from "../daemon.js";
+import type { CommitResult, SyncRemote } from "../remote.js";
 
 const ENV_KEYS = [
   "RBOX_DAEMON_WS_DISABLED",

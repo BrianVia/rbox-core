@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 // rescan (the pull's own pre-apply scan sees the old content and is left alone).
 let mutateWhenContent: { base: string; content: string; mutation: (abs: string) => Promise<void> } | undefined;
 
-mock.module("../engine/hash.js", () => ({
+mock.module("../../engine/hash.js", () => ({
   hashBytes: (bytes: Uint8Array | Buffer): string => createHash("sha256").update(bytes).digest("hex"),
   hashFile: async (abs: string): Promise<string> => {
     const bytes = await fs.readFile(abs);
@@ -29,15 +29,15 @@ mock.module("../engine/hash.js", () => ({
   },
 }));
 
-const { HashCache, scanManifest } = await import("../engine/index.js");
-const { encryptFileNameProbe } = await import("../engine/e2ee/e2ee-e2e.helpers.js");
-const { RboxDaemon } = await import("./daemon.js");
-type BlobStore = import("../engine/index.js").BlobStore;
-type FileEntry = import("../engine/index.js").FileEntry;
-type Manifest = import("../engine/index.js").Manifest;
-type CommitResult = import("./remote.js").CommitResult;
-type SyncRemote = import("./remote.js").SyncRemote;
-type WorkspaceConfig = import("./config.js").WorkspaceConfig;
+const { HashCache, scanManifest } = await import("../../engine/index.js");
+const { encryptFileNameProbe } = await import("../../engine/e2ee/e2ee-e2e.helpers.js");
+const { RboxDaemon } = await import("../daemon.js");
+type BlobStore = import("../../engine/index.js").BlobStore;
+type FileEntry = import("../../engine/index.js").FileEntry;
+type Manifest = import("../../engine/index.js").Manifest;
+type CommitResult = import("../remote.js").CommitResult;
+type SyncRemote = import("../remote.js").SyncRemote;
+type WorkspaceConfig = import("../config.js").WorkspaceConfig;
 
 const KEK = Buffer.alloc(32, 7);
 const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
