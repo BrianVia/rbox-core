@@ -67,17 +67,20 @@ right scopes. The worker-level `request` op (`apps/api/src/worker.ts`
 queries resolve to the span-proxied binding), while the handler-level
 `blob.batchPut` op wraps only the handler; both emit `ms`/`dbMs`/`dbCalls` to
 Analytics Engine. AE events carry **no correlation id**, so per-request
-subtraction is impossible with existing data — the decomposition is
-**aggregate**: over an isolated window in which `POST /v1/blob-batch/put`
-dominates traffic (a dedicated dev-worker publish, or the FM window after
-outcome/count reconciliation to exclude `request` rows with no handler
-event), compare the aggregate mean/sum of `request` vs `blob.batchPut`
-`ms`/`dbMs`. That bounds mean pre-handler (auth + routing) cost per request
-with stated uncertainty, using data we already collect. This design proceeds
-to implementation only if that aggregate decomposition shows a pre-handler
-cost consistent with a material wall win (§6.0); otherwise it is parked in
-favor of the batch-fill/slot levers. Per-request correlation instrumentation
-is explicitly NOT required for gate 0 and not added.
+subtraction is impossible with existing data and unmatched rows cannot be
+identified for exclusion either — the decomposition is **aggregate over a
+reconciled window**: filter `request` rows by their route dimension to
+`POST /v1/blob-batch/put` (the `request` op is emitted with a templated
+route), require the filtered `request` count to equal the `blob.batchPut`
+event count for the window, and only then compare aggregate means/sums of
+`ms`/`dbMs`. A dedicated dev-worker publish gives such a clean window; if
+counts do not reconcile exactly, unmatched rows stay IN the aggregates and
+the count mismatch is reported as uncertainty on the estimate — never
+silently "excluded". This design proceeds to implementation only if that
+aggregate decomposition shows a pre-handler (auth + routing) cost consistent
+with a material wall win (§6.0); otherwise it is parked in favor of the
+batch-fill/slot levers. Per-request correlation instrumentation is explicitly
+NOT required for gate 0 and not added.
 
 ## 2. Root-cause analysis
 
@@ -378,15 +381,15 @@ data migration or cleanup is required.
 ### 6.0 Gate 0 — attribution before implementation (existing data only)
 
 Before any code is written, pull from Analytics Engine for an isolated window
-(preferred: a fresh dedicated dev-worker publish; otherwise the FM window with
-outcome/count reconciliation, since AE events carry no correlation id and only
-aggregate comparison is possible — §1.1):
+(preferred: a fresh dedicated dev-worker publish; AE events carry no
+correlation id, so only reconciled aggregate comparison is possible — §1.1):
 
-- aggregate `request` vs `blob.batchPut` comparison for a window dominated by
-  `POST /v1/blob-batch/put` (`ms`, `dbMs`, `dbCalls` means/sums, after
-  excluding `request` rows with no matching handler outcome): the difference
-  bounds mean pre-handler auth + routing cost per request, with stated
-  uncertainty;
+- aggregate `request` vs `blob.batchPut` comparison: filter `request` rows by
+  route dimension to `POST /v1/blob-batch/put`, require the filtered count to
+  equal the `blob.batchPut` count for the window (else keep all rows and
+  report the mismatch as uncertainty — unmatched rows cannot be identified or
+  excluded), then compare `ms`/`dbMs`/`dbCalls` means/sums: the difference
+  estimates mean pre-handler auth + routing cost per request;
 - the batch-fill distribution from `blob.batchPut` `count`/`bytes`.
 
 Go/no-go: implement this design only if the measured mean pre-handler cost

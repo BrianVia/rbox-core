@@ -32,6 +32,14 @@ every finding's cited file:line was confirmed accurate.
 No findings rejected this round — all fifteen were verified accurate against
 the code.
 
+## Round 3 — 2026-07-13
+
+Verdict: **CHANGES-REQUIRED** (1 MAJOR residual; R2-1 verified resolved).
+
+| # | Sev | Finding (compressed) | Decision | Rationale / doc change |
+|---|-----|----------------------|----------|------------------------|
+| R3-1 | MAJOR | R2-2 fix still claimed to "exclude `request` rows with no matching handler outcome" — without a correlation id, unmatched rows cannot be identified, so they cannot be excluded from aggregates; the FM-window fallback cannot honor that promise. | **ADOPT** | §1.1/§6.0 rewritten: gate 0 filters `request` rows by their route dimension (the `request` op is emitted with `${method} ${routeTemplate}`), REQUIRES exact count reconciliation with `blob.batchPut` for the window (a dedicated dev-worker publish provides this), and otherwise keeps unmatched rows IN and reports the count mismatch as uncertainty — never a silent exclusion. |
+
 ## Round 2 — 2026-07-13
 
 Verdict: **CHANGES-REQUIRED** (2 MAJOR residual on round-1 material; findings
