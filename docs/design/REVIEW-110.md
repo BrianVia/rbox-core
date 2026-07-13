@@ -53,6 +53,22 @@ round-1 finding 14 resolved (its finding 15).
 | 14 | NIT | Round-1 #16 rejections confirmed sound | no action |
 | 15 | NIT | Round-1 #14 confirmed resolved | no action |
 
+## Round 3 — 2026-07-12
+
+Verdict: **CHANGES-REQUIRED** (1 BLOCKER, 4 MAJOR, 2 MINOR). Codex's audit
+confirmed round-2 findings 2, 3, 5-13 resolved; 1 and 4 partially (closed this
+round).
+
+| # | Sev | Finding (compressed) | Judgment |
+|---|---|---|---|
+| 1 | BLOCKER | Re-probe not normatively ordered before accounting — a post-accounting `R` reads this request's own grants/marker-clears as `state_moved` | **ADOPT** — normative total sequence added to §3: B → A → compare → R → classify/emit → materialize A's result → single accounting |
+| 2 | MAJOR | Authoritative-422 path drops divergence telemetry: current `runFullAdmission` returns 422 immediately (`workspace-sync.ts:520-526`); B=have/A=missing would never be compared | **ADOPT** — comparison + re-probe required before materializing every A-derived result incl. 422; shadow always answers from A on every path |
+| 3 | MAJOR | 80%-of-projection gate undefined across workloads/units | **ADOPT** — Phase 0.5 records baseline + projected reduction per gated workload in absolute ms; the 80% comparison is absolute-ms, per workload |
+| 4 | MAJOR | Rollout step 6 "sample-count gate" undefined → shadow→enforce not decidable | **ADOPT** — defined: ≥10 prod-shadow genesis commits, ≥3 at ≥10k refs (manufactured if organic traffic is too rare), zero divergence/unexcused state_moved |
+| 5 | MAJOR | 111 seam lacks an implementation-order gate in the doc itself | **ADOPT** — "Ordering dependency on design 111" section: Phase 0.5+ valid only under the pre-drained `receipts:{}` shape; a 111 request-shape change forces Phase 0/0.5 + gate rerun before shadow. 109 explicitly non-blocking (baseline remeasured) |
+| 6 | MINOR | "Exactly two classification passes" conflicts with the diagnostic re-probe | **ADOPT** — "two full-set classification passes (plus the bounded diagnostic re-probe)" |
+| 7 | MINOR | `admit_stmts` emits `op.span.dbCalls` (calls), not statements, despite the design-102 name | **ADOPT** — verified `workspace-sync.ts:524,531`; Phase 0 notes the misnomer and adds a true statement counter or records it as calls |
+
 ## Seam items (for the joint round with 109/111)
 
 - **111 (redemption tail):** Round-1 finding 5 establishes that at genesis the

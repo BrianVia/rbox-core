@@ -1,6 +1,6 @@
 # 110 — First-publish commit-tail latency
 
-Status: UNDER REVIEW, 2026-07-12 — codex rounds 1-2 adopted (see
+Status: UNDER REVIEW, 2026-07-12 — codex rounds 1-3 adopted (see
 `docs/design/REVIEW-110.md`).
 
 This design addresses the long synchronous tail of a greenfield first publish.
@@ -412,7 +412,8 @@ telemetry/shape rules:
   ahead of that call must synthesize the same emission (same event, reason,
   and count) whenever `deltaMode != off`, and the correctness matrix asserts
   its count/tags — otherwise design-102 soak dashboards silently change.
-- **Exactly two classification passes at genesis under bulk shadow:** bulk
+- **Exactly two full-set classification passes at genesis under bulk shadow**
+  (plus the bounded diagnostic re-probe of §3, when divergence occurs): bulk
   plus the authoritative validator, then one accounting pass. Design-102's
   `readShadowFlags` comparison never runs at genesis today (the `first_commit`
   fallback bypasses the `delta && deltaMode === "shadow"` branch,
@@ -449,9 +450,29 @@ earlier observation was correct, so the protocol is fail-closed: **ambiguity
 blocks the gate; only externally corroborated concurrency can be excused, and
 only in soak review, never automatically.**
 
+The per-request sequence is normative and total, and every step precedes the
+single accounting pass:
+
+```
+bulk read B → authoritative read A → compare → bounded re-probe R (if divergent)
+  → classify + emit telemetry → materialize A's result (200/422/402/…)
+  → exactly one accounting pass from A (success path only)
+```
+
+Two consequences are explicit. First, the re-probe always reads
+**pre-accounting** state — accounting grants entitlements and clears candidate
+markers, so a post-accounting `R` would misread this request's own mutations
+as `state_moved`. Second, comparison and re-probe run **before materializing
+every A-derived result, including the 422 missing response**: the current
+`runFullAdmission` control flow returns the 422 immediately
+(`workspace-sync.ts:520-526`), and keeping that shape unmodified would
+silently drop exactly the divergence class where `B` says have and `A` says
+missing. In shadow, the response returned to the client is always the one
+derived from `A`, on every path, regardless of `B` or `R`.
+
 For each request: bulk result `B`, authoritative result `A` (read after `B`),
 and — when harmful divergence is detected — a re-probe `R` of the divergent
-SHAs with the current predicate, taken after both:
+SHAs with the current predicate, taken after both reads and before accounting:
 
 - The re-probe is capped at one validator batch (≤ 34 × 90 = 3,060 SHAs). If
   more SHAs diverge, none are re-probed and **all** count as `divergence` —
@@ -516,8 +537,23 @@ Rollout order:
    `state_moved` event.
 5. Enable dev `enforce`; run forced conflict, epoch, quota, 422, deletion-fence,
    and response-loss retries.
-6. Deploy prod code with `off`, then `shadow`. Require the sample-count gate.
+6. Deploy prod code with `off`, then `shadow`. The production shadow gate is
+   defined as: at least 10 genesis commits observed in prod shadow, of which
+   at least 3 carry ≥ 10k refs — manufactured if organic genesis traffic is
+   too rare (throwaway large-workspace `rbox init` publishes are cheap on the
+   single-user fleet) — with zero `divergence` and zero unexcused
+   `state_moved` events across all of them.
 7. Enable prod `enforce`.
+
+**Ordering dependency on design 111:** everything from Phase 0.5 onward is
+valid only under the current pre-drained commit shape
+(`{parentSequence, commit, receipts: {}}`). If design 111 folds receipt
+redemption into the commit request before this design ships, genesis
+`newRefs`, accounting cost, the Phase 0.5 projections, and the combined-path
+budget all change materially: Phase 0/0.5 and the affected resource and
+correctness gates must be rerun under the new request shape before shadow is
+enabled. Design 109 does not similarly block: it only moves the
+`upstream-of-DO` baseline, which is remeasured, not re-designed.
 
 ## Validation plan
 
@@ -534,7 +570,10 @@ FirstPublishStats object. Add/confirm numbers-only fields for:
 - final commit POST request bytes;
 - existing `p`, `srv/env/acct/ssc/cm/mir/rsp`;
 - existing design-102 `admit_stmts`, `admitAccountMs`, `childParseMs`, fallback
-  reason, and D1 call count.
+  reason, and D1 call count — noting that the current `admit_stmts` emission
+  actually carries `op.span.dbCalls` deltas (`workspace-sync.ts:524,531`),
+  i.e. D1 **calls** despite the name; Phase 0 either adds a true
+  statement counter or records the field as a call count.
 
 Derive, recording the **raw signed residuals** alongside any clamped
 presentation value (the client timers, the drain timer, and the server tokens
@@ -556,9 +595,9 @@ the **median of the three samples** (a screening signal, not a distribution):
 - Proceed with genesis bulk admission iff `median(acct) >= 0.5 * median(p)`
   **or** `median(acct) >= 10s`.
 - Independently: if `median(finalDrainMs) >= 10s`, the redemption lane
-  proceeds under design 111. Both clauses may pass and both lanes then proceed
-  — they share no mechanism (but see the seam note in `REVIEW-110.md`:
-  commit-request-shape changes from 111 alter this design's premise).
+  proceeds under design 111. Both clauses may pass and both lanes may then be
+  designed in parallel, but implementation ordering is constrained — see
+  "Ordering dependency on design 111" under Flag and rollout.
 - If `median(env) >= 10s`, Worker→DO request streaming/body buffering must be
   investigated and explained first (the small request-byte measurement must
   agree), before either lane's implementation starts.
@@ -593,6 +632,11 @@ wall **and** at least 3s absolute at the reproduced 49k workload. Anything
 less: stop, record the numbers in this document, and close the design as a
 measured no-op. The prototype cannot weaken its own gate — the implementation
 gate below is then expressed against this projection, not vice versa.
+
+The projection record is per gated workload: for **each** of 49k and ~118k,
+record the measured baseline `acct` and the projected reduction in **absolute
+milliseconds** (the percentage is derived and reported, but the downstream 80%
+implementation gate compares absolute milliseconds only).
 
 ### Correctness matrix
 
@@ -652,10 +696,10 @@ subrequests at these scales, so improvement bounds cannot be assumed. The
 provisional targets below stand only until then and any revision must record
 its Phase-0/0.5 justification here:
 
-- 49k and ~118k genesis `acct` p50 reduced by at least 80% of the Phase-0.5
-  projected reduction (the projection itself already passed the fixed stop
-  rule: ≥50% of measured `acct` and ≥3s absolute at 49k), and in no case
-  slower than flag-off;
+- 49k and ~118k genesis `acct` p50 reduced by at least 80% of that workload's
+  Phase-0.5 projected reduction, compared in absolute milliseconds (the
+  projection itself already passed the fixed stop rule: ≥50% of measured
+  `acct` and ≥3s absolute at 49k), and in no case slower than flag-off;
 - end-to-end commit-wall p50 improvement consistent with the Phase-0 maximum
   possible speedup (no fixed 2x claim — commit wall contains sidecar,
   manifest, refresh, and pin work this change cannot touch), with no
