@@ -45,7 +45,7 @@ export interface SyncRemote {
   ): Promise<void>;
   ownsUploadLaneTiming?(size: number): boolean;
   closeUploader?(err: Error): Promise<void>;
-  receiptPort?(): ReceiptPort;
+  receiptPort?(): ReceiptPort | undefined;
   commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult>;
   /** BlobStore view for applyActions / git capture+apply on the pull path. */
   blobStore(): BlobStore;

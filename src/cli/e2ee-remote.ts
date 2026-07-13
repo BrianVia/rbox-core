@@ -39,6 +39,7 @@ import {
 } from "../engine/index.js";
 import type { GlobalManifestMeta } from "./config.js";
 import type { CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo } from "./e2ee-remote-types.js";
+import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type LatestTimings, type SyncRemote } from "./remote.js";
 
 export type { AccountKeysDTO, CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo, WsKeyDTO } from "./e2ee-remote-types.js";
@@ -859,6 +860,17 @@ export class E2eeRemote implements SyncRemote {
   ownsUploadLaneTiming(size: number): boolean {
     return this.api.ownsUploadLaneTiming?.(size) === true;
   }
+  /** Forward the upload-receipt drain port (design 111). Every real publish runs
+   *  through this wrapper; omitting this forward silently disabled upload-time
+   *  receipt draining fleet-wide (field gap, 2026-07 FM validation). */
+  receiptPort(): ReceiptPort | undefined {
+    return this.api.receiptPort?.();
+  }
+  // Deliberately do not forward closeUploader: one pipeline abort would
+  // permanently close the daemon's long-lived batch uploader
+  // (BlobBatchUploader.close is terminal). Forward it only once uploader
+  // close/reopen is attempt-scoped. The parity guard below the class keeps
+  // every OTHER optional SyncRemote capability forwarded.
   blobStore(): BlobStore {
     return this.api.blobStore();
   }
@@ -930,3 +942,14 @@ export class E2eeRemote implements SyncRemote {
     });
   }
 }
+
+// Compile-time parity guard: E2eeRemote must forward every optional SyncRemote
+// capability — an omitted forward silently no-ops in production, which is
+// exactly how the design-111 upload-time receipt drain was disabled fleet-wide
+// (receiptPort was never forwarded; found via FM field validation 2026-07).
+// Lives HERE, not in a test file: tsconfig excludes **/*.test.ts, so only a
+// production module puts this in front of `tsc`. closeUploader is deliberately
+// excluded — see the comment beside receiptPort above.
+const _e2eeForwardsAllOptionalSyncRemoteCaps: Required<Omit<SyncRemote, "closeUploader">> =
+  {} as unknown as E2eeRemote;
+void _e2eeForwardsAllOptionalSyncRemoteCaps;

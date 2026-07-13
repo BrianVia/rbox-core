@@ -42,6 +42,7 @@ import {
   fuseEnabled,
   isDeferrableChurn,
   materializeLease,
+  redeemDrainUpload,
   uploadConcurrency,
 } from "./shared.js";
 
@@ -104,7 +105,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   const sigint = () => abort(new Error("publish interrupted"));
   process.on("SIGINT", sigint);
 
-  const port = args.api.receiptPort?.();
+  const port = redeemDrainUpload() ? args.api.receiptPort?.() : undefined;
   const threshold = clampConc(process.env.RBOX_PIPELINE_REDEEM_THRESHOLD, DEFAULT_REDEEM_THRESHOLD, 1_000_000);
   const drainer = port ? new ReceiptDrainer(port, { threshold, backlogMax: threshold * 2, onError: abort }) : undefined;
   drainer?.maybeKick();

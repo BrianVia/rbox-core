@@ -1,6 +1,7 @@
 import type { ByteProgressCallback } from "../engine/blobstore.js";
 import type { DeviceSecrets, SignedCommit } from "../engine/e2ee/index.js";
 import type { BlobStore } from "../engine/index.js";
+import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";
 import type { CommitResult } from "./remote.js";
 
 export interface AccountKeysDTO {
@@ -32,6 +33,7 @@ export interface E2eeApi {
     onBytes?: ByteProgressCallback
   ): Promise<void>;
   ownsUploadLaneTiming?(size: number): boolean;
+  receiptPort?(): ReceiptPort | undefined;
   putBlobBytes(sha256: string, bytes: Uint8Array, onBytes?: ByteProgressCallback): Promise<void>;
   blobStore(): BlobStore;
   // key material
