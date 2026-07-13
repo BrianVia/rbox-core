@@ -6,16 +6,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { pull, push, pushManifest, sync, type SyncDeps } from "./sync.js";
-import { loadState, saveState, type SyncState, type WorkspaceConfig } from "./config.js";
-import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
-import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../engine/index.js";
+import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
+import { loadState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
+import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
 import {
   MAX_GIT_CONFIG_KEYS,
   MAX_GIT_CONFIG_KEY_BYTES,
   MAX_GIT_CONFIG_SERIALIZED_BYTES,
   MAX_GIT_CONFIG_VALUE_BYTES,
-} from "../engine/git/config-sync.js";
+} from "../../engine/git/config-sync.js";
 import {
   applyGitSections,
   GIT_FINGERPRINT_VERSION,
@@ -25,8 +25,8 @@ import {
   gitFingerprintVersionForBounds,
   planGitSections,
   type GitPushPlan,
-} from "./sync-git.js";
-import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
+} from "../sync-git.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
