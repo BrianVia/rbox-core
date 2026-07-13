@@ -76,6 +76,11 @@ export async function blobBatchPutWithVerifiedGrant(req: Request, env: Env, acco
 export async function blobBatchPut(req: Request, env: Env, accountId: string, authOutcome?: BatchPutAuthOutcome): Promise<Response> {
   const op = startOp(env, "blob.batchPut");
   const auth = authOutcome ?? (uploadGrantsEnabled(env) ? "fallback_missing" : undefined);
+  // Requests rejected by authenticate()/token-kind gates (401/403) never reach
+  // this handler, so they have no auth event or echo; the request op covers them
+  // (docs/observability-server-metrics.md). A post-verification handler throw
+  // becomes a top-level 500 without the echo, but this entry event still records
+  // the true path and the client safely over-reports that unclassified 500 as authn.
   if (auth) emit(env, { op: "blob.batchPut.auth", outcome: auth });
   const finish = (response: Response): Response => {
     if (auth) response.headers.set("x-rbox-auth-path", auth === "fast_path" ? "grant" : "bearer");

@@ -123,6 +123,24 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     expect(await verifyReceipt(env, result.receipt, { accountId: a.accountId, encSha: sha256, size: result.sizeBytes, nowMs: Date.now() })).toEqual({ ok: true, size: result.sizeBytes });
   });
 
+  test("a pre-tombstone grant remains usable only within TTL after account tombstoning", async () => {
+    const a = await bootstrap("auth-grant-account-tombstone");
+    const grant = await mintUploadGrant(env, { accountId: a.accountId, nowMs: Date.now() });
+    const expired = await mintUploadGrant(env, { accountId: a.accountId, nowMs: Date.now() - UPLOAD_GRANT_TTL_MS - 1 });
+    await env.rbox_dev_db.prepare("UPDATE accounts SET deleted_at = ? WHERE id = ?").bind(Date.now(), a.accountId).run();
+
+    expect((await SELF.fetch(`${BASE}/v1/blobs/check`, {
+      method: "POST", headers: bearer(a.token, { "content-type": "application/json" }), body: JSON.stringify({ shas: [] }),
+    })).status).toBe(401);
+
+    const withinTtl = await batchPut(bearer(a.token, { ...receipts, "x-rbox-upload-grant": grant! }), "account tombstone within ttl");
+    expect(withinTtl.status).toBe(200);
+    expect(withinTtl.headers.get("x-rbox-auth-path")).toBe("grant");
+
+    const afterTtl = await batchPut(bearer(a.token, { ...receipts, "x-rbox-upload-grant": expired! }), "account tombstone expired");
+    expect(afterTtl.status).toBe(401);
+  });
+
   test("missing, malformed, wrong-domain, expired, and wrong-key grants use the bearer path", async () => {
     const a = await bootstrap("auth-grant-fallbacks");
     const download = await mintGrant(env, { accountId: a.accountId, workspaceId: "ws", nowMs: Date.now() });
@@ -194,6 +212,22 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     expect(off.headers.get("x-rbox-auth-path")).toBeNull();
     expect(offPoints.some((p) => p.indexes?.[0] === "blob.batchPut.auth")).toBe(false);
 
+    const offSuccessPoints: Array<{ indexes?: string[]; blobs?: string[] }> = [];
+    const offSuccessBody = batchPutBody("flag off success").body;
+    const offSuccess = await blobBatchPut(
+      new Request(`${BASE}/v1/blob-batch/put`, { method: "POST", headers: { ...receipts, "content-type": BATCH_BLOB_CONTENT_TYPE }, body: offSuccessBody }),
+      metricEnv(offSuccessPoints, { flag: "0" }),
+      "acct",
+    );
+    expect(offSuccess.status).toBe(200);
+    expect(offSuccess.headers.get("x-rbox-auth-path")).toBeNull();
+    const offResults = (await offSuccess.json() as { results: Array<{ ok: boolean; receipt?: string }> }).results;
+    expect(offResults).toHaveLength(1);
+    expect(offResults[0]!.ok).toBe(true);
+    expect(typeof offResults[0]!.receipt).toBe("string");
+    expect(offSuccessPoints.filter((p) => p.indexes?.[0] === "blob.batchPut").map((p) => p.blobs?.[2])).toEqual(["ok"]);
+    expect(offSuccessPoints.some((p) => p.indexes?.[0] === "blob.batchPut.auth")).toBe(false);
+
     const check = await blobsCheck(new Request(`${BASE}/v1/blobs/check`, { method: "POST", headers: { "content-type": "application/json", ...receipts }, body: JSON.stringify({ shas: [] }) }), { ...env, RBOX_AUTH_GRANT: "0" } as Env, /^[0-9a-f]{64}$/, "acct");
     expect(await check.json()).toEqual({ missing: [] });
   });
@@ -213,12 +247,16 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     const claims: Array<[unknown, string]> = [
       [{ v: 2, a: "acct", t: NOW, e: NOW + 1 }, "bad_version"],
       [{ v: 1, a: "acct", t: NOW + 120_000, e: NOW + 120_001 }, "future"],
+      [{ v: 1, a: "acct", t: NOW + 59_000, e: NOW + 59_000 + UPLOAD_GRANT_TTL_MS }, "future"],
       [{ v: 1, a: "acct", t: NOW, e: NOW + UPLOAD_GRANT_TTL_MS + 1 }, "bad_ttl"],
       [{ v: 1, t: NOW, e: NOW + 1 }, "malformed"],
     ];
     for (const [claim, expectedReason] of claims) {
       expect(await reason(await signedUploadPayload(KEY, claim))).toBe(expectedReason);
     }
+    expect(await verifyUploadGrantCredential(e, await signedUploadPayload(KEY, {
+      v: 1, a: "acct", t: NOW, e: NOW + UPLOAD_GRANT_TTL_MS,
+    }), { nowMs: NOW })).toEqual({ ok: true, accountId: "acct" });
     const old = await mintUploadGrant({ RBOX_GRANT_KEY: PREV } as Env, { accountId: "acct", nowMs: NOW });
     expect(await verifyUploadGrantCredential({ RBOX_GRANT_KEY: KEY, RBOX_GRANT_KEY_PREV: PREV } as Env, old!, { nowMs: NOW })).toEqual({ ok: true, accountId: "acct" });
     expect(await reason(await signedUploadPayload(KEY, { v: 1, a: "acct", t: NOW - GRANT_TTL_MS, e: NOW }))).toBe("expired");

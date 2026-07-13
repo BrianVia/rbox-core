@@ -244,7 +244,10 @@ export function firstPublishAuthDispatchStart(): number {
 /** authn counts settle-classified bearer-path batch PUTs from the server echo.
  *  A missing echo or thrown fetch is classified bearer by the caller. */
 export function firstPublishAuthSettle(startT: number, path: "grant" | "bearer"): void {
-  if (!firstPublishTiming.enabled || path === "grant") return;
+  if (!firstPublishTiming.enabled || startT === 0 || path === "grant") return;
+  // A nonzero dispatch from measurement A could theoretically settle into B,
+  // but publishes are serialized under the sync mutex and finalization disables
+  // this singleton, so that latent cross-measurement case is accepted.
   firstPublishTiming.stats.authCallCount++;
   firstPublishTiming.authStartedAt = firstPublishTiming.authStartedAt
     ? Math.min(firstPublishTiming.authStartedAt, startT)

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fromHex } from "../../../engine/e2ee/index.js";
 import {
   RemoteContext,
   UPLOAD_GRANT_ATTACH_WINDOW_MS,
@@ -11,6 +12,7 @@ import {
 } from "../context.js";
 import { BlobBatchUploader } from "./uploader.js";
 import { resetBatchBlobStateForTests } from "../blob-batch.js";
+import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES } from "./wire.js";
 import {
   beginFirstPublishTiming,
   finishFirstPublishStats,
@@ -24,6 +26,7 @@ const savedBatchFill = process.env.RBOX_BATCH_FILL;
 
 let tmpDir = "";
 let uploaders: BlobBatchUploader[] = [];
+let pendingReleases: Array<() => void> = [];
 let now = 1_000_000;
 
 type Call = { url: string; method: string; headers: Record<string, string>; body: BodyInit | null | undefined };
@@ -61,10 +64,30 @@ function batchOkForBody(body: BodyInit | null | undefined, authPath?: "grant" | 
   return batchOk(recordSha, sizeBytes, authPath);
 }
 
+function expectedBatchBody(payload: { sha: string; bytes: Uint8Array }): Uint8Array {
+  const body = new Uint8Array(BATCH_FRAME_HEADER_BYTES + payload.bytes.byteLength);
+  body.set(fromHex(payload.sha));
+  new DataView(body.buffer).setUint32(32, payload.bytes.byteLength, false);
+  body.set(payload.bytes, BATCH_FRAME_HEADER_BYTES);
+  return body;
+}
+
+function expectLegacyBatchHeaders(call: Call, contentLength: number): void {
+  expect(Object.keys(call.headers).sort()).toEqual([
+    "accept", "authorization", "content-length", "content-type", "x-rbox-protocol",
+  ]);
+  expect(call.headers.authorization).toBe("Bearer durable-token");
+  expect(call.headers["x-rbox-protocol"]).toBe("upload-receipts-v1");
+  expect(call.headers.accept).toBe("application/json");
+  expect(call.headers["content-type"]).toBe(BATCH_BLOB_CONTENT_TYPE);
+  expect(call.headers["content-length"]).toBe(String(contentLength));
+}
+
 beforeEach(async () => {
   resetBatchBlobStateForTests();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-upload-grant-"));
   uploaders = [];
+  pendingReleases = [];
   calls = [];
   now = 1_000_000;
   Date.now = () => now;
@@ -74,6 +97,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  for (const release of pendingReleases.splice(0)) release();
   await Promise.all(uploaders.map((value) => value.close(new Error("test cleanup"))));
   // Reset the process-global measurement singleton even when an assertion failed.
   finishFirstPublishStats();
@@ -126,9 +150,9 @@ describe("upload grants", () => {
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
 
     const puts = calls.filter((call) => call.url.endsWith("/v1/blob-batch/put"));
-    expect(Object.keys(puts[0]!.headers).sort()).toEqual([
-      "accept", "authorization", "content-length", "content-type", "x-rbox-protocol",
-    ]);
+    const expectedBody = expectedBatchBody(payload);
+    expectLegacyBatchHeaders(puts[0]!, expectedBody.byteLength);
+    expect(new Uint8Array(puts[0]!.body as Uint8Array)).toEqual(expectedBody);
     expect(calls.filter((call) => call.url.endsWith("/v1/blobs/check"))).toHaveLength(1);
   });
 
@@ -150,7 +174,7 @@ describe("upload grants", () => {
 
     const put = calls.find((call) => call.url.endsWith("/v1/blob-batch/put"))!;
     expect(put.headers["x-rbox-upload-grant"]).toBeUndefined();
-    expect(put.headers.authorization).toBe("Bearer durable-token");
+    expectLegacyBatchHeaders(put, expectedBatchBody(payload).byteLength);
     expect(ctx.receipts.get(payload.sha)).toBe(`receipt:${payload.sha}`);
     expect(calls.some((call) => call.url.endsWith("/v1/blobs/check"))).toBe(true);
   });
@@ -162,6 +186,7 @@ describe("upload grants", () => {
     const payloads = await Promise.all(Array.from({ length: 8 }, (_, index) => file(`refresh-${index}`)));
     let release!: (response: Response) => void;
     const pendingRefresh = new Promise<Response>((resolve) => { release = resolve; });
+    pendingReleases.push(() => release(json({ missing: [], uploadGrant: "new" })));
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const headers = init?.headers as Record<string, string>;
@@ -189,6 +214,48 @@ describe("upload grants", () => {
     const laterPut = calls.filter((call) => call.url.endsWith("/v1/blob-batch/put")).at(-1)!;
     expect(laterPut.headers["x-rbox-upload-grant"]).toBe("new");
     expect(laterPut.headers.authorization).toBe("Bearer durable-token");
+  });
+
+  test("a stale refresh grant cannot overwrite a newer missingBlobs capture", async () => {
+    const ctx = context();
+    ctx.captureUploadGrant({ uploadGrant: "initial" });
+    now += UPLOAD_GRANT_REFRESH_AFTER_MS + 1;
+    let release!: (response: Response) => void;
+    const pendingRefresh = new Promise<Response>((resolve) => { release = resolve; });
+    pendingReleases.push(() => release(json({ missing: [], uploadGrant: "stale" })));
+    let checks = 0;
+    globalThis.fetch = (async () => {
+      checks++;
+      return checks === 1 ? pendingRefresh : json({ missing: [], uploadGrant: "newer" });
+    }) as typeof fetch;
+
+    ctx.maybeRefreshUploadGrant();
+    await ctx.missingBlobs(["a".repeat(64)]);
+    release(json({ missing: [], uploadGrant: "stale" }));
+    await pendingRefresh;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBe("newer");
+  });
+
+  test("a stale grantless refresh cannot clear a newer missingBlobs capture", async () => {
+    const ctx = context();
+    ctx.captureUploadGrant({ uploadGrant: "initial" });
+    now += UPLOAD_GRANT_REFRESH_AFTER_MS + 1;
+    let release!: (response: Response) => void;
+    const pendingRefresh = new Promise<Response>((resolve) => { release = resolve; });
+    pendingReleases.push(() => release(json({ missing: [] })));
+    let checks = 0;
+    globalThis.fetch = (async () => {
+      checks++;
+      return checks === 1 ? pendingRefresh : json({ missing: [], uploadGrant: "newer" });
+    }) as typeof fetch;
+
+    ctx.maybeRefreshUploadGrant();
+    await ctx.missingBlobs(["b".repeat(64)]);
+    release(json({ missing: [] }));
+    await pendingRefresh;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBe("newer");
   });
 
   test("failed refresh is internally handled and obeys the retry interval", async () => {
@@ -232,7 +299,7 @@ describe("upload grants", () => {
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
     const put = calls.find((call) => call.url.endsWith("/v1/blob-batch/put"))!;
     expect(put.headers["x-rbox-upload-grant"]).toBeUndefined();
-    expect(put.headers.authorization).toBe("Bearer durable-token");
+    expectLegacyBatchHeaders(put, expectedBatchBody(payload).byteLength);
     expect(calls.filter((call) => call.url.endsWith("/v1/blobs/check"))).toHaveLength(1);
   });
 
@@ -243,6 +310,7 @@ describe("upload grants", () => {
     const payload = await file("close-refresh");
     let release!: (response: Response) => void;
     const pendingRefresh = new Promise<Response>((resolve) => { release = resolve; });
+    pendingReleases.push(() => release(json({ missing: [], uploadGrant: "new" })));
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/blobs/check")) return pendingRefresh;
@@ -282,7 +350,6 @@ describe("upload grants", () => {
     process.env.RBOX_BATCH_RECORDS = "1";
     const ctx = context();
     const payloads = await Promise.all([file("timing-bearer-a"), file("timing-bearer-b")]);
-    const releases: Array<() => void> = [];
     const intervals: Array<{ start: number; end: number }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -291,7 +358,7 @@ describe("upload grants", () => {
       const index = calls.filter((call) => call.url.endsWith("/v1/blob-batch/put")).length - 1;
       const start = performance.now();
       return new Promise<Response>((resolve) => {
-        releases[index] = () => {
+        pendingReleases[index] = () => {
           intervals[index] = { start, end: performance.now() };
           resolve(batchOk(payloads[index]!.sha, payloads[index]!.bytes.byteLength));
         };
@@ -302,13 +369,13 @@ describe("upload grants", () => {
     const value = uploader(ctx);
     const pending = payloads.map((payload) => value.putFile(payload.sha, payload.path, payload.bytes.byteLength));
     const deadline = performance.now() + 1_000;
-    while (releases.length < 2 && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
-    expect(releases).toHaveLength(2);
+    while (pendingReleases.length < 2 && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
+    expect(pendingReleases).toHaveLength(2);
     await new Promise((resolve) => setTimeout(resolve, 20));
     // Settle out of dispatch order to pin the min(start)/max(end) folding.
-    releases[1]!();
+    pendingReleases[1]!();
     await new Promise((resolve) => setTimeout(resolve, 5));
-    releases[0]!();
+    pendingReleases[0]!();
     await Promise.all(pending);
 
     const stats = finishFirstPublishStats()!;

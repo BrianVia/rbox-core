@@ -24,6 +24,7 @@ import { ctEqual } from "./util.js";
 // worker routing falls back to the normal bearer-authenticated D1 entitlement path.
 export const GRANT_TTL_MS = 5 * 60_000;
 export const UPLOAD_GRANT_TTL_MS = 5 * 60_000;
+const UPLOAD_GRANT_EXPIRY_GRACE_MS = 5_000;
 const CLOCK_SKEW_MS = 60_000; // tolerate ≤60s of client/server clock skew on `t` (matches receipts)
 const MIN_KEY_BYTES = 32;
 const DOMAIN = "rbox.grant.v1|"; // domain-separates this MAC from the §23 receipt MAC and every other key use
@@ -179,6 +180,12 @@ async function verifyGrantPayload(
   if (!(payload.e - payload.t > 0 && payload.e - payload.t <= opts.ttlMs)) return { ok: false, reason: "bad_ttl" };
   if (payload.t > nowMs + CLOCK_SKEW_MS) return { ok: false, reason: "future" };
   if (payload.e <= nowMs) return { ok: false, reason: "expired" };
+  // Upload mint and verification both use Worker clocks, so the client-skew
+  // tolerance above must not extend the revocation-lag window. A small grace
+  // absorbs isolate drift while keeping usable upload grants effectively TTL-bound.
+  if (opts.domain === UPLOAD_DOMAIN && payload.e - nowMs > opts.ttlMs + UPLOAD_GRANT_EXPIRY_GRACE_MS) {
+    return { ok: false, reason: "future" };
+  }
 
   return { ok: true, payload: payload as Payload | UploadPayload };
 }

@@ -42,6 +42,7 @@ export class RemoteContext {
   // context-owned control call, deliberately outside the uploader's in-flight work.
   private uploadGrant?: string;
   private uploadGrantCapturedAtMs = 0;
+  private uploadGrantGeneration = 0;
   private uploadGrantRefresh?: Promise<void>;
   private uploadGrantRetryBlockedUntilMs = 0;
 
@@ -80,7 +81,14 @@ export class RemoteContext {
     if (authGrantEnabled() && typeof body.uploadGrant === "string") {
       this.uploadGrant = body.uploadGrant;
       this.uploadGrantCapturedAtMs = Date.now();
+      this.uploadGrantGeneration++;
     }
+  }
+
+  private clearUploadGrant(): void {
+    this.uploadGrant = undefined;
+    this.uploadGrantCapturedAtMs = 0;
+    this.uploadGrantGeneration++;
   }
 
   /** Fire-and-forget: upload correctness never depends on grant refresh. */
@@ -156,6 +164,7 @@ export class RemoteContext {
   }
 
   private async refreshUploadGrant(): Promise<void> {
+    const generation = this.uploadGrantGeneration;
     const res = await this.fetch(`${this.baseUrl}/v1/blobs/check`, {
       method: "POST",
       headers: { ...this.protoAuth, "content-type": "application/json" },
@@ -163,11 +172,11 @@ export class RemoteContext {
     }, { op: "refreshing upload grant", retries: 0 });
     if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
     const body = (await res.json()) as { uploadGrant?: unknown };
+    if (this.uploadGrantGeneration !== generation) return;
     if (typeof body.uploadGrant === "string") this.captureUploadGrant(body);
     else {
       // The server kill switch may have changed since the original check.
-      this.uploadGrant = undefined;
-      this.uploadGrantCapturedAtMs = 0;
+      this.clearUploadGrant();
     }
   }
 }
