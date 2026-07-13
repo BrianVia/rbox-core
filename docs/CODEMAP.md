@@ -62,7 +62,7 @@ src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/rel
 src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
 src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
 src/cli/daemon-control.ts     — daemon process lifecycle + on-disk records: binding/pid files, start/stop/liveness/PID-ownership, rbox logs tailing. Never: the daemon's sync loop (daemon/).
-src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming accumulator, overlap math, summary formatters. Never: network or file I/O.
+src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming + dispatch-reason accumulators, overlap math, summary formatters. Never: network or file I/O.
 src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
 src/cli/e2ee-remote-types.ts  — pure shared contracts: E2eeApi, AccountKeysDTO, WsKeyDTO, CommitChainResult, VersionInfo, VerifiedSuffixEntry, HeadPin, PinStore, E2eeContext, CurrentWriteKek. Never: behavior, policy constants.
 src/cli/e2ee-client.ts        — E2EE account/device bootstrap + pairing client flows (bootstrap, redemption, admission, verifyAccount glue). Never: transport (RboxApi/E2eeRemote), key storage (e2ee-keystore.ts).
@@ -91,10 +91,10 @@ src/cli/remote/multipart-fake-server.ts — test-only in-process fake of the ser
 ```
 src/cli/remote/blob-batch.ts            — barrel: pre-113-split public surface of blob-batch/.
 src/cli/remote/blob-batch/wire.ts       — client half of the wire contract with apps/api/src/blob-batch.ts: framing constants, BatchFrame, parseBatchFrames, codecs (framedBytes, parseStatus, parseBatchPutResponse). Change in lockstep with the server twin. Never: tuning knobs, scheduling.
-src/cli/remote/blob-batch/gate.ts       — process-wide batch kill switches + dispatch counter + SingleGate. SINGLE definition site (a second instance breaks 404/405 degradation). Never: per-request logic.
-src/cli/remote/blob-batch/config.ts     — all tuning defaults/caps + BatchConfig + env readers (uploadBatchConfig/downloadBatchConfig). Never: wire constants, class logic.
+src/cli/remote/blob-batch/gate.ts       — process-wide batch kill switches + monotonic records ceiling + dispatch counter + SingleGate. SINGLE definition site for process-wide batch degradation (a second instance breaks degradation). Never: per-request logic.
+src/cli/remote/blob-batch/config.ts     — all tuning defaults/caps + fill-policy selector + wire-cap constants + BatchConfig + env readers (uploadBatchConfig/downloadBatchConfig). Never: wire framing constants, class logic.
 src/cli/remote/blob-batch/downloader.ts — BlobBatchDownloader: queue/scheduler, batch GET, watchdog, single-lane degradation, race-safe publication + its private models. Never: upload logic, wire codecs.
-src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, batch PUT, receipt accounting, degradation, close protocol + its private models. Never: download logic, wire codecs.
+src/cli/remote/blob-batch/uploader.ts   — BlobBatchUploader: SHA coalescing, fill-v1/v2 dispatch policy, batch PUT, 400 skew-latch trigger (ceiling lives in gate.ts), receipt accounting, degradation, close protocol + its private models. Never: download logic, wire codecs.
 ```
 
 ## `src/cli/publish-pipeline/` — overlapped first-publish (design 98)

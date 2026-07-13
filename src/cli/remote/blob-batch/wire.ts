@@ -3,7 +3,8 @@ import { DEFAULT_BATCH_RECORD_BYTES } from "./config.js";
 
 // Wire twin: apps/api/src/blob-batch.ts — the framing constants and codec are
 // duplicated per build target (house pattern, like UPLOAD_RECEIPTS_V1). Change
-// them in lockstep; nothing fails to compile if they drift.
+// them in lockstep; the server emits {error:"too_many_records", max} on an
+// over-cap PUT 400. Nothing fails to compile if the twins drift.
 
 export const BATCH_BLOB_CONTENT_TYPE = "application/x-rbox-blobs";
 export const BATCH_FRAME_HEADER_BYTES = 36;
@@ -115,6 +116,17 @@ export function parseBatchPutResponse(body: unknown): BatchPutResponseRecord[] |
     }
   }
   return out;
+}
+
+export function parseBatchPutErrorMax(body: unknown): number | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const error = body as { error?: unknown; max?: unknown };
+  return error.error === "too_many_records"
+      && typeof error.max === "number"
+      && Number.isSafeInteger(error.max)
+      && error.max > 0
+    ? error.max
+    : undefined;
 }
 
 const textDecoder = new TextDecoder();

@@ -60,6 +60,8 @@ export interface Env {
    *  each send, fail-closed on a missing/malformed connectedAt) instead of sending.
    *  Recommended production value 21600000 (6h). Rollback = unset. */
   RBOX_WS_MAX_SESSION_MS?: string;
+  /** Design 112 blob-batch PUT record cap: default 32, candidate 64; set 32 to kill-switch. */
+  RBOX_BLOB_BATCH_MAX_RECORDS?: string;
   /** Design 102. O(change) commit delta admission. Off/unset preserves full
    * validation; shadow compares read-only and returns the full result; enforce is
    * explicitly flag-gated and is not enabled by this change. */

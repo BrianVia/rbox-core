@@ -135,6 +135,13 @@ function batchPutBody(records: Array<{ sha: string; payload: Uint8Array }>): Uin
   return out;
 }
 
+function batchPutRecords(count: number, prefix: string): Array<{ sha: string; payload: Uint8Array }> {
+  return Array.from({ length: count }, (_, i) => {
+    const payload = new TextEncoder().encode(`${prefix}-${i}`);
+    return { sha: sha(`${prefix}-${i}`), payload };
+  });
+}
+
 async function batchPutDirect(body: Uint8Array, envOverride = fakePutEnv(), headers: Record<string, string> = { "x-rbox-protocol": "upload-receipts-v1" }): Promise<Response> {
   return blobBatchPut(new Request(`${BASE}/v1/blob-batch/put`, { method: "POST", headers, body }), envOverride, "acct_batch_put");
 }
@@ -232,6 +239,17 @@ describe("POST /v1/blob-batch/get", () => {
     }
     const deduped = await SELF.fetch(`${BASE}/v1/blob-batch/get`, { method: "POST", headers: authed(a.token), body: JSON.stringify(Array.from({ length: 33 }, () => s)) });
     expect(deduped.status).toBe(200);
+  });
+
+  test("keeps the 32-sha GET cap when the PUT cap is raised", async () => {
+    const shas = Array.from({ length: 33 }, (_, i) => sha(`get-cap-${i}`));
+    const res = await blobBatchGetWithVerifiedGrant(
+      new Request(`${BASE}/v1/blob-batch/get`, { method: "POST", body: JSON.stringify(shas) }),
+      { ...fakePutEnv(), RBOX_BLOB_BATCH_MAX_RECORDS: "64" },
+      "acct_get_cap",
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "bad_request", message: "too many shas", max: 32 });
   });
 
   test("starts all R2 gets before completion and streams frames in completion order", async () => {
@@ -403,6 +421,67 @@ describe("POST /v1/blob-batch/put", () => {
     expect(res.status).toBe(400);
   });
 
+  test("accepts 32 records by default and rejects 33 with a machine-readable cap", async () => {
+    const accepted = await batchPutDirect(batchPutBody(batchPutRecords(32, "default-cap-ok")));
+    expect(accepted.status).toBe(200);
+    expect(((await accepted.json()) as { results: unknown[] }).results).toHaveLength(32);
+
+    const rejected = await batchPutDirect(batchPutBody(batchPutRecords(33, "default-cap-over")));
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ error: "too_many_records", max: 32 });
+  });
+
+  test("accepts 64 records at the raised cap and rejects 65", async () => {
+    const env64 = () => ({ ...fakePutEnv(), RBOX_BLOB_BATCH_MAX_RECORDS: "64" });
+    const accepted = await batchPutDirect(batchPutBody(batchPutRecords(64, "raised-cap-ok")), env64());
+    expect(accepted.status).toBe(200);
+    const body = (await accepted.json()) as { results: Array<{ ok: boolean; receipt?: string }> };
+    expect(body.results).toHaveLength(64);
+    expect(body.results.every((result) => result.ok && typeof result.receipt === "string")).toBe(true);
+
+    const rejected = await batchPutDirect(batchPutBody(batchPutRecords(65, "raised-cap-over")), env64());
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ error: "too_many_records", max: 64 });
+  });
+
+  test.each([
+    ["abc", 400],
+    ["128", 200],
+    ["16", 400],
+  ])("bounds the configured PUT cap %s", async (configured, status) => {
+    const configuredEnv = () => ({ ...fakePutEnv(), RBOX_BLOB_BATCH_MAX_RECORDS: configured });
+    const res = await batchPutDirect(
+      batchPutBody(batchPutRecords(33, `configured-cap-${configured}`)),
+      configuredEnv(),
+    );
+    expect(res.status).toBe(status);
+    if (status === 400) expect(await res.json()).toEqual({ error: "too_many_records", max: 32 });
+    if (configured === "128") {
+      const clamped = await batchPutDirect(batchPutBody(batchPutRecords(65, "configured-cap-128-over")), configuredEnv());
+      expect(clamped.status).toBe(400);
+      expect(await clamped.json()).toEqual({ error: "too_many_records", max: 64 });
+    }
+  });
+
+  test("reports a structural error before an over-cap record count", async () => {
+    const valid = batchPutBody(batchPutRecords(33, "precedence"));
+    const malformed = new Uint8Array(valid.byteLength + BATCH_FRAME_HEADER_BYTES - 1);
+    malformed.set(valid);
+    const res = await batchPutDirect(malformed);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "bad_request", message: "truncated frame header" });
+  });
+
+  test("preserves the receipt fence across a 64-record PUT", async () => {
+    const records = batchPutRecords(64, "raised-cap-fence");
+    const res = await batchPutDirect(batchPutBody(records), {
+      ...fakePutEnv({ fenceSha: records[37]!.sha }),
+      RBOX_BLOB_BATCH_MAX_RECORDS: "64",
+    });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "retry_later" });
+  });
+
   test("deduplicates duplicate shas and returns too_large per record while siblings succeed", async () => {
     const env2 = fakePutEnv();
     const okPayload = new TextEncoder().encode("dedupe payload");
@@ -444,7 +523,7 @@ describe("POST /v1/blob-batch/put", () => {
     expect((await verifyReceipt(env2, body.results[0]!.receipt!, { accountId: "acct_batch_put", encSha: okSha, size: okPayload.byteLength, nowMs: Date.now() })).ok).toBe(true);
   });
 
-  test("emits blob.batchPut metrics with ok, partial, and bad_request outcomes", async () => {
+  test("emits blob.batchPut metrics with ok, partial, bad_request, and too_many_records outcomes", async () => {
     const metrics: Array<{ blobs: string[]; doubles: number[] }> = [];
     const okPayload = new TextEncoder().encode("metric ok");
     const okSha = sha("metric ok");
@@ -453,9 +532,12 @@ describe("POST /v1/blob-batch/put", () => {
     const badSha = sha("not metric payload");
     await batchPutDirect(batchPutBody([{ sha: badSha, payload: okPayload }]), fakePutEnv({ metrics }));
     await batchPutDirect(new Uint8Array(0), fakePutEnv({ metrics }));
+    await batchPutDirect(batchPutBody(batchPutRecords(33, "metric-over-cap")), fakePutEnv({ metrics }));
 
-    expect(metrics.map((m) => m.blobs[2])).toEqual(["ok", "partial", "bad_request"]);
+    expect(metrics.map((m) => m.blobs[2])).toEqual(["ok", "partial", "bad_request", "too_many_records"]);
     expect(metrics[0]?.doubles[4]).toBe(okPayload.byteLength);
     expect(metrics[0]?.doubles[5]).toBe(1);
+    expect(metrics[3]?.doubles[4]).toBe(0);
+    expect(metrics[3]?.doubles[5]).toBe(33);
   });
 });
