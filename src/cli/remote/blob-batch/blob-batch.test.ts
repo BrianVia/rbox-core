@@ -3,11 +3,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { BlobRetryLaterError, BlobShaMismatchError, RboxApi } from "../remote.js";
-import { BlobDownloadIntegrityError } from "./blobs.js";
-import { FakeServer } from "../e2ee-fake-server.js";
-import { encryptFileToTemp, generateKek } from "../../engine/crypto.js";
-import type { FileEntry } from "../../engine/types.js";
+import { BlobRetryLaterError, BlobShaMismatchError, RboxApi } from "../../remote.js";
+import { BlobDownloadIntegrityError } from "../blobs.js";
+import { FakeServer } from "../../e2ee-fake-server.js";
+import { encryptFileToTemp, generateKek } from "../../../engine/crypto.js";
+import type { FileEntry } from "../../../engine/types.js";
 import {
   BATCH_FRAME_HEADER_BYTES,
   BATCH_STATUS_BIT,
@@ -17,7 +17,7 @@ import {
   resetUploaderDispatchCountForTests,
   uploadBatchConfig,
   uploaderDispatchCount,
-} from "./blob-batch.js";
+} from "../blob-batch.js";
 
 const origFetch = globalThis.fetch;
 // per-sha: serve this many CORRUPT (bit-flipped, same-length) single-GET responses first.
@@ -469,7 +469,7 @@ describe("BlobBatchUploader queueing", () => {
   });
 
   test("upload supply default is 512 with batching, 64 when disabled, and explicit env wins", async () => {
-    const { uploadConcurrencyForTests } = await import("../sync-recovery.js");
+    const { uploadConcurrencyForTests } = await import("../../sync-recovery.js");
     delete process.env.RBOX_UPLOAD_CONCURRENCY;
     delete process.env.RBOX_BATCH_BLOBS;
     expect(uploadConcurrencyForTests()).toBe(512);
@@ -591,7 +591,7 @@ describe("BlobBatchDownloader grant freshness", () => {
 describe("apply integration", () => {
   test("pulling small encrypted files with batching on matches batching off and preserves lane blob count", async () => {
     process.env.RBOX_LANE_TIMING = "1";
-    const applyMod = await import(`../../engine/apply.ts?batch-e2e=${Date.now()}-${Math.random()}`) as typeof import("../../engine/apply.js");
+    const applyMod = await import(`../../../engine/apply.ts?batch-e2e=${Date.now()}-${Math.random()}`) as typeof import("../../../engine/apply.js");
     const kek = generateKek();
     const server = new FakeServer();
     const entries: FileEntry[] = [];
