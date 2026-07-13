@@ -47,6 +47,8 @@ const zeroFirstPublishStats = (): FirstPublishStats => ({
  * deliberately inert unless an enabled PhaseReport starts a measurement. */
 export const firstPublishTiming = {
   enabled: false,
+  /** Bumped on every arm/disarm/void — see firstPublishMeasurementToken. */
+  generation: 0,
   stats: zeroFirstPublishStats(),
   startedAt: 0,
   firstReadyAt: 0,
@@ -75,6 +77,7 @@ export const firstPublishTiming = {
  *  rather than cross-attributed: disarm and record nothing — mis-attributed timing is
  *  worse than no timing. */
 export function beginFirstPublishTiming(enabled: boolean): void {
+  firstPublishTiming.generation++; // any arm/disarm/void invalidates in-flight measurement tokens
   if (enabled && firstPublishTiming.enabled) {
     firstPublishTiming.enabled = false; // concurrent measurement detected: void both, never mix
     return;
@@ -130,6 +133,18 @@ export function firstPublishUploadEnd(): void {
       firstPublishTiming.uploadOpenAt = 0;
     }
   }
+}
+
+/** Arm-scoped settlement guard for timers that may span a disarm/re-arm (e.g. a
+ *  receipt drain in flight while a push finishes): capture the token when the timed
+ *  work starts and settle stats only while the SAME armed measurement is live.
+ *  Gating on `enabled` alone would let a drain started under measurement A (or under
+ *  no measurement, with a zero start timestamp) credit a later measurement B. */
+export function firstPublishMeasurementToken(): number {
+  return firstPublishTiming.enabled ? firstPublishTiming.generation : 0;
+}
+export function firstPublishMeasurementLive(token: number): boolean {
+  return token !== 0 && firstPublishTiming.enabled && firstPublishTiming.generation === token;
 }
 
 export function intervalUnionOverlapMs(

@@ -211,3 +211,39 @@ test("redeemReceipts with no upload activity records no overlap", async () => {
     expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBe(0);
   } finally { beginFirstPublishTiming(false); }
 });
+
+test("a drain that starts unmeasured credits nothing to a measurement armed mid-drain", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(sha("late-arm"), "receipt");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () => {
+    beginFirstPublishTiming(true); // measurement armed while the unmeasured drain is in flight
+    await Bun.sleep(5);
+    return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+  };
+  try {
+    await redeemReceipts(ctx);
+    expect(firstPublishTiming.stats.receiptRedemptionWallMs).toBe(0);
+    expect(firstPublishTiming.stats.receiptRedemptionOverlapMs).toBe(0);
+    expect(firstPublishTiming.stats.finalDrainMs).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
+});
+
+test("a commit-enclosed drain spanning a disarm/re-arm credits neither measurement", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(sha("span"), "receipt");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url) => {
+    if (url.endsWith("/receipts/redeem")) {
+      beginFirstPublishTiming(false); // measurement A ends mid-drain…
+      beginFirstPublishTiming(true); // …and measurement B arms before the drain settles
+      await Bun.sleep(5);
+      return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
+    }
+    return json(200, { sequence: 1 });
+  };
+  try {
+    beginFirstPublishTiming(true);
+    await commitSigned(ctx, 0, commit);
+    expect(firstPublishTiming.stats.receiptRedemptionWallMs).toBe(0);
+    expect(firstPublishTiming.stats.finalDrainMs).toBe(0);
+  } finally { beginFirstPublishTiming(false); }
+});

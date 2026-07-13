@@ -62,3 +62,15 @@ test("uploadActiveOverlapMs includes the currently open upload interval", async 
     expect(uploadActiveOverlapMs(t0, t1)).toBeCloseTo(t1 - t0, 5);
   } finally { beginFirstPublishTiming(false); }
 });
+
+test("uploadActiveOverlapMs sums closed intervals and the open interval without double credit", () => {
+  try {
+    beginFirstPublishTiming(true);
+    firstPublishTiming.uploadIntervals = [{ start: 10, end: 20 }, { start: 30, end: 40 }];
+    firstPublishTiming.uploadOpenAt = 50; // an upload is still in flight
+    // Window [15, 60]: closed parts are [15,20] (5) + [30,40] (10); open part is [50,60] (10).
+    expect(uploadActiveOverlapMs(15, 60)).toBe(25);
+    // Window entirely before the open interval takes no open-interval credit.
+    expect(uploadActiveOverlapMs(15, 45)).toBe(15);
+  } finally { beginFirstPublishTiming(false); }
+});
