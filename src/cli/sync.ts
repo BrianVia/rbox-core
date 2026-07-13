@@ -40,7 +40,7 @@ import {
   uploadLaneTimingSummary,
   type EncryptAndUploadOptions,
 } from "./sync-recovery.js";
-import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
+import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "./upload-lane-timing.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "./config.js";
 import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource } from "./sync-state.js";
@@ -1013,10 +1013,11 @@ async function runPushAttempt(
       };
     }
     const parentSequence = repair?.parentSequence ?? appliedSequence;
-    const commitStatsT0 = firstPublishTiming.enabled ? performance.now() : 0;
+    const commitStatsToken = firstPublishMeasurementToken();
+    const commitStatsT0 = commitStatsToken ? performance.now() : 0;
     const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
     const res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
-    if (firstPublishTiming.enabled) {
+    if (firstPublishMeasurementLive(commitStatsToken)) {
       const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
       firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
     }
