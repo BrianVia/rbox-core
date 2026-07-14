@@ -3,9 +3,13 @@
 	import { page } from '$app/state';
 	import { authState, redirectIfSignedIn } from '$lib/auth.svelte';
 	import { mountAuth } from '$lib/clerk';
-	import { stashPlanIntent } from '$lib/plan-intent';
+	import { peekPlanIntent, stashPlanIntent } from '$lib/plan-intent';
 
 	let host = $state<HTMLDivElement>();
+	const PLANS = {
+		solo: { name: 'Solo', monthly: '$8/month', annual: '$80/year' },
+		pro: { name: 'Pro', monthly: '$20/month', annual: '$200/year' }
+	} as const;
 
 	// "/" is the ONE place the marketing pricing CTA (?plan=solo|pro) lands — for both
 	// signed-out buyers (before the Clerk redirect dance) and already-signed-in ones
@@ -22,6 +26,14 @@
 		history.replaceState(history.state, '', url);
 	}
 
+	const planIntent = peekPlanIntent();
+	const planCopy = planIntent
+		? {
+				name: PLANS[planIntent.plan].name,
+				price: PLANS[planIntent.plan][planIntent.cadence]
+			}
+		: null;
+
 	redirectIfSignedIn(); // already signed in → /dashboard
 
 	onMount(() => {
@@ -30,9 +42,24 @@
 </script>
 
 {#if !authState.signedIn}
-	<p class="mb-6 text-center text-sm text-muted-foreground">
-		Sign in to manage your devices, workspaces, and billing.
-	</p>
+	{#if planCopy}
+		<div class="mb-6 text-center">
+			<h1 class="text-xl font-semibold tracking-tight">Create or sign in to continue</h1>
+			<p class="mt-2 text-sm leading-6 text-muted-foreground">
+				You're starting <strong class="font-medium text-foreground">{planCopy.name}</strong> at
+				<strong class="font-medium text-foreground">{planCopy.price}</strong>.
+				If this is your first subscription, it includes 14 days free.
+			</p>
+			<p class="mt-2 text-sm leading-6 text-muted-foreground">
+				Create or sign in so your subscription is attached to your rbox account.
+				Secure Stripe checkout is next.
+			</p>
+		</div>
+	{:else}
+		<p class="mb-6 text-center text-sm text-muted-foreground">
+			Sign in to manage your devices, workspaces, and billing.
+		</p>
+	{/if}
 	<div bind:this={host}></div>
 	<!-- Clerk renders its bot/Smart-CAPTCHA challenge here when needed. -->
 	<div id="clerk-captcha"></div>

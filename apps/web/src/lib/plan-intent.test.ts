@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { stashPlanIntent, consumePlanIntent, PLAN_INTENT_TTL_MS } from './plan-intent';
+import { stashPlanIntent, peekPlanIntent, consumePlanIntent, PLAN_INTENT_TTL_MS } from './plan-intent';
 
 function makeStorage() {
 	const m = new Map<string, string>();
@@ -48,6 +48,14 @@ describe('plan intent handoff', () => {
 		expect(consumePlanIntent()).toBeNull();
 	});
 
+	it('peek exposes the checkout context without consuming it', () => {
+		stashPlanIntent('solo', 'annual');
+		expect(peekPlanIntent()).toEqual({ plan: 'solo', cadence: 'annual' });
+		expect(peekPlanIntent()).toEqual({ plan: 'solo', cadence: 'annual' });
+		expect(consumePlanIntent()).toEqual({ plan: 'solo', cadence: 'annual' });
+		expect(peekPlanIntent()).toBeNull();
+	});
+
 	it('honors the TTL: consumable right up to 30min, null (and cleared) after', () => {
 		const t0 = 1_700_000_000_000; // injected clock — no sleeping in tests
 		stashPlanIntent('pro', null, t0);
@@ -56,6 +64,10 @@ describe('plan intent handoff', () => {
 		stashPlanIntent('pro', null, t0);
 		expect(consumePlanIntent(t0 + PLAN_INTENT_TTL_MS + 1)).toBeNull(); // expired
 		expect(store.length).toBe(0); // and cleared, not left to rot
+
+		stashPlanIntent('solo', null, t0);
+		expect(peekPlanIntent(t0 + PLAN_INTENT_TTL_MS + 1)).toBeNull();
+		expect(store.length).toBe(0);
 	});
 
 	it('returns null (and clears) on garbage stored values without throwing', () => {
@@ -80,6 +92,7 @@ describe('plan intent handoff', () => {
 			}
 		});
 		expect(stashPlanIntent('pro')).toBe(false);
+		expect(peekPlanIntent()).toBeNull();
 		expect(consumePlanIntent()).toBeNull();
 	});
 });

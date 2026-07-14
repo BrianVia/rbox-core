@@ -41,6 +41,30 @@ export function stashPlanIntent(raw: string | null, rawCadence: string | null = 
 	}
 }
 
+function parsePlanIntent(v: string, now: number): PlanIntent | null {
+	try {
+		const { plan, cadence, at } = JSON.parse(v) as { plan?: unknown; cadence?: unknown; at?: unknown };
+		if (typeof at !== 'number' || now - at > PLAN_INTENT_TTL_MS) return null;
+		return isPlanIntentPlan(plan) ? { plan, cadence: cadenceFor(cadence) } : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Read without consuming so the auth page can explain the selected purchase before
+ *  Clerk returns the buyer to the dashboard. Invalid and expired values are cleared. */
+export function peekPlanIntent(now = Date.now()): PlanIntent | null {
+	try {
+		const v = sessionStorage.getItem(KEY);
+		if (!v) return null;
+		const intent = parsePlanIntent(v, now);
+		if (!intent) sessionStorage.removeItem(KEY);
+		return intent;
+	} catch {
+		return null;
+	}
+}
+
 /** Read-and-clear the stashed intent (one-shot): a checkout the buyer cancels comes
  *  back through /billing → /dashboard, and the intent must NOT re-fire. Returns null
  *  when absent, expired, or garbage (non-JSON / wrong shape) — whatever was read is
@@ -54,11 +78,5 @@ export function consumePlanIntent(now = Date.now()): PlanIntent | null {
 		return null;
 	}
 	if (!v) return null;
-	try {
-		const { plan, cadence, at } = JSON.parse(v) as { plan?: unknown; cadence?: unknown; at?: unknown };
-		if (typeof at !== 'number' || now - at > PLAN_INTENT_TTL_MS) return null;
-		return isPlanIntentPlan(plan) ? { plan, cadence: cadenceFor(cadence) } : null;
-	} catch {
-		return null; // legacy/garbage value — already cleared above
-	}
+	return parsePlanIntent(v, now); // legacy/garbage value was already cleared above
 }
