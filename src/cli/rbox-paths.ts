@@ -36,7 +36,9 @@ export function workspaceKey(root: string): string {
   return `${base}-${hash}`;
 }
 
-const daemonHome = () => path.join(process.env.RBOX_HOME || os.homedir(), RBOX_DIR);
+export const rboxDir = (): string => path.join(process.env.RBOX_HOME || homeDir(), RBOX_DIR);
+
+const daemonHome = () => rboxDir();
 
 export const daemonRuntimeDir = (root: string): string => path.join(daemonHome(), "daemons", workspaceKey(root));
 export const daemonStatusPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.status.json");

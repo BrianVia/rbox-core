@@ -8,6 +8,7 @@ import type { WorkspaceKind } from "./setup-cmd.js";
 import { runSyncCommand } from "./sync-cmd.js";
 import { statusCmd } from "./status-cmd.js";
 import { stderrStyle as e } from "./style.js";
+import { getIdentity, identityText } from "./account-profile.js";
 
 export type FrontDoorAction = "nothing" | "sync" | "logs" | "start" | "stop";
 export type UntrackedMenuAction = WorkspaceKind | "nothing";
@@ -91,11 +92,17 @@ export const UNTRACKED_MENU_CHOICES = (cwd: string) =>
 interface UntrackedMenuDeps {
   promptSelect?: SelectPrompt;
   writeStderr?: (text: string) => void;
+  getIdentity?: typeof getIdentity;
 }
 
 export async function runUntrackedMenu(cwd: string, accountId: string, deps: UntrackedMenuDeps = {}): Promise<WorkspaceKind | undefined> {
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
-  writeStderr(`\n${e.green("✓")}  Signed in and enrolled (${e.cyan(accountId)}). This directory isn't tracked yet.\n\n`);
+  const identity = await (deps.getIdentity ?? getIdentity)(accountId);
+  writeStderr(
+    identity
+      ? `\n${e.green("✓")}  Signed in as ${e.cyan(identityText(identity.email, identity.signInMethod)!)}. This directory isn't tracked yet.\n\n`
+      : `\n${e.green("✓")}  Signed in and enrolled (${e.cyan(accountId)}). This directory isn't tracked yet.\n\n`
+  );
   const action = await promptCancelable<UntrackedMenuAction>(deps.promptSelect ?? promptSelect, {
     message: "What would you like to do?",
     choices: UNTRACKED_MENU_CHOICES(cwd),

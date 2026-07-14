@@ -37,6 +37,7 @@ import { stderrStyle as e } from "./style.js";
 import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
 import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
+import { getIdentity, identityText } from "./account-profile.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -86,6 +87,21 @@ export type WorkspaceKind = "new" | "existing";
  *  (the yellow notice explains), so a fixed denominator stays honest. */
 export const stepHeader = (step: number, total: 2 | 3, label: string): string => `Step ${step} of ${total} · ${label}`;
 
+interface EnrolledSkipNoticeDeps {
+  getIdentity?: typeof getIdentity;
+  writeStderr?: (text: string) => void;
+}
+
+export async function writeEnrolledSkipNotice(accountId: string, deps: EnrolledSkipNoticeDeps = {}): Promise<void> {
+  const identity = await (deps.getIdentity ?? getIdentity)(accountId);
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  writeStderr(
+    identity
+      ? `${e.dim(`Signed in as ${identityText(identity.email, identity.signInMethod)} — skipping account setup.`)}\n`
+      : `${e.dim(`Signed in and enrolled (${e.cyan(accountId)}) — skipping account setup.`)}\n`
+  );
+}
+
 export async function runSetup(opts: {
   cwd: string;
   defaultRemote: string;
@@ -129,7 +145,7 @@ export async function runSetup(opts: {
   if (!viaUntrackedMenu) {
     process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
     if (accountId) {
-      process.stderr.write(`${e.dim(`Signed in and enrolled (${e.cyan(accountId)}) — skipping account setup.`)}\n`);
+      await writeEnrolledSkipNotice(accountId);
     } else {
       process.stderr.write(`\n── ${e.bold(stepHeader(1, 3, "Account"))} ${HR.slice(0, 46)}\n`);
       const hasCreds = Boolean((await loadCredentials())?.accountId);

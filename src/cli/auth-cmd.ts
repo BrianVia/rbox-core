@@ -1,5 +1,6 @@
 import os from "node:os";
 import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
+import { clearAccountProfile } from "./account-profile.js";
 import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
@@ -298,6 +299,7 @@ function offerApprovalOpen(url: string): { cancel: () => void } | undefined {
 export async function logout(): Promise<void> {
   const autostartEnabled = await isAutostartEnabled().catch(() => false);
   await clearCredentials();
+  await clearAccountProfile();
   console.log("logged out (credential removed)");
   if (autostartEnabled) console.log("autostart still enabled");
 }

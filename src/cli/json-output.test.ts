@@ -6,6 +6,7 @@ import path from "node:path";
 import { HashCache, type Manifest } from "../engine/index.js";
 import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { accountStatus } from "./account-cmd.js";
+import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import type { DaemonActivity } from "./activity.js";
@@ -118,6 +119,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await flushAccountProfileWrites();
   globalThis.fetch = origFetch;
   process.stdout.write = origStdout;
   process.stderr.write = origStderr;
@@ -340,12 +342,12 @@ test("account status --json emits JSON", async () => {
   process.env.RBOX_DEVICE_ID = "dev_a";
   stubFetch((url) =>
     url.endsWith("/v1/account/status")
-      ? { status: 200, body: { accountId: "acct_a", linked: true, plan: "none" } }
+      ? { status: 200, body: { accountId: "acct_a", linked: true, plan: "none", email: "owner@example.com", signInMethod: "github" } }
       : { status: 200, body: { plan: "pro", graceUntil: 123, readOnly: true } }
   );
 
   const dto = JSON.parse(await captureStdout(() => accountStatus({ json: true })));
-  expect(dto).toEqual({ accountId: "acct_a", plan: "pro", graceUntil: 123, readOnly: true, linked: true });
+  expect(dto).toEqual({ accountId: "acct_a", plan: "pro", graceUntil: 123, readOnly: true, linked: true, email: "owner@example.com", signInMethod: "github" });
 });
 
 test("versions --json emits JSON", async () => {

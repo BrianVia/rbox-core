@@ -5,10 +5,13 @@ import path from "node:path";
 import {
   handleDeviceCodePostApprovalEncryption,
   login,
+  logout,
   readPairingTokenInteractive,
   recoverCmd,
   runGenesisEnrollment,
 } from "./auth-cmd.js";
+import { accountProfilePath, flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
+import { saveCredentials } from "./credentials.js";
 import { _setSpawner } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError } from "./remote.js";
 import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveRecoveryKey } from "./e2ee-keystore.js";
@@ -119,6 +122,16 @@ function installImmediateTimers(): number[] {
   }) as typeof setTimeout;
   return sleeps;
 }
+
+test("logout clears credentials and the queued account profile", async () => {
+  await saveCredentials({ token: "tok", deviceId: "dev", remoteUrl: "https://api.test", accountId: "acct_logout" });
+  scheduleAccountProfileWrite({ accountId: "acct_logout", email: "owner@example.com", signInMethod: "github" });
+  await logout();
+  await flushAccountProfileWrites();
+  expect(await fs.exists(path.join(home, ".rbox", "credentials.json"))).toBe(false);
+  expect(await fs.exists(accountProfilePath())).toBe(false);
+  await expect(logout()).resolves.toBeUndefined();
+});
 
 describe("runGenesisEnrollment", () => {
   test("null account keys mints genesis, shows the phrase, and leaves local device material", async () => {

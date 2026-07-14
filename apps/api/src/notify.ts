@@ -296,6 +296,7 @@ async function fetchClerkPrimaryEmail(env: Env, sub: string): Promise<ClerkLooku
 export async function refreshOwnerEmail(env: Env, sub: string, now: number): Promise<void> {
   const row = await dirDb(env).prepare("SELECT email_updated_at, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ email_updated_at: number | null; signin_method_updated_at: number | null }>();
   if (!row) return; // no mapping (shouldn't happen post-provision) → nothing to refresh
+  // clerk.ts may seed email with NULL email_updated_at; throttle on the timestamp, never email presence.
   if (row.signin_method_updated_at !== null && row.email_updated_at && now - row.email_updated_at < EMAIL_REFRESH_MS) return; // throttled
   const fetched = await fetchClerkPrimaryEmail(env, sub);
   if (fetched.kind === "ok") await cacheOwnerEmail(env, sub, fetched.address, now);
