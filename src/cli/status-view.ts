@@ -12,7 +12,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
-import type { GitDeferralReason } from "./config.js";
+import type { GitDeferral, GitDeferralReason } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
@@ -171,6 +171,66 @@ export function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
   }
 }
 
+export interface GitDeferralDisplayEntry {
+  repo: string;
+  deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">;
+}
+
+/** One authoritative display row per repo, shared by every local visibility surface. */
+export interface GitDeferralRepoProjection {
+  repo: string;
+  oldestDeferredSince: string;
+  displayReason: GitDeferralReason;
+  bytesChanged: boolean;
+  checkout?: GitDeferral["checkout"];
+}
+
+const parsedDeferralTime = (iso: string): number => {
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+};
+
+/**
+ * Collapse independent apply/capture/config lanes into the single repo-level
+ * projection promised by design 116. The chronic age is the oldest standing
+ * lane, while the reason is selected independently by display precedence.
+ */
+export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntry>): GitDeferralRepoProjection[] {
+  const grouped = new Map<string, GitDeferralDisplayEntry["deferral"][]>();
+  for (const { repo, deferral } of entries) {
+    const lanes = grouped.get(repo) ?? [];
+    lanes.push(deferral);
+    grouped.set(repo, lanes);
+  }
+  const projected: GitDeferralRepoProjection[] = [];
+  for (const [repo, lanes] of grouped) {
+    const ordered = [...lanes].sort((a, b) =>
+      gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
+      || parsedDeferralTime(a.deferredSince) - parsedDeferralTime(b.deferredSince)
+      || a.lane.localeCompare(b.lane)
+      || a.reason.localeCompare(b.reason)
+    );
+    const display = ordered[0]!;
+    const oldest = [...lanes].sort((a, b) =>
+      parsedDeferralTime(a.deferredSince) - parsedDeferralTime(b.deferredSince)
+      || a.lane.localeCompare(b.lane)
+    )[0]!;
+    const checkout = display.checkout ?? ordered.find((lane) => lane.checkout !== undefined)?.checkout;
+    projected.push({
+      repo,
+      oldestDeferredSince: oldest.deferredSince,
+      displayReason: display.reason,
+      bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
+      ...(checkout === undefined ? {} : { checkout }),
+    });
+  }
+  return projected.sort((a, b) =>
+    parsedDeferralTime(a.oldestDeferredSince) - parsedDeferralTime(b.oldestDeferredSince)
+    || gitDeferralReasonPrecedence(a.displayReason) - gitDeferralReasonPrecedence(b.displayReason)
+    || a.repo.localeCompare(b.repo)
+  );
+}
+
 /** Pure, terminal-safe local rendering. Detached checkouts never expose an OID. */
 export function renderGitDeferralLine(input: {
   relPath: string;
@@ -218,8 +278,11 @@ const DETAIL_MAX = 40;
  *  sequences and every remaining control char first, then truncate by CODE POINTS
  *  (Array.from — a `.slice` on UTF-16 units could cut through a surrogate pair and
  *  emit a lone-surrogate mojibake) keeping the tail. */
+export const sanitizeTerminalText = (text: string): string =>
+  text.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "").replace(/\p{Cc}/gu, "");
+
 const truncateDetail = (d: string): string => {
-  const clean = d.replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "").replace(/\p{Cc}/gu, "");
+  const clean = sanitizeTerminalText(d);
   const cps = Array.from(clean);
   return cps.length > DETAIL_MAX ? `…${cps.slice(-(DETAIL_MAX - 1)).join("")}` : clean;
 };

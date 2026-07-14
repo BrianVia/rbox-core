@@ -44,6 +44,7 @@ import {
   type FollowProgress,
 } from "./sync-git/follow.js";
 import { gitIncomingKey, repoDirOf } from "./sync-git/shared.js";
+import { sanitizeTerminalText } from "./status-view.js";
 
 export type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 
@@ -342,18 +343,23 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps): void 
       : value));
     return;
   }
-  if (output.status === "show-me") { printShow(output, out); return; }
+  // Every human-readable field can ultimately contain local repository, ref,
+  // worktree, subject, or error text. Sanitize once at the output boundary so
+  // future verbs cannot accidentally introduce a terminal-control sink.
+  const safeOut = (line: string): void => out(sanitizeTerminalText(line));
+  const safeErr = (line: string): void => err(sanitizeTerminalText(line));
+  if (output.status === "show-me") { printShow(output, safeOut); return; }
   if (output.status === "resolved") {
-    out(`${output.repo}: followed incoming checkout; local Git state quarantined at ${output.quarantine}`);
+    safeOut(`${output.repo}: followed incoming checkout; local Git state quarantined at ${output.quarantine}`);
     return;
   }
   if (output.status === "unsupported") {
-    err(`${output.repo}: keep-mine is not yet supported in this build.`);
-    for (const line of output.recovery) err(`  ${line}`);
+    safeErr(`${output.repo}: keep-mine is not yet supported in this build.`);
+    for (const line of output.recovery) safeErr(`  ${line}`);
     return;
   }
-  err(`${output.repo}: ${output.message}`);
-  if (output.current) printShow(output.current, err);
+  safeErr(`${output.repo}: ${output.message}`);
+  if (output.current) printShow(output.current, safeErr);
 }
 
 function refusalMessage(reason: GitDeferralReason, detail: string): string {

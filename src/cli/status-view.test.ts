@@ -6,6 +6,7 @@ import {
   healthDetailLines,
   healthLine,
   lastSyncLines,
+  projectGitDeferralRepos,
   progressLabel,
   relTime,
   renderGitDeferralLine,
@@ -70,6 +71,24 @@ test("renderGitDeferralLine sanitizes branches, hides detached OIDs, and marks c
     checkout: { kind: "detached", label: "deadbeef" },
     now: NOW,
   })).toBe("git deferred 1h: local commits on detached checkout (repo)");
+});
+
+test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, and bytes OR", () => {
+  const projected = projectGitDeferralRepos([
+    { repo: "repo", deferral: { lane: "capture", reason: "local-commits", deferredSince: iso(3600), bytesChanged: true } },
+    { repo: "repo", deferral: { lane: "apply", reason: "local-edits", deferredSince: iso(60), checkout: { kind: "branch", label: "main" } } },
+    { repo: "other", deferral: { lane: "config", reason: "config", deferredSince: iso(30) } },
+  ]);
+  expect(projected).toEqual([
+    {
+      repo: "repo",
+      oldestDeferredSince: iso(3600),
+      displayReason: "local-edits",
+      bytesChanged: true,
+      checkout: { kind: "branch", label: "main" },
+    },
+    { repo: "other", oldestDeferredSince: iso(30), displayReason: "config", bytesChanged: false },
+  ]);
 });
 
 // ── progressLabel ─────────────────────────────────────────────────────────────

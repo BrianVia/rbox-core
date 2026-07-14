@@ -148,6 +148,15 @@ test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
   expect(withoutSnapshot).not.toMatch(/\b[0-9a-f]{40}\b/);
 });
 
+test("show-me sanitizes terminal controls from every non-JSON output line", async () => {
+  await fixture();
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--amend", "-qm", "subject\u001b[2Jforged");
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(lines))).toBe(0);
+  expect(lines.join("\n")).toContain("subjectforged");
+  expect(lines.join("\n")).not.toMatch(/[\u001b\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/);
+});
+
 test("take-theirs quarantines, pins, follows under the kill switch, and clears state", async () => {
   const { incoming, localTip } = await fixture();
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "0" })).toBe(false);

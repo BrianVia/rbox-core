@@ -4,7 +4,7 @@ import { constants, type Stats } from "node:fs";
 import { indexByPath } from "./diff.js";
 import type { DirCache, DirCacheChild } from "./dircache.js";
 import { hashBytes, hashFile } from "./hash.js";
-import { HashCache } from "./hashcache.js";
+import { HashCache, type HashCacheStatIdentity } from "./hashcache.js";
 import type { IgnoreMatcher } from "./ignore.js";
 import { isSafeRelPath } from "./manifest-validate.js";
 import { statsStableAcrossHash } from "./manifest.js";
@@ -309,6 +309,7 @@ class ManifestOracle implements AppliedManifestOracle {
     private readonly oracleManifest: Manifest,
     private readonly scanDeferred: Set<string>,
     private readonly dircache?: DirCache,
+    private readonly preScanHashCache?: HashCache,
   ) {}
 
   receiptHash(rel: string): string | undefined {
@@ -438,7 +439,14 @@ class ManifestOracle implements AppliedManifestOracle {
     }
 
     for (const [expected, actual] of aligned.pairs) {
-      const verified = await this.verifyFastEntry(expected, actual.path, projected.touchedKeys.has(equivalentPath(expected.path, eq)), preGroups.get(equivalentPath(expected.path, eq))?.[0]);
+      const pre = preGroups.get(equivalentPath(expected.path, eq))?.[0];
+      const verified = await this.verifyFastEntry(
+        expected,
+        actual.path,
+        projected.touchedKeys.has(equivalentPath(expected.path, eq)),
+        pre,
+        pre ? this.preScanHashCache?.statIdentity(pre.path, pre.sha256) : undefined,
+      );
       if (verified.kind !== "match") {
         if (verified.kind === "mismatch") {
           return this.scanAndCompareProjected(rel, eq, projected);
@@ -457,7 +465,13 @@ class ManifestOracle implements AppliedManifestOracle {
     return semantic;
   }
 
-  private async verifyFastEntry(expected: FileEntry, actualPath: string, touched: boolean, pre?: FileEntry): Promise<EntryVerification> {
+  private async verifyFastEntry(
+    expected: FileEntry,
+    actualPath: string,
+    touched: boolean,
+    pre?: FileEntry,
+    preStat?: HashCacheStatIdentity,
+  ): Promise<EntryVerification> {
     const abs = this.abs(actualPath);
     let st: Stats;
     try {
@@ -484,10 +498,16 @@ class ManifestOracle implements AppliedManifestOracle {
     } catch {
       return indeterminate("repo entry is unreadable");
     }
-    const tokenAgrees = touched
-      ? st.size === expected.size
-      : pre !== undefined && st.size === pre.size && st.mtimeMs === pre.mtimeMs;
-    if (tokenAgrees) return { kind: "match", token: tokenFromStat(st) };
+    // An action-touched entry is never accepted from stat metadata: a human edit
+    // can replace the just-applied bytes with equal-sized content and restore its
+    // mtime before Git classification. Untouched entries retain the scan fast path,
+    // but only when every pre-scan stat field still available agrees.
+    const untouchedTokenAgrees = !touched && pre !== undefined &&
+      st.size === pre.size && st.mtimeMs === pre.mtimeMs &&
+      (preStat === undefined || (
+        st.size === preStat.size && st.mtimeMs === preStat.mtimeMs && st.ctimeMs === preStat.ctimeMs
+      ));
+    if (untouchedTokenAgrees) return { kind: "match", token: tokenFromStat(st) };
     try {
       const before = st;
       const sha256 = await hashFile(abs, before.size);
@@ -666,6 +686,9 @@ export function oracleFromPull(opts: {
   oracle: Manifest;
   matcher: IgnoreMatcher;
   dircache?: DirCache;
+  /** Hash cache used by preScan. Untouched files may trust its mtime+size+ctime
+   *  identity; action-touched files are always content-hashed. */
+  hashcache?: HashCache;
   root: string;
   scanDeferred: Set<string>;
 }): AppliedManifestOracle {
@@ -697,7 +720,7 @@ export function oracleFromPull(opts: {
       ...(invalidWhy ? { invalidWhy } : {}),
     };
   };
-  return new ManifestOracle("pull", opts.root, opts.matcher, source, opts.oracle, opts.scanDeferred, opts.dircache);
+  return new ManifestOracle("pull", opts.root, opts.matcher, source, opts.oracle, opts.scanDeferred, opts.dircache, opts.hashcache);
 }
 
 export function oracleFromState(opts: {

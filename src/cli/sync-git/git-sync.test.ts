@@ -1396,6 +1396,25 @@ test("pending: outbound pushes CARRY the pending section (never the stale base) 
   expect(await fs.readFile(path.join(b, "f.txt"), "utf8")).toBe("v2");
 }, 20_000);
 
+test("standing apply deferral marks pushed repo bytes changed, survives restart, and clears with the episode", async () => {
+  const { b, lock } = await makePending("bytes-marker");
+  const before = repoRecordsForState(await st(rootB))["bytes-marker"]!.deferrals!.apply!;
+  expect(before.bytesChanged).toBeUndefined();
+
+  await fs.writeFile(path.join(b, "f.txt"), "human bytes during deferral");
+  await push(rootB, cfgB, depsB);
+
+  const restarted = await st(rootB);
+  const marked = repoRecordsForState(restarted)["bytes-marker"]!.deferrals!.apply!;
+  expect(marked.bytesChanged).toBe(true);
+  expect(marked.deferredSince).toBe(before.deferredSince);
+  expect(marked.lastSeen).toBe(before.lastSeen);
+
+  await fs.rm(lock);
+  await pull(rootB, cfgB, depsB);
+  expect(repoRecordsForState(await st(rootB))["bytes-marker"]?.deferrals?.apply).toBeUndefined();
+}, 20_000);
+
 test("remote absence while partial: absence supersedes pending+partial [v6] — state clears with no outbound resurrection", async () => {
   const { a, b, lock } = await makePending("r");
   const partialState = await st(rootB);

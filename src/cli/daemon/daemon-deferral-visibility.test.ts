@@ -21,7 +21,7 @@ function deferral(overrides: Partial<GitDeferral> = {}): GitDeferral {
   };
 }
 
-test("durable git deferral lines dedup per lane, reason transition, and coarse age boundary", () => {
+test("durable git deferral lines dedup per repo, reason transition, and coarse age boundary", () => {
   const seen = new Map<string, GitDeferralLogSeen>();
   const initial = state({ apply: deferral() });
   expect(durableGitDeferralLines(initial, seen, START + 30 * 60_000)).toEqual([
@@ -40,8 +40,9 @@ test("durable git deferral lines dedup per lane, reason transition, and coarse a
     apply: transitioned.repoRecords!["repo\u001b[31m"]!.deferrals!.apply!,
     capture: deferral({ lane: "capture", reason: "local-commits", deferredSince: new Date(START + 62 * 60_000).toISOString() }),
   });
-  expect(durableGitDeferralLines(twoLanes, seen, START + 63 * 60_000)).toHaveLength(1);
+  const collapsed = durableGitDeferralLines(twoLanes, seen, START + 63 * 60_000);
+  expect(collapsed).toHaveLength(1);
+  expect(collapsed[0]).toContain("git deferred 1h: local commits");
   expect(durableGitDeferralLines(state(), seen, START + 64 * 60_000)).toEqual([]);
   expect(durableGitDeferralLines(initial, seen, START + 65 * 60_000)).toHaveLength(1); // new episode after clear
 });
-

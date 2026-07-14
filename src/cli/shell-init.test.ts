@@ -176,6 +176,16 @@ test("shell.deferrals routes on component boundaries and chooses the deepest enc
   expect(driveHooks(writeScript(), ws, join(ws, "repository")).glyph).toContain("✓");
 });
 
+test("shell.deferrals root overflow row warns an omitted 51st repo while explicit rows win", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const explicit = Array.from({ length: 49 }, (_, i) => `repo${i}\tlocal-edits\t14d\t0`).join("\n");
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`, `v1\n${explicit}\n.\tother\t1h\t1\n`);
+  for (let i = 0; i < 51; i++) mkdirSync(join(ws, `repo${i}`), { recursive: true });
+  expect(driveHooks(writeScript(), ws, join(ws, "repo1")).glyph).toContain("⚠git:14d");
+  expect(driveHooks(writeScript(), ws, join(ws, "repo50")).glyph).toContain("⚠git:1h+files");
+});
+
 test("malformed or oversized shell.deferrals is ignored whole", () => {
   if (!ZSH) return;
   const now = Math.floor(Date.now() / 1000);

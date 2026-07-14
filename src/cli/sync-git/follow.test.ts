@@ -18,9 +18,9 @@ import {
   type Manifest,
 } from "../../engine/index.js";
 import { repoCtx } from "../../engine/git/shared.js";
-import { loadState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
-import { saveStateSource } from "../sync-state.js";
+import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { checkoutJournalBinding, FollowCrashInjectedError, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
 import { planGitSections } from "./plan.js";
@@ -180,6 +180,29 @@ test("field incident follows an incoming branch switch", async () => {
   await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
 });
 
+test("degraded clean arm defers a sibling-owned intersection as a whole section", async () => {
+  await commit("one\n", "c1");
+  const baseTip = await commit("two\n", "c2");
+  await git(sender, "branch", "side", baseTip);
+  const base = await capture();
+  await materialize(base);
+
+  const sibling = path.join(tmp, "receiver-side-worktree");
+  await git(receiver, "worktree", "add", "-q", sibling, "side");
+  const incomingTip = await commit("three\n", "c3");
+  await git(sender, "branch", "-f", "side", incomingTip);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+
+  const { outcome } = await applyIncoming(stateWith(base), incoming, matchingOracle, { degradedMutex: true });
+  expect(outcome.gitRepos?.repo).toEqual(base);
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+  expect(outcome.partial?.repo).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(base.refs["refs/heads/main"]);
+  expect(await git(sibling, "rev-parse", "refs/heads/side")).toBe(baseTip);
+});
+
 test("field incident follows a contained stale tip to detached incoming HEAD", async () => {
   const { c1, state, incoming } = await baseAndIncoming("detached");
   const old = await git(receiver, "rev-parse", "refs/heads/main");
@@ -215,6 +238,32 @@ test("disposition: staged index changes defer local-index", async () => {
   expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-index");
   expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
 });
+
+for (const semanticEdit of ["skip-worktree", "assume-unchanged", "intent-to-add"] as const) {
+  test(`clean production arm preserves ${semanticEdit} and defers local-index`, async () => {
+    const { state, incoming } = await baseAndIncoming();
+    const baseTip = await git(receiver, "rev-parse", "HEAD");
+    if (semanticEdit === "intent-to-add") {
+      await fs.writeFile(path.join(receiver, "intent.txt"), "human intent\n");
+      await git(receiver, "add", "-N", "intent.txt");
+    } else {
+      await git(receiver, "update-index", `--${semanticEdit}`, "tracked.txt");
+    }
+    const projectionBefore = await indexIdentityV2(receiver, path.join(receiver, ".git", "index"));
+    const { outcome } = await applyIncoming(state, incoming);
+    expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-index");
+    expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+    expect(await git(receiver, "rev-parse", "HEAD")).toBe(baseTip);
+    expect(await indexIdentityV2(receiver, path.join(receiver, ".git", "index"))).toBe(projectionBefore);
+    if (semanticEdit === "skip-worktree") {
+      expect(await git(receiver, "ls-files", "-v", "tracked.txt")).toStartWith("S ");
+    } else if (semanticEdit === "assume-unchanged") {
+      expect(await git(receiver, "ls-files", "-v", "tracked.txt")).toStartWith("h ");
+    } else {
+      expect(await git(receiver, "ls-files", "--debug", "intent.txt")).toContain("flags: 20004000");
+    }
+  });
+}
 
 test("design safety: local merge state defers local-operation", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
@@ -334,7 +383,7 @@ test("deferredSince survives a partial follow followed by a new defer reason", a
     values: {
       bases: first.outcome.gitRepos,
       pending: first.outcome.gitPendingRemote,
-      deferrals: first.outcome.deferrals,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), first.outcome.deferrals),
       partial: first.outcome.partial,
       idxProj: first.outcome.idxProj,
     },
@@ -741,7 +790,7 @@ test("crash before journal clear leaves published state recoverable without dupl
       bases: first.outcome.gitRepos,
       pending: first.outcome.gitPendingRemote,
       resolutions: first.outcome.gitNeedsResolution,
-      deferrals: first.outcome.deferrals,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), first.outcome.deferrals),
       partial: first.outcome.partial,
       idxProj: first.outcome.idxProj,
     },
@@ -801,7 +850,7 @@ test("published partial recovery is idempotent after a branch-switch hold", asyn
     values: {
       bases: first.outcome.gitRepos,
       pending: first.outcome.gitPendingRemote,
-      deferrals: first.outcome.deferrals,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), first.outcome.deferrals),
       partial: first.outcome.partial,
       idxProj: first.outcome.idxProj,
     },

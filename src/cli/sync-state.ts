@@ -5,6 +5,7 @@ import {
   applyStateSavePacket,
   expectedStateNonce,
   loadRawState,
+  MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
   saveState,
   stateFromRepoRecords,
@@ -20,7 +21,14 @@ import {
 } from "./config.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+/** Planner-facing lane results. Persistence converts these to ordered
+ * transitions with orderedDeferralUpdates() before a generation-CAS save. */
 export type GitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferral | null>>;
+export type GitDeferralTransition =
+  | { set: GitDeferral; ifPreviouslyAbsent: true }
+  | { set: GitDeferral; ifLastSeenAtMost: string }
+  | { clear: true; ifLastSeenAtMost: string };
+export type OrderedGitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferralTransition>>;
 
 export function configLaneState(record: ConfigLaneState): ConfigLaneState {
   return {
@@ -40,8 +48,10 @@ export interface RepoStateValues {
    * means preserve them. This rides the same generation-CAS transition as base and
    * pending; there is never a second config-only state write. */
   configLane?: Record<string, ConfigLaneState>;
-  /** Missing repo/lane preserves it; null repo clears all lanes; null lane clears it. */
-  deferrals?: Record<string, GitDeferralUpdates | null>;
+  /** Missing repo/lane preserves it. Every transition is bound to the lane
+   * predecessor observed by its writer, so a CAS recompute cannot clear or
+   * resurrect a newer episode. */
+  deferrals?: Record<string, OrderedGitDeferralUpdates>;
   partial?: Record<string, GitPartialApply | null>;
   /** Semantic projection of the last applied index; null clears a stale cache. */
   idxProj?: Record<string, string | null>;
@@ -93,17 +103,66 @@ const inputRecord = (record: RepoRecord): RepoRecordInput => {
   return input;
 };
 
-export function mergeDeferrals(
+const isStrictlyNewer = (candidate: string, bound: string): boolean => {
+  const candidateMs = Date.parse(candidate);
+  const boundMs = Date.parse(bound);
+  return Number.isFinite(candidateMs) && Number.isFinite(boundMs) ? candidateMs > boundMs : candidate > bound;
+};
+
+export function orderedDeferralUpdates(
   current: GitDeferrals | undefined,
   incoming: GitDeferralUpdates | null | undefined,
+): OrderedGitDeferralUpdates | undefined {
+  if (incoming === undefined) return undefined;
+  const updates: OrderedGitDeferralUpdates = {};
+  for (const lane of ["apply", "capture", "config"] as const) {
+    const previous = current?.[lane];
+    const value = incoming === null ? null : incoming[lane];
+    if (value === undefined) continue;
+    if (value === null) {
+      if (previous) updates[lane] = { clear: true, ifLastSeenAtMost: previous.lastSeen };
+      continue;
+    }
+    updates[lane] = previous
+      ? { set: value, ifLastSeenAtMost: previous.lastSeen }
+      : { set: value, ifPreviouslyAbsent: true };
+  }
+  return Object.keys(updates).length === 0 ? undefined : updates;
+}
+
+export function orderedRepoDeferralUpdates(
+  current: Record<string, RepoRecord>,
+  incoming: Record<string, GitDeferralUpdates | null> | undefined,
+): Record<string, OrderedGitDeferralUpdates> | undefined {
+  if (incoming === undefined) return undefined;
+  const updates: Record<string, OrderedGitDeferralUpdates> = {};
+  for (const [relPath, lanes] of Object.entries(incoming)) {
+    const ordered = orderedDeferralUpdates(current[relPath]?.deferrals, lanes);
+    if (ordered !== undefined) updates[relPath] = ordered;
+  }
+  return Object.keys(updates).length === 0 ? undefined : updates;
+}
+
+export function mergeDeferrals(
+  current: GitDeferrals | undefined,
+  incoming: OrderedGitDeferralUpdates | undefined,
 ): GitDeferrals | undefined {
   if (incoming === undefined) return current;
-  if (incoming === null) return undefined;
   const merged: GitDeferrals = { ...(current ?? {}) };
   for (const lane of ["apply", "capture", "config"] as const) {
-    const value = incoming[lane];
-    if (value === null) delete merged[lane];
-    else if (value !== undefined) merged[lane] = value;
+    const transition = incoming[lane];
+    if (transition === undefined) continue;
+    const present = merged[lane];
+    if ("clear" in transition) {
+      if (present && !isStrictlyNewer(present.lastSeen, transition.ifLastSeenAtMost)) delete merged[lane];
+      continue;
+    }
+    // A set computed from a standing predecessor cannot resurrect that episode
+    // after a concurrent clear. Otherwise only a strictly newer standing truth
+    // wins; equal/older observations may be refreshed by this source.
+    if (present === undefined && "ifLastSeenAtMost" in transition) continue;
+    if (present && isStrictlyNewer(present.lastSeen, transition.set.lastSeen)) continue;
+    merged[lane] = transition.set;
   }
   return Object.keys(merged).length === 0 ? undefined : merged;
 }
@@ -167,6 +226,17 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
+  const legacyMap = <T>(pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined => {
+    const result: Record<string, T> = {};
+    for (const [relPath, record] of Object.entries(records).sort(([a], [b]) => a.localeCompare(b))) {
+      const value = pick(record);
+      if (value !== undefined) {
+        result[relPath] = value;
+        if (Object.keys(result).length === MAX_LEGACY_GIT_SIDECAR_REPOS) break;
+      }
+    }
+    return Object.keys(result).length === 0 ? undefined : result;
+  };
   return {
     ...stateFromRepoRecords({
       ...snapshot,
@@ -178,6 +248,8 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
     stateNonce: undefined,
     stateRevision: undefined,
     repoRecords: undefined,
+    gitDeferrals: legacyMap((record) => record.deferrals),
+    gitPartial: legacyMap((record) => record.partial),
   };
 }
 

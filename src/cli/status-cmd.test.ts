@@ -259,6 +259,29 @@ test("status renders durable lanes oldest-first with reason precedence and safe 
   expect(out).not.toContain("0123456789abcdef");
 });
 
+test("degraded legacy deferral reload retains status reason and age", async () => {
+  const deferredSince = new Date(NOW - 15 * 86400_000).toISOString();
+  await saveState(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: new Date(NOW - 20_000).toISOString(), files: [] },
+    gitDeferrals: {
+      legacy: {
+        apply: {
+          lane: "apply",
+          reason: "unsupported",
+          deferredSince,
+          reasonSince: deferredSince,
+          lastSeen: deferredSince,
+        },
+      },
+    },
+  });
+  const out = await captureStatus({});
+  expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
+  expect(out).toContain("git deferred 14d: unsupported git state on checkout unavailable (legacy)");
+});
+
 test("status --json exposes only the stable local deferral projection and cannot report ok", async () => {
   await saveDeferralState();
   const parsed = JSON.parse(await captureStatus({ json: true })) as Record<string, any>;
@@ -290,6 +313,31 @@ test("status --json exposes only the stable local deferral projection and cannot
       reason: "git-busy",
       deferredSince: new Date(NOW - 2 * 86400_000).toISOString(),
       reasonSince: new Date(NOW - 2 * 86400_000).toISOString(),
+      ageSeconds: 2 * 86400,
+      bytesChanged: false,
+    },
+  ]);
+  expect(parsed.git.deferredRepos).toEqual([
+    {
+      repo: "zeta",
+      oldestDeferredSince: new Date(NOW - 15 * 86400_000).toISOString(),
+      displayReason: "local-commits",
+      ageSeconds: 15 * 86400,
+      bytesChanged: false,
+      checkout: { kind: "detached" },
+    },
+    {
+      repo: "alpha",
+      oldestDeferredSince: new Date(NOW - 2 * 86400_000).toISOString(),
+      displayReason: "local-edits",
+      ageSeconds: 2 * 86400,
+      bytesChanged: true,
+      checkout: { kind: "branch", label: "release/0.9" },
+    },
+    {
+      repo: "beta",
+      oldestDeferredSince: new Date(NOW - 2 * 86400_000).toISOString(),
+      displayReason: "git-busy",
       ageSeconds: 2 * 86400,
       bytesChanged: false,
     },
@@ -331,7 +379,7 @@ test("typed divergence seam deferrals gate health even when local detail records
   expect(out.split("\n").filter((line) => line.includes("git deferred "))).toHaveLength(0);
 });
 
-test("health counts unique repos while git-sync aggregate counts deferred lanes", async () => {
+test("one repo with multiple lanes renders one repo-level line and count", async () => {
   const at = new Date(NOW - 86_400_000).toISOString();
   await saveState(root, {
     stream: syncStreamId(cfg),
@@ -350,6 +398,8 @@ test("health counts unique repos while git-sync aggregate counts deferred lanes"
   });
   const out = await captureStatus({});
   expect(out).toContain("1 git repo deferred");
-  expect(out).toContain("git-sync: 0 repos synced · 2 deferred");
-  expect(out.split("\n").filter((line) => line.includes("git deferred "))).toHaveLength(2);
+  expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
+  const rows = out.split("\n").filter((line) => line.includes("git deferred "));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toContain("local edits");
 });

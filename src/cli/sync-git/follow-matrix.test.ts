@@ -19,7 +19,7 @@ import {
 import { readOpState } from "../../engine/git/refs.js";
 import { hashFile } from "../../engine/hash.js";
 import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
-import { saveStateSource } from "../sync-state.js";
+import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { gitIncomingKey } from "./shared.js";
 
@@ -223,7 +223,7 @@ async function persist(root: string, state: SyncState, outcome: Awaited<ReturnTy
       removals: outcome.gitReposRemoved,
       resolutions: outcome.gitNeedsResolution,
       configLane: outcome.configLane,
-      deferrals: outcome.deferrals,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), outcome.deferrals),
       partial: outcome.partial,
       idxProj: outcome.idxProj,
     },
@@ -424,6 +424,30 @@ describe("design 116 generated disposition matrix", () => {
     },
     20_000,
   );
+});
+
+describe("production clean-arm working-byte residual", () => {
+  test.each(["ff", "branch-switch", "detached"] as const)("%s metadata-base-clean human dirt", async (topology) => {
+    const { root, repo, template, incoming } = await cloneCase({ topology, syncDirt: 1, label: "clean-arm-human-dirt" });
+    try {
+      const humanBytes = `human-clean-arm-${topology}\n`;
+      await fs.writeFile(path.join(repo, "tracked.txt"), humanBytes);
+      const result = await applyIncoming(root, stateWith(template.base), incoming, realOracle(root, template.expectedBytes[1]));
+
+      // Documented post-116 residual: metadata-base-clean working-byte-only dirt
+      // still enters the legacy clean arm, whose metadata-only apply does not call
+      // the follow oracle. The next design cycle owns routing this case through the
+      // oracle; this review round must pin the production disposition without
+      // broadening the adjudicated fix.
+      expect(result.logs).toContain(`git-sync applied ${REL}`);
+      expect(result.outcome.gitRepos?.[REL]).toEqual(incoming);
+      expect(result.outcome.gitPendingRemote?.[REL]).toBeUndefined();
+      expect(result.outcome.deferrals?.[REL]?.apply).toBeUndefined();
+      expect(await fs.readFile(path.join(repo, "tracked.txt"), "utf8")).toBe(humanBytes);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 const crossingCases = (["ff", "branch-switch", "detached"] as const).flatMap((topology) => [

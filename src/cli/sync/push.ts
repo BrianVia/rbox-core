@@ -26,7 +26,7 @@ import {
   nextDeferral,
 } from "../sync-git.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { changedSidecarRepoKeys, observedRepoKeys, saveStateSource, type GitDeferralUpdates } from "../sync-state.js";
+import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
@@ -385,7 +385,7 @@ async function runPushAttempt(
   );
   // Visibility is durable as soon as planning settles. This sidecar-only packet carries
   // the accepted sequence and therefore cannot claim a candidate commit that later fails.
-  const deferralUpdates: Record<string, GitDeferralUpdates | null> = {};
+  const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};
   const repoRecords = repoRecordsForState(state);
   const now = new Date().toISOString();
   for (const rel of gitPlan.captureObserved) {
@@ -405,7 +405,31 @@ async function runPushAttempt(
         lanes.config = next;
       } else if (current?.config) lanes.config = null;
     }
-    if (Object.keys(lanes).length > 0) deferralUpdates[rel] = lanes;
+    const ordered = orderedDeferralUpdates(current, lanes);
+    if (ordered !== undefined) deferralUpdates[rel] = ordered;
+  }
+  // A standing apply episode is also a warning that the checkout metadata may
+  // describe older working bytes. Once this push observes a file-plane change
+  // anywhere in that repo subtree, retain the marker monotonically until the
+  // apply episode itself clears. This is sender-local state only; it never enters
+  // the manifest or changes the apply lane's retry timestamp.
+  const changedPaths = [
+    ...filesDiff.added.map((entry) => entry.path),
+    ...filesDiff.changed.map((entry) => entry.path),
+    ...filesDiff.deleted,
+  ];
+  for (const [rel, record] of Object.entries(repoRecords)) {
+    const apply = record.deferrals?.apply;
+    if (!apply || apply.bytesChanged === true) continue;
+    const intersects = changedPaths.some((filePath) =>
+      rel === "." || filePath === rel || filePath.startsWith(`${rel}/`));
+    if (!intersects) continue;
+    const ordered = orderedDeferralUpdates(record.deferrals, {
+      apply: { ...apply, bytesChanged: true },
+    });
+    if (ordered?.apply) {
+      deferralUpdates[rel] = { ...(deferralUpdates[rel] ?? {}), apply: ordered.apply };
+    }
   }
   const deferralValues = {
     bases: state.lastSyncedManifest.gitRepos,

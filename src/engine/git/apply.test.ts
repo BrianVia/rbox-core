@@ -165,3 +165,107 @@ test("design 116 phase-0: pointer publish to an identical sibling-owned OID is n
   expect(result.filteredRefs).toBeUndefined();
   expect(await git(main, "rev-parse", "main")).toBe(incoming.refs["refs/heads/main"]);
 });
+
+test("design 116 F3: sibling advance after import is held at the mutation boundary", async () => {
+  const { sender, receiver, sideOid } = await incidentBaseline();
+  const worktree = path.join(tmp, "boundary-advance-side");
+  await git(receiver, "worktree", "add", worktree, "side");
+  await commit(sender, "main.txt", "incoming", "advance main");
+  const incoming = await capture(sender);
+  let humanOid = "";
+
+  const result = await applyGitState(receiver, incoming, store, KEK, {
+    beforeMutate: async () => {
+      await commit(worktree, "human.txt", "human", "human sibling advance");
+      humanOid = await git(worktree, "rev-parse", "HEAD");
+    },
+  });
+
+  expect(humanOid).not.toBe(sideOid);
+  expect(result.applied).toBe(true);
+  expect(result.heldRefs).toEqual({ "refs/heads/side": path.basename(worktree) });
+  expect(await git(receiver, "rev-parse", "main")).toBe(incoming.refs["refs/heads/main"]);
+  expect(await git(receiver, "rev-parse", "side")).toBe(humanOid);
+  expect(await git(worktree, "rev-parse", "HEAD")).toBe(humanOid);
+});
+
+test("design 116 F3: newly attached sibling ref is held at the mutation boundary", async () => {
+  const { sender, receiver, sideOid } = await incidentBaseline();
+  await git(sender, "checkout", "-q", "side");
+  await commit(sender, "incoming-side.txt", "incoming", "advance incoming side");
+  await git(sender, "checkout", "-q", "main");
+  await commit(sender, "main.txt", "incoming", "advance main");
+  const incoming = await capture(sender);
+  const worktree = path.join(tmp, "boundary-attach-side");
+
+  const result = await applyGitState(receiver, incoming, store, KEK, {
+    beforeMutate: async () => {
+      await git(receiver, "worktree", "add", worktree, "side");
+    },
+  });
+
+  expect(result.applied).toBe(true);
+  expect(result.heldRefs).toEqual({ "refs/heads/side": path.basename(worktree) });
+  expect(await git(receiver, "rev-parse", "main")).toBe(incoming.refs["refs/heads/main"]);
+  expect(await git(receiver, "rev-parse", "side")).toBe(sideOid);
+  expect(await git(worktree, "rev-parse", "HEAD")).toBe(sideOid);
+});
+
+test("design 116 F3: newly owned incoming HEAD defers the whole section at the mutation boundary", async () => {
+  const { sender, receiver } = await incidentBaseline();
+  await git(receiver, "checkout", "-q", "--detach");
+  await commit(sender, "main.txt", "incoming", "advance main");
+  const incoming = await capture(sender);
+  const mainBefore = await git(receiver, "rev-parse", "main");
+  const worktree = path.join(tmp, "boundary-head-main");
+
+  const result = await applyGitState(receiver, incoming, store, KEK, {
+    beforeMutate: async () => {
+      await git(receiver, "worktree", "add", worktree, "main");
+    },
+  });
+
+  expect(result.applied).toBe(false);
+  expect(result.reason).toContain("worktree-ownership");
+  expect(result.reason).toContain(path.basename(worktree));
+  expect(await git(receiver, "rev-parse", "main")).toBe(mainBefore);
+});
+
+test("design 116 F1b: all-scope deletion pins reflog-only human commits", async () => {
+  const { sender, receiver } = await incidentBaseline();
+  await git(receiver, "checkout", "-qb", "doomed");
+  await commit(receiver, "human.txt", "human", "human reflog-only commit");
+  const humanOid = await git(receiver, "rev-parse", "HEAD");
+  await git(receiver, "checkout", "-q", "main");
+  await git(receiver, "branch", "-f", "doomed", "main");
+
+  const result = await applyGitState(receiver, await capture(sender), store, KEK);
+
+  expect(result.applied).toBe(true);
+  await expect(git(receiver, "rev-parse", "--verify", "refs/heads/doomed")).rejects.toThrow();
+  expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${humanOid}`)).toBe(humanOid);
+  const origins = JSON.parse(await fs.readFile(path.join(receiver, ".git", "rbox-keep-origins.json"), "utf8"));
+  expect(origins[humanOid]).toContainEqual(expect.objectContaining({ ref: "refs/heads/doomed", class: "human" }));
+});
+
+test("design 116 F5: legacy ownership mode defers the whole section without partial publication", async () => {
+  const { sender, receiver, sideOid } = await incidentBaseline();
+  const worktree = path.join(tmp, "legacy-held-side");
+  await git(receiver, "worktree", "add", worktree, "side");
+  await git(sender, "checkout", "-q", "side");
+  await commit(sender, "side.txt", "incoming side", "advance side");
+  await git(sender, "checkout", "-q", "main");
+  await commit(sender, "main.txt", "incoming main", "advance main");
+  const incoming = await capture(sender);
+  const mainBefore = await git(receiver, "rev-parse", "main");
+
+  const result = await applyGitState(receiver, incoming, store, KEK, {
+    legacyWholeSectionOwnership: true,
+  });
+
+  expect(result.applied).toBe(false);
+  expect(result.reason).toContain("worktree-ownership");
+  expect(result.heldRefs).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "main")).toBe(mainBefore);
+  expect(await git(receiver, "rev-parse", "side")).toBe(sideOid);
+});

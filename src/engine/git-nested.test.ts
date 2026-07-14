@@ -623,15 +623,15 @@ test("a rolled-back apply leaks NO stash reflog entries (git stash list stays cl
   const section = await captureGitState(A, store, KEK);
   expect(section!.refs["refs/stash"]).toBeDefined();
 
-  // Sabotage: a syncable ref pointing at an object the bundle doesn't carry —
-  // update-ref fails AFTER refs/stash published (insertion order puts it last),
-  // forcing the rollback path.
-  const bogus: typeof section = { ...section!, refs: { ...section!.refs, "refs/heads/zzz": "f".repeat(40) } };
-
   const B = path.join(tmp, "B");
   await initRepo(B);
   await commit(B, "g.txt", "y", "c1");
-  const res = await applyGitState(B, bogus!, store, KEK);
+  // Force a failure after refs/stash publishes. A per-ref CAS failure is now an
+  // intentional partial hold (design 116 F3), so the final mutation hook is the
+  // deterministic rollback injection for this rollback-specific assertion.
+  const res = await applyGitState(B, section!, store, KEK, {
+    afterGitMutate: async () => { throw new Error("rollback injection"); },
+  });
   expect(res.applied).toBe(false);
   expect(res.reason).toContain("rolled back");
   // the ref rollback also rolled back the REFLOG the stash publish appended —

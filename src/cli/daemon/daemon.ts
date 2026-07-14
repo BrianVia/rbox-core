@@ -64,7 +64,7 @@ import {
 import { saveAmbientDaemonStatus } from "../ambient-status-writer.js";
 import { RBOX_VERSION } from "../version.js";
 import { daemonBindingMatches } from "../sync-state.js";
-import { ageBucket, renderGitDeferralLine } from "../status-view.js";
+import { ageBucket, projectGitDeferralRepos, renderGitDeferralLine } from "../status-view.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "../sync-mutex.js";
 import { repairChain, type SuffixInfo } from "../chain-repair.js";
 import {
@@ -112,24 +112,31 @@ export function durableGitDeferralLines(
 ): string[] {
   const active = new Set<string>();
   const pending: Array<{ at: number; line: string }> = [];
-  for (const [relPath, record] of Object.entries(repoRecordsForState(state))) {
-    for (const [lane, deferral] of Object.entries(record.deferrals ?? {})) {
-      if (!deferral) continue;
-      const key = `${relPath}\0${lane}`;
-      active.add(key);
-      const displayBucket = ageBucket(deferral.deferredSince, now);
-      // Minute precision is useful on first display, but only the normative coarse
-      // boundaries trigger later lines (never one line per minute before 1h).
-      const boundary = displayBucket.endsWith("m") ? "<1h" : displayBucket;
-      const previous = seen.get(key);
-      if (!previous || previous.reason !== deferral.reason || previous.boundary !== boundary) {
-        pending.push({
-          at: Date.parse(deferral.deferredSince),
-          line: renderGitDeferralLine({ relPath, ...deferral, now }),
-        });
-      }
-      seen.set(key, { reason: deferral.reason, boundary });
+  const projections = projectGitDeferralRepos(Object.entries(repoRecordsForState(state)).flatMap(([repo, record]) =>
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
+  ));
+  for (const deferral of projections) {
+    const key = deferral.repo;
+    active.add(key);
+    const displayBucket = ageBucket(deferral.oldestDeferredSince, now);
+    // Minute precision is useful on first display, but only the normative coarse
+    // boundaries trigger later lines (never one line per minute before 1h).
+    const boundary = displayBucket.endsWith("m") ? "<1h" : displayBucket;
+    const previous = seen.get(key);
+    if (!previous || previous.reason !== deferral.displayReason || previous.boundary !== boundary) {
+      pending.push({
+        at: Date.parse(deferral.oldestDeferredSince),
+        line: renderGitDeferralLine({
+          relPath: deferral.repo,
+          reason: deferral.displayReason,
+          deferredSince: deferral.oldestDeferredSince,
+          checkout: deferral.checkout,
+          bytesChanged: deferral.bytesChanged,
+          now,
+        }),
+      });
     }
+    seen.set(key, { reason: deferral.displayReason, boundary });
   }
   for (const key of seen.keys()) if (!active.has(key)) seen.delete(key);
   return pending.sort((a, b) => a.at - b.at || a.line.localeCompare(b.line)).map((row) => row.line);

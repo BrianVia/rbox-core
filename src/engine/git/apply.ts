@@ -7,6 +7,7 @@ import { validateGitSection } from "../manifest-validate.js";
 import type { GitSection } from "../types.js";
 import {
   addTimedMs,
+  HEX40,
   type GitChainTimings,
   type RepoCtx,
   clearIndexResolveUndo,
@@ -26,6 +27,9 @@ import { listRefs, readAllRefs, restoreOpState } from "./refs.js";
 import { pruneStaleScratchRefs } from "./pins.js";
 import { quarantineLocal } from "./quarantine.js";
 import { restoreLocal, snapshotLocal } from "./rollback.js";
+import { prepareDisplacedRefPins, runUpdateRefTransaction } from "./keep-pins.js";
+
+const ZERO_OID = "0".repeat(40);
 
 // ---- apply (design 43 §7) -------------------------------------------------------
 
@@ -67,12 +71,14 @@ async function classifyWorktreeOwnership(
   ctx: RepoCtx,
   section: GitSection,
   deletesAbsent: boolean,
-  beforeMutateWipesRefs: boolean
+  beforeMutateWipesRefs: boolean,
+  legacyWholeSectionOwnership = false,
+  localRefs?: Record<string, string>,
 ): Promise<{ heldRefs: Map<string, string>; deferReason?: string }> {
   const owned = await branchesCheckedOutElsewhere(ctx);
   const heldRefs = new Map<string, string>();
   if (owned.size === 0) return { heldRefs };
-  const localRefs = await readAllRefs(ctx.repoDir);
+  const refs = localRefs ?? await readAllRefs(ctx.repoDir);
   const shortName = (ref: string) => ref.replace(/^refs\/heads\//, "");
   const collision = (ref: string, suffix = "") => `worktree-ownership: branch ${shortName(ref)} checked out in linked worktree ${owned.get(ref)}${suffix}`;
   // HEAD move is a checkout-plane collision even when its ref OID is already equal:
@@ -82,18 +88,35 @@ async function classifyWorktreeOwnership(
   // pre-mutation ref wipe — clean materialization deletes every local syncable ref before
   // publishing even scoped sections; partial holding of a wipe is undefined in D1.
   if (beforeMutateWipesRefs) {
-    for (const ref of Object.keys(localRefs)) {
+    for (const ref of Object.keys(refs)) {
       if (owned.has(ref)) return { heldRefs, deferReason: collision(ref, " (would be wiped)") };
     }
+  }
+  // Degraded serialization deliberately retains design 68's whole-section
+  // ownership disposition. Equality is not an exemption in that legacy mode:
+  // no ref-plane portion is independently published while a section intersects
+  // a sibling-owned branch.
+  if (legacyWholeSectionOwnership) {
+    for (const ref of Object.keys(section.refs)) {
+      if (owned.has(ref)) return { heldRefs, deferReason: collision(ref) };
+    }
+    if (deletesAbsent) {
+      for (const ref of Object.keys(refs)) {
+        if (owned.has(ref) && !(ref in section.refs)) {
+          return { heldRefs, deferReason: collision(ref, " (would be deleted)") };
+        }
+      }
+    }
+    return { heldRefs };
   }
   // Ref updates: equality is a true no-op, so only a different/absent local OID is held.
   for (const [ref, incomingOid] of Object.entries(section.refs)) {
     const worktree = owned.get(ref);
-    if (worktree && localRefs[ref] !== incomingOid) heldRefs.set(ref, worktree);
+    if (worktree && refs[ref] !== incomingOid) heldRefs.set(ref, worktree);
   }
   // Ref deletions: an owned local branch absent from an all-scope section survives.
   if (deletesAbsent) {
-    for (const ref of Object.keys(localRefs)) {
+    for (const ref of Object.keys(refs)) {
       const worktree = owned.get(ref);
       if (worktree && !(ref in section.refs)) heldRefs.set(ref, worktree);
     }
@@ -139,6 +162,9 @@ export async function applyGitState(
   opts: {
     beforeMutate?: () => Promise<void>;
     beforeMutateWipesRefs?: boolean;
+    /** Degraded-mode compatibility: any sibling-owned intersection defers the
+     * whole section, retaining the pre-design-116 ownership disposition. */
+    legacyWholeSectionOwnership?: boolean;
     /** Final mutation in the rollback boundary. Design 93 uses this for config:
      * its rename is the combined git+config commit point. */
     afterGitMutate?: () => Promise<void>;
@@ -163,7 +189,7 @@ export async function applyGitState(
   if (preKind && !ctx) return { applied: false, reason: "repo unusable (dangling .git pointer?)" };
 
   // Scope-gated publish set (design 43 §7). A fresh target materializes as a dir repo.
-  const publishRefs: Record<string, string> = { ...section.refs };
+  const eligiblePublishRefs: Record<string, string> = { ...section.refs };
   const filteredRefs: string[] = [];
   const heldRefs = new Map<string, string>();
   let deleteAbsent = false;
@@ -183,31 +209,28 @@ export async function applyGitState(
     // Design 116 phase-0: retain the zero-cost no-worktrees path, then hold only
     // sibling-owned refs whose OIDs would actually move (or whose deletion is requested).
     if (ctx && (await exists(path.join(ctx.commonDir, "worktrees")))) {
-      const ownership = await classifyWorktreeOwnership(ctx, section, deleteAbsent, opts.beforeMutateWipesRefs === true);
+      const ownership = await classifyWorktreeOwnership(
+        ctx,
+        section,
+        deleteAbsent,
+        opts.beforeMutateWipesRefs === true,
+        opts.legacyWholeSectionOwnership === true,
+      );
       if (ownership.deferReason) return { applied: false, reason: ownership.deferReason };
-      for (const [ref, worktree] of ownership.heldRefs) {
-        heldRefs.set(ref, worktree);
-        delete publishRefs[ref];
-      }
     }
   } else {
-    for (const ref of Object.keys(publishRefs)) {
+    for (const ref of Object.keys(eligiblePublishRefs)) {
       if (!ref.startsWith("refs/heads/")) {
         // a standalone receiver's stash/tags must never overwrite the SHARED stash stack
         // or tag namespace [v3]
         filteredRefs.push(ref);
-        delete publishRefs[ref];
+        delete eligiblePublishRefs[ref];
       }
     }
     const owned = await branchesCheckedOutElsewhere(ctx);
-    const localRefs = owned.size > 0 ? await readAllRefs(ctx.repoDir) : {};
-    for (const ref of Object.keys(publishRefs)) {
-      // Design 116 phase-0: publishing the identical OID cannot disturb the sibling;
-      // keep it in the publish set as an explicit no-op, not a filtered ref.
-      if (owned.has(ref) && localRefs[ref] !== publishRefs[ref]) {
-        filteredRefs.push(ref);
-        delete publishRefs[ref];
-      }
+    if (opts.legacyWholeSectionOwnership && owned.size > 0) {
+      const ownership = await classifyWorktreeOwnership(ctx, section, false, false, true);
+      if (ownership.deferReason) return { applied: false, reason: ownership.deferReason, filteredRefs };
     }
     const headBranch = headBranchOf(section.head);
     if (headBranch && owned.has(headBranch)) {
@@ -337,22 +360,115 @@ export async function applyGitState(
     }
 
     try {
+      // The ownership decision made before artifact I/O is only an early refusal
+      // for destructive hooks.  The publication plan is rebuilt here, after import
+      // and quarantine, from CURRENT worktree ownership and exact ref OIDs.  Every
+      // subsequent update is compare-and-swap against this snapshot.
+      const boundaryRefs = await readAllRefs(repoDir);
+      const boundaryOwned = await branchesCheckedOutElsewhere(ctx);
+      const incomingHeadRef = headBranchOf(section.head);
+      if (incomingHeadRef && boundaryOwned.has(incomingHeadRef)) {
+        return {
+          applied: false,
+          reason: `worktree-ownership: branch ${incomingHeadRef.replace(/^refs\/heads\//, "")} checked out in linked worktree ${boundaryOwned.get(incomingHeadRef)}`,
+          conflictBundle,
+          filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+        };
+      }
+
+      if (opts.legacyWholeSectionOwnership) {
+        const ownership = await classifyWorktreeOwnership(ctx, section, deleteAbsent, false, true, boundaryRefs);
+        if (ownership.deferReason) {
+          return {
+            applied: false,
+            reason: ownership.deferReason,
+            conflictBundle,
+            filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+          };
+        }
+      }
+
+      heldRefs.clear();
+      const publishRefs: Record<string, string> = {};
+      for (const [ref, oid] of Object.entries(eligiblePublishRefs)) {
+        const sibling = boundaryOwned.get(ref);
+        if (sibling && boundaryRefs[ref] !== oid) {
+          if (ctx.kind === "pointer") {
+            if (!filteredRefs.includes(ref)) filteredRefs.push(ref);
+          } else {
+            heldRefs.set(ref, sibling);
+          }
+          continue;
+        }
+        publishRefs[ref] = oid;
+      }
+      const deletionCandidates = deleteAbsent
+        ? Object.keys(boundaryRefs).filter((ref) => !(ref in section.refs))
+        : [];
+
       // Publish refs per the scope-gated rules (see doc comment).
       for (const [ref, sha] of Object.entries(publishRefs)) {
+        const oldOid = boundaryRefs[ref] ?? ZERO_OID;
         if (ref === "refs/stash") {
           // refs/stash is only usable through its REFLOG (`git stash list`/`pop` read
           // stash@{N}, never the bare ref) — publish it WITH a reflog entry whose
           // message is the stash commit's subject (`git stash` writes the same text to
           // both), so the synced stash is listable/poppable on the receiver.
           const subject = (await git(repoDir, ["log", "-1", "--format=%s", sha]).catch(() => "")) || "rbox: synced stash";
-          await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha]);
+          try {
+            await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha, oldOid]);
+          } catch {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
+            heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+          }
         } else {
-          await git(repoDir, ["update-ref", ref, sha]);
+          try {
+            await git(repoDir, ["update-ref", ref, sha, oldOid]);
+          } catch {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
+            heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+          }
         }
       }
       if (deleteAbsent) {
-        for (const ref of Object.keys(await readAllRefs(repoDir))) {
-          if (!(ref in section.refs) && !heldRefs.has(ref)) await git(repoDir, ["update-ref", "-d", ref]).catch(() => {});
+        for (const ref of deletionCandidates) {
+          if (heldRefs.has(ref)) continue;
+          // Ownership is re-read for each destructive mutation, not merely at
+          // the section boundary. A branch attached by a sibling while earlier
+          // refs publish survives this cycle.
+          const ownedNow = await branchesCheckedOutElsewhere(ctx);
+          if (ownedNow.has(ref)) {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`worktree ownership changed for ${ref}`);
+            heldRefs.set(ref, ownedNow.get(ref)!);
+            continue;
+          }
+          const liveRefs = await readAllRefs(repoDir);
+          const oldOid = liveRefs[ref];
+          if (!oldOid || ref in section.refs) continue;
+          const durable = { ...liveRefs };
+          delete durable[ref];
+          const detachedIncoming = section.head.trim();
+          const plannedGraphRoots = [
+            ...Object.values(durable),
+            ...(HEX40.test(detachedIncoming) ? [detachedIncoming] : []),
+          ];
+          const pins = await prepareDisplacedRefPins(repoDir, ref, plannedGraphRoots, {
+            ref,
+            episode: section.generatedAt || String(Date.now()),
+            time: new Date().toISOString(),
+            class: "human",
+          });
+          if (pins.status === "indeterminate") {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`reflog reachability ${pins.marker} for ${ref}`);
+            heldRefs.set(ref, `reflog-${pins.marker}`);
+            continue;
+          }
+          try {
+            await runUpdateRefTransaction(repoDir, [...pins.transactionLines, `delete ${ref} ${oldOid}`]);
+          } catch {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
+            heldRefs.set(ref, "concurrent-update");
+          }
         }
       }
       await writeFileAtomic(path.join(ctx.gitDir, "HEAD"), section.head.endsWith("\n") ? section.head : `${section.head}\n`);
@@ -369,7 +485,7 @@ export async function applyGitState(
       if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {
         // ROLLBACK (fresh target: removing the .git we created IS the rollback)
         if (createdGit) await removeFreshGit();
-        else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined);
+        else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined);
         return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
       // Must remain LAST inside the mutation boundary. A pre-commit throw follows
@@ -379,7 +495,7 @@ export async function applyGitState(
     } catch (e) {
       // ROLLBACK on any mutation error (fresh target: remove the .git we created)
       if (createdGit) await removeFreshGit();
-      else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(publishRefs)) : undefined).catch(() => {});
+      else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined).catch(() => {});
       return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     } finally {
       await cleanupIncoming();

@@ -64,7 +64,7 @@ async function scanFixture(root: string, matcher: IgnoreMatcher = buildIgnoreMat
 }
 
 function pullOracle(root: string, fixture: Awaited<ReturnType<typeof scanFixture>>, actions: Action[] = [], truth = fixture.preScan, scanDeferred = fixture.deferred) {
-  return oracleFromPull({ preScan: fixture.preScan, actions, oracle: truth, matcher: fixture.matcher, dircache: fixture.dircache, root, scanDeferred });
+  return oracleFromPull({ preScan: fixture.preScan, actions, oracle: truth, matcher: fixture.matcher, dircache: fixture.dircache, hashcache: fixture.hashcache, root, scanDeferred });
 }
 
 function expectNotMatch(verdict: OracleVerdict): void {
@@ -118,7 +118,26 @@ test("oracle construction is lazy over manifest inputs and filesystem probing", 
   }
 });
 
-test("untouched-entry racy-clean boundary trusts exact mtime+size, but movement re-hashes", async () => {
+test("action-touched same-size mtime-restored edits are content-hashed", async () => {
+  const root = await tmp();
+  const abs = path.join(root, "repo/file.txt");
+  await fs.writeFile(abs, "old!");
+  const stableTime = Math.floor(Date.now() / 1000) - 10;
+  await fs.utimes(abs, stableTime, stableTime);
+  const fixture = await scanFixture(root);
+  const remote = fileEntry("repo/file.txt", "aaaa");
+  const action: Action = { kind: "write", entry: remote, expectedLocal: fixture.preScan.files[0] };
+  await applyActions(root, [action], storeFor({ remote: "aaaa" }));
+  await fs.utimes(abs, stableTime, stableTime);
+  const appliedMtime = (await fs.lstat(abs)).mtimeMs;
+
+  await fs.writeFile(abs, "bbbb");
+  await fs.utimes(abs, new Date(appliedMtime), new Date(appliedMtime));
+  expect((await fs.lstat(abs)).mtimeMs).toBe(appliedMtime);
+  expect((await pullOracle(root, fixture, [action], manifest([remote])).proveRepo("repo")).kind).toBe("mismatch");
+});
+
+test("untouched-entry token trust includes cached ctime and re-hashes on movement", async () => {
   const root = await tmp();
   const abs = path.join(root, "repo/file.txt");
   await fs.writeFile(abs, "aaaa");
@@ -127,10 +146,12 @@ test("untouched-entry racy-clean boundary trusts exact mtime+size, but movement 
   const fixture = await scanFixture(root);
   const before = fixture.preScan.files.find((entry) => entry.path === "repo/file.txt")!;
 
+  expect((await pullOracle(root, fixture).proveRepo("repo")).kind).toBe("match");
+
   await fs.writeFile(abs, "bbbb");
   await fs.utimes(abs, new Date(before.mtimeMs), new Date(before.mtimeMs));
   expect((await fs.lstat(abs)).mtimeMs).toBe(before.mtimeMs);
-  expect((await pullOracle(root, fixture).proveRepo("repo")).kind).toBe("match");
+  expect((await pullOracle(root, fixture).proveRepo("repo")).kind).toBe("mismatch");
 
   await fs.writeFile(abs, "different-size");
   expect((await pullOracle(root, fixture).proveRepo("repo")).kind).toBe("mismatch");

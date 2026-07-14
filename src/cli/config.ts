@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
+import { MAX_GIT_REPOS, MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
@@ -119,6 +119,11 @@ export interface SyncState {
    *  suppressed, and each pull retries the apply. Cleared on successful apply or when
    *  the remote deletes the repo ([v6] absence supersedes pending). */
   gitPendingRemote?: Record<string, GitSection>;
+  /** Legacy/degraded-mode local sidecars. Transactional states keep these in
+   * repoRecords; nonce-less states cannot, so they retain the same typed truth
+   * in bounded per-repo maps instead. These fields are local state, never wire. */
+  gitDeferrals?: Record<string, GitDeferrals>;
+  gitPartial?: Record<string, GitPartialApply>;
   /** Random state-file incarnation. A delayed packet from before a reset/rebind
    * cannot land even when the stream later changes A→B→A. */
   stateNonce?: string;
@@ -267,6 +272,7 @@ export const RBOX_DIR = ".rbox";
 const CONFIG_FILE = "workspace.json";
 const STATE_FILE = "state.json";
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+export const MAX_LEGACY_GIT_SIDECAR_REPOS = MAX_GIT_REPOS;
 
 const configPath = (root: string) => path.join(root, RBOX_DIR, CONFIG_FILE);
 export const statePath = (root: string) => path.join(root, RBOX_DIR, STATE_FILE);
@@ -325,12 +331,20 @@ function validCounter(value: unknown): number {
 /** Fold the legacy parallel maps into complete records. Every later state write
  * reconstructs gitRepos and sidecars solely from this returned record set. */
 export function repoRecordsForState(state: SyncState): Record<string, RepoRecord> {
+  const legacyDeferrals = state.repoRecords === undefined
+    ? Object.fromEntries(Object.entries(state.gitDeferrals ?? {}).sort(([a], [b]) => a.localeCompare(b)).slice(0, MAX_LEGACY_GIT_SIDECAR_REPOS))
+    : {};
+  const legacyPartial = state.repoRecords === undefined
+    ? Object.fromEntries(Object.entries(state.gitPartial ?? {}).sort(([a], [b]) => a.localeCompare(b)).slice(0, MAX_LEGACY_GIT_SIDECAR_REPOS))
+    : {};
   const keys = new Set([
     ...Object.keys(state.repoRecords ?? {}),
     ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
     ...Object.keys(state.gitPendingRemote ?? {}),
     ...Object.keys(state.gitReposRemoved ?? {}),
     ...Object.keys(state.gitNeedsResolution ?? {}),
+    ...Object.keys(legacyDeferrals),
+    ...Object.keys(legacyPartial),
   ]);
   const records: Record<string, RepoRecord> = {};
   for (const relPath of keys) {
@@ -348,6 +362,8 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
       ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
       ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
       ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),
+      ...(legacyDeferrals[relPath] === undefined ? {} : { deferrals: legacyDeferrals[relPath] }),
+      ...(legacyPartial[relPath] === undefined ? {} : { partial: legacyPartial[relPath] }),
     };
   }
   return records;
@@ -372,6 +388,10 @@ export function stateFromRepoRecords(state: SyncState, records: Record<string, R
     gitReposRemoved: mapFromRecords(records, (record) => record.removedKey),
     gitNeedsResolution: mapFromRecords(records, (record) => record.resolutionKey),
     gitPendingRemote: mapFromRecords(records, (record) => record.pending),
+    // A transactional record supersedes the legacy sidecar maps. legacyState()
+    // deliberately reconstructs them after dropping repoRecords.
+    gitDeferrals: undefined,
+    gitPartial: undefined,
     repoRecords: records,
   };
 }

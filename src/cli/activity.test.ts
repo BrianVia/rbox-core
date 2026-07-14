@@ -168,15 +168,27 @@ test("shell.deferrals is stable, encoded, precedence-collapsed, oldest-first, an
     "v1", "old%09repo\tconfig\t1d\t0", "nested%20repo\tlocal-edits\t30m\t1",
   ]);
 
-  const many = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`repo-${i}-${"x".repeat(300)}`, {
+  const many = Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`repo-${String(i).padStart(2, "0")}`, {
+    repoGen: 1, sourceSeq: 1, deferrals: { apply: {
+      lane: "apply" as const, reason: "other" as const, deferredSince: "2026-07-13T11:00:00Z",
+      reasonSince: "2026-07-13T11:00:00Z", lastSeen: "2026-07-13T11:00:00Z",
+      bytesChanged: true,
+    } },
+  }]));
+  const bounded = renderShellDeferrals(deferralState(many), now, ageBucket)!;
+  expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(8192);
+  const boundedRows = bounded.trimEnd().split("\n").slice(1);
+  expect(boundedRows).toHaveLength(50);
+  expect(boundedRows.at(-1)).toBe(".\tother\t1h\t1");
+  expect(boundedRows.some((row) => row.startsWith("repo-50\t"))).toBe(false);
+
+  const longRows = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`repo-${i}-${"x".repeat(300)}`, {
     repoGen: 1, sourceSeq: 1, deferrals: { apply: {
       lane: "apply" as const, reason: "other" as const, deferredSince: "2026-07-13T11:00:00Z",
       reasonSince: "2026-07-13T11:00:00Z", lastSeen: "2026-07-13T11:00:00Z",
     } },
   }]));
-  const bounded = renderShellDeferrals(deferralState(many), now, ageBucket)!;
-  expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(8192);
-  expect(bounded.trimEnd().split("\n").length - 1).toBeLessThanOrEqual(50);
+  expect(Buffer.byteLength(renderShellDeferrals(deferralState(longRows), now, ageBucket)!)).toBeLessThanOrEqual(8192);
 });
 
 test("saveShellDeferrals deletes the sidecar when no deferrals remain", async () => {

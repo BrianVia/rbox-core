@@ -8,6 +8,7 @@ import {
   applyStateSavePacket,
   expectedStateNonce,
   loadState,
+  MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
   resetSyncState,
   saveState,
@@ -21,6 +22,7 @@ import {
   composeStateSavePacket,
   daemonBindingMatches,
   observedRepoKeys,
+  orderedDeferralUpdates,
   savePublishedRepoIntent,
   saveStateSource,
   stampConfigAck,
@@ -141,6 +143,14 @@ describe("design 93 §6 transactional unit", () => {
     const initial = baseState({
       r: { repoGen: 3, sourceSeq: 1, base: section("base"), cfgSynced: "old", cfgApplied: "old" },
     });
+    const applyDeferral = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-02T00:00:00.000Z",
+      reason: "unsupported" as const,
+    };
+    const partial = { incomingKey: "legacy-partial", checkoutPending: true, appliedRefs: {}, heldRefs: {}, configApplied: false };
     let lockedApplyCalled = false;
     const saved = await saveStateSource(root, initial, {
       expectedStream: stream,
@@ -150,6 +160,8 @@ describe("design 93 §6 transactional unit", () => {
       values: {
         bases: { r: section("next") },
         configLane: { r: { cfgSynced: "new", cfgApplied: "new" } },
+        deferrals: { r: orderedDeferralUpdates(undefined, { apply: applyDeferral })! },
+        partial: { r: partial },
       },
     }, {
       forceLegacy: workspaceSyncMutexDegraded(syncMutex),
@@ -163,12 +175,41 @@ describe("design 93 §6 transactional unit", () => {
     expect(saved.stateRevision).toBeUndefined();
     expect(saved.repoRecords).toBeUndefined();
     expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
+    expect(saved.gitDeferrals?.r?.apply).toEqual(applyDeferral);
+    expect(saved.gitPartial?.r).toEqual(partial);
+    const restarted = await loadState(root, stream);
+    expect(repoRecordsForState(restarted).r).toMatchObject({
+      deferrals: { apply: applyDeferral },
+      partial,
+    });
 
     await resetSyncState(root, "next-stream", syncMutex);
     const reset = await loadState(root, "next-stream");
     expect(reset.stateNonce).toBeUndefined();
     expect(reset.repoRecords).toBeUndefined();
     await releaseWorkspaceSyncMutex(syncMutex);
+  });
+
+  test("legacy sidecar maps are bounded and ignored once repoRecords is authoritative", () => {
+    const deferral = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-02T00:00:00.000Z",
+      reason: "unsupported" as const,
+    };
+    const entries = Object.fromEntries(Array.from(
+      { length: MAX_LEGACY_GIT_SIDECAR_REPOS + 1 },
+      (_, i) => [`r${String(i).padStart(4, "0")}`, { apply: deferral }],
+    ));
+    const legacy: SyncState = { ...baseState(), repoRecords: undefined, gitDeferrals: entries };
+    expect(Object.keys(repoRecordsForState(legacy))).toHaveLength(MAX_LEGACY_GIT_SIDECAR_REPOS);
+
+    const authoritative: SyncState = {
+      ...legacy,
+      repoRecords: { kept: { repoGen: 1, sourceSeq: 1 } },
+    };
+    expect(Object.keys(repoRecordsForState(authoritative))).toEqual(["kept"]);
   });
 
   test("file-only global candidate rebuilds gitRepos solely from records", async () => {
@@ -397,7 +438,7 @@ describe("design 93 §6 transactional unit", () => {
       expectedStream: stream,
       sourceGlobalSeq: 5,
       observedRepos: ["r"],
-      values: { deferrals: { r: { capture: captureDeferral } } },
+      values: { deferrals: { r: orderedDeferralUpdates(undefined, { capture: captureDeferral })! } },
     }, {
       apply: async (_root, packet) => {
         packets.push(packet);
@@ -415,7 +456,7 @@ describe("design 93 §6 transactional unit", () => {
       expectedStream: stream,
       sourceGlobalSeq: 5,
       observedRepos: ["r"],
-      values: { deferrals: { r: { apply: null } } },
+      values: { deferrals: { r: orderedDeferralUpdates(concurrent.repoRecords?.r?.deferrals, { apply: null })! } },
     });
     expect(cleared.repos[0]?.newRecord).toMatchObject({ sourceSeq: 7, base: section("seven"), idxProj: "cached" });
     expect(cleared.repos[0]?.newRecord.deferrals).toBeUndefined();
@@ -430,6 +471,59 @@ describe("design 93 §6 transactional unit", () => {
     expect(acceptedCommit.repos[0]?.newRecord.deferrals?.apply).toEqual(applyDeferral);
   });
 
+  test("same-lane clear and set transitions drop after the predecessor changes during CAS recompute", async () => {
+    const old = {
+      lane: "capture" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "artifact" as const,
+    };
+    const newer = {
+      ...old,
+      lastSeen: "2026-01-03T00:00:00.000Z",
+      reasonSince: "2026-01-03T00:00:00.000Z",
+      reason: "git-busy" as const,
+    };
+    const initial = baseState({ r: { repoGen: 0, sourceSeq: 4, deferrals: { capture: old } } });
+
+    // A observes success (clear); B records a newer standing episode first.
+    const afterNewerSet = baseState({ r: { repoGen: 1, sourceSeq: 4, deferrals: { capture: newer } } });
+    const clearAttempts: StateSavePacket[] = [];
+    await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { deferrals: { r: orderedDeferralUpdates({ capture: old }, { capture: null })! } },
+    }, {
+      apply: async (_root, packet) => {
+        clearAttempts.push(packet);
+        return clearAttempts.length === 1
+          ? { status: "rejected", reason: "repo-generation", state: afterNewerSet }
+          : { status: "accepted", state: afterNewerSet };
+      },
+    });
+    expect(clearAttempts[1]?.repos[0]?.newRecord.deferrals?.capture).toEqual(newer);
+
+    // A observes a refreshed set; B clears the observed predecessor first.
+    const afterClear = baseState({ r: { repoGen: 1, sourceSeq: 4 } });
+    const setAttempts: StateSavePacket[] = [];
+    await saveStateSource(root, initial, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { deferrals: { r: orderedDeferralUpdates({ capture: old }, { capture: newer })! } },
+    }, {
+      apply: async (_root, packet) => {
+        setAttempts.push(packet);
+        return setAttempts.length === 1
+          ? { status: "rejected", reason: "repo-generation", state: afterClear }
+          : { status: "accepted", state: afterClear };
+      },
+    });
+    expect(setAttempts[1]?.repos[0]?.newRecord.deferrals).toBeUndefined();
+  });
+
   test("explicit lane and partial clears are distinct from omitted values", () => {
     const apply = {
       lane: "apply" as const,
@@ -441,15 +535,15 @@ describe("design 93 §6 transactional unit", () => {
     const partial = { incomingKey: "k", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true };
     const state = baseState({ r: { repoGen: 2, sourceSeq: 4, base: section("base"), deferrals: { apply }, partial } });
     expect(changedSidecarRepoKeys(state, {})).toEqual([]);
-    expect(changedSidecarRepoKeys(state, { deferrals: { r: { apply: null } } })).toEqual(["r"]);
+    expect(changedSidecarRepoKeys(state, { deferrals: { r: orderedDeferralUpdates({ apply }, { apply: null })! } })).toEqual(["r"]);
     expect(changedSidecarRepoKeys(state, { partial: { r: null } })).toEqual(["r"]);
-    expect(changedSidecarRepoKeys(baseState({ r: { repoGen: 0, sourceSeq: 0 } }), { deferrals: { r: { apply } } })).toEqual(["r"]);
+    expect(changedSidecarRepoKeys(baseState({ r: { repoGen: 0, sourceSeq: 0 } }), { deferrals: { r: orderedDeferralUpdates(undefined, { apply })! } })).toEqual(["r"]);
     expect(changedSidecarRepoKeys(baseState({ r: { repoGen: 0, sourceSeq: 0 } }), { partial: { r: partial } })).toEqual(["r"]);
     const packet = composeStateSavePacket(state, {
       expectedStream: stream,
       sourceGlobalSeq: 4,
       observedRepos: ["r"],
-      values: { bases: { r: section("base") }, deferrals: { r: { apply: null } }, partial: { r: null } },
+      values: { bases: { r: section("base") }, deferrals: { r: orderedDeferralUpdates({ apply }, { apply: null })! }, partial: { r: null } },
     });
     expect(packet.repos[0]?.newRecord.deferrals).toBeUndefined();
     expect(packet.repos[0]?.newRecord.partial).toBeUndefined();

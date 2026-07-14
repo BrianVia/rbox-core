@@ -31,7 +31,10 @@ function cleanGitEnv(): NodeJS.ProcessEnv {
   return { ...process.env, GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv;
 }
 
-async function runUpdateRefTransaction(repoDir: string, lines: readonly string[]): Promise<void> {
+/** Commit caller-prepared recovery-pin lines together with their destructive ref
+ * mutation.  Keeping this public prevents apply paths from accidentally splitting
+ * the fsynced-origin -> pin+displacement transaction discipline. */
+export async function runUpdateRefTransaction(repoDir: string, lines: readonly string[]): Promise<void> {
   if (lines.length === 0) return;
   const ctx = await repoCtx(repoDir);
   if (!ctx) throw new Error("repository unavailable while committing recovery pins");

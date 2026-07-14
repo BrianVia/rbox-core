@@ -199,6 +199,8 @@ _rbox_deferrals() {
       exec {fd}<&-
       return 0
     }
+    # The writer reserves "." as an aggregate overflow fallback. It matches
+    # every workspace path here; any explicit repo row wins by being longer.
     [[ \$decoded == . ]] && repo=\$root || repo="\$root/\$decoded"
     if [[ "\$PWD" == "\$repo" || "\$PWD" == "\$repo"/* ]]; then
       if (( \${#repo} > best_len )); then

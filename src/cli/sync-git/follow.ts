@@ -594,14 +594,18 @@ async function publishRefPlane(
   };
 }
 
-async function deriveBaseProjection(opts: FollowOptions, staged: StagedIncoming): Promise<string | undefined> {
+export async function deriveBaseIndexProjection(
+  opts: Pick<FollowOptions, "ctx" | "base" | "store" | "kek" | "record">,
+  tmpDir: string,
+  ignoreCache = false,
+): Promise<string | undefined> {
   if (!indexArtifact(opts.base)) return undefined;
-  if (opts.record?.idxProj) return opts.record.idxProj;
+  if (!ignoreCache && opts.record?.idxProj) return opts.record.idxProj;
   const artifact = indexArtifact(opts.base);
   if (!artifact) return undefined;
   const raw = path.join(opts.ctx.gitDir, `.rbox-base-index-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
   try {
-    await getGitArtifact(opts.store, opts.kek, artifact, raw, staged.tmpDir);
+    await getGitArtifact(opts.store, opts.kek, artifact, raw, tmpDir);
     await clearIndexResolveUndo(opts.ctx.repoDir, raw);
     // `return await`, not `return`: the finally's rm would otherwise race the
     // projection's own read of `raw` (observed as a flaky false-indeterminate).
@@ -630,7 +634,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
   try {
     const liveBefore = await readLive(opts.ctx);
     if (!liveBefore) return { status: "defer", reason: "unreadable", detail: "git metadata could not be read", ...emptyProgress };
-    const baseProjection = opts.record?.idxProj ?? await deriveBaseProjection(opts, staged).catch(() => undefined);
+    const baseProjection = opts.record?.idxProj ?? await deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined);
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
     const roots = incomingOwnershipRoots(ownershipSection, { prefix: staged.incomingNs, opState: staged.opBytes });

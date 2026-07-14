@@ -14,7 +14,7 @@ import {
   snapshotApplyStats,
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
-import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
 import { type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
@@ -25,7 +25,7 @@ import {
   withRevalidatedGitPartialApplies,
 } from "../sync-git.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { observedRepoKeys, saveStateSource } from "../sync-state.js";
+import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
@@ -226,6 +226,7 @@ export async function applyPulledManifest(
     oracle: remote,
     matcher: finalMatcher,
     dircache,
+    hashcache: cache,
     root,
     scanDeferred,
   });
@@ -248,6 +249,7 @@ export async function applyPulledManifest(
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
+  const deferralUpdates = orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals);
   const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
@@ -259,7 +261,7 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
-      deferrals: gitOutcome.deferrals,
+      deferrals: deferralUpdates,
       partial: gitOutcome.partial,
       idxProj: gitOutcome.idxProj,
     }),
@@ -269,7 +271,7 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
-      deferrals: gitOutcome.deferrals,
+      deferrals: deferralUpdates,
       partial: gitOutcome.partial,
       idxProj: gitOutcome.idxProj,
     },

@@ -4,6 +4,7 @@ import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
 import type { DaemonActivity } from "./activity.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "./config.js";
+import { projectGitDeferralRepos } from "./status-view.js";
 import {
   AMBIENT_STATUS_STALE_MS,
   hasFreshPopulateHeartbeat,
@@ -152,17 +153,11 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
           currentPath: cleanLocalPath(input.currentPath),
         })
       : undefined;
-  let deferredRepos = 0;
-  let oldestDeferredSince = Number.POSITIVE_INFINITY;
-  for (const record of Object.values(input.repoRecords ?? {})) {
-    const deferrals = Object.values(record.deferrals ?? {}).filter((entry) => entry !== undefined);
-    if (deferrals.length === 0) continue;
-    deferredRepos++;
-    for (const deferral of deferrals) {
-      const deferredSince = Date.parse(deferral.deferredSince);
-      if (Number.isFinite(deferredSince)) oldestDeferredSince = Math.min(oldestDeferredSince, deferredSince);
-    }
-  }
+  const projectedDeferrals = projectGitDeferralRepos(Object.entries(input.repoRecords ?? {}).flatMap(([repo, record]) =>
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
+  ));
+  const deferredRepos = projectedDeferrals.length;
+  const oldestDeferredSince = Date.parse(projectedDeferrals[0]?.oldestDeferredSince ?? "");
   const oldestDeferralAgeSeconds = deferredRepos === 0
     ? null
     : Number.isFinite(oldestDeferredSince)

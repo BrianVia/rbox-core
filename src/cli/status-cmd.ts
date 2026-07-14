@@ -10,10 +10,10 @@ import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
 import {
   attributeDaemonForStatus,
-  gitDeferralReasonPrecedence,
   healthDetailLines,
   healthLine,
   lastSyncLines,
+  projectGitDeferralRepos,
   renderGitDeferralLine,
   trashLine,
   type StatusRemoteHead,
@@ -52,8 +52,6 @@ interface LocalGitDeferral extends GitDeferral {
 }
 
 const DEFERRAL_LANES: GitDeferral["lane"][] = ["apply", "capture", "config"];
-const compareText = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
-
 function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
   const out: LocalGitDeferral[] = [];
   for (const [repo, record] of Object.entries(repoRecordsForState(state))) {
@@ -62,15 +60,9 @@ function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
       if (deferral) out.push({ repo, ...deferral });
     }
   }
-  return out.sort((a, b) => {
-    const aAt = Date.parse(a.deferredSince);
-    const bAt = Date.parse(b.deferredSince);
-    const ageOrder = (Number.isFinite(aAt) ? aAt : Number.POSITIVE_INFINITY) - (Number.isFinite(bAt) ? bAt : Number.POSITIVE_INFINITY);
-    return ageOrder
-      || gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
-      || compareText(a.repo, b.repo)
-      || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane);
-  });
+  return out.sort((a, b) => Date.parse(a.deferredSince) - Date.parse(b.deferredSince)
+    || a.repo.localeCompare(b.repo)
+    || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane));
 }
 
 type StatusLocalCounts =
@@ -403,16 +395,17 @@ export async function statusCmdWithDeps(
   const crypto = cryptoPoolStatus();
   const gitDeferrals = localGitDeferrals(state);
   const projectedGitDeferrals = counts.gitDeferrals;
-  const gitDeferredRepos = new Set(projectedGitDeferrals.map((d) => d.relPath)).size;
-  const gitBytesChangedDeferrals = projectedGitDeferrals.filter((d) => d.bytesChanged === true).length;
-  const gitOldestDeferral = [...projectedGitDeferrals].sort((a, b) => {
-    const aAt = Date.parse(a.deferredSince);
-    const bAt = Date.parse(b.deferredSince);
-    return ((Number.isFinite(aAt) ? aAt : Number.POSITIVE_INFINITY) - (Number.isFinite(bAt) ? bAt : Number.POSITIVE_INFINITY))
-      || gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
-      || compareText(a.relPath, b.relPath)
-      || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane);
-  })[0];
+  const projectedGitRepos = projectGitDeferralRepos(projectedGitDeferrals.map((deferral) => ({
+    repo: deferral.relPath,
+    deferral,
+  })));
+  const localGitRepoProjections = projectGitDeferralRepos(gitDeferrals.map((deferral) => ({
+    repo: deferral.repo,
+    deferral,
+  })));
+  const gitDeferredRepos = projectedGitRepos.length;
+  const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
+  const gitOldestDeferral = projectedGitRepos[0];
 
   if (opts.json) {
     const statusJson = {
@@ -460,6 +453,18 @@ export async function statusCmdWithDeps(
               ? { checkout: { kind: "detached" as const } }
               : {}),
         })),
+        deferredRepos: localGitRepoProjections.map((repo) => ({
+          repo: repo.repo,
+          oldestDeferredSince: repo.oldestDeferredSince,
+          displayReason: repo.displayReason,
+          ageSeconds: Math.max(0, Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)) || 0,
+          bytesChanged: repo.bytesChanged,
+          ...(repo.checkout?.kind === "branch"
+            ? { checkout: { kind: "branch" as const, ...(repo.checkout.label === undefined ? {} : { label: repo.checkout.label }) } }
+            : repo.checkout?.kind === "detached"
+              ? { checkout: { kind: "detached" as const } }
+              : {}),
+        })),
       },
       ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
         ? {
@@ -487,7 +492,7 @@ export async function statusCmdWithDeps(
     gitDeferrals: gitDeferredRepos,
     gitBytesChangedDeferrals,
     gitOldestDeferral: gitOldestDeferral
-      ? { deferredSince: gitOldestDeferral.deferredSince, reason: gitOldestDeferral.reason }
+      ? { deferredSince: gitOldestDeferral.oldestDeferredSince, reason: gitOldestDeferral.displayReason }
       : undefined,
     trackedFiles: counts.trackedFiles,
     daemonRunning: bg.running,
@@ -543,7 +548,7 @@ export async function statusCmdWithDeps(
     }
     if (pending) parts.push(style.yellow(`${pending} pending`));
     if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
-    if (projectedGitDeferrals.length) parts.push(style.yellow(`${projectedGitDeferrals.length} deferred`));
+    if (projectedGitRepos.length) parts.push(style.yellow(`${projectedGitRepos.length} deferred`));
     if (counts.gitConfigChecking?.length) {
       const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
       parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
@@ -552,11 +557,11 @@ export async function statusCmdWithDeps(
       parts.push(style.yellow(`config: disabled (${counts.gitConfigDisabled.map((issue) => `${issue.relPath}: ${issue.reason}`).join("; ")})`));
     }
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
-    for (const deferral of gitDeferrals) {
+    for (const deferral of localGitRepoProjections) {
       console.log(`    ${renderGitDeferralLine({
         relPath: deferral.repo,
-        reason: deferral.reason,
-        deferredSince: deferral.deferredSince,
+        reason: deferral.displayReason,
+        deferredSince: deferral.oldestDeferredSince,
         checkout: deferral.checkout,
         bytesChanged: deferral.bytesChanged,
         now,

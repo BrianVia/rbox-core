@@ -1,13 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import { git } from "../../engine/git/shared.js";
 import { expectedStateNonce, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, savePublishedRepoIntent, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
-import { checkoutJournalBinding, clearFollowJournal, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
+import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
 import { configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral } from "./shared.js";
 import { gitConfigHash, sameConfigShape, configReceiver } from "./config-lane.js";
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
@@ -689,7 +689,77 @@ opts: {
         partial[rel] = null;
       }
     }
-    const localDiverged = !cleanMaterialize && localDivergedFromBase(divergenceId, baseSec);
+    // Legacy GitIdentity deliberately projects the index through write-tree, which
+    // cannot see assume-unchanged, skip-worktree, intent-to-add, sparse, or
+    // resolve-undo semantics. Pay for the v2 projection only after every unchanged
+    // shortcut, immediately before a clean-path mutation would otherwise begin.
+    const legacyDiverged = !cleanMaterialize && localDivergedFromBase(divergenceId, baseSec);
+    let semanticIndexDiverged = false;
+    if (!legacyDiverged && !cleanMaterialize && dotGit && baseSec) {
+      const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+      if (!ctx) {
+        semanticIndexDiverged = true;
+      } else {
+        const liveIndexPath = path.join(ctx.gitDir, "index");
+        const liveIndexPresent = await fs.lstat(liveIndexPath).then(
+          (stat) => stat.isFile(),
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error),
+        ).catch(() => undefined);
+        const baseHasIndex = baseSec.indexSha !== undefined
+          && baseSec.indexEncSha !== undefined
+          && baseSec.indexCipherSize !== undefined;
+        let baseProjection = records[rel]?.idxProj;
+        const deriveProjection = async (ignoreCache = false): Promise<string | undefined> => {
+          const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-base-projection-${process.pid}-`));
+          try {
+            return await deriveBaseIndexProjection({ ctx, base: baseSec, store, kek, record: records[rel] }, tmpDir, ignoreCache);
+          } finally {
+            await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+          }
+        };
+        if (baseHasIndex && baseProjection === undefined) {
+          baseProjection = await deriveProjection();
+          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
+        }
+        const liveProjection = liveIndexPresent === true
+          ? await indexIdentityV2(repoDir, liveIndexPath)
+          : undefined;
+        // A projection cached by an older client may be stale. Re-derive only
+        // on disagreement; a real semantic edit still disagrees, while a stale
+        // cache is repaired without manufacturing a local-index episode.
+        if (baseHasIndex && liveProjection !== undefined && baseProjection !== liveProjection && records[rel]?.idxProj) {
+          baseProjection = await deriveProjection(true);
+          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
+        }
+        let matchesRboxPartial = false;
+        if (recordedPartial && pend
+          && recordedPartial.incomingKey === gitIncomingKey(pend)
+          && recordedPartial.checkoutPending === false
+          && liveIndexPresent !== undefined) {
+          const partialHasIndex = pend.indexSha !== undefined
+            && pend.indexEncSha !== undefined
+            && pend.indexCipherSize !== undefined;
+          if (!partialHasIndex) {
+            matchesRboxPartial = liveIndexPresent === false;
+          } else if (liveProjection !== undefined) {
+            const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-partial-projection-${process.pid}-`));
+            try {
+              const partialProjection = await deriveBaseIndexProjection(
+                { ctx, base: pend, store, kek, record: undefined },
+                tmpDir,
+              );
+              matchesRboxPartial = partialProjection !== undefined && liveProjection === partialProjection;
+            } finally {
+              await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+            }
+          }
+        }
+        semanticIndexDiverged = !matchesRboxPartial && (liveIndexPresent === undefined
+          || liveIndexPresent !== baseHasIndex
+          || (liveIndexPresent && (liveProjection === undefined || baseProjection === undefined || liveProjection !== baseProjection)));
+      }
+    }
+    const localDiverged = legacyDiverged || semanticIndexDiverged;
     const legacyConflict = async (reason: GitDeferralReason = "conflict", progress?: FollowProgress): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
       const { recoveryBundle } = await preserveGitConflict(repoDir, remoteSec, store, kek);
       const held = Object.keys(progress?.heldRefs ?? {}).length > 0;
@@ -805,7 +875,9 @@ opts: {
         store,
         kek,
         oracle: opts.oracle,
-        record: records[rel],
+        record: idxProj[rel] && records[rel]
+          ? { ...records[rel], idxProj: idxProj[rel]! }
+          : records[rel],
         binding,
         followEnabled: gitFollowEnabled(),
         runConfig: runFollowConfig,
@@ -912,6 +984,7 @@ opts: {
       store,
       kek,
       {
+        ...(opts.degradedMutex ? { legacyWholeSectionOwnership: true } : {}),
         ...(wipeLeftover
           ? {
             beforeMutateWipesRefs: true,
@@ -999,7 +1072,7 @@ opts: {
       if (/\bconfig\b/i.test(reason)) {
         setDeferral(rel, "config", "config", gitIncomingKey(remoteSec), await checkoutOf(repoDir));
       }
-      const typed: GitDeferralReason = reason.includes("ownership-deferred") ? "worktree-ownership"
+      const typed: GitDeferralReason = /worktree-ownership|ownership-deferred/.test(reason) ? "worktree-ownership"
         : reason.includes("busy") ? "git-busy"
         : /\bconfig\b/i.test(reason) ? "config"
         : /quarantine/i.test(reason) ? "other"
