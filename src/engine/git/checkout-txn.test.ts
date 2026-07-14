@@ -225,7 +225,7 @@ test("second-proof failure aborts the prepared transaction and owned index lock"
   expect(await fs.stat(path.join(ctx.gitDir, "index.lock")).then(() => true, () => false)).toBe(false);
 });
 
-test("ref-commit crash leaves pinned transient and journal recovery restores old coherence", async () => {
+test("ref-commit crash leaves the ref advanced and journal recovery restores old coherence", async () => {
   const candidate = await candidateFor(newOid);
   const { binding, journal } = await checkoutJournal();
 

@@ -712,7 +712,7 @@ export class RboxDaemon {
               this.emitDurableGitDeferrals(durableState, now);
               if (before !== renderShellDeferrals(durableState, now, ageBucket)) this.writeActivity();
             } catch {
-              // Preserve the original pump failure; this is a best-effort surface refresh.
+              // Preserve the original pump failure if the visibility refresh fails.
             }
             // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
             // first hit and every 10th after, with the running count — so the log stays

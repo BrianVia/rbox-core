@@ -28,7 +28,7 @@ export const configInvalidSkipLogged = new Set<string>();
  * projection so a daemon cannot flood its log on every tick. */
 export const configCredentialSkipLogged = new Set<string>();
 /** Ambiguous logical repo keys are held every pull, but the namespace hazard is
- * logged only once per workspace for a long-lived daemon. Exported for tests. */
+ * logged only once per workspace for a long-lived daemon. */
 export const repoEquivalenceWarningLogged = new Set<string>();
 
 const envInt = (name: string, fallback: number, min: number, max: number): number => {

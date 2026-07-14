@@ -90,18 +90,17 @@ export interface FollowIntended {
 export interface FollowProgress {
   appliedRefs: GitPartialApply["appliedRefs"];
   heldRefs: GitPartialApply["heldRefs"];
-  filteredRefs: string[];
   configApplied: boolean;
   incomingIndexProjection?: string;
   derivedBaseIndexProjection?: string;
 }
 
-export type FollowResult =
-  | ({ status: "followed"; journalPendingClear: true } & FollowProgress)
+type FollowResult =
+  | ({ status: "followed" } & FollowProgress)
   | ({ status: "defer"; reason: GitDeferralReason; detail: string } & FollowProgress)
   | ({ status: "legacy"; reason: GitDeferralReason; detail: string } & FollowProgress);
 
-export interface FollowOptions {
+interface FollowOptions {
   workspaceRoot: string;
   relPath: string;
   ctx: RepoCtx;
@@ -155,12 +154,7 @@ async function candidateIndexCollision(workspaceRoot: string, repoDir: string, i
   return collisions.size > 0 ? [...collisions].sort().join(", ") : undefined;
 }
 
-/** Test seam for receiver-equivalence probe memoization. */
-export function resetCandidateIndexCollisionProbeForTests(): void {
-  receiverEquivalenceByWorkspace.clear();
-}
-
-export interface StagedIncoming {
+interface StagedIncoming {
   tmpDir: string;
   incomingNs: string;
   candidateIndex?: string;
@@ -170,7 +164,7 @@ export interface StagedIncoming {
   cleanup(): Promise<void>;
 }
 
-export type StageIncomingOptions = Pick<FollowOptions, "ctx" | "incoming" | "store" | "kek" | "chainTimings">;
+type StageIncomingOptions = Pick<FollowOptions, "ctx" | "incoming" | "store" | "kek" | "chainTimings">;
 
 interface LiveMetadata {
   headContent: string;
@@ -206,7 +200,7 @@ export async function recoverFollowJournal(
   return recoverJournal<FollowIntended>(workspaceRoot, relPath, binding);
 }
 
-export type RecoverAndLandFollowJournalResult = {
+type RecoverAndLandFollowJournalResult = {
   recovery: Awaited<ReturnType<typeof recoverFollowJournal>>;
   state: import("../config.js").SyncState;
   disposition?: PublishedRepoIntentDisposition;
@@ -432,15 +426,13 @@ async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
   }
 }
 
-function effectiveRefs(ctx: RepoCtx, incoming: GitSection): { refs: Record<string, string>; filtered: string[]; deleteAbsent: boolean } {
-  if (ctx.kind === "dir") return { refs: { ...incoming.refs }, filtered: [], deleteAbsent: incoming.refScope === "all" };
+function effectiveRefs(ctx: RepoCtx, incoming: GitSection): { refs: Record<string, string>; deleteAbsent: boolean } {
+  if (ctx.kind === "dir") return { refs: { ...incoming.refs }, deleteAbsent: incoming.refScope === "all" };
   const refs: Record<string, string> = {};
-  const filtered: string[] = [];
   for (const [ref, oid] of Object.entries(incoming.refs)) {
     if (ref.startsWith("refs/heads/")) refs[ref] = oid;
-    else filtered.push(ref);
   }
-  return { refs, filtered, deleteAbsent: false };
+  return { refs, deleteAbsent: false };
 }
 
 async function publishRefPlane(
@@ -633,7 +625,6 @@ async function publishRefPlane(
   return {
     appliedRefs,
     heldRefs,
-    filteredRefs: effective.filtered,
     configApplied,
     checkoutRefReason,
     checkoutRefDetail,
@@ -668,7 +659,7 @@ function expectedHead(section: GitSection): string {
 
 export async function followDivergedRepo(opts: FollowOptions): Promise<FollowResult> {
   const valid = validateGitSection(opts.incoming);
-  const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, filteredRefs: [], configApplied: true };
+  const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, configApplied: true };
   if (!valid.ok) return { status: "defer", reason: "unsupported", detail: `invalid git section: ${valid.reason}`, ...emptyProgress };
 
   let staged: StagedIncoming;
@@ -705,7 +696,6 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const progress: FollowProgress = {
       appliedRefs: refProgress.appliedRefs,
       heldRefs: refProgress.heldRefs,
-      filteredRefs: refProgress.filteredRefs,
       configApplied: refProgress.configApplied,
       ...(staged.incomingIndexProjection === undefined ? {} : { incomingIndexProjection: staged.incomingIndexProjection }),
       ...(opts.record?.idxProj || baseProjection === undefined ? {} : { derivedBaseIndexProjection: baseProjection }),
@@ -947,7 +937,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     await markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath);
     if (opts.manualResolution && effective.refs["refs/stash"]) await ensureStashReflog(opts.ctx.repoDir, effective.refs["refs/stash"]!);
     opts.crashAt?.("after-published-flip");
-    return { status: "followed", journalPendingClear: true, ...postProgress };
+    return { status: "followed", ...postProgress };
   } finally {
     await staged.cleanup();
   }

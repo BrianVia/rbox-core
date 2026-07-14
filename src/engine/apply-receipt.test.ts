@@ -91,7 +91,7 @@ test("sync-applied bytes match the oracle even while dirty against old HEAD", as
   expect((await pullOracle(root, fixture, [action], manifest([remote])).proveRepo("repo")).kind).toBe("match");
 });
 
-test("oracle construction is lazy over manifest inputs and filesystem probing", async () => {
+test("oracle construction does not iterate manifests or create dircache state", async () => {
   const root = await tmp();
   let iterations = 0;
   const files = new Proxy<FileEntry[]>([], {
@@ -157,7 +157,7 @@ test("untouched-entry token trust includes cached ctime and re-hashes on movemen
   expect((await pullOracle(root, fixture).proveRepo("repo")).kind).toBe("mismatch");
 });
 
-test("post-scan create, delete, and rename never false-PASS", async () => {
+test("post-scan create, delete, and rename never return match", async () => {
   for (const mutate of [
     async (root: string) => fs.writeFile(path.join(root, "repo/extra.txt"), "extra"),
     async (root: string) => fs.unlink(path.join(root, "repo/a.txt")),

@@ -59,7 +59,6 @@ export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   } as NodeJS.ProcessEnv;
 }
 
-/** Emit one message per key through a caller-selected sink. */
 export function warnOnce(seen: Set<string>, key: string, message: string, sink: (message: string) => void): void {
   if (seen.has(key)) return;
   seen.add(key);

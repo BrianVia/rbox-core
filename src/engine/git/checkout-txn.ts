@@ -65,7 +65,7 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
 }
 
 export type CommitCheckoutResult =
-  | { status: "committed"; indexHash?: string }
+  | { status: "committed" }
   | { status: "defer"; reason: string; journalIntact?: true }
   | { status: "unsupported"; reason: string };
 
@@ -625,7 +625,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     reservationHandles.length = 0;
     for (const token of reservationTokens) await fs.rm(token.path, { force: true });
     reservationTokens.length = 0;
-    return { status: "committed", ...(indexHash === undefined ? {} : { indexHash }) };
+    return { status: "committed" };
   } catch (error) {
     if (!refsCommitted) {
       await tx?.abort().catch(() => {});

@@ -492,7 +492,7 @@ describe("design 116 index/op-state crossed interactions", () => {
   }, 20_000);
 });
 
-test("design 116 incoming-stash row advances A's stash when B has no stash divergence", async () => {
+test("design 116 incoming-stash row advances the receiver stash when it has no stash divergence", async () => {
   const { root, repo, template } = await cloneCase({ topology: "ff", syncDirt: 1, label: "incoming-stash" });
   try {
     const sender = path.join(suiteTmp, "incoming-stash-sender");

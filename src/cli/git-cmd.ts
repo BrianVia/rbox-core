@@ -44,14 +44,14 @@ import {
 import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "./sync-git/shared.js";
 import { sanitizeTerminalText } from "./status-view.js";
 
-export type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
+type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 
 interface ResolveEnvironment {
   cfg: WorkspaceConfig;
   store: BlobStore;
 }
 
-export interface GitResolveDeps {
+interface GitResolveDeps {
   build?: (root: string) => Promise<ResolveEnvironment>;
   capabilityProbe?: CheckoutCapabilityProbe;
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */

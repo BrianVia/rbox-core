@@ -25,7 +25,7 @@ export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" |
 /** Planner-facing lane results. Persistence converts these to ordered
  * transitions with orderedDeferralUpdates() before a generation-CAS save. */
 export type GitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferral | null>>;
-export type GitDeferralTransition =
+type GitDeferralTransition =
   | { set: GitDeferral; ifPreviouslyAbsent: true }
   | { set: GitDeferral; ifLastSeenAtMost: string }
   | { clear: true; ifLastSeenAtMost: string };
@@ -144,7 +144,7 @@ export function orderedRepoDeferralUpdates(
   return Object.keys(updates).length === 0 ? undefined : updates;
 }
 
-export function mergeDeferrals(
+function mergeDeferrals(
   current: GitDeferrals | undefined,
   incoming: OrderedGitDeferralUpdates | undefined,
 ): GitDeferrals | undefined {
@@ -312,7 +312,7 @@ export type PublishedRepoIntentDisposition = "landed" | "already-semantic" | "su
 export const intentSettled = (disposition: PublishedRepoIntentDisposition): boolean =>
   disposition === "landed" || disposition === "already-semantic" || disposition === "superseded";
 
-export interface PublishedRepoIntentResult {
+interface PublishedRepoIntentResult {
   state: SyncState;
   disposition: PublishedRepoIntentDisposition;
 }

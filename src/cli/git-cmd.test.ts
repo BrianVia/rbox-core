@@ -148,7 +148,7 @@ test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
   expect(withoutSnapshot).not.toMatch(/\b[0-9a-f]{40}\b/);
 });
 
-test("show-me sanitizes terminal controls from every non-JSON output line", async () => {
+test("show-me strips terminal controls from a commit subject", async () => {
   await fixture();
   await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--amend", "-qm", "subject\u001b[2Jforged");
   const lines: string[] = [];
@@ -157,7 +157,7 @@ test("show-me sanitizes terminal controls from every non-JSON output line", asyn
   expect(lines.join("\n")).not.toMatch(/[\u001b\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/);
 });
 
-test("take-theirs quarantines, pins, follows under the kill switch, and clears state", async () => {
+test("take-theirs quarantines, pins, follows, and clears pending resolution state", async () => {
   const { incoming, localTip } = await fixture();
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "0" })).toBe(false);
   const showLines: string[] = [];
@@ -196,7 +196,7 @@ test("take-theirs rejects a stale confirmation before quarantine when a ref move
   await expect(fs.access(path.join(root, ".rbox", "git-quarantine"))).rejects.toThrow();
 });
 
-test("take-theirs aborts and re-shows when the locked snapshot changes", async () => {
+test("take-theirs aborts when the locked snapshot changes", async () => {
   await fixture();
   const showLines: string[] = [];
   const current = await show(showLines);

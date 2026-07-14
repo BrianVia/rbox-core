@@ -278,7 +278,7 @@ test("published journal keeps checkout and returns opaque intended data for a fr
   expect(await fs.readFile(path.join(checkoutJournalDir(root, "repo"), "journal.json"), "utf8")).toContain('"phase": "published"');
 });
 
-test("created-fresh intent atomically quarantines the entire partial .git instead of deleting it", async () => {
+test("created-fresh intent quarantines the entire partial .git instead of deleting it", async () => {
   await fs.writeFile(path.join(gitDir, "human-hook-artifact"), "preserve me\n");
   const head = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
   const journal = makeJournal({ oldHead: head, expectedHead: head, intended: "fresh", createdFresh: true });

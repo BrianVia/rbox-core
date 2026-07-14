@@ -353,8 +353,6 @@ export function renderShellDeferrals(
   if (included < rows.length) {
     const omitted = rows.slice(included);
     const fallback = `.\tother\t${ageBucket(omitted[0]!.projection.oldestDeferredSince, now)}\t${omitted.some((item) => item.projection.bytesChanged) ? 1 : 0}\n`;
-    // A fallback row is deliberately tiny; retain a defensive fail-closed gate
-    // so the writer never violates the reader's byte contract.
     if (Buffer.byteLength(rendered + fallback) <= SHELL_DEFERRALS_MAX_BYTES) rendered += fallback;
   }
   return rendered;
@@ -376,7 +374,5 @@ export async function saveShellDeferrals(
     }
     await fs.mkdir(path.dirname(file), { recursive: true });
     await writeFileAtomic(file, rendered);
-  } catch {
-    /* best-effort by contract */
-  }
+  } catch {}
 }

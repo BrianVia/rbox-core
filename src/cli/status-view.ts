@@ -155,12 +155,12 @@ const DEFERRAL_REASON_TEXT: Record<GitDeferralReason, string> = {
   other: "other git issue",
 };
 
-export function gitDeferralReasonText(reason: GitDeferralReason): string {
+function gitDeferralReasonText(reason: GitDeferralReason): string {
   return DEFERRAL_REASON_TEXT[reason];
 }
 
 /** Human-divergence reasons lead operational reasons when chronic ages tie. */
-export function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
+function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
   switch (reason) {
     case "local-edits": return 0;
     case "local-index": return 1;
@@ -171,13 +171,13 @@ export function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
   }
 }
 
-export interface GitDeferralDisplayEntry {
+interface GitDeferralDisplayEntry {
   repo: string;
   deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">;
 }
 
 /** One authoritative display row per repo, shared by every local visibility surface. */
-export interface GitDeferralRepoProjection {
+interface GitDeferralRepoProjection {
   repo: string;
   oldestDeferredSince: string;
   displayReason: GitDeferralReason;

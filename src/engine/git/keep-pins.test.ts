@@ -42,7 +42,7 @@ async function refExists(ref: string): Promise<boolean> {
   return exec("git", ["-C", repo, "show-ref", "--verify", "--quiet", ref]).then(() => true, () => false);
 }
 
-test("content-addressed pins are create-only, idempotent, and keep multi-origin human promotion", async () => {
+test("content-addressed pins are create-only, idempotent, and preserve promoted human provenance", async () => {
   const oid = await commit("one.txt", "one\n");
   const tracking = { ref: "refs/remotes/origin/main", episode: "episode-1", time: "2026-07-13T10:00:00.000Z", class: "tracking" as const };
   const first = await pinDisplaced(repo, [oid, oid], tracking);
