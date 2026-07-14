@@ -379,6 +379,25 @@ test("typed divergence seam deferrals gate health even when local detail records
   expect(out.split("\n").filter((line) => line.includes("git deferred "))).toHaveLength(0);
 });
 
+test("status returns the effective daemon state in text and json modes", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readDaemonPidRecord = () => ({ present: true });
+  const oldLog = console.log;
+  const oldWrite = process.stdout.write;
+  console.log = () => {};
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  try {
+    expect(await statusCmdWithDeps(root, {}, d)).toEqual({ daemonRunning: true });
+    expect(await statusCmdWithDeps(root, { json: true }, d)).toEqual({ daemonRunning: true });
+    d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: "ws_previous", stale: true });
+    expect(await statusCmdWithDeps(root, { json: true }, d)).toEqual({ daemonRunning: false });
+  } finally {
+    console.log = oldLog;
+    process.stdout.write = oldWrite;
+  }
+});
+
 test("one repo with multiple lanes renders one repo-level line and count", async () => {
   const at = new Date(NOW - 86_400_000).toISOString();
   await saveState(root, {

@@ -2,11 +2,23 @@ import { test, expect } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { workspaceFlags, authorizePath, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
+import { workspaceFlags, authorizePath, stepHeader, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
 import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
+
+test("setup step header numbers fresh and enrolled flows", () => {
+  expect([stepHeader(1, 3, "Account"), stepHeader(2, 3, "Workspace"), stepHeader(3, 3, "Start syncing")]).toEqual([
+    "Step 1 of 3 · Account",
+    "Step 2 of 3 · Workspace",
+    "Step 3 of 3 · Start syncing",
+  ]);
+  expect([stepHeader(1, 2, "Workspace"), stepHeader(2, 2, "Start syncing")]).toEqual([
+    "Step 1 of 2 · Workspace",
+    "Step 2 of 2 · Start syncing",
+  ]);
+});
 
 // The guided flow's menus are now arrow-key `@inquirer` `select`s (thin widgets we
 // don't unit-test). The one pure step-transition left is `workspaceFlags` — the

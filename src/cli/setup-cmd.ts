@@ -79,7 +79,22 @@ const HR = "─".repeat(72);
 
 // ── the guided flow ───────────────────────────────────────────────────────────
 
-export async function runSetup(opts: { cwd: string; defaultRemote: string; flags?: Record<string, string> }): Promise<void> {
+export type WorkspaceKind = "new" | "existing";
+
+/** Steady-state step header. The subscribe-gated path intentionally still says
+ *  "of 3": step 3 (start syncing) exists but is deferred until `rbox subscribe`
+ *  (the yellow notice explains), so a fixed denominator stays honest. */
+export const stepHeader = (step: number, total: 2 | 3, label: string): string => `Step ${step} of ${total} · ${label}`;
+
+export async function runSetup(opts: {
+  cwd: string;
+  defaultRemote: string;
+  flags?: Record<string, string>;
+  preselectedWorkspaceKind?: WorkspaceKind;
+  /** The untracked menu is only reachable after `resolveBareRboxTarget` verifies
+   * enrollment, so this path skips the welcome banner and account step. */
+  viaUntrackedMenu?: boolean;
+}): Promise<void> {
   const flags = opts.flags ?? {};
   if (flags.key && flags.key !== "true" && flags.key !== "-") {
     throw new Error("refusing --key=<value>: argv leaks secrets via shell history and process listings. Use RBOX_KEY, --key-file <path>, or --key -.");
@@ -101,26 +116,38 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
     return;
   }
 
-  process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
-
   // Step 1 · Account — unless this machine is already enrolled. When credentials
   // already exist but enrollment doesn't (authorized-but-unenrolled from a prior
   // device-code login), resolve enrollment inline instead of restarting the full
   // new/existing picker as if the user had never signed in.
   let syncDisabledUntilSubscribe = false;
-  if (await alreadyEnrolled()) {
-    process.stderr.write(`${e.dim("This machine is already signed in and enrolled. Continuing to your workspace.")}\n`);
-  } else {
-    const hasCreds = Boolean((await loadCredentials())?.accountId);
-    const result = hasCreds ? { ok: await resolveEnrollment(opts.defaultRemote), created: false } : await stepAccount(opts.defaultRemote);
-    if (!result.ok) return;
-    if (result.created) {
-      syncDisabledUntilSubscribe = !(await startTrialAfterAccountCreation());
+  const viaUntrackedMenu = opts.viaUntrackedMenu === true;
+  const accountId = viaUntrackedMenu ? undefined : await enrolledAccountId();
+  const accountSkipped = viaUntrackedMenu || accountId !== undefined;
+  // Via the untracked menu, enrollment was verified by resolveBareRboxTarget and
+  // the menu printed its own banner — skip both.
+  if (!viaUntrackedMenu) {
+    process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
+    if (accountId) {
+      process.stderr.write(`${e.dim(`Signed in and enrolled (${e.cyan(accountId)}) — skipping account setup.`)}\n`);
+    } else {
+      process.stderr.write(`\n── ${e.bold(stepHeader(1, 3, "Account"))} ${HR.slice(0, 46)}\n`);
+      const hasCreds = Boolean((await loadCredentials())?.accountId);
+      const result = hasCreds ? { ok: await resolveEnrollment(opts.defaultRemote), created: false } : await stepAccount(opts.defaultRemote);
+      if (!result.ok) return;
+      if (result.created) {
+        syncDisabledUntilSubscribe = !(await startTrialAfterAccountCreation());
+      }
     }
   }
 
   // Step 2 · Workspace — bind a directory + run the initial populate-sync.
-  const outcome = await stepWorkspace(opts, { noSync: syncDisabledUntilSubscribe });
+  const shortFlow = accountSkipped;
+  const outcome = await stepWorkspace(opts, {
+    noSync: syncDisabledUntilSubscribe,
+    preselectedKind: opts.preselectedWorkspaceKind,
+    header: shortFlow ? stepHeader(1, 2, "Workspace") : stepHeader(2, 3, "Workspace"),
+  });
   if (!outcome) return;
 
   if (syncDisabledUntilSubscribe) {
@@ -130,7 +157,7 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
   }
 
   // Step 3 · Start syncing in the background.
-  process.stderr.write(`\n── ${e.bold("Step 3 of 3 · Start syncing")} ${HR.slice(0, 38)}\n`);
+  process.stderr.write(`\n── ${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))} ${HR.slice(0, 38)}\n`);
   const startChoice = await promptSelect<StartSyncChoice>({
     message: "Keep this workspace syncing in the background?",
     choices: START_SYNC_CHOICES,
@@ -168,10 +195,15 @@ export async function runSetup(opts: { cwd: string; defaultRemote: string; flags
   printSummary(outcome.workspaceId, outcome.deviceId);
 }
 
-/** True when this machine already holds the account's key material (skip Step 1). */
-async function alreadyEnrolled(): Promise<boolean> {
+/** The enrolled account id, or undefined when signed out / not enrolled. */
+export async function enrolledAccountId(): Promise<string | undefined> {
   const creds = await loadCredentials();
-  return Boolean(creds?.accountId && (await hasDevice(creds.accountId)));
+  return creds?.accountId && (await hasDevice(creds.accountId)) ? creds.accountId : undefined;
+}
+
+/** True when this machine already holds the account's key material (skip Step 1). */
+export async function alreadyEnrolled(): Promise<boolean> {
+  return (await enrolledAccountId()) !== undefined;
 }
 
 /** Step 1 · Account. Returns true if this machine is now enrolled (flow continues),
@@ -182,7 +214,6 @@ interface StepAccountResult {
 }
 
 async function stepAccount(remote: string): Promise<StepAccountResult> {
-  process.stderr.write(`\n── ${e.bold("Step 1 of 3 · Account")} ${HR.slice(0, 46)}\n`);
   const choice = await promptSelect<"create" | "existing">({
     message: "Are you new here, or do you already have an rbox account?",
     choices: [
@@ -192,7 +223,7 @@ async function stepAccount(remote: string): Promise<StepAccountResult> {
   });
 
   if (choice === "create") {
-    const secret = await promptPassword({ message: "Account bootstrap secret (enter to approve from another machine instead)" });
+    const secret = await promptPassword({ message: "Account bootstrap secret (leave blank for browser device-code sign-up)" });
     // A secret bootstraps the genesis device (shows the recovery phrase); blank falls
     // back to device-code, which authorizes but can't enroll → resolve inline.
     await login(remote, secret || undefined);
@@ -367,16 +398,18 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
 /** Step 2 · Workspace. Returns the init outcome, or undefined if the user backed out. */
 async function stepWorkspace(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean } = {}
+  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string }
 ): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
-  process.stderr.write(`\n── ${e.bold("Step 2 of 3 · Workspace")} ${HR.slice(0, 44)}\n`);
-  const choice = await promptSelect<"new" | "existing">({
-    message: "What do you want to track here?",
-    choices: [
-      { name: "Create a new workspace from a directory", value: "new" },
-      { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced" },
-    ],
-  });
+  process.stderr.write(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
+  const choice =
+    setupOpts.preselectedKind ??
+    (await promptSelect<WorkspaceKind>({
+      message: "What do you want to track here?",
+      choices: [
+        { name: "Create a new workspace from a directory", value: "new" },
+        { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced" },
+      ],
+    }));
 
   let workspace: string | undefined;
   let name: string | undefined;
