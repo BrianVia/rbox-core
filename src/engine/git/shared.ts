@@ -50,6 +50,15 @@ export const ZERO_OID = "0".repeat(40);
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    // Reflog writes (`update-ref --create-reflog`, including transactional
+    // reflog creation) require a committer ident. An identity-less receiver —
+    // for example a fresh machine or a daemon started before Git is configured —
+    // must not defer stash-carrying sections. This synthetic ident is local
+    // forensic text only; rbox never uses it to author commits for the user.
+    GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "rbox",
+    GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "rbox@local",
+    GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "rbox",
+    GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "rbox@local",
     GIT_DIR: undefined,
     GIT_OBJECT_DIRECTORY: undefined,
     GIT_COMMON_DIR: undefined,

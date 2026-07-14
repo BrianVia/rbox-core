@@ -7,12 +7,18 @@ import { promisify } from "node:util";
 import { indexIdentityV2 } from "./index-identity.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 
 let tmp: string;
 let repo: string;
 
 async function git(...args: string[]): Promise<string> {
-  const result = await exec("git", ["-C", repo, ...args]);
+  const result = await exec("git", ["-C", repo, ...args], { env: TEST_GIT_ENV });
   return result.stdout.toString().trim();
 }
 
@@ -78,7 +84,7 @@ describe("indexIdentityV2", () => {
     await git("checkout", "-q", "main");
     await fs.writeFile(path.join(repo, "conflict.txt"), "main\n");
     await git("commit", "-qam", "main side");
-    await exec("git", ["-C", repo, "merge", "other"]).catch(() => undefined);
+    await exec("git", ["-C", repo, "merge", "other"], { env: TEST_GIT_ENV }).catch(() => undefined);
 
     const stages = (await git("ls-files", "--unmerged", "conflict.txt")).split("\n");
     expect(stages).toHaveLength(3);

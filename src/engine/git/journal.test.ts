@@ -16,7 +16,13 @@ import {
 } from "./journal.js";
 
 const exec = promisify(execFile);
-const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then(({ stdout }) => stdout.toString().trim());
 const ZERO_SHA = "0".repeat(64);
 
 let root: string;
@@ -66,7 +72,7 @@ async function privateIndexFor(oid: string, name: string): Promise<Buffer> {
   const candidate = path.join(root, name);
   await fs.copyFile(index, candidate);
   await exec("git", ["-C", repo, "read-tree", oid], {
-    env: { ...process.env, GIT_INDEX_FILE: candidate },
+    env: { ...TEST_GIT_ENV, GIT_INDEX_FILE: candidate },
   });
   return fs.readFile(candidate);
 }

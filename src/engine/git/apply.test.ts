@@ -7,7 +7,14 @@ import { promisify } from "node:util";
 import { applyGitState, captureGitState, gitIdentity, LocalBlobStore, type GitSection } from "../index.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const gitExec = (args: string[]) => exec("git", args, { env: TEST_GIT_ENV });
+const git = (dir: string, ...args: string[]) => gitExec(["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 116);
 
 let tmp: string;
@@ -258,7 +265,7 @@ test("design 116 R2-8: clean-path NFF replacement pins reflog-only human commits
   await git(receiver, "branch", "-f", "side", sideOid);
 
   const tree = await git(sender, "write-tree");
-  const replacement = await exec("git", [
+  const replacement = await gitExec([
     "-C", sender,
     "-c", "user.email=t@t.t",
     "-c", "user.name=t",
@@ -286,7 +293,7 @@ test("design 116 R2-8: clean-path NFF pins the displaced tip when its reflog is 
   await fs.rm(path.join(receiver, ".git", "logs", "refs", "heads", "side"), { force: true });
 
   const tree = await git(sender, "write-tree");
-  const replacement = await exec("git", [
+  const replacement = await gitExec([
     "-C", sender,
     "-c", "user.email=t@t.t",
     "-c", "user.name=t",

@@ -1203,3 +1203,18 @@ measure publish→bytes-on-disk propagation before and after and show it
 unchanged, and record the pull wall-time delta, before default-on ships. The
 residual cost is bounded local I/O off the file plane's critical path. The
 field incident's residual cost was an indefinitely wrong checkout.
+
+## CI and receiver identity hermeticity amendment
+
+Every production Git child inherits fallback author and committer identity
+(`rbox <rbox@local>`) from the shared clean Git environment only when the
+corresponding process variable is unset. Git requires a committer identity for
+reflog creation, including `update-ref --create-reflog` and transactional
+reflog writes. Therefore an identity-less fresh receiver or daemon must still
+publish stash-carrying sections rather than defer them. The fallback is local
+forensic text and never represents user authorship; an identity supplied by the
+calling process remains authoritative.
+
+All direct Git subprocesses in test fixtures use an explicit synthetic test
+identity and disable system/global Git config. This makes fixture commits and
+stashes independent of CI's `HOME` and of developer-machine Git configuration.

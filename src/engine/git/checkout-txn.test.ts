@@ -18,6 +18,12 @@ import { repoCtx, type RepoCtx } from "./shared.js";
 const exec = promisify(execFile);
 const cleanEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test",
+  GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test",
+  GIT_COMMITTER_EMAIL: "rbox-test@local",
   GIT_DIR: undefined,
   GIT_COMMON_DIR: undefined,
   GIT_OBJECT_DIRECTORY: undefined,

@@ -18,6 +18,12 @@ import { acquireLock, formatLockMarker, type LockIdentitySource, type ProcessPro
 import { gitRaw } from "./shared.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 const roots: string[] = [];
 const current = { hostId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", bootId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", pid: 800, startTime: "100" };
 
@@ -43,7 +49,7 @@ async function tempDir(prefix = "rbox-config-txn-"): Promise<string> {
 
 async function initRepo(): Promise<{ repo: string; configPath: string }> {
   const repo = await tempDir();
-  await exec("git", ["-C", repo, "init", "-q"]);
+  await exec("git", ["-C", repo, "init", "-q"], { env: TEST_GIT_ENV });
   return { repo, configPath: path.join(repo, ".git", "config") };
 }
 
@@ -80,7 +86,7 @@ describe("§4 bounded read dispositions", () => {
 describe("snapshot-file parsing", () => {
   test("Git receives a bounded same-dir snapshot path, never the live config", async () => {
     const { repo, configPath } = await initRepo();
-    await exec("git", ["-C", repo, "config", "remote.origin.url", "https://example.com/repo.git"]);
+    await exec("git", ["-C", repo, "config", "remote.origin.url", "https://example.com/repo.git"], { env: TEST_GIT_ENV });
     let parsedPath = "";
     const runner: GitConfigRunner = async (root, args) => {
       parsedPath = args[2]!;
@@ -113,7 +119,7 @@ describe("optimistic config transaction", () => {
 
   test("present keys are untouched and missing keys receive every value in order", async () => {
     const { repo, configPath } = await initRepo();
-    await exec("git", ["-C", repo, "config", "remote.origin.url", "https://local.example/repo.git"]);
+    await exec("git", ["-C", repo, "config", "remote.origin.url", "https://local.example/repo.git"], { env: TEST_GIT_ENV });
     const input: GitConfig = { ...desired, "remote.origin.fetch": ["refs/heads/main:refs/remotes/origin/main", "+refs/heads/*:refs/remotes/origin/*"] };
     const result = await applyConfigTransaction(repo, configPath, input, { identity: identity() });
     expect(result.status).toBe("completed");
@@ -287,7 +293,7 @@ describe("fresh materialization", () => {
     expect(seen.every((args) => args[0] === "config" && args[1] === "--local" && args[2] === "--add")).toBe(true);
 
     const doomed = await tempDir("rbox-config-fresh-");
-    await exec("git", ["-C", doomed, "init", "-q"]);
+    await exec("git", ["-C", doomed, "init", "-q"], { env: TEST_GIT_ENV });
     let calls = 0;
     await expect(materializeFreshGitConfig(doomed, desired, doomed, async () => {
       if (++calls === 2) throw new Error("git failed");

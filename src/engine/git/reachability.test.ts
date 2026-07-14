@@ -13,12 +13,18 @@ import {
 } from "./reachability.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 
 let tmp: string;
 let repo: string;
 
 async function gitAt(dir: string, ...args: string[]): Promise<string> {
-  const result = await exec("git", ["-C", dir, ...args]);
+  const result = await exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV });
   return result.stdout.toString().trim();
 }
 
@@ -132,7 +138,7 @@ describe("fail-closed reachability proofs", () => {
     await commit("one.txt", "one\n");
     const sourceTip = await commit("two.txt", "two\n");
     const shallow = path.join(tmp, "shallow");
-    await exec("git", ["clone", "-q", "--depth", "1", `file://${repo}`, shallow]);
+    await exec("git", ["clone", "-q", "--depth", "1", `file://${repo}`, shallow], { env: TEST_GIT_ENV });
     const shallowTip = await gitAt(shallow, "rev-parse", "HEAD");
     expect(shallowTip).toBe(sourceTip);
 

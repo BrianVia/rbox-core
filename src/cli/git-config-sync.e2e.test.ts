@@ -27,12 +27,18 @@ import {
 import { pull, push, sync, type SyncDeps } from "./sync.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 const KEK = Buffer.alloc(32, 93);
 const noBackoff = async () => {};
 const runGit = (dir: string, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args]).then((result) => result.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString().trim());
 const runGitEnv = (dir: string, env: NodeJS.ProcessEnv, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args], { env: { ...process.env, ...env } }).then((result) => result.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: { ...TEST_GIT_ENV, ...env } }).then((result) => result.stdout.toString().trim());
 
 class LoopRemote implements SyncRemote {
   private head = 0;
@@ -216,7 +222,7 @@ afterEach(async () => {
 
 test("§11 E2E: fresh materialization keeps remote/tracking config and can pull from a local bare remote", async () => {
   const bare = path.join(tmp, "origin.git");
-  await exec("git", ["init", "--bare", "-q", bare]);
+  await exec("git", ["init", "--bare", "-q", bare], { env: TEST_GIT_ENV });
   const repoA = path.join(rootA, "repo");
   await initRepo(repoA);
   await commitFile(repoA, "tracked.txt", "one\n", "initial");
@@ -495,7 +501,7 @@ test("§11 E2E: status is indeterminate when all bounded config reads are unstab
   let attempt = 0;
   const unstableRunner: GitConfigRunner = async (repoDir, args) => {
     await fs.appendFile(configPath, `# forced instability ${++attempt}\n`);
-    return exec("git", ["-C", repoDir, ...args]).then((result) => result.stdout.toString());
+    return exec("git", ["-C", repoDir, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString());
   };
   const status = await gitDivergenceStatus(
     rootA,

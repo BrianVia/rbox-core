@@ -24,7 +24,13 @@ import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { gitIncomingKey } from "./shared.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 116);
 const STREAM = "follow-matrix";
 const REL = "repo";

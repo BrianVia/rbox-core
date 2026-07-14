@@ -11,7 +11,13 @@ import { pinDisplaced, prepareDisplacedRefPins, prepareKeepPins, type KeepPinOri
 import { isSyncableRef } from "../manifest-validate.js";
 
 const exec = promisify(execFile);
-const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 116);
 
 let tmp: string;
@@ -39,7 +45,7 @@ async function commit(name: string, contents: string): Promise<string> {
 }
 
 async function refExists(ref: string): Promise<boolean> {
-  return exec("git", ["-C", repo, "show-ref", "--verify", "--quiet", ref]).then(() => true, () => false);
+  return exec("git", ["-C", repo, "show-ref", "--verify", "--quiet", ref], { env: TEST_GIT_ENV }).then(() => true, () => false);
 }
 
 test("content-addressed pins are create-only, idempotent, and preserve promoted human provenance", async () => {

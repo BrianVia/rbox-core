@@ -19,7 +19,13 @@ import {
 } from "../sync-git.js";
 
 const exec = promisify(execFile);
-const runGit = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((result) => result.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const runGit = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString().trim());
 
 let root = "";
 let cfg: WorkspaceConfig;

@@ -28,7 +28,13 @@ import {
 } from "./index.js";
 
 const exec = promisify(execFile);
-const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: TEST_GIT_ENV }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7);
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 
@@ -164,7 +170,7 @@ test("preflight refusals: no .git, dangling pointer, bare, alternates (both kind
   // bare `.git`
   const bare = path.join(tmp, "bare");
   await fs.mkdir(bare);
-  await exec("git", ["init", "-q", "--bare", path.join(bare, ".git")]);
+  await exec("git", ["init", "-q", "--bare", path.join(bare, ".git")], { env: TEST_GIT_ENV });
   expect((await gitPreflight(bare)).ok).toBe(false);
 
   // alternates on a dir repo

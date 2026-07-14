@@ -29,7 +29,14 @@ import { planGitSections } from "./plan.js";
 import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled, repoEquivalenceWarningLogged } from "./shared.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const gitExec = (args: string[]) => exec("git", args, { env: TEST_GIT_ENV });
+const git = (dir: string, ...args: string[]) => gitExec(["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 19);
 
 const hostReceiverEquivalence = await (async () => {
@@ -381,7 +388,7 @@ test("R2-2 invalidated partial ref moved back to base is held, never republished
 test("disposition: receiver-only non-current branch is held while checkout follows", async () => {
   const { state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
-  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/local-side", local);
   const { outcome, logs } = await applyIncoming(state, incoming);
   expect(logs.some((line) => line.startsWith("git-sync followed repo"))).toBe(true);
@@ -394,7 +401,7 @@ test("disposition: receiver-only non-current branch is held while checkout follo
 test("design safety: receiver-only tag is held and reachable while the safe checkout follows", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
-  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "tag-only commit"])
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "tag-only commit"])
     .then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/tags/receiver-only", local);
   const { outcome, logs } = await applyIncoming(state, incoming);
@@ -432,7 +439,7 @@ test("design safety: ignored human file stays byte-identical and does not block 
 test("deferredSince survives a partial follow followed by a new defer reason", async () => {
   const { state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
-  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/local-side", local);
   await saveState(workspace, state);
   const first = await applyIncoming(state, incoming);
@@ -613,7 +620,7 @@ for (const { mutation, reason } of boundaryMutations) {
         await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "boundary commit");
       } else if (mutation === "checkout") {
         const tree = await git(receiver, "rev-parse", `${c1}^{tree}`);
-        protectedOid = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "boundary checkout commit"])
+        protectedOid = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "boundary checkout commit"])
           .then(({ stdout }) => stdout.toString().trim());
         await git(receiver, "branch", "boundary-checkout", protectedOid);
         await git(receiver, "checkout", "-q", "boundary-checkout");
@@ -649,14 +656,14 @@ for (const { mutation } of boundaryMutations) {
       mutated = true;
       if (mutation === "git-add") {
         fsSync.writeFileSync(path.join(receiver, "post-index.txt"), "post\n");
-        execFileSync("git", ["-C", receiver, "add", "post-index.txt"]);
+        execFileSync("git", ["-C", receiver, "add", "post-index.txt"], { env: TEST_GIT_ENV });
       } else if (mutation === "commit") {
-        execFileSync("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "post-follow commit"]);
+        execFileSync("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "post-follow commit"], { env: TEST_GIT_ENV });
       } else if (mutation === "checkout") {
-        execFileSync("git", ["-C", receiver, "checkout", "-qb", "post-follow-checkout"]);
+        execFileSync("git", ["-C", receiver, "checkout", "-qb", "post-follow-checkout"], { env: TEST_GIT_ENV });
       } else if (mutation === "stash") {
         fsSync.writeFileSync(path.join(receiver, "post-stash.txt"), "post stash\n");
-        execFileSync("git", ["-C", receiver, "stash", "push", "-uqm", "post-follow stash"]);
+        execFileSync("git", ["-C", receiver, "stash", "push", "-uqm", "post-follow stash"], { env: TEST_GIT_ENV });
       } else {
         fsSync.writeFileSync(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
       }
@@ -721,7 +728,7 @@ test("crash-window human ref move is preserved and takes conflict path", async (
     crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-ref-commit");
   const tree = await git(receiver, "rev-parse", `${incoming.refs["refs/heads/main"]}^{tree}`);
-  const human = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", incoming.refs["refs/heads/main"]!, "-m", "human crash-window move"]).then(({ stdout }) => stdout.toString().trim());
+  const human = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", incoming.refs["refs/heads/main"]!, "-m", "human crash-window move"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/main", human, incoming.refs["refs/heads/main"]!);
 
   const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming);
@@ -803,7 +810,7 @@ test("non-current NFF publication pins the displaced live tip in the same episod
   await materialize(base);
   await commit("three\n", "c3");
   const tree = await git(sender, "write-tree");
-  const replacement = await exec("git", ["-C", sender, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-m", "unrelated side replacement"]).then(({ stdout }) => stdout.toString().trim());
+  const replacement = await gitExec(["-C", sender, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-m", "unrelated side replacement"]).then(({ stdout }) => stdout.toString().trim());
   const displaced = base.refs["refs/heads/side"]!;
   await git(sender, "update-ref", "refs/heads/side", replacement, displaced);
   const incoming = await capture();
@@ -898,7 +905,7 @@ test("published partial recovery is idempotent after a branch-switch hold", asyn
   const old = await git(receiver, "rev-parse", "refs/heads/main");
   await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const tree = await git(receiver, "write-tree");
-  const local = await exec("git", ["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "held local side"]).then(({ stdout }) => stdout.toString().trim());
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "held local side"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/local-side", local);
   await saveState(workspace, state);
   const first = await applyIncoming(state, incoming, matchingOracle, {

@@ -32,9 +32,15 @@ import {
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then((r) => r.stdout.toString().trim());
 const gitAt = (dir: string, date: string, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: { ...TEST_GIT_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
   cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
@@ -1888,7 +1894,7 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   // Swap in a SHALLOW clone at the same path — simulating a base section whose repo
   // is now structurally unsyncable (the exact shape the old client authored live).
   await fs.rm(p, { recursive: true, force: true });
-  await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p]);
+  await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p], { env: TEST_GIT_ENV });
 
   // Design 45: the pending structural DROP is an unpublished change —
   // status must not read "in sync" while the next push would commit a removal.
@@ -2177,7 +2183,7 @@ test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mu
     if (mutated || spawnRoot !== repo || args[0] !== "write-tree") return;
     mutated = true;
     fsSync.writeFileSync(path.join(repo, "late.txt"), "late");
-    execFileSync("git", ["-C", repo, "add", "late.txt"]);
+    execFileSync("git", ["-C", repo, "add", "late.txt"], { env: TEST_GIT_ENV });
   });
   try {
     expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
@@ -2287,8 +2293,8 @@ test("design 83: plan cache does not trust a stale carried probe after another r
     if (mutatedClean || spawnRoot !== slow || args[0] !== "bundle" || args[1] !== "create") return;
     mutatedClean = true;
     fsSync.writeFileSync(path.join(clean, "late.txt"), "late");
-    execFileSync("git", ["-C", clean, "add", "late.txt"]);
-    execFileSync("git", ["-C", clean, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "late clean"]);
+    execFileSync("git", ["-C", clean, "add", "late.txt"], { env: TEST_GIT_ENV });
+    execFileSync("git", ["-C", clean, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "late clean"], { env: TEST_GIT_ENV });
   });
   try {
     await push(rootA, cfgA, depsA);
