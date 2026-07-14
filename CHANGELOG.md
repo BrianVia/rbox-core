@@ -5,6 +5,25 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.2] — 2026-07-14 — rbox knows your name
+
+### Added
+- **Identity banners show who you are, not your account id (#278, design
+  117).** The untracked-dir menu, the setup skip-notice, `rbox account
+  status`, and `rbox status`'s ACCOUNT section render
+  "Signed in as you@example.com (github)" once the local profile cache has
+  seen an account fetch (any `rbox status` fills it). Falls back to the
+  account id when uncached — or permanently for CLI-only accounts with no
+  web login. The cache (`~/.rbox/account-profile.json`) is non-secret,
+  0600, sanitized against terminal injection, keyed to the signed-in
+  account, and cleared on logout.
+
+### Fixed
+- **New accounts get their email cached at first login (server).** The
+  provisioning path now seeds the email from the Clerk fetch it already
+  makes; previously the address stayed unknown until the second web login
+  (affecting new-device alert recipient resolution too).
+
 ## [1.6.1] — 2026-07-14 — bare `rbox` meets you where you are
 
 ### Added
