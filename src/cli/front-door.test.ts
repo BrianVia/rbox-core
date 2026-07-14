@@ -120,6 +120,7 @@ for (const action of ["new", "existing", "nothing"] as const satisfies ReadonlyA
     const writes: string[] = [];
     const result = await runUntrackedMenu("/tmp/scratch", "acct_ab12cd34", {
       writeStderr: (text) => void writes.push(text),
+      getIdentity: async () => undefined,
       promptSelect: async (cfg) => {
         expect(cfg.message).toBe("What would you like to do?");
         expect(cfg.choices).toEqual(UNTRACKED_MENU_CHOICES("/tmp/scratch"));
@@ -132,9 +133,24 @@ for (const action of ["new", "existing", "nothing"] as const satisfies ReadonlyA
   });
 }
 
+test("untracked menu renders cached email and method instead of the account id", async () => {
+  const writes: string[] = [];
+  await runUntrackedMenu("/tmp/scratch", "acct_hidden", {
+    writeStderr: (text) => void writes.push(text),
+    getIdentity: async (accountId) => {
+      expect(accountId).toBe("acct_hidden");
+      return { email: "owner@example.com", signInMethod: "github" };
+    },
+    promptSelect: async () => "nothing",
+  });
+  expect(writes.join("")).toContain("Signed in as owner@example.com (github). This directory isn't tracked yet.");
+  expect(writes.join("")).not.toContain("acct_hidden");
+});
+
 test("untracked menu exits cleanly on prompt abort", async () => {
   const result = await runUntrackedMenu("/tmp/scratch", "acct_ab12cd34", {
     writeStderr: () => {},
+    getIdentity: async () => undefined,
     promptSelect: async () => {
       throw simulatedExitPromptError();
     },

@@ -639,7 +639,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const row = await env.rbox_dev_db.prepare("SELECT signin_method, signin_method_updated_at FROM clerk_users WHERE clerk_user_id = ?").bind(sub).first<{ signin_method: string; signin_method_updated_at: number }>();
     expect(row).toEqual({ signin_method: "github+password", signin_method_updated_at: 110 });
     const status = await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(token) });
-    expect((await status.json()) as { signInMethod: string | null }).toMatchObject({ signInMethod: "github+password" });
+    expect((await status.json()) as { email: string | null; signInMethod: string | null }).toMatchObject({
+      email: "owner@example.com",
+      signInMethod: "github+password",
+    });
   });
 
   test("returning login refreshes when email is stale", async () => {
@@ -1362,7 +1365,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     await linkConfirm(sub, a.pollKey);
     expect(await clerkMap(sub)).toBe(x.accountId);
     // Status reports linked.
-    expect(((await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()) as { linked: boolean }).linked).toBe(true);
+    expect(await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()).toMatchObject({
+      linked: true,
+      email: "owner@example.com",
+    });
 
     // Billing on X → unlink blocks.
     await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = 'cus_x' WHERE id = ?").bind(x.accountId).run();
@@ -1374,7 +1380,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const fresh = ((await un.json()) as { account: string }).account;
     expect(await clerkMap(sub)).toBe(fresh);
     expect(fresh).not.toBe(x.accountId);
-    expect(((await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()) as { linked: boolean }).linked).toBe(false);
+    expect(await (await SELF.fetch(`${BASE}/v1/account/status`, { headers: authed(x.token) })).json()).toMatchObject({
+      linked: false,
+      email: null,
+    });
   });
 
   test("idempotent re-confirm: confirming the SAME committed target again → 200 (not 409)", async () => {

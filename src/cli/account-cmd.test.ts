@@ -1,5 +1,9 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { accountLink, accountStatus, accountUnlink, fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
+import { accountProfilePath, flushAccountProfileWrites, readAccountProfile } from "./account-profile.js";
 
 // Drive the CLI account verbs against a stubbed control plane. loadCredentials()
 // honors RBOX_TOKEN/RBOX_API env overrides, so no file or module mock is needed —
@@ -15,6 +19,7 @@ const origLog = console.log;
 const origStdout = process.stdout.write.bind(process.stdout);
 let calls: { url: string; init?: RequestInit }[] = [];
 let logs: string[] = [];
+let home: string;
 
 async function captureStdout(fn: () => Promise<void>): Promise<string> {
   const out: string[] = [];
@@ -43,7 +48,9 @@ function stub(responder: (url: string) => { status: number; body?: unknown }): v
   }) as unknown as typeof fetch;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-account-cmd-"));
+  process.env.RBOX_HOME = home;
   calls = [];
   logs = [];
   console.log = (...m: unknown[]) => void logs.push(m.map(String).join(" "));
@@ -51,13 +58,16 @@ beforeEach(() => {
   process.env.RBOX_API = "https://api.test";
   process.env.RBOX_DEVICE_ID = "dev_test";
 });
-afterEach(() => {
+afterEach(async () => {
+  await flushAccountProfileWrites();
   globalThis.fetch = origFetch;
   console.log = origLog;
   process.stdout.write = origStdout;
   delete process.env.RBOX_TOKEN;
   delete process.env.RBOX_API;
   delete process.env.RBOX_DEVICE_ID;
+  delete process.env.RBOX_HOME;
+  await fs.rm(home, { recursive: true, force: true });
 });
 
 describe("rbox account link", () => {
@@ -88,13 +98,15 @@ describe("rbox account link", () => {
 
 describe("rbox account status / unlink", () => {
   test("status prints the account id, plan and linked state", async () => {
-    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro", signInMethod: "github+password" } }));
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro", email: "owner@example.com", signInMethod: "github+password" } }));
     await accountStatus();
     const out = logs.join("\n");
     expect(out).toContain("acct_xyz");
     expect(out).toMatch(/plan:\s*pro/i);
     expect(out).toMatch(/linked:\s*yes/i);
-    expect(out).toMatch(/sign-in:\s*github\+password/i);
+    expect(out).toMatch(/signed in as:\s*owner@example\.com \(github\+password\)/i);
+    await flushAccountProfileWrites();
+    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "github+password" });
   });
 
   test.each([
@@ -125,6 +137,14 @@ describe("rbox account status / unlink", () => {
     expect(JSON.parse(out)).toMatchObject({ signInMethod: "google" });
   });
 
+  test("--json includes a known email", async () => {
+    stub((url) => url.endsWith("/v1/account/status")
+      ? { status: 200, body: { accountId: "acct_json", linked: true, email: "owner@example.com", signInMethod: "google" } }
+      : { status: 200, body: { plan: "solo" } });
+    const out = await captureStdout(() => accountStatus({ json: true }));
+    expect(JSON.parse(out)).toMatchObject({ email: "owner@example.com", signInMethod: "google" });
+  });
+
   test("unlink maps 409 → billing error and 404 → not-linked error", async () => {
     stub(() => ({ status: 409 }));
     await expect(accountUnlink()).rejects.toThrow(/billing/i);
@@ -145,20 +165,24 @@ describe("rbox account status / unlink", () => {
 // account fetch would take the whole (otherwise-local) `rbox status` down with it.
 describe("rbox status — account section", () => {
   test("ok: formats account id, plan and linked=yes", async () => {
-    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "solo", signInMethod: "google" } }));
+    stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "solo", email: "owner@example.com", signInMethod: "google" } }));
     const summary = await fetchAccountSummary();
-    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_xyz", plan: "solo", linked: true, signInMethod: "google" } });
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_xyz", plan: "solo", linked: true, email: "owner@example.com", signInMethod: "google" } });
     const out = plain(formatAccountSummary(summary).join("\n"));
     expect(out).toContain("acct_xyz");
     expect(out).toMatch(/plan:\s*solo/i);
     expect(out).toMatch(/linked:\s*yes/i);
-    expect(out).toMatch(/sign-in:\s*google/i);
+    expect(out).toMatch(/signed in as:\s*owner@example\.com \(google\)/i);
+    await flushAccountProfileWrites();
+    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "google" });
   });
 
   test("ok: an API without the plan field degrades to no active plan, not a failure", async () => {
     stub(() => ({ status: 200, body: { accountId: "acct_old", linked: false } }));
     const summary = await fetchAccountSummary();
     expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "none", linked: false } });
+    await flushAccountProfileWrites();
+    expect(await readAccountProfile("acct_old")).toMatchObject({ email: null, signInMethod: null });
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*no active plan/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/linked:\s*no/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).not.toMatch(/sign-in:/i);
@@ -183,6 +207,8 @@ describe("rbox status — account section", () => {
   test("graceful degradation: a non-2xx (e.g. 500) is `unavailable`, not a throw", async () => {
     stub(() => ({ status: 500 }));
     expect(await fetchAccountSummary()).toEqual({ state: "unavailable" });
+    await flushAccountProfileWrites();
+    expect(await fs.exists(accountProfilePath())).toBe(false);
   });
 
   test("timeout: a hung request aborts and resolves to `unavailable` within the budget", async () => {

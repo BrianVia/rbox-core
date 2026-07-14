@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { workspaceFlags, authorizePath, stepHeader, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup } from "./setup-cmd.js";
+import { workspaceFlags, authorizePath, stepHeader, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup, writeEnrolledSkipNotice } from "./setup-cmd.js";
 import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
@@ -18,6 +18,21 @@ test("setup step header numbers fresh and enrolled flows", () => {
     "Step 1 of 2 · Workspace",
     "Step 2 of 2 · Start syncing",
   ]);
+});
+
+test("enrolled setup skip notice renders cached identity or the exact account-id fallback", async () => {
+  const writes: string[] = [];
+  await writeEnrolledSkipNotice("acct_hidden", {
+    getIdentity: async () => ({ email: "owner@example.com", signInMethod: "github" }),
+    writeStderr: (text) => void writes.push(text),
+  });
+  expect(writes.pop()).toBe("Signed in as owner@example.com (github) — skipping account setup.\n");
+
+  await writeEnrolledSkipNotice("acct_fallback", {
+    getIdentity: async () => undefined,
+    writeStderr: (text) => void writes.push(text),
+  });
+  expect(writes.pop()).toBe("Signed in and enrolled (acct_fallback) — skipping account setup.\n");
 });
 
 // The guided flow's menus are now arrow-key `@inquirer` `select`s (thin widgets we

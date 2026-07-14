@@ -138,9 +138,14 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // candidate ids ever materialize, so a lost race never orphans an account.
     const candAcct = randomId("acct", 8);
     const candUser = randomId("user", 8);
+    // Seed the email cache from the fetch the verified gate already paid for — the
+    // design-16 refresh below skips first logins, and account-status/new-device
+    // consumers shouldn't wait for a second login to see an address.
+    // email_updated_at stays NULL ("seeded, never refreshed") so notify.ts's
+    // returning-login refresh throttle behaves exactly as before this seed existed.
     await dirDb(env)
-      .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at, signin_method, signin_method_updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(sub, candAcct, candUser, nowMs, clerkUser.signInMethod, clerkUser.clerkUpdatedAt)
+      .prepare("INSERT OR IGNORE INTO clerk_users (clerk_user_id, account_id, user_id, created_at, signin_method, signin_method_updated_at, email) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(sub, candAcct, candUser, nowMs, clerkUser.signInMethod, clerkUser.clerkUpdatedAt, clerkUser.email)
       .run();
     map = await dirDb(env)
       .prepare("SELECT account_id, user_id FROM clerk_users WHERE clerk_user_id = ?")
