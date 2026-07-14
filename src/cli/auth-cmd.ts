@@ -367,7 +367,7 @@ export async function pairCreate(): Promise<void> {
   const full = `${token}.${toB64url(tokenSecret)}`; // <redeemToken>.<tokenSecret>
   console.log(`\nPairing token (valid ~10 min, single use — carries your encryption key):\n`);
   console.log(`    ${full}\n`);
-  console.log(`On the new machine: run \`rbox\`, choose "Paste a pairing token", and paste it.`);
+  console.log(`On the new machine, run \`rbox setup\`, choose "Log into an existing account", then "Paste a pairing token".`);
 
   if (isInteractive()) {
     process.stdout.write("Press [c] to copy the token to your clipboard, any other key to continue... ");

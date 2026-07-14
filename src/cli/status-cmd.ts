@@ -235,7 +235,11 @@ function createGitRepoFeed(): {
   };
 }
 
-export async function statusCmd(root: string, opts: { json?: boolean } = {}): Promise<void> {
+export interface StatusCmdResult {
+  daemonRunning: boolean;
+}
+
+export async function statusCmd(root: string, opts: { json?: boolean } = {}): Promise<StatusCmdResult> {
   return statusCmdWithDeps(root, opts, defaultStatusDeps);
 }
 
@@ -243,7 +247,7 @@ export async function statusCmdWithDeps(
   root: string,
   opts: { json?: boolean } = {},
   deps: StatusCmdDeps = defaultStatusDeps
-): Promise<void> {
+): Promise<StatusCmdResult> {
   const creds = await loadCredentials().catch(() => undefined);
   const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
   const rawCfg = await loadConfig(root);
@@ -476,7 +480,7 @@ export async function statusCmdWithDeps(
         : {}),
     };
     emitJson(statusJson);
-    return;
+    return { daemonRunning: bg.running };
   }
 
   const wsLabel = cfg.name
@@ -580,4 +584,5 @@ export async function statusCmdWithDeps(
   for (const line of formatAccountSummary((await accountSummaryP)!)) console.log(line);
   const updateLine = formatUpdateAvailableLine(await readUpdateCheckState());
   if (updateLine) console.log(`  ${updateLine}`);
+  return { daemonRunning: bg.running };
 }

@@ -493,10 +493,16 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // Non-interactive bare `rbox`, or an unknown command → the grouped help
       // screen (never hangs). An unknown command also exits non-zero.
       if (!cmd && process.stdin.isTTY) {
-        const { resolveBareRboxTarget, runFrontDoor } = await import("./front-door.js");
+        const { resolveBareRboxTarget, runFrontDoor, runUntrackedMenu } = await import("./front-door.js");
         const target = await resolveBareRboxTarget(process.cwd());
         if (target.kind === "front-door") {
           await runFrontDoor(target.root);
+        } else if (target.kind === "untracked-menu") {
+          const kind = await runUntrackedMenu(process.cwd(), target.accountId);
+          if (kind) {
+            const { runSetup } = await import("./setup-cmd.js");
+            await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: kind, viaUntrackedMenu: true });
+          }
         } else {
           const { runSetup } = await import("./setup-cmd.js");
           await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {} });
