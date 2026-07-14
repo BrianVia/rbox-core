@@ -131,7 +131,14 @@ export async function prepareDisplacedRefPins(
   origin: KeepPinOrigin,
 ): Promise<PrepareDisplacedPinsResult> {
   const displaced: string[] = [];
-  for (const oid of await enumerateRefReflogOids(repoDir, ref)) {
+  // The live tip is a displacement candidate in its own right, not only the
+  // reflog entries: with reflogs disabled or pruned (core.logAllRefUpdates=false,
+  // fresh-materialized stores) the enumeration below is empty, and deleting the
+  // ref would otherwise strand a unique tip with no refs/rbox-local/keep/* pin —
+  // the quarantine bundle is defense in depth, never the protection (r1 F6).
+  const liveTip = await git(repoDir, ["rev-parse", "--verify", "--quiet", ref]).catch(() => "");
+  const candidates = new Set([...(HEX40.test(liveTip) ? [liveTip] : []), ...(await enumerateRefReflogOids(repoDir, ref))]);
+  for (const oid of candidates) {
     const proof = await tipOwnedByIncoming(repoDir, oid, plannedGraphRoots);
     if (proof.status === "indeterminate") return { status: "indeterminate", oid, marker: proof.marker };
     if (proof.status === "unowned") displaced.push(oid);

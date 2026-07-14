@@ -180,9 +180,18 @@ export function receiverEquivalentPath(value: string, eq: ReceiverEquivalence): 
 }
 
 /** Repo targets and ref stores can alias independently of worktree behavior
- * (for example packed versus loose refs, or state later moved to APFS). */
+ * (for example packed versus loose refs, or state later moved to APFS).
+ * The key approximates Unicode FULL case folding, not just toLowerCase():
+ * upper-then-lower collapses one-way foldings like final sigma (ς → Σ → σ)
+ * that a single lowercase pass leaves distinct while APFS/HFS+ fold tables
+ * treat them as one caseless class. Exhaustive per-filesystem fold tables are
+ * unknowable statically — this key is a deliberately conservative superset
+ * used only to DEFER on collision, never to authorize anything. */
 export function conservativeReceiverEquivalentPath(value: string): string {
-  return value.split("/").map((part) => part.normalize("NFC").toLowerCase()).join("/");
+  return value
+    .split("/")
+    .map((part) => part.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC"))
+    .join("/");
 }
 
 export function receiverEquivalentCollisionNames(

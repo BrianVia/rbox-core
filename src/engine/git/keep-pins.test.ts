@@ -92,6 +92,28 @@ test("reflog protection returns same-transaction create lines for reflog-only co
   expect(await refExists(`refs/rbox-local/keep/${displaced}`)).toBe(false);
 });
 
+test("a reflog-less unique live tip is pinned before deletion (confirmation-pass finding)", async () => {
+  const base = await commit("history.txt", "base\n");
+  const unique = await commit("history.txt", "unique on doomed\n");
+  await runGit(repo, "update-ref", "refs/heads/doomed", unique);
+  await runGit(repo, "reset", "--hard", base);
+  // Simulate reflogs disabled/pruned: with no reflog the enumeration alone
+  // finds nothing and deletion would strand `unique` with no keep pin.
+  await fs.rm(path.join(repo, ".git", "logs", "refs", "heads", "doomed"), { force: true });
+
+  const result = await prepareDisplacedRefPins(repo, "refs/heads/doomed", [base], {
+    ref: "refs/heads/doomed",
+    episode: "reflogless-delete",
+    time: "2026-07-13T12:30:00.000Z",
+    class: "human",
+  });
+
+  expect(result.status).toBe("prepared");
+  if (result.status !== "prepared") throw new Error("unexpected indeterminate reachability proof");
+  expect(result.oids).toContain(unique);
+  expect(result.transactionLines).toContain(`create refs/rbox-local/keep/${unique} ${unique}`);
+});
+
 test("recovery namespace is excluded from syncable refs, capture, and ordinary identity", async () => {
   const oid = await commit("tracked.txt", "tracked\n");
   await pinDisplaced(repo, [oid], {
