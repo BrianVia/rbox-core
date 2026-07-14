@@ -28,7 +28,13 @@ import {
 } from "./index.js";
 
 const exec = promisify(execFile);
-const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: TEST_GIT_ENV }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7);
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 
@@ -164,7 +170,7 @@ test("preflight refusals: no .git, dangling pointer, bare, alternates (both kind
   // bare `.git`
   const bare = path.join(tmp, "bare");
   await fs.mkdir(bare);
-  await exec("git", ["init", "-q", "--bare", path.join(bare, ".git")]);
+  await exec("git", ["init", "-q", "--bare", path.join(bare, ".git")], { env: TEST_GIT_ENV });
   expect((await gitPreflight(bare)).ok).toBe(false);
 
   // alternates on a dir repo
@@ -444,7 +450,7 @@ test("a repo APPEARING at a fresh target during artifact download defers — its
   expect(await fs.readFile(path.join(D, "user.txt"), "utf8")).toBe("user work");
 });
 
-test("design 68 §3.2: apply into a primary with linked worktrees DEFERS on a checked-out-branch collision, then applies once the worktree is removed (V10, V3)", async () => {
+test("design 116 phase-0 supersedes design 68 §3.2: absent sibling branch is held while unrelated refs apply, then deletes after removal", async () => {
   const A = path.join(tmp, "A");
   await initRepo(A);
   await commit(A, "f.txt", "x", "c1");
@@ -454,14 +460,14 @@ test("design 68 §3.2: apply into a primary with linked worktrees DEFERS on a ch
   const siblingSha = await git(M, "rev-parse", "sibling");
   const mMain = await git(M, "rev-parse", "main");
 
-  // The all-scope apply would DELETE `sibling` (absent from the section) — but prim-wt has it
-  // checked out, so `update-ref -d` would strand that worktree. Whole-section defer, no mutation.
+  // The all-scope apply would DELETE `sibling` (absent from the section), so D1 holds that
+  // ref in place while allowing the unrelated main/HEAD/index lanes to progress.
   const res = await applyGitState(M, section!, store, KEK);
-  expect(res.applied).toBe(false);
-  expect(res.reason).toContain("linked worktree");
-  expect(res.reason).toContain("sibling");
+  expect(res.applied).toBe(true);
+  expect(res.heldRefs).toEqual({ "refs/heads/sibling": "prim-wt" });
   expect(await git(M, "rev-parse", "sibling")).toBe(siblingSha); // untouched
-  expect(await git(M, "rev-parse", "main")).toBe(mMain); // no partial application
+  expect(await git(M, "rev-parse", "main")).toBe(await git(A, "rev-parse", "main"));
+  expect(await git(M, "rev-parse", "main")).not.toBe(mMain); // unrelated ref applied
 
   // Remove the worktree → the checked-out set clears → the section applies next cycle (V3).
   await git(M, "worktree", "remove", "--force", path.join(tmp, "prim-wt"));
@@ -623,15 +629,15 @@ test("a rolled-back apply leaks NO stash reflog entries (git stash list stays cl
   const section = await captureGitState(A, store, KEK);
   expect(section!.refs["refs/stash"]).toBeDefined();
 
-  // Sabotage: a syncable ref pointing at an object the bundle doesn't carry —
-  // update-ref fails AFTER refs/stash published (insertion order puts it last),
-  // forcing the rollback path.
-  const bogus: typeof section = { ...section!, refs: { ...section!.refs, "refs/heads/zzz": "f".repeat(40) } };
-
   const B = path.join(tmp, "B");
   await initRepo(B);
   await commit(B, "g.txt", "y", "c1");
-  const res = await applyGitState(B, bogus!, store, KEK);
+  // Force a failure after refs/stash publishes. A per-ref CAS failure is now an
+  // intentional partial hold (design 116 F3), so the final mutation hook is the
+  // deterministic rollback injection for this rollback-specific assertion.
+  const res = await applyGitState(B, section!, store, KEK, {
+    afterGitMutate: async () => { throw new Error("rollback injection"); },
+  });
   expect(res.applied).toBe(false);
   expect(res.reason).toContain("rolled back");
   // the ref rollback also rolled back the REFLOG the stash publish appended —

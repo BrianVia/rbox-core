@@ -8,6 +8,7 @@ import {
   checkDeviceIdentity,
   doctorCmd,
   presentDiagnosticsPreview,
+  redactGitLogLines,
   type DiagnosticsBundle,
   type DoctorChecks,
   type DoctorContext,
@@ -193,6 +194,110 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
     expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.metrics).toEqual({ excluded: "stale daemon binding" });
     expect(bundle.activity).toEqual({ excluded: "stale daemon binding" });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("git daemon forensics are fail-closed and privacy-safe in diagnostics", async () => {
+  const oid = "0123456789abcdef0123456789abcdef01234567";
+  const raw = [
+    "2026-07-13T12:00:00.000Z ordinary daemon line",
+    "2026-07-13T12:00:00.500Z git-sync: captured 1 (private/summary) · carried 0 · skipped 0 · deferred 1 (private/summary: raw summary failure) · removed 0",
+    "2026-07-13T12:00:01.000Z git deferred 14d: local edits on branch secret stash branch\tname (private/repo)",
+    "2026-07-13T12:00:01.500Z git deferred 14d: local edits on branch another private branch (other/private)",
+    `2026-07-13T12:00:02.000Z git-sync deferred private/legacy repo: fatal: raw git failure ${oid}`,
+    "2026-07-13T12:00:03.000Z git-sync CONFLICT private/conflict — local kept; remote preserved at refs/rbox-conflict/private",
+    "2026-07-13T12:00:04.000Z git-sync WARNING private/repo: post-apply containment check failed: /secret/path",
+    "2026-07-13T12:00:05.000Z git-sync config skipped private/repo: local branch name does not own config",
+    `2026-07-13T12:00:06.000Z git-sync applied private/repo (held refs: refs/heads/secret=${oid})`,
+    "2026-07-13T12:00:07.000Z git-sync applied private/repo (filtered refs: refs/heads/private)",
+    "2026-07-13T12:00:07.500Z git-sync removed private/repo (remote deleted; local .git untouched)",
+    "2026-07-13T12:00:08.000Z git-sync deferred malformed-without-colon private/repo secret",
+    "2026-07-13T12:00:09.000Z git-sync UNKNOWN private/repo raw error",
+    "2026-07-13T12:00:10.000Z git-sync WARNING private/repo: raw error starts here",
+    "injected continuation /secret/control-path refs/heads/private",
+    "2026-07-13T12:00:10.500Z TIMESTAMP_SHAPED_SECRET /secret/spoof private/repo",
+    "2026-07-13T12:00:10.750Z git deferred 1h: artifact on checkout unavailable (private/missing-checkout)",
+    "2026-07-13T12:00:11.000Z ordinary daemon end",
+  ].join("\n") + "\n";
+
+  const redacted = redactGitLogLines(raw);
+  expect(redacted).toContain("ordinary daemon line");
+  expect(redacted).toContain("git-sync summary reason=other age=-");
+  expect(redacted).toContain("git-sync deferred reason=local-edits age=14d count=2");
+  expect(redacted).toContain("git-sync deferred reason=other age=-");
+  expect(redacted).toContain("git-sync conflict reason=conflict age=-");
+  expect(redacted).toContain("git-sync warning reason=containment age=-");
+  expect(redacted).toContain("git-sync config-skipped reason=config age=-");
+  expect(redacted).toContain("git-sync applied reason=local-commits age=-");
+  expect(redacted).toContain("git-sync applied reason=other age=-");
+  expect(redacted).toContain("git-sync removed reason=other age=-");
+  expect(redacted).toContain("git-sync deferred reason=artifact age=1h");
+  expect(redacted).not.toMatch(/\d{4}-\d\d-\d\dT\S+Z git-sync/);
+  expect(redacted).not.toContain("ordinary daemon end");
+  for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret/", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
+    expect(redacted).not.toContain(secret);
+  }
+
+  const root = await makeWorkspace();
+  try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "daemon.log"), raw);
+    const ctx: DoctorContext = {
+      root,
+      cfg: {
+        schema: "e2ee/v1",
+        remoteWorkspaceId: "ws_diag",
+        projectId: "root",
+        rootPath: root,
+        remoteUrl: "https://api.test",
+        token: "",
+        deviceId: "dev_1",
+      },
+      checks: { ...checks, daemon: { ok: true, label: "background sync", message: "running", status: "running" } },
+      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      daemonStale: false,
+    };
+    const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
+    expect(payload).toContain("git-sync deferred reason=local-edits age=14d");
+    for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret/", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
+      expect(payload).not.toContain(secret);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a byte-truncated Git log record cannot leak a continuation", async () => {
+  const root = await makeWorkspace();
+  try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    const sentinel = "TRUNCATED_GIT_CONTINUATION_SECRET";
+    await fs.writeFile(path.join(runtime, "daemon.log"), [
+      "2026-07-13T11:59:59.000Z ordinary safely framed record",
+      `2026-07-13T12:00:00.000Z git-sync WARNING repo: ${"x".repeat(70 * 1024)}`,
+      sentinel,
+      "2026-07-13T12:00:01.000Z TIMESTAMP_SPOOFED_CONTINUATION_SECRET",
+      "",
+    ].join("\n"));
+    const ctx: DoctorContext = {
+      root,
+      cfg: {
+        schema: "e2ee/v1", remoteWorkspaceId: "ws_diag", projectId: "root", rootPath: root,
+        remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
+      },
+      checks,
+      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      daemonStale: false,
+    };
+    const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
+    // The byte tail begins within the unsafe Git record, so neither its raw
+    // continuations nor timestamp-shaped continuations may be treated as records.
+    expect(payload).not.toContain("TIMESTAMP_SPOOFED_CONTINUATION_SECRET");
+    expect(payload).not.toContain(sentinel);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

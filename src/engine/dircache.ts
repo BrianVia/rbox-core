@@ -7,7 +7,7 @@ import { isSafeRelPath } from "./manifest-validate.js";
 export const RACY_MARGIN_MS = 2_000;
 export const UNPRUNED_DEADLINE_MS = 30 * 60_000;
 
-export type ChildType = "file" | "dir" | "symlink";
+export type ChildType = "file" | "dir" | "symlink" | "other";
 export interface DirCacheChild { name: string; type: ChildType; }
 export interface DirCacheEntry { mtimeMs: number; ctimeMs: number; children: DirCacheChild[]; }
 export type RuleFileRecord =
@@ -16,7 +16,10 @@ export type RuleFileRecord =
 export type DircacheOutcome = "off" | "unpruned" | "deadline" | "rules-dropped" | "hit" | "cold";
 
 export interface DirCacheFile {
-  version: 1;
+  /** v2 records unsupported/special directory children as `other`.  A v1
+   * listing silently omitted them and therefore cannot prove complete
+   * inventory for the applied-manifest receipt. */
+  version: 2;
   lastScanStartMs: number;
   lastUnprunedScanAtMs: number;
   ruleFiles: RuleFileRecord[];
@@ -56,7 +59,7 @@ function validEntry(value: unknown): value is DirCacheEntry {
   return validNumber(entry.mtimeMs) && validNumber(entry.ctimeMs) && Array.isArray(entry.children) && entry.children.every((child) => {
     if (!child || typeof child !== "object") return false;
     const c = child as Record<string, unknown>;
-    return typeof c.name === "string" && c.name !== "" && c.name !== "." && c.name !== ".." && !c.name.includes("/") && (c.type === "file" || c.type === "dir" || c.type === "symlink");
+    return typeof c.name === "string" && c.name !== "" && c.name !== "." && c.name !== ".." && !c.name.includes("/") && (c.type === "file" || c.type === "dir" || c.type === "symlink" || c.type === "other");
   });
 }
 
@@ -100,7 +103,7 @@ export class DirCache {
       const parsed: unknown = JSON.parse(await fs.readFile(path.join(root, CACHE_REL), "utf8"));
       if (!parsed || typeof parsed !== "object") return new DirCache();
       const file = parsed as Partial<DirCacheFile>;
-      if (file.version !== 1 || !validNumber(file.lastScanStartMs) || !validNumber(file.lastUnprunedScanAtMs) ||
+      if (file.version !== 2 || !validNumber(file.lastScanStartMs) || !validNumber(file.lastUnprunedScanAtMs) ||
           !Array.isArray(file.ruleFiles) || !file.ruleFiles.every(validRuleFile) || !file.entries || typeof file.entries !== "object") return new DirCache();
       if (!Object.keys(file.entries).every(validRel) || !Object.values(file.entries).every(validEntry)) return new DirCache();
       return new DirCache(file as DirCacheFile);
@@ -114,7 +117,7 @@ export class DirCache {
     const abs = path.join(root, CACHE_REL);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     const file: DirCacheFile = {
-      version: 1,
+      version: 2,
       lastScanStartMs: this.lastScanStartMs,
       lastUnprunedScanAtMs: this.lastUnprunedScanAtMs,
       ruleFiles: this.loadedRuleFiles,

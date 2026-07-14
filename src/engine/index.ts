@@ -84,6 +84,19 @@ export { scanManifest, createScanStats, applyWatchEvents, statsStableAcrossHash,
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
+export {
+  conservativeReceiverEquivalentPath,
+  oracleFromPull,
+  oracleFromState,
+  probeReceiverEquivalence,
+  receiverEquivalentCollisionNames,
+  receiverEquivalentPath,
+  setReceiverEquivalenceProbeForTests,
+  type AppliedManifestOracle,
+  type OracleVerdict,
+  type ReceiverEquivalence,
+  type ReceiverEquivalenceProbe,
+} from "./apply-receipt.js";
 export { applyActions,
   laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
 export {
@@ -115,6 +128,53 @@ export {
   type EncryptAddressCacheEntry,
 } from "./encrypt-address-cache.js";
 export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
+export { indexIdentityV2 } from "./git/index-identity.js";
+export {
+  incomingOwnershipRoots,
+  tipOwnedByIncoming,
+  noDropProof,
+  enumerateStashReflogOids,
+  type ImportedScratchNamespace,
+  type OwnershipProof,
+  type NoDropProof,
+} from "./git/reachability.js";
+export {
+  prepareKeepPins,
+  pinDisplaced,
+  enumerateRefReflogOids,
+  prepareDisplacedRefPins,
+  type KeepPinOrigin,
+  type KeepPinOrigins,
+  type PreparedKeepPins,
+  type PrepareDisplacedPinsResult,
+} from "./git/keep-pins.js";
+export {
+  checkoutJournalDir,
+  writeCheckoutJournal,
+  updateCheckoutJournal,
+  markCheckoutJournalPublished,
+  clearCheckoutJournal,
+  recoverJournal,
+  type CheckoutJournalBinding,
+  type CheckoutJournal,
+  type WriteCheckoutJournalSources,
+  type JournalRecoveryResult,
+} from "./git/journal.js";
+export {
+  commitCheckout,
+  checkoutTransactionSupported,
+  ownershipAwareGitBusy,
+  setCheckoutCapabilityProbeForTests,
+  resetCheckoutCapabilityProbeCacheForTests,
+  type CheckoutRefUpdate,
+  type CheckoutHeadUpdate,
+  type CheckoutPlan,
+  type OwnedGitLock,
+  type SecondProofContext,
+  type CommitCheckoutOptions,
+  type CommitCheckoutResult,
+  type CheckoutCapabilityProbe,
+} from "./git/checkout-txn.js";
 export {
   validateManifest,
   validateGitRepos,

@@ -164,6 +164,21 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
+    name: "git resolve",
+    group: "SYNCING",
+    summary: "inspect or resolve a deferred Git checkout",
+    usage: "rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming]",
+    flags: [
+      { flag: "--json", desc: "print a typed JSON result (commit OIDs are omitted)" },
+      { flag: "--confirm <token>", desc: "confirm the exact snapshot printed by show-me" },
+      { flag: "--force-discard-incoming", desc: "keep-mine only: acknowledge incoming artifacts cannot be retained" },
+    ],
+    notes: [
+      "The default verb is show-me.",
+      "take-theirs quarantines and pins local Git work before following incoming metadata; working files are not rewritten.",
+    ],
+  },
+  {
     name: "push",
     group: "SYNCING",
     summary: "upload local changes",

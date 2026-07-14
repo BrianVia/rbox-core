@@ -22,6 +22,8 @@ export interface HashCacheEntry {
   sha256: string;
 }
 
+export type HashCacheStatIdentity = Omit<HashCacheEntry, "sha256">;
+
 interface HashCacheFileV2 {
   version: 2;
   entries: Record<string, HashCacheEntry>;
@@ -50,6 +52,14 @@ export class HashCache {
     const e = this.map.get(relPath);
     if (e && e.mtimeMs === mtimeMs && e.size === size && e.ctimeMs === ctimeMs) return e.sha256;
     return undefined;
+  }
+
+  /** The complete stat identity retained for a particular scanned content hash.
+   *  Consumers must still compare every returned field with the live stat. */
+  statIdentity(relPath: string, sha256: string): HashCacheStatIdentity | undefined {
+    const entry = this.map.get(relPath);
+    if (!entry || entry.sha256 !== sha256) return undefined;
+    return { mtimeMs: entry.mtimeMs, size: entry.size, ctimeMs: entry.ctimeMs };
   }
 
   record(relPath: string, entry: HashCacheEntry): void {

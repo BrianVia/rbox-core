@@ -3,6 +3,7 @@ import {
   isIgnoreRuleFile,
   PhaseReport,
   reconcile,
+  oracleFromPull,
   scanManifest,
   validateManifest,
   type Action,
@@ -13,7 +14,7 @@ import {
   snapshotApplyStats,
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
-import { loadState, manifestFromMeta, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
 import { type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
@@ -21,9 +22,10 @@ import {
 import {
   applyGitSections,
   formatGitApplyMetrics,
+  withRevalidatedGitPartialApplies,
 } from "../sync-git.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { observedRepoKeys, saveStateSource } from "../sync-state.js";
+import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
@@ -218,6 +220,17 @@ export async function applyPulledManifest(
   }
   await report.phase("cache-save", () => Promise.all([save(), dircacheSave()]).then(() => undefined));
 
+  const oracle = oracleFromPull({
+    preScan: local,
+    actions,
+    oracle: remote,
+    matcher: finalMatcher,
+    dircache,
+    hashcache: cache,
+    root,
+    scanDeferred,
+  });
+
   // Git repos (design 43 §7): per-repo loop over remote ∪ base ∪ pending with
   // scope-projected identity, per-repo base advance (one busy repo never blocks the
   // others), removal memories, needs-resolution checkpoints, pending-remote carry.
@@ -225,15 +238,19 @@ export async function applyPulledManifest(
   const gitOutcome = await report.phase("git-apply", () =>
     applyGitSections(root, cfg, state, remote, api.blobStore(), finalMatcher, glog, {
       collectMetrics: report.enabled,
+      oracle,
       onProgress: deps.onGitProgress,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+      degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
+      sourceGlobalSeq: sequence,
     })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
-  await report.phase("state-save", () => saveStateSource(root, state, {
+  const deferralUpdates = orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals);
+  const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
     globalManifest: remote,
@@ -244,6 +261,9 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
+      deferrals: deferralUpdates,
+      partial: gitOutcome.partial,
+      idxProj: gitOutcome.idxProj,
     }),
     values: {
       bases: gitOutcome.gitRepos,
@@ -251,11 +271,19 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
+      deferrals: deferralUpdates,
+      partial: gitOutcome.partial,
+      idxProj: gitOutcome.idxProj,
     },
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-  }));
+  })));
+  try {
+    deps.onGitDeferralsSaved?.(savedState);
+  } catch {
+    // A local visibility hook cannot fail a save that is already durable.
+  }
   if (actions.length > 0) {
     try {
       deps.onPullApplied?.(actions);

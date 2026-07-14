@@ -117,6 +117,68 @@ interface RepoState {
   status: string; // `git status --porcelain`
 }
 
+interface RigRepoRecord {
+  pending?: unknown;
+  partial?: {
+    checkoutPending?: boolean;
+    heldRefs?: Record<string, string>;
+  };
+  deferrals?: Record<string, { reason?: string; deferredSince?: string }>;
+}
+
+interface RigSyncState {
+  lastSyncedSequence?: number;
+  gitPendingRemote?: Record<string, unknown>;
+  gitNeedsResolution?: Record<string, unknown>;
+  repoRecords?: Record<string, RigRepoRecord>;
+}
+
+async function readSyncState(dev: Device): Promise<RigSyncState> {
+  return JSON.parse(await dev.readFile(`${GUEST.workDir}/.rbox/state.json`)) as RigSyncState;
+}
+
+function assertRepoSettled(rec: Recorder, label: string, state: RigSyncState): void {
+  const record = state.repoRecords?.[TOP];
+  const settled = state.gitPendingRemote?.[TOP] === undefined
+    && state.gitNeedsResolution?.[TOP] === undefined
+    && record?.pending === undefined
+    && record?.partial === undefined
+    && record?.deferrals?.apply === undefined;
+  rec.assert(`[${label}] pending/partial/apply-deferral absent`, settled, settled ? "settled" : JSON.stringify({
+    legacyPending: state.gitPendingRemote?.[TOP] !== undefined,
+    pending: record?.pending !== undefined,
+    partial: record?.partial,
+    deferral: record?.deferrals?.apply,
+  }));
+}
+
+async function assertTrackedFollow(rec: Recorder, label: string, a: Device, b: Device, repoA: string, repoB: string): Promise<void> {
+  const opShape = (dev: Device, repo: string) => dev.exec(["sh", "-c", `for n in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do p="$(git -C '${repo}' rev-parse --git-path "$n")"; test ! -e "$p" || printf '%s\\n' "$n"; done`]);
+  const configShape = (dev: Device, repo: string) => gitExec(dev, repo, ["config", "--local", "--get-regexp", "^(branch\\.|remote\\.)"]);
+  const [aState, bState, aIndex, bIndex, aBytes, bBytes, aOp, bOp, aConfig, bConfig] = await Promise.all([
+    readRepoState(a, repoA),
+    readRepoState(b, repoB),
+    gitExec(a, repoA, ["write-tree"]),
+    gitExec(b, repoB, ["write-tree"]),
+    a.readFile(`${repoA}/a.txt`),
+    b.readFile(`${repoB}/a.txt`),
+    opShape(a, repoA),
+    opShape(b, repoB),
+    configShape(a, repoA),
+    configShape(b, repoB),
+  ]);
+  rec.assert(`[${label}] B fsck --strict clean`, bState.fsckCode === 0, `exit ${bState.fsckCode}`);
+  rec.assert(`[${label}] HEAD form exact`, aState.headSymbolic === bState.headSymbolic, `A=${aState.headSymbolic || "(detached)"} B=${bState.headSymbolic || "(detached)"}`);
+  rec.assert(`[${label}] HEAD oid exact`, aState.headSha === bState.headSha, `A=${aState.headSha.slice(0, 12)} B=${bState.headSha.slice(0, 12)}`);
+  rec.assert(`[${label}] semantic index tree exact`, aIndex.code === 0 && bIndex.code === 0 && aIndex.out.trim() === bIndex.out.trim(), `A=${aIndex.out.trim().slice(0, 12)} B=${bIndex.out.trim().slice(0, 12)}`);
+  rec.assert(`[${label}] tracked file bytes exact`, aBytes === bBytes, `A=${aBytes.length}B B=${bBytes.length}B`);
+  rec.assert(`[${label}] op-state exact`, aOp.stdout === bOp.stdout, `A=${aOp.stdout.trim() || "none"} B=${bOp.stdout.trim() || "none"}`);
+  rec.assert(`[${label}] safe config/upstream exact`, aConfig.out === bConfig.out, aConfig.out.trim() || "no branch/remote config");
+  const refs = diffRefLines(parseForEachRef(aState.refs), parseForEachRef(bState.refs));
+  rec.assert(`[${label}] safe refs exact`, refs.identical, refs.identical ? `${parseForEachRef(bState.refs).length} refs` : refDiffDetail(refs));
+  assertRepoSettled(rec, label, await readSyncState(b));
+}
+
 async function readRepoState(dev: Device, repoDir: string): Promise<RepoState> {
   const [fsck, sym, head, refs, log, status] = await Promise.all([
     gitExec(dev, repoDir, ["fsck", "--strict", "--no-progress"]),
@@ -226,6 +288,222 @@ git ${IDENT} add churn.txt && git ${IDENT} commit -q -m 'churn commit on feature
         // HEAD must now be on feature on BOTH sides (the branch switch propagated).
         rec.assert(`[${TOP}@churn] HEAD moved to feature`, bTop.headSymbolic === "refs/heads/feature", `B HEAD=${bTop.headSymbolic || "(detached)"}`);
       });
+
+      // ── Design 116 field gate: tracked bytes land before checkout metadata ───────
+      const trackedRound = async (kind: "ff" | "switch" | "detached", date: string): Promise<void> => {
+        await rec.step(`[A→B] tracked-file ${kind} follow`, async () => {
+          const move = kind === "switch"
+            ? `git ${IDENT} checkout -q main`
+            : kind === "detached"
+              ? `git ${IDENT} checkout -q --detach HEAD`
+              : ":";
+          const commit = kind === "detached"
+            ? `git ${IDENT} commit --allow-empty -q -m 'tracked detached head move'`
+            : `printf '${kind}\\n' > 'head-${kind}.txt'; git ${IDENT} add 'head-${kind}.txt'; git ${IDENT} commit -q -m 'tracked ${kind} head move'`;
+          const script = `
+set -e
+export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com'
+export GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
+export GIT_AUTHOR_DATE='${date}T00:00:00 +0000' GIT_COMMITTER_DATE='${date}T00:00:00 +0000'
+cd '${topA}'
+${move}
+${commit}
+printf 'sync-dirt-${kind}\\n' >> a.txt
+`;
+          await ctx.a.exec(["sh", "-c", script]);
+          await ctx.a.rbox(["push"], { cwd: GUEST.workDir, env: { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY } });
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
+          await assertTrackedFollow(rec, `tracked-${kind}`, ctx.a, ctx.b, topA, topB);
+          const expectedHead = kind === "detached" ? "" : kind === "switch" ? "refs/heads/main" : "refs/heads/feature";
+          const bHead = (await gitExec(ctx.b, topB, ["symbolic-ref", "-q", "HEAD"])).out.trim();
+          rec.assert(`[tracked-${kind}] exact checkout form`, bHead === expectedHead, `B=${bHead || "(detached)"}`);
+        });
+      };
+      await trackedRound("ff", "2026-03-02");
+      await trackedRound("switch", "2026-03-03");
+      await trackedRound("detached", "2026-03-04");
+
+      await rec.step("two idle cycles after tracked follow emit zero sequences", async () => {
+        const [beforeA, beforeB] = await Promise.all([readSyncState(ctx.a), readSyncState(ctx.b)]);
+        const baseline = Math.max(beforeA.lastSyncedSequence ?? -1, beforeB.lastSyncedSequence ?? -1);
+        for (let cycle = 0; cycle < 2; cycle++) {
+          await ctx.a.rbox(["sync"], { cwd: GUEST.workDir });
+          await ctx.b.rbox(["sync"], { cwd: GUEST.workDir });
+        }
+        const [afterA, afterB] = await Promise.all([readSyncState(ctx.a), readSyncState(ctx.b)]);
+        const after = Math.max(afterA.lastSyncedSequence ?? -1, afterB.lastSyncedSequence ?? -1);
+        rec.assert("two tracked-follow idle cycles produced zero sequences", after === baseline, `before=${baseline} after=${after}`);
+        assertRepoSettled(rec, "tracked-idle", afterB);
+      });
+
+      // ── Linked-worktree regression: OID equality is a no-op, divergence holds ────
+      const siblingB = "/tmp/rbox-rig-git-entanglement-side";
+      try {
+        await rec.step("[A→B] normalize main and create synced side branch", async () => {
+          const script = `
+set -e
+export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com'
+export GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
+export GIT_AUTHOR_DATE='2026-03-05T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-05T00:00:00 +0000'
+cd '${topA}'
+git ${IDENT} branch -f detached-gate HEAD
+git ${IDENT} checkout -q main
+printf 'normalize-main\n' > normalize-main.txt
+git ${IDENT} add normalize-main.txt && git ${IDENT} commit -q -m 'normalize main for worktree gate'
+git ${IDENT} branch -f side HEAD
+`;
+          await ctx.a.exec(["sh", "-c", script]);
+          await ctx.a.rbox(["push"], { cwd: GUEST.workDir });
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          await ctx.b.exec(["rm", "-rf", siblingB], { allowFail: true });
+          await ctx.b.exec(["git", "-C", topB, "worktree", "prune"]);
+          await ctx.b.exec(["git", "-C", topB, "worktree", "add", "-q", siblingB, "side"]);
+        });
+
+        await rec.step("linked worktree identical OID does not hold checkout", async () => {
+          await ctx.a.exec(["sh", "-c", `set -e; cd '${topA}'; printf 'equal\n' > wt-equal.txt; git ${IDENT} add wt-equal.txt; GIT_AUTHOR_DATE='2026-03-06T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-06T00:00:00 +0000' git ${IDENT} commit -q -m 'worktree equal oid row'`]);
+          await ctx.a.rbox(["push"], { cwd: GUEST.workDir });
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          await assertTrackedFollow(rec, "worktree-identical", ctx.a, ctx.b, topA, topB);
+          const [side, sibling] = await Promise.all([
+            gitExec(ctx.b, topB, ["rev-parse", "refs/heads/side"]),
+            gitExec(ctx.b, siblingB, ["rev-parse", "HEAD"]),
+          ]);
+          rec.assert("identical-OID sibling branch remains exact", side.out.trim() === sibling.out.trim(), `ref=${side.out.trim().slice(0, 12)} wt=${sibling.out.trim().slice(0, 12)}`);
+        });
+
+        await rec.step("linked worktree diverged OID holds side while checkout follows", async () => {
+          const beforeSide = (await gitExec(ctx.b, topB, ["rev-parse", "refs/heads/side"])).out.trim();
+          const script = `
+set -e
+export GIT_AUTHOR_NAME='Rig Tester' GIT_AUTHOR_EMAIL='rig@example.com'
+export GIT_COMMITTER_NAME='Rig Tester' GIT_COMMITTER_EMAIL='rig@example.com'
+cd '${topA}'
+git ${IDENT} checkout -q side
+printf 'diverged\n' > wt-side-diverged.txt
+git ${IDENT} add wt-side-diverged.txt
+GIT_AUTHOR_DATE='2026-03-07T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-07T00:00:00 +0000' git ${IDENT} commit -q -m 'diverge sibling side'
+git ${IDENT} checkout -q main
+printf 'main-continues\n' > wt-main-continues.txt
+git ${IDENT} add wt-main-continues.txt
+GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00:00 +0000' git ${IDENT} commit -q -m 'main follows despite side hold'
+`;
+          await ctx.a.exec(["sh", "-c", script]);
+          const incomingMain = (await gitExec(ctx.a, topA, ["rev-parse", "refs/heads/main"])).out.trim();
+          const incomingSide = (await gitExec(ctx.a, topA, ["rev-parse", "refs/heads/side"])).out.trim();
+          await ctx.a.rbox(["push"], { cwd: GUEST.workDir });
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          const [bMain, bSide, sibling] = await Promise.all([
+            gitExec(ctx.b, topB, ["rev-parse", "HEAD"]),
+            gitExec(ctx.b, topB, ["rev-parse", "refs/heads/side"]),
+            gitExec(ctx.b, siblingB, ["rev-parse", "HEAD"]),
+          ]);
+          rec.assert("diverged sibling does not block checkout follow", bMain.out.trim() === incomingMain, `B=${bMain.out.trim().slice(0, 12)} A=${incomingMain.slice(0, 12)}`);
+          rec.assert("diverged sibling ref is held", bSide.out.trim() === beforeSide && sibling.out.trim() === beforeSide && incomingSide !== beforeSide, `held=${beforeSide.slice(0, 12)} incoming=${incomingSide.slice(0, 12)}`);
+          const state = await readSyncState(ctx.b);
+          const record = state.repoRecords?.[TOP];
+          rec.assert("diverged sibling records a non-checkout ownership hold", record?.partial?.checkoutPending === false && record.partial.heldRefs?.["refs/heads/side"] === "ownership" && record.deferrals?.apply?.reason === "worktree-ownership", JSON.stringify(record?.partial));
+        });
+
+        await rec.step("removing sibling lets held side retry without another push", async () => {
+          const incomingSide = (await gitExec(ctx.a, topA, ["rev-parse", "refs/heads/side"])).out.trim();
+          await ctx.b.exec(["git", "-C", topB, "worktree", "remove", "--force", siblingB]);
+          await ctx.b.exec(["git", "-C", topB, "worktree", "prune"]);
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          const bSide = (await gitExec(ctx.b, topB, ["rev-parse", "refs/heads/side"])).out.trim();
+          rec.assert("held side advanced on pending retry", bSide === incomingSide, `B=${bSide.slice(0, 12)} A=${incomingSide.slice(0, 12)}`);
+          assertRepoSettled(rec, "worktree-retry", await readSyncState(ctx.b));
+        });
+      } finally {
+        await ctx.b.exec(["git", "-C", topB, "worktree", "remove", "--force", siblingB], { allowFail: true });
+        await ctx.b.exec(["git", "-C", topB, "worktree", "prune"], { allowFail: true });
+        await ctx.b.exec(["rm", "-rf", siblingB], { allowFail: true });
+      }
+
+      // ── Local blocker rows: checkout stays safe, unrelated refs still advance ──
+      for (const blocker of ["edit", "commit", "index", "stash"] as const) {
+        await rec.step(`[A→B] local ${blocker} blocks checkout with aged visibility`, async () => {
+          const preHead = (await gitExec(ctx.b, topB, ["rev-parse", "HEAD"])).out.trim();
+          const aBytesBefore = await ctx.a.readFile(`${topA}/a.txt`);
+          let protectedValue = "";
+          if (blocker === "edit") {
+            await ctx.b.exec(["sh", "-c", `printf 'receiver-local-edit\\n' >> '${topB}/a.txt'`]);
+            protectedValue = await ctx.b.readFile(`${topB}/a.txt`);
+          } else if (blocker === "commit") {
+            await ctx.b.exec(["git", "-C", topB, "-c", "user.name=Rig Tester", "-c", "user.email=rig@example.com", "commit", "--allow-empty", "-q", "-m", "receiver-only blocker"]);
+            protectedValue = (await gitExec(ctx.b, topB, ["rev-parse", "HEAD"])).out.trim();
+          } else if (blocker === "index") {
+            await ctx.b.writeFile(`${topB}/receiver-index-only.txt`, "staged only\n");
+            await ctx.b.exec(["git", "-C", topB, "add", "receiver-index-only.txt"]);
+            await ctx.b.exec(["rm", "-f", `${topB}/receiver-index-only.txt`]);
+            protectedValue = (await gitExec(ctx.b, topB, ["write-tree"])).out.trim();
+          } else {
+            await ctx.b.writeFile(`${topB}/receiver-stash-only.txt`, "stash only\n");
+            await ctx.b.exec(["git", "-C", topB, "add", "receiver-stash-only.txt"]);
+            await ctx.b.exec(["git", "-C", topB, "-c", "user.name=Rig Tester", "-c", "user.email=rig@example.com", "stash", "push", "-q", "-m", "receiver-only blocker stash"]);
+            await ctx.b.writeFile(`${topB}/a.txt`, aBytesBefore);
+            protectedValue = (await gitExec(ctx.b, topB, ["rev-parse", "refs/stash"])).out.trim();
+          }
+
+          const dateDay = blocker === "edit" ? "09" : blocker === "commit" ? "10" : blocker === "index" ? "11" : "12";
+          await ctx.a.exec(["sh", "-c", `set -e; cd '${topA}'; printf '${blocker}\\n' > 'advance-${blocker}.txt'; git ${IDENT} add 'advance-${blocker}.txt'; GIT_AUTHOR_DATE='2026-03-${dateDay}T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-${dateDay}T00:00:00 +0000' git ${IDENT} commit -q -m 'advance past ${blocker} blocker'; git ${IDENT} branch -f 'safe-${blocker}' HEAD`]);
+          const incomingHead = (await gitExec(ctx.a, topA, ["rev-parse", "HEAD"])).out.trim();
+          await ctx.a.rbox(["push"], { cwd: GUEST.workDir });
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+
+          const expectedReason = blocker === "edit" ? "local-edits" : blocker === "commit" ? "local-commits" : blocker === "index" ? "local-index" : "local-stash";
+          const state = await readSyncState(ctx.b);
+          const deferred = state.repoRecords?.[TOP]?.deferrals?.apply;
+          rec.assert(`[${blocker}] exact durable reason`, deferred?.reason === expectedReason && state.repoRecords?.[TOP]?.pending !== undefined, JSON.stringify(deferred));
+          const safe = (await gitExec(ctx.b, topB, ["rev-parse", `refs/heads/safe-${blocker}`])).out.trim();
+          rec.assert(`[${blocker}] unrelated ref advanced`, safe === incomingHead, `safe=${safe.slice(0, 12)} incoming=${incomingHead.slice(0, 12)}`);
+          const bHead = (await gitExec(ctx.b, topB, ["rev-parse", "HEAD"])).out.trim();
+          rec.assert(`[${blocker}] checkout held`, bHead !== incomingHead, `B=${bHead.slice(0, 12)} incoming=${incomingHead.slice(0, 12)}`);
+          if (blocker === "edit") rec.assert("local edit bytes preserved", await ctx.b.readFile(`${topB}/a.txt`) === protectedValue, "byte comparison");
+          else if (blocker === "commit") rec.assert("local commit remains reachable", bHead === protectedValue && (await gitExec(ctx.b, topB, ["cat-file", "-e", `${protectedValue}^{commit}`])).code === 0, protectedValue.slice(0, 12));
+          else if (blocker === "index") rec.assert("staged-only index preserved", (await gitExec(ctx.b, topB, ["write-tree"])).out.trim() === protectedValue, protectedValue.slice(0, 12));
+          else rec.assert("local stash remains reachable", (await gitExec(ctx.b, topB, ["rev-parse", "refs/stash"])).out.trim() === protectedValue && (await gitExec(ctx.b, topB, ["cat-file", "-e", `${protectedValue}^{commit}`])).code === 0, protectedValue.slice(0, 12));
+
+          const human = await ctx.b.rbox(["status"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
+          const renderedReason = blocker === "edit" ? "local edits" : blocker === "commit" ? "local commits" : blocker === "index" ? "local index changes" : "local stash";
+          const humanLine = human.stdout.trim().split("\n").find((line) => line.includes("git deferred") && line.includes(TOP));
+          rec.assert(`[${blocker}] human status shows aged reason`, humanLine?.includes(renderedReason) === true && /git deferred\s+\d+[smhd]:/.test(humanLine), humanLine ?? "missing deferral line");
+          const jsonStatus = await ctx.b.rbox(["status", "--json"], { cwd: GUEST.workDir, allowFail: true });
+          let visible: { repo?: string; reason?: string; deferredSince?: string; ageSeconds?: number } | undefined;
+          try {
+            const parsed = JSON.parse(jsonStatus.stdout) as { git?: { deferrals?: Array<{ repo?: string; reason?: string; deferredSince?: string; ageSeconds?: number }> } };
+            visible = parsed.git?.deferrals?.find((entry) => entry.repo === TOP && entry.reason === expectedReason);
+          } catch {
+            visible = undefined;
+          }
+          rec.assert(`[${blocker}] JSON status exposes stable age`, visible?.deferredSince === deferred?.deferredSince && typeof visible?.ageSeconds === "number", JSON.stringify(visible));
+
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          const retried = await readSyncState(ctx.b);
+          rec.assert(`[${blocker}] retry preserves deferredSince`, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince === deferred?.deferredSince, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince ?? "missing");
+
+          const aBytes = await ctx.a.readFile(`${topA}/a.txt`);
+          if (blocker === "edit") await ctx.b.writeFile(`${topB}/a.txt`, aBytes);
+          else if (blocker === "commit") {
+            // The receiver-only commit is allow-empty: move only the protected
+            // current ref back. A hard reset would delete remote files already
+            // landed by the file plane before this pending Git retry.
+            await ctx.b.exec(["git", "-C", topB, "update-ref", "refs/heads/main", preHead, protectedValue]);
+            await ctx.b.writeFile(`${topB}/a.txt`, aBytes);
+          } else if (blocker === "index") {
+            await ctx.b.exec(["git", "-C", topB, "reset", "--mixed", "HEAD"]);
+            await ctx.b.exec(["rm", "-f", `${topB}/receiver-index-only.txt`]);
+          } else {
+            await ctx.b.exec(["git", "-C", topB, "update-ref", "-d", "refs/stash"]);
+            await ctx.b.exec(["sh", "-c", `rm -f "$(git -C '${topB}' rev-parse --git-path logs/refs/stash)"`]);
+            await ctx.b.writeFile(`${topB}/a.txt`, aBytes);
+          }
+          await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
+          const followed = (await gitExec(ctx.b, topB, ["rev-parse", "HEAD"])).out.trim();
+          rec.assert(`[${blocker}] pending checkout follows without another push`, followed === incomingHead, `B=${followed.slice(0, 12)} incoming=${incomingHead.slice(0, 12)}`);
+          assertRepoSettled(rec, `${blocker}-cleared`, await readSyncState(ctx.b));
+        });
+      }
 
       // ── Manifest convergence (plain files) — the git channel is asserted above; this
       //    covers the PLAIN-file half (`.git` is fingerprint-pruned, never plain-synced). ──

@@ -191,3 +191,60 @@ test("state projection table follows design-88 precedence and operation shape", 
     attentionReason: "ownership-lost",
   });
 });
+
+test("deferral projection and reader round-trip expose counts and oldest age only", async () => {
+  const projected = projectAmbientDaemonStatus({
+    activity: { at: freshAt },
+    settled: true,
+    now: NOW,
+    repoRecords: {
+      "private/repo-name": {
+        repoGen: 1,
+        sourceSeq: 1,
+        deferrals: {
+          apply: {
+            lane: "apply",
+            reason: "local-edits",
+            deferredSince: new Date(NOW - 3_600_500).toISOString(),
+            reasonSince: freshAt,
+            lastSeen: freshAt,
+            checkout: { kind: "branch", label: "secret branch" },
+          },
+          capture: {
+            lane: "capture",
+            reason: "local-index",
+            deferredSince: new Date(NOW - 600_000).toISOString(),
+            reasonSince: freshAt,
+            lastSeen: freshAt,
+          },
+        },
+      },
+      other: {
+        repoGen: 1,
+        sourceSeq: 1,
+        deferrals: {
+          config: {
+            lane: "config",
+            reason: "config",
+            deferredSince: new Date(NOW - 86_400_000).toISOString(),
+            reasonSince: freshAt,
+            lastSeen: freshAt,
+          },
+        },
+      },
+    },
+  });
+  expect(projected.deferredRepos).toBe(2);
+  expect(projected.oldestDeferralAgeSeconds).toBe(86_400);
+  expect(JSON.stringify(projected)).not.toContain("private/repo-name");
+  expect(JSON.stringify(projected)).not.toContain("secret branch");
+
+  await writeStatus(projected);
+  const verdict = readPromptStatus(root, NOW);
+  expect(verdict).toMatchObject({ kind: "workspace", state: "synced" });
+
+  await writeStatus({ deferredRepos: -1 as never });
+  expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
+  await writeStatus({ deferredRepos: 1, oldestDeferralAgeSeconds: -1 as never });
+  expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
+});

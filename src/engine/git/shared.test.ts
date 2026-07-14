@@ -4,9 +4,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { gitBusy, gitRaw, readLocalGitConfigEntries, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, type RepoCtx } from "./shared.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 const roots: string[] = [];
 
 async function tempDir(): Promise<string> {
@@ -17,7 +23,7 @@ async function tempDir(): Promise<string> {
 
 async function initRepo(): Promise<string> {
   const root = await tempDir();
-  await exec("git", ["-C", root, "init", "-q"]);
+  await exec("git", ["-C", root, "init", "-q"], { env: TEST_GIT_ENV });
   return root;
 }
 
@@ -25,18 +31,27 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
+test("cleanGitEnv supplies reflog identity fallbacks without replacing caller identity", () => {
+  const env = cleanGitEnv();
+  expect(env.GIT_AUTHOR_NAME).toBe(process.env.GIT_AUTHOR_NAME ?? "rbox");
+  expect(env.GIT_AUTHOR_EMAIL).toBe(process.env.GIT_AUTHOR_EMAIL ?? "rbox@local");
+  expect(env.GIT_COMMITTER_NAME).toBe(process.env.GIT_COMMITTER_NAME ?? "rbox");
+  expect(env.GIT_COMMITTER_EMAIL).toBe(process.env.GIT_COMMITTER_EMAIL ?? "rbox@local");
+  expect(cleanGitEnv({ GIT_COMMITTER_NAME: "fixture caller" }).GIT_COMMITTER_NAME).toBe("fixture caller");
+});
+
 describe("raw NUL-delimited local config reads", () => {
   test("gitRaw preserves stdout whitespace, including a successful empty value", async () => {
     const repo = await initRepo();
-    await exec("git", ["-C", repo, "config", "remote.origin.url", ""]);
+    await exec("git", ["-C", repo, "config", "remote.origin.url", ""], { env: TEST_GIT_ENV });
     expect(await gitRaw(repo, ["config", "--local", "--get", "remote.origin.url"])).toBe("\n");
   });
 
   test("readLocalGitConfigEntries preserves order, empty strings, and embedded newlines", async () => {
     const repo = await initRepo();
-    await exec("git", ["-C", repo, "config", "remote.origin.url", ""]);
-    await exec("git", ["-C", repo, "config", "--add", "remote.origin.url", "line1\nline2"]);
-    await exec("git", ["-C", repo, "config", "branch.main.rebase", "false"]);
+    await exec("git", ["-C", repo, "config", "remote.origin.url", ""], { env: TEST_GIT_ENV });
+    await exec("git", ["-C", repo, "config", "--add", "remote.origin.url", "line1\nline2"], { env: TEST_GIT_ENV });
+    await exec("git", ["-C", repo, "config", "branch.main.rebase", "false"], { env: TEST_GIT_ENV });
     expect(await readLocalGitConfigEntries(repo)).toEqual([
       ["remote.origin.url", ""],
       ["remote.origin.url", "line1\nline2"],
@@ -55,8 +70,8 @@ describe("raw NUL-delimited local config reads", () => {
     const repo = await initRepo();
     const included = path.join(await tempDir(), "included.config");
     await fs.writeFile(included, '[remote "included"]\n\turl = https://included.example/repo\n');
-    await exec("git", ["-C", repo, "config", "include.path", included]);
-    await exec("git", ["-C", repo, "config", "remote.local.url", "https://local.example/repo"]);
+    await exec("git", ["-C", repo, "config", "include.path", included], { env: TEST_GIT_ENV });
+    await exec("git", ["-C", repo, "config", "remote.local.url", "https://local.example/repo"], { env: TEST_GIT_ENV });
     expect(await readLocalGitConfigEntries(repo)).toEqual([
       ["remote.local.url", "https://local.example/repo"],
     ]);

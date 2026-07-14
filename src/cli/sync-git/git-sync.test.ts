@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
-import { loadState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
 import {
@@ -23,18 +23,44 @@ import {
   gitDivergenceCount,
   gitDivergenceFastRepoSource,
   gitFingerprintVersionForBounds,
+  gitIncomingKey,
+  nextDeferral,
   planGitSections,
+  withRevalidatedGitPartialApplies,
   type GitPushPlan,
 } from "../sync-git.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then((r) => r.stdout.toString().trim());
 const gitAt = (dir: string, date: string, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args], { env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: { ...TEST_GIT_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).then((r) => r.stdout.toString().trim());
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
   cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
+
+test("D2 deferral writer preserves chronic age across newer incoming keys and resets reason age", () => {
+  const first = nextDeferral("apply", undefined, "git-busy", "2026-01-01T00:00:00.000Z", "incoming-v1");
+  first.bytesChanged = true;
+  const newer = nextDeferral("apply", first, "git-busy", "2026-01-02T00:00:00.000Z", "incoming-v2");
+  expect(newer).toMatchObject({
+    deferredSince: first.deferredSince,
+    reasonSince: first.reasonSince,
+    lastSeen: "2026-01-02T00:00:00.000Z",
+    subjectKey: "incoming-v2",
+    bytesChanged: true,
+  });
+  const changed = nextDeferral("apply", newer, "artifact", "2026-01-03T00:00:00.000Z", "incoming-v3");
+  expect(changed.deferredSince).toBe(first.deferredSince);
+  expect(changed.reasonSince).toBe("2026-01-03T00:00:00.000Z");
+  expect(changed.lastSeen).toBe("2026-01-03T00:00:00.000Z");
+});
 
 async function withCompressEnv<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
   const prev = process.env.RBOX_COMPRESS;
@@ -294,6 +320,38 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const resolvesWithin = async (promise: Promise<unknown>, ms: number): Promise<boolean> =>
   Promise.race([promise.then(() => true), delay(ms).then(() => false)]);
 
+test("design 116 FIELD INCIDENT: pull receipt authorizes sync-dirt-only stale branch follow", async () => {
+  const a = path.join(rootA, "field-incident");
+  await initRepo(a);
+  await commitFile(a, "tracked.txt", "one\n", "c1");
+  const c1 = await git(a, "rev-parse", "HEAD");
+  await commitFile(a, "tracked.txt", "two\n", "c2");
+  await syncCycle();
+
+  const b = path.join(rootB, "field-incident");
+  const baseTip = await git(b, "rev-parse", "refs/heads/main");
+  await commitFile(a, "tracked.txt", "three\n", "c3");
+  const incomingTip = await git(a, "rev-parse", "HEAD");
+  await sync(rootA, cfgA, depsA);
+
+  // Reproduce the incident: Git metadata is stale/contained while the pull's
+  // file phase will install the incoming tracked bytes before Git apply.
+  await git(b, "update-ref", "refs/heads/main", c1, baseTip);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+
+  expect(logsB).toContain("git-sync followed field-incident");
+  expect(await git(b, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(b, "rev-parse", "HEAD")).toBe(incomingTip);
+  await expect(git(b, "diff", "--cached", "--quiet")).resolves.toBe("");
+  await expect(git(b, "diff", "--quiet")).resolves.toBe("");
+  expect(await fs.readFile(path.join(b, "tracked.txt"), "utf8")).toBe("three\n");
+  const record = repoRecordsForState(await st(rootB))["field-incident"]!;
+  expect(record.pending).toBeUndefined();
+  expect(record.partial).toBeUndefined();
+  expect(record.deferrals?.apply).toBeUndefined();
+}, 20_000);
+
 function observingBlobStore(inner: BlobStore, onGetToFile: (sha: string) => Promise<void> | void): BlobStore {
   const wrapped: BlobStore = {
     has: (sha) => inner.has(sha),
@@ -315,6 +373,85 @@ const gitState = (gitRepos?: Record<string, GitSection>): SyncState => ({
   stream: "test",
   lastSyncedSequence: 0,
   lastSyncedManifest: gitRepos ? gitManifest(gitRepos) : { generatedAt: "", files: [] },
+});
+
+test("D2 pre-save partial revalidation invalidates a human-moved non-current ref", async () => {
+  const repo = path.join(rootA, "r");
+  await initRepo(repo);
+  await commitFile(repo, "base.txt", "base", "base");
+  await git(repo, "branch", "side");
+  const recorded = await git(repo, "rev-parse", "side");
+  await commitFile(repo, "main.txt", "next", "next");
+  const human = await git(repo, "rev-parse", "main");
+  await git(repo, "update-ref", "refs/heads/side", human);
+  const state: SyncState = {
+    ...gitState(),
+    repoRecords: {
+      r: {
+        repoGen: 1,
+        sourceSeq: 1,
+        partial: {
+          incomingKey: "incoming",
+          checkoutPending: false,
+          appliedRefs: { "refs/heads/side": { kind: "direct", oid: recorded } },
+          heldRefs: { "refs/heads/held": "ownership" },
+          configApplied: true,
+        },
+      },
+    },
+  };
+  const outcome = {};
+  let saveRan = false;
+  await withRevalidatedGitPartialApplies(rootA, state, outcome, async () => {
+    saveRan = true;
+    await expect(git(repo, "update-ref", "refs/heads/side", recorded)).rejects.toThrow();
+  });
+  expect(saveRan).toBe(true);
+  expect(outcome).toEqual({ partial: { r: null } });
+  expect(await git(repo, "rev-parse", "side")).toBe(human);
+});
+
+test("D2 capture deferral survives a post-plan push failure and clears on a later clean plan", async () => {
+  const repo = path.join(rootA, "capture-restart");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "v1", "v1");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  await commitFile(repo, "f.txt", "v2", "v2");
+  await fs.writeFile(path.join(rootA, "force-commit.txt"), "x");
+  remote.failNextGitPut = true;
+  const realCommit = remote.commit.bind(remote);
+  let durableObserved = false;
+  depsA.onGitDeferralsSaved = (saved) => {
+    durableObserved = repoRecordsForState(saved)["capture-restart"]?.deferrals?.capture?.reason === "artifact";
+  };
+  remote.commit = async () => {
+    expect(durableObserved).toBe(true); // visibility hook ran immediately after the lane save
+    throw new Error("post-plan network failure");
+  };
+  await expect(push(rootA, cfgA, depsA)).rejects.toThrow(/post-plan network failure/);
+  let record = repoRecordsForState(await st(rootA))["capture-restart"]!;
+  expect(record.deferrals?.capture?.reason).toBe("artifact");
+  const since = record.deferrals?.capture?.deferredSince;
+
+  remote.commit = realCommit;
+  delete depsA.onGitDeferralsSaved;
+  const repoB = path.join(rootB, "capture-restart");
+  await commitFile(repoB, "remote.txt", "newer", "newer remote truth");
+  await push(rootB, cfgB, depsB);
+  const busyLock = path.join(repo, ".git", "index.lock");
+  await fs.writeFile(busyLock, "");
+  await pull(rootA, cfgA, depsA);
+  record = repoRecordsForState(await st(rootA))["capture-restart"]!;
+  expect(record.deferrals?.capture?.deferredSince).toBe(since);
+  expect(record.deferrals?.apply?.reason).toBe("git-busy");
+
+  await fs.rm(busyLock);
+  await push(rootA, cfgA, depsA);
+  record = repoRecordsForState(await st(rootA))["capture-restart"]!;
+  expect(record.deferrals?.capture).toBeUndefined();
+  expect(record.deferrals?.apply?.reason).toBe("git-busy");
+  expect(since).toBeDefined();
 });
 
 async function captureSections(rels: readonly string[]): Promise<Record<string, GitSection>> {
@@ -593,10 +730,11 @@ test("e2e: worktree scope-crossing converges (§7 trace) — B's edit applies in
   await push(rootB, cfgB, depsB);
   expect((await remote.latest()).manifest.gitRepos!["wt"]!.refScope).toBe("all");
 
-  // A pulls: the all-scope section applies into the POINTER repo (update-only, guarded)
+  // A pulls: the all-scope section follows into the existing POINTER repo
+  // through the steady oracle/journal pipeline (still update-only and guarded).
   await pull(rootA, cfgA, depsA);
   expect(await git(W, "rev-parse", "feat")).toBe(await git(bw, "rev-parse", "feat"));
-  expect(logsA.some((l) => l.startsWith("git-sync applied wt"))).toBe(true);
+  expect(logsA.some((l) => l.startsWith("git-sync followed wt"))).toBe(true);
 
   // Convergence: one settling round, then TWO quiescent cycles make ZERO new commits.
   await syncCycle();
@@ -812,7 +950,7 @@ test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK
   expect(fetches).toBe(6);
 }, 30_000);
 
-test("design 53: conflict preserve materializes a complete recovery bundle for chained sections", async () => {
+test("design 116: chained-section human edits defer with newest incoming carried", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
   const r = path.join(rootA, "r");
   await initRepo(r);
@@ -827,11 +965,10 @@ test("design 53: conflict preserve materializes a complete recovery bundle for c
   const b = path.join(rootB, "r");
   await commitFile(b, "local.txt", "local\n", "local");
   await pull(rootB, cfgB, depsB);
-  expect((await st(rootB)).gitNeedsResolution?.["r"]).toBeDefined();
-  const recDir = path.join(b, ".rbox", "git-conflicts");
-  const bundles = (await fs.readdir(recDir)).filter((f) => f.endsWith(".bundle"));
-  expect(bundles.length).toBeGreaterThan(0);
-  await expect(git(b, "bundle", "verify", path.join(recDir, bundles[0]!))).resolves.toBeDefined();
+  const deferred = repoRecordsForState(await st(rootB)).r!;
+  expect(deferred.deferrals?.apply?.reason).toBe("local-edits");
+  expect(deferred.pending?.packChain).toHaveLength(1);
+  expect(deferred.resolutionKey).toBeUndefined();
 }, 30_000);
 
 // ── design 68 §3.3: in-tree linked-worktree pointer skip (base-carry) ──────────────
@@ -1069,6 +1206,117 @@ test("repo dir GONE ENTIRELY → pusher drops the section (§9); receiver drops 
 
 // ── (c) design §13.5 pending tests ────────────────────────────────────────────────
 
+test("design 116 phase-0: linked-worktree partial apply stays pending, retries without conflict, then completes after removal", async () => {
+  const a = path.join(rootA, "r");
+  await initRepo(a);
+  await commitFile(a, "base.txt", "base", "base");
+  await git(a, "branch", "side");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+
+  const b = path.join(rootB, "r");
+  const baseline = (await st(rootB)).lastSyncedManifest.gitRepos!["r"]!;
+  const heldSide = await git(b, "rev-parse", "side");
+  const worktree = path.join(tmp, "b-r-side");
+  await git(b, "worktree", "add", worktree, "side");
+
+  await git(a, "checkout", "-q", "side");
+  await commitFile(a, "side.txt", "incoming side", "advance side");
+  const incomingSide = await git(a, "rev-parse", "side");
+  await git(a, "checkout", "-q", "main");
+  await commitFile(a, "main.txt", "incoming main", "advance main");
+  const incomingMain = await git(a, "rev-parse", "main");
+  await push(rootA, cfgA, depsA);
+
+  await pull(rootB, cfgB, depsB);
+  let state = await st(rootB);
+  expect(await git(b, "rev-parse", "main")).toBe(incomingMain); // checkout/unrelated ref plane advanced
+  expect(await git(b, "rev-parse", "side")).toBe(heldSide);
+  expect(await git(worktree, "rev-parse", "HEAD")).toBe(heldSide);
+  expect(state.gitPendingRemote?.["r"]?.refs["refs/heads/side"]).toBe(incomingSide);
+  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs).toEqual(baseline.refs); // D1 never advances base on partial
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  let record = repoRecordsForState(state).r!;
+  expect(record.partial).toEqual({
+    incomingKey: gitIncomingKey(state.gitPendingRemote!["r"]!),
+    checkoutPending: false,
+    appliedRefs: expect.objectContaining({ "refs/heads/main": { kind: "direct", oid: incomingMain } }),
+    heldRefs: { "refs/heads/side": "ownership" },
+    configApplied: true,
+  });
+  const chronicSince = record.deferrals?.apply?.deferredSince;
+  expect(record.deferrals?.apply).toMatchObject({ lane: "apply", reason: "worktree-ownership", checkout: { kind: "branch", label: "main" } });
+  expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
+
+  // A newer wire section may arrive after the v2 partial. The proof is against persisted
+  // pending v2, then apply retries newest v3: unrelated main advances, side stays held.
+  await commitFile(a, "main-v3.txt", "newest main", "advance main again");
+  const newestMain = await git(a, "rev-parse", "main");
+  await push(rootA, cfgA, depsA);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+  state = await st(rootB);
+  expect(await git(b, "rev-parse", "main")).toBe(newestMain);
+  expect(state.gitPendingRemote?.["r"]).toBeDefined();
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  record = repoRecordsForState(state).r!;
+  expect(record.partial?.incomingKey).toBe(gitIncomingKey(state.gitPendingRemote!["r"]!));
+  expect(record.deferrals?.apply?.deferredSince).toBe(chronicSince);
+  expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
+  expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
+
+  // Once ownership disappears, the same recognizable three-way partial shape retries
+  // into a full apply; pending clears and the base finally advances to incoming truth.
+  await git(b, "worktree", "remove", "--force", worktree);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+  state = await st(rootB);
+  expect(await git(b, "rev-parse", "side")).toBe(incomingSide);
+  expect(state.gitPendingRemote?.["r"]).toBeUndefined();
+  expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(repoRecordsForState(state).r?.partial).toBeUndefined();
+  expect(repoRecordsForState(state).r?.deferrals?.apply).toBeUndefined();
+  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs["refs/heads/side"]).toBe(incomingSide);
+  expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
+}, 20_000);
+
+test("D2 partial retry never overwrites a human-moved applied non-current ref", async () => {
+  const a = path.join(rootA, "partial-human");
+  await initRepo(a);
+  await commitFile(a, "base.txt", "base", "base");
+  await git(a, "branch", "side");
+  await git(a, "branch", "other");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, "partial-human");
+  const oldOther = await git(b, "rev-parse", "other");
+  const worktree = path.join(tmp, "partial-human-side");
+  await git(b, "worktree", "add", worktree, "side");
+
+  await git(a, "checkout", "-q", "side");
+  await commitFile(a, "side.txt", "incoming", "side");
+  await git(a, "checkout", "-q", "other");
+  await commitFile(a, "other.txt", "incoming", "other");
+  const incomingOther = await git(a, "rev-parse", "other");
+  await git(a, "checkout", "-q", "main");
+  await commitFile(a, "main.txt", "incoming", "main");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  expect(await git(b, "rev-parse", "other")).toBe(incomingOther);
+  expect(repoRecordsForState(await st(rootB))["partial-human"]?.partial).toBeDefined();
+
+  // Simulated crash interval: state says rbox published `other`, then a human moves it.
+  await git(b, "update-ref", "refs/heads/other", oldOther);
+  await git(b, "worktree", "remove", "--force", worktree);
+  logsB.length = 0;
+  await pull(rootB, cfgB, depsB);
+  expect(await git(b, "rev-parse", "other")).toBe(oldOther);
+  const held = repoRecordsForState(await st(rootB))["partial-human"]!;
+  expect(held.partial?.heldRefs["refs/heads/other"]).toBe("local-commits");
+  expect(held.deferrals?.apply?.reason).toBe("local-commits");
+  expect(logsB.some((line) => line.includes("CONFLICT partial-human"))).toBe(false);
+}, 20_000);
+
 /** Sync a repo to both machines, advance it on A, then make B's pull DEFER the apply
  *  (index.lock = receiver busy) so `gitPendingRemote` is recorded. Returns repo paths. */
 async function makePending(rel: string): Promise<{ a: string; b: string; lock: string }> {
@@ -1085,9 +1333,46 @@ async function makePending(rel: string): Promise<{ a: string; b: string; lock: s
   await pull(rootB, cfgB, depsB); // apply defers: receiver git busy → pending v2
   const sB = await st(rootB);
   expect(sB.gitPendingRemote?.[rel]).toBeDefined();
+  expect(repoRecordsForState(sB)[rel]?.deferrals?.apply?.reason).toBe("git-busy");
   expect(logsB.some((l) => l.startsWith(`git-sync deferred ${rel}`))).toBe(true);
   return { a, b, lock };
 }
+
+test("D2 apply deferral keeps chronic age across newer truth and resets reason age", async () => {
+  const { a, lock } = await makePending("chronic");
+  const busy = repoRecordsForState(await st(rootB)).chronic!.deferrals!.apply!;
+  await commitFile(a, "newer.txt", "v3", "v3");
+  await push(rootA, cfgA, depsA);
+  remote.deleteBlob((await remote.latest()).manifest.gitRepos!.chronic!.bundleEncSha);
+  await fs.rm(lock);
+  await pull(rootB, cfgB, depsB);
+  const artifact = repoRecordsForState(await st(rootB)).chronic!.deferrals!.apply!;
+  expect(artifact.reason).toBe("artifact");
+  expect(artifact.deferredSince).toBe(busy.deferredSince);
+  expect(artifact.reasonSince).not.toBe(busy.reasonSince);
+  expect(artifact.lastSeen >= busy.lastSeen).toBe(true);
+  expect(artifact.subjectKey).not.toBe(busy.subjectKey);
+}, 20_000);
+
+test("design 116: pending remote plus ordinary human divergence remains a typed deferral", async () => {
+  const { b, lock } = await makePending("human-divergence");
+  await fs.rm(lock);
+  await commitFile(b, "local.txt", "human work", "local commit");
+  logsB.length = 0;
+
+  await pull(rootB, cfgB, depsB);
+
+  const state = await st(rootB);
+  expect(state.gitNeedsResolution?.["human-divergence"]).toBeUndefined();
+  expect(state.gitPendingRemote?.["human-divergence"]).toBeDefined();
+  const first = repoRecordsForState(state)["human-divergence"]?.deferrals?.apply;
+  expect(first?.reason).toBe("local-edits");
+  expect(logsB.some((line) => line.startsWith("git-sync deferred human-divergence"))).toBe(true);
+  await pull(rootB, cfgB, depsB);
+  const held = repoRecordsForState(await st(rootB))["human-divergence"]?.deferrals?.apply;
+  expect(held?.reason).toBe("local-edits");
+  expect(held?.deferredSince).toBe(first?.deferredSince);
+}, 20_000);
 
 test("pending: outbound pushes CARRY the pending section (never the stale base) and the base does not advance [v5]", async () => {
   const { b, lock } = await makePending("r");
@@ -1114,11 +1399,41 @@ test("pending: outbound pushes CARRY the pending section (never the stale base) 
   const sB3 = await st(rootB);
   expect(sB3.gitPendingRemote?.["r"]).toBeUndefined();
   expect(sB3.lastSyncedManifest.gitRepos!["r"]!.bundleEncSha).toBe(pendingSec.bundleEncSha);
+  expect(repoRecordsForState(sB3).r?.deferrals?.apply).toBeUndefined();
   expect(await fs.readFile(path.join(b, "f.txt"), "utf8")).toBe("v2");
 }, 20_000);
 
-test("pending + remote deletion: absence supersedes pending [v6] — pending cleared, removal memory recorded, no outbound resurrection", async () => {
+test("standing apply deferral marks pushed repo bytes changed, survives restart, and clears with the episode", async () => {
+  const { b, lock } = await makePending("bytes-marker");
+  const before = repoRecordsForState(await st(rootB))["bytes-marker"]!.deferrals!.apply!;
+  expect(before.bytesChanged).toBeUndefined();
+
+  await fs.writeFile(path.join(b, "f.txt"), "human bytes during deferral");
+  await push(rootB, cfgB, depsB);
+
+  const restarted = await st(rootB);
+  const marked = repoRecordsForState(restarted)["bytes-marker"]!.deferrals!.apply!;
+  expect(marked.bytesChanged).toBe(true);
+  expect(marked.deferredSince).toBe(before.deferredSince);
+  expect(marked.lastSeen).toBe(before.lastSeen);
+
+  await fs.rm(lock);
+  await pull(rootB, cfgB, depsB);
+  expect(repoRecordsForState(await st(rootB))["bytes-marker"]?.deferrals?.apply).toBeUndefined();
+}, 20_000);
+
+test("remote absence while partial: absence supersedes pending+partial [v6] — state clears with no outbound resurrection", async () => {
   const { a, b, lock } = await makePending("r");
+  const partialState = await st(rootB);
+  const pending = partialState.gitPendingRemote!.r!;
+  partialState.repoRecords!.r!.partial = {
+    incomingKey: gitIncomingKey(pending),
+    checkoutPending: true,
+    appliedRefs: {},
+    heldRefs: {},
+    configApplied: true,
+  };
+  await saveState(rootB, partialState);
   await fs.rm(lock);
   await fs.rm(a, { recursive: true, force: true });
   await push(rootA, cfgA, depsA); // A deletes the repo
@@ -1128,6 +1443,8 @@ test("pending + remote deletion: absence supersedes pending [v6] — pending cle
   expect(sB.gitPendingRemote?.["r"]).toBeUndefined(); // absence supersedes pending
   expect(sB.lastSyncedManifest.gitRepos).toBeUndefined(); // base dropped
   expect(sB.gitReposRemoved?.["r"]).toBeDefined(); // leftover memory
+  expect(repoRecordsForState(sB).r?.deferrals).toBeUndefined();
+  expect(repoRecordsForState(sB).r?.partial).toBeUndefined();
   await expect(git(b, "rev-parse", "HEAD")).resolves.toBeDefined(); // local .git survives (at v1)
 
   // B's next push must NOT resurrect the repo A just deleted (no pending carry, no re-add)
@@ -1498,7 +1815,7 @@ test("cap: new repos beyond the cap are deferred LOUDLY; base-carrying repos alw
 
 // ── needs-resolution conflict suppression [v2, M2] ─────────────────────────────────
 
-test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED until local identity changes", async () => {
+test("per-repo human divergence is pending-carried and capture-suppressed without a checkpoint", async () => {
   const a = path.join(rootA, "r");
   await initRepo(a);
   await commitFile(a, "f.txt", "v1", "c1");
@@ -1516,12 +1833,11 @@ test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED
 
   await pull(rootB, cfgB, depsB);
   expect(await git(b, "rev-parse", "HEAD")).toBe(bHead); // local never clobbered
-  expect(logsB.some((l) => l.includes("CONFLICT r"))).toBe(true);
+  expect(logsB.some((l) => l.startsWith("git-sync deferred r"))).toBe(true);
   const sB = await st(rootB);
-  expect(sB.gitNeedsResolution?.["r"]).toBeDefined();
-  expect(sB.lastSyncedManifest.gitRepos!["r"]!.bundleEncSha).toBe((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha); // checkpointed to remote
-  const refs = await git(b, "for-each-ref", "--format=%(refname)", "refs/rbox-conflict");
-  expect(refs.length).toBeGreaterThan(0); // remote preserved for manual merge
+  expect(sB.gitNeedsResolution?.["r"]).toBeUndefined();
+  expect(sB.gitPendingRemote?.["r"]?.bundleEncSha).toBe((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha);
+  expect(repoRecordsForState(sB).r?.deferrals?.apply?.reason).toBe("local-edits");
 
   // sync()'s immediate push-after-pull must NOT republish the conflicted local state:
   // the git section stays the checkpointed remote (files like g.txt may still sync)
@@ -1533,11 +1849,7 @@ test("per-repo conflict: remote preserved, base checkpointed, capture SUPPRESSED
   await push(rootB, cfgB, depsB);
   expect(remote.headSeq()).toBe(head);
 
-  // the user resolves (identity changes) → republishing becomes intentional
-  await commitFile(b, "f.txt", "merged", "b merge");
-  await push(rootB, cfgB, depsB);
-  expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).not.toBe(remoteSec.bundleEncSha);
-  expect((await st(rootB)).gitNeedsResolution?.["r"]).toBeUndefined();
+  expect((await st(rootB)).gitPendingRemote?.["r"]).toBeDefined();
 }, 20_000);
 
 // ── per-repo independence: one busy repo defers only itself ────────────────────────
@@ -1582,7 +1894,7 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   // Swap in a SHALLOW clone at the same path — simulating a base section whose repo
   // is now structurally unsyncable (the exact shape the old client authored live).
   await fs.rm(p, { recursive: true, force: true });
-  await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p]);
+  await exec("git", ["clone", "-q", "--depth", "1", `file://${origin}`, p], { env: TEST_GIT_ENV });
 
   // Design 45: the pending structural DROP is an unpublished change —
   // status must not read "in sync" while the next push would commit a removal.
@@ -1871,7 +2183,7 @@ test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mu
     if (mutated || spawnRoot !== repo || args[0] !== "write-tree") return;
     mutated = true;
     fsSync.writeFileSync(path.join(repo, "late.txt"), "late");
-    execFileSync("git", ["-C", repo, "add", "late.txt"]);
+    execFileSync("git", ["-C", repo, "add", "late.txt"], { env: TEST_GIT_ENV });
   });
   try {
     expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(1);
@@ -1981,8 +2293,8 @@ test("design 83: plan cache does not trust a stale carried probe after another r
     if (mutatedClean || spawnRoot !== slow || args[0] !== "bundle" || args[1] !== "create") return;
     mutatedClean = true;
     fsSync.writeFileSync(path.join(clean, "late.txt"), "late");
-    execFileSync("git", ["-C", clean, "add", "late.txt"]);
-    execFileSync("git", ["-C", clean, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "late clean"]);
+    execFileSync("git", ["-C", clean, "add", "late.txt"], { env: TEST_GIT_ENV });
+    execFileSync("git", ["-C", clean, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "late clean"], { env: TEST_GIT_ENV });
   });
   try {
     await push(rootA, cfgA, depsA);

@@ -54,28 +54,38 @@ struct StatusReader {
             daemonVersion: verdict.daemonVersion,
             lastSyncedAt: verdict.lastSyncedAt,
             heartbeatAgeSeconds: verdict.heartbeatAgeSeconds,
-            desiredState: desired?.state
+            desiredState: desired?.state,
+            deferredRepos: verdict.deferredRepos,
+            oldestDeferralAgeSeconds: verdict.oldestDeferralAgeSeconds
         )
     }
 
     private func verdict(for dir: URL, now: Date) -> Verdict {
+        let statusURL = dir.appendingPathComponent("daemon.status.json")
+        let statusResult = readDaemonStatus(statusURL)
         let populateURL = dir.appendingPathComponent("populate.status.json")
         if let populate = readPopulateStatus(populateURL),
            now.timeIntervalSince(populate.heartbeatAt) <= Self.staleInterval,
            isProcessAlive(pid: populate.pid) {
+            let ambient: DaemonStatus?
+            if case .valid(let status) = statusResult {
+                ambient = status
+            } else {
+                ambient = nil
+            }
             return Verdict(
                 state: .syncing,
                 reason: nil,
                 operation: populate.operation,
                 sequence: nil,
                 lastSyncedAt: nil,
-                heartbeatAgeSeconds: now.timeIntervalSince(populate.heartbeatAt)
+                heartbeatAgeSeconds: now.timeIntervalSince(populate.heartbeatAt),
+                deferredRepos: ambient?.deferredRepos,
+                oldestDeferralAgeSeconds: ambient?.oldestDeferralAgeSeconds
             )
         }
 
-        let statusURL = dir.appendingPathComponent("daemon.status.json")
         let pidPresent = fileManager.fileExists(atPath: dir.appendingPathComponent("daemon.pid").path)
-        let statusResult = readDaemonStatus(statusURL)
 
         switch statusResult {
         case .missing:
@@ -97,7 +107,9 @@ struct StatusReader {
                     daemonVersion: status.daemonVersion,
                     workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
-                    heartbeatAgeSeconds: age
+                    heartbeatAgeSeconds: age,
+                    deferredRepos: status.deferredRepos,
+                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds
                 )
             }
 
@@ -116,7 +128,9 @@ struct StatusReader {
                     daemonVersion: status.daemonVersion,
                     workspaceRoot: status.workspaceRoot,
                     lastSyncedAt: status.lastSyncedAt,
-                    heartbeatAgeSeconds: age
+                    heartbeatAgeSeconds: age,
+                    deferredRepos: status.deferredRepos,
+                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds
                 )
             }
 
@@ -135,7 +149,9 @@ struct StatusReader {
             daemonVersion: status?.daemonVersion,
             workspaceRoot: status?.workspaceRoot,
             lastSyncedAt: status?.lastSyncedAt,
-            heartbeatAgeSeconds: age
+            heartbeatAgeSeconds: age,
+            deferredRepos: status?.deferredRepos,
+            oldestDeferralAgeSeconds: status?.oldestDeferralAgeSeconds
         )
     }
 
@@ -177,7 +193,9 @@ struct StatusReader {
                   let heartbeatString = object["heartbeatAt"] as? String,
                   let heartbeatAt = parseDate(heartbeatString),
                   isNullOrInt(object["sequence"]),
-                  isNullOrString(object["lastSyncedAt"]) else {
+                  isNullOrString(object["lastSyncedAt"]),
+                  isOptionalNonnegativeInt(object, key: "deferredRepos", nullable: false),
+                  isOptionalNonnegativeInt(object, key: "oldestDeferralAgeSeconds", nullable: true) else {
                 return .invalid
             }
 
@@ -196,6 +214,8 @@ struct StatusReader {
             let totalBytes = int64Value(object["totalBytes"]).flatMap { $0 >= 0 ? $0 : nil }
             let daemonVersion = (object["daemonVersion"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let workspaceRoot = (object["workspaceRoot"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let deferredRepos = (object["deferredRepos"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
+            let oldestDeferralAgeSeconds = (object["oldestDeferralAgeSeconds"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
             return .valid(DaemonStatus(
                 state: state,
                 heartbeatAt: heartbeatAt,
@@ -206,7 +226,9 @@ struct StatusReader {
                 workspaceRoot: workspaceRoot,
                 lastSyncedAt: lastSyncedAt,
                 operation: operation,
-                attentionReason: reason
+                attentionReason: reason,
+                deferredRepos: deferredRepos,
+                oldestDeferralAgeSeconds: oldestDeferralAgeSeconds
             ))
         } catch CocoaError.fileReadNoSuchFile {
             return .missing
@@ -254,6 +276,13 @@ struct StatusReader {
 
     private func isNullOrString(_ value: Any?) -> Bool {
         value == nil || value is NSNull || value is String
+    }
+
+    private func isOptionalNonnegativeInt(_ object: [String: Any], key: String, nullable: Bool) -> Bool {
+        guard let value = object[key] else { return true }
+        if value is NSNull { return nullable }
+        guard let int = value as? Int else { return false }
+        return int >= 0
     }
 
     private func int64Value(_ value: Any?) -> Int64? {
@@ -333,6 +362,8 @@ private struct DaemonStatus {
     var lastSyncedAt: Date?
     var operation: SyncOperation?
     var attentionReason: AmbientAttentionReason?
+    var deferredRepos: Int?
+    var oldestDeferralAgeSeconds: Int?
 }
 
 private enum DaemonStatusResult {
@@ -353,6 +384,8 @@ private struct Verdict {
     var workspaceRoot: String? = nil
     var lastSyncedAt: Date? = nil
     var heartbeatAgeSeconds: Double? = nil
+    var deferredRepos: Int? = nil
+    var oldestDeferralAgeSeconds: Int? = nil
 }
 
 private extension ISO8601DateFormatter {

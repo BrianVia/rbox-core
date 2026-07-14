@@ -416,6 +416,24 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       }
       break;
     }
+    case "git": {
+      const sub = positional[0];
+      const repo = positional[1];
+      const verb = positional[2] ?? "show-me";
+      if (sub !== "resolve" || !repo || positional.length > 3 || !["show-me", "take-theirs", "keep-mine"].includes(verb)) {
+        fail("usage: rbox git resolve <repo> [show-me|take-theirs|keep-mine] [--json] [--confirm <token>] [--force-discard-incoming]");
+        break;
+      }
+      const root = await resolveRoot(repo);
+      const { gitResolveCmd } = await import("./git-cmd.js");
+      const code = await gitResolveCmd(root, repo, verb as "show-me" | "take-theirs" | "keep-mine", {
+        json: jsonMode,
+        confirm: flags.confirm,
+        forceDiscardIncoming: flags["force-discard-incoming"] === "true",
+      });
+      if (code !== 0) process.exitCode = code;
+      break;
+    }
     case "shell-init": {
       // design 46: print the zsh prompt integration + completions to stdout, for
       // `eval "$(rbox shell-init zsh)"` in .zshrc. Only zsh today (bash/fish use the

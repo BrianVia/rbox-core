@@ -1,11 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
-import { repoRecordsForState, type ConfigShapeIdentity, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "../config.js";
-import { completeConfigApply, configLaneState, type ConfigLaneState } from "../sync-state.js";
-import { configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency } from "./shared.js";
+import { readAllRefs } from "../../engine/git/refs.js";
+import { git, readHead, warnOnce } from "../../engine/git/shared.js";
+import { DEFERRAL_LANES, expectedStateNonce, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "../config.js";
+import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
+import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
+import { checkoutLabel, configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
 import { gitConfigHash, sameConfigShape, configReceiver } from "./config-lane.js";
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
@@ -18,6 +21,43 @@ function localDivergedFromBase(localId: GitIdentity | undefined, base: GitSectio
   const n = narrowerScope(localId.refScope, base.refScope);
   return projectedKey(localId, n) !== projectedKey(base, n);
 }
+
+async function partialRefsStillMatch(repoDir: string, partial: GitPartialApply): Promise<boolean> {
+  const directRefs = await readAllRefs(repoDir);
+  for (const [ref, expected] of Object.entries(partial.appliedRefs)) {
+    if (expected.kind === "symbolic") {
+      const target = await git(repoDir, ["symbolic-ref", "-q", ref]).catch(() => undefined);
+      if (target !== expected.target) return false;
+    } else {
+      if (directRefs[ref] !== expected.oid) return false;
+    }
+  }
+  return true;
+}
+
+function withoutRboxAuthoredRefs(localId: GitIdentity, base: GitSection | undefined, partial: GitPartialApply): GitIdentity {
+  const refs = { ...localId.refs };
+  for (const ref of Object.keys(partial.appliedRefs)) {
+    const old = base?.refs[ref];
+    if (old === undefined) delete refs[ref];
+    else refs[ref] = old;
+  }
+  if (partial.checkoutPending) return { ...localId, refs };
+  return {
+    ...localId,
+    refs,
+    head: base?.head ?? localId.head,
+    indexTree: base?.indexTree,
+    opState: base?.opState === undefined ? undefined : sectionOpState(base),
+  };
+}
+
+function checkoutMatchesIncoming(localId: GitIdentity, incoming: GitSection): boolean {
+  const incomingOp = incoming.opState === undefined ? undefined : sectionOpState(incoming);
+  return localId.head.trimEnd() === incoming.head.trimEnd()
+    && localId.indexTree === incoming.indexTree
+    && JSON.stringify(localId.opState ?? null) === JSON.stringify(incomingOp ?? null);
+}
 export interface GitPullOutcome {
   gitRepos?: Record<string, GitSection>;
   gitReposRemoved?: Record<string, string>;
@@ -26,6 +66,12 @@ export interface GitPullOutcome {
   /** Completed/invalidation config-lane updates, saved atomically with this
    * pull's base and pending transitions by the step-4 packet composer. */
   configLane?: Record<string, ConfigLaneState>;
+  deferrals?: Record<string, GitDeferralUpdates | null>;
+  partial?: Record<string, GitPartialApply | null>;
+  idxProj?: Record<string, string | null>;
+  /** Published checkout journals clear only after the surrounding state CAS. */
+  publishedJournals?: string[];
+  journalCrashAt?: (point: FollowCrashPoint) => void;
   gitApplyMetrics?: GitApplyMetrics;
 }
 
@@ -113,11 +159,12 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
  *    (§13.5), then clear pending ([v6] absence supersedes pending), record a removal
  *    memory when the local `.git` survives, drop the base entry — NEVER touch local .git.
  *  - unchanged (projected onto the narrower scope) → base advances, no apply.
- *  - local diverged from base → per-repo CONFLICT: preserve remote, checkpoint base to
- *    remote, record `needsResolution` with the conflict-time local identity [v2, M2].
- *  - clean → applyGitState (containment + ignored-subtree refusal BEFORE any mutation);
- *    a removal-memory-matching leftover is treated as ABSENT → clean materialization
- *    (dir: quarantine + ref-wipe first; pointer: NEVER ref-wipe — guarded update-only).
+ *  - existing usable steady receiver + remote change → design-116 follow pipeline
+ *    (oracle, classifier, safe-ref plane, journaled checkout transaction), including
+ *    metadata-base-clean receivers; legacy modes retain the conflict checkpoint.
+ *  - fresh targets and removal-memory clean-materialization wipes → applyGitState
+ *    (containment + ignored-subtree refusal BEFORE any mutation); dir leftovers
+ *    quarantine + ref-wipe first, pointer leftovers remain guarded update-only.
  *  - deferred apply → record `gitPendingRemote`; that repo's base does not advance;
  *    every other repo advances independently.
  */
@@ -130,6 +177,8 @@ export async function applyGitSections(
   matcher: IgnoreMatcher,
   glog: (line: string) => void,
 opts: {
+    /** D3 typed passthrough; D4b owns all follow decisions that consume it. */
+    oracle?: AppliedManifestOracle;
     collectMetrics?: boolean;
     onProgress?: (done: number, total: number) => void;
     /** Workspace-wide legacy fallback: Git applies, config is left untouched. */
@@ -137,15 +186,25 @@ opts: {
     /** Deterministic fault injection for §11 pull-lane tests. */
     applyConfig?: typeof applyConfigTransaction;
     materializeFreshConfig?: typeof materializeFreshGitConfig;
+    /** Incoming sequence used by a published journal's intended RepoRecord. */
+    sourceGlobalSeq?: number;
+    /** Degraded workspace mutex disables follow and independent ref publication. */
+    degradedMutex?: boolean;
+    capabilityProbe?: CheckoutCapabilityProbe;
+    crashAt?: (point: FollowCrashPoint) => void;
   } = {}
 ): Promise<GitPullOutcome> {
-  const baseRepos = state.lastSyncedManifest.gitRepos ?? {};
+  const baseRepos = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
   const applied: Record<string, GitSection> = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
   const records = repoRecordsForState(state);
   const configLane: Record<string, ConfigLaneState> = {};
+  const deferrals: Record<string, GitDeferralUpdates | null> = {};
+  const partial: Record<string, GitPartialApply | null> = {};
+  const idxProj: Record<string, string | null> = {};
+  const publishedJournals: string[] = [];
   let commonDirGroups: Map<string, number> | undefined;
   let metrics: GitApplyMetrics | undefined;
   const pack = (): GitPullOutcome => ({
@@ -154,10 +213,24 @@ opts: {
     gitNeedsResolution: emptyToUndef(needsRes),
     gitPendingRemote: emptyToUndef(pending),
     configLane: emptyToUndef(configLane),
+    deferrals: emptyToUndef(deferrals),
+    partial: emptyToUndef(partial),
+    idxProj: emptyToUndef(idxProj),
+    publishedJournals: publishedJournals.length ? [...publishedJournals] : undefined,
+    journalCrashAt: opts.crashAt,
     gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
   });
   if (!cfg.syncGit) return pack();
   const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  // Logical repo keys must remain one-to-one with receiver targets even if this
+  // state later lands on an NFC/case-aliasing filesystem.
+  const collidingRepoKeys = receiverEquivalentCollisionNames(keys);
+  if (collidingRepoKeys.size > 0) warnOnce(
+    repoEquivalenceWarningLogged,
+    root,
+    `git-sync WARNING: receiver-equivalent Git repo keys all deferred: ${[...collidingRepoKeys].sort().join(", ")}`,
+    glog,
+  );
   if (opts.collectMetrics) {
     commonDirGroups = new Map();
     metrics = {
@@ -196,6 +269,37 @@ opts: {
     sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
     ...(configLane[rel] ?? configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
   });
+  const currentDeferral = (rel: string, lane: GitDeferral["lane"]): GitDeferral | undefined => {
+    const transition = deferrals[rel];
+    if (transition === null) return undefined;
+    if (transition && Object.prototype.hasOwnProperty.call(transition, lane)) return transition[lane] ?? undefined;
+    return records[rel]?.deferrals?.[lane];
+  };
+  const setDeferral = (
+    rel: string,
+    lane: GitDeferral["lane"],
+    reason: GitDeferralReason,
+    subjectKey?: string,
+    checkout?: GitDeferral["checkout"],
+  ): void => {
+    const next = nextDeferral(lane, currentDeferral(rel, lane), reason, new Date().toISOString(), subjectKey, checkout);
+    deferrals[rel] = { ...(deferrals[rel] ?? {}), [lane]: next };
+  };
+  const clearDeferral = (rel: string, lane: GitDeferral["lane"]): void => {
+    if (!currentDeferral(rel, lane)) return;
+    // Runtime transition supports explicit-null lanes; sync-state merges mechanically.
+    deferrals[rel] = { ...(deferrals[rel] ?? {}), [lane]: null };
+  };
+  const markCheckpointReproof = (rel: string): void => {
+    const transition = deferrals[rel];
+    const apply = transition && transition !== null ? transition.apply : undefined;
+    if (apply) apply.reproof = true;
+  };
+  const checkoutOf = async (repoDir: string): Promise<GitDeferral["checkout"] | undefined> => {
+    const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!ctx) return undefined;
+    return checkoutLabel(await readHead(ctx).catch(() => ""));
+  };
   const replaceLane = (rel: string, record: RepoRecordInput): void => {
     configLane[rel] = configLaneState(record);
   };
@@ -273,6 +377,15 @@ opts: {
     });
   };
 
+  const installRecoveredRecord = (rel: string, record: RepoRecord): void => {
+    records[rel] = record;
+    if (record.base) { baseRepos[rel] = record.base; applied[rel] = record.base; }
+    else { delete baseRepos[rel]; delete applied[rel]; }
+    if (record.pending) pending[rel] = record.pending; else delete pending[rel];
+    if (record.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
+    if (record.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
+  };
+
   const processRepo = async (rel: string, chainTimings?: GitChainTimings): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     let remoteSec = wireRemoteSec;
@@ -296,11 +409,68 @@ opts: {
         }
       }
     }
-    const baseSec = baseRepos[rel];
-    const pend = pending[rel];
+    const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
+    let baseSec = baseRepos[rel];
+    let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
-    const dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+    let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     const commonDirGroup = await commonDirGroupFor(repoDir, dotGit !== undefined);
+
+    // Design 116 recovery is the first per-repo operation in every arm. The
+    // surrounding runRepo chain lock is already keyed by this common dir.
+    let recoveryConflict = false;
+    const recoveryCtx = dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined;
+    if (recoveryCtx) {
+      const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), recoveryCtx);
+      const landed = await recoverAndLandFollowJournal(root, rel, binding, state, {
+        land: !opts.degradedMutex,
+        crashAt: opts.crashAt,
+      });
+      const recovery = landed.recovery;
+      if (recovery.status === "keep") {
+        if (opts.degradedMutex) {
+          if (remoteSec) {
+            pending[rel] = remoteSec;
+            setDeferral(rel, "apply", "unsupported", incomingKey, await checkoutOf(repoDir));
+          }
+          glog(`git-sync deferred ${rel}: published checkout journal awaits non-degraded state save`);
+          return { result: "deferred", commonDirGroup };
+        }
+        state = landed.state;
+        const recoveredRecord = repoRecordsForState(state)[rel];
+        if (recoveredRecord) installRecoveredRecord(rel, recoveredRecord);
+        baseSec = baseRepos[rel];
+        pend = pending[rel];
+        glog(`git-sync recovered published checkout ${rel}`);
+      } else if (recovery.status === "defer") {
+        if (remoteSec) {
+          pending[rel] = remoteSec;
+          setDeferral(rel, "apply", "unreadable", incomingKey, await checkoutOf(repoDir));
+        }
+        glog(`git-sync deferred ${rel}: ${recovery.reason}`);
+        return { result: "deferred", commonDirGroup };
+      } else if (recovery.status === "human-intervened") {
+        recoveryConflict = true;
+        glog(`git-sync WARNING ${rel}: crash-window human changes preserved (${recovery.fields.join(", ")}); journal quarantined at ${recovery.quarantinePath}`);
+      } else if (recovery.status === "binding-mismatch") {
+        glog(`git-sync WARNING ${rel}: stale checkout journal quarantined at ${recovery.quarantinePath}`);
+      } else if (recovery.status === "fresh-quarantined") {
+        glog(`git-sync WARNING ${rel}: partial fresh repository quarantined at ${recovery.quarantinePath}`);
+        dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+      }
+    } else {
+      const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
+      if (recovery.status === "binding-mismatch") {
+        glog(`git-sync WARNING ${rel}: journal for an absent/unreadable repository quarantined at ${recovery.quarantinePath}`);
+      } else if (recovery.status === "defer") {
+        if (remoteSec) {
+          pending[rel] = remoteSec;
+          setDeferral(rel, "apply", "unreadable", incomingKey, await checkoutOf(repoDir));
+        }
+        glog(`git-sync deferred ${rel}: ${recovery.reason}`);
+        return { result: "deferred", commonDirGroup };
+      }
+    }
 
     // Receiver quiescence (design 43 §7): a busy repo defers only itself, and the busy
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
@@ -309,6 +479,7 @@ opts: {
     const busy = dotGit !== undefined && (await isGitBusy(repoDir));
     if (busy && remoteSec) {
       pending[rel] = remoteSec; // apply needs quiescence — retry next pull; outbound carries newest truth
+      setDeferral(rel, "apply", "git-busy", incomingKey, await checkoutOf(repoDir));
       glog(`git-sync deferred ${rel}: receiver git busy`);
       return { result: "deferred", commonDirGroup };
     }
@@ -328,6 +499,9 @@ opts: {
       const diverged = pend !== undefined && localDivergedFromBase(localId, baseSec);
       delete pending[rel];
       delete needsRes[rel];
+      deferrals[rel] = null;
+      partial[rel] = null;
+      idxProj[rel] = null;
       if (rel in applied) {
         delete applied[rel];
         glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
@@ -357,6 +531,24 @@ opts: {
       }
       return { result: "removed", commonDirGroup };
     }
+    const inheritedConfigBase = records[rel]?.partial?.configBase ?? baseSec?.config;
+    const partialFrom = (
+      progress: Pick<GitPartialApply, "appliedRefs" | "heldRefs" | "configApplied">,
+      checkoutPending: boolean,
+    ): GitPartialApply => ({
+      incomingKey: incomingKey!,
+      checkoutPending,
+      appliedRefs: progress.appliedRefs,
+      heldRefs: progress.heldRefs,
+      configApplied: progress.configApplied,
+      ...(!progress.configApplied && inheritedConfigBase !== undefined ? { configBase: inheritedConfigBase } : {}),
+    });
+    const heldReasonOf = (heldRefs: GitPartialApply["heldRefs"]): GitDeferralReason => {
+      const reasons = Object.values(heldRefs);
+      return reasons.includes("local-commits") ? "local-commits"
+        : reasons.includes("local-stash") ? "local-stash"
+        : "worktree-ownership";
+    };
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
     // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
@@ -371,6 +563,7 @@ opts: {
         cleanMaterialize = true;
       } else if (!localId && dotGit.isFile()) {
         pending[rel] = remoteSec;
+        setDeferral(rel, "apply", "unreadable", incomingKey, await checkoutOf(repoDir));
         glog(`git-sync deferred ${rel}: leftover pointer repo unreadable — keeping removal memory`);
         return { result: "deferred", commonDirGroup };
       } else {
@@ -378,8 +571,9 @@ opts: {
       }
     }
 
-    const defer = (reason: string) => {
+    const defer = async (reason: string, typedReason: GitDeferralReason = "other") => {
       pending[rel] = remoteSec; // [v5]: outbound pushes carry newest unapplied truth
+      setDeferral(rel, "apply", typedReason, incomingKey, await checkoutOf(repoDir));
       glog(`git-sync deferred ${rel}: ${reason}`);
     };
 
@@ -422,37 +616,57 @@ opts: {
         }
       }
     }
+    if (!opts.disableConfigLane && !configDue) clearDeferral(rel, "config");
+
+    const tryConfigApply = async (): Promise<boolean> => {
+      try {
+        await runConfigApply(rel, repoDir, remoteSec.config!, inheritedConfigBase, configTarget!);
+        clearDeferral(rel, "config");
+        return true;
+      } catch (error) {
+        setDeferral(rel, "config", "config", incomingKey, await checkoutOf(repoDir));
+        glog(`git-sync deferred ${rel}: ${errMsg(error)}`);
+        return false;
+      }
+    };
 
     // A conflict checkpoint owns the Git disposition until the user changes the
     // recorded local identity. Config waits; after that change the same due
     // predicate above feeds either the converged shortcut or a new conflict/apply.
     let resolutionChanged = false;
+    let checkpointReproof = false;
     if (needsRes[rel] !== undefined) {
       if (gitIdentityKey(localId) === needsRes[rel]) {
-        return { result: "unchanged", commonDirGroup };
+        const alreadyReproved = records[rel]?.deferrals?.apply?.subjectKey === incomingKey && records[rel]?.deferrals?.apply?.reproof === true;
+        if (opts.degradedMutex || !gitFollowEnabled() || !opts.oracle || alreadyReproved) {
+          setDeferral(rel, "apply", "conflict", incomingKey, await checkoutOf(repoDir));
+          return { result: "unchanged", commonDirGroup };
+        }
+        checkpointReproof = true;
+      } else {
+        delete needsRes[rel];
+        resolutionChanged = true;
       }
-      delete needsRes[rel];
-      resolutionChanged = true;
     }
 
+    let configFailed = false;
     const applyConfigOnly = async (): Promise<boolean> => {
       if (!configDue || !configTarget || configTarget.fresh) return !configDue;
-      try {
-        await runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget);
-        return true;
-      } catch (error) {
-        defer(errMsg(error));
-        return false;
-      }
+      if (await tryConfigApply()) return true;
+      configFailed = true;
+      partial[rel] = partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
+      return true;
     };
 
     // Projected identity comparison on the NARROWER of the two scopes (§7) — what makes
     // worktree→standalone→worktree round-trips converge without apply ping-pong.
     const cmpScope = narrowerScope(remoteSec.refScope, baseSec?.refScope);
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
-    if (!remoteChanged && !pend && !resolutionChanged && !(configDue && configTarget?.fresh)) {
+    if (!remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
       if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
+      clearDeferral(rel, "apply");
+      if (!configFailed) partial[rel] = null;
       return { result: "unchanged", commonDirGroup };
     }
 
@@ -467,32 +681,264 @@ opts: {
         applied[rel] = remoteSec;
         delete pending[rel];
         delete removedMem[rel];
+        clearDeferral(rel, "apply");
+        if (!configFailed) partial[rel] = null;
+        idxProj[rel] = null;
         return { result: "unchanged", commonDirGroup };
       }
     }
 
     const kek = cfg.kek!; // guaranteed by the fail-closed gate above
-    if (!cleanMaterialize && localDivergedFromBase(localId, baseSec)) {
-      // Per-repo conflict: never auto-clobber local. Preserve remote for manual merge,
-      // checkpoint base to remote (stop pull-conflict-looping), and suppress capture
-      // until the local identity changes from this recorded value [v2, M2].
+    const recordedPartial = records[rel]?.partial;
+    let forcedHeldRefs: GitPartialApply["heldRefs"] | undefined;
+    let divergenceId = localId;
+    if (recordedPartial && localId && pend && gitIncomingKey(pend) === recordedPartial.incomingKey) {
+      if (await partialRefsStillMatch(repoDir, recordedPartial)) {
+        divergenceId = withoutRboxAuthoredRefs(
+          localId,
+          baseSec,
+          !recordedPartial.checkoutPending && !checkoutMatchesIncoming(localId, pend)
+            ? { ...recordedPartial, checkoutPending: true }
+            : recordedPartial,
+        );
+      } else {
+        forcedHeldRefs = Object.fromEntries(Object.keys(recordedPartial.appliedRefs).map((ref) => [ref, "local-commits" as const]));
+        partial[rel] = null;
+      }
+    }
+    // Legacy GitIdentity deliberately projects the index through write-tree, which
+    // cannot see assume-unchanged, skip-worktree, intent-to-add, sparse, or
+    // resolve-undo semantics. Pay for the v2 projection only after every unchanged
+    // shortcut, immediately before a clean-path mutation would otherwise begin.
+    const legacyDiverged = !cleanMaterialize && localDivergedFromBase(divergenceId, baseSec);
+    let semanticIndexDiverged = false;
+    if (!legacyDiverged && !cleanMaterialize && dotGit && baseSec) {
+      const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+      if (!ctx) {
+        semanticIndexDiverged = true;
+      } else {
+        const liveIndexPath = path.join(ctx.gitDir, "index");
+        const liveIndexPresent = await fs.lstat(liveIndexPath).then(
+          (stat) => stat.isFile(),
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error),
+        ).catch(() => undefined);
+        const baseHasIndex = baseSec.indexSha !== undefined
+          && baseSec.indexEncSha !== undefined
+          && baseSec.indexCipherSize !== undefined;
+        let baseProjection = records[rel]?.idxProj;
+        const deriveProjection = async (ignoreCache = false): Promise<string | undefined> => {
+          const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-base-projection-${process.pid}-`));
+          try {
+            return await deriveBaseIndexProjection({ ctx, base: baseSec, store, kek, record: records[rel] }, tmpDir, ignoreCache);
+          } finally {
+            await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+          }
+        };
+        if (baseHasIndex && baseProjection === undefined) {
+          baseProjection = await deriveProjection();
+          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
+        }
+        const liveProjection = liveIndexPresent === true
+          ? await indexIdentityV2(repoDir, liveIndexPath)
+          : undefined;
+        // A projection cached by an older client may be stale. Re-derive only
+        // on disagreement; a real semantic edit still disagrees, while a stale
+        // cache is repaired without manufacturing a local-index episode.
+        if (baseHasIndex && liveProjection !== undefined && baseProjection !== liveProjection && records[rel]?.idxProj) {
+          baseProjection = await deriveProjection(true);
+          if (baseProjection !== undefined) idxProj[rel] = baseProjection;
+        }
+        let matchesRboxPartial = false;
+        if (recordedPartial && pend
+          && recordedPartial.incomingKey === gitIncomingKey(pend)
+          && recordedPartial.checkoutPending === false
+          && liveIndexPresent !== undefined) {
+          const partialHasIndex = pend.indexSha !== undefined
+            && pend.indexEncSha !== undefined
+            && pend.indexCipherSize !== undefined;
+          if (!partialHasIndex) {
+            matchesRboxPartial = liveIndexPresent === false;
+          } else if (liveProjection !== undefined) {
+            const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-partial-projection-${process.pid}-`));
+            try {
+              const partialProjection = await deriveBaseIndexProjection(
+                { ctx, base: pend, store, kek, record: undefined },
+                tmpDir,
+              );
+              matchesRboxPartial = partialProjection !== undefined && liveProjection === partialProjection;
+            } finally {
+              await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+            }
+          }
+        }
+        semanticIndexDiverged = !matchesRboxPartial && (liveIndexPresent === undefined
+          || liveIndexPresent !== baseHasIndex
+          || (liveIndexPresent && (liveProjection === undefined || baseProjection === undefined || liveProjection !== baseProjection)));
+      }
+    }
+    const localDiverged = legacyDiverged || semanticIndexDiverged;
+    // Design 116 review R2-1/R2-2: a usable, already-materialized STEADY
+    // receiver always takes the oracle + journal follow pipeline when the
+    // remote changed, even when its Git metadata still equals the base.  That
+    // is what lets working-byte-only human dirt classify as local-edits, and an
+    // invalidated applied-ref marker must likewise reach the forced-hold plane
+    // instead of falling back through the base-clean shortcut.
+    const steadyFollowCtx = remoteChanged && baseSec && dotGit && !cleanMaterialize
+      && !opts.degradedMutex && opts.oracle && gitFollowEnabled()
+      ? await repoCtxFromDisk(repoDir).catch(() => undefined)
+      : undefined;
+    const routeThroughFollow = localDiverged || checkpointReproof
+      || Object.keys(forcedHeldRefs ?? {}).length > 0
+      || steadyFollowCtx !== undefined;
+    const legacyConflict = async (reason: GitDeferralReason = "conflict", progress?: FollowProgress): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
       const { recoveryBundle } = await preserveGitConflict(repoDir, remoteSec, store, kek);
-      applied[rel] = remoteSec;
-      needsRes[rel] = gitIdentityKey(localId);
-      delete pending[rel];
+      const held = Object.keys(progress?.heldRefs ?? {}).length > 0;
+      const configApplied = progress?.configApplied ?? true;
+      if (held) {
+        pending[rel] = remoteSec;
+      } else {
+        applied[rel] = remoteSec;
+        delete pending[rel];
+      }
+      partial[rel] = progress && (held || !configApplied)
+        ? partialFrom({ ...progress, configApplied }, true)
+        : null;
+      needsRes[rel] = gitIdentityKey(progress ? await gitIdentity(repoDir) : localId);
+      setDeferral(rel, "apply", reason, incomingKey, await checkoutOf(repoDir));
       glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
       return { result: "conflict", commonDirGroup };
+    };
+    if (routeThroughFollow) {
+      // Design-43 containment and ignored-target refusals remain ahead of every
+      // artifact import or ref-plane mutation in the new diverged path.
+      if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
+        await defer("target is inside an ignored subtree — refusing to follow", "ignored-target");
+        return { result: "deferred", commonDirGroup };
+      }
+      try {
+        await assertGitTargetWithinRoot(root, rel);
+      } catch (error) {
+        await defer(errMsg(error), "containment");
+        return { result: "deferred", commonDirGroup };
+      }
+      if (recoveryConflict || opts.degradedMutex || !opts.oracle) return legacyConflict(opts.oracle ? "conflict" : "unsupported");
+      const ctx = steadyFollowCtx ?? await repoCtxFromDisk(repoDir).catch(() => undefined);
+      if (!ctx) return legacyConflict("unreadable");
+      const preflight = await gitPreflight(repoDir, ctx);
+      if (!preflight.ok) {
+        await defer(preflight.reason ?? "git preflight refused follow", preflight.structural ? "unsupported" : "unreadable");
+        return { result: "deferred", commonDirGroup };
+      }
+
+      const runFollowConfig = async (): Promise<boolean> => {
+        if (!configDue || !configTarget || configTarget.fresh || remoteSec.config === undefined) return !configDue || configTarget === undefined;
+        return tryConfigApply();
+      };
+
+      const intendedFor = async (progress: FollowProgress): Promise<FollowIntended> => {
+        const held = Object.keys(progress.heldRefs).length > 0;
+        const effectiveDeferrals = { ...(records[rel]?.deferrals ?? {}) };
+        const transition = deferrals[rel];
+        if (transition === null) {
+          for (const lane of DEFERRAL_LANES) delete effectiveDeferrals[lane];
+        } else if (transition) {
+          for (const lane of DEFERRAL_LANES) {
+            if (transition[lane] === null) delete effectiveDeferrals[lane];
+            else if (transition[lane]) effectiveDeferrals[lane] = transition[lane]!;
+          }
+        }
+        if (held) {
+          const heldReason = heldReasonOf(progress.heldRefs);
+          const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
+          effectiveDeferrals.apply = next;
+        } else delete effectiveDeferrals.apply;
+        const lane = laneRecord(rel);
+        const part = held || !progress.configApplied ? partialFrom(progress, false) : undefined;
+        const previous = records[rel];
+        const previousRecord = previous === undefined ? undefined : inputRecord(previous);
+        const record: RepoRecordInput = {
+          sourceSeq: opts.sourceGlobalSeq ?? state.lastSyncedSequence,
+          base: held ? baseSec : remoteSec,
+          ...(held ? { pending: remoteSec } : {}),
+          ...configLaneState(lane),
+          ...(Object.keys(effectiveDeferrals).length ? { deferrals: effectiveDeferrals } : {}),
+          ...(part ? { partial: part } : {}),
+          ...(progress.incomingIndexProjection ? { idxProj: progress.incomingIndexProjection } : {}),
+        };
+        return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, ...(previousRecord ? { previousRecord } : {}) };
+      };
+
+      const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
+      const follow = await followDivergedRepo({
+        workspaceRoot: root,
+        relPath: rel,
+        ctx,
+        base: baseSec,
+        incoming: remoteSec,
+        store,
+        kek,
+        oracle: opts.oracle,
+        record: idxProj[rel] && records[rel]
+          ? { ...records[rel], idxProj: idxProj[rel]! }
+          : records[rel],
+        binding,
+        followEnabled: gitFollowEnabled(),
+        runConfig: runFollowConfig,
+        makeIntended: intendedFor,
+        chainTimings,
+        capabilityProbe: opts.capabilityProbe,
+        crashAt: opts.crashAt,
+        log: glog,
+        forcedHeldRefs,
+      });
+      if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
+      if (follow.status === "legacy") return legacyConflict(follow.reason, follow);
+      if (follow.status === "defer") {
+        if (checkpointReproof && follow.reason !== "unsupported") {
+          pending[rel] = remoteSec;
+          partial[rel] = partialFrom(follow, true);
+          needsRes[rel] = gitIdentityKey(await gitIdentity(repoDir));
+          setDeferral(rel, "apply", "conflict", incomingKey, await checkoutOf(repoDir));
+          markCheckpointReproof(rel);
+          return { result: "unchanged", commonDirGroup };
+        }
+        pending[rel] = remoteSec;
+        partial[rel] = partialFrom(follow, true);
+        setDeferral(rel, "apply", follow.reason, incomingKey, await checkoutOf(repoDir));
+        glog(`git-sync deferred ${rel}: ${follow.detail}`);
+        return { result: "deferred", commonDirGroup };
+      }
+
+      delete needsRes[rel];
+      delete removedMem[rel];
+      const held = Object.entries(follow.heldRefs);
+      idxProj[rel] = follow.incomingIndexProjection ?? null;
+      if (held.length > 0) {
+        pending[rel] = remoteSec;
+        partial[rel] = partialFrom(follow, false);
+        setDeferral(rel, "apply", heldReasonOf(follow.heldRefs), incomingKey, await checkoutOf(repoDir));
+      } else {
+        applied[rel] = remoteSec;
+        delete pending[rel];
+        partial[rel] = follow.configApplied
+          ? null
+          : partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
+        clearDeferral(rel, "apply");
+      }
+      publishedJournals.push(rel);
+      glog(`git-sync followed ${rel}`);
+      return { result: "applied", commonDirGroup };
     }
 
     // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
     if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
-      defer("target is inside an ignored subtree — refusing to materialize");
+      await defer("target is inside an ignored subtree — refusing to materialize", "ignored-target");
       return { result: "deferred", commonDirGroup };
     }
     try {
       await assertGitTargetWithinRoot(root, rel);
     } catch (e) {
-      defer(errMsg(e));
+      await defer(errMsg(e), "containment");
       return { result: "deferred", commonDirGroup };
     }
 
@@ -505,15 +951,18 @@ opts: {
     // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
     // update-only apply is the whole treatment; the memory clears on success.
     const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
-    const configAfterGit = configDue && configTarget && remoteSec.config !== undefined
-      ? async () => runConfigApply(rel, repoDir, remoteSec.config!, baseSec?.config, configTarget!)
-      : undefined;
+    // Documented residual (design 116 review R2-1): genuinely fresh targets
+    // and clean-materialization wipes have no pre-existing checkout to
+    // clobber, so they remain on legacy applyGitState. Journal coverage for
+    // fresh/wipe materialization lands with the next design cycle. Degraded,
+    // flag-off, and no-oracle modes likewise retain their legacy path.
     const res = await applyGitState(
       repoDir,
       remoteSec,
       store,
       kek,
       {
+        ...(opts.degradedMutex ? { legacyWholeSectionOwnership: true } : {}),
         ...(wipeLeftover
           ? {
             beforeMutateWipesRefs: true,
@@ -523,7 +972,6 @@ opts: {
             },
           }
           : {}),
-        ...(configAfterGit ? { afterGitMutate: configAfterGit } : {}),
         ...(chainTimings ? { chainTimings } : {}),
       }
     );
@@ -534,13 +982,57 @@ opts: {
       } catch (e) {
         glog(`git-sync WARNING ${rel}: post-apply containment check failed: ${errMsg(e)}`);
       }
-      applied[rel] = remoteSec;
-      delete pending[rel];
+      const held = Object.entries(res.heldRefs ?? {}).sort(([a], [b]) => a.localeCompare(b));
+      let configApplied = !configDue || configTarget === undefined;
+      if (configDue && configTarget && remoteSec.config !== undefined) {
+        configApplied = await tryConfigApply();
+      }
+      if (held.length > 0) {
+        pending[rel] = remoteSec;
+        const filtered = new Set(res.filteredRefs ?? []);
+        const heldSet = new Set(held.map(([ref]) => ref));
+        partial[rel] = partialFrom({
+          appliedRefs: Object.fromEntries(Object.entries(remoteSec.refs)
+            .filter(([ref]) => !heldSet.has(ref) && !filtered.has(ref))
+            .map(([ref, oid]) => [ref, { kind: "direct" as const, oid }])),
+          heldRefs: Object.fromEntries(held.map(([ref]) => [ref, "ownership" as const])),
+          configApplied,
+        }, false);
+        setDeferral(rel, "apply", "worktree-ownership", incomingKey, await checkoutOf(repoDir));
+      } else {
+        applied[rel] = remoteSec;
+        delete pending[rel];
+        partial[rel] = configApplied
+          ? null
+          : partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
+        clearDeferral(rel, "apply");
+      }
       delete removedMem[rel];
-      glog(`git-sync applied ${rel}${res.filteredRefs?.length ? ` (filtered refs: ${res.filteredRefs.join(" ")})` : ""}`);
+      // A legacy clean apply may normalize the index. Never retain a semantic
+      // projection cached for the prior base; the next follow derives it once
+      // from the decrypt-verified new base artifact.
+      idxProj[rel] = null;
+      glog(
+        `git-sync applied ${rel}${held.length
+          ? ` (held refs: ${held.map(([ref, worktree]) => `${ref}=${worktree}`).join(" ")})`
+          : res.filteredRefs?.length
+            ? ` (filtered refs: ${res.filteredRefs.join(" ")})`
+            : ""}`
+      );
       return { result: "applied", commonDirGroup };
     } else {
-      defer(res.reason ?? "apply deferred");
+      const reason = res.reason ?? "apply deferred";
+      if (/\bconfig\b/i.test(reason)) {
+        setDeferral(rel, "config", "config", incomingKey, await checkoutOf(repoDir));
+      }
+      const typed: GitDeferralReason = /worktree-ownership|ownership-deferred/.test(reason) ? "worktree-ownership"
+        : reason.includes("busy") ? "git-busy"
+        : /\bconfig\b/i.test(reason) ? "config"
+        : /quarantine/i.test(reason) ? "other"
+        : /artifact|bundle|decrypt|import/i.test(reason) ? "artifact"
+        : /unsupported|invalid git section/i.test(reason) ? "unsupported"
+        : "other";
+      await defer(reason, typed);
       return { result: "deferred", commonDirGroup };
     }
   };
@@ -550,12 +1042,20 @@ opts: {
   const indexes = new Map(keys.map((rel, i) => [rel, i]));
   let progressDone = 0;
   const runRepo = async (rel: string): Promise<void> => {
+    const remoteSec = remote.gitRepos?.[rel];
+    const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
     const i = indexes.get(rel)!;
     let startedAt = Date.now();
     let result: GitApplyRepoResult = "deferred";
     let commonDirGroup: number | undefined;
     const chainTimings = metrics ? zeroGitChainTimings() : undefined;
     try {
+      if (collidingRepoKeys.has(rel)) {
+        if (remoteSec) pending[rel] = remoteSec;
+        setDeferral(rel, "apply", "unreadable", incomingKey);
+        result = "deferred";
+        return;
+      }
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async () => {
         startedAt = Date.now();
@@ -564,11 +1064,14 @@ opts: {
         commonDirGroup = processed.commonDirGroup;
       });
     } catch (e) {
+      if (e instanceof FollowCrashInjectedError) throw e;
       // Per-repo failures defer only THAT repo — one bad repo (a blob missing mid
       // conflict-preserve, an ENOTDIR/hostile target, an fs error) must never abort
       // the whole pull or block the other repos' base advance.
-      const remoteSec = remote.gitRepos?.[rel];
-      if (remoteSec) pending[rel] = remoteSec;
+      if (remoteSec) {
+        pending[rel] = remoteSec;
+        setDeferral(rel, "apply", "other", incomingKey, await checkoutOf(repoDirOf(root, rel)));
+      }
       glog(`git-sync deferred ${rel}: ${errMsg(e)}`);
       result = "deferred";
     } finally {
@@ -590,4 +1093,87 @@ opts: {
     for (const rel of chain) await runRepo(rel);
   });
   return pack();
+}
+
+/** Re-prove partial crash hints immediately before the state CAS. */
+export async function revalidateGitPartialApplies(
+  root: string,
+  state: SyncState,
+  outcome: GitPullOutcome,
+): Promise<void> {
+  const records = repoRecordsForState(state);
+  const rels = new Set([
+    ...Object.entries(records).filter(([, record]) => record.partial !== undefined).map(([rel]) => rel),
+    ...Object.entries(outcome.partial ?? {}).filter(([, value]) => value !== null).map(([rel]) => rel),
+  ]);
+  const locks = new Map<string, Promise<void>>();
+  await Promise.all([...rels].map(async (rel) => {
+    const transition = outcome.partial?.[rel];
+    const effective = transition === null ? undefined : transition ?? records[rel]?.partial;
+    if (!effective) return;
+    const key = await gitApplyMutationKey(root, rel);
+    await chainLock(locks, key, async () => {
+      if (await partialRefsStillMatch(repoDirOf(root, rel), effective)) return;
+      outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+    });
+  }));
+}
+
+/** Hold the per-common-dir serialization boundary from the final exact-ref proof
+ * through the state CAS that persists the marker. */
+export async function withRevalidatedGitPartialApplies<T>(
+  root: string,
+  state: SyncState,
+  outcome: GitPullOutcome,
+  save: () => Promise<T>,
+): Promise<T> {
+  const records = repoRecordsForState(state);
+  const partials = [...new Set([
+    ...Object.keys(records),
+    ...Object.keys(outcome.partial ?? {}),
+  ])].flatMap((rel) => {
+    const transition = outcome.partial?.[rel];
+    const partial = transition === null ? undefined : transition ?? records[rel]?.partial;
+    return partial ? [{ rel, partial }] : [];
+  });
+  const requested = new Map<string, Set<string>>();
+  for (const { rel, partial } of partials) {
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (!ctx) {
+      outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+      continue;
+    }
+    const commonDir = path.resolve(ctx.commonDir);
+    for (const ref of Object.keys(partial.appliedRefs)) {
+      const lockPath = path.resolve(ctx.commonDir, `${ref}.lock`);
+      if (!lockPath.startsWith(`${commonDir}${path.sep}`)) {
+        outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+        continue;
+      }
+      const rels = requested.get(lockPath) ?? new Set<string>();
+      rels.add(rel);
+      requested.set(lockPath, rels);
+    }
+  }
+  const held: Array<{ lockPath: string; handle: Awaited<ReturnType<typeof fs.open>> }> = [];
+  try {
+    for (const [lockPath, rels] of [...requested.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      try {
+        await fs.mkdir(path.dirname(lockPath), { recursive: true });
+        held.push({ lockPath, handle: await fs.open(lockPath, "wx") });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        for (const rel of rels) outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+      }
+    }
+    await revalidateGitPartialApplies(root, state, outcome);
+    const saved = await save();
+    for (const rel of outcome.publishedJournals ?? []) await clearFollowJournal(root, rel, outcome.journalCrashAt);
+    return saved;
+  } finally {
+    for (const { lockPath, handle } of held.reverse()) {
+      await handle.close().catch(() => {});
+      await fs.rm(lockPath, { force: true }).catch(() => {});
+    }
+  }
 }

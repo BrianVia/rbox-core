@@ -25,6 +25,11 @@ const STALE_EXCLUDED = { excluded: "stale daemon binding" } as const;
 const NOTICE =
   "this includes your daemon log tail, which contains file and folder names/paths from this workspace, your device id, and raw error messages; it is stored UNENCRYPTED for support for 30 days.";
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
+const GIT_DEFERRAL_REASONS = new Set([
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
+  "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable",
+  "artifact", "config", "containment", "unsupported", "other",
+]);
 
 type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" | "version" | "state" | "crypto";
 
@@ -94,6 +99,107 @@ function keepLastUtf8(s: string, maxBytes: number): string {
   const bytes = Buffer.from(s, "utf8");
   if (bytes.byteLength <= maxBytes) return s;
   return bytes.subarray(bytes.byteLength - maxBytes).toString("utf8");
+}
+
+function gitReasonOf(detail: string, fallback = "other"): string {
+  const normalized = detail.toLowerCase().replace(/[ _]+/g, "-");
+  for (const reason of GIT_DEFERRAL_REASONS) {
+    if (normalized.includes(reason)) return reason;
+  }
+  if (/local edits|working (?:tree|files)|unstaged|porcelain/.test(detail.toLowerCase())) return "local-edits";
+  if (/local index|\bstaged\b|\bindex\b/.test(detail.toLowerCase())) return "local-index";
+  if (/operation|rebase|cherry-pick|sequencer|bisect|revert/.test(detail.toLowerCase())) return "local-operation";
+  if (/local commits?|diverg|held refs?|\bheads?\b/.test(detail.toLowerCase())) return "local-commits";
+  if (/stash/.test(detail.toLowerCase())) return "local-stash";
+  if (/conflict/.test(detail.toLowerCase())) return "conflict";
+  if (/\bbusy\b|lock/.test(detail.toLowerCase())) return "git-busy";
+  if (/ownership|non-owned|does not own|outside workspace/.test(detail.toLowerCase())) return "worktree-ownership";
+  if (/ignor/.test(detail.toLowerCase())) return "ignored-target";
+  if (/unreadable|cannot read|could not read/.test(detail.toLowerCase())) return "unreadable";
+  if (/artifact|bundle|op-state/.test(detail.toLowerCase())) return "artifact";
+  if (/config/.test(detail.toLowerCase())) return "config";
+  if (/containment|outside root/.test(detail.toLowerCase())) return "containment";
+  if (/unsupported/.test(detail.toLowerCase())) return "unsupported";
+  return fallback;
+}
+
+function classifyGitLogMessage(message: string): { text: string; key: string } | undefined {
+  let klass: string;
+  let reason = "other";
+  let age = "-";
+  let match: RegExpExecArray | null;
+
+  if ((match = /^git deferred (\d+m|1h|1d|7d|14d|30d):\s+(.+?) on (?:branch .+|detached checkout|checkout unavailable) \(.+\)(?: \(working files changed since\))?$/.exec(message))) {
+    klass = "deferred";
+    age = match[1]!;
+    reason = gitReasonOf(match[2]!);
+  } else if ((match = /^git-sync deferred\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
+    klass = "deferred";
+    reason = gitReasonOf(match[1]!);
+  } else if ((match = /^git-sync CONFLICT\s+(.+)$/.exec(message))) {
+    klass = "conflict";
+    reason = "conflict";
+  } else if ((match = /^git-sync WARNING\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
+    klass = "warning";
+    reason = gitReasonOf(match[1]!);
+  } else if ((match = /^git-sync config skipped\s+[^:\r\n]+:\s*(.+)$/.exec(message))) {
+    klass = "config-skipped";
+    reason = "config";
+  } else if ((match = /^git-sync applied\s+(.+)$/.exec(message))) {
+    klass = "applied";
+    reason = /\(held refs:/.test(match[1]!) ? gitReasonOf(match[1]!, "local-commits") : "other";
+  } else if ((match = /^git-sync removed\s+(.+)$/.exec(message))) {
+    klass = "removed";
+    reason = "other";
+  } else if (/^git-sync: captured \d+(?: \(.+\))? · carried \d+ · skipped \d+(?: \(.*\))? · deferred \d+(?: \(.*\))? · removed \d+(?: \(.*\))?$/.test(message)) {
+    klass = "summary";
+    reason = "other";
+  } else {
+    return undefined;
+  }
+
+  const key = `git-sync ${klass} reason=${reason} age=${age}`;
+  return { text: key, key };
+}
+
+/** Redact local Git forensics before diagnostics leave the machine. Git-family
+ * lines are fail-closed: recognized forms become closed enums; all others and
+ * any physical continuation of a timestamped Git message are omitted. */
+export function redactGitLogLines(tail: string): string {
+  const rows: Array<{ key: string; text: string }> = [];
+  // A raw Git error can contain arbitrary newlines, including a forged daemon
+  // timestamp. Once a Git record starts there is no trustworthy delimiter left
+  // in this legacy text format: retain only later structurally recognized Git
+  // records (which are rewritten), and drop all ordinary physical lines.
+  let afterGitFamily = false;
+  for (const line of tail.split(/\r?\n/)) {
+    const stamped = /^(\d{4}-\d\d-\d\dT\S+Z)\s+(.*)$/.exec(line);
+    const message = stamped ? stamped[2]! : line;
+    const isGitFamily = message.startsWith("git-sync ") || message.startsWith("git-sync:") || message.startsWith("git deferred");
+    if (!isGitFamily) {
+      if (!afterGitFamily) rows.push({ key: `raw\0${rows.length}`, text: line });
+      continue;
+    }
+    afterGitFamily = true;
+    const classified = classifyGitLogMessage(message);
+    if (classified) rows.push(classified);
+  }
+
+  const counts = new Map<string, number>();
+  for (const row of rows) if (!row.key.startsWith("raw\0")) counts.set(row.key, (counts.get(row.key) ?? 0) + 1);
+  const emitted = new Set<string>();
+  const output: string[] = [];
+  for (const row of rows) {
+    if (row.key.startsWith("raw\0")) {
+      output.push(row.text);
+      continue;
+    }
+    if (emitted.has(row.key)) continue;
+    emitted.add(row.key);
+    const count = counts.get(row.key) ?? 1;
+    output.push(`${row.text}${count > 1 ? ` count=${count}` : ""}`);
+  }
+  return output.join("\n") + (tail.endsWith("\n") && output.length > 0 ? "\n" : "");
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS): Promise<{ res: Response; latencyMs: number }> {
@@ -328,8 +434,13 @@ async function readTailBytes(file: string, maxBytes: number): Promise<string | u
       const { size } = await fd.stat();
       const len = Math.min(size, maxBytes);
       const buf = Buffer.alloc(len);
-      await fd.read(buf, 0, len, size - len);
-      return buf.toString("utf8");
+      const offset = size - len;
+      await fd.read(buf, 0, len, offset);
+      if (offset === 0) return buf.toString("utf8");
+      // This byte window begins mid-record, and raw Git errors can forge both
+      // newlines and timestamp-shaped prefixes. No text delimiter can prove a
+      // later physical line is a real daemon record, so omit the tail entirely.
+      return "";
     } finally {
       await fd.close();
     }
@@ -383,7 +494,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
   const sidecars = daemonOwnedSectionsExcluded(ctx)
     ? { daemonLogTail: STALE_EXCLUDED, metrics: STALE_EXCLUDED, activity: STALE_EXCLUDED }
     : {
-        daemonLogTail: await daemonLogTail(ctx.root),
+        daemonLogTail: redactGitLogLines(await daemonLogTail(ctx.root)),
         metrics: pickMetrics(await loadMetrics(ctx.root)),
         activity: pickActivity(await loadActivity(ctx.root)),
       };

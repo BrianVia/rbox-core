@@ -33,7 +33,15 @@ import { repoCtx } from "./git/shared.js";
 
 const exec = promisify(execFile);
 const cleanGitEnv = (extra: NodeJS.ProcessEnv = {}) =>
-  ({ ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined, ...extra }) as NodeJS.ProcessEnv;
+  ({
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+    GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+    GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined,
+    GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined,
+    ...extra,
+  }) as NodeJS.ProcessEnv;
 const git = (root: string, ...args: string[]) => exec("git", ["-C", root, ...args], { env: cleanGitEnv() }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 7); // §28: git artifacts are convergent-encrypted under the workspace KEK
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
@@ -78,14 +86,24 @@ async function appendPackedRef(dir: string, ref: string, sha: string) {
   await fs.writeFile(packed, `${existing.endsWith("\n") ? existing : `${existing}\n`}${sha} ${ref}\n`);
 }
 async function gitWithStdin(dir: string, args: string[], stdin: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn("git", ["-C", dir, ...args], { env: cleanGitEnv() });
-    let stderr = "";
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`git ${args.join(" ")} failed (${code}): ${stderr}`))));
-    child.stdin.end(stdin);
-  });
+  const inputDir = await fs.mkdtemp(path.join(tmp, "git-stdin-"));
+  const inputPath = path.join(inputDir, "input");
+  await fs.writeFile(inputPath, stdin);
+  const input = await fs.open(inputPath, "r");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      // A regular-file stdin is deliberate: Bun 1.3 can report a successful
+      // child close while dropping a just-ended pipe before Git consumes it.
+      const child = spawn("git", ["-C", dir, ...args], { env: cleanGitEnv(), stdio: [input.fd, "ignore", "pipe"] });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d.toString()));
+      child.on("error", reject);
+      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`git ${args.join(" ")} failed (${code}): ${stderr}`))));
+    });
+  } finally {
+    await input.close();
+    await fs.rm(inputDir, { recursive: true, force: true });
+  }
 }
 async function gitWithIndex(dir: string, indexFile: string, ...args: string[]): Promise<string> {
   return exec("git", ["-C", dir, ...args], { env: cleanGitEnv({ GIT_INDEX_FILE: indexFile }) }).then((r) => r.stdout.toString().trim());

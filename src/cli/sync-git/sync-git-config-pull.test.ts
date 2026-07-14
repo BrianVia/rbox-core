@@ -20,7 +20,13 @@ import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
 import { applyGitSections, gitConfigHash } from "../sync-git.js";
 
 const exec = promisify(execFile);
-const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then((r) => r.stdout.toString().trim());
 const KEK = Buffer.alloc(32, 93);
 const desired: GitConfig = { "remote.upstream.url": ["git@example.com:team/repo.git"] };
 const configFailure = async () => ({
@@ -226,14 +232,16 @@ test("grammar-invalid incoming config is ignored while Git state applies", async
   expect(logs.filter((line) => line.includes("ignored invalid incoming config") && line.includes("values are empty or malformed"))).toHaveLength(1);
 });
 
-test("config-only failure holds pending and old base through BOTH unchanged shortcuts", async () => {
+test("config-only failure advances Git base while retaining an independent config retry", async () => {
   const shape = await dirShape();
   const oldLane = { cfgShape: shape, cfgApplied: "old-applied", cfgSynced: "old-synced" };
   const remoteSameGit = { ...base, config: desired };
   const first = await apply(remoteSameGit, stateWith(base, oldLane), { applyConfig: configFailure });
-  expect(first.gitRepos?.["."]).toEqual(base);
-  expect(first.gitPendingRemote?.["."]).toEqual(remoteSameGit);
+  expect(first.gitRepos?.["."]).toEqual(remoteSameGit);
+  expect(first.gitPendingRemote).toBeUndefined();
   expect(first.configLane).toBeUndefined();
+  expect(first.partial?.["."]?.configApplied).toBe(false);
+  expect(first.deferrals?.["."]?.config?.reason).toBe("config");
 
   await commit(source, "two\n", "two");
   const remoteNewGit = { ...(await capture()), config: desired };
@@ -242,12 +250,13 @@ test("config-only failure holds pending and old base through BOTH unchanged shor
   await git(receiver, "remote", "remove", "origin");
   const convergedLane = { ...oldLane, cfgShape: await dirShape() };
   const converged = await apply(remoteNewGit, stateWith(base, convergedLane), { applyConfig: configFailure });
-  expect(converged.gitRepos?.["."]).toEqual(base);
-  expect(converged.gitPendingRemote?.["."]).toEqual(remoteNewGit);
+  expect(converged.gitRepos?.["."]).toEqual(remoteNewGit);
+  expect(converged.gitPendingRemote).toBeUndefined();
   expect(converged.configLane).toBeUndefined();
+  expect(converged.partial?.["."]?.configApplied).toBe(false);
 });
 
-test("combined config failure rolls ordinary Git back but clean-materialization lands pending", async () => {
+test("combined config failure keeps safe Git progress and defers only config", async () => {
   await commit(source, "two\n", "two");
   const remote = { ...(await capture()), config: desired };
   const oldHead = await git(receiver, "rev-parse", "HEAD");
@@ -255,17 +264,20 @@ test("combined config failure rolls ordinary Git back but clean-materialization 
   const lane = { cfgShape: shape, cfgApplied: "old", cfgSynced: "old" };
 
   const ordinary = await apply(remote, stateWith(base, lane), { applyConfig: configFailure });
-  expect(ordinary.gitPendingRemote?.["."]).toEqual(remote);
-  expect(ordinary.gitRepos?.["."]).toEqual(base);
-  expect(await git(receiver, "rev-parse", "HEAD")).toBe(oldHead);
+  expect(ordinary.gitPendingRemote).toBeUndefined();
+  expect(ordinary.gitRepos?.["."]).toEqual(remote);
+  expect(await git(receiver, "rev-parse", "HEAD")).not.toBe(oldHead);
   expect(await git(receiver, "config", "--get", "remote.upstream.url").catch(() => "missing")).toBe("missing");
+  expect(ordinary.partial?.["."]?.configApplied).toBe(false);
+  expect(ordinary.deferrals?.["."]?.apply).toBeUndefined();
+  expect(ordinary.deferrals?.["."]?.config?.reason).toBe("config");
 
   const removedKey = gitIdentityKey((await gitIdentity(receiver))!);
   const cleanState = stateWith(base, { ...lane, removedKey });
   cleanState.gitReposRemoved = { ".": removedKey };
   const clean = await apply(remote, cleanState, { applyConfig: configFailure });
-  expect(clean.gitPendingRemote?.["."]).toEqual(remote);
-  expect(clean.gitRepos?.["."]).toEqual(base);
+  expect(clean.gitPendingRemote).toBeUndefined();
+  expect(clean.gitRepos?.["."]).toEqual(remote);
   expect(clean.gitReposRemoved?.["."]).toBeUndefined();
 });
 

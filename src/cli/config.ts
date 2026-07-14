@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
+import { MAX_GIT_REPOS, MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
@@ -119,6 +119,11 @@ export interface SyncState {
    *  suppressed, and each pull retries the apply. Cleared on successful apply or when
    *  the remote deletes the repo ([v6] absence supersedes pending). */
   gitPendingRemote?: Record<string, GitSection>;
+  /** Legacy/degraded-mode local sidecars. Transactional states keep these in
+   * repoRecords; nonce-less states cannot, so they retain the same typed truth
+   * in bounded per-repo maps instead. These fields are local state, never wire. */
+  gitDeferrals?: Record<string, GitDeferrals>;
+  gitPartial?: Record<string, GitPartialApply>;
   /** Random state-file incarnation. A delayed packet from before a reset/rebind
    * cannot land even when the stream later changes A→B→A. */
   stateNonce?: string;
@@ -189,6 +194,37 @@ export interface ConfigShapeIdentity {
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
+export type GitDeferralReason =
+  | "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash"
+  | "conflict" | "git-busy" | "worktree-ownership" | "ignored-target" | "unreadable"
+  | "artifact" | "config" | "containment" | "unsupported" | "other";
+
+export interface GitDeferral {
+  lane: "apply" | "capture" | "config";
+  deferredSince: string;
+  reasonSince: string;
+  lastSeen: string;
+  subjectKey?: string;
+  reason: GitDeferralReason;
+  checkout?: { kind: "branch" | "detached"; label?: string };
+  bytesChanged?: boolean;
+  /** D4 r2 F5: this checkpoint was classified once for subjectKey. */
+  reproof?: boolean;
+}
+
+export const DEFERRAL_LANES = ["apply", "capture", "config"] as const satisfies readonly GitDeferral["lane"][];
+
+export type GitDeferrals = Partial<Record<GitDeferral["lane"], GitDeferral>>;
+
+export interface GitPartialApply {
+  incomingKey: string;
+  checkoutPending: boolean;
+  appliedRefs: Record<string, { kind: "direct"; oid: string } | { kind: "symbolic"; target: string }>;
+  heldRefs: Record<string, "local-commits" | "local-stash" | "ownership">;
+  configApplied: boolean;
+  configBase?: Record<string, string[]>;
+}
+
 export interface RepoRecord {
   repoGen: number;
   sourceSeq: number;
@@ -200,6 +236,10 @@ export interface RepoRecord {
   cfgApplied?: string;
   cfgToken?: ConfigStatToken;
   cfgShape?: ConfigShapeIdentity;
+  deferrals?: GitDeferrals;
+  partial?: GitPartialApply;
+  /** D4's projected-index cache; stored here so RepoRecord's shape lands once. */
+  idxProj?: string;
 }
 
 export type RepoRecordInput = Omit<RepoRecord, "repoGen">;
@@ -234,6 +274,7 @@ export const RBOX_DIR = ".rbox";
 const CONFIG_FILE = "workspace.json";
 const STATE_FILE = "state.json";
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
+export const MAX_LEGACY_GIT_SIDECAR_REPOS = MAX_GIT_REPOS;
 
 const configPath = (root: string) => path.join(root, RBOX_DIR, CONFIG_FILE);
 export const statePath = (root: string) => path.join(root, RBOX_DIR, STATE_FILE);
@@ -292,12 +333,20 @@ function validCounter(value: unknown): number {
 /** Fold the legacy parallel maps into complete records. Every later state write
  * reconstructs gitRepos and sidecars solely from this returned record set. */
 export function repoRecordsForState(state: SyncState): Record<string, RepoRecord> {
+  const legacyDeferrals = state.repoRecords === undefined
+    ? Object.fromEntries(Object.entries(state.gitDeferrals ?? {}).sort(([a], [b]) => a.localeCompare(b)).slice(0, MAX_LEGACY_GIT_SIDECAR_REPOS))
+    : {};
+  const legacyPartial = state.repoRecords === undefined
+    ? Object.fromEntries(Object.entries(state.gitPartial ?? {}).sort(([a], [b]) => a.localeCompare(b)).slice(0, MAX_LEGACY_GIT_SIDECAR_REPOS))
+    : {};
   const keys = new Set([
     ...Object.keys(state.repoRecords ?? {}),
     ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
     ...Object.keys(state.gitPendingRemote ?? {}),
     ...Object.keys(state.gitReposRemoved ?? {}),
     ...Object.keys(state.gitNeedsResolution ?? {}),
+    ...Object.keys(legacyDeferrals),
+    ...Object.keys(legacyPartial),
   ]);
   const records: Record<string, RepoRecord> = {};
   for (const relPath of keys) {
@@ -315,6 +364,8 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
       ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
       ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
       ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),
+      ...(legacyDeferrals[relPath] === undefined ? {} : { deferrals: legacyDeferrals[relPath] }),
+      ...(legacyPartial[relPath] === undefined ? {} : { partial: legacyPartial[relPath] }),
     };
   }
   return records;
@@ -339,6 +390,10 @@ export function stateFromRepoRecords(state: SyncState, records: Record<string, R
     gitReposRemoved: mapFromRecords(records, (record) => record.removedKey),
     gitNeedsResolution: mapFromRecords(records, (record) => record.resolutionKey),
     gitPendingRemote: mapFromRecords(records, (record) => record.pending),
+    // A transactional record supersedes the legacy sidecar maps. legacyState()
+    // deliberately reconstructs them after dropping repoRecords.
+    gitDeferrals: undefined,
+    gitPartial: undefined,
     repoRecords: records,
   };
 }
@@ -566,9 +621,11 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
       path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
       path.join(root, RBOX_DIR, "state", "activity.json"),
       path.join(root, RBOX_DIR, "state", "shell.line"),
+      path.join(root, RBOX_DIR, "state", "git-journal"),
+      path.join(root, RBOX_DIR, "state", "shell.deferrals"),
     ]) {
       try {
-        await fs.rm(p);
+        await fs.rm(p, { recursive: true });
       } catch (e) {
         if (!isENOENT(e)) throw e;
       }

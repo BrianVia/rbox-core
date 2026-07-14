@@ -1,14 +1,20 @@
 import type { GitSection, Manifest } from "../engine/index.js";
+import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import {
   applyStateSavePacket,
+  DEFERRAL_LANES,
   expectedStateNonce,
   loadRawState,
+  MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
   saveState,
   stateFromRepoRecords,
   type FileOnlyManifest,
   type GlobalManifestMeta,
+  type GitDeferral,
+  type GitDeferrals,
+  type GitPartialApply,
   type RepoRecord,
   type RepoRecordInput,
   type StateSavePacket,
@@ -16,6 +22,14 @@ import {
 } from "./config.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
+/** Planner-facing lane results. Persistence converts these to ordered
+ * transitions with orderedDeferralUpdates() before a generation-CAS save. */
+export type GitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferral | null>>;
+type GitDeferralTransition =
+  | { set: GitDeferral; ifPreviouslyAbsent: true }
+  | { set: GitDeferral; ifLastSeenAtMost: string }
+  | { clear: true; ifLastSeenAtMost: string };
+export type OrderedGitDeferralUpdates = Partial<Record<GitDeferral["lane"], GitDeferralTransition>>;
 
 export function configLaneState(record: ConfigLaneState): ConfigLaneState {
   return {
@@ -35,6 +49,13 @@ export interface RepoStateValues {
    * means preserve them. This rides the same generation-CAS transition as base and
    * pending; there is never a second config-only state write. */
   configLane?: Record<string, ConfigLaneState>;
+  /** Missing repo/lane preserves it. Every transition is bound to the lane
+   * predecessor observed by its writer, so a CAS recompute cannot clear or
+   * resurrect a newer episode. */
+  deferrals?: Record<string, OrderedGitDeferralUpdates>;
+  partial?: Record<string, GitPartialApply | null>;
+  /** Semantic projection of the last applied index; null clears a stale cache. */
+  idxProj?: Record<string, string | null>;
 }
 
 export interface StateSource {
@@ -78,25 +99,103 @@ export function fileOnlyManifest(manifest: Manifest): FileOnlyManifest {
   return filesAndMetadata;
 }
 
-const inputRecord = (record: RepoRecord): RepoRecordInput => {
+export const inputRecord = (record: RepoRecord): RepoRecordInput => {
   const { repoGen: _repoGen, ...input } = record;
   return input;
 };
+
+const isStrictlyNewer = (candidate: string, bound: string): boolean => {
+  const candidateMs = Date.parse(candidate);
+  const boundMs = Date.parse(bound);
+  return Number.isFinite(candidateMs) && Number.isFinite(boundMs) ? candidateMs > boundMs : candidate > bound;
+};
+
+export function orderedDeferralUpdates(
+  current: GitDeferrals | undefined,
+  incoming: GitDeferralUpdates | null | undefined,
+): OrderedGitDeferralUpdates | undefined {
+  if (incoming === undefined) return undefined;
+  const updates: OrderedGitDeferralUpdates = {};
+  for (const lane of DEFERRAL_LANES) {
+    const previous = current?.[lane];
+    const value = incoming === null ? null : incoming[lane];
+    if (value === undefined) continue;
+    if (value === null) {
+      if (previous) updates[lane] = { clear: true, ifLastSeenAtMost: previous.lastSeen };
+      continue;
+    }
+    updates[lane] = previous
+      ? { set: value, ifLastSeenAtMost: previous.lastSeen }
+      : { set: value, ifPreviouslyAbsent: true };
+  }
+  return Object.keys(updates).length === 0 ? undefined : updates;
+}
+
+export function orderedRepoDeferralUpdates(
+  current: Record<string, RepoRecord>,
+  incoming: Record<string, GitDeferralUpdates | null> | undefined,
+): Record<string, OrderedGitDeferralUpdates> | undefined {
+  if (incoming === undefined) return undefined;
+  const updates: Record<string, OrderedGitDeferralUpdates> = {};
+  for (const [relPath, lanes] of Object.entries(incoming)) {
+    const ordered = orderedDeferralUpdates(current[relPath]?.deferrals, lanes);
+    if (ordered !== undefined) updates[relPath] = ordered;
+  }
+  return Object.keys(updates).length === 0 ? undefined : updates;
+}
+
+function mergeDeferrals(
+  current: GitDeferrals | undefined,
+  incoming: OrderedGitDeferralUpdates | undefined,
+): GitDeferrals | undefined {
+  if (incoming === undefined) return current;
+  const merged: GitDeferrals = { ...(current ?? {}) };
+  for (const lane of DEFERRAL_LANES) {
+    const transition = incoming[lane];
+    if (transition === undefined) continue;
+    const present = merged[lane];
+    if ("clear" in transition) {
+      if (present && !isStrictlyNewer(present.lastSeen, transition.ifLastSeenAtMost)) delete merged[lane];
+      continue;
+    }
+    // A set computed from a standing predecessor cannot resurrect that episode
+    // after a concurrent clear. Otherwise only a strictly newer standing truth
+    // wins; equal/older observations may be refreshed by this source.
+    if (present === undefined && "ifLastSeenAtMost" in transition) continue;
+    if (present && isStrictlyNewer(present.lastSeen, transition.set.lastSeen)) continue;
+    merged[lane] = transition.set;
+  }
+  return Object.keys(merged).length === 0 ? undefined : merged;
+}
 
 function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): RepoRecordInput {
   // A recompute from an older source retains the entire newer record. This is the
   // ordering half of the generation CAS: older pending/absence cannot regress a
   // newer success, while the transition still records that this path was observed.
-  if (current.sourceSeq > source.sourceGlobalSeq) return inputRecord(current);
+  const mergedDeferrals = mergeDeferrals(current.deferrals, source.values.deferrals?.[relPath]);
+  if (current.sourceSeq > source.sourceGlobalSeq) {
+    const retained = inputRecord(current);
+    if (mergedDeferrals === undefined) delete retained.deferrals;
+    else retained.deferrals = mergedDeferrals;
+    return retained;
+  }
   const lane = source.values.configLane?.[relPath] ?? current;
-  return stampConfigAck({
+  const next = stampConfigAck({
     sourceSeq: source.sourceGlobalSeq,
     ...(source.values.bases?.[relPath] === undefined ? {} : { base: source.values.bases[relPath] }),
     ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
     ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
     ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
     ...configLaneState(lane),
+    ...(mergedDeferrals === undefined ? {} : { deferrals: mergedDeferrals }),
+    ...(source.values.partial?.[relPath] === undefined
+      ? (current.partial === undefined ? {} : { partial: current.partial })
+      : source.values.partial[relPath] === null ? {} : { partial: source.values.partial[relPath] }),
+    ...(source.values.idxProj?.[relPath] === undefined
+      ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
+      : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
   }, source.authoredCfgHashByRepo?.[relPath]);
+  return next;
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
@@ -128,6 +227,17 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
+  const legacyMap = <T>(pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined => {
+    const result: Record<string, T> = {};
+    for (const [relPath, record] of Object.entries(records).sort(([a], [b]) => a.localeCompare(b))) {
+      const value = pick(record);
+      if (value !== undefined) {
+        result[relPath] = value;
+        if (Object.keys(result).length === MAX_LEGACY_GIT_SIDECAR_REPOS) break;
+      }
+    }
+    return Object.keys(result).length === 0 ? undefined : result;
+  };
   return {
     ...stateFromRepoRecords({
       ...snapshot,
@@ -139,6 +249,8 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
     stateNonce: undefined,
     stateRevision: undefined,
     repoRecords: undefined,
+    gitDeferrals: legacyMap((record) => record.deferrals),
+    gitPartial: legacyMap((record) => record.partial),
   };
 }
 
@@ -188,7 +300,161 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
     ...Object.keys(values.configLane ?? {}),
+    ...Object.keys(values.deferrals ?? {}),
+    ...Object.keys(values.partial ?? {}),
+    ...Object.keys(values.idxProj ?? {}),
   ])].sort();
+}
+
+export type PublishedRepoIntentDisposition = "landed" | "already-semantic" | "superseded";
+
+/** A published intent is settled for every currently known terminal disposition. */
+export const intentSettled = (disposition: PublishedRepoIntentDisposition): boolean =>
+  disposition === "landed" || disposition === "already-semantic" || disposition === "superseded";
+
+interface PublishedRepoIntentResult {
+  state: SyncState;
+  disposition: PublishedRepoIntentDisposition;
+}
+
+/** Complete a published checkout journal with a fresh generation-CAS merge.
+ * The opaque intended record supplies the checkout/config result, while current
+ * capture deferrals are retained. Apply/config transitions are merged by their
+ * own episode: a retry-only lastSeen refresh is not a competing transition. */
+export async function savePublishedRepoIntent(
+  root: string,
+  snapshot: SyncState,
+  relPath: string,
+  intended: { record: RepoRecordInput; expectedRepoGen: number; relPath: string; previousRecord?: RepoRecordInput },
+  options: { forceLegacy?: boolean } = {},
+): Promise<PublishedRepoIntentResult> {
+  if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
+  const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
+    Object.fromEntries(fields.map((field) => [field, record?.[field]]));
+  const applyFields = ["base", "pending", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
+  const configFields = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
+  const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
+    for (const field of fields) {
+      if (desired[field] === undefined) delete target[field];
+      else (target as Record<string, unknown>)[field] = desired[field];
+    }
+  };
+  const laneDeferral = (record: RepoRecordInput | undefined, lane: "apply" | "capture" | "config") => record?.deferrals?.[lane];
+  const sameEpisode = (left: GitDeferral | undefined, right: GitDeferral | undefined): boolean =>
+    left === undefined || right === undefined
+      ? left === right
+      : left.deferredSince === right.deferredSince && left.reason === right.reason;
+  const deferralSemantic = (current: GitDeferral | undefined, desired: GitDeferral | undefined): boolean => {
+    if (!current || !desired) return current === desired;
+    const { lastSeen: _currentLastSeen, ...currentEffect } = current;
+    const { lastSeen: _desiredLastSeen, ...desiredEffect } = desired;
+    return isDeepStrictEqual(currentEffect, desiredEffect)
+      && !isStrictlyNewer(desired.lastSeen, current.lastSeen);
+  };
+  const laneSemantic = (
+    current: RepoRecordInput,
+    desired: RepoRecordInput,
+    fields: readonly (keyof RepoRecordInput)[],
+    lane: "apply" | "config",
+  ): boolean => isDeepStrictEqual(select(current, fields), select(desired, fields))
+    && deferralSemantic(laneDeferral(current, lane), laneDeferral(desired, lane));
+  const laneStillAtPredecessor = (
+    current: RepoRecordInput,
+    previous: RepoRecordInput,
+    desired: RepoRecordInput,
+    fields: readonly (keyof RepoRecordInput)[],
+    lane: "apply" | "config",
+  ): boolean => {
+    const fieldsCompatible = isDeepStrictEqual(select(current, fields), select(previous, fields))
+      || isDeepStrictEqual(select(current, fields), select(desired, fields));
+    const currentDeferral = laneDeferral(current, lane);
+    return fieldsCompatible && (
+      sameEpisode(currentDeferral, laneDeferral(previous, lane))
+      || sameEpisode(currentDeferral, laneDeferral(desired, lane))
+    );
+  };
+  const installDeferral = (
+    deferrals: GitDeferrals,
+    current: GitDeferral | undefined,
+    desired: GitDeferral | undefined,
+    lane: "apply" | "config",
+  ): void => {
+    if (!desired) {
+      delete deferrals[lane];
+      return;
+    }
+    // Preserve only the newer observation time. The journal's other fields are
+    // the intended set effect and must land even when the predecessor refreshed.
+    if (current && sameEpisode(current, desired) && isStrictlyNewer(current.lastSeen, desired.lastSeen)) {
+      deferrals[lane] = { ...desired, lastSeen: current.lastSeen };
+    } else {
+      deferrals[lane] = desired;
+    }
+  };
+  let currentSnapshot = snapshot;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = repoRecordsForState(currentSnapshot)[relPath] ?? { repoGen: 0, sourceSeq: 0 };
+    const currentInput = inputRecord(current);
+    const exactGeneration = current.repoGen === intended.expectedRepoGen;
+    const previous = intended.previousRecord ?? { sourceSeq: 0 };
+    const appAlready = laneSemantic(currentInput, intended.record, applyFields, "apply");
+    const configAlready = laneSemantic(currentInput, intended.record, configFields, "config");
+    if (appAlready && configAlready && currentInput.sourceSeq >= intended.record.sourceSeq) {
+      return { state: currentSnapshot, disposition: "already-semantic" };
+    }
+    const appUnchanged = exactGeneration
+      || laneStillAtPredecessor(currentInput, previous, intended.record, applyFields, "apply");
+    const configUnchanged = exactGeneration
+      || laneStillAtPredecessor(currentInput, previous, intended.record, configFields, "config");
+    const superseded = (!appAlready && !appUnchanged) || (!configAlready && !configUnchanged);
+
+    // Generation drift means another save landed. Install a journal lane only
+    // while it remains at the predecessor episode (a lastSeen refresh is still
+    // that episode); a genuinely different episode wins. Capture is never
+    // journal-owned and is always preserved.
+    const merged: RepoRecordInput = { ...currentInput };
+    if (!appAlready && appUnchanged) {
+      replace(merged, intended.record, applyFields);
+    }
+    if (!configAlready && configUnchanged) replace(merged, intended.record, configFields);
+    const deferrals = { ...(currentInput.deferrals ?? {}) };
+    if (!appAlready && appUnchanged) {
+      installDeferral(deferrals, currentInput.deferrals?.apply, intended.record.deferrals?.apply, "apply");
+    }
+    if (!configAlready && configUnchanged) {
+      installDeferral(deferrals, currentInput.deferrals?.config, intended.record.deferrals?.config, "config");
+    }
+    if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
+    merged.sourceSeq = Math.max(currentInput.sourceSeq, intended.record.sourceSeq);
+    if (isDeepStrictEqual(currentInput, merged)) {
+      return { state: currentSnapshot, disposition: superseded ? "superseded" : "already-semantic" };
+    }
+
+    if (options.forceLegacy) {
+      const records = repoRecordsForState(currentSnapshot);
+      records[relPath] = { ...merged, repoGen: current.repoGen + 1 };
+      const next = stateFromRepoRecords(currentSnapshot, records);
+      await saveState(root, next);
+      return { state: next, disposition: superseded ? "superseded" : "landed" };
+    }
+    const result = await applyStateSavePacket(root, {
+      expectedStream: currentSnapshot.stream,
+      expectedNonce: expectedStateNonce(currentSnapshot),
+      sourceGlobalSeq: merged.sourceSeq,
+      repos: [{ relPath, expectedRepoGen: current.repoGen, newRecord: merged }],
+    });
+    if (result.status === "accepted") {
+      return { state: result.state, disposition: superseded ? "superseded" : "landed" };
+    }
+    if (result.status === "rejected" && (result.reason === "repo-generation" || result.reason === "global-sequence")) {
+      currentSnapshot = result.state;
+      continue;
+    }
+    if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
+    if (result.status === "unsupported") throw new Error(`sync state transactional save unsupported (${String(result.error)})`);
+    throw new Error(`sync state changed during published recovery (${result.reason})`);
+  }
+  throw new Error("sync state kept changing during published recovery (3 recomputes exhausted)");
 }
 
 /** The no-op site is intentionally narrow: only records whose exact sidecar
@@ -200,13 +466,17 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     ...Object.keys(values.pending ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
+    ...Object.keys(values.deferrals ?? {}),
+    ...Object.keys(values.partial ?? {}),
   ]);
   const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   return [...keys].filter((relPath) => {
     const record = records[relPath];
     return !same(record?.pending, values.pending?.[relPath])
       || record?.removedKey !== values.removed?.[relPath]
-      || record?.resolutionKey !== values.resolutions?.[relPath];
+      || record?.resolutionKey !== values.resolutions?.[relPath]
+      || (values.deferrals?.[relPath] !== undefined && !same(mergeDeferrals(record?.deferrals, values.deferrals[relPath]), record?.deferrals))
+      || (values.partial?.[relPath] !== undefined && !same(values.partial[relPath], record?.partial));
   }).sort();
 }
 

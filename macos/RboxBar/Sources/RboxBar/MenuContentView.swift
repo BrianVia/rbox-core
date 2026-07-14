@@ -66,13 +66,16 @@ struct MenuContentView: View {
                 operationBlock(workspace.operation)
             }
 
-            if workspace.severityTier == .degraded {
+            if workspace.attentionReason == .watcherDegraded {
                 degradedStatusLine
             } else if workspace.severityTier == .critical {
                 attentionBanner(workspace)
             }
 
             statusSummary(workspace)
+            if let deferred = deferredStatusText(workspace) {
+                infoRow(label: "Git", value: deferred, monospace: false, color: .secondary)
+            }
 
             Divider()
             pauseResumeButton(for: workspace)
@@ -284,6 +287,25 @@ struct MenuContentView: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
+    private func deferredStatusText(_ workspace: WorkspaceStatus) -> String? {
+        guard let count = workspace.deferredRepos, count > 0 else { return nil }
+        let noun = count == 1 ? "repo" : "repos"
+        if let age = workspace.oldestDeferralAgeSeconds {
+            return "\(count) \(noun) deferred · \(Self.deferralAgeBucket(age))"
+        }
+        return "\(count) \(noun) deferred"
+    }
+
+    static func deferralAgeBucket(_ seconds: Int) -> String {
+        let age = max(0, seconds)
+        if age < 3_600 { return "\(age / 60)m" }
+        if age < 86_400 { return "1h" }
+        if age < 7 * 86_400 { return "1d" }
+        if age < 14 * 86_400 { return "7d" }
+        if age < 30 * 86_400 { return "14d" }
+        return "30d"
+    }
+
     private func sizeOrSequenceLabel(_ workspace: WorkspaceStatus) -> String? {
         if let totalBytes = workspace.totalBytes {
             return Self.byteCountFormatter.string(fromByteCount: totalBytes)
@@ -297,7 +319,7 @@ struct MenuContentView: View {
     private func stateSummary(_ workspace: WorkspaceStatus) -> String {
         switch workspace.severityTier {
         case .degraded:
-            return "periodic scans active"
+            return workspace.attentionReason == .watcherDegraded ? "periodic scans active" : "git deferred"
         case .critical:
             return "not syncing"
         case .ok:

@@ -2,13 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { GitCaptureDeferredError, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
-import { type SyncState, type WorkspaceConfig } from "../config.js";
+import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
+import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -29,6 +30,10 @@ export interface GitPushPlan {
   captured: string[];
   carried: string[];
   deferred: Array<{ relPath: string; reason: string }>;
+  captureDeferrals: Record<string, GitDeferralReason>;
+  configDeferrals: Record<string, GitDeferralReason>;
+  captureObserved: string[];
+  configObserved: string[];
   /** Design 68 §3.3 — in-tree linked-worktree pointers whose full-store capture was
    *  policy-skipped because the owning main clone is captured in this same cycle (history
    *  travels with the parent bundle). Base-carry, never a drop — so no removal memory. */
@@ -57,6 +62,8 @@ export interface GitPlanOptions {
   /** Workspace lock identity/link support is unavailable. Preserve Git syncing,
    * but neither read nor author config-lane updates. */
   disableConfigLane?: boolean;
+  /** Degraded workspace serialization permits rollback-only journal recovery. */
+  degradedMutex?: boolean;
   /** Design 108 §3.2: files-first genesis defer. When true, planGitSections returns an
    *  empty/absent git section with changed=false WITHOUT discovering/capturing any repo
    *  and WITHOUT touching any local-only sidecar (base/pending/needsRes/removed are all
@@ -89,7 +96,7 @@ export async function planGitSections(
   backoff?: (attempt: number) => Promise<void>,
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
-  const base = state.lastSyncedManifest.gitRepos ?? {};
+  const base = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
@@ -99,6 +106,9 @@ export async function planGitSections(
   const removed: string[] = [];
   const deferred: Array<{ relPath: string; reason: string }> = [];
   const configLaneDefers = new Set<(typeof deferred)[number]>();
+  const configLaneItems = new Set<(typeof deferred)[number]>();
+  const captureObserved = new Set<string>();
+  const configObserved = new Set<string>();
   const skipped: Array<{ relPath: string; reason: string }> = [];
   const out: Record<string, GitSection> = {};
   const cache = await loadGitDivergenceCache(root);
@@ -126,6 +136,15 @@ export async function planGitSections(
     logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
   const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
     readLocalGitConfig(root, rel, diskCtx, options.gitConfigRunner, () => noteCredentialSkip(rel));
+  const captureReason = (reason: string): GitDeferralReason => {
+    if (/\bbusy\b/i.test(reason)) return "git-busy";
+    if (/ownership|worktree/i.test(reason)) return "worktree-ownership";
+    if (/containment|outside.*root/i.test(reason)) return "containment";
+    if (/unsupported|structural|shallow|bare|alternates/i.test(reason)) return "unsupported";
+    if (/capture|artifact|blob|decrypt|import|bundle/i.test(reason)) return "artifact";
+    if (/unreadable|no usable \.git|preflight/i.test(reason)) return "unreadable";
+    return "other";
+  };
   const plan = (): GitPushPlan => {
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
     // pending repo the last commit carried the pending section itself (see the per-repo
@@ -139,6 +158,13 @@ export async function planGitSections(
         break;
       }
     }
+    const captureDeferrals: Record<string, GitDeferralReason> = {};
+    const configDeferrals: Record<string, GitDeferralReason> = {};
+    for (const item of deferred) {
+      if (configLaneDefers.has(item)) configDeferrals[item.relPath] = "config";
+      else if (configLaneItems.has(item)) continue;
+      else captureDeferrals[item.relPath] = captureReason(item.reason);
+    }
     return {
       gitRepos: emptyToUndef(out),
       changed,
@@ -149,6 +175,10 @@ export async function planGitSections(
       captured,
       carried,
       deferred,
+      captureDeferrals,
+      configDeferrals,
+      captureObserved: [...captureObserved].sort(),
+      configObserved: [...configObserved].sort(),
       skipped,
       removed,
       gitPlanStats: { ...stats, carried: carried.length, captured: captured.length },
@@ -170,6 +200,10 @@ export async function planGitSections(
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving
     // pending entry would otherwise re-trigger the per-repo base restore every push
     // (changed forever → echo-commit loop).
+    for (const k of new Set([...Object.keys(state.repoRecords ?? {}), ...Object.keys(base), ...Object.keys(pending)])) {
+      captureObserved.add(k);
+      configObserved.add(k);
+    }
     for (const k of Object.keys(pending)) delete pending[k];
     for (const k of Object.keys(needsRes)) delete needsRes[k];
     for (const k of Object.keys(removedMem)) delete removedMem[k];
@@ -191,6 +225,42 @@ export async function planGitSections(
   }
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
+  const recoveryBlocked = new Map<string, string>();
+  for (const rel of keys) {
+    const repoDir = repoDirOf(root, rel);
+    const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    if (!ctx) {
+      const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
+      if (recovery.status === "binding-mismatch") glog(`git-sync WARNING ${rel}: journal for an absent/unreadable repository quarantined at ${recovery.quarantinePath}`);
+      else if (recovery.status === "defer") recoveryBlocked.set(rel, recovery.reason);
+      continue;
+    }
+    const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
+    const landedRecovery = await recoverAndLandFollowJournal(root, rel, binding, state, { land: !options.degradedMutex });
+    const recovery = landedRecovery.recovery;
+    if (recovery.status === "keep") {
+      if (options.degradedMutex) {
+        recoveryBlocked.set(rel, "published checkout journal awaits non-degraded state save");
+        continue;
+      }
+      state = landedRecovery.state;
+      const record = repoRecordsForState(state)[rel];
+      if (record?.base) base[rel] = record.base; else delete base[rel];
+      if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
+      if (record?.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
+      if (record?.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
+      glog(`git-sync recovered published checkout ${rel} before capture`);
+    } else if (recovery.status === "defer") {
+      recoveryBlocked.set(rel, recovery.reason);
+    } else if (recovery.status === "human-intervened") {
+      recoveryBlocked.set(rel, `crash-window human changes preserved; journal quarantined at ${recovery.quarantinePath}`);
+    } else if (recovery.status === "binding-mismatch") {
+      glog(`git-sync WARNING ${rel}: stale checkout journal quarantined at ${recovery.quarantinePath}`);
+    } else if (recovery.status === "fresh-quarantined") {
+      recoveryBlocked.set(rel, `partial fresh repository quarantined at ${recovery.quarantinePath}`);
+    }
+  }
+  for (const rel of keys) captureObserved.add(rel);
   stats.repos = keys.length;
   // New-repo admission budget [v2, M4]: base/pending repos never count as new work.
   const cap = gitRepoCap();
@@ -201,6 +271,7 @@ export async function planGitSections(
     out[rel] = baseSec;
     carried.push(rel);
     if (options.disableConfigLane) return;
+    configObserved.add(rel);
     const diskCtx = knownCtx ?? (await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined));
     if (!diskCtx || diskCtx.kind !== "dir") {
       logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
@@ -218,7 +289,7 @@ export async function planGitSections(
         reason: `git config over wire bounds — publication disabled; carrying base verbatim (${localCfg.reason})`,
       };
       deferred.push(item);
-      configLaneDefers.add(item);
+      configLaneItems.add(item);
       return;
     }
     if (localCfg.status === "failed") {
@@ -227,7 +298,8 @@ export async function planGitSections(
         reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} (${localCfg.fault.reason}) — carrying base verbatim`,
       };
       deferred.push(item);
-      configLaneDefers.add(item);
+      configLaneItems.add(item);
+      if (localCfg.fault.disposition === "transient") configLaneDefers.add(item);
       return;
     }
     if (!shouldPublishGitConfig(baseSec.config, localCfg.cached, state.repoRecords?.[rel]?.cfgSynced)) return;
@@ -242,6 +314,7 @@ export async function planGitSections(
   };
   const captureWithConfig = async (rel: string, section: GitSection): Promise<GitSection> => {
     if (options.disableConfigLane) return carryBaseConfig(section, base[rel]);
+    configObserved.add(rel);
     const repoDir = repoDirOf(root, rel);
     const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
     if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
@@ -281,7 +354,7 @@ export async function planGitSections(
         reason: `git config over wire bounds — capture config suppressed; carrying base config (${localCfg.reason})`,
       };
       deferred.push(item);
-      configLaneDefers.add(item);
+      configLaneItems.add(item);
       return carryBaseConfig(section, base[rel]);
     }
     if (localCfg.status === "failed") {
@@ -290,7 +363,8 @@ export async function planGitSections(
         reason: `git config ${localCfg.fault.disposition === "permanent" ? "disabled" : "deferred"} during capture (${localCfg.fault.reason}) — carrying base config`,
       };
       deferred.push(item);
-      configLaneDefers.add(item);
+      configLaneItems.add(item);
+      if (localCfg.fault.disposition === "transient") configLaneDefers.add(item);
       return carryBaseConfig(section, base[rel]);
     }
     const embedded = { ...section, config: localCfg.config };
@@ -475,6 +549,20 @@ export async function planGitSections(
     const pend = pending[rel];
     let fastLookup: FingerprintHitProbeResult | undefined;
 
+    const recoveryReason = recoveryBlocked.get(rel);
+    if (recoveryReason) {
+      if (pend) {
+        deferred.push({ relPath: rel, reason: recoveryReason });
+        if (!force.has(rel)) {
+          out[rel] = pend;
+          carried.push(rel);
+        }
+        continue;
+      }
+      deferOne(rel, recoveryReason);
+      continue;
+    }
+
     // Pending unapplied remote [v5]: carry THE PENDING SECTION (the newest known truth),
     // capture suppressed. 422-while-pending [v6] → M5 drop; the pending entry stays for
     // the next pull to refresh (remote re-establishes it or absence-supersedes clears it).
@@ -540,6 +628,7 @@ export async function planGitSections(
           if (options.disableConfigLane || (fastLookup.cachedLocalCfg && !shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced))) {
             out[rel] = baseSec;
             carried.push(rel);
+            if (!options.disableConfigLane) configObserved.add(rel);
             fastPathParentRel.set(rel, probe.parentRel);
             stats.fpHits++;
             continue;
@@ -596,7 +685,7 @@ export async function planGitSections(
     // linked pointers are non-owned and therefore carry their base verbatim.
     delete authoredCfgHashByRepo[rel];
     for (let i = deferred.length - 1; i >= 0; i--) {
-      if (deferred[i]!.relPath === rel && configLaneDefers.has(deferred[i]!)) deferred.splice(i, 1);
+      if (deferred[i]!.relPath === rel && configLaneItems.has(deferred[i]!)) deferred.splice(i, 1);
     }
     const b = base[rel];
     if (b) out[rel] = b; // base-carry: never a remote absence, never a removal memory

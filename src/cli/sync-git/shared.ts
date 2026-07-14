@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
-import { type WorkspaceConfig } from "../config.js";
+import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { headBranchOf } from "../../engine/git/shared.js";
+import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "../sync-recovery.js";
 // ---- git-sync orchestration (design 43 §§6-7, 9, 13.5) ------------------------------
@@ -26,6 +27,9 @@ export const configInvalidSkipLogged = new Set<string>();
  * grammar. Log them once per workspace/repo while continuing with the safe
  * projection so a daemon cannot flood its log on every tick. */
 export const configCredentialSkipLogged = new Set<string>();
+/** Ambiguous logical repo keys are held every pull, but the namespace hazard is
+ * logged only once per workspace for a long-lived daemon. */
+export const repoEquivalenceWarningLogged = new Set<string>();
 
 const envInt = (name: string, fallback: number, min: number, max: number): number => {
   const raw = process.env[name]?.trim();
@@ -41,6 +45,11 @@ const envInt = (name: string, fallback: number, min: number, max: number): numbe
 };
 
 export const gitApplyConcurrency = (): number => envInt("RBOX_GIT_APPLY_CONCURRENCY", GIT_APPLY_CONCURRENCY_DEFAULT, 1, 16);
+
+/** Design 116 rollout gate. Read on every decision so tests and long-lived
+ * daemons never retain a stale environment value. Only the exact string "0"
+ * disables automatic checkout follow; every other value is intentionally on. */
+export const gitFollowEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => env.RBOX_GIT_FOLLOW !== "0";
 
 /** The push-side new-repo admission cap (design 43 §3 [v2, M4]). Env-overridable for
  *  tests/tuning; the manifest-validation bound stays the hard MAX_GIT_REPOS. The cap
@@ -66,6 +75,56 @@ export const gitReposManifestSchema = (gitRepos: Record<string, GitSection> | un
   gitRepos ? (Object.values(gitRepos).some((s) => (s.packChain?.length ?? 0) > 0) ? 3 : 2) : undefined;
 export const emptyToUndef = <T,>(o: Record<string, T>): Record<string, T> | undefined => (Object.keys(o).length ? o : undefined);
 export const errMsg = (e: unknown): string => (e as Error)?.message ?? String(e);
+
+const sortedRecord = <T>(record: Record<string, T> | undefined, value: (v: T) => unknown = (v) => v): unknown =>
+  record === undefined ? undefined : Object.fromEntries(Object.keys(record).sort().map((key) => [key, value(record[key]!)]));
+
+/** Local-only identity for every section field that can affect receiver mutation. */
+export function gitIncomingKey(section: GitSection): string {
+  const normalized = {
+    head: section.head.trimEnd(),
+    refs: sortedRecord(section.refs),
+    indexSha: section.indexSha,
+    indexTree: section.indexTree,
+    opState: sortedRecord(section.opState, (artifact) => artifact.sha),
+    config: sortedRecord(section.config, (values) => [...values]),
+    refScope: section.refScope,
+    bundleSha: section.bundleSha,
+    packChain: (section.packChain ?? []).map((link) => link.sha),
+  };
+  return hashBytes(Buffer.from(JSON.stringify(normalized)));
+}
+
+/** Plaintext identity of each operation-state artifact in a section. */
+export const sectionOpState = (section: GitSection | undefined): Record<string, string> =>
+  Object.fromEntries(Object.entries(section?.opState ?? {}).map(([name, artifact]) => [name, artifact.sha]));
+
+/** Human-facing checkout classification shared by resolve and apply status. */
+export function checkoutLabel(head: string): GitDeferral["checkout"] {
+  const branch = headBranchOf(head);
+  return branch ? { kind: "branch", label: branch.replace(/^refs\/heads\//, "") } : { kind: "detached" };
+}
+
+export function nextDeferral(
+  lane: GitDeferral["lane"],
+  current: GitDeferral | undefined,
+  reason: GitDeferralReason,
+  now: string,
+  subjectKey?: string,
+  checkout?: GitDeferral["checkout"],
+): GitDeferral {
+  return {
+    lane,
+    deferredSince: current?.deferredSince ?? now,
+    reasonSince: current?.reason === reason ? current.reasonSince : now,
+    lastSeen: now,
+    ...(subjectKey === undefined ? {} : { subjectKey }),
+    reason,
+    ...(checkout === undefined ? {} : { checkout }),
+    ...(current?.bytesChanged === undefined ? {} : { bytesChanged: current.bytesChanged }),
+    ...(current?.reproof === undefined || current.subjectKey !== subjectKey ? {} : { reproof: current.reproof }),
+  };
+}
 function incrementalCapturePlan(cfg: WorkspaceConfig, baseSec: GitSection | undefined, forced: boolean): { basisTips: string[]; chain: GitPackLink[] } | undefined {
   if (cfg.git?.incremental === false || !baseSec || forced) return undefined;
   const basisTips = gitSectionTips(baseSec);

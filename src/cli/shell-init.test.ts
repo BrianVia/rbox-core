@@ -18,11 +18,12 @@ function writeScript(): string {
  * A temp workspace dir with `.rbox/workspace.json` and (optionally) a hand-written
  * `shell.line`. Returns the workspace root path.
  */
-function makeWorkspace(shellLine?: string): string {
+function makeWorkspace(shellLine?: string, shellDeferrals?: string): string {
   const root = mkdtempSync(join(tmpdir(), "rbox-shellinit-ws-"));
   mkdirSync(join(root, ".rbox", "state"), { recursive: true });
   writeFileSync(join(root, ".rbox", "workspace.json"), "{}");
   if (shellLine !== undefined) writeFileSync(join(root, ".rbox", "state", "shell.line"), shellLine);
+  if (shellDeferrals !== undefined) writeFileSync(join(root, ".rbox", "state", "shell.deferrals"), shellDeferrals);
   return root;
 }
 
@@ -30,10 +31,10 @@ function makeWorkspace(shellLine?: string): string {
  * Source the plugin, cd into a workspace, and fire the hooks directly (chpwd may
  * not run under `zsh -c`). Returns the raw glyph and the banner (stderr).
  */
-function driveHooks(scriptFile: string, wsDir: string): { glyph: string; banner: string } {
+function driveHooks(scriptFile: string, wsDir: string, pwd = wsDir): { glyph: string; banner: string } {
   const cmd = [
     `source ${scriptFile}`,
-    `cd ${wsDir}`,
+    `cd ${pwd}`,
     "_rbox_chpwd",
     "_rbox_precmd",
     'print -r -- "GLYPH:${RBOX_PROMPT}"',
@@ -156,6 +157,92 @@ test("a malformed / wrong-version sidecar degrades silently (no glyph, no banner
   const { glyph, banner } = driveHooks(writeScript(), ws);
   expect(glyph).toBe("");
   expect(banner).toBe("");
+});
+
+test("shell.deferrals routes on component boundaries and chooses the deepest enclosing repo", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(
+    `v1 ${now} ok - 80 - - ws\n`,
+    "v1\nrepo\tlocal-edits\t14d\t0\nrepo%2Fnested\tlocal-commits\t30m\t1\n",
+  );
+  mkdirSync(join(ws, "repo", "nested", "src"), { recursive: true });
+  mkdirSync(join(ws, "repository"), { recursive: true });
+  const nested = driveHooks(writeScript(), ws, join(ws, "repo", "nested", "src"));
+  expect(nested.glyph).toContain("⚠git:30m+files");
+  expect(nested.banner).toContain("git deferred 30m · working files changed");
+  expect(nested.banner).not.toContain("in sync");
+  expect(driveHooks(writeScript(), ws, join(ws, "repo")).glyph).toContain("⚠git:14d");
+  expect(driveHooks(writeScript(), ws, join(ws, "repository")).glyph).toContain("✓");
+});
+
+test("shell.deferrals root overflow row warns an omitted 51st repo while explicit rows win", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const explicit = Array.from({ length: 49 }, (_, i) => `repo${i}\tlocal-edits\t14d\t0`).join("\n");
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`, `v1\n${explicit}\n.\tother\t1h\t1\n`);
+  for (let i = 0; i < 51; i++) mkdirSync(join(ws, `repo${i}`), { recursive: true });
+  expect(driveHooks(writeScript(), ws, join(ws, "repo1")).glyph).toContain("⚠git:14d");
+  expect(driveHooks(writeScript(), ws, join(ws, "repo50")).glyph).toContain("⚠git:1h+files");
+});
+
+test("malformed or oversized shell.deferrals is ignored whole", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const cases = [
+    "v2\nrepo\tlocal-edits\t14d\t0\n",
+    "v1\nrepo\tnot-a-reason\t14d\t0\n",
+    "v1\nrepo%ZZ\tlocal-edits\t14d\t0\n",
+    "v1\nrepo\tlocal-edits\t14d\t0\t\n",
+    "v1\nrepo\tlocal-edits\t60m\t0\n",
+    "v1\nrepo\tlocal-edits\t14d\t0\nunterminated-row",
+    `v1\nrepo\tlocal-edits\t${"9".repeat(1000)}m\t0\n`,
+    `v1\nrepo\tlocal-edits\t14d\t0\n${"x".repeat(8200)}\tother\t1h\t0\n`,
+    `v1\nrepo\tlocal-edits\t14d\t0\n${"é".repeat(4100)}\tother\t1h\t0\n`,
+    `v1\n${Array.from({ length: 51 }, (_, i) => `repo${i}\tother\t1h\t0`).join("\n")}\n`,
+  ];
+  for (const sidecar of cases) {
+    const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`, sidecar);
+    mkdirSync(join(ws, "repo"), { recursive: true });
+    expect(driveHooks(writeScript(), ws, join(ws, "repo")).glyph, sidecar.slice(0, 40)).toContain("✓");
+  }
+});
+
+test("shell.deferrals does not mask halt, active, or pending shell.line states", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const states = [
+    { line: `v1 ${now} halt - 80 - - ws\n`, glyph: "⚠" },
+    { line: `v1 ${now} active 50 80 - - ws\n`, glyph: "↻" },
+    { line: `v1 ${now} pending - 80 - - ws\n`, glyph: "↑" },
+  ];
+  for (const { line, glyph } of states) {
+    const ws = makeWorkspace(line, "v1\n.\tlocal-edits\t14d\t1\n");
+    const driven = driveHooks(writeScript(), ws);
+    expect(driven.glyph).toContain(glyph);
+    expect(driven.glyph).not.toContain("git:");
+    expect(driven.banner).not.toContain("git deferred");
+  }
+});
+
+test("shell.deferrals present-sidecar reader stays within the 5ms p99 prompt budget", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const rows = Array.from({ length: 50 }, (_, i) => `repo%2Fnested%2Fr${i}\tother\t14d\t0`).join("\n");
+  const ws = makeWorkspace(`v1 ${now} ok - 80 - - ws\n`, `v1\n${rows}\n`);
+  const file = writeScript();
+  const cmd = [
+    `source ${file}`,
+    `cd ${ws}`,
+    "zmodload zsh/datetime",
+    `for i in {1..350}; do start=$EPOCHREALTIME; _rbox_deferrals ${ws}; print -r -- $(( (EPOCHREALTIME - start) * 1000000 )); done`,
+  ].join("; ");
+  const res = Bun.spawnSync([ZSH, "-f", "-c", cmd], { cwd: tmpdir() });
+  expect(res.exitCode).toBe(0);
+  const micros = new TextDecoder().decode(res.stdout).trim().split("\n").map(Number).filter(Number.isFinite).slice(50).sort((a, b) => a - b);
+  expect(micros.length).toBe(300);
+  const p99 = micros[Math.ceil(micros.length * 0.99) - 1]!;
+  expect(p99).toBeLessThanOrEqual(5_000);
 });
 
 // ── review-regression guards ─────────────────────────────────────────────────────

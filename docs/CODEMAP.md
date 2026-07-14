@@ -39,7 +39,8 @@ src/cli/sync/format.ts        — compact stat/timing token rendering (formatCom
 src/cli/sync-git.ts                  — barrel: pre-113-split public surface of sync-git/.
 src/cli/sync-git/shared.ts           — cross-lane orchestration policy (capture/apply concurrency, repo cap/path helpers, scope projection/carry matrix, log-once sets) + capture/locking primitives (chainLock, gitApplyMutationKey, nestedRepoChains, capturePlannedGitSection). SINGLE owner of the module-level state shared by plan AND apply. Never: plan or apply decisions themselves.
 src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 — one closure unit, helper order is semantic), plan contracts, push formatters, gitBaseAfterCommit, gitForceForMissingBlobs. Never: apply-side mutation, status rendering.
-src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
+src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, receiver-equivalent repo-key admission, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
+src/cli/sync-git/follow.ts           — design-116 checkout orchestration: artifact/index-equivalence staging guards, all-guard classification, independent safe-ref publication, journaled checkout commit/recovery adapters. Never: D4a journal/reachability/index/pin mechanics or state-file persistence.
 src/cli/sync-git/config-lane.ts      — config-lane capture model + receiver: CachedLocalCfg, gitConfigHash, shouldPublishGitConfig, readLocalGitConfig, configReceiver, sameConfigShape. Never: fingerprinting, apply transactions.
 src/cli/sync-git/fingerprint.ts      — divergence fingerprint construction: stat/tree/index tokenization, racy-clean trust, GIT_FINGERPRINT_VERSION derivation (version MUST stay adjacent to the token code it versions — design 113 §8). Never: cache persistence, probing.
 src/cli/sync-git/divergence-cache.ts — divergence cache schema/persistence + probe build/classify/write/refresh. Never: fingerprint token construction.
@@ -60,7 +61,7 @@ src/cli/daemon/render.ts     — daemon log-line rendering: log, scanStatsLine, 
 ```
 src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/release/withWorkspaceSyncMutex) + degraded lock-unsupported fallback, CLI vs daemon acquisition policy. Never: the lockfile primitive itself (engine/git/lockfile.ts).
 src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing, flag-gated serialized receipt-drainer wiring) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
-src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
+src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, episode-aware published-checkout recovery, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
 src/cli/daemon-control.ts     — daemon process lifecycle + on-disk records: binding/pid files, start/stop/liveness/PID-ownership, rbox logs tailing. Never: the daemon's sync loop (daemon/).
 src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming + batch-dispatch/pack-lane telemetry accumulators, overlap math, summary formatters. Never: network or file I/O.
 src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
@@ -116,6 +117,7 @@ src/cli/publish-pipeline/stale-temp.ts      — stale enc-* temp-dir reclamation
 src/engine/index.ts                 — barrel: the full public engine API for src/cli. Never: logic.
 src/engine/types.ts                 — core types only: FileEntry, FileType, Manifest, GitSection/GitArtifactRef/GitPackLink/GitRefScope. Never: logic, I/O.
 src/engine/manifest.ts              — the filesystem scan producer: scanManifest (ignore rules + dircache/hashcache reuse), applyWatchEvents, ScanStats, present-vs-absent error classification. Owns "what's on disk" → manifest. Never: diffing, wire encoding.
+src/engine/apply-receipt.ts         — applied-manifest oracle + shared receiver-equivalence probe/key helpers: lazy derived/persisted per-repo receipt proof, token-first re-proof, scoped inventory/hash widening. Never: Git follow decisions or workspace-wide per-repo scans.
 src/engine/manifest-delta.ts        — manifest wire envelope codec: canonical (JCS float-tolerant) manifest hashing, snapshot/delta envelopes, delta ops diff/fold, ManifestChainError. Owns the on-wire manifest format. Never: scanning.
 src/engine/manifest-chain.ts        — pure validator: readManifestChain bounds/validates a manifest's delta chain. Never: I/O.
 src/engine/manifest-validate.ts     — dependency-free (no node:*) manifest/path/git-section validation shared by client AND Worker (isSafeRelPath, validateManifest, validateGitSection, schema/size constants). Pure string logic — must stay bundleable into the Worker.
@@ -179,11 +181,11 @@ src/engine/e2ee/session.ts        — top-level E2EE orchestration composing all
 ## `src/engine/git/` — git-native repo state capture/apply
 
 ```
-src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
+src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, generic reflog reads, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
 src/engine/git/preflight.ts   — decides whether a repo's shape is syncable (dir vs pointer, worktrees, alternates, submodule superprojects, busy-check): gitPreflight, isGitBusy (structural vs transient refusal). Never: capture or apply.
 src/engine/git/identity.ts    — stable plaintext-only identity of a repo's git state for change detection (gitIdentity, projectIdentity, gitIdentityKey), scope-aware. Never: the stored GitSection shape (types.ts).
 src/engine/git/capture.ts     — git-native state capture (design 43): history bundles, index/HEAD/op-state snapshot, stable change identity, scratch-dir rooting/sweep, GitCaptureDeferredError. Owns "what to upload for a repo this cycle". Never: apply.
-src/engine/git/apply.ts       — mutating git-state apply (design 43): fetch/decrypt/import pack chain, move index/op-state into place, quarantine + rollback on failure. Never: capture, planning.
+src/engine/git/apply.ts       — mutating git-state apply (design 43): fetch/decrypt/import pack chain, receiver-equivalent ref holds, NFF displacement pins, move index/op-state into place, quarantine + rollback on failure. Never: capture, planning.
 src/engine/git/quarantine.ts  — pre-mutation quarantine (bundle + index/op-state copy) + post-failure conflict preservation (quarantineLocal, quarantineAndWipeGitState, preserveGitConflict). Never: the apply itself.
 src/engine/git/rollback.ts    — local pre-apply snapshot/restore of refs+HEAD+index+op-state+stash reflog (snapshotLocal, restoreLocal with onlyRefs scoping for pointer repos). Never: quarantine policy.
 src/engine/git/refs.ts        — low-level ref/op-state enumeration and restore (readAllRefs, listRefs, readOpState/restoreOpState). Pure plumbing wrappers. Never: policy.
@@ -192,4 +194,9 @@ src/engine/git/containment.ts — single safety check: assertGitTargetWithinRoot
 src/engine/git/lockfile.ts    — generic cross-process advisory lockfile with liveness probing (acquireLock, OwnedLock, inspectLock, stale detection). Never: what the lock protects.
 src/engine/git/config-sync.ts — pure (node-free, bundles into Worker) grammar/projection/canonicalization for git config sync (design 93): allowlisted keys, canonicalizeGitConfig, credential/value safety. Never: I/O.
 src/engine/git/config-txn.ts  — transactional on-disk git config read/write: lockfile-guarded atomic apply, fault classification, orphan sweep. The stateful counterpart to config-sync.ts. Never: the grammar.
+src/engine/git/index-identity.ts — semantic GitIndexIdentityV2 projection from a private index copy. Never: follow authorization or live-index mutation.
+src/engine/git/reachability.ts — fail-closed incoming-ownership/no-drop graph proofs plus full stash-reflog enumeration. Never: ref mutation or follow policy.
+src/engine/git/journal.ts      — durable two-phase checkout journal write/mark/clear, prepared-lock ownership recovery, and old/new/third-value arbitration. Never: CLI state interpretation or checkout planning.
+src/engine/git/checkout-txn.ts — prepared expected-old ref transaction + journaled ref/HEAD/index-lock checkout commit and capability/boundary proof protocol. Never: classifier policy or state saving.
+src/engine/git/keep-pins.ts    — content-addressed recovery pins, reflog-displacement discovery, and pre-displacement provenance sidecar. Never: retention policy or ref-plane classification.
 ```

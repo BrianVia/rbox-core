@@ -51,7 +51,7 @@ export interface BulkStat {
 
 export interface BulkChild {
   name: string;
-  type: "file" | "dir" | "symlink";
+  type: "file" | "dir" | "symlink" | "other";
   stat?: BulkStat;
 }
 
@@ -104,11 +104,11 @@ function attrsBuffer(): Uint8Array {
   return bytes;
 }
 
-function objectType(value: number): ChildType | undefined {
+function objectType(value: number): ChildType {
   if (value === 1) return "file";
   if (value === 2) return "dir";
   if (value === 5) return "symlink";
-  return undefined;
+  return "other";
 }
 
 function modeFor(type: ChildType, access: number): number {
@@ -118,8 +118,7 @@ function modeFor(type: ChildType, access: number): number {
 
 function childFromLstat(absDir: string, name: string): BulkChild | undefined {
   const st = fs.lstatSync(path.join(absDir, name));
-  const type: ChildType | undefined = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : undefined;
-  if (!type) return undefined;
+  const type: ChildType = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : "other";
   return type === "file" ? { name, type, stat: st } : { name, type };
 }
 
@@ -138,7 +137,6 @@ function parseRecord(view: DataView, start: number, length: number, absDir: stri
   const missingCommon = (returnedCommon & COMMON_PAYLOAD) !== COMMON_PAYLOAD;
   if (missingCommon) return childFromLstat(absDir, name);
   const type = objectType(view.getUint32(start + 36, true));
-  if (!type) return undefined;
   const returnedFile = view.getUint32(start + 16, true);
   // Files carry the extra ATTR_FILE_DATALENGTH word (read at offset 84). If it
   // wasn't packed for this file, or the record is too short to hold it, take the

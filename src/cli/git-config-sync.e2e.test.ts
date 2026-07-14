@@ -27,12 +27,18 @@ import {
 import { pull, push, sync, type SyncDeps } from "./sync.js";
 
 const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test", GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test", GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
 const KEK = Buffer.alloc(32, 93);
 const noBackoff = async () => {};
 const runGit = (dir: string, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args]).then((result) => result.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString().trim());
 const runGitEnv = (dir: string, env: NodeJS.ProcessEnv, ...args: string[]) =>
-  exec("git", ["-C", dir, ...args], { env: { ...process.env, ...env } }).then((result) => result.stdout.toString().trim());
+  exec("git", ["-C", dir, ...args], { env: { ...TEST_GIT_ENV, ...env } }).then((result) => result.stdout.toString().trim());
 
 class LoopRemote implements SyncRemote {
   private head = 0;
@@ -216,7 +222,7 @@ afterEach(async () => {
 
 test("§11 E2E: fresh materialization keeps remote/tracking config and can pull from a local bare remote", async () => {
   const bare = path.join(tmp, "origin.git");
-  await exec("git", ["init", "--bare", "-q", bare]);
+  await exec("git", ["init", "--bare", "-q", bare], { env: TEST_GIT_ENV });
   const repoA = path.join(rootA, "repo");
   await initRepo(repoA);
   await commitFile(repoA, "tracked.txt", "one\n", "initial");
@@ -346,7 +352,7 @@ test("§11 E2E: old-writer strip and structural drop both recover through presen
   ]);
 });
 
-test("§11 E2E: config failure holds pending through both shortcuts; combined failure rolls Git back", async () => {
+test("§11 E2E: config failure retries independently while safe Git progress lands", async () => {
   const repoA = path.join(rootA, "repo");
   await initRepo(repoA);
   await commitFile(repoA, "tracked.txt", "one\n", "initial");
@@ -371,8 +377,9 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(first.gitRepos?.repo).toEqual(oldSection);
-  expect(first.gitPendingRemote?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(first.gitRepos?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(first.gitPendingRemote).toBeUndefined();
+  expect(first.partial?.repo?.configApplied).toBe(false);
 
   // Shortcut 2: retrying the same pending section must not clear it merely because
   // the local Git identity already equals the incoming identity.
@@ -387,11 +394,10 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(second.gitRepos?.repo).toEqual(oldSection);
-  expect(second.gitPendingRemote?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(second.gitRepos?.repo).toEqual(configOnlyHead.manifest.gitRepos!.repo);
+  expect(second.gitPendingRemote).toBeUndefined();
 
-  // Combined Git+config mutation: Git lands first inside the boundary, then the
-  // injected config failure forces the ordinary-row snapshot rollback.
+  // Combined Git+config mutation: safe Git lands even though config remains deferred.
   await commitFile(repoA, "tracked.txt", "two\n", "git plus config");
   await runGit(repoA, "remote", "add", "backup", "https://example.test/backup.git");
   await push(rootA, cfgA, depsA);
@@ -407,10 +413,11 @@ test("§11 E2E: config failure holds pending through both shortcuts; combined fa
     () => {},
     { applyConfig: failConfig }
   );
-  expect(combined.gitRepos?.repo).toEqual(oldSection);
-  expect(combined.gitPendingRemote?.repo).toEqual(combinedHead.manifest.gitRepos!.repo);
-  expect(await runGit(repoB, "rev-parse", "HEAD")).toBe(oldGitHead);
+  expect(combined.gitRepos?.repo).toEqual(combinedHead.manifest.gitRepos!.repo);
+  expect(combined.gitPendingRemote).toBeUndefined();
+  expect(await runGit(repoB, "rev-parse", "HEAD")).not.toBe(oldGitHead);
   expect(await configValue(repoB, "remote.backup.url")).toBeUndefined();
+  expect(combined.partial?.repo?.configApplied).toBe(false);
 });
 
 test("§11 E2E: pointer historical all-base carry is verbatim; scoped→standalone→pointer skips config", async () => {
@@ -494,7 +501,7 @@ test("§11 E2E: status is indeterminate when all bounded config reads are unstab
   let attempt = 0;
   const unstableRunner: GitConfigRunner = async (repoDir, args) => {
     await fs.appendFile(configPath, `# forced instability ${++attempt}\n`);
-    return exec("git", ["-C", repoDir, ...args]).then((result) => result.stdout.toString());
+    return exec("git", ["-C", repoDir, ...args], { env: TEST_GIT_ENV }).then((result) => result.stdout.toString());
   };
   const status = await gitDivergenceStatus(
     rootA,
