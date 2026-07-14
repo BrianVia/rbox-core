@@ -387,9 +387,13 @@ async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined,
   }
   const recovery = await recoverFollowJournal(root, rel, await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx));
   if (recovery.status === "keep") {
-    const saved = await savePublishedRepoIntent(root, state, rel, recovery.intended);
-    await clearFollowJournal(root, rel);
-    return { state: saved };
+    const published = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+    if (published.disposition === "landed"
+      || published.disposition === "already-semantic"
+      || published.disposition === "superseded") {
+      await clearFollowJournal(root, rel);
+    }
+    return { state: published.state };
   }
   if (recovery.status === "defer") return { state, error: recovery.reason };
   if (recovery.status === "human-intervened") return { state, error: `crash-window changes were preserved in ${recovery.quarantinePath}` };
@@ -551,8 +555,12 @@ export async function gitResolveCmd(
       return 1;
     }
     if (Object.keys(follow.heldRefs).length || !intended) throw new Error("manual resolution published an incomplete checkout");
-    await savePublishedRepoIntent(root, state, rel, intended);
-    await clearFollowJournal(root, rel);
+    const published = await savePublishedRepoIntent(root, state, rel, intended);
+    if (published.disposition === "landed"
+      || published.disposition === "already-semantic"
+      || published.disposition === "superseded") {
+      await clearFollowJournal(root, rel);
+    }
     emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps);
     return 0;
   });

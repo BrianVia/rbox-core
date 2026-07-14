@@ -181,6 +181,32 @@ test("intent recovery restores an attached branch switch and removes the newly-c
   await expect(runGit(repo, "rev-parse", "--verify", "refs/heads/incoming")).rejects.toThrow();
 });
 
+test("intent recovery uses exact prepared-lock shape in the prepare-to-token journal window", async () => {
+  const { oldOid, newOid } = await history();
+  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
+  const index = await fs.readFile(path.join(gitDir, "index"));
+  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": newOid }, expectedIndex: index, intended: "prepare-window" });
+  const refLock = path.join(gitDir, "refs/heads/main.lock");
+  const headLock = path.join(gitDir, "HEAD.lock");
+  journal.expectedNew.preparedTransactions = [{
+    id: "primary",
+    ownerPid: 1234,
+    prepareStarted: true,
+    locks: [
+      { path: refLock, expectedBytes: [Buffer.from(`${newOid}\n`).toString("base64")] },
+      { path: headLock, expectedBytes: [Buffer.alloc(0).toString("base64")] },
+    ],
+  }];
+  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  await fs.mkdir(path.dirname(refLock), { recursive: true });
+  await fs.writeFile(refLock, `${newOid}\n`);
+  await fs.writeFile(headLock, "");
+
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
+  await expect(fs.access(refLock)).rejects.toThrow();
+  await expect(fs.access(headLock)).rejects.toThrow();
+});
+
 test("intent recovery preserves detached HEAD form", async () => {
   const { oldOid, newOid } = await history();
   await runGit(repo, "checkout", "-q", "--detach", oldOid);

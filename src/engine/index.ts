@@ -85,10 +85,17 @@ export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./di
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
 export {
+  conservativeReceiverEquivalentPath,
   oracleFromPull,
   oracleFromState,
+  probeReceiverEquivalence,
+  receiverEquivalentCollisionNames,
+  receiverEquivalentPath,
+  setReceiverEquivalenceProbeForTests,
   type AppliedManifestOracle,
   type OracleVerdict,
+  type ReceiverEquivalence,
+  type ReceiverEquivalenceProbe,
 } from "./apply-receipt.js";
 export { applyActions,
   laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";

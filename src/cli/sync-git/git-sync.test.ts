@@ -724,10 +724,11 @@ test("e2e: worktree scope-crossing converges (§7 trace) — B's edit applies in
   await push(rootB, cfgB, depsB);
   expect((await remote.latest()).manifest.gitRepos!["wt"]!.refScope).toBe("all");
 
-  // A pulls: the all-scope section applies into the POINTER repo (update-only, guarded)
+  // A pulls: the all-scope section follows into the existing POINTER repo
+  // through the steady oracle/journal pipeline (still update-only and guarded).
   await pull(rootA, cfgA, depsA);
   expect(await git(W, "rev-parse", "feat")).toBe(await git(bw, "rev-parse", "feat"));
-  expect(logsA.some((l) => l.startsWith("git-sync applied wt"))).toBe(true);
+  expect(logsA.some((l) => l.startsWith("git-sync followed wt"))).toBe(true);
 
   // Convergence: one settling round, then TWO quiescent cycles make ZERO new commits.
   await syncCycle();
@@ -1239,7 +1240,7 @@ test("design 116 phase-0: linked-worktree partial apply stays pending, retries w
   });
   const chronicSince = record.deferrals?.apply?.deferredSince;
   expect(record.deferrals?.apply).toMatchObject({ lane: "apply", reason: "worktree-ownership", checkout: { kind: "branch", label: "main" } });
-  expect(logsB.some((line) => line.includes("git-sync applied r (held refs: refs/heads/side=b-r-side)"))).toBe(true);
+  expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 
   // A newer wire section may arrive after the v2 partial. The proof is against persisted
   // pending v2, then apply retries newest v3: unrelated main advances, side stays held.
@@ -1256,7 +1257,7 @@ test("design 116 phase-0: linked-worktree partial apply stays pending, retries w
   expect(record.partial?.incomingKey).toBe(gitIncomingKey(state.gitPendingRemote!["r"]!));
   expect(record.deferrals?.apply?.deferredSince).toBe(chronicSince);
   expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
-  expect(logsB.some((line) => line.includes("held refs: refs/heads/side=b-r-side"))).toBe(true);
+  expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 
   // Once ownership disappears, the same recognizable three-way partial shape retries
   // into a full apply; pending clears and the base finally advances to incoming truth.

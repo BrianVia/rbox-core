@@ -426,7 +426,7 @@ describe("design 116 generated disposition matrix", () => {
   );
 });
 
-describe("production clean-arm working-byte residual", () => {
+describe("production steady base-clean working-byte classification", () => {
   test.each(["ff", "branch-switch", "detached"] as const)("%s metadata-base-clean human dirt", async (topology) => {
     const { root, repo, template, incoming } = await cloneCase({ topology, syncDirt: 1, label: "clean-arm-human-dirt" });
     try {
@@ -434,15 +434,10 @@ describe("production clean-arm working-byte residual", () => {
       await fs.writeFile(path.join(repo, "tracked.txt"), humanBytes);
       const result = await applyIncoming(root, stateWith(template.base), incoming, realOracle(root, template.expectedBytes[1]));
 
-      // Documented post-116 residual: metadata-base-clean working-byte-only dirt
-      // still enters the legacy clean arm, whose metadata-only apply does not call
-      // the follow oracle. The next design cycle owns routing this case through the
-      // oracle; this review round must pin the production disposition without
-      // broadening the adjudicated fix.
-      expect(result.logs).toContain(`git-sync applied ${REL}`);
-      expect(result.outcome.gitRepos?.[REL]).toEqual(incoming);
-      expect(result.outcome.gitPendingRemote?.[REL]).toBeUndefined();
-      expect(result.outcome.deferrals?.[REL]?.apply).toBeUndefined();
+      expect(result.logs.some((line) => line.startsWith(`git-sync deferred ${REL}:`))).toBe(true);
+      expect(result.outcome.gitRepos?.[REL]).toEqual(template.base);
+      expect(result.outcome.gitPendingRemote?.[REL]).toEqual(incoming);
+      expect(result.outcome.deferrals?.[REL]?.apply?.reason).toBe("local-edits");
       expect(await fs.readFile(path.join(repo, "tracked.txt"), "utf8")).toBe(humanBytes);
     } finally {
       await fs.rm(root, { recursive: true, force: true });

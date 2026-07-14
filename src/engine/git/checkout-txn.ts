@@ -58,6 +58,8 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
   secondProof: (context: SecondProofContext) => Promise<boolean>;
   journal?: { workspaceRoot: string; relPath: string; value: CheckoutJournal<TIntended> };
   crashAt?: (point: "after-connectivity-proof" | "after-prepare" | "after-index-lock" | "after-head-commit" | "after-ref-commit" | "before-index-publish" | "after-index-publish" | "mid-op-state") => void;
+  /** Test seam for the real failure mode where Git dies after prepare: ok. */
+  afterPrepareChild?: (pid: number, transaction: "primary" | "post-head") => void | Promise<void>;
   capabilityProbe?: CheckoutCapabilityProbe;
   /** Caller already ran the exact capability probe for this transaction. */
   capabilitySupported?: boolean;
@@ -65,7 +67,7 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
 
 export type CommitCheckoutResult =
   | { status: "committed"; indexHash?: string }
-  | { status: "defer"; reason: string }
+  | { status: "defer"; reason: string; journalIntact?: true }
   | { status: "unsupported"; reason: string };
 
 export type CheckoutCapabilityProbe = (gitVersion: string) => Promise<boolean>;
@@ -102,6 +104,8 @@ class RefTransaction {
   private stderrPath?: string;
   private responseOffset = 0;
   private closed = false;
+  private childDone = false;
+  private childExit?: Promise<number | null>;
 
   constructor(repoDir: string) {
     this.ready = this.initialize(repoDir);
@@ -120,6 +124,14 @@ class RefTransaction {
     this.child = spawn("sh", ["-c", 'exec git -C "$1" update-ref --stdin <"$2" >"$3" 2>"$4"', "rbox-update-ref", repoDir, fifo, this.stdoutPath, this.stderrPath], {
       env: cleanGitEnv(),
       stdio: "ignore",
+    });
+    // Register lifecycle listeners immediately. A SIGKILL can otherwise land
+    // between response failure and finish(), and Bun does not reliably retain
+    // a late-observable exitCode for that already-delivered close event.
+    this.childExit = new Promise<number | null>((resolve) => {
+      this.child!.once("exit", () => { this.childDone = true; });
+      this.child!.once("close", (code) => { this.childDone = true; resolve(code); });
+      this.child!.once("error", () => { this.childDone = true; resolve(1); });
     });
     await new Promise<void>((resolve, reject) => {
       this.child!.once("spawn", resolve);
@@ -144,7 +156,7 @@ class RefTransaction {
         if (line !== `${command}: ok`) throw new Error(`update-ref ${command} failed: ${line}`);
         return;
       }
-      if (this.child!.exitCode !== null) break;
+      if (this.childDone || this.child!.exitCode !== null || this.child!.signalCode !== null) break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     const stderr = await fs.readFile(this.stderrPath!, "utf8").catch(() => "");
@@ -153,6 +165,11 @@ class RefTransaction {
 
   async start(): Promise<void> { await this.response("start"); }
   async prepare(): Promise<void> { await this.response("prepare"); }
+  async processId(): Promise<number> {
+    await this.ready;
+    if (!this.child?.pid) throw new Error("update-ref child has no process id");
+    return this.child.pid;
+  }
   async commit(): Promise<void> { await this.response("commit"); await this.finish(); }
   async abort(): Promise<void> {
     if (this.closed) return;
@@ -164,11 +181,7 @@ class RefTransaction {
     this.closed = true;
     await this.ready.catch(() => {});
     await this.input?.close().catch(() => {});
-    const code = this.child ? await new Promise<number | null>((resolve, reject) => {
-      if (this.child!.exitCode !== null) return resolve(this.child!.exitCode);
-      this.child!.once("error", reject);
-      this.child!.once("close", resolve);
-    }) : 1;
+    const code = this.child ? await this.childExit : 1;
     const stderr = this.stderrPath ? await fs.readFile(this.stderrPath, "utf8").catch(() => "") : "";
     if (this.controlDir) await fs.rm(this.controlDir, { recursive: true, force: true }).catch(() => {});
     if (code !== 0) throw new Error(`git update-ref exited ${code}: ${stderr.trim()}`);
@@ -263,7 +276,15 @@ function transactionLines(plan: CheckoutPlan): string[] {
   // transaction that updates HEAD's unchanged referent. In that one shape the
   // expected-old branch update plus the caller's locked second proof verifies
   // the stable symbolic target; branch switches still use symref-update below.
-  else if (plan.head.newTarget === plan.head.oldTarget) { /* no HEAD write */ }
+  else if (plan.head.newTarget === plan.head.oldTarget) {
+    const oldTarget = plan.head.oldTarget;
+    const referentUpdated = plan.refUpdates.some((update) => update.ref === oldTarget)
+      || (plan.extraTransactionLines ?? []).some((line) => /^(?:create|update|delete) (refs\/\S+)/.exec(line)?.[1] === oldTarget);
+    // Git rejects HEAD verification beside an update of its current referent,
+    // because that referent update already reserves HEAD.lock. An index/op-state
+    // only checkout has no such update, so verify the symref explicitly.
+    if (!referentUpdated) lines.push(`symref-verify HEAD ${oldTarget}`);
+  }
   else if (plan.head.oldTarget) lines.push(`symref-update HEAD ${plan.head.newTarget} ref ${plan.head.oldTarget}`);
   else if (plan.head.oldOid) lines.push(`symref-update HEAD ${plan.head.newTarget} oid ${plan.head.oldOid}`);
   else throw new Error("symbolic HEAD update requires an expected old target or OID");
@@ -281,27 +302,105 @@ function refUpdateLines(updates: readonly CheckoutRefUpdate[], extra: readonly s
   return lines;
 }
 
-function expectedTransactionLockPaths(ctx: RepoCtx, plan: CheckoutPlan): Set<string> {
-  // Only per-ref/HEAD paths named by this exact plan are eligible. A broad
-  // packed-refs.lock allow-list cannot prove which process created that lock;
-  // treating it as external may conservatively defer a packed-ref rewrite but
-  // can never bless a concurrent Git writer.
-  const locks = new Set<string>([path.resolve(ctx.gitDir, "HEAD.lock")]);
-  if (plan.head.kind === "symbolic") {
-    locks.add(path.resolve(ctx.commonDir, `${plan.head.newTarget}.lock`));
-    if (plan.head.oldTarget) locks.add(path.resolve(ctx.commonDir, `${plan.head.oldTarget}.lock`));
+type JournalPreparedTransaction = NonNullable<CheckoutJournal["expectedNew"]["preparedTransactions"]>[number];
+
+function expectedLockBytes(line: string): { ref: string; bytes: string } | undefined {
+  const fields = line.split(" ");
+  const command = fields[0];
+  const ref = fields[1];
+  if (!ref || (ref !== "HEAD" && !ref.startsWith("refs/"))) return undefined;
+  if (command === "create" || command === "update") {
+    const oid = fields[2];
+    if (!oid) return undefined;
+    return { ref, bytes: Buffer.from(`${oid}\n`).toString("base64") };
   }
-  for (const update of plan.refUpdates) locks.add(path.resolve(ctx.commonDir, `${update.ref}.lock`));
-  for (const update of plan.postHeadRefUpdates ?? []) locks.add(path.resolve(ctx.commonDir, `${update.ref}.lock`));
-  for (const line of plan.extraTransactionLines ?? []) {
-    const match = /^(?:create|update|delete|verify) (refs\/\S+)/.exec(line);
-    if (match) locks.add(path.resolve(ctx.commonDir, `${match[1]}.lock`));
+  if (command === "delete" || command === "verify" || command === "symref-update" || command === "symref-verify") {
+    return { ref, bytes: Buffer.alloc(0).toString("base64") };
   }
-  for (const line of plan.postHeadExtraTransactionLines ?? []) {
-    const match = /^(?:create|update|delete|verify) (refs\/\S+)/.exec(line);
-    if (match) locks.add(path.resolve(ctx.commonDir, `${match[1]}.lock`));
+  return undefined;
+}
+
+async function preparedTransactionIntent(
+  ctx: RepoCtx,
+  id: JournalPreparedTransaction["id"],
+  ownerPid: number,
+  lines: readonly string[],
+  includeHeadReservation: boolean,
+): Promise<JournalPreparedTransaction> {
+  const byPath = new Map<string, Set<string>>();
+  const add = (abs: string, bytes: string) => {
+    const key = path.resolve(abs);
+    const values = byPath.get(key) ?? new Set<string>();
+    values.add(bytes);
+    byPath.set(key, values);
+  };
+  for (const line of lines) {
+    const expected = expectedLockBytes(line);
+    if (!expected) continue;
+    const abs = expected.ref === "HEAD" ? path.join(ctx.gitDir, "HEAD.lock") : path.join(ctx.commonDir, `${expected.ref}.lock`);
+    add(abs, expected.bytes);
   }
-  return locks;
+  // Updating the checked-out referent also makes files-backend Git reserve
+  // HEAD, even when HEAD itself is intentionally omitted from the commands.
+  if (includeHeadReservation) add(path.join(ctx.gitDir, "HEAD.lock"), Buffer.alloc(0).toString("base64"));
+
+  const packed = await fs.readFile(path.join(ctx.commonDir, "packed-refs"), "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const packedNames = new Set(packed.split("\n").filter((line) => line && !line.startsWith("#") && !line.startsWith("^")).map((line) => line.split(" ")[1]).filter(Boolean));
+  const deleted = new Set(lines.filter((line) => line.startsWith("delete refs/")).map((line) => line.split(" ")[1]!));
+  if ([...deleted].some((ref) => packedNames.has(ref))) {
+    const packedLock = path.join(ctx.commonDir, "packed-refs.lock");
+    // Files-backend Git may stage either the current packed file or the
+    // delete-filtered successor depending on exactly where it dies.
+    add(packedLock, Buffer.from(packed).toString("base64"));
+    if (deleted.size > 0) {
+      const kept: string[] = [];
+      let omitPeeled = false;
+      for (const line of packed.split("\n")) {
+        if (line.startsWith("^")) {
+          if (!omitPeeled) kept.push(line);
+          continue;
+        }
+        const ref = line && !line.startsWith("#") ? line.split(" ")[1] : undefined;
+        omitPeeled = ref !== undefined && deleted.has(ref);
+        if (!omitPeeled) kept.push(line);
+      }
+      add(packedLock, Buffer.from(kept.join("\n")).toString("base64"));
+    }
+  }
+
+  return {
+    id,
+    ownerPid,
+    prepareStarted: true,
+    locks: [...byPath].map(([lockPath, expectedBytes]) => ({ path: lockPath, expectedBytes: [...expectedBytes] })),
+  };
+}
+
+async function observePreparedLockTokens(transaction: JournalPreparedTransaction): Promise<void> {
+  for (const lock of transaction.locks) {
+    const token = await lockToken(lock.path);
+    if (token) lock.token = { dev: token.dev, ino: token.ino };
+  }
+}
+
+function activeJournalLockPaths(journal: CheckoutJournal): string[] {
+  const out = new Set<string>();
+  for (const transaction of journal.expectedNew.preparedTransactions ?? []) {
+    if (!transaction.completed) for (const lock of transaction.locks) out.add(lock.path);
+  }
+  if (journal.expectedNew.headLock?.acquireStarted) out.add(journal.expectedNew.headLock.path);
+  if (journal.expectedNew.indexLock) out.add(path.join(journal.binding.gitDirReal, "index.lock"));
+  for (const ref of Object.keys(journal.expectedNew.reservedLocks ?? {})) out.add(path.join(journal.binding.commonDirReal, `${ref}.lock`));
+  return [...out];
+}
+
+async function journalLocksRemain(journal: CheckoutJournal | undefined): Promise<boolean> {
+  if (!journal) return false;
+  for (const abs of activeJournalLockPaths(journal)) if (await lockToken(abs)) return true;
+  return false;
 }
 
 async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: string; tmp: string }>, crashAt?: CommitCheckoutOptions["crashAt"]): Promise<void> {
@@ -334,6 +433,8 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   let postHeadTx: RefTransaction | undefined;
   let indexHandle: fs.FileHandle | undefined;
   let indexToken: OwnedGitLock | undefined;
+  let headHandle: fs.FileHandle | undefined;
+  let headToken: OwnedGitLock | undefined;
   const reservationHandles: fs.FileHandle[] = [];
   const reservationTokens: OwnedGitLock[] = [];
   let refsCommitted = false;
@@ -361,12 +462,26 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       if (token) locksBeforePrepare.set(token.path, `${token.dev}:${token.ino}`);
     }
 
+    const primaryLines = transactionLines(plan);
     tx = new RefTransaction(ctx.repoDir);
     await tx.start();
     await tx.write("option no-deref");
-    for (const line of transactionLines(plan)) await tx.write(line);
+    for (const line of primaryLines) await tx.write(line);
+    const primaryIntent = await preparedTransactionIntent(ctx, "primary", await tx.processId(), primaryLines, plan.head.kind === "symbolic");
+    if (opts.journal) {
+      opts.journal.value.expectedNew.preparedTransactions = [
+        ...(opts.journal.value.expectedNew.preparedTransactions ?? []).filter((entry) => entry.id !== "primary"),
+        primaryIntent,
+      ];
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
     await tx.prepare();
     const postHeadLines = refUpdateLines(plan.postHeadRefUpdates ?? [], plan.postHeadExtraTransactionLines);
+    await opts.afterPrepareChild?.(await tx.processId(), "primary");
+    await observePreparedLockTokens(primaryIntent);
+    if (opts.journal) {
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
     try { opts.crashAt?.("after-prepare"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
     for (const reservation of plan.refReservations ?? []) {
@@ -407,8 +522,12 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     try { opts.crashAt?.("after-index-lock"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
-    const owned: OwnedGitLock[] = [indexToken, ...reservationTokens];
-    const expectedLocks = expectedTransactionLockPaths(ctx, plan);
+    const owned: OwnedGitLock[] = [
+      indexToken,
+      ...reservationTokens,
+      ...primaryIntent.locks.flatMap((lock) => lock.token ? [{ path: lock.path, ...lock.token }] : []),
+    ];
+    const expectedLocks = new Set(primaryIntent.locks.map((lock) => lock.path));
     for (const abs of await allGitLocks(ctx)) {
       if (!expectedLocks.has(abs) || abs === indexToken.path) continue;
       const token = await lockToken(abs);
@@ -429,13 +548,42 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       reservationHandles.length = 0;
       for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
       reservationTokens.length = 0;
-      return { status: "defer", reason: becameBusy ? "git became busy at checkout boundary" : "checkout boundary proof changed" };
+      const reason = becameBusy ? "git became busy at checkout boundary" : "checkout boundary proof changed";
+      return await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
 
+    const branchSwitchTarget = plan.head.kind === "symbolic" && plan.head.newTarget !== plan.head.oldTarget ? plan.head.newTarget : undefined;
+    const branchSwitch = branchSwitchTarget !== undefined;
+    if (branchSwitch && opts.journal) {
+      opts.journal.value.expectedNew.headLock = {
+        path: path.resolve(ctx.gitDir, "HEAD.lock"),
+        acquireStarted: true,
+        expectedBytes: [Buffer.alloc(0).toString("base64")],
+      };
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
     await tx.commit();
     tx = undefined;
     refsCommitted = true;
     try { opts.crashAt?.("after-head-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+    if (branchSwitch) {
+      const headLockPath = path.join(ctx.gitDir, "HEAD.lock");
+      headHandle = await fs.open(headLockPath, "wx");
+      headToken = await lockToken(headLockPath);
+      if (!headToken) throw new Error("could not identify owned HEAD.lock reservation");
+      if (opts.journal?.value.expectedNew.headLock) {
+        opts.journal.value.expectedNew.headLock.token = { dev: headToken.dev, ino: headToken.ino };
+        const primary = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "primary");
+        if (primary) primary.completed = true;
+        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      }
+      const head = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
+      if (head !== `ref: ${branchSwitchTarget}\n`) throw new JournalArbitrationDefer("symbolic HEAD changed after branch-switch commit");
+    } else if (opts.journal) {
+      const primary = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "primary");
+      if (primary) primary.completed = true;
+      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+    }
     if (postHeadLines.length) {
       // Git cannot prepare an update of HEAD's old referent while HEAD.lock is
       // held by the symref transaction. Keep this second expected-old commit
@@ -444,9 +592,28 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await postHeadTx.start();
       await postHeadTx.write("option no-deref");
       for (const line of postHeadLines) await postHeadTx.write(line);
+      if (opts.journal) {
+        const intent = await preparedTransactionIntent(ctx, "post-head", await postHeadTx.processId(), postHeadLines, false);
+        opts.journal.value.expectedNew.preparedTransactions = [
+          ...(opts.journal.value.expectedNew.preparedTransactions ?? []).filter((entry) => entry.id !== "post-head"),
+          intent,
+        ];
+        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      }
       await postHeadTx.prepare();
+      await opts.afterPrepareChild?.(await postHeadTx.processId(), "post-head");
+      if (opts.journal) {
+        const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
+        if (intent) await observePreparedLockTokens(intent);
+        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      }
       await postHeadTx.commit();
       postHeadTx = undefined;
+      if (opts.journal) {
+        const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
+        if (intent) intent.completed = true;
+        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      }
     }
     try { opts.crashAt?.("after-ref-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
     try { opts.crashAt?.("before-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
@@ -463,6 +630,10 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     try { opts.crashAt?.("after-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
     await restoreOpStateWithCrash(ctx, plan.opState, opts.crashAt);
+    await headHandle?.close();
+    headHandle = undefined;
+    if (headToken) await fs.rm(headToken.path, { force: true });
+    headToken = undefined;
     for (const handle of reservationHandles) await handle.close();
     reservationHandles.length = 0;
     for (const token of reservationTokens) await fs.rm(token.path, { force: true });
@@ -474,19 +645,25 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await postHeadTx?.abort().catch(() => {});
       await indexHandle?.close().catch(() => {});
       if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+      await headHandle?.close().catch(() => {});
+      if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
       for (const handle of reservationHandles) await handle.close().catch(() => {});
       for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
       if (error instanceof InjectedCheckoutCrash) throw error.cause;
-      return { status: "defer", reason: error instanceof Error ? error.message : "checkout transaction failed" };
+      const reason = error instanceof Error ? error.message : "checkout transaction failed";
+      return await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
     // After ref commit, never call unconditional restoreLocal (r2 F4). The
     // durable journal's old/new arbitration is the only repair authority.
     await indexHandle?.close().catch(() => {});
     await postHeadTx?.abort().catch(() => {});
     if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+    await headHandle?.close().catch(() => {});
+    if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
     for (const handle of reservationHandles) await handle.close().catch(() => {});
     for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
     if (error instanceof InjectedCheckoutCrash) throw error.cause;
+    if (error instanceof JournalArbitrationDefer) return { status: "defer", reason: error.message, journalIntact: true };
     throw error;
   } finally {
     await fs.rm(staged, { force: true }).catch(() => {});
@@ -496,3 +673,5 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
 class InjectedCheckoutCrash extends Error {
   constructor(readonly cause: unknown) { super("injected checkout crash"); }
 }
+
+class JournalArbitrationDefer extends Error {}

@@ -6,7 +6,7 @@ import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type S
 import { savePublishedRepoIntent } from "../sync-state.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection, gitIncomingKey } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
@@ -243,17 +243,18 @@ export async function planGitSections(
         recoveryBlocked.set(rel, "published checkout journal awaits non-degraded state save");
         continue;
       }
-      const before = repoRecordsForState(state)[rel];
-      const alreadyApplied = before?.base !== undefined
-        && gitIncomingKey(before.base) === recovery.incomingKey
-        && before.pending === undefined;
-      if (!alreadyApplied) state = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+      const published = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+      state = published.state;
       const record = repoRecordsForState(state)[rel];
       if (record?.base) base[rel] = record.base; else delete base[rel];
       if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
       if (record?.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
       if (record?.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
-      await clearFollowJournal(root, rel);
+      if (published.disposition === "landed"
+        || published.disposition === "already-semantic"
+        || published.disposition === "superseded") {
+        await clearFollowJournal(root, rel);
+      }
       glog(`git-sync recovered published checkout ${rel} before capture`);
     } else if (recovery.status === "defer") {
       recoveryBlocked.set(rel, recovery.reason);

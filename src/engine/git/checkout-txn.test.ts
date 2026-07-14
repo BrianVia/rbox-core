@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { promisify } from "node:util";
 import {
   checkoutTransactionSupported,
   commitCheckout,
+  ownershipAwareGitBusy,
   resetCheckoutCapabilityProbeCacheForTests,
   type CheckoutPlan,
 } from "./checkout-txn.js";
@@ -82,6 +84,46 @@ function plan(candidateIndexPath: string, overrides: Partial<CheckoutPlan> = {})
 const supported = async () => true;
 const proof = async () => true;
 
+async function checkoutJournal(expectedHead = "ref: refs/heads/main\n"): Promise<{ binding: CheckoutJournalBinding; journal: CheckoutJournal<{ snapshot: string }> }> {
+  const binding: CheckoutJournalBinding = {
+    stream: "test-stream",
+    stateNonce: "test-nonce",
+    gitDirReal: await fs.realpath(ctx.gitDir),
+    commonDirReal: await fs.realpath(ctx.commonDir),
+    worktreeId: "main",
+  };
+  const journal: CheckoutJournal<{ snapshot: string }> = {
+    phase: "intent",
+    incomingKey: "incoming",
+    incomingSection: {
+      bundleSha: "a".repeat(64),
+      bundleEncSha: "b".repeat(64),
+      bundleCipherSize: 1,
+      head: expectedHead,
+      refs: { "refs/heads/main": newOid },
+      refScope: "all",
+      generatedAt: new Date(0).toISOString(),
+    },
+    old: {
+      currentRefName: "refs/heads/main",
+      currentRefOid: oldOid,
+      headContent: "ref: refs/heads/main\n",
+      indexPresent: true,
+      opState: {},
+    },
+    expectedNew: {
+      opState: {},
+      refs: { "refs/heads/main": newOid },
+      head: expectedHead,
+    },
+    binding,
+    createdFresh: false,
+    intended: { snapshot: "new" },
+  };
+  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
+  return { binding, journal };
+}
+
 test("design 116 checkout transaction commits an attached branch and candidate index", async () => {
   const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), { capabilityProbe: supported, secondProof: proof });
 
@@ -90,6 +132,18 @@ test("design 116 checkout transaction commits an attached branch and candidate i
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(newOid);
   expect(await git(repo, "write-tree")).toBe(await git(repo, "rev-parse", `${newOid}^{tree}`));
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).not.toEqual(oldIndex);
+});
+
+test("index-only checkout reserves unchanged symbolic HEAD with symref-verify", async () => {
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refUpdates: [],
+    plannedGraphRoots: [oldOid, newOid],
+  }), { capabilityProbe: supported, secondProof: proof });
+
+  expect(result.status).toBe("committed");
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect(await git(repo, "write-tree")).toBe(await git(repo, "rev-parse", `${newOid}^{tree}`));
 });
 
 test("design 116 checkout transaction commits detached HEAD", async () => {
@@ -118,6 +172,27 @@ test("design 116 checkout transaction switches symbolic HEAD between branches", 
   expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/feature");
   expect(await git(repo, "rev-parse", "HEAD")).toBe(newOid);
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+});
+
+test("branch switch holds its HEAD reservation across the old-referent transaction", async () => {
+  await git(repo, "branch", "feature", newOid);
+  let sawHeadReservation = false;
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refUpdates: [],
+    postHeadRefUpdates: [{ kind: "update", ref: "refs/heads/main", newOid, oldOid }],
+    head: { kind: "symbolic", newTarget: "refs/heads/feature", oldTarget: "refs/heads/main" },
+  }), {
+    capabilityProbe: supported,
+    secondProof: proof,
+    crashAt: (point) => {
+      if (point === "after-ref-commit") sawHeadReservation = existsSync(path.join(ctx.gitDir, "HEAD.lock"));
+    },
+  });
+
+  expect(result.status).toBe("committed");
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/feature");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(newOid);
+  expect(sawHeadReservation).toBe(true);
 });
 
 test("expected-old mismatch aborts without refs, index, or lock residue", async () => {
@@ -152,42 +227,7 @@ test("second-proof failure aborts the prepared transaction and owned index lock"
 
 test("ref-commit crash leaves pinned transient and journal recovery restores old coherence", async () => {
   const candidate = await candidateFor(newOid);
-  const binding: CheckoutJournalBinding = {
-    stream: "test-stream",
-    stateNonce: "test-nonce",
-    gitDirReal: await fs.realpath(ctx.gitDir),
-    commonDirReal: await fs.realpath(ctx.commonDir),
-    worktreeId: "main",
-  };
-  const journal: CheckoutJournal<{ snapshot: string }> = {
-    phase: "intent",
-    incomingKey: "incoming",
-    incomingSection: {
-      bundleSha: "a".repeat(64),
-      bundleEncSha: "b".repeat(64),
-      bundleCipherSize: 1,
-      head: "ref: refs/heads/main\n",
-      refs: { "refs/heads/main": newOid },
-      refScope: "all",
-      generatedAt: new Date(0).toISOString(),
-    },
-    old: {
-      currentRefName: "refs/heads/main",
-      currentRefOid: oldOid,
-      headContent: "ref: refs/heads/main\n",
-      indexPresent: true,
-      opState: {},
-    },
-    expectedNew: {
-      opState: {},
-      refs: { "refs/heads/main": newOid },
-      head: "ref: refs/heads/main\n",
-    },
-    binding,
-    createdFresh: false,
-    intended: { snapshot: "new" },
-  };
-  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
+  const { binding, journal } = await checkoutJournal();
 
   await expect(commitCheckout(ctx, plan(candidate), {
     capabilityProbe: supported,
@@ -205,6 +245,79 @@ test("ref-commit crash leaves pinned transient and journal recovery restores old
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
   expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+});
+
+test("SIGKILL after prepare leaves a journal-owned defer and recovery removes exactly the prepared locks", async () => {
+  await git(repo, "tag", "packed", oldOid);
+  await git(repo, "pack-refs", "--all");
+  const { binding, journal } = await checkoutJournal();
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refUpdates: [
+      { kind: "update", ref: "refs/heads/main", newOid, oldOid },
+      { kind: "delete", ref: "refs/tags/packed", oldOid },
+    ],
+  }), {
+    capabilityProbe: supported,
+    secondProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    afterPrepareChild: (pid, transaction) => {
+      if (transaction === "primary") process.kill(pid, "SIGKILL");
+    },
+  });
+
+  expect(result).toEqual({ status: "defer", reason: expect.any(String), journalIntact: true });
+  expect(journal.expectedNew.preparedTransactions?.[0]?.locks.map((lock) => path.basename(lock.path))).toContain("packed-refs.lock");
+  expect(await fs.access(path.join(ctx.gitDir, "HEAD.lock")).then(() => true, () => false)).toBe(true);
+  expect(await fs.access(path.join(ctx.commonDir, "refs/heads/main.lock")).then(() => true, () => false)).toBe(true);
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
+  expect(await ownershipAwareGitBusy(ctx, [])).toBe(false);
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+});
+
+test("prepared-lock recovery removes owned locks but preserves a replaced foreign lock", async () => {
+  const { binding, journal } = await checkoutJournal();
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), {
+    capabilityProbe: supported,
+    secondProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    afterPrepareChild: (pid, transaction) => {
+      if (transaction === "primary") process.kill(pid, "SIGKILL");
+    },
+  });
+  expect(result.status).toBe("defer");
+
+  const foreign = path.join(ctx.gitDir, "HEAD.lock");
+  await fs.rm(foreign, { force: true });
+  await fs.writeFile(foreign, "foreign lock\n");
+  const recovery = await recoverJournal(root, "repo", binding);
+  expect(recovery.status).toBe("human-intervened");
+  expect(await fs.readFile(foreign, "utf8")).toBe("foreign lock\n");
+  await expect(fs.access(path.join(ctx.commonDir, "refs/heads/main.lock"))).rejects.toThrow();
+});
+
+test("branch-switch HEAD gap arbitration preserves a human HEAD move", async () => {
+  await git(repo, "branch", "feature", newOid);
+  await git(repo, "branch", "human", oldOid);
+  const { binding, journal } = await checkoutJournal("ref: refs/heads/feature\n");
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refUpdates: [],
+    postHeadRefUpdates: [{ kind: "update", ref: "refs/heads/main", newOid, oldOid }],
+    head: { kind: "symbolic", newTarget: "refs/heads/feature", oldTarget: "refs/heads/main" },
+  }), {
+    capabilityProbe: supported,
+    secondProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    crashAt: (point) => {
+      if (point === "after-head-commit") execFileSync("git", ["-C", repo, "symbolic-ref", "HEAD", "refs/heads/human"], { env: cleanEnv() });
+    },
+  });
+
+  expect(result).toEqual({ status: "defer", reason: "symbolic HEAD changed after branch-switch commit", journalIntact: true });
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/human");
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("human-intervened");
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/human");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
 });
 
 test("the held index.lock rejects a concurrent git add before ref commit", async () => {

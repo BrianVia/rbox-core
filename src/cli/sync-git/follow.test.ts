@@ -12,7 +12,9 @@ import {
   hashBytes,
   indexIdentityV2,
   oracleFromState,
+  probeReceiverEquivalence,
   resetCheckoutCapabilityProbeCacheForTests,
+  setReceiverEquivalenceProbeForTests,
   type AppliedManifestOracle,
   type GitSection,
   type Manifest,
@@ -24,11 +26,20 @@ import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { checkoutJournalBinding, FollowCrashInjectedError, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
 import { planGitSections } from "./plan.js";
-import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled } from "./shared.js";
+import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled, repoEquivalenceWarningLogged } from "./shared.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 19);
+
+const hostReceiverEquivalence = await (async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-equivalence-"));
+  try {
+    return await probeReceiverEquivalence(root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+})();
 
 let tmp: string;
 let sender: string;
@@ -70,9 +81,11 @@ afterEach(async () => {
   if (priorGitFollow === undefined) delete process.env.RBOX_GIT_FOLLOW;
   else process.env.RBOX_GIT_FOLLOW = priorGitFollow;
   resetCheckoutCapabilityProbeCacheForTests();
+  setReceiverEquivalenceProbeForTests(undefined);
   configOwnershipSkipLogged.clear();
   configInvalidSkipLogged.clear();
   configCredentialSkipLogged.clear();
+  repoEquivalenceWarningLogged.clear();
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -319,6 +332,52 @@ test("disposition: receiver-only current commit defers local-commits", async () 
   expect(outcome.partial?.repo?.appliedRefs["refs/heads/incoming-side"]).toBeDefined();
 });
 
+test("R2-2 invalidated partial ref moved back to base is held, never republished", async () => {
+  const c1 = await commit("one\n", "c1");
+  await commit("two\n", "c2");
+  await git(sender, "branch", "side", c1);
+  const base = await capture();
+  await materialize(base);
+  await commit("three\n", "c3");
+  await git(sender, "branch", "-f", "side", await git(sender, "rev-parse", "main"));
+  const incoming = await capture();
+  const state = stateWith(base);
+  await saveState(workspace, state);
+
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "human first episode\n");
+  const mismatch: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    reproveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    receiptHash: () => undefined,
+  };
+  const first = await applyIncoming(state, incoming, mismatch);
+  const incomingSide = incoming.refs["refs/heads/side"]!;
+  const baseSide = base.refs["refs/heads/side"]!;
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingSide);
+  expect(first.outcome.partial?.repo?.appliedRefs["refs/heads/side"]).toEqual({ kind: "direct", oid: incomingSide });
+  const saved = await saveStateSource(workspace, state, {
+    expectedStream: "test-stream",
+    sourceGlobalSeq: 2,
+    observedRepos: ["repo"],
+    values: {
+      bases: first.outcome.gitRepos,
+      pending: first.outcome.gitPendingRemote,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), first.outcome.deferrals),
+      partial: first.outcome.partial,
+      idxProj: first.outcome.idxProj,
+    },
+  });
+
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await git(receiver, "update-ref", "refs/heads/side", baseSide, incomingSide);
+  const retry = await applyIncoming(saved, incoming);
+
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(baseSide);
+  expect(retry.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(retry.outcome.partial?.repo?.heldRefs["refs/heads/side"]).toBe("local-commits");
+  expect(retry.outcome.deferrals?.repo?.apply?.reason).toBe("local-commits");
+});
+
 test("disposition: receiver-only non-current branch is held while checkout follows", async () => {
   const { state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
@@ -475,13 +534,16 @@ test("flag zero keeps the legacy conflict checkpoint; invalid values stay on", a
   expect(on.outcome.gitNeedsResolution?.repo).toBeUndefined();
 });
 
-test("unsupported checkout capability keeps legacy disposition with typed visibility", async () => {
+test("unsupported checkout capability defers without creating a legacy checkpoint", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
   await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const unsupported = { ...incoming, refs: { ...incoming.refs, "refs/heads/unsupported-safe": incoming.refs["refs/heads/main"]! } };
   const { outcome } = await applyIncoming(state, unsupported, matchingOracle, { capabilityProbe: async () => false });
-  expect(outcome.gitNeedsResolution?.repo).toBeDefined();
+  expect(outcome.gitNeedsResolution?.repo).toBeUndefined();
+  expect(outcome.gitRepos?.repo).toEqual(state.lastSyncedManifest.gitRepos?.repo);
+  expect(outcome.gitPendingRemote?.repo).toEqual(unsupported);
+  expect(outcome.partial?.repo?.checkoutPending).toBe(true);
   expect(outcome.deferrals?.repo?.apply?.reason).toBe("unsupported");
   expect(await git(receiver, "rev-parse", "refs/heads/unsupported-safe")).toBe(unsupported.refs["refs/heads/unsupported-safe"]);
 });
@@ -862,12 +924,13 @@ test("published partial recovery is idempotent after a branch-switch hold", asyn
   expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBe(landedGen);
 });
 
-test("clean apply clears a stale index cache before the next contained follow", async () => {
+test("steady base-clean follow repairs a stale index cache before the next contained follow", async () => {
   const { base, state, incoming } = await baseAndIncoming();
   state.repoRecords!.repo!.idxProj = "v2:stale-cache";
   await saveState(workspace, state);
   const clean = await applyIncoming(state, incoming);
-  expect(clean.outcome.idxProj?.repo).toBeNull();
+  expect(clean.logs).toContain("git-sync followed repo");
+  expect(clean.outcome.idxProj?.repo).toStartWith("v2:");
   const saved = await saveStateSource(workspace, state, {
     expectedStream: "test-stream",
     sourceGlobalSeq: 2,
@@ -882,4 +945,94 @@ test("clean apply clears a stale index cache before the next contained follow", 
   const followed = await applyIncoming(saved, newer, matchingOracle, { sourceGlobalSeq: 3 });
   expect(followed.logs).toContain("git-sync followed repo");
   expect(followed.outcome.deferrals?.repo?.apply?.reason).not.toBe("local-index");
+});
+
+async function captureWithLiteralIndexTwins(first: string, second: string): Promise<GitSection> {
+  const parent = await git(sender, "rev-parse", "HEAD");
+  await fs.writeFile(path.join(sender, "blob-source"), "same bytes\n");
+  const blob = await git(sender, "hash-object", "-w", "blob-source");
+  await git(sender, "read-tree", "--empty");
+  await git(sender, "update-index", "--add", "--cacheinfo", "100644", blob, first);
+  await git(sender, "update-index", "--add", "--cacheinfo", "100644", blob, second);
+  const tree = await git(sender, "write-tree");
+  const commitOid = await git(sender, "commit-tree", tree, "-p", parent, "-m", "literal index twins");
+  await git(sender, "update-ref", "refs/heads/main", commitOid, parent);
+  return capture();
+}
+
+test("R2-9: injected NFC receiver equivalence rejects an incoming index with NFC/NFD literal twins", async () => {
+  await commit("base\n", "base");
+  const base = await capture();
+  await materialize(base);
+  const incoming = await captureWithLiteralIndexTwins("é.txt", "e\u0301.txt");
+  setReceiverEquivalenceProbeForTests(async () => ({ caseAliases: false, unicodeAliases: true }));
+
+  const { outcome, logs } = await applyIncoming(stateWith(base), incoming);
+
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+  expect(logs.some((line) => line.includes("incoming index has receiver-equivalent paths"))).toBe(true);
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(base.refs["refs/heads/main"]);
+});
+
+test.skipIf(!hostReceiverEquivalence.caseAliases)("R2-9: actual case-aliasing receiver rejects a case-colliding incoming index", async () => {
+  await commit("base\n", "base");
+  const base = await capture();
+  await materialize(base);
+  const incoming = await captureWithLiteralIndexTwins("Case.txt", "case.txt");
+
+  const { outcome } = await applyIncoming(stateWith(base), incoming);
+
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+});
+
+test("R2-10: NFC/NFD-twin repo keys are all deferred before either target mutates", async () => {
+  await commit("base\n", "base");
+  const section = await capture();
+  const first = "repos/é";
+  const second = "repos/e\u0301";
+  const logs: string[] = [];
+  const remote: Manifest = {
+    generatedAt: "",
+    files: [],
+    manifestSchema: 2,
+    gitRepos: { [first]: section, [second]: section },
+  };
+
+  const outcome = await applyGitSections(workspace, cfg, stateWith(), remote, store, buildIgnoreMatcher(workspace), (line) => logs.push(line));
+
+  expect(outcome.gitPendingRemote?.[first]).toEqual(section);
+  expect(outcome.gitPendingRemote?.[second]).toEqual(section);
+  expect(outcome.deferrals?.[first]?.apply?.reason).toBe("unreadable");
+  expect(outcome.deferrals?.[second]?.apply?.reason).toBe("unreadable");
+  expect(logs.filter((line) => line.includes("receiver-equivalent Git repo keys"))).toHaveLength(1);
+  await applyGitSections(workspace, cfg, stateWith(), remote, store, buildIgnoreMatcher(workspace), (line) => logs.push(line));
+  expect(logs.filter((line) => line.includes("receiver-equivalent Git repo keys"))).toHaveLength(1);
+  await expect(fs.lstat(path.join(workspace, first, ".git"))).rejects.toThrow();
+  await expect(fs.lstat(path.join(workspace, second, ".git"))).rejects.toThrow();
+});
+
+test("R2-11: refname alias group is held while an unrelated checkout follows", async () => {
+  await commit("base\n", "base");
+  await git(sender, "branch", "Foo");
+  const base = await capture();
+  await materialize(base);
+  const sibling = path.join(tmp, "sibling-Foo");
+  await git(receiver, "worktree", "add", sibling, "Foo");
+  await git(sender, "branch", "foo");
+  await git(sender, "branch", "-D", "Foo");
+  await commit("incoming\n", "advance unrelated main");
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "incoming\n");
+
+  const { outcome, logs } = await applyIncoming(stateWith(base), incoming);
+
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
+  expect(await git(receiver, "rev-parse", "refs/heads/Foo")).toBe(base.refs["refs/heads/Foo"]);
+  await expect(git(receiver, "rev-parse", "--verify", "refs/heads/foo")).rejects.toThrow();
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(outcome.partial?.repo?.heldRefs["refs/heads/Foo"]).toBe("ownership");
+  expect(outcome.partial?.repo?.heldRefs["refs/heads/foo"]).toBe("ownership");
+  expect(logs.some((line) => line.includes("receiver-equivalent Git refnames held"))).toBe(true);
 });

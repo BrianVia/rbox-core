@@ -13,6 +13,9 @@ import {
   noDropProof,
   prepareDisplacedRefPins,
   prepareKeepPins,
+  probeReceiverEquivalence,
+  receiverEquivalentCollisionNames,
+  receiverEquivalentPath,
   recoverJournal,
   tipOwnedByIncoming,
   validateGitSection,
@@ -34,6 +37,7 @@ import {
   clearIndexResolveUndo,
   getGitArtifact,
   git,
+  gitWithIndexFile,
   headBranchOf,
   importGitPackChain,
   repoCtx,
@@ -48,6 +52,7 @@ import type {
 import { gitIncomingKey } from "./shared.js";
 
 const ZERO_OID = "0".repeat(40);
+const refEquivalenceWarnings = new Set<string>();
 
 export type FollowCrashPoint =
   | "after-safe-refs"
@@ -109,6 +114,8 @@ export interface FollowOptions {
   chainTimings?: GitChainTimings;
   capabilityProbe?: CheckoutCapabilityProbe;
   crashAt?: (point: FollowCrashPoint) => void;
+  /** Loud receiver-ambiguity diagnostics supplied by pull orchestration. */
+  log?: (line: string) => void;
   /** A D2 applied-ref marker failed exact revalidation; human movement wins. */
   forcedHeldRefs?: GitPartialApply["heldRefs"];
   /** D6's explicit, snapshot-confirmed authorization. Automatic follow keeps
@@ -123,6 +130,19 @@ export interface FollowOptions {
     protectedOids: readonly string[];
     secondProof: (authoredRefChanges: readonly { ref: string; before?: string; after?: string }[]) => Promise<boolean>;
   };
+}
+
+async function candidateIndexCollision(workspaceRoot: string, repoDir: string, indexPath: string): Promise<string | undefined> {
+  const equivalence = await probeReceiverEquivalence(workspaceRoot);
+  if (!equivalence.caseAliases && !equivalence.unicodeAliases) return undefined;
+  const raw = await gitWithIndexFile(repoDir, indexPath, ["ls-files", "-z", "--stage"]);
+  const names = new Set(raw.split("\0").filter(Boolean).map((record) => {
+    const tab = record.indexOf("\t");
+    if (tab < 0) throw new Error("candidate index ls-files record lacks pathname");
+    return record.slice(tab + 1);
+  }));
+  const collisions = receiverEquivalentCollisionNames(names, (name) => receiverEquivalentPath(name, equivalence));
+  return collisions.size > 0 ? [...collisions].sort().join(", ") : undefined;
 }
 
 export interface StagedIncoming {
@@ -452,6 +472,19 @@ async function publishRefPlane(
   const authoredRefChanges: Array<{ ref: string; before?: string; after?: string }> = [];
   const manualProtected = new Set(opts.manualResolution?.protectedOids ?? []);
   const incomingHeadRef = headBranchOf(opts.incoming.head);
+  const ambiguousRefs = receiverEquivalentCollisionNames([
+    ...Object.keys(effective.refs),
+    ...Object.keys(live.refs),
+    ...owned.keys(),
+  ]);
+  if (ambiguousRefs.size > 0 && !refEquivalenceWarnings.has(opts.workspaceRoot)) {
+    refEquivalenceWarnings.add(opts.workspaceRoot);
+    opts.log?.(`git-sync WARNING: receiver-equivalent Git refnames held in ${opts.relPath}: ${[...ambiguousRefs].sort().join(", ")}`);
+  }
+  if ((live.currentRef && ambiguousRefs.has(live.currentRef)) || (incomingHeadRef && ambiguousRefs.has(incomingHeadRef))) {
+    checkoutRefReason = "unreadable";
+    checkoutRefDetail = "checkout ref belongs to an ambiguous receiver-equivalence group";
+  }
   if (incomingHeadRef && owned.has(incomingHeadRef)) {
     checkoutRefReason = "worktree-ownership";
     checkoutRefDetail = `branch ${incomingHeadRef.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(incomingHeadRef)}`;
@@ -460,6 +493,7 @@ async function publishRefPlane(
   if (effective.deleteAbsent) for (const ref of Object.keys(live.refs)) candidates.add(ref);
 
   const classifiedHolds = new Map<string, GitPartialApply["heldRefs"][string]>();
+  for (const ref of candidates) if (ambiguousRefs.has(ref)) classifiedHolds.set(ref, "ownership");
   const protectedByRef = new Map<string, string[]>();
   for (const ref of candidates) {
     if (ref === live.currentRef) continue;
@@ -530,22 +564,37 @@ async function publishRefPlane(
     if (ref === live.currentRef) continue; // current branch belongs to checkout txn.
     const oldOid = live.refs[ref];
     const newOid = effective.refs[ref];
+    const hold = classifiedHolds.get(ref);
+    if (hold) {
+      heldRefs[ref] = hold;
+      if (opts.manualResolution) checkoutRefReason ??= hold === "ownership" ? "worktree-ownership" : hold;
+      if (ref === incomingHeadRef) checkoutRefReason = ambiguousRefs.has(ref)
+        ? "unreadable"
+        : hold === "ownership" ? "worktree-ownership" : hold;
+      continue;
+    }
     if (oldOid === newOid) {
       if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
       if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
       continue;
     }
-    const hold = classifiedHolds.get(ref);
-    if (hold) {
-      heldRefs[ref] = hold;
-      if (opts.manualResolution) checkoutRefReason ??= hold === "ownership" ? "worktree-ownership" : hold;
-      if (ref === incomingHeadRef) checkoutRefReason = hold === "ownership" ? "worktree-ownership" : hold;
-      continue;
-    }
     try {
-      if ((await branchesCheckedOutElsewhere(opts.ctx)).has(ref)) {
+      const ownedNow = await branchesCheckedOutElsewhere(opts.ctx);
+      const liveNow = await readAllRefs(opts.ctx.repoDir);
+      const ambiguousNow = receiverEquivalentCollisionNames([
+        ...Object.keys(effective.refs),
+        ...Object.keys(liveNow),
+        ...ownedNow.keys(),
+      ]);
+      if (ambiguousNow.has(ref)) {
         heldRefs[ref] = "ownership";
-        const sibling = (await branchesCheckedOutElsewhere(opts.ctx)).get(ref);
+        checkoutRefDetail ??= "ref belongs to an ambiguous receiver-equivalence group";
+        if (opts.manualResolution || ref === incomingHeadRef) checkoutRefReason = "unreadable";
+        continue;
+      }
+      if (ownedNow.has(ref)) {
+        heldRefs[ref] = "ownership";
+        const sibling = ownedNow.get(ref);
         checkoutRefDetail ??= `branch ${ref.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${sibling}`;
         if (opts.manualResolution || ref === incomingHeadRef) checkoutRefReason = "worktree-ownership";
         continue;
@@ -632,12 +681,28 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
   }
 
   try {
+    if (staged.candidateIndex) {
+      try {
+        const collision = await candidateIndexCollision(opts.workspaceRoot, opts.ctx.repoDir, staged.candidateIndex);
+        if (collision) {
+          opts.log?.(`git-sync WARNING ${opts.relPath}: incoming index has receiver-equivalent paths (${collision})`);
+          return { status: "defer", reason: "unreadable", detail: "incoming index has receiver path-equivalence collision", ...emptyProgress };
+        }
+      } catch {
+        return { status: "defer", reason: "unreadable", detail: "incoming index receiver-equivalence check failed", ...emptyProgress };
+      }
+    }
     const liveBefore = await readLive(opts.ctx);
     if (!liveBefore) return { status: "defer", reason: "unreadable", detail: "git metadata could not be read", ...emptyProgress };
     const baseProjection = opts.record?.idxProj ?? await deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined);
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
     const roots = incomingOwnershipRoots(ownershipSection, { prefix: staged.incomingNs, opState: staged.opBytes });
+    // R2-3 adjudication: safe-ref publication intentionally precedes the state
+    // save. A crash/republication reaches the same design-LWW outcome; the
+    // displaced value is incoming-owned, remains reachable, and the design's
+    // idempotency clause covers the retry. Do not move this behind the checkout
+    // journal absent a new normative design change.
     const refProgress = await publishRefPlane(opts, liveBefore, roots);
     const progress: FollowProgress = {
       appliedRefs: refProgress.appliedRefs,
@@ -651,11 +716,14 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
 
     // The design kill switch disables oracle-authorized checkout only. Safe
     // refs/config and their partial markers remain active in both flag arms.
+    // R2-7 adjudication preserves design 43 [v2,M2] here: exact =0 keeps the
+    // legacy conflict-checkpoint disposition; only capability unsupported is
+    // converted to a typed retryable defer below.
     if (!opts.followEnabled && !opts.manualResolution) return { status: "legacy", reason: "conflict", detail: "automatic checkout follow disabled", ...progress };
     const capabilitySupported = opts.capabilityProbe
       ? await opts.capabilityProbe(await git(opts.ctx.repoDir, ["--version"]))
       : await checkoutTransactionSupported(opts.ctx.repoDir);
-    if (!capabilitySupported) return { status: "legacy", reason: "unsupported", detail: "git lacks prepared transactional symref-update", ...progress };
+    if (!capabilitySupported) return { status: "defer", reason: "unsupported", detail: "git lacks prepared transactional symref-update", ...progress };
 
     // Scratch refs and held incoming values are not durable roots. Authorize
     // checkout only from incoming refs that are already published (plus the
@@ -863,13 +931,15 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       crashAt: (point) => opts.crashAt?.(point),
     });
     if (result.status !== "committed") {
-      await clearCheckoutJournal(opts.workspaceRoot, opts.relPath);
+      // A dead prepared child or post-symref HEAD arbitration can leave locks
+      // and/or committed checkout fields that only intent recovery may touch.
+      if (result.status !== "defer" || !result.journalIntact) await clearCheckoutJournal(opts.workspaceRoot, opts.relPath);
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
         : /connectivity/.test(result.reason) ? "artifact"
         : boundaryFailure?.reason ?? "other";
       return {
-        status: result.status === "unsupported" ? "legacy" : "defer",
+        status: "defer",
         reason,
         detail: boundaryFailure?.detail ?? result.reason,
         ...progress,

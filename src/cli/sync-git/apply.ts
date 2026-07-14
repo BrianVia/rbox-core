@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, isGitBusy, preserveGitConflict, quarantineAndWipeGitState, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
@@ -8,7 +8,7 @@ import { git } from "../../engine/git/shared.js";
 import { expectedStateNonce, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, savePublishedRepoIntent, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
 import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
-import { configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral } from "./shared.js";
+import { configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged } from "./shared.js";
 import { gitConfigHash, sameConfigShape, configReceiver } from "./config-lane.js";
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
@@ -163,11 +163,12 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
  *    (§13.5), then clear pending ([v6] absence supersedes pending), record a removal
  *    memory when the local `.git` survives, drop the base entry — NEVER touch local .git.
  *  - unchanged (projected onto the narrower scope) → base advances, no apply.
- *  - local diverged from base → per-repo CONFLICT: preserve remote, checkpoint base to
- *    remote, record `needsResolution` with the conflict-time local identity [v2, M2].
- *  - clean → applyGitState (containment + ignored-subtree refusal BEFORE any mutation);
- *    a removal-memory-matching leftover is treated as ABSENT → clean materialization
- *    (dir: quarantine + ref-wipe first; pointer: NEVER ref-wipe — guarded update-only).
+ *  - existing usable steady receiver + remote change → design-116 follow pipeline
+ *    (oracle, classifier, safe-ref plane, journaled checkout transaction), including
+ *    metadata-base-clean receivers; legacy modes retain the conflict checkpoint.
+ *  - fresh targets and removal-memory clean-materialization wipes → applyGitState
+ *    (containment + ignored-subtree refusal BEFORE any mutation); dir leftovers
+ *    quarantine + ref-wipe first, pointer leftovers remain guarded update-only.
  *  - deferred apply → record `gitPendingRemote`; that repo's base does not advance;
  *    every other repo advances independently.
  */
@@ -225,6 +226,13 @@ opts: {
   });
   if (!cfg.syncGit) return pack();
   const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  // Logical repo keys must remain one-to-one with receiver targets even if this
+  // state later lands on an NFC/case-aliasing filesystem.
+  const collidingRepoKeys = receiverEquivalentCollisionNames(keys);
+  if (collidingRepoKeys.size > 0 && !repoEquivalenceWarningLogged.has(root)) {
+    repoEquivalenceWarningLogged.add(root);
+    glog(`git-sync WARNING: receiver-equivalent Git repo keys all deferred: ${[...collidingRepoKeys].sort().join(", ")}`);
+  }
   if (opts.collectMetrics) {
     commonDirGroups = new Map();
     metrics = {
@@ -428,15 +436,19 @@ opts: {
           glog(`git-sync deferred ${rel}: published checkout journal awaits non-degraded state save`);
           return { result: "deferred", commonDirGroup };
         }
-        const alreadyApplied = records[rel]?.base !== undefined
-          && gitIncomingKey(records[rel]!.base!) === recovery.incomingKey
-          && records[rel]?.pending === undefined;
-        if (!alreadyApplied) state = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+        const published = await savePublishedRepoIntent(root, state, rel, recovery.intended);
+        state = published.state;
         const recoveredRecord = repoRecordsForState(state)[rel];
         if (recoveredRecord) installRecoveredRecord(rel, recoveredRecord);
         baseSec = baseRepos[rel];
         pend = pending[rel];
-        await clearFollowJournal(root, rel, opts.crashAt);
+        // Every successful recovery result explicitly proves that the intent
+        // landed, was already semantically present, or lost to a newer episode.
+        if (published.disposition === "landed"
+          || published.disposition === "already-semantic"
+          || published.disposition === "superseded") {
+          await clearFollowJournal(root, rel, opts.crashAt);
+        }
         glog(`git-sync recovered published checkout ${rel}`);
       } else if (recovery.status === "defer") {
         if (remoteSec) {
@@ -760,6 +772,19 @@ opts: {
       }
     }
     const localDiverged = legacyDiverged || semanticIndexDiverged;
+    // Design 116 review R2-1/R2-2: a usable, already-materialized STEADY
+    // receiver always takes the oracle + journal follow pipeline when the
+    // remote changed, even when its Git metadata still equals the base.  That
+    // is what lets working-byte-only human dirt classify as local-edits, and an
+    // invalidated applied-ref marker must likewise reach the forced-hold plane
+    // instead of falling back through the base-clean shortcut.
+    const steadyFollowCtx = remoteChanged && baseSec && dotGit && !cleanMaterialize
+      && !opts.degradedMutex && opts.oracle && gitFollowEnabled()
+      ? await repoCtxFromDisk(repoDir).catch(() => undefined)
+      : undefined;
+    const routeThroughFollow = localDiverged || checkpointReproof
+      || Object.keys(forcedHeldRefs ?? {}).length > 0
+      || steadyFollowCtx !== undefined;
     const legacyConflict = async (reason: GitDeferralReason = "conflict", progress?: FollowProgress): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
       const { recoveryBundle } = await preserveGitConflict(repoDir, remoteSec, store, kek);
       const held = Object.keys(progress?.heldRefs ?? {}).length > 0;
@@ -785,7 +810,7 @@ opts: {
       glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
       return { result: "conflict", commonDirGroup };
     };
-    if (localDiverged || checkpointReproof) {
+    if (routeThroughFollow) {
       // Design-43 containment and ignored-target refusals remain ahead of every
       // artifact import or ref-plane mutation in the new diverged path.
       if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
@@ -799,7 +824,7 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
       if (recoveryConflict || opts.degradedMutex || !opts.oracle) return legacyConflict(opts.oracle ? "conflict" : "unsupported");
-      const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+      const ctx = steadyFollowCtx ?? await repoCtxFromDisk(repoDir).catch(() => undefined);
       if (!ctx) return legacyConflict("unreadable");
       const preflight = await gitPreflight(repoDir, ctx);
       if (!preflight.ok) {
@@ -885,12 +910,13 @@ opts: {
         chainTimings,
         capabilityProbe: opts.capabilityProbe,
         crashAt: opts.crashAt,
+        log: glog,
         forcedHeldRefs,
       });
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") return legacyConflict(follow.reason, follow);
       if (follow.status === "defer") {
-        if (checkpointReproof) {
+        if (checkpointReproof && follow.reason !== "unsupported") {
           pending[rel] = remoteSec;
           partial[rel] = {
             incomingKey: gitIncomingKey(remoteSec),
@@ -978,6 +1004,11 @@ opts: {
     // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
     // update-only apply is the whole treatment; the memory clears on success.
     const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
+    // Documented residual (design 116 review R2-1): genuinely fresh targets
+    // and clean-materialization wipes have no pre-existing checkout to
+    // clobber, so they remain on legacy applyGitState. Journal coverage for
+    // fresh/wipe materialization lands with the next design cycle. Degraded,
+    // flag-off, and no-oracle modes likewise retain their legacy path.
     const res = await applyGitState(
       repoDir,
       remoteSec,
@@ -1095,6 +1126,13 @@ opts: {
     let commonDirGroup: number | undefined;
     const chainTimings = metrics ? zeroGitChainTimings() : undefined;
     try {
+      if (collidingRepoKeys.has(rel)) {
+        const remoteSec = remote.gitRepos?.[rel];
+        if (remoteSec) pending[rel] = remoteSec;
+        setDeferral(rel, "apply", "unreadable", remoteSec ? gitIncomingKey(remoteSec) : undefined);
+        result = "deferred";
+        return;
+      }
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async () => {
         startedAt = Date.now();

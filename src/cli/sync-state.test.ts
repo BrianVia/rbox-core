@@ -117,15 +117,174 @@ describe("design 93 §6 transactional unit", () => {
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r", expectedRepoGen: 1, previousRecord: previous, record: intended,
     });
-    expect(recovered.repoRecords?.r).toMatchObject({
+    expect(recovered.disposition).toBe("superseded");
+    expect(recovered.state.repoRecords?.r).toMatchObject({
       repoGen: 3, sourceSeq: 2, base: section("next"), cfgApplied: "newer-config", idxProj: "next-index",
       deferrals: { capture },
     });
-    const repeated = await savePublishedRepoIntent(root, recovered, "r", {
+    const repeated = await savePublishedRepoIntent(root, recovered.state, "r", {
       relPath: "r", expectedRepoGen: 1, previousRecord: previous, record: intended,
     });
-    expect(repeated.repoRecords?.r?.repoGen).toBe(3);
-    expect(repeated.repoRecords?.r?.cfgApplied).toBe("newer-config");
+    expect(repeated.disposition).toBe("superseded");
+    expect(repeated.state.repoRecords?.r?.repoGen).toBe(3);
+    expect(repeated.state.repoRecords?.r?.cfgApplied).toBe("newer-config");
+  });
+
+  test("published checkpoint re-proof recovery lands non-base lane clears", async () => {
+    const conflict = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "conflict" as const,
+    };
+    const previous = {
+      sourceSeq: 4,
+      base: section("incoming"),
+      resolutionKey: "checkpoint",
+      deferrals: { apply: conflict },
+    };
+    const initial = baseState({ r: { repoGen: 3, ...previous } });
+    await saveState(root, initial);
+
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r",
+      expectedRepoGen: 3,
+      previousRecord: previous,
+      record: { sourceSeq: 4, base: section("incoming"), idxProj: "reproved" },
+    });
+
+    expect(recovered.disposition).toBe("landed");
+    expect(recovered.state.repoRecords?.r).toMatchObject({
+      repoGen: 4,
+      sourceSeq: 4,
+      base: section("incoming"),
+      idxProj: "reproved",
+    });
+    expect(recovered.state.repoRecords?.r?.resolutionKey).toBeUndefined();
+    expect(recovered.state.repoRecords?.r?.deferrals?.apply).toBeUndefined();
+
+    const repeated = await savePublishedRepoIntent(root, recovered.state, "r", {
+      relPath: "r",
+      expectedRepoGen: 3,
+      previousRecord: previous,
+      record: { sourceSeq: 4, base: section("incoming"), idxProj: "reproved" },
+    });
+    expect(repeated.disposition).toBe("already-semantic");
+    expect(repeated.state.repoRecords?.r?.repoGen).toBe(4);
+  });
+
+  test("published recovery treats lastSeen drift in the same episode as compatible", async () => {
+    const oldConflict = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "conflict" as const,
+    };
+    const refreshedConflict = { ...oldConflict, lastSeen: "2026-01-02T00:00:00.000Z" };
+    const previous = {
+      sourceSeq: 4,
+      base: section("incoming"),
+      resolutionKey: "checkpoint",
+      deferrals: { apply: oldConflict },
+    };
+    const initial = baseState({ r: { repoGen: 3, ...previous } });
+    const concurrent = baseState({
+      r: { ...previous, repoGen: 4, deferrals: { apply: refreshedConflict } },
+    });
+    await saveState(root, concurrent);
+
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r",
+      expectedRepoGen: 3,
+      previousRecord: previous,
+      record: { sourceSeq: 4, base: section("incoming"), idxProj: "reproved" },
+    });
+
+    expect(recovered.disposition).toBe("landed");
+    expect(recovered.state.repoRecords?.r?.repoGen).toBe(5);
+    expect(recovered.state.repoRecords?.r?.resolutionKey).toBeUndefined();
+    expect(recovered.state.repoRecords?.r?.deferrals?.apply).toBeUndefined();
+  });
+
+  test("published recovery applies a same-episode set without regressing refreshed lastSeen", async () => {
+    const previousDeferral = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      subjectKey: "incoming",
+      reason: "conflict" as const,
+    };
+    const refreshed = { ...previousDeferral, lastSeen: "2026-01-03T00:00:00.000Z" };
+    const intendedDeferral = { ...previousDeferral, lastSeen: "2026-01-02T00:00:00.000Z", reproof: true };
+    const previous = { sourceSeq: 4, base: section("incoming"), deferrals: { apply: previousDeferral } };
+    const initial = baseState({ r: { repoGen: 3, ...previous } });
+    const concurrent = baseState({ r: { repoGen: 4, sourceSeq: 4, base: section("incoming"), deferrals: { apply: refreshed } } });
+    await saveState(root, concurrent);
+
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r",
+      expectedRepoGen: 3,
+      previousRecord: previous,
+      record: { sourceSeq: 4, base: section("incoming"), deferrals: { apply: intendedDeferral } },
+    });
+
+    expect(recovered.disposition).toBe("landed");
+    expect(recovered.state.repoRecords?.r?.deferrals?.apply).toEqual({
+      ...intendedDeferral,
+      lastSeen: refreshed.lastSeen,
+    });
+  });
+
+  test("published recovery never regresses sourceSeq", async () => {
+    const previous = { sourceSeq: 2, base: section("old") };
+    const initial = baseState({ r: { repoGen: 1, ...previous } });
+    const concurrent = baseState({ r: { repoGen: 2, sourceSeq: 9, base: section("old") } });
+    concurrent.lastSyncedSequence = 9;
+    await saveState(root, concurrent);
+
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r",
+      expectedRepoGen: 1,
+      previousRecord: previous,
+      record: { sourceSeq: 3, base: section("next") },
+    });
+
+    expect(recovered.disposition).toBe("landed");
+    expect(recovered.state.repoRecords?.r).toMatchObject({ sourceSeq: 9, base: section("next") });
+  });
+
+  test("published recovery preserves and reports a genuinely different apply episode", async () => {
+    const previousDeferral = {
+      lane: "apply" as const,
+      deferredSince: "2026-01-01T00:00:00.000Z",
+      reasonSince: "2026-01-01T00:00:00.000Z",
+      lastSeen: "2026-01-01T00:00:00.000Z",
+      reason: "conflict" as const,
+    };
+    const newerEpisode = {
+      ...previousDeferral,
+      deferredSince: "2026-02-01T00:00:00.000Z",
+      reasonSince: "2026-02-01T00:00:00.000Z",
+      lastSeen: "2026-02-01T00:00:00.000Z",
+      reason: "local-edits" as const,
+    };
+    const previous = { sourceSeq: 4, base: section("old"), deferrals: { apply: previousDeferral } };
+    const initial = baseState({ r: { repoGen: 3, ...previous } });
+    const concurrent = baseState({ r: { repoGen: 4, sourceSeq: 4, base: section("old"), deferrals: { apply: newerEpisode } } });
+    await saveState(root, concurrent);
+
+    const recovered = await savePublishedRepoIntent(root, initial, "r", {
+      relPath: "r",
+      expectedRepoGen: 3,
+      previousRecord: previous,
+      record: { sourceSeq: 4, base: section("next") },
+    });
+
+    expect(recovered.disposition).toBe("superseded");
+    expect(recovered.state.repoRecords?.r).toEqual(concurrent.repoRecords?.r);
   });
 
   test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {

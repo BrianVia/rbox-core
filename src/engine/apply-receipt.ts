@@ -25,9 +25,17 @@ export interface AppliedManifestOracle {
   receiptHash(rel: string): string | undefined;
 }
 
-interface Equivalence {
+export interface ReceiverEquivalence {
   caseAliases: boolean;
   unicodeAliases: boolean;
+}
+
+export type ReceiverEquivalenceProbe = (root: string) => Promise<ReceiverEquivalence>;
+let injectedReceiverEquivalenceProbe: ReceiverEquivalenceProbe | undefined;
+
+/** Test seam shared by the manifest oracle and Git receiver-collision guards. */
+export function setReceiverEquivalenceProbeForTests(probe: ReceiverEquivalenceProbe | undefined): void {
+  injectedReceiverEquivalenceProbe = probe;
 }
 
 type TokenKind = "absent" | "file" | "dir" | "symlink" | "other";
@@ -160,18 +168,38 @@ function normalizeRel(rel: string): string | undefined {
   return rel;
 }
 
-function equivalentPart(value: string, eq: Equivalence): string {
+function equivalentPart(value: string, eq: ReceiverEquivalence): string {
   let result = value;
   if (eq.unicodeAliases) result = result.normalize("NFC");
   if (eq.caseAliases) result = result.toLowerCase();
   return result;
 }
 
-function equivalentPath(value: string, eq: Equivalence): string {
+export function receiverEquivalentPath(value: string, eq: ReceiverEquivalence): string {
   return value.split("/").map((part) => equivalentPart(part, eq)).join("/");
 }
 
-function inProjection(candidate: string, rel: string, eq: Equivalence): boolean {
+/** Repo targets and ref stores can alias independently of worktree behavior
+ * (for example packed versus loose refs, or state later moved to APFS). */
+export function conservativeReceiverEquivalentPath(value: string): string {
+  return value.split("/").map((part) => part.normalize("NFC").toLowerCase()).join("/");
+}
+
+export function receiverEquivalentCollisionNames(
+  names: Iterable<string>,
+  key: (value: string) => string = conservativeReceiverEquivalentPath,
+): Set<string> {
+  const groups = new Map<string, Set<string>>();
+  for (const name of names) {
+    const canonical = key(name);
+    const values = groups.get(canonical) ?? new Set<string>();
+    values.add(name);
+    groups.set(canonical, values);
+  }
+  return new Set([...groups.values()].filter((values) => values.size > 1).flatMap((values) => [...values]));
+}
+
+function inProjection(candidate: string, rel: string, eq: ReceiverEquivalence): boolean {
   if (rel === ".") return true;
   const c = candidate.split("/");
   const r = rel.split("/");
@@ -182,7 +210,7 @@ function inProjection(candidate: string, rel: string, eq: Equivalence): boolean 
   return true;
 }
 
-function hardExcluded(candidate: string, eq: Equivalence): boolean {
+function hardExcluded(candidate: string, eq: ReceiverEquivalence): boolean {
   const parts = candidate.replace(/\/+$/, "").split("/");
   if (parts.length > 0 && equivalentPart(parts[0]!, eq) === equivalentPart(".rbox", eq)) return true;
   return parts.some((part) => equivalentPart(part, eq) === equivalentPart(".git", eq));
@@ -213,13 +241,13 @@ type Alignment<T extends { path: string }, U extends { path: string }> =
 async function alignPaths<T extends { path: string }, U extends { path: string }>(
   left: T[],
   right: U[],
-  eq: Equivalence,
+  eq: ReceiverEquivalence,
   root: string,
 ): Promise<Alignment<T, U>> {
   const group = <V extends { path: string }>(entries: V[]): Map<string, V[]> => {
     const out = new Map<string, V[]>();
     for (const entry of entries) {
-      const key = equivalentPath(entry.path, eq);
+      const key = receiverEquivalentPath(entry.path, eq);
       const values = out.get(key) ?? [];
       values.push(entry);
       out.set(key, values);
@@ -252,7 +280,7 @@ async function alignPaths<T extends { path: string }, U extends { path: string }
   return samples.length > 0 ? { kind: "mismatch", sample: samples.slice(0, MAX_SAMPLE) } : { kind: "match", pairs };
 }
 
-async function compareEntries(left: FileEntry[], right: FileEntry[], eq: Equivalence, root: string): Promise<OracleVerdict> {
+async function compareEntries(left: FileEntry[], right: FileEntry[], eq: ReceiverEquivalence, root: string): Promise<OracleVerdict> {
   const aligned = await alignPaths(left, right, eq, root);
   if (aligned.kind === "indeterminate") return aligned;
   if (aligned.kind === "mismatch") return { kind: "mismatch", sample: aligned.sample };
@@ -260,7 +288,7 @@ async function compareEntries(left: FileEntry[], right: FileEntry[], eq: Equival
   return samples.length > 0 ? mismatch(samples) : MATCH;
 }
 
-async function probeEquivalence(root: string): Promise<Equivalence> {
+async function defaultReceiverEquivalenceProbe(root: string): Promise<ReceiverEquivalence> {
   const parent = path.join(root, ".rbox", "state", "tmp");
   await fs.mkdir(parent, { recursive: true });
   const probe = await fs.mkdtemp(path.join(parent, "apply-receipt-probe-"));
@@ -288,6 +316,10 @@ async function probeEquivalence(root: string): Promise<Equivalence> {
   }
 }
 
+export async function probeReceiverEquivalence(root: string): Promise<ReceiverEquivalence> {
+  return (injectedReceiverEquivalenceProbe ?? defaultReceiverEquivalenceProbe)(root);
+}
+
 class ManifestOracle implements AppliedManifestOracle {
   private prepared?: {
     expectedMap: Map<string, FileEntry>;
@@ -298,7 +330,7 @@ class ManifestOracle implements AppliedManifestOracle {
   };
   private readonly records = new Map<string, ProofRecord>();
   private readonly inflight = new Map<string, Promise<OracleVerdict>>();
-  private equivalence?: Promise<Equivalence>;
+  private equivalence?: Promise<ReceiverEquivalence>;
   private hashCache?: Promise<HashCache>;
 
   constructor(
@@ -349,8 +381,8 @@ class ManifestOracle implements AppliedManifestOracle {
     return rel === "." ? this.root : path.join(this.root, rel);
   }
 
-  private getEquivalence(): Promise<Equivalence> {
-    return this.equivalence ??= probeEquivalence(this.root);
+  private getEquivalence(): Promise<ReceiverEquivalence> {
+    return this.equivalence ??= probeReceiverEquivalence(this.root);
   }
 
   private getHashCache(): Promise<HashCache> {
@@ -369,7 +401,7 @@ class ManifestOracle implements AppliedManifestOracle {
     };
   }
 
-  private project(rel: string, eq: Equivalence): Projected | OracleVerdict {
+  private project(rel: string, eq: ReceiverEquivalence): Projected | OracleVerdict {
     const prepared = this.getPrepared();
     if (prepared.invalidWhy) return indeterminate(prepared.invalidWhy);
     const normalized = normalizeRel(rel);
@@ -386,12 +418,12 @@ class ManifestOracle implements AppliedManifestOracle {
       expected,
       oracle,
       preScan,
-      touchedKeys: new Set([...prepared.touched].filter((candidate) => inProjection(candidate, normalized, eq)).map((candidate) => equivalentPath(candidate, eq))),
+      touchedKeys: new Set([...prepared.touched].filter((candidate) => inProjection(candidate, normalized, eq)).map((candidate) => receiverEquivalentPath(candidate, eq))),
     };
   }
 
   private async proveFresh(rel: string): Promise<OracleVerdict> {
-    let eq: Equivalence;
+    let eq: ReceiverEquivalence;
     try {
       eq = await this.getEquivalence();
     } catch {
@@ -429,7 +461,7 @@ class ManifestOracle implements AppliedManifestOracle {
 
     const preGroups = new Map<string, FileEntry[]>();
     for (const entry of projected.preScan) {
-      const key = equivalentPath(entry.path, eq);
+      const key = receiverEquivalentPath(entry.path, eq);
       preGroups.set(key, [...(preGroups.get(key) ?? []), entry]);
     }
     if ([...preGroups.values()].some((entries) => entries.length > 1)) {
@@ -439,11 +471,11 @@ class ManifestOracle implements AppliedManifestOracle {
     }
 
     for (const [expected, actual] of aligned.pairs) {
-      const pre = preGroups.get(equivalentPath(expected.path, eq))?.[0];
+      const pre = preGroups.get(receiverEquivalentPath(expected.path, eq))?.[0];
       const verified = await this.verifyFastEntry(
         expected,
         actual.path,
-        projected.touchedKeys.has(equivalentPath(expected.path, eq)),
+        projected.touchedKeys.has(receiverEquivalentPath(expected.path, eq)),
         pre,
         pre ? this.preScanHashCache?.statIdentity(pre.path, pre.sha256) : undefined,
       );
@@ -519,7 +551,7 @@ class ManifestOracle implements AppliedManifestOracle {
     }
   }
 
-  private async inventory(rel: string, eq: Equivalence): Promise<{ kind: "ok"; entries: InventoryEntry[]; tokens: ProofTokens } | { kind: "indeterminate"; why: string }> {
+  private async inventory(rel: string, eq: ReceiverEquivalence): Promise<{ kind: "ok"; entries: InventoryEntry[]; tokens: ProofTokens } | { kind: "indeterminate"; why: string }> {
     const entries: InventoryEntry[] = [];
     const tokens: ProofTokens = { entries: new Map(), directories: new Map() };
     const walk = async (dirRel: string): Promise<void> => {
@@ -574,7 +606,7 @@ class ManifestOracle implements AppliedManifestOracle {
     }
   }
 
-  private async scanAndCompare(rel: string, eq: Equivalence): Promise<OracleVerdict> {
+  private async scanAndCompare(rel: string, eq: ReceiverEquivalence): Promise<OracleVerdict> {
     const projected = this.project(rel, eq);
     if ("kind" in projected) {
       this.records.set(rel, { verdict: projected });
@@ -583,7 +615,7 @@ class ManifestOracle implements AppliedManifestOracle {
     return this.scanAndCompareProjected(rel, eq, projected);
   }
 
-  private async scanAndCompareProjected(rel: string, eq: Equivalence, projected: Projected): Promise<OracleVerdict> {
+  private async scanAndCompareProjected(rel: string, eq: ReceiverEquivalence, projected: Projected): Promise<OracleVerdict> {
     const scanned = await this.scopedScan(rel, eq);
     if (scanned.kind === "indeterminate") {
       const verdict = indeterminate(scanned.why);
@@ -600,7 +632,7 @@ class ManifestOracle implements AppliedManifestOracle {
     return verdict;
   }
 
-  private async scopedScan(rel: string, eq: Equivalence): Promise<CompleteScan> {
+  private async scopedScan(rel: string, eq: ReceiverEquivalence): Promise<CompleteScan> {
     const files: FileEntry[] = [];
     const tokens: ProofTokens = { entries: new Map(), directories: new Map() };
     const cache = await this.getHashCache();

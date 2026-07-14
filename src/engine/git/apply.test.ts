@@ -248,6 +248,60 @@ test("design 116 F1b: all-scope deletion pins reflog-only human commits", async 
   expect(origins[humanOid]).toContainEqual(expect.objectContaining({ ref: "refs/heads/doomed", class: "human" }));
 });
 
+test("design 116 R2-8: clean-path NFF replacement pins reflog-only human commits", async () => {
+  const { sender, receiver, sideOid } = await incidentBaseline();
+
+  await git(receiver, "checkout", "-q", "side");
+  await commit(receiver, "human-nff.txt", "human", "human side commit");
+  const humanOid = await git(receiver, "rev-parse", "HEAD");
+  await git(receiver, "checkout", "-q", "main");
+  await git(receiver, "branch", "-f", "side", sideOid);
+
+  const tree = await git(sender, "write-tree");
+  const replacement = await exec("git", [
+    "-C", sender,
+    "-c", "user.email=t@t.t",
+    "-c", "user.name=t",
+    "commit-tree", tree,
+    "-m", "unrelated replacement",
+  ]).then(({ stdout }) => stdout.toString().trim());
+  await git(sender, "update-ref", "refs/heads/side", replacement, sideOid);
+
+  const result = await applyGitState(receiver, await capture(sender), store, KEK);
+
+  expect(result.applied).toBe(true);
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(replacement);
+  expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${humanOid}`)).toBe(humanOid);
+  const origins = JSON.parse(await fs.readFile(path.join(receiver, ".git", "rbox-keep-origins.json"), "utf8"));
+  expect(origins[humanOid]).toContainEqual(expect.objectContaining({ ref: "refs/heads/side", class: "human" }));
+});
+
+test("design 116 R2-8: clean-path NFF pins the displaced tip when its reflog is absent", async () => {
+  const { sender, receiver, sideOid } = await incidentBaseline();
+
+  await git(receiver, "checkout", "-q", "side");
+  await commit(receiver, "human-tip.txt", "human", "human live side tip");
+  const humanOid = await git(receiver, "rev-parse", "HEAD");
+  await git(receiver, "checkout", "-q", "main");
+  await fs.rm(path.join(receiver, ".git", "logs", "refs", "heads", "side"), { force: true });
+
+  const tree = await git(sender, "write-tree");
+  const replacement = await exec("git", [
+    "-C", sender,
+    "-c", "user.email=t@t.t",
+    "-c", "user.name=t",
+    "commit-tree", tree,
+    "-m", "unrelated no-reflog replacement",
+  ]).then(({ stdout }) => stdout.toString().trim());
+  await git(sender, "update-ref", "refs/heads/side", replacement, sideOid);
+
+  const result = await applyGitState(receiver, await capture(sender), store, KEK);
+
+  expect(result.applied).toBe(true);
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(replacement);
+  expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${humanOid}`)).toBe(humanOid);
+});
+
 test("design 116 F5: legacy ownership mode defers the whole section without partial publication", async () => {
   const { sender, receiver, sideOid } = await incidentBaseline();
   const worktree = path.join(tmp, "legacy-held-side");

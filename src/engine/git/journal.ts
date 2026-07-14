@@ -40,6 +40,28 @@ export interface CheckoutJournal<TIntended = unknown> {
     reservedRefs?: Record<string, string>;
     indexLock?: { dev: number; ino: number };
     reservedLocks?: Record<string, { dev: number; ino: number }>;
+    /** Ref-transaction locks are named durably before prepare. A token is
+     * filled after prepare; expectedBytes closes the prepare-ok -> token-write
+     * crash window for the journal-owned child transaction. */
+    preparedTransactions?: Array<{
+      id: "primary" | "post-head";
+      ownerPid: number;
+      prepareStarted: boolean;
+      completed?: boolean;
+      locks: Array<{
+        path: string;
+        expectedBytes: string[];
+        token?: { dev: number; ino: number };
+      }>;
+    }>;
+    /** Our O_EXCL reservation acquired immediately after a branch-switch
+     * symref commit and held through index/op-state publication. */
+    headLock?: {
+      path: string;
+      acquireStarted: boolean;
+      expectedBytes: string[];
+      token?: { dev: number; ino: number };
+    };
   };
   binding: CheckoutJournalBinding;
   createdFresh: boolean;
@@ -147,6 +169,64 @@ function normHead(value: string): string {
   return value.trim();
 }
 
+function lockPathIsBound(abs: string, binding: CheckoutJournalBinding): boolean {
+  const resolved = path.resolve(abs);
+  const roots = [path.resolve(binding.gitDirReal), path.resolve(binding.commonDirReal)];
+  return resolved.endsWith(".lock") && roots.some((root) => resolved.startsWith(`${root}${path.sep}`));
+}
+
+async function readLock(abs: string): Promise<{ bytes: Buffer; dev: number; ino: number } | undefined> {
+  try {
+    const handle = await fs.open(abs, "r");
+    try {
+      const stat = await handle.stat();
+      return { bytes: await handle.readFile(), dev: stat.dev, ino: stat.ino };
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** Remove only lockfiles owned by the intent journal. Token equality is the
+ * normal proof. Exact expected bytes are the deliberately narrow fallback for
+ * a crash after O_EXCL/prepare but before the observed inode was journaled. */
+async function recoverJournalLocks(journal: CheckoutJournal, binding: CheckoutJournalBinding): Promise<string[]> {
+  const human: string[] = [];
+  const candidates = new Map<string, Array<{ expectedBytes: string[]; token?: { dev: number; ino: number }; shapeOwned: boolean }>>();
+  for (const transaction of journal.expectedNew.preparedTransactions ?? []) {
+    if (transaction.completed) continue;
+    for (const lock of transaction.locks) {
+      const list = candidates.get(lock.path) ?? [];
+      list.push({ expectedBytes: lock.expectedBytes, token: lock.token, shapeOwned: transaction.prepareStarted });
+      candidates.set(lock.path, list);
+    }
+  }
+  const headLock = journal.expectedNew.headLock;
+  if (headLock?.acquireStarted) {
+    const list = candidates.get(headLock.path) ?? [];
+    list.push({ expectedBytes: headLock.expectedBytes, token: headLock.token, shapeOwned: true });
+    candidates.set(headLock.path, list);
+  }
+
+  for (const [abs, intents] of candidates) {
+    if (!lockPathIsBound(abs, binding)) {
+      human.push(`lock:${abs}`);
+      continue;
+    }
+    const live = await readLock(abs);
+    if (!live) continue;
+    const encoded = live.bytes.toString("base64");
+    const owned = intents.some((intent) => intent.token?.dev === live.dev && intent.token.ino === live.ino)
+      || intents.some((intent) => intent.shapeOwned && intent.expectedBytes.includes(encoded));
+    if (owned) await fs.rm(abs, { force: true });
+    else human.push(`lock:${abs}`);
+  }
+  return human;
+}
+
 /**
  * Intent recovery is rollback-only (r2 F2). Every field uses old/new/third
  * arbitration (r3 F5); a third value is preserved and causes journal retirement.
@@ -186,8 +266,12 @@ export async function recoverJournal<T = unknown>(
     }
   }
 
-  // Validate ALL rollback bytes before the first mutation. This makes a corrupt
-  // nested op-state copy as fail-closed as a corrupt old-index copy.
+  const human: string[] = await recoverJournalLocks(journal, binding);
+  if (human.length > 0) return { status: "human-intervened", quarantinePath: await retireJournal(workspaceRoot, relPath), fields: human };
+
+  // Validate ALL rollback bytes before the first checkout-state mutation (owned
+  // transaction-lock cleanup above is independently journal-arbitrated). This
+  // makes a corrupt nested op-state copy as fail-closed as a corrupt old index.
   try {
     if (journal.old.indexPresent) {
       if (!journal.old.indexHash || await hashFile(path.join(dir, "old-index")) !== journal.old.indexHash) throw new Error("old-index checksum mismatch");
@@ -199,7 +283,6 @@ export async function recoverJournal<T = unknown>(
     return { status: "defer", reason: "unreadable or corrupt journaled rollback bytes", journalPath: dir };
   }
 
-  const human: string[] = [];
   const repoDir = relPath === "." ? workspaceRoot : path.join(workspaceRoot, ...relPath.split("/"));
   const indexPath = path.join(binding.gitDirReal, "index");
   const indexLockPath = path.join(binding.gitDirReal, "index.lock");

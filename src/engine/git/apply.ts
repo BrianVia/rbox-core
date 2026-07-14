@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { BlobStore } from "../blobstore.js";
+import { receiverEquivalentCollisionNames } from "../apply-receipt.js";
 import { writeFileAtomic } from "../fsutil.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitSection } from "../types.js";
@@ -27,9 +28,17 @@ import { listRefs, readAllRefs, restoreOpState } from "./refs.js";
 import { pruneStaleScratchRefs } from "./pins.js";
 import { quarantineLocal } from "./quarantine.js";
 import { restoreLocal, snapshotLocal } from "./rollback.js";
-import { prepareDisplacedRefPins, runUpdateRefTransaction } from "./keep-pins.js";
+import { prepareDisplacedRefPins, prepareKeepPins, runUpdateRefTransaction } from "./keep-pins.js";
+import { tipOwnedByIncoming } from "./reachability.js";
 
 const ZERO_OID = "0".repeat(40);
+const refEquivalenceWarnings = new Set<string>();
+
+function warnRefEquivalence(repoDir: string, refs: Set<string>): void {
+  if (refs.size === 0 || refEquivalenceWarnings.has(repoDir)) return;
+  refEquivalenceWarnings.add(repoDir);
+  console.warn(`git-sync WARNING: receiver-equivalent Git refnames held in ${repoDir}: ${[...refs].sort().join(", ")}`);
+}
 
 // ---- apply (design 43 §7) -------------------------------------------------------
 
@@ -77,17 +86,26 @@ async function classifyWorktreeOwnership(
 ): Promise<{ heldRefs: Map<string, string>; deferReason?: string }> {
   const owned = await branchesCheckedOutElsewhere(ctx);
   const heldRefs = new Map<string, string>();
-  if (owned.size === 0) return { heldRefs };
   const refs = localRefs ?? await readAllRefs(ctx.repoDir);
+  const ambiguous = receiverEquivalentCollisionNames([...Object.keys(section.refs), ...Object.keys(refs), ...owned.keys()]);
+  warnRefEquivalence(ctx.repoDir, ambiguous);
+  for (const ref of ambiguous) heldRefs.set(ref, owned.get(ref) ?? "receiver-equivalent-refname");
+  if (owned.size === 0 && ambiguous.size === 0) return { heldRefs };
   const shortName = (ref: string) => ref.replace(/^refs\/heads\//, "");
   const collision = (ref: string, suffix = "") => `worktree-ownership: branch ${shortName(ref)} checked out in linked worktree ${owned.get(ref)}${suffix}`;
   // HEAD move is a checkout-plane collision even when its ref OID is already equal:
   // the primary checkout may not attach to a branch held by a sibling worktree.
   const headBranch = headBranchOf(section.head);
+  if (headBranch && ambiguous.has(headBranch)) {
+    return { heldRefs, deferReason: `worktree-ownership/unreadable: HEAD ref ${headBranch} has a receiver-equivalent alias` };
+  }
   if (headBranch && owned.has(headBranch)) return { heldRefs, deferReason: collision(headBranch) };
   // pre-mutation ref wipe — clean materialization deletes every local syncable ref before
   // publishing even scoped sections; partial holding of a wipe is undefined in D1.
   if (beforeMutateWipesRefs) {
+    if (ambiguous.size > 0) {
+      return { heldRefs, deferReason: "worktree-ownership/unreadable: receiver-equivalent refnames would be wiped" };
+    }
     for (const ref of Object.keys(refs)) {
       if (owned.has(ref)) return { heldRefs, deferReason: collision(ref, " (would be wiped)") };
     }
@@ -97,6 +115,7 @@ async function classifyWorktreeOwnership(
   // no ref-plane portion is independently published while a section intersects
   // a sibling-owned branch.
   if (legacyWholeSectionOwnership) {
+    if (ambiguous.size > 0) return { heldRefs, deferReason: "worktree-ownership/unreadable: receiver-equivalent refnames" };
     for (const ref of Object.keys(section.refs)) {
       if (owned.has(ref)) return { heldRefs, deferReason: collision(ref) };
     }
@@ -111,12 +130,14 @@ async function classifyWorktreeOwnership(
   }
   // Ref updates: equality is a true no-op, so only a different/absent local OID is held.
   for (const [ref, incomingOid] of Object.entries(section.refs)) {
+    if (ambiguous.has(ref)) continue;
     const worktree = owned.get(ref);
     if (worktree && refs[ref] !== incomingOid) heldRefs.set(ref, worktree);
   }
   // Ref deletions: an owned local branch absent from an all-scope section survives.
   if (deletesAbsent) {
     for (const ref of Object.keys(refs)) {
+      if (ambiguous.has(ref)) continue;
       const worktree = owned.get(ref);
       if (worktree && !(ref in section.refs)) heldRefs.set(ref, worktree);
     }
@@ -206,9 +227,10 @@ export async function applyGitState(
       }
     }
     deleteAbsent = section.refScope === "all";
-    // Design 116 phase-0: retain the zero-cost no-worktrees path, then hold only
-    // sibling-owned refs whose OIDs would actually move (or whose deletion is requested).
-    if (ctx && (await exists(path.join(ctx.commonDir, "worktrees")))) {
+    // Design 116: classify every existing store so receiver-equivalent refnames
+    // are caught before a destructive wipe; absent sibling worktrees otherwise
+    // reduce to the cheap exact-ref scan.
+    if (ctx) {
       const ownership = await classifyWorktreeOwnership(
         ctx,
         section,
@@ -367,6 +389,20 @@ export async function applyGitState(
       const boundaryRefs = await readAllRefs(repoDir);
       const boundaryOwned = await branchesCheckedOutElsewhere(ctx);
       const incomingHeadRef = headBranchOf(section.head);
+      const ambiguousRefs = receiverEquivalentCollisionNames([
+        ...Object.keys(eligiblePublishRefs),
+        ...Object.keys(boundaryRefs),
+        ...boundaryOwned.keys(),
+      ]);
+      warnRefEquivalence(repoDir, ambiguousRefs);
+      if (incomingHeadRef && ambiguousRefs.has(incomingHeadRef)) {
+        return {
+          applied: false,
+          reason: `worktree-ownership/unreadable: HEAD ref ${incomingHeadRef} has a receiver-equivalent alias`,
+          conflictBundle,
+          filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+        };
+      }
       if (incomingHeadRef && boundaryOwned.has(incomingHeadRef)) {
         return {
           applied: false,
@@ -389,8 +425,10 @@ export async function applyGitState(
       }
 
       heldRefs.clear();
+      for (const ref of ambiguousRefs) heldRefs.set(ref, boundaryOwned.get(ref) ?? "receiver-equivalent-refname");
       const publishRefs: Record<string, string> = {};
       for (const [ref, oid] of Object.entries(eligiblePublishRefs)) {
+        if (ambiguousRefs.has(ref)) continue;
         const sibling = boundaryOwned.get(ref);
         if (sibling && boundaryRefs[ref] !== oid) {
           if (ctx.kind === "pointer") {
@@ -409,6 +447,52 @@ export async function applyGitState(
       // Publish refs per the scope-gated rules (see doc comment).
       for (const [ref, sha] of Object.entries(publishRefs)) {
         const oldOid = boundaryRefs[ref] ?? ZERO_OID;
+        if (oldOid !== ZERO_OID && oldOid !== sha) {
+          // Review R2-8: replacing an existing ref is classified by the
+          // complete graph walk used by the follow plane. A non-FF update
+          // protects the displaced ref's reflog-only commits, with the
+          // fsynced human-origin sidecar written before pin creation and the
+          // compare-and-swap replacement commit in one update-ref transaction.
+          const ff = await tipOwnedByIncoming(repoDir, oldOid, [sha]);
+          if (ff.status === "indeterminate") {
+            if (opts.legacyWholeSectionOwnership) throw new Error(`ref ancestry ${ff.marker} for ${ref}`);
+            heldRefs.set(ref, `ancestry-${ff.marker}`);
+            continue;
+          }
+          if (ff.status === "unowned") {
+            const durable = await readAllRefs(repoDir);
+            durable[ref] = sha;
+            const origin = {
+              ref,
+              episode: section.generatedAt || String(Date.now()),
+              time: new Date().toISOString(),
+              class: "human" as const,
+            };
+            const pins = await prepareDisplacedRefPins(repoDir, ref, Object.values(durable), origin);
+            if (pins.status === "indeterminate") {
+              if (opts.legacyWholeSectionOwnership) throw new Error(`reflog reachability ${pins.marker} for ${ref}`);
+              heldRefs.set(ref, `reflog-${pins.marker}`);
+              continue;
+            }
+            // Reflogs may be disabled or missing. The live displaced tip is
+            // independently mandatory protection, not merely one likely
+            // member of the reflog enumeration.
+            const tipPin = pins.oids.includes(oldOid)
+              ? undefined
+              : await prepareKeepPins(repoDir, [oldOid], origin);
+            try {
+              await runUpdateRefTransaction(repoDir, [
+                ...pins.transactionLines,
+                ...(tipPin?.transactionLines ?? []),
+                `update ${ref} ${sha} ${oldOid}`,
+              ]);
+            } catch {
+              if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
+              heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+            }
+            continue;
+          }
+        }
         if (ref === "refs/stash") {
           // refs/stash is only usable through its REFLOG (`git stash list`/`pop` read
           // stash@{N}, never the bare ref) — publish it WITH a reflog entry whose
@@ -437,6 +521,17 @@ export async function applyGitState(
           // the section boundary. A branch attached by a sibling while earlier
           // refs publish survives this cycle.
           const ownedNow = await branchesCheckedOutElsewhere(ctx);
+          const liveNowForAliases = await readAllRefs(repoDir);
+          const ambiguousNow = receiverEquivalentCollisionNames([
+            ...Object.keys(section.refs),
+            ...Object.keys(liveNowForAliases),
+            ...ownedNow.keys(),
+          ]);
+          if (ambiguousNow.has(ref)) {
+            warnRefEquivalence(repoDir, ambiguousNow);
+            heldRefs.set(ref, ownedNow.get(ref) ?? "receiver-equivalent-refname");
+            continue;
+          }
           if (ownedNow.has(ref)) {
             if (opts.legacyWholeSectionOwnership) throw new Error(`worktree ownership changed for ${ref}`);
             heldRefs.set(ref, ownedNow.get(ref)!);
