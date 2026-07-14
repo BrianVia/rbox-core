@@ -5,6 +5,27 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.1] — 2026-07-14 — bare `rbox` meets you where you are
+
+### Added
+- **Enrolled machines get a menu, not a mid-wizard jump (#277).** Bare `rbox`
+  in an untracked directory used to dump already-enrolled users into the setup
+  wizard at "Step 2 of 3" (step 1 silently skipped). It now offers: Track this
+  directory / Sync an existing workspace / Nothing. The choice preselects the
+  wizard's create-vs-join prompt, so the total number of prompts is unchanged.
+  First-time machines still land directly in the wizard.
+- **The front-door menu is daemon-aware**: "Pause syncing" when the daemon is
+  running, "Start syncing" when it isn't (previously always Pause).
+
+### Fixed
+- **Setup step numbers count only the steps that actually run**: an enrolled
+  `rbox setup` shows "Step 1 of 2 · Workspace"; the authorized-but-unenrolled
+  enrollment prompt gained its missing "Step 1 of 3 · Account" frame.
+- **Copy**: the contradictory "Continuing to your workspace." line is gone;
+  `rbox pair`'s finish message describes the real menu path on the new
+  machine; the bootstrap-secret prompt says blank = browser device-code
+  sign-up.
+
 ## [1.6.0] — 2026-07-14 — the checkout follows you: git state reconciles across machines
 
 ### Added
