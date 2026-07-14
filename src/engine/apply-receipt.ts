@@ -247,24 +247,33 @@ type Alignment<T extends { path: string }, U extends { path: string }> =
   | { kind: "mismatch"; sample: string[] }
   | { kind: "indeterminate"; why: string };
 
+function groupPaths<V extends { path: string }>(entries: V[], eq: ReceiverEquivalence): Map<string, V[]> {
+  const out = new Map<string, V[]>();
+  for (const entry of entries) {
+    const key = receiverEquivalentPath(entry.path, eq);
+    const values = out.get(key) ?? [];
+    values.push(entry);
+    out.set(key, values);
+  }
+  return out;
+}
+
+function whyFromScanError(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  if (error.message === "unsupported-entry") return "unsupported entry type in repo subtree";
+  if (error.message === "directory-churn") return "repo directory changed during proof";
+  if (error.message === "scan-churn") return "repo subtree changed during scoped scan";
+  return undefined;
+}
+
 async function alignPaths<T extends { path: string }, U extends { path: string }>(
   left: T[],
   right: U[],
   eq: ReceiverEquivalence,
   root: string,
 ): Promise<Alignment<T, U>> {
-  const group = <V extends { path: string }>(entries: V[]): Map<string, V[]> => {
-    const out = new Map<string, V[]>();
-    for (const entry of entries) {
-      const key = receiverEquivalentPath(entry.path, eq);
-      const values = out.get(key) ?? [];
-      values.push(entry);
-      out.set(key, values);
-    }
-    return out;
-  };
-  const l = group(left);
-  const r = group(right);
+  const l = groupPaths(left, eq);
+  const r = groupPaths(right, eq);
   if ([...l.values(), ...r.values()].some((entries) => entries.length > 1)) {
     return { kind: "indeterminate", why: "receiver path-equivalence collision" };
   }
@@ -372,8 +381,7 @@ class ManifestOracle implements AppliedManifestOracle {
         return MATCH;
       } catch {
         const verdict = indeterminate("receipt tokens could not be read");
-        this.records.set(rel, { verdict });
-        return verdict;
+        return this.settle(rel, verdict);
       }
     });
   }
@@ -384,6 +392,11 @@ class ManifestOracle implements AppliedManifestOracle {
     const promise = run().finally(() => this.inflight.delete(rel));
     this.inflight.set(rel, promise);
     return promise;
+  }
+
+  private settle(rel: string, verdict: OracleVerdict): OracleVerdict {
+    this.records.set(rel, { verdict });
+    return verdict;
   }
 
   private abs(rel: string): string {
@@ -437,46 +450,36 @@ class ManifestOracle implements AppliedManifestOracle {
       eq = await this.getEquivalence();
     } catch {
       const verdict = indeterminate("filesystem-equivalence probe failed");
-      this.records.set(rel, { verdict });
-      return verdict;
+      return this.settle(rel, verdict);
     }
     const projected = this.project(rel, eq);
     if ("kind" in projected) {
-      this.records.set(rel, { verdict: projected });
-      return projected;
+      return this.settle(rel, projected);
     }
     if (this.kind === "state") return this.scanAndCompareProjected(rel, eq, projected);
 
     const semantic = await compareEntries(projected.expected, projected.oracle, eq, this.root);
     if (semantic.kind === "indeterminate") {
-      this.records.set(rel, { verdict: semantic });
-      return semantic;
+      return this.settle(rel, semantic);
     }
 
     const inventory = await this.inventory(rel, eq);
     if (inventory.kind === "indeterminate") {
       const verdict = indeterminate(inventory.why);
-      this.records.set(rel, { verdict });
-      return verdict;
+      return this.settle(rel, verdict);
     }
     const aligned = await alignPaths(projected.expected, inventory.entries, eq, this.root);
     if (aligned.kind === "indeterminate") {
-      this.records.set(rel, { verdict: aligned });
-      return aligned;
+      return this.settle(rel, aligned);
     }
     if (aligned.kind === "mismatch" || aligned.pairs.some(([expected, actual]) => expected.type !== actual.type)) {
       return this.scanAndCompareProjected(rel, eq, projected);
     }
 
-    const preGroups = new Map<string, FileEntry[]>();
-    for (const entry of projected.preScan) {
-      const key = receiverEquivalentPath(entry.path, eq);
-      preGroups.set(key, [...(preGroups.get(key) ?? []), entry]);
-    }
+    const preGroups = groupPaths(projected.preScan, eq);
     if ([...preGroups.values()].some((entries) => entries.length > 1)) {
       const verdict = indeterminate("receiver path-equivalence collision");
-      this.records.set(rel, { verdict });
-      return verdict;
+      return this.settle(rel, verdict);
     }
 
     for (const [expected, actual] of aligned.pairs) {
@@ -492,8 +495,7 @@ class ManifestOracle implements AppliedManifestOracle {
         if (verified.kind === "mismatch") {
           return this.scanAndCompareProjected(rel, eq, projected);
         }
-        this.records.set(rel, { verdict: verified });
-        return verified;
+        return this.settle(rel, verified);
       }
       // The receipt token must be the token bracketed by the verification above.
       // A fresh restat here could adopt an edit that landed after different bytes
@@ -501,7 +503,7 @@ class ManifestOracle implements AppliedManifestOracle {
       inventory.tokens.entries.set(actual.path, verified.token);
     }
 
-    const receiptHash = canonicalReceipt("pull", rel, projected.oracle, projected.expected);
+    const receiptHash = canonicalReceipt(this.kind, rel, projected.oracle, projected.expected);
     this.records.set(rel, { verdict: semantic, receiptHash, tokens: semantic.kind === "match" ? inventory.tokens : undefined });
     return semantic;
   }
@@ -606,11 +608,7 @@ class ManifestOracle implements AppliedManifestOracle {
       }
       return { kind: "ok", entries, tokens };
     } catch (error) {
-      const why = error instanceof Error && error.message === "unsupported-entry"
-        ? "unsupported entry type in repo subtree"
-        : error instanceof Error && error.message === "directory-churn"
-          ? "repo directory changed during proof"
-          : "repo subtree inventory could not be read";
+      const why = whyFromScanError(error) ?? "repo subtree inventory could not be read";
       return { kind: "indeterminate", why };
     }
   }
@@ -618,8 +616,7 @@ class ManifestOracle implements AppliedManifestOracle {
   private async scanAndCompare(rel: string, eq: ReceiverEquivalence): Promise<OracleVerdict> {
     const projected = this.project(rel, eq);
     if ("kind" in projected) {
-      this.records.set(rel, { verdict: projected });
-      return projected;
+      return this.settle(rel, projected);
     }
     return this.scanAndCompareProjected(rel, eq, projected);
   }
@@ -628,13 +625,11 @@ class ManifestOracle implements AppliedManifestOracle {
     const scanned = await this.scopedScan(rel, eq);
     if (scanned.kind === "indeterminate") {
       const verdict = indeterminate(scanned.why);
-      this.records.set(rel, { verdict });
-      return verdict;
+      return this.settle(rel, verdict);
     }
     const verdict = await compareEntries(scanned.files, projected.oracle, eq, this.root);
     if (verdict.kind === "indeterminate") {
-      this.records.set(rel, { verdict });
-      return verdict;
+      return this.settle(rel, verdict);
     }
     const receiptHash = canonicalReceipt(this.kind, rel, projected.oracle, scanned.files);
     this.records.set(rel, { verdict, receiptHash, tokens: verdict.kind === "match" ? scanned.tokens : undefined });
@@ -711,11 +706,7 @@ class ManifestOracle implements AppliedManifestOracle {
       files.sort((a, b) => a.path.localeCompare(b.path));
       return { kind: "ok", files, tokens };
     } catch (error) {
-      const why = error instanceof Error && error.message === "unsupported-entry"
-        ? "unsupported entry type in repo subtree"
-        : error instanceof Error && error.message === "scan-churn"
-          ? "repo subtree changed during scoped scan"
-          : "repo subtree could not be scanned";
+      const why = whyFromScanError(error) ?? "repo subtree could not be scanned";
       return { kind: "indeterminate", why };
     }
   }

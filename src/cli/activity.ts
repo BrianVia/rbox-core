@@ -13,7 +13,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
-import { RBOX_DIR, repoRecordsForState, type SyncState } from "./config.js";
+import { RBOX_DIR, repoRecordsForState, type RepoRecord, type SyncState } from "./config.js";
 import { projectGitDeferralRepos } from "./status-view.js";
 import type { TransferPhase } from "./transfer-progress.js";
 
@@ -321,8 +321,9 @@ export function renderShellDeferrals(
   state: SyncState,
   now: number,
   ageBucket: (iso: string, now: number) => string,
+  repoRecords: Record<string, RepoRecord> = repoRecordsForState(state),
 ): string | undefined {
-  const entries = Object.entries(repoRecordsForState(state)).flatMap(([repo, record]) =>
+  const entries = Object.entries(repoRecords).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
   );
   const projections = projectGitDeferralRepos(entries);

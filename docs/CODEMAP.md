@@ -181,7 +181,7 @@ src/engine/e2ee/session.ts        — top-level E2EE orchestration composing all
 ## `src/engine/git/` — git-native repo state capture/apply
 
 ```
-src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
+src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, generic reflog reads, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
 src/engine/git/preflight.ts   — decides whether a repo's shape is syncable (dir vs pointer, worktrees, alternates, submodule superprojects, busy-check): gitPreflight, isGitBusy (structural vs transient refusal). Never: capture or apply.
 src/engine/git/identity.ts    — stable plaintext-only identity of a repo's git state for change detection (gitIdentity, projectIdentity, gitIdentityKey), scope-aware. Never: the stored GitSection shape (types.ts).
 src/engine/git/capture.ts     — git-native state capture (design 43): history bundles, index/HEAD/op-state snapshot, stable change identity, scratch-dir rooting/sweep, GitCaptureDeferredError. Owns "what to upload for a repo this cycle". Never: apply.

@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -11,8 +10,6 @@ import {
   indexIdentityV2,
   markCheckoutJournalPublished,
   noDropProof,
-  prepareDisplacedRefPins,
-  prepareKeepPins,
   probeReceiverEquivalence,
   receiverEquivalentCollisionNames,
   receiverEquivalentPath,
@@ -30,6 +27,11 @@ import {
   type GitSection,
 } from "../../engine/index.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import {
+  humanDisplacementOrigin,
+  prepareDisplacementPins,
+  runUpdateRefTransaction,
+} from "../../engine/git/keep-pins.js";
 import { hashFile } from "../../engine/hash.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
 import { listRefs, readAllRefs, readOpState } from "../../engine/git/refs.js";
@@ -41,6 +43,8 @@ import {
   headBranchOf,
   importGitPackChain,
   repoCtx,
+  exists,
+  warnOnce,
   type RepoCtx,
 } from "../../engine/git/shared.js";
 import type {
@@ -49,10 +53,11 @@ import type {
   RepoRecord,
   RepoRecordInput,
 } from "../config.js";
-import { gitIncomingKey } from "./shared.js";
+import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
+import { gitIncomingKey, sectionOpState } from "./shared.js";
 
-const ZERO_OID = "0".repeat(40);
 const refEquivalenceWarnings = new Set<string>();
+const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
 
 export type FollowCrashPoint =
   | "after-safe-refs"
@@ -133,7 +138,12 @@ export interface FollowOptions {
 }
 
 async function candidateIndexCollision(workspaceRoot: string, repoDir: string, indexPath: string): Promise<string | undefined> {
-  const equivalence = await probeReceiverEquivalence(workspaceRoot);
+  let pending = receiverEquivalenceByWorkspace.get(workspaceRoot);
+  if (!pending) {
+    pending = probeReceiverEquivalence(workspaceRoot);
+    receiverEquivalenceByWorkspace.set(workspaceRoot, pending);
+  }
+  const equivalence = await pending;
   if (!equivalence.caseAliases && !equivalence.unicodeAliases) return undefined;
   const raw = await gitWithIndexFile(repoDir, indexPath, ["ls-files", "-z", "--stage"]);
   const names = new Set(raw.split("\0").filter(Boolean).map((record) => {
@@ -143,6 +153,11 @@ async function candidateIndexCollision(workspaceRoot: string, repoDir: string, i
   }));
   const collisions = receiverEquivalentCollisionNames(names, (name) => receiverEquivalentPath(name, equivalence));
   return collisions.size > 0 ? [...collisions].sort().join(", ") : undefined;
+}
+
+/** Test seam for receiver-equivalence probe memoization. */
+export function resetCandidateIndexCollisionProbeForTests(): void {
+  receiverEquivalenceByWorkspace.clear();
 }
 
 export interface StagedIncoming {
@@ -173,23 +188,6 @@ interface CheckoutClassification {
   detail?: string;
 }
 
-async function prepareDisplacementPins(
-  repoDir: string,
-  ref: string,
-  oldOid: string,
-  plannedRoots: readonly string[],
-  origin: Parameters<typeof prepareDisplacedRefPins>[3],
-) {
-  const reflog = await prepareDisplacedRefPins(repoDir, ref, plannedRoots, origin);
-  if (reflog.status === "indeterminate" || reflog.oids.includes(oldOid)) return reflog;
-  const tip = await prepareKeepPins(repoDir, [oldOid], origin);
-  return {
-    ...reflog,
-    oids: [...reflog.oids, oldOid],
-    transactionLines: [...reflog.transactionLines, ...tip.transactionLines],
-  };
-}
-
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
   return {
     stream,
@@ -206,6 +204,27 @@ export async function recoverFollowJournal(
   binding: CheckoutJournalBinding,
 ) {
   return recoverJournal<FollowIntended>(workspaceRoot, relPath, binding);
+}
+
+export type RecoverAndLandFollowJournalResult = {
+  recovery: Awaited<ReturnType<typeof recoverFollowJournal>>;
+  state: import("../config.js").SyncState;
+  disposition?: PublishedRepoIntentDisposition;
+};
+
+/** Recover a checkout journal and, when permitted, land and retire its published intent. */
+export async function recoverAndLandFollowJournal(
+  workspaceRoot: string,
+  relPath: string,
+  binding: CheckoutJournalBinding,
+  state: import("../config.js").SyncState,
+  opts: { land?: boolean; crashAt?: FollowOptions["crashAt"] } = {},
+): Promise<RecoverAndLandFollowJournalResult> {
+  const recovery = await recoverFollowJournal(workspaceRoot, relPath, binding);
+  if (recovery.status !== "keep" || opts.land === false) return { recovery, state };
+  const published = await savePublishedRepoIntent(workspaceRoot, state, relPath, recovery.intended);
+  if (intentSettled(published.disposition)) await clearFollowJournal(workspaceRoot, relPath, opts.crashAt);
+  return { recovery, state: published.state, disposition: published.disposition };
 }
 
 /** No usable repo context means recovery must never touch Git. Supplying an
@@ -303,10 +322,6 @@ async function readLive(ctx: RepoCtx): Promise<LiveMetadata | undefined> {
   }
 }
 
-function sectionOpState(section: GitSection | undefined): Record<string, string> {
-  return Object.fromEntries(Object.entries(section?.opState ?? {}).map(([rel, artifact]) => [rel, artifact.sha]));
-}
-
 function firstReason(reasons: Set<GitDeferralReason>): GitDeferralReason | undefined {
   const precedence: GitDeferralReason[] = [
     "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
@@ -398,30 +413,6 @@ async function classifyCheckout(args: {
   return reason ? { safe: false, reason, detail: details.join("; ") } : { safe: true };
 }
 
-async function runRefTransaction(repoDir: string, lines: readonly string[]): Promise<void> {
-  if (lines.length === 0) return;
-  const ctx = await repoCtx(repoDir);
-  if (!ctx) throw new Error("repository unavailable for ref transaction");
-  const inputPath = path.join(ctx.commonDir, `.rbox-follow-ref-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
-  await fs.writeFile(inputPath, ["start", ...lines, "prepare", "commit", ""].join("\n"));
-  const input = await fs.open(inputPath, "r");
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn("git", ["-C", repoDir, "update-ref", "--stdin"], {
-        env: { ...process.env, GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv,
-        stdio: [input.fd, "ignore", "pipe"],
-      });
-      let stderr = "";
-      child.stderr!.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-      child.once("error", reject);
-      child.once("close", (code) => code === 0 && !/\bfatal:/i.test(stderr) ? resolve() : reject(new Error(`git update-ref failed (${code}): ${stderr.trim()}`)));
-    });
-  } finally {
-    await input.close();
-    await fs.rm(inputPath, { force: true });
-  }
-}
-
 async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
   const ctx = await repoCtx(repoDir);
   if (!ctx) throw new Error("repository unavailable while creating stash reflog");
@@ -466,8 +457,7 @@ async function publishRefPlane(
   const appliedRefs: GitPartialApply["appliedRefs"] = {};
   const heldRefs: GitPartialApply["heldRefs"] = {};
   const plannedRoots = [...new Set(Object.values(effective.refs))];
-  const forcedCurrent = live.currentRef ? opts.forcedHeldRefs?.[live.currentRef] : undefined;
-  let checkoutRefReason: GitDeferralReason | undefined = forcedCurrent === "ownership" ? "worktree-ownership" : forcedCurrent;
+  let checkoutRefReason: GitDeferralReason | undefined;
   let checkoutRefDetail: string | undefined;
   const authoredRefChanges: Array<{ ref: string; before?: string; after?: string }> = [];
   const manualProtected = new Set(opts.manualResolution?.protectedOids ?? []);
@@ -477,10 +467,12 @@ async function publishRefPlane(
     ...Object.keys(live.refs),
     ...owned.keys(),
   ]);
-  if (ambiguousRefs.size > 0 && !refEquivalenceWarnings.has(opts.workspaceRoot)) {
-    refEquivalenceWarnings.add(opts.workspaceRoot);
-    opts.log?.(`git-sync WARNING: receiver-equivalent Git refnames held in ${opts.relPath}: ${[...ambiguousRefs].sort().join(", ")}`);
-  }
+  if (ambiguousRefs.size > 0) warnOnce(
+    refEquivalenceWarnings,
+    opts.workspaceRoot,
+    `git-sync WARNING: receiver-equivalent Git refnames held in ${opts.relPath}: ${[...ambiguousRefs].sort().join(", ")}`,
+    opts.log ?? (() => {}),
+  );
   if ((live.currentRef && ambiguousRefs.has(live.currentRef)) || (incomingHeadRef && ambiguousRefs.has(incomingHeadRef))) {
     checkoutRefReason = "unreadable";
     checkoutRefDetail = "checkout ref belongs to an ambiguous receiver-equivalence group";
@@ -492,17 +484,22 @@ async function publishRefPlane(
   const candidates = new Set(Object.keys(effective.refs));
   if (effective.deleteAbsent) for (const ref of Object.keys(live.refs)) candidates.add(ref);
 
-  const classifiedHolds = new Map<string, GitPartialApply["heldRefs"][string]>();
-  for (const ref of candidates) if (ambiguousRefs.has(ref)) classifiedHolds.set(ref, "ownership");
+  const classifiedHolds = new Map<string, "local-commits" | "local-stash" | "worktree-ownership">();
+  for (const ref of candidates) if (ambiguousRefs.has(ref)) classifiedHolds.set(ref, "worktree-ownership");
+  for (const [ref, reason] of Object.entries(opts.forcedHeldRefs ?? {})) {
+    const classified = reason === "ownership" ? "worktree-ownership" : reason;
+    classifiedHolds.set(ref, classified);
+    if (ref === live.currentRef) checkoutRefReason ??= classified;
+  }
   const protectedByRef = new Map<string, string[]>();
   for (const ref of candidates) {
     if (ref === live.currentRef) continue;
     const oldOid = live.refs[ref];
     const newOid = effective.refs[ref];
     if (oldOid === newOid) continue;
-    let hold = opts.forcedHeldRefs?.[ref];
+    let hold = classifiedHolds.get(ref);
     if (!hold && owned.has(ref)) {
-      hold = "ownership";
+      hold = "worktree-ownership";
       if (opts.manualResolution) checkoutRefReason ??= "worktree-ownership";
       checkoutRefDetail ??= `branch ${ref.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(ref)}`;
     }
@@ -566,11 +563,11 @@ async function publishRefPlane(
     const newOid = effective.refs[ref];
     const hold = classifiedHolds.get(ref);
     if (hold) {
-      heldRefs[ref] = hold;
-      if (opts.manualResolution) checkoutRefReason ??= hold === "ownership" ? "worktree-ownership" : hold;
+      heldRefs[ref] = hold === "worktree-ownership" ? "ownership" : hold;
+      if (opts.manualResolution) checkoutRefReason ??= hold;
       if (ref === incomingHeadRef) checkoutRefReason = ambiguousRefs.has(ref)
         ? "unreadable"
-        : hold === "ownership" ? "worktree-ownership" : hold;
+        : hold;
       continue;
     }
     if (oldOid === newOid) {
@@ -603,14 +600,15 @@ async function publishRefPlane(
 
       const lines: string[] = [];
       if (oldOid && (!newOid || (await tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid])).status !== "owned")) {
-        const durableNow = await readAllRefs(opts.ctx.repoDir);
+        const durableNow = { ...liveNow };
         delete durableNow[ref];
-        const pins = await prepareDisplacementPins(opts.ctx.repoDir, ref, oldOid, [...Object.values(durableNow), ...(newOid ? [newOid] : [])], {
+        const pins = await prepareDisplacementPins(
+          opts.ctx.repoDir,
           ref,
-          episode: opts.incoming.generatedAt || String(Date.now()),
-          time: new Date().toISOString(),
-          class: "human",
-        });
+          oldOid,
+          [...Object.values(durableNow), ...(newOid ? [newOid] : [])],
+          humanDisplacementOrigin(ref, opts.incoming),
+        );
         if (pins.status === "indeterminate") {
           heldRefs[ref] = ref === "refs/stash" ? "local-stash" : "local-commits";
           if (ref === incomingHeadRef) checkoutRefReason = ref === "refs/stash" ? "local-stash" : "local-commits";
@@ -621,7 +619,7 @@ async function publishRefPlane(
       if (oldOid && newOid) lines.push(`update ${ref} ${newOid} ${oldOid}`);
       else if (newOid) lines.push(`create ${ref} ${newOid}`);
       else lines.push(`delete ${ref} ${oldOid}`);
-      await runRefTransaction(opts.ctx.repoDir, lines);
+      await runUpdateRefTransaction(opts.ctx.repoDir, lines);
       if (opts.manualResolution) authoredRefChanges.push({ ref, ...(oldOid ? { before: oldOid } : {}), ...(newOid ? { after: newOid } : {}) });
       if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
       if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
@@ -763,14 +761,15 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const newOid = effective.refs[liveBefore.currentRef];
       let pinLines: string[] = [];
       if (oldOid && (!newOid || (await tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid])).status !== "owned")) {
-        const durableNow = await readAllRefs(opts.ctx.repoDir);
+        const durableNow = { ...liveBefore.refs };
         delete durableNow[liveBefore.currentRef];
-        const pins = await prepareDisplacementPins(opts.ctx.repoDir, liveBefore.currentRef, oldOid, [...Object.values(durableNow), ...(newOid ? [newOid] : [])], {
-          ref: liveBefore.currentRef,
-          episode: opts.incoming.generatedAt || String(Date.now()),
-          time: new Date().toISOString(),
-          class: "human",
-        });
+        const pins = await prepareDisplacementPins(
+          opts.ctx.repoDir,
+          liveBefore.currentRef,
+          oldOid,
+          [...Object.values(durableNow), ...(newOid ? [newOid] : [])],
+          humanDisplacementOrigin(liveBefore.currentRef, opts.incoming),
+        );
         if (pins.status === "indeterminate") {
           return { status: "defer", reason: "unreadable", detail: `current-ref reflog reachability ${pins.marker}`, ...progress };
         }
@@ -817,7 +816,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     }
 
     const oldOp = Object.fromEntries(Object.keys(liveBefore.opState).map((rel) => [rel, true as const]));
-    const newOp = Object.fromEntries(Object.entries(opts.incoming.opState ?? {}).map(([rel, artifact]) => [rel, artifact.sha]));
+    const newOp = sectionOpState(opts.incoming);
     const intended = await opts.makeIntended(postProgress);
     const journal: CheckoutJournal<FollowIntended> = {
       phase: "intent",
@@ -911,7 +910,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         }
         for (const bad of opts.ctx.kind === "dir" ? ["modules", "objects/info/alternates"] : ["objects/info/alternates"]) {
           const root = opts.ctx.kind === "dir" ? opts.ctx.gitDir : opts.ctx.commonDir;
-          if (await fs.access(path.join(root, bad)).then(() => true, () => false)) {
+          if (await exists(path.join(root, bad))) {
             noteBoundaryFailure("unsupported", `repository structure changed at ${bad}`);
             return false;
           }

@@ -40,9 +40,9 @@ test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>
   cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
 
 test("D2 deferral writer preserves chronic age across newer incoming keys and resets reason age", () => {
-  const first = nextDeferral(undefined, "git-busy", "2026-01-01T00:00:00.000Z", "incoming-v1");
+  const first = nextDeferral("apply", undefined, "git-busy", "2026-01-01T00:00:00.000Z", "incoming-v1");
   first.bytesChanged = true;
-  const newer = nextDeferral(first, "git-busy", "2026-01-02T00:00:00.000Z", "incoming-v2");
+  const newer = nextDeferral("apply", first, "git-busy", "2026-01-02T00:00:00.000Z", "incoming-v2");
   expect(newer).toMatchObject({
     deferredSince: first.deferredSince,
     reasonSince: first.reasonSince,
@@ -50,7 +50,7 @@ test("D2 deferral writer preserves chronic age across newer incoming keys and re
     subjectKey: "incoming-v2",
     bytesChanged: true,
   });
-  const changed = nextDeferral(newer, "artifact", "2026-01-03T00:00:00.000Z", "incoming-v3");
+  const changed = nextDeferral("apply", newer, "artifact", "2026-01-03T00:00:00.000Z", "incoming-v3");
   expect(changed.deferredSince).toBe(first.deferredSince);
   expect(changed.reasonSince).toBe("2026-01-03T00:00:00.000Z");
   expect(changed.lastSeen).toBe("2026-01-03T00:00:00.000Z");

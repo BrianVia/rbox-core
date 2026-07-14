@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -17,8 +16,8 @@ import {
 import { enumerateRefReflogOids, pinDisplaced } from "../engine/git/keep-pins.js";
 import { quarantineLocal } from "../engine/git/quarantine.js";
 import { readAllRefs, readOpState } from "../engine/git/refs.js";
-import { git, headBranchOf, repoCtx, type RepoCtx } from "../engine/git/shared.js";
-import { hashFile } from "../engine/hash.js";
+import { exists, git, repoCtx, type RepoCtx } from "../engine/git/shared.js";
+import { hashBytes, hashFile } from "../engine/hash.js";
 import {
   expectedStateNonce,
   loadState,
@@ -31,19 +30,18 @@ import {
   type WorkspaceConfig,
 } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { savePublishedRepoIntent } from "./sync-state.js";
+import { inputRecord } from "./sync-state.js";
 import { withWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
 import {
   checkoutJournalBinding,
-  clearFollowJournal,
   followDivergedRepo,
   quarantineUnboundFollowJournal,
-  recoverFollowJournal,
+  recoverAndLandFollowJournal,
   stageIncoming,
   type FollowIntended,
   type FollowProgress,
 } from "./sync-git/follow.js";
-import { gitIncomingKey, repoDirOf } from "./sync-git/shared.js";
+import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "./sync-git/shared.js";
 import { sanitizeTerminalText } from "./status-view.js";
 
 export type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
@@ -114,7 +112,17 @@ function sortedEntries(value: Record<string, string>): Array<[string, string]> {
 }
 
 function snapshotId(identity: SnapshotIdentity): string {
-  return crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return hashBytes(Buffer.from(JSON.stringify(identity)));
+}
+
+function reconcileLog(confirmed: readonly string[], actual: readonly string[], authored?: string): string[] | undefined {
+  const before = [...confirmed].sort();
+  const live = [...actual].sort();
+  if (authored === undefined) return live.length === 0 ? before : undefined;
+  const withAuthored = [...new Set([...before, authored])].sort();
+  return JSON.stringify(live) === JSON.stringify(before) || JSON.stringify(live) === JSON.stringify(withAuthored)
+    ? before
+    : undefined;
 }
 
 function normalizedAfterAuthoredRefs(
@@ -130,24 +138,14 @@ function normalizedAfterAuthoredRefs(
     if (refs.get(change.ref) !== change.after) return undefined;
     if (change.before) refs.set(change.ref, change.before); else refs.delete(change.ref);
     if (change.ref === "refs/stash") {
-      const beforeStash = [...confirmed.stash].sort();
-      const withAuthored = [...new Set([...beforeStash, ...(change.after ? [change.after] : [])])].sort();
-      const actual = [...stash].sort();
-      const allowed = change.after === undefined
-        ? actual.length === 0
-        : JSON.stringify(actual) === JSON.stringify(beforeStash) || JSON.stringify(actual) === JSON.stringify(withAuthored);
-      if (!allowed) return undefined;
-      stash = beforeStash;
+      const reconciled = reconcileLog(confirmed.stash, stash, change.after);
+      if (!reconciled) return undefined;
+      stash = reconciled;
       continue;
     }
-    const beforeLog = [...(confirmedLogs.get(change.ref) ?? [])].sort();
-    const actualLog = [...(liveLogs.get(change.ref) ?? [])].sort();
-    const withAuthored = [...new Set([...beforeLog, ...(change.after ? [change.after] : [])])].sort();
-    const allowed = change.after === undefined
-      ? actualLog.length === 0
-      : JSON.stringify(actualLog) === JSON.stringify(beforeLog) || JSON.stringify(actualLog) === JSON.stringify(withAuthored);
-    if (!allowed) return undefined;
-    if (beforeLog.length) liveLogs.set(change.ref, beforeLog); else liveLogs.delete(change.ref);
+    const reconciled = reconcileLog(confirmedLogs.get(change.ref) ?? [], liveLogs.get(change.ref) ?? [], change.after);
+    if (!reconciled) return undefined;
+    if (reconciled.length) liveLogs.set(change.ref, reconciled); else liveLogs.delete(change.ref);
   }
   return {
     ...current,
@@ -171,19 +169,8 @@ function incomingFor(record: RepoRecord | undefined): GitSection | undefined {
   return undefined;
 }
 
-function sectionOpState(section: GitSection | undefined): Record<string, string> {
-  return Object.fromEntries(Object.entries(section?.opState ?? {}).map(([rel, artifact]) => [rel, artifact.sha]));
-}
-
 function sameMap(a: Record<string, string>, b: Record<string, string>): boolean {
   return JSON.stringify(sortedEntries(a)) === JSON.stringify(sortedEntries(b));
-}
-
-function checkoutLabel(section: GitSection): GitResolveShow["incomingCheckout"] {
-  const branch = headBranchOf(section.head);
-  return branch
-    ? { kind: "branch", label: branch.replace(/^refs\/heads\//, "") }
-    : { kind: "detached" };
 }
 
 async function snapshotIdentityOnly(args: {
@@ -196,7 +183,7 @@ async function snapshotIdentityOnly(args: {
   oracle: AppliedManifestOracle;
   boundary: boolean;
 }): Promise<SnapshotIdentity> {
-  const { root, rel, ctx, state, record, incoming, oracle } = args;
+  const { rel, ctx, state, record, incoming, oracle } = args;
   const refs = await readAllRefs(ctx.repoDir);
   const reflogs: Array<[string, string[]]> = [];
   for (const ref of Object.keys(refs).filter((ref) => ref !== "refs/stash").sort()) {
@@ -204,7 +191,7 @@ async function snapshotIdentityOnly(args: {
   }
   const head = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
   const indexPath = path.join(ctx.gitDir, "index");
-  const indexPresent = await fs.access(indexPath).then(() => true, () => false);
+  const indexPresent = await exists(indexPath);
   const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
   const index: SnapshotIdentity["index"] = !indexPresent
     ? { kind: "absent" }
@@ -304,7 +291,7 @@ async function buildSnapshot(args: {
       public: {
         status: "show-me",
         repo: args.rel,
-        incomingCheckout: checkoutLabel(args.incoming),
+        incomingCheckout: checkoutLabel(args.incoming.head) ?? { kind: "detached" },
         localOnlyCommits: localOnly.map(({ labels, subject }) => ({ labels, subject })),
         oracle: oracleClass,
         index: indexClass,
@@ -385,15 +372,15 @@ async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined,
     if (recovery.status === "defer") return { state, error: recovery.reason };
     return { state, error: "repository is absent or unreadable" };
   }
-  const recovery = await recoverFollowJournal(root, rel, await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx));
+  const landedRecovery = await recoverAndLandFollowJournal(
+    root,
+    rel,
+    await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx),
+    state,
+  );
+  const recovery = landedRecovery.recovery;
   if (recovery.status === "keep") {
-    const published = await savePublishedRepoIntent(root, state, rel, recovery.intended);
-    if (published.disposition === "landed"
-      || published.disposition === "already-semantic"
-      || published.disposition === "superseded") {
-      await clearFollowJournal(root, rel);
-    }
-    return { state: published.state };
+    return { state: landedRecovery.state };
   }
   if (recovery.status === "defer") return { state, error: recovery.reason };
   if (recovery.status === "human-intervened") return { state, error: `crash-window changes were preserved in ${recovery.quarantinePath}` };
@@ -410,6 +397,7 @@ export async function gitResolveCmd(
 ): Promise<number> {
   const rel = normalizedRepo(root, repoArg);
   const json = options.json === true;
+  const now = deps.now ?? (() => new Date());
   const run = withWorkspaceSyncMutex(root, async (mutex) => {
     const env = await (deps.build ?? defaultBuild)(root);
     let state = await loadState(root, syncStreamId(env.cfg));
@@ -449,7 +437,7 @@ export async function gitResolveCmd(
       return 1;
     }
     const takeSnapshot = () => buildSnapshot({
-      root, rel, ctx, state, record, incoming, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: (deps.now ?? (() => new Date()))(),
+      root, rel, ctx, state, record, incoming, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
     });
     let snapshot = await takeSnapshot();
     if (verb === "show-me") {
@@ -482,17 +470,17 @@ export async function gitResolveCmd(
       return 1;
     }
 
-    const quarantine = await quarantineLocal(ctx, path.join(root, ".rbox", "git-quarantine", crypto.createHash("sha256").update(rel).digest("hex").slice(0, 16)), `${Date.now()}`);
+    const quarantine = await quarantineLocal(ctx, path.join(root, ".rbox", "git-quarantine", hashBytes(Buffer.from(rel)).slice(0, 16)), `${Date.now()}`);
     await pinDisplaced(ctx.repoDir, snapshot.protectedOids, {
       ref: `resolve:${rel}`,
       episode: snapshot.public.snapshot,
-      time: (deps.now ?? (() => new Date()))().toISOString(),
+      time: now().toISOString(),
       class: "human",
     });
 
     let intended: FollowIntended | undefined;
     let boundaryMismatch = false;
-    const previousRecord: RepoRecordInput = (({ repoGen: _repoGen, ...value }) => value)(record);
+    const previousRecord: RepoRecordInput = inputRecord(record);
     const makeIntended = (progress: FollowProgress): FollowIntended => {
       const next: RepoRecordInput = { ...previousRecord, sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence), base: incoming };
       delete next.pending;
@@ -547,7 +535,7 @@ export async function gitResolveCmd(
       const freshRecord = repoRecordsForState(freshState)[rel];
       const freshIncoming = incomingFor(freshRecord);
       if (boundaryMismatch && freshRecord && freshIncoming) {
-        const fresh = await buildSnapshot({ root, rel, ctx, state: freshState, record: freshRecord, incoming: freshIncoming, store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: (deps.now ?? (() => new Date()))() });
+        const fresh = await buildSnapshot({ root, rel, ctx, state: freshState, record: freshRecord, incoming: freshIncoming, store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: now() });
         emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed at the locked checkout boundary; confirm the fresh snapshot", current: fresh.public }, json, deps);
       } else {
         emit({ status: "refused", verb, repo: rel, code: follow.reason, message: refusalMessage(follow.reason, follow.detail) }, json, deps);
@@ -555,12 +543,8 @@ export async function gitResolveCmd(
       return 1;
     }
     if (Object.keys(follow.heldRefs).length || !intended) throw new Error("manual resolution published an incomplete checkout");
-    const published = await savePublishedRepoIntent(root, state, rel, intended);
-    if (published.disposition === "landed"
-      || published.disposition === "already-semantic"
-      || published.disposition === "superseded") {
-      await clearFollowJournal(root, rel);
-    }
+    const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
+    if (landed.recovery.status !== "keep") throw new Error("published checkout journal could not be recovered");
     emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps);
     return 0;
   });

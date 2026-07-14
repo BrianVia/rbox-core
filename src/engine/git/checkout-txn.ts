@@ -5,12 +5,11 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { hashBytes } from "../hash.js";
-import { clearIndexResolveUndo, moveFileAtomic, walkFiles, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
 import { readOpState, pruneEmptyOpStateDirs } from "./refs.js";
 import { updateCheckoutJournal, type CheckoutJournal } from "./journal.js";
 
 const exec = promisify(execFile);
-const ZERO_OID = "0".repeat(40);
 
 export type CheckoutRefUpdate =
   | { kind: "create"; ref: string; newOid: string }
@@ -81,18 +80,6 @@ export function setCheckoutCapabilityProbeForTests(probe: CheckoutCapabilityProb
 export function resetCheckoutCapabilityProbeCacheForTests(): void {
   capabilityCache.clear();
   injectedCapabilityProbe = undefined;
-}
-
-function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    GIT_DIR: undefined,
-    GIT_OBJECT_DIRECTORY: undefined,
-    GIT_COMMON_DIR: undefined,
-    GIT_WORK_TREE: undefined,
-    GIT_INDEX_FILE: undefined,
-    ...extra,
-  } as NodeJS.ProcessEnv;
 }
 
 class RefTransaction {
@@ -492,8 +479,8 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       const token = await lockToken(lockPath);
       if (!token) throw new Error(`could not identify owned ${reservation.ref}.lock`);
       reservationTokens.push(token);
-      const { stdout } = await exec("git", ["-C", ctx.repoDir, "rev-parse", "--verify", reservation.ref], { env: cleanGitEnv() });
-      if (stdout.toString().trim() !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
+      const oid = await git(ctx.repoDir, ["rev-parse", "--verify", reservation.ref]);
+      if (oid !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
     }
     if (opts.journal && reservationTokens.length) {
       opts.journal.value.expectedNew.reservedLocks = Object.fromEntries((plan.refReservations ?? []).map((reservation, i) => [reservation.ref, {

@@ -3,8 +3,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { writeFileAtomic, fsyncDirectory } from "../fsutil.js";
-import { HEX40, git, repoCtx } from "./shared.js";
+import type { GitSection } from "../types.js";
+import { cleanGitEnv, enumerateRefReflogOids, HEX40, git, repoCtx } from "./shared.js";
 import { tipOwnedByIncoming } from "./reachability.js";
+
+export { enumerateRefReflogOids } from "./shared.js";
 
 export interface KeepPinOrigin {
   ref: string;
@@ -27,8 +30,13 @@ export type PrepareDisplacedPinsResult =
 
 const pinRef = (oid: string) => `refs/rbox-local/keep/${oid}`;
 
-function cleanGitEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv;
+export function humanDisplacementOrigin(ref: string, section: Pick<GitSection, "generatedAt">): KeepPinOrigin {
+  return {
+    ref,
+    episode: section.generatedAt || String(Date.now()),
+    time: new Date().toISOString(),
+    class: "human",
+  };
 }
 
 /** Commit caller-prepared recovery-pin lines together with their destructive ref
@@ -47,7 +55,7 @@ export async function runUpdateRefTransaction(repoDir: string, lines: readonly s
       let stderr = "";
       child.stderr!.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
       child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`git update-ref failed (${code}): ${stderr.trim()}`)));
+      child.once("close", (code) => code === 0 && !/\bfatal:/i.test(stderr) ? resolve() : reject(new Error(`git update-ref failed (${code}): ${stderr.trim()}`)));
     });
   } finally {
     await input.close();
@@ -83,9 +91,14 @@ export async function prepareKeepPins(repoDir: string, oids: readonly string[], 
   await writeFileAtomic(sidecarPath, `${JSON.stringify(origins, null, 2)}\n`);
   await fsyncDirectory(ctx.commonDir);
 
+  const listed = await git(repoDir, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/rbox-local/keep"]);
+  const existingPins = new Map(listed.split("\n").filter(Boolean).map((line) => {
+    const separator = line.indexOf(" ");
+    return [line.slice(0, separator), line.slice(separator + 1)] as const;
+  }));
   const transactionLines: string[] = [];
   for (const oid of unique) {
-    const existing = await git(repoDir, ["rev-parse", "--verify", "--quiet", pinRef(oid)]).catch(() => "");
+    const existing = existingPins.get(pinRef(oid)) ?? "";
     if (existing === oid) continue;
     if (existing) throw new Error(`recovery pin collision at ${pinRef(oid)}`);
     transactionLines.push(`create ${pinRef(oid)} ${oid}`);
@@ -104,23 +117,6 @@ export async function pinDisplaced(repoDir: string, oids: readonly string[], ori
     for (const oid of prepared.oids) if (await git(repoDir, ["rev-parse", "--verify", pinRef(oid)]).catch(() => "") !== oid) throw error;
   }
   return prepared;
-}
-
-export async function enumerateRefReflogOids(repoDir: string, ref: string): Promise<string[]> {
-  if (!ref.startsWith("refs/") || ref.includes("..")) throw new Error("invalid reflog ref");
-  const ctx = await repoCtx(repoDir);
-  if (!ctx) throw new Error("repository unavailable while reading reflog");
-  const raw = await fs.readFile(path.join(ctx.commonDir, "logs", ...ref.split("/")), "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  });
-  const result = new Set<string>();
-  for (const line of raw.split("\n")) {
-    const [oldOid, newOid] = line.split(" ");
-    if (oldOid && HEX40.test(oldOid) && !/^0+$/.test(oldOid)) result.add(oldOid);
-    if (newOid && HEX40.test(newOid) && !/^0+$/.test(newOid)) result.add(newOid);
-  }
-  return [...result];
 }
 
 /** r1 F6: protect every reflog-only OID not in the caller's planned durable graph. */
@@ -144,4 +140,22 @@ export async function prepareDisplacedRefPins(
     if (proof.status === "unowned") displaced.push(oid);
   }
   return { status: "prepared", ...(await prepareKeepPins(repoDir, displaced, origin)) };
+}
+
+/** Include a displaced live tip even when it is absent from the ref's reflog. */
+export async function prepareDisplacementPins(
+  repoDir: string,
+  ref: string,
+  oldOid: string,
+  plannedRoots: readonly string[],
+  origin: KeepPinOrigin,
+): Promise<PrepareDisplacedPinsResult> {
+  const reflog = await prepareDisplacedRefPins(repoDir, ref, plannedRoots, origin);
+  if (reflog.status === "indeterminate" || reflog.oids.includes(oldOid)) return reflog;
+  const tip = await prepareKeepPins(repoDir, [oldOid], origin);
+  return {
+    ...reflog,
+    oids: [...reflog.oids, oldOid],
+    transactionLines: [...reflog.transactionLines, ...tip.transactionLines],
+  };
 }

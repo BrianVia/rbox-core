@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
-import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
+import { headBranchOf } from "../../engine/git/shared.js";
 import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "../sync-recovery.js";
@@ -92,10 +92,21 @@ export function gitIncomingKey(section: GitSection): string {
     bundleSha: section.bundleSha,
     packChain: (section.packChain ?? []).map((link) => link.sha),
   };
-  return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  return hashBytes(Buffer.from(JSON.stringify(normalized)));
+}
+
+/** Plaintext identity of each operation-state artifact in a section. */
+export const sectionOpState = (section: GitSection | undefined): Record<string, string> =>
+  Object.fromEntries(Object.entries(section?.opState ?? {}).map(([name, artifact]) => [name, artifact.sha]));
+
+/** Human-facing checkout classification shared by resolve and apply status. */
+export function checkoutLabel(head: string): GitDeferral["checkout"] {
+  const branch = headBranchOf(head);
+  return branch ? { kind: "branch", label: branch.replace(/^refs\/heads\//, "") } : { kind: "detached" };
 }
 
 export function nextDeferral(
+  lane: GitDeferral["lane"],
   current: GitDeferral | undefined,
   reason: GitDeferralReason,
   now: string,
@@ -103,7 +114,7 @@ export function nextDeferral(
   checkout?: GitDeferral["checkout"],
 ): GitDeferral {
   return {
-    lane: current?.lane ?? "apply",
+    lane,
     deferredSince: current?.deferredSince ?? now,
     reasonSince: current?.reason === reason ? current.reasonSince : now,
     lastSeen: now,

@@ -3,14 +3,13 @@ import path from "node:path";
 import { GitCaptureDeferredError, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
-import { savePublishedRepoIntent } from "../sync-state.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
-import { checkoutJournalBinding, clearFollowJournal, quarantineUnboundFollowJournal, recoverFollowJournal } from "./follow.js";
+import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -237,24 +236,19 @@ export async function planGitSections(
       continue;
     }
     const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
-    const recovery = await recoverFollowJournal(root, rel, binding);
+    const landedRecovery = await recoverAndLandFollowJournal(root, rel, binding, state, { land: !options.degradedMutex });
+    const recovery = landedRecovery.recovery;
     if (recovery.status === "keep") {
       if (options.degradedMutex) {
         recoveryBlocked.set(rel, "published checkout journal awaits non-degraded state save");
         continue;
       }
-      const published = await savePublishedRepoIntent(root, state, rel, recovery.intended);
-      state = published.state;
+      state = landedRecovery.state;
       const record = repoRecordsForState(state)[rel];
       if (record?.base) base[rel] = record.base; else delete base[rel];
       if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
       if (record?.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
       if (record?.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
-      if (published.disposition === "landed"
-        || published.disposition === "already-semantic"
-        || published.disposition === "superseded") {
-        await clearFollowJournal(root, rel);
-      }
       glog(`git-sync recovered published checkout ${rel} before capture`);
     } else if (recovery.status === "defer") {
       recoveryBlocked.set(rel, recovery.reason);

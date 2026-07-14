@@ -23,21 +23,26 @@ import {
   listWorktrees,
   moveFileAtomic,
   repoCtx,
+  warnOnce,
+  ZERO_OID,
 } from "./shared.js";
 import { listRefs, readAllRefs, restoreOpState } from "./refs.js";
 import { pruneStaleScratchRefs } from "./pins.js";
 import { quarantineLocal } from "./quarantine.js";
 import { restoreLocal, snapshotLocal } from "./rollback.js";
-import { prepareDisplacedRefPins, prepareKeepPins, runUpdateRefTransaction } from "./keep-pins.js";
+import { humanDisplacementOrigin, prepareDisplacementPins, runUpdateRefTransaction } from "./keep-pins.js";
 import { tipOwnedByIncoming } from "./reachability.js";
 
-const ZERO_OID = "0".repeat(40);
 const refEquivalenceWarnings = new Set<string>();
 
-function warnRefEquivalence(repoDir: string, refs: Set<string>): void {
-  if (refs.size === 0 || refEquivalenceWarnings.has(repoDir)) return;
-  refEquivalenceWarnings.add(repoDir);
-  console.warn(`git-sync WARNING: receiver-equivalent Git refnames held in ${repoDir}: ${[...refs].sort().join(", ")}`);
+function warnRefEquivalence(repoDir: string, refs: Set<string>, sink: (message: string) => void): void {
+  if (refs.size === 0) return;
+  warnOnce(
+    refEquivalenceWarnings,
+    repoDir,
+    `git-sync WARNING: receiver-equivalent Git refnames held in ${repoDir}: ${[...refs].sort().join(", ")}`,
+    sink,
+  );
 }
 
 // ---- apply (design 43 §7) -------------------------------------------------------
@@ -83,12 +88,13 @@ async function classifyWorktreeOwnership(
   beforeMutateWipesRefs: boolean,
   legacyWholeSectionOwnership = false,
   localRefs?: Record<string, string>,
+  warningSink: (message: string) => void = console.warn,
 ): Promise<{ heldRefs: Map<string, string>; deferReason?: string }> {
   const owned = await branchesCheckedOutElsewhere(ctx);
   const heldRefs = new Map<string, string>();
   const refs = localRefs ?? await readAllRefs(ctx.repoDir);
   const ambiguous = receiverEquivalentCollisionNames([...Object.keys(section.refs), ...Object.keys(refs), ...owned.keys()]);
-  warnRefEquivalence(ctx.repoDir, ambiguous);
+  warnRefEquivalence(ctx.repoDir, ambiguous, warningSink);
   for (const ref of ambiguous) heldRefs.set(ref, owned.get(ref) ?? "receiver-equivalent-refname");
   if (owned.size === 0 && ambiguous.size === 0) return { heldRefs };
   const shortName = (ref: string) => ref.replace(/^refs\/heads\//, "");
@@ -190,6 +196,7 @@ export async function applyGitState(
      * its rename is the combined git+config commit point. */
     afterGitMutate?: () => Promise<void>;
     chainTimings?: GitChainTimings;
+    warningSink?: (message: string) => void;
   } = {}
 ): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
@@ -237,6 +244,8 @@ export async function applyGitState(
         deleteAbsent,
         opts.beforeMutateWipesRefs === true,
         opts.legacyWholeSectionOwnership === true,
+        undefined,
+        opts.warningSink,
       );
       if (ownership.deferReason) return { applied: false, reason: ownership.deferReason };
     }
@@ -394,7 +403,7 @@ export async function applyGitState(
         ...Object.keys(boundaryRefs),
         ...boundaryOwned.keys(),
       ]);
-      warnRefEquivalence(repoDir, ambiguousRefs);
+      warnRefEquivalence(repoDir, ambiguousRefs, opts.warningSink ?? console.warn);
       if (incomingHeadRef && ambiguousRefs.has(incomingHeadRef)) {
         return {
           applied: false,
@@ -413,7 +422,7 @@ export async function applyGitState(
       }
 
       if (opts.legacyWholeSectionOwnership) {
-        const ownership = await classifyWorktreeOwnership(ctx, section, deleteAbsent, false, true, boundaryRefs);
+        const ownership = await classifyWorktreeOwnership(ctx, section, deleteAbsent, false, true, boundaryRefs, opts.warningSink);
         if (ownership.deferReason) {
           return {
             applied: false,
@@ -443,6 +452,16 @@ export async function applyGitState(
       const deletionCandidates = deleteAbsent
         ? Object.keys(boundaryRefs).filter((ref) => !(ref in section.refs))
         : [];
+      const ownershipChangedRefs = new Set<string>();
+      const hold = (ref: string, label: string): void => {
+        if (opts.legacyWholeSectionOwnership) {
+          if (label.startsWith("ancestry-")) throw new Error(`ref ancestry ${label.slice("ancestry-".length)} for ${ref}`);
+          if (label.startsWith("reflog-")) throw new Error(`reflog reachability ${label.slice("reflog-".length)} for ${ref}`);
+          if (ownershipChangedRefs.has(ref)) throw new Error(`worktree ownership changed for ${ref}`);
+          throw new Error(`ref compare-and-swap failed for ${ref}`);
+        }
+        heldRefs.set(ref, label);
+      };
 
       // Publish refs per the scope-gated rules (see doc comment).
       for (const [ref, sha] of Object.entries(publishRefs)) {
@@ -455,40 +474,29 @@ export async function applyGitState(
           // compare-and-swap replacement commit in one update-ref transaction.
           const ff = await tipOwnedByIncoming(repoDir, oldOid, [sha]);
           if (ff.status === "indeterminate") {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`ref ancestry ${ff.marker} for ${ref}`);
-            heldRefs.set(ref, `ancestry-${ff.marker}`);
+            hold(ref, `ancestry-${ff.marker}`);
             continue;
           }
           if (ff.status === "unowned") {
-            const durable = await readAllRefs(repoDir);
+            const durable = { ...boundaryRefs };
             durable[ref] = sha;
-            const origin = {
-              ref,
-              episode: section.generatedAt || String(Date.now()),
-              time: new Date().toISOString(),
-              class: "human" as const,
-            };
-            const pins = await prepareDisplacedRefPins(repoDir, ref, Object.values(durable), origin);
+            const origin = humanDisplacementOrigin(ref, section);
+            const pins = await prepareDisplacementPins(repoDir, ref, oldOid, Object.values(durable), origin);
             if (pins.status === "indeterminate") {
-              if (opts.legacyWholeSectionOwnership) throw new Error(`reflog reachability ${pins.marker} for ${ref}`);
-              heldRefs.set(ref, `reflog-${pins.marker}`);
+              hold(ref, `reflog-${pins.marker}`);
               continue;
             }
             // Reflogs may be disabled or missing. The live displaced tip is
             // independently mandatory protection, not merely one likely
             // member of the reflog enumeration.
-            const tipPin = pins.oids.includes(oldOid)
-              ? undefined
-              : await prepareKeepPins(repoDir, [oldOid], origin);
             try {
               await runUpdateRefTransaction(repoDir, [
                 ...pins.transactionLines,
-                ...(tipPin?.transactionLines ?? []),
                 `update ${ref} ${sha} ${oldOid}`,
               ]);
+              boundaryRefs[ref] = sha;
             } catch {
-              if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
-              heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+              hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
             }
             continue;
           }
@@ -501,16 +509,16 @@ export async function applyGitState(
           const subject = (await git(repoDir, ["log", "-1", "--format=%s", sha]).catch(() => "")) || "rbox: synced stash";
           try {
             await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha, oldOid]);
+            boundaryRefs[ref] = sha;
           } catch {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
-            heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+            hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
           }
         } else {
           try {
             await git(repoDir, ["update-ref", ref, sha, oldOid]);
+            boundaryRefs[ref] = sha;
           } catch {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
-            heldRefs.set(ref, boundaryOwned.get(ref) ?? "concurrent-update");
+            hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
           }
         }
       }
@@ -521,23 +529,22 @@ export async function applyGitState(
           // the section boundary. A branch attached by a sibling while earlier
           // refs publish survives this cycle.
           const ownedNow = await branchesCheckedOutElsewhere(ctx);
-          const liveNowForAliases = await readAllRefs(repoDir);
+          const liveRefs = await readAllRefs(repoDir);
           const ambiguousNow = receiverEquivalentCollisionNames([
             ...Object.keys(section.refs),
-            ...Object.keys(liveNowForAliases),
+            ...Object.keys(liveRefs),
             ...ownedNow.keys(),
           ]);
           if (ambiguousNow.has(ref)) {
-            warnRefEquivalence(repoDir, ambiguousNow);
+            warnRefEquivalence(repoDir, ambiguousNow, opts.warningSink ?? console.warn);
             heldRefs.set(ref, ownedNow.get(ref) ?? "receiver-equivalent-refname");
             continue;
           }
           if (ownedNow.has(ref)) {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`worktree ownership changed for ${ref}`);
-            heldRefs.set(ref, ownedNow.get(ref)!);
+            ownershipChangedRefs.add(ref);
+            hold(ref, ownedNow.get(ref)!);
             continue;
           }
-          const liveRefs = await readAllRefs(repoDir);
           const oldOid = liveRefs[ref];
           if (!oldOid || ref in section.refs) continue;
           const durable = { ...liveRefs };
@@ -547,22 +554,22 @@ export async function applyGitState(
             ...Object.values(durable),
             ...(HEX40.test(detachedIncoming) ? [detachedIncoming] : []),
           ];
-          const pins = await prepareDisplacedRefPins(repoDir, ref, plannedGraphRoots, {
+          const pins = await prepareDisplacementPins(
+            repoDir,
             ref,
-            episode: section.generatedAt || String(Date.now()),
-            time: new Date().toISOString(),
-            class: "human",
-          });
+            oldOid,
+            plannedGraphRoots,
+            humanDisplacementOrigin(ref, section),
+          );
           if (pins.status === "indeterminate") {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`reflog reachability ${pins.marker} for ${ref}`);
-            heldRefs.set(ref, `reflog-${pins.marker}`);
+            hold(ref, `reflog-${pins.marker}`);
             continue;
           }
           try {
             await runUpdateRefTransaction(repoDir, [...pins.transactionLines, `delete ${ref} ${oldOid}`]);
+            delete boundaryRefs[ref];
           } catch {
-            if (opts.legacyWholeSectionOwnership) throw new Error(`ref compare-and-swap failed for ${ref}`);
-            heldRefs.set(ref, "concurrent-update");
+            hold(ref, "concurrent-update");
           }
         }
       }

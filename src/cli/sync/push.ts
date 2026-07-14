@@ -393,16 +393,12 @@ async function runPushAttempt(
     const lanes: GitDeferralUpdates = {};
     const captureReason = gitPlan.captureDeferrals[rel];
     if (captureReason) {
-      const next = nextDeferral(current?.capture, captureReason, now);
-      next.lane = "capture";
-      lanes.capture = next;
+      lanes.capture = nextDeferral("capture", current?.capture, captureReason, now);
     } else if (current?.capture) lanes.capture = null;
     if (gitPlan.configObserved.includes(rel)) {
       const configReason = gitPlan.configDeferrals[rel];
       if (configReason) {
-        const next = nextDeferral(current?.config, configReason, now);
-        next.lane = "config";
-        lanes.config = next;
+        lanes.config = nextDeferral("config", current?.config, configReason, now);
       } else if (current?.config) lanes.config = null;
     }
     const ordered = orderedDeferralUpdates(current, lanes);
@@ -413,24 +409,31 @@ async function runPushAttempt(
   // anywhere in that repo subtree, retain the marker monotonically until the
   // apply episode itself clears. This is sender-local state only; it never enters
   // the manifest or changes the apply lane's retry timestamp.
-  const changedPaths = [
-    ...filesDiff.added.map((entry) => entry.path),
-    ...filesDiff.changed.map((entry) => entry.path),
-    ...filesDiff.deleted,
-  ];
-  for (const [rel, record] of Object.entries(repoRecords)) {
-    const apply = record.deferrals?.apply;
-    if (!apply || apply.bytesChanged === true) continue;
-    const intersects = changedPaths.some((filePath) =>
-      rel === "." || filePath === rel || filePath.startsWith(`${rel}/`));
-    if (!intersects) continue;
-    const ordered = orderedDeferralUpdates(record.deferrals, {
-      apply: { ...apply, bytesChanged: true },
+  const writeBytesChanged = (): void => {
+    const candidates = Object.entries(repoRecords).filter(([, record]) => {
+      const apply = record.deferrals?.apply;
+      return apply !== undefined && apply.bytesChanged !== true;
     });
-    if (ordered?.apply) {
-      deferralUpdates[rel] = { ...(deferralUpdates[rel] ?? {}), apply: ordered.apply };
+    if (candidates.length === 0) return;
+    const changedPaths = [
+      ...filesDiff.added.map((entry) => entry.path),
+      ...filesDiff.changed.map((entry) => entry.path),
+      ...filesDiff.deleted,
+    ];
+    for (const [rel, record] of candidates) {
+      const apply = record.deferrals!.apply!;
+      const intersects = changedPaths.some((filePath) =>
+        rel === "." || filePath === rel || filePath.startsWith(`${rel}/`));
+      if (!intersects) continue;
+      const ordered = orderedDeferralUpdates(record.deferrals, {
+        apply: { ...apply, bytesChanged: true },
+      });
+      if (ordered?.apply) {
+        deferralUpdates[rel] = { ...(deferralUpdates[rel] ?? {}), apply: ordered.apply };
+      }
     }
-  }
+  };
+  writeBytesChanged();
   const deferralValues = {
     bases: state.lastSyncedManifest.gitRepos,
     pending: state.gitPendingRemote,

@@ -3,7 +3,7 @@ import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
-import { loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
+import { DEFERRAL_LANES, loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
 import { emitJson } from "./json.js";
@@ -51,7 +51,6 @@ interface LocalGitDeferral extends GitDeferral {
   repo: string;
 }
 
-const DEFERRAL_LANES: GitDeferral["lane"][] = ["apply", "capture", "config"];
 function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
   const out: LocalGitDeferral[] = [];
   for (const [repo, record] of Object.entries(repoRecordsForState(state))) {

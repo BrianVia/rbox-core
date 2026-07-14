@@ -44,22 +44,43 @@ export function setGitSpawnObserver(observer: ((root: string, args: readonly str
 }
 
 export const HEX40 = /^[0-9a-f]{40}$/;
+export const ZERO_OID = "0".repeat(40);
+
+/** Remove repository-routing variables inherited from hooks/wrappers. */
+export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_DIR: undefined,
+    GIT_OBJECT_DIRECTORY: undefined,
+    GIT_COMMON_DIR: undefined,
+    GIT_WORK_TREE: undefined,
+    GIT_INDEX_FILE: undefined,
+    ...extra,
+  } as NodeJS.ProcessEnv;
+}
+
+/** Emit one message per key through a caller-selected sink. */
+export function warnOnce(seen: Set<string>, key: string, message: string, sink: (message: string) => void): void {
+  if (seen.has(key)) return;
+  seen.add(key);
+  sink(message);
+}
 
 /** Run Git without altering stdout bytes. Required for NUL-delimited config reads,
  * where trimming would erase a successful empty value. */
-export async function gitRaw(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+export async function gitRaw(root: string, args: string[], opts: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
   gitSpawnObserver?.(root, args);
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
     // Strip every repo-redirecting env var: rbox may be invoked from a git hook or wrapper,
     // and a leaked GIT_COMMON_DIR/GIT_WORK_TREE/GIT_INDEX_FILE would point commonDir (now
     // load-bearing for the apply shape refusal + gitBusy) at a FOREIGN repo.
-    env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined } as NodeJS.ProcessEnv,
+    env: cleanGitEnv(opts.env),
   });
   return stdout.toString();
 }
 
-export async function git(root: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
+export async function git(root: string, args: string[], opts: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
   return (await gitRaw(root, args, opts)).trim();
 }
 
@@ -93,7 +114,7 @@ export async function gitWithIndexFile(root: string, indexFile: string, args: st
   gitSpawnObserver?.(root, args);
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
-    env: { ...process.env, GIT_DIR: undefined, GIT_OBJECT_DIRECTORY: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: indexFile } as NodeJS.ProcessEnv,
+    env: cleanGitEnv({ GIT_INDEX_FILE: indexFile }),
   });
   return stdout.toString().trim();
 }
@@ -109,6 +130,23 @@ export async function gitOk(root: string, args: string[]): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function enumerateRefReflogOids(repoDir: string, ref: string): Promise<string[]> {
+  if (!ref.startsWith("refs/") || ref.includes("..")) throw new Error("invalid reflog ref");
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) throw new Error("repository unavailable while reading reflog");
+  const raw = await fs.readFile(path.join(ctx.commonDir, "logs", ...ref.split("/")), "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const result = new Set<string>();
+  for (const line of raw.split("\n")) {
+    const [oldOid, newOid] = line.split(" ");
+    if (oldOid && HEX40.test(oldOid) && !/^0+$/.test(oldOid)) result.add(oldOid);
+    if (newOid && HEX40.test(newOid) && !/^0+$/.test(newOid)) result.add(newOid);
+  }
+  return [...result];
 }
 
 // ---- repo context -----------------------------------------------------------

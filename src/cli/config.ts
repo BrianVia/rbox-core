@@ -212,6 +212,8 @@ export interface GitDeferral {
   reproof?: boolean;
 }
 
+export const DEFERRAL_LANES = ["apply", "capture", "config"] as const satisfies readonly GitDeferral["lane"][];
+
 export type GitDeferrals = Partial<Record<GitDeferral["lane"], GitDeferral>>;
 
 export interface GitPartialApply {

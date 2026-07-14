@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { discoverGitRepos, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
-import { repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
+import { DEFERRAL_LANES, repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";
 import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";
@@ -52,7 +52,7 @@ export async function gitDivergenceStatus(
 ): Promise<GitDivergenceStatus> {
   const deferrals: GitDivergenceStatus["deferrals"] = [];
   for (const [relPath, record] of Object.entries(repoRecordsForState(state))) {
-    for (const lane of ["apply", "capture", "config"] as const) {
+    for (const lane of DEFERRAL_LANES) {
       const deferral = record.deferrals?.[lane];
       if (!deferral) continue;
       deferrals.push({

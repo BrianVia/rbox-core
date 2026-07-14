@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import {
   applyStateSavePacket,
+  DEFERRAL_LANES,
   expectedStateNonce,
   loadRawState,
   MAX_LEGACY_GIT_SIDECAR_REPOS,
@@ -98,7 +99,7 @@ export function fileOnlyManifest(manifest: Manifest): FileOnlyManifest {
   return filesAndMetadata;
 }
 
-const inputRecord = (record: RepoRecord): RepoRecordInput => {
+export const inputRecord = (record: RepoRecord): RepoRecordInput => {
   const { repoGen: _repoGen, ...input } = record;
   return input;
 };
@@ -115,7 +116,7 @@ export function orderedDeferralUpdates(
 ): OrderedGitDeferralUpdates | undefined {
   if (incoming === undefined) return undefined;
   const updates: OrderedGitDeferralUpdates = {};
-  for (const lane of ["apply", "capture", "config"] as const) {
+  for (const lane of DEFERRAL_LANES) {
     const previous = current?.[lane];
     const value = incoming === null ? null : incoming[lane];
     if (value === undefined) continue;
@@ -149,7 +150,7 @@ export function mergeDeferrals(
 ): GitDeferrals | undefined {
   if (incoming === undefined) return current;
   const merged: GitDeferrals = { ...(current ?? {}) };
-  for (const lane of ["apply", "capture", "config"] as const) {
+  for (const lane of DEFERRAL_LANES) {
     const transition = incoming[lane];
     if (transition === undefined) continue;
     const present = merged[lane];
@@ -307,6 +308,10 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
 
 export type PublishedRepoIntentDisposition = "landed" | "already-semantic" | "superseded";
 
+/** A published intent is settled for every currently known terminal disposition. */
+export const intentSettled = (disposition: PublishedRepoIntentDisposition): boolean =>
+  disposition === "landed" || disposition === "already-semantic" || disposition === "superseded";
+
 export interface PublishedRepoIntentResult {
   state: SyncState;
   disposition: PublishedRepoIntentDisposition;
@@ -324,10 +329,6 @@ export async function savePublishedRepoIntent(
   options: { forceLegacy?: boolean } = {},
 ): Promise<PublishedRepoIntentResult> {
   if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
-  const withoutGen = (value: RepoRecord): RepoRecordInput => {
-    const { repoGen: _repoGen, ...record } = value;
-    return record;
-  };
   const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
     Object.fromEntries(fields.map((field) => [field, record?.[field]]));
   const applyFields = ["base", "pending", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
@@ -393,7 +394,7 @@ export async function savePublishedRepoIntent(
   let currentSnapshot = snapshot;
   for (let attempt = 0; attempt < 3; attempt++) {
     const current = repoRecordsForState(currentSnapshot)[relPath] ?? { repoGen: 0, sourceSeq: 0 };
-    const currentInput = withoutGen(current);
+    const currentInput = inputRecord(current);
     const exactGeneration = current.repoGen === intended.expectedRepoGen;
     const previous = intended.previousRecord ?? { sourceSeq: 0 };
     const appAlready = laneSemantic(currentInput, intended.record, applyFields, "apply");

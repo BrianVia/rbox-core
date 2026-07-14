@@ -104,6 +104,15 @@ interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: numb
 
 export interface GitDeferralLogSeen { reason: string; boundary: string }
 
+const repoRecordProjection = new WeakMap<SyncState, ReturnType<typeof repoRecordsForState>>();
+const projectedRepoRecords = (state: SyncState): ReturnType<typeof repoRecordsForState> => {
+  const cached = repoRecordProjection.get(state);
+  if (cached) return cached;
+  const records = repoRecordsForState(state);
+  repoRecordProjection.set(state, records);
+  return records;
+};
+
 /** Pure state projection used by the daemon's instance-local durable-line dedup. */
 export function durableGitDeferralLines(
   state: SyncState,
@@ -112,7 +121,7 @@ export function durableGitDeferralLines(
 ): string[] {
   const active = new Set<string>();
   const pending: Array<{ at: number; line: string }> = [];
-  const projections = projectGitDeferralRepos(Object.entries(repoRecordsForState(state)).flatMap(([repo, record]) =>
+  const projections = projectGitDeferralRepos(Object.entries(projectedRepoRecords(state)).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
   ));
   for (const deferral of projections) {
@@ -1054,6 +1063,9 @@ export class RboxDaemon {
    *  `pending` because the follow-up push was still queued, and the no-op push
    *  never writes — without the settle pass the glyph reads pending forever). */
   private lastShellState?: string;
+  /** Last shell.deferrals rendering scheduled for persistence; null means no write
+   * has been attempted yet, so startup still removes a stale empty sidecar. */
+  private lastShellDeferrals: string | undefined | null = null;
   /** Instance-local suppression only; authoritative episode state remains state.json. */
   private readonly gitDeferralLogSeen = new Map<string, GitDeferralLogSeen>();
 
@@ -1065,10 +1077,12 @@ export class RboxDaemon {
   /** Runs synchronously after the authoritative state save, before later network
    * work can hang/fail, so every new durable episode becomes locally visible. */
   private observeDurableGitState(state: SyncState, now = Date.now()): void {
-    const before = this.syncBase ? renderShellDeferrals(this.syncBase, now, ageBucket) : undefined;
+    const before = this.syncBase
+      ? renderShellDeferrals(this.syncBase, now, ageBucket, projectedRepoRecords(this.syncBase))
+      : undefined;
     this.syncBase = state;
     this.emitDurableGitDeferrals(state, now);
-    if (before !== renderShellDeferrals(state, now, ageBucket)) this.writeActivity();
+    if (before !== renderShellDeferrals(state, now, ageBucket, projectedRepoRecords(state))) this.writeActivity();
   }
 
   /** Persist the activity record and bump the pump heartbeat. */
@@ -1209,7 +1223,7 @@ export class RboxDaemon {
         watcherDegraded: this.watcherDegraded,
         ownershipLost: this.ownershipWindDownStarted,
         currentPath: this.activeProgressPath,
-        repoRecords: this.syncBase ? repoRecordsForState(this.syncBase) : undefined,
+        repoRecords: this.syncBase ? projectedRepoRecords(this.syncBase) : undefined,
       }),
       fileCount: this.manifest.files.length,
       totalBytes: this.manifest.files.reduce((n, f) => n + f.size, 0),
@@ -1285,12 +1299,17 @@ export class RboxDaemon {
     });
     const ambient = this.ambientStatusFrom(snapshot, settled, now);
     const syncBase = this.syncBase;
+    const shellDeferrals = syncBase
+      ? renderShellDeferrals(syncBase, now, ageBucket, projectedRepoRecords(syncBase))
+      : undefined;
+    const writeShellDeferrals = syncBase !== undefined && shellDeferrals !== this.lastShellDeferrals;
+    if (syncBase) this.lastShellDeferrals = shellDeferrals;
     this.emitDurableGitDeferrals(syncBase, now);
     this.lastShellState = shellState;
     this.activityWrite = this.activityWrite.then(async () => {
       if (this.canPersistTrustedSurface()) {
         await saveShellLine(this.root, line);
-        if (syncBase) await saveShellDeferrals(this.root, syncBase, now, ageBucket);
+        if (writeShellDeferrals) await saveShellDeferrals(this.root, syncBase!, now, ageBucket);
       }
       await this.saveAmbientStatusIfOwned(ambient);
     });
@@ -1320,12 +1339,17 @@ export class RboxDaemon {
     });
     const ambient = this.ambientStatusFrom(snapshot, settled, now);
     const syncBase = this.syncBase;
+    const shellDeferrals = syncBase
+      ? renderShellDeferrals(syncBase, now, ageBucket, projectedRepoRecords(syncBase))
+      : undefined;
+    const writeShellDeferrals = syncBase !== undefined && shellDeferrals !== this.lastShellDeferrals;
+    if (syncBase) this.lastShellDeferrals = shellDeferrals;
     this.activityWrite = this.activityWrite
       .then(async () => {
         if (!this.canPersistTrustedSurface()) return;
         await saveActivity(this.root, snapshot);
         await saveShellLine(this.root, line);
-        if (syncBase) await saveShellDeferrals(this.root, syncBase, now, ageBucket);
+        if (writeShellDeferrals) await saveShellDeferrals(this.root, syncBase!, now, ageBucket);
         await this.saveAmbientStatusIfOwned(ambient);
       });
   }

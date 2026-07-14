@@ -3,7 +3,7 @@ import path from "node:path";
 import { hashBytes, hashFile } from "../hash.js";
 import { fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 import type { GitSection } from "../types.js";
-import { git } from "./shared.js";
+import { exists, git, ZERO_OID } from "./shared.js";
 import { pruneEmptyOpStateDirs, readAllRefs } from "./refs.js";
 
 export interface CheckoutJournalBinding {
@@ -150,7 +150,7 @@ async function uniqueRetirePath(root: string, area: string, key: string): Promis
   const base = path.join(root, ".rbox", area);
   await fs.mkdir(base, { recursive: true });
   let dest = path.join(base, `${Date.now()}-${key}`);
-  for (let n = 1; await fs.access(dest).then(() => true, () => false); n++) dest = path.join(base, `${Date.now()}-${key}-${n}`);
+  for (let n = 1; await exists(dest); n++) dest = path.join(base, `${Date.now()}-${key}-${n}`);
   return dest;
 }
 
@@ -338,7 +338,7 @@ export async function recoverJournal<T = unknown>(
     const expected = journal.expectedNew.refs[ref] ?? null;
     if (live === old) continue;
     if (live !== expected) { human.push(`ref:${ref}`); continue; }
-    if (old) await git(repoDir, ["update-ref", ref, old, live ?? "0".repeat(40)]);
+    if (old) await git(repoDir, ["update-ref", ref, old, live ?? ZERO_OID]);
     else if (live) await git(repoDir, ["update-ref", "-d", ref, live]);
   }
 

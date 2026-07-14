@@ -1,12 +1,7 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import type { GitSection } from "../types.js";
-import { HEX40, headBranchOf, repoCtx } from "./shared.js";
-
-const exec = promisify(execFile);
-const ZERO_OID = "0".repeat(40);
+import { enumerateRefReflogOids, HEX40, git, headBranchOf, repoCtx } from "./shared.js";
 
 export interface ImportedScratchNamespace {
   /** Imported scratch names are deliberately not ownership roots. */
@@ -25,24 +20,9 @@ export type NoDropProof =
   | { status: "would-drop"; tip: string }
   | { status: "indeterminate"; marker: "shallow-store" | "missing-object" | "walk-error" };
 
-function cleanGitEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    GIT_DIR: undefined,
-    GIT_OBJECT_DIRECTORY: undefined,
-    GIT_COMMON_DIR: undefined,
-    GIT_WORK_TREE: undefined,
-    GIT_INDEX_FILE: undefined,
-    // r1 F5: graph classification must never turn a promisor fetch into an
-    // apparently complete local proof.
-    GIT_NO_LAZY_FETCH: "1",
-  } as NodeJS.ProcessEnv;
-}
-
-async function walkGit(repoDir: string, args: string[]): Promise<string> {
-  const { stdout } = await exec("git", ["-C", repoDir, ...args], { env: cleanGitEnv(), maxBuffer: 16 * 1024 * 1024 });
-  return stdout.toString().trim();
-}
+// r1 F5: graph classification must never turn a promisor fetch into an
+// apparently complete local proof.
+const graphEnv: NodeJS.ProcessEnv = { GIT_NO_LAZY_FETCH: "1" };
 
 function errorCode(error: unknown): number | undefined {
   const code = (error as { code?: unknown }).code;
@@ -91,11 +71,11 @@ async function peelAndVerify(repoDir: string, roots: readonly string[]): Promise
     for (const root of roots) {
       // Explicit ^{commit} peeling is required for annotated tags; a peel error
       // is indeterminate, never evidence that a tip is unreachable (r1 F5).
-      const commit = await walkGit(repoDir, ["rev-parse", "--verify", `${root}^{commit}`]);
+      const commit = await git(repoDir, ["rev-parse", "--verify", `${root}^{commit}`], { env: graphEnv });
       if (!HEX40.test(commit)) return { marker: "missing-object" };
       commits.push(commit);
     }
-    if (commits.length > 0) await walkGit(repoDir, ["rev-list", "--quiet", ...commits, "--"]);
+    if (commits.length > 0) await git(repoDir, ["rev-list", "--quiet", ...commits, "--"], { env: graphEnv });
     return { commits };
   } catch (error) {
     return { marker: errorCode(error) === 128 ? "missing-object" : "walk-error" };
@@ -111,7 +91,7 @@ export async function tipOwnedByIncoming(repoDir: string, tip: string, roots: re
   if (!tipCommit) return { status: "indeterminate", marker: "missing-object" };
   for (const root of rootCommits) {
     try {
-      await walkGit(repoDir, ["merge-base", "--is-ancestor", tipCommit, root!]);
+      await git(repoDir, ["merge-base", "--is-ancestor", tipCommit, root!], { env: graphEnv });
       return { status: "owned" };
     } catch (error) {
       if (errorCode(error) !== 1) return { status: "indeterminate", marker: errorCode(error) === 128 ? "missing-object" : "walk-error" };
@@ -140,7 +120,7 @@ export async function noDropProof(
     let reachable = false;
     for (const root of durable) {
       try {
-        await walkGit(repoDir, ["merge-base", "--is-ancestor", tip, root!]);
+        await git(repoDir, ["merge-base", "--is-ancestor", tip, root!], { env: graphEnv });
         reachable = true;
         break;
       } catch (error) {
@@ -156,15 +136,5 @@ export async function noDropProof(
 export async function enumerateStashReflogOids(repoDir: string): Promise<string[]> {
   const ctx = await repoCtx(repoDir);
   if (!ctx || ctx.kind !== "dir") return [];
-  const raw = await fs.readFile(path.join(ctx.commonDir, "logs", "refs", "stash"), "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  });
-  const out = new Set<string>();
-  for (const line of raw.split("\n")) {
-    const [oldOid, newOid] = line.split(" ");
-    if (oldOid && HEX40.test(oldOid) && oldOid !== ZERO_OID) out.add(oldOid);
-    if (newOid && HEX40.test(newOid) && newOid !== ZERO_OID) out.add(newOid);
-  }
-  return [...out];
+  return enumerateRefReflogOids(repoDir, "refs/stash");
 }
