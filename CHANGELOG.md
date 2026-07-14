@@ -5,6 +5,24 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.0] — 2026-07-14 — the checkout follows you: git state reconciles across machines
+
+### Added
+- **Checkout-follows-sync (design 116, #273/#274/#276).** Switch branches on
+  one machine and machines with no local divergence follow automatically —
+  branch, HEAD, index, stash — proven safe by a derived manifest-receipt
+  oracle, a two-phase rollback-only checkout journal, and a pinned ref-update
+  lock protocol. Kill switch: RBOX_GIT_FOLLOW=0.
+- **Per-ref worktree holds replace whole-section deferral** (the bug that
+  froze a Mac checkout for 3 days): a linked worktree holding a branch pins
+  only that ref; identical-OID updates never defer at all.
+- **Drift is visible everywhere**: per-repo git deferral age in rbox status
+  (+ --json), the daemon line, the shell prompt, the macOS menu bar. "In
+  sync" now means BOTH planes.
+- **`rbox git resolve <repo>`**: show-me + take-theirs (keep-mine next cycle).
+- Fresh-machine fix: git operations no longer fatal without a configured git
+  identity (caught by CI's identity-less runners).
+
 ## [1.5.4] — 2026-07-13 — receipt draining actually engages: −19%% push wall
 
 ### Fixed
