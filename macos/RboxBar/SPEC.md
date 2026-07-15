@@ -68,7 +68,9 @@ Runtime dir: `${RBOX_HOME or ~}/.rbox/daemons/<workspaceKey>/`. Files:
 ```
 { rootPath: string, state:"running"|"stopped", accountId, workspaceId, at: ISO }
 ```
-Other files in the dir: `daemon.pid` (presence matters for staleness), `daemon.log`.
+Other runtime artifacts may appear in this directory, including `daemon.pid` (whose
+presence matters for staleness) and daemon log files. The menu's **Open logs** affordance
+opens the runtime directory; use `rbox logs` to follow the live daemon log stream.
 
 ## Discovery (StatusReader.workspaces())
 1. `daemonsDir = (getenv RBOX_HOME ?? $HOME)/.rbox/daemons` — mirror rbox-paths.ts

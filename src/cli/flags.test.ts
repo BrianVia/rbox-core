@@ -15,6 +15,7 @@ test("boolean long flags do not consume following positionals", () => {
   expect(parseFlags(["--follow", "."])).toEqual({ positional: ["."], flags: { follow: "true" } });
   expect(parseFlags(["--yes", "genesis"])).toEqual({ positional: ["genesis"], flags: { yes: "true" } });
   expect(parseFlags(["--annual", "solo"])).toEqual({ positional: ["solo"], flags: { annual: "true" } });
+  expect(parseFlags(["deferrals", "--brief"])).toEqual({ positional: ["deferrals"], flags: { brief: "true" } });
 });
 
 test("known value long flags still consume values", () => {
@@ -33,6 +34,8 @@ test("unknown flags are rejected against command and subcommand help", () => {
   expect(unknownFlagError("start", [], { pullonly: "true" })).toContain("rbox start --help");
   expect(unknownFlagError("start", [], { "pull-only": "true" })).toBeUndefined();
   expect(unknownFlagError("key", ["materialize"], { "key-file": "x" })).toBeUndefined();
+  expect(unknownFlagError("git", ["deferrals"], { brief: "true" })).toBeUndefined();
+  expect(unknownFlagError("git", ["deferrals"], { confirm: "x" })).toContain("--confirm");
 });
 
 test("global and real undocumented flags remain allowed", () => {

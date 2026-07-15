@@ -1,84 +1,82 @@
 import XCTest
-import SwiftUI
 @testable import RboxBar
 
-/// Not an assertion test — a visual harness. Renders the dropdown for each design-88
-/// state to PNGs under /tmp/rboxbar-snapshots so the panel can be eyeballed against
-/// docs/design/assets/88-menubar-mockup.html without driving the live menu bar.
 @MainActor
-final class DropdownSnapshotTests: XCTestCase {
-    private func ws(state: DaemonState, op: SyncOperation? = nil, reason: String? = nil,
-                    attentionReason: AmbientAttentionReason? = nil,
-                    seq: Int? = 247, lastSyncedAgo: TimeInterval? = 120,
-                    hbAge: Double? = nil, name: String = "Development",
-                    fileCount: Int? = 128_517, totalBytes: Int64? = 15_600_000_000,
-                    daemonVersion: String? = "0.9.16") -> WorkspaceStatus {
+final class DropdownSemanticTests: XCTestCase {
+    private let reference = Date(timeIntervalSince1970: 1_752_580_800)
+
+    private func ws(
+        count: Int,
+        deferrals: [GitDeferralDetail],
+        provenance: DeferralProvenance
+    ) -> WorkspaceStatus {
         WorkspaceStatus(
-            name: name,
+            name: "Development",
             rootPath: "/Users/via/Development",
-            dirURL: URL(fileURLWithPath: "/tmp/daemons/\(name)"),
-            logURL: URL(fileURLWithPath: "/tmp/daemon.log"),
-            state: state, reason: reason, attentionReason: attentionReason,
-            operation: op, sequence: seq, fileCount: fileCount, totalBytes: totalBytes, daemonVersion: daemonVersion,
-            lastSyncedAt: lastSyncedAgo.map { Date().addingTimeInterval(-$0) },
-            heartbeatAgeSeconds: hbAge, desiredState: state == .paused ? "stopped" : "running"
+            dirURL: URL(fileURLWithPath: "/tmp/daemons/Development"),
+            logURL: URL(fileURLWithPath: "/tmp/daemons/Development"),
+            state: .synced,
+            reason: nil,
+            operation: nil,
+            sequence: 247,
+            lastSyncedAt: reference.addingTimeInterval(-120),
+            heartbeatAgeSeconds: 2,
+            desiredState: "running",
+            deferredRepos: count,
+            deferrals: deferrals,
+            deferralReferenceDate: reference,
+            deferralProvenance: provenance
         )
     }
 
-    private func render(_ model: AppModel, _ name: String, scheme: ColorScheme) throws {
-        let view = MenuContentView(model: model)
-            .environment(\.colorScheme, scheme)
-            .frame(width: 296)
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 2
-        guard let image = renderer.nsImage,
-              let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]) else {
-            XCTFail("render failed for \(name)"); return
-        }
-        let dir = URL(fileURLWithPath: "/tmp/rboxbar-snapshots")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let output = dir.appendingPathComponent("\(name).png")
-        try png.write(to: output, options: .atomic)
-        XCTAssertGreaterThan((try output.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0, 0)
+    private func detail(_ repo: String, label: String = "local edits", hours: Double = 2) -> GitDeferralDetail {
+        GitDeferralDetail(
+            repo: repo,
+            reason: "local-edits",
+            reasonLabel: label,
+            reasonText: "Working files changed here.",
+            remediationClass: "transient",
+            deferredSince: reference.addingTimeInterval(-hours * 3_600),
+            reasonSince: reference.addingTimeInterval(-60),
+            checkout: .branch("main")
+        )
     }
 
-    func testRenderAllSeverityTiers() throws {
-        try? FileManager.default.removeItem(atPath: "/tmp/rboxbar-snapshots")
+    func testDeferralRowsExposeSemanticTextFullPathsAndOmittedCount() {
+        let details = [
+            detail("customer-a/shared/repo", label: "local Git operation"),
+            detail("customer-b/shared/repo", label: "git config", hours: 1),
+            detail("third/repo-3"),
+            detail("fourth/repo-4"),
+            detail("fifth/repo-5"),
+        ]
+        let workspace = ws(count: 7, deferrals: details, provenance: .live)
+        let rows = MenuContentView.deferralRowPresentations(workspace, reference: reference)
 
-        let okModel = AppModel(previewWorkspaces: [ws(state: .synced)], version: "0.9.16")
-        let watcherWorkspace = ws(state: DaemonState.attention, reason: "watcher",
-            attentionReason: .watcherDegraded, seq: 244, lastSyncedAgo: 120, hbAge: 2.0)
-        let degradedModel = AppModel(previewWorkspaces: [watcherWorkspace], version: "0.9.16")
-        let criticalWorkspace = ws(state: .attention, reason: "halt",
-            attentionReason: .halt, seq: 244, lastSyncedAgo: 10800, hbAge: 42.0)
-        let criticalModel = AppModel(previewWorkspaces: [criticalWorkspace], version: "0.9.16")
-        let updateModel = AppModel(
-            previewWorkspaces: [ws(state: .synced)],
-            version: "0.9.16",
-            latestVersion: "0.9.17"
-        )
+        XCTAssertEqual(rows.count, 5)
+        XCTAssertEqual(rows[0].text, "repo — local Git operation · deferred 1h · reason 1m")
+        XCTAssertEqual(rows[1].text, "repo — git config · deferred 1h · reason 1m",
+                       "colliding basenames remain distinct through their full-path semantics")
+        XCTAssertEqual(rows[0].accessibilityLabel, "customer-a/shared/repo, local Git operation")
+        XCTAssertEqual(rows[1].accessibilityLabel, "customer-b/shared/repo, git config")
+        XCTAssertEqual(rows[0].helpText, "customer-a/shared/repo")
+        XCTAssertEqual(rows[1].helpText, "customer-b/shared/repo")
+        XCTAssertEqual(MenuContentView.omittedDeferralRowText(workspace), "+2 more")
+    }
 
-        XCTAssertEqual(okModel.labelWorkspace.severityTier, .ok)
-        XCTAssertEqual(degradedModel.labelWorkspace.severityTier, .degraded)
-        XCTAssertEqual(criticalModel.labelWorkspace.severityTier, .critical)
-        XCTAssertEqual(MenuContentView.degradedStatusText,
-                       "File watching degraded — periodic scans keep syncing (~1 min latency).")
-        XCTAssertEqual(MenuContentView.criticalRemedy(criticalWorkspace.reason),
-                       "Resolve the logged cause, then restart rbox.")
-        XCTAssertNil(MenuContentView.informativeDetail(
-            headline: MenuContentView.attentionTitle(criticalWorkspace.reason),
-            detail: MenuContentView.attentionDetail(criticalWorkspace)
-        ))
-        XCTAssertEqual(updateModel.availableUpdate(for: updateModel.selectedWorkspace!), "0.9.17")
-
-        for scheme in [ColorScheme.dark, .light] {
-            let suffix = scheme == .dark ? "dark" : "light"
-            try render(okModel, "ok-\(suffix)", scheme: scheme)
-            try render(degradedModel, "degraded-\(suffix)", scheme: scheme)
-            try render(criticalModel, "critical-\(suffix)", scheme: scheme)
-            try render(updateModel, "update-available-\(suffix)", scheme: scheme)
+    func testDeferralRowsPinFreshnessSuffixes() {
+        let item = detail("customer/shared/repo")
+        let cases: [(DeferralProvenance, String)] = [
+            (.live, ""),
+            (.populate, " · initial sync"),
+            (.paused, " · as of pause"),
+            (.dead, " · stale/display-only"),
+        ]
+        for (provenance, suffix) in cases {
+            let workspace = ws(count: 1, deferrals: [item], provenance: provenance)
+            let row = MenuContentView.deferralRowPresentations(workspace, reference: reference)[0]
+            XCTAssertTrue(row.text.hasSuffix("reason 1m\(suffix)"), "wrong suffix for \(provenance)")
+            XCTAssertNil(MenuContentView.omittedDeferralRowText(workspace))
         }
     }
 

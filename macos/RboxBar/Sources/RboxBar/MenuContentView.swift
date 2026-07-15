@@ -2,6 +2,12 @@ import AppKit
 import SwiftUI
 
 struct MenuContentView: View {
+    struct DeferralRowPresentation: Equatable {
+        var text: String
+        var accessibilityLabel: String
+        var helpText: String
+    }
+
     @ObservedObject var model: AppModel
 
     var body: some View {
@@ -78,11 +84,26 @@ struct MenuContentView: View {
             statusSummary(workspace)
             if let deferred = deferredStatusText(workspace) {
                 infoRow(label: "Git", value: deferred, monospace: false, color: .secondary)
+                deferralRows(workspace)
             }
 
             Divider()
             pauseResumeButton(for: workspace)
             restartButton(for: workspace)
+            if (workspace.deferredRepos ?? 0) > 0 {
+                itemButton(
+                    title: model.isCopyInProgress ? "Preparing fix brief…" : (model.copyConfirmation ?? "Copy Git fix brief"),
+                    symbol: model.copyConfirmation == nil ? "doc.on.doc" : "checkmark",
+                    disabled: model.isCopyInProgress
+                ) {
+                    model.copyDeferralBrief()
+                }
+                if model.canOfferPartialCopy {
+                    itemButton(title: "Copy partial last-known details", symbol: "doc.on.clipboard") {
+                        model.copyPartialDeferralDetails()
+                    }
+                }
+            }
             itemButton(title: "Open logs", symbol: "line.3.horizontal") {
                 model.openLog(for: workspace)
             }
@@ -293,10 +314,69 @@ struct MenuContentView: View {
     private func deferredStatusText(_ workspace: WorkspaceStatus) -> String? {
         guard let count = workspace.deferredRepos, count > 0 else { return nil }
         let noun = count == 1 ? "repo" : "repos"
+        if let first = workspace.renderedDeferrals.first,
+           workspace.deferralReferenceDate != nil {
+            let reference = workspace.deferralReference()
+            return "\(count) \(noun) deferred · \(AppModel.deferralAge(first.deferredSince, reference: reference))"
+        }
         if let age = workspace.oldestDeferralAgeSeconds {
             return "\(count) \(noun) deferred · \(Self.deferralAgeBucket(age))"
         }
         return "\(count) \(noun) deferred"
+    }
+
+    @ViewBuilder
+    private func deferralRows(_ workspace: WorkspaceStatus) -> some View {
+        let rows = Self.deferralRowPresentations(workspace)
+        VStack(alignment: .leading, spacing: 4) {
+            if rows.isEmpty {
+                Text("details unavailable")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Deferred Git repository details unavailable")
+            } else {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    Text(row.text)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(row.helpText)
+                        .accessibilityLabel(row.accessibilityLabel)
+                }
+            }
+            if let omitted = Self.omittedDeferralRowText(workspace) {
+                Text(omitted)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.leading, 66)
+    }
+
+    static func deferralRowPresentations(
+        _ workspace: WorkspaceStatus,
+        reference: Date? = nil
+    ) -> [DeferralRowPresentation] {
+        let ageReference = reference ?? workspace.deferralReference()
+        let freshness: String
+        switch workspace.deferralProvenance {
+        case .paused: freshness = " · as of pause"
+        case .dead: freshness = " · stale/display-only"
+        case .populate: freshness = " · initial sync"
+        case .live, nil: freshness = ""
+        }
+        return workspace.renderedDeferrals.map { detail in
+            DeferralRowPresentation(
+                text: "\(detail.basename) — \(detail.reasonLabel) · deferred \(AppModel.deferralAge(detail.deferredSince, reference: ageReference)) · reason \(AppModel.deferralAge(detail.reasonSince, reference: ageReference))\(freshness)",
+                accessibilityLabel: "\(detail.repo), \(detail.reasonLabel)",
+                helpText: detail.repo
+            )
+        }
+    }
+
+    static func omittedDeferralRowText(_ workspace: WorkspaceStatus) -> String? {
+        workspace.omittedDeferralCount > 0 ? "+\(workspace.omittedDeferralCount) more" : nil
     }
 
     static func deferralAgeBucket(_ seconds: Int) -> String {

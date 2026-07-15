@@ -31,6 +31,7 @@ import { shortWorkspaceId } from "./workspace-picker.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./ambient-status.js";
+import { serializeGitDeferralLanes } from "./git-deferral-json.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -247,8 +248,11 @@ export interface StatusCmdResult {
   daemonRunning: boolean;
 }
 
-export async function statusCmd(root: string, opts: { json?: boolean } = {}): Promise<StatusCmdResult> {
-  return statusCmdWithDeps(root, opts, defaultStatusDeps);
+export async function statusCmd(root: string, opts: { json?: boolean; now?: Date } = {}): Promise<StatusCmdResult> {
+  const deps = opts.now === undefined
+    ? defaultStatusDeps
+    : { ...defaultStatusDeps, now: () => opts.now!.getTime() };
+  return statusCmdWithDeps(root, opts, deps);
 }
 
 export async function statusCmdWithDeps(
@@ -410,11 +414,11 @@ export async function statusCmdWithDeps(
   const projectedGitRepos = projectGitDeferralRepos(projectedGitDeferrals.map((deferral) => ({
     repo: deferral.relPath,
     deferral,
-  })));
+  })), now);
   const localGitRepoProjections = projectGitDeferralRepos(gitDeferrals.map((deferral) => ({
     repo: deferral.repo,
     deferral,
-  })));
+  })), now);
   const gitDeferredRepos = projectedGitRepos.length;
   const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
   const gitOldestDeferral = projectedGitRepos[0];
@@ -481,25 +485,14 @@ export async function statusCmdWithDeps(
       crypto,
       git: {
         ...(gitCapability ? { capability: gitCapability } : {}),
-        deferrals: gitDeferrals.map((deferral) => ({
-          repo: deferral.repo,
-          lane: deferral.lane,
-          reason: deferral.reason,
-          deferredSince: deferral.deferredSince,
-          reasonSince: deferral.reasonSince,
-          ageSeconds: Math.max(0, Math.floor((now - Date.parse(deferral.deferredSince)) / 1000)) || 0,
-          bytesChanged: deferral.bytesChanged === true,
-          ...(deferral.checkout?.kind === "branch"
-            ? { checkout: { kind: "branch" as const, ...(deferral.checkout.label === undefined ? {} : { label: deferral.checkout.label }) } }
-            : deferral.checkout?.kind === "detached"
-              ? { checkout: { kind: "detached" as const } }
-              : {}),
-        })),
+        deferrals: serializeGitDeferralLanes(gitDeferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
         deferredRepos: localGitRepoProjections.map((repo) => ({
           repo: repo.repo,
           oldestDeferredSince: repo.oldestDeferredSince,
           displayReason: repo.displayReason,
-          ageSeconds: Math.max(0, Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)) || 0,
+          ageSeconds: Number.isFinite(Date.parse(repo.oldestDeferredSince)) && Date.parse(repo.oldestDeferredSince) <= now
+            ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
+            : null,
           bytesChanged: repo.bytesChanged,
           ...(repo.checkout?.kind === "branch"
             ? { checkout: { kind: "branch" as const, ...(repo.checkout.label === undefined ? {} : { label: repo.checkout.label }) } }

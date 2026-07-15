@@ -12,7 +12,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
-import type { GitDeferral, GitDeferralReason } from "./config.js";
+import type { GitDeferral, GitDeferralReason, RepoRecord } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
@@ -33,7 +33,7 @@ export interface StatusSnapshot {
   /** Deferred lanes whose working bytes changed during the episode. */
   gitBytesChangedDeferrals?: number;
   /** Oldest durable lane, for concise context below the verdict. */
-  gitOldestDeferral?: { deferredSince: string; reason: GitDeferralReason };
+  gitOldestDeferral?: { deferredSince: string; reason: string };
   trackedFiles: number;
   daemonRunning: boolean;
   localSequence: number;
@@ -128,8 +128,8 @@ export function relTime(iso: string, now: number): string {
 /** Coarse chronic-age bucket shared by all deferral visibility surfaces. */
 export function ageBucket(iso: string, now: number): string {
   const parsed = Date.parse(iso);
-  if (!Number.isFinite(parsed)) return "--";
-  const seconds = Math.max(0, Math.floor((now - parsed) / 1000));
+  if (!Number.isFinite(parsed) || parsed > now) return "unknown";
+  const seconds = Math.floor((now - parsed) / 1000);
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return "1h";
   if (seconds < 7 * 86400) return "1d";
@@ -138,30 +138,52 @@ export function ageBucket(iso: string, now: number): string {
   return "30d";
 }
 
-const DEFERRAL_REASON_TEXT: Record<GitDeferralReason, string> = {
-  "local-edits": "local edits",
-  "local-index": "local index changes",
-  "local-operation": "local git operation",
-  "local-commits": "local commits",
-  "local-stash": "local stash",
-  conflict: "conflict",
-  "git-busy": "git busy",
-  "worktree-ownership": "worktree ownership",
-  "ignored-target": "ignored target",
-  unreadable: "unreadable repository",
-  artifact: "git artifact",
-  config: "git config",
-  containment: "repository containment",
-  unsupported: "unsupported git state",
-  other: "other git issue",
+export interface GitDeferralReasonPresentation {
+  label: string;
+  text: string;
+  repair: string;
+  transient: boolean;
+}
+
+export const UNKNOWN_GIT_DEFERRAL_PRESENTATION: GitDeferralReasonPresentation = {
+  label: "unrecognized Git issue",
+  text: "Git sync is deferred for an unrecognized reason.",
+  repair: "Inspect rbox status and the daemon logs before changing repository state.",
+  transient: false,
 };
 
-function gitDeferralReasonText(reason: GitDeferralReason): string {
-  return DEFERRAL_REASON_TEXT[reason];
+const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonPresentation> = {
+  "local-edits": { label: "local edits", text: "Working files changed here.", repair: "Stop Git and file changes, then let normal sync retry.", transient: true },
+  "local-index": { label: "local index changes", text: "The Git index changed here.", repair: "Stop Git and file changes, then let normal sync retry.", transient: true },
+  "local-operation": { label: "local Git operation", text: "A Git operation is active or changed here.", repair: "Finish or stop the Git operation, then let normal sync retry.", transient: true },
+  "local-commits": { label: "local commits", text: "Local commits changed here.", repair: "Stop Git mutation, then let normal sync retry.", transient: true },
+  "local-stash": { label: "local stash", text: "The local stash changed here.", repair: "Stop stash mutation, then let normal sync retry.", transient: true },
+  conflict: { label: "conflict", text: "Incoming and local Git state conflict.", repair: "Repair the conflicting repository state, then let sync retry.", transient: false },
+  "git-busy": { label: "git busy", text: "Another Git process is using this repository.", repair: "Let the other Git process finish, then let sync retry.", transient: false },
+  "worktree-ownership": { label: "worktree ownership", text: "Another worktree owns a required Git ref.", repair: "Repair the worktree ownership conflict, then let sync retry.", transient: false },
+  "ignored-target": { label: "ignored target", text: "The incoming checkout targets an ignored repository.", repair: "Correct the ignore rule or repository target, then let sync retry.", transient: false },
+  unreadable: { label: "unreadable repository", text: "Git metadata could not be read completely.", repair: "Restore repository readability and permissions, then let sync retry.", transient: false },
+  artifact: { label: "Git artifact", text: "Required Git artifacts could not be fetched or verified.", repair: "Repair artifact availability or integrity, then let sync retry.", transient: false },
+  config: { label: "git config", text: "Common Git configuration could not be synchronized safely.", repair: "Correct the local common Git config so it is readable, supported, within wire bounds, and workspace-owned, then let sync retry.", transient: false },
+  containment: { label: "repository containment", text: "Repository containment could not be proved.", repair: "Repair the repository or worktree layout so it stays within the workspace, then let sync retry.", transient: false },
+  unsupported: { label: "unsupported git state", text: "This Git version or repository shape is unsupported.", repair: "Upgrade Git or repair the repository shape, then let sync retry.", transient: false },
+  other: { label: "other git issue", text: "Git sync is deferred by another known condition.", repair: "Inspect rbox status and the daemon logs, repair the reported condition, then let sync retry.", transient: false },
+};
+
+export function gitDeferralReasonPresentation(reason: string): GitDeferralReasonPresentation {
+  return DEFERRAL_REASON_PRESENTATION[reason as GitDeferralReason] ?? UNKNOWN_GIT_DEFERRAL_PRESENTATION;
+}
+
+export function isKnownGitDeferralReason(reason: string): reason is GitDeferralReason {
+  return Object.hasOwn(DEFERRAL_REASON_PRESENTATION, reason);
+}
+
+function gitDeferralReasonText(reason: string): string {
+  return gitDeferralReasonPresentation(reason).label;
 }
 
 /** Human-divergence reasons lead operational reasons when chronic ages tie. */
-function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
+function gitDeferralReasonPrecedence(reason: string): number {
   switch (reason) {
     case "local-edits": return 0;
     case "local-index": return 1;
@@ -172,61 +194,100 @@ function gitDeferralReasonPrecedence(reason: GitDeferralReason): number {
   }
 }
 
-interface GitDeferralDisplayEntry {
+export interface GitDeferralDisplayEntry {
   repo: string;
-  deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">;
+  deferral: Pick<GitDeferral, "lane" | "reason" | "deferredSince" | "bytesChanged" | "checkout">
+    & Partial<Pick<GitDeferral, "reasonSince">>;
+  record?: RepoRecord;
 }
 
 /** One authoritative display row per repo, shared by every local visibility surface. */
-interface GitDeferralRepoProjection {
+export type GitDeferralRemediationClass = "transient" | "capture" | "config" | "apply-resolvable" | "apply-unavailable";
+
+export interface GitDeferralRepoProjection {
   repo: string;
   oldestDeferredSince: string;
-  displayReason: GitDeferralReason;
+  displayReason: string;
+  displayLane: GitDeferral["lane"];
+  reasonSince: string;
+  reasonLabel: string;
+  reasonText: string;
+  repairText: string;
+  remediationClass: GitDeferralRemediationClass;
+  canResolve: boolean;
+  alsoDeferred?: string;
   bytesChanged: boolean;
   checkout?: GitDeferral["checkout"];
 }
 
-const parsedDeferralTime = (iso: string): number => {
+const parsedDeferralTime = (iso: string, now: number): number => {
   const parsed = Date.parse(iso);
-  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+  return Number.isFinite(parsed) && parsed <= now ? parsed : Number.POSITIVE_INFINITY;
 };
+
+/** The exact truthiness gate used by `rbox git resolve` to select incoming state. */
+export function hasGitResolutionIncoming(record: RepoRecord | undefined): boolean {
+  return Boolean(record?.pending || ((record?.resolutionKey || record?.deferrals?.apply) && record?.base));
+}
 
 /**
  * Collapse independent apply/capture/config lanes into the single repo-level
  * projection promised by design 116. The chronic age is the oldest standing
  * lane, while the reason is selected independently by display precedence.
  */
-export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntry>): GitDeferralRepoProjection[] {
-  const grouped = new Map<string, GitDeferralDisplayEntry["deferral"][]>();
-  for (const { repo, deferral } of entries) {
-    const lanes = grouped.get(repo) ?? [];
-    lanes.push(deferral);
-    grouped.set(repo, lanes);
+export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntry>, now = Date.now()): GitDeferralRepoProjection[] {
+  const grouped = new Map<string, { lanes: GitDeferralDisplayEntry["deferral"][]; record?: RepoRecord }>();
+  for (const { repo, deferral, record } of entries) {
+    const group = grouped.get(repo) ?? { lanes: [] };
+    group.lanes.push(deferral);
+    if (record) group.record = record;
+    grouped.set(repo, group);
   }
   const projected: GitDeferralRepoProjection[] = [];
-  for (const [repo, lanes] of grouped) {
+  for (const [repo, { lanes, record }] of grouped) {
     const ordered = [...lanes].sort((a, b) =>
       gitDeferralReasonPrecedence(a.reason) - gitDeferralReasonPrecedence(b.reason)
-      || parsedDeferralTime(a.deferredSince) - parsedDeferralTime(b.deferredSince)
+      || parsedDeferralTime(a.deferredSince, now) - parsedDeferralTime(b.deferredSince, now)
       || a.lane.localeCompare(b.lane)
       || a.reason.localeCompare(b.reason)
     );
     const display = ordered[0]!;
     const oldest = [...lanes].sort((a, b) =>
-      parsedDeferralTime(a.deferredSince) - parsedDeferralTime(b.deferredSince)
+      parsedDeferralTime(a.deferredSince, now) - parsedDeferralTime(b.deferredSince, now)
       || a.lane.localeCompare(b.lane)
     )[0]!;
     const checkout = display.checkout ?? ordered.find((lane) => lane.checkout !== undefined)?.checkout;
+    const presentation = gitDeferralReasonPresentation(display.reason);
+    const knownReason = isKnownGitDeferralReason(display.reason);
+    const canResolve = knownReason && hasGitResolutionIncoming(record);
+    const remediationClass: GitDeferralRemediationClass = !knownReason
+      ? "apply-unavailable"
+      : presentation.transient
+      ? "transient"
+      : display.lane === "capture"
+        ? "capture"
+        : display.lane === "config"
+          ? "config"
+          : canResolve ? "apply-resolvable" : "apply-unavailable";
+    const additional = ordered.slice(1).map((lane) => `${lane.lane} — ${gitDeferralReasonPresentation(lane.reason).label}`);
     projected.push({
       repo,
       oldestDeferredSince: oldest.deferredSince,
       displayReason: display.reason,
+      displayLane: display.lane,
+      reasonSince: display.reasonSince ?? display.deferredSince,
+      reasonLabel: presentation.label,
+      reasonText: presentation.text,
+      repairText: presentation.repair,
+      remediationClass,
+      canResolve,
+      ...(additional.length ? { alsoDeferred: `Also deferred: ${additional.join("; ")}.` } : {}),
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
       ...(checkout === undefined ? {} : { checkout }),
     });
   }
   return projected.sort((a, b) =>
-    parsedDeferralTime(a.oldestDeferredSince) - parsedDeferralTime(b.oldestDeferredSince)
+    parsedDeferralTime(a.oldestDeferredSince, now) - parsedDeferralTime(b.oldestDeferredSince, now)
     || gitDeferralReasonPrecedence(a.displayReason) - gitDeferralReasonPrecedence(b.displayReason)
     || a.repo.localeCompare(b.repo)
   );
@@ -235,7 +296,7 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
 /** Pure, terminal-safe local rendering. Detached checkouts never expose an OID. */
 export function renderGitDeferralLine(input: {
   relPath: string;
-  reason: GitDeferralReason;
+  reason: string;
   deferredSince: string;
   checkout?: { kind: "branch" | "detached"; label?: string };
   bytesChanged?: boolean;

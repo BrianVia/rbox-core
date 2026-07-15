@@ -52,6 +52,13 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.state, .synced)
         XCTAssertEqual(ws.sequence, 247)
         XCTAssertNotNil(ws.lastSyncedAt)
+        // macOS tmp dirs live behind the /var → /private/var symlink; the reader may
+        // hand back either spelling, so compare resolved paths.
+        XCTAssertEqual(
+            ws.logURL.resolvingSymlinksInPath().path,
+            daemonDir.resolvingSymlinksInPath().path,
+            "log affordances open the runtime directory, not daemon.log"
+        )
     }
 
     func testAdditiveBarFieldsParseAndAmbientRootWins() {
@@ -166,6 +173,17 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.state, .paused, "graceful paused with no pidfile stays paused, not dead")
     }
 
+    func testFreshPausedUsesPauseReferenceAndCannotFeedFallback() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"paused","heartbeatAt":"\(iso(2))","sequence":5,"lastSyncedAt":null,
+         "deferredRepos":1,"deferrals":[{"repo":"a/repo","reason":"config","reasonLabel":"git config","reasonText":"Config failed.","remediationClass":"config","deferredSince":"\(iso(3600))","reasonSince":"\(iso(60))"}]}
+        """)
+        let ws = only()
+        XCTAssertEqual(ws.deferralProvenance, .paused)
+        XCTAssertFalse(ws.canCopyPartialDeferrals)
+        XCTAssertNotNil(ws.deferralReferenceDate)
+    }
+
     func testStaleNonPausedNoPidfileIsDead() {
         write("daemon.status.json", """
         {"schemaVersion":1,"state":"syncing","heartbeatAt":"\(iso(600))","sequence":5,"lastSyncedAt":null}
@@ -227,9 +245,12 @@ final class StatusReaderTests: XCTestCase {
     }
 
     func testFreshPopulatePreservesDeferralProjectionFromValidDaemonStatus() {
+        write("desired.json", """
+        {"rootPath":"/tmp/populate-root","state":"running","workspaceId":"w"}
+        """)
         write("daemon.status.json", """
-        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(30))","sequence":247,"lastSyncedAt":null,
-         "deferredRepos":3,"oldestDeferralAgeSeconds":604800}
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":247,"lastSyncedAt":null,
+         "workspaceRoot":"/tmp/populate-root","deferredRepos":3,"oldestDeferralAgeSeconds":604800}
         """)
         write("populate.status.json", """
         {"schemaVersion":1,"kind":"initial-populate","workspaceId":"w","projectId":"p","stream":"s",
@@ -241,6 +262,128 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.deferredRepos, 3)
         XCTAssertEqual(ws.oldestDeferralAgeSeconds, 604_800)
         XCTAssertEqual(ws.severityTier, .degraded)
+        XCTAssertEqual(ws.deferralProvenance, .populate)
+    }
+
+    func testStalePopulateDoesNotBorrowAmbientDeferralDetails() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(30))","sequence":247,"lastSyncedAt":null,
+         "deferredRepos":1,"deferrals":[{"repo":"private/repo","reason":"local-edits","reasonLabel":"local edits",
+         "reasonText":"Working files changed here.","remediationClass":"transient","deferredSince":"\(iso(3600))","reasonSince":"\(iso(60))"}]}
+        """)
+        write("populate.status.json", """
+        {"schemaVersion":1,"kind":"initial-populate","workspaceId":"w","projectId":"p","stream":"s",
+         "pid":\(getpid()),"startedAt":"\(iso(10))","heartbeatAt":"\(iso(1))",
+         "operation":{"kind":"pull","phase":"download","filesDone":40,"filesTotal":100}}
+        """)
+        let ws = only()
+        XCTAssertTrue(ws.deferrals.isEmpty)
+        XCTAssertNil(ws.deferralProvenance)
+        XCTAssertFalse(ws.canCopyPartialDeferrals)
+    }
+
+    func testPopulateIdentityMismatchDoesNotBorrowFreshDetails() {
+        write("desired.json", """
+        {"rootPath":"/tmp/current","state":"running","workspaceId":"desired"}
+        """)
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
+         "workspaceRoot":"/tmp/current","deferredRepos":1,"deferrals":[{"repo":"private/repo","reason":"config","reasonLabel":"git config","reasonText":"Config failed.","remediationClass":"config","deferredSince":"\(iso(3600))","reasonSince":"\(iso(60))"}]}
+        """)
+        write("populate.status.json", """
+        {"schemaVersion":1,"kind":"initial-populate","workspaceId":"other","projectId":"p","stream":"s",
+         "pid":\(getpid()),"startedAt":"\(iso(10))","heartbeatAt":"\(iso(1))",
+         "operation":{"kind":"pull","phase":"download","filesDone":1,"filesTotal":2}}
+        """)
+        let ws = only()
+        XCTAssertTrue(ws.deferrals.isEmpty)
+        XCTAssertNil(ws.deferralProvenance)
+    }
+
+    func testNestedDeferralsAreSanitizedBoundedAndItemLocal() {
+        let rows = """
+        {"repo":"folder\\nrepo","reason":"future-reason","reasonLabel":"forged label","reasonText":"forged text",
+         "remediationClass":"apply-resolvable","deferredSince":"\(iso(3600))","reasonSince":"\(iso(60))",
+         "checkout":{"kind":"branch","label":"topic\\u0000name"},"futureKey":true},
+        {"repo":"","reason":"config","reasonLabel":"git config","reasonText":"text","remediationClass":"config","deferredSince":"\(iso(1))","reasonSince":"\(iso(1))"},
+        {"repo":"bad-time","reason":"config","reasonLabel":"git config","reasonText":"text","remediationClass":"config","deferredSince":"today","reasonSince":"\(iso(1))"},
+        {"repo":"bad-checkout","reason":"config","reasonLabel":"git config","reasonText":"text","remediationClass":"config","deferredSince":"\(iso(1))","reasonSince":"\(iso(1))","checkout":{"kind":"future"}},
+        {"repo":"second/repo","reason":"config","reasonLabel":"git config","reasonText":"Config failed.","remediationClass":"config","deferredSince":"\(iso(2))","reasonSince":"\(iso(1))"},
+        {"repo":"ignored-sixth","reason":"config","reasonLabel":"git config","reasonText":"Config failed.","remediationClass":"config","deferredSince":"\(iso(2))","reasonSince":"\(iso(1))"}
+        """
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(2))","sequence":1,"lastSyncedAt":null,
+         "deferredRepos":8,"deferrals":[\(rows)]}
+        """)
+        let ws = only()
+        XCTAssertEqual(ws.deferrals.count, 2)
+        XCTAssertEqual(ws.deferrals[0].repo, "folder repo")
+        XCTAssertEqual(ws.deferrals[0].reasonLabel, "unrecognized Git issue")
+        XCTAssertEqual(ws.deferrals[0].reasonText, "Git sync is deferred for an unrecognized reason.")
+        XCTAssertEqual(ws.deferrals[0].remediationClass, "apply-unavailable")
+        XCTAssertEqual(ws.deferrals[0].checkout, .branch("topic name"))
+        XCTAssertEqual(ws.renderedDeferrals.count, 2)
+        XCTAssertEqual(ws.omittedDeferralCount, 6)
+        XCTAssertEqual(ws.deferralProvenance, .live)
+        XCTAssertTrue(ws.canCopyPartialDeferrals)
+    }
+
+    func testTimezoneLessAmbientAndPopulateTimestampsAreMalformed() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"2026-07-15T12:00:00.000","sequence":1,"lastSyncedAt":null}
+        """)
+        XCTAssertEqual(only().state, .attention, "ambient timestamps require an explicit timezone")
+
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(1))","sequence":1,"lastSyncedAt":"2026-07-15T12:00:00.000"}
+        """)
+        XCTAssertEqual(only().state, .attention, "optional ambient timestamps use the same timezone contract")
+
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"paused","heartbeatAt":"\(iso(1))","sequence":1,"lastSyncedAt":null}
+        """)
+        write("populate.status.json", """
+        {"schemaVersion":1,"kind":"initial-populate","workspaceId":"w","projectId":"p","stream":"s",
+         "pid":\(getpid()),"startedAt":"2026-07-15T11:59:00.000Z","heartbeatAt":"2026-07-15T12:00:00.000",
+         "operation":{"kind":"pull","phase":"download","filesDone":1,"filesTotal":2}}
+        """)
+        XCTAssertEqual(only().state, .paused, "timezone-less populate heartbeat must not override daemon state")
+
+        write("populate.status.json", "{}")
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(1))","sequence":1,"lastSyncedAt":null,
+         "deferredRepos":1,"deferrals":[{"repo":"no-zone","reason":"config","reasonLabel":"git config",
+         "reasonText":"Config failed.","remediationClass":"config","deferredSince":"2026-07-15T11:00:00.000",
+         "reasonSince":"\(iso(60))"}]}
+        """)
+        XCTAssertTrue(only().deferrals.isEmpty, "timezone-less nested deferral timestamps are item-locally malformed")
+    }
+
+    func testFutureHeartbeatIsNotLiveAndFutureDeferralAgeIsUnknown() {
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"synced","heartbeatAt":"\(iso(-60))","sequence":1,"lastSyncedAt":null}
+        """)
+        XCTAssertEqual(only().state, .attention)
+        XCTAssertEqual(AppModel.deferralAge(Date().addingTimeInterval(60), reference: Date()), "unknown")
+    }
+
+    func testCountIsAuthoritativeAndPausedDeadDetailsAreDisplayOnly() {
+        let detail = """
+        {"repo":"a/repo","reason":"config","reasonLabel":"git config","reasonText":"Config failed.","remediationClass":"config","deferredSince":"\(iso(3600))","reasonSince":"\(iso(60))"}
+        """
+        write("daemon.status.json", """
+        {"schemaVersion":1,"state":"paused","heartbeatAt":"\(iso(600))","sequence":1,"lastSyncedAt":null,
+         "deferredRepos":1,"deferrals":[\(detail),\(detail)]}
+        """)
+        var ws = only()
+        XCTAssertEqual(ws.renderedDeferrals.count, 1)
+        XCTAssertEqual(ws.deferralProvenance, .paused)
+        XCTAssertFalse(ws.canCopyPartialDeferrals)
+
+        write("daemon.pid", "v2 999999 boot")
+        ws = only()
+        XCTAssertEqual(ws.deferralProvenance, .dead)
+        XCTAssertFalse(ws.canCopyPartialDeferrals)
     }
 
     func testStalePopulateIsIgnored() {

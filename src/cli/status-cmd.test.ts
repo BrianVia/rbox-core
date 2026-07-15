@@ -7,6 +7,7 @@ import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js"
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
 import { daemonLogPath } from "./rbox-paths.js";
+import { main } from "./main-dispatch.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -158,6 +159,37 @@ async function captureStatus(opts: { json?: boolean }): Promise<string> {
     process.stdout.write = oldWrite;
   }
   return opts.json ? stdout.trim() : lines.join("\n");
+}
+
+async function captureDispatch(args: string[]): Promise<string> {
+  const previousArgv = process.argv;
+  const previousCwd = process.cwd();
+  const previousExitCode = process.exitCode;
+  const oldLog = console.log;
+  const oldWrite = process.stdout.write;
+  let stdout = "";
+  process.argv = [process.execPath, "rbox", ...args];
+  process.chdir(root);
+  process.exitCode = undefined;
+  console.log = (...values: unknown[]) => { stdout += `${values.map(String).join(" ")}\n`; };
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    stdout += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    await main({ now: () => new Date(NOW) });
+    // Bun quirk: `process.exitCode = undefined` cannot clear a previously set
+    // numeric code (reads back 0), so a pristine-undefined assertion is
+    // poisoned by any earlier suite that set an exit code.
+    expect(process.exitCode ?? 0).toBe(0);
+    return stdout.trim();
+  } finally {
+    process.argv = previousArgv;
+    process.chdir(previousCwd);
+    process.exitCode = previousExitCode;
+    console.log = oldLog;
+    process.stdout.write = oldWrite;
+  }
 }
 
 test("status text and JSON expose only closed locking health", async () => {
@@ -376,6 +408,13 @@ test("status --json exposes only the stable local deferral projection and cannot
   expect(payload).not.toContain("secret-oid-like-subject");
   expect(payload).not.toContain("0123456789abcdef");
   expect(payload).not.toContain("lastSeen");
+});
+
+test("status and git deferrals JSON dispatches serialize identical lane arrays", async () => {
+  await saveDeferralState();
+  const status = JSON.parse(await captureDispatch(["status", "--json"]));
+  const deferrals = JSON.parse(await captureDispatch(["git", "deferrals", "--json"]));
+  expect(deferrals.deferrals).toEqual(status.git.deferrals);
 });
 
 test("typed divergence seam deferrals gate health even when local detail records are absent", async () => {

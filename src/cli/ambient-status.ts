@@ -4,7 +4,12 @@ import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
 import type { DaemonActivity } from "./activity.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "./config.js";
-import { projectGitDeferralRepos } from "./status-view.js";
+import {
+  gitDeferralReasonPresentation,
+  isKnownGitDeferralReason,
+  projectGitDeferralRepos,
+  type GitDeferralRemediationClass,
+} from "./status-view.js";
 import { parseSemver } from "./semver.js";
 import {
   AMBIENT_STATUS_STALE_MS,
@@ -19,6 +24,17 @@ export { AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "./populate
 export type AmbientDaemonState = "synced" | "syncing" | "attention" | "paused";
 export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degraded" | "ownership-lost" | "unknown-error";
 export type AmbientOperationKind = "pull" | "push";
+
+export interface AmbientGitDeferral {
+  repo: string;
+  reason: string;
+  reasonLabel: string;
+  reasonText: string;
+  remediationClass: GitDeferralRemediationClass | string;
+  deferredSince: string;
+  reasonSince: string;
+  checkout?: { kind: "detached" } | { kind: "branch"; label?: string };
+}
 
 export interface AmbientDaemonStatusV1 {
   schemaVersion: 1;
@@ -39,6 +55,7 @@ export interface AmbientDaemonStatusV1 {
   attentionReason?: AmbientAttentionReason;
   deferredRepos?: number;
   oldestDeferralAgeSeconds?: number | null;
+  deferrals?: AmbientGitDeferral[];
 }
 
 export function validDaemonVersion(value: unknown): value is string {
@@ -115,6 +132,59 @@ function cleanLocalPath(p: string | undefined): string | undefined {
   return clean.length > 0 ? clean : undefined;
 }
 
+function boundedAmbientText(value: string, maxScalars: number): string {
+  const clean = value.replace(/[\r\n\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/gu, " ").trim();
+  return [...clean].slice(0, maxScalars).join("");
+}
+
+function ambientIso(value: unknown): value is string {
+  return typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function ambientCheckout(value: unknown): AmbientGitDeferral["checkout"] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const checkout = value as Record<string, unknown>;
+  if (checkout.kind === "detached") return { kind: "detached" };
+  if (checkout.kind !== "branch") return null;
+  if (checkout.label !== undefined && typeof checkout.label !== "string") return null;
+  return {
+    kind: "branch",
+    ...(typeof checkout.label === "string" ? { label: boundedAmbientText(checkout.label, 512) } : {}),
+  };
+}
+
+function parseAmbientDeferral(value: unknown): AmbientGitDeferral | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (typeof item.repo !== "string" || typeof item.reason !== "string"
+    || typeof item.reasonLabel !== "string" || typeof item.reasonText !== "string"
+    || typeof item.remediationClass !== "string"
+    || !ambientIso(item.deferredSince) || !ambientIso(item.reasonSince)) return undefined;
+  const repo = boundedAmbientText(item.repo, 1_024);
+  if (!repo) return undefined;
+  const reason = boundedAmbientText(item.reason, 128);
+  const suppliedLabel = boundedAmbientText(item.reasonLabel, 160);
+  const suppliedText = boundedAmbientText(item.reasonText, 512);
+  const suppliedClass = boundedAmbientText(item.remediationClass, 64);
+  const checkout = ambientCheckout(item.checkout);
+  if (checkout === null) return undefined;
+  const known = isKnownGitDeferralReason(reason);
+  const presentation = gitDeferralReasonPresentation(reason);
+  return {
+    repo,
+    reason,
+    reasonLabel: known ? suppliedLabel : presentation.label,
+    reasonText: known ? suppliedText : presentation.text,
+    remediationClass: known ? suppliedClass : "apply-unavailable",
+    deferredSince: item.deferredSince,
+    reasonSince: item.reasonSince,
+    ...(checkout === undefined ? {} : { checkout }),
+  };
+}
+
 function attentionReason(input: AmbientStatusProjectionInput): AmbientAttentionReason | undefined {
   if (input.ownershipLost) return "ownership-lost";
   if (input.activity.halt) return "halt";
@@ -166,14 +236,14 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
         })
       : undefined;
   const projectedDeferrals = projectGitDeferralRepos(Object.entries(input.repoRecords ?? {}).flatMap(([repo, record]) =>
-    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral }] : [])
-  ));
+    Object.values(record.deferrals ?? {}).flatMap((deferral) => deferral ? [{ repo, deferral, record }] : [])
+  ), input.now);
   const deferredRepos = projectedDeferrals.length;
   const oldestDeferredSince = Date.parse(projectedDeferrals[0]?.oldestDeferredSince ?? "");
   const oldestDeferralAgeSeconds = deferredRepos === 0
     ? null
-    : Number.isFinite(oldestDeferredSince)
-      ? Math.max(0, Math.floor((input.now - oldestDeferredSince) / 1_000))
+    : Number.isFinite(oldestDeferredSince) && oldestDeferredSince <= input.now
+      ? Math.floor((input.now - oldestDeferredSince) / 1_000)
       : null;
 
   return stripUndefined({
@@ -186,12 +256,31 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
     attentionReason: state === "attention" ? reason ?? "unknown-error" : undefined,
     deferredRepos,
     oldestDeferralAgeSeconds,
+    deferrals: projectedDeferrals.flatMap((deferral) => {
+      const repo = boundedAmbientText(deferral.repo, 1_024);
+      if (!repo || !ambientIso(deferral.oldestDeferredSince) || !ambientIso(deferral.reasonSince)) return [];
+      const checkout = deferral.checkout?.kind === "detached"
+        ? { kind: "detached" as const }
+        : deferral.checkout?.kind === "branch"
+          ? { kind: "branch" as const, ...(deferral.checkout.label === undefined ? {} : { label: boundedAmbientText(deferral.checkout.label, 512) }) }
+          : undefined;
+      return [{
+        repo,
+        reason: boundedAmbientText(deferral.displayReason, 128),
+        reasonLabel: boundedAmbientText(deferral.reasonLabel, 160),
+        reasonText: boundedAmbientText(deferral.reasonText, 512),
+        remediationClass: boundedAmbientText(deferral.remediationClass, 64),
+        deferredSince: deferral.oldestDeferredSince,
+        reasonSince: deferral.reasonSince,
+        ...(checkout === undefined ? {} : { checkout }),
+      }];
+    }).slice(0, 5),
   }) as AmbientDaemonStatusV1;
 }
 
 export function pausedAmbientDaemonStatus(
   now = Date.now(),
-  previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "deferredRepos" | "oldestDeferralAgeSeconds">,
+  previous?: Pick<AmbientDaemonStatusV1, "sequence" | "lastSyncedAt" | "deferredRepos" | "oldestDeferralAgeSeconds" | "deferrals">,
 ): AmbientDaemonStatusV1 {
   return {
     schemaVersion: 1,
@@ -201,6 +290,7 @@ export function pausedAmbientDaemonStatus(
     lastSyncedAt: previous?.lastSyncedAt ?? null,
     ...(previous?.deferredRepos === undefined ? {} : { deferredRepos: previous.deferredRepos }),
     ...(previous?.oldestDeferralAgeSeconds === undefined ? {} : { oldestDeferralAgeSeconds: previous.oldestDeferralAgeSeconds }),
+    ...(previous?.deferrals === undefined ? {} : { deferrals: previous.deferrals.slice(0, 5) }),
   };
 }
 
@@ -227,9 +317,9 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
   try {
     const j = JSON.parse(raw) as Partial<AmbientDaemonStatusV1>;
     if (j.schemaVersion !== 1 || !STATES.has(j.state as AmbientDaemonState)) return undefined;
-    if (typeof j.heartbeatAt !== "string" || Number.isNaN(Date.parse(j.heartbeatAt))) return undefined;
+    if (!ambientIso(j.heartbeatAt)) return undefined;
     if (!(j.sequence === null || uint(j.sequence))) return undefined;
-    if (!(j.lastSyncedAt === null || typeof j.lastSyncedAt === "string")) return undefined;
+    if (!(j.lastSyncedAt === null || ambientIso(j.lastSyncedAt))) return undefined;
     if (j.daemonVersion !== undefined && !validDaemonVersion(j.daemonVersion)) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
@@ -245,6 +335,13 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
     if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
+    if (j.deferrals !== undefined) {
+      const items = Array.isArray(j.deferrals) ? j.deferrals : [];
+      out.deferrals = items.slice(0, 5).flatMap((item) => {
+        const parsed = parseAmbientDeferral(item);
+        return parsed ? [parsed] : [];
+      });
+    }
     const op = j.operation;
     if (op !== undefined) {
       if (op.kind !== "pull" && op.kind !== "push") return undefined;

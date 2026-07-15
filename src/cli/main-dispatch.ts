@@ -76,7 +76,11 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
   return root;
 }
 
-export async function main(): Promise<void> {
+export interface MainDispatchDeps {
+  now?: () => Date;
+}
+
+export async function main(deps: MainDispatchDeps = {}): Promise<void> {
   // Resolve and persist this boot even for commands which never acquire a
   // workspace lock. Locking remains availability-biased when identity is
   // unavailable, so non-locking commands must not fail on this health hook.
@@ -133,7 +137,8 @@ export async function main(): Promise<void> {
   // Bare `rbox` (cmd === undefined) is excluded too: in a tracked dir it renders the
   // status block (whose own update line covers this — nudging here would print BEFORE
   // the block, which `rbox status` never does), and mid-setup an upgrade nag is noise.
-  if (!rawJsonMode && cmd && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
+  const isGitDeferrals = cmd === "git" && positional[0] === "deferrals";
+  if (!rawJsonMode && !isGitDeferrals && cmd && cmd !== "status" && cmd !== "upgrade" && cmd !== "help" && cmd !== "__daemon-run" && cmd !== BOOT_RESUME_MARKER) {
     await maybeNudgeForUpdate();
   }
 
@@ -308,7 +313,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       }
       const root = await resolveRoot(positional[0]);
       const { statusCmd } = await import("./status-cmd.js");
-      await statusCmd(root, { json: jsonMode });
+      await statusCmd(root, { json: jsonMode, now: deps.now?.() });
       break;
     }
     case "doctor": {
@@ -423,6 +428,17 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     }
     case "git": {
       const sub = positional[0];
+      if (sub === "deferrals") {
+        if (positional.length !== 1 || (flags.brief === "true" && jsonMode)) {
+          fail("usage: rbox git deferrals [--brief | --json]");
+          break;
+        }
+        const root = await resolveRoot(undefined);
+        const { gitDeferralsCmd } = await import("./git-cmd.js");
+        const code = await gitDeferralsCmd(root, { brief: flags.brief === "true", json: jsonMode }, { now: deps.now });
+        if (code !== 0) process.exitCode = code;
+        break;
+      }
       const repo = positional[1];
       const verb = positional[2] ?? "show-me";
       if (sub !== "resolve" || !repo || positional.length > 3 || !["show-me", "take-theirs", "keep-mine"].includes(verb)) {

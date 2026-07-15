@@ -43,7 +43,7 @@ struct StatusReader {
             name: name,
             rootPath: rootPath,
             dirURL: dir,
-            logURL: dir.appendingPathComponent("daemon.log"),
+            logURL: dir,
             state: verdict.state,
             reason: verdict.reason,
             attentionReason: verdict.attentionReason,
@@ -56,19 +56,27 @@ struct StatusReader {
             heartbeatAgeSeconds: verdict.heartbeatAgeSeconds,
             desiredState: desired?.state,
             deferredRepos: verdict.deferredRepos,
-            oldestDeferralAgeSeconds: verdict.oldestDeferralAgeSeconds
+            oldestDeferralAgeSeconds: verdict.oldestDeferralAgeSeconds,
+            deferrals: verdict.deferrals,
+            deferralReferenceDate: verdict.deferralReferenceDate,
+            deferralProvenance: verdict.deferralProvenance
         )
     }
 
     private func verdict(for dir: URL, now: Date) -> Verdict {
+        let desired = readDesired(dir.appendingPathComponent("desired.json"))
         let statusURL = dir.appendingPathComponent("daemon.status.json")
         let statusResult = readDaemonStatus(statusURL)
         let populateURL = dir.appendingPathComponent("populate.status.json")
         if let populate = readPopulateStatus(populateURL),
-           now.timeIntervalSince(populate.heartbeatAt) <= Self.staleInterval,
+           isFresh(populate.heartbeatAt, now: now),
            isProcessAlive(pid: populate.pid) {
             let ambient: DaemonStatus?
-            if case .valid(let status) = statusResult {
+            if case .valid(let status) = statusResult,
+               isFresh(status.heartbeatAt, now: now),
+               let desired,
+               desired.workspaceId == populate.workspaceId,
+               status.workspaceRoot == desired.rootPath {
                 ambient = status
             } else {
                 ambient = nil
@@ -81,7 +89,10 @@ struct StatusReader {
                 lastSyncedAt: nil,
                 heartbeatAgeSeconds: now.timeIntervalSince(populate.heartbeatAt),
                 deferredRepos: ambient?.deferredRepos,
-                oldestDeferralAgeSeconds: ambient?.oldestDeferralAgeSeconds
+                oldestDeferralAgeSeconds: ambient?.oldestDeferralAgeSeconds,
+                deferrals: ambient?.deferrals ?? [],
+                deferralReferenceDate: ambient == nil ? nil : now,
+                deferralProvenance: ambient == nil ? nil : .populate
             )
         }
 
@@ -94,7 +105,7 @@ struct StatusReader {
             return deadVerdict(age: nil, status: nil)
         case .valid(let status):
             let age = now.timeIntervalSince(status.heartbeatAt)
-            let stale = age > Self.staleInterval
+            let stale = age < 0 || age > Self.staleInterval
             if !stale {
                 return Verdict(
                     state: status.state,
@@ -109,7 +120,10 @@ struct StatusReader {
                     lastSyncedAt: status.lastSyncedAt,
                     heartbeatAgeSeconds: age,
                     deferredRepos: status.deferredRepos,
-                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds
+                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds,
+                    deferrals: status.deferrals,
+                    deferralReferenceDate: status.state == .paused ? status.heartbeatAt : now,
+                    deferralProvenance: status.state == .paused ? .paused : .live
                 )
             }
 
@@ -130,7 +144,10 @@ struct StatusReader {
                     lastSyncedAt: status.lastSyncedAt,
                     heartbeatAgeSeconds: age,
                     deferredRepos: status.deferredRepos,
-                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds
+                    oldestDeferralAgeSeconds: status.oldestDeferralAgeSeconds,
+                    deferrals: status.deferrals,
+                    deferralReferenceDate: status.heartbeatAt,
+                    deferralProvenance: .paused
                 )
             }
 
@@ -151,7 +168,10 @@ struct StatusReader {
             lastSyncedAt: status?.lastSyncedAt,
             heartbeatAgeSeconds: age,
             deferredRepos: status?.deferredRepos,
-            oldestDeferralAgeSeconds: status?.oldestDeferralAgeSeconds
+            oldestDeferralAgeSeconds: status?.oldestDeferralAgeSeconds,
+            deferrals: status?.deferrals ?? [],
+            deferralReferenceDate: status?.heartbeatAt,
+            deferralProvenance: status == nil ? nil : .dead
         )
     }
 
@@ -160,10 +180,12 @@ struct StatusReader {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rootPath = object["rootPath"] as? String,
               !rootPath.isEmpty,
-              let state = object["state"] as? String else {
+              let state = object["state"] as? String,
+              let workspaceId = object["workspaceId"] as? String,
+              !workspaceId.isEmpty else {
             return nil
         }
-        return DesiredState(rootPath: rootPath, state: state)
+        return DesiredState(rootPath: rootPath, state: state, workspaceId: workspaceId)
     }
 
     private func readPopulateStatus(_ url: URL) -> PopulateStatus? {
@@ -171,6 +193,7 @@ struct StatusReader {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["schemaVersion"] as? Int == 1,
               object["kind"] as? String == "initial-populate",
+              let workspaceId = object["workspaceId"] as? String, !workspaceId.isEmpty,
               // JSONSerialization yields Int/NSNumber, never Int32 — bridge via Int.
               let pidInt = object["pid"] as? Int, pidInt > 0,
               case let pid = Int32(truncatingIfNeeded: pidInt),
@@ -180,7 +203,7 @@ struct StatusReader {
               let operation = parseOperation(operationObject, defaultKind: .pull) else {
             return nil
         }
-        return PopulateStatus(pid: pid, heartbeatAt: heartbeatAt, operation: operation)
+        return PopulateStatus(workspaceId: workspaceId, pid: pid, heartbeatAt: heartbeatAt, operation: operation)
     }
 
     private func readDaemonStatus(_ url: URL) -> DaemonStatusResult {
@@ -201,7 +224,8 @@ struct StatusReader {
 
             var lastSyncedAt: Date?
             if let lastSyncedString = object["lastSyncedAt"] as? String {
-                lastSyncedAt = parseDate(lastSyncedString)
+                guard let parsedLastSyncedAt = parseDate(lastSyncedString) else { return .invalid }
+                lastSyncedAt = parsedLastSyncedAt
             }
 
             var operation: SyncOperation?
@@ -216,6 +240,13 @@ struct StatusReader {
             let workspaceRoot = (object["workspaceRoot"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let deferredRepos = (object["deferredRepos"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
             let oldestDeferralAgeSeconds = (object["oldestDeferralAgeSeconds"] as? Int).flatMap { $0 >= 0 ? $0 : nil }
+            let deferrals: [GitDeferralDetail]
+            if let rawDeferrals = object["deferrals"] {
+                let array = rawDeferrals as? [Any] ?? []
+                deferrals = array.prefix(5).compactMap(parseDeferral)
+            } else {
+                deferrals = []
+            }
             return .valid(DaemonStatus(
                 state: state,
                 heartbeatAt: heartbeatAt,
@@ -228,7 +259,8 @@ struct StatusReader {
                 operation: operation,
                 attentionReason: reason,
                 deferredRepos: deferredRepos,
-                oldestDeferralAgeSeconds: oldestDeferralAgeSeconds
+                oldestDeferralAgeSeconds: oldestDeferralAgeSeconds,
+                deferrals: deferrals
             ))
         } catch CocoaError.fileReadNoSuchFile {
             return .missing
@@ -263,12 +295,93 @@ struct StatusReader {
         )
     }
 
+    private func parseDeferral(_ value: Any) -> GitDeferralDetail? {
+        guard let object = value as? [String: Any],
+              let rawRepo = object["repo"] as? String,
+              let rawReason = object["reason"] as? String,
+              let rawLabel = object["reasonLabel"] as? String,
+              let rawText = object["reasonText"] as? String,
+              let rawClass = object["remediationClass"] as? String,
+              let deferredString = object["deferredSince"] as? String,
+              let reasonString = object["reasonSince"] as? String,
+              let deferredSince = parseDate(deferredString),
+              let reasonSince = parseDate(reasonString) else { return nil }
+
+        let repo = boundedText(rawRepo, maximum: 1_024)
+        guard !repo.isEmpty else { return nil }
+        let reason = boundedText(rawReason, maximum: 128)
+        let suppliedLabel = boundedText(rawLabel, maximum: 160)
+        let suppliedText = boundedText(rawText, maximum: 512)
+        let suppliedRemediation = boundedText(rawClass, maximum: 64)
+        let knownReason = Self.knownGitDeferralReasons.contains(reason)
+        let label = knownReason ? suppliedLabel : "unrecognized Git issue"
+        let text = knownReason ? suppliedText : "Git sync is deferred for an unrecognized reason."
+        let remediation = knownReason ? suppliedRemediation : "apply-unavailable"
+
+        var checkout: GitDeferralCheckout?
+        if let rawCheckout = object["checkout"] {
+            guard let checkoutObject = rawCheckout as? [String: Any],
+                  let kind = checkoutObject["kind"] as? String else { return nil }
+            if kind == "detached" {
+                checkout = .detached
+            } else if kind == "branch" {
+                if let rawLabel = checkoutObject["label"] {
+                    guard let branchLabel = rawLabel as? String else { return nil }
+                    checkout = .branch(boundedText(branchLabel, maximum: 512))
+                } else {
+                    checkout = .branch(nil)
+                }
+            } else {
+                return nil
+            }
+        }
+        return GitDeferralDetail(
+            repo: repo,
+            reason: reason,
+            reasonLabel: label,
+            reasonText: text,
+            remediationClass: remediation,
+            deferredSince: deferredSince,
+            reasonSince: reasonSince,
+            checkout: checkout
+        )
+    }
+
+    private func boundedText(_ value: String, maximum: Int) -> String {
+        var scalars: [Unicode.Scalar] = []
+        var replacingControl = false
+        for scalar in value.unicodeScalars {
+            let category = scalar.properties.generalCategory
+            if scalar == "\r" || scalar == "\n" || category == .control || category == .format {
+                if !replacingControl { scalars.append(" ") }
+                replacingControl = true
+            } else {
+                scalars.append(scalar)
+                replacingControl = false
+            }
+        }
+        let collapsed = String(String.UnicodeScalarView(scalars))
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return String(collapsed.unicodeScalars.prefix(maximum))
+    }
+
     private func parseDate(_ string: String) -> Date? {
+        guard string.range(
+            of: #"^\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})$"#,
+            options: .regularExpression
+        ) != nil else { return nil }
         if let date = ISO8601DateFormatter.rboxWithFractional.date(from: string) {
             return date
         }
         return ISO8601DateFormatter.rbox.date(from: string)
     }
+
+    private static let knownGitDeferralReasons: Set<String> = [
+        "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
+        "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable",
+        "artifact", "config", "containment", "unsupported", "other",
+    ]
 
     private func isNullOrInt(_ value: Any?) -> Bool {
         value == nil || value is NSNull || value is Int
@@ -338,14 +451,22 @@ struct StatusReader {
         }
         return errno == EPERM
     }
+
+    private func isFresh(_ date: Date, now: Date) -> Bool {
+        let age = now.timeIntervalSince(date)
+        return age >= 0 && age <= Self.staleInterval
+    }
+
 }
 
 private struct DesiredState {
     var rootPath: String
     var state: String
+    var workspaceId: String
 }
 
 private struct PopulateStatus {
+    var workspaceId: String
     var pid: Int32
     var heartbeatAt: Date
     var operation: SyncOperation
@@ -364,6 +485,7 @@ private struct DaemonStatus {
     var attentionReason: AmbientAttentionReason?
     var deferredRepos: Int?
     var oldestDeferralAgeSeconds: Int?
+    var deferrals: [GitDeferralDetail]
 }
 
 private enum DaemonStatusResult {
@@ -386,6 +508,9 @@ private struct Verdict {
     var heartbeatAgeSeconds: Double? = nil
     var deferredRepos: Int? = nil
     var oldestDeferralAgeSeconds: Int? = nil
+    var deferrals: [GitDeferralDetail] = []
+    var deferralReferenceDate: Date? = nil
+    var deferralProvenance: DeferralProvenance? = nil
 }
 
 private extension ISO8601DateFormatter {

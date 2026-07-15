@@ -53,6 +53,36 @@ struct SyncOperation: Codable, Equatable {
     var bytesTotal: Int64?
 }
 
+enum DeferralProvenance: Equatable {
+    case live
+    case populate
+    case paused
+    case dead
+
+    var allowsPartialCopy: Bool { self == .live || self == .populate }
+}
+
+enum GitDeferralCheckout: Equatable {
+    case branch(String?)
+    case detached
+}
+
+struct GitDeferralDetail: Equatable, Identifiable {
+    var id: String { "\(repo)\u{0}\(deferredSince.timeIntervalSince1970)\u{0}\(reason)" }
+    var repo: String
+    var reason: String
+    var reasonLabel: String
+    var reasonText: String
+    var remediationClass: String
+    var deferredSince: Date
+    var reasonSince: Date
+    var checkout: GitDeferralCheckout?
+
+    var basename: String {
+        URL(fileURLWithPath: repo).lastPathComponent
+    }
+}
+
 struct WorkspaceStatus: Identifiable, Equatable {
     var id: URL { dirURL }
     var name: String
@@ -72,6 +102,30 @@ struct WorkspaceStatus: Identifiable, Equatable {
     var desiredState: String?
     var deferredRepos: Int? = nil
     var oldestDeferralAgeSeconds: Int? = nil
+    var deferrals: [GitDeferralDetail] = []
+    var deferralReferenceDate: Date? = nil
+    var deferralProvenance: DeferralProvenance? = nil
+
+    var renderedDeferrals: [GitDeferralDetail] {
+        Array(deferrals.prefix(min(5, max(0, deferredRepos ?? 0))))
+    }
+
+    var omittedDeferralCount: Int {
+        max(0, (deferredRepos ?? 0) - renderedDeferrals.count)
+    }
+
+    var canCopyPartialDeferrals: Bool {
+        deferralProvenance?.allowsPartialCopy == true && !renderedDeferrals.isEmpty
+    }
+
+    func deferralReference(now: Date = Date()) -> Date {
+        switch deferralProvenance {
+        case .paused, .dead:
+            return deferralReferenceDate ?? now
+        case .live, .populate, nil:
+            return now
+        }
+    }
 }
 
 extension WorkspaceStatus {

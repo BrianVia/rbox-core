@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, captureGitState, type GitSection, type Manifest } from "../engine/index.js";
 import { checkoutJournalDir } from "../engine/git/journal.js";
 import { loadState, repoRecordsForState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
-import { gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
+import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { gitFollowEnabled } from "./sync-git/shared.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
@@ -154,6 +154,169 @@ test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
   expect(first.deferrals[0]?.ageSeconds).toBe(3600);
   const withoutSnapshot = JSON.stringify(first).replace(first.snapshot, "");
   expect(withoutSnapshot).not.toMatch(/\b[0-9a-f]{40}\b/);
+});
+
+test("git deferrals renders empty human and JSON forms", async () => {
+  const state: SyncState = { stream: syncStreamId(cfg), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } };
+  const human: string[] = [];
+  expect(await gitDeferralsCmd(root, {}, { loadConfig: async () => cfg, loadState: async () => state, stdout: (line) => human.push(line) })).toBe(0);
+  expect(human).toEqual(["no deferred repos"]);
+  const json: string[] = [];
+  expect(await gitDeferralsCmd(root, { json: true }, { loadConfig: async () => cfg, loadState: async () => state, stdout: (line) => json.push(line) })).toBe(0);
+  expect(JSON.parse(json[0]!)).toEqual({ schemaVersion: 1, deferrals: [] });
+});
+
+test("git deferrals brief is deterministic, actionable, anchored, quoted, and host-free", async () => {
+  const { base } = await fixture();
+  const saved = await loadState(root, syncStreamId(cfg));
+  const original = repoRecordsForState(saved).repo!;
+  const hostile = "Customer [x]/-it's `$(touch nope)`\nrepo";
+  const state: SyncState = {
+    ...saved,
+    repoRecords: {
+      [hostile]: {
+        ...original,
+        base,
+        deferrals: {
+          ...original.deferrals,
+          capture: {
+            lane: "capture",
+            reason: "artifact",
+            deferredSince: "2026-07-12T00:00:00.000Z",
+            reasonSince: "2026-07-13T00:30:00.000Z",
+            lastSeen: "2026-07-13T00:30:00.000Z",
+            checkout: { kind: "branch", label: "user@example.test/TICKET_[7]" },
+          },
+        },
+      },
+    },
+  };
+  const lines: string[] = [];
+  const code = await gitDeferralsCmd(root, { brief: true }, {
+    loadConfig: async () => cfg,
+    loadState: async () => state,
+    now: () => new Date("2026-07-13T01:00:00.000Z"),
+    version: "9.8.7-test",
+    hostname: "private-host@example.test",
+    stdout: (line) => lines.push(line),
+  });
+  expect(code).toBe(0);
+  expect(lines[0]).toBe("contains local repo paths and branch names — share accordingly");
+  expect(lines.at(-1)).toBe("-- end of brief · 1 repo(s)");
+  const output = lines.join("\n");
+  expect(output).toContain("rbox version: 9.8.7-test");
+  expect(output).toContain("Also deferred: capture");
+  expect(output).toContain("`keep-mine` is unavailable");
+  const command = lines.find((line) => line.startsWith("cd "))!;
+  expect(command).toContain(`cd '${root}' && 'rbox' 'git' 'resolve'`);
+  expect(command).toContain("'\\''");
+  expect(command).toContain("`$(touch nope)`\nrepo'");
+  expect(output).toContain("'<token-printed-by-show-me>'");
+  expect(output).not.toContain("private-host@example.test");
+});
+
+test("brief escapes only Markdown structure and leaves dotted names and versions readable", async () => {
+  const { base } = await fixture();
+  const saved = await loadState(root, syncStreamId(cfg));
+  const original = repoRecordsForState(saved).repo!;
+  const lines: string[] = [];
+  await gitDeferralsCmd(root, { brief: true }, {
+    loadConfig: async () => cfg,
+    loadState: async () => ({ ...saved, repoRecords: { "foo.bar": { ...original, base, deferrals: {
+      capture: { lane: "capture", reason: "artifact", deferredSince: "2026-07-13T00:00:00.000Z", reasonSince: "2026-07-13T00:00:00.000Z", lastSeen: "2026-07-13T00:00:00.000Z", checkout: { kind: "branch", label: "<script>" } },
+    } } } }),
+    now: () => new Date("2026-07-13T01:00:00.000Z"),
+    version: "1.6.3",
+    stdout: (line) => lines.push(line),
+  });
+  const output = lines.join("\n");
+  expect(output).toContain("rbox version: 1.6.3");
+  expect(output).toContain("## foo.bar");
+  expect(output).toContain("branch \\<script\\>");
+  expect(lines.at(-1)).toBe("-- end of brief · 1 repo(s)");
+});
+
+test("brief never resolves capture/config primaries and protects leading-dash repo argv", async () => {
+  const { base } = await fixture();
+  const saved = await loadState(root, syncStreamId(cfg));
+  const original = repoRecordsForState(saved).repo!;
+  const state: SyncState = {
+    ...saved,
+    repoRecords: {
+      "--customer": { ...original, base },
+      "config-primary": {
+        ...original,
+        base,
+        deferrals: {
+          apply: { lane: "apply", reason: "conflict", deferredSince: "2026-07-13T00:30:00.000Z", reasonSince: "2026-07-13T00:30:00.000Z", lastSeen: "2026-07-13T00:30:00.000Z" },
+          config: { lane: "config", reason: "config", deferredSince: "2026-07-12T00:00:00.000Z", reasonSince: "2026-07-12T00:00:00.000Z", lastSeen: "2026-07-13T00:30:00.000Z" },
+        },
+      },
+    },
+  };
+  const lines: string[] = [];
+  expect(await gitDeferralsCmd(root, { brief: true }, {
+    loadConfig: async () => cfg,
+    loadState: async () => state,
+    now: () => new Date("2026-07-13T01:00:00.000Z"),
+    stdout: (line) => lines.push(line),
+  })).toBe(0);
+  const output = lines.join("\n");
+  expect(output).toContain("'git' 'resolve' './--customer'");
+  const configStart = output.indexOf("## config-primary");
+  const configEnd = output.indexOf("\n## ", configStart + 3);
+  const configSection = output.slice(configStart, configEnd === -1 ? undefined : configEnd);
+  expect(configSection).not.toContain("'git' 'resolve'");
+  expect(configSection).toContain("resolver commands do not apply");
+});
+
+test("brief emits no resolver commands for null pending or an empty resolution key", async () => {
+  const { base } = await fixture();
+  const saved = await loadState(root, syncStreamId(cfg));
+  const original = repoRecordsForState(saved).repo!;
+  const capture = { lane: "capture" as const, reason: "local-commits" as const, deferredSince: "2026-07-13T00:00:00.000Z", reasonSince: "2026-07-13T00:00:00.000Z", lastSeen: "2026-07-13T00:00:00.000Z" };
+  const lines: string[] = [];
+  await gitDeferralsCmd(root, { brief: true }, {
+    loadConfig: async () => cfg,
+    loadState: async () => ({ ...saved, repoRecords: {
+      "null-pending": { ...original, pending: null as any, resolutionKey: undefined, base, deferrals: { capture } },
+      "empty-key": { ...original, pending: undefined, resolutionKey: "", base, deferrals: { capture } },
+    } }),
+    stdout: (line) => lines.push(line),
+  });
+  expect(lines.join("\n")).not.toContain("'git' 'resolve'");
+});
+
+test("an emitted resolver command preserves a hostile repo name as one inert argv element", async () => {
+  const { base } = await fixture();
+  const saved = await loadState(root, syncStreamId(cfg));
+  const original = repoRecordsForState(saved).repo!;
+  const hostile = '-\'quote " double\n$(touch command-substitution) `touch backtick` space';
+  const lines: string[] = [];
+  await gitDeferralsCmd(root, { brief: true }, {
+    loadConfig: async () => cfg,
+    loadState: async () => ({ ...saved, repoRecords: { [hostile]: { ...original, pending: base, base, deferrals: {
+      apply: { lane: "apply", reason: "conflict", deferredSince: "2026-07-13T00:00:00.000Z", reasonSince: "2026-07-13T00:00:00.000Z", lastSeen: "2026-07-13T00:00:00.000Z" },
+    } } } }),
+    stdout: (line) => lines.push(line),
+  });
+  const command = lines.find((line) => line.startsWith("cd "))!;
+  const harnessDir = path.join(tmp, "argv-harness");
+  const unrelated = path.join(tmp, "unrelated-cwd");
+  const argvOut = path.join(tmp, "argv.bin");
+  await fs.mkdir(harnessDir);
+  await fs.mkdir(unrelated);
+  const harness = path.join(harnessDir, "rbox");
+  await fs.writeFile(harness, "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$RBOX_ARGV_OUT\"\n");
+  await fs.chmod(harness, 0o755);
+  await exec("sh", ["-c", command], {
+    cwd: unrelated,
+    env: { ...process.env, PATH: `${harnessDir}:${process.env.PATH ?? ""}`, RBOX_ARGV_OUT: argvOut },
+  });
+  const argv = (await fs.readFile(argvOut)).toString().split("\0").filter(Boolean);
+  expect(argv).toEqual(["git", "resolve", `./${hostile}`]);
+  expect(await fs.stat(path.join(root, "command-substitution")).then(() => true, () => false)).toBe(false);
+  expect(await fs.stat(path.join(root, "backtick")).then(() => true, () => false)).toBe(false);
 });
 
 test("show-me strips terminal controls from a commit subject", async () => {

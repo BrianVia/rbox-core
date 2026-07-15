@@ -164,6 +164,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
+    name: "git deferrals",
+    group: "SYNCING",
+    summary: "show deferred Git repos and copyable repair guidance",
+    usage: "rbox git deferrals [--brief | --json]",
+    flags: [
+      { flag: "--brief", desc: "print a complete copyable diagnosis and repair brief" },
+      { flag: "--json", desc: "print the raw lane-level deferrals as JSON" },
+    ],
+    notes: ["Run from anywhere inside the workspace; no repository argument is accepted."],
+  },
+  {
     name: "git resolve",
     group: "SYNCING",
     summary: "inspect or resolve a deferred Git checkout",

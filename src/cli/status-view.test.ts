@@ -7,6 +7,7 @@ import {
   healthLine,
   lastSyncLines,
   projectGitDeferralRepos,
+  gitDeferralReasonPresentation,
   progressLabel,
   relTime,
   renderGitDeferralLine,
@@ -52,7 +53,8 @@ test("ageBucket uses the D5 coarse boundaries", () => {
   expect(ageBucket(iso(7 * 86400), NOW)).toBe("7d");
   expect(ageBucket(iso(14 * 86400), NOW)).toBe("14d");
   expect(ageBucket(iso(30 * 86400), NOW)).toBe("30d");
-  expect(ageBucket("bad", NOW)).toBe("--");
+  expect(ageBucket("bad", NOW)).toBe("unknown");
+  expect(ageBucket(new Date(NOW + 1).toISOString(), NOW)).toBe("unknown");
 });
 
 test("renderGitDeferralLine sanitizes branches, hides detached OIDs, and marks changed bytes", () => {
@@ -75,20 +77,87 @@ test("renderGitDeferralLine sanitizes branches, hides detached OIDs, and marks c
 
 test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, and bytes OR", () => {
   const projected = projectGitDeferralRepos([
-    { repo: "repo", deferral: { lane: "capture", reason: "local-commits", deferredSince: iso(3600), bytesChanged: true } },
-    { repo: "repo", deferral: { lane: "apply", reason: "local-edits", deferredSince: iso(60), checkout: { kind: "branch", label: "main" } } },
-    { repo: "other", deferral: { lane: "config", reason: "config", deferredSince: iso(30) } },
-  ]);
-  expect(projected).toEqual([
-    {
-      repo: "repo",
-      oldestDeferredSince: iso(3600),
-      displayReason: "local-edits",
-      bytesChanged: true,
-      checkout: { kind: "branch", label: "main" },
-    },
-    { repo: "other", oldestDeferredSince: iso(30), displayReason: "config", bytesChanged: false },
-  ]);
+    { repo: "repo", deferral: { lane: "capture", reason: "local-commits", deferredSince: iso(3600), reasonSince: iso(120), bytesChanged: true } },
+    { repo: "repo", deferral: { lane: "apply", reason: "local-edits", deferredSince: iso(60), reasonSince: iso(30), checkout: { kind: "branch", label: "main" } } },
+    { repo: "other", deferral: { lane: "config", reason: "config", deferredSince: iso(30), reasonSince: iso(20) } },
+  ], NOW);
+  expect(projected[0]).toMatchObject({
+    repo: "repo",
+    oldestDeferredSince: iso(3600),
+    displayReason: "local-edits",
+    reasonSince: iso(30),
+    remediationClass: "transient",
+    canResolve: false,
+    alsoDeferred: "Also deferred: capture — local commits.",
+    bytesChanged: true,
+    checkout: { kind: "branch", label: "main" },
+  });
+  expect(projected[1]).toMatchObject({ repo: "other", displayReason: "config", remediationClass: "config" });
+});
+
+test("projection derives resolver capability from the complete record and sorts invalid times last", () => {
+  const valid = { lane: "apply" as const, reason: "conflict" as const, deferredSince: iso(60), reasonSince: iso(30) };
+  const record = {
+    repoGen: 1,
+    sourceSeq: 1,
+    base: { bundleSha: "a", bundleEncSha: "b", bundleCipherSize: 1, head: "0".repeat(40), refs: {}, refScope: "all" as const, generatedAt: iso(1) },
+    deferrals: { apply: { ...valid, lastSeen: iso(1) } },
+  };
+  const projected = projectGitDeferralRepos([
+    { repo: "future", deferral: { ...valid, deferredSince: new Date(NOW + 1_000).toISOString() } },
+    { repo: "bad", deferral: { ...valid, deferredSince: "bad" } },
+    { repo: "actionable", deferral: valid, record },
+  ], NOW);
+  expect(projected.map((entry) => entry.repo)).toEqual(["actionable", "bad", "future"]);
+  expect(projected[0]).toMatchObject({ canResolve: true, remediationClass: "apply-resolvable" });
+});
+
+test("the reason vocabulary is exhaustive and unknown reasons stay opaque and non-actionable", () => {
+  const reasons = ["local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable", "artifact", "config", "containment", "unsupported", "other"];
+  for (const reason of reasons) {
+    const presentation = gitDeferralReasonPresentation(reason);
+    expect(presentation.label.length).toBeGreaterThan(0);
+    expect(presentation.text.length).toBeGreaterThan(0);
+    expect(presentation.repair.length).toBeGreaterThan(0);
+  }
+  expect(gitDeferralReasonPresentation("future-reason")).toMatchObject({
+    label: "unrecognized Git issue",
+    text: "Git sync is deferred for an unrecognized reason.",
+    transient: false,
+  });
+  const section = { bundleSha: "a", bundleEncSha: "b", bundleCipherSize: 1, head: "0".repeat(40), refs: {}, refScope: "all" as const, generatedAt: iso(1) };
+  const [unknown] = projectGitDeferralRepos([{
+    repo: "forged",
+    deferral: { lane: "apply", reason: "future-reason", deferredSince: iso(60), reasonSince: iso(30) } as any,
+    record: { repoGen: 1, sourceSeq: 1, pending: section },
+  }], NOW);
+  expect(unknown).toMatchObject({
+    reasonLabel: "unrecognized Git issue",
+    reasonText: "Git sync is deferred for an unrecognized reason.",
+    remediationClass: "apply-unavailable",
+    canResolve: false,
+  });
+});
+
+test("remediation classification covers every lane and the apply capability gate", () => {
+  const at = { deferredSince: iso(60), reasonSince: iso(30) };
+  const section = { bundleSha: "a", bundleEncSha: "b", bundleCipherSize: 1, head: "0".repeat(40), refs: {}, refScope: "all" as const, generatedAt: iso(1) };
+  const apply = { lane: "apply" as const, reason: "conflict" as const, ...at };
+  const cases = [
+    { repo: "capture", deferral: { lane: "capture" as const, reason: "artifact" as const, ...at }, expected: "capture" },
+    { repo: "config", deferral: { lane: "config" as const, reason: "config" as const, ...at }, expected: "config" },
+    { repo: "unavailable", deferral: apply, expected: "apply-unavailable" },
+    { repo: "resolvable", deferral: apply, record: { repoGen: 1, sourceSeq: 1, pending: section }, expected: "apply-resolvable" },
+    { repo: "null-pending", deferral: apply, record: { repoGen: 1, sourceSeq: 1, pending: null as any }, expected: "apply-unavailable" },
+    { repo: "empty-key", deferral: apply, record: { repoGen: 1, sourceSeq: 1, resolutionKey: "", base: section }, expected: "apply-unavailable" },
+    { repo: "transient-capture", deferral: { lane: "capture" as const, reason: "local-commits" as const, ...at }, expected: "transient" },
+  ];
+  const projected = projectGitDeferralRepos(cases.map(({ expected: _, ...entry }) => entry), NOW);
+  for (const item of cases) {
+    expect(projected.find(({ repo }) => repo === item.repo)?.remediationClass).toBe(item.expected);
+  }
+  expect(projected.find(({ repo }) => repo === "resolvable")?.canResolve).toBe(true);
+  expect(projected.find(({ repo }) => repo === "unavailable")?.canResolve).toBe(false);
 });
 
 // ── progressLabel ─────────────────────────────────────────────────────────────
