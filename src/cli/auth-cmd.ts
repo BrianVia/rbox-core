@@ -322,7 +322,7 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
   const creds = await requireCreds();
   const res = await fetch(`${creds.remoteUrl}/v1/auth/devices`, { headers: { authorization: `Bearer ${creds.token}` } });
   if (!res.ok) throw await friendlyHttpError(res, "device list");
-  const { devices } = (await res.json()) as { devices: Array<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null; isSelf: boolean }> };
+  const { devices } = (await res.json()) as { devices: Array<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null; last_seen_version?: string | null; isSelf: boolean }> };
   if (opts.json) {
     emitJson({
       devices: devices.map((d) => ({
@@ -330,6 +330,7 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
         kind: "cli",
         createdAt: d.created_at,
         lastSeenAt: d.last_seen_at,
+        lastSeenVersion: d.last_seen_version ?? null,
         revoked: false,
       })),
     });
@@ -337,7 +338,7 @@ export async function listDevices(opts: { json?: boolean } = {}): Promise<void> 
   }
   for (const d of devices) {
     const seen = d.last_seen_at ? new Date(d.last_seen_at).toISOString() : "never";
-    console.log(`${d.isSelf ? "* " : "  "}${d.device_id}  ${d.label ?? ""}  last-seen ${seen}`);
+    console.log(`${d.isSelf ? "* " : "  "}${d.device_id}  ${d.label ?? ""}  version ${d.last_seen_version ?? "—"}  last-seen ${seen}`);
   }
 }
 

@@ -58,6 +58,7 @@ interface DeviceRow {
   label: string | null;
   created_at: number;
   last_seen_at: number | null;
+  last_seen_version: string | null;
   expires_at: number | null;
   kind: string | null;
 }
@@ -87,7 +88,7 @@ export async function accountDevices(env: Env, p: Principal, url: URL): Promise<
   binds.push(limit + 1); // +1 sentinel → is there a next page?
 
   const rows = await dirDb(env)
-    .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, expires_at, kind FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .prepare(`SELECT rowid AS rid, device_id, label, created_at, last_seen_at, last_seen_version, expires_at, kind FROM devices WHERE ${where} ORDER BY created_at ASC, rowid ASC LIMIT ?`)
     .bind(...binds)
     .all<DeviceRow>();
   const { page, nextCursor } = keysetPage(rows.results, limit);
@@ -101,6 +102,7 @@ export async function accountDevices(env: Env, p: Principal, url: URL): Promise<
         kind: kind === "device" ? "cli" : kind,
         createdAt: r.created_at,
         lastSeenAt: r.last_seen_at,
+        lastSeenVersion: r.last_seen_version,
         isCurrent: r.device_id === p.deviceId,
       };
     }),

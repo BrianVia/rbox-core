@@ -74,7 +74,7 @@ function expectedBatchBody(payload: { sha: string; bytes: Uint8Array }): Uint8Ar
 
 function expectLegacyBatchHeaders(call: Call, contentLength: number): void {
   expect(Object.keys(call.headers).sort()).toEqual([
-    "accept", "authorization", "content-length", "content-type", "x-rbox-protocol",
+    "accept", "authorization", "content-length", "content-type", "x-rbox-protocol", "x-rbox-version",
   ]);
   expect(call.headers.authorization).toBe("Bearer durable-token");
   expect(call.headers["x-rbox-protocol"]).toBe("upload-receipts-v1");
