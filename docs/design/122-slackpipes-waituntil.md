@@ -1,4 +1,4 @@
-# Design 118 — Durable request-lifetime Slackpipes pings
+# Design 122 — Durable request-lifetime Slackpipes pings
 
 ## Incident and goal
 
