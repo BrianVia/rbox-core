@@ -152,7 +152,7 @@ export async function verifyStripeSignature(rawBody: string, sigHeader: string, 
 
 /** POST /v1/stripe/webhook — PUBLIC, signature-verified. Keeps accounts.plan
  *  authoritative on subscription lifecycle. Idempotent via the stripe_events table. */
-export async function stripeWebhook(req: Request, env: Env, nowMs: number): Promise<Response> {
+export async function stripeWebhook(req: Request, env: Env, nowMs: number, ctx: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: "billing_not_configured" }, 501);
   const sig = req.headers.get("stripe-signature") ?? "";
   const raw = await req.text(); // RAW body — signature is over exact bytes
@@ -167,7 +167,7 @@ export async function stripeWebhook(req: Request, env: Env, nowMs: number): Prom
   // 500) is retried by Stripe rather than silently swallowed (at-least-once).
   const seen = await dirDb(env).prepare("SELECT 1 FROM stripe_events WHERE id = ?").bind(event.id).first();
   if (seen) return json({ received: true, duplicate: true });
-  await applyStripeEvent(env, event, nowMs);
+  await applyStripeEvent(env, event, nowMs, ctx);
   await dirDb(env).prepare("INSERT OR IGNORE INTO stripe_events (id, type, received_at) VALUES (?, ?, ?)").bind(event.id, event.type, nowMs).run();
   return json({ received: true });
 }
@@ -181,7 +181,7 @@ function graceCase(): string {
   return "CASE WHEN plan <> 'none' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END";
 }
 
-async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }, nowMs: number): Promise<void> {
+async function applyStripeEvent(env: Env, event: { type: string; data: { object: any } }, nowMs: number, ctx: Pick<ExecutionContext, "waitUntil">): Promise<void> {
   const obj = event.data.object;
   switch (event.type) {
     case "checkout.session.completed": {
@@ -221,7 +221,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // subscription, not every renewal `subscription.updated`, AND only when the
         // write actually transitioned a row. A late webhook for a reclaimed/CAS-guarded
         // shell no-ops the UPDATE (changes == 0) → no FALSE "new subscription" alert.
-        if (event.type === "customer.subscription.created" && (upd.meta.changes ?? 0) > 0) await pingNewSubscription(env, { accountId, plan });
+        if (event.type === "customer.subscription.created" && (upd.meta.changes ?? 0) > 0) pingNewSubscription(ctx, env, { accountId, plan });
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
         await dbFor(env, accountId)
@@ -244,7 +244,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // §32 Tier 1 churn ping (best-effort) — only when this delete actually
         // downgraded an account; a stale/duplicate delete that matches no live row
         // (changes == 0) must not emit a FALSE churn alert.
-        if ((del.meta.changes ?? 0) > 0) await pingChurn(env, { accountId: obj.metadata?.account_id ?? null });
+        if ((del.meta.changes ?? 0) > 0) pingChurn(ctx, env, { accountId: obj.metadata?.account_id ?? null });
       }
       break;
     }
@@ -256,7 +256,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
       const acct = obj.customer
         ? await dbFor(env, "").prepare("SELECT id FROM accounts WHERE stripe_customer_id = ?").bind(obj.customer).first<{ id: string }>()
         : null;
-      await pingPaymentFailed(env, { accountId: acct?.id ?? null, amountCents: typeof obj.amount_due === "number" ? obj.amount_due : null });
+      pingPaymentFailed(ctx, env, { accountId: acct?.id ?? null, amountCents: typeof obj.amount_due === "number" ? obj.amount_due : null });
       break;
     }
     default:

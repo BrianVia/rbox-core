@@ -14,6 +14,7 @@ export interface RouteCtx {
   req: Request;
   env: Env;
   exports: WorkerEntrypointExports;
+  executionCtx: Pick<ExecutionContext, "waitUntil">;
   url: URL;
   seg: string[];
 }

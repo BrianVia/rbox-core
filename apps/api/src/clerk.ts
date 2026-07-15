@@ -108,7 +108,7 @@ function randomId(prefix: string, bytes: number): string {
 }
 
 /** POST /v1/web/session { token } — PUBLIC. Verify Clerk JWT → rbox web session. */
-export async function webSession(req: Request, env: Env, nowMs: number): Promise<Response> {
+export async function webSession(req: Request, env: Env, nowMs: number, ctx: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   if (!env.CLERK_ISSUER) return json({ error: "web_auth_not_configured" }, 501);
   const body = (await req.json().catch(() => ({}))) as { token?: string };
   if (typeof body.token !== "string") return json({ error: "unauthorized" }, 401);
@@ -174,7 +174,7 @@ export async function webSession(req: Request, env: Env, nowMs: number): Promise
     // Rich fields are best-effort: a degraded Clerk fetch (email/method null) just omits
     // those segments. New web accounts are created locked (see the accounts INSERT above).
     if ((acctIns.meta.changes ?? 0) > 0)
-      await pingNewAccount(env, {
+      pingNewAccount(ctx, env, {
         accountId: map.account_id,
         origin: "web",
         email: clerkUser.email,

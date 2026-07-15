@@ -1902,6 +1902,7 @@ describe("release distribution (design 14)", () => {
       req,
       env: options.env ?? env,
       exports: options.exports ?? cachedExports,
+      executionCtx: { waitUntil: (promise) => void promise },
       url,
       seg: url.pathname.split("/").filter(Boolean),
     });

@@ -7,7 +7,7 @@ import type { Principal } from "../authz.js";
  * pasted pair token / device flow IS the credential), so they sit BEFORE
  * authenticate().
  */
-export async function authPublicRoutes({ req, env, seg }: RouteCtx): Promise<Response | null> {
+export async function authPublicRoutes({ req, env, executionCtx, seg }: RouteCtx): Promise<Response | null> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "start"])) return startDeviceAuth(req, env);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "poll"])) return pollDeviceAuth(req, env);
   // design 47: the web confirm page only has the userCode from the URL — this lets
@@ -15,7 +15,7 @@ export async function authPublicRoutes({ req, env, seg }: RouteCtx): Promise<Res
   // route (no path param), so it's `seg`-matched like the others; `code` is read
   // inside the handler.
   if (req.method === "GET" && eq(seg, ["v1", "auth", "device", "lookup"])) return lookupDeviceAuth(req, env);
-  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env);
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "bootstrap"])) return bootstrap(req, env, executionCtx);
   // Pairing redeem is PUBLIC (the pasted token IS the credential) — exact route.
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "redeem"])) return redeemPairToken(req, env);
   return null;
