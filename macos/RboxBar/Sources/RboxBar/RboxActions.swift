@@ -59,6 +59,23 @@ enum RboxActions {
         }
     }
 
+    static func upgrade(completion: @escaping (Result<Void, Error>) -> Void) {
+        queue.async {
+            guard let binary = resolveBinary() else {
+                completion(.failure(RboxActionError.binaryNotFound))
+                return
+            }
+
+            do {
+                try run(binary: binary, arguments: ["upgrade"], rootPath: NSHomeDirectory())
+                cachedVersion = nil
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
     static func version(completion: @escaping (String) -> Void) {
         queue.async {
             if let cachedVersion {
@@ -118,9 +135,11 @@ enum RboxActions {
         process.standardOutput = pipe
 
         try process.run()
+        // Drain while the child is running so verbose commands such as `upgrade`
+        // cannot fill the pipe buffer and deadlock before termination.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let message = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let command = arguments.first ?? "command"

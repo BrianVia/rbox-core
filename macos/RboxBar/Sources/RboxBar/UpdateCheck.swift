@@ -6,6 +6,8 @@ struct SemanticVersion: Comparable, Equatable {
     private let patch: Int
     private let prerelease: [String]?
 
+    var isPrerelease: Bool { prerelease != nil }
+
     init?(_ value: String) {
         var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if normalized.lowercased().hasPrefix("rbox ") {
