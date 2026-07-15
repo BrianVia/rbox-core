@@ -1,4 +1,4 @@
-# REVIEW-118 — Slackpipes request-lifetime pings
+# REVIEW-122 — Slackpipes request-lifetime pings
 
 Status: **ALIGNED** after round 2.
 
@@ -13,7 +13,7 @@ with a controlled unresolved ping while keeping Stripe ledger insertion independ
 
 ## Round 2 — revision
 
-Design 118 now incorporates all six corrections. It specifies the exact route and
+Design 122 now incorporates all six corrections. It specifies the exact route and
 handler chain, `Pick<ExecutionContext, "waitUntil">` schedulers with no caller
 await, all terminal/retry classifications (including dependency failures), removal
 of the superseded non-2xx log, injected signal/delay/fetch seams, and direct
@@ -33,7 +33,7 @@ pass returned **CLEAN**.
 
 The founder subsequently confirmed that SlackPipes URLs are channel-addressed and
 that terminal business-ping failures should themselves produce a one-shot alert.
-Design 118 now specifies alerts URL derivation with explicit-secret precedence, a
+Design 122 now specifies alerts URL derivation with explicit-secret precedence, a
 closed event-name enum, a single synthetic alerts ping after terminal failure, a
 hard alerts-channel recursion boundary, and URL-free logging. The amendment is
 subject to a fresh adversarial review below before implementation.
