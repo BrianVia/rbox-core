@@ -81,12 +81,12 @@ export function bulkWalkSupported(): boolean {
   return binding() !== null;
 }
 
-function logErrno(errno: number): void {
+function logErrno(errno: number, warningSink: (line: string) => void): void {
   // Once per DISTINCT errno: a single boring EACCES on one protected dir must not
   // permanently mask a later, different failure this feature would need to debug.
   if (loggedErrnos.has(errno)) return;
   loggedErrnos.add(errno);
-  console.warn(`getattrlistbulk errno=${errno}`);
+  warningSink(`getattrlistbulk errno=${errno}`);
 }
 
 function errorNumber(error: unknown): number | undefined {
@@ -172,7 +172,7 @@ function parseRecord(view: DataView, start: number, length: number, absDir: stri
   return { name, type, stat };
 }
 
-export function bulkWalkDir(absDir: string): BulkChild[] | null {
+export function bulkWalkDir(absDir: string, warningSink: (line: string) => void = console.warn): BulkChild[] | null {
   const native = binding();
   if (!native) return null;
   let fd: number;
@@ -180,7 +180,7 @@ export function bulkWalkDir(absDir: string): BulkChild[] | null {
     fd = fs.openSync(absDir, "r");
   } catch (error) {
     const errno = errorNumber(error);
-    if (errno !== undefined) logErrno(errno);
+    if (errno !== undefined) logErrno(errno, warningSink);
     return null;
   }
   let result: BulkChild[] | null = [];
@@ -197,7 +197,7 @@ export function bulkWalkDir(absDir: string): BulkChild[] | null {
       const count = Number(native.bulk(fd, ptr(attrs), ptr(buffer), buffer.byteLength, BigInt(FSOPT_PACK_INVAL_ATTRS)));
       if (count === 0) break;
       if (count < 0) {
-        logErrno(read.i32(Number(native.error()), 0));
+        logErrno(read.i32(Number(native.error()), 0), warningSink);
         result = null;
         break;
       }

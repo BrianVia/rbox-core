@@ -53,7 +53,8 @@ src/cli/sync-git/status.ts           — read-only divergence status: gitDiverge
 src/cli/daemon.ts            — barrel: pre-113-split public surface of daemon/ (main-dispatch's dynamic import("./daemon.js") lands here).
 src/cli/daemon/daemon.ts     — RboxDaemon (§2.7 — one state machine: pump single-flight, watcher trust/retrust, safety/deep scan cadence, push/pull drivers, retry fences, drift audits, activity/ambient-status persistence, WS channel, ownership wind-down) + runDaemon + class-coupled types. Never: reusable policy or rendering (those live in siblings).
 src/cli/daemon/policy.ts     — daemon policy, pure: DaemonChainRepairPolicy, classifyWatcherError, TrustState/worseTrust, daemonConsumesWakeup, Wants, cadence/retrust/WS constants, reconnectDelayMs/nextSafetyDelay/jitter. Never: class state, I/O.
-src/cli/daemon/render.ts     — daemon log-line rendering: log, scanStatsLine, summarizeActions, path cleaning. Format strings are load-bearing. Never: state, decisions.
+src/cli/daemon/render.ts     — daemon log-line rendering: scanStatsLine, summarizeActions, path cleaning. Format strings are load-bearing. Never: state, decisions, sink ownership.
+src/cli/daemon/logger.ts     — per-daemon synchronous dated-log ownership: append/rollover, crash-channel pointers/fallback, unlink recovery, and filename-date retention. Never: daemon sync state or reader/follow policy.
 ```
 
 ## `src/cli/` — sync-adjacent singles

@@ -191,7 +191,8 @@ export class CryptoPool {
     readonly kek: Buffer,
     readonly fingerprint: string,
     readonly keyEpoch: number,
-    readonly targetWorkers: number
+    readonly targetWorkers: number,
+    private readonly warningSink: (line: string) => void = console.warn,
   ) {
     this.queueLimit = targetWorkers * QUEUE_PER_WORKER;
   }
@@ -213,7 +214,7 @@ export class CryptoPool {
       if (result.status === "fulfilled") {
         rest.push(result.value);
       } else {
-        console.warn(
+        this.warningSink(
           `rbox: crypto worker spawn failed; continuing with ${this.workers.length + restResults.filter((r) => r.status === "fulfilled").length} worker(s): ${
             result.reason instanceof Error ? result.reason.message : String(result.reason)
           }`
@@ -778,17 +779,17 @@ export class CryptoPool {
   }
 }
 
-async function selectCryptoPool(kek: Buffer, keyEpoch: number, expectedJobs: number): Promise<CryptoPool | undefined> {
+async function selectCryptoPool(kek: Buffer, keyEpoch: number, expectedJobs: number, warningSink: (line: string) => void): Promise<CryptoPool | undefined> {
   if (expectedJobs <= 0 || expectedJobs < minJobs()) return undefined;
   if (disabledReason) return undefined;
-  const configured = configuredWorkers();
+  const configured = configuredWorkers(warningSink);
   if (configured.count === 0) return undefined;
 
   const fingerprint = kekFingerprint(kek);
   if (activePool?.matches(fingerprint, keyEpoch)) return activePool;
   if (activePool) await activePool.close();
 
-  const pool = new CryptoPool(Buffer.from(kek), fingerprint, keyEpoch, configured.count);
+  const pool = new CryptoPool(Buffer.from(kek), fingerprint, keyEpoch, configured.count, warningSink);
   try {
     await pool.start();
   } catch (err) {
@@ -804,9 +805,10 @@ export async function withCryptoPool<T>(
   kek: Buffer | undefined,
   keyEpoch: number | undefined,
   expectedJobs: number,
-  fn: (pool: CryptoPool | undefined) => Promise<T>
+  fn: (pool: CryptoPool | undefined) => Promise<T>,
+  warningSink: (line: string) => void = console.warn,
 ): Promise<T> {
-  const pool = kek && keyEpoch !== undefined ? await selectCryptoPool(kek, keyEpoch, expectedJobs) : undefined;
+  const pool = kek && keyEpoch !== undefined ? await selectCryptoPool(kek, keyEpoch, expectedJobs, warningSink) : undefined;
   return poolScope.run(pool, () => fn(pool));
 }
 

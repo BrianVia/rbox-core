@@ -12,7 +12,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import * as C from "./container.js";
-import type { Device } from "./device.js";
+import { daemonLogHarvestScript, type Device } from "./device.js";
 
 // ── pure summarizers ─────────────────────────────────────────────────────────
 
@@ -254,7 +254,7 @@ export interface CaptureDeps {
   devices: { a: Device; b: Device };
   /** Guest workspace dir (holds `.rbox/state/metrics.json`). */
   workDir: string;
-  /** Guest rbox home (holds the per-workspace `daemons/<key>/daemon.log`). */
+  /** Guest rbox home (holds per-workspace daily streams and crash sinks). */
   rboxHome: string;
   env: NodeJS.ProcessEnv;
   /** Status line → run.log + console (the ctx logger). */
@@ -432,9 +432,10 @@ export class RunCapture {
     } catch (e) {
       fs.writeFileSync(this.p(`metrics-${label}.json`), JSON.stringify({ present: false, reason: msg(e) }, null, 2) + "\n");
     }
-    // daemon logs — concatenate every ~/.rbox/daemons/*/daemon.log with separators.
+    // Daemon logs — ordered daily streams plus the concurrent crash sink, with
+    // separators retained in the artifact so rollover and runtime failures coexist.
     try {
-      const script = `for f in ${this.deps.rboxHome}/daemons/*/daemon.log; do [ -f "$f" ] && printf '── %s ──\\n' "$f" && cat "$f"; done`;
+      const script = daemonLogHarvestScript(this.deps.rboxHome);
       const out = await device.exec(["sh", "-c", script], { allowFail: true });
       const body = out.stdout.trim();
       fs.writeFileSync(this.p(`daemon-${label}.log`), body ? out.stdout : "(no daemon logs found — P2 daemon scenarios will populate this)\n");

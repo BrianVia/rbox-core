@@ -308,6 +308,55 @@ test("a byte-truncated Git log record cannot leak a continuation", async () => {
   }
 });
 
+test("diagnostics merges bounded dated and crash channels before redaction", async () => {
+  const root = await makeWorkspace();
+  try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "daemon.log"), "2026-07-13T12:00:00.000Z crash diagnostic\n");
+    await fs.writeFile(path.join(runtime, "daemon-2026-07-13.log"), "2026-07-13T12:00:01.000Z dated diagnostic\n");
+    const ctx: DoctorContext = {
+      root,
+      cfg: {
+        schema: "e2ee/v1", remoteWorkspaceId: "ws_diag", projectId: "root", rootPath: root,
+        remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
+      },
+      checks,
+      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      daemonStale: false,
+    };
+    const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;
+    expect(tail).toContain("crash diagnostic");
+    expect(tail).toContain("dated diagnostic");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostics retains the bounded tail of an oversized daemon source", async () => {
+  const root = await makeWorkspace();
+  try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "daemon.log"), `OLD_PREFIX_${"x".repeat(70 * 1024)}_FINAL_TAIL_SENTINEL\n`);
+    const ctx: DoctorContext = {
+      root,
+      cfg: {
+        schema: "e2ee/v1", remoteWorkspaceId: "ws_diag", projectId: "root", rootPath: root,
+        remoteUrl: "https://api.test", token: "", deviceId: "dev_1",
+      },
+      checks,
+      workspaceShape: { fileCount: 1, totalBytes: 42 },
+      daemonStale: false,
+    };
+    const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;
+    expect(tail).toContain("_FINAL_TAIL_SENTINEL");
+    expect(tail).not.toContain("OLD_PREFIX_");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("doctor --report prints a local preview and does not upload", async () => {
   const root = await makeWorkspace();
   try {

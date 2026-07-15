@@ -33,7 +33,7 @@ export async function repairChain(
   // here, never re-acquired.
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const remote = repairRemote(deps);
-  const originalApplied = (await loadState(root, syncStreamId(cfg))).lastSyncedSequence;
+  const originalApplied = (await loadState(root, syncStreamId(cfg), deps.warningSink)).lastSyncedSequence;
   const detected = await describeSuffix(remote, originalApplied, error);
   const detectedHead = detected.at(-1)?.seq ?? error.head?.seq ?? originalApplied;
   // §3.6.3 convergence probe: a peer may have published a READABLE head between
@@ -64,7 +64,7 @@ export async function repairChain(
       throw candidateError;
     }
   }
-  const applied = (await loadState(root, syncStreamId(cfg))).lastSyncedSequence;
+  const applied = (await loadState(root, syncStreamId(cfg), deps.warningSink)).lastSyncedSequence;
   let suffix = await describeSuffix(remote, applied, error);
   if (!(await opts.confirmSupersede(suffix))) return { kind: "declined", suffix, actions };
 

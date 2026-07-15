@@ -42,7 +42,7 @@ export function minJobs(): number {
   return env !== undefined && env > 0 ? env : 8;
 }
 
-export function configuredWorkers(): { count: number; offReason?: string } {
+export function configuredWorkers(warningSink: (line: string) => void = console.warn): { count: number; offReason?: string } {
   if (configuredWorkersCache) return configuredWorkersCache;
   const override = parsePositiveIntEnv("RBOX_CRYPTO_WORKERS");
   if (override === 0) {
@@ -58,7 +58,7 @@ export function configuredWorkers(): { count: number; offReason?: string } {
 
   const fdCap = fileDescriptorWorkerCap();
   if (fdCap !== undefined && count > fdCap) {
-    console.warn(`rbox: crypto worker count reduced from ${count} to ${fdCap} due to RLIMIT_NOFILE headroom`);
+    warningSink(`rbox: crypto worker count reduced from ${count} to ${fdCap} due to RLIMIT_NOFILE headroom`);
     count = fdCap;
   }
   configuredWorkersCache = { count: Math.max(0, count) };

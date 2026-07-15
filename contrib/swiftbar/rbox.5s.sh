@@ -239,7 +239,21 @@ key = workspace_key(root)
 runtime = Path(os.environ.get("RBOX_HOME", str(Path.home() / ".rbox"))) / "daemons" / key
 v = verdict(root, runtime)
 name = workspace_name(root, key)
-log_path = runtime / "daemon.log"
+
+
+def log_lines():
+    try:
+        res = subprocess.run(
+            [RBOX_BIN, "logs", str(root), "--limit", "8"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if res.returncode == 0:
+            return res.stdout.splitlines()[-8:]
+        return ["logs unavailable"]
+    except Exception:
+        return ["logs unavailable"]
 
 print(title(v))
 print("---")
@@ -272,15 +286,12 @@ if v.get("state") == "paused":
 else:
     item("Pause Syncing", bash=RBOX_BIN, param1="stop", param2=str(root), terminal=False, refresh=True)
 item("Open Dashboard", href=f"{APP_URL}/dashboard")
-item("Open Raw Daemon Log", bash="/usr/bin/open", param1=str(log_path), terminal=False)
+item("Open Daemon Logs", bash=RBOX_BIN, param1="logs", param2=str(root), param3="--follow", terminal=True)
 
 item("---")
 item("Daemon Log")
-if log_path.exists():
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
-    except Exception:
-        lines = ["log unavailable"]
+lines = log_lines()
+if lines:
     for line in lines:
         item(f"--{line[:100]}")
 else:

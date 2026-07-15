@@ -56,13 +56,13 @@ export async function push(
   deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
-  const deferErrnos = makeDeferErrnoReporter();
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
@@ -228,7 +228,7 @@ export async function pushManifest(
     const outcome = await runPushAttempt(root, cfg, deps, backoff, state);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
-      if (lane) process.stderr.write(`${lane}\n`);
+      if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
       return outcome.result;
     }
     if (outcome.action.kind === "repair-conflict") {
@@ -324,7 +324,7 @@ async function runPushAttempt(
   // §4); §35's "a no-op tick allocates nothing" still holds — disabled() is a shared
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
-  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
@@ -551,6 +551,7 @@ async function runPushAttempt(
       pruneLivePaths: scannedFilePaths,
       recoverAddresses,
       forceFullAudit,
+      ...(deps.warningSink ? { warningSink: deps.warningSink } : {}),
     });
 
     // Build the manifest we actually COMMIT. A deferred file is dropped from this commit;
@@ -582,7 +583,7 @@ async function runPushAttempt(
           // uploaded is safe; the re-run reconstructs disk truth.
           return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
         }
-        reportDeferred(deferred);
+        reportDeferred(deferred, deps.warningSink);
         return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false } };
       }
     }
@@ -670,7 +671,7 @@ async function runPushAttempt(
     const firstPublish = finishFirstPublishStats();
     if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
 
-    if (deferred.size > 0) reportDeferred(deferred);
+    if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
     return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}) } };
   } finally {
     if (firstPublishTiming.enabled) beginFirstPublishTiming(false);

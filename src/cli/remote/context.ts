@@ -19,7 +19,8 @@ export class RemoteContext {
     readonly baseUrl: string,
     readonly token: string,
     readonly workspaceId: string,
-    readonly projectId: string
+    readonly projectId: string,
+    readonly warningSink: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
   ) {}
 
   // §23 upload-receipts: single-PUT/check/commit speak the receipts protocol. PUT

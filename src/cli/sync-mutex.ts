@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
-import { daemonLogPath } from "./rbox-paths.js";
+import { resolveDaemonLogSources } from "./daemon-control.js";
 
 export type SyncMutexMode = "cli" | "daemon";
 
@@ -58,7 +58,9 @@ async function readStarvationWarning(root: string): Promise<LockStarvationReason
     if (Buffer.byteLength(episodeRaw) > 4 * 1024) return undefined;
     const episode = JSON.parse(episodeRaw) as Record<string, unknown>;
     if (typeof episode.warnedAt !== "number" || !Number.isSafeInteger(episode.warnedAt)) return undefined;
-    const handle = await fs.open(daemonLogPath(root), "r");
+    const operational = (await resolveDaemonLogSources(root)).dated;
+    if (!operational) return undefined;
+    const handle = await fs.open(operational, "r");
     try {
       const stat = await handle.stat();
       const length = Math.min(stat.size, 64 * 1024);

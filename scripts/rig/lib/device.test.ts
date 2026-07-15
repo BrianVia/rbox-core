@@ -1,5 +1,13 @@
-import { test, expect } from "bun:test";
-import { scrubSelfPrinted } from "./device.js";
+import { afterEach, test, expect } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { daemonLogHarvestScript, daemonWatcherMode, scrubSelfPrinted } from "./device.js";
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 // The CLI prints two secrets a redact-list can't know at call time (it generates
 // them mid-run): the 24-word recovery phrase and the pairing token. The transcript
@@ -31,4 +39,38 @@ test("scrub: pull summaries and corpus filenames pass through untouched", () => 
     "a short sentence with lowercase words but far fewer than twenty",
   ].join("\n");
   expect(scrubSelfPrinted(body)).toBe(body);
+});
+
+test("daemon log harvest reads valid dated files in order, then the crash sink", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "rbox rig logs "));
+  tempDirs.push(home);
+  const runtime = path.join(home, "daemons", "workspace-key");
+  fs.mkdirSync(runtime, { recursive: true });
+  fs.writeFileSync(path.join(runtime, "daemon-2026-07-15.log"), "new-day\n");
+  fs.writeFileSync(path.join(runtime, "daemon-2026-07-14.log"), "old-day\n");
+  fs.writeFileSync(path.join(runtime, "daemon-2026-02-30.log"), "impossible\n");
+  fs.writeFileSync(path.join(runtime, "daemon-2026-7-01.log"), "loose-name\n");
+  fs.writeFileSync(path.join(runtime, "daemon.log"), "runtime-crash\n");
+
+  const result = Bun.spawnSync(["sh", "-c", daemonLogHarvestScript(home)]);
+  expect(result.exitCode).toBe(0);
+  const out = result.stdout.toString();
+  expect(out.indexOf("old-day")).toBeLessThan(out.indexOf("new-day"));
+  expect(out.indexOf("new-day")).toBeLessThan(out.indexOf("runtime-crash"));
+  expect(out).toContain("daemon-2026-07-14.log");
+  expect(out).toContain("daemon.log (crash sink)");
+  expect(out).not.toContain("impossible");
+  expect(out).not.toContain("loose-name");
+});
+
+test("watcher classification consumes rollover-spanning operational output", () => {
+  const combined = [
+    "── daemon-2026-07-14.log ──",
+    "2026-07-14T23:59:59.000Z daemon boot",
+    "── daemon-2026-07-15.log ──",
+    "2026-07-15T00:00:00.000Z live watch unavailable; degrading to periodic scan",
+    "── daemon.log (crash sink) ──",
+    "runtime diagnostic",
+  ].join("\n");
+  expect(daemonWatcherMode(combined)).toBe("polling");
 });

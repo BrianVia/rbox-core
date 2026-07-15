@@ -10,8 +10,8 @@ import { SingleGate, downloadDisabled, disableDownloadForProcess } from "./gate.
 import { downloadBatchConfig, FLUSH_DELAY_MS, GRANT_REFRESH_AFTER_MS, SINGLE_FALLBACK_CONCURRENCY, DEFAULT_PULL_JOIN_WATCHDOG_MS, DEFAULT_PULL_JOIN_WATCHDOG_MAX_FIRINGS, type BatchConfig } from "./config.js";
 import { parseBatchFrames, parseStatus, BATCH_BLOB_CONTENT_TYPE } from "./wire.js";
 
-const debug = (msg: string): void => {
-  if (process.env.RBOX_DEBUG) process.stderr.write(`rbox: ${msg}\n`);
+const debug = (ctx: RemoteContext, msg: string): void => {
+  if (process.env.RBOX_DEBUG) ctx.warningSink(`rbox: ${msg}`);
 };
 
 interface BatchRequest {
@@ -135,9 +135,9 @@ export class BlobBatchDownloader {
       for (const req of outstanding) this.settleErr(req, err);
       return;
     }
-    process.stderr.write(
+    this.ctx.warningSink(
       `rbox: pull download liveness watchdog: no blob completions or stream progress for ${Math.round(idleMs / 1000)}s; ` +
-        `retrying ${outstanding.length} outstanding blob(s): ${sample}${outstanding.length > 8 ? ", …" : ""}\n`
+        `retrying ${outstanding.length} outstanding blob(s): ${sample}${outstanding.length > 8 ? ", …" : ""}`
     );
     for (const req of outstanding) void this.dispatchSingle(req, "watchdog-duplicate");
     this.armWatchdog();
@@ -358,7 +358,7 @@ export class BlobBatchDownloader {
     } catch (e) {
       await fs.rm(tmp, { force: true }).catch(() => {});
       if (kind === "watchdog-duplicate") {
-        debug(`pull download watchdog duplicate retry failed for ${req.sha}: ${e instanceof Error ? e.message : String(e)}`);
+        debug(this.ctx, `pull download watchdog duplicate retry failed for ${req.sha}: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
       this.settleErr(req, e);

@@ -34,17 +34,6 @@ export interface MultipartTimings {
   server?: MultipartServerTimings;
 }
 
-let sink: (line: string) => void = (line) => console.error(line);
-const defaultSink = sink;
-
-export function setMultipartMetricsSink(fn: (line: string) => void): void {
-  sink = fn;
-}
-
-export function resetMultipartMetricsSinkForTests(): void {
-  sink = defaultSink;
-}
-
 function distribution(values: number[]): Distribution {
   if (values.length === 0) return { p50: 0, p95: 0, max: 0, sum: 0 };
   const sorted = [...values].sort((a, b) => a - b);
@@ -67,7 +56,7 @@ export class MultipartMetrics {
   private completionWallMs = 0;
   private server?: MultipartServerTimings;
 
-  constructor(private readonly enabled: boolean) {}
+  constructor(private readonly enabled: boolean, private readonly output: (line: string) => void) {}
 
   /** Callers use this to skip optional metric-only work (e.g. reading a response body). */
   get isEnabled(): boolean {
@@ -105,6 +94,6 @@ export class MultipartMetrics {
   }
 
   emit(): void {
-    if (this.enabled && this.partWalls.length > 0) sink(this.summaryLine());
+    if (this.enabled && this.partWalls.length > 0) this.output(this.summaryLine());
   }
 }

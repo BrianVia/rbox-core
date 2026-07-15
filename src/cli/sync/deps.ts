@@ -59,6 +59,9 @@ export interface SyncDeps {
    *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
    *  injects its timestamped logger so the lines land in the daemon log. */
   onGitLog?: (line: string) => void;
+  /** Operational warning/metrics sink. Daemons inject their instance-local dated
+   * logger; foreground commands retain their existing stderr defaults. */
+  warningSink?: (line: string) => void;
   /** Called immediately after a state save that may set/clear durable Git
    * deferrals. Observability-only: callers must not throw or mutate the state. */
   onGitDeferralsSaved?: (state: SyncState) => void;

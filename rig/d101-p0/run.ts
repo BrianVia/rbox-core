@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { RemoteContext } from "../../src/cli/remote/context.js";
 import { putBlobMultipart } from "../../src/cli/remote/multipart.js";
-import { resetMultipartMetricsSinkForTests, setMultipartMetricsSink } from "../../src/cli/remote/multipart-metrics.js";
 import { startFakeMultipartServer } from "../../src/cli/remote/multipart-fake-server.js";
 
 const argv = process.argv.slice(2);
@@ -50,11 +49,10 @@ async function sha256(file: string): Promise<string> {
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-d101-p0-"));
 const server = await startFakeMultipartServer({ partLatencyMs: latencyMs, failPartOnce: failPart });
 const lines: string[] = [];
-setMultipartMetricsSink((line) => lines.push(line));
 process.env.RBOX_METRICS = "1";
 
 try {
-  const ctx = new RemoteContext(server.baseUrl, "local-token", "local-workspace", "local-project");
+  const ctx = new RemoteContext(server.baseUrl, "local-token", "local-workspace", "local-project", (line) => lines.push(line));
   for (const [label, random] of [["incompressible", true], ["compressible", false]] as const) {
     const file = path.join(temp, `${label}.bin`);
     await writeSynthetic(file, size, random);
@@ -66,7 +64,6 @@ try {
     for (const line of lines.slice(lineOffset)) console.log(line);
   }
 } finally {
-  resetMultipartMetricsSinkForTests();
   await server.close();
   await fs.rm(temp, { recursive: true, force: true });
 }
