@@ -5,6 +5,7 @@ import type { DaemonActivity } from "./activity.js";
 import type { TransferPhase } from "./transfer-progress.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "./config.js";
 import { projectGitDeferralRepos } from "./status-view.js";
+import { parseSemver } from "./semver.js";
 import {
   AMBIENT_STATUS_STALE_MS,
   hasFreshPopulateHeartbeat,
@@ -21,6 +22,7 @@ export type AmbientOperationKind = "pull" | "push";
 
 export interface AmbientDaemonStatusV1 {
   schemaVersion: 1;
+  daemonVersion?: string;
   state: AmbientDaemonState;
   heartbeatAt: string;
   sequence: number | null;
@@ -37,6 +39,16 @@ export interface AmbientDaemonStatusV1 {
   attentionReason?: AmbientAttentionReason;
   deferredRepos?: number;
   oldestDeferralAgeSeconds?: number | null;
+}
+
+export function validDaemonVersion(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 80) return false;
+  try {
+    parseSemver(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export type PromptAttentionReason = "dead" | "halt" | "quota" | "watcher" | "owner" | "error";
@@ -218,6 +230,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (typeof j.heartbeatAt !== "string" || Number.isNaN(Date.parse(j.heartbeatAt))) return undefined;
     if (!(j.sequence === null || uint(j.sequence))) return undefined;
     if (!(j.lastSyncedAt === null || typeof j.lastSyncedAt === "string")) return undefined;
+    if (j.daemonVersion !== undefined && !validDaemonVersion(j.daemonVersion)) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
     if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
@@ -228,6 +241,7 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
       sequence: j.sequence,
       lastSyncedAt: j.lastSyncedAt,
     };
+    if (j.daemonVersion !== undefined) out.daemonVersion = j.daemonVersion;
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
     if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
@@ -256,7 +270,9 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
   }
 }
 
-function readStatusFile(root: string): { kind: "absent" } | { kind: "corrupt" } | { kind: "ok"; status: AmbientDaemonStatusV1 } {
+export type AmbientDaemonStatusRecord = { kind: "absent" } | { kind: "corrupt" } | { kind: "ok"; status: AmbientDaemonStatusV1 };
+
+export function readAmbientDaemonStatusRecord(root: string): AmbientDaemonStatusRecord {
   try {
     const status = parseStatus(fs.readFileSync(daemonStatusPath(root), "utf8"));
     return status ? { kind: "ok", status } : { kind: "corrupt" };
@@ -391,7 +407,7 @@ export function readPromptStatus(start = process.cwd(), now = Date.now()): Promp
   if (populate) return populate;
 
   const pidfilePresent = filePresent(daemonPidPath(root));
-  const read = readStatusFile(root);
+  const read = readAmbientDaemonStatusRecord(root);
   if (read.kind === "absent") return pidfilePresent ? deadVerdict(true) : pausedVerdict(false);
   if (read.kind === "corrupt") return deadVerdict(pidfilePresent);
 

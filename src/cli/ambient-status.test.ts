@@ -7,6 +7,7 @@ import {
   formatPromptStatus,
   projectAmbientDaemonStatus,
   promptStatusJson,
+  readAmbientDaemonStatusRecord,
   readPromptStatus,
   type AmbientDaemonStatusV1,
 } from "./ambient-status.js";
@@ -247,4 +248,21 @@ test("deferral projection and reader round-trip expose counts and oldest age onl
   expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
   await writeStatus({ deferredRepos: 1, oldestDeferralAgeSeconds: -1 as never });
   expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
+});
+
+test("ambient reader retains an optional daemonVersion and accepts pre-1.6.3 records", async () => {
+  await writeStatus({ daemonVersion: "1.6.3" });
+  expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
+  const stored = JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8"));
+  expect(stored.daemonVersion).toBe("1.6.3");
+
+  await writeStatus({ daemonVersion: undefined });
+  expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
+});
+
+test("ambient reader rejects malformed daemonVersion records", async () => {
+  await writeStatus({ daemonVersion: "1.6.3\nforged" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+  await writeStatus({ daemonVersion: "" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
 });

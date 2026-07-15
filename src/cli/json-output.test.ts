@@ -155,7 +155,8 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
   expect(dto).toEqual({
     workspace: { id: "ws_json", name: "JSON Workspace", root: tmp },
     health: "outofstorage",
-    daemon: { running: false, pid: null },
+    daemon: { running: false, pid: null, version: null, cliVersion: "1.6.2", versionSkew: false },
+    locking: { status: "ok", reason: null, path: ".rbox/state/sync.lock" },
     remote: null,
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },

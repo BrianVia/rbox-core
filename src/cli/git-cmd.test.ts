@@ -5,10 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, captureGitState, type GitSection, type Manifest } from "../engine/index.js";
+import { checkoutJournalDir } from "../engine/git/journal.js";
 import { loadState, repoRecordsForState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
-import { gitResolveCmd, type GitResolveShow } from "./git-cmd.js";
+import { gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
 import { applyGitSections } from "./sync-git/apply.js";
 import { gitFollowEnabled } from "./sync-git/shared.js";
+import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -159,7 +161,7 @@ test("show-me strips terminal controls from a commit subject", async () => {
   await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--amend", "-qm", "subject\u001b[2Jforged");
   const lines: string[] = [];
   expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(lines))).toBe(0);
-  expect(lines.join("\n")).toContain("subjectforged");
+  expect(lines.join("\n")).toContain("subject [2Jforged");
   expect(lines.join("\n")).not.toMatch(/[\u001b\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/);
 });
 
@@ -228,7 +230,8 @@ test("take-theirs names a sibling worktree collision", async () => {
   expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(1);
   const result = JSON.parse(lines.at(-1)!);
   expect(result).toMatchObject({ status: "refused", code: "worktree-ownership" });
-  expect(result.message).toContain("sibling-next");
+  expect(result.message).toBe("another worktree owns a ref required by the confirmed checkout");
+  expect(result.message).not.toContain("sibling-next");
 });
 
 test("keep-mine is a typed unsupported result and never clears pending state", async () => {
@@ -241,4 +244,80 @@ test("keep-mine is a typed unsupported result and never clears pending state", a
     code: "not-yet-supported",
   });
   expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending).toBeDefined();
+});
+
+test("resolve maps workspace contention to the closed sync-busy refusal", async () => {
+  await fixture();
+  const held = await acquireWorkspaceSyncMutex(root, "cli");
+  const lines: string[] = [];
+  try {
+    expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(lines))).toBe(1);
+  } finally {
+    await releaseWorkspaceSyncMutex(held);
+  }
+  expect(JSON.parse(lines.at(-1)!)).toEqual({
+    status: "refused", verb: "show-me", repo: "repo", code: "sync-busy",
+    message: "daemon/CLI is syncing; retry, or run `rbox stop` first",
+  });
+});
+
+test("resolve maps missing incoming state and unknown exceptions to closed codes", async () => {
+  await fixture();
+  const state = await loadState(root, syncStreamId(cfg));
+  if (state.repoRecords) delete state.repoRecords.repo;
+  await saveState(root, state);
+  const missing: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(missing))).toBe(1);
+  expect(JSON.parse(missing.at(-1)!)).toMatchObject({ code: "no-incoming", message: "no deferred incoming Git state is available for this repository" });
+
+  const failed: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(failed, {
+    build: async () => { throw new Error("Authorization: Bearer secret-token\n/private/path\u001b[2J"); },
+  }))).toBe(1);
+  const output = failed.at(-1)!;
+  expect(JSON.parse(output)).toMatchObject({ code: "operation-failed" });
+  expect(output).not.toContain("secret-token");
+  expect(output).not.toContain("/private/path");
+  expect(output).not.toMatch(/[\r\n\u001b]/);
+});
+
+test("hostile repository arguments produce identical safe JSON and human semantics", async () => {
+  const hostile = "https://user:password@example.invalid/outside\nAuthorization: Bearer token";
+  const jsonLines: string[] = [];
+  expect(await gitResolveCmd(root, hostile, "show-me", { json: true }, deps(jsonLines))).toBe(1);
+  const json = JSON.parse(jsonLines.at(-1)!);
+  const human: string[] = [];
+  expect(await gitResolveCmd(root, hostile, "show-me", {}, deps(human))).toBe(1);
+  expect(json).toMatchObject({ code: "operation-failed", message: "the Git resolution could not complete safely; no confirmation can be reused" });
+  expect(human.join("\n")).toContain(json.message);
+  expect(`${jsonLines.join("\n")}\n${human.join("\n")}`).not.toMatch(/user:password|Bearer token|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/);
+});
+
+test("safe resolve rendering keeps multiline error words separated", () => {
+  const error = new Error("first line\nsecond line");
+  expect(safeResolveText(error.message, root)).toBe("first line second line");
+});
+
+test("resolve maps indeterminate proof, journal recovery, and degraded mutex to closed codes", async () => {
+  await fixture();
+  const proof: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true }, deps(proof, { forceProofIndeterminate: true }))).toBe(1);
+  expect(JSON.parse(proof.at(-1)!)).toMatchObject({ code: "proof-indeterminate", message: "proof could not complete; retry after Git state settles" });
+
+  const journalDir = checkoutJournalDir(root, "repo");
+  await fs.mkdir(journalDir, { recursive: true });
+  await fs.writeFile(path.join(journalDir, "journal.json"), "{corrupt\n");
+  const journal: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(journal))).toBe(1);
+  expect(JSON.parse(journal.at(-1)!)).toMatchObject({ code: "journal-recovery" });
+  expect(journal.at(-1)).not.toContain(journalDir);
+  await fs.rm(journalDir, { recursive: true, force: true });
+
+  const current = await show([]);
+  const degraded: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(degraded, {
+    mutexOptions: { lock: { identity: { current: async () => { throw new Error("private identity failure"); }, probe: async () => ({ status: "unknown" }) } } },
+  }))).toBe(1);
+  expect(JSON.parse(degraded.at(-1)!)).toMatchObject({ code: "mutex-degraded", message: "locking unavailable; resolution refused" });
+  expect(degraded.at(-1)).not.toContain("private identity failure");
 });

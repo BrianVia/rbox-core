@@ -1,6 +1,7 @@
 import os from "node:os";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import {
   applyWatchEvents,
@@ -18,6 +19,7 @@ import {
   type Manifest,
   type WatchEvent,
   ManifestChainError,
+  writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
 import { renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
@@ -65,7 +67,13 @@ import { saveAmbientDaemonStatus } from "../ambient-status-writer.js";
 import { RBOX_VERSION } from "../version.js";
 import { daemonBindingMatches } from "../sync-state.js";
 import { ageBucket, projectGitDeferralRepos, renderGitDeferralLine } from "../status-view.js";
-import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, type DaemonMutexResult, type WorkspaceSyncMutex } from "../sync-mutex.js";
+import {
+  acquireWorkspaceSyncMutex,
+  releaseWorkspaceSyncMutex,
+  type DaemonMutexResult,
+  type LockStarvationReason,
+  type WorkspaceSyncMutex,
+} from "../sync-mutex.js";
 import { repairChain, type SuffixInfo } from "../chain-repair.js";
 import {
   ACTIVITY_HEARTBEAT_MS,
@@ -99,6 +107,62 @@ type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   daemonVersion: string;
   workspaceRoot: string;
 };
+
+const LOCK_STARVATION_MS = 15 * 60_000;
+const LOCK_STARVATION_MAX_BYTES = 4 * 1024;
+const MUTEX_BACKOFF_TIERS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
+const MUTEX_EARLY_REPROBE_MS = 2_000;
+
+export interface LockStarvationEpisode {
+  holderKey: string;
+  firstSeenAt: number;
+  warnedAt?: number;
+  countedAt?: number;
+}
+
+export const lockStarvationPath = (root: string): string => path.join(root, ".rbox", "state", "lock-starvation.json");
+
+const episodeTime = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+export async function readLockStarvationEpisode(root: string): Promise<LockStarvationEpisode | undefined> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(lockStarvationPath(root), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > LOCK_STARVATION_MAX_BYTES) return undefined;
+    const raw = await handle.readFile("utf8");
+    if (Buffer.byteLength(raw) > LOCK_STARVATION_MAX_BYTES) return undefined;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const keys = Object.keys(parsed);
+    if (keys.some((key) => !["holderKey", "firstSeenAt", "warnedAt", "countedAt"].includes(key))) return undefined;
+    if (typeof parsed.holderKey !== "string" || !/^[0-9a-f]{64}$/.test(parsed.holderKey)) return undefined;
+    if (!episodeTime(parsed.firstSeenAt)) return undefined;
+    if (parsed.warnedAt !== undefined && !episodeTime(parsed.warnedAt)) return undefined;
+    if (parsed.countedAt !== undefined && !episodeTime(parsed.countedAt)) return undefined;
+    return {
+      holderKey: parsed.holderKey,
+      firstSeenAt: parsed.firstSeenAt,
+      ...(parsed.warnedAt === undefined ? {} : { warnedAt: parsed.warnedAt }),
+      ...(parsed.countedAt === undefined ? {} : { countedAt: parsed.countedAt }),
+    };
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function saveLockStarvationEpisode(root: string, episode: LockStarvationEpisode): Promise<void> {
+  await fs.mkdir(path.dirname(lockStarvationPath(root)), { recursive: true });
+  await writeFileAtomic(lockStarvationPath(root), JSON.stringify(episode));
+}
+
+export function lockStarvationAgeBucket(ageMs: number): "15m" | "1h" | "1d" {
+  if (ageMs >= 24 * 60 * 60_000) return "1d";
+  if (ageMs >= 60 * 60_000) return "1h";
+  return "15m";
+}
 
 interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
 
@@ -278,7 +342,7 @@ export class RboxDaemon {
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
-  private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0 };
+  private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
   /** In-memory activity record mirrored to `.rbox/state/activity.json` (design 45) —
    *  what `rbox status` reads for the health verdict, last-sync trail, live transfer
    *  progress, and (crucially) the mass-delete-guard halt warning. */
@@ -293,7 +357,15 @@ export class RboxDaemon {
   private readonly bootId: string;
   private readonly pullOnly: boolean;
   private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
-  private readonly syncMutexBackoff: () => Promise<void>;
+  private readonly now: () => number;
+  private lockStarvationEpisode?: LockStarvationEpisode;
+  private mutexHolderKey?: string;
+  private mutexBackoffTier = 0;
+  private mutexLoggedTier = -1;
+  private mutexBackoffResolve?: () => void;
+  private mutexBackoffTimer?: ReturnType<typeof setTimeout>;
+  private mutexBackoffController?: AbortController;
+  private lastMutexEarlyReprobeAt = Number.NEGATIVE_INFINITY;
   private readonly wsDisabled: boolean;
   private readonly wsReliabilityDisabled: boolean;
   private readonly pongDeadlineMs: number;
@@ -309,7 +381,7 @@ export class RboxDaemon {
       bootId?: string;
       pullOnly?: boolean;
       acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
-      syncMutexBackoff?: () => Promise<void>;
+      now?: () => number;
     } = {},
   ) {
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
@@ -318,7 +390,7 @@ export class RboxDaemon {
     this.pullOnly = opts.pullOnly === true;
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
-    this.syncMutexBackoff = opts.syncMutexBackoff ?? (() => sleep(jitter(250)));
+    this.now = opts.now ?? Date.now;
     this.wsDisabled = process.env.RBOX_DAEMON_WS_DISABLED === "1";
     this.wsReliabilityDisabled = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED === "1";
     this.pongDeadlineMs = this.wsReliabilityDisabled
@@ -341,10 +413,13 @@ export class RboxDaemon {
 
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
+    this.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
     log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
     if (!(await this.writeStartupBinding())) return;
+    this.writeAmbientStatus();
+    await this.activityWrite;
     this.markWsStartupDisconnected();
     await this.activityWrite;
     if (this.stopped) return;
@@ -529,6 +604,7 @@ export class RboxDaemon {
   async stop(): Promise<void> {
     const firstStop = !this.stopped;
     this.stopped = true;
+    this.abortMutexBackoff();
     if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
@@ -564,7 +640,10 @@ export class RboxDaemon {
   // ---- single-flight pump --------------------------------------------------
 
   private requestPush(): void {
-    if (!this.pullOnly) this.want.push = true;
+    if (!this.pullOnly) {
+      this.want.push = true;
+      this.signalMutexEarlyReprobe();
+    }
   }
 
   private request(kind: keyof Wants): void {
@@ -572,6 +651,7 @@ export class RboxDaemon {
     else {
       if (this.pullOnly && kind !== "pull") return;
       this.want[kind] = true;
+      this.signalMutexEarlyReprobe();
     }
     this.writeAmbientStatus();
     void this.pump();
@@ -591,6 +671,98 @@ export class RboxDaemon {
   /** The in-flight pump loop, if any — awaited by stop() so shutdown drains it. */
   private pumpRun: Promise<void> = Promise.resolve();
 
+  private signalMutexEarlyReprobe(): void {
+    if (!this.mutexBackoffResolve) return;
+    const now = this.now();
+    if (now - this.lastMutexEarlyReprobeAt < MUTEX_EARLY_REPROBE_MS) return;
+    this.lastMutexEarlyReprobeAt = now;
+    this.mutexBackoffController?.abort();
+  }
+
+  private finishMutexBackoff(): void {
+    if (this.mutexBackoffTimer) clearTimeout(this.mutexBackoffTimer);
+    this.mutexBackoffTimer = undefined;
+    this.mutexBackoffController = undefined;
+    const resolve = this.mutexBackoffResolve;
+    this.mutexBackoffResolve = undefined;
+    resolve?.();
+  }
+
+  private abortMutexBackoff(): void {
+    this.mutexBackoffController?.abort();
+    this.finishMutexBackoff();
+  }
+
+  private mutexDelay(holderKey: string): { delayMs: number; shouldLog: boolean } {
+    if (this.mutexHolderKey !== holderKey) {
+      this.mutexHolderKey = holderKey;
+      this.mutexBackoffTier = 0;
+      this.mutexLoggedTier = -1;
+    } else {
+      this.mutexBackoffTier = Math.min(this.mutexBackoffTier + 1, MUTEX_BACKOFF_TIERS.length - 1);
+    }
+    const shouldLog = this.mutexLoggedTier !== this.mutexBackoffTier;
+    if (shouldLog) this.mutexLoggedTier = this.mutexBackoffTier;
+    return { delayMs: MUTEX_BACKOFF_TIERS[this.mutexBackoffTier]!, shouldLog };
+  }
+
+  private resetMutexBackoff(): void {
+    this.mutexHolderKey = undefined;
+    this.mutexBackoffTier = 0;
+    this.mutexLoggedTier = -1;
+    this.lastMutexEarlyReprobeAt = Number.NEGATIVE_INFINITY;
+  }
+
+  private async waitForMutexBackoff(delayMs: number): Promise<void> {
+    if (this.stopped) return;
+    await new Promise<void>((resolve) => {
+      const controller = new AbortController();
+      this.mutexBackoffController = controller;
+      this.mutexBackoffResolve = resolve;
+      this.mutexBackoffTimer = setTimeout(() => this.finishMutexBackoff(), delayMs);
+      controller.signal.addEventListener("abort", () => this.finishMutexBackoff(), { once: true });
+    });
+  }
+
+  private async clearLockStarvationEpisode(): Promise<void> {
+    if (!this.lockStarvationEpisode) return;
+    this.lockStarvationEpisode = undefined;
+    await fs.rm(lockStarvationPath(this.root), { force: true });
+  }
+
+  private async observeLockContention(contention: Extract<DaemonMutexResult, { status: "contended" }>): Promise<void> {
+    const reason = contention.warningReason;
+    if (!reason) {
+      await this.clearLockStarvationEpisode();
+      return;
+    }
+    const now = this.now();
+    let episode = this.lockStarvationEpisode;
+    if (!episode || episode.holderKey !== contention.holderKey) {
+      episode = { holderKey: contention.holderKey, firstSeenAt: now };
+      this.lockStarvationEpisode = episode;
+      await saveLockStarvationEpisode(this.root, episode);
+      return;
+    }
+    const age = Math.max(0, now - episode.firstSeenAt);
+    if (age < LOCK_STARVATION_MS) return;
+    if (episode.warnedAt === undefined) {
+      log(`lock starved: reason=${reason} age=${lockStarvationAgeBucket(age)}`);
+      episode = { ...episode, warnedAt: now };
+      this.lockStarvationEpisode = episode;
+      await saveLockStarvationEpisode(this.root, episode);
+    }
+    if (episode.countedAt === undefined) {
+      episode = { ...episode, countedAt: now };
+      this.lockStarvationEpisode = episode;
+      // Persist the episode fence before the metric: a crash may lose one count,
+      // but can never count the same starvation episode twice.
+      await saveLockStarvationEpisode(this.root, episode);
+      this.metrics.lockStarved += 1;
+      await saveMetrics(this.root, this.metrics);
+    }
+  }
+
   private async pump(): Promise<void> {
     if (this.pumping || this.stopped) return;
     this.pumping = true;
@@ -608,10 +780,18 @@ export class RboxDaemon {
         const acquired = await this.acquireSyncMutexFn(this.root);
         if (acquired.status === "contended") {
           // Do not clear want[op]: contention must requeue, never consume, this tick.
-          log(`pump op ${op}: another sync is in progress (${acquired.detail}); re-queued`);
-          await this.syncMutexBackoff();
+          await this.observeLockContention(acquired).catch(() => {
+            log("lock starvation state unavailable");
+          });
+          const backoff = this.mutexDelay(acquired.holderKey);
+          if (backoff.shouldLog) log(`pump op ${op}: sync busy; re-queued (backoff ${backoff.delayMs}ms)`);
+          await this.waitForMutexBackoff(backoff.delayMs);
           continue;
         }
+        this.resetMutexBackoff();
+        await this.clearLockStarvationEpisode().catch(() => {
+          log("lock starvation state unavailable");
+        });
         const syncMutex = acquired.handle;
         try {
           const binding = this.syncBase ?? await this.loadSyncBase();

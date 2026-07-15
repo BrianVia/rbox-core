@@ -12,9 +12,10 @@ and pasting chunks into Slack.
 rbox doctor
 ```
 
-✓/✗ checklist with fix-it hints, exit 1 on any ✗: credentials valid, E2EE
-enrollment (device key + MK), daemon state for this workspace, remote
-reachability, local sync-state sanity.
+✓/✗ checklist with fix-it hints, exit 1 on any ✗: credentials, E2EE enrollment
+and device identity, daemon state, remote reachability, version and local
+sync-state sanity, crypto workers, workspace locking, the functional Git
+transaction capability, and manifest-chain health.
 
 ### Support report (ships OFF — double opt-in)
 
@@ -37,10 +38,17 @@ when design 51 ships.)
 
 **What the report contains** (JSON, client-capped ≤ 512 KiB): rbox/bun version +
 platform, the doctor checklist results, the last 64 KiB of this workspace's
-`daemon.log`, whitelisted sync counters (`metrics.json`), daemon heartbeat/halt
-state (`activity.json`), and workspace shape (file count + total bytes). Never
-file contents. The daemon log tail *does* contain relative file paths, your
-device id, and raw error messages — which is why:
+`daemon.log`, whitelisted counts-only sync counters (`metrics.json`, including
+the integer `lockStarved` episode count), daemon heartbeat/halt state
+(`activity.json`), and workspace shape (file count + total bytes). Never file
+contents, lock markers, UUIDs, holder keys, tokens, or the private starvation
+episode record. Git-family log lines are reduced to closed reason classes;
+lock warnings are accepted only in the exact closed form `lock starved:
+reason=<foreign|identity-drift|stale-owned|fence> age=<15m|1h|1d>`. Forged
+prefixes, controls, paths, credential URLs, and raw error details are dropped.
+Other non-Git daemon records can still contain relative operational paths or
+error text, which is why the full preview and per-upload consent remain
+mandatory.
 
 **Consent flow**: the CLI prints the ENTIRE bundle verbatim plus a plain-language
 notice (stored **unencrypted**, 30-day auto-delete) and asks before uploading.
@@ -75,7 +83,10 @@ Success prints the report id + auto-delete date.
 
 - **Server contract**: `POST /v1/diagnostics`, device principals only (web
   session tokens → 403), 600 KiB body cap (413), strict top-level + nested key
-  allowlist (400 `bad_shape`), **5 reports per account per rolling 24h** (429,
+  allowlist (400 `bad_shape`). The legacy six checks remain required;
+  `device`, `crypto`, `locking`, `git`, and `chain` are optional for backward
+  compatibility, and `lockStarved` is the only new metric key. **5 reports per
+  account per rolling 24h** (429,
   enforced atomically; a failed R2 write releases its quota slot).
 
 - **Lifecycle**: rows are written pending-first, then the R2 object, then marked

@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
@@ -16,6 +16,7 @@ import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
+import { readLockingHealth } from "./sync-mutex.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -31,7 +32,7 @@ const GIT_DEFERRAL_REASONS = new Set([
   "artifact", "config", "containment", "unsupported", "other",
 ]);
 
-type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" | "version" | "state" | "crypto";
+type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" | "version" | "state" | "crypto" | "locking" | "git";
 
 export interface DoctorCheck {
   ok: boolean;
@@ -176,11 +177,20 @@ export function redactGitLogLines(tail: string): string {
     const stamped = /^(\d{4}-\d\d-\d\dT\S+Z)\s+(.*)$/.exec(line);
     const message = stamped ? stamped[2]! : line;
     const isGitFamily = message.startsWith("git-sync ") || message.startsWith("git-sync:") || message.startsWith("git deferred");
-    if (!isGitFamily) {
+    const isLockFamily = message.startsWith("lock starved:");
+    if (!isGitFamily && !isLockFamily) {
       if (!afterGitFamily) rows.push({ key: `raw\0${rows.length}`, text: line });
       continue;
     }
     afterGitFamily = true;
+    if (isLockFamily) {
+      const lock = /^lock starved: reason=(foreign|identity-drift|stale-owned|fence) age=(15m|1h|1d)$/.exec(message);
+      if (lock) {
+        const key = `lock starved: reason=${lock[1]} age=${lock[2]}`;
+        rows.push({ key, text: key });
+      }
+      continue;
+    }
     const classified = classifyGitLogMessage(message);
     if (classified) rows.push(classified);
   }
@@ -362,6 +372,23 @@ function checkCryptoWorkers(): DoctorCheck {
   return { ok: true, label: "crypto workers", message: `${status.state} (${status.workers} worker${status.workers === 1 ? "" : "s"})`, status: status.state };
 }
 
+async function checkGitCapability(root: string): Promise<DoctorCheck> {
+  const capability = await checkoutTransactionCapability(root);
+  const current = capability.version;
+  switch (capability.status) {
+    case "supported":
+      return { ok: true, label: "git", message: `transactional symref-update supported${current ? ` (${current})` : ""}`, status: capability.status, ...(current ? { current } : {}) };
+    case "git-missing":
+      return { ok: false, label: "git", message: "Git is not installed", hint: "install Git >= 2.46", status: capability.status };
+    case "version-unavailable":
+      return { ok: false, label: "git", message: "Git version is unavailable", hint: "repair or upgrade Git to >= 2.46", status: capability.status };
+    case "probe-failed":
+      return { ok: false, label: "git", message: "transactional symref-update probe failed", hint: "retry after Git state settles", status: capability.status, ...(current ? { current } : {}) };
+    case "unsupported":
+      return { ok: false, label: "git", message: `needs Git >= 2.46 transactional symref-update${current ? `; found ${current}` : ""}`, hint: "upgrade Git to >= 2.46", status: capability.status, ...(current ? { current } : {}) };
+  }
+}
+
 async function workspaceShape(root: string, cfg: WorkspaceConfig): Promise<WorkspaceShape> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
@@ -400,18 +427,42 @@ async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMa
   }
 }
 
+async function checkLocking(root: string): Promise<DoctorCheck> {
+  const health = await readLockingHealth(root);
+  if (health.status === "ok") {
+    return {
+      ok: true,
+      label: "locking",
+      message: "ok (.rbox/state/sync.lock)",
+      status: "ok",
+    };
+  }
+  return {
+    ok: false,
+    label: "locking",
+    message: `${health.reason} (.rbox/state/sync.lock)`,
+    hint: health.status === "starved"
+      ? "stop the current sync holder or retry after it exits"
+      : "retry after host identity is available",
+    status: health.status,
+    current: health.reason,
+  };
+}
+
 export async function collectDoctorContext(root: string): Promise<DoctorContext> {
   const rawCfg = await loadConfig(root);
   const creds = await loadCredentials();
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, device, remote, version, state, shape, chain] = await Promise.all([
+  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain] = await Promise.all([
     checkCredentials(creds),
     checkEnrollment(creds),
     checkDeviceIdentity(creds, cfg),
     checkRemote(creds, cfg),
     checkVersion(creds, cfg),
     checkState(root, cfg),
+    checkLocking(root),
+    checkGitCapability(root),
     workspaceShape(root, cfg),
     buildAuthedRemote(root).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
       ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
@@ -423,7 +474,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     creds,
     daemonStale: daemon.stale,
     workspaceShape: shape,
-    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), chain },
+    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, chain },
   };
 }
 
@@ -459,6 +510,7 @@ function pickMetrics(m: SyncMetrics): MetricsSection {
     syncs: Number.isFinite(m.syncs) ? Math.max(0, Math.trunc(m.syncs)) : 0,
     commitConflicts409: Number.isFinite(m.commitConflicts409) ? Math.max(0, Math.trunc(m.commitConflicts409)) : 0,
     fileConflicts: Number.isFinite(m.fileConflicts) ? Math.max(0, Math.trunc(m.fileConflicts)) : 0,
+    lockStarved: Number.isFinite(m.lockStarved) ? Math.max(0, Math.trunc(m.lockStarved)) : 0,
   };
   if (typeof m.lastConflictAt === "string") {
     const capped = capString(m.lastConflictAt);
@@ -533,7 +585,7 @@ function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
 
 export function renderDoctor(checks: DoctorChecks): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "chain"] as const) {
+  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "locking", "git", "chain"] as const) {
     const c = checks[key];
     if (!c) continue;
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);

@@ -176,15 +176,30 @@ function isAlive(pid: number): boolean {
   }
 }
 
-/** Confirm the pid is actually OUR daemon for THIS root — defends against PID reuse. */
-function isOurDaemon(pid: number, root: string): boolean {
+function readDaemonCommand(pid: number): string {
+  return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+}
+
+/** Confirm the pid is an rbox daemon, optionally for one exact workspace root.
+ * The command line is read once so the ownership hot path does not spawn two ps
+ * subprocesses. The reader seam keeps the single-read contract testable. */
+export function daemonProcessMatches(pid: number, root?: string, readCommand: (pid: number) => string = readDaemonCommand): boolean {
   if (!isAlive(pid)) return false;
   try {
-    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-    return cmd.includes(DAEMON_MARKER) && cmd.includes(root);
+    const cmd = readCommand(pid);
+    return cmd.includes(DAEMON_MARKER) && (root === undefined || cmd.includes(root));
   } catch {
     return false; // ps failed / process gone
   }
+}
+
+/** Standalone daemon ownership check used by upgrade discovery. */
+export function isDaemonProcess(pid: number): boolean {
+  return daemonProcessMatches(pid);
+}
+
+function isOurDaemon(pid: number, root: string): boolean {
+  return daemonProcessMatches(pid, root);
 }
 
 export interface DaemonPidRecord {
@@ -238,6 +253,16 @@ export function forceKill(pid: number): void {
   } catch {
     /* already gone */
   }
+}
+
+export interface StopDaemonDeps {
+  isDaemonRunning?: typeof isDaemonRunning;
+  waitForExit?: typeof waitForExit;
+  forceKill?: typeof forceKill;
+  signal?: (pid: number, signal: NodeJS.Signals) => void;
+  log?: (line: string) => void;
+  termTimeoutMs?: number;
+  killTimeoutMs?: number;
 }
 
 export type StartDaemonResult = "started" | "already-running" | "retry-later";
@@ -304,19 +329,60 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
   return "started";
 }
 
-export async function stopDaemon(root: string): Promise<void> {
-  const pid = readPid(root);
+export async function stopDaemon(root: string, deps: StopDaemonDeps = {}): Promise<void> {
+  const running = deps.isDaemonRunning ?? isDaemonRunning;
+  const wait = deps.waitForExit ?? waitForExit;
+  const kill = deps.forceKill ?? forceKill;
+  const signal = deps.signal ?? ((pid, sig) => process.kill(pid, sig));
+  const output = deps.log ?? console.log;
+  const original = readDaemonPidRecord(root);
+  const sameRecord = (record: DaemonPidRecord): boolean =>
+    record.present === original.present
+    && record.pid === original.pid
+    && record.bootId === original.bootId
+    && record.version === original.version;
+  const removeOwnedPidfile = async (): Promise<void> => {
+    if (sameRecord(readDaemonPidRecord(root))) await fsp.rm(daemonPidPath(root), { force: true });
+  };
+  const pid = original.pid;
   if (!pid) {
-    console.log("background sync is not running");
+    output("background sync is not running");
     return;
   }
-  if (isOurDaemon(pid, root)) {
-    process.kill(pid, "SIGTERM");
-    console.log(`stopping background sync (sent SIGTERM to process ${pid})`);
-  } else {
-    console.log(`found a leftover record of an old background sync (process ${pid} is gone or not ours) — cleaned up`);
+  const first = running(root);
+  if (!first.running || first.pid !== pid) {
+    output(`found a leftover record of an old background sync (process ${pid} is gone or not ours) — cleaned up`);
+    await removeOwnedPidfile();
+    return;
   }
-  await fsp.rm(pidPath(root), { force: true });
+
+  // Ownership is deliberately re-read immediately before every signal. A PID
+  // record is never removed while the daemon it names may still be running.
+  const beforeTerm = running(root);
+  if (!beforeTerm.running || beforeTerm.pid !== pid) {
+    await removeOwnedPidfile();
+    return;
+  }
+  try { signal(pid, "SIGTERM"); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  output(`stopping background sync (sent SIGTERM to process ${pid})`);
+  if (await wait(pid, deps.termTimeoutMs ?? 60_000)) {
+    await removeOwnedPidfile();
+    return;
+  }
+
+  const beforeKill = running(root);
+  if (!beforeKill.running || beforeKill.pid !== pid) {
+    await removeOwnedPidfile();
+    return;
+  }
+  output(`background sync did not stop within 60 seconds; sending SIGKILL to process ${pid}`);
+  kill(pid);
+  if (!(await wait(pid, deps.killTimeoutMs ?? 60_000))) {
+    throw new Error("background sync could not be confirmed stopped; daemon record retained");
+  }
+  await removeOwnedPidfile();
 }
 
 export const DEFAULT_LOG_LINES = 50;

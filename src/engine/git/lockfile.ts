@@ -4,13 +4,18 @@ import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fsyncDirectory } from "../fsutil.js";
+import { fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 
 const MARKER_PREFIX = "rbox-93";
 const MARKER_MAX_BYTES = 1024;
+const LEDGER_MAX_BYTES = 32 * 1024;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 const ID_RE = /^[0-9a-f-]+$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const START_RE = /^\d+(?:\.\d+)?$/;
+const LINUX_LOCAL_FS = new Set([0xef53n, 0x9123683en, 0x58465342n, 0x2fc12fc1n, 0xf2f52010n, 0x01021994n, 0x794c7630n]);
+const DARWIN_LOCAL_FS = new Set(["apfs", "hfs"]);
+const bootSeenAt = Math.max(0, Math.floor(Date.now() - process.uptime() * 1000));
 
 export interface ProcessIncarnation {
   hostId: string;
@@ -23,33 +28,76 @@ export interface LockMarker extends ProcessIncarnation {
   token: string;
 }
 
+export interface HostIdentityBoot {
+  platformUuid?: string;
+  kernUuid: string;
+  bootSessionUuid: string;
+  seenAt: number;
+}
+
+/** Enrichment used by new readers only. LockMarker deliberately remains wire-only. */
+export interface ResolvedLockIdentity extends ProcessIncarnation {
+  platformUuid?: string;
+  knownBoots?: readonly HostIdentityBoot[];
+}
+
 export type ProcessProbe =
   | { status: "alive"; startTime: string }
   | { status: "dead" }
   | { status: "unknown"; error?: unknown };
 
 export interface LockIdentitySource {
-  current(): Promise<ProcessIncarnation>;
+  current(): Promise<ProcessIncarnation | ResolvedLockIdentity>;
   probe(pid: number): Promise<ProcessProbe>;
+}
+
+export interface LockStorageStat {
+  dev: bigint;
+  type: bigint | string;
+  local?: boolean;
+}
+
+export interface DarwinMountStat extends LockStorageStat {
+  type: string;
+  local: boolean;
 }
 
 export interface LockfileHooks {
   link?: (existingPath: string, newPath: string) => Promise<void>;
   afterTempFsync?: (tempPath: string, marker: string) => void | Promise<void>;
+  afterCreate?: (lockPath: string, marker: string) => void | Promise<void>;
+  beforeCreatedCleanup?: (lockPath: string) => void | Promise<void>;
   beforeReapInspect?: (lockPath: string) => void | Promise<void>;
   beforeReapUnlink?: (lockPath: string) => void | Promise<void>;
   beforeReleaseUnlink?: (lockPath: string) => void | Promise<void>;
 }
 
+interface MarkerObservation {
+  dev: bigint;
+  inode: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  raw: string;
+}
+
 export type LockInspection =
   | { kind: "absent" }
-  | { kind: "live"; marker: LockMarker; raw: string }
-  | { kind: "dead"; marker: LockMarker; raw: string }
-  | { kind: "foreign"; raw?: string; reason: string };
+  | { kind: "live"; marker: LockMarker; raw: string; identityDrift?: boolean; observation: MarkerObservation }
+  | { kind: "dead"; marker: LockMarker; raw: string; observation: MarkerObservation }
+  | { kind: "foreign"; raw?: string; reason: string; observation?: MarkerObservation };
+
+export type LockBlockerKind = "live" | "foreign" | "stale-owned" | "fence";
+export type LockWarningReason = "foreign" | "identity-drift" | "stale-owned" | "fence";
 
 export type LockAcquireResult =
   | { status: "acquired"; lock: OwnedLock }
-  | { status: "held"; inspection: Exclude<LockInspection, { kind: "absent" }> }
+  | {
+      status: "held";
+      inspection: Exclude<LockInspection, { kind: "absent" }>;
+      blockerKind: LockBlockerKind;
+      warningReason?: LockWarningReason;
+      holderKey: string;
+    }
   | { status: "unsupported"; error: unknown }
   | { status: "error"; error: unknown };
 
@@ -63,10 +111,12 @@ export interface AcquireLockOptions {
   identity?: LockIdentitySource;
   hooks?: LockfileHooks;
   token?: () => string;
+  storageLocal?: (storagePath: string) => Promise<boolean>;
+  /** Used solely by the host-identity ledger's own lock. */
+  skipIdentityRefresh?: boolean;
 }
 
-interface MarkerRead {
-  raw: string;
+interface MarkerRead extends MarkerObservation {
   marker?: LockMarker;
   reason?: string;
 }
@@ -76,7 +126,16 @@ interface AtomicCreateResult {
   error?: unknown;
 }
 
+interface ReapBlocker {
+  inspection: Exclude<LockInspection, { kind: "absent" }>;
+  kind: LockBlockerKind;
+  reason?: LockWarningReason;
+}
+
+type ReapResult = { status: "reaped" } | { status: "retry" } | { status: "blocked"; blocker: ReapBlocker };
+
 const staleOwnedMarkers = new Map<string, string>();
+const localStorageCache = new Map<string, boolean>();
 const darwinFallbackOwnStart = Math.max(1, Math.floor((Date.now() - process.uptime() * 1000) * 1000)).toString();
 
 function errno(error: unknown): string | undefined {
@@ -87,45 +146,102 @@ function isLinkUnsupported(error: unknown): boolean {
   return ["ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV", "EMLINK", "ENOSYS"].includes(errno(error) ?? "");
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export type IdentityCommand = (command: string, args: string[]) => Promise<Buffer>;
+
 async function execBytes(command: string, args: string[]): Promise<Buffer> {
   return await new Promise<Buffer>((resolve, reject) => {
-    execFile(command, args, { encoding: "buffer", maxBuffer: 64 * 1024 }, (error, stdout) => {
+    execFile(command, args, {
+      encoding: "buffer",
+      maxBuffer: 64 * 1024,
+      timeout: 2_000,
+      killSignal: "SIGKILL",
+    }, (error, stdout) => {
       if (error) reject(error);
       else resolve(Buffer.from(stdout));
     });
   });
 }
 
-async function sysctlString(name: string): Promise<string> {
-  return (await execBytes("/usr/sbin/sysctl", ["-n", name])).toString("utf8").trim().toLowerCase();
+/** Bounded identity subprocess runner, exported for adversarial platform tests. */
+export const runIdentityCommand = execBytes;
+
+function uuid(raw: string): string | undefined {
+  const value = raw.trim().toLowerCase();
+  return UUID_RE.test(value) ? value : undefined;
+}
+
+async function retryComponent(read: () => Promise<string | undefined>): Promise<string | undefined> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const value = await read();
+      if (value) return value;
+    } catch {
+      // Missing components remain independently retryable.
+    }
+    if (attempt < 2) await sleep(25 * (attempt + 1));
+  }
+  return undefined;
+}
+
+async function sysctlUuid(name: string, run: IdentityCommand): Promise<string | undefined> {
+  const bytes = await run("/usr/sbin/sysctl", ["-n", name]);
+  return bytes.length <= 1024 ? uuid(bytes.toString("utf8")) : undefined;
+}
+
+async function ioregPlatformUuid(run: IdentityCommand): Promise<string | undefined> {
+  const raw = (await run("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"])).toString("utf8");
+  if (Buffer.byteLength(raw) > 64 * 1024) return undefined;
+  const value = /"IOPlatformUUID"\s*=\s*"([0-9A-F-]+)"/i.exec(raw)?.[1];
+  return value ? uuid(value) : undefined;
+}
+
+export interface DarwinIdentityComponents {
+  platformUuid?: string;
+  kernUuid?: string;
+  bootSessionUuid?: string;
+}
+
+/** Independently resolves Darwin's stable platform identity and compatible wire pair. */
+export async function resolveDarwinIdentityComponents(run: IdentityCommand = execBytes): Promise<DarwinIdentityComponents> {
+  const [kernUuid, bootSessionUuid, platformUuid] = await Promise.all([
+    retryComponent(() => sysctlUuid("kern.uuid", run)),
+    retryComponent(() => sysctlUuid("kern.bootsessionuuid", run)),
+    retryComponent(async () => {
+      try {
+        const value = await sysctlUuid("kern.iokit.platform-uuid", run);
+        return value ?? await ioregPlatformUuid(run);
+      } catch {
+        return await ioregPlatformUuid(run);
+      }
+    }),
+  ]);
+  return { kernUuid, bootSessionUuid, platformUuid };
 }
 
 async function darwinProcessStart(pid: number): Promise<string> {
-  // kern.proc.pid returns struct kinfo_proc. On supported 64-bit macOS targets,
-  // kp_proc.p_starttime is the first member (timeval: seconds, microseconds).
   let bytes: Buffer;
   try {
     bytes = await execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
   } catch (error) {
-    // Some macOS application sandboxes deny kern.proc sysctl. We can still own
-    // locks safely in-process; other-pid probes remain unknown/live (fail closed).
     if (pid === process.pid) return darwinFallbackOwnStart;
     throw error;
   }
   if (bytes.length < 16) {
-    const error = new Error(`kern.proc.pid.${pid} returned ${bytes.length} bytes`);
+    const error = new Error("process incarnation unavailable");
     (error as NodeJS.ErrnoException).code = bytes.length === 0 ? "ESRCH" : "EIO";
     throw error;
   }
   const seconds = bytes.readBigInt64LE(0);
   const microseconds = bytes.readBigInt64LE(8);
-  if (seconds < 0n || microseconds < 0n || microseconds >= 1_000_000n) throw new Error("invalid kern.proc.pid start time");
+  if (seconds < 0n || microseconds < 0n || microseconds >= 1_000_000n) throw new Error("invalid process incarnation");
   return `${seconds}.${microseconds.toString().padStart(6, "0")}`;
 }
 
 function parseLinuxProcStart(raw: string): string {
-  // The comm field is parenthesized and may itself contain spaces or ')'. Field
-  // 22 is therefore the 20th field after the final ')' (field 3 starts there).
   const close = raw.lastIndexOf(")");
   if (close < 0) throw new Error("malformed /proc/<pid>/stat");
   const fields = raw.slice(close + 1).trim().split(/\s+/);
@@ -143,9 +259,6 @@ export interface LinuxHostIdOptions {
   hostname?: () => string;
 }
 
-/** Resolve the Linux host identity in design-93 order. Hostnames are hashed into
- * the marker's hex grammar; this preserves their (weak) equality semantics without
- * allowing punctuation or whitespace to make an otherwise usable source invalid. */
 export async function resolveLinuxHostId(options: LinuxHostIdOptions = {}): Promise<string> {
   const readFile = options.readFile ?? ((filePath: string) => fs.readFile(filePath, "utf8"));
   for (const filePath of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
@@ -160,7 +273,7 @@ export async function resolveLinuxHostId(options: LinuxHostIdOptions = {}): Prom
     const hostname = (options.hostname ?? os.hostname)().trim().toLowerCase();
     if (hostname) return crypto.createHash("sha256").update(`hostname:${hostname}`).digest("hex");
   } catch {
-    // The caller maps total identity-source failure to the legacy lock bucket.
+    // Total failure is reported below.
   }
   throw new Error("no Linux host identity source");
 }
@@ -176,8 +289,6 @@ async function probeProcess(pid: number): Promise<ProcessProbe> {
     return { status: "alive", startTime: await processStart(pid) };
   } catch (error) {
     if (["ENOENT", "ESRCH"].includes(errno(error) ?? "")) return { status: "dead" };
-    // Darwin's sysctl CLI does not preserve errno. kill(pid, 0) is used only to
-    // recognize the design's ESRCH death case; any other probe failure is live.
     if (process.platform === "darwin") {
       try {
         process.kill(pid, 0);
@@ -189,45 +300,205 @@ async function probeProcess(pid: number): Promise<ProcessProbe> {
   }
 }
 
-async function currentSystemIncarnation(): Promise<ProcessIncarnation> {
-  let hostId: string;
-  let bootId: string;
+let cachedKernUuid: string | undefined;
+let cachedBootSessionUuid: string | undefined;
+let cachedPlatformUuid: string | undefined;
+let cachedLinuxHostId: string | undefined;
+let cachedLinuxBootId: string | undefined;
+let cachedKnownBoots: readonly HostIdentityBoot[] | undefined;
+let cachedOwnProcessStart: Promise<string> | undefined;
+let systemLedgerRefresh: Promise<ResolvedLockIdentity> | undefined;
+
+async function currentSystemIncarnation(): Promise<ResolvedLockIdentity> {
+  let hostId: string | undefined;
+  let bootId: string | undefined;
+  let platformUuid: string | undefined;
   if (process.platform === "darwin") {
-    try {
-      [hostId, bootId] = await Promise.all([sysctlString("kern.uuid"), sysctlString("kern.bootsessionuuid")]);
-    } catch {
-      // `ioreg` exposes the same stable machine/boot identities when sysctl is
-      // denied by an app sandbox. This is an identity-source fallback only; all
-      // marker, no-follow, reaper, and owner checks remain in this primitive.
-      const [platform, chosen] = await Promise.all([
-        execBytes("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]).then((v) => v.toString("utf8")),
-        execBytes("/usr/sbin/ioreg", ["-p", "IODeviceTree", "-n", "chosen", "-r", "-d1"]).then((v) => v.toString("utf8")),
-      ]);
-      const host = /"IOPlatformUUID"\s*=\s*"([0-9A-F-]+)"/i.exec(platform)?.[1];
-      const boot = /"boot-uuid"\s*=\s*<"([0-9A-F-]+)">/i.exec(chosen)?.[1];
-      if (!host || !boot) throw new Error("ioreg did not expose host/boot UUIDs");
-      hostId = host.toLowerCase();
-      bootId = boot.toLowerCase();
+    if (!cachedKernUuid || !cachedBootSessionUuid || !cachedPlatformUuid) {
+      const found = await resolveDarwinIdentityComponents();
+      cachedKernUuid ??= found.kernUuid;
+      cachedBootSessionUuid ??= found.bootSessionUuid;
+      cachedPlatformUuid ??= found.platformUuid;
     }
+    hostId = cachedKernUuid;
+    bootId = cachedBootSessionUuid;
+    platformUuid = cachedPlatformUuid;
   } else if (process.platform === "linux") {
-    [hostId, bootId] = await Promise.all([
-      resolveLinuxHostId(),
-      fs.readFile("/proc/sys/kernel/random/boot_id", "utf8").then((v) => v.trim().toLowerCase()),
-    ]);
+    cachedLinuxHostId ??= await resolveLinuxHostId();
+    if (!cachedLinuxBootId) {
+      const candidate = (await fs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim().toLowerCase();
+      if (!UUID_RE.test(candidate)) throw new Error("invalid Linux boot identity source");
+      cachedLinuxBootId = candidate;
+    }
+    hostId = cachedLinuxHostId;
+    bootId = cachedLinuxBootId;
   } else {
     throw new Error(`unsupported lock identity platform: ${process.platform}`);
   }
-  if (!ID_RE.test(hostId) || !ID_RE.test(bootId)) throw new Error("invalid host or boot identity source");
-  return { hostId, bootId, pid: process.pid, startTime: await processStart(process.pid) };
+  if (!hostId || !bootId || !ID_RE.test(hostId) || !ID_RE.test(bootId)) throw new Error("compatible lock identity unavailable");
+  cachedOwnProcessStart ??= processStart(process.pid);
+  return { hostId, bootId, platformUuid, knownBoots: cachedKnownBoots, pid: process.pid, startTime: await cachedOwnProcessStart };
 }
 
 export const systemLockIdentity: LockIdentitySource = {
-  current: (() => {
-    let cached: Promise<ProcessIncarnation> | undefined;
-    return () => (cached ??= currentSystemIncarnation());
-  })(),
+  current: currentSystemIncarnation,
   probe: probeProcess,
 };
+
+function rboxHome(): string {
+  if (!process.env.RBOX_HOME && process.env.RBOX_TEST_HOST_IDENTITY_DIR) {
+    return process.env.RBOX_TEST_HOST_IDENTITY_DIR;
+  }
+  return path.join(process.env.RBOX_HOME || process.env.HOME || os.homedir(), ".rbox");
+}
+
+export function hostIdentityLedgerPath(): string {
+  return path.join(rboxHome(), "host-identity.json");
+}
+
+function validBoot(value: unknown): value is HostIdentityBoot {
+  if (!value || typeof value !== "object") return false;
+  const boot = value as Partial<HostIdentityBoot>;
+  const keys = Object.keys(boot);
+  return keys.every((key) => ["platformUuid", "kernUuid", "bootSessionUuid", "seenAt"].includes(key))
+    && keys.includes("kernUuid") && keys.includes("bootSessionUuid") && keys.includes("seenAt")
+    && UUID_RE.test(boot.kernUuid ?? "")
+    && UUID_RE.test(boot.bootSessionUuid ?? "")
+    && (boot.platformUuid === undefined || UUID_RE.test(boot.platformUuid))
+    && Number.isSafeInteger(boot.seenAt) && (boot.seenAt ?? -1) >= 0;
+}
+
+export async function readHostIdentityLedger(filePath: string): Promise<HostIdentityBoot[] | undefined> {
+  let before: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    before = await fs.lstat(filePath, { bigint: true });
+  } catch (error) {
+    if (errno(error) === "ENOENT") return [];
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(LEDGER_MAX_BYTES)) return undefined;
+  const handle = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!sameStat(before, opened)) throw new Error("host identity ledger changed during read");
+    const bytes = Buffer.alloc(LEDGER_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    const after = await handle.stat({ bigint: true });
+    if (bytesRead > LEDGER_MAX_BYTES || !sameStat(opened, after) || BigInt(bytesRead) !== opened.size) {
+      throw new Error("host identity ledger changed during read");
+    }
+    const parsed = JSON.parse(bytes.subarray(0, bytesRead).toString("utf8")) as { version?: unknown; boots?: unknown };
+    if (!parsed || Object.keys(parsed).some((key) => !["version", "boots"].includes(key))
+      || parsed.version !== 1 || !Array.isArray(parsed.boots) || parsed.boots.length > 8 || !parsed.boots.every(validBoot)) return undefined;
+    return parsed.boots;
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+export function mergeHostIdentityBoots(existing: readonly HostIdentityBoot[], current: HostIdentityBoot): HostIdentityBoot[] {
+  const byBoot = new Map<string, HostIdentityBoot>();
+  for (const boot of [...existing, current]) {
+    const key = `${boot.kernUuid}\0${boot.bootSessionUuid}`;
+    const prior = byBoot.get(key);
+    if (!prior) byBoot.set(key, { ...boot });
+    else byBoot.set(key, {
+      kernUuid: boot.kernUuid,
+      bootSessionUuid: boot.bootSessionUuid,
+      platformUuid: boot.platformUuid || prior.platformUuid,
+      seenAt: Math.max(prior.seenAt, boot.seenAt),
+    });
+  }
+  const currentKey = `${current.kernUuid}\0${current.bootSessionUuid}`;
+  const pinned = byBoot.get(currentKey)!;
+  const history = [...byBoot.values()]
+    .filter((boot) => `${boot.kernUuid}\0${boot.bootSessionUuid}` !== currentKey)
+    .sort((a, b) => b.seenAt - a.seenAt || b.bootSessionUuid.localeCompare(a.bootSessionUuid))
+    .slice(0, 7);
+  return [pinned, ...history];
+}
+
+async function writeLedger(filePath: string, boots: readonly HostIdentityBoot[]): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await writeFileAtomic(filePath, `${JSON.stringify({ version: 1, boots }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  await fs.chmod(filePath, 0o600);
+  await fsyncDirectory(dir);
+}
+
+/** Resolve and durably merge this boot before any normal marker is published. */
+export async function refreshSystemLockIdentityLedger(): Promise<ResolvedLockIdentity> {
+  systemLedgerRefresh ??= (async () => {
+    const current = await systemLockIdentity.current() as ResolvedLockIdentity;
+    // The v1 ledger records Darwin's kern UUID aliases. Linux's compatible wire
+    // host id is commonly a 32-byte machine-id rather than a UUID; persisting it
+    // into this UUID-only schema would make every subsequent read look corrupt.
+    if (process.platform !== "darwin") return current;
+    return refreshHostIdentityLedger(current);
+  })().catch((error) => {
+    // Never memoize a rejection (design 118 F1): a transient identity failure
+    // must retry on the next acquire, not fail the process forever.
+    systemLedgerRefresh = undefined;
+    throw error;
+  });
+  return systemLedgerRefresh;
+}
+
+export async function refreshHostIdentityLedger(
+  current: ResolvedLockIdentity,
+  filePath = hostIdentityLedgerPath(),
+  seenAt = bootSeenAt,
+): Promise<ResolvedLockIdentity> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const ledgerIdentity: LockIdentitySource = { current: async () => current, probe: systemLockIdentity.probe };
+  const deadline = Date.now() + 2_000;
+  let lockResult: LockAcquireResult;
+  do {
+    lockResult = await acquireLock(`${filePath}.lock`, { identity: ledgerIdentity, skipIdentityRefresh: true });
+    if (lockResult.status === "acquired") break;
+    if (lockResult.status !== "held") throw new Error("host identity ledger lock unavailable");
+    await sleep(10);
+  } while (Date.now() < deadline);
+  if (lockResult.status !== "acquired") throw new Error("host identity ledger lock unavailable");
+  try {
+    let boots: HostIdentityBoot[];
+    let read: HostIdentityBoot[] | undefined;
+    try {
+      read = await readHostIdentityLedger(filePath);
+    } catch {
+      // An unclassified read error must not overwrite existing history.
+      throw new Error("host identity ledger unreadable");
+    }
+    if (read === undefined) {
+      const corrupt = `${filePath}.corrupt`;
+      await fs.rm(corrupt, { force: true }).catch(() => {});
+      try {
+        await fs.rename(filePath, corrupt);
+        await fsyncDirectory(path.dirname(filePath));
+      } catch (error) {
+        if (errno(error) !== "ENOENT") throw error;
+      }
+      boots = [];
+    } else {
+      boots = read;
+    }
+    const merged = mergeHostIdentityBoots(boots, {
+      kernUuid: current.hostId,
+      bootSessionUuid: current.bootId,
+      platformUuid: current.platformUuid,
+      seenAt,
+    });
+    if (JSON.stringify(merged) !== JSON.stringify(boots)) await writeLedger(filePath, merged);
+    cachedKnownBoots = merged;
+    return { ...current, knownBoots: merged };
+  } finally {
+    const released = await lockResult.lock.release();
+    if (!released.released) throw new Error("host identity ledger lock release failed");
+  }
+}
 
 export function formatLockMarker(marker: LockMarker): string {
   if (!ID_RE.test(marker.hostId) || !ID_RE.test(marker.bootId) || !Number.isSafeInteger(marker.pid) || marker.pid <= 0 || !START_RE.test(marker.startTime) || !TOKEN_RE.test(marker.token)) {
@@ -244,6 +515,14 @@ export function parseLockMarker(raw: string): LockMarker | undefined {
   return { hostId: match[1]!, bootId: match[2]!, pid, startTime: match[4]!, token: match[5]! };
 }
 
+function statToken(stat: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }): Omit<MarkerObservation, "raw"> {
+  return { dev: stat.dev, inode: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
+}
+
+function sameStat(a: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }, b: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
+}
+
 async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefined> {
   let before: Awaited<ReturnType<typeof fs.lstat>>;
   try {
@@ -252,52 +531,179 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
     if (errno(error) === "ENOENT") return undefined;
     throw error;
   }
-  if (before.isSymbolicLink()) return { raw: "", reason: "symlink lock" };
-  if (!before.isFile()) return { raw: "", reason: "non-regular lock" };
-  if (before.size > BigInt(MARKER_MAX_BYTES)) return { raw: "", reason: "oversized lock marker" };
-
+  const token = statToken(before);
+  if (before.isSymbolicLink()) return { ...token, raw: "", reason: "symlink lock" };
+  if (!before.isFile()) return { ...token, raw: "", reason: "non-regular lock" };
   let handle: fs.FileHandle | undefined;
   try {
     handle = await fs.open(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return { raw: "", reason: "lock changed during inspection" };
+    if (!opened.isFile() || !sameStat(before, opened)) return { ...token, raw: "", reason: "lock changed during inspection" };
+    if (opened.size > BigInt(MARKER_MAX_BYTES)) {
+      const bounded = Buffer.alloc(MARKER_MAX_BYTES);
+      const { bytesRead } = await handle.read(bounded, 0, bounded.length, 0);
+      const after = await handle.stat({ bigint: true });
+      if (!sameStat(opened, after)) return { ...token, raw: "", reason: "lock changed during inspection" };
+      return { ...statToken(opened), raw: bounded.subarray(0, bytesRead).toString("utf8"), reason: "oversized lock marker" };
+    }
     const bytes = Buffer.alloc(MARKER_MAX_BYTES + 1);
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    if (bytesRead > MARKER_MAX_BYTES) return { raw: "", reason: "oversized lock marker" };
+    const after = await handle.stat({ bigint: true });
+    if (!sameStat(opened, after) || BigInt(bytesRead) !== opened.size) return { ...token, raw: "", reason: "lock changed during inspection" };
+    if (bytesRead > MARKER_MAX_BYTES) return { ...token, raw: "", reason: "oversized lock marker" };
     const raw = bytes.subarray(0, bytesRead).toString("utf8");
     const marker = parseLockMarker(raw);
-    return { raw, marker, reason: marker ? undefined : "malformed or foreign lock marker" };
+    return { ...statToken(opened), raw, marker, reason: marker ? undefined : "malformed or foreign lock marker" };
   } catch (error) {
-    if (["ENOENT", "ELOOP"].includes(errno(error) ?? "")) return { raw: "", reason: "lock changed during inspection" };
+    if (["ENOENT", "ELOOP"].includes(errno(error) ?? "")) return { ...token, raw: "", reason: "lock changed during inspection" };
     throw error;
   } finally {
     await handle?.close().catch(() => {});
   }
 }
 
-export async function inspectLock(lockPath: string, identity: LockIdentitySource = systemLockIdentity): Promise<LockInspection> {
+interface DarwinMountEntry {
+  mountpoint: string;
+  type: string;
+  local: boolean;
+}
+
+function balancedParens(value: string): boolean {
+  let depth = 0;
+  for (const char of value) {
+    if (char === "(") depth++;
+    if (char === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+function isPathPrefix(mountpoint: string, storageRealpath: string): boolean {
+  return mountpoint === "/"
+    ? storageRealpath.startsWith("/")
+    : storageRealpath === mountpoint || storageRealpath.startsWith(`${mountpoint}/`);
+}
+
+/** Parse `/sbin/mount` output, rejecting malformed records that could own the requested path. */
+export function parseDarwinMountOutput(raw: string, storageRealpath: string): Omit<DarwinMountStat, "dev"> | undefined {
+  const entries: DarwinMountEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const detailsAt = line.lastIndexOf(" (");
+    const separator = " on ";
+    const location = detailsAt < 0 ? line : line.slice(0, detailsAt);
+    const onAt = location.indexOf(separator);
+    if (onAt < 0) continue;
+    const mountpoint = location.slice(onAt + separator.length);
+    const matchesPath = path.isAbsolute(mountpoint) && isPathPrefix(mountpoint, storageRealpath);
+    const sourceValid = location.slice(0, onAt).trim().length > 0;
+    const ambiguousOn = location.indexOf(separator, onAt + separator.length) >= 0;
+    if (ambiguousOn) {
+      for (let candidateAt = onAt; candidateAt >= 0; candidateAt = location.indexOf(separator, candidateAt + separator.length)) {
+        const candidate = location.slice(candidateAt + separator.length);
+        if (path.isAbsolute(candidate) && isPathPrefix(candidate, storageRealpath)) return undefined;
+      }
+      continue;
+    }
+    if (!sourceValid || detailsAt < 0 || !line.endsWith(")") || !path.isAbsolute(mountpoint) || !balancedParens(mountpoint)) {
+      if (matchesPath) return undefined;
+      continue;
+    }
+    const fields = line.slice(detailsAt + 2, -1).split(",").map((field) => field.trim());
+    const type = fields[0]?.toLowerCase();
+    if (!type || fields.some((field) => !field)) {
+      if (matchesPath) return undefined;
+      continue;
+    }
+    entries.push({ mountpoint, type, local: fields.slice(1).includes("local") });
+  }
+
+  const matches = entries
+    .filter(({ mountpoint }) => isPathPrefix(mountpoint, storageRealpath))
+    .sort((a, b) => b.mountpoint.length - a.mountpoint.length);
+  if (!matches[0] || (matches[1] && matches[1].mountpoint.length === matches[0].mountpoint.length)) return undefined;
+  return { type: matches[0].type, local: matches[0].local };
+}
+
+export async function defaultStorageStat(storagePath: string): Promise<LockStorageStat> {
+  if (process.platform === "linux") {
+    const stat = await fs.stat(storagePath, { bigint: true });
+    const value = await fs.statfs(storagePath, { bigint: true });
+    return { dev: stat.dev, type: value.type };
+  }
+  if (process.platform === "darwin") {
+    const storageRealpath = await fs.realpath(storagePath);
+    const stat = await fs.stat(storageRealpath, { bigint: true });
+    const mount = parseDarwinMountOutput((await execBytes("/sbin/mount", [])).toString("utf8"), storageRealpath);
+    if (!mount) throw new Error("storage mount unavailable");
+    return { dev: stat.dev, ...mount };
+  }
+  throw new Error("unsupported filesystem platform");
+}
+
+export async function lockStorageLocal(
+  storagePath: string,
+  adapter: (storagePath: string) => Promise<LockStorageStat> = defaultStorageStat,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  try {
+    const stat = await adapter(storagePath);
+    const type = typeof stat.type === "string" ? stat.type.toLowerCase() : stat.type;
+    const key = `${platform}:${stat.dev}:${String(type)}:${String(stat.local)}`;
+    if (localStorageCache.get(key)) return true;
+    const local = platform === "darwin"
+      ? stat.local === true && typeof type === "string" && DARWIN_LOCAL_FS.has(type)
+      : platform === "linux" && typeof type === "bigint" && LINUX_LOCAL_FS.has(type);
+    if (local) localStorageCache.set(key, true);
+    return local;
+  } catch {
+    return false;
+  }
+}
+
+function observationOf(inspection: Exclude<LockInspection, { kind: "absent" }>): MarkerObservation | undefined {
+  return inspection.observation;
+}
+
+async function classifyProbe(read: MarkerRead, identity: LockIdentitySource, identityDrift: boolean): Promise<LockInspection> {
+  const marker = read.marker!;
+  const probe = await identity.probe(marker.pid);
+  if (probe.status === "unknown") return { kind: "foreign", raw: read.raw, reason: "process liveness unavailable", observation: read };
+  if (probe.status === "dead" || probe.startTime !== marker.startTime) return { kind: "dead", marker, raw: read.raw, observation: read };
+  return { kind: "live", marker, raw: read.raw, identityDrift: identityDrift || undefined, observation: read };
+}
+
+export async function inspectLock(
+  lockPath: string,
+  identity: LockIdentitySource = systemLockIdentity,
+  storageLocal: (storagePath: string) => Promise<boolean> = lockStorageLocal,
+): Promise<LockInspection> {
   let read: MarkerRead | undefined;
   try {
     read = await readMarkerNoFollow(lockPath);
-  } catch (error) {
-    return { kind: "foreign", reason: `marker inspection failed: ${errno(error) ?? "unknown"}` };
+  } catch {
+    return { kind: "foreign", reason: "marker inspection failed" };
   }
   if (!read) return { kind: "absent" };
-  if (!read.marker) return { kind: "foreign", raw: read.raw || undefined, reason: read.reason ?? "foreign lock" };
+  if (!read.marker) return { kind: "foreign", raw: read.raw || undefined, reason: read.reason ?? "foreign lock", observation: read };
 
-  let current: ProcessIncarnation;
+  let current: ProcessIncarnation | ResolvedLockIdentity;
   try {
     current = await identity.current();
   } catch {
-    return { kind: "foreign", raw: read.raw, reason: "local incarnation unavailable" };
+    return { kind: "foreign", raw: read.raw, reason: "local incarnation unavailable", observation: read };
   }
   const marker = read.marker;
-  if (marker.hostId !== current.hostId) return { kind: "foreign", raw: read.raw, reason: "cross-host lock" };
-  if (marker.bootId !== current.bootId) return { kind: "dead", marker, raw: read.raw };
-  const probe = await identity.probe(marker.pid);
-  if (probe.status === "unknown") return { kind: "live", marker, raw: read.raw };
-  if (probe.status === "dead" || probe.startTime !== marker.startTime) return { kind: "dead", marker, raw: read.raw };
-  return { kind: "live", marker, raw: read.raw };
+  const known = (current as ResolvedLockIdentity).knownBoots?.find((boot) => boot.kernUuid === marker.hostId && boot.bootSessionUuid === marker.bootId);
+  if (known && marker.bootId !== current.bootId) return { kind: "dead", marker, raw: read.raw, observation: read };
+  if ((known && marker.bootId === current.bootId) || (marker.hostId === current.hostId && marker.bootId === current.bootId)) {
+    return classifyProbe(read, identity, false);
+  }
+  if (marker.hostId === current.hostId && marker.bootId !== current.bootId) {
+    // Linux and legacy stable-host identities retain the prior-boot shortcut.
+    return { kind: "dead", marker, raw: read.raw, observation: read };
+  }
+  if (await storageLocal(path.dirname(lockPath))) return classifyProbe(read, identity, true);
+  return { kind: "foreign", raw: read.raw, reason: "cross-host lock", observation: read };
 }
 
 async function atomicCreateMarker(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<AtomicCreateResult> {
@@ -327,12 +733,17 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
   }
 }
 
-async function unlinkIfExact(lockPath: string, expectedRaw: string, hook?: () => void | Promise<void>): Promise<boolean> {
-  const before = await readMarkerNoFollow(lockPath).catch(() => undefined);
-  if (!before || before.raw !== expectedRaw) return false;
+function sameObservation(actual: MarkerRead, expected: MarkerObservation): boolean {
+  return actual.raw === expected.raw && actual.dev === expected.dev && actual.inode === expected.inode
+    && actual.size === expected.size && actual.mtimeNs === expected.mtimeNs;
+}
+
+async function unlinkIfExact(lockPath: string, expected: string | MarkerObservation, hook?: () => void | Promise<void>): Promise<boolean> {
+  const before = await readMarkerNoFollow(lockPath);
+  if (!before || (typeof expected === "string" ? before.raw !== expected : !sameObservation(before, expected))) return false;
   await hook?.();
-  const after = await readMarkerNoFollow(lockPath).catch(() => undefined);
-  if (!after || after.raw !== expectedRaw) return false;
+  const after = await readMarkerNoFollow(lockPath);
+  if (!after || (typeof expected === "string" ? after.raw !== expected : !sameObservation(after, expected))) return false;
   try {
     await fs.unlink(lockPath);
     return true;
@@ -342,35 +753,136 @@ async function unlinkIfExact(lockPath: string, expectedRaw: string, hook?: () =>
   }
 }
 
-async function acquireFence(fencePath: string, incarnation: ProcessIncarnation, identity: LockIdentitySource, hooks: LockfileHooks | undefined, token: () => string): Promise<OwnedLock | undefined> {
+function heldResult(blocker: ReapBlocker): Extract<LockAcquireResult, { status: "held" }> {
+  const observation = observationOf(blocker.inspection);
+  const raw = blocker.inspection.raw ?? "";
+  const holderKey = crypto.createHash("sha256")
+    .update(blocker.kind).update("\0").update(raw).update("\0")
+    .update(observation ? `${observation.dev}:${observation.inode}:${observation.mtimeNs}` : "unknown")
+    .digest("hex");
+  return {
+    status: "held",
+    inspection: blocker.inspection,
+    blockerKind: blocker.kind,
+    warningReason: blocker.reason,
+    holderKey,
+  };
+}
+
+function blockerFor(inspection: Exclude<LockInspection, { kind: "absent" }>): ReapBlocker {
+  if (inspection.kind === "live") {
+    return { inspection, kind: "live", reason: inspection.identityDrift ? "identity-drift" : undefined };
+  }
+  return { inspection, kind: "foreign", reason: "foreign" };
+}
+
+async function verifyCreated(lockPath: string, raw: string): Promise<boolean> {
+  const read = await readMarkerNoFollow(lockPath);
+  return read?.raw === raw;
+}
+
+async function finalizeCreated(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<{ ok: true } | { ok: false; cleaned: boolean; error?: unknown }> {
+  let failure: unknown;
+  try {
+    await fsyncDirectory(path.dirname(lockPath));
+    await hooks?.afterCreate?.(lockPath, raw);
+    if (await verifyCreated(lockPath, raw)) return { ok: true };
+    failure = new Error("created lock verification failed");
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    return { ok: false, cleaned: await unlinkIfExact(lockPath, raw, () => hooks?.beforeCreatedCleanup?.(lockPath)), error: failure };
+  } catch (error) {
+    return { ok: false, cleaned: false, error };
+  }
+}
+
+async function acquireFence(
+  fencePath: string,
+  incarnation: ProcessIncarnation,
+  identity: LockIdentitySource,
+  hooks: LockfileHooks | undefined,
+  token: () => string,
+  storageLocal: (storagePath: string) => Promise<boolean>,
+): Promise<{ status: "acquired"; lock: OwnedLock } | { status: "retry" } | { status: "blocked"; blocker: ReapBlocker }> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const marker: LockMarker = { ...incarnation, token: token() };
     const raw = formatLockMarker(marker);
     const created = await atomicCreateMarker(fencePath, raw, hooks);
-    if (created.status === "created") return new OwnedLock(fencePath, marker, raw, identity, hooks);
-    if (created.status !== "exists") return undefined;
-    const existing = await inspectLock(fencePath, identity);
-    if (existing.kind !== "dead") return undefined;
-    // A reaper fence is the one deliberate single-level exception: a dead
-    // <lock>.reap is exact-checked and unlinked directly, never recursively.
-    if (!(await unlinkIfExact(fencePath, existing.raw))) return undefined;
+    if (created.status === "created") {
+      const finalized = await finalizeCreated(fencePath, raw, hooks);
+      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(fencePath, marker, raw, identity, hooks) };
+      if (finalized.cleaned) return { status: "retry" };
+      staleOwnedMarkers.set(fencePath, raw);
+      const inspection = await inspectLock(fencePath, identity, storageLocal);
+      if (inspection.kind === "absent") return { status: "retry" };
+      return { status: "blocked", blocker: { inspection, kind: "fence", reason: "fence" } };
+    }
+    if (created.status !== "exists") {
+      const inspection = await inspectLock(fencePath, identity, storageLocal);
+      if (inspection.kind === "absent") return { status: "retry" };
+      return { status: "blocked", blocker: { inspection, kind: "fence", reason: "fence" } };
+    }
+    const existing = await inspectLock(fencePath, identity, storageLocal);
+    if (existing.kind === "absent") continue;
+    const staleRaw = staleOwnedMarkers.get(fencePath);
+    if (staleRaw !== undefined && (existing.kind === "live" || existing.kind === "foreign") && staleRaw === existing.raw) {
+      try {
+        if (await unlinkIfExact(fencePath, staleRaw)) {
+          staleOwnedMarkers.delete(fencePath);
+          continue;
+        }
+      } catch {
+        // Keep the exact candidate for a later acquire.
+      }
+      return { status: "blocked", blocker: { inspection: existing, kind: "fence", reason: "fence" } };
+    }
+    if (existing.kind !== "dead" || !existing.observation) {
+      return { status: "blocked", blocker: { inspection: existing, kind: "fence", reason: "fence" } };
+    }
+    try {
+      if (await unlinkIfExact(fencePath, existing.observation)) continue;
+    } catch {
+      // Re-observe below.
+    }
+    return { status: "retry" };
   }
-  return undefined;
+  return { status: "retry" };
 }
 
-async function tryReap(lockPath: string, expected: LockInspection & { kind: "dead" } | { kind: "live"; marker: LockMarker; raw: string }, identity: LockIdentitySource, hooks: LockfileHooks | undefined, token: () => string, allowLive: boolean): Promise<boolean> {
+async function tryReap(
+  lockPath: string,
+  expected: Exclude<LockInspection, { kind: "absent" }>,
+  identity: LockIdentitySource,
+  hooks: LockfileHooks | undefined,
+  token: () => string,
+  allowLive: boolean,
+  storageLocal: (storagePath: string) => Promise<boolean>,
+): Promise<ReapResult> {
   const incarnation = await identity.current();
-  const fence = await acquireFence(`${lockPath}.reap`, incarnation, identity, hooks, token);
-  if (!fence) return false;
+  const fence = await acquireFence(`${lockPath}.reap`, incarnation, identity, hooks, token, storageLocal);
+  if (fence.status === "blocked") return fence;
+  if (fence.status === "retry") return { status: "retry" };
+  let result: ReapResult = { status: "retry" };
   try {
     await hooks?.beforeReapInspect?.(lockPath);
-    const again = await inspectLock(lockPath, identity);
-    const eligible = again.kind === "dead" || (allowLive && again.kind === "live");
-    if (!eligible || again.raw !== expected.raw) return false;
-    return await unlinkIfExact(lockPath, expected.raw, () => hooks?.beforeReapUnlink?.(lockPath));
+    const again = await inspectLock(lockPath, identity, storageLocal);
+    const eligible = again.kind === "dead" || (allowLive && again.kind !== "absent" && again.raw === expected.raw);
+    const capability = allowLive ? expected.raw : expected.observation;
+    if (!eligible || !capability) result = { status: "retry" };
+    else if (await unlinkIfExact(lockPath, capability, () => hooks?.beforeReapUnlink?.(lockPath))) result = { status: "reaped" };
+  } catch {
+    result = { status: "retry" };
   } finally {
-    await fence.release();
+    const released = await fence.lock.release();
+    if (!released.released) {
+      staleOwnedMarkers.set(fence.lock.path, fence.lock.raw);
+      const inspection = await inspectLock(fence.lock.path, identity, storageLocal);
+      if (inspection.kind !== "absent") result = { status: "blocked", blocker: { inspection, kind: "fence", reason: "fence" } };
+    }
   }
+  return result;
 }
 
 export class OwnedLock {
@@ -383,8 +895,11 @@ export class OwnedLock {
   ) {}
 
   async isOwner(): Promise<boolean> {
-    const current = await readMarkerNoFollow(this.path).catch(() => undefined);
-    return current?.raw === this.raw;
+    try {
+      return (await readMarkerNoFollow(this.path))?.raw === this.raw;
+    } catch {
+      return false;
+    }
   }
 
   async recheckOwner(hook?: () => void | Promise<void>): Promise<boolean> {
@@ -395,7 +910,11 @@ export class OwnedLock {
   async release(): Promise<LockReleaseResult> {
     try {
       const released = await unlinkIfExact(this.path, this.raw, () => this.hooks?.beforeReleaseUnlink?.(this.path));
-      if (!released) return { released: false, durable: false };
+      if (!released) {
+        const read = await readMarkerNoFollow(this.path).catch(() => undefined);
+        if (read?.raw === this.raw) staleOwnedMarkers.set(this.path, this.raw);
+        return { released: false, durable: false };
+      }
       staleOwnedMarkers.delete(this.path);
       const durable = await fsyncDirectory(path.dirname(this.path)).then(() => true, () => false);
       return { released: true, durable };
@@ -409,13 +928,16 @@ export class OwnedLock {
 export async function acquireLock(lockPath: string, options: AcquireLockOptions = {}): Promise<LockAcquireResult> {
   const identity = options.identity ?? systemLockIdentity;
   const token = options.token ?? (() => crypto.randomBytes(16).toString("hex"));
-  let incarnation: ProcessIncarnation;
+  const storageLocal = options.storageLocal ?? lockStorageLocal;
+  let incarnation: ProcessIncarnation | ResolvedLockIdentity;
   try {
-    incarnation = await identity.current();
+    incarnation = identity === systemLockIdentity && !options.skipIdentityRefresh
+      ? await refreshSystemLockIdentityLedger()
+      : await identity.current();
   } catch (error) {
     return { status: "unsupported", error };
   }
-  const marker: LockMarker = { ...incarnation, token: token() };
+  const marker: LockMarker = { hostId: incarnation.hostId, bootId: incarnation.bootId, pid: incarnation.pid, startTime: incarnation.startTime, token: token() };
   let raw: string;
   try {
     raw = formatLockMarker(marker);
@@ -423,26 +945,36 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
     return { status: "unsupported", error };
   }
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const created = await atomicCreateMarker(lockPath, raw, options.hooks);
-    if (created.status === "created") return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, identity, options.hooks) };
-    if (created.status === "unsupported") return { status: "unsupported", error: created.error };
-    if (created.status === "error") return { status: "error", error: created.error };
+    if (created.status === "created") {
+      const finalized = await finalizeCreated(lockPath, raw, options.hooks);
+      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, identity, options.hooks) };
+      if (finalized.cleaned) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
+      staleOwnedMarkers.set(lockPath, raw);
+    } else if (created.status === "unsupported") return { status: "unsupported", error: created.error };
+    else if (created.status === "error") return { status: "error", error: created.error };
 
-    const inspection = await inspectLock(lockPath, identity);
+    const inspection = await inspectLock(lockPath, identity, storageLocal);
     if (inspection.kind === "absent") continue;
     const staleRaw = staleOwnedMarkers.get(lockPath);
-    if (inspection.kind === "dead" || (inspection.kind === "live" && staleRaw === inspection.raw)) {
-      const reaped = await tryReap(lockPath, inspection, identity, options.hooks, token, inspection.kind === "live");
-      if (reaped) {
-        staleOwnedMarkers.delete(lockPath);
+    const staleOwned = staleRaw !== undefined && inspection.raw === staleRaw;
+    if (inspection.kind === "dead" || staleOwned) {
+      const reap = await tryReap(lockPath, inspection, identity, options.hooks, token, staleOwned, storageLocal);
+      if (reap.status === "reaped" || reap.status === "retry") {
+        if (reap.status === "reaped") staleOwnedMarkers.delete(lockPath);
         continue;
       }
+      return heldResult(reap.blocker);
     }
-    return { status: "held", inspection };
+    return heldResult(staleOwned
+      ? { inspection, kind: "stale-owned", reason: "stale-owned" }
+      : blockerFor(inspection));
   }
-  const inspection = await inspectLock(lockPath, identity);
+  const inspection = await inspectLock(lockPath, identity, storageLocal);
   return inspection.kind === "absent"
     ? { status: "error", error: new Error("lock acquisition race did not settle") }
-    : { status: "held", inspection };
+    : heldResult(staleOwnedMarkers.get(lockPath) === inspection.raw
+      ? { inspection, kind: "stale-owned", reason: "stale-owned" }
+      : blockerFor(inspection));
 }

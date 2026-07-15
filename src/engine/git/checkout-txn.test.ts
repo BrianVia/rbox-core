@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
+  checkoutTransactionCapability,
   checkoutTransactionSupported,
   commitCheckout,
   ownershipAwareGitBusy,
@@ -372,4 +373,19 @@ test("unsupported capability returns a typed result without mutation", async () 
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
   expect(await fs.stat(path.join(ctx.gitDir, "index.lock")).then(() => true, () => false)).toBe(false);
+});
+
+test("typed capability distinguishes missing/version/probe/unsupported states and sanitizes version", async () => {
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  expect(await checkoutTransactionCapability(repo, undefined, async () => { throw missing; })).toEqual({ status: "git-missing" });
+  expect(await checkoutTransactionCapability(repo, undefined, async () => ({ stdout: "\n\u001b[2J" }))).toEqual({ status: "version-unavailable" });
+
+  resetCheckoutCapabilityProbeCacheForTests();
+  expect(await checkoutTransactionCapability(repo, async () => { throw new Error("probe I/O"); }, async () => ({ stdout: "git version 9.1.0\nforged\u001b[2J" }))).toEqual({
+    status: "probe-failed", version: "git version 9.1.0 forged [2J",
+  });
+  resetCheckoutCapabilityProbeCacheForTests();
+  expect(await checkoutTransactionCapability(repo, async () => false, async () => ({ stdout: "git version 2.43.0" }))).toEqual({
+    status: "unsupported", version: "git version 2.43.0",
+  });
 });

@@ -8,3 +8,7 @@ process.env.RBOX_FILES_FIRST = "0";
 process.env.RBOX_BATCH_FILL = "v1";
 process.env.RBOX_REDEEM_DRAIN = "off";
 process.env.RBOX_AUTH_GRANT = "0";
+// Lock identity history is intentionally host-global in production. Keep the
+// test runner's ledger writable and process-local without changing HOME (many
+// fixtures exercise HOME/RBOX_HOME precedence explicitly).
+process.env.RBOX_TEST_HOST_IDENTITY_DIR = `/tmp/rbox-test-host-identity-${process.pid}`;

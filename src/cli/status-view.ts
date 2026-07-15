@@ -16,6 +16,7 @@ import type { GitDeferral, GitDeferralReason } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";
+import type { CheckoutTransactionCapability } from "../engine/index.js";
 
 /** Everything the status verdict needs, precomputed by the caller. */
 export interface StatusSnapshot {
@@ -239,6 +240,7 @@ export function renderGitDeferralLine(input: {
   checkout?: { kind: "branch" | "detached"; label?: string };
   bytesChanged?: boolean;
   now: number;
+  capability?: CheckoutTransactionCapability;
 }): string {
   const checkout = input.checkout?.kind === "branch"
     ? `branch ${input.checkout.label ? truncateDetail(input.checkout.label) : "(unknown)"}`
@@ -246,7 +248,10 @@ export function renderGitDeferralLine(input: {
       ? "detached checkout"
       : "checkout unavailable";
   const changed = input.bytesChanged ? " (working files changed since)" : "";
-  return `git deferred ${ageBucket(input.deferredSince, input.now)}: ${gitDeferralReasonText(input.reason)} on ${checkout} (${truncateDetail(input.relPath)})${changed}`;
+  const reason = input.reason === "unsupported" && input.capability
+    ? `needs Git >= 2.46 transactional symref-update${input.capability.version ? `; found ${truncateDetail(input.capability.version)}` : `; ${input.capability.status}`}`
+    : gitDeferralReasonText(input.reason);
+  return `git deferred ${ageBucket(input.deferredSince, input.now)}: ${reason} on ${checkout} (${truncateDetail(input.relPath)})${changed}`;
 }
 
 const ageLabel = (ageMs: number | undefined): string => {

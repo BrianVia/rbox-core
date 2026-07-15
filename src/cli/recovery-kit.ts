@@ -1,7 +1,7 @@
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { writeFileAtomic } from "../engine/fsutil.js";
 
 export const KIT_BANNER = "rbox RECOVERY KIT — keep this somewhere safe";
 
@@ -165,7 +165,6 @@ async function writeRecoveryKitRecord(accountId: string, record: RecoveryKitReco
 
 async function secretSafeWrite(file: string, data: string): Promise<void> {
   const dir = path.dirname(file);
-  const base = path.basename(file);
   const existing = await fs.lstat(file).catch((e) => {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw e;
@@ -173,21 +172,8 @@ async function secretSafeWrite(file: string, data: string): Promise<void> {
   if (existing?.isSymbolicLink()) throw new Error(`refusing to write recovery kit through a symlink: ${file}`);
   if (existing && !existing.isFile()) throw new Error(`refusing to replace non-file recovery kit path: ${file}`);
 
-  const tmp = path.join(dir, `.rbox-kit-${process.pid}-${crypto.randomBytes(16).toString("hex")}-${base}`);
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(tmp, "wx", FILE_MODE);
-    await handle.writeFile(data, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await fs.rename(tmp, file);
-    await fs.chmod(file, FILE_MODE).catch(() => {});
-  } catch (e) {
-    await handle?.close().catch(() => {});
-    await fs.rm(tmp, { force: true }).catch(() => {});
-    throw e;
-  }
+  await writeFileAtomic(file, data, { flag: "wx", mode: FILE_MODE });
+  await fs.chmod(file, FILE_MODE).catch(() => {});
 }
 
 function recordPath(accountId: string): string {

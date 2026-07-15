@@ -19,6 +19,7 @@ import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
+import { refreshSystemLockIdentityLedger } from "../engine/git/lockfile.js";
 
 /** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
 function printHelp(cmd: string | undefined, positional: string[]): void {
@@ -76,6 +77,10 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
 }
 
 export async function main(): Promise<void> {
+  // Resolve and persist this boot even for commands which never acquire a
+  // workspace lock. Locking remains availability-biased when identity is
+  // unavailable, so non-locking commands must not fail on this health hook.
+  await refreshSystemLockIdentityLedger().catch(() => {});
   let [cmd] = process.argv.slice(2) as [string | undefined];
   const rest = process.argv.slice(3);
   const parsed = parseFlags(rest);

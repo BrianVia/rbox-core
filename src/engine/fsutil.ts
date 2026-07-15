@@ -16,17 +16,26 @@ let counter = 0;
 export async function writeFileAtomic(
   absPath: string,
   data: string | Uint8Array,
-  opts: { beforeRename?: () => boolean | Promise<boolean> } = {}
+  opts: {
+    beforeRename?: () => boolean | Promise<boolean>;
+    mode?: number;
+    flag?: string;
+  } = {}
 ): Promise<void> {
   const dir = path.dirname(absPath);
   const tmp = path.join(dir, `${RBOX_TMP_PREFIX}${process.pid}-${counter++}-${path.basename(absPath)}`);
   let fh: fs.FileHandle | undefined;
   try {
-    fh = await fs.open(tmp, "w");
-    await fh.writeFile(data);
-    await fh.sync(); // durability: bytes hit disk before the rename publishes them
-  } finally {
-    await fh?.close();
+    try {
+      fh = await fs.open(tmp, opts.flag ?? "w", opts.mode);
+      await fh.writeFile(data);
+      await fh.sync(); // durability: bytes hit disk before the rename publishes them
+    } finally {
+      await fh?.close();
+    }
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
   }
   let publish = true;
   try {
@@ -39,7 +48,12 @@ export async function writeFileAtomic(
     await fs.rm(tmp, { force: true }).catch(() => {});
     return;
   }
-  await fs.rename(tmp, absPath);
+  try {
+    await fs.rename(tmp, absPath);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 /** Flush directory metadata after publishing or removing an entry. Callers choose

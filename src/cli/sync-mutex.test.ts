@@ -6,6 +6,7 @@ import type { LockIdentitySource } from "../engine/git/lockfile.js";
 import { daemonConsumesWakeup } from "./daemon.js";
 import {
   acquireWorkspaceSyncMutex,
+  readLockingHealth,
   releaseWorkspaceSyncMutex,
   syncMutexPath,
   withWorkspaceSyncMutex,
@@ -62,18 +63,20 @@ describe("design 93 §6 workspace sync mutex", () => {
     expect(surfaced).toHaveLength(1);
     expect(surfaced[0]).toContain("git config sync disabled");
     expect(surfaced[0]).toContain("legacy state saves");
+    expect(await readLockingHealth(root)).toEqual({ status: "degraded-unlocked", reason: "identity-unavailable" });
   });
 
-  test("CLI contender exits loudly with owner pid", async () => {
+  test("CLI contender exits with the closed typed busy message", async () => {
     const owner = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
-    await expect(acquireWorkspaceSyncMutex(root, "cli", options(identity()))).rejects.toThrow(/another sync is in progress \(pid 9301\)/);
+    await expect(acquireWorkspaceSyncMutex(root, "cli", options(identity()))).rejects.toThrow("daemon/CLI is syncing; retry, or run `rbox stop` first");
     await releaseWorkspaceSyncMutex(owner);
   });
 
   test("daemon contention requeues: the wakeup is never consumed", async () => {
     const owner = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
     const contender = await acquireWorkspaceSyncMutex(root, "daemon", options(identity()));
-    expect(contender).toMatchObject({ status: "contended", detail: "pid 9301" });
+    expect(contender).toMatchObject({ status: "contended", blockerKind: "live", holderKey: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(contender).not.toHaveProperty("detail");
     expect(daemonConsumesWakeup(contender)).toBe(false);
     await releaseWorkspaceSyncMutex(owner);
     const acquired = await acquireWorkspaceSyncMutex(root, "daemon", options(identity())) as DaemonMutexResult;
@@ -103,7 +106,7 @@ describe("design 93 §6 workspace sync mutex", () => {
     expect(daemon.status).toBe("acquired");
     workingTree = `${workingTree}+serialized-daemon`;
     const cliWhileHeld = acquireWorkspaceSyncMutex(root, "cli", options(identity()));
-    await expect(cliWhileHeld).rejects.toThrow(/another sync is in progress/);
+    await expect(cliWhileHeld).rejects.toThrow(/daemon\/CLI is syncing/);
     expect(workingTree).toBe("base+daemon+serialized-daemon");
     if (daemon.status === "acquired") await releaseWorkspaceSyncMutex(daemon.handle);
     const cliAfter = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
@@ -166,7 +169,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
     expect(acquire).toBeGreaterThan(0);
     expect(revalidate).toBeGreaterThan(acquire);
     expect(consume).toBeGreaterThan(revalidate);
-    expect(source).toContain("continue;\n        }\n        const syncMutex");
+    expect(source.indexOf("continue;", acquire)).toBeLessThan(revalidate);
   });
 
   test("purge recomputes after confirmation under the mutex", async () => {
