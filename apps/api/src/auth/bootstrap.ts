@@ -14,7 +14,7 @@ export function allowedBootstrapPlan(plan: unknown): BootstrapPlan | null {
 
 // POST /v1/auth/device/bootstrap { secret, label, plan? } -> { token, deviceId, accountId }
 // Creates a fresh account + owner user + device (the trust anchor for a new tenant).
-export async function bootstrap(req: Request, env: Env): Promise<Response> {
+export async function bootstrap(req: Request, env: Env, ctx: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   const body = (await req.json().catch(() => ({}))) as { secret?: string; label?: string; accountName?: string; plan?: unknown };
   const secret = env.RBOX_BOOTSTRAP_SECRET ?? "";
   if (!secret || typeof body.secret !== "string" || !ctEqual(body.secret, secret)) {
@@ -40,6 +40,6 @@ export async function bootstrap(req: Request, env: Env): Promise<Response> {
   const { token, deviceId } = await mintDevice(env, accountId, userId, "dev", body.label ?? "bootstrap");
   // §32 Tier 1 business ping (best-effort, never throws/blocks) — a new tenant via the
   // CLI bootstrap path. Fires after the account is durably created.
-  await pingNewAccount(env, { accountId, origin: "bootstrap", ...(plan !== "none" ? { plan } : {}) });
+  pingNewAccount(ctx, env, { accountId, origin: "bootstrap", ...(plan !== "none" ? { plan } : {}) });
   return json({ token, deviceId, accountId });
 }
