@@ -12,6 +12,7 @@ import { daemonRuntimeDir } from "./daemon-control.js";
 import type { DaemonActivity } from "./activity.js";
 import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { trashCmd } from "./trash-cmd.js";
+import { RBOX_VERSION } from "./version.js";
 import { versionsCmd } from "./versions-cmd.js";
 import { fail, setJsonErrorMode } from "./style.js";
 
@@ -155,7 +156,7 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
   expect(dto).toEqual({
     workspace: { id: "ws_json", name: "JSON Workspace", root: tmp },
     health: "outofstorage",
-    daemon: { running: false, pid: null, version: null, cliVersion: "1.6.2", versionSkew: false },
+    daemon: { running: false, pid: null, version: null, cliVersion: RBOX_VERSION, versionSkew: false },
     locking: { status: "ok", reason: null, path: ".rbox/state/sync.lock" },
     remote: null,
     trash: null,
