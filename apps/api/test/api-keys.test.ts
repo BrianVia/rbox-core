@@ -163,6 +163,7 @@ describe("agent/API sync keys", () => {
           },
         },
       } as WorkerEntrypointExports,
+      executionCtx: { waitUntil: (promise) => void promise },
       url: new URL(req.url),
       seg: ["agent.sh"],
     });

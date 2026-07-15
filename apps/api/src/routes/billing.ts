@@ -4,8 +4,8 @@ import type { Principal } from "../authz.js";
 
 /** Stripe webhook is PUBLIC but signature-verified (exact route), so it sits
  *  BEFORE authenticate(). */
-export async function billingWebhookRoutes({ req, env, seg }: RouteCtx): Promise<Response | null> {
-  if (req.method === "POST" && eq(seg, ["v1", "stripe", "webhook"])) return stripeWebhook(req, env, Date.now());
+export async function billingWebhookRoutes({ req, env, executionCtx, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "POST" && eq(seg, ["v1", "stripe", "webhook"])) return stripeWebhook(req, env, Date.now(), executionCtx);
   return null;
 }
 

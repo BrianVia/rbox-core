@@ -158,7 +158,9 @@ export interface Env {
    *  Wrangler secret; absent ⇒ business pings no-op (self-gating). NEVER in repo. */
   SLACKPIPES_WEBHOOK_URL?: string;
   /** Slackpipes ALERTS webhook (#rbox-alerts) — error/payment-failed pings, and the
-   *  Tail Worker's rare-important alerts. Wrangler secret; absent ⇒ no-op. NEVER in repo. */
+   *  Tail Worker's rare-important alerts. Optional Wrangler-secret override; API
+   *  pings otherwise derive it from SLACKPIPES_WEBHOOK_URL's final channel segment.
+   *  NEVER log or store either URL in the repo. */
   SLACKPIPES_ALERTS_WEBHOOK_URL?: string;
 
   // ── §32 Tier 3a: platform-admin cockpit (GET /v1/admin/overview) ─────────────

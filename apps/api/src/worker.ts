@@ -79,7 +79,7 @@ export default {
     const op = startOp(env, "request", `${req.method} ${routeTemplate(new URL(req.url).pathname)}`);
     let res: Response;
     try {
-      res = await route(req, op.env, ctx.exports);
+      res = await route(req, op.env, ctx);
     } catch (e) {
       if (e instanceof Response) res = e; // thrown 4xx flows out as itself
       else {
@@ -238,10 +238,10 @@ export default {
  * the documented overlapping-prefix cases (e.g. blobs/check before blobs/:sha);
  * exact-match routes across groups are mutually exclusive.
  */
-async function route(req: Request, env: Env, exports: WorkerEntrypointExports): Promise<Response> {
+async function route(req: Request, env: Env, executionCtx: ExecutionContext & { exports: WorkerEntrypointExports }): Promise<Response> {
   const url = new URL(req.url);
   const seg = url.pathname.split("/").filter(Boolean);
-  const ctx: RouteCtx = { req, env, exports, url, seg };
+  const ctx: RouteCtx = { req, env, exports: executionCtx.exports, executionCtx, url, seg };
 
   if (url.pathname === "/health") return jsonResponse({ ok: true, service: "rbox-api" });
 
