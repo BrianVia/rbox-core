@@ -13,6 +13,13 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track![0]!.usage).toContain("rbox track");
 });
 
+test("git deferrals help registers both exclusive output modes", () => {
+  const entry = helpFor("git deferrals");
+  expect(entry).toHaveLength(1);
+  expect(entry![0]!.usage).toBe("rbox git deferrals [--brief | --json]");
+  expect(entry![0]!.flags?.map(({ flag }) => flag)).toEqual(["--brief", "--json"]);
+});
+
 test("per-command help: a command with registered sub-verbs includes them", () => {
   expect(helpFor("key")?.map((entry) => entry.name)).toEqual([
     "key",
@@ -42,6 +49,7 @@ test("per-command help: the deps group is currently empty (commented out, design
 test("helpKeyFor resolves group subcommands to the leaf, else the group", () => {
   expect(helpKeyFor("track", ["~/x"])).toBe("track"); // a path positional is not a subcommand
   expect(helpKeyFor("device", ["approve"])).toBe("device"); // device has no per-sub entry
+  expect(helpKeyFor("git", ["deferrals"])).toBe("git deferrals");
 });
 
 test("unknown command path has no help entry (caller falls back to the grouped screen)", () => {

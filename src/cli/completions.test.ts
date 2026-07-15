@@ -38,6 +38,8 @@ test("known flags are completed from registry metadata", () => {
   const owners = COMMAND_HELP.filter((c) => c.flags?.some((f) => f.flag.startsWith("--allow-mass-delete")));
   expect(owners.length, "--allow-mass-delete should exist in the registry").toBeGreaterThan(0);
   expect(script).toContain("--allow-mass-delete[");
+  expect(script).toContain("'deferrals:show deferred Git repos and copyable repair guidance'");
+  expect(script).toContain("--brief[print a complete copyable diagnosis and repair brief]");
 });
 
 test("no hidden or internal tokens leak into the script", () => {

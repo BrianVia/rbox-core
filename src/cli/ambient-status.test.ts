@@ -94,6 +94,17 @@ test("reader matrix: absent/corrupt/stale/fresh status crossed with pidfile pres
   expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! quota");
 });
 
+test("top-level ambient timestamps require an explicit timezone", async () => {
+  await writeStatus({ heartbeatAt: "2026-07-08T11:59:59.000" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+
+  await writeStatus({ lastSyncedAt: "2026-07-08T11:59:59.000" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+
+  await writeStatus({ heartbeatAt: "2026-07-08T07:59:59.000-04:00", lastSyncedAt: null });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("ok");
+});
+
 test("outside a workspace prints nothing, including --json shape", async () => {
   const verdict = readPromptStatus(outside, NOW);
   expect(formatPromptStatus(verdict)).toBe("");
@@ -193,7 +204,7 @@ test("state projection table follows design-88 precedence and operation shape", 
   });
 });
 
-test("deferral projection and reader round-trip expose counts and oldest age only", async () => {
+test("deferral projection and reader round-trip expose bounded repo details", async () => {
   const projected = projectAmbientDaemonStatus({
     activity: { at: freshAt },
     settled: true,
@@ -237,8 +248,13 @@ test("deferral projection and reader round-trip expose counts and oldest age onl
   });
   expect(projected.deferredRepos).toBe(2);
   expect(projected.oldestDeferralAgeSeconds).toBe(86_400);
-  expect(JSON.stringify(projected)).not.toContain("private/repo-name");
-  expect(JSON.stringify(projected)).not.toContain("secret branch");
+  expect(projected.deferrals).toHaveLength(2);
+  expect(projected.deferrals?.[1]).toMatchObject({
+    repo: "private/repo-name",
+    reason: "local-edits",
+    reasonLabel: "local edits",
+    checkout: { kind: "branch", label: "secret branch" },
+  });
 
   await writeStatus(projected);
   const verdict = readPromptStatus(root, NOW);
@@ -248,6 +264,66 @@ test("deferral projection and reader round-trip expose counts and oldest age onl
   expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
   await writeStatus({ deferredRepos: 1, oldestDeferralAgeSeconds: -1 as never });
   expect(formatPromptStatus(readPromptStatus(root, NOW))).toBe("! dead");
+});
+
+test("nested deferrals are capped, sanitized, item-local, and unknown-safe", async () => {
+  const valid = {
+    repo: " private\nrepo ", reason: "future-reason", reasonLabel: "forged", reasonText: "forged text",
+    remediationClass: "forged", deferredSince: freshAt, reasonSince: freshAt,
+    checkout: { kind: "branch", label: " topic\u0000name " }, extra: true,
+  };
+  await writeStatus({
+    deferredRepos: 8,
+    deferrals: [
+      valid,
+      { ...valid, repo: "" },
+      { ...valid, repo: "bad-time", deferredSince: "today" },
+      { ...valid, repo: "bad-checkout", checkout: { kind: "future" } },
+      ...Array.from({ length: 6 }, (_, index) => ({ ...valid, repo: `repo-${index}` })),
+    ],
+  });
+  const record = readAmbientDaemonStatusRecord(root);
+  expect(record.kind).toBe("ok");
+  if (record.kind !== "ok") return;
+  expect(record.status.deferrals).toHaveLength(2);
+  expect(record.status.deferrals?.[0]).toMatchObject({
+    repo: "private repo",
+    reason: "future-reason",
+    reasonLabel: "unrecognized Git issue",
+    reasonText: "Git sync is deferred for an unrecognized reason.",
+    remediationClass: "apply-unavailable",
+    checkout: { kind: "branch", label: "topic name" },
+  });
+});
+
+test("ambient deferral timestamps require an explicit timezone", async () => {
+  const valid = {
+    repo: "repo", reason: "conflict", reasonLabel: "conflict", reasonText: "conflict",
+    remediationClass: "apply-unavailable", deferredSince: freshAt, reasonSince: freshAt,
+  };
+  await writeStatus({
+    deferredRepos: 3,
+    deferrals: [
+      valid,
+      { ...valid, repo: "no-zone-deferred", deferredSince: "2026-07-08T11:59:59.000" },
+      { ...valid, repo: "no-zone-reason", reasonSince: "2026-07-08T11:59:59.000" },
+    ],
+  });
+  const record = readAmbientDaemonStatusRecord(root);
+  expect(record.kind).toBe("ok");
+  if (record.kind === "ok") expect(record.status.deferrals?.map(({ repo }) => repo)).toEqual(["repo"]);
+});
+
+test("future producer timestamps sort last and never become a fresh zero age", () => {
+  const future = new Date(NOW + 60_000).toISOString();
+  const projected = projectAmbientDaemonStatus({
+    activity: { at: freshAt }, settled: true, now: NOW,
+    repoRecords: {
+      future: { repoGen: 1, sourceSeq: 1, deferrals: { apply: { lane: "apply", reason: "conflict", deferredSince: future, reasonSince: future, lastSeen: future } } },
+    },
+  });
+  expect(projected.oldestDeferralAgeSeconds).toBeNull();
+  expect(projected.deferrals?.[0]?.deferredSince).toBe(future);
 });
 
 test("ambient reader retains an optional daemonVersion and accepts pre-1.6.3 records", async () => {

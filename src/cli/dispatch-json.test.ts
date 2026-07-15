@@ -125,3 +125,27 @@ test("trash usage errors emit JSON to stderr when --json is active", async () =>
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("git deferrals rejects conflicting modes, positionals, and leaf-unknown flags", () => {
+  const conflict = run(["git", "deferrals", "--brief", "--json"]);
+  expect(conflict.status).toBe(1);
+  expect(conflict.stdout).toBe("");
+  expect(JSON.parse(conflict.stderr)).toEqual({ error: "usage: rbox git deferrals [--brief | --json]" });
+
+  const positional = run(["git", "deferrals", "repo"]);
+  expect(positional.status).toBe(1);
+  expect(positional.stdout).toBe("");
+  expect(positional.stderr).toContain("usage: rbox git deferrals");
+
+  const unknown = run(["git", "deferrals", "--confirm", "token"]);
+  expect(unknown.status).toBe(1);
+  expect(unknown.stdout).toBe("");
+  expect(unknown.stderr).toContain("unknown flag --confirm");
+});
+
+test("git deferrals root discovery failures never emit success JSON", () => {
+  const result = run(["git", "deferrals", "--json"]);
+  expect(result.status).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(JSON.parse(result.stderr).error).toContain("Not inside an rbox workspace");
+});
