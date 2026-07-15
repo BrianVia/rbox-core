@@ -5,6 +5,47 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.3] — 2026-07-15 — locks that survive reboots, upgrades that finish the job
+
+### Fixed
+- **A Mac reboot can no longer freeze sync behind its own stale lock (#282,
+  design 118).** macOS's per-boot `kern.uuid` made a rebooted machine read its
+  own pre-reboot lock as another host's — unbreakable by design — starving the
+  founder's Mac for 26 hours. Lock identity now prefers the stable hardware
+  UUID with an 8-boot alias ledger, and on a proven-local disk (the kernel's
+  own `local` mount flag, fail-closed) an unrecognized stale marker is probed
+  and reaped like any dead local lock. Wire format unchanged — old and new
+  binaries interoperate within a boot; downgrades stay safe.
+- **`rbox git resolve` works and tells the truth (#282).** A failed resolve
+  used to leak its own lock marker (bricking every later attempt) and swallow
+  the real error into a generic message. The break path now cleans up only
+  what it provably owns (`.reap` fence included), and errors are typed —
+  `sync-busy` names the daemon holding the mutex.
+- **Sync starvation is loud (#282).** Blocked >15 minutes by the same lock →
+  one durable warning, an explanation in `rbox status` and `rbox doctor`, and
+  a counts-only `lockStarved` metric. Retry spam is gone (250ms→30s abortable
+  backoff; the incident wrote 341,824 identical log lines).
+- **Old git is explained, not mysterious (#282).** Doctor probes the actual
+  `update-ref` transaction capability: "checkout-follow needs git ≥ 2.46,
+  found 2.43" instead of "unsupported git state".
+
+### Added
+- **`rbox upgrade` finishes the job (#282).** It now stops every running
+  daemon and WAITS for exit (the old stop removed the pidfile without
+  waiting — its own race), restarts them with settings preserved, and `rbox
+  status` flags daemon/CLI version skew.
+- **RboxBar notifies once per new version and updates in one click (#283,
+  design 121).** macOS notification (persisted once-per-version, lazy
+  permission ask) + "Update to <version>" menu action running the managed
+  upgrade.
+- **Per-device CLI version tracking (#279, design 119).** Every authed
+  request carries `x-rbox-version`; `rbox device list` and the dashboard show
+  each device's last-seen version — the compat dashboard for real customers.
+- **Slack pings survive slow relays (#281, design 122).** Signup/subscription
+  pings run post-response via `waitUntil` (5s budget + retry; the first
+  customer's signup ping died at the old inline 700ms), and failures
+  self-report to #rbox-alerts (URL derived from the business webhook).
+
 ## [1.6.2] — 2026-07-14 — rbox knows your name
 
 ### Added
