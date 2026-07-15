@@ -173,13 +173,23 @@ and a different boot is `dead`. Apply this exact rule to both `sync.lock` and
 Classification uses no timestamp or elapsed-time heuristic. Before treating an
 unrecognized marker as local identity drift, injectable
 `lockStorageLocal(<root>/.rbox/state)` must positively prove
-that the marker storage is local. On Darwin it reads `statfs.f_fstypename` and
-allows only `apfs` and `hfs`. On Linux it reads `statfs.f_type` and allows only
+that the marker storage is local. On Darwin it realpaths the state directory,
+runs absolute `/sbin/mount` through the existing 2s-timeout, 64 KiB-bounded
+subprocess runner, and parses records shaped as
+`<dev> on <mountpoint> (<fstype>, <flag>, ...)`. It selects the mount whose
+mountpoint is the longest path-component prefix of the realpath. Locality
+requires both the kernel-derived `local` (`MNT_LOCAL`) mount flag and an
+`apfs` or `hfs` filesystem type. An ambiguous or malformed record that could
+own the storage path (including an ambiguous ` on ` delimiter or unbalanced
+mountpoint parentheses), duplicate best matches, no match, command failure,
+and timeout fail closed. On Linux it
+reads `statfs.f_type` and allows only
 ext4 (`0xef53`), btrfs (`0x9123683e`), xfs (`0x58465342`), zfs
 (`0x2fc12fc1`), f2fs (`0xf2f52010`), tmpfs (`0x01021994`), and overlay
 (`0x794c7630`). NFS, SMB/CIFS, FUSE, every unlisted value, malformed results,
 and every syscall/error path return `false`. Cache only a successful result
-for that state filesystem identity; tests inject the platform statfs adapter.
+for that state filesystem identity; tests inject the platform storage-locality
+adapter.
 
 On a proven-local filesystem, an unrecognized `hostId` is this machine's
 identity drift, not evidence of another live machine. Parse the marker's PID
@@ -444,7 +454,11 @@ Also required:
 - Resolve tests cover every mapping row and hostile paths, credentials,
   newlines, controls, token-like text, and identical safe JSON/human semantics.
 - The locality matrix covers every allowlisted Darwin/Linux type, NFS,
-  SMB/CIFS, FUSE, unknown type, malformed result, and statfs error. Unproven
+  SMB/CIFS, FUSE, unknown type, missing Darwin `local`, malformed result, and
+  adapter error. Darwin mount fixtures cover longest-prefix selection and
+  real mount lines with spaces and balanced parentheses; ambiguous ` on ` and
+  unbalanced parentheses fail closed. A Darwin-only integration test runs the
+  real adapter against the repository's `.rbox/state` directory. Unproven
   locality never unlinks a foreign main marker or fence.
 - An unknown-hostId marker on proven-local storage is tested with a dead PID,
   a recycled PID with different start time, and an alive PID with matching

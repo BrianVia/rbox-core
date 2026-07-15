@@ -62,3 +62,36 @@ Verified against the implementation before the final fold:
 The daemon-version name is specifically `daemonVersion` in
 `RboxBarAmbientStatus`/`RboxDaemon.ambientStatusFrom`; the final design does not
 reuse the unrelated pid/binding parser field named `version`.
+
+## Field-fix addendum (2026-07-15): darwin locality adapter
+
+
+Status: implementation and adversarial reviewer aligned after four rounds.
+
+## Round 1
+
+The reviewer found that globally rejecting any malformed mount record could
+disable recovery for an unrelated storage path. The parser was revised to
+fail closed only when a malformed or ambiguous record could own the requested
+realpath. Darwin adapter-error coverage and stale statfs-adapter prose were
+also corrected; the field-incident mount line was marked as verbatim.
+
+## Round 2
+
+The reviewer found that checking only the first ` on ` delimiter could miss a
+plausible target mountpoint after a source-side delimiter. The parser now
+enumerates every delimiter suffix, and a source-side ambiguity fixture pins
+the closed result.
+
+## Round 3
+
+The reviewer found that empty and whitespace-only source fields could bypass
+the target-sensitive malformed-record check. Source text is now validated and
+target-relevant invalid sources fail closed, with regression fixtures.
+
+## Round 4
+
+The reviewer verified delimiter-loop termination, target-sensitive malformed
+handling, path-component matching, longest-prefix selection, duplicate-best
+rejection, caching, adapter shape, design text, and the Darwin-only real
+adapter test. No remaining correctness issues were found.

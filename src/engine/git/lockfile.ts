@@ -54,6 +54,12 @@ export interface LockIdentitySource {
 export interface LockStorageStat {
   dev: bigint;
   type: bigint | string;
+  local?: boolean;
+}
+
+export interface DarwinMountStat extends LockStorageStat {
+  type: string;
+  local: boolean;
 }
 
 export interface LockfileHooks {
@@ -556,15 +562,80 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
   }
 }
 
-async function defaultStorageStat(storagePath: string): Promise<LockStorageStat> {
-  const stat = await fs.stat(storagePath, { bigint: true });
+interface DarwinMountEntry {
+  mountpoint: string;
+  type: string;
+  local: boolean;
+}
+
+function balancedParens(value: string): boolean {
+  let depth = 0;
+  for (const char of value) {
+    if (char === "(") depth++;
+    if (char === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+function isPathPrefix(mountpoint: string, storageRealpath: string): boolean {
+  return mountpoint === "/"
+    ? storageRealpath.startsWith("/")
+    : storageRealpath === mountpoint || storageRealpath.startsWith(`${mountpoint}/`);
+}
+
+/** Parse `/sbin/mount` output, rejecting malformed records that could own the requested path. */
+export function parseDarwinMountOutput(raw: string, storageRealpath: string): Omit<DarwinMountStat, "dev"> | undefined {
+  const entries: DarwinMountEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const detailsAt = line.lastIndexOf(" (");
+    const separator = " on ";
+    const location = detailsAt < 0 ? line : line.slice(0, detailsAt);
+    const onAt = location.indexOf(separator);
+    if (onAt < 0) continue;
+    const mountpoint = location.slice(onAt + separator.length);
+    const matchesPath = path.isAbsolute(mountpoint) && isPathPrefix(mountpoint, storageRealpath);
+    const sourceValid = location.slice(0, onAt).trim().length > 0;
+    const ambiguousOn = location.indexOf(separator, onAt + separator.length) >= 0;
+    if (ambiguousOn) {
+      for (let candidateAt = onAt; candidateAt >= 0; candidateAt = location.indexOf(separator, candidateAt + separator.length)) {
+        const candidate = location.slice(candidateAt + separator.length);
+        if (path.isAbsolute(candidate) && isPathPrefix(candidate, storageRealpath)) return undefined;
+      }
+      continue;
+    }
+    if (!sourceValid || detailsAt < 0 || !line.endsWith(")") || !path.isAbsolute(mountpoint) || !balancedParens(mountpoint)) {
+      if (matchesPath) return undefined;
+      continue;
+    }
+    const fields = line.slice(detailsAt + 2, -1).split(",").map((field) => field.trim());
+    const type = fields[0]?.toLowerCase();
+    if (!type || fields.some((field) => !field)) {
+      if (matchesPath) return undefined;
+      continue;
+    }
+    entries.push({ mountpoint, type, local: fields.slice(1).includes("local") });
+  }
+
+  const matches = entries
+    .filter(({ mountpoint }) => isPathPrefix(mountpoint, storageRealpath))
+    .sort((a, b) => b.mountpoint.length - a.mountpoint.length);
+  if (!matches[0] || (matches[1] && matches[1].mountpoint.length === matches[0].mountpoint.length)) return undefined;
+  return { type: matches[0].type, local: matches[0].local };
+}
+
+export async function defaultStorageStat(storagePath: string): Promise<LockStorageStat> {
   if (process.platform === "linux") {
+    const stat = await fs.stat(storagePath, { bigint: true });
     const value = await fs.statfs(storagePath, { bigint: true });
     return { dev: stat.dev, type: value.type };
   }
   if (process.platform === "darwin") {
-    const raw = (await execBytes("/usr/bin/stat", ["-f", "%T", storagePath])).toString("utf8").trim().toLowerCase();
-    return { dev: stat.dev, type: raw };
+    const storageRealpath = await fs.realpath(storagePath);
+    const stat = await fs.stat(storageRealpath, { bigint: true });
+    const mount = parseDarwinMountOutput((await execBytes("/sbin/mount", [])).toString("utf8"), storageRealpath);
+    if (!mount) throw new Error("storage mount unavailable");
+    return { dev: stat.dev, ...mount };
   }
   throw new Error("unsupported filesystem platform");
 }
@@ -577,10 +648,10 @@ export async function lockStorageLocal(
   try {
     const stat = await adapter(storagePath);
     const type = typeof stat.type === "string" ? stat.type.toLowerCase() : stat.type;
-    const key = `${platform}:${stat.dev}:${String(type)}`;
+    const key = `${platform}:${stat.dev}:${String(type)}:${String(stat.local)}`;
     if (localStorageCache.get(key)) return true;
     const local = platform === "darwin"
-      ? typeof type === "string" && DARWIN_LOCAL_FS.has(type)
+      ? stat.local === true && typeof type === "string" && DARWIN_LOCAL_FS.has(type)
       : platform === "linux" && typeof type === "bigint" && LINUX_LOCAL_FS.has(type);
     if (local) localStorageCache.set(key, true);
     return local;

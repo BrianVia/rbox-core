@@ -7,10 +7,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   acquireLock,
+  defaultStorageStat,
   formatLockMarker,
   inspectLock,
   lockStorageLocal,
   mergeHostIdentityBoots,
+  parseDarwinMountOutput,
   parseLockMarker,
   readHostIdentityLedger,
   refreshHostIdentityLedger,
@@ -145,16 +147,78 @@ describe("design 118 local-filesystem proof", () => {
       expect(await lockStorageLocal("/state", async () => ({ dev: type, type }), "linux"), String(type)).toBe(true);
     }
     for (const type of ["apfs", "hfs", "APFS"]) {
-      expect(await lockStorageLocal("/state", async () => ({ dev: 1n, type }), "darwin"), type).toBe(true);
+      expect(await lockStorageLocal("/state", async () => ({ dev: 1n, type, local: true }), "darwin"), type).toBe(true);
     }
     for (const type of [0x6969n, 0xff534d42n, 0x65735546n, 0n]) {
       expect(await lockStorageLocal("/state", async () => ({ dev: 9n, type }), "linux"), String(type)).toBe(false);
     }
     for (const type of ["nfs", "smbfs", "fusefs", "unknown", ""]) {
-      expect(await lockStorageLocal("/state", async () => ({ dev: 2n, type }), "darwin"), type).toBe(false);
+      expect(await lockStorageLocal("/state", async () => ({ dev: 2n, type, local: true }), "darwin"), type).toBe(false);
     }
+    expect(await lockStorageLocal("/state", async () => ({ dev: 4n, type: "apfs", local: false }), "darwin")).toBe(false);
+    expect(await lockStorageLocal("/state", async () => ({ dev: 5n, type: "apfs" }), "darwin")).toBe(false);
     expect(await lockStorageLocal("/state", async () => { throw new Error("statfs failed"); }, "linux")).toBe(false);
+    expect(await lockStorageLocal("/state", async () => { throw new Error("mount timed out"); }, "darwin")).toBe(false);
     expect(await lockStorageLocal("/state", async () => ({ dev: 3n, type: "apfs" }), "linux")).toBe(false);
+  });
+
+  // Verbatim from the field incident that exposed the `%T` bug.
+  const incidentMountLine = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)";
+  const representativeMountFixture = [
+    incidentMountLine,
+    "/dev/disk3s6 on /System/Volumes/Data (apfs, local, journaled, nobrowse, protect)",
+    "map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)",
+    "/dev/disk4s1 on /Volumes/Field Data (Primary) (apfs, local, nodev, nosuid, journaled)",
+  ].join("\n");
+
+  test("Darwin mount parsing selects the longest path-component prefix", () => {
+    expect(parseDarwinMountOutput(representativeMountFixture, "/System/Volumes/Data/Users/founder/repo/.rbox/state"))
+      .toEqual({ type: "apfs", local: true });
+    expect(parseDarwinMountOutput(representativeMountFixture, "/System/Volumes/Database"))
+      .toEqual({ type: "apfs", local: true });
+    expect(parseDarwinMountOutput(representativeMountFixture, "/System/Volumes/Data/home/founder"))
+      .toEqual({ type: "autofs", local: false });
+  });
+
+  test("Darwin mount parsing accepts spaces and balanced parentheses", () => {
+    expect(parseDarwinMountOutput(representativeMountFixture, "/Volumes/Field Data (Primary)/repo/.rbox/state"))
+      .toEqual({ type: "apfs", local: true });
+  });
+
+  test("Darwin mount parsing fails closed on ambiguous or malformed records", () => {
+    expect(parseDarwinMountOutput(`${incidentMountLine}\n/dev/disk4s1 on /Volumes/Field on Data (apfs, local)`, "/Volumes/Field on Data/repo"))
+      .toBeUndefined();
+    expect(parseDarwinMountOutput(`${incidentMountLine}\nsource on label on /Volumes/Target (apfs, local)`, "/Volumes/Target/repo"))
+      .toBeUndefined();
+    expect(parseDarwinMountOutput(`${incidentMountLine}\n on /Volumes/Target (apfs, local)`, "/Volumes/Target/repo"))
+      .toBeUndefined();
+    expect(parseDarwinMountOutput(`${incidentMountLine}\n    on /Volumes/Target (apfs, local)`, "/Volumes/Target/repo"))
+      .toBeUndefined();
+    expect(parseDarwinMountOutput(`${incidentMountLine}\n/dev/disk4s1 on /Volumes/Field (Data (apfs, local)`, "/Volumes/Field (Data/repo"))
+      .toBeUndefined();
+    expect(parseDarwinMountOutput(`${incidentMountLine}\nnot a mount record`, "/repo/.rbox/state"))
+      .toEqual({ type: "apfs", local: true });
+    expect(parseDarwinMountOutput(`${incidentMountLine}\n/dev/disk4s1 on /Volumes/Other on Data (apfs, local)`, "/repo/.rbox/state"))
+      .toEqual({ type: "apfs", local: true });
+    expect(parseDarwinMountOutput("/dev/disk4s1 on /Volumes/Elsewhere (apfs, local)", "/repo/.rbox/state"))
+      .toBeUndefined();
+  });
+
+  test.skipIf(process.platform !== "darwin")("Darwin real adapter proves the repository state directory local", async () => {
+    const repoRoot = path.resolve(import.meta.dir, "../../..");
+    const rboxDir = path.join(repoRoot, ".rbox");
+    const stateDir = path.join(rboxDir, "state");
+    const stateExisted = await fs.stat(stateDir).then(() => true, () => false);
+    const rboxExisted = await fs.stat(rboxDir).then(() => true, () => false);
+    await fs.mkdir(stateDir, { recursive: true });
+    try {
+      const stat = await defaultStorageStat(stateDir);
+      expect(stat.local).toBe(true);
+      expect(await lockStorageLocal(stateDir)).toBe(true);
+    } finally {
+      if (!stateExisted) await fs.rmdir(stateDir).catch(() => {});
+      if (!rboxExisted) await fs.rmdir(rboxDir).catch(() => {});
+    }
   });
 });
 
