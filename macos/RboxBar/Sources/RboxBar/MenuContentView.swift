@@ -40,6 +40,9 @@ struct MenuContentView: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             Divider()
+            if let availableVersion = model.availableUpdateWithoutWorkspace {
+                updateButton(availableVersion)
+            }
             footer(nil)
             quitButton
         }
@@ -333,14 +336,15 @@ struct MenuContentView: View {
     }
 
     private func pauseResumeButton(for workspace: WorkspaceStatus) -> some View {
-        let disabled = workspace.rootPath == nil
+        let missingRoot = workspace.rootPath == nil
+        let disabled = missingRoot || model.isActionInProgress
         let title: String
         let symbol: String
         if workspace.state == .paused {
-            title = disabled ? "Resume unavailable: missing root" : "Resume rbox"
+            title = missingRoot ? "Resume unavailable: missing root" : "Resume rbox"
             symbol = "play.fill"
         } else {
-            title = disabled ? "Pause unavailable: missing root" : "Pause rbox"
+            title = missingRoot ? "Pause unavailable: missing root" : "Pause rbox"
             symbol = "pause.fill"
         }
 
@@ -350,9 +354,10 @@ struct MenuContentView: View {
     }
 
     private func restartButton(for workspace: WorkspaceStatus) -> some View {
-        let disabled = workspace.rootPath == nil
+        let missingRoot = workspace.rootPath == nil
+        let disabled = missingRoot || model.isActionInProgress
         return itemButton(
-            title: disabled ? "Restart unavailable: missing root" : "Restart rbox",
+            title: missingRoot ? "Restart unavailable: missing root" : "Restart rbox",
             symbol: "arrow.clockwise",
             disabled: disabled
         ) {
@@ -382,12 +387,18 @@ struct MenuContentView: View {
 
     private func updateButton(_ availableVersion: String) -> some View {
         Button {
-            model.copyInstallCommand()
+            model.upgrade()
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: model.copiedInstallCommand ? "checkmark" : "arrow.down.circle")
-                    .frame(width: 14)
-                Text(model.copiedInstallCommand ? "Copied install command" : "Update available: \(availableVersion)")
+                if model.isUpgradeInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 14)
+                } else {
+                    Image(systemName: "arrow.down.circle")
+                        .frame(width: 14)
+                }
+                Text(model.isUpgradeInProgress ? "Updating to \(availableVersion)…" : "Update to \(availableVersion)")
                     .lineLimit(1)
                 Spacer()
             }
@@ -398,6 +409,7 @@ struct MenuContentView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(model.isActionInProgress)
     }
 
     private func footer(_ workspace: WorkspaceStatus?) -> some View {
