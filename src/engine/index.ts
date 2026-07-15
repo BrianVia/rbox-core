@@ -162,6 +162,7 @@ export {
 } from "./git/journal.js";
 export {
   commitCheckout,
+  checkoutTransactionCapability,
   checkoutTransactionSupported,
   ownershipAwareGitBusy,
   setCheckoutCapabilityProbeForTests,
@@ -174,6 +175,8 @@ export {
   type CommitCheckoutOptions,
   type CommitCheckoutResult,
   type CheckoutCapabilityProbe,
+  type CheckoutTransactionCapability,
+  type CheckoutTransactionCapabilityStatus,
 } from "./git/checkout-txn.js";
 export {
   validateManifest,

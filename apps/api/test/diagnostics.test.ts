@@ -34,13 +34,18 @@ function bundle(over: Record<string, unknown> = {}): Record<string, unknown> {
     checks: {
       credentials: { ok: true, label: "credentials", message: "authenticated", latencyMs: 12 },
       enrollment: { ok: true, label: "encryption", message: "present" },
+      device: { ok: true, label: "device", message: "present" },
       daemon: { ok: true, label: "background sync", message: "running", status: "running", pid: 123 },
       remote: { ok: true, label: "remote", message: "reachable", latencyMs: 8 },
       version: { ok: true, label: "version", message: "up to date", current: "0.6.8", latest: "0.6.8" },
       state: { ok: true, label: "state", message: "ok" },
+      crypto: { ok: true, label: "crypto", message: "idle", status: "idle" },
+      locking: { ok: true, label: "locking", message: "ok (.rbox/state/sync.lock)", status: "ok" },
+      git: { ok: true, label: "git", message: "supported", status: "supported", current: "git version 2.46.0" },
+      chain: { ok: true, label: "manifest chain", message: "ok" },
     },
     daemonLogTail: "2026-07-03T00:00:00Z push: published sequence 1 (1 files)\n",
-    metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0 },
+    metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 2 },
     activity: { at: "2026-07-03T00:00:00.000Z", lastPush: { at: "2026-07-03T00:00:00.000Z", files: 1, sequence: 1 } },
     workspaceShape: { fileCount: 1, totalBytes: 42 },
     ...over,
@@ -52,6 +57,19 @@ function req(body: unknown): Request {
 }
 
 describe("POST /v1/diagnostics", () => {
+  test("accepts the legacy six checks while allowing the exact new optional vocabulary", async () => {
+    const a = await bootstrap("diag-compatible-checks");
+    const legacy = bundle();
+    const checks = legacy.checks as Record<string, unknown>;
+    for (const key of ["device", "crypto", "locking", "git", "chain"]) delete checks[key];
+    const res = await SELF.fetch(`${BASE}/v1/diagnostics`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": "application/json" }),
+      body: JSON.stringify(legacy),
+    });
+    expect(res.status).toBe(200);
+  });
+
   test("stores row-first, writes R2 outside blob accounting, and records bytes + sha", async () => {
     const a = await bootstrap("diag-upload");
     const res = await SELF.fetch(`${BASE}/v1/diagnostics`, {
@@ -75,6 +93,10 @@ describe("POST /v1/diagnostics", () => {
     const obj = await env.rbox_dev_blobs.get(row!.r2_key);
     expect(obj).not.toBeNull();
     const stored = await obj!.text();
+    const storedJson = JSON.parse(stored) as any;
+    expect(storedJson.checks.locking).toMatchObject({ status: "ok" });
+    expect(storedJson.checks.git).toMatchObject({ status: "supported" });
+    expect(storedJson.metrics).toMatchObject({ lockStarved: 2 });
     expect(row!.bytes).toBe(Buffer.byteLength(stored, "utf8"));
     expect(row!.sha256).toBe(sha(stored));
   });

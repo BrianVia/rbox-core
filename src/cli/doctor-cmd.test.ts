@@ -32,6 +32,8 @@ const checks: DoctorChecks = {
   version: { ok: true, label: "version", message: "up to date", current: "0.6.8", latest: "0.6.8" },
   state: { ok: true, label: "state", message: "ok" },
   crypto: { ok: true, label: "crypto workers", message: "idle", status: "idle" },
+  locking: { ok: true, label: "locking", message: "ok (.rbox/state/sync.lock)", status: "ok" },
+  git: { ok: true, label: "git", message: "transactional symref-update supported", status: "supported", current: "git version 2.46.0" },
 };
 
 beforeEach(async () => {
@@ -63,7 +65,7 @@ function sampleBundle(): DiagnosticsBundle {
     bunVersion: bunVersion(),
     checks,
     daemonLogTail: "daemon line with path src/app.ts\n",
-    metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0 },
+    metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 1 },
     activity: { at: "2026-07-03T00:00:00.000Z" },
     workspaceShape: { fileCount: 1, totalBytes: 42 },
   };
@@ -203,6 +205,8 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
   const oid = "0123456789abcdef0123456789abcdef01234567";
   const raw = [
     "2026-07-13T12:00:00.000Z ordinary daemon line",
+    "2026-07-13T12:00:00.100Z lock starved: reason=foreign age=15m",
+    "2026-07-13T12:00:00.200Z lock starved: reason=foreign age=15m path=/secret token=deadbeef https://user:pass@example.test",
     "2026-07-13T12:00:00.500Z git-sync: captured 1 (private/summary) · carried 0 · skipped 0 · deferred 1 (private/summary: raw summary failure) · removed 0",
     "2026-07-13T12:00:01.000Z git deferred 14d: local edits on branch secret stash branch\tname (private/repo)",
     "2026-07-13T12:00:01.500Z git deferred 14d: local edits on branch another private branch (other/private)",
@@ -224,6 +228,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
 
   const redacted = redactGitLogLines(raw);
   expect(redacted).toContain("ordinary daemon line");
+  expect(redacted).toContain("lock starved: reason=foreign age=15m");
   expect(redacted).toContain("git-sync summary reason=other age=-");
   expect(redacted).toContain("git-sync deferred reason=local-edits age=14d count=2");
   expect(redacted).toContain("git-sync deferred reason=other age=-");
@@ -236,7 +241,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
   expect(redacted).toContain("git-sync deferred reason=artifact age=1h");
   expect(redacted).not.toMatch(/\d{4}-\d\d-\d\dT\S+Z git-sync/);
   expect(redacted).not.toContain("ordinary daemon end");
-  for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret/", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
+  for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret", "deadbeef", "user:pass", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
     expect(redacted).not.toContain(secret);
   }
 
@@ -262,7 +267,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
     };
     const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
     expect(payload).toContain("git-sync deferred reason=local-edits age=14d");
-    for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret/", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
+    for (const secret of ["private/", "secret stash branch", "refs/heads", oid, "raw git failure", "raw summary failure", "/secret", "deadbeef", "user:pass", "TIMESTAMP_SHAPED_SECRET", "UNKNOWN", "malformed-without-colon"]) {
       expect(payload).not.toContain(secret);
     }
   } finally {

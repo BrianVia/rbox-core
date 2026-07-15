@@ -1,4 +1,4 @@
-import { buildIgnoreMatcher, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
@@ -29,6 +29,8 @@ import { style } from "./style.js";
 import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
+import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
+import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./ambient-status.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -82,6 +84,9 @@ export interface StatusCmdDeps {
   ) => Promise<GitDivergenceRepoHint[]>;
   daemonBindingStatus: typeof daemonBindingStatus;
   readDaemonPidRecord: typeof readDaemonPidRecord;
+  readLockingHealth?: (root: string) => Promise<LockingHealth>;
+  checkoutTransactionCapability?: typeof checkoutTransactionCapability;
+  readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -93,6 +98,9 @@ const defaultStatusDeps: StatusCmdDeps = {
   gitDivergenceFastRepoSource,
   daemonBindingStatus,
   readDaemonPidRecord,
+  readLockingHealth,
+  checkoutTransactionCapability,
+  readAmbientDaemonStatusRecord,
 };
 
 const LOCAL_TRUST_MS = 60_000;
@@ -261,6 +269,7 @@ export async function statusCmdWithDeps(
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);
+  const lockingP = (deps.readLockingHealth ?? readLockingHealth)(root);
   const accountJsonP = opts.json ? fetchStatusAccountJson(creds) : Promise.resolve(null);
   const rawActivity = await activityP;
   const attributionNow = deps.now();
@@ -392,7 +401,7 @@ export async function statusCmdWithDeps(
     };
   }
 
-  const [remote, trash, accountJson] = await Promise.all([remoteHeadP, trashP, accountJsonP]);
+  const [remote, trash, accountJson, locking] = await Promise.all([remoteHeadP, trashP, accountJsonP, lockingP]);
   const localChanges = counts.added + counts.changed + counts.deleted;
   const now = deps.now();
   const crypto = cryptoPoolStatus();
@@ -409,6 +418,24 @@ export async function statusCmdWithDeps(
   const gitDeferredRepos = projectedGitRepos.length;
   const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
   const gitOldestDeferral = projectedGitRepos[0];
+  const gitCapability: CheckoutTransactionCapability | undefined = projectedGitRepos.some((repo) => repo.displayReason === "unsupported")
+    ? await (deps.checkoutTransactionCapability ?? checkoutTransactionCapability)(root)
+    : undefined;
+  let daemonVersion: string | undefined;
+  let daemonVersionKnown = false;
+  if (alive.running) {
+    const record = (deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord)(root);
+    if (record.kind === "ok") {
+      if (record.status.daemonVersion === undefined) {
+        daemonVersion = "pre-1.6.3";
+        daemonVersionKnown = true;
+      } else if (validDaemonVersion(record.status.daemonVersion)) {
+        daemonVersion = record.status.daemonVersion;
+        daemonVersionKnown = true;
+      }
+    }
+  }
+  const daemonVersionSkew = daemonVersionKnown && daemonVersion !== RBOX_VERSION;
 
   if (opts.json) {
     const statusJson = {
@@ -424,7 +451,18 @@ export async function statusCmdWithDeps(
         remote,
         now,
       }),
-      daemon: { running: bg.running, pid: bg.pid ?? null },
+      daemon: {
+        running: bg.running,
+        pid: bg.pid ?? null,
+        version: daemonVersion ?? null,
+        cliVersion: RBOX_VERSION,
+        versionSkew: daemonVersionSkew,
+      },
+      locking: {
+        status: locking.status,
+        reason: locking.status === "ok" ? null : locking.reason,
+        path: ".rbox/state/sync.lock",
+      },
       remote: remote ? { sequence: remote.sequence, source: remote.source } : null,
       ...(counts.source === "daemon"
         ? {
@@ -442,6 +480,7 @@ export async function statusCmdWithDeps(
       account: accountJson,
       crypto,
       git: {
+        ...(gitCapability ? { capability: gitCapability } : {}),
         deferrals: gitDeferrals.map((deferral) => ({
           repo: deferral.repo,
           lane: deferral.lane,
@@ -529,6 +568,13 @@ export async function statusCmdWithDeps(
           : style.yellow("stopped")
     }`
   );
+  if (daemonVersionSkew) {
+    const daemonLabel = daemonVersion === "pre-1.6.3" ? daemonVersion : `v${daemonVersion}`;
+    console.log(`  ${style.yellow(`daemon ${daemonLabel}, CLI v${RBOX_VERSION} — restart: rbox stop && rbox start`)}`);
+  }
+  console.log(`  ${style.dim("locking:")} ${locking.status === "ok"
+    ? style.green("ok (.rbox/state/sync.lock)")
+    : style.yellow(`${locking.status}: ${locking.reason} (.rbox/state/sync.lock)`)}`);
   if (cfg.syncGit || projectedGitDeferrals.length > 0) {
     const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
     const pending = Object.keys(state.gitPendingRemote ?? {}).length;
@@ -568,6 +614,7 @@ export async function statusCmdWithDeps(
         checkout: deferral.checkout,
         bytesChanged: deferral.bytesChanged,
         now,
+        capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
       })}`);
     }
   }

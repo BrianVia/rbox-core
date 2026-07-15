@@ -31,7 +31,7 @@ import {
 } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { inputRecord } from "./sync-state.js";
-import { withWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
+import { withWorkspaceSyncMutex, WorkspaceSyncBusyError, workspaceSyncMutexDegraded, type SyncMutexOptions } from "./sync-mutex.js";
 import {
   checkoutJournalBinding,
   followDivergedRepo,
@@ -54,6 +54,9 @@ interface ResolveEnvironment {
 interface GitResolveDeps {
   build?: (root: string) => Promise<ResolveEnvironment>;
   capabilityProbe?: CheckoutCapabilityProbe;
+  mutexOptions?: SyncMutexOptions;
+  /** Test seam for the closed proof-refusal mapping after a real snapshot. */
+  forceProofIndeterminate?: boolean;
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */
   beforeSecondProof?: () => Promise<void>;
   now?: () => Date;
@@ -100,11 +103,15 @@ interface ResolveSnapshot {
   oracle: AppliedManifestOracle;
 }
 
+export type ResolveRefusalCode =
+  | "sync-busy" | "proof-indeterminate" | "journal-recovery" | "no-incoming" | "mutex-degraded" | "operation-failed"
+  | GitDeferralReason;
+
 type ResolveOutput =
   | GitResolveShow
   | { status: "resolved"; verb: "take-theirs"; repo: string; snapshot: string; quarantine: string }
   | { status: "snapshot-mismatch"; verb: "take-theirs"; repo: string; message: string; current: GitResolveShow }
-  | { status: "refused"; verb: GitResolveVerb; repo: string; code: string; message: string; current?: GitResolveShow }
+  | { status: "refused"; verb: GitResolveVerb; repo: string; code: ResolveRefusalCode; message: string; current?: GitResolveShow }
   | { status: "unsupported"; verb: "keep-mine"; repo: string; code: "not-yet-supported"; message: string; recovery: string[] };
 
 function sortedEntries(value: Record<string, string>): Array<[string, string]> {
@@ -321,11 +328,30 @@ function printShow(show: GitResolveShow, write: (line: string) => void): void {
   write(`  snapshot: ${show.snapshot}`);
 }
 
-function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps): void {
+export function safeResolveText(value: string, root: string): string {
+  let out = sanitizeTerminalText(value.replace(/[\r\n\p{Cc}]+/gu, " "));
+  const normalizedRoot = path.resolve(root).split(path.sep).join("/");
+  out = out.split(path.resolve(root)).join(".").split(normalizedRoot).join(".");
+  out = out.replace(/\b(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, "$1[redacted]@");
+  out = out.replace(/\b(authorization|bearer|access[_-]?token|api[_-]?key|password|secret)\b(?:\s*[:=]\s*|\s+)[^\s,;]+/gi, "$1 [redacted]");
+  return out.replace(/\s+/g, " ").trim();
+}
+
+function safeResolveOutput<T>(value: T, root: string): T {
+  if (typeof value === "string") return safeResolveText(value, root) as T;
+  if (Array.isArray(value)) return value.map((entry) => safeResolveOutput(entry, root)) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, safeResolveOutput(entry, root)])) as T;
+  }
+  return value;
+}
+
+function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: string): void {
   const out = deps.stdout ?? console.log;
   const err = deps.stderr ?? console.error;
+  const safe = safeResolveOutput(output, root);
   if (json) {
-    out(JSON.stringify(output, (key, value) => typeof value === "string" && key !== "snapshot"
+    out(JSON.stringify(safe, (key, value) => typeof value === "string" && key !== "snapshot"
       ? value.replace(/\b[0-9a-f]{40}\b/gi, "[commit]")
       : value));
     return;
@@ -335,30 +361,39 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps): void 
   // future verbs cannot accidentally introduce a terminal-control sink.
   const safeOut = (line: string): void => out(sanitizeTerminalText(line));
   const safeErr = (line: string): void => err(sanitizeTerminalText(line));
-  if (output.status === "show-me") { printShow(output, safeOut); return; }
-  if (output.status === "resolved") {
-    safeOut(`${output.repo}: followed incoming checkout; local Git state quarantined at ${output.quarantine}`);
+  if (safe.status === "show-me") { printShow(safe, safeOut); return; }
+  if (safe.status === "resolved") {
+    safeOut(`${safe.repo}: followed incoming checkout; local Git state quarantined at ${safe.quarantine}`);
     return;
   }
-  if (output.status === "unsupported") {
-    safeErr(`${output.repo}: keep-mine is not yet supported in this build.`);
-    for (const line of output.recovery) safeErr(`  ${line}`);
+  if (safe.status === "unsupported") {
+    safeErr(`${safe.repo}: keep-mine is not yet supported in this build.`);
+    for (const line of safe.recovery) safeErr(`  ${line}`);
     return;
   }
-  safeErr(`${output.repo}: ${output.message}`);
-  if (output.current) printShow(output.current, safeErr);
+  safeErr(`${safe.repo}: ${safe.message}`);
+  if (safe.current) printShow(safe.current, safeErr);
 }
 
-function refusalMessage(reason: GitDeferralReason, detail: string): string {
-  if (reason === "worktree-ownership") return detail;
-  const messages: Partial<Record<GitDeferralReason, string>> = {
+function refusalMessage(reason: GitDeferralReason): string {
+  const messages: Record<GitDeferralReason, string> = {
+    "local-edits": "local edits prevent the confirmed checkout from being published safely",
+    "local-index": "local index changes prevent the confirmed checkout from being published safely",
+    "local-operation": "a local Git operation prevents the confirmed checkout from being published safely",
+    "local-commits": "local commits changed while the checkout was being confirmed",
+    "local-stash": "the local stash changed while the checkout was being confirmed",
+    conflict: "the confirmed checkout still conflicts with local Git state",
     artifact: "incoming Git artifacts could not be fetched and verified",
     unreadable: "Git metadata could not be read completely",
     unsupported: "this repository shape or Git version cannot perform the journaled checkout",
     "git-busy": "Git became busy during resolution; retry after the other Git operation finishes",
     containment: "the repository containment proof failed",
+    "worktree-ownership": "another worktree owns a ref required by the confirmed checkout",
+    "ignored-target": "the confirmed checkout targets an ignored repository",
+    config: "Git configuration could not be published safely",
+    other: "the confirmed checkout could not be published safely",
   };
-  return messages[reason] ?? "the confirmed checkout could not be published safely";
+  return messages[reason];
 }
 
 async function defaultBuild(root: string): Promise<ResolveEnvironment> {
@@ -395,8 +430,14 @@ export async function gitResolveCmd(
   options: { json?: boolean; confirm?: string; forceDiscardIncoming?: boolean } = {},
   deps: GitResolveDeps = {},
 ): Promise<number> {
-  const rel = normalizedRepo(root, repoArg);
   const json = options.json === true;
+  let rel = ".";
+  try {
+    rel = normalizedRepo(root, repoArg);
+  } catch {
+    emit({ status: "refused", verb, repo: rel, code: "operation-failed", message: "the Git resolution could not complete safely; no confirmation can be reused" }, json, deps, root);
+    return 1;
+  }
   const now = deps.now ?? (() => new Date());
   const run = withWorkspaceSyncMutex(root, async (mutex) => {
     const env = await (deps.build ?? defaultBuild)(root);
@@ -406,7 +447,7 @@ export async function gitResolveCmd(
     const recovered = await recoverFirst(root, rel, ctx, state);
     state = recovered.state;
     if (recovered.error || !ctx) {
-      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: recovered.error ?? "repository is unavailable" }, json, deps);
+      emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: "journal recovery could not complete; retry after Git state settles, or inspect the local recovery copy" }, json, deps, root);
       return 1;
     }
 
@@ -425,7 +466,7 @@ export async function gitResolveCmd(
         recovery: options.forceDiscardIncoming
           ? [...recovery, "`--force-discard-incoming` cannot bypass this build-time safety boundary."]
           : recovery,
-      }, json, deps);
+      }, json, deps, root);
       return 1;
     }
 
@@ -433,7 +474,7 @@ export async function gitResolveCmd(
     const record = repoRecordsForState(state)[rel];
     const incoming = incomingFor(record);
     if (!record || !incoming || !env.cfg.kek) {
-      emit({ status: "refused", verb, repo: rel, code: "no-incoming", message: "no deferred incoming Git state is available for this repository" }, json, deps);
+      emit({ status: "refused", verb, repo: rel, code: "no-incoming", message: "no deferred incoming Git state is available for this repository" }, json, deps, root);
       return 1;
     }
     const takeSnapshot = () => buildSnapshot({
@@ -441,11 +482,11 @@ export async function gitResolveCmd(
     });
     let snapshot = await takeSnapshot();
     if (verb === "show-me") {
-      emit(snapshot.public, json, deps);
+      emit(snapshot.public, json, deps, root);
       return 0;
     }
-    if (snapshot.proofIndeterminate) {
-      emit({ status: "refused", verb, repo: rel, code: "indeterminate", message: "Git state could not be proven completely; no metadata was changed", current: snapshot.public }, json, deps);
+    if (snapshot.proofIndeterminate || deps.forceProofIndeterminate === true) {
+      emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: "proof could not complete; retry after Git state settles", current: snapshot.public }, json, deps, root);
       return 1;
     }
     if (!options.confirm || options.confirm !== snapshot.public.snapshot) {
@@ -455,18 +496,18 @@ export async function gitResolveCmd(
         repo: rel,
         message: options.confirm ? "snapshot changed; review the fresh summary and confirm again" : "--confirm <snapshot> is required",
         current: snapshot.public,
-      }, json, deps);
+      }, json, deps, root);
       return 1;
     }
     if (workspaceSyncMutexDegraded(mutex)) {
-      emit({ status: "refused", verb, repo: rel, code: "mutex-degraded", message: "workspace synchronization lock is degraded; refusing metadata mutation" }, json, deps);
+      emit({ status: "refused", verb, repo: rel, code: "mutex-degraded", message: "locking unavailable; resolution refused" }, json, deps, root);
       return 1;
     }
 
     // Confirmation is checked again immediately before the first mutation.
     snapshot = await takeSnapshot();
     if (options.confirm !== snapshot.public.snapshot) {
-      emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed before resolution began; confirm the fresh snapshot", current: snapshot.public }, json, deps);
+      emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed before resolution began; confirm the fresh snapshot", current: snapshot.public }, json, deps, root);
       return 1;
     }
 
@@ -536,20 +577,27 @@ export async function gitResolveCmd(
       const freshIncoming = incomingFor(freshRecord);
       if (boundaryMismatch && freshRecord && freshIncoming) {
         const fresh = await buildSnapshot({ root, rel, ctx, state: freshState, record: freshRecord, incoming: freshIncoming, store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: now() });
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed at the locked checkout boundary; confirm the fresh snapshot", current: fresh.public }, json, deps);
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed at the locked checkout boundary; confirm the fresh snapshot", current: fresh.public }, json, deps, root);
       } else {
-        emit({ status: "refused", verb, repo: rel, code: follow.reason, message: refusalMessage(follow.reason, follow.detail) }, json, deps);
+        emit({ status: "refused", verb, repo: rel, code: follow.reason, message: refusalMessage(follow.reason) }, json, deps, root);
       }
       return 1;
     }
     if (Object.keys(follow.heldRefs).length || !intended) throw new Error("manual resolution published an incomplete checkout");
     const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
     if (landed.recovery.status !== "keep") throw new Error("published checkout journal could not be recovered");
-    emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps);
+    emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps, root);
     return 0;
-  });
-  return run.catch(() => {
-    emit({ status: "refused", verb, repo: rel, code: "operation-failed", message: "the Git resolution could not complete safely; no confirmation can be reused" }, json, deps);
+  }, deps.mutexOptions);
+  return run.catch((error) => {
+    const busy = error instanceof WorkspaceSyncBusyError;
+    emit({
+      status: "refused",
+      verb,
+      repo: rel,
+      code: busy ? "sync-busy" : "operation-failed",
+      message: busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first" : "the Git resolution could not complete safely; no confirmation can be reused",
+    }, json, deps, root);
     return 1;
   });
 }

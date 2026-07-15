@@ -30,15 +30,27 @@ export interface SyncMetrics {
   syncs: number;
   commitConflicts409: number;
   fileConflicts: number;
+  lockStarved: number;
   lastConflictAt?: string;
 }
 
-const ZERO: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0 };
+const ZERO: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
 const metricsPath = (root: string) => path.join(root, RBOX_DIR, "state", "metrics.json");
+
+function safeCounter(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
 
 export async function loadMetrics(root: string): Promise<SyncMetrics> {
   try {
-    return { ...ZERO, ...(JSON.parse(await fs.readFile(metricsPath(root), "utf8")) as Partial<SyncMetrics>) };
+    const parsed = JSON.parse(await fs.readFile(metricsPath(root), "utf8")) as Partial<SyncMetrics>;
+    return {
+      syncs: safeCounter(parsed.syncs),
+      commitConflicts409: safeCounter(parsed.commitConflicts409),
+      fileConflicts: safeCounter(parsed.fileConflicts),
+      lockStarved: safeCounter(parsed.lockStarved),
+      ...(typeof parsed.lastConflictAt === "string" ? { lastConflictAt: parsed.lastConflictAt } : {}),
+    };
   } catch {
     return { ...ZERO }; // absent or unreadable → fresh counters (metrics are best-effort)
   }

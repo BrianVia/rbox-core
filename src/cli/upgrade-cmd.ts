@@ -8,6 +8,10 @@ import { RELEASE_KEYS } from "./release-key.js";
 import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
 import { isStandaloneBinary } from "./runtime.js";
+import { currentWorkspaceId, isDaemonProcess, parseDaemonPid, startDaemon, stopDaemon } from "./daemon-control.js";
+import { readDesiredDaemonRows, type DesiredStateRow } from "./autostart-cmd.js";
+import { workspaceKey } from "./rbox-paths.js";
+import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 
 /**
  * `rbox upgrade` (design 14) — self-update the installed binary, SAFELY:
@@ -80,9 +84,80 @@ function artifactName(): string {
   return `rbox-${osName}-${arch}`;
 }
 
-const rboxDir = () => path.join(os.homedir(), ".rbox");
+const rboxDir = () => path.join(process.env.RBOX_HOME || os.homedir(), ".rbox");
 const releaseStatePath = () => path.join(rboxDir(), "release.json");
 const lockPath = () => path.join(rboxDir(), "upgrade.lock");
+const daemonsDir = () => path.join(rboxDir(), "daemons");
+
+export interface UpgradeDaemonDeps {
+  readDesiredDaemonRows?: typeof readDesiredDaemonRows;
+  isDaemonProcess?: typeof isDaemonProcess;
+  currentWorkspaceId?: typeof currentWorkspaceId;
+  stopDaemon?: typeof stopDaemon;
+  startDaemon?: typeof startDaemon;
+  log?: (line: string) => void;
+}
+
+export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): Promise<void> {
+  const desiredRows = await (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)();
+  const desiredByKey = new Map<string, DesiredStateRow>(desiredRows.map((row) => [row.key, row]));
+  const owned = deps.isDaemonProcess ?? isDaemonProcess;
+  const currentId = deps.currentWorkspaceId ?? currentWorkspaceId;
+  const stop = deps.stopDaemon ?? stopDaemon;
+  const start = deps.startDaemon ?? startDaemon;
+  const log = deps.log ?? console.log;
+  let entries: import("node:fs").Dirent[] = [];
+  try { entries = await fsp.readdir(daemonsDir(), { withFileTypes: true }); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  let failed = false;
+  for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+    const key = entry.name;
+    let pid: number | undefined;
+    try {
+      const parsed = parseDaemonPid(await fsp.readFile(path.join(daemonsDir(), key, "daemon.pid"), "utf8"));
+      pid = parsed.pid;
+      if (!pid) throw new Error("invalid daemon record");
+    } catch {
+      failed = true;
+      log(`daemon ${key}: not restarted (runtime record unreadable)`);
+      continue;
+    }
+    if (!pid || !owned(pid)) continue;
+    const row = desiredByKey.get(key);
+    const root = row ? path.resolve(row.desired.rootPath) : undefined;
+    const valid = row !== undefined
+      && root !== undefined
+      && workspaceKey(root) === key
+      && row.desired.workspaceId === currentId(root);
+    if (!valid || !root || !row) {
+      failed = true;
+      log(`daemon ${key}: not restarted (live runtime has no valid desired workspace binding)`);
+      continue;
+    }
+    try {
+      await stop(root);
+      if (row.desired.state === "stopped") {
+        log(`daemon ${key}: stopped (desired state is stopped)`);
+        continue;
+      }
+      const result = await start(root, { pullOnly: row.desired.pullOnly === true });
+      if (result === "retry-later") throw new Error("start deferred");
+      log(`daemon ${key}: restarted${row.desired.pullOnly === true ? " (pull-only)" : ""}`);
+    } catch {
+      failed = true;
+      log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
+    }
+  }
+  if (failed) throw new Error("upgrade installed, but one or more live daemons could not be restarted");
+}
+
+async function recordVerifiedRelease(version: string): Promise<void> {
+  await fsp.mkdir(rboxDir(), { recursive: true, mode: 0o700 });
+  await writeFileAtomic(releaseStatePath(), JSON.stringify({ version }), { flag: "wx", mode: 0o600 });
+  await fsyncDirectory(rboxDir());
+}
 
 /** Acquire an exclusive cross-process upgrade lock so two concurrent `rbox
  *  upgrade` runs can't both pass the floor check and rename in reverse order
@@ -158,7 +233,7 @@ async function downloadToTemp(url: string, dir: string): Promise<{ tmp: string; 
   }
 }
 
-export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean } = {}): Promise<void> {
+export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; daemonDeps?: UpgradeDaemonDeps } = {}): Promise<void> {
   if (!isStandaloneBinary()) {
     throw new Error("`rbox upgrade` only works on an installed binary — you're running from source. Use git, or install via the one-liner.");
   }
@@ -231,8 +306,9 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean } = 
     }
 
     // 5. Record the highest verified version ONLY after a successful replace.
-    await fsp.writeFile(releaseStatePath(), JSON.stringify({ version: manifest.version }));
-    console.log(`upgraded ${RBOX_VERSION} → ${manifest.version}. Re-run rbox.`);
+    await recordVerifiedRelease(manifest.version);
+    console.log(`upgraded ${RBOX_VERSION} → ${manifest.version}`);
+    await restartDaemonsAfterUpgrade(opts.daemonDeps);
   } finally {
     releaseLock();
   }

@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { acquireLock, type AcquireLockOptions, type LockInspection, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
+import { writeFileAtomic } from "../engine/fsutil.js";
+import { daemonLogPath } from "./rbox-paths.js";
 
 export type SyncMutexMode = "cli" | "daemon";
 
@@ -12,9 +14,26 @@ export interface WorkspaceSyncMutex {
   readonly degraded?: { reason: string };
 }
 
+export type MutexBlockerKind = "live" | "foreign" | "stale-owned" | "fence";
+export type LockStarvationReason = "foreign" | "identity-drift" | "stale-owned" | "fence";
+
+export class WorkspaceSyncBusyError extends Error {
+  constructor() {
+    super("daemon/CLI is syncing; retry, or run `rbox stop` first");
+    this.name = "WorkspaceSyncBusyError";
+  }
+}
+
 export type DaemonMutexResult =
   | { status: "acquired"; handle: WorkspaceSyncMutex }
-  | { status: "contended"; detail: string };
+  | {
+      status: "contended";
+      /** Private scheduling identity. Never render, log, or upload. */
+      holderKey: string;
+      blockerKind: MutexBlockerKind;
+      /** Only these closed causes are eligible for a durable starvation episode. */
+      warningReason?: LockStarvationReason;
+    };
 
 export interface SyncMutexOptions {
   lock?: AcquireLockOptions;
@@ -26,27 +45,73 @@ export interface SyncMutexOptions {
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-const surfacedDegradedRoots = new Set<string>();
-
 export const syncMutexPath = (root: string): string => path.join(root, ".rbox", "state", "sync.lock");
+export const lockingHealthPath = (root: string): string => path.join(root, ".rbox", "state", "locking-health.json");
+export type LockingHealth =
+  | { status: "ok" }
+  | { status: "degraded-unlocked"; reason: "identity-unavailable" }
+  | { status: "starved"; reason: LockStarvationReason };
 
-function heldDetail(inspection: Exclude<LockInspection, { kind: "absent" }>): string {
-  if (inspection.kind === "live" || inspection.kind === "dead") return `pid ${inspection.marker.pid}`;
-  return inspection.reason;
+async function readStarvationWarning(root: string): Promise<LockStarvationReason | undefined> {
+  try {
+    const episodeRaw = await fs.readFile(path.join(root, ".rbox", "state", "lock-starvation.json"), "utf8");
+    if (Buffer.byteLength(episodeRaw) > 4 * 1024) return undefined;
+    const episode = JSON.parse(episodeRaw) as Record<string, unknown>;
+    if (typeof episode.warnedAt !== "number" || !Number.isSafeInteger(episode.warnedAt)) return undefined;
+    const handle = await fs.open(daemonLogPath(root), "r");
+    try {
+      const stat = await handle.stat();
+      const length = Math.min(stat.size, 64 * 1024);
+      const bytes = Buffer.alloc(length);
+      await handle.read(bytes, 0, length, stat.size - length);
+      const lines = bytes.toString("utf8").split(/\r?\n/).reverse();
+      for (const line of lines) {
+        const match = /(?:^|\s)lock starved: reason=(foreign|identity-drift|stale-owned|fence) age=(?:15m|1h|1d)$/.exec(line);
+        if (match) return match[1] as LockStarvationReason;
+      }
+      return undefined;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
 }
 
-function degradedHandle(root: string, error: unknown, onDegraded?: (message: string) => void): WorkspaceSyncMutex {
-  const reason = String(error);
-  if (!surfacedDegradedRoots.has(root)) {
-    surfacedDegradedRoots.add(root);
-    const message = `workspace locking unavailable; git config sync disabled, continuing with legacy state saves (${reason})`;
+export async function readLockingHealth(root: string): Promise<LockingHealth> {
+  try {
+    await fs.readFile(lockingHealthPath(root), "utf8");
+    return { status: "degraded-unlocked", reason: "identity-unavailable" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return { status: "degraded-unlocked", reason: "identity-unavailable" };
+    }
+    const starvation = await readStarvationWarning(root);
+    return starvation ? { status: "starved", reason: starvation } : { status: "ok" };
+  }
+}
+
+function daemonContention(result: Extract<Awaited<ReturnType<typeof acquireLock>>, { status: "held" }>): Extract<DaemonMutexResult, { status: "contended" }> {
+  return {
+    status: "contended",
+    holderKey: result.holderKey,
+    blockerKind: result.blockerKind,
+    ...(result.warningReason ? { warningReason: result.warningReason } : {}),
+  };
+}
+
+async function degradedHandle(root: string, onDegraded?: (message: string) => void): Promise<WorkspaceSyncMutex> {
+  const previous = await readLockingHealth(root);
+  await writeFileAtomic(lockingHealthPath(root), JSON.stringify({ status: "degraded-unlocked", reason: "identity-unavailable" }));
+  const message = "workspace locking unavailable; git config sync disabled, continuing with legacy state saves";
+  if (previous.status === "ok") {
     try {
       (onDegraded ?? ((line) => process.stderr.write(`warning: ${line}\n`)))(message);
     } catch {
       // Surfacing is advisory; the entire point of this bucket is never-fatal sync.
     }
   }
-  return { root, degraded: { reason } };
+  return { root, degraded: { reason: "identity-unavailable" } };
 }
 
 export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
@@ -75,24 +140,22 @@ export async function acquireWorkspaceSyncMutex(
   const attempts = mode === "cli" ? (options.attempts ?? 16) : 1;
   const retryDelayMs = options.retryDelayMs ?? 50;
   const sleep = options.sleep ?? defaultSleep;
-  let lastDetail = "unknown owner";
-
   for (let attempt = 0; attempt < attempts; attempt++) {
     const result = await acquireLock(lockPath, options.lock);
     if (result.status === "acquired") {
+      await fs.rm(lockingHealthPath(root), { force: true });
       const handle = { root, lock: result.lock };
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "unsupported") {
-      const handle = degradedHandle(root, result.error, options.onDegraded);
+      const handle = await degradedHandle(root, options.onDegraded);
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "error") throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
-    lastDetail = heldDetail(result.inspection);
-    if (mode === "daemon") return { status: "contended", detail: lastDetail };
+    if (mode === "daemon") return daemonContention(result);
     if (attempt + 1 < attempts) await sleep(retryDelayMs);
   }
-  throw new Error(`another sync is in progress (${lastDetail})`);
+  throw new WorkspaceSyncBusyError();
 }
 
 export function assertSyncMutex(handle: WorkspaceSyncMutex, root: string): void {

@@ -5,6 +5,8 @@ import path from "node:path";
 import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
+import { lockingHealthPath } from "./sync-mutex.js";
+import { daemonLogPath } from "./rbox-paths.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -158,6 +160,34 @@ async function captureStatus(opts: { json?: boolean }): Promise<string> {
   return opts.json ? stdout.trim() : lines.join("\n");
 }
 
+test("status text and JSON expose only closed locking health", async () => {
+  await fs.mkdir(path.dirname(lockingHealthPath(root)), { recursive: true });
+  await fs.writeFile(lockingHealthPath(root), JSON.stringify({ status: "degraded-unlocked", reason: "identity-unavailable" }));
+  const text = await captureStatus({});
+  const lockingLine = text.split("\n").find((line) => line.includes("locking:")) ?? "";
+  expect(lockingLine).toContain("locking: degraded-unlocked: identity-unavailable (.rbox/state/sync.lock)");
+  expect(lockingLine).not.toContain(root);
+
+  const json = JSON.parse(await captureStatus({ json: true })) as any;
+  expect(json.locking).toEqual({
+    status: "degraded-unlocked",
+    reason: "identity-unavailable",
+    path: ".rbox/state/sync.lock",
+  });
+});
+
+test("status exposes a durable starvation warning without holder details", async () => {
+  await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "state", "lock-starvation.json"), JSON.stringify({
+    holderKey: "a".repeat(64), firstSeenAt: NOW - 900_000, warnedAt: NOW,
+  }));
+  await fs.mkdir(path.dirname(daemonLogPath(root)), { recursive: true });
+  await fs.writeFile(daemonLogPath(root), `${new Date(NOW).toISOString()} lock starved: reason=foreign age=15m\n`);
+  const json = JSON.parse(await captureStatus({ json: true })) as any;
+  expect(json.locking).toEqual({ status: "starved", reason: "foreign", path: ".rbox/state/sync.lock" });
+  expect(JSON.stringify(json.locking)).not.toContain("a".repeat(64));
+});
+
 test("status renders initial sync progress instead of sequence-zero local changes", async () => {
   await fs.writeFile(path.join(root, "partially-downloaded.txt"), "local file that must not be counted as new");
   const marker: PopulateStatusV1 = {
@@ -279,7 +309,7 @@ test("degraded legacy deferral reload retains status reason and age", async () =
   });
   const out = await captureStatus({});
   expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
-  expect(out).toContain("git deferred 14d: unsupported git state on checkout unavailable (legacy)");
+  expect(out).toContain("git deferred 14d: needs Git >= 2.46 transactional symref-update; found git version");
 });
 
 test("status --json exposes only the stable local deferral projection and cannot report ok", async () => {
@@ -396,6 +426,54 @@ test("status returns the effective daemon state in text and json modes", async (
     console.log = oldLog;
     process.stdout.write = oldWrite;
   }
+});
+
+test("live daemon version skew is closed in text and JSON; stopped records are ignored", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readDaemonPidRecord = () => ({ present: true });
+  d.readAmbientDaemonStatusRecord = () => ({
+    kind: "ok",
+    status: { schemaVersion: 1, daemonVersion: "1.6.1", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+  });
+  const logs: string[] = [];
+  const oldLog = console.log;
+  const oldWrite = process.stdout.write;
+  console.log = (...parts) => void logs.push(parts.join(" "));
+  const stdout: string[] = [];
+  process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await statusCmdWithDeps(root, {}, d);
+    expect(logs.join("\n")).toContain("daemon v1.6.1, CLI v");
+    expect(logs.join("\n")).toContain("restart: rbox stop && rbox start");
+    await statusCmdWithDeps(root, { json: true }, d);
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.6.1", versionSkew: true } });
+    d.daemonBindingStatus = () => ({ alive: { running: false }, stale: false });
+    stdout.length = 0;
+    await statusCmdWithDeps(root, { json: true }, d);
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: null, versionSkew: false } });
+  } finally {
+    console.log = oldLog;
+    process.stdout.write = oldWrite;
+  }
+});
+
+test("live ambient record without daemonVersion renders pre-1.6.3 skew", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234 }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readAmbientDaemonStatusRecord = () => ({
+    kind: "ok",
+    status: { schemaVersion: 1, state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+  });
+  const logs: string[] = [];
+  const oldLog = console.log;
+  console.log = (...parts) => void logs.push(parts.join(" "));
+  try {
+    await statusCmdWithDeps(root, {}, d);
+  } finally {
+    console.log = oldLog;
+  }
+  expect(logs.join("\n")).toContain("daemon pre-1.6.3, CLI v");
 });
 
 test("one repo with multiple lanes renders one repo-level line and count", async () => {

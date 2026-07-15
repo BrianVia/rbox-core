@@ -46,6 +46,12 @@ consistency gate), commit `release: vX.Y.Z — …` on main, tag `v*`, push.
 Fleet upgrade after the run goes green:
 `curl -fsSL https://rbox.to/install.sh | sh` then `rbox stop && rbox start`
 (run from inside the workspace; binary at `~/.rbox/bin/rbox`).
+The installer is intentionally a binary swap only, so fleet/install-script
+deployments retain that explicit stop/start step. The managed `rbox upgrade`
+command instead snapshots every live daemon under `~/.rbox/daemons`, waits for
+each to stop, and restarts every safely bound desired workspace with its
+existing pull-only setting. It reports all workspace outcomes and exits
+non-zero if any live runtime cannot be restarted safely.
 Update `CHANGELOG.md` per release.
 
 ## Secrets (GitHub repo)

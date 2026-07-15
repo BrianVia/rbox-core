@@ -15,10 +15,12 @@ const PENDING_RETENTION_MS = 60 * 60 * 1000;
 const SWEEP_LIMIT = 200;
 
 const TOP_KEYS = ["version", "platform", "bunVersion", "checks", "daemonLogTail", "metrics", "activity", "workspaceShape"] as const;
-const CHECK_KEYS = ["credentials", "enrollment", "daemon", "remote", "version", "state"] as const;
+const REQUIRED_CHECK_KEYS = ["credentials", "enrollment", "daemon", "remote", "version", "state"] as const;
+const OPTIONAL_CHECK_KEYS = ["device", "crypto", "locking", "git", "chain"] as const;
+const CHECK_KEYS = [...REQUIRED_CHECK_KEYS, ...OPTIONAL_CHECK_KEYS] as const;
 const CHECK_RESULT_KEYS = ["ok", "label", "message", "hint", "latencyMs", "status", "current", "latest", "pid"] as const;
 const PLATFORM_KEYS = ["os", "arch"] as const;
-const METRICS_KEYS = ["syncs", "commitConflicts409", "fileConflicts", "lastConflictAt", "excluded", "truncated", "originalBytes"] as const;
+const METRICS_KEYS = ["syncs", "commitConflicts409", "fileConflicts", "lockStarved", "lastConflictAt", "excluded", "truncated", "originalBytes"] as const;
 const ACTIVITY_KEYS = ["at", "lastPush", "lastPull", "active", "halt", "excluded", "truncated", "originalBytes"] as const;
 const WORKSPACE_SHAPE_KEYS = ["fileCount", "totalBytes"] as const;
 
@@ -117,10 +119,11 @@ function validateCheckResult(v: unknown, name: string): ValidationResult {
 
 function validateChecks(v: unknown): ValidationResult {
   if (!isRecord(v)) return { ok: false, message: "checks must be an object" };
-  const unknown = assertOnlyKeys(v, CHECK_KEYS, "checks") ?? requireKeys(v, CHECK_KEYS, "checks");
+  const unknown = assertOnlyKeys(v, CHECK_KEYS, "checks") ?? requireKeys(v, REQUIRED_CHECK_KEYS, "checks");
   if (unknown) return { ok: false, message: unknown };
   const out: JsonRecord = {};
   for (const key of CHECK_KEYS) {
+    if (!(key in v)) continue;
     const r = validateCheckResult(v[key], `checks.${key}`);
     if (!r.ok) return r;
     out[key] = r.value;
@@ -139,7 +142,7 @@ function validateMetrics(v: unknown): ValidationResult {
   const unknown = assertOnlyKeys(v, METRICS_KEYS, "metrics");
   if (unknown) return { ok: false, message: unknown };
   const out: JsonRecord = {};
-  for (const key of ["syncs", "commitConflicts409", "fileConflicts", "originalBytes"] as const) {
+  for (const key of ["syncs", "commitConflicts409", "fileConflicts", "lockStarved", "originalBytes"] as const) {
     if (v[key] === undefined) continue;
     const n = safeNumber(v[key], `metrics.${key}`);
     if (!n.ok) return n;

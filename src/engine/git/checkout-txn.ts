@@ -70,7 +70,12 @@ export type CommitCheckoutResult =
   | { status: "unsupported"; reason: string };
 
 export type CheckoutCapabilityProbe = (gitVersion: string) => Promise<boolean>;
-const capabilityCache = new Map<string, boolean>();
+export type CheckoutTransactionCapabilityStatus = "supported" | "git-missing" | "version-unavailable" | "probe-failed" | "unsupported";
+export interface CheckoutTransactionCapability {
+  status: CheckoutTransactionCapabilityStatus;
+  version?: string;
+}
+const capabilityCache = new Map<string, CheckoutTransactionCapability>();
 let injectedCapabilityProbe: CheckoutCapabilityProbe | undefined;
 
 export function setCheckoutCapabilityProbeForTests(probe: CheckoutCapabilityProbe | undefined): void {
@@ -184,27 +189,60 @@ async function defaultCapabilityProbe(): Promise<boolean> {
     await exec("git", ["-C", root, "commit", "--allow-empty", "-qm", "probe"], { env: cleanGitEnv() });
     await exec("git", ["-C", root, "branch", "probe"], { env: cleanGitEnv() });
     const tx = new RefTransaction(root);
-    await tx.start();
-    await tx.write("option no-deref");
-    await tx.write("symref-update HEAD refs/heads/probe ref refs/heads/main");
-    await tx.prepare();
-    await tx.commit();
-    return true;
-  } catch {
-    return false;
+    try {
+      await tx.start();
+      await tx.write("option no-deref");
+      await tx.write("symref-update HEAD refs/heads/probe ref refs/heads/main");
+      await tx.prepare();
+      await tx.commit();
+      return true;
+    } catch (error) {
+      await tx.abort().catch(() => {});
+      // Older Git rejects the command itself. Other failures mean the
+      // functional probe could not complete and must not be mislabeled as an
+      // unsupported capability.
+      const detail = error instanceof Error ? error.message : "";
+      if (/unknown command|invalid command|symref-update/i.test(detail)) return false;
+      throw error;
+    }
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
 }
 
-export async function checkoutTransactionSupported(repoDir: string, probe?: CheckoutCapabilityProbe): Promise<boolean> {
-  const { stdout } = await exec("git", ["--version"], { env: cleanGitEnv() });
-  const version = stdout.toString().trim();
+function cleanGitVersion(value: string): string | undefined {
+  const clean = value.replace(/[\r\n\p{Cc}]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+  return /^git version \S+(?: .*)?$/.test(clean) ? clean : undefined;
+}
+
+export async function checkoutTransactionCapability(
+  repoDir: string,
+  probe?: CheckoutCapabilityProbe,
+  versionCommand: () => Promise<{ stdout: Buffer | string }> = () => exec("git", ["--version"], { env: cleanGitEnv() }),
+): Promise<CheckoutTransactionCapability> {
+  let version: string | undefined;
+  try {
+    const result = await versionCommand();
+    version = cleanGitVersion(result.stdout.toString());
+  } catch (error) {
+    return { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "git-missing" : "version-unavailable" };
+  }
+  if (!version) return { status: "version-unavailable" };
   const cached = capabilityCache.get(version);
   if (cached !== undefined) return cached;
-  const supported = await (probe ?? injectedCapabilityProbe ?? (async () => defaultCapabilityProbe()))(version);
-  capabilityCache.set(version, supported);
-  return supported;
+  let result: CheckoutTransactionCapability;
+  try {
+    const supported = await (probe ?? injectedCapabilityProbe ?? (async () => defaultCapabilityProbe()))(version);
+    result = { status: supported ? "supported" : "unsupported", version };
+  } catch {
+    result = { status: "probe-failed", version };
+  }
+  capabilityCache.set(version, result);
+  return result;
+}
+
+export async function checkoutTransactionSupported(repoDir: string, probe?: CheckoutCapabilityProbe): Promise<boolean> {
+  return (await checkoutTransactionCapability(repoDir, probe)).status === "supported";
 }
 
 async function defaultConnectivityProof(repoDir: string, roots: readonly string[]): Promise<boolean> {
