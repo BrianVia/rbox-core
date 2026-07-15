@@ -1675,6 +1675,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const a = await bootstrap("acct-dev-list");
     const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
     await pairRedeem(pair); // a 2nd durable device on the account
+    await env.rbox_dev_db.prepare("UPDATE devices SET last_seen_version = '1.6.2' WHERE device_id = ?").bind(a.deviceId).run();
     const res = await getDevices(a.token);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { devices: Array<Record<string, unknown>>; nextCursor: string | null };
@@ -1685,9 +1686,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
       expect(raw).not.toContain(banned);
     }
     for (const d of body.devices) {
-      expect(Object.keys(d).sort()).toEqual(["createdAt", "deviceId", "isCurrent", "kind", "label", "lastSeenAt"]);
+      expect(Object.keys(d).sort()).toEqual(["createdAt", "deviceId", "isCurrent", "kind", "label", "lastSeenAt", "lastSeenVersion"]);
       expect(d.kind).toBe("cli");
     }
+    expect(body.devices.find((d) => d.deviceId === a.deviceId)?.lastSeenVersion).toBe("1.6.2");
     // isCurrent is true for EXACTLY the caller's own device.
     expect(body.devices.filter((d) => d.isCurrent).map((d) => d.deviceId)).toEqual([a.deviceId]);
   });

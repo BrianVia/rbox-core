@@ -99,6 +99,7 @@ export interface Device {
 	kind: 'cli' | 'web';
 	createdAt: number;
 	lastSeenAt: number | null;
+	lastSeenVersion: string | null;
 	isCurrent: boolean;
 }
 export interface Workspace {

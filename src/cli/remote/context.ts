@@ -7,6 +7,7 @@
  */
 import { translateRemoteError } from "./errors.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
+import { RBOX_VERSION } from "../version.js";
 
 const authGrantEnabled = (): boolean => process.env.RBOX_AUTH_GRANT !== "0";
 export const UPLOAD_GRANT_ATTACH_WINDOW_MS = 270_000;
@@ -47,7 +48,7 @@ export class RemoteContext {
   private uploadGrantRetryBlockedUntilMs = 0;
 
   get auth(): Record<string, string> {
-    return { authorization: `Bearer ${this.token}` };
+    return { authorization: `Bearer ${this.token}`, "x-rbox-version": RBOX_VERSION };
   }
   /** `auth` plus the §27 download grant when held (so blob GETs skip the D1 read). */
   get authDownload(): Record<string, string> {
@@ -61,7 +62,7 @@ export class RemoteContext {
     }
   }
   get protoAuth(): Record<string, string> {
-    return { authorization: `Bearer ${this.token}`, "x-rbox-protocol": RemoteContext.PROTO };
+    return { ...this.auth, "x-rbox-protocol": RemoteContext.PROTO };
   }
   /** Bearer is always present; the grant is only a server verification fast path. */
   get batchPutAuth(): Record<string, string> {

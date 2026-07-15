@@ -14,3 +14,4 @@ export function resolveRboxVersion(definedVersion: string | undefined): string {
  *  In a source checkout it stays the package.json version. Dev builds pass
  *  __RBOX_DEV_VERSION__ via `bun build --compile --define`. */
 export const RBOX_VERSION = resolveRboxVersion(typeof __RBOX_DEV_VERSION__ === "string" ? __RBOX_DEV_VERSION__ : undefined);
+

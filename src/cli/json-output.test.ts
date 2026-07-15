@@ -329,11 +329,39 @@ test("device list --json emits JSON", async () => {
   process.env.RBOX_DEVICE_ID = "dev_a";
   stubFetch(() => ({
     status: 200,
-    body: { devices: [{ device_id: "dev_a", label: "laptop", created_at: 1, last_seen_at: 2, isSelf: true }] },
+    body: { devices: [{ device_id: "dev_a", label: "laptop", created_at: 1, last_seen_at: 2, last_seen_version: "1.6.2", isSelf: true }] },
   }));
 
   const dto = JSON.parse(await captureStdout(() => listDevices({ json: true })));
-  expect(dto).toEqual({ devices: [{ id: "dev_a", kind: "cli", createdAt: 1, lastSeenAt: 2, revoked: false }] });
+  expect(dto).toEqual({ devices: [{ id: "dev_a", kind: "cli", createdAt: 1, lastSeenAt: 2, lastSeenVersion: "1.6.2", revoked: false }] });
+});
+
+test("device list text renders known and unknown versions", async () => {
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_API = "https://api.test";
+  process.env.RBOX_DEVICE_ID = "dev_a";
+  stubFetch(() => ({
+    status: 200,
+    body: {
+      devices: [
+        { device_id: "dev_a", label: "laptop", created_at: 1, last_seen_at: null, last_seen_version: "1.6.2", isSelf: true },
+        { device_id: "dev_b", label: null, created_at: 2, last_seen_at: null, isSelf: false },
+      ],
+    },
+  }));
+
+  // console.log capture (NOT captureStdout): Bun's console.log writes to the fd
+  // directly, bypassing process.stdout.write, so the shared helper can't see it.
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => lines.push(args.join(" "));
+  try {
+    await listDevices();
+  } finally {
+    console.log = originalLog;
+  }
+  expect(lines).toContain("* dev_a  laptop  version 1.6.2  last-seen never");
+  expect(lines).toContain("  dev_b    version —  last-seen never");
 });
 
 test("account status --json emits JSON", async () => {

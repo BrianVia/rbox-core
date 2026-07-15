@@ -6,9 +6,9 @@ import { dirDb } from "../db.js";
 // GET /v1/auth/devices  (authed) -> device list, SCOPED to the caller's account.
 export async function listDevices(env: Env, self: Principal): Promise<Response> {
   const rows = await dirDb(env)
-    .prepare("SELECT device_id, label, created_at, last_seen_at FROM devices WHERE revoked = 0 AND account_id = ? ORDER BY created_at")
+    .prepare("SELECT device_id, label, created_at, last_seen_at, last_seen_version FROM devices WHERE revoked = 0 AND account_id = ? ORDER BY created_at")
     .bind(self.accountId)
-    .all<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null }>();
+    .all<{ device_id: string; label: string | null; created_at: number; last_seen_at: number | null; last_seen_version: string | null }>();
   return json({ devices: (rows.results ?? []).map((r) => ({ ...r, isSelf: r.device_id === self.deviceId })) });
 }
 
