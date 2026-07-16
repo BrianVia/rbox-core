@@ -277,10 +277,11 @@ test("rootless policy uses one deterministic skip-marker outcome", async () => {
   expect(runtimeMarkers()).toEqual([]);
 });
 
-test("transient Docker doctor probe always cleans up its namespaced container", async () => {
+test("transient Docker doctor probe uses an anonymous auto-removed container", async () => {
   select("docker"); const seen: string[][] = [];
-  setSpawnCaptureForTests(async (argv) => { seen.push(argv); return argv.includes("--attach") ? result("", 1, "probe failed") : result(); });
+  setSpawnCaptureForTests(async (argv) => { seen.push(argv); return result("", 1, "probe failed"); });
   expect((await runDockerDoctorProbe("/repo")).exitCode).toBe(1);
   expect(seen[0]).toContain("type=bind,source=/repo,target=/checkout,readonly");
-  expect(seen.at(-1)?.slice(0, 3)).toEqual(["docker", "rm", "--force"]);
+  expect(seen[0]?.slice(0, 3)).toEqual(["docker", "run", "--rm"]);
+  expect(seen).toHaveLength(1);
 });

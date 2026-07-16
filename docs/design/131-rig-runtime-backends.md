@@ -56,6 +56,9 @@ interface RunnerBackend {
                                                 // intervals (Docker) and keeps delta math for
                                                 // cumulative-usec (Apple) — idle-cpu mean/peak
                                                 // tested end-to-end on BOTH sample kinds
+                                                // idle peak gates on instant-percent p95 (raw max
+                                                // remains context), cumulative-usec true max
+                                                // (field calibration, first Docker run)
   createCmdOverride(): string[] | undefined;    // apple: ["/usr/bin/tini","--","sleep","infinity"];
                                                 // docker: undefined (ENTRYPOINT honored — the image's
                                                 // tini ENTRYPOINT + sleep CMD apply; zombie reaping

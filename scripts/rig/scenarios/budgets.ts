@@ -28,7 +28,11 @@ export const IDLE_BUDGETS = {
 
 export interface IdleAssessment {
   meanCpuPct: number;
+  /** Peak statistic used for the budget gate (p95 for instant-percent, max otherwise). */
   peakCpuPct: number;
+  /** True maximum, retained as context when instant-percent peak gating uses p95. */
+  rawMaxCpuPct: number;
+  peakCpuStatistic: "p95" | "max";
   peakMemMB: number;
   /** Samples that fell inside the soak window. */
   samples: number;
@@ -39,12 +43,22 @@ export interface IdleAssessment {
 
 type Sample = Record<string, unknown> & { ts?: unknown };
 
+/** Nearest-rank percentile: p95 is the value at sorted rank ceil(0.95 * n). */
+function percentile95(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.ceil(sorted.length * 0.95) - 1] ?? 0;
+}
+
 /**
  * Assess a device's idle soak: keep only samples whose `ts` falls in
- * [`windowStartMs`, `windowEndMs`], then derive peak CPU%/mem from
- * {@link summarizeStats} and MEAN CPU% as (core-seconds / window-span) × 100. A
- * window with <2 samples yields zero CPU (no interval to measure) and is within
- * budget — the caller decides whether too-few-samples is itself a failure. PURE.
+ * [`windowStartMs`, `windowEndMs`], then derive CPU%/mem from
+ * {@link summarizeStats} and MEAN CPU% as (core-seconds / window-span) × 100.
+ * Instant-percent runs use the nearest-rank p95 sample for the peak gate; cumulative
+ * runs retain the reducer's true interval max. The raw max is always returned for
+ * context. A window with <2 samples yields zero mean CPU (no interval to measure)
+ * and is within budget when its peak also passes — the caller decides whether
+ * too-few-samples is itself a failure. PURE.
  */
 export function assessIdle(samples: Sample[], windowStartMs: number, windowEndMs: number): IdleAssessment {
   const inWindow = samples.filter((s) => {
@@ -52,11 +66,29 @@ export function assessIdle(samples: Sample[], windowStartMs: number, windowEndMs
     return Number.isFinite(t) && t >= windowStartMs && t <= windowEndMs;
   });
   const stat = summarizeStats(inWindow);
+  const instantCpuPcts = inWindow.flatMap((sample) => {
+    const cpu = sample.cpu;
+    if (!cpu || typeof cpu !== "object" || !("kind" in cpu) || cpu.kind !== "instant-percent" || !("pct" in cpu) || typeof cpu.pct !== "number" || !Number.isFinite(cpu.pct)) return [];
+    return [cpu.pct];
+  });
+  // Only a homogeneous canonical instant-percent window gets spike smoothing.
+  // Mixed or malformed input falls back to the conservative true max.
+  const peakCpuStatistic = inWindow.length > 0 && instantCpuPcts.length === inWindow.length ? "p95" : "max";
+  const peakCpuPct = peakCpuStatistic === "p95" ? percentile95(instantCpuPcts) : stat.peakCpuPct;
   const times = inWindow.map((s) => Date.parse(String(s.ts))).filter((t) => Number.isFinite(t));
   const spanSeconds = times.length >= 2 ? (Math.max(...times) - Math.min(...times)) / 1000 : 0;
   const meanCpuPct = spanSeconds > 0 ? (stat.cpuCoreSecondsTotal / spanSeconds) * 100 : 0;
   // CPU-only: guest-wide peakMemMB is context (see IDLE_BUDGETS doc), the daemon-RSS
   // budget is asserted separately by the scenario from an in-guest VmHWM read.
-  const withinBudget = meanCpuPct < IDLE_BUDGETS.meanCpuPctMax && stat.peakCpuPct < IDLE_BUDGETS.peakCpuPctMax;
-  return { meanCpuPct, peakCpuPct: stat.peakCpuPct, peakMemMB: stat.peakMemMB, samples: inWindow.length, spanSeconds, withinBudget };
+  const withinBudget = meanCpuPct < IDLE_BUDGETS.meanCpuPctMax && peakCpuPct < IDLE_BUDGETS.peakCpuPctMax;
+  return {
+    meanCpuPct,
+    peakCpuPct,
+    rawMaxCpuPct: stat.peakCpuPct,
+    peakCpuStatistic,
+    peakMemMB: stat.peakMemMB,
+    samples: inWindow.length,
+    spanSeconds,
+    withinBudget,
+  };
 }
