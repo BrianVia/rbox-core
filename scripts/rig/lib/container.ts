@@ -28,11 +28,11 @@ export interface StatsSample {
   name: string;
   ts: string;
   memBytes: number;
+  /** Apple cumulative usec becomes an interval delta; Docker's instantaneous
+   * percentage is integrated over elapsed sample intervals. */
   cpu: { kind: "cumulative-usec"; usec: number } | { kind: "instant-percent"; pct: number };
   runner: RunnerName;
 }
-
-export interface DoctorCheck { id: string; label: string }
 
 export interface RunnerBackend {
   bin: "container" | "docker";
@@ -50,7 +50,13 @@ export interface RunnerBackend {
   parseStats(json: string): StatsSample[];
   createCmdOverride(): string[] | undefined;
   parseSpecLabel(inspectJson: unknown): string | undefined;
-  doctorChecks(): DoctorCheck[];
+  systemStatus(): Promise<{ healthy: boolean; raw: string }>;
+  systemStart(): Promise<void>;
+  imageExists(tag: string): Promise<boolean>;
+  networkExists(name: string): Promise<boolean>;
+  networkCreateArgs(name: string): string[];
+  containerExists(name: string): Promise<boolean>;
+  listRigVolumes(): Promise<RigVolume[]>;
 }
 
 function redactArgv(argv: string[], secrets: string[] | undefined): string {
@@ -201,17 +207,6 @@ export function parseDockerStats(json: string, ts = new Date().toISOString()): S
   });
 }
 
-const APPLE_DOCTOR: DoctorCheck[] = [
-  { id: "macos-version", label: "macOS >= 26" }, { id: "arm64", label: "arch arm64" },
-  { id: "runtime-version", label: "container CLI present" }, { id: "runtime-ready", label: "container system running" },
-  { id: "disk-headroom", label: "runs/cache disk headroom" },
-];
-const DOCKER_DOCTOR: DoctorCheck[] = [
-  { id: "docker-info", label: "Docker server capabilities" }, { id: "local-context", label: "Docker context is local" },
-  { id: "docker-disk", label: "Docker/runs/cache disk space" }, { id: "docker-probe", label: "Docker bind/network probe" },
-  { id: "builder-cache", label: "Docker builder cache size" }, { id: "rootless-policy", label: "rootless resource-limit policy" },
-];
-
 const APPLE_VERBS: RunnerBackend["verbs"] = {
   imageDelete: ["image", "delete"], networkList: ["network", "list"], networkDelete: ["network", "delete"],
   psAll: ["ls", "--all"], containerDelete: ["delete", "--force"], volumeList: ["volume", "list"],
@@ -222,13 +217,19 @@ const DOCKER_VERBS: RunnerBackend["verbs"] = {
 };
 
 export async function dockerEndpoint(): Promise<string> {
-  if (process.env.DOCKER_HOST) return process.env.DOCKER_HOST;
+  if (process.env.DOCKER_HOST) return process.env.DOCKER_HOST.trim().replace(/^["']+|["']+$/g, "");
   const shown = await spawnCapture(["docker", "context", "show"], { allowFail: true, timeoutMs: 10_000 });
   if (shown.exitCode !== 0) throw new Error(`docker context show failed: ${(shown.stderr || shown.stdout).trim()}`);
   const name = shown.stdout.trim();
   const inspected = await spawnCapture(["docker", "context", "inspect", name, "--format", "{{json .Endpoints.docker.Host}}"], { allowFail: true, timeoutMs: 10_000 });
   if (inspected.exitCode !== 0) throw new Error(`docker context inspect failed: ${(inspected.stderr || inspected.stdout).trim()}`);
-  try { return String(JSON.parse(inspected.stdout.trim())); } catch { return inspected.stdout.trim().replace(/^"|"$/g, ""); }
+  let endpoint: string;
+  try {
+    endpoint = String(JSON.parse(inspected.stdout.trim()));
+  } catch {
+    endpoint = inspected.stdout.trim();
+  }
+  return endpoint.replace(/^["']+|["']+$/g, "");
 }
 
 export function isLocalDockerEndpoint(endpoint: string): boolean { return endpoint.startsWith("unix://"); }
@@ -243,13 +244,19 @@ export interface DockerInfo {
   CpuCfsQuota?: unknown; // tolerate older/alternate API serializers
   DockerRootDir?: unknown;
   SecurityOptions?: unknown;
+  ServerErrors?: unknown;
 }
 export async function dockerInfo(): Promise<DockerInfo> {
   const r = await run(["info", "--format", "{{json .}}"], { allowFail: true, timeoutMs: 15_000 });
   if (r.exitCode !== 0) throw new Error(`Docker daemon is unavailable: ${(r.stderr || r.stdout).trim()}`);
   const parsed: unknown = JSON.parse(r.stdout);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("docker info returned a non-object payload");
-  return parsed as DockerInfo;
+  const info = parsed as DockerInfo;
+  if (Array.isArray(info.ServerErrors) && info.ServerErrors.length > 0) {
+    throw new Error(`Docker daemon is unavailable: ${String(info.ServerErrors[0])}`);
+  }
+  if (!info.ServerVersion) throw new Error("Docker daemon is unavailable: docker info returned no ServerVersion");
+  return info;
 }
 
 export function dockerIsRootless(info: DockerInfo): boolean {
@@ -284,7 +291,9 @@ export async function runDockerDoctorProbe(repoRoot: string): Promise<RunResult>
 }
 
 const appleBackend: RunnerBackend = {
-  bin: "container", name: "apple-container", verbs: APPLE_VERBS,
+  bin: "container",
+  name: "apple-container",
+  verbs: APPLE_VERBS,
   async ensureRuntimeReady() {
     const status = await run(["system", "status"], { allowFail: true });
     if (status.exitCode === 0) return;
@@ -292,21 +301,101 @@ const appleBackend: RunnerBackend = {
     const recheck = await run(["system", "status"], { allowFail: true });
     if (recheck.exitCode !== 0) throw new Error(`container system unhealthy after start:\n${(recheck.stdout + recheck.stderr).trim()}`);
   },
-  parseInspectMounts: parseAppleInspectMounts, parseStats: parseAppleStats,
+  parseInspectMounts: parseAppleInspectMounts,
+  parseStats: parseAppleStats,
+  // Apple ignores the image ENTRYPOINT, so explicitly keep tini as PID 1. Its
+  // zombie reaping prevents the production zombie-lock class the rig caught.
   createCmdOverride: () => ["/usr/bin/tini", "--", "sleep", "infinity"],
-  parseSpecLabel: parseAppleSpecLabel, doctorChecks: () => APPLE_DOCTOR.map((c) => ({ ...c })),
+  parseSpecLabel: parseAppleSpecLabel,
+  async systemStatus() {
+    const r = await run(["system", "status"], { allowFail: true });
+    return { healthy: r.exitCode === 0, raw: (r.stdout + r.stderr).trim() };
+  },
+  async systemStart() {
+    await run(["system", "start"]);
+  },
+  async imageExists(tag) {
+    const r = await run(["image", "ls", "--format", "json"], { allowFail: true });
+    if (r.exitCode !== 0) return false;
+    try {
+      const stdout = JSON.stringify(JSON.parse(r.stdout));
+      return stdout.includes(`"${tag}"`) || stdout.includes(`${tag}:latest`);
+    } catch {
+      return r.stdout.includes(tag);
+    }
+  },
+  async networkExists(name) {
+    const r = await run([...APPLE_VERBS.networkList, "--format", "json"], { allowFail: true });
+    return r.exitCode === 0 && r.stdout.includes(`"${name}"`);
+  },
+  networkCreateArgs: (name) => ["network", "create", name],
+  async containerExists(name) {
+    const r = await run([...APPLE_VERBS.psAll, "--format", "json"], { allowFail: true });
+    // Apple JSON is unstable pre-1.0; quoted substring matching defends against
+    // command/label substrings impersonating the container name.
+    return r.exitCode === 0 && r.stdout.includes(`"${name}"`);
+  },
+  async listRigVolumes() {
+    const r = await run([...APPLE_VERBS.volumeList, "--format", "json"], { allowFail: true });
+    if (r.exitCode !== 0) throw volumeListingError("container", r);
+    try {
+      const volumes: RigVolume[] = [];
+      for (const row of rows(JSON.parse(r.stdout))) {
+        const entry = Object.entries(row).find(([key, value]) => key.toLowerCase().includes("name") && typeof value === "string");
+        if (!entry) throw new Error("Apple volume row lacks a string name field");
+        const name = entry[1] as string;
+        if (name.startsWith("rig-")) volumes.push({ name, size: "unknown" });
+      }
+      return uniqueVolumes(volumes);
+    } catch (e) {
+      throw volumeParseError("container", e);
+    }
+  },
 };
 const dockerBackend: RunnerBackend = {
-  bin: "docker", name: "docker", verbs: DOCKER_VERBS,
+  bin: "docker",
+  name: "docker",
+  verbs: DOCKER_VERBS,
   async ensureRuntimeReady() {
     const endpoint = await dockerEndpoint();
     if (!isLocalDockerEndpoint(endpoint)) throw new Error(`rig: refusing remote Docker context (${endpoint || "unknown endpoint"}); bind mounts must resolve on this checkout's host`);
     const info = await run(["info"], { allowFail: true, timeoutMs: 15_000 });
     if (info.exitCode !== 0) throw new Error(`Docker daemon is unavailable: ${(info.stderr || info.stdout).trim()}\nfix: start Docker, then check local socket permissions`);
   },
-  parseInspectMounts: parseDockerInspectMounts, parseStats: parseDockerStats,
-  createCmdOverride: () => undefined, parseSpecLabel: parseDockerSpecLabel,
-  doctorChecks: () => DOCKER_DOCTOR.map((c) => ({ ...c })),
+  parseInspectMounts: parseDockerInspectMounts,
+  parseStats: parseDockerStats,
+  createCmdOverride: () => undefined,
+  parseSpecLabel: parseDockerSpecLabel,
+  async systemStatus() {
+    const r = await run(["info"], { allowFail: true, timeoutMs: 15_000 });
+    return { healthy: r.exitCode === 0, raw: (r.stdout + r.stderr).trim() };
+  },
+  async systemStart() {},
+  async imageExists(tag) {
+    return (await run(["image", "inspect", tag], { allowFail: true })).exitCode === 0;
+  },
+  async networkExists(name) {
+    const r = await run([...DOCKER_VERBS.networkList, "--filter", `name=^${name}$`, "--format", "json"], { allowFail: true });
+    return r.exitCode === 0 && exactDockerRows(r.stdout, "Name", name);
+  },
+  networkCreateArgs: (name) => ["network", "create", "--label", "rig=1", name],
+  async containerExists(name) {
+    const r = await run([...DOCKER_VERBS.psAll, "--filter", `name=^/${name}$`, "--format", "json"], { allowFail: true });
+    return r.exitCode === 0 && exactDockerRows(r.stdout, "Names", name);
+  },
+  async listRigVolumes() {
+    const r = await run([...DOCKER_VERBS.volumeList, "--filter", "name=rig-", "--format", "json"], { allowFail: true });
+    if (r.exitCode !== 0) throw volumeListingError("docker", r);
+    try {
+      const volumes = parseNdjson(r.stdout).map((row) => {
+        if (typeof row.Name !== "string") throw new Error("Docker volume row lacks string Name");
+        return { name: row.Name, size: typeof row.Size === "string" ? row.Size : "unknown" };
+      }).filter((volume) => volume.name.startsWith("rig-"));
+      return uniqueVolumes(volumes);
+    } catch (e) {
+      throw volumeParseError("docker", e);
+    }
+  },
 };
 
 export function resolveRunnerName(flag: string | undefined, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): RunnerName {
@@ -328,8 +417,12 @@ function backend(): RunnerBackend {
   return selected;
 }
 export function runnerName(): RunnerName { return backend().name; }
-export function runnerBackendForTests(name: RunnerName): RunnerBackend { return name === "docker" ? dockerBackend : appleBackend; }
-export function resetRunnerForTests(): void { selected = undefined; configuredFlag = undefined; markers = []; }
+export function backendFor(name: RunnerName): RunnerBackend { return name === "docker" ? dockerBackend : appleBackend; }
+export function resetRunnerForTests(): void {
+  selected = undefined;
+  configuredFlag = undefined;
+  markers = [];
+}
 
 /** Runtime invocation choke point. */
 export async function run(args: string[], opts: RunOpts = {}): Promise<RunResult> {
@@ -351,12 +444,24 @@ export function spawnStream(argv: string[], opts: StreamOpts = {}): StreamHandle
   return { exited: proc.exited, kill: (signal) => proc.kill(signal) };
 }
 async function pumpLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
-  const reader = stream.getReader(); const decoder = new TextDecoder(); let buf = "";
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (value) { buf += decoder.decode(value, { stream: true }); let nl: number; while ((nl = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); } }
-      if (done) { if (buf) onLine(buf); break; }
+      if (value) {
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          onLine(buf.slice(0, nl));
+          buf = buf.slice(nl + 1);
+        }
+      }
+      if (done) {
+        if (buf) onLine(buf);
+        break;
+      }
     }
   } catch { /* process killed */ }
 }
@@ -364,7 +469,6 @@ export function streamContainerLogsArgv(name: string, runner: RunnerName = runne
 export function streamContainerLogs(name: string, opts: StreamOpts = {}): StreamHandle { return spawnStream(streamContainerLogsArgv(name), opts); }
 
 export async function ensureRuntimeReady(): Promise<void> { await backend().ensureRuntimeReady(); }
-export function doctorChecks(): DoctorCheck[] { return backend().doctorChecks(); }
 export function createCmdOverride(): string[] | undefined { return backend().createCmdOverride(); }
 export async function containerStats(names: string[]): Promise<StatsSample[]> {
   const r = await run(["stats", "--format", "json", "--no-stream", ...names], { allowFail: true });
@@ -372,17 +476,16 @@ export async function containerStats(names: string[]): Promise<StatsSample[]> {
   return backend().parseStats(r.stdout);
 }
 export async function systemStatus(): Promise<{ healthy: boolean; raw: string }> {
-  if (backend().name === "docker") { const r = await run(["info"], { allowFail: true, timeoutMs: 15_000 }); return { healthy: r.exitCode === 0, raw: (r.stdout + r.stderr).trim() }; }
-  const r = await run(["system", "status"], { allowFail: true }); return { healthy: r.exitCode === 0, raw: (r.stdout + r.stderr).trim() };
+  return backend().systemStatus();
 }
-export async function systemStart(): Promise<void> { if (backend().name === "apple-container") await run(["system", "start"]); }
-export async function version(): Promise<string> { const r = await run(["--version"], { allowFail: true }); return (r.stdout || r.stderr).trim(); }
+export async function systemStart(): Promise<void> { await backend().systemStart(); }
+export async function version(): Promise<string> {
+  const r = await run(["--version"], { allowFail: true });
+  return (r.stdout || r.stderr).trim();
+}
 
 export async function imageExists(tag: string): Promise<boolean> {
-  if (backend().name === "docker") return (await run(["image", "inspect", tag], { allowFail: true })).exitCode === 0;
-  const r = await run(["image", "ls", "--format", "json"], { allowFail: true });
-  if (r.exitCode !== 0) return false;
-  try { return JSON.stringify(JSON.parse(r.stdout)).includes(`"${tag}"`) || JSON.stringify(JSON.parse(r.stdout)).includes(`${tag}:latest`); } catch { return r.stdout.includes(tag); }
+  return backend().imageExists(tag);
 }
 export interface BuildSpec { tag: string; dockerfile: string; contextDir: string; buildArgs?: Record<string, string>; labels?: Record<string, string> }
 export function buildImageArgs(spec: BuildSpec): string[] {
@@ -390,7 +493,8 @@ export function buildImageArgs(spec: BuildSpec): string[] {
   for (const [k, v] of Object.entries(spec.buildArgs ?? {})) args.push("--build-arg", `${k}=${v}`);
   const labels = { rig: "1", ...(spec.labels ?? {}) };
   for (const [k, v] of Object.entries(labels)) args.push("--label", `${k}=${v}`);
-  args.push(spec.contextDir); return args;
+  args.push(spec.contextDir);
+  return args;
 }
 export async function buildImage(spec: BuildSpec): Promise<void> { await run(buildImageArgs(spec)); }
 export async function ensureImagePresent(spec: BuildSpec): Promise<boolean> {
@@ -402,38 +506,45 @@ export async function imageDelete(tag: string): Promise<boolean> { return (await
 
 function exactDockerRows(text: string, field: string, name: string): boolean { return parseNdjson(text).some((row) => row[field] === name); }
 export async function networkExists(name: string): Promise<boolean> {
-  const args = backend().name === "docker" ? [...backend().verbs.networkList, "--filter", `name=^${name}$`, "--format", "json"] : [...backend().verbs.networkList, "--format", "json"];
-  const r = await run(args, { allowFail: true }); if (r.exitCode !== 0) return false;
-  if (backend().name === "docker") return exactDockerRows(r.stdout, "Name", name);
-  return r.stdout.includes(`"${name}"`);
+  return backend().networkExists(name);
 }
-export async function networkCreate(name: string): Promise<void> { await run(backend().name === "docker" ? ["network", "create", "--label", "rig=1", name] : ["network", "create", name]); }
+export async function networkCreate(name: string): Promise<void> {
+  await run(backend().networkCreateArgs(name));
+}
 export async function networkDelete(name: string): Promise<boolean> { return (await run([...backend().verbs.networkDelete, name], { allowFail: true })).exitCode === 0; }
 
 export async function containerExists(name: string): Promise<boolean> {
-  const args = backend().name === "docker" ? [...backend().verbs.psAll, "--filter", `name=^/${name}$`, "--format", "json"] : [...backend().verbs.psAll, "--format", "json"];
-  const r = await run(args, { allowFail: true }); if (r.exitCode !== 0) return false;
-  return backend().name === "docker" ? exactDockerRows(r.stdout, "Names", name) : r.stdout.includes(`"${name}"`);
+  return backend().containerExists(name);
 }
 export function inspectHasMounts(inspect: unknown, expected: readonly Mount[]): boolean {
   const mounts = backend().parseInspectMounts(inspect);
+  // Container names are process-global but source mounts are worktree-local;
+  // a source or target mismatch requires recreation.
   return expected.every((want) => mounts.some((m) => m.source === want.source && m.target === want.target));
 }
 export async function containerHasMounts(name: string, expected: readonly Mount[]): Promise<boolean> {
-  const r = await run(["inspect", name], { allowFail: true }); if (r.exitCode !== 0) return false;
-  try { return inspectHasMounts(JSON.parse(r.stdout), expected); } catch { return false; }
+  const r = await run(["inspect", name], { allowFail: true });
+  if (r.exitCode !== 0) return false;
+  try {
+    return inspectHasMounts(JSON.parse(r.stdout), expected);
+  } catch {
+    return false;
+  }
 }
 
 export function serializeMount(m: Mount, runner: RunnerName): string {
   const parts: string[] = [];
-  if (m.type) parts.push(`type=${m.type}`); else if (runner === "docker") parts.push("type=bind");
-  parts.push(`source=${m.source}`, `target=${m.target}`); if (m.readonly) parts.push("readonly"); return parts.join(",");
+  if (m.type) parts.push(`type=${m.type}`);
+  else if (runner === "docker") parts.push("type=bind");
+  parts.push(`source=${m.source}`, `target=${m.target}`);
+  if (m.readonly) parts.push("readonly");
+  return parts.join(",");
 }
 export interface CreateSpec { name: string; image: string; network: string; cpus: number; memory: string; mounts: Mount[]; env?: Record<string, string>; cmd?: string[]; imageHash?: string }
 function normalizedCreateSpec(spec: CreateSpec, runner: RunnerName): unknown {
   const mounts = spec.mounts.map((m) => ({ type: m.type ?? "bind", source: m.source, target: m.target, readonly: Boolean(m.readonly) }))
     .sort((a, b) => `${a.type}\0${a.source}\0${a.target}`.localeCompare(`${b.type}\0${b.source}\0${b.target}`));
-  return { name: spec.name, image: spec.image, network: spec.network, cpus: spec.cpus, memory: spec.memory, mounts, env: Object.fromEntries(Object.entries(spec.env ?? {}).sort(([a], [b]) => a.localeCompare(b))), cmd: spec.cmd ?? (runner === "apple-container" ? appleBackend.createCmdOverride() : undefined) ?? [] };
+  return { name: spec.name, image: spec.image, network: spec.network, cpus: spec.cpus, memory: spec.memory, mounts, env: Object.fromEntries(Object.entries(spec.env ?? {}).sort(([a], [b]) => a.localeCompare(b))), cmd: spec.cmd ?? backendFor(runner).createCmdOverride() ?? [] };
 }
 export function createSpecHash(spec: CreateSpec, runner: RunnerName = runnerName()): string {
   return createHash("sha256").update(JSON.stringify({ runner, imageHash: spec.imageHash ?? "", create: normalizedCreateSpec(spec, runner) })).digest("hex");
@@ -442,42 +553,50 @@ export function createContainerArgs(spec: CreateSpec, runner: RunnerName = runne
   const args = ["create", "--name", spec.name, "--network", spec.network, "--cpus", String(spec.cpus), "--memory", spec.memory, "--label", "rig=1", "--label", `rig.spec=${createSpecHash(spec, runner)}`];
   for (const m of spec.mounts) args.push("--mount", serializeMount(m, runner));
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
-  args.push(spec.image, ...(spec.cmd ?? (runner === "apple-container" ? appleBackend.createCmdOverride()! : []))); return args;
+  args.push(spec.image, ...(spec.cmd ?? backendFor(runner).createCmdOverride() ?? []));
+  return args;
 }
 export async function createContainer(spec: CreateSpec): Promise<void> { await run(createContainerArgs(spec)); }
 export async function containerHasSpec(name: string, spec: CreateSpec): Promise<boolean> {
-  const r = await run(["inspect", name], { allowFail: true }); if (r.exitCode !== 0) return false;
-  try { return backend().parseSpecLabel(JSON.parse(r.stdout)) === createSpecHash(spec); } catch { return false; }
+  const r = await run(["inspect", name], { allowFail: true });
+  if (r.exitCode !== 0) return false;
+  try {
+    return backend().parseSpecLabel(JSON.parse(r.stdout)) === createSpecHash(spec);
+  } catch {
+    return false;
+  }
 }
 export async function startContainer(name: string): Promise<void> { await run(["start", name], { allowFail: true }); }
 export async function stopContainer(name: string): Promise<void> { await run(["stop", name], { allowFail: true }); }
+/** SIGKILL models a crash; stopContainer is the graceful-stop path. */
 export async function killContainer(name: string): Promise<boolean> { return (await run(["kill", "--signal", "KILL", name], { allowFail: true })).exitCode === 0; }
 export async function deleteContainer(name: string): Promise<boolean> { return (await run([...backend().verbs.containerDelete, name], { allowFail: true })).exitCode === 0; }
 export interface ExecSpec { name: string; cmd: string[]; env?: Record<string, string>; cwd?: string; stdin?: string; allowFail?: boolean; redact?: string[] }
 export async function exec(spec: ExecSpec): Promise<RunResult> {
-  const args = ["exec"]; if (spec.stdin !== undefined) args.push("-i");
+  const args = ["exec"];
+  if (spec.stdin !== undefined) args.push("-i");
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
-  if (spec.cwd) args.push("-w", spec.cwd); args.push(spec.name, ...spec.cmd);
+  if (spec.cwd) args.push("-w", spec.cwd);
+  args.push(spec.name, ...spec.cmd);
   return run(args, { stdin: spec.stdin, allowFail: spec.allowFail, redact: spec.redact });
 }
-export async function rigVolumes(): Promise<string[]> {
-  const args = backend().name === "docker" ? [...backend().verbs.volumeList, "--filter", "name=rig-", "--format", "json"] : [...backend().verbs.volumeList, "--format", "json"];
-  const r = await run(args, { allowFail: true });
-  if (r.exitCode !== 0) throw new Error(`${backend().bin} volume listing failed: ${(r.stderr || r.stdout).trim()}`);
-  try {
-    if (backend().name === "docker") {
-      const parsed = parseNdjson(r.stdout);
-      const names = parsed.map((row) => { if (typeof row.Name !== "string") throw new Error("Docker volume row lacks string Name"); return row.Name; });
-      return [...new Set(names.filter((name) => name.startsWith("rig-")))];
-    }
-    const names = new Set<string>();
-    for (const row of rows(JSON.parse(r.stdout))) {
-      const entry = Object.entries(row).find(([key, value]) => key.toLowerCase().includes("name") && typeof value === "string");
-      if (!entry) throw new Error("Apple volume row lacks a string name field");
-      if ((entry[1] as string).startsWith("rig-")) names.add(entry[1] as string);
-    }
-    return [...names];
-  } catch (e) { throw new Error(`rig: cannot parse ${backend().bin} volume listing: ${e instanceof Error ? e.message : String(e)}`); }
+export interface RigVolume { name: string; size: string }
+
+function uniqueVolumes(volumes: RigVolume[]): RigVolume[] {
+  return [...new Map(volumes.map((volume) => [volume.name, volume])).values()];
+}
+
+function volumeListingError(bin: RunnerBackend["bin"], result: RunResult): Error {
+  return new Error(`${bin} volume listing failed: ${(result.stderr || result.stdout).trim()}`);
+}
+
+function volumeParseError(bin: RunnerBackend["bin"], error: unknown): Error {
+  return new Error(`rig: cannot parse ${bin} volume listing: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+/** Prefix identity is authoritative; labels are only an additional runtime signal. */
+export async function listRigVolumes(): Promise<RigVolume[]> {
+  return backend().listRigVolumes();
 }
 export async function volumeDelete(name: string): Promise<boolean> {
   if (!name.startsWith("rig-")) throw new Error(`rig: refusing to delete non-rig volume ${name}`);
@@ -503,20 +622,6 @@ export async function removeDanglingRigImages(): Promise<RigImage[]> {
     removed.push(image);
   }
   return removed;
-}
-export interface RigVolume { name: string; size: string }
-export async function rigLabeledVolumes(): Promise<RigVolume[]> {
-  if (backend().name !== "docker") return (await rigVolumes()).map((name) => ({ name, size: "unknown" }));
-  const r = await run(["volume", "ls", "--filter", "label=rig=1", "--format", "json"], { allowFail: true });
-  if (r.exitCode !== 0) throw new Error(`docker labeled-volume listing failed: ${(r.stderr || r.stdout).trim()}`);
-  try {
-    const volumes = parseNdjson(r.stdout).map((row) => {
-      if (typeof row.Name !== "string") throw new Error("Docker volume row lacks string Name");
-      return { name: row.Name, size: typeof row.Size === "string" ? row.Size : "unknown" };
-    }).filter((volume) => volume.name.startsWith("rig-"));
-    return [...new Map(volumes.map((volume) => [volume.name, volume])).values()];
-  }
-  catch (e) { throw new Error(`rig: cannot parse docker labeled-volume listing: ${e instanceof Error ? e.message : String(e)}`); }
 }
 export async function dockerBuilderDiskUsage(): Promise<string> {
   if (backend().name !== "docker") return "not applicable";

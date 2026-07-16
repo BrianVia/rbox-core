@@ -1,3 +1,7 @@
+/**
+ * Rig cleanup is scoped to rig=1 resources (with rig- volume identity as the
+ * deletion boundary). Global prune is forbidden because the host is shared.
+ */
 import fs from "node:fs";
 import path from "node:path";
 

@@ -376,7 +376,9 @@ async function down(all: boolean): Promise<void> {
   if (await C.networkDelete(NAMES.network)) removed.push(`network ${NAMES.network}`);
   if (all) {
     if (await C.imageDelete(NAMES.image)) removed.push(`image ${NAMES.image}`);
-    for (const v of await C.rigVolumes()) if (await C.volumeDelete(v)) removed.push(`volume ${v}`);
+    for (const volume of await C.listRigVolumes()) {
+      if (await C.volumeDelete(volume.name)) removed.push(`volume ${volume.name}`);
+    }
     for (const image of await C.rigDanglingImages()) if (await C.imageDelete(image.id)) removed.push(`dangling image ${image.id} (${image.size})`);
     try {
       deleteImageHashRecord(HASH_FILE, C.runnerName());
@@ -393,14 +395,14 @@ async function gc(): Promise<void> {
   let removedImages = 0;
   const reclaimedImageSizes: string[] = [];
   for (const image of images) if (await C.imageDelete(image.id)) { removedImages++; reclaimedImageSizes.push(image.size); }
-  const volumes = await C.rigLabeledVolumes();
+  const volumes = await C.listRigVolumes();
   let removedVolumes = 0;
   const reclaimedVolumeSizes: string[] = [];
   for (const volume of volumes) if (await C.volumeDelete(volume.name)) { removedVolumes++; reclaimedVolumeSizes.push(volume.size); }
   const runs = trimRunDirectories(RUNS_DIR);
   const cache = trimWorkloadCache(path.join(os.homedir(), ".cache", "rbox-rig", "workloads"));
   console.log(`rig gc: ${removedImages} dangling images (${reclaimedImageSizes.join(", ") || "0 B"})`);
-  console.log(`rig gc: ${removedVolumes} labeled volumes (${reclaimedVolumeSizes.join(", ") || "0 B"})`);
+  console.log(`rig gc: ${removedVolumes} rig volumes (${reclaimedVolumeSizes.join(", ") || "0 B"})`);
   console.log(`rig gc: ${runs.entries} old runs (${formatBytes(runs.bytes)})`);
   console.log(`rig gc: ${cache.entries} workload-cache entries (${formatBytes(cache.bytes)})`);
 }
@@ -483,13 +485,17 @@ async function doctor(apiUrl: string): Promise<number> {
       add("Docker context is local", dockerLocal, endpoint || "unknown", "select a local unix-socket Docker context; remote daemons cannot resolve checkout bind paths");
     } catch (e) { add("Docker context is local", false, e instanceof Error ? e.message : String(e)); }
     let info: C.DockerInfo | undefined;
+    let dockerInfoError: string | undefined;
     let dockerDiskOk = false;
     try {
       info = await C.dockerInfo();
       const capability = assessDockerInfo(info);
       add("Docker server capabilities", capability.ok, capability.detail, "enable Docker memory and CPU quota support");
-    } catch (e) { add("Docker server capabilities", false, e instanceof Error ? e.message : String(e), "start Docker and check local socket permissions"); }
-    if (dockerLocal && info && typeof info.DockerRootDir === "string") {
+    } catch (e) {
+      dockerInfoError = e instanceof Error ? e.message : String(e);
+      add("Docker server capabilities", false, dockerInfoError, "start Docker and check local socket permissions");
+    }
+    if (dockerLocal && info && typeof info.DockerRootDir === "string" && info.DockerRootDir !== "") {
       const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
       fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
       const disk = await C.spawnHost(["df", "-Pk", info.DockerRootDir, RUNS_DIR, cacheDir], { allowFail: true });
@@ -498,7 +504,10 @@ async function doctor(apiUrl: string): Promise<number> {
       add("Docker/runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail,
         "run `bun run rig gc`; if Docker build cache dominates, inspect it and choose `docker builder prune` manually");
       advise("Docker builder cache size", true, await C.dockerBuilderDiskUsage());
-    } else add("Docker/runs/cache disk space", false, dockerLocal ? "DockerRootDir unavailable" : "refused for remote Docker context");
+    } else {
+      add("Docker/runs/cache disk space", false,
+        dockerLocal ? dockerInfoError ?? "DockerRootDir unavailable" : "refused for remote Docker context");
+    }
     let dockerProbeOk = false;
     try {
       if (!dockerLocal) throw new Error("refused for remote Docker context");

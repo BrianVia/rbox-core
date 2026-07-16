@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
-  assessRuntimeResourcePolicy, buildImage, configureRunner, containerExists, containerHasMounts, containerHasSpec, createContainerArgs, createSpecHash, dockerBuilderDiskUsage,
+  assessRuntimeResourcePolicy, backendFor, buildImage, configureRunner, containerExists, containerHasMounts, containerHasSpec, createContainerArgs, createSpecHash, dockerBuilderDiskUsage, dockerEndpoint, dockerInfo,
   deleteContainer, ensureImagePresent, exec, imageDelete, imageExists, killContainer,
   ensureRuntimeReady, inspectHasMounts, networkExists, parseAppleInspectMounts,
   parseAppleSpecLabel, parseAppleStats, parseDockerInspectMounts, parseDockerMemoryUsage,
-  networkCreate, networkDelete, parseDockerSpecLabel, parseDockerStats, resetRunnerForTests, resolveRunnerName, rigVolumes,
-  removeDanglingRigImages, rigDanglingImages, rigLabeledVolumes, runDockerDoctorProbe, runnerBackendForTests, runtimeMarkers, serializeMount, setSpawnCaptureForTests, startContainer, stopContainer, streamContainerLogsArgv, volumeDelete,
+  listRigVolumes, networkCreate, networkDelete, parseDockerSpecLabel, parseDockerStats, resetRunnerForTests, resolveRunnerName,
+  removeDanglingRigImages, rigDanglingImages, runDockerDoctorProbe, runtimeMarkers, serializeMount, setSpawnCaptureForTests, startContainer, stopContainer, streamContainerLogsArgv, volumeDelete,
   type CreateSpec, type Mount, type RunResult,
 } from "./container.js";
 
@@ -23,11 +23,11 @@ test("runner selection is flag > env > platform", () => {
 });
 
 test("verb tables pin every lexical backend difference", () => {
-  expect(runnerBackendForTests("apple-container").verbs).toEqual({
+  expect(backendFor("apple-container").verbs).toEqual({
     imageDelete: ["image", "delete"], networkList: ["network", "list"], networkDelete: ["network", "delete"],
     psAll: ["ls", "--all"], containerDelete: ["delete", "--force"], volumeList: ["volume", "list"],
   });
-  expect(runnerBackendForTests("docker").verbs).toEqual({
+  expect(backendFor("docker").verbs).toEqual({
     imageDelete: ["image", "rm"], networkList: ["network", "ls"], networkDelete: ["network", "rm"],
     psAll: ["ps", "-a"], containerDelete: ["rm", "--force"], volumeList: ["volume", "ls"],
   });
@@ -90,8 +90,8 @@ test("golden create argv covers standard and workload paths on both backends", (
   expect(apple).toEqual(["create", "--name", "rig-dev-a", "--network", "rig-net", "--cpus", "2", "--memory", "2G", "--label", "rig=1", "--label", `rig.spec=${createSpecHash(standard, "apple-container")}`, "--mount", "source=/repo/src,target=/app/src,readonly", "--mount", "source=/repo/scripts,target=/app/scripts,readonly", "-e", "RBOX_API=https://dev.example", "rbox-rig:dev", "/usr/bin/tini", "--", "sleep", "infinity"]);
   const docker = createContainerArgs(workload, "docker");
   expect(docker).toEqual(["create", "--name", "rig-dev-a", "--network", "rig-net", "--cpus", "2", "--memory", "2G", "--label", "rig=1", "--label", `rig.spec=${createSpecHash(workload, "docker")}`, "--mount", "type=bind,source=/repo/src,target=/app/src,readonly", "--mount", "type=bind,source=/repo/scripts,target=/app/scripts,readonly", "--mount", "type=bind,source=/cache/tree,target=/workload,readonly", "-e", "RBOX_API=https://dev.example", "rbox-rig:dev"]);
-  expect(runnerBackendForTests("apple-container").createCmdOverride()).toEqual(["/usr/bin/tini", "--", "sleep", "infinity"]);
-  expect(runnerBackendForTests("docker").createCmdOverride()).toBeUndefined();
+  expect(backendFor("apple-container").createCmdOverride()).toEqual(["/usr/bin/tini", "--", "sleep", "infinity"]);
+  expect(backendFor("docker").createCmdOverride()).toBeUndefined();
   expect(createContainerArgs(workload, "apple-container")).toEqual([
     "create", "--name", "rig-dev-a", "--network", "rig-net", "--cpus", "2", "--memory", "2G", "--label", "rig=1", "--label", `rig.spec=${createSpecHash(workload, "apple-container")}`,
     "--mount", "source=/repo/src,target=/app/src,readonly", "--mount", "source=/repo/scripts,target=/app/scripts,readonly", "--mount", "source=/cache/tree,target=/workload,readonly",
@@ -157,29 +157,62 @@ test("Docker exact-name filters still typed-compare returned fields", async () =
   expect(await networkExists("rig-net")).toBe(false);
 });
 
-test("rigVolumes parses typed Docker NDJSON and fails loudly", async () => {
+test("listRigVolumes uses prefix identity, includes unlabeled volumes, and fails loudly", async () => {
   select("docker");
-  setSpawnCaptureForTests(async () => result('{"Name":"rig-one"}\n{"Name":"other"}\n'));
-  expect(await rigVolumes()).toEqual(["rig-one"]);
+  const seen: string[][] = [];
+  setSpawnCaptureForTests(async (argv) => {
+    seen.push(argv);
+    return result('{"Name":"rig-one","Labels":"rig=1","Size":"24MB"}\n{"Name":"rig-implicit","Labels":"","Size":"12MB"}\n{"Name":"other","Labels":"rig=1","Size":"1GB"}\n');
+  });
+  expect(await listRigVolumes()).toEqual([
+    { name: "rig-one", size: "24MB" },
+    { name: "rig-implicit", size: "12MB" },
+  ]);
+  expect(seen[0]).toEqual(["docker", "volume", "ls", "--filter", "name=rig-", "--format", "json"]);
   setSpawnCaptureForTests(async () => result("not-json"));
-  expect(rigVolumes()).rejects.toThrow("cannot parse");
+  await expect(listRigVolumes()).rejects.toThrow("cannot parse");
   setSpawnCaptureForTests(async () => result('{"Labels":"rig=1"}\n'));
-  expect(rigVolumes()).rejects.toThrow("lacks string Name");
+  await expect(listRigVolumes()).rejects.toThrow("lacks string Name");
   setSpawnCaptureForTests(async () => result("", 1, "denied"));
-  expect(rigVolumes()).rejects.toThrow("listing failed");
+  await expect(listRigVolumes()).rejects.toThrow("listing failed");
 });
 
-test("scoped Docker gc discovery uses rig labels and typed rows", async () => {
+test("scoped Docker gc image discovery uses rig labels and typed rows", async () => {
   select("docker"); const seen: string[][] = [];
   setSpawnCaptureForTests(async (argv) => {
     seen.push(argv);
-    if (argv.includes("image")) return result('{"ID":"sha256:old","Size":"2.5GB"}\n');
-    return result('{"Name":"rig-cache","Size":"24MB"}\n{"Name":"foreign","Size":"1GB"}\n');
+    return result('{"ID":"sha256:old","Size":"2.5GB"}\n');
   });
   expect(await rigDanglingImages()).toEqual([{ id: "sha256:old", size: "2.5GB" }]);
-  expect(await rigLabeledVolumes()).toEqual([{ name: "rig-cache", size: "24MB" }]);
   expect(seen[0]).toEqual(["docker", "image", "ls", "--filter", "dangling=true", "--filter", "label=rig=1", "--format", "json"]);
-  expect(seen[1]).toEqual(["docker", "volume", "ls", "--filter", "label=rig=1", "--format", "json"]);
+});
+
+test("dockerInfo rejects exit-zero daemon error payloads", async () => {
+  select("docker");
+  setSpawnCaptureForTests(async () => result(JSON.stringify({
+    ServerErrors: ["permission denied while trying to connect to the Docker daemon socket"],
+    DockerRootDir: "",
+  })));
+  await expect(dockerInfo()).rejects.toThrow("permission denied while trying to connect");
+
+  setSpawnCaptureForTests(async () => result(JSON.stringify({ DockerRootDir: "/var/lib/docker" })));
+  await expect(dockerInfo()).rejects.toThrow("no ServerVersion");
+});
+
+test("dockerEndpoint strips quotes from environment and context values", async () => {
+  const previous = process.env.DOCKER_HOST;
+  try {
+    process.env.DOCKER_HOST = '"unix:///run/user/1000/docker.sock"';
+    expect(await dockerEndpoint()).toBe("unix:///run/user/1000/docker.sock");
+
+    delete process.env.DOCKER_HOST;
+    let call = 0;
+    setSpawnCaptureForTests(async () => call++ === 0 ? result("default\n") : result('"unix:///var/run/docker.sock"\n'));
+    expect(await dockerEndpoint()).toBe("unix:///var/run/docker.sock");
+  } finally {
+    if (previous === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = previous;
+  }
 });
 
 test("doctor reports the typed Docker builder-cache size", async () => {
@@ -195,14 +228,14 @@ test("dangling-image cleanup fails loud and is rediscovered for retry", async ()
     deleteAttempts++;
     return result("", deleteAttempts === 1 ? 1 : 0);
   });
-  expect(removeDanglingRigImages()).rejects.toThrow("failed to remove");
+  await expect(removeDanglingRigImages()).rejects.toThrow("failed to remove");
   expect(await removeDanglingRigImages()).toEqual([{ id: "sha256:old", size: "1GB" }]);
 });
 
 test("runtime-ready Docker gate refuses remote contexts before info", async () => {
   select("docker"); const seen: string[][] = [];
   setSpawnCaptureForTests(async (a) => { seen.push(a); return seen.length === 1 ? result("remote\n") : result('"ssh://builder"\n'); });
-  expect(ensureRuntimeReady()).rejects.toThrow("refusing remote Docker context");
+  await expect(ensureRuntimeReady()).rejects.toThrow("refusing remote Docker context");
   expect(seen.some((a) => a.includes("info"))).toBe(false);
 });
 
@@ -223,16 +256,14 @@ test("Apple runtime-ready path performs status, start, recheck", async () => {
   expect(seen).toEqual([["container", "system", "status"], ["container", "system", "start"], ["container", "system", "status"]]);
 });
 
-test("doctor sets and stream argv are backend-specific", () => {
-  expect(runnerBackendForTests("apple-container").doctorChecks().map((c) => c.id)).toEqual(["macos-version", "arm64", "runtime-version", "runtime-ready", "disk-headroom"]);
-  expect(runnerBackendForTests("docker").doctorChecks().map((c) => c.id)).toEqual(["docker-info", "local-context", "docker-disk", "docker-probe", "builder-cache", "rootless-policy"]);
+test("stream argv is backend-specific", () => {
   expect(streamContainerLogsArgv("rig-dev-a", "apple-container")).toEqual(["container", "logs", "--follow", "rig-dev-a"]);
   expect(streamContainerLogsArgv("rig-dev-a", "docker")).toEqual(["docker", "logs", "--follow", "rig-dev-a"]);
 });
 
 test("rootless policy uses one deterministic skip-marker outcome", async () => {
   select("docker");
-  const info = JSON.stringify({ CgroupVersion: "2", MemoryLimit: true, CPUCfsQuota: true, SecurityOptions: ["name=rootless"] });
+  const info = JSON.stringify({ ServerVersion: "24.0.9", CgroupVersion: "2", MemoryLimit: true, CPUCfsQuota: true, SecurityOptions: ["name=rootless"] });
   let calls = 0;
   const seen: string[][] = [];
   setSpawnCaptureForTests(async (argv) => { seen.push(argv); calls++; return calls === 1 ? result(info) : result("", 1); });
