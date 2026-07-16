@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import * as C from "./lib/container.js";
 import { DEFAULT_DEV_API, GUEST, imageHash, NAMES, resolveConfig } from "./lib/config.js";
 import { Device } from "./lib/device.js";
-import { resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js";
+import { deleteAccount, readCredentials, resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js";
 import { RunCapture } from "./lib/capture.js";
 import { renderReportMd } from "./lib/report.js";
 import { deleteImageHashRecord, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
@@ -175,6 +175,26 @@ async function resetGuests(devices: { a: Device; b: Device }, log: (l: string) =
   }
 }
 
+async function cleanupScenarioAccount(ctx: RigCtx, report: ScenarioReport | undefined): Promise<void> {
+  if (ctx.keepAccount || report?.steps.some((step) => step.name === "teardown DELETE /v1/account" && step.ok)) return;
+  try {
+    const raw = await ctx.a.readFileIfExists(`${GUEST.rboxHome}/credentials.json`);
+    if (!raw) {
+      ctx.log("  account cleanup skipped: no A credentials");
+      return;
+    }
+    const creds = readCredentials(raw);
+    if (!creds.accountId) {
+      ctx.log("  account cleanup skipped: A credentials missing accountId");
+      return;
+    }
+    const result = await deleteAccount(ctx.apiUrl, creds.token, creds.accountId);
+    ctx.log(`  account cleanup ${result.ok ? "ok" : "failed"}: DELETE /v1/account → ${result.status}`);
+  } catch (e) {
+    ctx.log(`  account cleanup best-effort error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /**
  * Execute ONE scenario end-to-end: fresh run dir, a fresh {@link RigCtx} (device
  * handles + waiters), a guest reset, the P1 capture lifecycle, and the report
@@ -209,6 +229,7 @@ async function executeScenario(
     bootstrapSecret,
     platformSecret,
     runDir,
+    scenarioName: scenario.name,
     keepAccount: flags["keep-account"] === "true",
     flags,
     log,
@@ -241,18 +262,24 @@ async function executeScenario(
   });
   capture.start();
 
-  let report: ScenarioReport;
-  if (C.runtimeMarkers().includes("rootless-unvalidated") && scenario.name === "daemon-idle-cpu") {
-    report = skipReport(scenario.name, "resource-budget scenario skipped: rootless-unvalidated");
-  } else try {
-    report = await scenario.run(ctx);
-  } catch (e) {
-    // A scenario should catch its own step errors, but never let an escape crash the
-    // harness without a report.
-    log(`✗ scenario threw: ${e instanceof Error ? e.message : String(e)}`);
-    const now = new Date().toISOString();
-    report = finalizeReport({ scenario: scenario.name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
+  let report: ScenarioReport | undefined;
+  try {
+    if (C.runtimeMarkers().includes("rootless-unvalidated") && scenario.name === "daemon-idle-cpu") {
+      report = skipReport(scenario.name, "resource-budget scenario skipped: rootless-unvalidated");
+    } else try {
+      report = await scenario.run(ctx);
+    } catch (e) {
+      // A scenario should catch its own step errors, but never let an escape crash the
+      // harness without a report.
+      log(`✗ scenario threw: ${e instanceof Error ? e.message : String(e)}`);
+      const now = new Date().toISOString();
+      report = finalizeReport({ scenario: scenario.name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
+    }
+  } finally {
+    await cleanupScenarioAccount(ctx, report);
   }
+
+  if (!report) throw new Error(`scenario ${scenario.name} produced no report`);
 
   const persistedReport = { ...report, runner: C.runnerName(), ...(C.runtimeMarkers().length ? { markers: [...C.runtimeMarkers()] } : {}) };
   fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(persistedReport, null, 2));

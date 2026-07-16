@@ -120,7 +120,7 @@ async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemRes
 }
 
 /** Connect this machine via a split-secret pairing token (D3/D4/D7). */
-export async function enrollViaPairing(remoteUrl: string, fullToken: string, now: number): Promise<{ accountId: string; deviceId: string }> {
+export async function enrollViaPairing(remoteUrl: string, fullToken: string, now: number, label?: string): Promise<{ accountId: string; deviceId: string }> {
   const dot = fullToken.lastIndexOf(".");
   if (dot < 1) throw new Error("malformed pairing token (expected `rbox-pair_<id>.<secret>`)");
   const redeemToken = fullToken.slice(0, dot);
@@ -130,7 +130,7 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
   const res = await fetch(`${remoteUrl}/v1/auth/pair/redeem`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token: redeemToken }),
+    body: JSON.stringify({ token: redeemToken, ...(label ? { label } : {}) }),
   });
   if (!res.ok) throw await pairingRedeemError(res);
   const redeem = (await res.json()) as { token: string; deviceId: string; accountId: string; mkWrap: string | null; admissionGrant: string | null };

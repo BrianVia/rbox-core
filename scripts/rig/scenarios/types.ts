@@ -16,6 +16,8 @@ export interface RigCtx {
   /** Dev worker platform secret used only for provisioning throwaway account plans. */
   platformSecret: string;
   runDir: string;
+  /** Stable scenario slug used in deterministic ephemeral-device labels. */
+  scenarioName: string;
   /** Whether the per-run account teardown is skipped (`--keep-account`). */
   keepAccount: boolean;
   /** CLI flags for this run (e.g. `--workload-tar`); scenario-specific reads. */

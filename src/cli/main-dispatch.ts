@@ -180,7 +180,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       // "true") used to silently fall through to the device-approval flow and
       // block ~10min looking hung — fail fast with a clear message instead.
       if (flags.bootstrap === "true") throw new Error("`--bootstrap` needs a secret value: `rbox login --bootstrap <secret>` (or just `rbox login` for device approval)");
-      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap, flags.plan, recoveryKitOptionsFromFlags(flags));
+      await login(flags.remote ?? DEFAULT_REMOTE, flags.bootstrap, flags.plan, recoveryKitOptionsFromFlags(flags), flags.label);
       break;
     }
     case "logout": {

@@ -122,7 +122,8 @@ async function labelsFor(env: Env, deviceIds: string[]): Promise<Map<string, str
 }
 
 async function send(env: Env, text: string): Promise<void> {
-  await pingSlackpipes(env, "fleet_alert", text);
+  const label = env.RBOX_ENV_LABEL?.trim();
+  await pingSlackpipes(env, "fleet_alert", label ? `[${label}] ${text}` : text);
 }
 
 async function conditionTrue(

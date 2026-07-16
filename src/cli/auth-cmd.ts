@@ -180,13 +180,13 @@ export async function handleDeviceCodePostApprovalEncryption(
   return "already-setup";
 }
 
-/** `rbox login [--bootstrap <secret>] [--plan <solo|pro>]` — obtain a per-device token. */
-export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
-  const label = os.hostname();
+/** `rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>]` — obtain a per-device token. */
+export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string, kitOpts: RecoveryKitOptions = NO_KIT, requestedLabel?: string): Promise<void> {
+  const label = requestedLabel?.trim() || os.hostname();
   // Headless pairing: redeem a token from the env (never argv — it's a bearer).
   const envPair = process.env.RBOX_PAIR_TOKEN;
   if (envPair) {
-    await redeemPair(remoteUrl, envPair);
+    await redeemPair(remoteUrl, envPair, label);
     return;
   }
   if (bootstrapSecret) {
@@ -382,8 +382,8 @@ export async function pairCreate(): Promise<void> {
 
 /** Redeem a split-secret pairing token → device credential + E2EE enrollment.
  *  The full token is read from a prompt/stdin (never argv) and never logged. */
-export async function redeemPair(remoteUrl: string, pairToken: string): Promise<void> {
-  const { deviceId } = await enrollViaPairing(remoteUrl, pairToken.trim(), Date.now());
+export async function redeemPair(remoteUrl: string, pairToken: string, label?: string): Promise<void> {
+  const { deviceId } = await enrollViaPairing(remoteUrl, pairToken.trim(), Date.now(), label);
   console.log(`device authorized + encryption enrolled: ${deviceId}`);
 }
 
