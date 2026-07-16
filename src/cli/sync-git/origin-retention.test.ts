@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { composeStateSavePacket } from "/home/via/Development/Personal/rbox-core/.claude/worktrees/branch-hygiene/src/cli/sync-state.ts";
-import type { GitSection } from "/home/via/Development/Personal/rbox-core/.claude/worktrees/branch-hygiene/src/engine/index.ts";
+import { composeStateSavePacket } from "../sync-state.js";
+import type { GitSection } from "../../engine/index.ts";
 
 const T = "1".repeat(40);
 const LIN = "a".repeat(64);
