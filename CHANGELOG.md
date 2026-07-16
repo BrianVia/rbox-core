@@ -5,6 +5,20 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.7] — 2026-07-16 — a first sync you can predict
+
+### Changed
+- **Setup now respects `.gitignore` by default.** The wizard's default choice skips
+  gitignored untracked files, so your first sync is your source — lean and fast. The
+  previous behavior lives on as a clearly-worded option: gitignored files sync too,
+  end-to-end encrypted (rbox can never read them) — ideal for `.env` files, notes, and
+  local state — with `!` re-includes in `.rboxignore` and an ignore-mode toggle for
+  changing your mind later. Existing workspaces and scripted setups are unchanged.
+- `rbox ignore --list` now tells the truth: `.gitignore` rules are labeled active or
+  present-but-not-applied based on the workspace's actual setting.
+- Account creation leads with browser sign-up; docs corrected (`--purge` exists and is
+  documented; the README's sync-scope claims now match reality); assorted first-run copy.
+
 ## [1.6.6] — 2026-07-16 — strands heal themselves, show-me shows up
 
 ### Fixed
