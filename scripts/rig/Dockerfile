@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg software-properties-common \
     && add-apt-repository -y ppa:git-core/ppa \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git unzip tini \
+    && apt-get install -y --no-install-recommends git tmux unzip tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Official installer, pinned. BUN_INSTALL=/usr/local → bun lands on PATH at /usr/local/bin.
@@ -28,6 +28,12 @@ WORKDIR /app
 # image from the exact lockfile. src/ + scripts/ are NOT copied — they mount at runtime.
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
+
+# The UX walkthrough harness reuses this image and the rig's mounted-source CLI
+# path. Keep the human-facing command as `rbox` without installing a released
+# binary, so walkthroughs always exercise the candidate checkout.
+RUN printf '%s\n' '#!/bin/sh' 'exec bun /app/src/cli/index.ts "$@"' > /usr/local/bin/rbox \
+    && chmod 0755 /usr/local/bin/rbox
 
 # Long-lived guest; all real work happens via `container exec`. tini as PID 1
 # reaps orphaned daemons — a bare `sleep infinity` PID 1 leaves dead daemons as
