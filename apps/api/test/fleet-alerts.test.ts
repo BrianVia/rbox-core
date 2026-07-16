@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 function alertEnv(extra: Partial<Env> = {}): Env {
-  return { ...env, SLACKPIPES_WEBHOOK_URL: undefined, SLACKPIPES_ALERTS_WEBHOOK_URL: "https://hook.test/alerts", ...extra } as Env;
+  return { ...env, RBOX_ENV_LABEL: undefined, SLACKPIPES_WEBHOOK_URL: undefined, SLACKPIPES_ALERTS_WEBHOOK_URL: "https://hook.test/alerts", ...extra } as Env;
 }
 
 function capture(status = 200): string[] {
@@ -97,6 +97,20 @@ async function seedState(o: {
 }
 
 describe("evaluateFleetAlerts state machine", () => {
+  test("prefixes outbound messages with the configured environment label", async () => {
+    const messages = capture();
+    await sync();
+    await evaluateFleetAlerts(alertEnv({ RBOX_ENV_LABEL: "dev" }), NOW);
+    expect(messages).toEqual([expect.stringMatching(/^\[dev\] ⚠️ drift:/)]);
+  });
+
+  test("renders bare outbound messages when the environment label is absent", async () => {
+    const messages = capture();
+    await sync();
+    await evaluateFleetAlerts(alertEnv(), NOW);
+    expect(messages).toEqual([expect.stringMatching(/^⚠️ drift:/)]);
+  });
+
   test("fires only for fresh drift strictly over 24h", async () => {
     const messages = capture();
     await sync({ age: 24 * HOUR + 1 });

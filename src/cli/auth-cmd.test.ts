@@ -230,10 +230,11 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
   test("device/start retries on 429 (honoring Retry-After) then proceeds to poll", async () => {
     const sleeps = installImmediateTimers();
     let startCalls = 0;
-    globalThis.fetch = (async (input: string | URL | Request) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) {
         startCalls++;
+        expect(JSON.parse(String(init?.body))).toEqual({ label: "rig-a-onboard-smoke" });
         if (startCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "0" } });
         return new Response(JSON.stringify({ deviceCode: "dc_retry", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       }
@@ -241,7 +242,7 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    await expect(login("https://api.test")).rejects.toThrow("malformed approval response from server");
+    await expect(login("https://api.test", undefined, undefined, { kit: false }, "rig-a-onboard-smoke")).rejects.toThrow("malformed approval response from server");
     expect(startCalls).toBe(2);
     expect(sleeps.length).toBeGreaterThan(0);
     expect(Math.min(...sleeps)).toBeGreaterThanOrEqual(1000);

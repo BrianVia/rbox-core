@@ -40,6 +40,15 @@ export interface ProvisionResult {
   workspaceId: string;
 }
 
+export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = false): string[] {
+  return ["bun", GUEST.cliEntry, "login", ...(bootstrap ? ["--bootstrap", "$RIG_BOOT"] : []), "--label", `rig-${side}-${scenarioName}`, "--remote", "$RBOX_API"];
+}
+
+function rigLoginShell(side: "a" | "b", scenarioName: string, bootstrap = false): string {
+  const argv = rigLoginArgv(side, scenarioName, bootstrap);
+  return argv.map((arg) => arg.startsWith("$") ? `"${arg}"` : arg).join(" ");
+}
+
 /**
  * Run bootstrap→seed→init→push→pair→join→pull across A and B, recording each phase
  * into `rec`. Returns the workspace id. Throws (via `rec.step`) on any hard failure so
@@ -52,7 +61,7 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   // 1. A: bootstrap login (secret via env expansion, never argv).
   await rec.step("[A] login --bootstrap", async () => {
     await ctx.a.rboxShell(
-      `bun ${GUEST.cliEntry} login --bootstrap "$RIG_BOOT" --remote "$RBOX_API"`,
+      rigLoginShell("a", ctx.scenarioName, true),
       { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
     );
   });
@@ -105,7 +114,7 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
 
   // 6. B: redeem the pairing token (token via env, never argv).
   await rec.step("[B] login (redeem pair)", async () => {
-    await ctx.b.rboxShell(`bun ${GUEST.cliEntry} login --remote "$RBOX_API"`, {
+    await ctx.b.rboxShell(rigLoginShell("b", ctx.scenarioName), {
       env: { RBOX_PAIR_TOKEN: pairToken },
       redact: [pairToken],
     });

@@ -162,6 +162,8 @@ export interface Env {
    *  pings otherwise derive it from SLACKPIPES_WEBHOOK_URL's final channel segment.
    *  NEVER log or store either URL in the repo. */
   SLACKPIPES_ALERTS_WEBHOOK_URL?: string;
+  /** Optional outbound fleet-alert prefix (for example, `dev`). Production omits it. */
+  RBOX_ENV_LABEL?: string;
 
   // ── §32 Tier 3a: platform-admin cockpit (GET /v1/admin/overview) ─────────────
   /** Cloudflare Access team domain, e.g. `https://rbox.cloudflareaccess.com`. The

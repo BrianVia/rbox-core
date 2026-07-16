@@ -67,10 +67,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "login",
     group: "GETTING STARTED",
     summary: "authorize this machine",
-    usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--kit] [--kit-path <path>]",
+    usage: "rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>] [--kit] [--kit-path <path>]",
     flags: [
       { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret (a one-time secret; this machine becomes the account's first key-holding device)" },
       { flag: "--plan <solo|pro>", desc: "request a bootstrap plan when the server supports plan selection" },
+      { flag: "--label <text>", desc: "set the device label (defaults to this machine's hostname)" },
       { flag: "--kit", desc: "save the recovery phrase to a plaintext 'recovery kit' file at the default path" },
       { flag: "--kit-path <path>", desc: "save the recovery kit to a specific file" },
       { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
