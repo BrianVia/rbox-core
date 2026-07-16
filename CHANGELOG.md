@@ -5,6 +5,25 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.6] — 2026-07-16 — strands heal themselves, show-me shows up
+
+### Fixed
+- **ORIG_HEAD deferral self-heal** (design 126): a follower stranded by a stale `ORIG_HEAD`
+  breadcrumb (the class that required manual replica surgery, twice) now adopts the incoming
+  value automatically — but only when the repo is provably a pure replica (no local edits,
+  index, commits, stash, or any in-progress git operation), and never without durably
+  preserving the old value first (recovery refs under `refs/rbox-recovery/`, capped).
+  `git-sync: adopted stale ORIG_HEAD breadcrumb` in the daemon log marks each heal.
+- **`rbox git resolve show-me` is fast and talkative** (design 128): ownership proofs are
+  batched (~5 subprocesses instead of thousands on reflog-heavy repos — 30 minutes → seconds),
+  progress goes to stderr, and human output caps at 50 local-only commits. JSON output and
+  resolve safety data remain exhaustive.
+- Capture bundles no longer advertise internal `refs/rbox-*` refs.
+
+### Server (already live)
+- Fleet push alerts (design 127): drift >24h and reporting-stopped conditions page
+  #rbox-alerts hourly, with incident dedup/resolve semantics.
+
 ## [1.6.5] — 2026-07-16 — the fleet phones home (design 120)
 
 ### Added
