@@ -4,7 +4,7 @@ import { RBOX_VERSION } from "./version.js";
 import { semverGt } from "./semver.js";
 import { homeDir } from "./rbox-paths.js";
 import { style } from "./style.js";
-import { verifyAndParseManifest, type Manifest } from "./upgrade-cmd.js";
+import { verifyAndParseManifest, type Manifest } from "./release-verify.js";
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, type WatchEvent } from "../engine/index.js";
+import { buildIgnoreMatcher, type WatchEvent } from "../../engine/index.js";
 import { createBatcher, startWatcher, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp

@@ -19,7 +19,7 @@ import {
   snapshotAtPath,
   snapshotEntry,
   type DriftCandidate,
-} from "./drift-audit.js";
+} from "./daemon/drift-audit.js";
 
 const oldMetrics = process.env.RBOX_METRICS;
 afterEach(() => { if (oldMetrics === undefined) delete process.env.RBOX_METRICS; else process.env.RBOX_METRICS = oldMetrics; });

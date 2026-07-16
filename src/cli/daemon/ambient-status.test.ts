@@ -11,8 +11,8 @@ import {
   readPromptStatus,
   type AmbientDaemonStatusV1,
 } from "./ambient-status.js";
-import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
-import type { DaemonActivity } from "./activity.js";
+import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "../rbox-paths.js";
+import type { DaemonActivity } from "../activity.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 
 const NOW = Date.parse("2026-07-08T12:00:00.000Z");
@@ -110,7 +110,7 @@ test("outside a workspace prints nothing, including --json shape", async () => {
   expect(formatPromptStatus(verdict)).toBe("");
   expect(promptStatusJson(verdict)).toBe("");
 
-  const cliEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
+  const cliEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.ts");
   const res = Bun.spawnSync(["bun", cliEntry, "prompt-status", "--json"], {
     cwd: outside,
     env: { ...process.env, RBOX_HOME: process.env.RBOX_HOME! },

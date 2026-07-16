@@ -1,5 +1,5 @@
 import path from "node:path";
-import { formatPromptStatus, promptStatusJson, readPromptStatus } from "./ambient-status.js";
+import { formatPromptStatus, promptStatusJson, readPromptStatus } from "./daemon/ambient-status.js";
 
 // Programmatic ambient status surface for Starship/p10k/tooling. The default zsh
 // integration stays on the pure-zsh shell.line reader so precmd spawns no subprocess.

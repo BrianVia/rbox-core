@@ -17,8 +17,8 @@ import {
   type FileEntry,
   type IgnoreMatcher,
   type Manifest,
-  type OracleVerdict,
 } from "./index.js";
+import type { OracleVerdict } from "./apply-receipt.js";
 
 const roots: string[] = [];
 const blocked: string[] = [];

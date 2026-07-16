@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher } from "../engine/index.js";
-import { lowerIoPriority, verifyIoPriority } from "./io-priority.js";
+import { buildIgnoreMatcher } from "../../engine/index.js";
+import { lowerIoPriority, verifyIoPriority } from "../io-priority.js";
 import { startWatcher, type Watcher } from "./watcher.js";
 
 /**

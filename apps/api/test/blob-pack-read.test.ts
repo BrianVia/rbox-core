@@ -12,8 +12,8 @@ import {
 } from "../../../src/engine/blob-pack.js";
 import { BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT, blobBatchGet, planPackReads } from "../src/blob-batch.js";
 import { blobGet, blobGetWithVerifiedGrant } from "../src/blobs.js";
-import { blobPackPut, packKey } from "../src/blob-pack.js";
-import { blobKey } from "../src/util.js";
+import { blobPackPut } from "../src/blob-pack.js";
+import { blobKey, packKey } from "../src/util.js";
 import { mintGrant } from "../src/grants.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import type { Env } from "../src/env.js";

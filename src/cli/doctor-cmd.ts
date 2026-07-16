@@ -9,7 +9,7 @@ import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readM
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
-import { verifyAndParseManifest } from "./upgrade-cmd.js";
+import { verifyAndParseManifest } from "./release-verify.js";
 import { RBOX_VERSION } from "./version.js";
 import { semverGt } from "./semver.js";
 import { style } from "./style.js";

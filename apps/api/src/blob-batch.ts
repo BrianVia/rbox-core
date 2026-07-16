@@ -1,12 +1,11 @@
 import type { Env } from "./env.js";
 import { isEntitled } from "./authz.js";
-import { readBodyCapped, readBytesCapped } from "./commit-envelope.js";
 import { emit, emitBlobBatchGetSummary, startOp, type BlobBatchGetSummary, type Op } from "./metrics.js";
 import { uploadGrantsEnabled } from "./grants.js";
 import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
-import { blobKey, json, logErr, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
+import { blobKey, json, logErr, packKey, readBodyCapped, readBytesCapped, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 import { dbFor } from "./db.js";
-import { packedLocations, packKey, readPackedExtent, type PackedLocation } from "./blob-pack.js";
+import { packedLocations, readPackedExtent, type PackedLocation } from "./blob-pack.js";
 
 // Wire twin: src/cli/remote/blob-batch/wire.ts — the framing constants, codec,
 // and over-cap { error: "too_many_records", max } response are duplicated per

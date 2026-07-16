@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
-import { DIVERGENCE_SAMPLE } from "./commit-delta.js";
+
+export const DIVERGENCE_SAMPLE = 16; // design 102 §7.1
 
 /**
  * Server-side observability for the control plane (perf TODO, 2026-06-29).

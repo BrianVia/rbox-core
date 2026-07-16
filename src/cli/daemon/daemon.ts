@@ -52,20 +52,20 @@ import {
   type DriftCandidate,
   type DriftCandidateDraft,
   type EntrySnapshot,
-} from "../drift-audit.js";
+} from "./drift-audit.js";
 import { lowerIoPriority } from "../io-priority.js";
 import { QuotaExceededError, RboxApi } from "../remote.js";
 import { envInt } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
-import { startWatcher, type Watcher } from "../watcher.js";
+import { startWatcher, type Watcher } from "./watcher.js";
 import { runUpdateCheckIfDue } from "../update-check.js";
 import {
   AMBIENT_STATUS_HEARTBEAT_MS,
   pausedAmbientDaemonStatus,
   projectAmbientDaemonStatus,
   type AmbientDaemonStatusV1,
-} from "../ambient-status.js";
-import { saveAmbientDaemonStatus } from "../ambient-status-writer.js";
+} from "./ambient-status.js";
+import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "../version.js";
 import { daemonBindingMatches } from "../sync-state.js";
 import { ageBucket, projectGitDeferralRepos, renderGitDeferralLine } from "../status-view.js";

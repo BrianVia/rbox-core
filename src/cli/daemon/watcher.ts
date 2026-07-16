@@ -5,7 +5,7 @@ import path from "node:path";
 // dlopens nothing, so it's safe at module load on every platform. The NATIVE binding
 // is loaded lazily, per-host, in loadParcelWrapper() below. Types: parcel-watcher.d.ts.
 import { createWrapper } from "@parcel/watcher/wrapper";
-import { nativePruneGlobs, type IgnoreMatcher, type WatchEvent, type WatchEventKind } from "../engine/index.js";
+import { nativePruneGlobs, type IgnoreMatcher, type WatchEvent, type WatchEventKind } from "../../engine/index.js";
 
 export interface Watcher {
   close(): Promise<void>;

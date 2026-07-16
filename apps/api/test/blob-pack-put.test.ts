@@ -11,8 +11,8 @@ import {
   parsePack,
   type PackDirEntry,
 } from "../../../src/engine/blob-pack.js";
-import { blobPackPut, packKey, PACK_ORPHAN_GRACE_MS, sweepUploadingPacks } from "../src/blob-pack.js";
-import { blobKey } from "../src/util.js";
+import { blobPackPut, PACK_ORPHAN_GRACE_MS, sweepUploadingPacks } from "../src/blob-pack.js";
+import { blobKey, packKey } from "../src/util.js";
 import { mintUploadGrant } from "../src/grants.js";
 import { verifyReceipt } from "../src/receipts.js";
 import type { Env } from "../src/env.js";

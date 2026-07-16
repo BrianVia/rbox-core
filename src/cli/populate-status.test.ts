@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { readPromptStatus, formatPromptStatus, AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "./ambient-status.js";
+import { readPromptStatus, formatPromptStatus, AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "./daemon/ambient-status.js";
 import { createPopulateStatusWriter, populateStatusPath, readFreshPopulateStatus, type PopulateStatusV1 } from "./populate-status.js";
 import { syncStreamId, type WorkspaceConfig } from "./config.js";
 import { daemonStatusPath } from "./rbox-paths.js";

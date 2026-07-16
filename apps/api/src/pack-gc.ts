@@ -1,4 +1,5 @@
-import { PACK_ORPHAN_GRACE_MS, packGcMode, packKey, type PackGcMode } from "./blob-pack.js";
+import { PACK_ORPHAN_GRACE_MS, packGcMode, type PackGcMode } from "./blob-pack.js";
+import { packKey } from "./util.js";
 import { dbFor } from "./db.js";
 import type { Env } from "./env.js";
 import { emit, startOp, type OpSpan } from "./metrics.js";

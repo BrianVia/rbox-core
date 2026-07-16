@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { classifyShadow, compare32, DIVERGENCE_SAMPLE, divergenceDigest, mergeAddedShas, mergeSortedUnique } from "../src/commit-delta.js";
+import { classifyShadow, compare32, divergenceDigest, mergeAddedShas, mergeSortedUnique } from "../src/commit-delta.js";
+import { DIVERGENCE_SAMPLE } from "../src/metrics.js";
 import { loadSidecarRaw } from "../src/sidecar.js";
 import { sha256Hex } from "../src/util.js";
 import { REFSET_HEADER, REFSET_REC, serializeRefset } from "../../../src/engine/refset.js";

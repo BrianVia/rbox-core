@@ -10,7 +10,8 @@ import {
   type PackDirEntry,
 } from "../../../src/engine/blob-pack.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";
-import { blobPackPut, packGcMode, packKey, PACK_ORPHAN_GRACE_MS, resweepPackTombstones, sweepUploadingPacks } from "../src/blob-pack.js";
+import { blobPackPut, packGcMode, PACK_ORPHAN_GRACE_MS, resweepPackTombstones, sweepUploadingPacks } from "../src/blob-pack.js";
+import { packKey } from "../src/util.js";
 import {
   PACK_GC_CLOCK_STALENESS_MS,
   PACK_INTENT_QUIESCENCE_MS,

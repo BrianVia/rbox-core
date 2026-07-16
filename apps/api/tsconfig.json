@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tail/src", "../../src/engine/manifest-validate.ts", "../../src/engine/sha256-stream.ts", "../../src/engine/refset.ts", "../../src/engine/pat-token.ts"]
+  "include": ["src", "tail/src", "../../src/engine/manifest-validate.ts", "../../src/engine/sha256-stream.ts", "../../src/engine/refset.ts", "../../src/engine/pat-token.ts", "../../src/engine/blob-pack.ts", "../../src/engine/manifest-chain.ts"]
 }

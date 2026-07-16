@@ -12,7 +12,7 @@ import { pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
 import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
-import type { WatchOptions, Watcher } from "../watcher.js";
+import type { WatchOptions, Watcher } from "./watcher.js";
 import { RBOX_VERSION } from "../version.js";
 
 // Design 45: the daemon's activity sidecar is `rbox status`'s window into background
