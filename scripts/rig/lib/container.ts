@@ -204,11 +204,12 @@ export function parseDockerStats(json: string, ts = new Date().toISOString()): S
 const APPLE_DOCTOR: DoctorCheck[] = [
   { id: "macos-version", label: "macOS >= 26" }, { id: "arm64", label: "arch arm64" },
   { id: "runtime-version", label: "container CLI present" }, { id: "runtime-ready", label: "container system running" },
+  { id: "disk-headroom", label: "runs/cache disk headroom" },
 ];
 const DOCKER_DOCTOR: DoctorCheck[] = [
   { id: "docker-info", label: "Docker server capabilities" }, { id: "local-context", label: "Docker context is local" },
   { id: "docker-disk", label: "Docker/runs/cache disk space" }, { id: "docker-probe", label: "Docker bind/network probe" },
-  { id: "rootless-policy", label: "rootless resource-limit policy" },
+  { id: "builder-cache", label: "Docker builder cache size" }, { id: "rootless-policy", label: "rootless resource-limit policy" },
 ];
 
 const APPLE_VERBS: RunnerBackend["verbs"] = {
@@ -221,6 +222,7 @@ const DOCKER_VERBS: RunnerBackend["verbs"] = {
 };
 
 export async function dockerEndpoint(): Promise<string> {
+  if (process.env.DOCKER_HOST) return process.env.DOCKER_HOST;
   const shown = await spawnCapture(["docker", "context", "show"], { allowFail: true, timeoutMs: 10_000 });
   if (shown.exitCode !== 0) throw new Error(`docker context show failed: ${(shown.stderr || shown.stdout).trim()}`);
   const name = shown.stdout.trim();
@@ -237,7 +239,8 @@ export interface DockerInfo {
   CgroupDriver?: unknown;
   CgroupVersion?: unknown;
   MemoryLimit?: unknown;
-  CpuCfsQuota?: unknown;
+  CPUCfsQuota?: unknown;
+  CpuCfsQuota?: unknown; // tolerate older/alternate API serializers
   DockerRootDir?: unknown;
   SecurityOptions?: unknown;
 }
@@ -252,6 +255,7 @@ export async function dockerInfo(): Promise<DockerInfo> {
 export function dockerIsRootless(info: DockerInfo): boolean {
   return Array.isArray(info.SecurityOptions) && info.SecurityOptions.some((v) => typeof v === "string" && v.toLowerCase().includes("rootless"));
 }
+export function dockerHasCpuQuota(info: DockerInfo): boolean { return (info.CPUCfsQuota ?? info.CpuCfsQuota) === true; }
 
 let markers: string[] = [];
 export function runtimeMarkers(): readonly string[] { return markers; }
@@ -260,9 +264,9 @@ export async function assessRuntimeResourcePolicy(image: string): Promise<void> 
   if (backend().name !== "docker") return;
   const info = await dockerInfo();
   if (!dockerIsRootless(info)) return;
-  const basic = String(info.CgroupVersion) === "2" && info.MemoryLimit === true && info.CpuCfsQuota === true;
+  const basic = String(info.CgroupVersion) === "2" && info.MemoryLimit === true && dockerHasCpuQuota(info);
   const probe = basic
-    ? await run(["run", "--rm", "--cpus", "0.25", "--memory", "64m", image, "sh", "-c", "test -r /sys/fs/cgroup/cgroup.controllers && grep -qw cpu /sys/fs/cgroup/cgroup.controllers && grep -qw memory /sys/fs/cgroup/cgroup.controllers"], { allowFail: true, timeoutMs: 30_000 })
+    ? await run(["run", "--rm", "--label", "rig=1", "--cpus", "0.25", "--memory", "64m", image, "sh", "-c", "test -r /sys/fs/cgroup/cgroup.controllers && grep -qw cpu /sys/fs/cgroup/cgroup.controllers && grep -qw memory /sys/fs/cgroup/cgroup.controllers && test \"$(cat /sys/fs/cgroup/memory.max)\" = 67108864 && test \"$(cut -d' ' -f1 /sys/fs/cgroup/cpu.max)\" != max"], { allowFail: true, timeoutMs: 30_000 })
     : { exitCode: 1 } as RunResult;
   if (!basic || probe.exitCode !== 0) markers = ["rootless-unvalidated"];
 }
@@ -271,7 +275,7 @@ export async function runDockerDoctorProbe(repoRoot: string): Promise<RunResult>
   if (backend().name !== "docker") throw new Error("Docker probe requested for Apple backend");
   const name = `rig-doctor-${process.pid}`;
   try {
-    const created = await run(["create", "--name", name, "--network", "bridge", "--mount", serializeMount({ source: repoRoot, target: "/checkout", readonly: true }, "docker"), NAMES.image, "sh", "-c", "test -r /checkout/package.json && getent hosts example.com >/dev/null"], { allowFail: true, timeoutMs: 30_000 });
+    const created = await run(["create", "--name", name, "--label", "rig=1", "--network", "bridge", "--mount", serializeMount({ source: repoRoot, target: "/checkout", readonly: true }, "docker"), NAMES.image, "sh", "-c", "test -r /checkout/package.json && getent hosts example.com >/dev/null"], { allowFail: true, timeoutMs: 30_000 });
     if (created.exitCode !== 0) return created;
     return run(["start", "--attach", name], { allowFail: true, timeoutMs: 30_000 });
   } finally {
@@ -325,7 +329,7 @@ function backend(): RunnerBackend {
 }
 export function runnerName(): RunnerName { return backend().name; }
 export function runnerBackendForTests(name: RunnerName): RunnerBackend { return name === "docker" ? dockerBackend : appleBackend; }
-export function resetRunnerForTests(): void { selected = undefined; configuredFlag = undefined; }
+export function resetRunnerForTests(): void { selected = undefined; configuredFlag = undefined; markers = []; }
 
 /** Runtime invocation choke point. */
 export async function run(args: string[], opts: RunOpts = {}): Promise<RunResult> {
@@ -384,10 +388,16 @@ export interface BuildSpec { tag: string; dockerfile: string; contextDir: string
 export function buildImageArgs(spec: BuildSpec): string[] {
   const args = ["build", "-t", spec.tag, "-f", spec.dockerfile];
   for (const [k, v] of Object.entries(spec.buildArgs ?? {})) args.push("--build-arg", `${k}=${v}`);
-  for (const [k, v] of Object.entries(spec.labels ?? {})) args.push("--label", `${k}=${v}`);
+  const labels = { rig: "1", ...(spec.labels ?? {}) };
+  for (const [k, v] of Object.entries(labels)) args.push("--label", `${k}=${v}`);
   args.push(spec.contextDir); return args;
 }
 export async function buildImage(spec: BuildSpec): Promise<void> { await run(buildImageArgs(spec)); }
+export async function ensureImagePresent(spec: BuildSpec): Promise<boolean> {
+  if (await imageExists(spec.tag)) return false;
+  await buildImage(spec);
+  return true;
+}
 export async function imageDelete(tag: string): Promise<boolean> { return (await run([...backend().verbs.imageDelete, tag], { allowFail: true })).exitCode === 0; }
 
 function exactDockerRows(text: string, field: string, name: string): boolean { return parseNdjson(text).some((row) => row[field] === name); }
@@ -397,7 +407,7 @@ export async function networkExists(name: string): Promise<boolean> {
   if (backend().name === "docker") return exactDockerRows(r.stdout, "Name", name);
   return r.stdout.includes(`"${name}"`);
 }
-export async function networkCreate(name: string): Promise<void> { await run(["network", "create", name]); }
+export async function networkCreate(name: string): Promise<void> { await run(backend().name === "docker" ? ["network", "create", "--label", "rig=1", name] : ["network", "create", name]); }
 export async function networkDelete(name: string): Promise<boolean> { return (await run([...backend().verbs.networkDelete, name], { allowFail: true })).exitCode === 0; }
 
 export async function containerExists(name: string): Promise<boolean> {
@@ -421,13 +431,15 @@ export function serializeMount(m: Mount, runner: RunnerName): string {
 }
 export interface CreateSpec { name: string; image: string; network: string; cpus: number; memory: string; mounts: Mount[]; env?: Record<string, string>; cmd?: string[]; imageHash?: string }
 function normalizedCreateSpec(spec: CreateSpec, runner: RunnerName): unknown {
-  return { name: spec.name, image: spec.image, network: spec.network, cpus: spec.cpus, memory: spec.memory, mounts: spec.mounts.map((m) => ({ type: m.type ?? "bind", source: m.source, target: m.target, readonly: Boolean(m.readonly) })), env: Object.fromEntries(Object.entries(spec.env ?? {}).sort(([a], [b]) => a.localeCompare(b))), cmd: spec.cmd ?? (runner === "apple-container" ? appleBackend.createCmdOverride() : undefined) ?? [] };
+  const mounts = spec.mounts.map((m) => ({ type: m.type ?? "bind", source: m.source, target: m.target, readonly: Boolean(m.readonly) }))
+    .sort((a, b) => `${a.type}\0${a.source}\0${a.target}`.localeCompare(`${b.type}\0${b.source}\0${b.target}`));
+  return { name: spec.name, image: spec.image, network: spec.network, cpus: spec.cpus, memory: spec.memory, mounts, env: Object.fromEntries(Object.entries(spec.env ?? {}).sort(([a], [b]) => a.localeCompare(b))), cmd: spec.cmd ?? (runner === "apple-container" ? appleBackend.createCmdOverride() : undefined) ?? [] };
 }
 export function createSpecHash(spec: CreateSpec, runner: RunnerName = runnerName()): string {
   return createHash("sha256").update(JSON.stringify({ runner, imageHash: spec.imageHash ?? "", create: normalizedCreateSpec(spec, runner) })).digest("hex");
 }
 export function createContainerArgs(spec: CreateSpec, runner: RunnerName = runnerName()): string[] {
-  const args = ["create", "--name", spec.name, "--network", spec.network, "--cpus", String(spec.cpus), "--memory", spec.memory, "--label", `rig.spec=${createSpecHash(spec, runner)}`];
+  const args = ["create", "--name", spec.name, "--network", spec.network, "--cpus", String(spec.cpus), "--memory", spec.memory, "--label", "rig=1", "--label", `rig.spec=${createSpecHash(spec, runner)}`];
   for (const m of spec.mounts) args.push("--mount", serializeMount(m, runner));
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
   args.push(spec.image, ...(spec.cmd ?? (runner === "apple-container" ? appleBackend.createCmdOverride()! : []))); return args;
@@ -453,12 +465,67 @@ export async function rigVolumes(): Promise<string[]> {
   const r = await run(args, { allowFail: true });
   if (r.exitCode !== 0) throw new Error(`${backend().bin} volume listing failed: ${(r.stderr || r.stdout).trim()}`);
   try {
-    if (backend().name === "docker") return [...new Set(parseNdjson(r.stdout).map((row) => row.Name).filter((v): v is string => typeof v === "string" && v.startsWith("rig-")))];
-    const names = new Set<string>(); for (const row of rows(JSON.parse(r.stdout))) for (const v of Object.values(row)) if (typeof v === "string" && v.startsWith("rig-")) names.add(v); return [...names];
+    if (backend().name === "docker") {
+      const parsed = parseNdjson(r.stdout);
+      const names = parsed.map((row) => { if (typeof row.Name !== "string") throw new Error("Docker volume row lacks string Name"); return row.Name; });
+      return [...new Set(names.filter((name) => name.startsWith("rig-")))];
+    }
+    const names = new Set<string>();
+    for (const row of rows(JSON.parse(r.stdout))) {
+      const entry = Object.entries(row).find(([key, value]) => key.toLowerCase().includes("name") && typeof value === "string");
+      if (!entry) throw new Error("Apple volume row lacks a string name field");
+      if ((entry[1] as string).startsWith("rig-")) names.add(entry[1] as string);
+    }
+    return [...names];
   } catch (e) { throw new Error(`rig: cannot parse ${backend().bin} volume listing: ${e instanceof Error ? e.message : String(e)}`); }
 }
 export async function volumeDelete(name: string): Promise<boolean> {
   if (!name.startsWith("rig-")) throw new Error(`rig: refusing to delete non-rig volume ${name}`);
   return (await run(["volume", "rm", name], { allowFail: true })).exitCode === 0;
+}
+
+export interface RigImage { id: string; size: string }
+export async function rigDanglingImages(): Promise<RigImage[]> {
+  if (backend().name !== "docker") return [];
+  const r = await run(["image", "ls", "--filter", "dangling=true", "--filter", "label=rig=1", "--format", "json"], { allowFail: true });
+  if (r.exitCode !== 0) throw new Error(`docker dangling-image listing failed: ${(r.stderr || r.stdout).trim()}`);
+  try {
+    return parseNdjson(r.stdout).map((row) => {
+      if (typeof row.ID !== "string") throw new Error("Docker image row lacks ID");
+      return { id: row.ID, size: typeof row.Size === "string" ? row.Size : "unknown" };
+    });
+  } catch (e) { throw new Error(`rig: cannot parse docker dangling-image listing: ${e instanceof Error ? e.message : String(e)}`); }
+}
+export async function removeDanglingRigImages(): Promise<RigImage[]> {
+  const removed: RigImage[] = [];
+  for (const image of await rigDanglingImages()) {
+    if (!(await imageDelete(image.id))) throw new Error(`rig: failed to remove dangling rig image ${image.id}`);
+    removed.push(image);
+  }
+  return removed;
+}
+export interface RigVolume { name: string; size: string }
+export async function rigLabeledVolumes(): Promise<RigVolume[]> {
+  if (backend().name !== "docker") return (await rigVolumes()).map((name) => ({ name, size: "unknown" }));
+  const r = await run(["volume", "ls", "--filter", "label=rig=1", "--format", "json"], { allowFail: true });
+  if (r.exitCode !== 0) throw new Error(`docker labeled-volume listing failed: ${(r.stderr || r.stdout).trim()}`);
+  try {
+    const volumes = parseNdjson(r.stdout).map((row) => {
+      if (typeof row.Name !== "string") throw new Error("Docker volume row lacks string Name");
+      return { name: row.Name, size: typeof row.Size === "string" ? row.Size : "unknown" };
+    }).filter((volume) => volume.name.startsWith("rig-"));
+    return [...new Map(volumes.map((volume) => [volume.name, volume])).values()];
+  }
+  catch (e) { throw new Error(`rig: cannot parse docker labeled-volume listing: ${e instanceof Error ? e.message : String(e)}`); }
+}
+export async function dockerBuilderDiskUsage(): Promise<string> {
+  if (backend().name !== "docker") return "not applicable";
+  const r = await run(["system", "df", "--format", "json"], { allowFail: true, timeoutMs: 15_000 });
+  if (r.exitCode !== 0) return `unavailable: ${(r.stderr || r.stdout).trim()}`;
+  try {
+    const build = parseNdjson(r.stdout).find((row) => typeof row.Type === "string" && row.Type.toLowerCase().includes("build"));
+    if (!build) return "0 B (no build-cache row)";
+    return `${String(build.Size ?? "unknown")} total · ${String(build.Reclaimable ?? "unknown")} reclaimable`;
+  } catch (e) { return `unavailable: ${e instanceof Error ? e.message : String(e)}`; }
 }
 export { NAMES };

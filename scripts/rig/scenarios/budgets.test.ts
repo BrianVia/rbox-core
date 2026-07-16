@@ -25,6 +25,21 @@ test("assessIdle derives mean/peak CPU% and peak mem over the window", () => {
   expect(a.withinBudget).toBe(true);
 });
 
+test("assessIdle derives Docker instant-percent mean and peak end-to-end", () => {
+  const t0 = 1_500_000;
+  const base = { name: "rig-dev-a", runner: "docker" as const };
+  const samples = [
+    { ...base, ts: new Date(t0).toISOString(), memBytes: 100 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 1 } },
+    { ...base, ts: new Date(t0 + 2000).toISOString(), memBytes: 110 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 2 } },
+    { ...base, ts: new Date(t0 + 4000).toISOString(), memBytes: 105 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 4 } },
+  ];
+  const a = assessIdle(samples, t0, t0 + 4000);
+  expect(a.meanCpuPct).toBeCloseTo(3, 5);
+  expect(a.peakCpuPct).toBe(4);
+  expect(a.peakMemMB).toBe(110);
+  expect(a.withinBudget).toBe(true);
+});
+
 test("assessIdle excludes samples outside the soak window (a pre-soak CPU spike doesn't count)", () => {
   const t0 = 2_000_000;
   const samples = [

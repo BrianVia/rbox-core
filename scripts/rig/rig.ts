@@ -21,6 +21,8 @@ import { resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js"
 import { RunCapture } from "./lib/capture.js";
 import { renderReportMd } from "./lib/report.js";
 import { deleteImageHashRecord, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
+import { formatBytes, trimRunDirectories, trimWorkloadCache } from "./lib/gc.js";
+import { assessDiskHeadroom, assessDockerInfo, assessRootlessPolicy, mayRunDockerDoctorProbes } from "./lib/doctor.js";
 import { waitForConvergence, waitForPath } from "./lib/waiters.js";
 import { ensureWorkloadDir, resolveWorkloadTar } from "./lib/workload.js";
 import { FAST_SUITE, getScenario, scenarioNames } from "./scenarios/index.js";
@@ -64,6 +66,7 @@ usage:
   rig run conductor-initial-sync [--workload-tar <path>]   real-workload scale (explicit-only)
   rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
   rig down [--all]                    tear down containers + network (--all: +image +volumes)
+  rig gc                              scoped rig artifact + cache reclamation
 
 scenarios: ${scenarioNames().join(", ")}
 suite:     ${FAST_SUITE.join(", ")}
@@ -104,6 +107,8 @@ async function ensureImage(): Promise<string> {
  *  (re)start them. Re-running with everything present just reports state. */
 async function ensureUp(apiUrl: string): Promise<void> {
   await C.ensureRuntimeReady();
+  const trimmed = trimRunDirectories(RUNS_DIR);
+  if (trimmed.entries) console.log(`trimmed ${trimmed.entries} old rig runs (${formatBytes(trimmed.bytes)})`);
   const currentHash = await ensureImage();
   await C.assessRuntimeResourcePolicy(NAMES.image);
 
@@ -135,6 +140,13 @@ async function ensureUp(apiUrl: string): Promise<void> {
     }
     await C.startContainer(name);
     console.log(`${name} up`);
+  }
+  // Rebuild retags the old image, but Docker cannot remove that now-dangling ID
+  // until every container referencing it has been recreated by the spec guard.
+  // Sweep on every up, not only the rebuilding invocation, so a transient failed
+  // deletion remains discoverable and is retried next time.
+  for (const dangling of await C.removeDanglingRigImages()) {
+    console.log(`removed dangling rig image ${dangling.id} (${dangling.size})`);
   }
 }
 
@@ -365,6 +377,7 @@ async function down(all: boolean): Promise<void> {
   if (all) {
     if (await C.imageDelete(NAMES.image)) removed.push(`image ${NAMES.image}`);
     for (const v of await C.rigVolumes()) if (await C.volumeDelete(v)) removed.push(`volume ${v}`);
+    for (const image of await C.rigDanglingImages()) if (await C.imageDelete(image.id)) removed.push(`dangling image ${image.id} (${image.size})`);
     try {
       deleteImageHashRecord(HASH_FILE, C.runnerName());
     } catch {
@@ -372,6 +385,24 @@ async function down(all: boolean): Promise<void> {
     }
   }
   console.log(removed.length ? `removed:\n  ${removed.join("\n  ")}` : "nothing to remove (already clean)");
+}
+
+async function gc(): Promise<void> {
+  await C.ensureRuntimeReady();
+  const images = await C.rigDanglingImages();
+  let removedImages = 0;
+  const reclaimedImageSizes: string[] = [];
+  for (const image of images) if (await C.imageDelete(image.id)) { removedImages++; reclaimedImageSizes.push(image.size); }
+  const volumes = await C.rigLabeledVolumes();
+  let removedVolumes = 0;
+  const reclaimedVolumeSizes: string[] = [];
+  for (const volume of volumes) if (await C.volumeDelete(volume.name)) { removedVolumes++; reclaimedVolumeSizes.push(volume.size); }
+  const runs = trimRunDirectories(RUNS_DIR);
+  const cache = trimWorkloadCache(path.join(os.homedir(), ".cache", "rbox-rig", "workloads"));
+  console.log(`rig gc: ${removedImages} dangling images (${reclaimedImageSizes.join(", ") || "0 B"})`);
+  console.log(`rig gc: ${removedVolumes} labeled volumes (${reclaimedVolumeSizes.join(", ") || "0 B"})`);
+  console.log(`rig gc: ${runs.entries} old runs (${formatBytes(runs.bytes)})`);
+  console.log(`rig gc: ${cache.entries} workload-cache entries (${formatBytes(cache.bytes)})`);
 }
 
 // ── watch ─────────────────────────────────────────────────────────────────────
@@ -439,33 +470,61 @@ async function doctor(apiUrl: string): Promise<number> {
     add("container CLI present", ver.length > 0, ver || "not found", "brew install container   # Apple container runtime");
     const sys = await C.systemStatus();
     add("container system running", sys.healthy, sys.healthy ? "healthy" : sys.raw || "not running", "container system start");
+    const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
+    fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
+    const disk = await C.spawnHost(["df", "-Pk", RUNS_DIR, cacheDir], { allowFail: true });
+    const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
+    add("runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail, "run `bun run rig gc`");
   } else {
+    let dockerLocal = false;
     try {
       const endpoint = await C.dockerEndpoint();
-      add("Docker context is local", C.isLocalDockerEndpoint(endpoint), endpoint || "unknown", "select a local unix-socket Docker context; remote daemons cannot resolve checkout bind paths");
+      dockerLocal = mayRunDockerDoctorProbes(endpoint);
+      add("Docker context is local", dockerLocal, endpoint || "unknown", "select a local unix-socket Docker context; remote daemons cannot resolve checkout bind paths");
     } catch (e) { add("Docker context is local", false, e instanceof Error ? e.message : String(e)); }
     let info: C.DockerInfo | undefined;
+    let dockerDiskOk = false;
     try {
       info = await C.dockerInfo();
-      const limits = info.MemoryLimit === true && info.CpuCfsQuota === true;
-      add("Docker server capabilities", Boolean(info.ServerVersion) && Boolean(info.OperatingSystem) && limits,
-        `server ${String(info.ServerVersion ?? "unknown")} · ${String(info.OperatingSystem ?? "unknown")} · cgroup ${String(info.CgroupDriver ?? "?")}/${String(info.CgroupVersion ?? "?")} · memory=${String(info.MemoryLimit)} cpu-quota=${String(info.CpuCfsQuota)}`,
-        "enable Docker memory and CPU quota support");
+      const capability = assessDockerInfo(info);
+      add("Docker server capabilities", capability.ok, capability.detail, "enable Docker memory and CPU quota support");
     } catch (e) { add("Docker server capabilities", false, e instanceof Error ? e.message : String(e), "start Docker and check local socket permissions"); }
-    if (info && typeof info.DockerRootDir === "string") {
+    if (dockerLocal && info && typeof info.DockerRootDir === "string") {
       const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
       fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
       const disk = await C.spawnHost(["df", "-Pk", info.DockerRootDir, RUNS_DIR, cacheDir], { allowFail: true });
-      add("Docker/runs/cache disk space", disk.exitCode === 0, disk.exitCode === 0 ? disk.stdout.trim().split("\n").slice(1).join(" · ") : (disk.stderr || disk.stdout).trim());
-    } else add("Docker/runs/cache disk space", false, "DockerRootDir unavailable");
+      const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
+      dockerDiskOk = diskAssessment.ok;
+      add("Docker/runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail,
+        "run `bun run rig gc`; if Docker build cache dominates, inspect it and choose `docker builder prune` manually");
+      advise("Docker builder cache size", true, await C.dockerBuilderDiskUsage());
+    } else add("Docker/runs/cache disk space", false, dockerLocal ? "DockerRootDir unavailable" : "refused for remote Docker context");
+    let dockerProbeOk = false;
     try {
+      if (!dockerLocal) throw new Error("refused for remote Docker context");
+      if (!(await C.imageExists(NAMES.image))) {
+        if (!dockerDiskOk) throw new Error("probe image absent and disk-headroom gate failed; refusing to build");
+        const hash = currentImageHash();
+        console.log(`doctor: building scoped probe image ${NAMES.image} (${hash})…`);
+        const built = await C.ensureImagePresent({ tag: NAMES.image, dockerfile: path.join(RIG_DIR, "Dockerfile"), contextDir: REPO_ROOT, labels: { "rig.hash": hash } });
+        if (built) writeImageHashRecord(HASH_FILE, C.runnerName(), hash);
+      }
       const probe = await C.runDockerDoctorProbe(REPO_ROOT);
-      add("Docker bind/network probe", probe.exitCode === 0, probe.exitCode === 0 ? "read-only checkout bind + outbound DNS passed" : (probe.stderr || probe.stdout).trim(), "build the rig image, then check bind policy and daemon networking");
+      dockerProbeOk = probe.exitCode === 0;
+      add("Docker bind/network probe", probe.exitCode === 0, probe.exitCode === 0 ? "read-only checkout bind + outbound DNS passed" : (probe.stderr || probe.stdout).trim(), "check bind policy and daemon networking, then re-run doctor");
     } catch (e) { add("Docker bind/network probe", false, e instanceof Error ? e.message : String(e)); }
-    if (info && C.dockerIsRootless(info)) {
-      const valid = String(info.CgroupVersion) === "2" && info.MemoryLimit === true && info.CpuCfsQuota === true;
-      advise("rootless resource-limit policy", valid, valid ? "delegated cgroup v2 + limits reported; runtime probe validates enforcement" : "rootless-unvalidated (resource-budget scenarios will SKIP)");
-    } else advise("rootless resource-limit policy", true, "rootful daemon");
+    if (dockerLocal && info && C.dockerIsRootless(info)) {
+      let limitsProbeOk = false;
+      try {
+        await C.assessRuntimeResourcePolicy(NAMES.image);
+        limitsProbeOk = !C.runtimeMarkers().includes("rootless-unvalidated");
+      } catch { /* assessment below remains rootless-unvalidated */ }
+      const policy = assessRootlessPolicy(info, limitsProbeOk);
+      advise("rootless resource-limit policy", policy.ok, policy.detail);
+    } else if (dockerLocal && info) {
+      const policy = assessRootlessPolicy(info, dockerProbeOk);
+      advise("rootless resource-limit policy", policy.ok, policy.detail);
+    } else advise("rootless resource-limit policy", false, dockerLocal ? "docker info unavailable" : "refused for remote Docker context");
   }
 
   // bun on host
@@ -548,6 +607,9 @@ async function main(): Promise<number> {
       return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
     case "down":
       await down(flags.all === "true");
+      return 0;
+    case "gc":
+      await gc();
       return 0;
     default:
       console.error(`rig: unknown command ${JSON.stringify(cmd)}\n`);

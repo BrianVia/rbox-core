@@ -43,6 +43,22 @@ test("summarizeStats on a single sample yields zero CPU (no interval to measure)
   expect(s.peakMemMB).toBeCloseTo(8, 5);
 });
 
+test("summarizeStats integrates canonical Docker instant-percent samples", () => {
+  const t0 = 1_000_000_000_000;
+  const base = { name: "rig-dev-a", runner: "docker" as const };
+  const samples = [
+    { ...base, ts: new Date(t0).toISOString(), memBytes: 100 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 10 } },
+    { ...base, ts: new Date(t0 + 2000).toISOString(), memBytes: 120 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 20 } },
+    { ...base, ts: new Date(t0 + 4000).toISOString(), memBytes: 110 * 1024 * 1024, cpu: { kind: "instant-percent" as const, pct: 50 } },
+  ];
+  const s = summarizeStats(samples);
+  // Right-hand observations represent each elapsed Docker sampling interval:
+  // 2s × 20% + 2s × 50% = 1.4 core-seconds.
+  expect(s.cpuCoreSecondsTotal).toBeCloseTo(1.4, 5);
+  expect(s.peakCpuPct).toBe(50);
+  expect(s.peakMemMB).toBe(120);
+});
+
 // ── summarizeTail ─────────────────────────────────────────────────────────────
 
 test("summarizeTail classifies ok / exception / 5xx / 403 from real-shaped tail lines", () => {
