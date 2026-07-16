@@ -5,6 +5,38 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.4] — 2026-07-15 — logs that rotate, deferrals you can see and fix
+
+### Added
+- **The menu bar now shows *which* repos are deferred and why (#285, design
+  124).** Under the Git row: up to five repos with plain-language reasons and
+  ages ("local commits · deferred 1h"), full paths on hover, "+N more" beyond
+  five. A **Copy Git fix brief** button puts a self-contained, paste-anywhere
+  brief on the clipboard — per-repo diagnosis, what clears on its own vs what
+  needs a decision, and exact safe commands — readable by a human or an LLM.
+  Unknown or forged deferral reasons can never be offered a resolve command.
+- **`rbox git deferrals`** — the same drilldown in the terminal: human list,
+  `--brief` (the clipboard document), or `--json` (typed lane array, identical
+  to `status --json`).
+
+### Changed
+- **Daemon logs rotate daily (#286, design 125).** `daemon-YYYY-MM-DD.log`
+  files with 14-day retention (`RBOX_LOG_RETENTION_DAYS` to override) replace
+  the forever-growing `daemon.log` (44 MB after a week on the founder's Mac);
+  `daemon.log` remains as a small crash sink with pointer records. `rbox logs`
+  merges both streams chronologically and `--follow` survives midnight
+  rollover and daemon restarts.
+- **Sync perf lines went on a diet.** The per-repo `repoMs=` blob (one entry
+  per repo, 101 on the founder's workspace) is capped at 8 worst-case
+  exemplars plus p50/p95/max aggregates for queue, wall, and fresh-chain
+  phases — the distribution signals perf work actually uses, at 3% of the
+  bytes. Full detail returns under `RBOX_DEBUG=1`.
+
+### Fixed
+- **Test rig repaired (#286):** login rot from v1.6.1's flag rework, container
+  git below the 2.46 symref floor, and zombie daemons under a `sleep` PID 1
+  that wedged every subsequent sync (the image now runs `tini`).
+
 ## [1.6.3] — 2026-07-15 — locks that survive reboots, upgrades that finish the job
 
 ### Fixed
