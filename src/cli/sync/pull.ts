@@ -14,7 +14,7 @@ import {
   snapshotApplyStats,
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
-import { loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { ensureCapableStateLineage, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
 import { type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
@@ -22,6 +22,7 @@ import {
 import {
   applyGitSections,
   formatGitApplyMetrics,
+  settleCommittedBranchArtifacts,
   withRevalidatedGitPartialApplies,
 } from "../sync-git.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
@@ -34,7 +35,7 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
   const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
@@ -63,7 +64,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const validatedMeta = validManifestMeta(state.manifestMeta);
   const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL === "1";
   const fastFoldBase = fastPullEnabled && validatedMeta
@@ -98,7 +99,8 @@ export async function applyPulledManifest(
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
+  let state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  state = await ensureCapableStateLineage(root, state);
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
   const matcher = matcherForState(root, cfg, state);
@@ -255,13 +257,14 @@ export async function applyPulledManifest(
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
   const deferralUpdates = orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals);
-  const savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
+  let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
     globalManifest: remote,
     ...(manifestMeta ? { manifestMeta } : {}),
     observedRepos: observedRepoKeys(state, remote.gitRepos, {
       bases: gitOutcome.gitRepos,
+      branchBaseOrigins: gitOutcome.branchBaseOrigins,
       pending: gitOutcome.gitPendingRemote,
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
@@ -272,6 +275,7 @@ export async function applyPulledManifest(
     }),
     values: {
       bases: gitOutcome.gitRepos,
+      branchBaseOrigins: gitOutcome.branchBaseOrigins,
       pending: gitOutcome.gitPendingRemote,
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
@@ -280,10 +284,12 @@ export async function applyPulledManifest(
       partial: gitOutcome.partial,
       idxProj: gitOutcome.idxProj,
     },
+    repoProofs: gitOutcome.repoProofs,
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
   })));
+  savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome);
   try {
     deps.onGitDeferralsSaved?.(savedState);
   } catch {

@@ -201,12 +201,16 @@ test("flag ON but NO file diff (git-only): files-first bypassed, git-first singl
 test("flag ON but stream-mismatch (rebind, even nonzero persisted seq): git captured INLINE", async () => {
   process.env.RBOX_FILES_FIRST = "1";
   await repoWithFile();
-  // Persist a state stamped for a DIFFERENT stream with a stale nonzero sequence —
-  // loadState maps it to a fresh seq-0 state AND sets the stream-mismatch flag (design 44).
+  // Design 130, "Artifact lifecycle, reset, and diagnostics" forbids a
+  // fence-free reset. Persist a capable DIFFERENT-stream lineage; loadState
+  // transactionally replaces it with seq 0 and marks the result as a rebind.
   await saveState(root, {
     stream: "http://x::ws_OTHER::root",
+    stateNonce: "a".repeat(32),
+    stateRevision: 4,
     lastSyncedSequence: 5,
     lastSyncedManifest: { generatedAt: "", files: [] },
+    repoRecords: {},
   });
   expect(syncStreamId(cfg)).toBe(STREAM); // sanity: our stream differs from the persisted one
 

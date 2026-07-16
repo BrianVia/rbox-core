@@ -6,6 +6,7 @@ import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, w
 import type { GitSection } from "../types.js";
 import { exists, git, readRegularFileNoFollow, ZERO_OID } from "./shared.js";
 import { pruneEmptyOpStateDirs, readAllRefs } from "./refs.js";
+import { runUpdateRefTransaction } from "./keep-pins.js";
 
 export interface CheckoutJournalBinding {
   stream: string;
@@ -39,9 +40,16 @@ export interface CheckoutJournal<TIntended = unknown> {
     indexHash?: string;
     opState: Record<string, string | null>;
     refs: Record<string, string>;
+    /** Typed A/P/K/Z rollback supplied by the branch-transition planner. */
+    branchInverses?: Array<{
+      ref: string;
+      beforeOid: string | null;
+      afterOid: string | null;
+      lines: string[];
+    }>;
     head: string;
     /** Empty lockfiles owned by checkout-txn across a branch switch. */
-    reservedRefs?: Record<string, string>;
+    reservedRefs?: Record<string, string | null>;
     indexLock?: { dev: number; ino: number };
     reservedLocks?: Record<string, { dev: number; ino: number }>;
     /** Ref-transaction locks are named durably before prepare. A token is
@@ -418,11 +426,34 @@ export async function recoverJournal<T = unknown>(
 
   const oldRefs: Record<string, string | null> = { ...(journal.old.refs ?? {}), ...(journal.old.preWipeRefs ?? {}) };
   if (journal.old.currentRefName) oldRefs[journal.old.currentRefName] = journal.old.currentRefOid ?? null;
+  const branchInverses = journal.expectedNew.branchInverses ?? [];
+  const typedBranchRefs = new Set(branchInverses.map((inverse) => inverse.ref));
+  for (const inverse of branchInverses) {
+    const live = await liveRef(repoDir, inverse.ref);
+    // A confirmed manual absent-terminal transition can leave R absent on both
+    // sides while creating A under the same transaction. Its typed inverse is
+    // therefore intentionally non-empty even though the physical endpoints are
+    // equal; run it so rollback removes the exact A target.
+    if (live === inverse.beforeOid && inverse.beforeOid !== inverse.afterOid) continue;
+    if (live !== inverse.afterOid) { human.push(`ref:${inverse.ref}`); continue; }
+    try {
+      await runUpdateRefTransaction(repoDir, inverse.lines);
+    } catch {
+      human.push(`branch-inverse:${inverse.ref}`);
+    }
+  }
   const wipeLiveRefs = journal.old.preWipeRefs ? Object.keys(await readAllRefs(repoDir)) : [];
   for (const ref of new Set([...Object.keys(oldRefs), ...Object.keys(journal.expectedNew.refs), ...wipeLiveRefs])) {
     const live = await liveRef(repoDir, ref);
     const old = oldRefs[ref] ?? null;
     const expected = journal.expectedNew.refs[ref] ?? null;
+    // Branch rollback authority exists only in its exact typed inverse. Never
+    // fall through to the generic ref restore if that inverse hard-held, and
+    // never synthesize branch authority for an older/incomplete journal.
+    if (ref.startsWith("refs/heads/")) {
+      if (!typedBranchRefs.has(ref) && live !== old) human.push(`branch-inverse-missing:${ref}`);
+      continue;
+    }
     if (live === old) continue;
     if (live !== expected) { human.push(`ref:${ref}`); continue; }
     if (old) await git(repoDir, ["update-ref", ref, old, live ?? ZERO_OID]);

@@ -5,9 +5,10 @@ import {
   validateManifest,
   manifestRequiresSchema4,
   type IgnoreMatcher,
+  type GitSection,
   type Manifest,
 } from "../../engine/index.js";
-import { loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type WorkspaceConfig } from "../config.js";
+import { ensureCapableStateLineage, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type WorkspaceConfig } from "../config.js";
 import { type CommitOptions, type CommitTimings } from "../remote.js";
 import {
   deferManifest,
@@ -21,10 +22,12 @@ import {
   formatGitPushLine,
   gitBaseAfterCommit,
   gitForceForMissingBlobs,
+  gitIncomingKey,
   gitReposManifestSchema,
   planGitSections,
   nextDeferral,
 } from "../sync-git.js";
+import { carryRepoBaseProof, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
@@ -57,7 +60,7 @@ export async function push(
   deps = withReportScanStats(deps, report);
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
@@ -339,7 +342,8 @@ async function runPushAttempt(
   // §4); §35's "a no-op tick allocates nothing" still holds — disabled() is a shared
   // free singleton, not a per-attempt allocation.
   const report = deps.report ?? PhaseReport.disabled("push");
-  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
+  let state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
+  state = await ensureCapableStateLineage(root, state);
   // One authority for every push decision: the persisted base records the last
   // pull that applied completely. A newer remote manifest may have been verified
   // (and its anti-rollback head pinned) before apply failed, but it is not a base.
@@ -402,6 +406,20 @@ async function runPushAttempt(
   // the accepted sequence and therefore cannot claim a candidate commit that later fails.
   const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};
   const repoRecords = repoRecordsForState(state);
+  const carryProofsFor = (snapshot: typeof state, relPaths: readonly string[]): Record<string, RepoBaseProof> => {
+    const records = repoRecordsForState(snapshot);
+    return Object.fromEntries(relPaths.map((relPath) => {
+      const lineageHash = Object.values(records[relPath]?.branchBaseOrigins ?? {})[0]?.lineageHash
+        ?? gitPlan.publisherAckBindings?.[relPath]?.lineageHash
+        ?? "legacy-untrusted";
+      return [relPath, carryRepoBaseProof(lineageHash)];
+    }));
+  };
+  const currentRepoAbsent: Record<string, true> = Object.fromEntries(
+    Object.entries(repoRecords)
+      .filter(([, record]) => record.repoAbsent === true)
+      .map(([relPath]) => [relPath, true as const]),
+  );
   const now = new Date().toISOString();
   for (const rel of gitPlan.captureObserved) {
     const current = repoRecords[rel]?.deferrals;
@@ -463,6 +481,7 @@ async function runPushAttempt(
       sourceGlobalSeq: state.lastSyncedSequence,
       observedRepos: deferralRepos,
       values: deferralValues,
+      repoProofs: carryProofsFor(state, deferralRepos),
     }, {
       allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
       forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
@@ -502,12 +521,14 @@ async function runPushAttempt(
     const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
     if (
       cfg.syncGit &&
-      (!same(gitPlan.gitReposRemoved, state.gitReposRemoved) ||
+      (!same(gitPlan.repoAbsent, currentRepoAbsent) ||
+        !same(gitPlan.gitReposRemoved, state.gitReposRemoved) ||
         !same(gitPlan.gitNeedsResolution, state.gitNeedsResolution) ||
         !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
     ) {
       const values = {
         bases: appliedBase.gitRepos,
+        repoAbsent: gitPlan.repoAbsent ?? {},
         pending: gitPlan.gitPendingRemote,
         removed: gitPlan.gitReposRemoved,
         resolutions: gitPlan.gitNeedsResolution,
@@ -517,6 +538,7 @@ async function runPushAttempt(
         sourceGlobalSeq: appliedSequence,
         observedRepos: changedSidecarRepoKeys(state, values),
         values,
+        repoProofs: carryProofsFor(state, changedSidecarRepoKeys(state, values)),
       }, {
         allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
         forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
@@ -662,8 +684,44 @@ async function runPushAttempt(
     // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
     // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
     const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
+    const advertised: Record<string, GitSection | null> = {};
+    const repoProofs: Record<string, RepoBaseProof> = {};
+    const ackRecords = repoRecordsForState(state);
+    for (const relPath of new Set([
+      ...Object.keys(ackRecords),
+      ...Object.keys(committed.gitRepos ?? {}),
+    ])) {
+      const section = committed.gitRepos?.[relPath];
+      advertised[relPath] = section ?? null;
+      const binding = gitPlan.publisherAckBindings?.[relPath];
+      if (section && binding) repoProofs[relPath] = {
+        authority: {
+          kind: "publisher-ack",
+          lineageHash: binding.lineageHash,
+          repositoryIdentityHash: binding.repositoryIdentityHash,
+          incomingKey: gitIncomingKey(section),
+          sourceSeq: res.sequence!,
+          advertisedRefs: section.refs,
+        },
+        lockedProof: {
+          repoKind: binding.repoKind,
+          effectiveRefScope: section.refScope,
+          checkoutComplete: true,
+          branches: {},
+          safeRefs: {},
+        },
+      };
+      else {
+        const retainedLineage = Object.values(ackRecords[relPath]?.branchBaseOrigins ?? {})[0]?.lineageHash
+          ?? binding?.lineageHash
+          ?? "legacy-untrusted";
+        repoProofs[relPath] = carryRepoBaseProof(retainedLineage);
+      }
+    }
     const ackValues = {
       bases: stateGit,
+      advertised,
+      repoAbsent: gitPlan.repoAbsent ?? {},
       pending: gitPlan.gitPendingRemote,
       removed: gitPlan.gitReposRemoved,
       resolutions: gitPlan.gitNeedsResolution,
@@ -675,6 +733,7 @@ async function runPushAttempt(
       ...(res.manifestMeta ? { manifestMeta: res.manifestMeta } : {}),
       observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
       values: ackValues,
+      repoProofs,
       authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
     }, {
       allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),

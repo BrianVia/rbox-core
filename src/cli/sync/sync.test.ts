@@ -1388,13 +1388,14 @@ test("state ownership: another workspace's baseline reads as fresh; same workspa
   await push(root, cfg, deps(remote)); // stamps workspaceId: ws_t at seq 1
 
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1); // kept
+  const statePath = path.join(root, ".rbox", "state.json");
+  const original = JSON.parse(await fs.readFile(statePath, "utf8"));
   const foreign = await loadState(root, syncStreamId({ ...cfg, remoteWorkspaceId: "ws_other" })); // mismatch → no baseline
   expect(foreign.lastSyncedSequence).toBe(0);
   expect(foreign.lastSyncedManifest.files).toHaveLength(0);
 
   // Legacy state file written before the stamp existed: adopted as-is.
-  const statePath = path.join(root, ".rbox", "state.json");
-  const legacy = JSON.parse(await fs.readFile(statePath, "utf8"));
+  const legacy = original;
   delete legacy.stream;
   await fs.writeFile(statePath, JSON.stringify(legacy));
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1);

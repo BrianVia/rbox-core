@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { GitCaptureDeferredError, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
@@ -10,6 +10,7 @@ import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConf
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
+import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -22,11 +23,22 @@ export interface GitPushPlan {
    *  files-first was inactive or the workspace has no git repos (commit 1 is terminal). */
   filesFirstDeferred?: boolean;
   gitReposRemoved?: Record<string, string>;
+  /** Repositories intentionally omitted by the publisher without any branch
+   * CAS. Their RepoRecord BASE remains protected but is not wire-projected. */
+  repoAbsent?: Record<string, true>;
   gitNeedsResolution?: Record<string, string>;
   gitPendingRemote?: Record<string, GitSection>;
   /** Config hashes authored by this exact plan. Step 4 deliberately initializes
    * this empty; publication/capture rows add entries in steps 5 and 7. */
   authoredCfgHashByRepo: Record<string, string>;
+  /** Plan-time physical/logical binding for accepted publisher ACK authority.
+   * Captured before publication so a post-commit path replacement cannot lend
+   * the committed section another repository's lineage. */
+  publisherAckBindings?: Record<string, {
+    lineageHash: string;
+    repositoryIdentityHash: string;
+    repoKind: "dir" | "pointer";
+  }>;
   captured: string[];
   carried: string[];
   deferred: Array<{ relPath: string; reason: string }>;
@@ -70,6 +82,8 @@ export interface GitPlanOptions {
    *  empty on a genuine genesis, so they pass through untouched). Git is re-derived as
    *  owed by the next ordinary push. */
   filesFirstDefer?: boolean;
+  /** Deterministic design-130 tombstone timestamp seam. */
+  now?: () => Date;
 }
 
 /**
@@ -97,12 +111,18 @@ export async function planGitSections(
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
   const base = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
+  const repoAbsent: Record<string, true> = Object.fromEntries(
+    Object.entries(repoRecordsForState(state))
+      .filter(([, record]) => record.repoAbsent === true)
+      .map(([relPath]) => [relPath, true as const]),
+  );
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   const pending = { ...(state.gitPendingRemote ?? {}) };
   const captured: string[] = [];
   let carried: string[] = [];
   const authoredCfgHashByRepo: Record<string, string> = {};
+  const publisherAckBindings: NonNullable<GitPushPlan["publisherAckBindings"]> = {};
   const removed: string[] = [];
   const deferred: Array<{ relPath: string; reason: string }> = [];
   const configLaneDefers = new Set<(typeof deferred)[number]>();
@@ -146,14 +166,22 @@ export async function planGitSections(
     return "other";
   };
   const plan = (): GitPushPlan => {
+    const records = repoRecordsForState(state);
+    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [relPath, record.advertised]));
+    const normalized = normalizeOutgoingGitSections(out, pending, advertised, (options.now?.() ?? new Date()).toISOString());
+    for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
+    const outgoing = normalized.sections;
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
     // pending repo the last commit carried the pending section itself (see the per-repo
     // base-advance in pushManifest), so the expected-previous map is base ∪ pending —
     // a steady pending carry is NOT a change (no echo-commit storm).
     const prev: Record<string, GitSection> = { ...base, ...(state.gitPendingRemote ?? {}) };
+    for (const [relPath, record] of Object.entries(records)) {
+      if (record.advertised) prev[relPath] = record.advertised;
+    }
     let changed = false;
-    for (const k of new Set([...Object.keys(out), ...Object.keys(prev)])) {
-      if (!out[k] || !prev[k] || (out[k] !== prev[k] && JSON.stringify(out[k]) !== JSON.stringify(prev[k]))) {
+    for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
+      if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && JSON.stringify(outgoing[k]) !== JSON.stringify(prev[k]))) {
         changed = true;
         break;
       }
@@ -166,12 +194,14 @@ export async function planGitSections(
       else captureDeferrals[item.relPath] = captureReason(item.reason);
     }
     return {
-      gitRepos: emptyToUndef(out),
+      gitRepos: emptyToUndef(outgoing),
       changed,
+      repoAbsent: emptyToUndef(repoAbsent),
       gitReposRemoved: emptyToUndef(removedMem),
       gitNeedsResolution: emptyToUndef(needsRes),
       gitPendingRemote: emptyToUndef(pending),
       authoredCfgHashByRepo,
+      ...(Object.keys(publisherAckBindings).length > 0 ? { publisherAckBindings } : {}),
       captured,
       carried,
       deferred,
@@ -203,6 +233,7 @@ export async function planGitSections(
     for (const k of new Set([...Object.keys(state.repoRecords ?? {}), ...Object.keys(base), ...Object.keys(pending)])) {
       captureObserved.add(k);
       configObserved.add(k);
+      repoAbsent[k] = true;
     }
     for (const k of Object.keys(pending)) delete pending[k];
     for (const k of Object.keys(needsRes)) delete needsRes[k];
@@ -235,6 +266,25 @@ export async function planGitSections(
       else if (recovery.status === "defer") recoveryBlocked.set(rel, recovery.reason);
       continue;
     }
+    if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) {
+      try {
+        const identity = await readRepoIdentityV1(rel, ctx.kind, {
+          worktreeId: ctx.repoDir,
+          gitDirReal: ctx.gitDir,
+          commonDirReal: ctx.commonDir,
+        });
+        const lineage = await readStateLineageV1(root, state.stream, state.stateNonce!, identity);
+        const binding = artifactBinding(lineage);
+        publisherAckBindings[rel] = {
+          lineageHash: binding.lineageHash,
+          repositoryIdentityHash: binding.repositoryIdentityHash,
+          repoKind: ctx.kind,
+        };
+      } catch (error) {
+        recoveryBlocked.set(rel, `publisher BASE binding unavailable: ${errMsg(error)}`);
+        continue;
+      }
+    }
     const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
     const landedRecovery = await recoverAndLandFollowJournal(root, rel, binding, state, { land: !options.degradedMutex });
     const recovery = landedRecovery.recovery;
@@ -247,6 +297,7 @@ export async function planGitSections(
       const record = repoRecordsForState(state)[rel];
       if (record?.base) base[rel] = record.base; else delete base[rel];
       if (record?.pending) pending[rel] = record.pending; else delete pending[rel];
+      if (record?.repoAbsent === true) repoAbsent[rel] = true; else delete repoAbsent[rel];
       if (record?.removedKey) removedMem[rel] = record.removedKey; else delete removedMem[rel];
       if (record?.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
       glog(`git-sync recovered published checkout ${rel} before capture`);
@@ -479,6 +530,7 @@ export async function planGitSections(
       // preflight passes with no base tie to the old bad section.
       if (pf.structural) {
         if (baseSec) removed.push(rel);
+        if (baseSec || repoRecordsForState(state)[rel] !== undefined) repoAbsent[rel] = true;
         deferred.push({ relPath: rel, reason: `${pf.reason} — section ${baseSec ? "dropped" : "not captured"}` });
         delete needsRes[rel];
         return;
@@ -594,6 +646,7 @@ export async function planGitSections(
         // §9: repo dir GONE ENTIRELY → the pusher drops the section (receivers drop
         // their base entry but never touch local .git).
         removed.push(rel);
+        repoAbsent[rel] = true;
         delete needsRes[rel];
         continue;
       }
@@ -746,6 +799,7 @@ export async function planGitSections(
       );
       if (sec) {
         out[rel] = await captureWithConfig(rel, sec);
+        delete repoAbsent[rel];
         captured.push(rel);
       } else {
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");

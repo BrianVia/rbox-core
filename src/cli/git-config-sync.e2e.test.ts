@@ -50,6 +50,11 @@ class LoopRemote implements SyncRemote {
     return this.head;
   }
 
+  manifestsAfter(sequence: number): Manifest[] {
+    return Array.from({ length: this.head - sequence }, (_, index) => this.manifests.get(sequence + index + 1)!)
+      .filter((manifest): manifest is Manifest => manifest !== undefined);
+  }
+
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     return { sequence: this.head, manifest: this.manifests.get(this.head) ?? { generatedAt: "", files: [] } };
   }
@@ -293,7 +298,7 @@ test("§11 E2E: config-only edit changes no git identity, and cfgToken heals a m
   expect((await state(rootB, cfgB)).repoRecords!.repo!.cfgToken).not.toEqual(laneBeforeDelete);
 });
 
-test("§11 E2E: present-different hosts settle after at most one flip and two idle cycles emit zero sequences", async () => {
+test("§11 E2E: present-different hosts settle after one flip plus one publisher ACK and two idle cycles emit zero sequences", async () => {
   const repoA = path.join(rootA, "repo");
   await initRepo(repoA);
   await commitFile(repoA, "tracked.txt", "one\n", "initial");
@@ -308,7 +313,18 @@ test("§11 E2E: present-different hosts settle after at most one flip and two id
   await syncCycle();
   await syncCycle();
   const settled = remote.headSeq();
-  expect(settled - start).toBeLessThanOrEqual(2); // one authored value, at most one flip
+  // Design 130, "Repository absence and suppression": outbound delta uses each
+  // writer's exact `advertised` checkpoint, and publisher ACK advances it. After
+  // the one value flip, A may therefore emit one byte-identical ACK before its
+  // checkpoint catches up; this is bounded and must then become idle.
+  expect(settled - start).toBeLessThanOrEqual(3);
+  const postStart = remote.manifestsAfter(start).map((manifest) => manifest.gitRepos!.repo!);
+  const urls = postStart.map((section) => section.config!["remote.origin.url"]![0]);
+  const flips = urls.slice(1).filter((url, index) => url !== urls[index]).length;
+  const duplicateAcks = postStart.slice(1).filter((section, index) => JSON.stringify(section) === JSON.stringify(postStart[index])).length;
+  expect(flips).toBeLessThanOrEqual(1);
+  expect(duplicateAcks).toBeLessThanOrEqual(1);
+  if (postStart.length === 3) expect(postStart[2]).toEqual(postStart[1]);
   const wireUrl = (await remote.latest()).manifest.gitRepos!.repo!.config!["remote.origin.url"]![0];
   expect(["https://example.test/from-a.git", "https://example.test/from-b.git"]).toContain(wireUrl);
 
@@ -420,7 +436,7 @@ test("§11 E2E: config failure retries independently while safe Git progress lan
   expect(combined.partial?.repo?.configApplied).toBe(false);
 });
 
-test("§11 E2E: pointer historical all-base carry is verbatim; scoped→standalone→pointer skips config", async () => {
+test("§11 E2E: pointer historical all-base carry is normalized; scoped→standalone→pointer skips config", async () => {
   const main = path.join(tmp, "outside-main");
   const pointer = path.join(rootA, "wt");
   await initRepo(main);
@@ -444,7 +460,15 @@ test("§11 E2E: pointer historical all-base carry is verbatim; scoped→standalo
   const carried = await planGitSections(rootA, cfgA, historicalState, remote, new Set(), buildIgnoreMatcher(rootA), undefined, undefined, {
     onGitLog: (line) => logsA.push(line),
   });
-  expect(carried.gitRepos?.wt).toEqual(historical);
+  // Design 130, "The single outbound normalization boundary": every outgoing
+  // non-PENDING section is canonicalized, including historical carry paths.
+  // Empty tombstone fields are therefore explicit; verbatim carry is reserved
+  // for PENDING because changing its bytes would orphan partial progress.
+  expect(carried.gitRepos?.wt).toEqual({
+    ...historical,
+    refTombstones: {},
+    refTombstoneGeneration: 0,
+  });
   expect(carried.authoredCfgHashByRepo.wt).toBeUndefined();
   expect(await configValue(main, "remote.origin.url")).toBe("https://example.test/pointer-original.git");
 

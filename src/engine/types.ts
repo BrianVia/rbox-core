@@ -67,6 +67,13 @@ export interface GitPackLink extends GitArtifactRef {
  *             apply must ONLY update the listed refs, NEVER delete others. */
 export type GitRefScope = "all" | "scoped";
 
+/** A publisher-authored record of one superseded advertised branch value (design 130). */
+export interface GitRefTombstone {
+  oid: string;
+  ts: string;
+  generation: number;
+}
+
 export interface GitSection {
   /** plaintext sha of the `git bundle` (all refs + stash + a temp ref making index blobs reachable). */
   bundleSha: string;
@@ -82,6 +89,11 @@ export interface GitSection {
   head: string;
   /** refname → commit sha for every published ref (identity + receiver publish set). */
   refs: Record<string, string>;
+  /** Bounded per-branch history of values this publisher previously advertised and
+   * subsequently superseded. Absent means a pre-design-130/old-writer section. */
+  refTombstones?: Record<string, GitRefTombstone[]>;
+  /** Repository-wide monotonic high-water mark for tombstone supersession events. */
+  refTombstoneGeneration?: number;
   /** plaintext sha of the `.git/index` blob (staging) for exact restore, if present. */
   indexSha?: string;
   /** ciphertext address + size of the encrypted index blob (present iff indexSha is). */

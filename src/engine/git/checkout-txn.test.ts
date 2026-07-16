@@ -123,6 +123,12 @@ async function checkoutJournal(expectedHead = "ref: refs/heads/main\n"): Promise
       opState: {},
       refs: { "refs/heads/main": newOid },
       head: expectedHead,
+      branchInverses: [{
+        ref: "refs/heads/main",
+        beforeOid: oldOid,
+        afterOid: newOid,
+        lines: [`update refs/heads/main ${oldOid} ${newOid}`],
+      }],
     },
     binding,
     createdFresh: false,
@@ -231,6 +237,47 @@ test("second-proof failure aborts the prepared transaction and owned index lock"
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
   expect(await fs.stat(path.join(ctx.gitDir, "index.lock")).then(() => true, () => false)).toBe(false);
+});
+
+test("design 130 reserves expected branch absence and its exact A/Z target through second proof", async () => {
+  const absent = "refs/heads/absent";
+  const marker = "refs/rbox-local/base-absent/v2/" + "a".repeat(64) + "/" + "b".repeat(64);
+  await git(repo, "update-ref", marker, oldOid);
+  let sawReservations = false;
+  const reserved = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refReservations: [
+      { ref: absent, expectedOid: null },
+      { ref: marker, expectedOid: oldOid },
+    ],
+  }), {
+    capabilityProbe: supported,
+    secondProof: async () => {
+      sawReservations = existsSync(path.join(ctx.commonDir, `${absent}.lock`))
+        && existsSync(path.join(ctx.commonDir, `${marker}.lock`));
+      expect(await git(repo, "rev-parse", "--verify", "--quiet", absent).catch(() => "")).toBe("");
+      expect(await git(repo, "rev-parse", marker)).toBe(oldOid);
+      return true;
+    },
+  });
+  expect(reserved.status).toBe("committed");
+  expect(sawReservations).toBe(true);
+  expect(existsSync(path.join(ctx.commonDir, `${absent}.lock`))).toBe(false);
+  expect(existsSync(path.join(ctx.commonDir, `${marker}.lock`))).toBe(false);
+});
+
+test("design 130 expected-absence reservation rejects a next-cycle recreation", async () => {
+  const absent = "refs/heads/absent";
+  await git(repo, "update-ref", absent, oldOid);
+  let proofRan = false;
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refReservations: [{ ref: absent, expectedOid: null }],
+  }), {
+    capabilityProbe: supported,
+    secondProof: async () => { proofRan = true; return true; },
+  });
+  expect(result.status).toBe("defer");
+  expect(proofRan).toBe(false);
+  expect(await git(repo, "rev-parse", absent)).toBe(oldOid);
 });
 
 test("design 126 atomically-owned ORIG_HEAD.lock fences the second proof and releases after op-state publication", async () => {

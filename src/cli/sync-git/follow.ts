@@ -26,11 +26,13 @@ import {
   type CheckoutRefUpdate,
   type GitChainTimings,
   type GitSection,
+  basePresentKeepRef,
 } from "../../engine/index.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import {
   humanDisplacementOrigin,
   prepareDisplacementPins,
+  prepareTombstonePrunePins,
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
 import { hashFile } from "../../engine/hash.js";
@@ -63,6 +65,16 @@ import {
   type OrigHeadPreservation,
 } from "./orig-head.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
+import { checkTombstoneAttestation } from "./tombstone-attestation.js";
+import type { FollowerBranchProtocol } from "./follower-protocol.js";
+import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition, type PlannedBranchTransition } from "./branch-transition.js";
+import type { BranchTransitionWitness, RepoBaseProof, SafeRefWitness } from "./base-composer.js";
+import {
+  breadcrumbGateForReason,
+  highestBreadcrumbVetoGate,
+  logVetoOnce,
+  type BreadcrumbVetoGate,
+} from "./breadcrumb-veto.js";
 
 const refEquivalenceWarnings = new Set<string>();
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
@@ -93,6 +105,7 @@ export interface FollowIntended {
   relPath: string;
   /** Pre-journal record used to merge a published recovery lane-by-lane. */
   previousRecord?: RepoRecordInput;
+  baseProof?: RepoBaseProof;
 }
 
 export interface FollowProgress {
@@ -101,6 +114,11 @@ export interface FollowProgress {
   configApplied: boolean;
   incomingIndexProjection?: string;
   derivedBaseIndexProjection?: string;
+  branchWitnesses?: Record<string, BranchTransitionWitness>;
+  safeRefWitnesses?: Record<string, SafeRefWitness>;
+  /** Positive branch already at the confirmed candidate, with no ref mutation/P. */
+  manualBranchTerminals?: Record<string, { beforeBaseOid: string; afterOid: string }>;
+  tombstonePrunedThisCycle?: boolean;
 }
 
 type FollowResult =
@@ -130,6 +148,9 @@ interface FollowOptions {
   log?: (line: string) => void;
   /** A D2 applied-ref marker failed exact revalidation; human movement wins. */
   forcedHeldRefs?: GitPartialApply["heldRefs"];
+  /** Prevalidated, incoming-key-bound §130 lineage/artifact authority. Without
+   * it branch mutation is forbidden; tags/stash retain their distinct lane. */
+  branchProtocol?: FollowerBranchProtocol;
   /** D6's explicit, snapshot-confirmed authorization. Automatic follow keeps
    * using the ordinary oracle gates; this narrow mode only waives the exact
    * human divergences enumerated by show-me. Exact ref-plane progress authored
@@ -202,6 +223,7 @@ interface CheckoutClassification {
   detail?: string;
   breadcrumbMismatches: BreadcrumbMismatch[];
   breadcrumbWaived: boolean;
+  breadcrumbVetoGate?: BreadcrumbVetoGate;
 }
 
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
@@ -360,6 +382,8 @@ async function classifyCheckout(args: {
   baseProjection?: string;
   roots: readonly string[];
   boundary: boolean;
+  boundaryChanged?: boolean;
+  tombstonePrunedThisCycle?: boolean;
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
   heldRefs: GitPartialApply["heldRefs"];
@@ -442,22 +466,28 @@ async function classifyCheckout(args: {
     Object.keys(live.opState).some((rel) => OP_STATE_CLASSIFICATION[opStateRootOf(rel)] === "in-progress")
     || live.opStateRootsPresent.some((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress")
   );
+  const vetoes: BreadcrumbVetoGate[] = [];
+  if (Object.keys(args.heldRefs).length > 0) vetoes.push("held-refs");
+  if (args.tombstonePrunedThisCycle) vetoes.push("tombstone-pruned-this-cycle");
+  if (liveInProgress) vetoes.push("in-progress-present");
+  for (const reason of reasons) vetoes.push(breadcrumbGateForReason(reason));
+  if (args.boundaryChanged) vetoes.push("boundary");
+  const breadcrumbVetoGate = highestBreadcrumbVetoGate(vetoes);
   const breadcrumbWaived = !args.opts.manualResolution
     && breadcrumbMismatches.length > 0
-    && reasons.size === 0
-    && !liveInProgress
-    && Object.keys(args.heldRefs).length === 0;
+    && breadcrumbVetoGate === undefined;
   // Convert once before manual reason deletion so take-theirs can explicitly
   // waive local-operation. Presence gates only the automatic waiver.
   if (breadcrumbMismatches.length > 0 && !breadcrumbWaived) {
+    logVetoOnce(args.opts.workspaceRoot, args.opts.relPath, breadcrumbVetoGate ?? "indeterminate", args.opts.log);
     reasons.add("local-operation");
     for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
   }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
   const reason = firstReason(reasons);
   return reason
-    ? { safe: false, reason, detail: details.join("; "), breadcrumbMismatches, breadcrumbWaived: false }
-    : { safe: true, breadcrumbMismatches, breadcrumbWaived };
+    ? { safe: false, reason, detail: details.join("; "), breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
+    : { safe: true, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
 }
 
 async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
@@ -488,6 +518,13 @@ function effectiveRefs(ctx: RepoCtx, incoming: GitSection): { refs: Record<strin
   return { refs, deleteAbsent: false };
 }
 
+function appliedTerminalOid(value: GitPartialApply["appliedRefs"][string]): string | null | undefined {
+  if (value.kind === "direct" || value.kind === "present") return value.oid;
+  if (value.kind === "absent") return null;
+  if (value.kind === "safe-ref") return value.afterOid;
+  return undefined;
+}
+
 async function publishRefPlane(
   opts: FollowOptions,
   live: LiveMetadata,
@@ -501,6 +538,10 @@ async function publishRefPlane(
   const owned = await branchesCheckedOutElsewhere(opts.ctx);
   const appliedRefs: GitPartialApply["appliedRefs"] = {};
   const heldRefs: GitPartialApply["heldRefs"] = {};
+  const branchWitnesses: Record<string, BranchTransitionWitness> = {};
+  const safeRefWitnesses: Record<string, SafeRefWitness> = {};
+  const manualBranchTerminals: NonNullable<FollowProgress["manualBranchTerminals"]> = {};
+  let tombstonePrunedThisCycle = false;
   const plannedRoots = [...new Set(Object.values(effective.refs))];
   let checkoutRefReason: GitDeferralReason | undefined;
   let checkoutRefDetail: string | undefined;
@@ -527,9 +568,14 @@ async function publishRefPlane(
     checkoutRefDetail = `branch ${incomingHeadRef.replace(/^refs\/heads\//, "")} is checked out in linked worktree ${owned.get(incomingHeadRef)}`;
   }
   const candidates = new Set(Object.keys(effective.refs));
-  if (effective.deleteAbsent) for (const ref of Object.keys(live.refs)) candidates.add(ref);
+  if (effective.deleteAbsent) {
+    for (const ref of Object.keys(live.refs)) candidates.add(ref);
+    for (const ref of Object.keys(opts.base?.refs ?? {})) candidates.add(ref);
+  }
 
   const classifiedHolds = new Map<string, "local-commits" | "local-stash" | "worktree-ownership">();
+  const indeterminateRefs = new Set<string>();
+  const forcedRefs = new Set(Object.keys(opts.forcedHeldRefs ?? {}));
   for (const ref of candidates) if (ambiguousRefs.has(ref)) classifiedHolds.set(ref, "worktree-ownership");
   for (const [ref, reason] of Object.entries(opts.forcedHeldRefs ?? {})) {
     const classified = reason === "ownership" ? "worktree-ownership" : reason;
@@ -561,6 +607,7 @@ async function publishRefPlane(
           break;
         }
         if (proof.status === "indeterminate") {
+          indeterminateRefs.add(ref);
           hold = ref === "refs/stash" ? "local-stash" : "local-commits";
           checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
           break;
@@ -568,6 +615,25 @@ async function publishRefPlane(
       }
     }
     if (hold) classifiedHolds.set(ref, hold);
+  }
+
+  // Tombstones may waive only a determinate local-commits conclusion. Every
+  // ambiguity/forced/sibling/current/indeterminate/artifact gate has already
+  // run and remains binding.
+  const tombstoneAuthorized = new Set<string>();
+  for (const [ref, hold] of [...classifiedHolds]) {
+    const oldOid = live.refs[ref];
+    if (hold !== "local-commits" || !oldOid || !ref.startsWith("refs/heads/")
+      || ref === live.currentRef || owned.has(ref) || ambiguousRefs.has(ref)
+      || forcedRefs.has(ref) || indeterminateRefs.has(ref) || !opts.branchProtocol) continue;
+    const check = checkTombstoneAttestation(opts.branchProtocol.attestations, {
+      incomingKey: gitIncomingKey(opts.incoming), ref, oid: oldOid, liveOid: oldOid,
+      logicalBaseOid: opts.branchProtocol.logicalBaseRefs[ref] ?? null,
+    });
+    if (check.status === "authorized") {
+      classifiedHolds.delete(ref);
+      tombstoneAuthorized.add(ref);
+    }
   }
 
   // Recompute until stable: a ref may be called safe only from roots that will
@@ -592,6 +658,7 @@ async function publishRefPlane(
       if (ref === live.currentRef || classifiedHolds.has(ref)) continue;
       const protectedOids = protectedByRef.get(ref);
       if (!protectedOids?.length) continue;
+      if (tombstoneAuthorized.has(ref)) continue;
       if (opts.manualResolution && protectedOids.every((oid) => manualProtected.has(oid))) continue;
       const proof = await noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids);
       if (proof.status === "proven") continue;
@@ -606,7 +673,8 @@ async function publishRefPlane(
     if (ref === live.currentRef) continue; // current branch belongs to checkout txn.
     const oldOid = live.refs[ref];
     const newOid = effective.refs[ref];
-    const hold = classifiedHolds.get(ref);
+    let hold = classifiedHolds.get(ref);
+    if (!hold && ref.startsWith("refs/heads/") && oldOid !== newOid && !opts.branchProtocol) hold = "local-commits";
     if (hold) {
       heldRefs[ref] = hold === "worktree-ownership" ? "ownership" : hold;
       if (opts.manualResolution) checkoutRefReason ??= hold;
@@ -616,7 +684,49 @@ async function publishRefPlane(
       continue;
     }
     if (oldOid === newOid) {
-      if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
+      const baseOid = opts.base?.refs[ref] ?? null;
+      if (ref.startsWith("refs/heads/")) {
+        const logicalBaseOid = opts.branchProtocol?.logicalBaseRefs[ref] ?? null;
+        const disposition = opts.branchProtocol?.artifacts[ref];
+        const artifactsClear = disposition === undefined || (disposition.absence === "absent"
+          && disposition.present === "absent" && disposition.keeps === "clear" && disposition.settledAbsence === "absent");
+        if (logicalBaseOid === (newOid ?? null) && newOid) {
+          appliedRefs[ref] = { kind: "direct", oid: newOid };
+        } else if (opts.manualResolution && newOid && logicalBaseOid !== null && artifactsClear) {
+          manualBranchTerminals[ref] = { beforeBaseOid: logicalBaseOid, afterOid: newOid };
+          appliedRefs[ref] = { kind: "direct", oid: newOid };
+        } else if (opts.manualResolution && !newOid && logicalBaseOid !== null && opts.branchProtocol) {
+          try {
+            const plan = await planManualBranchTransition({
+              repoDir: opts.ctx.repoDir, binding: opts.branchProtocol.binding, ref,
+              physicalBeforeOid: null, afterOid: null, logicalBaseOid,
+            });
+            const witness = await commitPlannedBranchTransition(plan, async () => {
+              const lockedRefs = await readAllRefs(opts.ctx.repoDir);
+              const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
+              if (lockedRefs[ref] !== undefined || lockedOwned.has(ref)) throw new Error("manual absent branch changed at locked proof");
+            });
+            branchWitnesses[ref] = witness;
+            appliedRefs[ref] = plan.partial;
+          } catch {
+            heldRefs[ref] = "local-commits";
+            checkoutRefReason ??= "other";
+          }
+        } else if (baseOid !== (newOid ?? null)) {
+          heldRefs[ref] = "local-commits"; // equality cannot invent branch P/A authority.
+        }
+      } else if (baseOid !== (newOid ?? null)) {
+        const persisted = opts.record?.partial?.incomingKey === gitIncomingKey(opts.incoming)
+          ? opts.record.partial.appliedRefs[ref]
+          : undefined;
+        const witness: SafeRefWitness = persisted?.kind === "safe-ref" && persisted.afterOid === (newOid ?? null)
+          ? persisted
+          : { kind: "safe-ref", proof: "locked-terminal-observation", afterOid: newOid ?? null };
+        appliedRefs[ref] = witness;
+        safeRefWitnesses[ref] = witness;
+      } else if (newOid) {
+        appliedRefs[ref] = { kind: "direct", oid: newOid };
+      }
       if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
       continue;
     }
@@ -644,29 +754,77 @@ async function publishRefPlane(
       if (!oldOid && !newOid) continue;
 
       const lines: string[] = [];
+      let tombstoneFingerprint: string | undefined;
+      let branchEpisode: string | undefined;
       if (oldOid && (!newOid || (await tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid])).status !== "owned")) {
         const durableNow = { ...liveNow };
         delete durableNow[ref];
-        const pins = await prepareDisplacementPins(
-          opts.ctx.repoDir,
-          ref,
-          oldOid,
-          [...Object.values(durableNow), ...(newOid ? [newOid] : [])],
-          humanDisplacementOrigin(ref, opts.incoming),
-        );
-        if (pins.status === "indeterminate") {
+        branchEpisode = crypto.randomBytes(16).toString("hex");
+        const pins = tombstoneAuthorized.has(ref)
+          ? await prepareTombstonePrunePins(opts.ctx.repoDir, ref, oldOid, branchEpisode, new Date().toISOString())
+          : await prepareDisplacementPins(
+              opts.ctx.repoDir,
+              ref,
+              oldOid,
+              [...Object.values(durableNow), ...(newOid ? [newOid] : [])],
+              humanDisplacementOrigin(ref, opts.incoming),
+            );
+        if ("status" in pins && pins.status === "indeterminate") {
           heldRefs[ref] = ref === "refs/stash" ? "local-stash" : "local-commits";
           if (ref === incomingHeadRef) checkoutRefReason = ref === "refs/stash" ? "local-stash" : "local-commits";
           continue;
         }
         lines.push(...pins.transactionLines);
+        if ("reflogFingerprint" in pins) tombstoneFingerprint = pins.reflogFingerprint;
       }
-      if (oldOid && newOid) lines.push(`update ${ref} ${newOid} ${oldOid}`);
-      else if (newOid) lines.push(`create ${ref} ${newOid}`);
-      else lines.push(`delete ${ref} ${oldOid}`);
-      await runUpdateRefTransaction(opts.ctx.repoDir, lines);
+      if (ref.startsWith("refs/heads/")) {
+        const plan = opts.manualResolution
+          ? await planManualBranchTransition({
+              repoDir: opts.ctx.repoDir, binding: opts.branchProtocol!.binding, ref,
+              physicalBeforeOid: oldOid ?? null, afterOid: newOid ?? null,
+              logicalBaseOid: opts.branchProtocol!.logicalBaseRefs[ref] ?? null,
+              extraTransactionLines: lines,
+              ...(branchEpisode ? { episode: branchEpisode } : {}),
+            })
+          : await planBranchTransition({
+              repoDir: opts.ctx.repoDir,
+              binding: opts.branchProtocol!.binding,
+              ref,
+              beforeOid: oldOid ?? null,
+              afterOid: newOid ?? null,
+              logicalBaseOid: opts.branchProtocol!.logicalBaseRefs[ref] ?? null,
+              extraTransactionLines: lines,
+              ...(branchEpisode ? { episode: branchEpisode } : {}),
+              ...(tombstoneFingerprint ? { expectedReflogFingerprint: tombstoneFingerprint } : {}),
+            });
+        const witness = await commitPlannedBranchTransition(plan, async () => {
+          const lockedRefs = await readAllRefs(opts.ctx.repoDir);
+          const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
+          if ((lockedRefs[ref] ?? null) !== (oldOid ?? null) || lockedOwned.has(ref)) throw new Error("branch changed at locked second proof");
+          if (tombstoneAuthorized.has(ref) && oldOid) {
+            const checked = checkTombstoneAttestation(opts.branchProtocol!.attestations, {
+              incomingKey: gitIncomingKey(opts.incoming), ref, oid: oldOid,
+              liveOid: oldOid, logicalBaseOid: opts.branchProtocol!.logicalBaseRefs[ref] ?? null,
+            });
+            if (checked.status !== "authorized") throw new Error(checked.reason);
+          }
+        });
+        branchWitnesses[ref] = witness;
+        appliedRefs[ref] = plan.partial;
+        if (tombstoneAuthorized.has(ref) && !newOid) {
+          tombstonePrunedThisCycle = true;
+          opts.log?.(`git-sync: pruned tombstoned branch ${ref} (was ${oldOid!.slice(0, 12)})`);
+        }
+      } else {
+        if (oldOid && newOid) lines.push(`update ${ref} ${newOid} ${oldOid}`);
+        else if (newOid) lines.push(`create ${ref} ${newOid}`);
+        else lines.push(`delete ${ref} ${oldOid}`);
+        await runUpdateRefTransaction(opts.ctx.repoDir, lines);
+        const witness: SafeRefWitness = { kind: "safe-ref", proof: "expected-old-transaction", beforeOid: oldOid ?? null, afterOid: newOid ?? null };
+        safeRefWitnesses[ref] = witness;
+        appliedRefs[ref] = witness;
+      }
       if (opts.manualResolution) authoredRefChanges.push({ ref, ...(oldOid ? { before: oldOid } : {}), ...(newOid ? { after: newOid } : {}) });
-      if (newOid) appliedRefs[ref] = { kind: "direct", oid: newOid };
       if (!opts.manualResolution && ref === "refs/stash" && newOid) await ensureStashReflog(opts.ctx.repoDir, newOid);
     } catch (error) {
       const message = String((error as Error)?.message ?? error);
@@ -678,6 +836,10 @@ async function publishRefPlane(
   return {
     appliedRefs,
     heldRefs,
+    ...(Object.keys(branchWitnesses).length ? { branchWitnesses } : {}),
+    ...(Object.keys(safeRefWitnesses).length ? { safeRefWitnesses } : {}),
+    ...(Object.keys(manualBranchTerminals).length ? { manualBranchTerminals } : {}),
+    ...(tombstonePrunedThisCycle ? { tombstonePrunedThisCycle: true } : {}),
     configApplied,
     checkoutRefReason,
     checkoutRefDetail,
@@ -749,6 +911,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const progress: FollowProgress = {
       appliedRefs: refProgress.appliedRefs,
       heldRefs: refProgress.heldRefs,
+      ...(refProgress.branchWitnesses ? { branchWitnesses: refProgress.branchWitnesses } : {}),
+      ...(refProgress.safeRefWitnesses ? { safeRefWitnesses: refProgress.safeRefWitnesses } : {}),
+      ...(refProgress.manualBranchTerminals ? { manualBranchTerminals: refProgress.manualBranchTerminals } : {}),
+      ...(refProgress.tombstonePrunedThisCycle ? { tombstonePrunedThisCycle: true } : {}),
       configApplied: refProgress.configApplied,
       ...(staged.incomingIndexProjection === undefined ? {} : { incomingIndexProjection: staged.incomingIndexProjection }),
       ...(opts.record?.idxProj || baseProjection === undefined ? {} : { derivedBaseIndexProjection: baseProjection }),
@@ -771,8 +937,8 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // current ref value that this checkout transaction itself will publish).
     const incomingHeadRef = headBranchOf(opts.incoming.head);
     const durableIncomingRefs = Object.fromEntries(Object.entries(progress.appliedRefs)
-      .filter((entry): entry is [string, { kind: "direct"; oid: string }] => entry[1].kind === "direct")
-      .map(([ref, value]) => [ref, value.oid]));
+      .map(([ref, value]) => [ref, appliedTerminalOid(value)] as const)
+      .filter((entry): entry is readonly [string, string] => typeof entry[1] === "string"));
     if (incomingHeadRef && effective.refs[incomingHeadRef]) {
       durableIncomingRefs[incomingHeadRef] = effective.refs[incomingHeadRef]!;
     }
@@ -788,6 +954,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       baseProjection,
       roots: checkoutRoots,
       boundary: false,
+      tombstonePrunedThisCycle: progress.tombstonePrunedThisCycle === true,
       checkoutRefReason: refProgress.checkoutRefReason,
       checkoutRefDetail: refProgress.checkoutRefDetail,
       heldRefs: progress.heldRefs,
@@ -810,9 +977,16 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const refUpdates: CheckoutRefUpdate[] = [];
     const postHeadRefUpdates: CheckoutRefUpdate[] = [];
     const postHeadExtraTransactionLines: string[] = [];
-    const refReservations: Array<{ ref: string; expectedOid: string }> = [];
+    const refReservations: Array<{ ref: string; expectedOid: string | null }> = [];
+    const reserveRef = (ref: string, expectedOid: string | null): void => {
+      const existing = refReservations.find((reservation) => reservation.ref === ref);
+      if (existing && existing.expectedOid !== expectedOid) throw new Error(`contradictory ref reservation for ${ref}`);
+      if (!existing) refReservations.push({ ref, expectedOid });
+    };
     const extraTransactionLines: string[] = [];
     const expectedRefs: Record<string, string> = {};
+    let checkoutBranchPlan: PlannedBranchTransition | undefined;
+    let checkoutBranchPlanIsPostHead = false;
     if (origHeadPreservation?.transactionLine) extraTransactionLines.push(origHeadPreservation.transactionLine);
     if (liveBefore.currentRef) {
       const oldOid = liveBefore.currentTip;
@@ -833,24 +1007,28 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         }
         pinLines = pins.transactionLines;
       }
-      if (oldOid && newOid && oldOid !== newOid) {
-        if (incomingHeadRef === liveBefore.currentRef) {
-          extraTransactionLines.push(...pinLines);
-          refUpdates.push({ kind: "update", ref: liveBefore.currentRef, oldOid, newOid });
-          expectedRefs[liveBefore.currentRef] = newOid;
-        } else {
-          postHeadExtraTransactionLines.push(...pinLines);
-          postHeadRefUpdates.push({ kind: "update", ref: liveBefore.currentRef, oldOid, newOid });
-          expectedRefs[liveBefore.currentRef] = newOid;
-        }
-      } else if (oldOid && !newOid && effective.deleteAbsent) {
-        if (incomingHeadRef === liveBefore.currentRef) {
-          extraTransactionLines.push(...pinLines);
-          refUpdates.push({ kind: "delete", ref: liveBefore.currentRef, oldOid });
-        } else {
-          postHeadExtraTransactionLines.push(...pinLines);
-          postHeadRefUpdates.push({ kind: "delete", ref: liveBefore.currentRef, oldOid });
-        }
+      if (oldOid && ((newOid && oldOid !== newOid) || (!newOid && effective.deleteAbsent))) {
+        if (!opts.branchProtocol) return { status: "defer", reason: "artifact", detail: "checked-out branch transition lacks lineage authority", ...progress };
+        checkoutBranchPlan = opts.manualResolution
+          ? await planManualBranchTransition({
+              repoDir: opts.ctx.repoDir, binding: opts.branchProtocol.binding, ref: liveBefore.currentRef,
+              physicalBeforeOid: oldOid, afterOid: newOid ?? null,
+              logicalBaseOid: opts.branchProtocol.logicalBaseRefs[liveBefore.currentRef] ?? null,
+              extraTransactionLines: pinLines,
+            })
+          : await planBranchTransition({
+              repoDir: opts.ctx.repoDir,
+              binding: opts.branchProtocol.binding,
+              ref: liveBefore.currentRef,
+              beforeOid: oldOid,
+              afterOid: newOid ?? null,
+              logicalBaseOid: opts.branchProtocol.logicalBaseRefs[liveBefore.currentRef] ?? null,
+              extraTransactionLines: pinLines,
+            });
+        checkoutBranchPlanIsPostHead = incomingHeadRef !== liveBefore.currentRef;
+        if (checkoutBranchPlanIsPostHead) postHeadExtraTransactionLines.push(...checkoutBranchPlan.lines);
+        else extraTransactionLines.push(...checkoutBranchPlan.lines);
+        if (newOid) expectedRefs[liveBefore.currentRef] = newOid;
       }
     }
     const head = incomingHeadRef
@@ -859,18 +1037,54 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (incomingHeadRef && incomingHeadRef !== liveBefore.currentRef) {
       const targetOid = effective.refs[incomingHeadRef];
       if (!targetOid) return { status: "defer", reason: "unsupported", detail: "incoming HEAD branch is filtered or absent", ...progress };
-      refReservations.push({ ref: incomingHeadRef, expectedOid: targetOid });
+      reserveRef(incomingHeadRef, targetOid);
     }
 
     const postProgress: FollowProgress = {
       ...progress,
       appliedRefs: { ...progress.appliedRefs },
+      branchWitnesses: { ...(progress.branchWitnesses ?? {}) },
+      manualBranchTerminals: { ...(progress.manualBranchTerminals ?? {}) },
     };
-    if (incomingHeadRef && effective.refs[incomingHeadRef]) {
+    if (checkoutBranchPlan) {
+      postProgress.appliedRefs[checkoutBranchPlan.ref] = checkoutBranchPlan.partial;
+      postProgress.branchWitnesses![checkoutBranchPlan.ref] = checkoutBranchPlan.witness;
+    }
+    // §126/§130 second-proof reservations cover every ref-plane commit that is
+    // not already held by the checkout transaction itself. Absence is an exact
+    // locked fact, accompanied by its A/Z target; present branch progress also
+    // reserves P and every mandatory K until the state composer consumes it.
+    for (const [ref, witness] of Object.entries(postProgress.safeRefWitnesses ?? {})) {
+      reserveRef(ref, witness.afterOid);
+    }
+    for (const [ref, witness] of Object.entries(postProgress.branchWitnesses ?? {})) {
+      if (ref === checkoutBranchPlan?.ref) continue;
+      reserveRef(ref, witness.kind === "present" ? witness.nextOid : null);
+      reserveRef(witness.artifactRef, witness.artifactOid);
+      if (witness.kind === "present") {
+        if (witness.priorOid) reserveRef(
+          basePresentKeepRef(opts.branchProtocol!.binding, ref, witness.episode, "prior"),
+          witness.priorOid,
+        );
+        reserveRef(
+          basePresentKeepRef(opts.branchProtocol!.binding, ref, witness.episode, "next"),
+          witness.nextOid,
+        );
+      }
+    }
+    if (incomingHeadRef && effective.refs[incomingHeadRef] && incomingHeadRef !== checkoutBranchPlan?.ref) {
       postProgress.appliedRefs[incomingHeadRef] = { kind: "direct", oid: effective.refs[incomingHeadRef]! };
     }
-    if (liveBefore.currentRef && incomingHeadRef === liveBefore.currentRef && effective.refs[liveBefore.currentRef]) {
+    if (liveBefore.currentRef && incomingHeadRef === liveBefore.currentRef && effective.refs[liveBefore.currentRef]
+      && liveBefore.currentRef !== checkoutBranchPlan?.ref) {
       postProgress.appliedRefs[liveBefore.currentRef] = { kind: "direct", oid: effective.refs[liveBefore.currentRef]! };
+      const logicalBefore = opts.branchProtocol?.logicalBaseRefs[liveBefore.currentRef] ?? null;
+      if (opts.manualResolution && logicalBefore !== null && logicalBefore !== effective.refs[liveBefore.currentRef]) {
+        postProgress.manualBranchTerminals![liveBefore.currentRef] = {
+          beforeBaseOid: logicalBefore,
+          afterOid: effective.refs[liveBefore.currentRef]!,
+        };
+      }
     }
 
     const oldOp = Object.fromEntries(Object.keys(liveBefore.opState).map((rel) => [rel, true as const]));
@@ -892,6 +1106,12 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         opState: newOp,
         refs: expectedRefs,
         head: expectedHead(opts.incoming),
+        ...(checkoutBranchPlan ? { branchInverses: [{
+          ref: checkoutBranchPlan.ref,
+          beforeOid: checkoutBranchPlan.beforeOid,
+          afterOid: checkoutBranchPlan.afterOid,
+          lines: checkoutBranchPlan.inverseLines,
+        }] } : {}),
         ...(refReservations.length ? { reservedRefs: Object.fromEntries(refReservations.map(({ ref, expectedOid }) => [ref, expectedOid])) } : {}),
       },
       binding: opts.binding,
@@ -915,9 +1135,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       refUpdates,
       postHeadRefUpdates,
       postHeadExtraTransactionLines,
+      ...(checkoutBranchPlanIsPostHead && checkoutBranchPlan?.reflogMessage
+        ? { postHeadReflogMessage: checkoutBranchPlan.reflogMessage } : {}),
       refReservations,
       head,
       extraTransactionLines,
+      ...(!checkoutBranchPlanIsPostHead && checkoutBranchPlan?.reflogMessage
+        ? { reflogMessage: checkoutBranchPlan.reflogMessage } : {}),
       plannedGraphRoots: [...roots, ...(origHeadPreservation?.recoveryOid ? [origHeadPreservation.recoveryOid] : [])],
       opState: staged.opState,
       ...(origHeadPreservation ? { origHeadLock: { journalId, expectedOldBytes: origHeadPreservation.expectedOldBytes } } : {}),
@@ -953,6 +1177,8 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           baseProjection,
           roots: checkoutRoots,
           boundary: true,
+          boundaryChanged: !sameIncarnation,
+          tombstonePrunedThisCycle: progress.tombstonePrunedThisCycle === true,
           checkoutRefReason: refProgress.checkoutRefReason,
           checkoutRefDetail: refProgress.checkoutRefDetail,
           heldRefs: progress.heldRefs,
@@ -970,7 +1196,8 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         if (!live) { noteBoundaryFailure("unreadable", "git metadata became unreadable"); return false; }
         const boundaryOwned = await branchesCheckedOutElsewhere(opts.ctx);
         for (const [ref, expected] of Object.entries(progress.appliedRefs)) {
-          if (boundaryOwned.has(ref) && liveBefore.refs[ref] !== (expected.kind === "direct" ? expected.oid : undefined)) {
+          const terminal = appliedTerminalOid(expected);
+          if (boundaryOwned.has(ref) && (liveBefore.refs[ref] ?? null) !== (terminal ?? null)) {
             noteBoundaryFailure("worktree-ownership", `worktree ownership changed for ${ref}`);
             return false;
           }
@@ -987,7 +1214,8 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           }
         }
         for (const [ref, expected] of Object.entries(progress.appliedRefs)) {
-          if (expected.kind === "direct" && live.refs[ref] !== expected.oid) {
+          const terminal = appliedTerminalOid(expected);
+          if (terminal !== undefined && (live.refs[ref] ?? null) !== terminal) {
             noteBoundaryFailure("local-commits", `published ref changed at ${ref}`);
             return false;
           }

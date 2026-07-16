@@ -320,11 +320,10 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const resolvesWithin = async (promise: Promise<unknown>, ms: number): Promise<boolean> =>
   Promise.race([promise.then(() => true), delay(ms).then(() => false)]);
 
-test("design 116 FIELD INCIDENT: pull receipt authorizes sync-dirt-only stale branch follow", async () => {
+test("design 130: BASE-equal checked-out branch follow leaves a clean checkout", async () => {
   const a = path.join(rootA, "field-incident");
   await initRepo(a);
   await commitFile(a, "tracked.txt", "one\n", "c1");
-  const c1 = await git(a, "rev-parse", "HEAD");
   await commitFile(a, "tracked.txt", "two\n", "c2");
   await syncCycle();
 
@@ -334,9 +333,9 @@ test("design 116 FIELD INCIDENT: pull receipt authorizes sync-dirt-only stale br
   const incomingTip = await git(a, "rev-parse", "HEAD");
   await sync(rootA, cfgA, depsA);
 
-  // Reproduce the incident: Git metadata is stale/contained while the pull's
-  // file phase will install the incoming tracked bytes before Git apply.
-  await git(b, "update-ref", "refs/heads/main", c1, baseTip);
+  // The branch still equals the positive logical BASE. The pull's file phase
+  // installs incoming tracked bytes before the prepared checkout transaction.
+  expect(await git(b, "rev-parse", "refs/heads/main")).toBe(baseTip);
   logsB.length = 0;
   await pull(rootB, cfgB, depsB);
 
@@ -371,6 +370,7 @@ function observingBlobStore(inner: BlobStore, onGetToFile: (sha: string) => Prom
 const gitManifest = (gitRepos: Record<string, GitSection>): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos });
 const gitState = (gitRepos?: Record<string, GitSection>): SyncState => ({
   stream: "test",
+  stateNonce: "a".repeat(32),
   lastSyncedSequence: 0,
   lastSyncedManifest: gitRepos ? gitManifest(gitRepos) : { generatedAt: "", files: [] },
 });
@@ -1234,13 +1234,18 @@ test("design 116 phase-0: linked-worktree partial apply stays pending, retries w
   expect(await git(b, "rev-parse", "side")).toBe(heldSide);
   expect(await git(worktree, "rev-parse", "HEAD")).toBe(heldSide);
   expect(state.gitPendingRemote?.["r"]?.refs["refs/heads/side"]).toBe(incomingSide);
-  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs).toEqual(baseline.refs); // D1 never advances base on partial
+  expect(state.lastSyncedManifest.gitRepos!["r"]!.refs).toEqual({
+    ...baseline.refs,
+    "refs/heads/main": incomingMain,
+  }); // typed witnesses advance admitted members while the held member stays at prior BASE
   expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
   let record = repoRecordsForState(state).r!;
   expect(record.partial).toEqual({
     incomingKey: gitIncomingKey(state.gitPendingRemote!["r"]!),
     checkoutPending: false,
-    appliedRefs: expect.objectContaining({ "refs/heads/main": { kind: "direct", oid: incomingMain } }),
+    appliedRefs: expect.objectContaining({
+      "refs/heads/main": expect.objectContaining({ kind: "present", oid: incomingMain }),
+    }),
     heldRefs: { "refs/heads/side": "ownership" },
     configApplied: true,
   });
@@ -1890,6 +1895,7 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   await commitFile(p, "x.txt", "x", "c1");
   await push(rootA, cfgA, depsA); // full repo → section captured into base
   expect((await st(rootA)).lastSyncedManifest.gitRepos?.["sh"]).toBeDefined();
+  const protectedBefore = repoRecordsForState(await st(rootA)).sh!;
 
   // Swap in a SHALLOW clone at the same path — simulating a base section whose repo
   // is now structurally unsyncable (the exact shape the old client authored live).
@@ -1903,9 +1909,23 @@ test("structural preflight refusal (shallow clone): section DROPPED, not carried
   await push(rootA, cfgA, depsA);
   const state = await st(rootA);
   expect(state.lastSyncedManifest.gitRepos?.["sh"]).toBeUndefined(); // dropped, not carried
+  expect(repoRecordsForState(state).sh).toMatchObject({
+    base: protectedBefore.base,
+    repoAbsent: true,
+  });
+  expect(repoRecordsForState(state).sh?.branchBaseOrigins).toEqual(protectedBefore.branchBaseOrigins);
+  expect(repoRecordsForState(state).sh?.advertised).toBeUndefined();
   expect(logsA.some((l) => l.includes("shallow clone"))).toBe(true); // loud, with the un-shallow hint
   // …and once the drop is published, the still-shallow repo is no longer pending work.
   expect(await gitDivergenceCount(rootA, cfgA, state, buildIgnoreMatcher(rootA))).toBe(0);
+
+  // repoAbsent is not an identity-bound removal guard: repairing the structural
+  // shape permits a normal fresh capture even though HEAD/index did not change.
+  await git(p, "fetch", "--unshallow", "-q");
+  await push(rootA, cfgA, depsA);
+  const repaired = await st(rootA);
+  expect(repaired.lastSyncedManifest.gitRepos?.["sh"]).toBeDefined();
+  expect(repoRecordsForState(repaired).sh?.repoAbsent).toBeUndefined();
 });
 
 // ── design 45: the status verdict's advisory git-divergence walk ─────────────────

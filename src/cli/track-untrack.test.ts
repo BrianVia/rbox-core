@@ -154,8 +154,9 @@ test("untrack honors an interactive 'no' (confirm returns false) and changes not
 test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unstamped one) and keeps the device id", async () => {
   const { cfg: first } = await track(dir, { workspace: "ws_old" }, "https://api.test");
 
-  // A LEGACY (pre-stamp) baseline from the old workspace: the ownership check can't
-  // tell it apart, so track itself must reset it on rebind.
+  // Design 130, "Complete BASE-writer retrofit" requires the legacy reset path
+  // to enter the artifact protocol. The nonce-less old state is first fenced by
+  // a carry-only migration, then reset-v1 atomically installs the new lineage.
   const statePath = path.join(dir, ".rbox", "state.json");
   await fs.writeFile(
     statePath,
@@ -165,10 +166,35 @@ test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unsta
   const { cfg: rebound } = await track(dir, { workspace: "ws_new" }, "https://api.test");
   expect(rebound.remoteWorkspaceId).toBe("ws_new");
   expect(rebound.deviceId).toBe(first.deviceId); // rebinding must not mint a new device
-  await expect(fs.access(statePath)).rejects.toThrow(); // poisoned baseline gone
+  const reset = JSON.parse(await fs.readFile(statePath, "utf8"));
+  expect(reset).toMatchObject({
+    stream: "https://api.test::ws_new::root",
+    stateRevision: 2,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+    repoRecords: {},
+  });
+  expect(reset.stateNonce).toMatch(/^[0-9a-f]{32}$/);
+  expect(JSON.parse(await fs.readFile(path.join(dir, ".rbox", "state", "state-incarnation.json"), "utf8"))).toEqual({
+    stream: reset.stream,
+    stateNonce: reset.stateNonce,
+    stateRevision: reset.stateRevision,
+  });
+  const lineageDirs = await fs.readdir(path.join(dir, ".rbox", "state", "lineages"));
+  expect(lineageDirs).toHaveLength(1);
+  const archives = await fs.readdir(path.join(dir, ".rbox", "state", "lineages", lineageDirs[0]!));
+  expect(archives).toHaveLength(1);
+  const archived = JSON.parse(await fs.readFile(path.join(dir, ".rbox", "state", "lineages", lineageDirs[0]!, archives[0]!), "utf8"));
+  expect(archived).toMatchObject({
+    stream: "https://api.test::ws_old::root",
+    stateRevision: 1,
+    lastSyncedSequence: 9,
+    repoRecords: {},
+  });
+  expect(archived.stateNonce).toBe(lineageDirs[0]);
 
   // Re-tracking the SAME workspace keeps an existing baseline untouched.
-  await fs.writeFile(statePath, JSON.stringify({ stream: "https://api.test::ws_new::root", lastSyncedSequence: 3, lastSyncedManifest: { generatedAt: "", files: [] } }));
+  await fs.writeFile(statePath, JSON.stringify({ ...reset, lastSyncedSequence: 3 }));
   await track(dir, { workspace: "ws_new" }, "https://api.test");
   expect(JSON.parse(await fs.readFile(statePath, "utf8")).lastSyncedSequence).toBe(3);
 });

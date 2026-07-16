@@ -6,9 +6,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, captureGitState, setGitSpawnObserver, type GitSection, type Manifest } from "../engine/index.js";
 import { checkoutJournalDir } from "../engine/git/journal.js";
+import { repoCtx } from "../engine/git/shared.js";
 import { loadState, repoRecordsForState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
-import { applyGitSections } from "./sync-git/apply.js";
+import { applyGitSections, settleCommittedBranchArtifacts } from "./sync-git/apply.js";
+import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
+import { prepareFollowerBranchProtocol } from "./sync-git/follower-protocol.js";
 import { gitFollowEnabled } from "./sync-git/shared.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 
@@ -92,6 +95,19 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
   };
   const applied = await applyGitSections(root, cfg, emptyState, manifest(base), store, buildIgnoreMatcher(root), () => {});
   expect(applied.gitRepos?.repo).toEqual(base);
+  // Mirror production's state-first P settlement instead of deleting protocol
+  // refs in the fixture. This also keeps the later manual episode in one lineage.
+  const initial: SyncState = {
+    ...emptyState,
+    lastSyncedSequence: 1,
+    lastSyncedManifest: manifest(base),
+    repoRecords: { repo: {
+      repoGen: 1, sourceSeq: 1, base,
+      ...(applied.branchBaseOrigins?.repo ? { branchBaseOrigins: applied.branchBaseOrigins.repo } : {}),
+    } },
+  };
+  await saveState(root, initial);
+  await settleCommittedBranchArtifacts(root, initial, applied);
   await fs.writeFile(path.join(receiver, "tracked.txt"), "base\n");
 
   if (opts.syncedOperationAndBreadcrumb) await fs.rm(path.join(sender, ".git", "MERGE_HEAD"), { force: true });
@@ -113,7 +129,7 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
   await git(receiver, "branch", "local-topic");
   const state: SyncState = {
     stream: syncStreamId(cfg),
-    stateNonce: "b".repeat(32),
+    stateNonce: "a".repeat(32),
     lastSyncedSequence: 2,
     lastSyncedManifest: manifest(base),
     repoRecords: {
@@ -528,12 +544,98 @@ test("take-theirs quarantines, pins, follows, and clears pending resolution stat
   expect(origins[localTip][0].class).toBe("human");
   const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
   expect(saved.base).toEqual(incoming);
+  expect(saved.branchBaseOrigins?.["refs/heads/main"]).toMatchObject({
+    kind: "pull-p", oid: incoming.refs["refs/heads/main"], lineageHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+  });
+  expect((await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-local/base-present/v2", "refs/rbox-local/base-present-keep/v2"))
+    .split("\n").filter(Boolean)).toEqual([]);
   expect(saved.pending).toBeUndefined();
   expect(saved.resolutionKey).toBeUndefined();
   expect(saved.partial).toBeUndefined();
   expect(saved.deferrals?.apply).toBeUndefined();
   const quarantineRoot = path.join(root, ".rbox", "git-quarantine");
   expect((await fs.readdir(path.join(quarantineRoot, (await fs.readdir(quarantineRoot))[0]!))).some((name) => name.endsWith(".bundle"))).toBe(true);
+});
+
+test("take-theirs composes a stable side branch with no P into a manual origin", async () => {
+  const { base, incoming } = await fixture();
+  const baseOid = base.refs["refs/heads/main"]!;
+  const nextOid = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, nextOid);
+  await git(receiver, "branch", "topic", nextOid);
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = state.repoRecords!.repo!;
+  record.base = { ...record.base!, refs: { ...record.base!.refs, "refs/heads/topic": baseOid } };
+  record.pending = { ...record.pending!, refs: { ...record.pending!.refs, "refs/heads/topic": nextOid } };
+  await saveState(root, state);
+
+  const current = await show([]);
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps([]))).toBe(0);
+  const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  expect(saved.base?.refs["refs/heads/topic"]).toBe(nextOid);
+  expect(saved.branchBaseOrigins?.["refs/heads/topic"]).toMatchObject({ kind: "manual", oid: nextOid });
+  expect(saved.branchBaseOrigins?.["refs/heads/topic"]?.kind === "manual"
+    ? saved.branchBaseOrigins["refs/heads/topic"]!.episode : "").toMatch(/^[0-9a-f]{32}$/);
+});
+
+test("take-theirs verifies an already-absent branch and creates A before removing BASE", async () => {
+  const { base } = await fixture();
+  const prior = base.refs["refs/heads/main"]!;
+  const state = await loadState(root, syncStreamId(cfg));
+  const record = state.repoRecords!.repo!;
+  record.base = { ...record.base!, refs: { ...record.base!.refs, "refs/heads/gone": prior } };
+  record.pending = { ...record.pending!, refs: { ...record.pending!.refs } };
+  delete record.pending.refs["refs/heads/gone"];
+  await saveState(root, state);
+
+  const current = await show([]);
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps([]))).toBe(0);
+  const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  expect(saved.base?.refs["refs/heads/gone"]).toBeUndefined();
+  expect(saved.branchBaseOrigins?.["refs/heads/gone"]).toBeUndefined();
+  const activeA = await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-local/base-absent/v2");
+  expect(activeA).toBe("");
+});
+
+test("take-theirs P-repairs a moved standing episode, invalidates the old confirmation, then resnapshots", async () => {
+  const { base, incoming } = await fixture();
+  const prior = base.refs["refs/heads/main"]!;
+  const next = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, next);
+  await git(receiver, "branch", "topic", prior);
+  const state = await loadState(root, syncStreamId(cfg));
+  const stored = state.repoRecords!.repo!;
+  stored.base = { ...stored.base!, refs: { ...stored.base!.refs, "refs/heads/topic": prior } };
+  stored.pending = { ...stored.pending!, refs: { ...stored.pending!.refs, "refs/heads/topic": next } };
+  await saveState(root, state);
+  const record = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  const ctx = await repoCtx(receiver);
+  const prepared = await prepareFollowerBranchProtocol({
+    workspaceRoot: root, relPath: "repo", state: await loadState(root, syncStreamId(cfg)),
+    ctx,
+    record, base: record.base, incoming: record.pending!, liveRefs: Object.fromEntries((await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)"))
+      .split("\n").filter(Boolean).map((line) => line.split(" ") as [string, string])),
+  });
+  if (prepared.status !== "ready") throw new Error(prepared.reason);
+  const plan = await planBranchTransition({
+    repoDir: receiver, binding: prepared.protocol.binding, ref: "refs/heads/topic",
+    beforeOid: prior, afterOid: next, logicalBaseOid: prior,
+  });
+  await commitPlannedBranchTransition(plan);
+  await git(receiver, "update-ref", "-m", "user moved topic", "refs/heads/topic", prior, next);
+
+  const stale = await show([]);
+  const first: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: stale.snapshot }, deps(first))).toBe(1);
+  expect(JSON.parse(first.at(-1)!)).toMatchObject({ status: "snapshot-mismatch" });
+  const fresh = await show([]);
+  expect(fresh.snapshot).not.toBe(stale.snapshot);
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: fresh.snapshot }, deps([]))).toBe(0);
+  expect(await git(receiver, "rev-parse", "refs/heads/topic")).toBe(next);
+  const remainingP = await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)", "refs/rbox-local/base-present/v2");
+  const remainingPayloads = await Promise.all(remainingP.split("\n").filter(Boolean)
+    .map((line) => git(receiver, "cat-file", "-p", line.split(" ")[1]!)));
+  expect(remainingPayloads.some((payload) => payload.includes('"ref":"refs/heads/topic"'))).toBe(false);
 });
 
 test("design 126: confirmed take-theirs remains authorized with synced operation state and a breadcrumb mismatch", async () => {

@@ -287,7 +287,7 @@ describe("design 93 §6 transactional unit", () => {
     expect(recovered.state.repoRecords?.r).toEqual(concurrent.repoRecords?.r);
   });
 
-  test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {
+  test("identity degradation permits legacy save but design 130 forbids fence-free reset", async () => {
     const unavailable: LockIdentitySource = {
       current: async () => { throw new Error("no identity source"); },
       probe: async () => ({ status: "unknown" }),
@@ -342,10 +342,11 @@ describe("design 93 §6 transactional unit", () => {
       partial,
     });
 
-    await resetSyncState(root, "next-stream", syncMutex);
-    const reset = await loadState(root, "next-stream");
-    expect(reset.stateNonce).toBeUndefined();
-    expect(reset.repoRecords).toBeUndefined();
+    await expect(resetSyncState(root, "next-stream", syncMutex)).rejects.toThrow("non-degraded workspace fence");
+    const preserved = await loadState(root, stream);
+    expect(preserved.stateNonce).toBeUndefined();
+    expect(preserved.repoRecords).toBeUndefined();
+    expect(preserved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
     await releaseWorkspaceSyncMutex(syncMutex);
   });
 
@@ -528,11 +529,11 @@ describe("design 93 §6 transactional unit", () => {
     expect(await daemonBindingMatches(root, stream, expectedStateNonce(rebound))).toBe(true);
   });
 
-  test("observedRepoKeys includes explicit observed absence", () => {
+  test("observedRepoKeys includes explicit observed absence without manufacturing branch BASE absence", () => {
     const state = baseState({ absentNow: { repoGen: 1, sourceSeq: 1, base: section("old") } });
     expect(observedRepoKeys(state, {}, {})).toEqual(["absentNow"]);
     const packet = composeStateSavePacket(state, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: observedRepoKeys(state, {}, {}), values: {} });
-    expect(packet.repos[0]?.newRecord.base).toBeUndefined();
+    expect(packet.repos[0]?.newRecord.base).toEqual(section("old"));
   });
 
   test("a rejected packet recomputes in-operation, bounded to three attempts", async () => {
@@ -708,7 +709,7 @@ describe("design 93 §6 transactional unit", () => {
     expect(packet.repos[0]?.newRecord.partial).toBeUndefined();
   });
 
-  test("reset disposes git journal directory and shell deferral sidecar", async () => {
+  test("reset refuses an unbound checkout journal and preserves all reset sidecars", async () => {
     await saveState(root, baseState());
     const journal = path.join(root, ".rbox", "state", "git-journal");
     const shell = path.join(root, ".rbox", "state", "shell.deferrals");
@@ -716,9 +717,9 @@ describe("design 93 §6 transactional unit", () => {
     await fs.writeFile(path.join(journal, "entry"), "x");
     await fs.writeFile(shell, "v1\n");
     const mutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
-    await resetSyncState(root, stream, mutex);
+    await expect(resetSyncState(root, stream, mutex)).rejects.toThrow("unbound or unreadable checkout journal");
     await releaseWorkspaceSyncMutex(mutex);
-    expect(await fs.stat(journal).catch(() => undefined)).toBeUndefined();
-    expect(await fs.stat(shell).catch(() => undefined)).toBeUndefined();
+    expect(await fs.readFile(path.join(journal, "entry"), "utf8")).toBe("x");
+    expect(await fs.readFile(shell, "utf8")).toBe("v1\n");
   });
 });

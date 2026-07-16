@@ -1,13 +1,33 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAX_GIT_REPOS, MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos, type GitSection, type Manifest } from "../engine/index.js";
+import {
+  MAX_GIT_REPOS, MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos,
+  SETTLED_ABSENCE_PREFIX, artifactBinding, checkoutJournalDir, readSettledAbsence, readStateLineageV1, recoverJournal,
+  repositoryIdentityForContext, repoCtxFromDisk, scanBaseArtifacts, settleBaseAbsentArtifact,
+  withCommonDirOperationLocks, withProtocolLockClass, readBasePresentArtifact, runLockedPRepairAttempt,
+  resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair,
+  type GitSection, type Manifest,
+} from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
+import { gitRaw } from "../engine/git/shared.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
+import type { PRepairReceipt } from "../engine/git/p-repair.js";
 import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import {
+  carryRepoBaseProof,
+  composeRepoBase,
+  migrationRepoBaseProof,
+  type BranchBaseOrigin,
+  type RepoBaseProof,
+  type SafeRefWitness,
+} from "./sync-git/base-composer.js";
 import { BINDING_ID_RE } from "./telemetry/contract.js";
+import { beginResetJournal, readResetJournal, recoverResetJournal, type ResetZEntry } from "./reset-journal.js";
+import { createPRepairStatePort } from "./sync-git/p-repair-state.js";
+import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -222,7 +242,15 @@ export type GitDeferrals = Partial<Record<GitDeferral["lane"], GitDeferral>>;
 export interface GitPartialApply {
   incomingKey: string;
   checkoutPending: boolean;
-  appliedRefs: Record<string, { kind: "direct"; oid: string } | { kind: "symbolic"; target: string }>;
+  appliedRefs: Record<string,
+    | { kind: "direct"; oid: string }
+    | { kind: "symbolic"; target: string }
+    | { kind: "absent"; artifactOid: string }
+    | ({ kind: "present"; oid: string; artifactOid: string; episode: string })
+    | SafeRefWitness
+  >;
+  /** P-bound durable recovery members; unrelated checkout members stay intact. */
+  pRepaired?: Record<string, PRepairReceipt>;
   heldRefs: Record<string, "local-commits" | "local-stash" | "ownership">;
   configApplied: boolean;
   configBase?: Record<string, string[]>;
@@ -232,7 +260,16 @@ export interface RepoRecord {
   repoGen: number;
   sourceSeq: number;
   base?: GitSection;
+  /** Exact last acknowledged wire checkpoint. Never follower mutation authority. */
+  advertised?: GitSection;
+  /** Positive provenance exists only for refs/heads/* and must match BASE exactly. */
+  branchBaseOrigins?: Record<string, BranchBaseOrigin>;
   pending?: GitSection;
+  /** The publisher intentionally omitted this repository without performing any
+   * follower branch CAS (for example, structural refusal or syncGit:false).
+   * The protected BASE remains an anchor, but is hidden from the projected
+   * manifest until a normal apply or capture clears this disposition. */
+  repoAbsent?: true;
   removedKey?: string;
   resolutionKey?: string;
   cfgSynced?: string;
@@ -251,6 +288,8 @@ export interface RepoTransition {
   relPath: string;
   expectedRepoGen: number;
   newRecord: RepoRecordInput;
+  /** Closed BASE authority consumed again under the state generation CAS. */
+  baseProof?: RepoBaseProof;
 }
 
 export type FileOnlyManifest = Omit<Manifest, "gitRepos"> & { gitRepos?: never };
@@ -287,6 +326,23 @@ const stateIncarnationPath = (root: string) => path.join(root, RBOX_DIR, "state"
 const freshState = (stream: string): SyncState => ({ stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST });
 const streamMismatchFreshStates = new WeakSet<SyncState>();
 export const stateWasStreamMismatch = (state: SyncState): boolean => streamMismatchFreshStates.has(state);
+
+async function hasResetLineageArchive(root: string): Promise<boolean> {
+  const archiveRoot = path.join(root, RBOX_DIR, "state", "lineages");
+  const lineages = await fs.readdir(archiveRoot, { withFileTypes: true }).catch((error) => {
+    if (isENOENT(error)) return [];
+    throw error;
+  });
+  for (const lineage of lineages) {
+    if (!lineage.isDirectory() || !/^[0-9a-f]{32}$/.test(lineage.name)) continue;
+    const archives = await fs.readdir(path.join(archiveRoot, lineage.name), { withFileTypes: true }).catch((error) => {
+      if (isENOENT(error)) return [];
+      throw error;
+    });
+    if (archives.some((entry) => entry.isFile() && /^[0-9a-f]{64}\.json$/.test(entry.name))) return true;
+  }
+  return false;
+}
 
 function parseState(raw: string, file: string): SyncState {
   try {
@@ -363,7 +419,15 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
     records[relPath] = {
       repoGen: 0,
       sourceSeq: validCounter(state.lastSyncedSequence),
-      ...(state.lastSyncedManifest.gitRepos?.[relPath] === undefined ? {} : { base: state.lastSyncedManifest.gitRepos[relPath] }),
+      ...(() => {
+        const candidate = state.lastSyncedManifest.gitRepos?.[relPath];
+        const composed = composeRepoBase({}, { ...(candidate === undefined ? {} : { base: candidate }) },
+          migrationRepoBaseProof().authority, migrationRepoBaseProof().lockedProof);
+        return {
+          ...(composed.base === undefined ? {} : { base: composed.base }),
+          ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
+        };
+      })(),
       ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
       ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
       ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),
@@ -386,18 +450,36 @@ function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: R
 }
 
 export function stateFromRepoRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
-  const gitRepos = mapFromRecords(records, (record) => record.base);
+  const normalized: Record<string, RepoRecord> = Object.fromEntries(Object.entries(records).map(([relPath, record]) => {
+    const lineageHash = Object.values(record.branchBaseOrigins ?? {})[0]?.lineageHash ?? "legacy-untrusted";
+    const proof = carryRepoBaseProof(lineageHash);
+    const composed = composeRepoBase(
+      { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
+      { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
+      proof.authority,
+      proof.lockedProof,
+    );
+    const next = { ...record };
+    if (composed.base === undefined) delete next.base; else next.base = composed.base;
+    if (composed.branchBaseOrigins === undefined) delete next.branchBaseOrigins;
+    else next.branchBaseOrigins = composed.branchBaseOrigins;
+    return [relPath, next];
+  }));
+  // Removal/suppression hides the repository from the last-synced projection
+  // without destroying its non-authoritative BASE provenance anchor.
+  const gitRepos = mapFromRecords(normalized, (record) =>
+    record.repoAbsent !== true && record.removedKey === undefined ? record.base : undefined);
   return {
     ...state,
     lastSyncedManifest: { ...state.lastSyncedManifest, gitRepos },
-    gitReposRemoved: mapFromRecords(records, (record) => record.removedKey),
-    gitNeedsResolution: mapFromRecords(records, (record) => record.resolutionKey),
-    gitPendingRemote: mapFromRecords(records, (record) => record.pending),
+    gitReposRemoved: mapFromRecords(normalized, (record) => record.removedKey),
+    gitNeedsResolution: mapFromRecords(normalized, (record) => record.resolutionKey),
+    gitPendingRemote: mapFromRecords(normalized, (record) => record.pending),
     // A transactional record supersedes the legacy sidecar maps. legacyState()
     // deliberately reconstructs them after dropping repoRecords.
     gitDeferrals: undefined,
     gitPartial: undefined,
-    repoRecords: records,
+    repoRecords: normalized,
   };
 }
 
@@ -423,8 +505,15 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
   const lock = acquired.lock;
   try {
     const raw = await loadRawState(root);
-    const current = raw ?? freshState(packet.expectedStream);
-    if (current.stream !== packet.expectedStream) return { status: "rejected", reason: "stream", state: current };
+    const loaded = raw ?? freshState(packet.expectedStream);
+    // A pre-stream legacy state is adopted by its first transactional save, just
+    // as loadState has always adopted it in memory. The legacy nonce sentinel and
+    // state lock make this a one-time fenced migration; an explicitly different
+    // stream still rejects the whole packet.
+    if (loaded.stream !== undefined && loaded.stream !== packet.expectedStream) {
+      return { status: "rejected", reason: "stream", state: loaded };
+    }
+    const current = loaded.stream === undefined ? { ...loaded, stream: packet.expectedStream } : loaded;
     if (!packetNonceMatches(packet.expectedNonce, current.stateNonce)) return { status: "rejected", reason: "nonce", state: current };
     if (packet.global && packet.sourceGlobalSeq < current.lastSyncedSequence) {
       return { status: "rejected", reason: "global-sequence", state: current };
@@ -437,7 +526,22 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
       }
     }
     for (const transition of packet.repos) {
-      records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
+      const previous = records[transition.relPath] ?? { repoGen: 0, sourceSeq: 0 };
+      const proof = transition.baseProof ?? migrationRepoBaseProof();
+      const composed = composeRepoBase(
+        { base: previous.base, branchBaseOrigins: previous.branchBaseOrigins },
+        { base: transition.newRecord.base, branchBaseOrigins: transition.newRecord.branchBaseOrigins },
+        proof.authority,
+        proof.lockedProof,
+      );
+      const newRecord = { ...transition.newRecord };
+      if (composed.base === undefined) delete newRecord.base; else newRecord.base = composed.base;
+      if (composed.branchBaseOrigins === undefined) delete newRecord.branchBaseOrigins;
+      else newRecord.branchBaseOrigins = composed.branchBaseOrigins;
+      if (composed.disposition === "pending" && transition.newRecord.base && newRecord.pending === undefined) {
+        newRecord.pending = transition.newRecord.base;
+      }
+      records[transition.relPath] = { ...newRecord, repoGen: transition.expectedRepoGen + 1 };
     }
 
     const global = packet.global?.manifest;
@@ -464,6 +568,39 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
   } finally {
     await lock.release();
   }
+}
+
+/**
+ * Establish the durable lineage boundary before a first Git mutation. Only a
+ * physically absent, semantically empty state may be initialized here; an
+ * existing legacy baseline remains legacy-untrusted and must be migrated by an
+ * explicit confirmed workflow. The empty packet uses the ordinary state CAS,
+ * so concurrent initialization chooses exactly one nonce.
+ */
+export async function ensureCapableStateLineage(root: string, state: SyncState): Promise<SyncState> {
+  if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) return state;
+  const existing = await loadRawState(root);
+  if (existing) return state;
+  const records = repoRecordsForState(state);
+  const manifestGit = state.lastSyncedManifest.gitRepos;
+  if (state.lastSyncedSequence !== 0 || state.lastSyncedManifest.files.length !== 0
+    || Object.keys(records).length !== 0 || Object.keys(manifestGit ?? {}).length !== 0
+    || Object.keys(state.gitPendingRemote ?? {}).length !== 0
+    || Object.keys(state.gitReposRemoved ?? {}).length !== 0) {
+    throw new Error("refusing to manufacture a capable lineage over non-genesis sync state");
+  }
+  const result = await applyStateSavePacket(root, {
+    expectedStream: state.stream ?? "",
+    expectedNonce: "legacy",
+    sourceGlobalSeq: 0,
+    repos: [],
+  });
+  if (result.status === "accepted") return result.state;
+  if (result.status === "rejected" && (result.reason === "nonce" || result.reason === "repo-generation")) {
+    const raced = await loadRawState(root);
+    if (raced && raced.stream === state.stream && /^[0-9a-f]{32}$/.test(raced.stateNonce ?? "")) return raced;
+  }
+  throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
 }
 
 function configForDisk(cfg: WorkspaceConfig): WorkspaceConfig {
@@ -528,15 +665,34 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
  * remote file as "new" and every local file as conflicting — a destructive
  * surprise. We refuse and surface it instead.
  *
- * A baseline stamped with a DIFFERENT stream (see {@link syncStreamId}) is treated
- * as no baseline at all: it describes another manifest stream, and reconciling
- * against it turns "file not (yet) in the new stream" into "remotely deleted" —
- * the rebind mass-delete incident. A fresh base makes a rebound root
- * pull-without-deleting and push-everything, which is exactly right for a new
- * binding. A legacy state file with no stamp is adopted as-is (it predates the
- * stamp; every save since writes one).
+ * A baseline stamped with a DIFFERENT stream (see {@link syncStreamId}) describes
+ * another manifest stream. Before returning anything, load routes that mismatch
+ * through reset-v1 so the fresh base is durable, fenced, and has retired the old
+ * lineage safely. This makes a rebound root pull-without-deleting and
+ * push-everything. A legacy state file with no stamp is adopted as-is (it predates
+ * the stamp; every save since writes one).
  */
-export async function loadState(root: string, stream: string, warningSink: (line: string) => void = console.error): Promise<SyncState> {
+export async function loadState(
+  root: string,
+  stream: string,
+  warningSink: (line: string) => void = console.error,
+  heldMutex?: WorkspaceSyncMutex,
+): Promise<SyncState> {
+  if (await readResetJournal(root)) {
+    let recoveryMutex = heldMutex;
+    let releaseRecoveryMutex = false;
+    if (!recoveryMutex) {
+      recoveryMutex = await acquireWorkspaceSyncMutex(root, "cli");
+      releaseRecoveryMutex = true;
+    }
+    assertSyncMutex(recoveryMutex, root);
+    if (workspaceSyncMutexDegraded(recoveryMutex)) throw new Error("reset journal recovery requires a non-degraded workspace fence");
+    try {
+      await recoverResetJournal(root);
+    } finally {
+      if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
+    }
+  }
   const fresh = freshState(stream);
   let raw: string;
   try {
@@ -555,10 +711,24 @@ export async function loadState(root: string, stream: string, warningSink: (line
   if (state.stream !== stream) {
     warningSink(
       `sync state at ${statePath(root)} belongs to stream ${state.stream}, ` +
-        `not ${stream} — starting from a fresh baseline (files on disk untouched).`
+        `not ${stream} — installing a fresh fenced baseline (files on disk untouched).`
     );
-    streamMismatchFreshStates.add(fresh);
-    return fresh;
+    await resetSyncState(root, stream, heldMutex);
+    const reset = await loadRawState(root);
+    if (!reset || reset.stream !== stream) throw new Error("sync state reset did not install the requested stream");
+    // Design 130, "Complete BASE-writer retrofit": a reset/rebind is not true
+    // genesis even though its new lineage has an empty materialized BASE. Keep
+    // that provenance on the returned object so files-first cannot emit empty
+    // Git for a stream-mismatch freshening.
+    streamMismatchFreshStates.add(reset);
+    return reset;
+  }
+  // reset-v1's hash-addressed old-lineage archive is durable evidence that a
+  // seq-0 state came from rebind/freshening rather than true genesis. Re-mark
+  // every load so daemon preflight and direct pushManifest callers cannot lose
+  // the provenance merely by reloading the atomically installed next state.
+  if (state.lastSyncedSequence === 0 && await hasResetLineageArchive(root)) {
+    streamMismatchFreshStates.add(state);
   }
   return state;
 }
@@ -583,7 +753,7 @@ export async function ensureTelemetryBindingId(
     if (raw.stream !== undefined && raw.stream !== stream) {
       throw new Error(`sync state belongs to stream ${raw.stream}, not ${stream}; refusing to overwrite it`);
     }
-    const current = raw;
+    const current = stateFromRepoRecords(raw, repoRecordsForState(raw));
     if (typeof current.telemetryBindingId === "string" && BINDING_ID_RE.test(current.telemetryBindingId)) {
       return { state: current, bindingId: current.telemetryBindingId };
     }
@@ -598,6 +768,225 @@ export async function ensureTelemetryBindingId(
   } finally {
     await acquired.lock.release();
   }
+}
+
+async function withPreparedResetArtifacts<T>(
+  root: string,
+  state: SyncState,
+  finish: (state: SyncState, stateBytes: Buffer, z: ResetZEntry[]) => Promise<T>,
+): Promise<T> {
+  if (!state.stream || !state.stateNonce) throw new Error("reset refused: state lacks a fenced lineage");
+  const repos: Array<{
+    relPath: string;
+    repoDir: string;
+    ctx: NonNullable<Awaited<ReturnType<typeof repoCtxFromDisk>>>;
+    identity: Awaited<ReturnType<typeof repositoryIdentityForContext>>;
+    binding: ReturnType<typeof artifactBinding>;
+  }> = [];
+  for (const [relPath, record] of Object.entries(repoRecordsForState(state)).sort(([a], [b]) => a < b ? -1 : 1)) {
+    const repoDir = relPath === "." ? root : path.join(root, ...relPath.split("/"));
+    const ctx = await repoCtxFromDisk(repoDir);
+    const branchMembers = Object.keys(record.base?.refs ?? {}).filter((ref) => ref.startsWith("refs/heads/"));
+    if (!ctx) {
+      if (branchMembers.length || Object.keys(record.branchBaseOrigins ?? {}).length) throw new Error(`reset refused: repository identity unavailable for ${relPath}`);
+      continue;
+    }
+    const worktreeId = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
+    const identity = await repositoryIdentityForContext(relPath, ctx, worktreeId);
+    const lineage = await readStateLineageV1(root, state.stream, state.stateNonce, identity);
+    const binding = artifactBinding(lineage);
+    repos.push({ relPath, repoDir, ctx, identity, binding });
+  }
+
+  return withCommonDirOperationLocks(repos.map((repo) => repo.identity.commonDirReal), async () => {
+    let currentState = state;
+    const knownLineagesByCommonDir = new Map<string, Set<string>>();
+    for (const repo of repos) {
+      const known = knownLineagesByCommonDir.get(repo.identity.commonDirReal) ?? new Set<string>();
+      known.add(repo.binding.lineageHash);
+      knownLineagesByCommonDir.set(repo.identity.commonDirReal, known);
+    }
+
+    const assertScanValid = async (repo: typeof repos[number]): Promise<Awaited<ReturnType<typeof scanBaseArtifacts>>> => {
+      const scan = await scanBaseArtifacts(repo.repoDir, repo.binding);
+      if (scan.invalidNamespace.length || scan.orphanKeep.length || scan.absent.some((item) => item.status === "invalid")
+        || scan.present.some((item) => item.status === "invalid")
+        || scan.foreign.some((item) => item.status === "invalid" || !knownLineagesByCommonDir.get(repo.identity.commonDirReal)?.has(item.lineageHash))) {
+        throw new Error(`reset refused: malformed A/P/K artifacts for ${repo.relPath}`);
+      }
+      const settled = await readSettledAbsence(repo.repoDir, repo.binding);
+      if (settled.status === "invalid") throw new Error(`reset refused: malformed Z for ${repo.relPath}: ${settled.detail}`);
+      return scan;
+    };
+
+    // A published checkout intent owns its branch mutations. Refuse every such
+    // journal before settling any P or compacting any A in any repository.
+    for (const { relPath } of repos) {
+      const checkoutPath = path.join(checkoutJournalDir(root, relPath), "journal.json");
+      const checkoutStat = await fs.lstat(checkoutPath).catch((error) => isENOENT(error) ? undefined : Promise.reject(error));
+      if (checkoutStat) {
+        if (!checkoutStat.isFile() || checkoutStat.isSymbolicLink() || checkoutStat.size > 512 * 1024) {
+          throw new Error(`reset refused: unsafe or oversized checkout journal for ${relPath}`);
+        }
+        const handle = await fs.open(checkoutPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          const raw = JSON.parse((await handle.readFile()).toString("utf8")) as { phase?: unknown };
+          if (raw?.phase === "published") throw new Error(`reset refused: published checkout journal for ${relPath}`);
+        } catch (error) {
+          if (String(error).includes("published checkout journal")) throw error;
+          throw new Error(`reset refused: unreadable or corrupt checkout journal for ${relPath}`);
+        } finally {
+          await handle.close();
+        }
+      }
+    }
+
+    for (const { relPath, identity } of repos) {
+      const journalBinding = {
+        stream: state.stream, stateNonce: state.stateNonce!,
+        gitDirReal: identity.gitDirReal, commonDirReal: identity.commonDirReal, worktreeId: identity.worktreeId,
+      };
+      const checkout = await recoverJournal(root, relPath, journalBinding);
+      if (checkout.status === "keep") throw new Error(`reset refused: published checkout journal for ${relPath}`);
+      if (checkout.status === "defer") throw new Error(`reset refused: ${checkout.reason} for ${relPath}`);
+    }
+
+    // First classify every repository before mutating any protocol artifact, so
+    // a malformed peer cannot be hidden by successful work in an earlier repo.
+    for (const repo of repos) await assertScanValid(repo);
+
+    // A valid P is never a reset veto. Settle its exact episode, or preserve and
+    // quarantine every moved observation through P-repair, then start again from
+    // freshly loaded state and artifacts. The cap makes this bound unreachable
+    // without repeated external races; exhaustion is a safe-direction refusal.
+    let passes = 0;
+    for (const repo of repos) {
+      for (;;) {
+        if (++passes > 1_024) throw new Error("reset refused: P settlement did not stabilize");
+        const scan = await assertScanValid(repo);
+        const item = scan.present.find((candidate) => candidate.status === "valid");
+        if (!item || item.status !== "valid") break;
+        const p = item.artifact;
+        const exact = await settleExactPresentArtifact({
+          root, stream: state.stream, state: currentState, relPath: repo.relPath,
+          ctx: repo.ctx, binding: repo.binding, p,
+        });
+        if (exact.status === "hold") throw new Error(`reset refused: unpreservable P for ${repo.relPath}: ${exact.reason}`);
+        if (exact.status === "settled") {
+          currentState = exact.state;
+          continue;
+        }
+        if (exact.status === "absent") {
+          const reloaded = await loadRawState(root);
+          if (!reloaded || reloaded.stream !== state.stream || reloaded.stateNonce !== state.stateNonce) {
+            throw new Error("reset refused: state lineage changed while settling P");
+          }
+          currentState = reloaded;
+          continue;
+        }
+
+        const record = repoRecordsForState(currentState)[repo.relPath];
+        if (!record) throw new Error(`reset refused: RepoRecord disappeared while repairing P for ${repo.relPath}`);
+        const port = createPRepairStatePort({
+          root, stream: state.stream, relPath: repo.relPath, repoKind: repo.ctx.kind,
+          effectiveRefScope: record.base?.refScope ?? "all", p,
+        });
+        const validateArtifacts = async (): Promise<boolean> => {
+          const freshP = await readBasePresentArtifact(repo.repoDir, repo.binding, p.payload.ref);
+          if (freshP.status !== "valid" || freshP.artifact.targetOid !== p.targetOid) return false;
+          const freshScan = await scanBaseArtifacts(repo.repoDir, repo.binding);
+          if (freshScan.invalidNamespace.length || freshScan.orphanKeep.length
+            || freshScan.absent.some((candidate) => candidate.status !== "valid")
+            || freshScan.present.some((candidate) => candidate.status !== "valid")
+            || freshScan.foreign.some((candidate) => candidate.status !== "valid"
+              || candidate.branchRef === p.payload.ref)) return false;
+          if (freshScan.absent.some((candidate) => candidate.status === "valid" && candidate.artifact.payload.ref === p.payload.ref)) return false;
+          const z = await readSettledAbsence(repo.repoDir, repo.binding);
+          return z.status !== "invalid" && !(z.status === "valid"
+            && [...z.ledger.entries.values()].some((payload) => payload.ref === p.payload.ref));
+        };
+        const accepted = record.partial?.pRepaired?.[p.payload.ref];
+        const mismatches = {
+          live: exact.reason === "live",
+          reflog: exact.reason === "reflog",
+          baseShape: exact.reason === "base-shape",
+        };
+        let repaired;
+        if (accepted) {
+          const resumed = await resumeLockedAcceptedPRepair({ repoDir: repo.repoDir, receipt: accepted, validateArtifacts });
+          repaired = resumed.status === "refresh-receipt"
+            ? await refreshLockedAcceptedPRepair({
+                repoDir: repo.repoDir, p, state: port, repairAt: new Date().toISOString(),
+                acceptedReceipt: accepted, mismatches, validateArtifacts,
+              })
+            : resumed.status === "restart"
+              ? { status: "restart" as const }
+              : { status: "hold" as const, reason: resumed.reason };
+        } else {
+          repaired = await runLockedPRepairAttempt({
+            repoDir: repo.repoDir, p, state: port, repairAt: new Date().toISOString(), mismatches, validateArtifacts,
+          });
+        }
+        if (repaired.status === "hold") throw new Error(`reset refused: unpreservable P for ${repo.relPath}: ${repaired.reason}`);
+        if (repaired.status === "retry") continue;
+        const reloaded = await loadRawState(root);
+        if (!reloaded || reloaded.stream !== state.stream || reloaded.stateNonce !== state.stateNonce) {
+          throw new Error("reset refused: state lineage changed while repairing P");
+        }
+        currentState = reloaded;
+      }
+    }
+
+    // Normative post-P rescan: reset never relies on the pre-repair artifact
+    // view, and no valid/malformed standing P may slip into the lineage cutover.
+    const rescans = new Map<string, Awaited<ReturnType<typeof scanBaseArtifacts>>>();
+    for (const repo of repos) {
+      const scan = await assertScanValid(repo);
+      if (scan.present.some((item) => item.status === "valid")) {
+        throw new Error(`reset refused: present-transition artifact survived repair for ${repo.relPath}`);
+      }
+      rescans.set(repo.relPath, scan);
+    }
+
+    // A is authoritative over serialized BASE, including an old writer's stale
+    // positive member. Compact by exact A/Z CAS; never reject merely because the
+    // materialized state view still says present.
+    for (const repo of repos) {
+      for (const item of rescans.get(repo.relPath)?.absent ?? []) {
+        if (item.status === "valid") await settleBaseAbsentArtifact(repo.repoDir, repo.binding, item.artifact.payload.ref);
+      }
+    }
+
+    const entries: ResetZEntry[] = [];
+    for (const { relPath, repoDir, identity, binding } of repos) {
+      const settled = await readSettledAbsence(repoDir, binding);
+      if (settled.status === "invalid") throw new Error(`reset refused: malformed Z for ${relPath}: ${settled.detail}`);
+      if (settled.status === "valid") entries.push({
+        lineageHash: binding.lineageHash,
+        repositoryIdentityHash: binding.repositoryIdentityHash,
+        repositoryIdentity: identity,
+        activeRef: settled.ledger.ref,
+        targetOid: settled.ledger.targetOid,
+        recoveryRef: `refs/rbox-recovery/base-absent/v1/${binding.lineageHash}/${settled.ledger.targetOid}`,
+      });
+    }
+    for (const [commonDir, knownLineages] of knownLineagesByCommonDir) {
+      const refs = (await gitRaw(commonDir, ["for-each-ref", "--format=%(refname)", SETTLED_ABSENCE_PREFIX])).split("\n").filter(Boolean);
+      for (const ref of refs) {
+        const match = new RegExp(`^${SETTLED_ABSENCE_PREFIX}/([0-9a-f]{64})$`).exec(ref);
+        if (!match || !knownLineages.has(match[1]!)) throw new Error(`reset refused: foreign or malformed active Z ${ref}`);
+      }
+    }
+    const journalRoot = path.join(root, RBOX_DIR, "state", "git-journal");
+    const remaining = await fs.readdir(journalRoot).catch((error) => isENOENT(error) ? [] : Promise.reject(error));
+    if (remaining.length > 0) throw new Error(`reset refused: unbound or unreadable checkout journal entries remain at ${journalRoot}`);
+    const stateBytes = await fs.readFile(statePath(root));
+    const finalState = parseState(stateBytes.toString("utf8"), statePath(root));
+    if (finalState.stream !== state.stream || finalState.stateNonce !== state.stateNonce) {
+      throw new Error("reset refused: state lineage changed during artifact preflight");
+    }
+    return finish(finalState, stateBytes, entries.sort((a, b) => a.activeRef < b.activeRef ? -1 : a.activeRef > b.activeRef ? 1 : a.targetOid < b.targetOid ? -1 : 1));
+  });
 }
 
 /** Discard the local sync baseline (used when a root is REBOUND to a different
@@ -617,46 +1006,80 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
   assertSyncMutex(owned, root);
   try {
     await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-    const legacyReset = async (): Promise<void> => {
-      // Same deliberate fence-free fallback as legacy saves: remove both state
-      // representations so the next load starts from nextStream with no lane state.
-      await fs.rm(stateIncarnationPath(root), { force: true });
-      await fs.rm(statePath(root), { force: true });
-    };
-    if (workspaceSyncMutexDegraded(owned)) {
-      await legacyReset();
-    } else {
-      const acquired = await acquireLock(stateLockPath(root));
-      if (acquired.status === "unsupported") {
-        await legacyReset();
-      } else {
-        if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
-        try {
-          const prior = await loadRawState(root);
-          const reset = {
-            stream: nextStream,
-            stateNonce: crypto.randomBytes(16).toString("hex"),
-            stateRevision: validCounter(prior?.stateRevision) + 1,
-          };
-          let owner = true;
-          await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
-          await writeFileAtomic(stateIncarnationPath(root), JSON.stringify(reset, null, 2), {
-            beforeRename: async () => (owner = await acquired.lock.isOwner()),
-          });
-          if (!owner) throw new Error("sync state reset lock ownership was lost");
-          if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
-          await fs.rm(statePath(root), { force: true });
-        } finally {
-          await acquired.lock.release();
+    if (workspaceSyncMutexDegraded(owned)) throw new Error("sync state reset requires a non-degraded workspace fence");
+
+    // Recover a prior reset before observing ordinary state. Merely probing the
+    // state lock is insufficient: unsupported/fence-free filesystems are a hard refusal.
+    const fence = await acquireLock(stateLockPath(root));
+    if (fence.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(fence)})`);
+    await fence.lock.release();
+    await recoverResetJournal(root);
+
+    let oldBytes: Buffer;
+    try { oldBytes = await fs.readFile(statePath(root)); } catch (error) {
+      if (!isENOENT(error)) throw error;
+      // A truly absent baseline has no old lineage or Z to retire. Install a fenced
+      // genesis directly; this is initialization, not a present→absent BASE reset.
+      const genesis: SyncState = {
+        stream: nextStream,
+        stateNonce: crypto.randomBytes(16).toString("hex"),
+        stateRevision: 0,
+        lastSyncedSequence: 0,
+        lastSyncedManifest: EMPTY_MANIFEST,
+        repoRecords: {},
+      };
+      await saveState(root, genesis);
+      await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
+      await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({ stream: genesis.stream, stateNonce: genesis.stateNonce, stateRevision: 0 }, null, 2));
+      oldBytes = Buffer.alloc(0);
+    }
+    if (oldBytes.length > 0) {
+      let prior = parseState(oldBytes.toString("utf8"), statePath(root));
+      // Design 130 requires the legacy reset entry point to use the same
+      // artifact/journal protocol, while a nonce-less state itself may only
+      // carry BASE. First perform a no-op migration under the state CAS: it
+      // adopts the old binding's stream, routes legacy BASE through migration
+      // composition, and installs the nonce/revision needed by reset-v1.
+      if (prior.stateNonce === undefined) {
+        const legacyStream = prior.stream ?? await loadConfig(root).then(syncStreamId).catch(() => undefined);
+        if (!legacyStream) throw new Error("sync state reset requires the legacy binding stream");
+        const migrated = await applyStateSavePacket(root, {
+          expectedStream: legacyStream,
+          expectedNonce: "legacy",
+          sourceGlobalSeq: validCounter(prior.lastSyncedSequence),
+          repos: [],
+        });
+        if (migrated.status !== "accepted") {
+          const detail = migrated.status === "rejected" ? migrated.reason
+            : migrated.status === "busy" ? migrated.detail
+              : migrated.status;
+          throw new Error(`sync state legacy reset migration failed (${detail})`);
         }
+        oldBytes = await fs.readFile(statePath(root));
+        prior = parseState(oldBytes.toString("utf8"), statePath(root));
       }
+      if (!prior.stream || !prior.stateNonce || !Number.isSafeInteger(prior.stateRevision)) throw new Error("sync state reset requires a fenced state lineage");
+      await withPreparedResetArtifacts(root, prior, async (preparedState, preparedBytes, z) => {
+        await withProtocolLockClass("state", path.resolve(statePath(root)), async () => {
+          const acquired = await acquireLock(stateLockPath(root));
+          if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
+          try {
+            const revalidated = await fs.readFile(statePath(root));
+            if (!revalidated.equals(preparedBytes)) throw new Error("sync state changed before reset journal preparation");
+            if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
+            await beginResetJournal(root, nextStream, preparedBytes, preparedState, z);
+          } finally {
+            await acquired.lock.release();
+          }
+        });
+      });
+      await recoverResetJournal(root);
     }
 
     for (const p of [
       path.join(root, ENCRYPT_ADDRESS_CACHE_REL),
       path.join(root, RBOX_DIR, "state", "activity.json"),
       path.join(root, RBOX_DIR, "state", "shell.line"),
-      path.join(root, RBOX_DIR, "state", "git-journal"),
       path.join(root, RBOX_DIR, "state", "shell.deferrals"),
     ]) {
       try {

@@ -33,9 +33,13 @@ export interface CheckoutPlan {
    * commits them as one journal-arbitrated checkout publication. */
   postHeadRefUpdates?: CheckoutRefUpdate[];
   postHeadExtraTransactionLines?: string[];
+  /** Exact P episode for a checked-out branch transition committed after HEAD. */
+  postHeadReflogMessage?: string;
   head: CheckoutHeadUpdate;
   /** create-only recovery-pin lines already provenance-persisted by keep-pins. */
   extraTransactionLines?: string[];
+  /** Exact P episode for a checked-out branch transition in the primary txn. */
+  reflogMessage?: string;
   plannedGraphRoots: string[];
   opState: Array<{ rel: string; tmp: string }>;
   /** Automatic ORIG_HEAD breadcrumb adoption only. The journal sidecar already
@@ -47,7 +51,7 @@ export interface CheckoutPlan {
   malformedOrigHeadPreserved?: true;
   /** Refs read by HEAD but not mutated in this transaction. Their ordinary
    * ref lock is held across the boundary proof and commit. */
-  refReservations?: Array<{ ref: string; expectedOid: string }>;
+  refReservations?: Array<{ ref: string; expectedOid: string | null }>;
 }
 
 export interface OwnedGitLock {
@@ -110,11 +114,11 @@ class RefTransaction {
   private childDone = false;
   private childExit?: Promise<number | null>;
 
-  constructor(repoDir: string) {
-    this.ready = this.initialize(repoDir);
+  constructor(repoDir: string, reflogMessage?: string) {
+    this.ready = this.initialize(repoDir, reflogMessage);
   }
 
-  private async initialize(repoDir: string): Promise<void> {
+  private async initialize(repoDir: string, reflogMessage?: string): Promise<void> {
     // Bun 1.3's node:child_process buffers a pipe-backed stdin until end(),
     // which cannot drive start/prepare/commit interactively. A private FIFO is
     // still an ordinary kernel pipe to Git, but fs.write reaches it immediately.
@@ -124,7 +128,7 @@ class RefTransaction {
     this.stdoutPath = path.join(dir, "stdout");
     this.stderrPath = path.join(dir, "stderr");
     await exec("mkfifo", [fifo]);
-    this.child = spawn("sh", ["-c", 'exec git -C "$1" update-ref --stdin <"$2" >"$3" 2>"$4"', "rbox-update-ref", repoDir, fifo, this.stdoutPath, this.stderrPath], {
+    this.child = spawn("sh", ["-c", 'if [ -n "$5" ]; then exec git -C "$1" update-ref -m "$5" --stdin <"$2" >"$3" 2>"$4"; else exec git -C "$1" update-ref --stdin <"$2" >"$3" 2>"$4"; fi', "rbox-update-ref", repoDir, fifo, this.stdoutPath, this.stderrPath, reflogMessage ?? ""], {
       env: cleanGitEnv(),
       stdio: "ignore",
     });
@@ -565,7 +569,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
 
     const primaryLines = transactionLines(plan);
-    tx = new RefTransaction(ctx.repoDir);
+    tx = new RefTransaction(ctx.repoDir, plan.reflogMessage);
     await tx.start();
     await tx.write("option no-deref");
     for (const line of primaryLines) await tx.write(line);
@@ -594,8 +598,8 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       const token = await lockToken(lockPath);
       if (!token) throw new Error(`could not identify owned ${reservation.ref}.lock`);
       reservationTokens.push(token);
-      const oid = await git(ctx.repoDir, ["rev-parse", "--verify", reservation.ref]);
-      if (oid !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
+      const oid = await git(ctx.repoDir, ["rev-parse", "--verify", "--quiet", reservation.ref]).catch(() => "");
+      if ((oid || null) !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
     }
     if (opts.journal && reservationTokens.length) {
       opts.journal.value.expectedNew.reservedLocks = Object.fromEntries((plan.refReservations ?? []).map((reservation, i) => [reservation.ref, {
@@ -700,7 +704,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       // Git cannot prepare an update of HEAD's old referent while HEAD.lock is
       // held by the symref transaction. Keep this second expected-old commit
       // inside checkout-txn and under the same intent journal/index reservation.
-      postHeadTx = new RefTransaction(ctx.repoDir);
+      postHeadTx = new RefTransaction(ctx.repoDir, plan.postHeadReflogMessage);
       await postHeadTx.start();
       await postHeadTx.write("option no-deref");
       for (const line of postHeadLines) await postHeadTx.write(line);

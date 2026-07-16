@@ -34,6 +34,7 @@ let baseSection: GitSection;
 const remote = {} as SyncRemote; // carry-only fixtures never touch the blob API
 
 function stateWith(section: GitSection, cfgSynced?: string): SyncState {
+  const advertised = { ...section, refTombstones: section.refTombstones ?? {}, refTombstoneGeneration: section.refTombstoneGeneration ?? 0 };
   return {
     stream: "test",
     lastSyncedSequence: 1,
@@ -43,6 +44,7 @@ function stateWith(section: GitSection, cfgSynced?: string): SyncState {
         repoGen: 1,
         sourceSeq: 1,
         base: section,
+        advertised,
         ...(cfgSynced === undefined ? {} : { cfgSynced }),
       },
     },
@@ -168,7 +170,7 @@ test("over-bounds config carries each host base verbatim with no authorship or o
 
   for (const base of [hostA, hostB, hostA]) {
     const result = await plan(base);
-    expect(result.gitRepos?.["."]).toEqual(base);
+    expect(result.gitRepos?.["."]).toEqual({ ...base, refTombstones: {}, refTombstoneGeneration: 0 });
     expect(result.authoredCfgHashByRepo).toEqual({});
     expect(result.changed).toBe(false);
     expect(result.deferred.some((item) => item.reason.includes("over wire bounds"))).toBe(true);
@@ -219,12 +221,12 @@ test("non-publishing coverage rows carry verbatim or drop structurally with no a
   resolutionState.gitNeedsResolution = { ".": gitIdentityKey((await gitIdentity(root))!) };
   resolutionState.repoRecords!["."]!.resolutionKey = resolutionState.gitNeedsResolution["."];
   const resolution = await planGitSections(root, cfg, resolutionState, remote, new Set(), buildIgnoreMatcher(root));
-  expect(resolution.gitRepos?.["."]).toEqual(base);
+  expect(resolution.gitRepos?.["."]).toEqual({ ...base, refTombstones: {}, refTombstoneGeneration: 0 });
   expect(resolution.authoredCfgHashByRepo).toEqual({});
 
   await fs.writeFile(path.join(root, ".git", "config.lock"), "busy");
   const busy = await plan(base);
-  expect(busy.gitRepos?.["."]).toEqual(base);
+  expect(busy.gitRepos?.["."]).toEqual({ ...base, refTombstones: {}, refTombstoneGeneration: 0 });
   expect(busy.authoredCfgHashByRepo).toEqual({});
   await fs.unlink(path.join(root, ".git", "config.lock"));
 
@@ -241,14 +243,14 @@ test("non-publishing coverage rows carry verbatim or drop structurally with no a
 
   await fs.rename(path.join(root, ".git"), path.join(root, ".git-hidden"));
   const undiscoverable = await plan(base);
-  expect(undiscoverable.gitRepos?.["."]).toEqual(base);
+  expect(undiscoverable.gitRepos?.["."]).toEqual({ ...base, refTombstones: {}, refTombstoneGeneration: 0 });
   expect(undiscoverable.authoredCfgHashByRepo).toEqual({});
   await fs.rename(path.join(root, ".git-hidden"), path.join(root, ".git"));
 
   await fs.rm(path.join(root, ".git"), { recursive: true, force: true });
   await runGit(root, "init", "-q");
   const empty = await plan(base);
-  expect(empty.gitRepos?.["."]).toEqual(base);
+  expect(empty.gitRepos?.["."]).toEqual({ ...base, refTombstones: {}, refTombstoneGeneration: 0 });
   expect(empty.authoredCfgHashByRepo).toEqual({});
 });
 
@@ -279,7 +281,7 @@ test("in-tree linked pointer is non-owned: late policy skip removes provisional 
   };
 
   const result = await planGitSections(root, cfg, state, remote, new Set(), buildIgnoreMatcher(root));
-  expect(result.gitRepos?.linked).toEqual(linkedBase);
+  expect(result.gitRepos?.linked).toEqual({ ...linkedBase, refTombstones: {}, refTombstoneGeneration: 0 });
   expect(result.authoredCfgHashByRepo.linked).toBeUndefined();
   expect(result.skipped.some((item) => item.relPath === "linked")).toBe(true);
 });

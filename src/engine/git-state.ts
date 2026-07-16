@@ -6,7 +6,7 @@
 
 // Re-exported for compat: these moved to manifest-validate.ts (pure — validateManifest
 // validates gitRepos values, and manifest-validate must stay node:*-free for the Worker).
-export { isSyncableRef, validateGitSection } from "./manifest-validate.js";
+export { isSyncableRef, validateGitSection, validateRefTombstones } from "./manifest-validate.js";
 
 export type { GitChainTimings, GitRepoKind, RepoCtx } from "./git/shared.js";
 export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver, zeroGitChainTimings } from "./git/shared.js";
@@ -20,6 +20,80 @@ export {
   sweepStaleGitCaptureDirs,
   GitCaptureDeferredError,
 } from "./git/capture.js";
-export { applyGitState, type ApplyGitResult } from "./git/apply.js";
+export { applyGitState, type ApplyGitResult, type ApplyBranchTransitionInput, type ApplyBranchTransitionResult, type ApplyBranchTransitionAdapter } from "./git/apply.js";
 export { quarantineAndWipeGitState, preserveGitConflict } from "./git/quarantine.js";
 export { assertGitTargetWithinRoot } from "./git/containment.js";
+export {
+  validateRepoIdentityV1,
+  encodeRepoIdentityV1,
+  repositoryIdentityHash,
+  readRepoIdentityV1,
+  encodeStateLineageV1,
+  readStateLineageV1,
+  lineageHash,
+  artifactBinding,
+  bindingForContext,
+  repositoryIdentityForContext,
+  type RepoIdentityV1,
+  type StateLineageV1,
+  type ArtifactBinding,
+} from "./git/repo-lineage.js";
+export {
+  BASE_ABSENT_PREFIX,
+  BASE_PRESENT_PREFIX,
+  BASE_PRESENT_KEEP_PREFIX,
+  SETTLED_ABSENCE_PREFIX,
+  MAX_UNSETTLED_BASE_ABSENT,
+  MAX_BASE_PRESENT,
+  MAX_BASE_PRESENT_KEEP,
+  branchRefHash,
+  baseAbsentArtifactRef,
+  basePresentArtifactRef,
+  basePresentKeepRef,
+  settledAbsenceRef,
+  baseAbsentPayload,
+  basePresentPayload,
+  assertBaseArtifactCapacity,
+  prepareBaseAbsentArtifact,
+  prepareBasePresentArtifact,
+  readBaseAbsentArtifact,
+  readBaseAbsentArtifactRef,
+  inspectBaseAbsentArtifactRef,
+  readBasePresentArtifact,
+  readBasePresentArtifactRef,
+  inspectBasePresentArtifactRef,
+  buildSettledAbsenceTree,
+  readSettledAbsence,
+  lookupSettledAbsence,
+  prepareSettleBaseAbsent,
+  prepareRetireSettledAbsence,
+  settleBaseAbsentArtifact,
+  commitProtocolRefTransaction,
+  type BaseAbsentPayload,
+  type BasePresentPayload,
+  type SettledAbsenceMeta,
+  type PreparedProtocolRef,
+  type PreparedBasePresent,
+  type ArtifactInvalidReason,
+  type ArtifactReadResult,
+  type SettledAbsenceLedger,
+  type SettledAbsenceReadResult,
+  type PreparedSettledAbsence,
+  type PreparedSettledAbsenceRetirement,
+} from "./git/base-artifacts.js";
+export { scanBaseArtifacts, type BaseArtifactScan, type ForeignBaseArtifactScanEntry } from "./git/base-artifact-scan.js";
+export {
+  PROTOCOL_LOCK_ORDER,
+  heldProtocolLocks,
+  setProtocolLockTraceForTests,
+  withProtocolLockClass,
+  withPostHeadCompatibilityException,
+  withCommonDirOperationLocks,
+  withRepoOperationLock,
+  reflogMaintenanceLockPath,
+  withReflogMaintenanceLocks,
+  withKeepOriginsLock,
+  withRepoProtocolLocks,
+  type ProtocolLockClass,
+  type ProtocolLockTraceEvent,
+} from "./git/protocol-locks.js";

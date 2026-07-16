@@ -232,7 +232,7 @@ test("grammar-invalid incoming config is ignored while Git state applies", async
   expect(logs.filter((line) => line.includes("ignored invalid incoming config") && line.includes("values are empty or malformed"))).toHaveLength(1);
 });
 
-test("config-only failure advances Git base while retaining an independent config retry", async () => {
+test("config failure advances unchanged Git while an unauthorized converged branch remains pending", async () => {
   const shape = await dirShape();
   const oldLane = { cfgShape: shape, cfgApplied: "old-applied", cfgSynced: "old-synced" };
   const remoteSameGit = { ...base, config: desired };
@@ -249,11 +249,28 @@ test("config-only failure advances Git base while retaining an independent confi
   await git(tmp, "clone", "-q", source, receiver);
   await git(receiver, "remote", "remove", "origin");
   const convergedLane = { ...oldLane, cfgShape: await dirShape() };
-  const converged = await apply(remoteNewGit, stateWith(base, convergedLane), { applyConfig: configFailure });
-  expect(converged.gitRepos?.["."]).toEqual(remoteNewGit);
-  expect(converged.gitPendingRemote).toBeUndefined();
+  const converged = await apply(remoteNewGit, stateWith(base, convergedLane), {
+    applyConfig: configFailure,
+    oracle: {
+      proveRepo: async () => ({ kind: "match" }),
+      reproveRepo: async () => ({ kind: "match" }),
+      receiptHash: () => "receipt",
+    },
+    capabilityProbe: async () => true,
+  });
+  // Live equality with a changed positive branch is observation-only. It cannot
+  // manufacture P authority, but the independent config lane still attempts and
+  // records its retry while the incoming Git section remains pending.
+  expect(converged.gitRepos?.["."]).toEqual(base);
+  expect(converged.gitPendingRemote?.["."]).toEqual(remoteNewGit);
   expect(converged.configLane).toBeUndefined();
   expect(converged.partial?.["."]?.configApplied).toBe(false);
+  expect(converged.partial?.["."]?.appliedRefs["refs/heads/main"]).toEqual({
+    kind: "direct",
+    oid: remoteNewGit.refs["refs/heads/main"],
+  });
+  expect(converged.deferrals?.["."]?.config?.reason).toBe("config");
+  expect(converged.deferrals?.["."]?.apply?.reason).toBe("artifact");
 });
 
 test("combined config failure keeps safe Git progress and defers only config", async () => {

@@ -26,17 +26,18 @@ export async function snapshotLocal(ctx: RepoCtx): Promise<LocalSnapshot> {
 /** Roll back to the pre-apply snapshot. For a POINTER target, `onlyRefs` restricts the
  *  ref restore to exactly the refs the apply touched — a full reset would clobber
  *  concurrent sibling-worktree ref updates in the SHARED store. */
-export async function restoreLocal(ctx: RepoCtx, snap: LocalSnapshot, onlyRefs?: Set<string>): Promise<void> {
+export async function restoreLocal(ctx: RepoCtx, snap: LocalSnapshot, onlyRefs?: Set<string>, skipRefs: ReadonlySet<string> = new Set()): Promise<void> {
   if (onlyRefs) {
     for (const ref of onlyRefs) {
+      if (skipRefs.has(ref)) continue;
       const sha = snap.refs[ref];
       if (sha) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
       else await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
     }
   } else {
     // Reset syncable refs to the snapshot.
-    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) if (!(ref in snap.refs)) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
-    for (const [ref, sha] of Object.entries(snap.refs)) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
+    for (const ref of Object.keys(await readAllRefs(ctx.repoDir))) if (!skipRefs.has(ref) && !(ref in snap.refs)) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
+    for (const [ref, sha] of Object.entries(snap.refs)) if (!skipRefs.has(ref)) await git(ctx.repoDir, ["update-ref", ref, sha]).catch(() => {});
     // The stash REFLOG must match the snapshot too: the publish appends an entry
     // (--create-reflog) that `git stash list` would still show after a bare ref rollback.
     const stashLog = path.join(ctx.commonDir, "logs", "refs", "stash");

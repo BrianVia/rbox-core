@@ -119,6 +119,19 @@ function makeJournal<T>(args: {
       opState: args.expectedOp ?? {},
       refs: args.expectedRefs ?? {},
       head: args.expectedHead,
+      branchInverses: Object.entries(args.expectedRefs ?? {})
+        .filter(([ref, afterOid]) => ref.startsWith("refs/heads/") && (ref === "refs/heads/main" ? args.oldOid ?? null : null) !== afterOid)
+        .map(([ref, afterOid]) => {
+          const beforeOid = ref === "refs/heads/main" ? args.oldOid ?? null : null;
+          return {
+            ref,
+            beforeOid,
+            afterOid,
+            lines: beforeOid
+              ? [`update ${ref} ${beforeOid} ${afterOid}`]
+              : [`delete ${ref} ${afterOid}`],
+          };
+        }),
     },
     binding,
     createdFresh: args.createdFresh ?? false,
