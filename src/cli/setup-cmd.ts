@@ -22,7 +22,7 @@
  * promises Steps 2–3 it can't deliver.
  */
 import os from "node:os";
-import { runInit } from "./init-cmd.js";
+import { GITIGNORE_CHOICES, runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaRecovery } from "./e2ee-client.js";
@@ -239,7 +239,7 @@ async function stepAccount(remote: string): Promise<StepAccountResult> {
   });
 
   if (choice === "create") {
-    const secret = await promptPassword({ message: "Account bootstrap secret (leave blank for browser device-code sign-up)" });
+    const secret = await promptPassword({ message: "Press Enter to sign up in your browser (advanced: enter an account bootstrap secret)" });
     // A secret bootstraps the genesis device (shows the recovery phrase); blank falls
     // back to device-code, which authorizes but can't enroll → resolve inline.
     await login(remote, secret || undefined);
@@ -486,14 +486,7 @@ async function stepWorkspace(
     choice === "new" &&
     (await promptSelect<"false" | "true">({
       message: "How should rbox handle gitignored files?",
-      choices: [
-        { name: "Sync everything (current behavior)", value: "false" },
-        {
-          name: "Skip gitignored untracked files",
-          value: "true",
-          description: "build output and caches stay local; re-include notes/state in .rboxignore",
-        },
-      ],
+      choices: SETUP_GITIGNORE_CHOICES,
     })) === "true";
 
   const flags = workspaceFlags(
@@ -508,7 +501,10 @@ function printSummary(workspaceId: string, deviceId: string): void {
   process.stderr.write(`${e.green("✓")}  ${e.bold("rbox is set up.")}\n`);
   process.stderr.write(`     workspace: ${e.cyan(workspaceId)}     device: ${deviceId}\n`);
   process.stderr.write(`     ${e.dim("This workspace is end-to-end encrypted — the server never sees your files.")}\n`);
+  process.stderr.write(`     ${e.dim("Tune what syncs with `rbox ignore` or .rboxignore.")}\n`);
   process.stderr.write(`\n   ${e.bold("Bring another machine online:")}\n`);
   process.stderr.write(`     rbox pair      ${e.dim("(here — prints a token)")}\n`);
   process.stderr.write(`     rbox setup     ${e.dim('(there — choose "Log into an existing account" → paste the token)')}\n`);
 }
+
+export const SETUP_GITIGNORE_CHOICES = GITIGNORE_CHOICES;

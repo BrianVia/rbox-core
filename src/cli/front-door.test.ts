@@ -30,7 +30,7 @@ test("inside workspace renders status before picker and default nothing runs no 
     promptSelect: async (cfg) => {
       calls.push("prompt");
       expect(statusDone).toBe(true);
-      expect(cfg.message).toBe("Anything else?");
+      expect(cfg.message).toBe("What would you like to do?");
       expect(cfg.choices).toEqual(frontDoorChoices(false));
       return "nothing";
     },

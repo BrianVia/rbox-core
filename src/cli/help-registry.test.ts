@@ -20,6 +20,14 @@ test("git deferrals help registers both exclusive output modes", () => {
   expect(entry![0]!.flags?.map(({ flag }) => flag)).toEqual(["--brief", "--json"]);
 });
 
+test("guided setup help marks flags that only keyed setup honors", () => {
+  const setup = byName.get("setup")!;
+  const keyedOnly = new Set(["--dir <path>", "--daemon", "--pull-only", "--force"]);
+  const flags = (setup.flags ?? []).filter(({ flag }) => keyedOnly.has(flag));
+  expect(flags.map(({ flag }) => flag)).toEqual([...keyedOnly]);
+  for (const { desc } of flags) expect(desc).toContain("(keyed setup only)");
+});
+
 test("per-command help: a command with registered sub-verbs includes them", () => {
   expect(helpFor("key")?.map((entry) => entry.name)).toEqual([
     "key",

@@ -35,16 +35,23 @@ export async function addIgnorePattern(root: string, pattern: string): Promise<v
   console.log(` to remove a file from all machines, delete it FIRST, let that sync, then ignore it.)`);
 }
 
-/** Print the effective ignore rule set, labeled by source, in precedence order. */
-export function listIgnoreRules(root: string, opts: { full?: boolean } = {}): void {
+/** Print the ignore rule set, labeled by source and current activity, in precedence order. */
+export async function listIgnoreRules(root: string, opts: { full?: boolean } = {}): Promise<void> {
+  const cfg = await loadConfig(root);
+  const respectGitignore = cfg.respectGitignore === true;
   const rules = effectiveIgnoreRules(root);
-  console.log(`effective ignore rules (precedence: builtin → .gitignore → .rboxignore):`);
+  console.log(`respectGitignore: ${respectGitignore ? "on" : "off"}`);
+  console.log(`ignore rules (precedence: builtin → .gitignore → .rboxignore):`);
+  const label = (source: (typeof rules)[number]["source"]): string => {
+    if (source !== ".gitignore") return source;
+    return respectGitignore ? ".gitignore ACTIVE" : ".gitignore present but NOT applied (respectGitignore off)";
+  };
   if (opts.full) {
-    for (const r of rules) console.log(`  [${r.source}] ${r.pattern}`);
+    for (const r of rules) console.log(`  [${label(r.source)}] ${r.pattern}`);
   } else {
     const builtinCount = rules.filter((r) => r.source === "builtin").length;
     console.log(`  [builtin] ${builtinCount} default patterns (node_modules, .git, build caches, …) — see them all with \`rbox ignore --list\``);
-    for (const r of rules) if (r.source !== "builtin") console.log(`  [${r.source}] ${r.pattern}`);
+    for (const r of rules) if (r.source !== "builtin") console.log(`  [${label(r.source)}] ${r.pattern}`);
   }
   console.log(style.dim("add a pattern:  rbox ignore '<glob>'    ·    respect .gitignore: rbox ignore --respect-gitignore <on|off>"));
 }

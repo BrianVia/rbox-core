@@ -2,7 +2,17 @@ import { test, expect } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { workspaceFlags, authorizePath, stepHeader, resolveEnrollment, startSyncActions, START_SYNC_CHOICES, runSetup, writeEnrolledSkipNotice } from "./setup-cmd.js";
+import {
+  workspaceFlags,
+  authorizePath,
+  stepHeader,
+  resolveEnrollment,
+  startSyncActions,
+  START_SYNC_CHOICES,
+  SETUP_GITIGNORE_CHOICES,
+  runSetup,
+  writeEnrolledSkipNotice,
+} from "./setup-cmd.js";
 import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 
@@ -65,10 +75,26 @@ test("Step 2 → runInit flags: a create carries the prompted name to the server
   expect(f).toMatchObject({ new: "true", name: "Conductor Workspaces", "no-interactive": "true" });
 });
 
-test("Step 2 → runInit flags: respectGitignore is opt-in and only forwarded for creates", () => {
+test("Step 2 → runInit flags: respectGitignore is forwarded only when true and only for creates", () => {
   expect(workspaceFlags({ kind: "new", root: "/code/app" })["respect-gitignore"]).toBeUndefined();
+  expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: false })["respect-gitignore"]).toBeUndefined();
   expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: true })).toMatchObject({ "respect-gitignore": "true" });
   expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
+});
+
+test("Step 2 gitignore prompt defaults to skipping, with both escape hatches and an honest sync-all opt-in", () => {
+  expect(SETUP_GITIGNORE_CHOICES).toEqual([
+    {
+      name: "Skip gitignored untracked files (recommended)",
+      value: "true",
+      description: "re-include specific files with ! lines in .rboxignore (e.g. !.env), or switch later with `rbox ignore --respect-gitignore off`",
+    },
+    {
+      name: "Sync gitignored files too (end-to-end encrypted)",
+      value: "false",
+      description: "rbox can never read them; great for notes/local state (and .env via !.env), but large builds/datasets sync too",
+    },
+  ]);
 });
 
 // Step 3 collapsed the keep→resume double-confirm into one `select` (the founder once

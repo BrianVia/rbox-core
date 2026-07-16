@@ -129,22 +129,35 @@ sync state. For single-file rollback, use `rbox restore <path>@<seq>`.
 
 ## 5. `.rboxignore` — shared, cross-machine ignore rules
 
-**Status: shipped (design 03b).** Combines with built-in defaults and
-`.gitignore` to decide what does *not* sync.
+**Status: shipped (designs 03b and 72).** The builtin ignore layer is enabled in
+every mode and applies before the later override layers described below. When you
+create a workspace through the interactive `rbox setup` or `rbox init --new` wizard,
+rbox also respects `.gitignore` by default, skipping gitignored untracked files.
+Scripted init keeps its compatibility default unless you pass
+`--respect-gitignore true`; existing workspaces keep their configured mode.
 
-**Precedence:** `BUILTIN_IGNORE` → `.gitignore` → `.rboxignore` (later rules
-win). `.rboxignore` can re-include an individual file an earlier rule
+**Precedence when `.gitignore` is enabled:** `BUILTIN_IGNORE` → `.gitignore` →
+`.rboxignore` (later rules win). `.rboxignore` can re-include an individual file an earlier rule
 excluded (`!important.log`), but **cannot** resurrect files inside a directory
 an earlier rule pruned wholesale — `!dist/keep.txt` won't work if `dist/` was
 already pruned as a directory; you'd have to re-include the directory itself.
 
 **It is not created automatically.** `.rboxignore` doesn't exist until the
-first time you run `rbox ignore <glob>` — `rbox init` never touches it. Until
-then, ignore behavior is just `BUILTIN_IGNORE` + `.gitignore`.
+first time you run `rbox ignore <glob>` — `rbox init` never touches it. A `!`
+rule can opt a specific file back in, including one excluded by the builtins:
+`rbox ignore '!.env'` syncs `.env` with the same end-to-end encryption as every
+other file (rbox can never read it).
+
+The wizard's **sync Git-ignored files too** option turns `.gitignore` handling
+off, which is useful for ignored notes and local state. It can also catch large
+ignored builds or datasets. Builtin ignores still apply in that mode; use a
+`.rboxignore` `!` rule for a builtin-ignored file such as `.env`. Change the mode
+later with `rbox ignore --respect-gitignore <on|off>`.
 
 ```bash
 rbox ignore "*.local.json"     # append a pattern (creates the file if absent, de-duped)
-rbox ignore --list             # print the effective merged rule set, labeled by source
+rbox ignore --list             # print the current mode and rules, labeled by source/activity
+rbox ignore --respect-gitignore off
 rbox ignore --path ~/code/myapp --list
 ```
 
@@ -152,10 +165,13 @@ rbox ignore --path ~/code/myapp --list
 ignoring a pattern that matches files already synced is **forward-only**: those
 files stop syncing *future* changes but are **not deleted** from other
 machines — their last-synced copies stay put, now untracked by rbox. This is
-deliberately the non-destructive default. There is currently no CLI-level
-`--purge` flag exposed for the destructive variant (propagating deletion); if
-you need a file gone everywhere, delete it locally first, let that delete
-sync, *then* add the ignore pattern.
+deliberately the non-destructive default.
+
+`rbox ignore --purge` previews already-synced paths that now match the active
+ignore rules, then asks for confirmation before deleting those copies from synced
+state and other machines. The ignored files on this machine stay on disk. Pass
+`--yes` to skip confirmation; it is required in a headless session. Without
+`--purge`, ignore changes remain forward-only.
 
 Since `.rboxignore` is a normal file (not in `BUILTIN_IGNORE`), it syncs like
 any other tracked file — everyone bound to the workspace ends up with the same
