@@ -1,7 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { encryptFileToTemp, decryptFileToPath } from "../crypto.js";
@@ -76,8 +78,102 @@ export function warnOnce(seen: Set<string>, key: string, message: string, sink: 
 
 /** Run Git without altering stdout bytes. Required for NUL-delimited config reads,
  * where trimming would erase a successful empty value. */
-export async function gitRaw(root: string, args: string[], opts: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+export interface GitRunOptions {
+  maxBuffer?: number;
+  env?: NodeJS.ProcessEnv;
+  stdin?: string;
+  /** Streams stdout without retaining it in the runner's result buffer. */
+  onStdoutChunk?: (chunk: string) => void;
+}
+
+export async function gitRaw(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
   gitSpawnObserver?.(root, args);
+  if (opts.stdin !== undefined || opts.onStdoutChunk) {
+    // Match runUpdateRefTransaction's Node-spawn path so stdin is reliable under Bun.
+    const stdinDir = opts.stdin === undefined ? undefined : await fs.mkdtemp(path.join(os.tmpdir(), "rbox-git-stdin-"));
+    let stdinFile: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      if (stdinDir) {
+        const stdinPath = path.join(stdinDir, "input");
+        await fs.writeFile(stdinPath, opts.stdin!);
+        stdinFile = await fs.open(stdinPath, "r");
+      }
+      return await new Promise<string>((resolve, reject) => {
+        const child = spawn("git", ["-C", root, ...args], {
+          env: cleanGitEnv(opts.env),
+          stdio: [stdinFile?.fd ?? "pipe", "pipe", "pipe"],
+        });
+        const stdout: Buffer[] = [];
+        const stderr: Buffer[] = [];
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
+        let exitCode: number | null | undefined;
+        let stdoutEnded = false;
+        let stderrEnded = false;
+        let settled = false;
+        let bufferError: Error | undefined;
+        const streamDecoder = opts.onStdoutChunk ? new StringDecoder("utf8") : undefined;
+        const maxBuffer = opts.maxBuffer ?? 16 * 1024 * 1024;
+        const finish = () => {
+          if (settled || exitCode === undefined || !stdoutEnded || !stderrEnded) return;
+          settled = true;
+          if (bufferError) reject(bufferError);
+          else if (exitCode === 0) resolve(opts.onStdoutChunk ? "" : Buffer.concat(stdout).toString());
+          else reject(Object.assign(new Error(Buffer.concat(stderr).toString() || `git exited with status ${exitCode ?? "unknown"}`), { code: exitCode }));
+        };
+        child.stdout!.on("data", (value: Buffer) => {
+          if (settled) return;
+          if (opts.onStdoutChunk) {
+            try {
+              const decoded = streamDecoder!.write(value);
+              if (decoded) opts.onStdoutChunk(decoded);
+            }
+            catch (error) {
+              settled = true;
+              child.kill();
+              reject(error);
+            }
+          }
+          else {
+            stdoutBytes += value.length;
+            if (stdoutBytes <= maxBuffer) stdout.push(value);
+            else { bufferError = new Error("git stdout exceeded maxBuffer"); child.kill(); }
+          }
+        });
+        child.stdout!.on("end", () => {
+          if (!settled && opts.onStdoutChunk) {
+            try {
+              const tail = streamDecoder!.end();
+              if (tail) opts.onStdoutChunk(tail);
+            } catch (error) {
+              settled = true;
+              reject(error);
+            }
+          }
+          stdoutEnded = true;
+          finish();
+        });
+        child.stderr!.on("data", (value: Buffer) => {
+          stderrBytes += value.length;
+          if (stderrBytes <= maxBuffer) stderr.push(value);
+          else { bufferError = new Error("git stderr exceeded maxBuffer"); child.kill(); }
+        });
+        child.stderr!.on("end", () => { stderrEnded = true; finish(); });
+        child.on("error", (error) => { if (!settled) { settled = true; reject(error); } });
+        child.on("close", (code) => {
+          exitCode = code;
+          finish();
+        });
+        child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+          if (error.code !== "EPIPE" && !settled) { settled = true; reject(error); }
+        });
+        child.stdin?.end();
+      });
+    } finally {
+      await stdinFile?.close();
+      if (stdinDir) await fs.rm(stdinDir, { recursive: true, force: true });
+    }
+  }
   const { stdout } = await exec("git", ["-C", root, ...args], {
     maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
     // Strip every repo-redirecting env var: rbox may be invoked from a git hook or wrapper,
@@ -88,7 +184,7 @@ export async function gitRaw(root: string, args: string[], opts: { maxBuffer?: n
   return stdout.toString();
 }
 
-export async function git(root: string, args: string[], opts: { maxBuffer?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+export async function git(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
   return (await gitRaw(root, args, opts)).trim();
 }
 

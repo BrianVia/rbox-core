@@ -7,7 +7,7 @@ import {
   incomingOwnershipRoots,
   indexIdentityV2,
   oracleFromState,
-  tipOwnedByIncoming,
+  partitionOwnedByIncoming,
   type AppliedManifestOracle,
   type BlobStore,
   type CheckoutCapabilityProbe,
@@ -67,6 +67,8 @@ interface GitResolveDeps {
   now?: () => Date;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Test seam for heartbeat scheduling; production remains ten seconds. */
+  progressIntervalMs?: number;
 }
 
 export interface GitDeferralsCmdDeps {
@@ -363,6 +365,7 @@ async function buildSnapshot(args: {
   kek: Buffer;
   cfg: WorkspaceConfig;
   now: Date;
+  progress?: (phase: "proving" | "found", count: number) => void;
 }): Promise<ResolveSnapshot> {
   const matcher = buildIgnoreMatcher(args.root, {
     respectGitignore: args.cfg.respectGitignore === true,
@@ -386,14 +389,28 @@ async function buildSnapshot(args: {
     const branch = /^ref:\s*(refs\/\S+)\s*$/.exec(identity.head)?.[1];
     if (!branch) addCandidate(await git(args.ctx.repoDir, ["rev-parse", "--verify", "HEAD"]).catch(() => undefined), "detached HEAD");
 
+    args.progress?.("proving", candidates.size);
     const localOnly: Array<{ oid: string; labels: string[]; subject: string }> = [];
     let proofIndeterminate = identity.index.kind === "indeterminate";
-    for (const [oid, labels] of candidates) {
-      const proof = await tipOwnedByIncoming(args.ctx.repoDir, oid, roots);
+    const partition = await partitionOwnedByIncoming(args.ctx.repoDir, [...candidates.keys()], roots);
+    const unowned = partition.filter((entry) => entry.proof.status === "unowned");
+    const subjects = new Map<string, string>();
+    if (unowned.length > 0) {
+      const raw = await git(args.ctx.repoDir, ["log", "--no-walk=unsorted", "--format=%H%x00%s", "--stdin"], {
+        env: { GIT_NO_LAZY_FETCH: "1" },
+        stdin: unowned.map((entry) => entry.tip).join("\n") + "\n",
+      }).catch(() => "");
+      for (const line of raw.split("\n")) {
+        const separator = line.indexOf("\0");
+        if (separator > 0) subjects.set(line.slice(0, separator), line.slice(separator + 1).trim().replace(/[\r\n\t]+/g, " "));
+      }
+    }
+    for (const entry of partition) {
+      const { tip: oid, proof } = entry;
+      const labels = candidates.get(oid)!;
       if (proof.status === "indeterminate") { proofIndeterminate = true; continue; }
       if (proof.status === "owned") continue;
-      const subject = (await git(args.ctx.repoDir, ["log", "-1", "--format=%s", oid]).catch(() => "unreadable commit"))
-        .replace(/[\r\n\t]+/g, " ");
+      const subject = (entry.commit ? subjects.get(entry.commit) : undefined) ?? "unreadable commit";
       localOnly.push({ oid, labels: [...labels].sort(), subject });
     }
     localOnly.sort((a, b) => `${a.labels.join("\0")}\0${a.subject}`.localeCompare(`${b.labels.join("\0")}\0${b.subject}`));
@@ -425,6 +442,7 @@ async function buildSnapshot(args: {
         ...(value.bytesChanged === undefined ? {} : { bytesChanged: value.bytesChanged }),
       })).sort((a, b) => a.lane.localeCompare(b.lane));
     const id = snapshotId(identity);
+    args.progress?.("found", localOnly.length);
     return {
       public: {
         status: "show-me",
@@ -449,12 +467,17 @@ async function buildSnapshot(args: {
   }
 }
 
+const HUMAN_LOCAL_ONLY_CAP = 50;
+
 function printShow(show: GitResolveShow, write: (line: string) => void): void {
   const checkout = show.incomingCheckout.kind === "branch" ? `branch ${show.incomingCheckout.label}` : "detached checkout";
   write(`${show.repo}: incoming ${checkout}`);
   write(`  oracle: ${show.oracle}; index: ${show.index}; operation state: ${show.operationState}; stash: ${show.stash}`);
   if (show.localOnlyCommits.length === 0) write("  local-only commits: none");
-  else for (const commit of show.localOnlyCommits) write(`  local-only ${commit.labels.join(", ")}: ${commit.subject}`);
+  else {
+    for (const commit of show.localOnlyCommits.slice(0, HUMAN_LOCAL_ONLY_CAP)) write(`  local-only ${commit.labels.join(", ")}: ${commit.subject}`);
+    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more local-only commits`);
+  }
   for (const d of show.deferrals) write(`  ${d.lane} deferred (${d.reason}) since ${d.deferredSince}${d.bytesChanged ? "; working bytes changed" : ""}`);
   write(`  snapshot: ${show.snapshot}`);
 }
@@ -608,10 +631,34 @@ export async function gitResolveCmd(
       emit({ status: "refused", verb, repo: rel, code: "no-incoming", message: "no deferred incoming Git state is available for this repository" }, json, deps, root);
       return 1;
     }
+    let progressTimer: ReturnType<typeof setInterval> | undefined;
+    let progressStarted = 0;
+    const progressWrite = deps.stderr ?? console.error;
+    const setProgressPhase = verb === "show-me" ? (phase: "staging" | "proving" | "found", count?: number) => {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = undefined; }
+      progressStarted = Date.now();
+      if (phase === "staging") progressWrite("show-me: staging incoming bundle…");
+      else if (phase === "proving") progressWrite(`show-me: proving ownership of ${count ?? 0} candidates…`);
+      else progressWrite(`show-me: ${count ?? 0} local-only commits found`);
+      if (phase !== "found") {
+        progressTimer = setInterval(() => {
+          progressWrite(`show-me: still working (${Math.max(0, Math.floor((Date.now() - progressStarted) / 1000))}s)`);
+        }, deps.progressIntervalMs ?? 10_000);
+      }
+    } : undefined;
     const takeSnapshot = () => buildSnapshot({
       root, rel, ctx, state, record, incoming, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
+      ...(setProgressPhase ? { progress: (phase: "proving" | "found", count: number) => setProgressPhase(phase, count) } : {}),
     });
-    let snapshot = await takeSnapshot();
+    if (setProgressPhase) {
+      setProgressPhase("staging");
+    }
+    let snapshot: ResolveSnapshot;
+    try {
+      snapshot = await takeSnapshot();
+    } finally {
+      if (progressTimer) clearInterval(progressTimer);
+    }
     if (verb === "show-me") {
       emit(snapshot.public, json, deps, root);
       return 0;

@@ -131,11 +131,13 @@ export { writeFileAtomic, RBOX_TMP_PREFIX } from "./fsutil.js";
 export { indexIdentityV2 } from "./git/index-identity.js";
 export {
   incomingOwnershipRoots,
+  partitionOwnedByIncoming,
   tipOwnedByIncoming,
   noDropProof,
   enumerateStashReflogOids,
   type ImportedScratchNamespace,
   type OwnershipProof,
+  type PartitionedOwnership,
   type NoDropProof,
 } from "./git/reachability.js";
 export {

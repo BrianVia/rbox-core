@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, setGitSpawnObserver, type RepoCtx } from "./shared.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -28,7 +28,24 @@ async function initRepo(): Promise<string> {
 }
 
 afterEach(async () => {
+  setGitSpawnObserver(undefined);
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
+
+test("gitRaw feeds stdin, streams stdout without returning it, and retains observer notification", async () => {
+  const repo = await initRepo();
+  await exec("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "subject"], { env: TEST_GIT_ENV });
+  const oid = (await exec("git", ["-C", repo, "rev-parse", "HEAD"], { env: TEST_GIT_ENV })).stdout.toString().trim();
+  const observed: string[][] = [];
+  const chunks: string[] = [];
+  setGitSpawnObserver((_root, args) => observed.push([...args]));
+  const returned = await gitRaw(repo, ["rev-list", "--stdin"], {
+    stdin: `${oid}\n`,
+    onStdoutChunk: (chunk) => chunks.push(chunk),
+  });
+  expect(returned).toBe("");
+  expect(chunks.join("").trim()).toBe(oid);
+  expect(observed).toEqual([["rev-list", "--stdin"]]);
 });
 
 test("cleanGitEnv supplies reflog identity fallbacks without replacing caller identity", () => {
