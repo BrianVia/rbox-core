@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { dbFor, dirDb } from "./db.js";
+import { chunked } from "./util.js";
 import { sanitizeLabel } from "./notify.js";
 import { pingSlackpipes } from "./slackpipes.js";
 
@@ -53,15 +54,11 @@ interface DeviceSummary {
   reposDeferred: number;
 }
 
+/** Re-asserts the SOURCE condition inside each claim's WHERE clause: an evaluator acting
+ *  on a stale snapshot cannot claim a send that fresher `device_sync_state` contradicts. */
 interface SourceGuard {
   sql: string;
   params: unknown[];
-}
-
-function chunks<T>(values: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < values.length; i += size) out.push(values.slice(i, i + size));
-  return out;
 }
 
 function escapeSlack(value: string): string {
@@ -79,7 +76,7 @@ function deviceFallback(deviceId: string): string {
 
 export function renderFleetDeviceLabel(label: string | null, deviceId: string): string {
   const clean = sanitizeLabel(label);
-  if (!label || clean === "Unknown device" || clean.includes("/") || clean.includes("\\") || clean.includes("@") || clean.includes("://")) return deviceFallback(deviceId);
+  if (clean === "Unknown device" || clean.includes("/") || clean.includes("\\") || clean.includes("@") || clean.includes("://")) return deviceFallback(deviceId);
   return escapeSlack(clean);
 }
 
@@ -103,6 +100,8 @@ function rowKey(row: AlertRow): string {
   return [row.condition, row.device_id, row.workspace_id, row.project_id, row.binding_id].join("\u0000");
 }
 
+const KEY_WHERE = "condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?";
+
 function binds(key: AlertKey): [Condition, string, string, string, string] {
   return [key.condition, key.deviceId, key.workspaceId, key.projectId, key.bindingId];
 }
@@ -112,7 +111,7 @@ async function labelsFor(env: Env, deviceIds: string[]): Promise<Map<string, str
   const ids = [...new Set(deviceIds)];
   if (!ids.length) return labels;
   const directory = dirDb(env);
-  for (const page of chunks(ids, ID_CHUNK)) {
+  for (const page of chunked(ids, ID_CHUNK)) {
     const result = await directory
       .prepare(`SELECT device_id, label FROM devices WHERE device_id IN (${page.map(() => "?").join(",")})`)
       .bind(...page)
@@ -134,9 +133,9 @@ async function conditionTrue(
   fireMessage: string,
   stillMessage: string,
   guard: SourceGuard,
-  allowRenotify = true,
 ): Promise<void> {
   const values = binds(key);
+  // fire: new incident
   const inserted = await db
     .prepare(`INSERT OR IGNORE INTO alert_state
       (condition, device_id, workspace_id, project_id, binding_id, incident_started_at, last_notified_at, resolved_at, resolve_notified_at)
@@ -148,9 +147,10 @@ async function conditionTrue(
     return;
   }
 
+  // reopen: resolved ≥2h ago — a genuinely new incident
   const reopened = await db
     .prepare(`UPDATE alert_state SET incident_started_at = ?, last_notified_at = ?, resolved_at = NULL, resolve_notified_at = NULL
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
+      WHERE ${KEY_WHERE}
         AND resolved_at IS NOT NULL AND resolved_at <= ? AND ${guard.sql}`)
     .bind(nowMs, nowMs, ...values, nowMs - CONTINUATION_MS, ...guard.params)
     .run();
@@ -159,27 +159,21 @@ async function conditionTrue(
     return;
   }
 
+  // continuation: resolved <2h ago — same incident, no message, resolve marker preserved
   await db
     .prepare(`UPDATE alert_state SET resolved_at = NULL
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
+      WHERE ${KEY_WHERE}
         AND resolved_at IS NOT NULL AND resolved_at > ? AND ${guard.sql}`)
     .bind(...values, nowMs - CONTINUATION_MS, ...guard.params)
     .run();
 
-  if (!allowRenotify) return;
-  const renotify = await db
-    .prepare(`UPDATE alert_state SET last_notified_at = ?
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
-        AND resolved_at IS NULL AND last_notified_at <= ? AND incident_started_at >= ? AND ${guard.sql}`)
-    .bind(nowMs, ...values, nowMs - DAY_MS, nowMs - RENOTIFY_END_MS, ...guard.params)
-    .run();
-  if ((renotify.meta.changes ?? 0) === 1) await send(env, stillMessage);
+  await renotifyExisting(env, db, key, nowMs, stillMessage, guard);
 }
 
 async function renotifyExisting(env: Env, db: D1Database, key: AlertKey, nowMs: number, message: string, guard: SourceGuard): Promise<void> {
   const claim = await db
     .prepare(`UPDATE alert_state SET last_notified_at = ?
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
+      WHERE ${KEY_WHERE}
         AND resolved_at IS NULL AND last_notified_at <= ? AND incident_started_at >= ? AND ${guard.sql}`)
     .bind(nowMs, ...binds(key), nowMs - DAY_MS, nowMs - RENOTIFY_END_MS, ...guard.params)
     .run();
@@ -197,13 +191,13 @@ async function conditionResolved(
   const values = binds(key);
   const current = await db
     .prepare(`SELECT incident_started_at FROM alert_state
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ? AND resolved_at IS NULL`)
+      WHERE ${KEY_WHERE} AND resolved_at IS NULL`)
     .bind(...values)
     .first<{ incident_started_at: number }>();
   if (!current) return;
   const claimed = await db
     .prepare(`UPDATE alert_state SET resolved_at = ?, resolve_notified_at = ?
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
+      WHERE ${KEY_WHERE}
         AND resolved_at IS NULL AND resolve_notified_at IS NULL AND incident_started_at = ? AND ${guard.sql}`)
     .bind(nowMs, nowMs, ...values, current.incident_started_at, ...guard.params)
     .run();
@@ -213,7 +207,7 @@ async function conditionResolved(
   }
   await db
     .prepare(`UPDATE alert_state SET resolved_at = ?
-      WHERE condition = ? AND device_id = ? AND workspace_id = ? AND project_id = ? AND binding_id = ?
+      WHERE ${KEY_WHERE}
         AND resolved_at IS NULL AND resolve_notified_at IS NOT NULL AND incident_started_at = ? AND ${guard.sql}`)
     .bind(nowMs, ...values, current.incident_started_at, ...guard.params)
     .run();
@@ -231,7 +225,8 @@ export async function evaluateFleetAlerts(env: Env, nowMs: number): Promise<void
   const [syncResult, stateResult] = await Promise.all([
     db.prepare(`SELECT device_id, workspace_id, project_id, binding_id, repos_total, repos_deferred,
       oldest_deferral_age_ms, deferral_reasons, reported_at FROM device_sync_state`).all<SyncRow>(),
-    db.prepare("SELECT * FROM alert_state").all<AlertRow>(),
+    db.prepare(`SELECT condition, device_id, workspace_id, project_id, binding_id,
+      incident_started_at, last_notified_at, resolved_at, resolve_notified_at FROM alert_state`).all<AlertRow>(),
   ]);
   const rows = syncResult.results ?? [];
   const states = stateResult.results ?? [];
@@ -247,16 +242,13 @@ export async function evaluateFleetAlerts(env: Env, nowMs: number): Promise<void
   }
 
   // Pinned ordering: stopped incidents are updated before stale-drift coverage decisions.
-  for (const state of states) {
-    if (state.condition === "reporting_stopped" && state.resolved_at === null && !devices.has(state.device_id)) {
-      await db
-        .prepare(`DELETE FROM alert_state WHERE condition = 'reporting_stopped' AND device_id = ?
-          AND workspace_id = '' AND project_id = '' AND binding_id = '' AND resolved_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM device_sync_state WHERE device_id = ?)`)
-        .bind(state.device_id, state.device_id)
-        .run();
-    }
-  }
+  // Administrative closure: a device with zero sync-state rows loses its stopped incident
+  // outright (no message, no continuation window) — one correlated statement.
+  await db
+    .prepare(`DELETE FROM alert_state WHERE condition = 'reporting_stopped' AND resolved_at IS NULL
+      AND workspace_id = '' AND project_id = '' AND binding_id = ''
+      AND NOT EXISTS (SELECT 1 FROM device_sync_state WHERE device_id = alert_state.device_id)`)
+    .run();
   for (const [deviceId, summary] of devices) {
     const key: AlertKey = { condition: "reporting_stopped", deviceId, workspaceId: "", projectId: "", bindingId: "" };
     const label = renderFleetDeviceLabel(labels.get(deviceId) ?? null, deviceId);

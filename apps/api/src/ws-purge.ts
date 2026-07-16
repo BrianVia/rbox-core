@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
-import { chunked, purgeWorkspaceDO } from "./account-delete.js";
+import { purgeWorkspaceDO } from "./account-delete.js";
 import { dbFor } from "./db.js";
-import { json, logErr } from "./util.js";
+import { json, logErr, chunked } from "./util.js";
 
 export const WS_PURGE_ROW_CAP = 2000;
 export const WS_PURGE_PAIR_BATCH = 100;
