@@ -15,6 +15,10 @@ Full version in AGENTS.md.
 
 @docs/DEPLOYMENTS.md
 
+`main` is integration-only and deploys nothing. After green CI and dev
+verification, production ships only by explicitly fast-forwarding `main` to
+the `production` branch; prod D1 migrations auto-apply during that promotion.
+
 ## D1 migrations (apps/api/migrations/README.md)
 
 Before adding or touching anything under `apps/api/migrations/`, read

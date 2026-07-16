@@ -58,7 +58,8 @@ existing inline commits keep verifying.
 Validate on the **dev** worker `rbox-dev-api` — real Cloudflare D1/R2/DO, the only place
 the latency/contention this change targets actually shows up (local Miniflare has ~0
 network latency and would hide it). The dev deploy is a **separate, manual** step —
-**do NOT push to `main` to test**: push-to-`main` auto-deploys *prod* (`deploy-api.yml`).
+**do NOT promote to `production` to test**: `main` is integration-only;
+production deploys from explicit `production` branch updates.
 
 ```bash
 # on a branch/worktree with the change (server + the client binary if it's a protocol change):
@@ -77,7 +78,7 @@ bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
 - **Success metric = this doc's Target/Goal section.** Once the §25 server metrics are live on
   dev you can read the server-side split (`d1Calls` / `d1Ms` / `r2Ms` per op) directly instead
   of inferring it from client wall-time — land §25 on dev first.
-- Only merge to `main` (→ prod) once it's proven on dev.
+- Merge only after dev proof, then explicitly promote `main` to `production`.
 - For an **isolated, repeatable** target (no contention with other dev work, wipe-and-repeat),
   set up a dedicated `[env.bench]` → `rbox-bench-api` + throwaway `rbox-bench-db`/`-blobs` and
   point `--remote` at it. (See the README "Benchmarking" section.)

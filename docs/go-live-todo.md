@@ -2,7 +2,8 @@
 
 Status as of 2026-06-29. Test/sandbox billing + Clerk provisioning are **done**;
 the prod funnel (marketing → auth → checkout) is **live end-to-end**; the dashboard
-has been **rebuilt on SvelteKit**, **CI/CD auto-deploys** on push to `main`, and
+has been **rebuilt on SvelteKit**, **CI/CD deploys** from the explicit
+`production` branch, and
 **GitHub + Google one-click sign-in** are wired. Remaining work is hardening +
 the post-launch feature set (see the design-docs batch at the bottom).
 
@@ -46,9 +47,9 @@ the post-launch feature set (see the design-docs batch at the bottom).
 ## ✅ Update 2026-06-29 (cont. 2) — SvelteKit rebuild, CI/CD, one-click OAuth
 - [x] **Dashboard rebuilt on SvelteKit + Vite + Svelte 5 runes** (replaces the vanilla static SPA). `@sveltejs/adapter-static` (`fallback: index.html`), Pages `_redirects` + `_headers` (CSP). Clerk-js **v6** prebuilt sign-in/up component (loads the `@clerk/ui` bundle from the FAPI). Session-bound rbox-token cache keyed by Clerk session id with a refresh mutex + one-shot 401 retry. **Codex-reviewed → /simplify → /antislop-codebase**, merged to `main`, deployed to the `rbox-app` Pages project (`app.rbox.to`). `apps/web` package renamed `web-next → web`; vanilla dashboard retired.
 - [x] **Subscribed-state UX fix** — plan buttons hide once `usage.plan !== 'free'`; paid users see **Manage billing** (portal) instead of a second-checkout path.
-- [x] **CI/CD auto-deploy on push to `main`** (GitHub Actions):
-  - `.github/workflows/deploy-api.yml` — `apps/api/**` → `wrangler deploy --env production` (`rbox-prod-api` / `api.rbox.to`), gated on typecheck + worker tests.
-  - `.github/workflows/deploy-web.yml` — `apps/web/**` → build + `wrangler pages deploy` (`rbox-app` / `app.rbox.to`), gated on `check` + unit tests. Uses `npm install` (not `ci`) — macOS-generated lock fails strict `npm ci` on Linux (utf-8-validate optional dep).
+- [x] **CI/CD production deploys** (originally push-to-`main`; split on 2026-07-16 so green, dev-verified `main` is explicitly promoted to `production`):
+  - Cloudflare Workers Builds — `production` pushes touching `apps/api/**` apply prod D1 migrations and deploy `rbox-prod-api` / `api.rbox.to`. The former `.github/workflows/deploy-api.yml` was removed.
+  - `.github/workflows/deploy-web.yml` — `production` pushes touching `apps/web/**` → build + `wrangler pages deploy` (`rbox-app` / `app.rbox.to`), gated on `check` + unit tests. Uses `npm install` (not `ci`) — macOS-generated lock fails strict `npm ci` on Linux (utf-8-validate optional dep).
   - `.github/workflows/release.yml` — `v*` tags → build/sign/publish the `rbox` CLI binaries to R2. **First CI-signed release `v0.1.0` shipped.**
   - Repo secret **`CLOUDFLARE_DEPLOY_TOKEN`** (Workers Scripts:Edit + Cloudflare Pages:Edit + Account:Read), distinct from release.yml's R2-only `CLOUDFLARE_API_TOKEN`. Dev-first workflow documented in `AGENTS.md`.
 - [x] **One-click sign-in — GitHub + Google OAuth** (reduces signup friction; bot protection stays ON):
