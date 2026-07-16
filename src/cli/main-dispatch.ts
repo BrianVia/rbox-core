@@ -348,7 +348,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const root = await resolvePathFlagRoot(flags.path);
       if (flags["respect-gitignore"] !== undefined) await setRespectGitignore(root, flags["respect-gitignore"]);
       else if (flags.purge === "true") await purgeIgnored(root, { yes: flags.yes === "true", allowMassDelete: flags["allow-mass-delete"] === "true" });
-      else if (flags.list === "true" || positional.length === 0) listIgnoreRules(root, { full: flags.list === "true" });
+      else if (flags.list === "true" || positional.length === 0) await listIgnoreRules(root, { full: flags.list === "true" });
       else await addIgnorePattern(root, positional[0]!);
       break;
     }

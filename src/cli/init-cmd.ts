@@ -85,18 +85,24 @@ async function promptMissing(
   if (!next.workspace && next["respect-gitignore"] == null) {
     next["respect-gitignore"] = await promptSelect<"false" | "true">({
       message: "How should rbox handle gitignored files?",
-      choices: [
-        { name: "Sync everything (current behavior)", value: "false" },
-        {
-          name: "Skip gitignored untracked files",
-          value: "true",
-          description: "build output and caches stay local; re-include notes/state in .rboxignore",
-        },
-      ],
+      choices: GITIGNORE_CHOICES,
     });
   }
   return next;
 }
+
+export const GITIGNORE_CHOICES = [
+  {
+    name: "Skip gitignored untracked files (recommended)",
+    value: "true",
+    description: "re-include specific files with ! lines in .rboxignore (e.g. !.env), or switch later with `rbox ignore --respect-gitignore off`",
+  },
+  {
+    name: "Sync gitignored files too (end-to-end encrypted)",
+    value: "false",
+    description: "rbox can never read them; great for notes/local state (and .env via !.env), but large builds/datasets sync too",
+  },
+] as const;
 
 /** What an executed init produced — returned so callers like `setup` can print a
  *  unified summary (with `summary: false`) instead of init's own trailing block. */

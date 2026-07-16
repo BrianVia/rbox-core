@@ -71,7 +71,7 @@ async function promptCancelable<V>(select: SelectPrompt, cfg: { message: string;
 export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Promise<void> {
   const { daemonRunning } = await (deps.statusCmd ?? statusCmd)(root);
   const action = await promptCancelable<FrontDoorAction>(deps.promptSelect ?? promptSelect, {
-    message: "Anything else?",
+    message: "What would you like to do?",
     choices: frontDoorChoices(daemonRunning),
   });
 
