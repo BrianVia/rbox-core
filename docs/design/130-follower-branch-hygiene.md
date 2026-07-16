@@ -191,7 +191,10 @@ redundant P recovery case. Global order is workspace mutex → common dirs by ca
 path → refs by bytewise name → state lock; no state writer may acquire a Git proof lock in
 the reverse order. This closes the proof-to-state race for generic saves and journal recovery.
 
-The following is the exhaustive v7 retrofit list from the current code. Every listed site
+The following is the exhaustive retrofit list from the current code (v8 adds
+`ensureTelemetryBindingId`, src/cli/config.ts:~572 — it rewrites state.json wholesale via
+its own lock and MUST route through the composer so it can never drop/alter BASE or A/P
+bookkeeping it did not read; round-7 catch). Every listed site
 must call the composer; the cited assignment/deletion is removed or becomes a caller:
 
 - **Pull initialization and recovery (`apply.ts`):** map initialization
@@ -505,37 +508,34 @@ second-proof snapshot/lock boundary changed. No free-form `reasons[...]` gate ex
 - Pre-activation old writers may rebuild the section and drop the chains/high-water mark;
   this remains safe-direction truncation and followers hold.
 
-**v7 (round-6), F9 — two-stage migration/refusal rule.** Local A/P semantics do not
-activate under today's permissive skew. Rollout is:
+**v8 (round-7), F9 — version skew is handled by READER-SIDE DISTRUST, not writer
+prevention.** (Round-7 correctly killed v7's launcher/floor architecture: rbox is a
+directly-executable standalone binary — nothing can stop an old binary from running and
+mutating local state before any server contact. Trying to prevent old writers was the
+wrong shape.) The rules, each safe-direction:
 
-1. Ship a bridge release that understands a signed workspace minimum-client floor and a
-   local `gitBaseProtocol` floor, preserves both fields, and refuses pull, push, reset,
-   manual resolution, and state writes when the floor exceeds its supported value. It
-   does not author A/P or BASE-absent semantics.
-2. Enforce that bridge release as the server/launcher minimum for every workspace writer;
-   sync requests carry `supportedGitBaseProtocol`, and the server's per-workspace floor
-   rejects a lower value before manifest read/write. The signed launcher refuses to exec
-   a binary older than the bridge once that workspace floor is cached. Only after this
-   fleet gate is observed does v7, under workspace mutex + state lock and before any Git
-   mutation, write `gitBaseProtocol:1` to state/state-incarnation and create the direct
-   common-dir ref `refs/rbox-local/base-protocol/v1` targeting the exact canonical blob
-   `{"floor":1,"v":1}`. Common-dir refs are written first in canonical path order, then
-   state; the bridge and v7 scan both, so a crash can only over-refuse or be completed by
-   v7. State/file CAS may proceed only when every copy equals 1. The floor is monotonic and
-   reset cannot lower it.
-3. A v7 manifest that carries tombstones also carries signed minimum protocol 1. The
-   server rejects writer commits below it, so an old writer cannot truncate an activated
-   lineage. A reader below it refuses before apply.
+1. Authorization needs BASE[R] PRESENT and equal to the tombstoned oid — a positive
+   record old binaries maintain correctly. BASE *absence* never authorizes anything, so an
+   old binary's inability to write A(R) artifacts or CAS-absent records can only produce
+   UNPROVEN states → holds.
+2. A live A(R) artifact for (R, T) BLOCKS authorization for that pair regardless of which
+   binary produced the surrounding state (old binaries neither create, retire, nor touch
+   `refs/rbox-local/*`).
+3. A(R) retires only inside a v8-executed transaction: the expected-absent CAS that
+   re-creates R, OR any normal v8 follow transaction that advances BASE[R] to a present
+   value (covers the interleaving where an OLD binary legitimately re-applied a
+   re-advertised R@T while A(R) was live — the next v8 follow revalidates through its own
+   composer and retires it).
 
-New→old→new proof: v7 first installs all refusal floors, then may create A/P and compose
-new BASE. Rolling to the bridge binary reads floor 1 > supported 0 and performs **zero**
-Git, state, reset, or wire writes; pre-bridge binaries are rejected by the already-raised
-server/launcher floor. Rolling forward to v7 finds the unchanged state and artifacts,
-revalidates them, settles P or overlays A, and continues. Therefore the old interval can
-neither manufacture BASE absence, expose stale presence, retire A/P, truncate tombstones,
-nor permanently strand the workspace—the capable binary resumes without repair. Failure
-to establish the bridge/server floor blocks activation; mixed-version safe degradation is
-not claimed after protocol 1.
+Mixed-interval walk (v8 → old → v8): v8 prunes R@T (BASE-absent-by-CAS + A(R)). Old binary
+interval: it sees no R, holds nothing, cannot forge CAS-absence or A(R); if the publisher
+re-advertises R@T the old binary may legitimately set R=T and record BASE=T (ordinary
+follow). User recreations in the interval look identical to that — WHICH IS THE POINT:
+returning v8 finds A(R) live → rule 2 blocks any re-deletion of R@T no matter its author;
+the next normal follow advances/revalidates BASE and retires A(R); a subsequent NEW
+tombstone generation must re-earn authorization from fresh live+BASE equality. No
+interleaving manufactures an authorized deletion of user work; every ambiguity resolves
+to a hold that ordinary syncing clears. No bridge release, no server floor, no launcher.
 
 ### Diagnostic rider — §126 veto observability (F16)
 
