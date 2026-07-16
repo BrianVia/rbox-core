@@ -198,7 +198,7 @@ export async function pushManifest(
 ): Promise<PushResult> {
   return withPushLaneAccumulator(
     () => pushManifestInner(root, cfg, local, deps, options),
-    (samples) => { for (const sample of samples) { try { deps.telemetry?.record(sample); } catch {} } },
+    (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
   );
 }
 
@@ -538,7 +538,7 @@ async function runPushAttempt(
   // daemon never consents, so a runaway wipe halts background push instead of publishing.
   const pushDeletes = filesDiff.deleted.length;
   if (!deps.allowMassDeletePush && pushMassDeleteTrips(pushDeletes, appliedBase.files.length)) {
-    try { deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }); } catch {}
+    deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
     throw new Error(
       `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` ` +
@@ -687,15 +687,13 @@ async function runPushAttempt(
     const firstPublish = finishFirstPublishStats();
     if (firstPublish) {
       report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
-      try {
-        deps.telemetry?.record({
-          kind: "first_publish",
-          timeToFilesSyncedMs: firstPublish.timeToFilesSyncedMs,
-          pushWallMs: report.toJSON().wallMs,
-          fileCount: fileCountOf(committed),
-          uniqueBlobs: report.blobs,
-        });
-      } catch {}
+      deps.telemetry?.record({
+        kind: "first_publish",
+        timeToFilesSyncedMs: firstPublish.timeToFilesSyncedMs,
+        pushWallMs: report.toJSON().wallMs,
+        fileCount: fileCountOf(committed),
+        uniqueBlobs: report.blobs,
+      });
     }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);

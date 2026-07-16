@@ -184,6 +184,12 @@ export class RboxApi implements SyncRemote {
     return this.ctx.token;
   }
 
+  /** JSON POST on the daemon's ONE RemoteContext (telemetry ingest, design 120) —
+   *  structurally satisfies TelemetryTransport without a second context. */
+  postJson(path: string, body: unknown, opts: { signal?: AbortSignal; retries?: number } = {}): Promise<Response> {
+    return this.ctx.postJson(path, body, opts);
+  }
+
   latest(_options?: LatestOptions): Promise<{ sequence: number; manifest: Manifest }> {
     return latest(this.ctx);
   }

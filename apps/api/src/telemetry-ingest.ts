@@ -3,6 +3,7 @@ import type { Principal } from "./authz.js";
 import { authorizeWorkspace } from "./authz.js";
 import { readBodyCapped } from "./commit-envelope.js";
 import { dbFor } from "./db.js";
+import { isRecord } from "./diagnostics.js";
 import { rateLimited } from "./ratelimit.js";
 import { json } from "./util.js";
 
@@ -79,6 +80,13 @@ export const SERVER_SYNC_STATE_NUMERIC_DOMAINS = {
   oldestDeferralAgeMs: { min: 0, max: 7_776_000_000, integer: true },
 } as const satisfies Record<string, NumericDomain>;
 
+const ALLOWED_SAMPLE_KEYS = new Map<ClientTelemetryKind, ReadonlySet<string>>(
+  (Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS) as [ClientTelemetryKind, SampleSchema][]).map(([kind, schema]) => [
+    kind,
+    new Set(["kind", ...schema.numbers.map((field) => field.field), ...schema.enums.map((field) => field.field)]),
+  ]),
+);
+
 export interface NormalizedClientMetric {
   readonly index: `client.${ClientTelemetryKind}` | "client.telemetry.drops";
   readonly blobs: readonly string[];
@@ -96,10 +104,6 @@ function emitClientMetric(env: Env, metric: NormalizedClientMetric): void {
   } catch {
     // Best-effort telemetry must never affect sync.
   }
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasOnlyKeys(value: JsonRecord, allowed: ReadonlySet<string>): boolean {
@@ -120,8 +124,7 @@ function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMe
   }
   const kind = value.kind as ClientTelemetryKind;
   const schema: SampleSchema = SERVER_TELEMETRY_SAMPLE_SCHEMAS[kind];
-  const allowed = new Set(["kind", ...schema.numbers.map((field) => field.field), ...schema.enums.map((field) => field.field)]);
-  if (!hasOnlyKeys(value, allowed)) return { ok: false, reason: "unknown_field" };
+  if (!hasOnlyKeys(value, ALLOWED_SAMPLE_KEYS.get(kind)!)) return { ok: false, reason: "unknown_field" };
 
   const wireNumbers: number[] = [];
   for (const field of schema.numbers) {
@@ -167,21 +170,30 @@ async function parsedEnvelope(req: Request, env: Env): Promise<{ value: unknown 
   }
 }
 
-async function telemetryRateLimit(env: Env, p: Principal): Promise<Response | null> {
-  return rateLimited(env.RL_TELEMETRY, p.deviceId);
+const TELEMETRY_ENVELOPE_KEYS = new Set(["v", "samples"]);
+const SYNC_STATE_ENVELOPE_KEYS = new Set(["v", "states"]);
+
+/** Shared front half of both ingest handlers: device-only gate, per-device rate
+ *  limit, capped body parse, and the `{v:1, <arrayKey>:[...]}` envelope shape. */
+async function openIngest(
+  req: Request, env: Env, p: Principal, arrayKey: "samples" | "states", envelopeKeys: ReadonlySet<string>,
+): Promise<{ items: unknown[] } | { response: Response }> {
+  if (p.kind !== "device") return { response: json({ error: "forbidden" }, 403) };
+  const limited = await rateLimited(env.RL_TELEMETRY, p.deviceId);
+  if (limited) return { response: limited };
+  const parsed = await parsedEnvelope(req, env);
+  if ("response" in parsed) return parsed;
+  if (!isRecord(parsed.value) || !hasOnlyKeys(parsed.value, envelopeKeys) || parsed.value.v !== 1 || !Array.isArray(parsed.value[arrayKey])) {
+    return { response: json({ error: "bad_request" }, 400) };
+  }
+  return { items: parsed.value[arrayKey] };
 }
 
 export async function ingestTelemetry(req: Request, env: Env, p: Principal): Promise<Response> {
-  if (p.kind !== "device") return json({ error: "forbidden" }, 403);
-  const limited = await telemetryRateLimit(env, p);
-  if (limited) return limited;
-  const parsed = await parsedEnvelope(req, env);
-  if ("response" in parsed) return parsed.response;
-  if (!isRecord(parsed.value) || !hasOnlyKeys(parsed.value, new Set(["v", "samples"])) || parsed.value.v !== 1 || !Array.isArray(parsed.value.samples)) {
-    return json({ error: "bad_request" }, 400);
-  }
+  const opened = await openIngest(req, env, p, "samples", TELEMETRY_ENVELOPE_KEYS);
+  if ("response" in opened) return opened.response;
 
-  const samples = parsed.value.samples;
+  const samples = opened.items;
   let accepted = 0;
   let dropped = Math.max(0, samples.length - TELEMETRY_BATCH_CAP);
   emitDrop(env, "batch_cap", dropped);
@@ -204,7 +216,6 @@ const SYNC_KEYS = new Set([
   "workspaceId", "projectId", "bindingId", "fileSeq", "reposTotal", "reposDeferred", "oldestDeferralAgeMs", "deferralReasons",
 ]);
 export const SERVER_BINDING_ID_RE = /^[0-9a-f]{16}$/;
-const DEFERRAL_REASON_SET = new Set<string>(SERVER_GIT_DEFERRAL_REASONS);
 
 interface ValidSyncState {
   workspaceId: string;
@@ -230,7 +241,7 @@ function validateSyncState(value: unknown): ValidSyncState | null {
   const canonicalReasons: string[] = [];
   for (const reason of deferralReasons) {
     const canonical = typeof reason === "string" ? SERVER_GIT_DEFERRAL_REASONS.find((candidate) => candidate === reason) : undefined;
-    if (canonical === undefined || !DEFERRAL_REASON_SET.has(canonical)) return null;
+    if (canonical === undefined) return null;
     if (!canonicalReasons.includes(canonical)) canonicalReasons.push(canonical);
   }
   if (reposDeferred === 0) {
@@ -242,21 +253,15 @@ function validateSyncState(value: unknown): ValidSyncState | null {
 }
 
 export async function ingestSyncState(req: Request, env: Env, p: Principal): Promise<Response> {
-  if (p.kind !== "device") return json({ error: "forbidden" }, 403);
-  const limited = await telemetryRateLimit(env, p);
-  if (limited) return limited;
-  const parsed = await parsedEnvelope(req, env);
-  if ("response" in parsed) return parsed.response;
-  if (!isRecord(parsed.value) || !hasOnlyKeys(parsed.value, new Set(["v", "states"])) || parsed.value.v !== 1 || !Array.isArray(parsed.value.states)) {
-    return json({ error: "bad_request" }, 400);
-  }
+  const opened = await openIngest(req, env, p, "states", SYNC_STATE_ENVELOPE_KEYS);
+  if ("response" in opened) return opened.response;
 
   let accepted = 0;
-  let dropped = Math.max(0, parsed.value.states.length - SYNC_STATE_BATCH_CAP);
+  let dropped = Math.max(0, opened.items.length - SYNC_STATE_BATCH_CAP);
   emitDrop(env, "batch_cap", dropped);
   const reportedAt = Date.now();
   const db = dbFor(env, p.accountId);
-  for (const raw of parsed.value.states.slice(0, SYNC_STATE_BATCH_CAP)) {
+  for (const raw of opened.items.slice(0, SYNC_STATE_BATCH_CAP)) {
     const state = validateSyncState(raw);
     if (!state) {
       dropped++;

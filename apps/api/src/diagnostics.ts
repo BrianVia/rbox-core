@@ -37,7 +37,7 @@ export const REAL_DIAGNOSTICS_DEPS: DiagnosticsDeps = {
   deleteReport: (env, key) => env.rbox_dev_blobs.delete(key).then(() => undefined),
 };
 
-function isRecord(v: unknown): v is JsonRecord {
+export function isRecord(v: unknown): v is JsonRecord {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 

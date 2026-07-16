@@ -156,7 +156,7 @@ export async function applyPulledManifest(
   const plannedDeletes = all.reduce((n, a) => n + (a.kind === "delete" ? 1 : 0), 0);
   const baseFiles = state.lastSyncedManifest.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
-    try { deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }); } catch {}
+    deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
     throw new Error(
       `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`

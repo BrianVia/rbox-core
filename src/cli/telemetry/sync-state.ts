@@ -10,19 +10,17 @@ export function buildSyncStateSummary(
   state: LocalSyncState,
   bindingId: string,
   now = Date.now(),
+  records = repoRecordsForState(state),
 ): SyncState {
-  const records = repoRecordsForState(state);
   const entries = Object.entries(records).flatMap(([repo, record]) =>
     Object.values(record.deferrals ?? {}).filter((value): value is NonNullable<typeof value> => value !== undefined)
       .map((deferral) => ({ repo, deferral, record })),
   );
   const projected = projectGitDeferralRepos(entries, now);
   const deferredRepos = new Set(projected.map((repo) => repo.repo));
-  const reasons = new Set<GitDeferralReason>();
-  for (const [repo, record] of Object.entries(records)) {
-    if (!deferredRepos.has(repo)) continue;
-    for (const deferral of Object.values(record.deferrals ?? {})) if (deferral) reasons.add(deferral.reason);
-  }
+  const reasons = new Set<GitDeferralReason>(
+    entries.filter((entry) => deferredRepos.has(entry.repo)).map((entry) => entry.deferral.reason),
+  );
   let oldestDeferralAgeMs: number | null = null;
   if (projected.length > 0) {
     const oldest = Math.min(...projected.map((repo) => Date.parse(repo.oldestDeferredSince)).filter(Number.isFinite));
@@ -71,11 +69,11 @@ export class SyncStateReporter {
     if (!enabled()) return;
     try {
       this.bindingId ??= (await ensureTelemetryBindingId(this.root, state.stream)).bindingId;
-      const summary = buildSyncStateSummary(this.cfg, state, this.bindingId, this.now());
+      const records = repoRecordsForState(state);
+      const summary = buildSyncStateSummary(this.cfg, state, this.bindingId, this.now(), records);
       // Ages advance continuously; they are refreshed by the hourly heartbeat, not a
       // reason to report every otherwise-unchanged sync tick. The persisted deferral
       // boundaries still make a new/restarted episode fingerprint differently.
-      const records = repoRecordsForState(state);
       const deferralBoundaries = Object.values(records).flatMap((record) =>
         Object.values(record.deferrals ?? {}).filter((value): value is NonNullable<typeof value> => value !== undefined)
           .map((deferral) => `${deferral.lane}:${deferral.deferredSince}:${deferral.reason}`),

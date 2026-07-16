@@ -103,7 +103,6 @@ import {
 } from "./policy.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
-import { RemoteContext } from "../remote/context.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 
@@ -403,9 +402,8 @@ export class RboxDaemon {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
     this.onStopped = opts.onStopped;
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
-    const telemetryContext = new RemoteContext(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
-    this.telemetry = new TelemetryQueue(telemetryContext, this.log);
-    this.syncStateReporter = new SyncStateReporter(root, cfg, telemetryContext, this.log);
+    this.telemetry = new TelemetryQueue(this.api, this.log);
+    this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
@@ -1235,7 +1233,7 @@ export class RboxDaemon {
     }
     this.chainRepairPolicy.clear();
     if (notifyPendingAt !== undefined) {
-      try { this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, Date.now() - notifyPendingAt) }); } catch {}
+      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, Date.now() - notifyPendingAt) });
     }
     report?.logSummaryTo((line) =>
       this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
@@ -1346,9 +1344,7 @@ export class RboxDaemon {
     }, 120_000);
     this.telemetryFlushTimer.unref?.();
     const capability = () => {
-      if (!this.stopped) {
-        try { this.telemetry.record({ kind: "capability", workerExecutions: cryptoPoolStatus().workerExecutions }); } catch {}
-      }
+      if (!this.stopped) this.telemetry.record({ kind: "capability", workerExecutions: cryptoPoolStatus().workerExecutions });
     };
     this.capabilityInitialTimer = setTimeout(() => {
       capability();
